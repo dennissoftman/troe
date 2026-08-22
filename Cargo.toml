@@ -6,6 +6,7 @@ members = [
     "crates/kllm-shell",
     "host",
     "kernel",
+    "xtask",
 ]
 default-members = [
     "crates/kllm-core",

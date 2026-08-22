@@ -62,9 +62,10 @@ not bundle firmware, provide code and variable-store images from rust-osdev
 
 The launcher refuses a QEMU version other than 11.1.0 unless
 `--skip-version-check` is supplied deliberately. Firmware is not silently
-downloaded. Stage 1 uses UEFI Simple Text I/O, so the interactive shell appears
-in QEMU's graphical firmware console; native serial I/O belongs to the next
-machine-owned increment.
+downloaded. Stage 1 uses UEFI Simple Text I/O, routed directly through the
+invoking terminal using the firmware's 16550-backed console on x86-64 and its
+PL011-backed console on AArch64. Native serial I/O owned by kllm belongs to the
+next machine-owned increment.
 
 ## Repository map
 

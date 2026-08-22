@@ -1,0 +1,2 @@
+[alias]
+qemu = "run --quiet --package kllm-xtask --"
