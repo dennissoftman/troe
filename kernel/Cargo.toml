@@ -1,0 +1,25 @@
+[package]
+name = "kllm-kernel"
+description = "Firmware-hosted kllm image composition root"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+kllm-core = { path = "../crates/kllm-core" }
+kllm-shell = { path = "../crates/kllm-shell" }
+kllm-vfs = { path = "../crates/kllm-vfs" }
+
+[target.'cfg(target_os = "uefi")'.dependencies]
+uefi = { version = "=0.39.0", features = ["global_allocator", "panic_handler"] }
+
+[lints]
+workspace = true
+
+[[bin]]
+name = "kllm-kernel"
+path = "src/main.rs"
+test = false
+bench = false
+
