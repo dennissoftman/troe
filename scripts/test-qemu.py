@@ -38,6 +38,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--firmware-vars", type=Path)
     parser.add_argument("--skip-version-check", action="store_true")
     parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="run a fast terminal-focused scenario instead of full acceptance",
+    )
+    parser.add_argument(
         "--skip-build",
         action="store_true",
         help="use boot images already present under build/",
@@ -344,6 +349,35 @@ def run_scenario(session: SerialSession, boot_timeout: float, command_timeout: f
     session.wait_for(b"halting: returning control to firmware", command_timeout, start)
 
 
+def run_smoke_scenario(
+    session: SerialSession, boot_timeout: float, command_timeout: float
+) -> None:
+    """Exercise the interactive console path without the exhaustive quota workload."""
+    session.wait_for(b"kllm:/> ", boot_timeout)
+    cwd = "/"
+    session.backspace_command(
+        "echo brokeX", "n", cwd, command_timeout, expected="\nbroken\n"
+    )
+    session.command(
+        "clear", cwd, command_timeout, raw_contains=(b"\x1b[2J",)
+    )
+    session.command(
+        "echo qemu-smoke | grep smoke",
+        cwd,
+        command_timeout,
+        contains=("qemu-smoke\n",),
+    )
+    session.command(
+        "mem",
+        cwd,
+        command_timeout,
+        contains=(f"arch: {session.architecture}", "memory owner: firmware"),
+    )
+    start = len(session.output)
+    session.send("halt", command_timeout)
+    session.wait_for(b"halting: returning control to firmware", command_timeout, start)
+
+
 def test_architecture(
     architecture: str,
     args: argparse.Namespace,
@@ -357,7 +391,8 @@ def test_architecture(
     )
     session = SerialSession(command, architecture)
     try:
-        run_scenario(session, args.boot_timeout, args.command_timeout)
+        scenario = run_smoke_scenario if args.smoke else run_scenario
+        scenario(session, args.boot_timeout, args.command_timeout)
     except Exception:
         print(f"--- {architecture} QEMU transcript ---", file=sys.stderr)
         print(session.transcript(), file=sys.stderr)
@@ -365,7 +400,8 @@ def test_architecture(
         raise
     finally:
         session.close()
-    print(f"QEMU acceptance ({architecture}): passed")
+    suite = "smoke" if args.smoke else "acceptance"
+    print(f"QEMU {suite} ({architecture}): passed")
 
 
 def main() -> int:

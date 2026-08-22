@@ -53,7 +53,9 @@ This includes the pinned x86-64 and AArch64 QEMU boot suites. If that exact
 QEMU/firmware pair is not installed, run the non-emulator gates explicitly with
 `python scripts/test.py --skip-qemu`. Run only the boot suites with
 `python scripts/test-qemu.py`; the two architectures run concurrently after
-their images have been built.
+their images have been built. For a quick terminal-focused iteration, use
+`python scripts/test-qemu.py --smoke`; the exhaustive suite remains the standard
+gate.
 
 Build the x86-64 image and open it in QEMU:
 
