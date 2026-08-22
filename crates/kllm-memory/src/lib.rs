@@ -15,6 +15,8 @@ pub const MAX_FIRMWARE_REGIONS: usize = 256;
 pub const MAX_RESERVATIONS: usize = 64;
 /// Maximum normalized ranges produced after reservation splitting.
 pub const MAX_NORMALIZED_REGIONS: usize = 512;
+/// Maximum physical frames tracked by the initial bitmap (256 GiB at 4 KiB).
+pub const MAX_MANAGED_FRAMES: u64 = 64 * 1024 * 1024;
 
 /// Failures produced while validating and normalizing physical memory.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -379,6 +381,213 @@ impl BootAllocator {
     }
 }
 
+/// Failures produced by the physical-frame bitmap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrameAllocationError {
+    /// Frame-count or bitmap-size arithmetic overflowed.
+    Overflow,
+    /// The configured bitmap capacity would be exceeded.
+    TooManyFrames,
+    /// Bitmap metadata could not be allocated.
+    MetadataExhausted,
+    /// No free usable frame remains.
+    Exhausted,
+    /// The supplied address is unaligned, reserved, or absent from the map.
+    InvalidFrame,
+    /// A usable frame that was already free was released.
+    DoubleFree,
+}
+
+impl fmt::Display for FrameAllocationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Overflow => formatter.write_str("frame allocator arithmetic overflowed"),
+            Self::TooManyFrames => formatter.write_str("frame bitmap capacity exceeded"),
+            Self::MetadataExhausted => formatter.write_str("frame bitmap metadata exhausted"),
+            Self::Exhausted => formatter.write_str("physical frames exhausted"),
+            Self::InvalidFrame => formatter.write_str("physical frame is not allocator-owned"),
+            Self::DoubleFree => formatter.write_str("physical frame was freed twice"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FrameSpan {
+    range: PhysicalRange,
+    first_frame: u64,
+}
+
+/// Compact ownership bitmap over the usable spans in a normalized map.
+///
+/// Only usable pages consume bitmap bits, so high device ranges do not inflate
+/// metadata. A zero bit denotes a free frame and a one bit an allocated frame.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrameAllocator {
+    spans: Vec<FrameSpan>,
+    bitmap: Vec<u64>,
+    total_frames: u64,
+    free_frames: u64,
+}
+
+impl FrameAllocator {
+    /// Build an empty frame allocator over every usable normalized region.
+    ///
+    /// # Errors
+    ///
+    /// Rejects checked arithmetic overflow, maps above the explicit bitmap
+    /// capacity, and fallible metadata allocation failure.
+    pub fn from_map(map: &NormalizedMemoryMap) -> Result<Self, FrameAllocationError> {
+        let mut spans = Vec::new();
+        spans
+            .try_reserve_exact(map.regions.len())
+            .map_err(|_| FrameAllocationError::MetadataExhausted)?;
+        let mut total_frames = 0_u64;
+        for region in &map.regions {
+            if region.kind != RegionKind::Usable {
+                continue;
+            }
+            spans.push(FrameSpan {
+                range: region.range,
+                first_frame: total_frames,
+            });
+            total_frames = total_frames
+                .checked_add(region.range.page_count())
+                .ok_or(FrameAllocationError::Overflow)?;
+            if total_frames > MAX_MANAGED_FRAMES {
+                return Err(FrameAllocationError::TooManyFrames);
+            }
+        }
+
+        let word_count = total_frames
+            .checked_add(63)
+            .ok_or(FrameAllocationError::Overflow)?
+            / 64;
+        let word_count = usize::try_from(word_count).map_err(|_| FrameAllocationError::Overflow)?;
+        let mut bitmap = Vec::new();
+        bitmap
+            .try_reserve_exact(word_count)
+            .map_err(|_| FrameAllocationError::MetadataExhausted)?;
+        bitmap.resize(word_count, 0);
+
+        Ok(Self {
+            spans,
+            bitmap,
+            total_frames,
+            free_frames: total_frames,
+        })
+    }
+
+    /// Allocate the lowest-addressed currently free physical frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FrameAllocationError::Exhausted`] when no frame is free.
+    pub fn allocate(&mut self) -> Result<u64, FrameAllocationError> {
+        if self.free_frames == 0 {
+            return Err(FrameAllocationError::Exhausted);
+        }
+        for frame_index in 0..self.total_frames {
+            if !self.is_allocated(frame_index)? {
+                self.set_allocated(frame_index, true)?;
+                self.free_frames -= 1;
+                return self
+                    .address_for_index(frame_index)
+                    .ok_or(FrameAllocationError::Overflow);
+            }
+        }
+        Err(FrameAllocationError::Exhausted)
+    }
+
+    /// Return one previously allocated physical frame to the bitmap.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unaligned, reserved, unmapped, and already-free addresses.
+    pub fn free(&mut self, address: u64) -> Result<(), FrameAllocationError> {
+        let frame_index = self
+            .index_for_address(address)
+            .ok_or(FrameAllocationError::InvalidFrame)?;
+        if !self.is_allocated(frame_index)? {
+            return Err(FrameAllocationError::DoubleFree);
+        }
+        self.set_allocated(frame_index, false)?;
+        self.free_frames = self
+            .free_frames
+            .checked_add(1)
+            .ok_or(FrameAllocationError::Overflow)?;
+        Ok(())
+    }
+
+    /// Number of usable frames represented by the bitmap.
+    #[must_use]
+    pub const fn total_frames(&self) -> u64 {
+        self.total_frames
+    }
+
+    /// Number of frames currently available for allocation.
+    #[must_use]
+    pub const fn free_frames(&self) -> u64 {
+        self.free_frames
+    }
+
+    /// Bitmap storage bytes, excluding the bounded span table.
+    #[must_use]
+    pub fn bitmap_bytes(&self) -> usize {
+        self.bitmap.len() * core::mem::size_of::<u64>()
+    }
+
+    fn is_allocated(&self, frame_index: u64) -> Result<bool, FrameAllocationError> {
+        let (word, mask) = self.bitmap_location(frame_index)?;
+        Ok(self.bitmap[word] & mask != 0)
+    }
+
+    fn set_allocated(
+        &mut self,
+        frame_index: u64,
+        allocated: bool,
+    ) -> Result<(), FrameAllocationError> {
+        let (word, mask) = self.bitmap_location(frame_index)?;
+        if allocated {
+            self.bitmap[word] |= mask;
+        } else {
+            self.bitmap[word] &= !mask;
+        }
+        Ok(())
+    }
+
+    fn bitmap_location(&self, frame_index: u64) -> Result<(usize, u64), FrameAllocationError> {
+        if frame_index >= self.total_frames {
+            return Err(FrameAllocationError::Overflow);
+        }
+        let word = usize::try_from(frame_index / 64).map_err(|_| FrameAllocationError::Overflow)?;
+        Ok((word, 1_u64 << (frame_index % 64)))
+    }
+
+    fn address_for_index(&self, frame_index: u64) -> Option<u64> {
+        for span in &self.spans {
+            let page_count = span.range.page_count();
+            if frame_index >= span.first_frame && frame_index - span.first_frame < page_count {
+                let offset = (frame_index - span.first_frame).checked_mul(BASE_PAGE_SIZE)?;
+                return span.range.start.checked_add(offset);
+            }
+        }
+        None
+    }
+
+    fn index_for_address(&self, address: u64) -> Option<u64> {
+        if !address.is_multiple_of(BASE_PAGE_SIZE) {
+            return None;
+        }
+        for span in &self.spans {
+            if address >= span.range.start && address < span.range.end {
+                let offset = (address - span.range.start) / BASE_PAGE_SIZE;
+                return span.first_frame.checked_add(offset);
+            }
+        }
+        None
+    }
+}
+
 fn normalize_firmware(regions: &[MemoryRegion]) -> Result<Vec<MemoryRegion>, MemoryMapError> {
     let mut sorted = regions.to_vec();
     sorted.sort_unstable_by_key(|region| region.range.start);
@@ -520,8 +729,9 @@ fn calculate_stats(regions: &[MemoryRegion]) -> Result<MemoryMapStats, MemoryMap
 #[cfg(test)]
 mod tests {
     use super::{
-        BASE_PAGE_SIZE, BootAllocation, BootAllocationError, BootAllocator, MAX_FIRMWARE_REGIONS,
-        MemoryMapError, MemoryRegion, NormalizedMemoryMap, PhysicalRange, RegionKind,
+        BASE_PAGE_SIZE, BootAllocation, BootAllocationError, BootAllocator, FrameAllocationError,
+        FrameAllocator, MAX_FIRMWARE_REGIONS, MemoryMapError, MemoryRegion, NormalizedMemoryMap,
+        PhysicalRange, RegionKind,
     };
     use alloc::vec;
 
@@ -714,5 +924,65 @@ mod tests {
         allocator.seal();
         assert!(allocator.is_sealed());
         assert_eq!(allocator.allocate(1, 1), Err(BootAllocationError::Sealed));
+    }
+
+    #[test]
+    fn frame_bitmap_tracks_discontiguous_usable_ranges() -> Result<(), FrameAllocationError> {
+        let map = NormalizedMemoryMap::build(
+            &[
+                region(1, 2, RegionKind::Usable),
+                region(3, 2, RegionKind::Reserved),
+                region(5, 1, RegionKind::Usable),
+            ],
+            &[],
+        )
+        .map_err(|_| FrameAllocationError::Overflow)?;
+        let mut allocator = FrameAllocator::from_map(&map)?;
+
+        assert_eq!(allocator.total_frames(), 3);
+        assert_eq!(allocator.bitmap_bytes(), 8);
+        assert_eq!(allocator.allocate(), Ok(BASE_PAGE_SIZE));
+        assert_eq!(allocator.allocate(), Ok(2 * BASE_PAGE_SIZE));
+        assert_eq!(allocator.allocate(), Ok(5 * BASE_PAGE_SIZE));
+        assert_eq!(allocator.free_frames(), 0);
+        assert_eq!(allocator.allocate(), Err(FrameAllocationError::Exhausted));
+        Ok(())
+    }
+
+    #[test]
+    fn frame_bitmap_rejects_invalid_and_double_free() -> Result<(), FrameAllocationError> {
+        let map = NormalizedMemoryMap::build(
+            &[
+                region(1, 1, RegionKind::Usable),
+                region(2, 1, RegionKind::Reserved),
+            ],
+            &[],
+        )
+        .map_err(|_| FrameAllocationError::Overflow)?;
+        let mut allocator = FrameAllocator::from_map(&map)?;
+        let frame = allocator.allocate()?;
+
+        assert_eq!(allocator.free(frame), Ok(()));
+        assert_eq!(allocator.free(frame), Err(FrameAllocationError::DoubleFree));
+        assert_eq!(
+            allocator.free(2 * BASE_PAGE_SIZE),
+            Err(FrameAllocationError::InvalidFrame)
+        );
+        assert_eq!(
+            allocator.free(BASE_PAGE_SIZE + 1),
+            Err(FrameAllocationError::InvalidFrame)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn frame_bitmap_capacity_arithmetic_is_checked() -> Result<(), MemoryMapError> {
+        let huge = PhysicalRange::from_pages(0, super::MAX_MANAGED_FRAMES + 1)?;
+        let map = NormalizedMemoryMap::build(&[MemoryRegion::new(huge, RegionKind::Usable)], &[])?;
+        assert_eq!(
+            FrameAllocator::from_map(&map),
+            Err(FrameAllocationError::TooManyFrames)
+        );
+        Ok(())
     }
 }
