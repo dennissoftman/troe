@@ -251,7 +251,8 @@ The terminal subsystem MUST expose byte-oriented input and output interfaces. UT
 Minimum behavior:
 
 - printable input;
-- backspace;
+- backspace, accepting both ASCII BS (`0x08`) and DEL (`0x7f`) from terminal
+  transports;
 - carriage-return/newline normalization;
 - a visible prompt;
 - bounded editable line length;

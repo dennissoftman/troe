@@ -3,5 +3,6 @@
 *.log
 *.fd
 *.img
+*.pyc
+__pycache__/
 !.keep
-

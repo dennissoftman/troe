@@ -16,6 +16,17 @@ pub const MAX_PIPELINE_STAGES: usize = 8;
 /// Maximum bytes passed between two pipeline stages.
 pub const PIPE_CAPACITY: usize = 64 * 1024;
 
+/// Whether a terminal character requests deletion of the preceding character.
+///
+/// Interactive transports disagree on whether the Backspace key produces the
+/// ASCII BS character or DEL. Firmware, UART, and future remote-terminal
+/// frontends use this shared rule so terminal configuration does not alter the
+/// editing semantics.
+#[must_use]
+pub const fn is_backspace(character: char) -> bool {
+    matches!(character, '\u{8}' | '\u{7f}')
+}
+
 /// Failures produced by a byte stream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StreamError {
@@ -211,7 +222,7 @@ pub struct MemoryStats {
 
 #[cfg(test)]
 mod tests {
-    use super::{BoundedOutput, Input, Output, SliceInput, StreamError, write_all};
+    use super::{BoundedOutput, Input, Output, SliceInput, StreamError, is_backspace, write_all};
 
     struct PartialOutput {
         bytes: alloc::vec::Vec<u8>,
@@ -251,5 +262,12 @@ mod tests {
         };
         assert_eq!(write_all(&mut output, b"test"), Ok(()));
         assert_eq!(output.bytes, b"test");
+    }
+
+    #[test]
+    fn terminal_backspace_accepts_bs_and_del() {
+        assert!(is_backspace('\u{8}'));
+        assert!(is_backspace('\u{7f}'));
+        assert!(!is_backspace('x'));
     }
 }

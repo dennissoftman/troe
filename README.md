@@ -19,7 +19,8 @@ use rather than providing a hardware security boundary.
 - `cat`, `echo`, literal `grep`, `ls`, `pwd`, `cd`, `help`, `mem`, `clear`,
   `halt`, `write`, `rm`, and `hexdump`;
 - deterministic 1.44 MiB FAT12 images for both primary architectures;
-- host/unit/smoke plumbing and QEMU launch plumbing.
+- host/unit/smoke gates and prompt-synchronized QEMU acceptance on both
+  architectures.
 
 ## Quick start
 
@@ -48,6 +49,12 @@ Run all local gates:
 python scripts/test.py
 ```
 
+This includes the pinned x86-64 and AArch64 QEMU boot suites. If that exact
+QEMU/firmware pair is not installed, run the non-emulator gates explicitly with
+`python scripts/test.py --skip-qemu`. Run only the boot suites with
+`python scripts/test-qemu.py`; the two architectures run concurrently after
+their images have been built.
+
 Build the x86-64 image and open it in QEMU:
 
 ```console
@@ -60,7 +67,7 @@ not bundle firmware, provide code and variable-store images from rust-osdev
 `ovmf-prebuilt` release `edk2-stable202605-r1` using `--firmware-code` and
 `--firmware-vars`.
 
-The launcher refuses a QEMU version other than 11.1.0 unless
+The launcher and acceptance harness refuse a QEMU version other than 11.1.0 unless
 `--skip-version-check` is supplied deliberately. Firmware is not silently
 downloaded. Stage 1 uses UEFI Simple Text I/O, routed directly through the
 invoking terminal using the firmware's 16550-backed console on x86-64 and its

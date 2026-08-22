@@ -16,7 +16,7 @@ mod firmware {
     use alloc::string::String;
     use core::fmt::Write as _;
 
-    use kllm_core::{Input, MAX_LINE_BYTES, Output, StreamError};
+    use kllm_core::{Input, MAX_LINE_BYTES, Output, StreamError, is_backspace};
     use kllm_shell::Shell;
     use kllm_vfs::{Namespace, RamFsQuota};
     use uefi::boot;
@@ -29,11 +29,18 @@ mod firmware {
 
     impl Output for ConsoleOutput {
         fn write(&mut self, bytes: &[u8]) -> Result<usize, StreamError> {
-            let text = String::from_utf8_lossy(bytes);
-            let result = uefi::system::with_stdout(|stdout| stdout.write_str(text.as_ref()));
-            match result {
-                Ok(()) => Ok(bytes.len()),
-                _ => Err(StreamError::Device),
+            let succeeded = uefi::system::with_stdout(|stdout| {
+                if bytes == b"\x1b[2J\x1b[H" {
+                    stdout.clear().is_ok()
+                } else {
+                    let text = String::from_utf8_lossy(bytes);
+                    stdout.write_str(text.as_ref()).is_ok()
+                }
+            });
+            if succeeded {
+                Ok(bytes.len())
+            } else {
+                Err(StreamError::Device)
             }
         }
     }
@@ -103,7 +110,7 @@ mod firmware {
                         }
                         return Ok(Cow::Owned(line));
                     }
-                    '\u{8}' => {
+                    value if is_backspace(value) => {
                         if line.pop().is_some() {
                             write_console(console, b"\x08 \x08")?;
                         }

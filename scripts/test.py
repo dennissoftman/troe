@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Run formatting, lint, test, consistency, smoke, and image-build gates."""
+"""Run formatting, lint, test, consistency, image, and QEMU boot gates."""
 
 from __future__ import annotations
 
+import argparse
 import subprocess
 import sys
 from pathlib import Path
@@ -10,6 +11,16 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOLS_DIR = REPO_ROOT / "tools"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--skip-qemu",
+        action="store_true",
+        help="skip boot acceptance when the pinned QEMU/firmware pair is unavailable",
+    )
+    return parser.parse_args()
 
 
 def run(*command: str | Path) -> None:
@@ -20,7 +31,8 @@ def run(*command: str | Path) -> None:
 
 
 def main() -> int:
-    commands: tuple[tuple[str | Path, ...], ...] = (
+    args = parse_args()
+    commands: list[tuple[str | Path, ...]] = [
         ("cargo", "fmt", "--all", "--", "--check"),
         (
             "cargo",
@@ -79,7 +91,11 @@ def main() -> int:
             REPO_ROOT / "tests" / "smoke.ksh",
         ),
         (sys.executable, REPO_ROOT / "scripts" / "build.py"),
-    )
+    ]
+    if not args.skip_qemu:
+        commands.append(
+            (sys.executable, REPO_ROOT / "scripts" / "test-qemu.py", "--skip-build")
+        )
 
     try:
         for command in commands:
