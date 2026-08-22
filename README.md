@@ -24,7 +24,7 @@ use rather than providing a hardware security boundary.
 
 Host model:
 
-```powershell
+```console
 cargo run -p kllm-host
 cargo run -p kllm-host -- --command "cat /etc/motd | grep kllm"
 cargo run -p kllm-host -- --script tests/smoke.ksh
@@ -32,8 +32,8 @@ cargo run -p kllm-host -- --script tests/smoke.ksh
 
 Build both boot images:
 
-```powershell
-./scripts/build.ps1
+```console
+python scripts/build.py
 ```
 
 Artifacts are `build/kllm-x86_64.img` and `build/kllm-aarch64.img`. The build
@@ -43,20 +43,20 @@ ceiling.
 
 Run all local gates:
 
-```powershell
-./scripts/test.ps1
+```console
+python scripts/test.py
 ```
 
 Run QEMU 11.1.0 with a code firmware image from rust-osdev
 `ovmf-prebuilt` release `edk2-stable202605-r1`:
 
-```powershell
-./scripts/run-qemu.ps1 -Architecture x86_64 -FirmwareCode C:\firmware\x64\code.fd -FirmwareVars C:\firmware\x64\vars.fd
-./scripts/run-qemu.ps1 -Architecture aarch64 -FirmwareCode C:\firmware\aarch64\code.fd -FirmwareVars C:\firmware\aarch64\vars.fd
+```console
+python scripts/run-qemu.py --architecture x86_64 --firmware-code path/to/x64/code.fd --firmware-vars path/to/x64/vars.fd
+python scripts/run-qemu.py --architecture aarch64 --firmware-code path/to/aarch64/code.fd --firmware-vars path/to/aarch64/vars.fd
 ```
 
 The launcher refuses a different QEMU version unless
-`-SkipVersionCheck` is supplied deliberately. QEMU/firmware are not silently
+`--skip-version-check` is supplied deliberately. QEMU/firmware are not silently
 downloaded by repository scripts. Stage 1 uses UEFI Simple Text I/O, so the
 interactive shell appears in QEMU's graphical firmware console; native serial
 I/O belongs to the next machine-owned increment.
