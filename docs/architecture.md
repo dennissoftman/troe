@@ -54,5 +54,7 @@ map, native console, exception path, and owned heap to land together.
 Stage 2 begins with an architecture-independent memory-map model in
 `kllm-memory`. It validates checked 4 KiB ranges, normalizes unordered firmware
 descriptors, overlays bounded explicit reservations, and reports usable and
-reserved bytes. The UEFI adapter and allocator mechanisms consume this model;
+reserved bytes. It also models checked, aligned monotonic allocation over one
+explicitly reserved boot arena, including padding, exhaustion, and sealing
+accounting. The UEFI adapter and later pointer boundary consume these models;
 firmware types do not enter the portable crate.
