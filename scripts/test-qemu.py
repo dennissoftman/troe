@@ -69,6 +69,17 @@ def normalize(data: bytes) -> str:
     return ANSI_ESCAPE.sub("", text)
 
 
+def assert_live_memory_accounting(report: str) -> None:
+    """Require nonzero numeric usable and reserved firmware snapshot values."""
+    for label in ("total usable", "reserved"):
+        match = re.search(rf"^{re.escape(label)}: ([0-9]+)$", report, re.MULTILINE)
+        if match is None or int(match.group(1)) == 0:
+            raise AcceptanceError(
+                f"mem did not report a positive numeric {label} value; "
+                f"command output was {report!r}"
+            )
+
+
 class SerialSession:
     """A QEMU child with deadline-bound serial reads and deterministic cleanup."""
 
@@ -194,6 +205,7 @@ class SerialSession:
         *,
         next_cwd: str | None = None,
         contains: tuple[str, ...] = (),
+        absent: tuple[str, ...] = (),
         raw_contains: tuple[bytes, ...] = (),
     ) -> str:
         """Execute a line, wait for the next prompt, and assert its output."""
@@ -211,6 +223,12 @@ class SerialSession:
             if expected not in text:
                 raise AcceptanceError(
                     f"{command!r} did not produce expected text {expected!r}; "
+                    f"command output was {text!r}"
+                )
+        for unexpected in absent:
+            if unexpected in text:
+                raise AcceptanceError(
+                    f"{command!r} unexpectedly produced {unexpected!r}; "
                     f"command output was {text!r}"
                 )
         for expected in raw_contains:
@@ -332,17 +350,20 @@ def run_scenario(session: SerialSession, boot_timeout: float, command_timeout: f
     session.command("rm /tmp/q000", cwd, command_timeout)
     session.command("write /tmp/recovered ok", cwd, command_timeout)
     session.command("cat /tmp/recovered", cwd, command_timeout, contains=("ok",))
-    session.command(
+    report = session.command(
         "mem",
         cwd,
         command_timeout,
         contains=(
             f"arch: {session.architecture}",
             "memory owner: firmware",
+            "memory map: firmware snapshot (advisory)",
             "ramfs limit: 1048576",
             "pressure: normal (RAMFS policy only)",
         ),
+        absent=("total usable: unavailable", "reserved: unavailable"),
     )
+    assert_live_memory_accounting(report)
 
     start = len(session.output)
     session.send("halt", command_timeout)
@@ -367,12 +388,14 @@ def run_smoke_scenario(
         command_timeout,
         contains=("qemu-smoke\n",),
     )
-    session.command(
+    report = session.command(
         "mem",
         cwd,
         command_timeout,
         contains=(f"arch: {session.architecture}", "memory owner: firmware"),
+        absent=("total usable: unavailable", "reserved: unavailable"),
     )
+    assert_live_memory_accounting(report)
     start = len(session.output)
     session.send("halt", command_timeout)
     session.wait_for(b"halting: returning control to firmware", command_timeout, start)

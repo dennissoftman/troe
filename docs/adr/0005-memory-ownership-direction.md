@@ -21,6 +21,7 @@ Revisit the bitmap only if very large-memory metadata is measured as material.
 
 The first landed Stage 2 component is the unsafe-free `kllm-memory`
 normalization model and its bounded monotonic boot-allocation model. Firmware
-adaptation, selection of the live reserved arena, pointer materialization, and
-the frame bitmap remain pending; these models do not by themselves transfer
-ownership from UEFI.
+descriptors are now adapted into an advisory normalized snapshot while boot
+services remain active. Selection of the live reserved arena, final-map capture,
+pointer materialization, and the frame bitmap remain pending; these models and
+snapshots do not by themselves transfer ownership from UEFI.

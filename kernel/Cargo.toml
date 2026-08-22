@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 kllm-core = { path = "../crates/kllm-core" }
+kllm-memory = { path = "../crates/kllm-memory" }
 kllm-shell = { path = "../crates/kllm-shell" }
 kllm-vfs = { path = "../crates/kllm-vfs" }
 
@@ -22,4 +23,3 @@ name = "kllm-kernel"
 path = "src/main.rs"
 test = false
 bench = false
-

@@ -58,3 +58,9 @@ reserved bytes. It also models checked, aligned monotonic allocation over one
 explicitly reserved boot arena, including padding, exhaustion, and sealing
 accounting. The UEFI adapter and later pointer boundary consume these models;
 firmware types do not enter the portable crate.
+
+While boot services remain active, the kernel adapts a live UEFI map into this
+model and supplies its checked usable/non-usable byte counts to `mem`. The
+report labels the map as an advisory firmware snapshot: subsequent firmware
+allocation makes its key stale, so it is diagnostic input rather than an
+ownership claim or the final ExitBootServices map.

@@ -6,7 +6,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
 
-use kllm_core::{Input, MAX_LINE_BYTES, Output, StreamError};
+use kllm_core::{Input, MAX_LINE_BYTES, MachineMemorySnapshot, Output, StreamError};
 use kllm_shell::Shell;
 use kllm_vfs::{Namespace, RamFsQuota};
 
@@ -52,8 +52,13 @@ fn run() -> Result<u8, String> {
     namespace
         .mount_embedded(ROOTFS)
         .map_err(|error| format!("cannot mount embedded root: {error}"))?;
-    let mut shell = Shell::new(namespace, env::consts::ARCH, true)
-        .map_err(|error| format!("cannot compose namespace: {error}"))?;
+    let mut shell = Shell::new(
+        namespace,
+        env::consts::ARCH,
+        MachineMemorySnapshot::hosted(),
+        true,
+    )
+    .map_err(|error| format!("cannot compose namespace: {error}"))?;
 
     let arguments: Vec<String> = env::args().skip(1).collect();
     if arguments.first().is_some_and(|value| value == "--command") {

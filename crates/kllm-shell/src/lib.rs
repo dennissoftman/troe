@@ -11,8 +11,9 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt::Write as _;
 use kllm_core::{
-    BoundedOutput, CommandStatus, Input, MAX_ARGS, MAX_LINE_BYTES, MAX_PIPELINE_STAGES, Output,
-    PIPE_CAPACITY, SliceInput, StreamError, write_all,
+    BoundedOutput, CommandStatus, Input, MAX_ARGS, MAX_LINE_BYTES, MAX_PIPELINE_STAGES,
+    MachineMemoryOwner, MachineMemorySnapshot, Output, PIPE_CAPACITY, SliceInput, StreamError,
+    write_all,
 };
 use kllm_vfs::{FsError, Namespace, NodeKind};
 
@@ -223,6 +224,7 @@ pub struct Shell {
     namespace: Namespace,
     cwd: String,
     architecture: String,
+    machine_memory: MachineMemorySnapshot,
     machine_control: bool,
     halt_requested: bool,
 }
@@ -236,6 +238,7 @@ impl Shell {
     pub fn new(
         mut namespace: Namespace,
         architecture: &str,
+        machine_memory: MachineMemorySnapshot,
         machine_control: bool,
     ) -> Result<Self, FsError> {
         namespace.set_system_file("/sys/arch", format!("{architecture}\n").as_bytes())?;
@@ -244,6 +247,7 @@ impl Shell {
             namespace,
             cwd: "/".to_string(),
             architecture: architecture.to_string(),
+            machine_memory,
             machine_control,
             halt_requested: false,
         };
@@ -556,9 +560,24 @@ impl Shell {
 
     fn memory_report(&self) -> String {
         let stats = self.namespace.memory_stats();
+        let (owner, map, heap) = match self.machine_memory.owner() {
+            MachineMemoryOwner::Host => (
+                "host process",
+                "unavailable",
+                "host allocator (unavailable)",
+            ),
+            MachineMemoryOwner::Firmware => (
+                "firmware",
+                "firmware snapshot (advisory)",
+                "UEFI pool (unavailable)",
+            ),
+            MachineMemoryOwner::Kernel => ("kernel", "owned", "kernel heap (unavailable)"),
+        };
+        let usable = optional_bytes(self.machine_memory.usable_bytes());
+        let reserved = optional_bytes(self.machine_memory.reserved_bytes());
         format!(
-            "arch: {}\nmemory owner: firmware\ntotal usable: unavailable\nreserved: unavailable\nframes: unavailable\nheap: UEFI pool (unavailable)\nramfs used: {}\nramfs limit: {}\nramfs high-water: {}\ncaches used: 0\ncaches limit: 0\npressure: normal (RAMFS policy only)\n",
-            self.architecture, stats.ramfs_used, stats.ramfs_limit, stats.ramfs_high_water
+            "arch: {}\nmemory owner: {owner}\nmemory map: {map}\ntotal usable: {usable}\nreserved: {reserved}\nframes: unavailable\nheap: {heap}\nramfs used: {}\nramfs limit: {}\nramfs high-water: {}\ncaches used: 0\ncaches limit: 0\npressure: normal (RAMFS policy only)\n",
+            self.architecture, stats.ramfs_used, stats.ramfs_limit, stats.ramfs_high_water,
         )
     }
 
@@ -566,6 +585,13 @@ impl Shell {
         let report = self.memory_report();
         self.namespace
             .set_system_file("/sys/memory", report.as_bytes())
+    }
+}
+
+fn optional_bytes(value: Option<u64>) -> String {
+    match value {
+        Some(bytes) => bytes.to_string(),
+        None => "unavailable".to_string(),
     }
 }
 
@@ -746,7 +772,7 @@ const fn parse_error_text(error: ParseError) -> &'static str {
 mod tests {
     use super::{ParseError, Shell, parse_line};
     use alloc::string::ToString;
-    use kllm_core::{BoundedOutput, SliceInput};
+    use kllm_core::{BoundedOutput, MachineMemorySnapshot, SliceInput};
     use kllm_vfs::{Namespace, RamFsQuota};
 
     fn shell() -> Shell {
@@ -756,7 +782,7 @@ mod tests {
             namespace.add_read_only_file("/help/readme", b"alpha\nbeta alpha\n"),
             Ok(())
         );
-        match Shell::new(namespace, "test", true) {
+        match Shell::new(namespace, "test", MachineMemorySnapshot::hosted(), true) {
             Ok(value) => value,
             Err(_error) => std::process::abort(),
         }
@@ -839,7 +865,7 @@ mod tests {
             namespace.add_read_only_file("/help/large", &oversized),
             Ok(())
         );
-        let mut shell = match Shell::new(namespace, "test", true) {
+        let mut shell = match Shell::new(namespace, "test", MachineMemorySnapshot::hosted(), true) {
             Ok(value) => value,
             Err(_error) => std::process::abort(),
         };
@@ -850,5 +876,35 @@ mod tests {
         assert_ne!(status.code(), 0);
         assert!(output.as_slice().is_empty());
         assert!(error.as_slice().ends_with(b"cat: output failed\n"));
+    }
+
+    #[test]
+    fn memory_report_uses_supplied_machine_snapshot() {
+        let namespace = Namespace::new(RamFsQuota::default());
+        let mut shell = match Shell::new(
+            namespace,
+            "snapshot-test",
+            MachineMemorySnapshot::firmware(123_456, 78_900),
+            true,
+        ) {
+            Ok(value) => value,
+            Err(_error) => std::process::abort(),
+        };
+        let mut input = SliceInput::new(b"");
+        let mut output = BoundedOutput::new(1024);
+        let mut error = BoundedOutput::new(128);
+
+        assert_eq!(
+            shell
+                .execute("mem", &mut input, &mut output, &mut error)
+                .code(),
+            0
+        );
+        let report = core::str::from_utf8(output.as_slice()).unwrap_or_default();
+        assert!(report.contains("memory owner: firmware\n"));
+        assert!(report.contains("memory map: firmware snapshot (advisory)\n"));
+        assert!(report.contains("total usable: 123456\n"));
+        assert!(report.contains("reserved: 78900\n"));
+        assert!(error.as_slice().is_empty());
     }
 }

@@ -220,6 +220,65 @@ pub struct MemoryStats {
     pub ramfs_high_water: u64,
 }
 
+/// Component that currently owns and accounts for machine memory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MachineMemoryOwner {
+    /// The shell is running inside a hosted process.
+    Host,
+    /// UEFI boot services still own machine memory.
+    Firmware,
+    /// The kernel has completed the reviewed ownership transition.
+    Kernel,
+}
+
+/// Machine-memory information supplied to portable reporting code.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MachineMemorySnapshot {
+    owner: MachineMemoryOwner,
+    usable_bytes: Option<u64>,
+    reserved_bytes: Option<u64>,
+}
+
+impl MachineMemorySnapshot {
+    /// Construct a hosted snapshot without physical-memory visibility.
+    #[must_use]
+    pub const fn hosted() -> Self {
+        Self {
+            owner: MachineMemoryOwner::Host,
+            usable_bytes: None,
+            reserved_bytes: None,
+        }
+    }
+
+    /// Construct an advisory snapshot while firmware still owns memory.
+    #[must_use]
+    pub const fn firmware(usable_bytes: u64, reserved_bytes: u64) -> Self {
+        Self {
+            owner: MachineMemoryOwner::Firmware,
+            usable_bytes: Some(usable_bytes),
+            reserved_bytes: Some(reserved_bytes),
+        }
+    }
+
+    /// Current memory owner.
+    #[must_use]
+    pub const fn owner(self) -> MachineMemoryOwner {
+        self.owner
+    }
+
+    /// Bytes currently classified as usable, when observable.
+    #[must_use]
+    pub const fn usable_bytes(self) -> Option<u64> {
+        self.usable_bytes
+    }
+
+    /// Bytes currently classified as reserved or otherwise unusable.
+    #[must_use]
+    pub const fn reserved_bytes(self) -> Option<u64> {
+        self.reserved_bytes
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{BoundedOutput, Input, Output, SliceInput, StreamError, is_backspace, write_all};

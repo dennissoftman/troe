@@ -14,12 +14,19 @@ mod firmware {
 
     use alloc::borrow::Cow;
     use alloc::string::String;
+    use alloc::vec::Vec;
     use core::fmt::Write as _;
 
-    use kllm_core::{Input, MAX_LINE_BYTES, Output, StreamError, is_backspace};
+    use kllm_core::{
+        Input, MAX_LINE_BYTES, MachineMemorySnapshot, Output, StreamError, is_backspace,
+    };
+    use kllm_memory::{
+        MAX_FIRMWARE_REGIONS, MemoryRegion, NormalizedMemoryMap, PhysicalRange, RegionKind,
+    };
     use kllm_shell::Shell;
     use kllm_vfs::{Namespace, RamFsQuota};
     use uefi::boot;
+    use uefi::mem::memory_map::MemoryMap;
     use uefi::prelude::*;
     use uefi::proto::console::text::{Key, ScanCode};
 
@@ -66,6 +73,7 @@ mod firmware {
     }
 
     fn run() -> Result<(), ()> {
+        let machine_memory = firmware_memory_snapshot()?;
         let mut console = ConsoleOutput;
         write_console(&mut console, b"kllm 0.1.0 UEFI hosted environment\n")?;
         write_console(
@@ -75,7 +83,8 @@ mod firmware {
 
         let mut namespace = Namespace::new(RamFsQuota::default());
         namespace.mount_embedded(ROOTFS).map_err(|_| ())?;
-        let mut shell = Shell::new(namespace, architecture(), true).map_err(|_| ())?;
+        let mut shell =
+            Shell::new(namespace, architecture(), machine_memory, true).map_err(|_| ())?;
 
         loop {
             write_console(&mut console, b"kllm:")?;
@@ -90,6 +99,30 @@ mod firmware {
                 return Ok(());
             }
         }
+    }
+
+    fn firmware_memory_snapshot() -> Result<MachineMemorySnapshot, ()> {
+        let memory_map = boot::memory_map(boot::MemoryType::LOADER_DATA).map_err(|_| ())?;
+        let mut regions = Vec::new();
+        for descriptor in memory_map.entries() {
+            if regions.len() >= MAX_FIRMWARE_REGIONS {
+                return Err(());
+            }
+            let range = PhysicalRange::from_pages(descriptor.phys_start, descriptor.page_count)
+                .map_err(|_| ())?;
+            let kind = if descriptor.ty == boot::MemoryType::CONVENTIONAL {
+                RegionKind::Usable
+            } else {
+                RegionKind::Reserved
+            };
+            regions.push(MemoryRegion::new(range, kind));
+        }
+        let normalized = NormalizedMemoryMap::build(&regions, &[]).map_err(|_| ())?;
+        let stats = normalized.stats();
+        Ok(MachineMemorySnapshot::firmware(
+            stats.usable_bytes(),
+            stats.reserved_bytes(),
+        ))
     }
 
     fn read_line(console: &mut ConsoleOutput) -> Result<Cow<'static, str>, ()> {

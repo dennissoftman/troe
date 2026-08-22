@@ -22,9 +22,10 @@ polling 16550/PL011 backends. Keep firmware services active until native fatal
 diagnostics and allocator accounting are verified.
 
 In progress: the bounded, architecture-independent normalization and monotonic
-boot-allocation models and their host tests have landed. Adapting the live UEFI
-descriptors and identifying the first explicit reserved arena are next; no
-machine memory is claimed yet.
+boot-allocation models and their host tests have landed. Live UEFI descriptors
+are now normalized and reported as an advisory snapshot on both architectures.
+Identifying and reserving the first explicit boot arena is next; no machine
+memory is claimed yet.
 
 Exit: allocator model tests cover discontiguous ranges, exhaustion, double
 free, invalid free, and checked overflow; native UART output matches firmware

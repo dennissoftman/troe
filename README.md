@@ -14,7 +14,8 @@ use rather than providing a hardware security boundary.
 - stable Rust 1.97.1, edition 2024, `no_std` portable crates;
 - deterministic, versioned, bounds-checked KEFS root image;
 - quota-bound writable `/tmp` and live `/sys` reporting;
-- bounded, checked physical-memory map normalization for Stage 2 ownership;
+- bounded, checked physical-memory map normalization plus advisory live UEFI
+  accounting for Stage 2 ownership;
 - single/double quotes and pipelines of up to eight stages;
 - 64 KiB bounded intermediate byte streams;
 - `cat`, `echo`, literal `grep`, `ls`, `pwd`, `cd`, `help`, `mem`, `clear`,

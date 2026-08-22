@@ -38,6 +38,7 @@ name = "kllm-kernel"
 version = "0.1.0"
 dependencies = [
  "kllm-core",
+ "kllm-memory",
  "kllm-shell",
  "kllm-vfs",
  "uefi",
