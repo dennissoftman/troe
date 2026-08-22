@@ -390,6 +390,31 @@ Quota exhaustion MUST return `NoSpace` without destabilizing unrelated subsystem
 - Symlinks are initially absent, eliminating link traversal cycles.
 - Directory order exposed by `ls` MUST be deterministic.
 
+### 12.6 Identity and foreign filesystem metadata (TBD)
+
+Persistent and external filesystem support MUST NOT assume that a raw numeric
+UID/GID, a Windows SID, or a familiar account name is proof of a local system
+identity. The planning direction is to use stable, opaque native principals
+and explicit mount/import identity mappings while retaining first-class
+UID/GID compatibility. Authentication, identity mapping, ownership, and active
+capability authority are separate concerns.
+
+Filesystem drivers SHOULD preserve security metadata in its native form when
+the source format can be round-tripped. In particular, ext4/XFS-style numeric
+UIDs, GIDs, mode bits, and supported ACL metadata should remain representable,
+while NTFS owner/group SIDs and complete supported security descriptors should
+not be irreversibly reduced to Unix mode bits. Unmapped identities remain
+distinguishable and inspectable; they MUST NOT silently collapse to a local
+user, group, administrator, or all-powerful fallback identity. Translation
+that is approximate or lossy must be reported explicitly.
+
+The exact principal representation, group model, mapping-domain format,
+authorization descriptor, copy/archive behavior, and fail-closed rules require
+a focused ADR before a persistent writable filesystem, foreign-filesystem
+write support, or stable VFS metadata ABI is accepted. The proposed direction
+and unresolved questions are recorded in
+[ADR 0007](docs/adr/0007-identity-and-foreign-filesystem-mapping.md).
+
 ## 13. Memory management
 
 ### 13.1 Principles
@@ -813,6 +838,9 @@ Dynamic linking is optional and SHOULD follow a working static executable format
 - Begin with a small practical protocol set such as Ethernet, ARP/NDP as appropriate, IPv4 and/or IPv6, ICMP, UDP, DHCP or static configuration, and DNS.
 - Add TCP only when its state, timer, retransmission, and memory bounds are specified and tested.
 - Expose networking through handles or service interfaces rather than ambient global access.
+- Resolve the native-principal and foreign-filesystem identity-mapping ADR
+  before accepting persistent VFS metadata or enabling foreign-filesystem
+  writes.
 - Add at least one persistent filesystem or carefully scoped block-storage format.
 - Define configuration, service startup, and recovery behavior suitable for unattended use.
 - Add the persistent content store and desired-system manifest only after their
@@ -926,6 +954,8 @@ The following must be resolved by short architecture decision records during imp
 - dependency/version semantics and multi-target lock-file representation;
 - content-store layout, generation activation record, and recovery protocol;
 - persistent-data migration and rollback contract;
+- native principal/group representation, identity domains, UID/GID and SID
+  mappings, foreign security-descriptor preservation, and lossy-copy policy;
 - package trust roots, key rotation, revocation, and offline verification policy.
 
 Each decision record MUST state alternatives, measurable costs, safety impact, and conditions under which the choice should be revisited.
