@@ -14,8 +14,9 @@ use rather than providing a hardware security boundary.
 - stable Rust 1.97.1, edition 2024, `no_std` portable crates;
 - deterministic, versioned, bounds-checked KEFS root image;
 - quota-bound writable `/tmp` and live `/sys` reporting;
-- bounded, checked physical-memory map normalization plus advisory live UEFI
-  accounting for Stage 2 ownership;
+- final UEFI handoff into a checked frame bitmap, a 6 MiB owned TLSF heap, and
+  full live memory accounting;
+- project-owned polling 16550 and PL011 consoles after boot services exit;
 - single/double quotes and pipelines of up to eight stages;
 - 64 KiB bounded intermediate byte streams;
 - `cat`, `echo`, literal `grep`, `ls`, `pwd`, `cd`, `help`, `mem`, `clear`,
@@ -73,17 +74,16 @@ not bundle firmware, provide code and variable-store images from rust-osdev
 
 The launcher and acceptance harness refuse a QEMU version other than 11.1.0 unless
 `--skip-version-check` is supplied deliberately. Firmware is not silently
-downloaded. Stage 1 uses UEFI Simple Text I/O, routed directly through the
-invoking terminal using the firmware's 16550-backed console on x86-64 and its
-PL011-backed console on AArch64. Native serial I/O owned by kllm belongs to the
-next machine-owned increment.
+downloaded. UEFI Simple Text Output carries only the bootstrap banner. The image
+then initializes and exclusively uses its polling 16550 backend on x86-64 or
+PL011 backend on AArch64, captures the final map, and exits boot services.
 
 ## Repository map
 
-- `crates`: portable byte streams, memory models, shell, VFS, and accounting
-  crates;
+- `crates`: portable byte streams, memory models, shell, VFS, accounting, and
+  the isolated native machine mechanism crate;
 - `host`: Stage 0 composition and acceptance runner;
-- `kernel`: Stage 1 UEFI machine boundary and console loop;
+- `kernel`: UEFI bootstrap and Stage 2 owned-machine composition root;
 - `rootfs`, `assets`: source tree and generated KEFS image;
 - `tools`: dependency-free deterministic image builders;
 - `scripts`: build, verification, and emulator entry points;

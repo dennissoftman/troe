@@ -69,14 +69,43 @@ def normalize(data: bytes) -> str:
     return ANSI_ESCAPE.sub("", text)
 
 
-def assert_live_memory_accounting(report: str) -> None:
-    """Require nonzero numeric usable and reserved firmware snapshot values."""
+def parse_owned_memory_accounting(report: str) -> int:
+    """Validate complete kernel-owned counters and return current heap use."""
     for label in ("total usable", "reserved"):
         match = re.search(rf"^{re.escape(label)}: ([0-9]+)$", report, re.MULTILINE)
         if match is None or int(match.group(1)) == 0:
             raise AcceptanceError(
                 f"mem did not report a positive numeric {label} value; "
                 f"command output was {report!r}"
+            )
+    frames = re.search(r"^frames: ([0-9]+)/([0-9]+) free$", report, re.MULTILINE)
+    if frames is None or int(frames.group(2)) == 0 or int(frames.group(1)) > int(frames.group(2)):
+        raise AcceptanceError(f"mem reported invalid frame counters: {report!r}")
+    heap = re.search(r"^heap: ([0-9]+)/([0-9]+) used$", report, re.MULTILINE)
+    if heap is None or int(heap.group(2)) == 0 or int(heap.group(1)) >= int(heap.group(2)):
+        raise AcceptanceError(f"mem reported invalid heap counters: {report!r}")
+    high_water = re.search(r"^heap high-water: ([0-9]+)$", report, re.MULTILINE)
+    if high_water is None or int(high_water.group(1)) < int(heap.group(1)):
+        raise AcceptanceError(f"mem reported invalid heap high-water: {report!r}")
+    failures = re.search(r"^allocation failures: ([0-9]+)$", report, re.MULTILINE)
+    if failures is None or int(failures.group(1)) < 1:
+        raise AcceptanceError(f"bounded allocation failure was not accounted: {report!r}")
+    return int(heap.group(1))
+
+
+def assert_owned_boot(session: "SerialSession") -> None:
+    """Require every marker emitted across the one-way ownership handoff."""
+    transcript = session.transcript()
+    for marker in (
+        "native console: ready",
+        "boot services: exited",
+        "frame bitmap: ready",
+        "allocation failure path: bounded",
+        "kllm owns memory and console",
+    ):
+        if marker not in transcript:
+            raise AcceptanceError(
+                f"{session.architecture} boot missed ownership marker {marker!r}"
             )
 
 
@@ -131,22 +160,20 @@ class SerialSession:
                 )
             self.output.extend(chunk)
 
-    def send(self, command: str, timeout: float) -> None:
-        """Send one firmware-console line after a prompt has been observed."""
+    def send(self, command: str, timeout: float, line_ending: bytes = b"\n") -> None:
+        """Send one console line after a prompt has been observed."""
         if self.process.stdin is None:
             raise AcceptanceError("QEMU serial input is unavailable")
         try:
-            # EDK2's serial-backed Simple Text Input queue is shallow. Pacing is
-            # required or a host pipe can overrun it between firmware polls.
-            # Waiting for each echoed byte is faster and more reliable than a
-            # machine-dependent sleep interval.
+            # Pace against guest echo so both firmware and native polling UART
+            # paths remain deterministic under loaded CI hosts.
             for byte in command.encode("utf-8"):
                 start = len(self.output)
                 self.process.stdin.write(bytes((byte,)))
                 self.process.stdin.flush()
                 self.wait_for(bytes((byte,)), timeout, start)
             start = len(self.output)
-            self.process.stdin.write(b"\n")
+            self.process.stdin.write(line_ending)
             self.process.stdin.flush()
             self.wait_for(b"\n", timeout, start)
         except (BrokenPipeError, OSError) as error:
@@ -207,10 +234,11 @@ class SerialSession:
         contains: tuple[str, ...] = (),
         absent: tuple[str, ...] = (),
         raw_contains: tuple[bytes, ...] = (),
+        line_ending: bytes = b"\n",
     ) -> str:
         """Execute a line, wait for the next prompt, and assert its output."""
         start = len(self.output)
-        self.send(command, timeout)
+        self.send(command, timeout, line_ending)
         resulting_cwd = cwd if next_cwd is None else next_cwd
         prompt = f"kllm:{resulting_cwd}> ".encode()
         end = self.wait_for(prompt, timeout, start)
@@ -260,6 +288,7 @@ class SerialSession:
 def run_scenario(session: SerialSession, boot_timeout: float, command_timeout: float) -> None:
     """Exercise every required built-in plus bounded failure behavior."""
     session.wait_for(b"kllm:/> ", boot_timeout)
+    assert_owned_boot(session)
     cwd = "/"
 
     session.command(
@@ -285,6 +314,13 @@ def run_scenario(session: SerialSession, boot_timeout: float, command_timeout: f
     session.command("help echo", cwd, command_timeout, contains=("echo [ARG...]",))
     session.backspace_command(
         "echo brokeX", "n", cwd, command_timeout, expected="\nbroken\n"
+    )
+    session.command(
+        "echo crlf-ready",
+        cwd,
+        command_timeout,
+        contains=("crlf-ready\n",),
+        line_ending=b"\r\n",
     )
     session.command("ls /", cwd, command_timeout, contains=("etc/", "help/", "sys/", "tmp/"))
     session.command(
@@ -356,18 +392,39 @@ def run_scenario(session: SerialSession, boot_timeout: float, command_timeout: f
         command_timeout,
         contains=(
             f"arch: {session.architecture}",
-            "memory owner: firmware",
-            "memory map: firmware snapshot (advisory)",
+            "memory owner: kernel",
+            "memory map: final map (owned)",
             "ramfs limit: 1048576",
             "pressure: normal (RAMFS policy only)",
         ),
-        absent=("total usable: unavailable", "reserved: unavailable"),
+        absent=("firmware", "advisory", "unavailable"),
     )
-    assert_live_memory_accounting(report)
+    baseline_heap = parse_owned_memory_accounting(report)
+
+    for _ in range(16):
+        session.command(
+            "echo allocation-cycle | grep cycle", cwd, command_timeout,
+            contains=("allocation-cycle\n",),
+        )
+        session.command("write /tmp/cycle stable", cwd, command_timeout)
+        session.command("rm /tmp/cycle", cwd, command_timeout)
+    final_report = session.command(
+        "mem",
+        cwd,
+        command_timeout,
+        contains=("memory owner: kernel", "memory map: final map (owned)"),
+        absent=("firmware", "advisory", "unavailable"),
+    )
+    final_heap = parse_owned_memory_accounting(final_report)
+    if final_heap != baseline_heap:
+        raise AcceptanceError(
+            f"owned heap grew across repeated transient workloads: "
+            f"{baseline_heap} -> {final_heap} bytes"
+        )
 
     start = len(session.output)
     session.send("halt", command_timeout)
-    session.wait_for(b"halting: returning control to firmware", command_timeout, start)
+    session.wait_for(b"halting: parking CPU", command_timeout, start)
 
 
 def run_smoke_scenario(
@@ -375,6 +432,7 @@ def run_smoke_scenario(
 ) -> None:
     """Exercise the interactive console path without the exhaustive quota workload."""
     session.wait_for(b"kllm:/> ", boot_timeout)
+    assert_owned_boot(session)
     cwd = "/"
     session.backspace_command(
         "echo brokeX", "n", cwd, command_timeout, expected="\nbroken\n"
@@ -392,13 +450,17 @@ def run_smoke_scenario(
         "mem",
         cwd,
         command_timeout,
-        contains=(f"arch: {session.architecture}", "memory owner: firmware"),
-        absent=("total usable: unavailable", "reserved: unavailable"),
+        contains=(
+            f"arch: {session.architecture}",
+            "memory owner: kernel",
+            "memory map: final map (owned)",
+        ),
+        absent=("firmware", "advisory", "unavailable"),
     )
-    assert_live_memory_accounting(report)
+    parse_owned_memory_accounting(report)
     start = len(session.output)
     session.send("halt", command_timeout)
-    session.wait_for(b"halting: returning control to firmware", command_timeout, start)
+    session.wait_for(b"halting: parking CPU", command_timeout, start)
 
 
 def test_architecture(

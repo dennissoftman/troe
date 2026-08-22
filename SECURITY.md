@@ -2,15 +2,16 @@
 
 ## Current boundary
 
-The hosted model has the security properties of its host process. The UEFI
-image is firmware-hosted and single-address-space: all commands execute with
-firmware application privilege. There is no userspace isolation, secure boot
+The hosted model has the security properties of its host process. The native
+image exits UEFI boot services but remains single-address-space: all commands
+execute with kernel privilege. There is no userspace isolation, secure boot
 integration, persistent storage parser, network stack, or untrusted executable
 loading in this milestone.
 
-The portable crates forbid unsafe Rust. The only unsafe code in the dependency
-graph is confined to the audited-at-the-boundary UEFI implementation and its
-raw bindings. Console input and both filesystem image formats are treated as
+The portable crates forbid unsafe Rust. Project-authored unsafe operations are
+confined to `kllm-machine`, counted by the verification gate, and documented in
+the unsafe inventory. Transitive unsafe code is limited to the pinned UEFI and
+TLSF boundaries. Console input and both filesystem image formats are treated as
 untrusted and bounded.
 
 ## Invariants enforced now
@@ -24,6 +25,9 @@ untrusted and bounded.
 - FAT builder: fixed geometry, duplicated FATs, finite acyclic chain, and exact
   executable round-trip verification;
 - release boot images: 16 MiB hard ceiling (currently exactly 1.44 MiB).
+- owned heap: 6 MiB fixed arena with use, high-water, and failure accounting;
+- physical frames: checked 4 KiB bitmap with invalid/double-free detection;
+- native UART transmit waits: finite polling bound on both architectures.
 
 ## Reporting
 
@@ -34,4 +38,3 @@ impact, and whether malformed console or image input is involved.
 
 No release is claimed to have zero vulnerabilities. A release may claim only
 that it has no known unresolved vulnerability at its publication time.
-

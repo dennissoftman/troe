@@ -13,7 +13,8 @@ kllm-shell = { path = "../crates/kllm-shell" }
 kllm-vfs = { path = "../crates/kllm-vfs" }
 
 [target.'cfg(target_os = "uefi")'.dependencies]
-uefi = { version = "=0.39.0", features = ["global_allocator", "panic_handler"] }
+kllm-machine = { path = "../crates/kllm-machine" }
+uefi = { version = "=0.39.0" }
 
 [lints]
 workspace = true

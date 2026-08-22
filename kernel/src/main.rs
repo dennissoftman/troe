@@ -1,4 +1,4 @@
-//! UEFI-hosted Stage 1 image. The host fallback only explains how to build it.
+//! UEFI-bootstrapped Stage 2 owned-machine image.
 #![cfg_attr(target_os = "uefi", no_std)]
 #![cfg_attr(target_os = "uefi", no_main)]
 #![forbid(unsafe_code)]
@@ -12,29 +12,31 @@ fn main() {
 mod firmware {
     extern crate alloc;
 
-    use alloc::borrow::Cow;
     use alloc::string::String;
     use alloc::vec::Vec;
     use core::fmt::Write as _;
+    use core::panic::PanicInfo;
 
     use kllm_core::{
         Input, MAX_LINE_BYTES, MachineMemorySnapshot, Output, StreamError, is_backspace,
     };
     use kllm_memory::{
-        MAX_FIRMWARE_REGIONS, MemoryRegion, NormalizedMemoryMap, PhysicalRange, RegionKind,
+        BASE_PAGE_SIZE, BootAllocator, FrameAllocator, MAX_FIRMWARE_REGIONS, MemoryMapStats,
+        MemoryRegion, NormalizedMemoryMap, PhysicalRange, RegionKind,
     };
     use kllm_shell::Shell;
     use kllm_vfs::{Namespace, RamFsQuota};
     use uefi::boot;
-    use uefi::mem::memory_map::MemoryMap;
+    use uefi::mem::memory_map::{MemoryMap, MemoryMapOwned};
     use uefi::prelude::*;
-    use uefi::proto::console::text::{Key, ScanCode};
 
     const ROOTFS: &[u8] = include_bytes!("../../assets/root.kefs");
+    const BOOT_ARENA_PAGES: usize = 2048;
+    const OWNED_HEAP_BYTES: u64 = 6 * 1024 * 1024;
 
-    struct ConsoleOutput;
+    struct FirmwareConsole;
 
-    impl Output for ConsoleOutput {
+    impl Output for FirmwareConsole {
         fn write(&mut self, bytes: &[u8]) -> Result<usize, StreamError> {
             let succeeded = uefi::system::with_stdout(|stdout| {
                 if bytes == b"\x1b[2J\x1b[H" {
@@ -52,6 +54,18 @@ mod firmware {
         }
     }
 
+    struct NativeConsole;
+
+    impl Output for NativeConsole {
+        fn write(&mut self, bytes: &[u8]) -> Result<usize, StreamError> {
+            if kllm_machine::write(bytes) {
+                Ok(bytes.len())
+            } else {
+                Err(StreamError::Device)
+            }
+        }
+    }
+
     struct EmptyInput;
 
     impl Input for EmptyInput {
@@ -60,49 +74,87 @@ mod firmware {
         }
     }
 
+    struct LineEditor {
+        discard_leading_lf: bool,
+    }
+
+    struct OwnedAccounting {
+        map: MemoryMapStats,
+        frames: FrameAllocator,
+    }
+
     #[entry]
     fn main() -> Status {
         if uefi::helpers::init().is_err() {
             return Status::DEVICE_ERROR;
         }
-        let result = run();
-        match result {
-            Ok(()) => Status::SUCCESS,
+        let mut firmware_console = FirmwareConsole;
+        match prepare_owned_kernel(&mut firmware_console) {
+            Ok(accounting) => run_owned(&accounting),
             Err(()) => Status::ABORTED,
         }
     }
 
-    fn run() -> Result<(), ()> {
-        let machine_memory = firmware_memory_snapshot()?;
-        let mut console = ConsoleOutput;
-        write_console(&mut console, b"kllm 0.1.0 UEFI hosted environment\n")?;
-        write_console(
-            &mut console,
-            b"type 'help'; quoting and bounded pipelines are enabled\n",
-        )?;
+    fn prepare_owned_kernel(console: &mut FirmwareConsole) -> Result<OwnedAccounting, ()> {
+        write_all(console, b"kllm 0.1.0 UEFI bootstrap\n")?;
+        write_all(console, b"preparing owned memory and native console\n")?;
 
-        let mut namespace = Namespace::new(RamFsQuota::default());
-        namespace.mount_embedded(ROOTFS).map_err(|_| ())?;
-        let mut shell =
-            Shell::new(namespace, architecture(), machine_memory, true).map_err(|_| ())?;
-
-        loop {
-            write_console(&mut console, b"kllm:")?;
-            write_console(&mut console, shell.cwd().as_bytes())?;
-            write_console(&mut console, b"> ")?;
-            let line = read_line(&mut console)?;
-            let mut input = EmptyInput;
-            let mut error = ConsoleOutput;
-            let _status = shell.execute(line.as_ref(), &mut input, &mut console, &mut error);
-            if shell.halt_requested() {
-                write_console(&mut console, b"halting: returning control to firmware\n")?;
-                return Ok(());
-            }
+        reserve_and_install_heap()?;
+        kllm_machine::initialize_console();
+        if !kllm_machine::write(b"native console: ready\n") {
+            return Err(());
         }
+
+        let final_map = kllm_machine::exit_boot_services_after_protocols();
+        kllm_machine::mark_firmware_exited();
+        if !kllm_machine::write(b"boot services: exited\n") {
+            return Err(());
+        }
+        let normalized = normalize_final_map(&final_map)?;
+        // The final-map buffer is LoaderData recorded as reserved in the map.
+        // It must remain live because boot services can no longer free it.
+        core::mem::forget(final_map);
+
+        let map = normalized.stats();
+        let mut frames = FrameAllocator::from_map(&normalized).map_err(|_| ())?;
+        let probe = frames.allocate().map_err(|_| ())?;
+        frames.free(probe).map_err(|_| ())?;
+        if !kllm_machine::write(b"frame bitmap: ready\n") {
+            return Err(());
+        }
+        if !kllm_machine::probe_allocation_failure() {
+            return Err(());
+        }
+        if !kllm_machine::write(b"allocation failure path: bounded\n") {
+            return Err(());
+        }
+        Ok(OwnedAccounting { map, frames })
     }
 
-    fn firmware_memory_snapshot() -> Result<MachineMemorySnapshot, ()> {
-        let memory_map = boot::memory_map(boot::MemoryType::LOADER_DATA).map_err(|_| ())?;
+    fn reserve_and_install_heap() -> Result<(), ()> {
+        let arena_pointer = boot::allocate_pages(
+            boot::AllocateType::AnyPages,
+            boot::MemoryType::LOADER_DATA,
+            BOOT_ARENA_PAGES,
+        )
+        .map_err(|_| ())?;
+        let arena_start = u64::try_from(arena_pointer.as_ptr() as usize).map_err(|_| ())?;
+        let arena_pages = u64::try_from(BOOT_ARENA_PAGES).map_err(|_| ())?;
+        let arena = PhysicalRange::from_pages(arena_start, arena_pages).map_err(|_| ())?;
+        let mut allocator = BootAllocator::new(arena);
+        let heap = allocator
+            .allocate(OWNED_HEAP_BYTES, BASE_PAGE_SIZE)
+            .map_err(|_| ())?;
+        allocator.seal();
+        let heap_start = usize::try_from(heap.start()).map_err(|_| ())?;
+        let heap_bytes = usize::try_from(heap.byte_count()).map_err(|_| ())?;
+        if !kllm_machine::initialize_heap(heap_start, heap_bytes) {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    fn normalize_final_map(memory_map: &MemoryMapOwned) -> Result<NormalizedMemoryMap, ()> {
         let mut regions = Vec::new();
         for descriptor in memory_map.entries() {
             if regions.len() >= MAX_FIRMWARE_REGIONS {
@@ -110,89 +162,128 @@ mod firmware {
             }
             let range = PhysicalRange::from_pages(descriptor.phys_start, descriptor.page_count)
                 .map_err(|_| ())?;
-            let kind = if descriptor.ty == boot::MemoryType::CONVENTIONAL {
+            let kind = if is_reclaimable_after_handoff(descriptor.ty) {
                 RegionKind::Usable
             } else {
                 RegionKind::Reserved
             };
             regions.push(MemoryRegion::new(range, kind));
         }
-        let normalized = NormalizedMemoryMap::build(&regions, &[]).map_err(|_| ())?;
-        let stats = normalized.stats();
-        Ok(MachineMemorySnapshot::firmware(
-            stats.usable_bytes(),
-            stats.reserved_bytes(),
-        ))
+        NormalizedMemoryMap::build(&regions, &[]).map_err(|_| ())
     }
 
-    fn read_line(console: &mut ConsoleOutput) -> Result<Cow<'static, str>, ()> {
-        let mut line = String::new();
-        let mut overflow = false;
+    const fn is_reclaimable_after_handoff(memory_type: boot::MemoryType) -> bool {
+        memory_type.0 == boot::MemoryType::CONVENTIONAL.0
+            || memory_type.0 == boot::MemoryType::BOOT_SERVICES_CODE.0
+            || memory_type.0 == boot::MemoryType::BOOT_SERVICES_DATA.0
+    }
+
+    fn run_owned(accounting: &OwnedAccounting) -> ! {
+        let mut console = NativeConsole;
+        let mut namespace = Namespace::new(RamFsQuota::default());
+        if namespace.mount_embedded(ROOTFS).is_err() {
+            fatal(b"fatal: cannot mount embedded root\n");
+        }
+        let initial_snapshot = machine_snapshot(accounting);
+        let Ok(mut shell) = Shell::new(namespace, architecture(), initial_snapshot, true) else {
+            fatal(b"fatal: cannot compose namespace\n");
+        };
+        let mut editor = LineEditor {
+            discard_leading_lf: false,
+        };
+
+        if write_all(&mut console, b"kllm owns memory and console; type 'help'\n").is_err() {
+            fatal(b"fatal: native console write failed\n");
+        }
+
         loop {
-            let key = wait_for_key()?;
-            match key {
-                Key::Printable(value) => match char::from(value) {
-                    '\r' | '\n' => {
-                        write_console(console, b"\n")?;
+            shell.set_machine_memory(machine_snapshot(accounting));
+            if write_all(&mut console, b"kllm:").is_err()
+                || write_all(&mut console, shell.cwd().as_bytes()).is_err()
+                || write_all(&mut console, b"> ").is_err()
+            {
+                fatal(b"fatal: native console write failed\n");
+            }
+            let Ok(line) = editor.read_line(&mut console) else {
+                fatal(b"fatal: native console input failed\n");
+            };
+            let mut input = EmptyInput;
+            let mut error = NativeConsole;
+            let _status = shell.execute(&line, &mut input, &mut console, &mut error);
+            if shell.halt_requested() {
+                let _result = write_all(&mut console, b"halting: parking CPU\n");
+                kllm_machine::park();
+            }
+        }
+    }
+
+    impl LineEditor {
+        fn read_line(&mut self, console: &mut NativeConsole) -> Result<String, ()> {
+            let mut line = String::new();
+            let mut overflow = false;
+            loop {
+                let byte = kllm_machine::read_byte();
+                if self.discard_leading_lf && byte == b'\n' {
+                    self.discard_leading_lf = false;
+                    continue;
+                }
+                self.discard_leading_lf = false;
+                match byte {
+                    b'\r' | b'\n' => {
+                        self.discard_leading_lf = byte == b'\r';
+                        write_all(console, b"\n")?;
                         if overflow {
-                            write_console(console, b"input: line exceeded 512 bytes; discarded\n")?;
+                            write_all(console, b"input: line exceeded 512 bytes; discarded\n")?;
                             line.clear();
                             overflow = false;
                             continue;
                         }
-                        return Ok(Cow::Owned(line));
+                        return Ok(line);
                     }
-                    value if is_backspace(value) => {
-                        erase_previous(&mut line, console)?;
+                    value if is_backspace(char::from(value)) => {
+                        if line.pop().is_some() {
+                            write_all(console, b"\x08 \x08")?;
+                        }
                     }
-                    value if !value.is_control() && !overflow => {
-                        if line.len() + value.len_utf8() > MAX_LINE_BYTES {
+                    0x20..=0x7e if !overflow => {
+                        if line.len() == MAX_LINE_BYTES {
                             overflow = true;
                         } else {
-                            line.push(value);
-                            let mut encoded = [0_u8; 4];
-                            write_console(console, value.encode_utf8(&mut encoded).as_bytes())?;
+                            line.push(char::from(byte));
+                            write_all(console, &[byte])?;
                         }
                     }
                     _ => {}
-                },
-                // Some serial-backed UEFI consoles report the host Backspace
-                // key through the DELETE scan code instead of Unicode BS/DEL.
-                Key::Special(ScanCode::DELETE) => erase_previous(&mut line, console)?,
-                Key::Special(_) => {}
+                }
             }
         }
     }
 
-    fn erase_previous(line: &mut String, console: &mut ConsoleOutput) -> Result<(), ()> {
-        if line.pop().is_some() {
-            write_console(console, b"\x08 \x08")?;
-        }
-        Ok(())
+    fn machine_snapshot(accounting: &OwnedAccounting) -> MachineMemorySnapshot {
+        let heap = kllm_machine::heap_stats();
+        MachineMemorySnapshot::kernel(
+            accounting.map.usable_bytes(),
+            accounting.map.reserved_bytes(),
+            accounting.frames.total_frames(),
+            accounting.frames.free_frames(),
+            usize_as_u64(heap.total_bytes),
+            usize_as_u64(heap.used_bytes),
+            usize_as_u64(heap.high_water_bytes),
+            usize_as_u64(heap.failed_allocations),
+        )
     }
 
-    fn wait_for_key() -> Result<Key, ()> {
-        loop {
-            let result = uefi::system::with_stdin(|stdin| {
-                if let Some(key) = stdin.read_key()? {
-                    return Ok(Some(key));
-                }
-                let mut events = [stdin.wait_for_key_event()?];
-                if boot::wait_for_event(&mut events).is_err() {
-                    return Err(Status::DEVICE_ERROR.into());
-                }
-                stdin.read_key()
-            });
-            match result {
-                Ok(Some(key)) => return Ok(key),
-                Ok(None) => {}
-                _ => return Err(()),
-            }
-        }
+    const fn usize_as_u64(value: usize) -> u64 {
+        value as u64
     }
 
-    fn write_console(console: &mut ConsoleOutput, bytes: &[u8]) -> Result<(), ()> {
-        kllm_core::write_all(console, bytes).map_err(|_| ())
+    fn write_all(output: &mut dyn Output, bytes: &[u8]) -> Result<(), ()> {
+        kllm_core::write_all(output, bytes).map_err(|_| ())
+    }
+
+    fn fatal(message: &[u8]) -> ! {
+        let _written = kllm_machine::write(message);
+        kllm_machine::park()
     }
 
     const fn architecture() -> &'static str {
@@ -204,5 +295,10 @@ mod firmware {
         {
             "aarch64"
         }
+    }
+
+    #[panic_handler]
+    fn panic(_information: &PanicInfo<'_>) -> ! {
+        fatal(b"fatal: kernel panic\n")
     }
 }

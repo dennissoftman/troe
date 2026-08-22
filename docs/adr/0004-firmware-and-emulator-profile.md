@@ -11,10 +11,11 @@ through the 16550-backed console on x86-64 and the PL011-backed console on
 AArch64, with the QEMU monitor disabled. This is firmware console routing, not
 direct UART ownership by kllm.
 
-The firmware application returns to firmware for authorized `halt`. It does not
-claim ownership of the machine or hardware isolation. Direct UART and
-ExitBootServices are intentionally coupled to the owned-memory increment rather
-than being partially simulated.
+This firmware-hosted behavior remains the historical Stage 1 contract. Stage 2
+keeps the same pinned boot profile but uses Simple Text Output only for its
+bootstrap banner, then initializes the native UART, exits boot services, and
+parks the CPU for authorized `halt`. The image still makes no claim of
+userspace or hardware isolation.
 
 Revisit exact machine versions only through this ADR and update transcript
 goldens at the same time.

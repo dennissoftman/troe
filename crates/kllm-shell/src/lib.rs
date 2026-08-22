@@ -267,6 +267,11 @@ impl Shell {
         &self.cwd
     }
 
+    /// Replace the machine-accounting snapshot used by `mem` and `/sys/memory`.
+    pub const fn set_machine_memory(&mut self, snapshot: MachineMemorySnapshot) {
+        self.machine_memory = snapshot;
+    }
+
     /// Execute a complete line, including any bounded pipeline.
     pub fn execute(
         &mut self,
@@ -560,23 +565,27 @@ impl Shell {
 
     fn memory_report(&self) -> String {
         let stats = self.namespace.memory_stats();
-        let (owner, map, heap) = match self.machine_memory.owner() {
-            MachineMemoryOwner::Host => (
-                "host process",
-                "unavailable",
-                "host allocator (unavailable)",
-            ),
-            MachineMemoryOwner::Firmware => (
-                "firmware",
-                "firmware snapshot (advisory)",
-                "UEFI pool (unavailable)",
-            ),
-            MachineMemoryOwner::Kernel => ("kernel", "owned", "kernel heap (unavailable)"),
+        let (owner, map) = match self.machine_memory.owner() {
+            MachineMemoryOwner::Host => ("host process", "unavailable"),
+            MachineMemoryOwner::Firmware => ("firmware", "firmware snapshot (advisory)"),
+            MachineMemoryOwner::Kernel => ("kernel", "final map (owned)"),
         };
         let usable = optional_bytes(self.machine_memory.usable_bytes());
         let reserved = optional_bytes(self.machine_memory.reserved_bytes());
+        let frames = optional_ratio(
+            self.machine_memory.free_frames(),
+            self.machine_memory.total_frames(),
+            "free",
+        );
+        let heap = optional_ratio(
+            self.machine_memory.heap_used_bytes(),
+            self.machine_memory.heap_total_bytes(),
+            "used",
+        );
+        let heap_high_water = optional_bytes(self.machine_memory.heap_high_water_bytes());
+        let failed_allocations = optional_bytes(self.machine_memory.failed_allocations());
         format!(
-            "arch: {}\nmemory owner: {owner}\nmemory map: {map}\ntotal usable: {usable}\nreserved: {reserved}\nframes: unavailable\nheap: {heap}\nramfs used: {}\nramfs limit: {}\nramfs high-water: {}\ncaches used: 0\ncaches limit: 0\npressure: normal (RAMFS policy only)\n",
+            "arch: {}\nmemory owner: {owner}\nmemory map: {map}\ntotal usable: {usable}\nreserved: {reserved}\nframes: {frames}\nheap: {heap}\nheap high-water: {heap_high_water}\nallocation failures: {failed_allocations}\nramfs used: {}\nramfs limit: {}\nramfs high-water: {}\ncaches used: 0\ncaches limit: 0\npressure: normal (RAMFS policy only)\n",
             self.architecture, stats.ramfs_used, stats.ramfs_limit, stats.ramfs_high_water,
         )
     }
@@ -592,6 +601,15 @@ fn optional_bytes(value: Option<u64>) -> String {
     match value {
         Some(bytes) => bytes.to_string(),
         None => "unavailable".to_string(),
+    }
+}
+
+fn optional_ratio(numerator: Option<u64>, denominator: Option<u64>, suffix: &str) -> String {
+    match (numerator, denominator) {
+        (Some(numerator), Some(denominator)) => {
+            format!("{numerator}/{denominator} {suffix}")
+        }
+        _ => "unavailable".to_string(),
     }
 }
 
@@ -905,6 +923,38 @@ mod tests {
         assert!(report.contains("memory map: firmware snapshot (advisory)\n"));
         assert!(report.contains("total usable: 123456\n"));
         assert!(report.contains("reserved: 78900\n"));
+        assert!(error.as_slice().is_empty());
+    }
+
+    #[test]
+    fn memory_report_exposes_owned_frame_and_heap_counters() {
+        let namespace = Namespace::new(RamFsQuota::default());
+        let mut shell = match Shell::new(
+            namespace,
+            "owned-test",
+            MachineMemorySnapshot::kernel(4096, 8192, 10, 9, 1024, 128, 256, 1),
+            true,
+        ) {
+            Ok(value) => value,
+            Err(_error) => std::process::abort(),
+        };
+        let mut input = SliceInput::new(b"");
+        let mut output = BoundedOutput::new(1024);
+        let mut error = BoundedOutput::new(128);
+
+        assert_eq!(
+            shell
+                .execute("mem", &mut input, &mut output, &mut error)
+                .code(),
+            0
+        );
+        let report = core::str::from_utf8(output.as_slice()).unwrap_or_default();
+        assert!(report.contains("memory owner: kernel\n"));
+        assert!(report.contains("memory map: final map (owned)\n"));
+        assert!(report.contains("frames: 9/10 free\n"));
+        assert!(report.contains("heap: 128/1024 used\n"));
+        assert!(report.contains("heap high-water: 256\n"));
+        assert!(report.contains("allocation failures: 1\n"));
         assert!(error.as_slice().is_empty());
     }
 }

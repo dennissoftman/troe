@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/kllm-core",
+    "crates/kllm-machine",
     "crates/kllm-memory",
     "crates/kllm-vfs",
     "crates/kllm-shell",

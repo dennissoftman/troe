@@ -237,6 +237,12 @@ pub struct MachineMemorySnapshot {
     owner: MachineMemoryOwner,
     usable_bytes: Option<u64>,
     reserved_bytes: Option<u64>,
+    total_frames: Option<u64>,
+    free_frames: Option<u64>,
+    heap_total_bytes: Option<u64>,
+    heap_used_bytes: Option<u64>,
+    heap_high_water_bytes: Option<u64>,
+    failed_allocations: Option<u64>,
 }
 
 impl MachineMemorySnapshot {
@@ -247,6 +253,12 @@ impl MachineMemorySnapshot {
             owner: MachineMemoryOwner::Host,
             usable_bytes: None,
             reserved_bytes: None,
+            total_frames: None,
+            free_frames: None,
+            heap_total_bytes: None,
+            heap_used_bytes: None,
+            heap_high_water_bytes: None,
+            failed_allocations: None,
         }
     }
 
@@ -257,6 +269,38 @@ impl MachineMemorySnapshot {
             owner: MachineMemoryOwner::Firmware,
             usable_bytes: Some(usable_bytes),
             reserved_bytes: Some(reserved_bytes),
+            total_frames: None,
+            free_frames: None,
+            heap_total_bytes: None,
+            heap_used_bytes: None,
+            heap_high_water_bytes: None,
+            failed_allocations: None,
+        }
+    }
+
+    /// Construct a complete snapshot after kernel ownership begins.
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub const fn kernel(
+        usable_bytes: u64,
+        reserved_bytes: u64,
+        total_frames: u64,
+        free_frames: u64,
+        heap_total_bytes: u64,
+        heap_used_bytes: u64,
+        heap_high_water_bytes: u64,
+        failed_allocations: u64,
+    ) -> Self {
+        Self {
+            owner: MachineMemoryOwner::Kernel,
+            usable_bytes: Some(usable_bytes),
+            reserved_bytes: Some(reserved_bytes),
+            total_frames: Some(total_frames),
+            free_frames: Some(free_frames),
+            heap_total_bytes: Some(heap_total_bytes),
+            heap_used_bytes: Some(heap_used_bytes),
+            heap_high_water_bytes: Some(heap_high_water_bytes),
+            failed_allocations: Some(failed_allocations),
         }
     }
 
@@ -276,6 +320,42 @@ impl MachineMemorySnapshot {
     #[must_use]
     pub const fn reserved_bytes(self) -> Option<u64> {
         self.reserved_bytes
+    }
+
+    /// Number of usable physical frames, when owned.
+    #[must_use]
+    pub const fn total_frames(self) -> Option<u64> {
+        self.total_frames
+    }
+
+    /// Number of currently free physical frames, when owned.
+    #[must_use]
+    pub const fn free_frames(self) -> Option<u64> {
+        self.free_frames
+    }
+
+    /// General-heap arena bytes, when owned.
+    #[must_use]
+    pub const fn heap_total_bytes(self) -> Option<u64> {
+        self.heap_total_bytes
+    }
+
+    /// Currently consumed general-heap bytes, when owned.
+    #[must_use]
+    pub const fn heap_used_bytes(self) -> Option<u64> {
+        self.heap_used_bytes
+    }
+
+    /// Maximum observed general-heap consumption, when owned.
+    #[must_use]
+    pub const fn heap_high_water_bytes(self) -> Option<u64> {
+        self.heap_high_water_bytes
+    }
+
+    /// Rejected general-heap allocation requests, when observable.
+    #[must_use]
+    pub const fn failed_allocations(self) -> Option<u64> {
+        self.failed_allocations
     }
 }
 

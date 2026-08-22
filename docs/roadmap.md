@@ -12,26 +12,24 @@
   built-ins, failure cases, RAMFS quota exhaustion and recovery, memory
   reporting, and authorized halt with bounded timeouts.
 
-## Next three increments
+## Stage 2: owned machine (complete)
 
-### 1. Owned memory and console substrate
+### 1. Owned memory and console substrate — complete
 
 Normalize the UEFI memory map, reserve the image/stack/KEFS/map, introduce a
 bounded monotonic boot allocator, implement a project-owned frame bitmap, and add
 polling 16550/PL011 backends. Keep firmware services active until native fatal
 diagnostics and allocator accounting are verified.
 
-In progress: the bounded, architecture-independent normalization and monotonic
-boot-allocation models and their host tests have landed. Live UEFI descriptors
-are now normalized and reported as an advisory snapshot on both architectures.
-Identifying and reserving the first explicit boot arena is next; no machine
-memory is claimed yet.
+Landed: the portable normalization, monotonic boot allocator, and compact frame
+bitmap are host tested. Both images reserve an explicit LoaderData arena and
+run polling 16550/PL011 backends before firmware services are released.
 
 Exit: allocator model tests cover discontiguous ranges, exhaustion, double
 free, invalid free, and checked overflow; native UART output matches firmware
 output in QEMU.
 
-### 2. Exit boot services as one reviewed transition
+### 2. Exit boot services as one reviewed transition — complete
 
 Select and audit the general heap, copy the final memory map into owned memory,
 drop every firmware protocol reference, switch console and fatal paths, exit
@@ -40,10 +38,16 @@ boot services, and publish full memory counters through `mem`.
 Exit: repeated pipeline/RAMFS workloads run without firmware services or leaks,
 and allocation failure reaches a bounded diagnostic path.
 
+Landed: `rlsf` TLSF was selected and measured, the final map is retained and
+normalized, every console/fatal path is native, boot services are exited, and
+`mem` exposes owned frame and heap counters. Dual-QEMU acceptance proves no net
+heap growth across repeated transient workloads and exercises the bounded
+allocation-failure probe.
+
 MMU-owned page tables and W^X follow this transition; they should not be mixed
 into the first memory-ownership patch.
 
-### 3. MMU-owned mappings and W^X
+## Stage 3: MMU-owned mappings and W^X (next)
 
 Build architecture-specific page tables from pure, host-tested range plans;
 classify normal and device memory; protect immutable and executable regions;
