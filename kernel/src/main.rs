@@ -21,7 +21,7 @@ mod firmware {
     use kllm_vfs::{Namespace, RamFsQuota};
     use uefi::boot;
     use uefi::prelude::*;
-    use uefi::proto::console::text::Key;
+    use uefi::proto::console::text::{Key, ScanCode};
 
     const ROOTFS: &[u8] = include_bytes!("../../assets/root.kefs");
 
@@ -97,9 +97,8 @@ mod firmware {
         let mut overflow = false;
         loop {
             let key = wait_for_key()?;
-            if let Key::Printable(value) = key {
-                let character: char = value.into();
-                match character {
+            match key {
+                Key::Printable(value) => match char::from(value) {
                     '\r' | '\n' => {
                         write_console(console, b"\n")?;
                         if overflow {
@@ -111,9 +110,7 @@ mod firmware {
                         return Ok(Cow::Owned(line));
                     }
                     value if is_backspace(value) => {
-                        if line.pop().is_some() {
-                            write_console(console, b"\x08 \x08")?;
-                        }
+                        erase_previous(&mut line, console)?;
                     }
                     value if !value.is_control() && !overflow => {
                         if line.len() + value.len_utf8() > MAX_LINE_BYTES {
@@ -125,9 +122,20 @@ mod firmware {
                         }
                     }
                     _ => {}
-                }
+                },
+                // Some serial-backed UEFI consoles report the host Backspace
+                // key through the DELETE scan code instead of Unicode BS/DEL.
+                Key::Special(ScanCode::DELETE) => erase_previous(&mut line, console)?,
+                Key::Special(_) => {}
             }
         }
+    }
+
+    fn erase_previous(line: &mut String, console: &mut ConsoleOutput) -> Result<(), ()> {
+        if line.pop().is_some() {
+            write_console(console, b"\x08 \x08")?;
+        }
+        Ok(())
     }
 
     fn wait_for_key() -> Result<Key, ()> {
