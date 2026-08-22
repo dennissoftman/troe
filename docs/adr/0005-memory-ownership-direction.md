@@ -1,6 +1,6 @@
 # ADR 0005: memory ownership direction
 
-Status: accepted direction; Stage 2 implementation pending.
+Status: accepted direction; Stage 2 implementation in progress.
 
 Implement the physical-frame mechanism as a compact bitmap over normalized
 4 KiB pages, with explicit reservations for discontiguous firmware and device
@@ -18,3 +18,8 @@ allocator was rejected as the first frame mechanism because coalescing adds
 metadata and invariants before workloads justify it.
 
 Revisit the bitmap only if very large-memory metadata is measured as material.
+
+The first landed Stage 2 component is the unsafe-free `kllm-memory`
+normalization model. Firmware adaptation, live reservations, the boot allocator,
+and the frame bitmap remain pending; the model does not by itself transfer
+ownership from UEFI.

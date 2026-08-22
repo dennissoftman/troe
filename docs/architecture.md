@@ -50,3 +50,9 @@ hard bound. Stage 1 obtains allocation from UEFI boot services through the
 maintained `uefi` crate. Exiting boot services is deliberately not attempted in
 this slice: doing that safely requires the boot allocator, normalized memory
 map, native console, exception path, and owned heap to land together.
+
+Stage 2 begins with an architecture-independent memory-map model in
+`kllm-memory`. It validates checked 4 KiB ranges, normalizes unordered firmware
+descriptors, overlays bounded explicit reservations, and reports usable and
+reserved bytes. The UEFI adapter and allocator mechanisms consume this model;
+firmware types do not enter the portable crate.

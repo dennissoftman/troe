@@ -21,6 +21,10 @@ bounded monotonic boot allocator, implement a project-owned frame bitmap, and ad
 polling 16550/PL011 backends. Keep firmware services active until native fatal
 diagnostics and allocator accounting are verified.
 
+In progress: the bounded, architecture-independent normalization model and its
+host tests have landed. Adapting the live UEFI descriptors and identifying the
+first explicit reservations are next; no machine memory is claimed yet.
+
 Exit: allocator model tests cover discontiguous ranges, exhaustion, double
 free, invalid free, and checked overflow; native UART output matches firmware
 output in QEMU.
