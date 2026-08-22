@@ -1,4 +1,4 @@
-# kllm — Tiny Rust Operating Environment Specification
+# Tiny Rust Operating Environment Specification
 
 **Status:** Draft design specification  
 **Version:** 0.1.0  
@@ -6,9 +6,19 @@
 **Future targets:** raw x86-64 PCs, raw AArch64 systems  
 **Implementation language:** Rust (`no_std`)  
 
+The product and CLI names are intentionally unset. This document uses “the
+project” and “the system” in prose. `<cli>` denotes the future control-plane
+executable without proposing its eventual name.
+
+The future developer tooling and package-composition model is specified in
+[TOOLING-PACKAGING-SPEC.md](TOOLING-PACKAGING-SPEC.md). That document
+extends this roadmap and inherits this specification's authority, resource,
+security, and staging constraints. It does not describe functionality present
+in release 0.1.
+
 ## 1. Purpose
 
-`kllm` is a tiny, autonomous command environment with just enough kernel beneath it to own a machine. It boots to a terminal, exposes a minimal filesystem, and provides a small set of composable built-in commands.
+The system is a tiny, autonomous command environment with just enough kernel beneath it to own a machine. It boots to a terminal, exposes a minimal filesystem, and provides a small set of composable built-in commands.
 
 It is an experiment in whether an operating environment can be simultaneously:
 
@@ -19,11 +29,11 @@ It is an experiment in whether an operating environment can be simultaneously:
 - capable of evolving toward tasks, message passing, and isolation without beginning as a full microkernel;
 - compact enough to aspire to a 1.44 MB boot image, while never exceeding a 16 MB experimental ceiling without an explicit specification change.
 
-`kllm` is not a miniature Linux distribution. It does not initially host conventional userspace programs, implement POSIX, or reproduce historical Unix internals. It borrows selected ideas and discards their accidental complexity.
+The system is not a miniature Linux distribution. It does not initially host conventional userspace programs, implement POSIX, or reproduce historical Unix internals. It borrows selected ideas and discards their accidental complexity.
 
 ## 2. Design thesis
 
-> `kllm` is a mechanically simple operating environment built around typed authority and composable objects, with architecture-dependent code confined to a small compile-time machine layer.
+> The system is a mechanically simple operating environment built around typed authority and composable objects, with architecture-dependent code confined to a small compile-time machine layer.
 
 Its influences are selective:
 
@@ -81,7 +91,7 @@ The MVP intentionally excludes the following. These are **deferred capabilities,
 
 The project instead aims for **no known vulnerabilities, explicit invariants, bounded behavior, and a small auditable attack surface**. “Clean from the start” is an engineering discipline, not a proof of perfection.
 
-After the MVP proves the boot, memory, VFS, command, and architecture boundaries, `kllm` is expected to grow into a genuinely usable small operating system. Candidate production capabilities include loadable ELF or another versioned executable container, isolated applications, networking, persistent filesystems, and a deliberately selected compatibility layer. Each addition must preserve the project's size, comprehensibility, authority, and resource-accounting principles.
+After the MVP proves the boot, memory, VFS, command, and architecture boundaries, the project is expected to grow into a genuinely usable small operating system. Candidate production capabilities include loadable ELF or another versioned executable container, isolated applications, networking, persistent filesystems, and a deliberately selected compatibility layer. Each addition must preserve the project's size, comprehensibility, authority, and resource-accounting principles.
 
 ## 6. System model
 
@@ -95,7 +105,7 @@ The initial execution model is deliberately narrow:
 +-------------------------------+
 | memory | terminal | storage   |
 +-------------------------------+
-| portable kllm core            |
+| portable core                 |
 +-------------------------------+
 | compile-time machine backend  |
 +---------------+---------------+
@@ -125,7 +135,7 @@ The recommended path is:
 
 1. **Hosted prototype:** portable parser, commands, VFS, embedded FS, and RAMFS run as a normal host program for rapid testing.
 2. **UEFI application:** x86-64 and AArch64 builds use firmware console, memory-map, and filesystem services while boot services remain active.
-3. **Owned-machine kernel:** firmware is used only to enter the image and obtain a memory map; `kllm` then exits boot services and owns memory, console, exceptions, and selected devices.
+3. **Owned-machine kernel:** firmware is used only to enter the image and obtain a memory map; the system then exits boot services and owns memory, console, exceptions, and selected devices.
 4. **Raw platform ports:** direct boot and board-specific initialization are added only for named, documented machines.
 
 UEFI is a bootstrap strategy, not a permanent dependency of the portable core.
@@ -330,7 +340,7 @@ These signatures are illustrative, not frozen ABI. The implementation SHOULD avo
 └── dev/         capability-backed device nodes, if enabled
 ```
 
-`/sys` and `/dev` are kllm namespaces, not Linux-compatible ABIs.
+`/sys` and `/dev` are project-defined namespaces, not Linux-compatible ABIs.
 
 Useful generated nodes include:
 
@@ -428,7 +438,7 @@ Selection criteria include:
 - tests covering fragmentation, exhaustion, and invalid frees;
 - ability to reserve discontiguous firmware and device regions.
 
-Borrowed code MUST be pinned to a revision, wrapped behind a kllm-owned interface, documented in `THIRD_PARTY.md`, and audited before becoming part of the trusted base.
+Borrowed code MUST be pinned to a revision, wrapped behind a project-owned interface, documented in `THIRD_PARTY.md`, and audited before becoming part of the trusted base.
 
 The frame allocator MUST detect or prevent double-free, freeing unowned frames, and range overflow in debug/test builds. Production behavior MUST be defined and MUST NOT corrupt allocator metadata.
 
@@ -634,7 +644,7 @@ These are planning budgets, not ABI guarantees. Code clarity MUST NOT be sacrifi
 Recommended workspace structure:
 
 ```text
-kllm/
+<repository>/
 ├── crates/
 │   ├── core/             portable types and errors
 │   ├── shell/            parser and command registry
@@ -785,6 +795,13 @@ Optional task isolation later strengthens this model; it does not retroactively 
 - Provide application startup, exit status, fault reporting, and resource reclamation.
 - Support architecture-native binaries; cross-architecture instruction emulation is not required.
 - Keep static built-ins available for recovery and constrained builds.
+- Define a versioned application/package manifest and a target-specific lock
+  format before released tooling consumes either one.
+- Validate immutable package artifacts on the host first, then reuse the same
+  format parser and validation rules at the native load boundary.
+- Introduce the first native SDK and hosted `<cli> build`, `<cli> run`,
+  `<cli> inspect`, and `<cli> explain` flows without granting the tooling client
+  ambient system authority.
 
 Dynamic linking is optional and SHOULD follow a working static executable format rather than ship with the first loader.
 
@@ -798,15 +815,24 @@ Dynamic linking is optional and SHOULD follow a working static executable format
 - Expose networking through handles or service interfaces rather than ambient global access.
 - Add at least one persistent filesystem or carefully scoped block-storage format.
 - Define configuration, service startup, and recovery behavior suitable for unattended use.
+- Add the persistent content store and desired-system manifest only after their
+  on-disk formats, bounds, corruption behavior, and recovery paths are tested.
+- Construct immutable system generations separately from mutable volumes and
+  secrets; activate a generation through a crash-consistent pointer.
+- Preserve the previous bootable generation and the static recovery shell when
+  activation or bounded health checks fail.
 
-**Exit criterion:** `kllm` can boot, configure a supported network device, exchange data with another host, persist selected state, and remain within declared memory budgets under malformed and high-volume input.
+**Exit criterion:** the system can boot, configure a supported network device, exchange data with another host, persist selected state, and remain within declared memory budgets under malformed and high-volume input.
 
 ### Stage 9 — Production usability
 
 - Establish a supported native application SDK and versioned ABI policy.
 - Add selected utilities and services driven by real use cases.
 - Decide whether a documented POSIX subset materially improves portability without dominating the design.
-- Add update, rollback, crash-diagnostic, and reproducible-release procedures.
+- Add supported update, rollback, garbage-collection, crash-diagnostic, and
+  reproducible-release procedures, including explicit data-migration limits.
+- Establish registry trust roots, signature and revocation policy, provenance
+  requirements, and stable machine-readable tooling schemas.
 - Define threat models and hardening profiles for supported deployment classes.
 - Maintain a minimal recovery image even when the full production image grows beyond the floppy-size target.
 
@@ -844,16 +870,20 @@ Before `1.0`, internal Rust APIs are unstable. The following formats MUST still 
 - embedded filesystem image;
 - boot configuration, if any;
 - message wire format, once introduced;
-- crash or diagnostic record, if persisted.
+- crash or diagnostic record, if persisted;
+- application/package manifest and immutable artifact envelope;
+- dependency lock file;
+- desired-system manifest and generation record;
+- registry metadata and stable machine-readable CLI output, when introduced.
 
 Command behavior SHOULD remain backward compatible within a minor release series, but POSIX compatibility MUST NOT be inferred from familiar command names.
 
 ## 26. Definition of the first useful release
 
-`kllm 0.1` is complete when:
+Release 0.1 is complete when:
 
 - separate x86-64 and AArch64 images boot under pinned QEMU configurations;
-- each reaches an interactive `kllm>` prompt;
+- each reaches an interactive recovery prompt;
 - `cat`, `echo`, literal `grep`, `ls`, `pwd`, `cd`, `help`, `mem`, and `halt` work as specified;
 - `/` includes an embedded read-only filesystem and `/tmp` is a quota-bound RAMFS;
 - `/sys/arch`, `/sys/version`, and `/sys/memory` are readable through the VFS;
@@ -877,7 +907,7 @@ When design choices compete, use this order:
 6. performance;
 7. compatibility and feature breadth.
 
-A feature belongs in `kllm` only when its value exceeds its cost in code size, runtime memory, unsafe surface, test burden, and conceptual complexity.
+A feature belongs in the project only when its value exceeds its cost in code size, runtime memory, unsafe surface, test burden, and conceptual complexity.
 
 ## 28. Open decisions
 
@@ -891,7 +921,12 @@ The following must be resolved by short architecture decision records during imp
 - whether command quoting ships in `0.1`;
 - whether native UART interrupts are necessary or polling is sufficient;
 - kernel virtual-address layout for each architecture;
-- license and minimum supported Rust version.
+- license and minimum supported Rust version;
+- canonical package-artifact encoding and digest/signature scope;
+- dependency/version semantics and multi-target lock-file representation;
+- content-store layout, generation activation record, and recovery protocol;
+- persistent-data migration and rollback contract;
+- package trust roots, key rotation, revocation, and offline verification policy.
 
 Each decision record MUST state alternatives, measurable costs, safety impact, and conditions under which the choice should be revisited.
 

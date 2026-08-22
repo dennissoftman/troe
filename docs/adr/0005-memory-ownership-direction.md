@@ -2,10 +2,10 @@
 
 Status: accepted direction; Stage 2 implementation pending.
 
-Implement the physical frame mechanism in kllm as a compact bitmap over
-normalized 4 KiB pages, with explicit reservations for discontiguous firmware
-and device regions. Debug and model builds detect invalid and double frees.
-Use a bounded monotonic allocator before the general heap.
+Implement the physical-frame mechanism as a compact bitmap over normalized
+4 KiB pages, with explicit reservations for discontiguous firmware and device
+regions. Debug and model builds detect invalid and double frees. Use a bounded
+monotonic allocator before the general heap.
 
 Do not invent the general heap until a short evaluation measures at least a
 segregated free-list and TLSF-style audited implementation against alignment,
@@ -18,4 +18,3 @@ allocator was rejected as the first frame mechanism because coalescing adds
 metadata and invariants before workloads justify it.
 
 Revisit the bitmap only if very large-memory metadata is measured as material.
-

@@ -11,10 +11,16 @@ UEFI text console ─┘                 └─ firmware application
 The graph is intentionally direct today. Interfaces are shaped so a later
 dispatcher can replace calls without exposing implementation pointers.
 
+Repository `scripts` and Cargo commands are bootstrap developer tooling, not a
+package manager or a privileged system-control plane. The future CLI described
+in [../TOOLING-PACKAGING-SPEC.md](../TOOLING-PACKAGING-SPEC.md) must sit
+above versioned libraries and service interfaces. It does not replace the
+statically linked recovery shell.
+
 ## Input-to-output trace
 
 1. A composition root owns line editing and enforces the 512-byte line bound.
-2. `kllm-shell` tokenizes iteratively. Quotes group bytes; no expansion,
+2. The shell crate tokenizes iteratively. Quotes group bytes; no expansion,
    recursion, substitution, environment lookup, or globbing occurs.
 3. The pipeline executor finds a statically linked command by name. Commands
    receive only stdin/stdout/stderr streams plus access mediated by `Shell`.
@@ -44,4 +50,3 @@ hard bound. Stage 1 obtains allocation from UEFI boot services through the
 maintained `uefi` crate. Exiting boot services is deliberately not attempted in
 this slice: doing that safely requires the boot allocator, normalized memory
 map, native console, exception path, and owned heap to land together.
-

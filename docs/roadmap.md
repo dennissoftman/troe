@@ -23,7 +23,7 @@ firmware within a timeout.
 ### 2. Owned memory and console substrate
 
 Normalize the UEFI memory map, reserve the image/stack/KEFS/map, introduce a
-bounded monotonic boot allocator, implement a kllm-owned frame bitmap, and add
+bounded monotonic boot allocator, implement a project-owned frame bitmap, and add
 polling 16550/PL011 backends. Keep firmware services active until native fatal
 diagnostics and allocator accounting are verified.
 
@@ -43,3 +43,16 @@ and allocation failure reaches a bounded diagnostic path.
 MMU-owned page tables and W^X follow this transition; they should not be mixed
 into the first memory-ownership patch.
 
+## Deferred tooling and packaging track
+
+The tooling/package architecture is documented now so early formats and
+interfaces do not foreclose it, but it is not part of the next three
+increments. Until loadable applications and persistence exist, Cargo,
+repository scripts, KEFS, and FAT images remain explicit bootstrap mechanisms,
+not public package or generation formats.
+
+Hosted manifest, lock, and artifact validation may be prototyped before native
+application loading. Native execution begins with core Stage 7; a persistent
+store, system generations, and rollback begin with Stage 8; supported updates,
+registry trust, and deployment belong to Stage 9. See
+[../TOOLING-PACKAGING-SPEC.md](../TOOLING-PACKAGING-SPEC.md#511-alignment-with-the-core-roadmap).

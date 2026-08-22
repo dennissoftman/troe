@@ -6,7 +6,7 @@ Header (16 bytes):
 
 | Offset | Size | Meaning |
 |---:|---:|---|
-| 0 | 8 | `KLLMFS1\0` magic/version |
+| 0 | 8 | `4b 4c 4c 4d 46 53 31 00` magic/version bytes |
 | 8 | 2 | record count |
 | 10 | 2 | reserved, zero |
 | 12 | 4 | exact total image length |
@@ -14,8 +14,8 @@ Header (16 bytes):
 Each record is `kind:u8`, `path_len:u16`, `data_len:u32`, UTF-8 path bytes,
 then file data. Kind 1 is a file and kind 2 is a directory. Directory data must
 be empty. Paths are absolute, normalized, non-root, strictly byte-lexically
-increasing, and must obey the global kllm path bounds. Parents precede children
-in the source image used by 0.1.
+increasing, and must obey the global path bounds. Parents precede children in
+the source image used by 0.1.
 
 The reader checks every addition and slice boundary before access, requires
 exact end-of-image consumption, parses into temporary owned records, and only
@@ -24,4 +24,3 @@ out-of-bounds read or partial mount.
 
 `tools/mkefs.py` is the canonical builder. It rejects symlinks and unsupported
 filesystem objects so host-specific link behavior cannot enter an image.
-
