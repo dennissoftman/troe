@@ -22,8 +22,10 @@ use rather than providing a hardware security boundary.
   yield/exit/reap accounting, and guarded 32 KiB task stacks;
 - generation-checked service handles, bounded synchronous request/reply
   messages, and a dispatched native console output path;
-- project-owned polling 16550 and PL011 recovery consoles after boot services
-  exit, plus an owned GOP framebuffer text console on both architectures;
+- owned receive interrupts through q35 LAPIC/I/O APIC and AArch64 GICv2,
+  bounded raw-event delivery, and race-free `hlt`/`wfi` shell idle;
+- project-owned polling 16550 and PL011 early/fatal recovery output, plus an
+  owned GOP framebuffer text console on both architectures;
 - configurable cursor-aware UTF-8 line editing, volatile bounded history,
   command/VFS completion, ANSI serial-key decoding, and x86-64 PS/2 input;
 - single/double quotes and pipelines of up to eight stages;
@@ -104,11 +106,14 @@ not bundle firmware, provide code and variable-store images from rust-osdev
 The launcher and acceptance harness refuse a QEMU version other than 11.1.0 unless
 `--skip-version-check` is supplied deliberately. Firmware is not silently
 downloaded. UEFI Simple Text Output carries only the bootstrap banner. The image
-then initializes its polling 16550 backend on x86-64 or PL011 backend on
+then initializes its native 16550 backend on x86-64 or PL011 backend on
 AArch64, copies validated GOP metadata, moves to an explicitly reserved kernel
 stack, captures the final map, and exits boot services through a non-returning
-continuation. Normal shell output is mirrored to the owned framebuffer when GOP
-is available; early and fatal diagnostics remain serial-first.
+continuation. After owned mappings and vectors are active, the shell receives
+serial input through the owned interrupt controller and sleeps with `hlt` or
+`wfi` when its bounded queue is empty. Normal shell output is mirrored to the
+owned framebuffer when GOP is available; early and fatal diagnostics remain
+serial-first.
 
 ## Repository map
 
@@ -136,12 +141,12 @@ ladder of subtly different defaults: `micro` for MCU-class systems without an
 MMU assumption, `tiny` for constrained machines, and `full` for larger systems.
 The current QEMU images select the named `tiny` configuration in their
 composition root; command-line profile selection is not implemented yet. The
-terminal/editor and completion crates expose validated constructors for line,
-history-entry, history-byte, escape-sequence, completion-candidate,
-completion-byte, text-cell, tab-width, color, and keyboard-layout policy, so
-these tunables are not scattered kernel literals. Future build profiles can
-replace that selection while preserving the same shell, stream, VFS, and
-authority semantics.
+terminal/editor, completion, and driver crates expose validated constructors
+for line, history-entry, history-byte, escape-sequence, completion-candidate,
+completion-byte, text-cell, tab-width, color, keyboard-layout, raw-input queue,
+per-interrupt drain, and interrupt-priority policy, so these tunables are not
+scattered kernel literals. Future build profiles can replace that selection
+while preserving the same shell, stream, VFS, and authority semantics.
 
 ## Naming
 

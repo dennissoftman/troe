@@ -10,6 +10,7 @@ license.workspace = true
 acceptance-probes = []
 
 [dependencies]
+kllm-driver = { path = "../kllm-driver" }
 kllm-memory = { path = "../kllm-memory" }
 kllm-task = { path = "../kllm-task" }
 kllm-terminal = { path = "../kllm-terminal" }

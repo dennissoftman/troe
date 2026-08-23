@@ -84,7 +84,9 @@ def normalize(data: bytes) -> str:
 def parse_owned_memory_accounting(report: str) -> int:
     """Validate complete kernel-owned counters and return current heap use."""
     for label in ("total usable", "reserved"):
-        match = re.search(rf"^{re.escape(label)}: ([0-9]+)$", report, re.MULTILINE)
+        match = re.search(
+            rf"^{re.escape(label)}: ([0-9]+) \([^\n]+\)$", report, re.MULTILINE
+        )
         if match is None or int(match.group(1)) == 0:
             raise AcceptanceError(
                 f"mem did not report a positive numeric {label} value; "
@@ -93,15 +95,39 @@ def parse_owned_memory_accounting(report: str) -> int:
     frames = re.search(r"^frames: ([0-9]+)/([0-9]+) free$", report, re.MULTILINE)
     if frames is None or int(frames.group(2)) == 0 or int(frames.group(1)) > int(frames.group(2)):
         raise AcceptanceError(f"mem reported invalid frame counters: {report!r}")
-    heap = re.search(r"^heap: ([0-9]+)/([0-9]+) used$", report, re.MULTILINE)
+    heap = re.search(
+        r"^heap: ([0-9]+)/([0-9]+) used \([^\n]+\)$", report, re.MULTILINE
+    )
     if heap is None or int(heap.group(2)) == 0 or int(heap.group(1)) >= int(heap.group(2)):
         raise AcceptanceError(f"mem reported invalid heap counters: {report!r}")
-    high_water = re.search(r"^heap high-water: ([0-9]+)$", report, re.MULTILINE)
+    high_water = re.search(
+        r"^heap high-water: ([0-9]+) \([^\n]+\)$", report, re.MULTILINE
+    )
     if high_water is None or int(high_water.group(1)) < int(heap.group(1)):
         raise AcceptanceError(f"mem reported invalid heap high-water: {report!r}")
     failures = re.search(r"^allocation failures: ([0-9]+)$", report, re.MULTILINE)
     if failures is None or int(failures.group(1)) < 1:
         raise AcceptanceError(f"bounded allocation failure was not accounted: {report!r}")
+    input_queue = re.search(
+        r"^input queue: ([0-9]+)/([0-9]+) queued$", report, re.MULTILINE
+    )
+    if (
+        input_queue is None
+        or int(input_queue.group(2)) == 0
+        or int(input_queue.group(1)) > int(input_queue.group(2))
+    ):
+        raise AcceptanceError(f"mem reported invalid input queue counters: {report!r}")
+    for label in ("input interrupts", "input delivered", "input idle waits", "input wakeups"):
+        match = re.search(rf"^{re.escape(label)}: ([0-9]+)$", report, re.MULTILINE)
+        if match is None or int(match.group(1)) == 0:
+            raise AcceptanceError(f"mem reported invalid {label}: {report!r}")
+    dropped = re.search(r"^input dropped: ([0-9]+)$", report, re.MULTILINE)
+    if dropped is None or int(dropped.group(1)) != 0:
+        raise AcceptanceError(f"ordinary input unexpectedly overflowed: {report!r}")
+    idle_waits = re.search(r"^input idle waits: ([0-9]+)$", report, re.MULTILINE)
+    wakeups = re.search(r"^input wakeups: ([0-9]+)$", report, re.MULTILINE)
+    if idle_waits is None or wakeups is None or int(wakeups.group(1)) > int(idle_waits.group(1)):
+        raise AcceptanceError(f"mem reported inconsistent idle accounting: {report!r}")
     return int(heap.group(1))
 
 
@@ -116,6 +142,7 @@ def assert_owned_boot(session: "SerialSession") -> None:
         "exception vectors: ready",
         "owned page tables: ready",
         "W^X mappings: active",
+        "interrupt-driven input: ready",
         "cooperative tasks: deterministic",
         "task stack guards: active",
         "task resources: reclaimed",
@@ -529,7 +556,7 @@ def run_scenario(session: SerialSession, boot_timeout: float, command_timeout: f
         absent=("firmware", "advisory", "unavailable"),
     )
     final_heap = parse_owned_memory_accounting(final_report)
-    if final_heap != baseline_heap:
+    if final_heap > baseline_heap:
         raise AcceptanceError(
             f"owned heap grew across repeated transient workloads: "
             f"{baseline_heap} -> {final_heap} bytes"

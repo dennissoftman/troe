@@ -134,7 +134,7 @@ def prepare_qemu_command(
     command = [
         executable,
         "-machine",
-        "q35" if architecture == "x86_64" else "virt",
+        "q35" if architecture == "x86_64" else "virt,gic-version=2",
         "-monitor",
         "none",
         "-serial",

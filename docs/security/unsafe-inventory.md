@@ -1,6 +1,6 @@
 # Unsafe inventory
 
-Stage 5.1 contains exactly 87 project-authored Rust `unsafe` tokens, all in the
+Stage 5.2 contains exactly 133 project-authored Rust `unsafe` tokens, all in the
 two audited modules of `crates/kllm-machine`. The verification gate fails if
 this count changes without a same-change inventory review. Portable crates and
 the kernel composition root continue to forbid unsafe code.
@@ -11,6 +11,9 @@ the kernel composition root continue to forbid unsafe code.
 | Owned-stack and interrupt transition | 8 | A checked, reserved stack receives one leaked continuation record; architecture trampolines replace SP/RSP once and cannot return; x86 IF and AArch64 DAIF are masked before firmware exception state is replaced. |
 | Cooperative task-stack calls | 4 | One unique call record and task state borrow remain live while an architecture trampoline replaces SP/RSP synchronously; the old stack is saved inside the mapped task payload and restored before Rust resumes. |
 | Owned framebuffer writes | 1 | GOP scalar metadata is checked before handoff; page-rounded bytes are allocator-reserved and mapped RW/NX as device memory; checked pixel offsets precede each volatile byte write. |
+| Bounded input-queue synchronization | 9 | The boot CPU initializes one preallocated queue before IRQ enablement; the current single-CPU profile masks owned IRQ delivery around main-context access, while interrupt gates enter masked, so the audited `UnsafeCell` never yields overlapping mutable references. |
+| x86-64 APIC input delivery and entry | 17 | Mapped LAPIC/I/O APIC registers and owned PIC/UART ports are accessed only from the pinned q35 profile; explicit IDT gates preserve interrupted integer and floating-point state; `sti; hlt; cli` closes the empty-check sleep race. |
+| AArch64 GICv2 input delivery and entry | 20 | The pinned `virt` GICv2 aperture is mapped RW/NX as device memory; distributor/CPU-interface operations are bounded by `GICD_TYPER`; the IRQ vector preserves all general and SIMD state; IRQ-masked `dsb; wfi` closes the pre-sleep handler race before pending dispatch returns to masked queue access. |
 | x86-64 16550, i8042, and `hlt` | 12 | The pinned q35 profile owns COM1 at `0x3f8` and the PS/2 controller at `0x60`/`0x64`; byte I/O checks readiness/status bits, ignores auxiliary-device data, and bounds transmit polling; halt is terminal. |
 | AArch64 PL011 and `wfe` | 10 | The pinned virt profile owns PL011 at `0x09000000`; aligned volatile accesses target documented registers; transmit polling is bounded; park is terminal. |
 | Heap host tests | 4 | Test arenas remain live, exclusively borrowed, and allocations are deallocated once with their original layouts. |

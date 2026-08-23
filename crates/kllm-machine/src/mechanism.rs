@@ -16,6 +16,13 @@ use core::ptr;
 use core::ptr::NonNull;
 #[cfg(target_os = "uefi")]
 use core::sync::atomic::{AtomicBool, Ordering};
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+use kllm_driver::IoPortResource;
+#[cfg(target_os = "uefi")]
+use kllm_driver::{
+    BoundedInputQueue, InputEvent, InputQueueConfig, InputQueueStats, InputSource,
+    InterruptResource, MmioResource, QueueError,
+};
 #[cfg(any(test, target_os = "uefi"))]
 use kllm_memory::PhysicalRange;
 #[cfg(target_os = "uefi")]
@@ -98,6 +105,39 @@ pub struct OwnedFramebuffer {
     descriptor: FramebufferDescriptor,
     base: usize,
 }
+
+/// Failure to configure owned interrupt-driven input.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(target_os = "uefi")]
+pub enum InputInterruptError {
+    /// Portable queue metadata could not be allocated before IRQ enablement.
+    QueueMetadataExhausted,
+    /// The one-time input runtime was already initialized.
+    AlreadyInitialized,
+    /// A pinned platform resource descriptor was invalid.
+    InvalidResource,
+    /// The interrupt controller did not expose the required input line.
+    InterruptLineUnavailable,
+}
+
+#[cfg(target_os = "uefi")]
+impl From<QueueError> for InputInterruptError {
+    fn from(_error: QueueError) -> Self {
+        Self::QueueMetadataExhausted
+    }
+}
+
+#[cfg(target_os = "uefi")]
+struct InputQueueCell(UnsafeCell<Option<BoundedInputQueue>>);
+
+// SAFETY: The boot CPU initializes this cell once with interrupts masked.
+// Main-context access masks IRQ delivery, and interrupt gates enter with IRQs
+// masked, so exactly one mutable reference exists on the current single CPU.
+#[cfg(target_os = "uefi")]
+unsafe impl Sync for InputQueueCell {}
+
+#[cfg(target_os = "uefi")]
+static INPUT_QUEUE: InputQueueCell = InputQueueCell(UnsafeCell::new(None));
 
 #[cfg(target_os = "uefi")]
 impl OwnedFramebuffer {
@@ -528,15 +568,18 @@ pub fn try_read_byte() -> Option<u8> {
 pub fn try_read_keyboard_scancode() -> Option<u8> {
     #[cfg(target_arch = "x86_64")]
     {
-        const PS2_DATA: u16 = 0x0060;
-        const PS2_STATUS: u16 = 0x0064;
+        let Ok(profile) = x86_input_profile() else {
+            return None;
+        };
+        let data = profile.keyboard_ports.base_port();
+        let status_port = data + 4;
         // SAFETY: The pinned q35 profile owns the legacy i8042 controller.
-        let status = unsafe { port_read(PS2_STATUS) };
+        let status = unsafe { port_read(status_port) };
         if status & 1 == 0 || status & (1 << 5) != 0 {
             None
         } else {
             // SAFETY: The status register reports one keyboard byte available.
-            Some(unsafe { port_read(PS2_DATA) })
+            Some(unsafe { port_read(data) })
         }
     }
     #[cfg(target_arch = "aarch64")]
@@ -545,12 +588,303 @@ pub fn try_read_keyboard_scancode() -> Option<u8> {
     }
 }
 
+/// Device-memory ranges required by the pinned interrupt-controller profile.
+///
+/// Empty array slots permit profiles with one contiguous controller aperture.
+///
+/// # Errors
+///
+/// Returns a typed failure if a pinned resource cannot form a checked page
+/// range.
+#[cfg(target_os = "uefi")]
+pub fn input_device_ranges() -> Result<[Option<PhysicalRange>; 2], InputInterruptError> {
+    architecture_input_device_ranges()
+}
+
+/// Preallocate the input queue, own the platform interrupt controller, and
+/// enable receive interrupts.
+///
+/// # Errors
+///
+/// Fails atomically before global IRQ enablement if queue allocation, one-time
+/// initialization, or platform resource validation fails.
+#[cfg(target_os = "uefi")]
+pub fn initialize_input_interrupts(config: InputQueueConfig) -> Result<(), InputInterruptError> {
+    let queue = BoundedInputQueue::try_new(config)?;
+    // SAFETY: Boot reaches this one-time initialization with architecture IRQs
+    // masked. No interrupt entry or main-context consumer can access the cell.
+    unsafe {
+        let slot = &mut *INPUT_QUEUE.0.get();
+        if slot.is_some() {
+            return Err(InputInterruptError::AlreadyInitialized);
+        }
+        *slot = Some(queue);
+    }
+    architecture_initialize_input_interrupts(config)
+}
+
+/// Block in the architecture idle instruction until one queued input event is
+/// available.
+///
+/// The empty check and IRQ-enable/sleep transition exclude a lost wakeup.
+#[must_use]
+#[cfg(target_os = "uefi")]
+pub fn wait_for_input_event() -> InputEvent {
+    architecture_mask_input_interrupts();
+    loop {
+        // SAFETY: IRQ delivery is masked on the single boot CPU, so the main
+        // consumer has exclusive access to the initialized queue.
+        if let Some(event) = unsafe { input_queue_mut() }.and_then(BoundedInputQueue::pop) {
+            architecture_enable_input_interrupts();
+            return event;
+        }
+        // SAFETY: IRQ delivery remains masked, so main context retains
+        // exclusive access while accounting the sleep transition.
+        if let Some(queue) = unsafe { input_queue_mut() } {
+            queue.record_idle_wait();
+        }
+        architecture_wait_for_input_interrupt();
+        // The architecture helper returns with IRQ delivery masked again.
+        // SAFETY: Main context therefore has exclusive queue access.
+        if let Some(queue) = unsafe { input_queue_mut() } {
+            queue.record_wakeup();
+        }
+    }
+}
+
+/// Snapshot interrupt input accounting without racing an interrupt producer.
+#[must_use]
+#[cfg(target_os = "uefi")]
+pub fn input_interrupt_stats() -> Option<InputQueueStats> {
+    architecture_mask_input_interrupts();
+    // SAFETY: IRQ delivery is masked on the single boot CPU.
+    let stats = unsafe { input_queue_mut() }.map(|queue| queue.stats());
+    architecture_enable_input_interrupts();
+    stats
+}
+
+/// Dispatch one owned architecture interrupt into the bounded raw-event queue.
+#[cfg(target_os = "uefi")]
+pub(crate) fn handle_input_interrupt() {
+    // SAFETY: Architecture interrupt gates enter with IRQ delivery masked and
+    // initialization enables a source only after installing this queue.
+    if let Some(queue) = unsafe { input_queue_mut() } {
+        architecture_handle_input_interrupt(queue);
+    }
+}
+
+#[cfg(target_os = "uefi")]
+unsafe fn input_queue_mut() -> Option<&'static mut BoundedInputQueue> {
+    // SAFETY: Callers establish single-CPU exclusion by boot state or IRQ mask.
+    unsafe { (&mut *INPUT_QUEUE.0.get()).as_mut() }
+}
+
 /// Park the current CPU permanently after an authorized halt.
 #[cfg(target_os = "uefi")]
 pub fn park() -> ! {
     loop {
         architecture_park();
     }
+}
+
+#[cfg(target_os = "uefi")]
+fn resource_page_range(resource: MmioResource) -> Result<PhysicalRange, InputInterruptError> {
+    if !resource
+        .base_address()
+        .is_multiple_of(kllm_memory::BASE_PAGE_SIZE)
+        || !resource
+            .byte_len()
+            .is_multiple_of(kllm_memory::BASE_PAGE_SIZE)
+    {
+        return Err(InputInterruptError::InvalidResource);
+    }
+    PhysicalRange::from_pages(
+        resource.base_address(),
+        resource.byte_len() / kllm_memory::BASE_PAGE_SIZE,
+    )
+    .map_err(|_| InputInterruptError::InvalidResource)
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+pub(crate) const X86_KEYBOARD_VECTOR: u8 = 0x31;
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+pub(crate) const X86_SERIAL_VECTOR: u8 = 0x34;
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+pub(crate) const X86_SPURIOUS_VECTOR: u8 = 0xff;
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+struct X86InputProfile {
+    lapic: MmioResource,
+    ioapic: MmioResource,
+    keyboard_ports: IoPortResource,
+    serial_ports: IoPortResource,
+    keyboard_interrupt: InterruptResource,
+    serial_interrupt: InterruptResource,
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn x86_input_profile() -> Result<X86InputProfile, InputInterruptError> {
+    Ok(X86InputProfile {
+        lapic: MmioResource::new(0xfee0_0000, 0x1000)
+            .map_err(|_| InputInterruptError::InvalidResource)?,
+        ioapic: MmioResource::new(0xfec0_0000, 0x1000)
+            .map_err(|_| InputInterruptError::InvalidResource)?,
+        keyboard_ports: IoPortResource::new(0x0060, 5)
+            .map_err(|_| InputInterruptError::InvalidResource)?,
+        serial_ports: IoPortResource::new(0x03f8, 8)
+            .map_err(|_| InputInterruptError::InvalidResource)?,
+        keyboard_interrupt: InterruptResource::new(1, X86_KEYBOARD_VECTOR)
+            .map_err(|_| InputInterruptError::InvalidResource)?,
+        serial_interrupt: InterruptResource::new(4, X86_SERIAL_VECTOR)
+            .map_err(|_| InputInterruptError::InvalidResource)?,
+    })
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn architecture_input_device_ranges() -> Result<[Option<PhysicalRange>; 2], InputInterruptError> {
+    let profile = x86_input_profile()?;
+    Ok([
+        Some(resource_page_range(profile.lapic)?),
+        Some(resource_page_range(profile.ioapic)?),
+    ])
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn architecture_initialize_input_interrupts(
+    _config: InputQueueConfig,
+) -> Result<(), InputInterruptError> {
+    const LAPIC_ID: usize = 0x020;
+    const LAPIC_SPURIOUS: usize = 0x0f0;
+    const LAPIC_SOFTWARE_ENABLE: u32 = 1 << 8;
+    let profile = x86_input_profile()?;
+
+    // SAFETY: The pinned q35 profile assigns the legacy PIC mask registers;
+    // masking both controllers prevents firmware-era PIC delivery.
+    unsafe {
+        port_write(0x21, 0xff);
+        port_write(0xa1, 0xff);
+    }
+
+    let ioapic_version = x86_ioapic_read(profile.ioapic, 1);
+    let maximum_entry = (ioapic_version >> 16) & 0xff;
+    if profile.keyboard_interrupt.line() > maximum_entry
+        || profile.serial_interrupt.line() > maximum_entry
+    {
+        return Err(InputInterruptError::InterruptLineUnavailable);
+    }
+    for line in 0..=maximum_entry {
+        x86_ioapic_write(profile.ioapic, 0x10 + line * 2, 1 << 16);
+        x86_ioapic_write(profile.ioapic, 0x11 + line * 2, 0);
+    }
+
+    let lapic_base = usize::try_from(profile.lapic.base_address())
+        .map_err(|_| InputInterruptError::InvalidResource)?;
+    // SAFETY: The LAPIC page is mapped RW/NX as device memory before this call.
+    let apic_id = unsafe { mmio_read32(lapic_base + LAPIC_ID) } >> 24;
+    // SAFETY: The spurious-vector register belongs to the owned BSP LAPIC.
+    unsafe {
+        mmio_write32(
+            lapic_base + LAPIC_SPURIOUS,
+            LAPIC_SOFTWARE_ENABLE | u32::from(X86_SPURIOUS_VECTOR),
+        );
+    }
+    x86_route_ioapic(profile.ioapic, profile.keyboard_interrupt, apic_id);
+    x86_route_ioapic(profile.ioapic, profile.serial_interrupt, apic_id);
+
+    // Retain bytes already present before enabling receive notification.
+    // SAFETY: Initialization still runs with CPU interrupts masked.
+    if let Some(queue) = unsafe { input_queue_mut() } {
+        x86_drain_input_devices(queue);
+    }
+    // SAFETY: COM1's interrupt-enable register is owned by the pinned profile.
+    unsafe {
+        let serial_base = profile.serial_ports.base_port();
+        port_write(serial_base + 1, 1);
+    }
+    architecture_enable_input_interrupts();
+    Ok(())
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn architecture_handle_input_interrupt(queue: &mut BoundedInputQueue) {
+    const LAPIC_EOI: usize = 0x0b0;
+    queue.record_interrupt();
+    x86_drain_input_devices(queue);
+    if let Ok(profile) = x86_input_profile()
+        && let Ok(lapic_base) = usize::try_from(profile.lapic.base_address())
+    {
+        // SAFETY: Every routed input interrupt requires one LAPIC EOI write.
+        unsafe { mmio_write32(lapic_base + LAPIC_EOI, 0) };
+    }
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn x86_drain_input_devices(queue: &mut BoundedInputQueue) {
+    let budget = queue.config().max_drain_per_interrupt();
+    for _ in 0..budget {
+        if let Some(byte) = try_read_keyboard_scancode() {
+            let _result = queue.push(InputEvent::new(InputSource::Keyboard, byte));
+            continue;
+        }
+        if let Some(byte) = architecture_try_read_byte() {
+            let _result = queue.push(InputEvent::new(InputSource::Serial, byte));
+            continue;
+        }
+        break;
+    }
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn x86_route_ioapic(ioapic: MmioResource, interrupt: InterruptResource, apic_id: u32) {
+    let register = 0x10 + interrupt.line() * 2;
+    x86_ioapic_write(ioapic, register, 1 << 16);
+    x86_ioapic_write(ioapic, register + 1, apic_id << 24);
+    x86_ioapic_write(ioapic, register, u32::from(interrupt.vector()));
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn x86_ioapic_read(ioapic: MmioResource, register: u32) -> u32 {
+    let Ok(base) = usize::try_from(ioapic.base_address()) else {
+        return 0;
+    };
+    // SAFETY: The IOAPIC selector/window registers are within the mapped page;
+    // callers serialize access while interrupts are masked.
+    unsafe {
+        mmio_write32(base, register);
+        mmio_read32(base + 0x10)
+    }
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn x86_ioapic_write(ioapic: MmioResource, register: u32, value: u32) {
+    let Ok(base) = usize::try_from(ioapic.base_address()) else {
+        return;
+    };
+    // SAFETY: The IOAPIC selector/window registers are within the mapped page;
+    // callers serialize access while interrupts are masked.
+    unsafe {
+        mmio_write32(base, register);
+        mmio_write32(base + 0x10, value);
+    }
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn architecture_mask_input_interrupts() {
+    // SAFETY: The boot CPU owns IF after firmware exit.
+    unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn architecture_enable_input_interrupts() {
+    // SAFETY: IDT gates, queue, devices, and controllers are initialized first.
+    unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn architecture_wait_for_input_interrupt() {
+    // SAFETY: STI delays maskable delivery through the following HLT boundary;
+    // CLI remasks after wake so the queue can be checked exclusively.
+    unsafe { core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack)) };
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
@@ -693,6 +1027,218 @@ unsafe fn port_write(port: u16, value: u8) {
     }
 }
 
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+unsafe fn mmio_read32(address: usize) -> u32 {
+    // SAFETY: The caller proves that the address names an aligned mapped MMIO
+    // register and owns the corresponding device operation.
+    unsafe { ptr::read_volatile(address as *const u32) }
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+unsafe fn mmio_write32(address: usize, value: u32) {
+    // SAFETY: The caller proves that the address names an aligned writable MMIO
+    // register and owns the corresponding device operation.
+    unsafe { ptr::write_volatile(address as *mut u32, value) };
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+struct Aarch64InputProfile {
+    gic: MmioResource,
+    serial_interrupt: InterruptResource,
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn aarch64_input_profile() -> Result<Aarch64InputProfile, InputInterruptError> {
+    Ok(Aarch64InputProfile {
+        gic: MmioResource::new(0x0800_0000, 0x0002_0000)
+            .map_err(|_| InputInterruptError::InvalidResource)?,
+        serial_interrupt: InterruptResource::new(33, 32)
+            .map_err(|_| InputInterruptError::InvalidResource)?,
+    })
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn architecture_input_device_ranges() -> Result<[Option<PhysicalRange>; 2], InputInterruptError> {
+    let profile = aarch64_input_profile()?;
+    Ok([Some(resource_page_range(profile.gic)?), None])
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn architecture_initialize_input_interrupts(
+    config: InputQueueConfig,
+) -> Result<(), InputInterruptError> {
+    const GICD_CTLR: usize = 0x000;
+    const GICD_TYPER: usize = 0x004;
+    const GICD_IGROUPR: usize = 0x080;
+    const GICD_ISENABLER: usize = 0x100;
+    const GICD_ICENABLER: usize = 0x180;
+    const GICD_ICPENDR: usize = 0x280;
+    const GICD_IPRIORITYR: usize = 0x400;
+    const GICD_ITARGETSR: usize = 0x800;
+    const GICD_ICFGR: usize = 0xc00;
+    const GICC_CTLR: usize = 0x000;
+    const GICC_PMR: usize = 0x004;
+    const GICC_BPR: usize = 0x008;
+    const GIC_CPU_OFFSET: usize = 0x1_0000;
+
+    let profile = aarch64_input_profile()?;
+    let distributor = usize::try_from(profile.gic.base_address())
+        .map_err(|_| InputInterruptError::InvalidResource)?;
+    let cpu = distributor + GIC_CPU_OFFSET;
+    let intid = usize::try_from(profile.serial_interrupt.line())
+        .map_err(|_| InputInterruptError::InvalidResource)?;
+
+    // SAFETY: The complete pinned GICv2 aperture is mapped RW/NX as device
+    // memory, and IRQ delivery remains masked during controller ownership.
+    unsafe {
+        mmio_write32(cpu + GICC_CTLR, 0);
+        mmio_write32(distributor + GICD_CTLR, 0);
+    }
+    // SAFETY: GICD_TYPER is a read-only register inside the owned aperture.
+    let typer = unsafe { mmio_read32(distributor + GICD_TYPER) };
+    let register_count =
+        usize::try_from((typer & 0x1f) + 1).map_err(|_| InputInterruptError::InvalidResource)?;
+    let interrupt_count = register_count
+        .checked_mul(32)
+        .ok_or(InputInterruptError::InvalidResource)?;
+    if intid >= interrupt_count {
+        return Err(InputInterruptError::InterruptLineUnavailable);
+    }
+    for register in 0..register_count {
+        let offset = register * 4;
+        // SAFETY: TYPER bounds every implemented enable/pending register.
+        unsafe {
+            mmio_write32(distributor + GICD_ICENABLER + offset, u32::MAX);
+            mmio_write32(distributor + GICD_ICPENDR + offset, u32::MAX);
+        }
+    }
+
+    let word = intid / 32;
+    let bit = 1_u32 << (intid % 32);
+    // SAFETY: The selected INTID was checked against GICD_TYPER.
+    unsafe {
+        let group = mmio_read32(distributor + GICD_IGROUPR + word * 4);
+        mmio_write32(distributor + GICD_IGROUPR + word * 4, group & !bit);
+        gicv2_update_byte(
+            distributor + GICD_IPRIORITYR,
+            intid,
+            config.interrupt_priority(),
+        );
+        gicv2_update_byte(distributor + GICD_ITARGETSR, intid, 0x01);
+        let config_address = distributor + GICD_ICFGR + (intid / 16) * 4;
+        let config_shift = (intid % 16) * 2;
+        let config = mmio_read32(config_address) & !(0b10 << config_shift);
+        mmio_write32(config_address, config);
+        mmio_write32(distributor + GICD_ISENABLER + word * 4, bit);
+        mmio_write32(cpu + GICC_PMR, 0xff);
+        mmio_write32(cpu + GICC_BPR, 0);
+        mmio_write32(cpu + GICC_CTLR, 1);
+        mmio_write32(distributor + GICD_CTLR, 1);
+    }
+
+    // SAFETY: Initialization still runs with IRQ delivery masked.
+    if let Some(queue) = unsafe { input_queue_mut() } {
+        aarch64_drain_serial(queue);
+    }
+    // SAFETY: PL011 receive and receive-timeout mask bits are documented and
+    // the device is mapped before this call.
+    unsafe {
+        mmio_write(
+            PL011_INTERRUPT_MASK,
+            PL011_RECEIVE_INTERRUPT | PL011_RECEIVE_TIMEOUT_INTERRUPT,
+        );
+        core::arch::asm!("dsb sy", "isb", options(nomem, nostack));
+    }
+    architecture_enable_input_interrupts();
+    Ok(())
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn architecture_handle_input_interrupt(queue: &mut BoundedInputQueue) {
+    const GICC_IAR: usize = 0x00c;
+    const GICC_EOIR: usize = 0x010;
+    const GIC_CPU_OFFSET: usize = 0x1_0000;
+    let Ok(profile) = aarch64_input_profile() else {
+        return;
+    };
+    let Ok(distributor) = usize::try_from(profile.gic.base_address()) else {
+        return;
+    };
+    let cpu = distributor + GIC_CPU_OFFSET;
+    // SAFETY: GICC_IAR acknowledges the highest-priority pending interrupt.
+    let acknowledge = unsafe { mmio_read32(cpu + GICC_IAR) };
+    let intid = acknowledge & 0x03ff;
+    if intid == profile.serial_interrupt.line() {
+        queue.record_interrupt();
+        aarch64_drain_serial(queue);
+        // SAFETY: These bits clear only the serviced PL011 receive sources.
+        unsafe {
+            mmio_write(
+                PL011_INTERRUPT_CLEAR,
+                PL011_RECEIVE_INTERRUPT | PL011_RECEIVE_TIMEOUT_INTERRUPT,
+            );
+        }
+    }
+    if intid < 1020 {
+        // SAFETY: A non-spurious IAR value must be returned verbatim to EOIR.
+        unsafe { mmio_write32(cpu + GICC_EOIR, acknowledge) };
+    }
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn aarch64_drain_serial(queue: &mut BoundedInputQueue) {
+    for _ in 0..queue.config().max_drain_per_interrupt() {
+        let Some(byte) = architecture_try_read_byte() else {
+            break;
+        };
+        let _result = queue.push(InputEvent::new(InputSource::Serial, byte));
+    }
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+unsafe fn gicv2_update_byte(base: usize, index: usize, value: u8) {
+    let address = base + (index / 4) * 4;
+    let shift = (index % 4) * 8;
+    // SAFETY: The caller bounds the register through GICD_TYPER and owns the
+    // distributor while IRQ delivery is masked.
+    let current = unsafe { mmio_read32(address) };
+    let updated = (current & !(0xff << shift)) | (u32::from(value) << shift);
+    // SAFETY: The same checked register is writable by the distributor owner.
+    unsafe { mmio_write32(address, updated) };
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn architecture_mask_input_interrupts() {
+    // SAFETY: The boot CPU owns DAIF after firmware exit.
+    unsafe { core::arch::asm!("msr daifset, #2", "isb", options(nomem, nostack)) };
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn architecture_enable_input_interrupts() {
+    // SAFETY: VBAR, queue, device, and GIC are initialized before IRQ unmask.
+    unsafe { core::arch::asm!("msr daifclr, #2", "isb", options(nomem, nostack)) };
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn architecture_wait_for_input_interrupt() {
+    // SAFETY: GICC_PMR leaves the owned IRQ eligible as a WFI wake source even
+    // while PSTATE.I prevents exception entry. Sleeping masked closes the race
+    // where a handler could run after unmask but before WFI. After wake, the
+    // brief unmask dispatches the pending handler; the final mask restores
+    // exclusive queue access before the caller rechecks it.
+    unsafe {
+        core::arch::asm!(
+            "dsb sy",
+            "wfi",
+            "msr daifclr, #2",
+            "isb",
+            "msr daifset, #2",
+            "isb",
+            options(nomem, nostack)
+        );
+    }
+}
+
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 const PL011_BASE: usize = 0x0900_0000;
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
@@ -711,6 +1257,10 @@ const PL011_CONTROL: usize = 0x030;
 const PL011_INTERRUPT_MASK: usize = 0x038;
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 const PL011_INTERRUPT_CLEAR: usize = 0x044;
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+const PL011_RECEIVE_INTERRUPT: u32 = 1 << 4;
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+const PL011_RECEIVE_TIMEOUT_INTERRUPT: u32 = 1 << 6;
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 fn architecture_initialize_console() {
@@ -829,6 +1379,20 @@ unsafe fn mmio_read(offset: usize) -> u32 {
 unsafe fn mmio_write(offset: usize, value: u32) {
     // SAFETY: The caller supplies a valid aligned writable PL011 register.
     unsafe { ptr::write_volatile((PL011_BASE + offset) as *mut u32, value) };
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+unsafe fn mmio_read32(address: usize) -> u32 {
+    // SAFETY: The caller proves that the address names an aligned mapped MMIO
+    // register and owns the corresponding device operation.
+    unsafe { ptr::read_volatile(address as *const u32) }
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+unsafe fn mmio_write32(address: usize, value: u32) {
+    // SAFETY: The caller proves that the address names an aligned writable MMIO
+    // register and owns the corresponding device operation.
+    unsafe { ptr::write_volatile(address as *mut u32, value) };
 }
 
 #[cfg(test)]

@@ -20,8 +20,10 @@ lock, and perform no unbounded loop.
 The first implementation remains single-CPU and cooperative. Main-context
 queue access temporarily masks the owned input interrupt class; interrupt
 context enters with that class masked. A queue-empty wait performs the
-architecture's enable-and-sleep transition atomically enough to exclude a lost
-wakeup: `sti; hlt` on x86-64 and an IRQ-unmask plus `wfi` sequence on AArch64.
+architecture's sleep transition so it excludes a lost wakeup: `sti; hlt` on
+x86-64, and `dsb; wfi` while IRQ exception entry remains masked on AArch64,
+followed by a brief unmask to dispatch the pending handler before the queue is
+rechecked.
 This increment does not add timer interrupts, preemption, nested interrupts, or
 general task blocking. Scheduler-visible wait channels are deferred until more
 than the shell consumes asynchronous events.
@@ -46,3 +48,6 @@ has been disabled, that native x86 keyboard input still works, that both CPUs
 enter and wake from their idle instruction, and that queue/interrupt counters
 are bounded and observable. Existing exception, W^X, terminal, and polling
 fatal-path tests remain mandatory.
+
+The machine-specific ordering constraints and regression checklist are kept in
+[the architecture-specific implementation notes](../architecture-specific-notes.md).

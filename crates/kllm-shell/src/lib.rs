@@ -15,6 +15,7 @@ use kllm_core::{
     MachineMemoryOwner, MachineMemorySnapshot, Output, PIPE_CAPACITY, SliceInput, StreamError,
     write_all,
 };
+use kllm_driver::InputQueueStats;
 use kllm_vfs::{FsError, Namespace, NodeKind};
 
 /// Shell parse failures caused by untrusted command input.
@@ -364,6 +365,7 @@ pub struct Shell {
     cwd: String,
     architecture: String,
     machine_memory: MachineMemorySnapshot,
+    machine_input: Option<InputQueueStats>,
     machine_control: bool,
     halt_requested: bool,
 }
@@ -387,6 +389,7 @@ impl Shell {
             cwd: "/".to_string(),
             architecture: architecture.to_string(),
             machine_memory,
+            machine_input: None,
             machine_control,
             halt_requested: false,
         };
@@ -438,6 +441,11 @@ impl Shell {
     /// Replace the machine-accounting snapshot used by `mem` and `/sys/memory`.
     pub const fn set_machine_memory(&mut self, snapshot: MachineMemorySnapshot) {
         self.machine_memory = snapshot;
+    }
+
+    /// Replace the interrupt-input snapshot used by `mem` and `/sys/memory`.
+    pub const fn set_machine_input(&mut self, snapshot: Option<InputQueueStats>) {
+        self.machine_input = snapshot;
     }
 
     /// Execute a complete line, including any bounded pipeline.
@@ -797,23 +805,45 @@ impl Shell {
             MachineMemoryOwner::Firmware => ("firmware", "firmware snapshot (advisory)"),
             MachineMemoryOwner::Kernel => ("kernel", "final map (owned)"),
         };
-        let usable = optional_bytes(self.machine_memory.usable_bytes());
-        let reserved = optional_bytes(self.machine_memory.reserved_bytes());
+        let usable = optional_byte_count(self.machine_memory.usable_bytes());
+        let reserved = optional_byte_count(self.machine_memory.reserved_bytes());
         let frames = optional_ratio(
             self.machine_memory.free_frames(),
             self.machine_memory.total_frames(),
             "free",
         );
-        let heap = optional_ratio(
+        let heap = optional_byte_ratio(
             self.machine_memory.heap_used_bytes(),
             self.machine_memory.heap_total_bytes(),
             "used",
         );
-        let heap_high_water = optional_bytes(self.machine_memory.heap_high_water_bytes());
+        let heap_high_water = optional_byte_count(self.machine_memory.heap_high_water_bytes());
         let failed_allocations = optional_bytes(self.machine_memory.failed_allocations());
+        let ramfs_used = byte_count(stats.ramfs_used);
+        let ramfs_limit = byte_count(stats.ramfs_limit);
+        let ramfs_high_water = byte_count(stats.ramfs_high_water);
+        let (input_queue, input_interrupts, input_delivered, input_dropped, idle_waits, wakeups) =
+            match self.machine_input {
+                Some(input) => (
+                    format!("{}/{} queued", input.queued, input.capacity),
+                    input.interrupts.to_string(),
+                    input.delivered.to_string(),
+                    input.dropped.to_string(),
+                    input.idle_waits.to_string(),
+                    input.wakeups.to_string(),
+                ),
+                None => (
+                    "unavailable".to_string(),
+                    "unavailable".to_string(),
+                    "unavailable".to_string(),
+                    "unavailable".to_string(),
+                    "unavailable".to_string(),
+                    "unavailable".to_string(),
+                ),
+            };
         format!(
-            "arch: {}\nmemory owner: {owner}\nmemory map: {map}\ntotal usable: {usable}\nreserved: {reserved}\nframes: {frames}\nheap: {heap}\nheap high-water: {heap_high_water}\nallocation failures: {failed_allocations}\nramfs used: {}\nramfs limit: {}\nramfs high-water: {}\ncaches used: 0\ncaches limit: 0\npressure: normal (RAMFS policy only)\n",
-            self.architecture, stats.ramfs_used, stats.ramfs_limit, stats.ramfs_high_water,
+            "arch: {}\nmemory owner: {owner}\nmemory map: {map}\ntotal usable: {usable}\nreserved: {reserved}\nframes: {frames}\nheap: {heap}\nheap high-water: {heap_high_water}\nallocation failures: {failed_allocations}\ninput queue: {input_queue}\ninput interrupts: {input_interrupts}\ninput delivered: {input_delivered}\ninput dropped: {input_dropped}\ninput idle waits: {idle_waits}\ninput wakeups: {wakeups}\nramfs used: {}\nramfs limit: {}\nramfs high-water: {}\ncaches used: 0\ncaches limit: 0\npressure: normal (RAMFS policy only)\n",
+            self.architecture, ramfs_used, ramfs_limit, ramfs_high_water,
         )
     }
 
@@ -977,11 +1007,57 @@ fn optional_bytes(value: Option<u64>) -> String {
     }
 }
 
+fn optional_byte_count(value: Option<u64>) -> String {
+    match value {
+        Some(bytes) => byte_count(bytes),
+        None => "unavailable".to_string(),
+    }
+}
+
+fn byte_count(bytes: u64) -> String {
+    format!("{bytes} ({})", human_bytes(bytes))
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    let (unit, label) = if bytes >= GIB {
+        (GIB, "GiB")
+    } else if bytes >= MIB {
+        (MIB, "MiB")
+    } else if bytes >= KIB {
+        (KIB, "KiB")
+    } else {
+        return format!("{bytes} B");
+    };
+    let whole = bytes / unit;
+    let hundredths = ((bytes % unit) * 100) / unit;
+    if hundredths == 0 {
+        format!("{whole} {label}")
+    } else if hundredths.is_multiple_of(10) {
+        format!("{whole}.{} {label}", hundredths / 10)
+    } else {
+        format!("{whole}.{hundredths:02} {label}")
+    }
+}
+
 fn optional_ratio(numerator: Option<u64>, denominator: Option<u64>, suffix: &str) -> String {
     match (numerator, denominator) {
         (Some(numerator), Some(denominator)) => {
             format!("{numerator}/{denominator} {suffix}")
         }
+        _ => "unavailable".to_string(),
+    }
+}
+
+fn optional_byte_ratio(numerator: Option<u64>, denominator: Option<u64>, suffix: &str) -> String {
+    match (numerator, denominator) {
+        (Some(numerator), Some(denominator)) => format!(
+            "{numerator}/{denominator} {suffix} ({}/{})",
+            human_bytes(numerator),
+            human_bytes(denominator)
+        ),
         _ => "unavailable".to_string(),
     }
 }
@@ -1164,6 +1240,7 @@ mod tests {
     use super::{CompletionConfig, CompletionConfigError, ParseError, Shell, parse_line};
     use alloc::string::ToString;
     use kllm_core::{BoundedOutput, MachineMemorySnapshot, SliceInput};
+    use kllm_driver::InputQueueStats;
     use kllm_vfs::{Namespace, RamFsQuota};
 
     fn shell() -> Shell {
@@ -1328,7 +1405,6 @@ mod tests {
         let mut input = SliceInput::new(b"");
         let mut output = BoundedOutput::new(1024);
         let mut error = BoundedOutput::new(128);
-
         assert_eq!(
             shell
                 .execute("mem", &mut input, &mut output, &mut error)
@@ -1338,8 +1414,8 @@ mod tests {
         let report = core::str::from_utf8(output.as_slice()).unwrap_or_default();
         assert!(report.contains("memory owner: firmware\n"));
         assert!(report.contains("memory map: firmware snapshot (advisory)\n"));
-        assert!(report.contains("total usable: 123456\n"));
-        assert!(report.contains("reserved: 78900\n"));
+        assert!(report.contains("total usable: 123456 (120.56 KiB)\n"));
+        assert!(report.contains("reserved: 78900 (77.05 KiB)\n"));
         assert!(error.as_slice().is_empty());
     }
 
@@ -1358,6 +1434,15 @@ mod tests {
         let mut input = SliceInput::new(b"");
         let mut output = BoundedOutput::new(1024);
         let mut error = BoundedOutput::new(128);
+        shell.set_machine_input(Some(InputQueueStats {
+            capacity: 256,
+            queued: 2,
+            delivered: 17,
+            dropped: 0,
+            interrupts: 9,
+            idle_waits: 8,
+            wakeups: 7,
+        }));
 
         assert_eq!(
             shell
@@ -1369,9 +1454,15 @@ mod tests {
         assert!(report.contains("memory owner: kernel\n"));
         assert!(report.contains("memory map: final map (owned)\n"));
         assert!(report.contains("frames: 9/10 free\n"));
-        assert!(report.contains("heap: 128/1024 used\n"));
-        assert!(report.contains("heap high-water: 256\n"));
+        assert!(report.contains("heap: 128/1024 used (128 B/1 KiB)\n"));
+        assert!(report.contains("heap high-water: 256 (256 B)\n"));
         assert!(report.contains("allocation failures: 1\n"));
+        assert!(report.contains("input queue: 2/256 queued\n"));
+        assert!(report.contains("input interrupts: 9\n"));
+        assert!(report.contains("input delivered: 17\n"));
+        assert!(report.contains("input dropped: 0\n"));
+        assert!(report.contains("input idle waits: 8\n"));
+        assert!(report.contains("input wakeups: 7\n"));
         assert!(error.as_slice().is_empty());
     }
 }

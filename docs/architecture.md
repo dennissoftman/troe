@@ -5,7 +5,7 @@ The same portable graph is linked into two composition roots:
 ```text
 host stdin/stdout ───────────┐                 ┌─ hosted process
                              ├─ shell ─ VFS ──┤
-serial / PS/2 → editor ──────┘                 └─ UART + GOP text console
+serial / PS/2 → IRQ → bounded queue → editor ─┘  └─ UART + GOP text console
 ```
 
 Stage 5 keeps the graph in one address space but can route selected edges
@@ -20,10 +20,12 @@ statically linked recovery shell.
 
 ## Input-to-output trace
 
-1. A composition root selects a validated editor policy. The portable editor
+1. A composition root selects validated driver and editor policies. Owned
+   device handlers drain only a configured number of raw bytes into a
+   preallocated queue, then acknowledge the controller. The portable editor
    enforces its UTF-8 byte bound, cursor-aware editing, volatile history limits,
    and decoded key events; ANSI serial input and x86 set-1 PS/2 input feed the
-   same event type.
+   same event type outside interrupt context.
 2. The shell crate tokenizes iteratively. Quotes group bytes; no expansion,
    recursion, substitution, environment lookup, or globbing occurs.
 3. The pipeline executor finds a statically linked command by name. Commands
@@ -32,7 +34,7 @@ statically linked recovery shell.
    frozen result through `SliceInput`; a stage cannot observe mutable internals.
 5. Filesystem commands ask `Namespace` to canonicalize from the logical cwd.
    Immutable KEFS nodes and writable `/tmp` nodes share one object model.
-6. The final output capability writes host bytes or the polling native UART.
+6. The final output capability writes host bytes or the native UART.
    When validated GOP metadata is available, normal native shell output is also
    rendered into an owned fixed-glyph framebuffer console. UEFI text output is
    confined to the pre-handoff banner.
@@ -69,8 +71,8 @@ firmware types do not enter the portable crate.
 
 The final handoff reserves a 2,084-page LoaderData arena, carves and seals a
 6 MiB general heap, dedicates 2 MiB to monotonic page-table construction, and
-reserves 128 KiB/16 KiB kernel and emergency stacks. It installs polling
-16550/PL011 and bounded native fatal paths, transfers to the owned stack, and
+reserves 128 KiB/16 KiB kernel and emergency stacks. It installs native
+16550/PL011 and bounded polling fatal paths, transfers to the owned stack, and
 enters a non-returning `ExitBootServices` continuation. Interrupts are masked
 before exception state changes. Only then does the kernel reclassify expired
 boot-services code/data as usable and build a compact bitmap over genuinely
@@ -81,10 +83,11 @@ publish owned-map bytes, free/total frames, and live heap use, capacity,
 high-water, and failure counts.
 
 Stage 3 adds a pure, bounded mapping plan. The composition root identity-maps
-only runtime RAM, PE-classified image sections, the boot arena, and the AArch64
-PL011 page. Physical aliases are rejected. The native backend emits fresh 4 KiB
-tables, validates CPU-reported physical-address limits, enables W^X, and replaces
-firmware exception state with fixed x86-64 GDT/TSS/IDT state or an AArch64 VBAR.
+only runtime RAM, PE-classified image sections, the boot arena, framebuffer,
+and selected UART/interrupt-controller apertures. Physical aliases are
+rejected. The native backend emits fresh 4 KiB tables, validates CPU-reported
+physical-address limits, enables W^X, and replaces firmware exception state
+with fixed x86-64 GDT/TSS/IDT state or an AArch64 VBAR.
 Executable image pages are RX, immutable image pages are RO/NX, and writable
 runtime/device pages are NX. Deliberate write and execute violations are
 validated in fresh QEMU boots for both architectures.
@@ -125,7 +128,7 @@ The first switched edge is native console output. `ConsoleService` converts a
 bounded write request into the existing `Output` operation, while
 `DispatchedOutput` presents the same byte-stream trait to the shell. Requests
 larger than one message are split through ordinary partial-write semantics.
-Fatal diagnostics and polling input remain direct machine mechanisms. This is
+Fatal diagnostics and input delivery remain direct machine mechanisms. This is
 still in-process dispatch, not IPC: service code shares the caller's privileged
 address space, borrowed request bytes are not a wire format, and service faults
 are not contained.
@@ -135,10 +138,25 @@ decoding, line editing, history, and fixed-glyph text rendering outside the
 machine mechanism. `kllm-shell` owns completion because it has the authoritative
 command registry and VFS namespace; both command candidates and directory
 listings are returned under caller-selected count and byte budgets. The native
-composition root currently selects the named `tiny` policies. x86-64 polls the
-q35 i8042 controller and decodes US set-1 scan codes, while both architectures
-retain serial input. AArch64 native keyboard input is deferred to a bounded
+composition root currently selects the named `tiny` policies. x86-64 decodes
+US set-1 scan codes from q35 i8042, while both architectures retain serial
+input. AArch64 native keyboard input is deferred to a bounded
 virtio-input transport rather than adding a firmware dependency after handoff.
+
+Stage 5.2 adds the portable `kllm-driver` resource and event boundary. The
+selected queue capacity, maximum ISR drain, and programmable controller
+priority come from validated profile configuration. The pinned x86-64 profile
+masks the legacy PIC, owns LAPIC/I/O APIC, and routes COM1 and keyboard receive
+interrupts through explicit IDT gates. The pinned AArch64 profile owns GICv2
+and routes PL011 through its IRQ vector. Handlers preserve interrupted CPU
+state, perform bounded non-allocating device work, and enqueue typed raw bytes;
+decoding and editing remain in main context. An empty queue executes a
+lost-wakeup-safe `sti; hlt` or IRQ-masked `dsb; wfi` transition followed by
+pending-handler dispatch. Direct polling is
+retained only for bootstrap and fatal recovery, and no timer or preemption is
+introduced. `mem` and `/sys/memory` expose queue, interrupt, delivery, drop,
+idle, and wakeup accounting; byte-valued memory counters retain exact values
+and add binary IEC `KiB`/`MiB`/`GiB` displays.
 
 ## Future persistent-storage boundary
 

@@ -8,8 +8,8 @@ license.workspace = true
 
 [dependencies]
 kllm-core = { path = "../kllm-core" }
+kllm-driver = { path = "../kllm-driver" }
 kllm-vfs = { path = "../kllm-vfs" }
 
 [lints]
 workspace = true
-

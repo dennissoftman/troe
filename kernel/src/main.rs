@@ -16,11 +16,11 @@ mod firmware {
     use alloc::string::String;
     use alloc::vec::Vec;
     use core::fmt::Write as _;
-    use core::hint::spin_loop;
     use core::panic::PanicInfo;
 
     use kllm_core::{Input, MAX_LINE_BYTES, MachineMemorySnapshot, Output, StreamError};
     use kllm_dispatch::{ConsoleService, DispatchedOutput, Dispatcher, Rights};
+    use kllm_driver::{InputQueueConfig, InputSource};
     use kllm_memory::{
         BASE_PAGE_SIZE, BootAllocator, FrameAllocator, MAX_FIRMWARE_REGIONS, Mapping,
         MappingLifetime, MappingMemoryType, MappingOwner, MappingPermissions, MappingPlan,
@@ -286,6 +286,10 @@ mod firmware {
         {
             return Err(());
         }
+        kllm_machine::initialize_input_interrupts(InputQueueConfig::tiny()).map_err(|_| ())?;
+        if !kllm_machine::write(b"interrupt-driven input: ready\n") {
+            return Err(());
+        }
         Ok(OwnedAccounting {
             map,
             frames,
@@ -421,6 +425,19 @@ mod firmware {
             )?;
         }
         if let Some(device) = console_device_range() {
+            insert_identity(
+                &mut plan,
+                device,
+                MappingPermissions::READ_WRITE,
+                MappingMemoryType::Device,
+                MappingOwner::MachineDevice,
+            )?;
+        }
+        for device in kllm_machine::input_device_ranges()
+            .map_err(|_| ())?
+            .into_iter()
+            .flatten()
+        {
             insert_identity(
                 &mut plan,
                 device,
@@ -804,7 +821,7 @@ mod firmware {
         }
 
         loop {
-            shell.set_machine_memory(machine_snapshot(task.accounting));
+            refresh_shell_stats(&mut shell, task.accounting);
             let mut prompt = String::from("kllm:");
             prompt.push_str(shell.cwd());
             prompt.push_str("> ");
@@ -822,6 +839,7 @@ mod firmware {
             ) else {
                 fatal(b"fatal: native console input failed\n");
             };
+            refresh_shell_stats(&mut shell, task.accounting);
             #[cfg(feature = "acceptance-probes")]
             if line == "mmu-probe write" {
                 let _result = write_all(&mut console, b"probing read-only mapping\n");
@@ -859,6 +877,11 @@ mod firmware {
         }
     }
 
+    fn refresh_shell_stats(shell: &mut Shell, accounting: &OwnedAccounting) {
+        shell.set_machine_memory(machine_snapshot(accounting));
+        shell.set_machine_input(kllm_machine::input_interrupt_stats());
+    }
+
     fn read_edited_line(
         editor: &mut LineEditor,
         decoder: &mut InputDecoder,
@@ -870,17 +893,14 @@ mod firmware {
     ) -> Result<String, ()> {
         loop {
             let key = loop {
-                if let Some(scan_code) = kllm_machine::try_read_keyboard_scancode()
-                    && let Some(key) = keyboard.push(scan_code)
-                {
+                let event = kllm_machine::wait_for_input_event();
+                let key = match event.source() {
+                    InputSource::Serial => decoder.push(event.byte()),
+                    InputSource::Keyboard => keyboard.push(event.byte()),
+                };
+                if let Some(key) = key {
                     break key;
                 }
-                if let Some(byte) = kllm_machine::try_read_byte()
-                    && let Some(key) = decoder.push(byte)
-                {
-                    break key;
-                }
-                spin_loop();
             };
             match editor.handle(key) {
                 EditorOutcome::Changed => redraw_editor(editor, prompt, console)?,

@@ -9,8 +9,11 @@ historical review evidence.
   and the next kernel milestone.
 - [Architecture](architecture.md) describes the current Stage 5 composition and
   its boundaries.
+- [Architecture-specific notes](architecture-specific-notes.md) preserve the
+  x86-64 and AArch64 interrupt, idle, and controller invariants that portable
+  refactors must not erase.
 - [Unsafe inventory](security/unsafe-inventory.md) records the current audited
-  project-authored unsafe surface through Stage 5.1.
+  project-authored unsafe surface through Stage 5.2.
 - [KEFS v1](formats/kefs-v1.md) defines the implemented embedded-filesystem
   format.
 
@@ -35,7 +38,7 @@ must be resolved before persistent security metadata or foreign-filesystem
 writes. ADR 0009 is an accepted future storage direction, not implemented
 filesystem support. ADR 0012 governs the completed Stage 5.1 terminal and
 framebuffer increment; AArch64 native keyboard input remains a later
-virtio-input transport decision. ADR 0013 governs the in-progress Stage 5.2
+virtio-input transport decision. ADR 0013 governs the completed Stage 5.2
 interrupt-driven input and bounded driver-resource increment.
 
 ## Evaluations

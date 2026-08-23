@@ -766,6 +766,16 @@ fn architecture_install_exception_vectors(exception_stack: PhysicalRange) -> Res
             let ist = u8::from(vector == 8);
             (*X86_IDT.0.get()).0[vector] = x86_interrupt_gate(offset, ist);
         }
+        let input = x86_input_interrupt_entry as *const () as usize as u64;
+        for vector in [
+            crate::mechanism::X86_KEYBOARD_VECTOR,
+            crate::mechanism::X86_SERIAL_VECTOR,
+        ] {
+            (*X86_IDT.0.get()).0[usize::from(vector)] = x86_interrupt_gate(input, 0);
+        }
+        let spurious = x86_spurious_interrupt_entry as *const () as usize as u64;
+        (*X86_IDT.0.get()).0[usize::from(crate::mechanism::X86_SPURIOUS_VECTOR)] =
+            x86_interrupt_gate(spurious, 0);
     }
     let gdt_descriptor = X86DescriptorTablePointer {
         limit: 63,
@@ -802,6 +812,65 @@ fn architecture_install_exception_vectors(exception_stack: PhysicalRange) -> Res
         );
     }
     Ok(())
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+#[unsafe(naked)]
+extern "C" fn x86_input_interrupt_entry() {
+    core::arch::naked_asm!(
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rbx",
+        "push rbp",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov rbx, rsp",
+        "sub rsp, 560",
+        "and rsp, -16",
+        "fxsave64 [rsp]",
+        "sub rsp, 32",
+        "call {handler}",
+        "add rsp, 32",
+        "fxrstor64 [rsp]",
+        "mov rsp, rbx",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rbp",
+        "pop rbx",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "iretq",
+        handler = sym x86_input_interrupt_handler,
+    );
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+extern "C" fn x86_input_interrupt_handler() {
+    crate::mechanism::handle_input_interrupt();
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+#[unsafe(naked)]
+extern "C" fn x86_spurious_interrupt_entry() {
+    core::arch::naked_asm!("iretq");
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
@@ -1032,7 +1101,7 @@ core::arch::global_asm!(
     "kllm_aarch64_vectors:",
     "b kllm_aarch64_exception_entry",
     ".balign 128",
-    "b kllm_aarch64_exception_entry",
+    "b kllm_aarch64_irq_entry",
     ".balign 128",
     "b kllm_aarch64_exception_entry",
     ".balign 128",
@@ -1040,7 +1109,7 @@ core::arch::global_asm!(
     ".balign 128",
     "b kllm_aarch64_exception_entry",
     ".balign 128",
-    "b kllm_aarch64_exception_entry",
+    "b kllm_aarch64_irq_entry",
     ".balign 128",
     "b kllm_aarch64_exception_entry",
     ".balign 128",
@@ -1048,7 +1117,7 @@ core::arch::global_asm!(
     ".balign 128",
     "b kllm_aarch64_exception_entry",
     ".balign 128",
-    "b kllm_aarch64_exception_entry",
+    "b kllm_aarch64_irq_entry",
     ".balign 128",
     "b kllm_aarch64_exception_entry",
     ".balign 128",
@@ -1056,7 +1125,7 @@ core::arch::global_asm!(
     ".balign 128",
     "b kllm_aarch64_exception_entry",
     ".balign 128",
-    "b kllm_aarch64_exception_entry",
+    "b kllm_aarch64_irq_entry",
     ".balign 128",
     "b kllm_aarch64_exception_entry",
     ".balign 128",
@@ -1068,6 +1137,85 @@ core::arch::global_asm!(
     "mrs x1, far_el1",
     "bl kllm_aarch64_exception_fatal",
     "b .",
+    ".balign 128",
+    "kllm_aarch64_irq_entry:",
+    "msr daifset, #2",
+    "sub sp, sp, #784",
+    "stp q0, q1, [sp, #272]",
+    "stp q2, q3, [sp, #304]",
+    "stp q4, q5, [sp, #336]",
+    "stp q6, q7, [sp, #368]",
+    "stp q8, q9, [sp, #400]",
+    "stp q10, q11, [sp, #432]",
+    "stp q12, q13, [sp, #464]",
+    "stp q14, q15, [sp, #496]",
+    "stp q16, q17, [sp, #528]",
+    "stp q18, q19, [sp, #560]",
+    "stp q20, q21, [sp, #592]",
+    "stp q22, q23, [sp, #624]",
+    "stp q24, q25, [sp, #656]",
+    "stp q26, q27, [sp, #688]",
+    "stp q28, q29, [sp, #720]",
+    "stp q30, q31, [sp, #752]",
+    "stp x0, x1, [sp, #0]",
+    "stp x2, x3, [sp, #16]",
+    "stp x4, x5, [sp, #32]",
+    "stp x6, x7, [sp, #48]",
+    "stp x8, x9, [sp, #64]",
+    "stp x10, x11, [sp, #80]",
+    "stp x12, x13, [sp, #96]",
+    "stp x14, x15, [sp, #112]",
+    "stp x16, x17, [sp, #128]",
+    "stp x18, x19, [sp, #144]",
+    "stp x20, x21, [sp, #160]",
+    "stp x22, x23, [sp, #176]",
+    "stp x24, x25, [sp, #192]",
+    "stp x26, x27, [sp, #208]",
+    "stp x28, x29, [sp, #224]",
+    "str x30, [sp, #240]",
+    "mrs x9, fpcr",
+    "mrs x10, fpsr",
+    "str x9, [sp, #248]",
+    "str x10, [sp, #256]",
+    "bl kllm_aarch64_input_interrupt",
+    "ldr x9, [sp, #248]",
+    "ldr x10, [sp, #256]",
+    "msr fpcr, x9",
+    "msr fpsr, x10",
+    "ldp q0, q1, [sp, #272]",
+    "ldp q2, q3, [sp, #304]",
+    "ldp q4, q5, [sp, #336]",
+    "ldp q6, q7, [sp, #368]",
+    "ldp q8, q9, [sp, #400]",
+    "ldp q10, q11, [sp, #432]",
+    "ldp q12, q13, [sp, #464]",
+    "ldp q14, q15, [sp, #496]",
+    "ldp q16, q17, [sp, #528]",
+    "ldp q18, q19, [sp, #560]",
+    "ldp q20, q21, [sp, #592]",
+    "ldp q22, q23, [sp, #624]",
+    "ldp q24, q25, [sp, #656]",
+    "ldp q26, q27, [sp, #688]",
+    "ldp q28, q29, [sp, #720]",
+    "ldp q30, q31, [sp, #752]",
+    "ldp x0, x1, [sp, #0]",
+    "ldp x2, x3, [sp, #16]",
+    "ldp x4, x5, [sp, #32]",
+    "ldp x6, x7, [sp, #48]",
+    "ldp x8, x9, [sp, #64]",
+    "ldp x10, x11, [sp, #80]",
+    "ldp x12, x13, [sp, #96]",
+    "ldp x14, x15, [sp, #112]",
+    "ldp x16, x17, [sp, #128]",
+    "ldp x18, x19, [sp, #144]",
+    "ldp x20, x21, [sp, #160]",
+    "ldp x22, x23, [sp, #176]",
+    "ldp x24, x25, [sp, #192]",
+    "ldp x26, x27, [sp, #208]",
+    "ldp x28, x29, [sp, #224]",
+    "ldr x30, [sp, #240]",
+    "add sp, sp, #784",
+    "eret",
 );
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
@@ -1105,6 +1253,12 @@ fn architecture_trigger_native_exception() -> ! {
     // SAFETY: This is an explicit terminal acceptance probe for a synchronous
     // breakpoint exception handled by the owned VBAR table.
     unsafe { core::arch::asm!("brk #0", options(noreturn)) }
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+#[unsafe(no_mangle)]
+extern "C" fn kllm_aarch64_input_interrupt() {
+    crate::mechanism::handle_input_interrupt();
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
