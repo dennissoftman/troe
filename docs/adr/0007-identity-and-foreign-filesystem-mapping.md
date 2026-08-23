@@ -87,3 +87,10 @@ persistent writable format, foreign-filesystem write path, or stable VFS
 security-metadata ABI should be frozen until this ADR is resolved. Read-only
 experiments are permitted when they retain raw metadata and do not treat it as
 native authority.
+
+[ADR 0009](0009-persistent-filesystems-and-partitions.md) selects a constrained
+ext4 profile for native persistent volumes, FAT12/16/32 and exFAT for
+synthetic-owner interchange, and later modular NTFS support. That storage
+direction does not resolve this ADR: exact principal widths, domain bindings,
+ACL semantics, and fail-closed mappings still precede writable persistent
+security metadata.

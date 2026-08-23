@@ -84,3 +84,35 @@ The post-handoff shell invokes no firmware protocol or allocator and cannot
 manipulate page tables or exception vectors. Authorized halt parks the CPU.
 Per-task stacks and guard pages begin with the cooperative-task stage. The
 Stage 3 dispatcher already uses an explicitly bounded owned RW/NX stack.
+
+## Future persistent-storage boundary
+
+Persistent storage preserves the same dependency direction. A transport
+provides bounded block-region capabilities; partition discovery turns a whole
+device into non-overlapping regions; independently selected filesystem
+providers expose VFS objects. Format-specific structures do not enter the
+machine backend, block transport, partition layer, or kernel composition root.
+
+```text
+block transport -> bounded region -> filesystem provider -> VFS namespace
+                         ^
+                  whole device or GPT
+```
+
+KEFS is the intentionally built-in recovery exception. The current FAT12 image
+is read by firmware. General FAT12/16/32, exFAT, the default persistent ext4
+profile, and later NTFS support are separate providers; before dynamic loading
+they may be statically selected crates, and later writable providers should run
+as capability-scoped services. An image does not carry providers it did not
+select.
+
+An external filesystem provider may be packaged under its own declared license,
+but the module label alone is not a license boundary. Differently licensed
+source and artifacts remain outside the Apache-licensed core and default image;
+the service/module ABI, provenance, notices, and release treatment are reviewed
+explicitly. Static linkage into the kernel image is not considered separation.
+
+Initial partition support is discovery rather than management: accept a whole
+device or validate a bounded GPT layout created by host/installer tooling. No
+filesystem provider can address blocks outside its granted region. See
+[ADR 0009](adr/0009-persistent-filesystems-and-partitions.md).

@@ -416,6 +416,46 @@ write support, or stable VFS metadata ABI is accepted. The proposed direction
 and unresolved questions are recorded in
 [ADR 0007](docs/adr/0007-identity-and-foreign-filesystem-mapping.md).
 
+### 12.7 Persistent filesystem modules and partitions
+
+Persistent disk formats MUST be replaceable filesystem providers behind the
+VFS and a bounded block-region capability. The kernel composition root and
+machine backends MUST NOT absorb FAT12/16/32, exFAT, ext4, NTFS, or
+partition-format logic. Before dynamic modules exist, a build may statically
+select a provider crate; this temporary composition choice must preserve the
+same narrow interface and include only the selected providers. Writable
+providers SHOULD become capability-scoped filesystem services once the task and
+application boundaries can isolate them.
+
+KEFS remains the built-in immutable recovery filesystem, and the fixed FAT12
+image remains the firmware-read boot container. A separate general FAT provider
+targets read/write FAT12/16/32 media, with FAT32 first for EFI and broad
+interchange compatibility; exFAT is a complementary optional provider for
+read/write access to large removable media. These formats use synthetic
+ownership and are not journaled native stores. A constrained, versioned ext4
+profile is the default native persistent data-volume format. NTFS is a later
+optional foreign-filesystem provider, read-only before read-write, using the
+maintained Linux NTFS3 project as a behavioral and interoperability reference
+subject to license review. No raw foreign UID, GID, SID, ACL, or security
+descriptor gains native authority merely because a provider can parse it.
+
+Filesystem providers receive a whole-device or partition-bounded region; they
+do not discover partitions themselves. Initial installed media SHOULD use
+bounded read-only GPT discovery and a fixed host-created FAT32 EFI plus ext4
+data layout. Whole-device volumes remain valid for tests and simple
+deployments. General MBR traversal, in-kernel partition editing, resizing, LVM,
+software RAID, and automatic partition repair are deferred.
+
+The accepted roles, modularity rule, ext4 profile direction, NTFS licensing
+gate, and lean partition scope are recorded in
+[ADR 0009](docs/adr/0009-persistent-filesystems-and-partitions.md).
+
+Filesystem module packaging MAY carry a license distinct from the Apache-2.0
+core only when source, artifact, SPDX/notices, provenance, and lifecycle remain
+explicitly separate. Static linking or bundling is not presumed to create a
+license boundary. The default system image MUST NOT silently combine
+license-incompatible code; each distribution form requires review.
+
 ## 13. Memory management
 
 ### 13.1 Principles
@@ -842,7 +882,12 @@ Dynamic linking is optional and SHOULD follow a working static executable format
 - Resolve the native-principal and foreign-filesystem identity-mapping ADR
   before accepting persistent VFS metadata or enabling foreign-filesystem
   writes.
-- Add at least one persistent filesystem or carefully scoped block-storage format.
+- Add bounded block I/O and block-region capabilities, whole-device volumes,
+  and read-only GPT discovery without an in-kernel partition editor.
+- Add the constrained ext4 provider as the default persistent data volume.
+  Add read/write FAT12/16/32 for EFI and broad/legacy interchange, add
+  read/write exFAT for large removable media, and defer NTFS as an optional
+  foreign provider; do not link unselected providers into the image.
 - Define configuration, service startup, and recovery behavior suitable for unattended use.
 - Add the persistent content store and desired-system manifest only after their
   on-disk formats, bounds, corruption behavior, and recovery paths are tested.
@@ -955,6 +1000,12 @@ The following must be resolved by short architecture decision records during imp
 - dependency/version semantics and multi-target lock-file representation;
 - content-store layout, generation activation record, and recovery protocol;
 - persistent-data migration and rollback contract;
+- exact versioned ext4 feature profile, journal/durability contract, recovery
+  bounds, host-tool versions, and maximum supported volume geometry;
+- exact FAT12/16/32 and exFAT interoperability profiles, mutation scope,
+  synthetic metadata policy, and dirty-volume recovery behavior;
+- filesystem-provider loading/isolation transition and the bounded GPT plus
+  block-region contract;
 - native principal/group representation, identity domains, UID/GID and SID
   mappings, foreign security-descriptor preservation, and lossy-copy policy;
 - package trust roots, key rotation, revocation, and offline verification policy.

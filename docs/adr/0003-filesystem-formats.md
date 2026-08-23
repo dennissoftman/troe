@@ -16,3 +16,7 @@ validated by extraction.
 Revisit FAT tooling when the container needs mutation, long filenames, multiple
 payloads, or non-FAT media. Bump KEFS for any incompatible record change.
 
+This ADR governs the current boot container only. General read/write FAT12/16/32
+and exFAT interchange, persistent ext4 volumes, later NTFS interoperability,
+modular filesystem providers, and lean GPT discovery are specified separately in
+[ADR 0009](0009-persistent-filesystems-and-partitions.md).

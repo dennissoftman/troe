@@ -94,3 +94,15 @@ application loading. Native execution begins with core Stage 7; a persistent
 store, system generations, and rollback begin with Stage 8; supported updates,
 registry trust, and deployment belong to Stage 9. See
 [../TOOLING-PACKAGING-SPEC.md](../TOOLING-PACKAGING-SPEC.md#511-alignment-with-the-core-roadmap).
+
+The Stage 8 storage direction is already bounded by
+[ADR 0009](adr/0009-persistent-filesystems-and-partitions.md): keep KEFS as the
+built-in recovery root and FAT12 as the current firmware container; introduce
+whole-device regions and read-only GPT discovery; provide read/write
+FAT12/16/32, exFAT, constrained ext4, and later NTFS as separately selected
+filesystem modules. Ext4 is the default native persistent data provider;
+FAT/exFAT serve removable-media interchange. Partition creation remains
+host-side, and writable filesystem providers should move behind isolated
+service boundaries when the task/application model can support that transition.
+Separately licensed modules remain outside the default Apache-2.0 image and
+require explicit packaging and distribution review.
