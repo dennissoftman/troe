@@ -34,6 +34,10 @@ untrusted and bounded.
   CPU-reported physical-address limits checked before activation;
 - exception state: interrupts masked during ownership transition, all x86
   exception gates present, and double fault uses a dedicated IST stack;
+- tasks: at most 16 records, with monotonic identities, explicit capabilities,
+  deterministic lifecycle accounting, and guarded native stack payloads;
+- dispatch: at most 16 ports and 32 handles, generation-checked identities,
+  explicit call rights, and 4 KiB request/reply limits;
 - dependencies: complete `Cargo.lock` checked by pinned `cargo-audit` against the
   exact RustSec database revision in `tools/rustsec-advisory-db.rev`.
 

@@ -32,10 +32,10 @@ statically linked recovery shell.
 6. The final output capability writes either host bytes or the polling native
    UART. UEFI text output is confined to the pre-handoff banner.
 
-Pipelines are sequential in this single-task milestone. This makes backpressure
-an explicit capacity error rather than requiring hidden scheduling. When tasks
-arrive, the public byte-stream semantics can remain while the implementation
-becomes a bounded ring with cooperative wakeups.
+Pipelines remain sequential even though cooperative tasks now exist. This makes
+backpressure an explicit capacity error rather than requiring hidden scheduling.
+A future bounded-ring implementation may add cooperative wakeups, but must
+preserve the current byte order, EOF, partial-I/O, and capacity-error semantics.
 
 ## Authority
 

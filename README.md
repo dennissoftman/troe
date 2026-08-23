@@ -44,7 +44,7 @@ cargo run --manifest-path host/Cargo.toml -- --script tests/smoke.ksh
 Build both boot images:
 
 ```console
-python scripts/build.py
+python3 scripts/build.py
 ```
 
 Artifacts are written under `build/`, and the script reports their exact
@@ -55,15 +55,15 @@ enforces the 16 MiB hard ceiling.
 Run all local gates:
 
 ```console
-python scripts/test.py
+python3 scripts/test.py
 ```
 
 This includes the pinned x86-64 and AArch64 QEMU boot suites. If that exact
 QEMU/firmware pair is not installed, run the non-emulator gates explicitly with
-`python scripts/test.py --skip-qemu`. Run only the boot suites with
-`python scripts/test-qemu.py`; the two architectures run concurrently after
+`python3 scripts/test.py --skip-qemu`. Run only the boot suites with
+`python3 scripts/test-qemu.py`; the two architectures run concurrently after
 their images have been built. For a quick terminal-focused iteration, use
-`python scripts/test-qemu.py --smoke`; the exhaustive suite remains the standard
+`python3 scripts/test-qemu.py --smoke`; the exhaustive suite remains the standard
 gate.
 
 The dependency gate requires exactly `cargo-audit 0.22.1` and checks the full
@@ -112,15 +112,19 @@ The core design is [CORE-SPEC.md](CORE-SPEC.md). The future, currently
 unimplemented tooling and package-composition design is
 [TOOLING-PACKAGING-SPEC.md](TOOLING-PACKAGING-SPEC.md). The
 implementation status and immediate sequence are in
-[docs/roadmap.md](docs/roadmap.md).
+[docs/roadmap.md](docs/roadmap.md), and [docs/README.md](docs/README.md)
+classifies the design records, evaluations, format references, and security
+notes by purpose and status.
 
 ## Resource profiles
 
-The system has three profiles rather than a continuous ladder of subtly
-different defaults: `micro` for MCU-class systems without an MMU assumption,
-`tiny` for constrained machines, and `full` for larger systems. They select
-capacities and compiled hardware capabilities while preserving the same shell,
-stream, VFS, and authority semantics.
+The design defines three future build-time profiles rather than a continuous
+ladder of subtly different defaults: `micro` for MCU-class systems without an
+MMU assumption, `tiny` for constrained machines, and `full` for larger systems.
+The current QEMU images use one fixed, explicitly bounded configuration; profile
+selection is not implemented yet. When it lands, profiles will select capacities
+and compiled hardware capabilities while preserving the same shell, stream,
+VFS, and authority semantics.
 
 ## Naming
 

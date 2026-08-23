@@ -125,6 +125,31 @@ dispatcher failure cannot recurse through itself. Both QEMU targets require the
 dispatch-ready boot marker. See
 [ADR 0011](adr/0011-bounded-in-process-message-dispatch.md).
 
+## Stage 5.1: native text console and shell usability (in progress)
+
+Extract a portable, configurable terminal-input and line-editor core; add
+bounded session history and command/VFS completion; copy and validate UEFI GOP
+metadata before handoff; and add an owned framebuffer text renderer while
+retaining UART for early, fatal, headless, and acceptance paths.
+
+Exit: both architectures can display and edit a shell line through the owned
+text-console abstraction; every retained-entry and byte budget comes from a
+validated selected profile; unknown serial escape sequences cannot corrupt the
+line; and the existing deterministic UART acceptance matrix remains available.
+See [ADR 0012](adr/0012-native-text-console-and-editor-policy.md).
+
+## Stage 6: optional isolation (planned after Stage 5.1)
+
+Introduce per-task address spaces, copied messages or validated shared-memory
+transfer, fault containment, and resource teardown without weakening the
+bounded handle and capability model established in Stage 5.
+
+Exit: a deliberately faulting isolated task cannot corrupt the kernel or an
+unrelated service; its memory, handles, and task resources are reclaimed, and
+authority transfer remains explicit. Stage 6 does not imply loadable
+applications, a stable userspace ABI, or preemption; those require separate
+decisions and later milestones.
+
 ## Deferred tooling and packaging track
 
 The tooling/package architecture is documented now so early formats and

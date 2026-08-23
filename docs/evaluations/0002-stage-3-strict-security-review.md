@@ -1,27 +1,35 @@
-# Stage 3 strict security review and remediation handoff
+# Historical Stage 3 strict security review and remediation handoff
 
 Date: 2026-08-23
 Repository baseline: `b3a0cd0` plus the uncommitted Stage 3 worktree
-Disposition: **GO for Stage 4**
+Historical disposition: **GO for Stage 4**
 
-Remediation status, 2026-08-23: all findings below have implementation changes
-in the current worktree. The complete non-emulator gate, pinned RustSec audit,
+Status: archived evaluation. The remediation was finalized in `3b0762c`; Stages
+4 and 5 have since landed. Findings, locations, counts, and instructions below
+describe the reviewed Stage 3 worktree and are retained as review evidence, not
+as current repository guidance. For current status use
+[../roadmap.md](../roadmap.md), and for the live unsafe count use
+[../security/unsafe-inventory.md](../security/unsafe-inventory.md).
+
+Remediation status, 2026-08-23: all findings below received implementation
+changes in the reviewed worktree. The complete non-emulator gate, pinned RustSec audit,
 production probe-string exclusion, and the x86_64/AArch64 acceptance matrix pass
 with QEMU 11.1.0. The reviewed unsafe inventory contains exactly 80 authored
 tokens. Stage 3 therefore satisfies the completion rule below.
 
 ## Purpose
 
-This document is a portable handoff for finishing and re-reviewing Stage 3:
-MMU-owned mappings and W^X. The automated gate passes on the pinned QEMU
+This document was the portable handoff for finishing and re-reviewing Stage 3:
+MMU-owned mappings and W^X. The automated gate passed on the pinned QEMU
 profiles, but review found three architecture-level blockers and six additional
-security or verification gaps. Do not begin Stage 4 until every P1 item is fixed
-and the complete gate passes again. The P2 items should also be resolved before
-Stage 3 is called polished or release-ready.
+security or verification gaps. At that baseline, Stage 4 was blocked until
+every P1 item was fixed and the complete gate passed again. The P2 items also
+needed resolution before Stage 3 could be called polished or release-ready.
 
-The referenced worktree is not committed. When moving this review to another
-machine, transfer the complete working directory or otherwise include modified
-and untracked files, especially:
+The referenced worktree was not committed when this review was written. Its
+final remediated form is preserved by commit `3b0762c`. At review time, moving
+the work to another machine required transferring modified and untracked files,
+especially:
 
 - `crates/kllm-machine/src/mmu.rs`
 - `docs/adr/0008-owned-page-tables-and-wx.md`
@@ -35,7 +43,7 @@ fixes are applied.
 The following command completed successfully on the reviewed tree:
 
 ```text
-python scripts/test.py
+python3 scripts/test.py
 ```
 
 It covered:
@@ -343,7 +351,7 @@ Acceptance criteria:
 After remediation, run at minimum:
 
 ```text
-python scripts/test.py
+python3 scripts/test.py
 git diff --check
 git status --short
 ```

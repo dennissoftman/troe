@@ -6,6 +6,11 @@
 **Future targets:** raw x86-64 PCs, raw AArch64 systems  
 **Implementation language:** Rust (`no_std`)  
 
+**Implementation status:** Stages 0–5 are implemented. Stage 5.1 is in progress,
+and Stage 6 is the next isolation milestone; later-stage requirements remain
+design constraints, not current functionality. See
+[docs/roadmap.md](docs/roadmap.md).
+
 The product and CLI names are intentionally unset. This document uses “the
 project” and “the system” in prose. `<cli>` denotes the future control-plane
 executable without proposing its eventual name.
@@ -95,35 +100,37 @@ After the MVP proves the boot, memory, VFS, command, and architecture boundaries
 
 ## 6. System model
 
-The initial execution model is deliberately narrow:
+The current native Stage 5 execution model remains deliberately narrow:
 
 ```text
--------------------------------+
-| shell and built-in commands   |
-+-------------------------------+
-| streams | VFS | system nodes  |
-+-------------------------------+
-| memory | terminal | storage   |
-+-------------------------------+
-| portable core                 |
-+-------------------------------+
-| compile-time machine backend  |
-+---------------+---------------+
-| x86_64        | AArch64       |
-+---------------+---------------+
-| firmware / QEMU / hardware    |
-+-------------------------------+
++-------------------------------------+
+| shell and statically linked commands |
++-------------------------------------+
+| tasks | bounded message dispatch     |
++-------------------------------------+
+| streams | VFS | system nodes         |
++-------------------------------------+
+| memory | terminal | storage          |
++-------------------------------------+
+| portable core                       |
++-------------------------------------+
+| compile-time machine backend         |
++------------------+------------------+
+| x86_64           | AArch64          |
++------------------+------------------+
+| UEFI bootstrap / QEMU / hardware     |
++-------------------------------------+
 ```
 
-For the first raw-kernel milestone there is:
+There is:
 
 - one active CPU;
 - one address space;
-- one kernel stack;
+- one owned kernel scheduler/handoff stack and three guarded task-stack slots;
 - one global physical-memory owner;
 - one command executing at a time;
 - no userspace/kernel-space security boundary;
-- no scheduler requirement.
+- cooperative continuations without preemption.
 
 Commands are statically linked Rust functions, not executable files. The shell dispatches them through a fixed registry.
 
@@ -205,8 +212,8 @@ The portable core MUST NOT contain architecture-specific registers, assembly, MM
 
 | Target | Initial machine | Console | Boot | MMU page size |
 |---|---|---|---|---|
-| `x86_64` | QEMU `q35` or documented equivalent | UEFI first; 16550 later | UEFI/OVMF | 4 KiB |
-| `aarch64` | QEMU `virt` | UEFI first; PL011 later | UEFI/AAVMF | 4 KiB |
+| `x86_64` | QEMU `q35` or documented equivalent | UEFI bootstrap; owned 16550 after handoff | UEFI/OVMF | 4 KiB |
+| `aarch64` | QEMU `virt` | UEFI bootstrap; owned PL011 after handoff | UEFI/AAVMF | 4 KiB |
 
 Exact QEMU invocations and device selections belong in target documentation and MUST be pinned in CI scripts.
 
@@ -259,21 +266,25 @@ Minimum behavior:
 - deterministic handling of overflow;
 - no terminal escape interpretation requirement in the first release.
 
-`stdin`, `stdout`, and `stderr` are stream capabilities. Built-ins SHOULD operate on streams where useful, even before shell pipelines exist, so tests and later composition do not depend on a physical console.
+`stdin`, `stdout`, and `stderr` are stream capabilities. Built-ins SHOULD operate
+on streams where useful so pipelines, tests, and later composition do not depend
+on a physical console.
 
 ## 11. Shell
 
 ### 11.1 Grammar
 
-The first shell grammar is intentionally small:
+The release 0.1 shell grammar is intentionally small:
 
 ```text
-line        := whitespace? command (whitespace argument)* whitespace?
-command     := bare-word
-argument    := bare-word | single-quoted | double-quoted
+line        := whitespace? pipeline whitespace?
+pipeline    := stage (whitespace? "|" whitespace? stage)*
+stage       := word (whitespace word)*
+word        := one-or-more bare or quoted byte segments
 ```
 
-The first implementation MAY support only bare words if this is documented at the prompt and tests reject unsupported quoting cleanly. The parser MUST:
+Single and double quotes group bytes and may appear within a word. Quotes do not
+perform interpolation. The parser MUST:
 
 - use bounded input;
 - reject malformed quoting;
@@ -281,7 +292,9 @@ The first implementation MAY support only bare words if this is documented at th
 - avoid recursive parsing;
 - never panic on arbitrary byte input.
 
-Initially there are no shell expansions, redirections, variables, pipelines, background jobs, or command substitution.
+There are no shell expansions, redirections, variables, background jobs, or
+command substitution. Pipelines contain at most eight sequential stages and
+each intermediate stream is capped at 64 KiB; overflow fails explicitly.
 
 ### 11.2 Built-in registry
 
@@ -301,8 +314,12 @@ Commands MUST be linked at build time and registered statically. Each command de
 | `mem` | Report memory totals, free pages, heap use, caches, and high-water marks. |
 | `clear` | MAY emit a minimal ANSI clear sequence when enabled. |
 | `halt` | Halt only when the shell possesses the machine-control capability. |
+| `write FILE [TEXT...]` | Atomically create or replace a RAMFS file from arguments, or from standard input when no text follows the path. |
+| `rm FILE` | Remove a writable RAMFS file. |
+| `hexdump [FILE]` | Render a file or standard input as bounded hexadecimal output. |
 
-`hexdump` and `write` are recommended early additions. `write FILE [TEXT...]` avoids relying on shell redirection before redirection exists.
+`write FILE [TEXT...]` provides deliberate RAMFS mutation without adding shell
+redirection.
 
 Commands MUST report errors to `stderr` and return a typed status. Partial output is permitted only when documented and followed by a non-success status.
 
@@ -522,7 +539,10 @@ Allocation failure MUST NOT default to an opaque infinite loop. The system MUST 
 
 ### 13.5 Memory profiles
 
-Memory policy is selected at build time and finalized from detected usable RAM at boot. At minimum, these profiles are defined:
+The design requires memory policy to be selected at build time and finalized
+from detected usable RAM at boot. The profiles below are defined but are not yet
+selectable in the implementation; current QEMU images use one fixed bounded
+configuration.
 
 | Profile | Intended machine | Heap approach | RAMFS default cap | Reclaimable cache cap |
 |---|---|---|---:|---:|
@@ -664,17 +684,20 @@ SMP is a separate future milestone requiring a memory model, lock ordering, per-
 
 ## 18. Observability
 
-At minimum, `mem` and `/sys/memory` expose:
+At Stage 5, `mem` and `/sys/memory` expose:
 
 - total normalized usable RAM;
 - permanently reserved RAM;
-- free and allocated frames;
-- page-table memory;
-- heap live, committed, limit, and high-water bytes;
-- RAMFS used and limit;
-- each reclaimable cache's used and limit;
+- free and total managed frames;
+- heap live, capacity, and high-water bytes;
+- allocation-failure count;
+- RAMFS live, limit, and high-water bytes;
+- cache live and limit bytes (both zero in the current configuration);
 - current memory-pressure state;
-- allocation and reclamation failure counters.
+
+Later memory-policy work SHOULD add separately charged page-table memory,
+allocated-frame totals, and reclamation counters when those distinctions become
+actionable.
 
 Debug builds SHOULD expose a boot log and invariant checks. Release builds MAY compile out verbose logging, but fatal diagnostics and resource counters SHOULD remain.
 
@@ -707,26 +730,25 @@ These are planning budgets, not ABI guarantees. Code clarity MUST NOT be sacrifi
 
 ## 20. Build and source organization
 
-Recommended workspace structure:
+Current workspace structure:
 
 ```text
 <repository>/
 ├── crates/
-│   ├── core/             portable types and errors
-│   ├── shell/            parser and command registry
-│   ├── commands/         built-in commands
-│   ├── vfs/              namespace and node contracts
-│   ├── fs-embedded/      immutable image reader
-│   ├── fs-ram/           quota-bound RAMFS
-│   ├── memory/           policy and safe mechanisms
-│   ├── machine-api/      architecture-neutral contracts
-│   ├── machine-x86_64/   x86-64 backend
-│   └── machine-aarch64/  AArch64 backend
-├── kernel/               target entry and composition root
-├── rootfs/               embedded files
-├── tools/                image builder and size reports
-├── tests/                host and QEMU integration tests
-└── docs/                 architecture decisions and audits
+│   ├── kllm-core/        portable types and bounded streams
+│   ├── kllm-dispatch/    bounded synchronous service dispatch
+│   ├── kllm-machine/     audited x86-64/AArch64 mechanisms
+│   ├── kllm-memory/      memory-map, frame, and mapping models
+│   ├── kllm-shell/       parser, pipelines, and built-ins
+│   ├── kllm-task/        cooperative task policy
+│   └── kllm-vfs/         KEFS, RAMFS, namespace, and generated nodes
+├── host/                 hosted composition and acceptance runner
+├── kernel/               native UEFI entry and composition root
+├── xtask/                Cargo QEMU launcher shim
+├── rootfs/, assets/      embedded source tree and generated KEFS image
+├── scripts/, tools/      build, test, audit, QEMU, and image utilities
+├── tests/                hosted shell acceptance script
+└── docs/                 architecture, decisions, evaluations, and audits
 ```
 
 Crates are boundaries for reasoning, testing, and unsafe-code policy. They SHOULD NOT become tiny crates without a concrete ownership or dependency benefit.
@@ -798,6 +820,8 @@ Optional task isolation later strengthens this model; it does not retroactively 
 
 ### Stage 0 — Portable model
 
+**Status:** complete.
+
 - Host executable with shell, streams, VFS, embedded FS, RAMFS, and commands.
 - No unsafe code in portable crates.
 - Resource quotas and deterministic tests.
@@ -805,6 +829,8 @@ Optional task isolation later strengthens this model; it does not retroactively 
 **Exit criterion:** arbitrary parser and filesystem test inputs do not panic; required commands pass host tests.
 
 ### Stage 1 — Firmware-hosted QEMU environment
+
+**Status:** complete.
 
 - UEFI x86-64 and AArch64 images.
 - Firmware console and memory services.
@@ -814,6 +840,8 @@ Optional task isolation later strengthens this model; it does not retroactively 
 
 ### Stage 2 — Machine-owning kernel
 
+**Status:** complete.
+
 - Exit firmware boot services.
 - Boot allocator, physical allocator, heap, native console.
 - Exception handling and explicit memory accounting.
@@ -821,6 +849,8 @@ Optional task isolation later strengthens this model; it does not retroactively 
 **Exit criterion:** repeated command and RAMFS workloads run without leaks or firmware services.
 
 ### Stage 3 — MMU hardening
+
+**Status:** complete and verified.
 
 - Owned page tables.
 - W^X kernel mappings, device memory types, guarded stacks where feasible.
@@ -830,20 +860,42 @@ Optional task isolation later strengthens this model; it does not retroactively 
 
 ### Stage 4 — Cooperative tasks
 
+**Status:** complete.
+
 - Multiple tasks in one address space.
 - Explicit stacks, lifecycle states, and capabilities.
 - Cooperative yield only; no preemption requirement.
 
-**Exit criterion:** a stalled but yielding service cannot corrupt another task's state, and task resource ownership is accounted.
+**Exit criterion:** multiple continuations yield and exit deterministically, and
+task identity, capability, lifecycle, and stack ownership are accounted. This
+stage does not claim fault containment or protection from memory-unsafe code.
 
 ### Stage 5 — In-process message dispatch
+
+**Status:** complete.
 
 - Handles, ports, bounded messages, request/reply semantics.
 - Selected direct service calls move behind dispatch without changing their conceptual API.
 
 **Exit criterion:** filesystem or console service can switch between direct and dispatched implementations in tests.
 
+### Stage 5.1 — Native text console and shell usability
+
+**Status:** in progress; accepted by
+[ADR 0012](docs/adr/0012-native-text-console-and-editor-policy.md).
+
+- Portable, policy-configured terminal input and cursor-aware line editing.
+- Bounded volatile history and shell/VFS completion.
+- Owned framebuffer text output while UART remains the recovery and acceptance
+  transport.
+
+**Exit criterion:** both architectures support the owned text-console
+abstraction within explicit input, history, completion, and framebuffer bounds,
+without weakening deterministic UART recovery and acceptance.
+
 ### Stage 6 — Optional isolation
+
+**Status:** planned after Stage 5.1; not implemented.
 
 - Per-task address spaces.
 - Copy or validated shared-memory message transfer.
@@ -853,6 +905,8 @@ Optional task isolation later strengthens this model; it does not retroactively 
 **Exit criterion:** an isolated task fault does not corrupt the kernel or unrelated service, and authority transfer is explicit.
 
 ### Stage 7 — Loadable applications
+
+**Status:** not implemented.
 
 - Load ELF or another small, versioned binary container selected through an architecture decision record.
 - Validate every header, segment, permission, alignment, relocation, entry point, and address range before mapping.
@@ -874,6 +928,8 @@ Dynamic linking is optional and SHOULD follow a working static executable format
 **Exit criterion:** an untrusted test application can be loaded, run, exit, and fault without corrupting the kernel, while malformed binaries are rejected deterministically.
 
 ### Stage 8 — Networking and persistent operation
+
+**Status:** not implemented.
 
 - Introduce network-device capabilities and a bounded-buffer network stack.
 - Begin with a small practical protocol set such as Ethernet, ARP/NDP as appropriate, IPv4 and/or IPv6, ICMP, UDP, DHCP or static configuration, and DNS.
@@ -899,6 +955,8 @@ Dynamic linking is optional and SHOULD follow a working static executable format
 **Exit criterion:** the system can boot, configure a supported network device, exchange data with another host, persist selected state, and remain within declared memory budgets under malformed and high-volume input.
 
 ### Stage 9 — Production usability
+
+**Status:** not implemented.
 
 - Establish a supported native application SDK and versioned ABI policy.
 - Add selected utilities and services driven by real use cases.
@@ -985,17 +1043,14 @@ A feature belongs in the project only when its value exceeds its cost in code si
 
 ## 28. Open decisions
 
-The following must be resolved by short architecture decision records during implementation:
+Decisions resolved through Stage 5 are recorded in
+[docs/adr](docs/adr) and summarized in [docs/roadmap.md](docs/roadmap.md).
+The following later-stage choices remain open and require short architecture
+decision records before implementation:
 
-- exact UEFI Rust crates and whether they remain after Stage 2;
-- physical and heap allocator selection and audit method;
-- embedded FS binary format and image-builder implementation;
-- precise QEMU machine/device versions;
-- canonical error and command-status representation;
-- whether command quoting ships in `0.1`;
-- whether native UART interrupts are necessary or polling is sufficient;
-- kernel virtual-address layout for each architecture;
-- license and minimum supported Rust version;
+- the Stage 6 isolation and message-transfer model, including teardown and
+  fault-containment semantics;
+- the executable container, application ABI, and loader contract for Stage 7;
 - canonical package-artifact encoding and digest/signature scope;
 - dependency/version semantics and multi-target lock-file representation;
 - content-store layout, generation activation record, and recovery protocol;

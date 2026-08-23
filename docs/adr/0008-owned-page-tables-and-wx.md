@@ -58,3 +58,8 @@ Stage 3 nevertheless leaves the UEFI dispatcher stack through a reviewed
 non-returning transition before it exposes expired boot-services memory to the
 frame allocator. The shell therefore runs on an explicit owned and accounted
 RW/NX stack; Stage 4 will replace it with per-task guarded stacks.
+
+Implementation note, 2026-08-23: Stage 4 subsequently added three guarded
+32 KiB task-stack payloads. The 128 KiB owned kernel stack remains the scheduler
+and handoff stack; the shell now runs on a guarded task stack. See
+[ADR 0010](0010-cooperative-tasks-and-guarded-stacks.md).

@@ -51,3 +51,8 @@ does not yield can monopolize the machine. Capabilities constrain intended
 dispatch and API authority but are not a hardware security boundary. Preemption,
 arbitrary suspended native frames, per-task page tables, fault containment, and
 message dispatch remain later-stage work.
+
+Implementation note, 2026-08-23: Stage 5 subsequently added bounded synchronous
+in-process message dispatch and routed ordinary native console output through
+it. Per-task page tables and fault containment remain deferred to Stage 6. See
+[ADR 0011](0011-bounded-in-process-message-dispatch.md).

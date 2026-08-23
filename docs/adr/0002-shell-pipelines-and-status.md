@@ -18,3 +18,6 @@ tasks exist; they add scheduler state without changing command semantics.
 Revisit the implementation when tasks land, preserving byte order, EOF,
 capacity, partial-I/O, and failure semantics.
 
+Implementation note, 2026-08-23: Stage 4 introduced cooperative tasks, but no
+measured workload justified concurrent pipeline rings or their wakeup state.
+Pipelines therefore remain sequential with the original bounded semantics.

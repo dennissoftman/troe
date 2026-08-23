@@ -14,6 +14,7 @@ the fixed memory pool, synchronization, ownership transition, and accounting
 adapter.
 
 Audit status: APIs, licenses, target isolation, and allocation/handoff contracts
-were reviewed for Stage 2. The complete lockfile is also checked by pinned
+were reviewed when the owned heap landed in Stage 2 and remain part of the
+current Stage 5 machine boundary. The complete lockfile is also checked by pinned
 `cargo-audit` against the committed RustSec database revision; no claim is made
 that this is a formal security audit.
