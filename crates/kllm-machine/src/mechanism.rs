@@ -1,6 +1,11 @@
 //! Pointer, allocator, port-I/O, and MMIO boundary.
 
 #[cfg(target_os = "uefi")]
+extern crate alloc;
+
+#[cfg(target_os = "uefi")]
+use alloc::boxed::Box;
+#[cfg(target_os = "uefi")]
 use core::alloc::GlobalAlloc;
 use core::alloc::Layout;
 #[cfg(target_os = "uefi")]
@@ -12,10 +17,32 @@ use core::ptr::NonNull;
 #[cfg(target_os = "uefi")]
 use core::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_os = "uefi")]
+use kllm_memory::PhysicalRange;
+#[cfg(target_os = "uefi")]
 use uefi::mem::memory_map::MemoryMapOwned;
 
 #[cfg(target_os = "uefi")]
 const UART_SPIN_LIMIT: usize = 1_000_000;
+#[cfg(target_os = "uefi")]
+const MIN_OWNED_STACK_BYTES: u64 = 16 * 1024;
+
+/// Failure to validate an owned stack before the one-way stack transition.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(target_os = "uefi")]
+pub enum StackSwitchError {
+    /// The supplied range is too small for the kernel continuation.
+    TooSmall,
+    /// The range end cannot be represented by the active architecture.
+    AddressUnsupported,
+    /// The initial stack pointer would violate the platform ABI alignment.
+    Unaligned,
+}
+
+#[cfg(target_os = "uefi")]
+struct StackLaunch<T: 'static> {
+    context: *mut T,
+    entry: fn(&mut T) -> !,
+}
 
 type OwnedTlsf = rlsf::Tlsf<'static, u32, u16, 20, 16>;
 
@@ -249,6 +276,64 @@ pub fn exit_boot_services_after_protocols() -> MemoryMapOwned {
     unsafe { uefi::boot::exit_boot_services(None) }
 }
 
+/// Move execution to a reserved stack and invoke a continuation that cannot return.
+///
+/// The context must live independently of the firmware stack. Validation failures
+/// are reported before the stack pointer changes; a successful transition never
+/// returns to its caller.
+///
+/// # Errors
+///
+/// Rejects a stack that is too small, unrepresentable, or ABI-misaligned.
+#[cfg(target_os = "uefi")]
+pub fn enter_owned_stack<T: 'static>(
+    stack: PhysicalRange,
+    context: &'static mut T,
+    entry: fn(&mut T) -> !,
+) -> Result<core::convert::Infallible, StackSwitchError> {
+    if stack.byte_count() < MIN_OWNED_STACK_BYTES {
+        return Err(StackSwitchError::TooSmall);
+    }
+    let stack_top =
+        usize::try_from(stack.end()).map_err(|_| StackSwitchError::AddressUnsupported)?;
+    if !stack_top.is_multiple_of(16) {
+        return Err(StackSwitchError::Unaligned);
+    }
+    let launch = Box::leak(Box::new(StackLaunch {
+        context: ptr::from_mut(context),
+        entry,
+    }));
+    architecture_enter_owned_stack(
+        stack_top,
+        ptr::from_mut(launch).cast::<()>() as usize,
+        stack_trampoline::<T> as *const () as usize,
+    )
+}
+
+#[cfg(target_os = "uefi")]
+extern "C" fn stack_trampoline<T: 'static>(launch: usize) -> ! {
+    // SAFETY: `enter_owned_stack` leaks one unique `StackLaunch<T>` immediately
+    // before transferring its address here; this continuation is non-returning.
+    let launch = unsafe { &mut *(launch as *mut StackLaunch<T>) };
+    // SAFETY: The caller supplied a unique static context, and the non-returning
+    // transition makes this the only continuation that can access it.
+    let context = unsafe { &mut *launch.context };
+    (launch.entry)(context)
+}
+
+/// Mask architecture interrupts before replacing firmware exception state.
+#[cfg(target_os = "uefi")]
+pub fn take_interrupt_ownership() {
+    architecture_take_interrupt_ownership();
+}
+
+/// Read the active stack pointer for ownership assertions.
+#[must_use]
+#[cfg(target_os = "uefi")]
+pub fn current_stack_pointer() -> usize {
+    architecture_stack_pointer()
+}
+
 /// Initialize the architecture-native UART for the pinned QEMU profile.
 #[cfg(target_os = "uefi")]
 pub fn initialize_console() {
@@ -328,9 +413,46 @@ fn try_read_byte() -> Option<u8> {
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 fn architecture_park() {
-    // SAFETY: Halting in the terminal state is intentional; interrupts may
-    // wake the CPU, after which the surrounding loop halts it again.
-    unsafe { core::arch::asm!("hlt", options(nomem, nostack, preserves_flags)) };
+    // SAFETY: The terminal state owns interrupt policy and intentionally keeps
+    // maskable interrupts disabled while halting forever.
+    unsafe { core::arch::asm!("cli", "hlt", options(nomem, nostack)) };
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn architecture_take_interrupt_ownership() {
+    // SAFETY: Boot services have ended, so firmware interrupt delivery must not
+    // enter firmware handlers while the kernel replaces descriptor state.
+    unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn architecture_stack_pointer() -> usize {
+    let stack_pointer: usize;
+    // SAFETY: Reading RSP has no side effects.
+    unsafe {
+        core::arch::asm!("mov {}, rsp", out(reg) stack_pointer, options(nomem, nostack, preserves_flags));
+    }
+    stack_pointer
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn architecture_enter_owned_stack(stack_top: usize, launch: usize, entry: usize) -> ! {
+    // SAFETY: The validated range is exclusively reserved and the leaked launch
+    // record outlives this non-returning transition. The call provides the x64
+    // ABI shadow space and enters with the required stack alignment.
+    unsafe {
+        core::arch::asm!(
+            "mov rsp, rax",
+            "and rsp, -16",
+            "sub rsp, 32",
+            "call rdx",
+            "ud2",
+            in("rax") stack_top,
+            in("rcx") launch,
+            in("rdx") entry,
+            options(noreturn),
+        );
+    }
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
@@ -425,6 +547,42 @@ fn architecture_park() {
     // SAFETY: WFE in the terminal state has no memory effects; the surrounding
     // loop repeats if an event wakes the CPU.
     unsafe { core::arch::asm!("wfe", options(nomem, nostack)) };
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn architecture_take_interrupt_ownership() {
+    // SAFETY: Boot services have ended and the kernel intentionally masks debug,
+    // SError, IRQ, and FIQ delivery until it owns the interrupt controller.
+    unsafe {
+        core::arch::asm!("msr daifset, #0xf", "isb", options(nomem, nostack));
+    }
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn architecture_stack_pointer() -> usize {
+    let stack_pointer: usize;
+    // SAFETY: Reading SP has no side effects.
+    unsafe {
+        core::arch::asm!("mov {}, sp", out(reg) stack_pointer, options(nomem, nostack));
+    }
+    stack_pointer
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn architecture_enter_owned_stack(stack_top: usize, launch: usize, entry: usize) -> ! {
+    // SAFETY: The validated range is exclusively reserved and the leaked launch
+    // record outlives this non-returning AAPCS64 transition.
+    unsafe {
+        core::arch::asm!(
+            "mov sp, x9",
+            "blr x10",
+            "brk #0",
+            in("x9") stack_top,
+            in("x0") launch,
+            in("x10") entry,
+            options(noreturn),
+        );
+    }
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]

@@ -61,14 +61,26 @@ explicitly reserved boot arena, including padding, exhaustion, and sealing
 accounting. The UEFI adapter and later pointer boundary consume these models;
 firmware types do not enter the portable crate.
 
-The final handoff reserves an 8 MiB LoaderData arena, carves and seals a 6 MiB
-general heap, installs polling 16550/PL011 and bounded native fatal paths, and
-then captures and retains the final UEFI map while exiting boot services. The
-kernel reclassifies expired boot-services code/data as usable, fails closed on
-all other non-conventional types, and builds a compact bitmap only over usable
-pages. `mem` and `/sys/memory` publish owned-map bytes, free/total frames, and
-live heap use, capacity, high-water, and failure counts.
+The final handoff reserves a 2,084-page LoaderData arena, carves and seals a
+6 MiB general heap, dedicates 2 MiB to monotonic page-table construction, and
+reserves 128 KiB/16 KiB kernel and emergency stacks. It installs polling
+16550/PL011 and bounded native fatal paths, transfers to the owned stack, and
+enters a non-returning `ExitBootServices` continuation. Interrupts are masked
+before exception state changes. Only then does the kernel reclassify expired
+boot-services code/data as usable and build a compact bitmap over genuinely
+allocatable pages. `mem` and `/sys/memory` publish owned-map bytes, free/total
+frames, and live heap use, capacity, high-water, and failure counts.
 
-The post-handoff shell uses no firmware protocol or allocator. Authorized halt
-parks the CPU. MMU replacement, W^X, and architecture exception vectors are the
-next stage and are intentionally absent from this ownership patch.
+Stage 3 adds a pure, bounded mapping plan. The composition root identity-maps
+only runtime RAM, PE-classified image sections, the boot arena, and the AArch64
+PL011 page. Physical aliases are rejected. The native backend emits fresh 4 KiB
+tables, validates CPU-reported physical-address limits, enables W^X, and replaces
+firmware exception state with fixed x86-64 GDT/TSS/IDT state or an AArch64 VBAR.
+Executable image pages are RX, immutable image pages are RO/NX, and writable
+runtime/device pages are NX. Deliberate write and execute violations are
+validated in fresh QEMU boots for both architectures.
+
+The post-handoff shell invokes no firmware protocol or allocator and cannot
+manipulate page tables or exception vectors. Authorized halt parks the CPU.
+Per-task stacks and guard pages begin with the cooperative-task stage. The
+Stage 3 dispatcher already uses an explicitly bounded owned RW/NX stack.

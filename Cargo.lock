@@ -55,6 +55,7 @@ dependencies = [
 name = "kllm-machine"
 version = "0.1.0"
 dependencies = [
+ "kllm-memory",
  "rlsf",
  "uefi",
 ]

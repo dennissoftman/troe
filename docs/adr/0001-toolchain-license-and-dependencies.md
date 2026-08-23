@@ -15,3 +15,9 @@ needs.
 
 Revisit the MSRV only on a planned release. Review each `uefi` update as a
 machine-boundary change, including feature and license diffs.
+
+Release verification uses exactly `cargo-audit 0.22.1` with the RustSec database
+commit recorded in `tools/rustsec-advisory-db.rev`. The audit runs without a
+database fetch after checking out that revision, fails on vulnerability and
+informational warning categories, and requires reviewed, owned, expiring
+repository documentation for any future exception.

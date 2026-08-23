@@ -14,4 +14,6 @@ the fixed memory pool, synchronization, ownership transition, and accounting
 adapter.
 
 Audit status: APIs, licenses, target isolation, and allocation/handoff contracts
-were reviewed for Stage 2; no claim is made that this is a formal security audit.
+were reviewed for Stage 2. The complete lockfile is also checked by pinned
+`cargo-audit` against the committed RustSec database revision; no claim is made
+that this is a formal security audit.

@@ -28,6 +28,19 @@ untrusted and bounded.
 - owned heap: 6 MiB fixed arena with use, high-water, and failure accounting;
 - physical frames: checked 4 KiB bitmap with invalid/double-free detection;
 - native UART transmit waits: finite polling bound on both architectures.
+- active kernel stack: explicit LoaderData reservation, RW/NX mapping, and
+  post-handoff stack-pointer assertion before frame allocation;
+- mappings: no virtual or physical overlap, no writable executable mapping, and
+  CPU-reported physical-address limits checked before activation;
+- exception state: interrupts masked during ownership transition, all x86
+  exception gates present, and double fault uses a dedicated IST stack;
+- dependencies: complete `Cargo.lock` checked by pinned `cargo-audit` against the
+  exact RustSec database revision in `tools/rustsec-advisory-db.rev`.
+
+RustSec exceptions are not implicit. Any future ignored advisory must be reviewed
+in the same change, identify the affected crate and advisory, explain why it is
+not currently exploitable, name an owner, and include an expiry date. Expired
+exceptions fail the release review and must be removed or renewed explicitly.
 
 ## Reporting
 

@@ -16,6 +16,8 @@ use rather than providing a hardware security boundary.
 - quota-bound writable `/tmp` and live `/sys` reporting;
 - final UEFI handoff into a checked frame bitmap, a 6 MiB owned TLSF heap, and
   full live memory accounting;
+- architecture-owned 4 KiB page tables with RX text, RO/NX immutable data,
+  RW/NX runtime memory, typed device mappings, and native fault vectors;
 - project-owned polling 16550 and PL011 consoles after boot services exit;
 - single/double quotes and pipelines of up to eight stages;
 - 64 KiB bounded intermediate byte streams;
@@ -60,6 +62,18 @@ their images have been built. For a quick terminal-focused iteration, use
 `python scripts/test-qemu.py --smoke`; the exhaustive suite remains the standard
 gate.
 
+The dependency gate requires exactly `cargo-audit 0.22.1` and checks the full
+lockfile against the RustSec database revision committed in
+`tools/rustsec-advisory-db.rev`. Install the tool with:
+
+```console
+cargo install cargo-audit --version 0.22.1 --locked
+```
+
+The exhaustive QEMU gate builds separate `*-acceptance.img` artifacts containing
+terminal permission/exception probes. Normal `scripts/build.py` output is a
+production image and is rejected if any probe command marker is present.
+
 Build the x86-64 image and open it in QEMU:
 
 ```console
@@ -76,14 +90,15 @@ The launcher and acceptance harness refuse a QEMU version other than 11.1.0 unle
 `--skip-version-check` is supplied deliberately. Firmware is not silently
 downloaded. UEFI Simple Text Output carries only the bootstrap banner. The image
 then initializes and exclusively uses its polling 16550 backend on x86-64 or
-PL011 backend on AArch64, captures the final map, and exits boot services.
+PL011 backend on AArch64, moves to an explicitly reserved kernel stack, captures
+the final map, and exits boot services through a non-returning continuation.
 
 ## Repository map
 
 - `crates`: portable byte streams, memory models, shell, VFS, accounting, and
   the isolated native machine mechanism crate;
 - `host`: Stage 0 composition and acceptance runner;
-- `kernel`: UEFI bootstrap and Stage 2 owned-machine composition root;
+- `kernel`: UEFI bootstrap and Stage 3 W^X owned-machine composition root;
 - `rootfs`, `assets`: source tree and generated KEFS image;
 - `tools`: dependency-free deterministic image builders;
 - `scripts`: build, verification, and emulator entry points;

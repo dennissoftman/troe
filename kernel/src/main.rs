@@ -1,4 +1,4 @@
-//! UEFI-bootstrapped Stage 2 owned-machine image.
+//! UEFI-bootstrapped Stage 3 W^X owned-machine image.
 #![cfg_attr(target_os = "uefi", no_std)]
 #![cfg_attr(target_os = "uefi", no_main)]
 #![forbid(unsafe_code)]
@@ -12,6 +12,7 @@ fn main() {
 mod firmware {
     extern crate alloc;
 
+    use alloc::boxed::Box;
     use alloc::string::String;
     use alloc::vec::Vec;
     use core::fmt::Write as _;
@@ -21,8 +22,9 @@ mod firmware {
         Input, MAX_LINE_BYTES, MachineMemorySnapshot, Output, StreamError, is_backspace,
     };
     use kllm_memory::{
-        BASE_PAGE_SIZE, BootAllocator, FrameAllocator, MAX_FIRMWARE_REGIONS, MemoryMapStats,
-        MemoryRegion, NormalizedMemoryMap, PhysicalRange, RegionKind,
+        BASE_PAGE_SIZE, BootAllocator, FrameAllocator, MAX_FIRMWARE_REGIONS, Mapping,
+        MappingLifetime, MappingMemoryType, MappingOwner, MappingPermissions, MappingPlan,
+        MemoryMapStats, MemoryRegion, NormalizedMemoryMap, PhysicalRange, RegionKind,
     };
     use kllm_shell::Shell;
     use kllm_vfs::{Namespace, RamFsQuota};
@@ -31,8 +33,13 @@ mod firmware {
     use uefi::prelude::*;
 
     const ROOTFS: &[u8] = include_bytes!("../../assets/root.kefs");
-    const BOOT_ARENA_PAGES: usize = 2048;
     const OWNED_HEAP_BYTES: u64 = 6 * 1024 * 1024;
+    const PAGE_TABLE_BYTES: u64 = 2 * 1024 * 1024;
+    const OWNED_STACK_BYTES: u64 = 128 * 1024;
+    const EXCEPTION_STACK_BYTES: u64 = 16 * 1024;
+    const BOOT_ARENA_PAGES: usize =
+        ((OWNED_HEAP_BYTES + PAGE_TABLE_BYTES + OWNED_STACK_BYTES + EXCEPTION_STACK_BYTES)
+            / BASE_PAGE_SIZE) as usize;
 
     struct FirmwareConsole;
 
@@ -81,6 +88,23 @@ mod firmware {
     struct OwnedAccounting {
         map: MemoryMapStats,
         frames: FrameAllocator,
+        #[cfg(feature = "acceptance-probes")]
+        execute_probe_address: usize,
+    }
+
+    #[derive(Clone, Copy)]
+    struct BootMemory {
+        arena: PhysicalRange,
+        #[cfg(feature = "acceptance-probes")]
+        heap: PhysicalRange,
+        page_tables: PhysicalRange,
+        stack: PhysicalRange,
+        exception_stack: PhysicalRange,
+    }
+
+    struct PreparedHandoff {
+        image_layout: kllm_machine::ImageLayout,
+        boot_memory: BootMemory,
     }
 
     #[entry]
@@ -89,28 +113,62 @@ mod firmware {
             return Status::DEVICE_ERROR;
         }
         let mut firmware_console = FirmwareConsole;
-        match prepare_owned_kernel(&mut firmware_console) {
-            Ok(accounting) => run_owned(&accounting),
+        match prepare_handoff(&mut firmware_console) {
+            Ok(prepared) => {
+                let stack = prepared.boot_memory.stack;
+                let prepared = Box::leak(Box::new(prepared));
+                match kllm_machine::enter_owned_stack(stack, prepared, post_handoff) {
+                    Err(_) => Status::ABORTED,
+                    Ok(never) => match never {},
+                }
+            }
             Err(()) => Status::ABORTED,
         }
     }
 
-    fn prepare_owned_kernel(console: &mut FirmwareConsole) -> Result<OwnedAccounting, ()> {
+    fn prepare_handoff(console: &mut FirmwareConsole) -> Result<PreparedHandoff, ()> {
         write_all(console, b"kllm 0.1.0 UEFI bootstrap\n")?;
         write_all(console, b"preparing owned memory and native console\n")?;
 
-        reserve_and_install_heap()?;
+        let image_layout = kllm_machine::loaded_image_layout().map_err(|_| ())?;
+        let boot_memory = reserve_and_install_heap()?;
         kllm_machine::initialize_console();
         if !kllm_machine::write(b"native console: ready\n") {
             return Err(());
         }
+        Ok(PreparedHandoff {
+            image_layout,
+            boot_memory,
+        })
+    }
 
+    fn post_handoff(prepared: &mut PreparedHandoff) -> ! {
         let final_map = kllm_machine::exit_boot_services_after_protocols();
         kllm_machine::mark_firmware_exited();
-        if !kllm_machine::write(b"boot services: exited\n") {
-            return Err(());
+        kllm_machine::take_interrupt_ownership();
+        let stack_pointer = usize_as_u64(kllm_machine::current_stack_pointer());
+        if !prepared.boot_memory.stack.contains(stack_pointer) {
+            fatal(b"fatal: active stack is not kernel-owned\n");
         }
-        let normalized = normalize_final_map(&final_map)?;
+        if !kllm_machine::write(b"boot services: exited\n") {
+            fatal(b"fatal: post-handoff console failed\n");
+        }
+        let accounting = complete_handoff(prepared, final_map)
+            .unwrap_or_else(|()| fatal(b"fatal: post-handoff initialization failed\n"));
+        run_owned(&accounting)
+    }
+
+    fn complete_handoff(
+        prepared: &PreparedHandoff,
+        final_map: MemoryMapOwned,
+    ) -> Result<OwnedAccounting, ()> {
+        let reservations = [prepared.boot_memory.arena];
+        let normalized = normalize_final_map(&final_map, &reservations)?;
+        let mapping_plan = build_mapping_plan(
+            &final_map,
+            &prepared.image_layout,
+            prepared.boot_memory.arena,
+        )?;
         // The final-map buffer is LoaderData recorded as reserved in the map.
         // It must remain live because boot services can no longer free it.
         core::mem::forget(final_map);
@@ -128,10 +186,31 @@ mod firmware {
         if !kllm_machine::write(b"allocation failure path: bounded\n") {
             return Err(());
         }
-        Ok(OwnedAccounting { map, frames })
+        kllm_machine::install_exception_vectors(prepared.boot_memory.exception_stack)
+            .map_err(|_| ())?;
+        if !kllm_machine::write(b"exception vectors: ready\n") {
+            return Err(());
+        }
+        let mmu = kllm_machine::install_mmu(&mapping_plan, prepared.boot_memory.page_tables)
+            .map_err(|_| ())?;
+        if mmu.mapped_pages == 0 || mmu.table_pages == 0 {
+            return Err(());
+        }
+        if !kllm_machine::write(b"owned page tables: ready\n")
+            || !kllm_machine::write(b"W^X mappings: active\n")
+        {
+            return Err(());
+        }
+        Ok(OwnedAccounting {
+            map,
+            frames,
+            #[cfg(feature = "acceptance-probes")]
+            execute_probe_address: usize::try_from(prepared.boot_memory.heap.start())
+                .map_err(|_| ())?,
+        })
     }
 
-    fn reserve_and_install_heap() -> Result<(), ()> {
+    fn reserve_and_install_heap() -> Result<BootMemory, ()> {
         let arena_pointer = boot::allocate_pages(
             boot::AllocateType::AnyPages,
             boot::MemoryType::LOADER_DATA,
@@ -145,16 +224,129 @@ mod firmware {
         let heap = allocator
             .allocate(OWNED_HEAP_BYTES, BASE_PAGE_SIZE)
             .map_err(|_| ())?;
+        let page_tables = allocator
+            .allocate(PAGE_TABLE_BYTES, BASE_PAGE_SIZE)
+            .map_err(|_| ())?;
+        let stack = allocator
+            .allocate(OWNED_STACK_BYTES, BASE_PAGE_SIZE)
+            .map_err(|_| ())?;
+        let exception_stack = allocator
+            .allocate(EXCEPTION_STACK_BYTES, BASE_PAGE_SIZE)
+            .map_err(|_| ())?;
         allocator.seal();
         let heap_start = usize::try_from(heap.start()).map_err(|_| ())?;
         let heap_bytes = usize::try_from(heap.byte_count()).map_err(|_| ())?;
         if !kllm_machine::initialize_heap(heap_start, heap_bytes) {
             return Err(());
         }
-        Ok(())
+        #[cfg(feature = "acceptance-probes")]
+        let heap_pages = heap.byte_count() / BASE_PAGE_SIZE;
+        let table_pages = page_tables.byte_count() / BASE_PAGE_SIZE;
+        Ok(BootMemory {
+            arena,
+            #[cfg(feature = "acceptance-probes")]
+            heap: PhysicalRange::from_pages(heap.start(), heap_pages).map_err(|_| ())?,
+            page_tables: PhysicalRange::from_pages(page_tables.start(), table_pages)
+                .map_err(|_| ())?,
+            stack: PhysicalRange::from_pages(stack.start(), stack.byte_count() / BASE_PAGE_SIZE)
+                .map_err(|_| ())?,
+            exception_stack: PhysicalRange::from_pages(
+                exception_stack.start(),
+                exception_stack.byte_count() / BASE_PAGE_SIZE,
+            )
+            .map_err(|_| ())?,
+        })
     }
 
-    fn normalize_final_map(memory_map: &MemoryMapOwned) -> Result<NormalizedMemoryMap, ()> {
+    fn build_mapping_plan(
+        memory_map: &MemoryMapOwned,
+        image: &kllm_machine::ImageLayout,
+        boot_arena: PhysicalRange,
+    ) -> Result<MappingPlan, ()> {
+        let mut plan = MappingPlan::new();
+        for descriptor in memory_map.entries() {
+            if !is_runtime_ram(descriptor.ty) {
+                continue;
+            }
+            let range = PhysicalRange::from_pages(descriptor.phys_start, descriptor.page_count)
+                .map_err(|_| ())?;
+            insert_identity(
+                &mut plan,
+                range,
+                MappingPermissions::READ_WRITE,
+                MappingMemoryType::Normal,
+                MappingOwner::KernelRuntime,
+            )?;
+        }
+        insert_identity(
+            &mut plan,
+            boot_arena,
+            MappingPermissions::READ_WRITE,
+            MappingMemoryType::Normal,
+            MappingOwner::KernelRuntime,
+        )?;
+        for index in 0..image.region_count() {
+            let region = image.region(index).ok_or(())?;
+            insert_identity(
+                &mut plan,
+                region.range(),
+                region.permissions(),
+                MappingMemoryType::Normal,
+                MappingOwner::KernelImage,
+            )?;
+        }
+        if let Some(device) = console_device_range() {
+            insert_identity(
+                &mut plan,
+                device,
+                MappingPermissions::READ_WRITE,
+                MappingMemoryType::Device,
+                MappingOwner::MachineDevice,
+            )?;
+        }
+        Ok(plan)
+    }
+
+    fn insert_identity(
+        plan: &mut MappingPlan,
+        range: PhysicalRange,
+        permissions: MappingPermissions,
+        memory_type: MappingMemoryType,
+        owner: MappingOwner,
+    ) -> Result<(), ()> {
+        let mapping = Mapping::identity(
+            range,
+            permissions,
+            memory_type,
+            owner,
+            MappingLifetime::Kernel,
+            false,
+        )
+        .map_err(|_| ())?;
+        plan.insert(mapping).map_err(|_| ())
+    }
+
+    const fn is_runtime_ram(memory_type: boot::MemoryType) -> bool {
+        memory_type.0 == boot::MemoryType::CONVENTIONAL.0
+            || memory_type.0 == boot::MemoryType::BOOT_SERVICES_CODE.0
+            || memory_type.0 == boot::MemoryType::BOOT_SERVICES_DATA.0
+    }
+
+    fn console_device_range() -> Option<PhysicalRange> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            None
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            PhysicalRange::from_pages(0x0900_0000, 1).ok()
+        }
+    }
+
+    fn normalize_final_map(
+        memory_map: &MemoryMapOwned,
+        reservations: &[PhysicalRange],
+    ) -> Result<NormalizedMemoryMap, ()> {
         let mut regions = Vec::new();
         for descriptor in memory_map.entries() {
             if regions.len() >= MAX_FIRMWARE_REGIONS {
@@ -169,7 +361,7 @@ mod firmware {
             };
             regions.push(MemoryRegion::new(range, kind));
         }
-        NormalizedMemoryMap::build(&regions, &[]).map_err(|_| ())
+        NormalizedMemoryMap::build(&regions, reservations).map_err(|_| ())
     }
 
     const fn is_reclaimable_after_handoff(memory_type: boot::MemoryType) -> bool {
@@ -207,6 +399,25 @@ mod firmware {
             let Ok(line) = editor.read_line(&mut console) else {
                 fatal(b"fatal: native console input failed\n");
             };
+            #[cfg(feature = "acceptance-probes")]
+            if line == "mmu-probe write" {
+                let _result = write_all(&mut console, b"probing read-only mapping\n");
+                kllm_machine::trigger_write_fault(ROOTFS.as_ptr() as usize);
+            }
+            #[cfg(feature = "acceptance-probes")]
+            if line == "mmu-probe execute" {
+                let _result = write_all(&mut console, b"probing non-executable mapping\n");
+                kllm_machine::trigger_execute_fault(accounting.execute_probe_address);
+            }
+            #[cfg(feature = "acceptance-probes")]
+            if line == "mmu-probe exception" {
+                let _result = write_all(&mut console, b"probing native exception vector\n");
+                kllm_machine::trigger_native_exception();
+            }
+            #[cfg(feature = "acceptance-probes")]
+            if line == "mmu-probe fatal" {
+                fatal(b"fatal: acceptance post-handoff failure\n");
+            }
             let mut input = EmptyInput;
             let mut error = NativeConsole;
             let _status = shell.execute(&line, &mut input, &mut console, &mut error);

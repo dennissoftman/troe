@@ -50,6 +50,7 @@ def main() -> int:
             "kllm-kernel",
             "--target",
             "x86_64-unknown-uefi",
+            "--all-features",
             "--",
             "-D",
             "warnings",
@@ -61,11 +62,13 @@ def main() -> int:
             "kllm-kernel",
             "--target",
             "aarch64-unknown-uefi",
+            "--all-features",
             "--",
             "-D",
             "warnings",
         ),
         ("cargo", "test", "--workspace"),
+        (sys.executable, REPO_ROOT / "scripts" / "audit.py"),
         (
             sys.executable,
             TOOLS_DIR / "mkefs.py",
@@ -78,7 +81,7 @@ def main() -> int:
             TOOLS_DIR / "check_unsafe.py",
             REPO_ROOT,
             "--expected",
-            "40",
+            "80",
         ),
         (
             "cargo",
@@ -91,6 +94,11 @@ def main() -> int:
             REPO_ROOT / "tests" / "smoke.ksh",
         ),
         (sys.executable, REPO_ROOT / "scripts" / "build.py"),
+        (
+            sys.executable,
+            REPO_ROOT / "scripts" / "build.py",
+            "--acceptance-probes",
+        ),
     ]
     if not args.skip_qemu:
         commands.append(

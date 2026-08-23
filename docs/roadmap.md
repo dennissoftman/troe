@@ -47,7 +47,7 @@ allocation-failure probe.
 MMU-owned page tables and W^X follow this transition; they should not be mixed
 into the first memory-ownership patch.
 
-## Stage 3: MMU-owned mappings and W^X (next)
+## Stage 3: MMU-owned mappings and W^X (verified)
 
 Build architecture-specific page tables from pure, host-tested range plans;
 classify normal and device memory; protect immutable and executable regions;
@@ -55,6 +55,31 @@ and add deliberate permission-fault acceptance cases on both architectures.
 
 Exit: mapping invariants hold in model tests and representative write and
 execute violations reach stable native fault diagnostics in QEMU.
+
+Landed: a bounded architecture-neutral mapping plan rejects virtual and physical
+overlap, overflow, W+X, executable devices, and unequal ranges in host tests. The kernel builds a
+minimal identity plan for owned runtime RAM, PE-classified image sections, and
+the PL011 device page; x86-64 and AArch64 translate it into fresh 4 KiB page
+tables from a reserved 2 MiB arena. Kernel text is RX, immutable image data is
+RO/NX, runtime memory is RW/NX, and device memory is RW/NX with device
+attributes. A one-way owned-stack handoff precedes firmware-memory reclamation.
+Native fixed-selector x86-64 GDT/TSS/IDT and masked AArch64 VBAR state provide
+terminal coverage for unexpected exceptions. Destructive write, execute, and
+native-exception probes exist only in separate acceptance images; production
+images are scanned to exclude their command strings. Host tests, both target
+Clippy gates, production/acceptance builds, and the pinned dependency audit pass.
+The exhaustive normal-boot, write-fault, execute-fault, native-exception,
+fatal-state, and terminal-halt matrix passes on both targets with QEMU 11.1.0.
+
+## Stage 4: cooperative tasks (next)
+
+Introduce bounded task records, explicit owned stacks with guard pages,
+cooperative yield, task lifecycle accounting, and capability-scoped dispatch
+without adding preemption or per-task address spaces.
+
+Exit: multiple tasks yield and terminate deterministically, stack guards reach
+native fault diagnostics, and task-owned resources are reclaimed without
+changing the single-address-space authority model.
 
 ## Deferred tooling and packaging track
 

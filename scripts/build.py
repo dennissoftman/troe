@@ -34,6 +34,11 @@ def parse_args() -> argparse.Namespace:
         default="all",
         help="architecture to build (default: all)",
     )
+    parser.add_argument(
+        "--acceptance-probes",
+        action="store_true",
+        help="build a separate image containing terminal MMU acceptance probes",
+    )
     return parser.parse_args()
 
 
@@ -51,7 +56,7 @@ def main() -> int:
 
         for architecture in architectures:
             target = TARGETS[architecture]
-            run(
+            cargo_command = [
                 "cargo",
                 "build",
                 "--locked",
@@ -60,10 +65,19 @@ def main() -> int:
                 "--release",
                 "--target",
                 target,
-            )
+            ]
+            if args.acceptance_probes:
+                cargo_command.extend(("--features", "acceptance-probes"))
+            run(*cargo_command)
 
             efi = REPO_ROOT / "target" / target / "release" / "kllm-kernel.efi"
-            image = REPO_ROOT / "build" / f"kllm-{architecture}.img"
+            suffix = "-acceptance" if args.acceptance_probes else ""
+            image = REPO_ROOT / "build" / f"kllm-{architecture}{suffix}.img"
+            if not args.acceptance_probes:
+                efi_bytes = efi.read_bytes()
+                forbidden = (b"mmu-probe", b"probing read-only", b"probing non-executable")
+                if any(marker in efi_bytes for marker in forbidden):
+                    raise RuntimeError(f"production EFI contains acceptance probe marker: {efi}")
             run(
                 sys.executable,
                 TOOLS_DIR / "mkfat.py",

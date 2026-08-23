@@ -6,6 +6,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+acceptance-probes = ["kllm-machine/acceptance-probes"]
+
 [dependencies]
 kllm-core = { path = "../crates/kllm-core" }
 kllm-memory = { path = "../crates/kllm-memory" }

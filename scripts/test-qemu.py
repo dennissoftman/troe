@@ -101,6 +101,9 @@ def assert_owned_boot(session: "SerialSession") -> None:
         "boot services: exited",
         "frame bitmap: ready",
         "allocation failure path: bounded",
+        "exception vectors: ready",
+        "owned page tables: ready",
+        "W^X mappings: active",
         "kllm owns memory and console",
     ):
         if marker not in transcript:
@@ -178,6 +181,29 @@ class SerialSession:
             self.wait_for(b"\n", timeout, start)
         except (BrokenPipeError, OSError) as error:
             raise AcceptanceError(f"cannot write QEMU serial input: {error}") from error
+
+    def assert_terminal(self, start: int, timeout: float) -> None:
+        """Require a bounded quiet, live terminal state without reboot markers."""
+        deadline = time.monotonic() + timeout
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                chunk = self.chunks.get(timeout=remaining)
+            except queue.Empty:
+                break
+            if chunk is None:
+                status = self.process.poll()
+                raise AcceptanceError(
+                    f"QEMU exited with status {status} instead of remaining parked"
+                )
+            self.output.extend(chunk)
+        if self.process.poll() is not None:
+            raise AcceptanceError("QEMU exited instead of remaining in the fatal state")
+        tail = normalize(bytes(self.output[start:]))
+        if "kllm 0.1.0 UEFI bootstrap" in tail or "kllm:/> " in tail:
+            raise AcceptanceError(f"machine rebooted after fatal marker: {tail!r}")
 
     def backspace_command(
         self,
@@ -463,6 +489,27 @@ def run_smoke_scenario(
     session.wait_for(b"halting: parking CPU", command_timeout, start)
 
 
+def run_fault_scenario(
+    session: SerialSession,
+    boot_timeout: float,
+    command_timeout: float,
+    fault: str,
+) -> None:
+    """Prove that one forbidden access reaches the native fatal vector."""
+    session.wait_for(b"kllm:/> ", boot_timeout)
+    assert_owned_boot(session)
+    start = len(session.output)
+    session.send(f"mmu-probe {fault}", command_timeout)
+    if fault == "exception":
+        expected = b"fault: native exception\n"
+    elif fault == "fatal":
+        expected = b"fatal: acceptance post-handoff failure\n"
+    else:
+        expected = f"fault: {fault} permission violation\n".encode()
+    marker_end = session.wait_for(expected, command_timeout, start)
+    session.assert_terminal(marker_end, min(command_timeout, 1.0))
+
+
 def test_architecture(
     architecture: str,
     args: argparse.Namespace,
@@ -473,6 +520,7 @@ def test_architecture(
         args.firmware_vars,
         skip_version_check=args.skip_version_check,
         build=False,
+        acceptance_probes=False,
     )
     session = SerialSession(command, architecture)
     try:
@@ -485,6 +533,33 @@ def test_architecture(
         raise
     finally:
         session.close()
+    if not args.smoke:
+        for fault in ("write", "execute", "exception", "fatal"):
+            command = prepare_qemu_command(
+                architecture,
+                args.firmware_code,
+                args.firmware_vars,
+                skip_version_check=args.skip_version_check,
+                build=False,
+                acceptance_probes=True,
+            )
+            fault_session = SerialSession(command, architecture)
+            try:
+                run_fault_scenario(
+                    fault_session,
+                    args.boot_timeout,
+                    args.command_timeout,
+                    fault,
+                )
+            except Exception:
+                print(
+                    f"--- {architecture} {fault} fault transcript ---",
+                    file=sys.stderr,
+                )
+                print(fault_session.transcript(), file=sys.stderr)
+                raise
+            finally:
+                fault_session.close()
     suite = "smoke" if args.smoke else "acceptance"
     print(f"QEMU {suite} ({architecture}): passed")
 
@@ -517,6 +592,18 @@ def main() -> int:
                 cwd=REPO_ROOT,
                 check=True,
             )
+            if not args.smoke:
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(REPO_ROOT / "scripts" / "build.py"),
+                        "--architecture",
+                        build_architecture,
+                        "--acceptance-probes",
+                    ],
+                    cwd=REPO_ROOT,
+                    check=True,
+                )
         if len(architectures) == 1:
             test_architecture(architectures[0], args)
         else:

@@ -90,6 +90,7 @@ def prepare_qemu_command(
     *,
     skip_version_check: bool = False,
     build: bool = True,
+    acceptance_probes: bool = False,
 ) -> list[str]:
     """Build an image, copy a disposable variable store, and return QEMU arguments."""
     executable_name = QEMU_EXECUTABLES[architecture]
@@ -115,12 +116,14 @@ def prepare_qemu_command(
                 str(REPO_ROOT / "scripts" / "build.py"),
                 "--architecture",
                 architecture,
+                *(("--acceptance-probes",) if acceptance_probes else ()),
             ],
             cwd=REPO_ROOT,
             check=True,
         )
 
-    image = REPO_ROOT / "build" / f"kllm-{architecture}.img"
+    suffix = "-acceptance" if acceptance_probes else ""
+    image = REPO_ROOT / "build" / f"kllm-{architecture}{suffix}.img"
     if not image.is_file():
         raise FileNotFoundError(f"boot image not found: {image}")
     variables = REPO_ROOT / "build" / f"qemu-vars-{architecture}.fd"

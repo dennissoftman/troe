@@ -20,8 +20,9 @@ metadata and invariants before workloads justify it.
 
 Revisit the bitmap only if very large-memory metadata is measured as material.
 
-Stage 2 reserves an 8 MiB LoaderData boot arena and uses the checked monotonic
-model to carve a 6 MiB heap before sealing it. The final map keeps LoaderCode,
+Stage 2 introduced the LoaderData boot arena and a checked monotonic model for a
+6 MiB heap. Stage 3 extends that arena to 2,084 pages for the 2 MiB page-table
+arena and explicit 128 KiB/16 KiB kernel and emergency stacks. The final map keeps LoaderCode,
 LoaderData (including image, stack, embedded KEFS, arena, and map buffer),
 runtime, ACPI, and device regions reserved. Conventional and expired boot-
 services regions become usable. A compact bitmap tracks only usable pages, so
@@ -29,6 +30,7 @@ high MMIO ranges do not inflate metadata. The final-map buffer remains a
 permanent loader reservation after handoff.
 
 The transition installs native UART and fatal output first, ends all protocol
-borrows, captures the final map, calls ExitBootServices once through the audited
-machine boundary, disables firmware allocation fallback, and never returns to
-UEFI. MMU-owned mappings and CPU exception vectors remain Stage 3 work.
+borrows, moves to the owned stack, and calls ExitBootServices through an audited
+non-returning machine boundary. It then disables firmware allocation fallback,
+masks interrupts, and never returns to UEFI. Stage 3 installs MMU-owned mappings
+and CPU exception vectors before entering the shell.
