@@ -1,4 +1,4 @@
-//! UEFI-bootstrapped Stage 3 W^X owned-machine image.
+//! UEFI-bootstrapped Stage 6 isolated owned-machine image.
 #![cfg_attr(target_os = "uefi", no_std)]
 #![cfg_attr(target_os = "uefi", no_main)]
 #![forbid(unsafe_code)]
@@ -19,15 +19,21 @@ mod firmware {
     use core::panic::PanicInfo;
 
     use kllm_core::{Input, MAX_LINE_BYTES, MachineMemorySnapshot, Output, StreamError};
-    use kllm_dispatch::{ConsoleService, DispatchedOutput, Dispatcher, Rights};
+    use kllm_dispatch::{
+        ConsoleService, CopiedMessage, DispatchedOutput, Dispatcher, HandleOwner, ReplyStatus,
+        Request, Rights, Service, ServiceReply,
+    };
     use kllm_driver::{InputQueueConfig, InputSource};
     use kllm_memory::{
         BASE_PAGE_SIZE, BootAllocator, FrameAllocator, MAX_FIRMWARE_REGIONS, Mapping,
         MappingLifetime, MappingMemoryType, MappingOwner, MappingPermissions, MappingPlan,
-        MemoryMapStats, MemoryRegion, NormalizedMemoryMap, PhysicalRange, RegionKind,
+        MemoryMapStats, MemoryRegion, NormalizedMemoryMap, PhysicalRange, RegionKind, VirtualRange,
     };
     use kllm_shell::{CompletionConfig, Shell};
-    use kllm_task::{Capabilities, Scheduler, StackResource, TaskId, TaskStep};
+    use kllm_task::{
+        Capabilities, IsolationResource, Scheduler, StackResource, TaskFault, TaskId, TaskState,
+        TaskStep,
+    };
     use kllm_terminal::{
         EditorConfig, EditorOutcome, FramebufferDescriptor, FramebufferPixelFormat, InputDecoder,
         KeyboardConfig, LineEditor, Ps2Set1Decoder, TextConsole, TextConsoleConfig,
@@ -47,6 +53,18 @@ mod firmware {
     const TASK_GUARD_BYTES: u64 = BASE_PAGE_SIZE;
     const TASK_STACK_PAGES: u16 = 8;
     const TASK_STACK_COUNT: usize = 3;
+    const ISOLATED_TABLE_PAGES: u64 = PAGE_TABLE_BYTES / BASE_PAGE_SIZE;
+    const ISOLATED_CODE_PAGES: u64 = 1;
+    const ISOLATED_DATA_PAGES: u64 = 1;
+    const ISOLATED_STACK_PAGES: u64 = 4;
+    const ISOLATED_PRIVATE_PAGES: u64 =
+        ISOLATED_CODE_PAGES + ISOLATED_DATA_PAGES + ISOLATED_STACK_PAGES;
+    const ISOLATED_RESOURCE_PAGES: u64 = ISOLATED_TABLE_PAGES + ISOLATED_PRIVATE_PAGES;
+    const USER_CODE_BASE: u64 = 0x0000_4000_0000_0000;
+    const USER_DATA_BASE: u64 = USER_CODE_BASE + BASE_PAGE_SIZE;
+    const USER_STACK_BASE: u64 = USER_CODE_BASE + 0x1_0000;
+    const USER_UNMAPPED_BASE: u64 = USER_CODE_BASE + 0x1000_0000;
+    const ISOLATED_MESSAGE: &[u8] = b"stage6 copied request";
     const BOOT_ARENA_PAGES: usize = ((OWNED_HEAP_BYTES
         + PAGE_TABLE_BYTES
         + OWNED_STACK_BYTES
@@ -147,6 +165,7 @@ mod firmware {
         execute_probe_address: usize,
         task_stacks: [TaskStackLayout; TASK_STACK_COUNT],
         framebuffer: Option<FramebufferDescriptor>,
+        kernel_plan: MappingPlan,
     }
 
     #[derive(Clone, Copy)]
@@ -181,6 +200,62 @@ mod firmware {
         image_layout: kllm_machine::ImageLayout,
         boot_memory: BootMemory,
         framebuffer: Option<FramebufferDescriptor>,
+    }
+
+    struct IsolatedAllocation {
+        complete: PhysicalRange,
+        tables: PhysicalRange,
+        code: PhysicalRange,
+        data: PhysicalRange,
+        stack: PhysicalRange,
+    }
+
+    struct EchoService;
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum IsolationProbe {
+        Success,
+        Translation,
+        WritePermission,
+        ExecutePermission,
+        IllegalInstruction,
+        UnexpectedEntry,
+        InvalidOpcode,
+        #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
+        InvalidCallEncoding,
+        InvalidPointer,
+        OversizeMessage,
+        InvalidStatus,
+    }
+
+    impl IsolationProbe {
+        const fn expected_fault(self) -> Option<TaskFault> {
+            match self {
+                Self::Success => None,
+                Self::Translation => Some(TaskFault::Translation),
+                Self::WritePermission | Self::ExecutePermission => Some(TaskFault::Permission),
+                Self::IllegalInstruction | Self::UnexpectedEntry => {
+                    Some(TaskFault::IllegalInstruction)
+                }
+                Self::InvalidOpcode
+                | Self::InvalidCallEncoding
+                | Self::InvalidPointer
+                | Self::OversizeMessage
+                | Self::InvalidStatus => Some(TaskFault::InvalidCall),
+            }
+        }
+    }
+
+    impl Service for EchoService {
+        fn call(
+            &mut self,
+            request: Request<'_>,
+        ) -> Result<ServiceReply, kllm_dispatch::DispatchError> {
+            if request.opcode() != 1 {
+                return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+            }
+            ServiceReply::with_payload(ReplyStatus::Success, request.payload())
+        }
     }
 
     #[entry]
@@ -233,7 +308,7 @@ mod firmware {
         }
         let accounting = complete_handoff(prepared, final_map)
             .unwrap_or_else(|()| fatal(b"fatal: post-handoff initialization failed\n"));
-        run_owned(&accounting)
+        run_owned(accounting)
     }
 
     fn complete_handoff(
@@ -298,6 +373,7 @@ mod firmware {
                 .map_err(|_| ())?,
             task_stacks: prepared.boot_memory.task_stacks,
             framebuffer,
+            kernel_plan: mapping_plan,
         })
     }
 
@@ -595,16 +671,25 @@ mod firmware {
             || memory_type.0 == boot::MemoryType::BOOT_SERVICES_DATA.0
     }
 
-    fn run_owned(accounting: &OwnedAccounting) -> ! {
+    fn run_owned(mut accounting: OwnedAccounting) -> ! {
         let mut scheduler = Scheduler::new(TASK_STACK_COUNT)
             .unwrap_or_else(|_| fatal(b"fatal: cannot create task scheduler\n"));
-        run_cooperative_services(&mut scheduler, accounting)
+        run_cooperative_services(&mut scheduler, &accounting)
             .unwrap_or_else(|()| fatal(b"fatal: cooperative task verification failed\n"));
         if !kllm_machine::write(b"cooperative tasks: deterministic\n")
             || !kllm_machine::write(b"task stack guards: active\n")
             || !kllm_machine::write(b"task resources: reclaimed\n")
         {
             fatal(b"fatal: task diagnostic failed\n");
+        }
+        run_isolation_verification(&mut scheduler, &mut accounting)
+            .unwrap_or_else(|()| fatal(b"fatal: Stage 6 isolation verification failed\n"));
+        if !kllm_machine::write(b"isolated address spaces: active\n")
+            || !kllm_machine::write(b"copied task messages: bounded\n")
+            || !kllm_machine::write(b"isolated faults: contained\n")
+            || !kllm_machine::write(b"isolated resources: reclaimed\n")
+        {
+            fatal(b"fatal: isolation diagnostic failed\n");
         }
 
         let capabilities = Capabilities::CONSOLE
@@ -625,7 +710,7 @@ mod firmware {
         }
         let stack = accounting.task_stacks[2].stack;
         let mut shell_task = ShellTask {
-            accounting,
+            accounting: &accounting,
             capabilities,
             stack,
         };
@@ -734,6 +819,587 @@ mod firmware {
             return Err(());
         }
         Ok(())
+    }
+
+    fn run_isolation_verification(
+        scheduler: &mut Scheduler,
+        accounting: &mut OwnedAccounting,
+    ) -> Result<(), ()> {
+        let mut dispatcher = Dispatcher::new(1, 4).map_err(|_| ())?;
+        let (port, kernel_handle) = dispatcher
+            .register(Box::new(EchoService), Rights::CALL)
+            .map_err(|_| ())?;
+        let baseline_frames = accounting.frames.free_frames();
+
+        let first = run_one_isolated(
+            scheduler,
+            accounting,
+            &mut dispatcher,
+            port,
+            IsolationProbe::Success,
+            0,
+        )?;
+        if accounting.frames.free_frames() != baseline_frames {
+            return Err(());
+        }
+        #[cfg(target_arch = "x86_64")]
+        let fault_probes = [
+            IsolationProbe::Translation,
+            IsolationProbe::WritePermission,
+            IsolationProbe::ExecutePermission,
+            IsolationProbe::IllegalInstruction,
+            IsolationProbe::UnexpectedEntry,
+            IsolationProbe::InvalidOpcode,
+            IsolationProbe::InvalidPointer,
+            IsolationProbe::OversizeMessage,
+            IsolationProbe::InvalidStatus,
+        ];
+        #[cfg(target_arch = "aarch64")]
+        let fault_probes = [
+            IsolationProbe::Translation,
+            IsolationProbe::WritePermission,
+            IsolationProbe::ExecutePermission,
+            IsolationProbe::IllegalInstruction,
+            IsolationProbe::UnexpectedEntry,
+            IsolationProbe::InvalidOpcode,
+            IsolationProbe::InvalidCallEncoding,
+            IsolationProbe::InvalidPointer,
+            IsolationProbe::OversizeMessage,
+            IsolationProbe::InvalidStatus,
+        ];
+        let expected_contained_faults = u32::try_from(fault_probes.len()).map_err(|_| ())?;
+        for (index, probe) in fault_probes.into_iter().enumerate() {
+            let resource = run_one_isolated(
+                scheduler,
+                accounting,
+                &mut dispatcher,
+                port,
+                probe,
+                u8::try_from(index + 1).map_err(|_| ())?,
+            )?;
+            if accounting.frames.free_frames() != baseline_frames || resource != first {
+                return Err(());
+            }
+        }
+        let reused = run_one_isolated(
+            scheduler,
+            accounting,
+            &mut dispatcher,
+            port,
+            IsolationProbe::Success,
+            0,
+        )?;
+        let stats = scheduler.stats();
+        let kernel_reply = dispatcher
+            .call(kernel_handle, 1, b"kernel authority retained")
+            .map_err(|_| ())?;
+        let dispatch_stats = dispatcher.stats();
+        if reused != first
+            || accounting.frames.free_frames() != baseline_frames
+            || stats.owned_address_spaces != 0
+            || stats.owned_isolation_pages != 0
+            || stats.owned_handles != 0
+            || stats.contained_faults != expected_contained_faults
+            || kernel_reply.status() != ReplyStatus::Success
+            || kernel_reply.payload() != b"kernel authority retained"
+            || dispatch_stats.live_ports != 1
+            || dispatch_stats.live_handles != 1
+        {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn run_one_isolated(
+        scheduler: &mut Scheduler,
+        accounting: &mut OwnedAccounting,
+        dispatcher: &mut Dispatcher,
+        port: kllm_dispatch::PortId,
+        probe: IsolationProbe,
+        address_space_slot: u8,
+    ) -> Result<u64, ()> {
+        let table_pages = u16::try_from(ISOLATED_TABLE_PAGES).map_err(|_| ())?;
+        let private_pages = u16::try_from(ISOLATED_PRIVATE_PAGES).map_err(|_| ())?;
+        let stack_pages = u16::try_from(ISOLATED_STACK_PAGES).map_err(|_| ())?;
+        let isolation = IsolationResource::new(address_space_slot, table_pages, private_pages, 1)
+            .map_err(|_| ())?;
+        let stack_resource = StackResource::new(address_space_slot, stack_pages).map_err(|_| ())?;
+
+        let allocation = allocate_isolated(&mut accounting.frames)?;
+        if prepare_isolated_memory(&allocation, probe).is_err() {
+            reclaim_isolated(&mut accounting.frames, allocation)?;
+            return Err(());
+        }
+        let Ok(plan) = build_isolated_plan(&accounting.kernel_plan, &allocation) else {
+            reclaim_isolated(&mut accounting.frames, allocation)?;
+            return Err(());
+        };
+        let Ok(address_space) = kllm_machine::build_user_address_space(&plan, allocation.tables)
+        else {
+            reclaim_isolated(&mut accounting.frames, allocation)?;
+            return Err(());
+        };
+        if address_space.stats().table_pages == 0
+            || address_space.stats().table_pages > ISOLATED_TABLE_PAGES
+        {
+            reclaim_isolated(&mut accounting.frames, allocation)?;
+            return Err(());
+        }
+        let Ok(task_id) =
+            scheduler.spawn_isolated(Capabilities::SERVICE, stack_resource, isolation)
+        else {
+            reclaim_isolated(&mut accounting.frames, allocation)?;
+            return Err(());
+        };
+        let mut live_owner = None;
+        let execution = (|| -> Result<(), ()> {
+            if scheduler
+                .dispatch_next(Capabilities::SERVICE)
+                .map_err(|_| ())?
+                != Some(task_id)
+            {
+                return Err(());
+            }
+            let owner = HandleOwner::isolated(task_id.get()).map_err(|_| ())?;
+            let handle = dispatcher
+                .open_owned(port, Rights::CALL, owner)
+                .map_err(|_| ())?;
+            live_owner = Some(owner);
+
+            let mut copied_bytes = [0_u8; kllm_dispatch::MAX_MESSAGE_BYTES];
+            let stack_top = USER_STACK_BASE
+                .checked_add(ISOLATED_STACK_PAGES.checked_mul(BASE_PAGE_SIZE).ok_or(())?)
+                .ok_or(())?;
+            let outcome = kllm_machine::run_isolated(
+                address_space,
+                USER_CODE_BASE,
+                stack_top,
+                &mut copied_bytes,
+            )
+            .map_err(|_| ())?;
+            match (probe.expected_fault(), outcome) {
+                (
+                    None,
+                    kllm_machine::IsolatedOutcome::Exited {
+                        status,
+                        message_bytes,
+                    },
+                ) => {
+                    if status != 0 || message_bytes != ISOLATED_MESSAGE.len() {
+                        return Err(());
+                    }
+                    let copied = CopiedMessage::copy_from_untrusted(&copied_bytes[..message_bytes])
+                        .map_err(|_| ())?;
+                    if copied.as_bytes() != ISOLATED_MESSAGE {
+                        return Err(());
+                    }
+                    let reply = dispatcher
+                        .call(handle, 1, copied.as_bytes())
+                        .map_err(|_| ())?;
+                    if reply.status() != ReplyStatus::Success || reply.payload() != ISOLATED_MESSAGE
+                    {
+                        return Err(());
+                    }
+                    scheduler.exit_current(task_id, 0).map_err(|_| ())?;
+                }
+                (Some(expected), kllm_machine::IsolatedOutcome::Faulted(fault)) => {
+                    let fault = match fault {
+                        kllm_machine::IsolatedFault::Translation => TaskFault::Translation,
+                        kllm_machine::IsolatedFault::Permission => TaskFault::Permission,
+                        kllm_machine::IsolatedFault::IllegalInstruction => {
+                            TaskFault::IllegalInstruction
+                        }
+                        kllm_machine::IsolatedFault::InvalidCall => TaskFault::InvalidCall,
+                    };
+                    if fault != expected || copied_bytes.iter().any(|byte| *byte != 0) {
+                        return Err(());
+                    }
+                    scheduler.fault_current(task_id, fault).map_err(|_| ())?;
+                }
+                _ => return Err(()),
+            }
+            if dispatcher.close_owner(owner).map_err(|_| ())? != 1 {
+                return Err(());
+            }
+            live_owner = None;
+            if dispatcher.call(handle, 1, b"stale")
+                != Err(kllm_dispatch::DispatchError::InvalidHandle)
+            {
+                return Err(());
+            }
+            Ok(())
+        })();
+        if execution.is_err() {
+            rollback_isolated_task(
+                scheduler,
+                task_id,
+                dispatcher,
+                live_owner,
+                &mut accounting.frames,
+                allocation,
+            )?;
+            return Err(());
+        }
+        let Ok(reaped) = scheduler.reap(task_id) else {
+            rollback_isolated_task(
+                scheduler,
+                task_id,
+                dispatcher,
+                live_owner,
+                &mut accounting.frames,
+                allocation,
+            )?;
+            return Err(());
+        };
+        let valid_reap = reaped.isolation == Some(isolation)
+            && reaped.stack.slot() == address_space_slot
+            && reaped.fault == probe.expected_fault();
+        let allocation_start = allocation.complete.start();
+        reclaim_isolated(&mut accounting.frames, allocation)?;
+        if !valid_reap {
+            return Err(());
+        }
+        Ok(allocation_start)
+    }
+
+    fn rollback_isolated_task(
+        scheduler: &mut Scheduler,
+        task_id: TaskId,
+        dispatcher: &mut Dispatcher,
+        owner: Option<HandleOwner>,
+        frames: &mut FrameAllocator,
+        allocation: IsolatedAllocation,
+    ) -> Result<(), ()> {
+        if let Some(owner) = owner {
+            dispatcher.close_owner(owner).map_err(|_| ())?;
+        }
+        match scheduler.task(task_id).map_err(|_| ())?.state() {
+            TaskState::Ready => scheduler.cancel_ready(task_id, 1).map_err(|_| ())?,
+            TaskState::Running => scheduler.exit_current(task_id, 1).map_err(|_| ())?,
+            TaskState::Exited | TaskState::Faulted => {}
+        }
+        scheduler.reap(task_id).map_err(|_| ())?;
+        reclaim_isolated(frames, allocation)
+    }
+
+    fn allocate_isolated(frames: &mut FrameAllocator) -> Result<IsolatedAllocation, ()> {
+        let complete = frames
+            .allocate_contiguous(ISOLATED_RESOURCE_PAGES, 1)
+            .map_err(|_| ())?;
+        let derived = (|| {
+            let tables = PhysicalRange::from_pages(complete.start(), ISOLATED_TABLE_PAGES)
+                .map_err(|_| ())?;
+            let code =
+                PhysicalRange::from_pages(tables.end(), ISOLATED_CODE_PAGES).map_err(|_| ())?;
+            let data =
+                PhysicalRange::from_pages(code.end(), ISOLATED_DATA_PAGES).map_err(|_| ())?;
+            let stack =
+                PhysicalRange::from_pages(data.end(), ISOLATED_STACK_PAGES).map_err(|_| ())?;
+            if stack.end() != complete.end() {
+                return Err(());
+            }
+            Ok(IsolatedAllocation {
+                complete,
+                tables,
+                code,
+                data,
+                stack,
+            })
+        })();
+        if derived.is_err() {
+            frames.free_range(complete).map_err(|_| ())?;
+        }
+        derived
+    }
+
+    fn prepare_isolated_memory(
+        allocation: &IsolatedAllocation,
+        probe: IsolationProbe,
+    ) -> Result<(), ()> {
+        kllm_machine::zero_physical_range(allocation.complete).map_err(|_| ())?;
+        let code = isolated_program(probe)?;
+        kllm_machine::copy_to_physical(allocation.code, 0, &code).map_err(|_| ())?;
+        if matches!(
+            probe,
+            IsolationProbe::Success
+                | IsolationProbe::InvalidOpcode
+                | IsolationProbe::InvalidCallEncoding
+                | IsolationProbe::InvalidPointer
+                | IsolationProbe::OversizeMessage
+                | IsolationProbe::InvalidStatus
+        ) {
+            kllm_machine::copy_to_physical(allocation.data, 0, ISOLATED_MESSAGE).map_err(|_| ())?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::needless_pass_by_value)] // Consuming the token prevents double teardown.
+    fn reclaim_isolated(
+        frames: &mut FrameAllocator,
+        allocation: IsolatedAllocation,
+    ) -> Result<(), ()> {
+        kllm_machine::zero_physical_range(allocation.complete).map_err(|_| ())?;
+        frames.free_range(allocation.complete).map_err(|_| ())
+    }
+
+    fn build_isolated_plan(
+        kernel: &MappingPlan,
+        allocation: &IsolatedAllocation,
+    ) -> Result<MappingPlan, ()> {
+        let mut plan = MappingPlan::new();
+        let mut protected_code = false;
+        for mapping in kernel.mappings() {
+            let physical = mapping.physical_range();
+            if allocation.code.start() < physical.end() && physical.start() < allocation.code.end()
+            {
+                if protected_code
+                    || allocation.code.start() < physical.start()
+                    || allocation.code.end() > physical.end()
+                    || mapping.virtual_range().start() != physical.start()
+                    || mapping.virtual_range().end() != physical.end()
+                    || mapping.permissions() != MappingPermissions::READ_WRITE
+                {
+                    return Err(());
+                }
+                insert_identity_segment(
+                    &mut plan,
+                    *mapping,
+                    physical.start(),
+                    allocation.code.start(),
+                )?;
+                insert_identity_segment_with_permissions(
+                    &mut plan,
+                    *mapping,
+                    allocation.code.start(),
+                    allocation.code.end(),
+                    MappingPermissions::READ_ONLY,
+                )?;
+                insert_identity_segment(
+                    &mut plan,
+                    *mapping,
+                    allocation.code.end(),
+                    physical.end(),
+                )?;
+                protected_code = true;
+            } else {
+                plan.insert(*mapping).map_err(|_| ())?;
+            }
+        }
+        if !protected_code {
+            return Err(());
+        }
+        for (virtual_start, physical, permissions) in [
+            (
+                USER_CODE_BASE,
+                allocation.code,
+                MappingPermissions::READ_EXECUTE,
+            ),
+            (
+                USER_DATA_BASE,
+                allocation.data,
+                MappingPermissions::READ_WRITE,
+            ),
+            (
+                USER_STACK_BASE,
+                allocation.stack,
+                MappingPermissions::READ_WRITE,
+            ),
+        ] {
+            let virtual_range =
+                VirtualRange::from_pages(virtual_start, physical.page_count()).map_err(|_| ())?;
+            let mapping = Mapping::user(
+                virtual_range,
+                physical,
+                permissions,
+                MappingOwner::IsolatedTask,
+                MappingLifetime::Task,
+            )
+            .map_err(|_| ())?;
+            plan.insert(mapping).map_err(|_| ())?;
+        }
+        if !plan.enforces_global_w_xor_x() {
+            return Err(());
+        }
+        Ok(plan)
+    }
+
+    fn insert_identity_segment(
+        plan: &mut MappingPlan,
+        template: Mapping,
+        start: u64,
+        end: u64,
+    ) -> Result<(), ()> {
+        insert_identity_segment_with_permissions(plan, template, start, end, template.permissions())
+    }
+
+    fn insert_identity_segment_with_permissions(
+        plan: &mut MappingPlan,
+        template: Mapping,
+        start: u64,
+        end: u64,
+        permissions: MappingPermissions,
+    ) -> Result<(), ()> {
+        if start == end {
+            return Ok(());
+        }
+        let pages = end.checked_sub(start).ok_or(())? / BASE_PAGE_SIZE;
+        let range = PhysicalRange::from_pages(start, pages).map_err(|_| ())?;
+        let mapping = Mapping::identity(
+            range,
+            permissions,
+            template.memory_type(),
+            template.owner(),
+            template.lifetime(),
+            template.remappable(),
+        )
+        .map_err(|_| ())?;
+        plan.insert(mapping).map_err(|_| ())
+    }
+
+    fn isolated_program(probe: IsolationProbe) -> Result<Vec<u8>, ()> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut code = Vec::new();
+            match probe {
+                IsolationProbe::Translation => {
+                    x86_mov_rax(&mut code, USER_UNMAPPED_BASE);
+                    code.extend_from_slice(&[0x48, 0x8b, 0x00]);
+                }
+                IsolationProbe::WritePermission => {
+                    x86_mov_rax(&mut code, USER_CODE_BASE);
+                    code.extend_from_slice(&[0xc6, 0x00, 0x00]);
+                }
+                IsolationProbe::ExecutePermission => {
+                    x86_mov_rax(&mut code, USER_DATA_BASE);
+                    code.extend_from_slice(&[0xff, 0xe0]);
+                }
+                IsolationProbe::IllegalInstruction => code.extend_from_slice(&[0x0f, 0x0b]),
+                IsolationProbe::UnexpectedEntry => code.extend_from_slice(&[0x0f, 0x05]),
+                IsolationProbe::Success
+                | IsolationProbe::InvalidOpcode
+                | IsolationProbe::InvalidCallEncoding
+                | IsolationProbe::InvalidPointer
+                | IsolationProbe::OversizeMessage
+                | IsolationProbe::InvalidStatus => {
+                    let (opcode, address, length, status) = exit_call_parameters(probe)?;
+                    if matches!(
+                        probe,
+                        IsolationProbe::Success | IsolationProbe::InvalidOpcode
+                    ) {
+                        // Enter with hostile user-controlled flags. The native
+                        // gate must clear DF for Rust and AC before SMAP-aware
+                        // validation/copying, then restore kernel RFLAGS.
+                        code.push(0xfd);
+                        code.extend_from_slice(&[
+                            0x9c, 0x81, 0x0c, 0x24, 0x00, 0x00, 0x04, 0x00, 0x9d,
+                        ]);
+                    }
+                    code.push(0xb8);
+                    code.extend_from_slice(&opcode.to_le_bytes());
+                    code.extend_from_slice(&[0x48, 0xbf]);
+                    code.extend_from_slice(&address.to_le_bytes());
+                    code.push(0xbe);
+                    code.extend_from_slice(&length.to_le_bytes());
+                    code.push(0xba);
+                    code.extend_from_slice(&status.to_le_bytes());
+                    code.extend_from_slice(&[0xcd, 0x80]);
+                }
+            }
+            code.extend_from_slice(&[0x0f, 0x0b]);
+            Ok(code)
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            let mut words = Vec::new();
+            match probe {
+                IsolationProbe::Translation => {
+                    emit_aarch64_immediate(&mut words, 1, USER_UNMAPPED_BASE);
+                    words.push(0xf940_0020);
+                }
+                IsolationProbe::WritePermission => {
+                    emit_aarch64_immediate(&mut words, 1, USER_CODE_BASE);
+                    words.push(0xf900_003f);
+                }
+                IsolationProbe::ExecutePermission => {
+                    emit_aarch64_immediate(&mut words, 1, USER_DATA_BASE);
+                    words.push(0xd61f_0020);
+                }
+                IsolationProbe::IllegalInstruction => words.push(0xd420_0000),
+                IsolationProbe::UnexpectedEntry => words.push(0xd400_0002),
+                IsolationProbe::Success
+                | IsolationProbe::InvalidOpcode
+                | IsolationProbe::InvalidCallEncoding
+                | IsolationProbe::InvalidPointer
+                | IsolationProbe::OversizeMessage
+                | IsolationProbe::InvalidStatus => {
+                    let (opcode, address, length, status) = exit_call_parameters(probe)?;
+                    emit_aarch64_immediate(&mut words, 0, u64::from(opcode));
+                    emit_aarch64_immediate(&mut words, 1, address);
+                    emit_aarch64_immediate(&mut words, 2, u64::from(length));
+                    emit_aarch64_immediate(&mut words, 3, u64::from(status));
+                    words.push(if probe == IsolationProbe::InvalidCallEncoding {
+                        0xd400_0021
+                    } else {
+                        0xd400_0001
+                    });
+                }
+            }
+            words.push(0xd420_0000);
+            let mut code = Vec::new();
+            code.try_reserve_exact(words.len() * 4).map_err(|_| ())?;
+            for word in words {
+                code.extend_from_slice(&word.to_le_bytes());
+            }
+            Ok(code)
+        }
+    }
+
+    fn exit_call_parameters(probe: IsolationProbe) -> Result<(u32, u64, u32, u32), ()> {
+        let message_len = u32::try_from(ISOLATED_MESSAGE.len()).map_err(|_| ())?;
+        Ok(match probe {
+            IsolationProbe::Success => (1, USER_DATA_BASE, message_len, 0),
+            IsolationProbe::InvalidOpcode => (99, USER_DATA_BASE, message_len, 0),
+            IsolationProbe::InvalidCallEncoding => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    (99, USER_DATA_BASE, message_len, 0)
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    (1, USER_DATA_BASE, message_len, 0)
+                }
+            }
+            IsolationProbe::InvalidPointer => (1, USER_UNMAPPED_BASE, message_len, 0),
+            IsolationProbe::OversizeMessage => (
+                1,
+                USER_DATA_BASE,
+                u32::try_from(kllm_dispatch::MAX_MESSAGE_BYTES + 1).map_err(|_| ())?,
+                0,
+            ),
+            IsolationProbe::InvalidStatus => (1, USER_DATA_BASE, message_len, 256),
+            IsolationProbe::Translation
+            | IsolationProbe::WritePermission
+            | IsolationProbe::ExecutePermission
+            | IsolationProbe::IllegalInstruction
+            | IsolationProbe::UnexpectedEntry => return Err(()),
+        })
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn x86_mov_rax(code: &mut Vec<u8>, value: u64) {
+        code.extend_from_slice(&[0x48, 0xb8]);
+        code.extend_from_slice(&value.to_le_bytes());
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn emit_aarch64_immediate(words: &mut Vec<u32>, register: u8, value: u64) {
+        let low = (value & 0xffff) as u32;
+        words.push(0xd280_0000 | (low << 5) | u32::from(register));
+        for halfword in 1..4_u32 {
+            let immediate = ((value >> (halfword * 16)) & 0xffff) as u32;
+            words.push(0xf280_0000 | (halfword << 21) | (immediate << 5) | u32::from(register));
+        }
     }
 
     fn cooperative_service_step(service: &mut CooperativeService) -> TaskStep {

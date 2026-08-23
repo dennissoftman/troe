@@ -7,13 +7,13 @@ historical review evidence.
 
 - [Implementation roadmap](roadmap.md) is the source of truth for landed stages
   and the next kernel milestone.
-- [Architecture](architecture.md) describes the current Stage 5 composition and
+- [Architecture](architecture.md) describes the current Stage 6 composition and
   its boundaries.
 - [Architecture-specific notes](architecture-specific-notes.md) preserve the
   x86-64 and AArch64 interrupt, idle, and controller invariants that portable
   refactors must not erase.
 - [Unsafe inventory](security/unsafe-inventory.md) records the current audited
-  project-authored unsafe surface through Stage 5.2.
+  project-authored unsafe surface through Stage 6.
 - [KEFS v1](formats/kefs-v1.md) defines the implemented embedded-filesystem
   format.
 
@@ -40,6 +40,10 @@ filesystem support. ADR 0012 governs the completed Stage 5.1 terminal and
 framebuffer increment; AArch64 native keyboard input remains a later
 virtio-input transport decision. ADR 0013 governs the completed Stage 5.2
 interrupt-driven input and bounded driver-resource increment.
+ADR 0014 governs the completed Stage 6 unprivileged address-space,
+copied-message, contained-fault, and transactional teardown boundary. Stage 7
+implementation begins only after its executable container, application ABI,
+memory budgets, and non-returning-code policy receive an accepted ADR.
 
 ## Evaluations
 

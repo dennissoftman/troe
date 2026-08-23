@@ -1,14 +1,16 @@
 //! PE image classification, owned page tables, and native fault vectors.
 
-#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+#[cfg(target_os = "uefi")]
 use core::cell::UnsafeCell;
 use core::fmt;
 #[cfg(target_os = "uefi")]
 use core::ptr;
-
-use kllm_memory::{BASE_PAGE_SIZE, MappingPermissions, PhysicalRange};
 #[cfg(target_os = "uefi")]
-use kllm_memory::{MappingMemoryType, MappingPlan};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+use kllm_memory::{BASE_PAGE_SIZE, MappingPermissions, PhysicalRange, VirtualRange};
+#[cfg(target_os = "uefi")]
+use kllm_memory::{MappingMemoryType, MappingPlan, MappingPrivilege};
 
 const MAX_IMAGE_REGIONS: usize = 64;
 const BASE_PAGE_BYTES: usize = 4096;
@@ -20,6 +22,85 @@ const OPTIONAL_SIZE_OF_IMAGE_OFFSET: usize = 56;
 const SECTION_HEADER_BYTES: usize = 40;
 const SECTION_EXECUTE: u32 = 0x2000_0000;
 const SECTION_WRITE: u32 = 0x8000_0000;
+const MAX_USER_REGIONS: usize = 8;
+#[cfg(target_os = "uefi")]
+const ISOLATED_EXIT_CALL: u64 = 1;
+#[cfg(target_os = "uefi")]
+const OUTCOME_FAULT_BIT: u64 = 1 << 63;
+
+/// Native fault category contained at the user/kernel boundary.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IsolatedFault {
+    /// Instruction or data translation failed.
+    Translation,
+    /// A mapped page denied the requested access.
+    Permission,
+    /// The task raised another synchronous exception.
+    IllegalInstruction,
+    /// The task supplied an unknown call or invalid message range.
+    InvalidCall,
+}
+
+/// Terminal result from one bounded cooperative unprivileged execution step.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IsolatedOutcome {
+    /// Task exited through the copied-message gate.
+    Exited {
+        /// Caller-selected process-style status.
+        status: u8,
+        /// Bytes copied into the kernel-owned destination.
+        message_bytes: usize,
+    },
+    /// Native fault or invalid call was contained and returned to the kernel.
+    Faulted(IsolatedFault),
+}
+
+/// Opaque architecture-owned root and validated unprivileged mapping summary.
+#[derive(Debug, Eq, PartialEq)]
+pub struct UserAddressSpace {
+    root: u64,
+    regions: [Option<UserRegion>; MAX_USER_REGIONS],
+    region_count: usize,
+    stats: MmuStats,
+}
+
+impl UserAddressSpace {
+    /// Page-table and mapped-page accounting for teardown validation.
+    #[must_use]
+    pub const fn stats(&self) -> MmuStats {
+        self.stats
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct UserRegion {
+    range: VirtualRange,
+    permissions: MappingPermissions,
+}
+
+#[cfg(target_os = "uefi")]
+struct IsolatedRunState {
+    regions: [Option<UserRegion>; MAX_USER_REGIONS],
+    region_count: usize,
+    destination: *mut u8,
+    destination_len: usize,
+}
+
+#[cfg(target_os = "uefi")]
+struct IsolatedRunCell(UnsafeCell<Option<IsolatedRunState>>);
+
+// SAFETY: Stage 6 remains single-CPU and cooperative. `run_isolated` is the
+// unique initializer and clears the cell before returning; interrupts remain
+// masked during EL0/ring-3 execution.
+#[cfg(target_os = "uefi")]
+unsafe impl Sync for IsolatedRunCell {}
+
+#[cfg(target_os = "uefi")]
+static ISOLATED_RUN: IsolatedRunCell = IsolatedRunCell(UnsafeCell::new(None));
+#[cfg(target_os = "uefi")]
+static ISOLATED_ACTIVE: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "uefi")]
+static KERNEL_ROOT: AtomicU64 = AtomicU64::new(0);
 
 /// One page-granular permission region in the loaded PE image.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -91,6 +172,10 @@ pub enum MmuError {
     AddressUnsupported,
     /// A required processor MMU feature is unavailable.
     UnsupportedCpu,
+    /// User entry, stack, mapping, or output bounds are invalid.
+    InvalidUserContext,
+    /// Another unprivileged execution boundary is already active.
+    IsolationBusy,
 }
 
 impl fmt::Display for MmuError {
@@ -102,6 +187,8 @@ impl fmt::Display for MmuError {
             Self::TableArenaExhausted => formatter.write_str("page-table arena exhausted"),
             Self::AddressUnsupported => formatter.write_str("mapping address is unsupported"),
             Self::UnsupportedCpu => formatter.write_str("required MMU feature is unavailable"),
+            Self::InvalidUserContext => formatter.write_str("isolated user context is invalid"),
+            Self::IsolationBusy => formatter.write_str("isolated execution is already active"),
         }
     }
 }
@@ -352,6 +439,67 @@ impl TableArena {
 /// processor state, duplicate leaf entries, and table-arena exhaustion.
 #[cfg(target_os = "uefi")]
 pub fn install_mmu(plan: &MappingPlan, table_arena: PhysicalRange) -> Result<MmuStats, MmuError> {
+    let (root, stats) = build_tables(plan, table_arena)?;
+    if KERNEL_ROOT
+        .compare_exchange(0, root, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(MmuError::InvalidPlan);
+    }
+    let capabilities = architecture_mmu_capabilities()?;
+    architecture_activate(root, capabilities);
+    Ok(stats)
+}
+
+/// Build, but do not activate, one task address space containing validated
+/// supervisor mappings and at least one explicit user mapping.
+///
+/// # Errors
+///
+/// Rejects all ordinary mapping/table failures, too many user regions, or a
+/// plan without distinct executable and writable unprivileged mappings.
+#[cfg(target_os = "uefi")]
+pub fn build_user_address_space(
+    plan: &MappingPlan,
+    table_arena: PhysicalRange,
+) -> Result<UserAddressSpace, MmuError> {
+    let mut regions = [None; MAX_USER_REGIONS];
+    let mut region_count = 0_usize;
+    let mut executable = false;
+    let mut writable = false;
+    for mapping in plan.mappings() {
+        if mapping.privilege() != MappingPrivilege::User {
+            continue;
+        }
+        if mapping.memory_type() != MappingMemoryType::Normal || region_count == MAX_USER_REGIONS {
+            return Err(MmuError::InvalidUserContext);
+        }
+        let permissions = mapping.permissions();
+        executable |= permissions.execute;
+        writable |= permissions.write;
+        regions[region_count] = Some(UserRegion {
+            range: mapping.virtual_range(),
+            permissions,
+        });
+        region_count += 1;
+    }
+    if !executable || !writable {
+        return Err(MmuError::InvalidUserContext);
+    }
+    let (root, stats) = build_tables(plan, table_arena)?;
+    Ok(UserAddressSpace {
+        root,
+        regions,
+        region_count,
+        stats,
+    })
+}
+
+#[cfg(target_os = "uefi")]
+fn build_tables(
+    plan: &MappingPlan,
+    table_arena: PhysicalRange,
+) -> Result<(u64, MmuStats), MmuError> {
     if !plan.enforces_global_w_xor_x() || plan.mappings().is_empty() {
         return Err(MmuError::InvalidPlan);
     }
@@ -384,15 +532,219 @@ pub fn install_mmu(plan: &MappingPlan, table_arena: PhysicalRange) -> Result<Mmu
                 physical_address,
                 permissions,
                 memory_type,
+                mapping.privilege(),
                 capabilities,
             )?;
         }
     }
-    architecture_activate(root, capabilities);
-    Ok(MmuStats {
-        mapped_pages: plan.page_count().map_err(|_| MmuError::InvalidPlan)?,
-        table_pages: arena.used_pages,
+    Ok((
+        root,
+        MmuStats {
+            mapped_pages: plan.page_count().map_err(|_| MmuError::InvalidPlan)?,
+            table_pages: arena.used_pages,
+        },
+    ))
+}
+
+/// Enter ring 3/EL0 with interrupts masked and return only through the bounded
+/// exit-message gate or a contained synchronous fault.
+///
+/// `message_destination` is kernel-owned. The native handler validates the
+/// complete untrusted source range against readable user mappings before
+/// copying any byte. Nested execution and invalid entry/stack bounds fail
+/// before activating the task root.
+///
+/// # Errors
+///
+/// Rejects invalid contexts, empty/oversize destinations, absent kernel root,
+/// or an already-active isolated task.
+#[cfg(target_os = "uefi")]
+#[allow(clippy::needless_pass_by_value)] // Consuming the opaque root enforces one-shot use.
+pub fn run_isolated(
+    address_space: UserAddressSpace,
+    entry: u64,
+    stack_top: u64,
+    message_destination: &mut [u8],
+) -> Result<IsolatedOutcome, MmuError> {
+    let UserAddressSpace {
+        root,
+        regions,
+        region_count,
+        stats: _,
+    } = address_space;
+    if message_destination.is_empty()
+        || message_destination.len() > 4 * 1024
+        || KERNEL_ROOT.load(Ordering::Acquire) == 0
+        || !user_range_contains(&regions, region_count, entry, 1, false, true)
+        || stack_top == 0
+        || !stack_top.is_multiple_of(16)
+        || !user_range_contains(&regions, region_count, stack_top - 1, 1, true, false)
+    {
+        return Err(MmuError::InvalidUserContext);
+    }
+    if ISOLATED_ACTIVE
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(MmuError::IsolationBusy);
+    }
+    // SAFETY: The successful active transition gives this call unique access
+    // until the native completion path returns; the destination borrow remains
+    // live and inaccessible to safe Rust across that synchronous boundary.
+    unsafe {
+        *ISOLATED_RUN.0.get() = Some(IsolatedRunState {
+            regions,
+            region_count,
+            destination: message_destination.as_mut_ptr(),
+            destination_len: message_destination.len(),
+        });
+    }
+    let raw = architecture_run_isolated(root, entry, stack_top);
+    // Clear the retained raw pointer and active flag immediately after native
+    // completion, preventing reuse after the destination borrow ends.
+    // SAFETY: Native execution has returned to this unique kernel call.
+    unsafe { *ISOLATED_RUN.0.get() = None };
+    ISOLATED_ACTIVE.store(false, Ordering::Release);
+    decode_isolated_outcome(raw)
+}
+
+#[cfg(target_os = "uefi")]
+fn decode_isolated_outcome(raw: u64) -> Result<IsolatedOutcome, MmuError> {
+    if raw & OUTCOME_FAULT_BIT != 0 {
+        let fault = match raw & 0xff {
+            1 => IsolatedFault::Translation,
+            2 => IsolatedFault::Permission,
+            3 => IsolatedFault::IllegalInstruction,
+            4 => IsolatedFault::InvalidCall,
+            _ => return Err(MmuError::InvalidUserContext),
+        };
+        return Ok(IsolatedOutcome::Faulted(fault));
+    }
+    let status = u8::try_from((raw >> 32) & 0xff).map_err(|_| MmuError::InvalidUserContext)?;
+    let message_bytes =
+        usize::try_from(raw & 0xffff_ffff).map_err(|_| MmuError::InvalidUserContext)?;
+    Ok(IsolatedOutcome::Exited {
+        status,
+        message_bytes,
     })
+}
+
+#[cfg(target_os = "uefi")]
+fn user_range_contains(
+    regions: &[Option<UserRegion>; MAX_USER_REGIONS],
+    count: usize,
+    start: u64,
+    byte_count: usize,
+    require_write: bool,
+    require_execute: bool,
+) -> bool {
+    let Ok(byte_count) = u64::try_from(byte_count) else {
+        return false;
+    };
+    let Some(end) = start.checked_add(byte_count) else {
+        return false;
+    };
+    byte_count != 0
+        && regions[..count].iter().flatten().any(|region| {
+            start >= region.range.start()
+                && end <= region.range.end()
+                && (!require_write || region.permissions.write)
+                && (!require_execute || region.permissions.execute)
+        })
+}
+
+#[cfg(target_os = "uefi")]
+fn isolated_syscall(opcode: u64, address: u64, length: u64, status: u64) -> u64 {
+    if opcode != ISOLATED_EXIT_CALL || status > u64::from(u8::MAX) {
+        return OUTCOME_FAULT_BIT | 4;
+    }
+    let Ok(length) = usize::try_from(length) else {
+        return OUTCOME_FAULT_BIT | 4;
+    };
+    // SAFETY: Only the single active native exception path accesses the cell.
+    let Some(state) = (unsafe { &mut *ISOLATED_RUN.0.get() }).as_mut() else {
+        return OUTCOME_FAULT_BIT | 4;
+    };
+    if length > state.destination_len
+        || !user_range_contains(
+            &state.regions,
+            state.region_count,
+            address,
+            length,
+            false,
+            false,
+        )
+    {
+        return OUTCOME_FAULT_BIT | 4;
+    }
+    let Ok(source) = usize::try_from(address) else {
+        return OUTCOME_FAULT_BIT | 4;
+    };
+    for offset in 0..length {
+        // SAFETY: Full source and destination ranges were validated before any
+        // byte is copied; the active task root maps the source and supervisor
+        // kernel mappings cover the borrowed destination.
+        let byte = unsafe { architecture_read_user_byte(source + offset) };
+        // SAFETY: `offset < length <= destination_len` and the destination is
+        // uniquely borrowed for the complete synchronous run.
+        unsafe { ptr::write(state.destination.add(offset), byte) };
+    }
+    (status << 32) | length as u64
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+unsafe fn architecture_read_user_byte(address: usize) -> u8 {
+    let value: u64;
+    // SAFETY: The caller validated the complete source mapping and the active
+    // ring-3 page tables remain installed. When SMAP is active, AC is raised
+    // only for this exact load and cleared before control returns to Rust.
+    unsafe {
+        core::arch::asm!(
+            "mov {control}, cr4",
+            "bt {control}, 21",
+            "jnc 2f",
+            "stac",
+            "movzx {value}, byte ptr [{address}]",
+            "clac",
+            "jmp 3f",
+            "2:",
+            "movzx {value}, byte ptr [{address}]",
+            "3:",
+            control = out(reg) _,
+            value = out(reg) value,
+            address = in(reg) address,
+            options(nostack, readonly),
+        );
+    }
+    value.to_le_bytes()[0]
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+unsafe fn architecture_read_user_byte(address: usize) -> u8 {
+    let value: u64;
+    // SAFETY: LDTRB performs an explicit unprivileged access, so PAN cannot
+    // silently turn a valid copied-message source into an EL1 access. The full
+    // range was validated against the active task's readable user mappings.
+    unsafe {
+        core::arch::asm!(
+            "ldtrb {value:w}, [{address}]",
+            value = out(reg) value,
+            address = in(reg) address,
+            options(nostack, readonly),
+        );
+    }
+    value.to_le_bytes()[0]
+}
+
+#[cfg(target_os = "uefi")]
+const fn encoded_fault(fault: IsolatedFault) -> u64 {
+    OUTCOME_FAULT_BIT
+        | match fault {
+            IsolatedFault::Translation => 1,
+            IsolatedFault::Permission => 2,
+            IsolatedFault::IllegalInstruction => 3,
+            IsolatedFault::InvalidCall => 4,
+        }
 }
 
 /// Install the architecture's native fatal exception vectors.
@@ -437,6 +789,8 @@ const X86_PRESENT: u64 = 1;
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 const X86_WRITABLE: u64 = 1 << 1;
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+const X86_USER: u64 = 1 << 2;
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 const X86_WRITE_THROUGH: u64 = 1 << 3;
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 const X86_CACHE_DISABLE: u64 = 1 << 4;
@@ -449,10 +803,34 @@ const X86_ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 struct ArchitectureMmuCapabilities {
     physical_address_bits: u8,
+    smep: bool,
+    smap: bool,
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 fn architecture_mmu_capabilities() -> Result<ArchitectureMmuCapabilities, MmuError> {
+    let mut maximum_basic = 0_u32;
+    let control: u64;
+    // SAFETY: CPUID leaf zero is available in 64-bit mode and reports the
+    // maximum supported basic leaf without touching memory. CR4 is readable at
+    // the current kernel privilege level.
+    unsafe {
+        core::arch::asm!(
+            "push rbx",
+            "cpuid",
+            "pop rbx",
+            inout("eax") 0_u32 => maximum_basic,
+            out("ecx") _,
+            out("edx") _,
+        );
+        core::arch::asm!("mov {}, cr4", out(reg) control, options(nostack));
+    }
+    // This backend emits four-level tables and does not own CET or supervisor
+    // protection-key state. Reject inherited modes before replacing tables or
+    // descriptor state instead of faulting partway through the handoff.
+    if control & ((1 << 12) | (1 << 23) | (1 << 24)) != 0 {
+        return Err(MmuError::UnsupportedCpu);
+    }
     let mut maximum_extended = 0_u32;
     // SAFETY: CPUID leaves memory untouched and is available in 64-bit mode.
     unsafe {
@@ -499,8 +877,27 @@ fn architecture_mmu_capabilities() -> Result<ArchitectureMmuCapabilities, MmuErr
     if !(32..=52).contains(&physical_address_bits) {
         return Err(MmuError::UnsupportedCpu);
     }
+    let mut basic_features = 0_u32;
+    if maximum_basic >= 7 {
+        // SAFETY: Subleaf zero of the checked structured-feature leaf reports
+        // SMEP/SMAP in EBX. RBX is preserved for LLVM's reserved use.
+        unsafe {
+            core::arch::asm!(
+                "push rbx",
+                "cpuid",
+                "mov esi, ebx",
+                "pop rbx",
+                inout("eax") 7_u32 => _,
+                inout("ecx") 0_u32 => _,
+                out("edx") _,
+                out("esi") basic_features,
+            );
+        }
+    }
     Ok(ArchitectureMmuCapabilities {
         physical_address_bits,
+        smep: basic_features & (1 << 7) != 0,
+        smap: basic_features & (1 << 20) != 0,
     })
 }
 
@@ -522,6 +919,7 @@ const fn x86_virtual_address_is_canonical(address: u64) -> bool {
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
 fn architecture_map_page(
     arena: &mut TableArena,
     root: u64,
@@ -529,6 +927,7 @@ fn architecture_map_page(
     physical_address: u64,
     permissions: MappingPermissions,
     memory_type: MappingMemoryType,
+    privilege: MappingPrivilege,
     capabilities: ArchitectureMmuCapabilities,
 ) -> Result<(), MmuError> {
     let physical_limit = 1_u64 << capabilities.physical_address_bits;
@@ -550,9 +949,16 @@ fn architecture_map_page(
         table = if current & X86_PRESENT == 0 {
             let child = arena.allocate()?;
             // SAFETY: This builder exclusively owns the entry until CR3 loads.
-            unsafe { ptr::write_volatile(entry, child | X86_PRESENT | X86_WRITABLE) };
+            let user = u64::from(privilege == MappingPrivilege::User) * X86_USER;
+            unsafe { ptr::write_volatile(entry, child | X86_PRESENT | X86_WRITABLE | user) };
             child
         } else {
+            if privilege == MappingPrivilege::User && current & X86_USER == 0 {
+                // SAFETY: Promoting a traversal entry does not expose any
+                // supervisor leaf; each terminal PTE still carries its own U/S
+                // bit. It is required when address ranges share upper levels.
+                unsafe { ptr::write_volatile(entry, current | X86_USER) };
+            }
             current & X86_ADDRESS_MASK
         };
     }
@@ -564,6 +970,9 @@ fn architecture_map_page(
     let mut flags = X86_PRESENT;
     if permissions.write {
         flags |= X86_WRITABLE;
+    }
+    if privilege == MappingPrivilege::User {
+        flags |= X86_USER;
     }
     if !permissions.execute {
         flags |= X86_NO_EXECUTE;
@@ -589,7 +998,7 @@ fn table_entry(table: u64, index: usize) -> Result<*mut u64, MmuError> {
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
-fn architecture_activate(root: u64, _capabilities: ArchitectureMmuCapabilities) {
+fn architecture_activate(root: u64, capabilities: ArchitectureMmuCapabilities) {
     let mut efer_low: u32;
     let mut efer_high: u32;
     // SAFETY: EFER is architectural in long mode; NX support was checked.
@@ -602,6 +1011,9 @@ fn architecture_activate(root: u64, _capabilities: ArchitectureMmuCapabilities) 
             options(nostack),
         );
         efer_low |= 1 << 11;
+        // The Stage 6 user gate is the owned DPL-3 interrupt entry. Firmware
+        // syscall state is not part of the post-handoff contract.
+        efer_low &= !1;
         core::arch::asm!(
             "wrmsr",
             in("ecx") 0xc000_0080_u32,
@@ -613,6 +1025,25 @@ fn architecture_activate(root: u64, _capabilities: ArchitectureMmuCapabilities) 
         core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nostack));
         cr0 |= 1 << 16;
         core::arch::asm!("mov cr0, {}", in(reg) cr0, options(nostack));
+        let mut cr4: u64;
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nostack));
+        // Normalize firmware-owned user-entry state, then enable supervisor
+        // execution/access protection only when CPUID proves support.
+        cr4 &= !((1 << 16) | (1 << 20) | (1 << 21) | (1 << 22));
+        if capabilities.smep {
+            cr4 |= 1 << 20;
+        }
+        if capabilities.smap {
+            cr4 |= 1 << 21;
+        }
+        core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack));
+        core::arch::asm!(
+            "wrmsr",
+            in("ecx") 0x174_u32,
+            in("eax") 0_u32,
+            in("edx") 0_u32,
+            options(nostack),
+        );
         core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack));
     }
 }
@@ -708,13 +1139,25 @@ const X86_CODE_SELECTOR: u16 = 0x08;
 const X86_DATA_SELECTOR: u16 = 0x10;
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 const X86_TSS_SELECTOR: u16 = 0x18;
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+const X86_USER_DATA_SELECTOR: u16 = 0x2b;
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+const X86_USER_CODE_SELECTOR: u16 = 0x33;
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+static X86_KERNEL_CONTEXT: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(any(test, all(target_os = "uefi", target_arch = "x86_64")))]
 fn x86_interrupt_gate(offset: u64, ist: u8) -> u128 {
+    x86_interrupt_gate_with_dpl(offset, ist, 0)
+}
+
+#[cfg(any(test, all(target_os = "uefi", target_arch = "x86_64")))]
+fn x86_interrupt_gate_with_dpl(offset: u64, ist: u8, dpl: u8) -> u128 {
     u128::from(offset & 0xffff)
         | (u128::from(X86_CODE_SELECTOR) << 16)
         | (u128::from(ist & 0x7) << 32)
-        | (u128::from(0x8e_u8) << 40)
+        | (u128::from(0x8e_u8 | ((dpl & 0x3) << 5)) << 40)
         | (u128::from((offset >> 16) & 0xffff) << 48)
         | (u128::from(offset >> 32) << 64)
 }
@@ -742,15 +1185,19 @@ fn architecture_install_exception_vectors(exception_stack: PhysicalRange) -> Res
     if exception_stack.byte_count() < BASE_PAGE_SIZE {
         return Err(MmuError::InvalidTableArena);
     }
+    let _capabilities = architecture_mmu_capabilities()?;
     // SAFETY: This is the unique boot-time initialization of the static TSS,
     // GDT, and IDT while interrupts remain disabled.
     unsafe {
+        (*X86_TSS.0.get()).0.privilege_stacks[0] = exception_stack.end();
         (*X86_TSS.0.get()).0.interrupt_stacks[0] = exception_stack.end();
         (*X86_GDT.0.get()).0[1] = 0x00af_9a00_0000_ffff;
         (*X86_GDT.0.get()).0[2] = 0x00cf_9200_0000_ffff;
         let (tss_low, tss_high) = x86_tss_descriptor(X86_TSS.0.get() as u64);
         (*X86_GDT.0.get()).0[3] = tss_low;
         (*X86_GDT.0.get()).0[4] = tss_high;
+        (*X86_GDT.0.get()).0[5] = 0x00cf_f200_0000_ffff;
+        (*X86_GDT.0.get()).0[6] = 0x00af_fa00_0000_ffff;
 
         let generic_no_error = x86_exception_no_error_entry as *const () as usize as u64;
         let generic_error = x86_exception_error_entry as *const () as usize as u64;
@@ -776,6 +1223,8 @@ fn architecture_install_exception_vectors(exception_stack: PhysicalRange) -> Res
         let spurious = x86_spurious_interrupt_entry as *const () as usize as u64;
         (*X86_IDT.0.get()).0[usize::from(crate::mechanism::X86_SPURIOUS_VECTOR)] =
             x86_interrupt_gate(spurious, 0);
+        let syscall = x86_isolated_syscall_entry as *const () as usize as u64;
+        (*X86_IDT.0.get()).0[0x80] = x86_interrupt_gate_with_dpl(syscall, 0, 3);
     }
     let gdt_descriptor = X86DescriptorTablePointer {
         limit: 63,
@@ -812,6 +1261,114 @@ fn architecture_install_exception_vectors(exception_stack: PhysicalRange) -> Res
         );
     }
     Ok(())
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn architecture_run_isolated(root: u64, entry: u64, stack_top: u64) -> u64 {
+    // SAFETY: `run_isolated` validated all mappings and exclusively installed
+    // the active state. The naked boundary preserves every x64 callee-saved GPR
+    // and the complete legacy/SSE state before entering ring 3.
+    unsafe { x86_enter_isolated(root, entry, stack_top) }
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+#[unsafe(naked)]
+unsafe extern "C" fn x86_enter_isolated(_root: u64, _entry: u64, _stack_top: u64) -> u64 {
+    core::arch::naked_asm!(
+        "push rbx",
+        "push rbp",
+        "push rdi",
+        "push rsi",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov rax, rsp",
+        "sub rsp, 544",
+        "and rsp, -16",
+        "fxsave64 [rsp]",
+        "mov [rsp + 512], rax",
+        "pushfq",
+        "pop rax",
+        "mov [rsp + 520], rax",
+        "lea rax, [rip + {context}]",
+        "mov [rax], rsp",
+        "push {user_data}",
+        "push r8",
+        "push 2",
+        "push {user_code}",
+        "push rdx",
+        "cli",
+        "mov cr3, rcx",
+        "iretq",
+        context = sym X86_KERNEL_CONTEXT,
+        user_data = const X86_USER_DATA_SELECTOR,
+        user_code = const X86_USER_CODE_SELECTOR,
+    );
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+#[unsafe(naked)]
+extern "C" fn x86_isolated_complete() -> ! {
+    core::arch::naked_asm!(
+        "mov r11, rax",
+        "lea rax, [rip + {kernel_root}]",
+        "mov rax, [rax]",
+        "mov cr3, rax",
+        "lea rax, [rip + {context}]",
+        "mov rsp, [rax]",
+        "mov r10, [rsp + 520]",
+        "fxrstor64 [rsp]",
+        "mov rsp, [rsp + 512]",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop rsi",
+        "pop rdi",
+        "pop rbp",
+        "pop rbx",
+        "push r10",
+        "popfq",
+        "mov rax, r11",
+        "ret",
+        kernel_root = sym KERNEL_ROOT,
+        context = sym X86_KERNEL_CONTEXT,
+    );
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+#[unsafe(naked)]
+extern "C" fn x86_isolated_syscall_entry() -> ! {
+    core::arch::naked_asm!(
+        "cld",
+        "pushfq",
+        "btr qword ptr [rsp], 18",
+        "popfq",
+        "mov r8, rsi",
+        "mov r9, rdx",
+        "mov rdx, rdi",
+        "mov rcx, rax",
+        "and rsp, -16",
+        "sub rsp, 32",
+        "call {handler}",
+        "jmp {complete}",
+        handler = sym x86_isolated_syscall_handler,
+        complete = sym x86_isolated_complete,
+    );
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+extern "C" fn x86_isolated_syscall_handler(
+    opcode: u64,
+    address: u64,
+    length: u64,
+    status: u64,
+) -> u64 {
+    if !ISOLATED_ACTIVE.load(Ordering::Acquire) {
+        x86_exception_fatal();
+    }
+    isolated_syscall(opcode, address, length, status)
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
@@ -877,10 +1434,17 @@ extern "C" fn x86_spurious_interrupt_entry() {
 #[unsafe(naked)]
 extern "C" fn x86_exception_no_error_entry() -> ! {
     core::arch::naked_asm!(
+        "cld",
+        "pushfq",
+        "btr qword ptr [rsp], 18",
+        "popfq",
+        "mov rcx, [rsp + 8]",
         "and rsp, -16",
         "sub rsp, 32",
-        "call {fatal}",
-        fatal = sym x86_exception_fatal,
+        "call {dispatch}",
+        "jmp {complete}",
+        dispatch = sym x86_exception_dispatch,
+        complete = sym x86_isolated_complete,
     );
 }
 
@@ -888,11 +1452,27 @@ extern "C" fn x86_exception_no_error_entry() -> ! {
 #[unsafe(naked)]
 extern "C" fn x86_exception_error_entry() -> ! {
     core::arch::naked_asm!(
+        "cld",
+        "pushfq",
+        "btr qword ptr [rsp], 18",
+        "popfq",
+        "mov rcx, [rsp + 16]",
         "and rsp, -16",
         "sub rsp, 32",
-        "call {fatal}",
-        fatal = sym x86_exception_fatal,
+        "call {dispatch}",
+        "jmp {complete}",
+        dispatch = sym x86_exception_dispatch,
+        complete = sym x86_isolated_complete,
     );
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+extern "C" fn x86_exception_dispatch(code_selector: u64) -> u64 {
+    if code_selector & 3 == 3 && ISOLATED_ACTIVE.load(Ordering::Acquire) {
+        encoded_fault(IsolatedFault::IllegalInstruction)
+    } else {
+        x86_exception_fatal()
+    }
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
@@ -905,13 +1485,33 @@ extern "C" fn x86_exception_fatal() -> ! {
 #[unsafe(naked)]
 extern "C" fn x86_page_fault_entry() -> ! {
     core::arch::naked_asm!(
+        "cld",
+        "pushfq",
+        "btr qword ptr [rsp], 18",
+        "popfq",
         "mov rdx, [rsp]",
+        "mov r8, [rsp + 16]",
         "mov rcx, cr2",
         "and rsp, -16",
         "sub rsp, 32",
-        "call {fatal}",
-        fatal = sym x86_page_fault_fatal,
+        "call {dispatch}",
+        "jmp {complete}",
+        dispatch = sym x86_page_fault_dispatch,
+        complete = sym x86_isolated_complete,
     );
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+extern "C" fn x86_page_fault_dispatch(address: u64, error: u64, code_selector: u64) -> u64 {
+    if code_selector & 3 == 3 && ISOLATED_ACTIVE.load(Ordering::Acquire) {
+        encoded_fault(if error & 1 == 0 {
+            IsolatedFault::Translation
+        } else {
+            IsolatedFault::Permission
+        })
+    } else {
+        x86_page_fault_fatal(address, error)
+    }
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
@@ -935,6 +1535,10 @@ const AARCH64_ACCESS_FLAG: u64 = 1 << 10;
 const AARCH64_INNER_SHAREABLE: u64 = 0b11 << 8;
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 const AARCH64_READ_ONLY: u64 = 0b10 << 6;
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+const AARCH64_USER_READ_WRITE: u64 = 0b01 << 6;
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+const AARCH64_USER_READ_ONLY: u64 = 0b11 << 6;
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 const AARCH64_ATTR_DEVICE: u64 = 1 << 2;
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
@@ -1001,6 +1605,7 @@ fn architecture_validate_table_arena(
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+#[allow(clippy::too_many_arguments)]
 fn architecture_map_page(
     arena: &mut TableArena,
     root: u64,
@@ -1008,6 +1613,7 @@ fn architecture_map_page(
     physical_address: u64,
     permissions: MappingPermissions,
     memory_type: MappingMemoryType,
+    privilege: MappingPrivilege,
     capabilities: ArchitectureMmuCapabilities,
 ) -> Result<(), MmuError> {
     let physical_limit = 1_u64 << capabilities.physical_address_bits;
@@ -1039,12 +1645,25 @@ fn architecture_map_page(
     if unsafe { ptr::read_volatile(leaf) } & AARCH64_TABLE_OR_PAGE != 0 {
         return Err(MmuError::InvalidPlan);
     }
-    let mut flags = AARCH64_TABLE_OR_PAGE | AARCH64_ACCESS_FLAG | AARCH64_UXN;
-    if !permissions.write {
-        flags |= AARCH64_READ_ONLY;
-    }
-    if !permissions.execute {
+    let mut flags = AARCH64_TABLE_OR_PAGE | AARCH64_ACCESS_FLAG;
+    if privilege == MappingPrivilege::User {
         flags |= AARCH64_PXN;
+        flags |= if permissions.write {
+            AARCH64_USER_READ_WRITE
+        } else {
+            AARCH64_USER_READ_ONLY
+        };
+        if !permissions.execute {
+            flags |= AARCH64_UXN;
+        }
+    } else {
+        flags |= AARCH64_UXN;
+        if !permissions.write {
+            flags |= AARCH64_READ_ONLY;
+        }
+        if !permissions.execute {
+            flags |= AARCH64_PXN;
+        }
     }
     if memory_type == MappingMemoryType::Device {
         flags |= AARCH64_ATTR_DEVICE;
@@ -1094,6 +1713,102 @@ fn architecture_activate(root: u64, capabilities: ArchitectureMmuCapabilities) {
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+static AARCH64_KERNEL_CONTEXT: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn architecture_run_isolated(root: u64, entry: u64, stack_top: u64) -> u64 {
+    // SAFETY: `run_isolated` validated all mappings and exclusively installed
+    // the active state. The naked boundary preserves AAPCS64 callee-saved GPR,
+    // SIMD, and floating-point control state before entering EL0t.
+    unsafe { aarch64_enter_isolated(root, entry, stack_top) }
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+#[unsafe(naked)]
+unsafe extern "C" fn aarch64_enter_isolated(_root: u64, _entry: u64, _stack_top: u64) -> u64 {
+    core::arch::naked_asm!(
+        "sub sp, sp, #272",
+        "stp x19, x20, [sp, #0]",
+        "stp x21, x22, [sp, #16]",
+        "stp x23, x24, [sp, #32]",
+        "stp x25, x26, [sp, #48]",
+        "stp x27, x28, [sp, #64]",
+        "stp x29, x30, [sp, #80]",
+        "stp q8, q9, [sp, #96]",
+        "stp q10, q11, [sp, #128]",
+        "stp q12, q13, [sp, #160]",
+        "stp q14, q15, [sp, #192]",
+        "mrs x9, fpcr",
+        "mrs x10, fpsr",
+        "str x9, [sp, #224]",
+        "str x10, [sp, #232]",
+        "mrs x9, daif",
+        "str x9, [sp, #240]",
+        "mrs x9, sp_el0",
+        "str x9, [sp, #248]",
+        "mrs x9, tpidr_el0",
+        "str x9, [sp, #256]",
+        "adr x9, {context}",
+        "mov x10, sp",
+        "str x10, [x9]",
+        "msr ttbr0_el1, x0",
+        "dsb sy",
+        "tlbi vmalle1",
+        "dsb sy",
+        "isb",
+        "msr sp_el0, x2",
+        "msr elr_el1, x1",
+        "mov x9, #0x3c0",
+        "msr spsr_el1, x9",
+        "eret",
+        context = sym AARCH64_KERNEL_CONTEXT,
+    );
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+#[unsafe(naked)]
+extern "C" fn aarch64_isolated_complete() -> ! {
+    core::arch::naked_asm!(
+        "mov x11, x0",
+        "adr x9, {kernel_root}",
+        "ldr x10, [x9]",
+        "msr ttbr0_el1, x10",
+        "dsb sy",
+        "tlbi vmalle1",
+        "dsb sy",
+        "isb",
+        "adr x9, {context}",
+        "ldr x9, [x9]",
+        "mov sp, x9",
+        "ldr x12, [sp, #240]",
+        "ldr x9, [sp, #248]",
+        "msr sp_el0, x9",
+        "ldr x9, [sp, #256]",
+        "msr tpidr_el0, x9",
+        "ldr x9, [sp, #224]",
+        "ldr x10, [sp, #232]",
+        "msr fpcr, x9",
+        "msr fpsr, x10",
+        "ldp q8, q9, [sp, #96]",
+        "ldp q10, q11, [sp, #128]",
+        "ldp q12, q13, [sp, #160]",
+        "ldp q14, q15, [sp, #192]",
+        "ldp x19, x20, [sp, #0]",
+        "ldp x21, x22, [sp, #16]",
+        "ldp x23, x24, [sp, #32]",
+        "ldp x25, x26, [sp, #48]",
+        "ldp x27, x28, [sp, #64]",
+        "ldp x29, x30, [sp, #80]",
+        "add sp, sp, #272",
+        "msr daif, x12",
+        "mov x0, x11",
+        "ret",
+        kernel_root = sym KERNEL_ROOT,
+        context = sym AARCH64_KERNEL_CONTEXT,
+    );
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 core::arch::global_asm!(
     ".text",
     ".balign 2048",
@@ -1115,7 +1830,7 @@ core::arch::global_asm!(
     ".balign 128",
     "b kllm_aarch64_exception_entry",
     ".balign 128",
-    "b kllm_aarch64_exception_entry",
+    "b kllm_aarch64_lower_sync_entry",
     ".balign 128",
     "b kllm_aarch64_irq_entry",
     ".balign 128",
@@ -1137,6 +1852,23 @@ core::arch::global_asm!(
     "mrs x1, far_el1",
     "bl kllm_aarch64_exception_fatal",
     "b .",
+    ".balign 128",
+    "kllm_aarch64_lower_sync_entry:",
+    "msr daifset, #0xf",
+    "mrs x9, esr_el1",
+    "lsr x10, x9, #26",
+    "cmp x10, #0x15",
+    "b.eq 1f",
+    "mov x0, x9",
+    "mrs x1, far_el1",
+    "bl kllm_aarch64_isolated_fault",
+    "b kllm_aarch64_isolated_complete_entry",
+    "1:",
+    "mov x4, x9",
+    "bl kllm_aarch64_isolated_syscall",
+    "b kllm_aarch64_isolated_complete_entry",
+    "kllm_aarch64_isolated_complete_entry:",
+    "b {isolated_complete}",
     ".balign 128",
     "kllm_aarch64_irq_entry:",
     "msr daifset, #2",
@@ -1216,6 +1948,7 @@ core::arch::global_asm!(
     "ldr x30, [sp, #240]",
     "add sp, sp, #784",
     "eret",
+    isolated_complete = sym aarch64_isolated_complete,
 );
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
@@ -1259,6 +1992,43 @@ fn architecture_trigger_native_exception() -> ! {
 #[unsafe(no_mangle)]
 extern "C" fn kllm_aarch64_input_interrupt() {
     crate::mechanism::handle_input_interrupt();
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+#[unsafe(no_mangle)]
+extern "C" fn kllm_aarch64_isolated_syscall(
+    opcode: u64,
+    address: u64,
+    length: u64,
+    status: u64,
+    syndrome: u64,
+) -> u64 {
+    if !ISOLATED_ACTIVE.load(Ordering::Acquire) {
+        kllm_aarch64_exception_fatal(0, 0);
+    }
+    if syndrome & 0xffff != 0 {
+        encoded_fault(IsolatedFault::InvalidCall)
+    } else {
+        isolated_syscall(opcode, address, length, status)
+    }
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+#[unsafe(no_mangle)]
+extern "C" fn kllm_aarch64_isolated_fault(esr: u64, _address: u64) -> u64 {
+    if !ISOLATED_ACTIVE.load(Ordering::Acquire) {
+        kllm_aarch64_exception_fatal(esr, 0);
+    }
+    let class = (esr >> 26) & 0x3f;
+    let status = esr & 0x3f;
+    let fault = if matches!(class, 0x20 | 0x24) && status & 0x3c == 0x04 {
+        IsolatedFault::Translation
+    } else if matches!(class, 0x20 | 0x24) && status & 0x3c == 0x0c {
+        IsolatedFault::Permission
+    } else {
+        IsolatedFault::IllegalInstruction
+    };
+    encoded_fault(fault)
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]

@@ -5,9 +5,11 @@ small VFS, and just enough machine layer to grow into an owned kernel. The
 current slice runs as a normal host program and as native x86-64/AArch64 UEFI
 images.
 
-This is pre-isolation software. Built-ins in the firmware image share one
-privileged address space, and typed capabilities prevent accidental authority
-use rather than providing a hardware security boundary.
+Statically linked recovery built-ins still share the privileged kernel address
+space. Stage 6 additionally runs bounded test tasks in fresh ring-3/EL0 address
+spaces; their typed handles, memory faults, and teardown now form a hardware
+security boundary. Loadable applications and a public userspace ABI begin in
+Stage 7 and are not implemented yet.
 
 ## What works now
 
@@ -22,6 +24,8 @@ use rather than providing a hardware security boundary.
   yield/exit/reap accounting, and guarded 32 KiB task stacks;
 - generation-checked service handles, bounded synchronous request/reply
   messages, and a dispatched native console output path;
+- per-task ring-3/EL0 address spaces, copied user messages, contained task
+  faults, owner-wide handle revocation, zeroization, and physical-frame reuse;
 - owned receive interrupts through q35 LAPIC/I/O APIC and AArch64 GICv2,
   bounded raw-event delivery, and race-free `hlt`/`wfi` shell idle;
 - project-owned polling 16550 and PL011 early/fatal recovery output, plus an
@@ -120,7 +124,7 @@ serial-first.
 - `crates`: portable byte streams, memory models, shell, VFS, terminal/editor,
   accounting, and the isolated native machine mechanism crate;
 - `host`: Stage 0 composition and acceptance runner;
-- `kernel`: UEFI bootstrap and Stage 5 dispatched owned-machine composition root;
+- `kernel`: UEFI bootstrap and Stage 6 isolated owned-machine composition root;
 - `rootfs`, `assets`: source tree and generated KEFS image;
 - `tools`: dependency-free deterministic image builders;
 - `scripts`: build, verification, and emulator entry points;

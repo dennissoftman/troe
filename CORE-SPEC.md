@@ -6,9 +6,9 @@
 **Future targets:** raw x86-64 PCs, raw AArch64 systems  
 **Implementation language:** Rust (`no_std`)  
 
-**Implementation status:** Stages 0–5 are implemented. Stage 5.1 is in progress,
-and Stage 6 is the next isolation milestone; later-stage requirements remain
-design constraints, not current functionality. See
+**Implementation status:** Stages 0–6 are implemented. Stage 7 loadable
+applications are the next milestone; later-stage requirements remain design
+constraints, not current functionality. See
 [docs/roadmap.md](docs/roadmap.md).
 
 The product and CLI names are intentionally unset. This document uses “the
@@ -100,39 +100,41 @@ After the MVP proves the boot, memory, VFS, command, and architecture boundaries
 
 ## 6. System model
 
-The current native Stage 5 execution model remains deliberately narrow:
+The current native Stage 6 execution model remains deliberately narrow:
 
 ```text
-+-------------------------------------+
-| shell and statically linked commands |
-+-------------------------------------+
-| tasks | bounded message dispatch     |
-+-------------------------------------+
-| streams | VFS | system nodes         |
-+-------------------------------------+
-| memory | terminal | storage          |
-+-------------------------------------+
-| portable core                       |
-+-------------------------------------+
-| compile-time machine backend         |
-+------------------+------------------+
-| x86_64           | AArch64          |
-+------------------+------------------+
-| UEFI bootstrap / QEMU / hardware     |
-+-------------------------------------+
++------------------------------------------+
+| privileged shell and recovery built-ins |
++------------------------------------------+
+| scheduler | handles | copied call gate  |
++------------------------------------------+
+| one bounded ring-3/EL0 continuation      |
++------------------------------------------+
+| streams | VFS | memory | terminal       |
++------------------------------------------+
+| compile-time x86-64/AArch64 backend      |
++------------------------------------------+
+| UEFI bootstrap / QEMU / hardware         |
++------------------------------------------+
 ```
 
 There is:
 
 - one active CPU;
-- one address space;
-- one owned kernel scheduler/handoff stack and three guarded task-stack slots;
+- one privileged kernel root and at most one synchronously active isolated task
+  root;
+- one owned kernel scheduler/handoff stack, three privileged guarded task-stack
+  slots, and one ephemeral unmapped-guard user stack per isolated launch;
 - one global physical-memory owner;
 - one command executing at a time;
-- no userspace/kernel-space security boundary;
-- cooperative continuations without preemption.
+- a ring-3/EL0 memory and fault boundary for the bounded isolated continuation;
+- no hardware isolation between the privileged recovery built-ins themselves;
+- cooperative continuations without preemption or protection from a task that
+  never returns through the internal gate.
 
-Commands are statically linked Rust functions, not executable files. The shell dispatches them through a fixed registry.
+Commands are statically linked privileged Rust functions, not executable files.
+The shell dispatches them through a fixed registry. Stage 6 isolated programs
+are boot-time verification payloads, not loadable applications or a public ABI.
 
 ## 7. Boot strategy
 
@@ -802,11 +804,16 @@ A release candidate MUST pass:
 
 ## 22. Security model
 
-Before isolation, all built-ins execute with kernel privilege in one address space. Typed capabilities reduce accidental authority but do not constitute a hardware security boundary. A memory-safety flaw in any privileged component may compromise the whole system.
+Statically linked recovery built-ins execute with kernel privilege in the shared
+kernel address space. Typed capabilities reduce accidental authority between
+those components but do not contain their memory-safety failures. Stage 6 adds
+a hardware boundary only for its bounded ring-3/EL0 continuations: supervisor
+page permissions, copied messages, contained user faults, owner-revoked handles,
+and zeroized teardown protect the kernel from that execution context.
 
 Accordingly:
 
-- untrusted executable code is not loaded;
+- externally supplied executable code is not loaded before Stage 7;
 - embedded FS input is treated as potentially malformed;
 - console input is untrusted and bounded;
 - external block filesystems remain optional until separately specified and fuzzed;
@@ -814,7 +821,10 @@ Accordingly:
 - no command may access raw memory or devices unless explicitly given that capability;
 - release documentation MUST state whether hardware isolation exists.
 
-Optional task isolation later strengthens this model; it does not retroactively make early releases multi-user secure.
+Stage 6 isolation does not make privileged built-ins mutually isolated, provide
+preemption, or make the system multi-user secure. Stage 7 must reuse this
+boundary while treating every application artifact and application-controlled
+address as untrusted.
 
 ## 23. Evolution roadmap
 
@@ -881,7 +891,7 @@ stage does not claim fault containment or protection from memory-unsafe code.
 
 ### Stage 5.1 — Native text console and shell usability
 
-**Status:** in progress; accepted by
+**Status:** complete; accepted by
 [ADR 0012](docs/adr/0012-native-text-console-and-editor-policy.md).
 
 - Portable, policy-configured terminal input and cursor-aware line editing.
@@ -895,14 +905,17 @@ without weakening deterministic UART recovery and acceptance.
 
 ### Stage 6 — Optional isolation
 
-**Status:** planned after Stage 5.1; not implemented.
+**Status:** complete; accepted by
+[ADR 0014](docs/adr/0014-unprivileged-task-isolation-and-teardown.md).
 
 - Per-task address spaces.
-- Copy or validated shared-memory message transfer.
+- Bounded copied-message transfer; no shared-memory contract.
 - Fault containment and task teardown.
-- Selected filesystem, console, or shell components may become servers.
+- Owner-scoped handle revocation and zeroized frame reclamation.
 
-**Exit criterion:** an isolated task fault does not corrupt the kernel or unrelated service, and authority transfer is explicit.
+**Exit criterion:** met on both primary architectures. An isolated task fault
+does not corrupt the kernel or unrelated service, authority transfer is
+explicit, and all owned resources are revoked, zeroed, and reclaimed.
 
 ### Stage 7 — Loadable applications
 
@@ -1043,14 +1056,14 @@ A feature belongs in the project only when its value exceeds its cost in code si
 
 ## 28. Open decisions
 
-Decisions resolved through Stage 5 are recorded in
+Decisions resolved through Stage 6 are recorded in
 [docs/adr](docs/adr) and summarized in [docs/roadmap.md](docs/roadmap.md).
 The following later-stage choices remain open and require short architecture
 decision records before implementation:
 
-- the Stage 6 isolation and message-transfer model, including teardown and
-  fault-containment semantics;
-- the executable container, application ABI, and loader contract for Stage 7;
+- the Stage 7 executable container, application ABI, loader, and policy for
+  non-yielding untrusted code (the Stage 6 privilege/message/teardown boundary
+  is fixed by ADR 0014);
 - canonical package-artifact encoding and digest/signature scope;
 - dependency/version semantics and multi-target lock-file representation;
 - content-store layout, generation activation record, and recovery protocol;

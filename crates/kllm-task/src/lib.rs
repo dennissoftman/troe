@@ -58,6 +58,82 @@ pub struct StackResource {
     mapped_pages: u16,
 }
 
+/// Address-space, frame, and handle ownership retained by one isolated task.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IsolationResource {
+    slot: u8,
+    table_pages: u16,
+    private_pages: u16,
+    handles: u16,
+}
+
+impl IsolationResource {
+    /// Describe one externally validated isolated address space.
+    ///
+    /// # Errors
+    ///
+    /// Rejects resources without page tables or private user pages.
+    pub const fn new(
+        slot: u8,
+        table_pages: u16,
+        private_pages: u16,
+        handles: u16,
+    ) -> Result<Self, TaskError> {
+        if table_pages == 0 || private_pages == 0 {
+            return Err(TaskError::EmptyAddressSpace);
+        }
+        Ok(Self {
+            slot,
+            table_pages,
+            private_pages,
+            handles,
+        })
+    }
+
+    /// Pool-local address-space slot.
+    #[must_use]
+    pub const fn slot(self) -> u8 {
+        self.slot
+    }
+
+    /// Page-table frames retained until reaping.
+    #[must_use]
+    pub const fn table_pages(self) -> u16 {
+        self.table_pages
+    }
+
+    /// Private code, data, and stack frames retained until reaping.
+    #[must_use]
+    pub const fn private_pages(self) -> u16 {
+        self.private_pages
+    }
+
+    /// Capability handles that teardown must invalidate.
+    #[must_use]
+    pub const fn handles(self) -> u16 {
+        self.handles
+    }
+
+    /// Total physical frames retained by the address space.
+    #[must_use]
+    pub const fn total_pages(self) -> u32 {
+        self.table_pages as u32 + self.private_pages as u32
+    }
+}
+
+/// Contained unprivileged failure category recorded without trusting task data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TaskFault {
+    /// Instruction or data address was not mapped.
+    Translation,
+    /// A mapped page denied the requested access.
+    Permission,
+    /// The task executed an invalid or unsupported instruction.
+    IllegalInstruction,
+    /// The task invoked an unknown call or supplied an invalid message range.
+    InvalidCall,
+}
+
 impl StackResource {
     /// Describe one externally validated stack slot.
     ///
@@ -93,6 +169,8 @@ pub enum TaskState {
     Running,
     /// Finished and retaining resources until explicitly reaped.
     Exited,
+    /// Faulted at unprivileged execution level and awaiting explicit reaping.
+    Faulted,
 }
 
 /// Result returned by one explicit cooperative continuation step.
@@ -117,6 +195,8 @@ pub struct TaskSnapshot {
     dispatches: u32,
     yields: u32,
     exit_status: Option<u8>,
+    isolation: Option<IsolationResource>,
+    fault: Option<TaskFault>,
 }
 
 impl TaskSnapshot {
@@ -161,6 +241,18 @@ impl TaskSnapshot {
     pub const fn exit_status(self) -> Option<u8> {
         self.exit_status
     }
+
+    /// Isolated resources retained by this record, when applicable.
+    #[must_use]
+    pub const fn isolation(self) -> Option<IsolationResource> {
+        self.isolation
+    }
+
+    /// Contained fault that terminated the task, when applicable.
+    #[must_use]
+    pub const fn fault(self) -> Option<TaskFault> {
+        self.fault
+    }
 }
 
 /// Resource returned after a completed task is reaped.
@@ -172,6 +264,11 @@ pub struct ReapedTask {
     pub stack: StackResource,
     /// Final task status.
     pub exit_status: u8,
+    /// Isolated resources returned for zeroization, handle revocation, and
+    /// physical-frame reclamation.
+    pub isolation: Option<IsolationResource>,
+    /// Contained fault, if the task did not exit normally.
+    pub fault: Option<TaskFault>,
 }
 
 /// Aggregate scheduler and task-owned-resource counters.
@@ -187,6 +284,14 @@ pub struct TaskStats {
     pub yields: u32,
     /// Mapped stack pages retained by live records.
     pub owned_stack_pages: u32,
+    /// Isolated address spaces retained by live records.
+    pub owned_address_spaces: u16,
+    /// Page-table plus private frames retained by isolated records.
+    pub owned_isolation_pages: u32,
+    /// Handles awaiting invalidation during isolated-task teardown.
+    pub owned_handles: u32,
+    /// Unprivileged task faults contained since scheduler creation.
+    pub contained_faults: u32,
 }
 
 /// Deterministic scheduler-policy failures.
@@ -202,8 +307,12 @@ pub enum TaskError {
     IdentityExhausted,
     /// No payload page exists between the stack guards.
     EmptyStack,
+    /// An isolated address space has no table or private pages.
+    EmptyAddressSpace,
     /// A retained task already owns the supplied stack slot.
     StackInUse,
+    /// A retained task already owns the supplied address-space slot.
+    AddressSpaceInUse,
     /// The requested identity is not retained.
     UnknownTask,
     /// Another task is already marked running.
@@ -222,7 +331,11 @@ impl fmt::Display for TaskError {
             Self::CapacityExhausted => formatter.write_str("task record capacity exhausted"),
             Self::IdentityExhausted => formatter.write_str("task identity space exhausted"),
             Self::EmptyStack => formatter.write_str("task stack has no mapped pages"),
+            Self::EmptyAddressSpace => formatter.write_str("isolated address space is empty"),
             Self::StackInUse => formatter.write_str("task stack slot is already owned"),
+            Self::AddressSpaceInUse => {
+                formatter.write_str("isolated address-space slot is already owned")
+            }
             Self::UnknownTask => formatter.write_str("task identity is unknown"),
             Self::TaskAlreadyRunning => {
                 formatter.write_str("a cooperative task is already running")
@@ -253,6 +366,7 @@ pub struct Scheduler {
     spawned: u32,
     reaped: u32,
     total_yields: u32,
+    contained_faults: u32,
 }
 
 impl Scheduler {
@@ -278,6 +392,7 @@ impl Scheduler {
             spawned: 0,
             reaped: 0,
             total_yields: 0,
+            contained_faults: 0,
         })
     }
 
@@ -291,6 +406,29 @@ impl Scheduler {
         capabilities: Capabilities,
         stack: StackResource,
     ) -> Result<TaskId, TaskError> {
+        self.spawn_with_isolation(capabilities, stack, None)
+    }
+
+    /// Retain a ready isolated task and all resources required for teardown.
+    ///
+    /// # Errors
+    ///
+    /// Rejects the ordinary spawn failures plus duplicate address-space slots.
+    pub fn spawn_isolated(
+        &mut self,
+        capabilities: Capabilities,
+        stack: StackResource,
+        isolation: IsolationResource,
+    ) -> Result<TaskId, TaskError> {
+        self.spawn_with_isolation(capabilities, stack, Some(isolation))
+    }
+
+    fn spawn_with_isolation(
+        &mut self,
+        capabilities: Capabilities,
+        stack: StackResource,
+        isolation: Option<IsolationResource>,
+    ) -> Result<TaskId, TaskError> {
         if self.records.len() == self.capacity {
             return Err(TaskError::CapacityExhausted);
         }
@@ -300,6 +438,16 @@ impl Scheduler {
             .any(|record| record.snapshot.stack.slot == stack.slot)
         {
             return Err(TaskError::StackInUse);
+        }
+        if let Some(isolation) = isolation
+            && self.records.iter().any(|record| {
+                record
+                    .snapshot
+                    .isolation
+                    .is_some_and(|owned| owned.slot == isolation.slot)
+            })
+        {
+            return Err(TaskError::AddressSpaceInUse);
         }
         let id = TaskId(self.next_id);
         let next_id = self
@@ -319,6 +467,8 @@ impl Scheduler {
                 dispatches: 0,
                 yields: 0,
                 exit_status: None,
+                isolation,
+                fault: None,
             },
         });
         self.next_id = next_id;
@@ -403,6 +553,51 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Cancel a ready isolated task whose native launch could not begin.
+    ///
+    /// This transition exists solely for transactional composition rollback:
+    /// it cannot cancel a running task, a kernel task, or an already terminal
+    /// record. Resources remain retained until the ordinary reap operation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unknown, non-ready, or non-isolated tasks.
+    pub fn cancel_ready(&mut self, id: TaskId, status: u8) -> Result<(), TaskError> {
+        let record = self.record_mut(id)?;
+        if record.snapshot.state != TaskState::Ready || record.snapshot.isolation.is_none() {
+            return Err(TaskError::InvalidState);
+        }
+        record.snapshot.state = TaskState::Exited;
+        record.snapshot.exit_status = Some(status);
+        Ok(())
+    }
+
+    /// Terminate the running unprivileged task after a contained native fault.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a non-current, non-running, or non-isolated task and checked
+    /// fault-accounting overflow. State is unchanged on every error.
+    pub fn fault_current(&mut self, id: TaskId, fault: TaskFault) -> Result<(), TaskError> {
+        if self.current != Some(id) {
+            return Err(TaskError::InvalidState);
+        }
+        let contained_faults = self
+            .contained_faults
+            .checked_add(1)
+            .ok_or(TaskError::AccountingOverflow)?;
+        let record = self.record_mut(id)?;
+        if record.snapshot.state != TaskState::Running || record.snapshot.isolation.is_none() {
+            return Err(TaskError::InvalidState);
+        }
+        record.snapshot.state = TaskState::Faulted;
+        record.snapshot.exit_status = Some(128);
+        record.snapshot.fault = Some(fault);
+        self.current = None;
+        self.contained_faults = contained_faults;
+        Ok(())
+    }
+
     /// Remove an exited record and return its task-owned stack resource.
     ///
     /// # Errors
@@ -415,7 +610,7 @@ impl Scheduler {
             .position(|record| record.snapshot.id == id)
             .ok_or(TaskError::UnknownTask)?;
         let snapshot = self.records[index].snapshot;
-        if snapshot.state != TaskState::Exited {
+        if !matches!(snapshot.state, TaskState::Exited | TaskState::Faulted) {
             return Err(TaskError::InvalidState);
         }
         let reaped = self
@@ -435,6 +630,8 @@ impl Scheduler {
             id,
             stack: snapshot.stack,
             exit_status: snapshot.exit_status.ok_or(TaskError::InvalidState)?,
+            isolation: snapshot.isolation,
+            fault: snapshot.fault,
         })
     }
 
@@ -457,12 +654,33 @@ impl Scheduler {
         let owned_stack_pages = self.records.iter().fold(0_u32, |total, record| {
             total.saturating_add(u32::from(record.snapshot.stack.mapped_pages))
         });
+        let owned_address_spaces = self
+            .records
+            .iter()
+            .filter(|record| record.snapshot.isolation.is_some())
+            .count();
+        let (owned_isolation_pages, owned_handles) =
+            self.records
+                .iter()
+                .fold((0_u32, 0_u32), |(pages, handles), record| {
+                    match record.snapshot.isolation {
+                        Some(resource) => (
+                            pages.saturating_add(resource.total_pages()),
+                            handles.saturating_add(u32::from(resource.handles)),
+                        ),
+                        None => (pages, handles),
+                    }
+                });
         TaskStats {
             spawned: self.spawned,
             live_records: u16::try_from(self.records.len()).unwrap_or(u16::MAX),
             reaped: self.reaped,
             yields: self.total_yields,
             owned_stack_pages,
+            owned_address_spaces: u16::try_from(owned_address_spaces).unwrap_or(u16::MAX),
+            owned_isolation_pages,
+            owned_handles,
+            contained_faults: self.contained_faults,
         }
     }
 
@@ -477,7 +695,8 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::{
-        Capabilities, MAX_TASKS, Scheduler, StackResource, TaskError, TaskSnapshot, TaskState,
+        Capabilities, IsolationResource, MAX_TASKS, Scheduler, StackResource, TaskError, TaskFault,
+        TaskSnapshot, TaskState,
     };
 
     fn stack(slot: u8) -> Result<StackResource, TaskError> {
@@ -586,6 +805,69 @@ mod tests {
             scheduler.dispatch_next(Capabilities::NONE),
             Err(TaskError::TaskAlreadyRunning)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn isolated_fault_teardown_returns_every_owned_resource() -> Result<(), TaskError> {
+        let mut scheduler = Scheduler::new(2)?;
+        let isolation = IsolationResource::new(3, 19, 6, 2)?;
+        let id = scheduler.spawn_isolated(Capabilities::SERVICE, stack(0)?, isolation)?;
+        let stats = scheduler.stats();
+        assert_eq!(stats.owned_address_spaces, 1);
+        assert_eq!(stats.owned_isolation_pages, 25);
+        assert_eq!(stats.owned_handles, 2);
+        assert_eq!(scheduler.dispatch_next(Capabilities::SERVICE), Ok(Some(id)));
+        scheduler.fault_current(id, TaskFault::Translation)?;
+        assert_eq!(
+            scheduler.task(id).map(TaskSnapshot::state),
+            Ok(TaskState::Faulted)
+        );
+        assert_eq!(
+            scheduler.task(id).map(TaskSnapshot::fault),
+            Ok(Some(TaskFault::Translation))
+        );
+        let reaped = scheduler.reap(id)?;
+        assert_eq!(reaped.isolation, Some(isolation));
+        assert_eq!(reaped.fault, Some(TaskFault::Translation));
+        assert_eq!(reaped.exit_status, 128);
+        let stats = scheduler.stats();
+        assert_eq!(stats.owned_address_spaces, 0);
+        assert_eq!(stats.owned_isolation_pages, 0);
+        assert_eq!(stats.owned_handles, 0);
+        assert_eq!(stats.contained_faults, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn isolated_resource_aliases_and_invalid_faults_fail_closed() -> Result<(), TaskError> {
+        assert_eq!(
+            IsolationResource::new(0, 0, 1, 0),
+            Err(TaskError::EmptyAddressSpace)
+        );
+        assert_eq!(
+            IsolationResource::new(0, 1, 0, 0),
+            Err(TaskError::EmptyAddressSpace)
+        );
+        let mut scheduler = Scheduler::new(2)?;
+        let resource = IsolationResource::new(1, 4, 2, 0)?;
+        let first = scheduler.spawn_isolated(Capabilities::NONE, stack(0)?, resource)?;
+        assert_eq!(
+            scheduler.spawn_isolated(Capabilities::NONE, stack(1)?, resource),
+            Err(TaskError::AddressSpaceInUse)
+        );
+        assert_eq!(
+            scheduler.fault_current(first, TaskFault::Permission),
+            Err(TaskError::InvalidState)
+        );
+        assert_eq!(
+            scheduler.task(first).map(TaskSnapshot::state),
+            Ok(TaskState::Ready)
+        );
+        scheduler.cancel_ready(first, 9)?;
+        let reaped = scheduler.reap(first)?;
+        assert_eq!(reaped.exit_status, 9);
+        assert_eq!(reaped.isolation, Some(resource));
         Ok(())
     }
 }

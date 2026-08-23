@@ -163,6 +163,8 @@ pub enum MappingOwner {
     KernelRuntime,
     /// Architecture-selected device registers.
     MachineDevice,
+    /// Private pages retained by one isolated task address space.
+    IsolatedTask,
 }
 
 /// Lifetime promised for a mapping.
@@ -172,6 +174,17 @@ pub enum MappingLifetime {
     Boot,
     /// Required for the lifetime of the kernel address space.
     Kernel,
+    /// Retained only until one isolated task is terminated and reaped.
+    Task,
+}
+
+/// Least-privileged execution level allowed to traverse one mapping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MappingPrivilege {
+    /// Accessible only while executing in the kernel privilege level.
+    Kernel,
+    /// Accessible from the unprivileged task execution level.
+    User,
 }
 
 /// One architecture-neutral virtual-to-physical mapping.
@@ -184,6 +197,7 @@ pub struct Mapping {
     owner: MappingOwner,
     lifetime: MappingLifetime,
     remappable: bool,
+    privilege: MappingPrivilege,
 }
 
 impl Mapping {
@@ -222,7 +236,40 @@ impl Mapping {
             owner,
             lifetime,
             remappable,
+            privilege: MappingPrivilege::Kernel,
         })
+    }
+
+    /// Construct a checked user-accessible mapping.
+    ///
+    /// Device memory cannot be exposed through this constructor. Stage 6 user
+    /// tasks receive services through copied messages rather than ambient MMIO.
+    ///
+    /// # Errors
+    ///
+    /// Returns the ordinary mapping validation errors, or
+    /// [`MappingPlanError::InvalidUserOwner`] for non-task ownership/lifetime.
+    pub fn user(
+        virtual_range: VirtualRange,
+        physical_range: PhysicalRange,
+        permissions: MappingPermissions,
+        owner: MappingOwner,
+        lifetime: MappingLifetime,
+    ) -> Result<Self, MappingPlanError> {
+        if owner != MappingOwner::IsolatedTask || lifetime != MappingLifetime::Task {
+            return Err(MappingPlanError::InvalidUserOwner);
+        }
+        let mut mapping = Self::new(
+            virtual_range,
+            physical_range,
+            permissions,
+            MappingMemoryType::Normal,
+            owner,
+            lifetime,
+            false,
+        )?;
+        mapping.privilege = MappingPrivilege::User;
+        Ok(mapping)
     }
 
     /// Construct an identity mapping over one physical range.
@@ -291,6 +338,12 @@ impl Mapping {
     pub const fn remappable(self) -> bool {
         self.remappable
     }
+
+    /// Least-privileged execution level allowed to use the mapping.
+    #[must_use]
+    pub const fn privilege(self) -> MappingPrivilege {
+        self.privilege
+    }
 }
 
 /// Failures produced while constructing a virtual mapping plan.
@@ -310,6 +363,8 @@ pub enum MappingPlanError {
     WritableExecutable,
     /// Device memory requested execute permission.
     ExecutableDevice,
+    /// A user mapping did not carry isolated-task ownership and lifetime.
+    InvalidUserOwner,
     /// Two virtual ranges overlap.
     VirtualOverlap,
     /// Two mappings refer to overlapping physical bytes.
@@ -328,6 +383,9 @@ impl fmt::Display for MappingPlanError {
             Self::Unreadable => formatter.write_str("mapping is not readable"),
             Self::WritableExecutable => formatter.write_str("mapping is writable and executable"),
             Self::ExecutableDevice => formatter.write_str("device mapping is executable"),
+            Self::InvalidUserOwner => {
+                formatter.write_str("user mapping lacks isolated-task ownership")
+            }
             Self::VirtualOverlap => formatter.write_str("virtual mappings overlap"),
             Self::PhysicalOverlap => formatter.write_str("physical mappings overlap"),
             Self::TooManyMappings => formatter.write_str("mapping plan bound exceeded"),
@@ -335,7 +393,7 @@ impl fmt::Display for MappingPlanError {
     }
 }
 
-/// Sorted, non-overlapping mappings for the initial kernel address space.
+/// Sorted, virtually non-overlapping mappings for one address space.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct MappingPlan {
     mappings: Vec<Mapping>,
@@ -354,7 +412,9 @@ impl MappingPlan {
     ///
     /// # Errors
     ///
-    /// Rejects virtual or physical overlap and plans above [`MAX_MAPPINGS`].
+    /// Rejects virtual overlap, unsafe physical aliases, and plans above
+    /// [`MAX_MAPPINGS`]. Read-only aliases and RW/NX aliases are allowed; any
+    /// physical alias that would combine write and execute permission is not.
     pub fn insert(&mut self, mapping: Mapping) -> Result<(), MappingPlanError> {
         if self.mappings.len() >= MAX_MAPPINGS {
             return Err(MappingPlanError::TooManyMappings);
@@ -371,12 +431,12 @@ impl MappingPlan {
         {
             return Err(MappingPlanError::VirtualOverlap);
         }
-        if self
-            .mappings
-            .iter()
-            .any(|existing| ranges_overlap(existing.physical_range, mapping.physical_range))
-        {
-            return Err(MappingPlanError::PhysicalOverlap);
+        for existing in &self.mappings {
+            if ranges_overlap(existing.physical_range, mapping.physical_range)
+                && !physical_alias_is_safe(*existing, mapping)
+            {
+                return Err(MappingPlanError::PhysicalOverlap);
+            }
         }
         self.mappings
             .try_reserve(1)
@@ -411,15 +471,25 @@ impl MappingPlan {
             if mapping.permissions.write && mapping.permissions.execute {
                 return false;
             }
-            if self.mappings[index + 1..]
-                .iter()
-                .any(|other| ranges_overlap(mapping.physical_range, other.physical_range))
-            {
-                return false;
+            for other in &self.mappings[index + 1..] {
+                if ranges_overlap(mapping.physical_range, other.physical_range)
+                    && !physical_alias_is_safe(*mapping, *other)
+                {
+                    return false;
+                }
             }
         }
         true
     }
+}
+
+fn physical_alias_is_safe(left: Mapping, right: Mapping) -> bool {
+    if left.memory_type != right.memory_type {
+        return false;
+    }
+    let writable = left.permissions.write || right.permissions.write;
+    let executable = left.permissions.execute || right.permissions.execute;
+    !(writable && executable)
 }
 
 const fn ranges_overlap(left: PhysicalRange, right: PhysicalRange) -> bool {
@@ -796,7 +866,8 @@ struct FrameSpan {
 ///
 /// Only usable pages consume bitmap bits, so high device ranges do not inflate
 /// metadata. A zero bit denotes a free frame and a one bit an allocated frame.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
+#[cfg_attr(test, derive(Clone))]
 pub struct FrameAllocator {
     spans: Vec<FrameSpan>,
     bitmap: Vec<u64>,
@@ -873,6 +944,80 @@ impl FrameAllocator {
         Err(FrameAllocationError::Exhausted)
     }
 
+    /// Allocate one physically contiguous, aligned frame range atomically.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero/non-power-of-two bounds, arithmetic overflow, or a lack of
+    /// one free run wholly contained in a usable physical span. No bitmap bit
+    /// changes unless the complete request can be satisfied.
+    pub fn allocate_contiguous(
+        &mut self,
+        page_count: u64,
+        alignment_pages: u64,
+    ) -> Result<PhysicalRange, FrameAllocationError> {
+        if page_count == 0 || alignment_pages == 0 || !alignment_pages.is_power_of_two() {
+            return Err(FrameAllocationError::InvalidFrame);
+        }
+        if page_count > self.free_frames {
+            return Err(FrameAllocationError::Exhausted);
+        }
+        for span in &self.spans {
+            let span_pages = span.range.page_count();
+            if span_pages < page_count {
+                continue;
+            }
+            let last_start = span_pages
+                .checked_sub(page_count)
+                .ok_or(FrameAllocationError::Overflow)?;
+            for local_start in 0..=last_start {
+                let address = span
+                    .range
+                    .start
+                    .checked_add(
+                        local_start
+                            .checked_mul(BASE_PAGE_SIZE)
+                            .ok_or(FrameAllocationError::Overflow)?,
+                    )
+                    .ok_or(FrameAllocationError::Overflow)?;
+                let alignment_bytes = alignment_pages
+                    .checked_mul(BASE_PAGE_SIZE)
+                    .ok_or(FrameAllocationError::Overflow)?;
+                if !address.is_multiple_of(alignment_bytes) {
+                    continue;
+                }
+                let first = span
+                    .first_frame
+                    .checked_add(local_start)
+                    .ok_or(FrameAllocationError::Overflow)?;
+                let end = first
+                    .checked_add(page_count)
+                    .ok_or(FrameAllocationError::Overflow)?;
+                let mut free = true;
+                for frame in first..end {
+                    if self.is_allocated(frame)? {
+                        free = false;
+                        break;
+                    }
+                }
+                if !free {
+                    continue;
+                }
+                let next_free = self
+                    .free_frames
+                    .checked_sub(page_count)
+                    .ok_or(FrameAllocationError::Overflow)?;
+                for frame in first..end {
+                    self.set_allocated(frame, true)?;
+                }
+                self.free_frames = next_free;
+                return PhysicalRange::from_pages(address, page_count)
+                    .map_err(|_| FrameAllocationError::Overflow);
+            }
+        }
+        Err(FrameAllocationError::Exhausted)
+    }
+
     /// Mark every currently free allocator-owned frame in `range` unavailable.
     ///
     /// Frames outside usable spans are ignored, and reserving the same range
@@ -937,6 +1082,45 @@ impl FrameAllocator {
             .free_frames
             .checked_add(1)
             .ok_or(FrameAllocationError::Overflow)?;
+        Ok(())
+    }
+
+    /// Return a complete previously allocated contiguous range atomically.
+    ///
+    /// Every page is validated before the bitmap is changed, so an invalid or
+    /// partially free range cannot cause partial teardown.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a range containing an unmanaged, reserved, or already-free page.
+    pub fn free_range(&mut self, range: PhysicalRange) -> Result<(), FrameAllocationError> {
+        for page in 0..range.page_count() {
+            let address = range
+                .start
+                .checked_add(
+                    page.checked_mul(BASE_PAGE_SIZE)
+                        .ok_or(FrameAllocationError::Overflow)?,
+                )
+                .ok_or(FrameAllocationError::Overflow)?;
+            let index = self
+                .index_for_address(address)
+                .ok_or(FrameAllocationError::InvalidFrame)?;
+            if !self.is_allocated(index)? {
+                return Err(FrameAllocationError::DoubleFree);
+            }
+        }
+        let next_free = self
+            .free_frames
+            .checked_add(range.page_count())
+            .ok_or(FrameAllocationError::Overflow)?;
+        for page in 0..range.page_count() {
+            let address = range.start + page * BASE_PAGE_SIZE;
+            let index = self
+                .index_for_address(address)
+                .ok_or(FrameAllocationError::InvalidFrame)?;
+            self.set_allocated(index, false)?;
+        }
+        self.free_frames = next_free;
         Ok(())
     }
 
@@ -1153,8 +1337,8 @@ mod tests {
     use super::{
         BASE_PAGE_SIZE, BootAllocation, BootAllocationError, BootAllocator, FrameAllocationError,
         FrameAllocator, MAX_FIRMWARE_REGIONS, Mapping, MappingLifetime, MappingMemoryType,
-        MappingOwner, MappingPermissions, MappingPlan, MappingPlanError, MemoryMapError,
-        MemoryRegion, NormalizedMemoryMap, PhysicalRange, RegionKind, VirtualRange,
+        MappingOwner, MappingPermissions, MappingPlan, MappingPlanError, MappingPrivilege,
+        MemoryMapError, MemoryRegion, NormalizedMemoryMap, PhysicalRange, RegionKind, VirtualRange,
     };
     use alloc::vec;
 
@@ -1429,6 +1613,69 @@ mod tests {
     }
 
     #[test]
+    fn contiguous_frame_allocation_and_teardown_are_atomic() -> Result<(), FrameAllocationError> {
+        let map = NormalizedMemoryMap::build(&[region(1, 16, RegionKind::Usable)], &[])
+            .map_err(|_| FrameAllocationError::Overflow)?;
+        let mut allocator = FrameAllocator::from_map(&map)?;
+        let isolated = allocator.allocate_contiguous(4, 4)?;
+        assert_eq!(isolated.start(), 4 * BASE_PAGE_SIZE);
+        assert_eq!(allocator.free_frames(), 12);
+
+        let middle = isolated.start() + BASE_PAGE_SIZE;
+        allocator.free(middle)?;
+        let before = allocator.clone();
+        assert_eq!(
+            allocator.free_range(isolated),
+            Err(FrameAllocationError::DoubleFree)
+        );
+        assert_eq!(allocator, before);
+        allocator.reserve_range(
+            PhysicalRange::from_pages(middle, 1).map_err(|_| FrameAllocationError::Overflow)?,
+        )?;
+        allocator.free_range(isolated)?;
+        assert_eq!(allocator.free_frames(), 16);
+        Ok(())
+    }
+
+    #[test]
+    fn contiguous_frame_bounds_fail_without_mutation() -> Result<(), FrameAllocationError> {
+        let map = NormalizedMemoryMap::build(
+            &[
+                region(1, 2, RegionKind::Usable),
+                region(3, 1, RegionKind::Reserved),
+                region(4, 2, RegionKind::Usable),
+            ],
+            &[],
+        )
+        .map_err(|_| FrameAllocationError::Overflow)?;
+        let mut allocator = FrameAllocator::from_map(&map)?;
+        let before = allocator.clone();
+        assert_eq!(
+            allocator.allocate_contiguous(3, 1),
+            Err(FrameAllocationError::Exhausted)
+        );
+        assert_eq!(allocator, before);
+        assert_eq!(
+            allocator.allocate_contiguous(0, 1),
+            Err(FrameAllocationError::InvalidFrame)
+        );
+        assert_eq!(
+            allocator.allocate_contiguous(1, 3),
+            Err(FrameAllocationError::InvalidFrame)
+        );
+        assert_eq!(
+            allocator.allocate_contiguous(1, 1_u64 << 63),
+            Err(FrameAllocationError::Overflow)
+        );
+        assert_eq!(
+            allocator.free_range(pages(3, 1)),
+            Err(FrameAllocationError::InvalidFrame)
+        );
+        assert_eq!(allocator, before);
+        Ok(())
+    }
+
+    #[test]
     fn active_stack_reservation_is_never_allocatable() -> Result<(), FrameAllocationError> {
         let stack = pages(4, 2);
         let map = NormalizedMemoryMap::build(&[region(1, 8, RegionKind::Usable)], &[stack])
@@ -1512,7 +1759,7 @@ mod tests {
     }
 
     #[test]
-    fn mapping_plan_rejects_physical_aliases_in_both_orders() -> Result<(), MappingPlanError> {
+    fn mapping_plan_rejects_write_execute_aliases_in_both_orders() -> Result<(), MappingPlanError> {
         for (first, second) in [
             (
                 MappingPermissions::READ_WRITE,
@@ -1535,13 +1782,73 @@ mod tests {
     }
 
     #[test]
-    fn mapping_plan_rejects_partial_and_same_permission_physical_aliases()
+    fn mapping_plan_accepts_only_aliases_that_preserve_global_w_xor_x()
     -> Result<(), MappingPlanError> {
         let mut plan = MappingPlan::new();
         plan.insert(aliased_mapping(1, 8, 4, MappingPermissions::READ_ONLY)?)?;
+        plan.insert(aliased_mapping(20, 10, 4, MappingPermissions::READ_ONLY)?)?;
+        plan.insert(aliased_mapping(30, 30, 2, MappingPermissions::READ_WRITE)?)?;
+        plan.insert(aliased_mapping(50, 30, 2, MappingPermissions::READ_WRITE)?)?;
+        assert!(plan.enforces_global_w_xor_x());
+
+        let virtual_range = VirtualRange::from_pages(40 * BASE_PAGE_SIZE, 1)?;
+        let physical_range = PhysicalRange::from_pages(8 * BASE_PAGE_SIZE, 1)
+            .map_err(|_| MappingPlanError::Overflow)?;
+        let user = Mapping::user(
+            virtual_range,
+            physical_range,
+            MappingPermissions::READ_ONLY,
+            MappingOwner::IsolatedTask,
+            MappingLifetime::Task,
+        )?;
+        assert_eq!(user.privilege(), MappingPrivilege::User);
+        plan.insert(user)?;
+        assert!(plan.enforces_global_w_xor_x());
+        Ok(())
+    }
+
+    #[test]
+    fn mapping_plan_rejects_aliases_with_conflicting_memory_types() -> Result<(), MappingPlanError>
+    {
+        let mut plan = MappingPlan::new();
+        plan.insert(aliased_mapping(1, 8, 1, MappingPermissions::READ_WRITE)?)?;
+        let device = Mapping::new(
+            VirtualRange::from_pages(20 * BASE_PAGE_SIZE, 1)?,
+            pages(8, 1),
+            MappingPermissions::READ_WRITE,
+            MappingMemoryType::Device,
+            MappingOwner::MachineDevice,
+            MappingLifetime::Kernel,
+            false,
+        )?;
+        assert_eq!(plan.insert(device), Err(MappingPlanError::PhysicalOverlap));
+        assert_eq!(plan.mappings().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn user_mapping_requires_task_ownership_and_lifetime() -> Result<(), MappingPlanError> {
+        let virtual_range = VirtualRange::from_pages(40 * BASE_PAGE_SIZE, 1)?;
+        let physical_range = pages(8, 1);
         assert_eq!(
-            plan.insert(aliased_mapping(20, 10, 4, MappingPermissions::READ_ONLY,)?),
-            Err(MappingPlanError::PhysicalOverlap)
+            Mapping::user(
+                virtual_range,
+                physical_range,
+                MappingPermissions::READ_ONLY,
+                MappingOwner::KernelRuntime,
+                MappingLifetime::Task,
+            ),
+            Err(MappingPlanError::InvalidUserOwner)
+        );
+        assert_eq!(
+            Mapping::user(
+                virtual_range,
+                physical_range,
+                MappingPermissions::READ_ONLY,
+                MappingOwner::IsolatedTask,
+                MappingLifetime::Kernel,
+            ),
+            Err(MappingPlanError::InvalidUserOwner)
         );
         Ok(())
     }

@@ -63,3 +63,9 @@ Implementation note, 2026-08-23: Stage 4 subsequently added three guarded
 32 KiB task-stack payloads. The 128 KiB owned kernel stack remains the scheduler
 and handoff stack; the shell now runs on a guarded task stack. See
 [ADR 0010](0010-cooperative-tasks-and-guarded-stacks.md).
+
+Implementation note, 2026-08-23: Stage 6 permits a narrowly safer alias class:
+RO aliases and RW/NX aliases are valid, while the union of permissions across
+every alias must still exclude write plus execute. Fresh task roots use this to
+map private pages at user virtual addresses without weakening global W^X. See
+[ADR 0014](0014-unprivileged-task-isolation-and-teardown.md).

@@ -144,7 +144,11 @@ def prepare_qemu_command(
         command.extend(("-display", "none"))
     if (graphical or framebuffer) and architecture == "aarch64":
         command.extend(("-device", "ramfb"))
-    if architecture == "aarch64":
+    if architecture == "x86_64":
+        # Exercise SMEP/SMAP and the normalized user-entry controls in TCG;
+        # the legacy default CPU omits security features Stage 6 supports.
+        command.extend(("-cpu", "max"))
+    else:
         command.extend(("-cpu", "cortex-a72"))
     command.extend(
         (

@@ -56,10 +56,11 @@ and add deliberate permission-fault acceptance cases on both architectures.
 Exit: mapping invariants hold in model tests and representative write and
 execute violations reach stable native fault diagnostics in QEMU.
 
-Landed: a bounded architecture-neutral mapping plan rejects virtual and physical
-overlap, overflow, W+X, executable devices, and unequal ranges in host tests. The kernel builds a
-minimal identity plan for owned runtime RAM, PE-classified image sections, and
-the PL011 device page; x86-64 and AArch64 translate it into fresh 4 KiB page
+Landed: a bounded architecture-neutral mapping plan rejects virtual overlap,
+unsafe physical aliases, overflow, W+X, executable devices, and unequal ranges
+in host tests. The kernel builds a minimal identity plan for owned runtime RAM,
+PE-classified image sections, and the PL011 device page; x86-64 and AArch64
+translate it into fresh 4 KiB page
 tables from a reserved 2 MiB arena. Kernel text is RX, immutable image data is
 RO/NX, runtime memory is RW/NX, and device memory is RW/NX with device
 attributes. A one-way owned-stack handoff precedes firmware-memory reclamation.
@@ -163,17 +164,50 @@ terminal, and recovery-console acceptance remains green. QEMU acceptance checks
 positive delivery/idle counters and zero drops under ordinary input. See
 [ADR 0013](adr/0013-interrupt-driven-input-and-driver-resources.md).
 
-## Stage 6: optional isolation (planned after Stage 5.2)
+## Stage 6: optional isolation (complete)
 
-Introduce per-task address spaces, copied messages or validated shared-memory
-transfer, fault containment, and resource teardown without weakening the
-bounded handle and capability model established in Stage 5.
+Landed: fresh per-task roots execute at x86-64 ring 3 and AArch64 EL0t with
+kernel mappings supervisor-only, explicit RX/RW user mappings, unmapped stack
+guards, and global W^X across safe aliases. The internal exit gate validates a
+complete user range before copying at most 4 KiB into kernel-owned memory.
+Handles carry monotonic task ownership and are generation-revoked before exact
+record reaping, page zeroization, and atomic frame-range return.
 
 Exit: a deliberately faulting isolated task cannot corrupt the kernel or an
 unrelated service; its memory, handles, and task resources are reclaimed, and
 authority transfer remains explicit. Stage 6 does not imply loadable
 applications, a stable userspace ABI, or preemption; those require separate
-decisions and later milestones.
+decisions and later milestones. Every boot on both architectures contains
+translation, write, execute, illegal-instruction, disabled alternate-entry,
+invalid-opcode, invalid-pointer, oversize-message, and invalid-status faults;
+AArch64 also rejects a nonzero `SVC` encoding. The matrix proves no partial
+copy or net frame loss, reuses the returned physical range, then enters the
+ordinary shell. See
+[ADR 0014](adr/0014-unprivileged-task-isolation-and-teardown.md).
+
+## Stage 7: loadable applications (next; design required)
+
+Stage 6 supplies the privilege, copied-message, fault-fate, and transactional
+teardown boundary required by a loader. Stage 7 may begin after one accepted ADR
+fixes the executable container, versioned startup/call ABI, application memory
+budgets, and the fate of code that never returns through the cooperative gate.
+Those choices are intentionally not inferred from the internal Stage 6 probe
+format.
+
+The first implementation must parse and validate artifacts into kernel-owned
+staging state before mapping any application page; reject unsupported headers,
+segments, permissions, alignments, relocations, entry points, and address
+ranges atomically; grant only explicit initial handles; and reuse the Stage 6
+one-shot root, copied-message, fault containment, zeroization, and reclamation
+paths. The same bounded format parser and rejection corpus should run on the
+host and both native targets.
+
+Exit: a valid target-specific static application can start, call a documented
+minimal ABI, exit or fault without harming the kernel or another service, and
+leave no memory or handle ownership behind. Malformed artifacts fail before
+execution with no partial mappings. Dynamic linking, POSIX compatibility,
+preemption, persistence, and a public package registry are not part of the
+first Stage 7 increment.
 
 ## Deferred tooling and packaging track
 

@@ -45,3 +45,10 @@ hardware isolation. Services and callers still share pointers, heap, privilege,
 and failure fate. Stage 6 may replace borrowed input with copied messages or a
 validated shared-memory transfer and may add fault containment; doing so must
 define a versioned wire representation independently of this Rust structure.
+
+Implementation note, 2026-08-23: Stage 6 adds an explicitly owned
+`CopiedMessage` and assigns isolated handles to monotonic task identities.
+Teardown revokes every matching handle and advances its generation before task
+memory is zeroed or returned. The internal exit gate is not a stable wire or
+userspace ABI. See
+[ADR 0014](0014-unprivileged-task-isolation-and-teardown.md).

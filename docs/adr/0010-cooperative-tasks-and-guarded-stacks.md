@@ -56,3 +56,9 @@ Implementation note, 2026-08-23: Stage 5 subsequently added bounded synchronous
 in-process message dispatch and routed ordinary native console output through
 it. Per-task page tables and fault containment remain deferred to Stage 6. See
 [ADR 0011](0011-bounded-in-process-message-dispatch.md).
+
+Implementation note, 2026-08-23: Stage 6 adds isolated records that retain
+address-space/private-frame/handle counts, contained fault fates, and ready-task
+cancellation for transactional launch rollback. The original privileged
+continuation and guarded-stack pool remain in use for recovery built-ins. See
+[ADR 0014](0014-unprivileged-task-isolation-and-teardown.md).

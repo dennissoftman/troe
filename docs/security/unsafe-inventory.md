@@ -1,6 +1,6 @@
 # Unsafe inventory
 
-Stage 5.2 contains exactly 133 project-authored Rust `unsafe` tokens, all in the
+Stage 6 contains exactly 160 project-authored Rust `unsafe` tokens, all in the
 two audited modules of `crates/kllm-machine`. The verification gate fails if
 this count changes without a same-change inventory review. Portable crates and
 the kernel composition root continue to forbid unsafe code.
@@ -18,9 +18,13 @@ the kernel composition root continue to forbid unsafe code.
 | AArch64 PL011 and `wfe` | 10 | The pinned virt profile owns PL011 at `0x09000000`; aligned volatile accesses target documented registers; transmit polling is bounded; park is terminal. |
 | Heap host tests | 4 | Test arenas remain live, exclusively borrowed, and allocations are deallocated once with their original layouts. |
 | Loaded PE view and terminal acceptance probes | 6 | Checked protocol metadata proves every raw-slice bound; feature-only probes target validated mappings or raise one native exception and never return. |
-| Page-table arena and native entries | 9 | One reserved, identity-mapped 2 MiB arena is exclusively zeroed and filled before activation; every table and leaf pointer is page/index checked; mapping-plan validation excludes overlap and W+X. |
-| x86-64 MMU controls and fault vectors | 12 | CPUID proves NX and the physical width; EFER.NXE and CR0.WP enforce permissions; fixed GDT selectors, a TSS/IST emergency stack, and all exception gates are installed before CR3 receives the owned root. |
+| Page-table arena and native entries | 9 | One reserved, identity-mapped 2 MiB arena is exclusively zeroed and filled before activation; every table and leaf pointer is page/index checked; mapping-plan validation rejects virtual overlap, unsafe physical aliases, and W+X. |
+| x86-64 MMU controls and fault vectors | 14 | CPUID proves NX, the physical width, SMEP, and SMAP; EFER.NXE, CR0.WP, and supported supervisor protections enforce permissions; fixed GDT selectors, a TSS/IST emergency stack, and all exception gates are installed before CR3 receives the owned root. |
 | AArch64 MMU controls and fault vectors | 5 | EL1, PARange, and 4 KiB granule support are verified; TCR.IPS matches accepted table/leaf addresses; the complete VBAR table receives every exception class. |
+| Isolated physical-page lifecycle | 2 | Checked identity-mapped ranges are zeroed before user exposure and before atomic frame return; initialized code/data copies prove complete non-overlapping bounds first. |
+| Isolated run state and copied-user access | 10 | One single-CPU active flag grants unique access to a synchronous raw-pointer record; entry, stack, source, and destination ranges are fully validated; invalid calls copy no bytes; the cell is cleared before the destination borrow ends. |
+| x86-64 ring-3 mappings and entries | 7 | Every user leaf and traversal level carries U/S while supervisor leaves do not; a DPL-3 gate and TSS RSP0 enter the kernel; all callee-saved GPR and FPU/SSE state survives the root switch; task faults return only through the saved kernel context. |
+| AArch64 EL0 mappings and entries | 6 | AP, PXN, and UXN distinguish EL0 code/data from EL1 mappings; the lower-EL vector handles only an active task; LDTRB honors user access under PAN; all AAPCS64 callee-saved GPR/SIMD and FP-control state survives TTBR0 replacement. |
 
 The UEFI ExitBootServices call is inside the mechanism module. Its sole call
 site has ended protocol borrows, installed native console/fatal output and the
@@ -28,10 +32,11 @@ owned heap, and transferred to a reserved 128 KiB stack. The successful call
 enters a non-returning continuation, masks interrupts, and never invokes boot
 services afterward. The retained final-map buffer lives inside mapped owned
 memory. Stage 3 then replaces firmware translation and exception state before
-entering the task scheduler; table, kernel-stack, and guarded task-stack pool
-arenas are permanent LoaderData reservations. Task payload slots are returned
-to the bounded pool when a record is reaped; their surrounding pages remain
-unmapped under the owned page tables.
+entering the task scheduler. The kernel table, kernel-stack, and cooperative
+guarded-stack arenas are permanent LoaderData reservations. Stage 6 task roots
+and private pages instead come from the frame bitmap, are zeroed on both
+ownership transitions, and are returned only after handle revocation and
+record reaping.
 
 Transitive unsafe implementation also exists in pinned `uefi`, `rlsf`, and
 their bindings/dependencies. Their APIs, licenses, and boundary assumptions are

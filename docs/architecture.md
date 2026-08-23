@@ -1,4 +1,4 @@
-# Initial architecture
+# Current architecture
 
 The same portable graph is linked into two composition roots:
 
@@ -8,8 +8,9 @@ host stdin/stdout ───────────┐                 ┌─ ho
 serial / PS/2 → IRQ → bounded queue → editor ─┘  └─ UART + GOP text console
 ```
 
-Stage 5 keeps the graph in one address space but can route selected edges
-through bounded synchronous message dispatch without exposing implementation
+Privileged built-ins retain the direct graph. Stage 6 can instead run a bounded
+continuation in a fresh ring-3/EL0 address space and route its copied output
+through generation-owned synchronous message dispatch without exposing kernel
 pointers.
 
 Repository `scripts` and Cargo commands are bootstrap developer tooling, not a
@@ -47,10 +48,11 @@ preserve the current byte order, EOF, partial-I/O, and capacity-error semantics.
 ## Authority
 
 There are no ambient device or reboot globals in portable crates. Only the UEFI
-composition root and isolated machine mechanism import firmware/hardware APIs. `Shell` receives a boolean
-machine-control grant; `halt` is denied without it. This is meaningful defense
-against accidental coupling, but is not isolation while commands share an
-address space.
+composition root and isolated machine mechanism import firmware/hardware APIs.
+`Shell` receives a boolean machine-control grant; `halt` is denied without it.
+Privileged recovery built-ins still rely on typed authority rather than a
+hardware boundary. Stage 6 task mappings and handles are additionally enforced
+by ring-3/EL0 page permissions and generation-revoked ownership.
 
 ## Allocation
 
@@ -84,10 +86,11 @@ high-water, and failure counts.
 
 Stage 3 adds a pure, bounded mapping plan. The composition root identity-maps
 only runtime RAM, PE-classified image sections, the boot arena, framebuffer,
-and selected UART/interrupt-controller apertures. Physical aliases are
-rejected. The native backend emits fresh 4 KiB tables, validates CPU-reported
-physical-address limits, enables W^X, and replaces firmware exception state
-with fixed x86-64 GDT/TSS/IDT state or an AArch64 VBAR.
+and selected UART/interrupt-controller apertures. Physical aliases are accepted
+only when their combined permissions preserve global W^X. The native backend
+emits fresh 4 KiB tables, validates CPU-reported physical-address limits,
+enables W^X, and replaces firmware exception state with fixed x86-64
+GDT/TSS/IDT state or an AArch64 VBAR.
 Executable image pages are RX, immutable image pages are RO/NX, and writable
 runtime/device pages are NX. Deliberate write and execute violations are
 validated in fresh QEMU boots for both architectures.
@@ -152,11 +155,33 @@ and routes PL011 through its IRQ vector. Handlers preserve interrupted CPU
 state, perform bounded non-allocating device work, and enqueue typed raw bytes;
 decoding and editing remain in main context. An empty queue executes a
 lost-wakeup-safe `sti; hlt` or IRQ-masked `dsb; wfi` transition followed by
-pending-handler dispatch. Direct polling is
-retained only for bootstrap and fatal recovery, and no timer or preemption is
-introduced. `mem` and `/sys/memory` expose queue, interrupt, delivery, drop,
+pending-handler dispatch. Direct polling is retained only for bootstrap and
+fatal recovery, and no timer or preemption is introduced. `mem` and
+`/sys/memory` expose queue, interrupt, delivery, drop,
 idle, and wakeup accounting; byte-valued memory counters retain exact values
 and add binary IEC `KiB`/`MiB`/`GiB` displays.
+
+Stage 6 adds fresh task roots built from the supervisor kernel plan plus at most
+eight explicit normal-RAM user regions. x86 page-table traversal and leaves use
+U/S and enter through a DPL-3 gate with TSS RSP0; AArch64 leaves use AP/PXN/UXN
+and enter EL0t through the lower-EL vector with SP_EL1. The native boundary
+preserves ABI callee-saved integer and floating-point/SIMD state and masks
+interrupts for the current cooperative, non-preemptive continuation.
+
+One internal exit gate validates opcode, status, the complete readable user
+range, and a preallocated 4 KiB destination before copying. Its result becomes
+a kernel-owned `CopiedMessage`; it is deliberately not a stable syscall or wire
+ABI. Translation, write, execute, illegal-instruction, and invalid-call fates
+terminate only the active user record. Kernel-originated faults remain terminal.
+
+Task creation and teardown are transactional. A record retains its root/private
+frame counts and owned handle count. Teardown revokes all handles for the
+monotonic task identity, reaps the exact record, zeroes the complete table/code/
+data/stack allocation, and atomically returns it to the frame bitmap. Every
+production boot exercises all fault classes, checks zero partial delivery and
+zero frame loss, proves the same physical allocation can be reused, then enters
+the shell. See
+[ADR 0014](adr/0014-unprivileged-task-isolation-and-teardown.md).
 
 ## Future persistent-storage boundary
 

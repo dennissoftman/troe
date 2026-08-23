@@ -63,6 +63,16 @@ pub enum TaskStackError {
     Unaligned,
 }
 
+/// Checked access failure while initializing or zeroizing owned physical RAM.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(target_os = "uefi")]
+pub enum PhysicalMemoryError {
+    /// Range or slice arithmetic cannot be represented by the machine.
+    AddressUnsupported,
+    /// Requested bytes fall outside the explicitly owned physical range.
+    OutOfBounds,
+}
+
 #[cfg(target_os = "uefi")]
 struct StackLaunch<T: 'static> {
     context: *mut T,
@@ -510,6 +520,62 @@ fn validate_task_stack(stack: PhysicalRange) -> Result<usize, TaskStackError> {
         return Err(TaskStackError::Unaligned);
     }
     Ok(stack_top)
+}
+
+/// Zero every byte in one kernel-owned, identity-mapped physical range.
+///
+/// This is used both before exposing frames to an unprivileged address space
+/// and before returning them to the general frame allocator.
+///
+/// # Errors
+///
+/// Rejects unrepresentable or pointer-sized ranges before changing memory.
+#[cfg(target_os = "uefi")]
+pub fn zero_physical_range(range: PhysicalRange) -> Result<(), PhysicalMemoryError> {
+    let start =
+        usize::try_from(range.start()).map_err(|_| PhysicalMemoryError::AddressUnsupported)?;
+    let byte_count =
+        usize::try_from(range.byte_count()).map_err(|_| PhysicalMemoryError::AddressUnsupported)?;
+    if byte_count > isize::MAX as usize || start.checked_add(byte_count).is_none() {
+        return Err(PhysicalMemoryError::AddressUnsupported);
+    }
+    // SAFETY: The caller owns this complete identity-mapped physical range;
+    // validation proves a non-wrapping pointer-sized byte span.
+    unsafe { ptr::write_bytes(start as *mut u8, 0, byte_count) };
+    Ok(())
+}
+
+/// Copy initialized bytes into one kernel-owned, identity-mapped range.
+///
+/// # Errors
+///
+/// Rejects offset/range overflow or any request outside `range` before writing.
+#[cfg(target_os = "uefi")]
+pub fn copy_to_physical(
+    range: PhysicalRange,
+    offset: usize,
+    bytes: &[u8],
+) -> Result<(), PhysicalMemoryError> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    let start =
+        usize::try_from(range.start()).map_err(|_| PhysicalMemoryError::AddressUnsupported)?;
+    let range_bytes =
+        usize::try_from(range.byte_count()).map_err(|_| PhysicalMemoryError::AddressUnsupported)?;
+    let end = offset
+        .checked_add(bytes.len())
+        .ok_or(PhysicalMemoryError::OutOfBounds)?;
+    if end > range_bytes || range_bytes > isize::MAX as usize {
+        return Err(PhysicalMemoryError::OutOfBounds);
+    }
+    let destination = start
+        .checked_add(offset)
+        .ok_or(PhysicalMemoryError::AddressUnsupported)?;
+    // SAFETY: Complete source and destination spans are valid and disjoint:
+    // safe Rust owns `bytes`, while `range` names externally owned physical RAM.
+    unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), destination as *mut u8, bytes.len()) };
+    Ok(())
 }
 
 /// Mask architecture interrupts before replacing firmware exception state.
@@ -1170,14 +1236,17 @@ fn architecture_handle_input_interrupt(queue: &mut BoundedInputQueue) {
     let intid = acknowledge & 0x03ff;
     if intid == profile.serial_interrupt.line() {
         queue.record_interrupt();
-        aarch64_drain_serial(queue);
-        // SAFETY: These bits clear only the serviced PL011 receive sources.
+        // Acknowledge the latched sources before draining. A byte arriving
+        // after this write either joins the drain or asserts a fresh source;
+        // clearing after the drain would erase that fresh event.
+        // SAFETY: These bits clear only the acknowledged PL011 receive sources.
         unsafe {
             mmio_write(
                 PL011_INTERRUPT_CLEAR,
                 PL011_RECEIVE_INTERRUPT | PL011_RECEIVE_TIMEOUT_INTERRUPT,
             );
         }
+        aarch64_drain_serial(queue);
     }
     if intid < 1020 {
         // SAFETY: A non-spurious IAR value must be returned verbatim to EOIR.

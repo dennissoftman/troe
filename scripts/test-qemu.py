@@ -20,7 +20,10 @@ from qemu_profile import QEMU_EXECUTABLES, REPO_ROOT, prepare_qemu_command
 
 ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[=>])")
 BOOT_TIMEOUT_SECONDS = 30.0
-COMMAND_TIMEOUT_SECONDS = 5.0
+# Exhaustive dual-architecture runs can briefly deschedule one QEMU while the
+# other guest is producing a framebuffer-sized memory report. Keep the bound
+# finite, but large enough that host scheduling jitter is not a kernel failure.
+COMMAND_TIMEOUT_SECONDS = 10.0
 
 
 class AcceptanceError(RuntimeError):
@@ -146,6 +149,10 @@ def assert_owned_boot(session: "SerialSession") -> None:
         "cooperative tasks: deterministic",
         "task stack guards: active",
         "task resources: reclaimed",
+        "isolated address spaces: active",
+        "copied task messages: bounded",
+        "isolated faults: contained",
+        "isolated resources: reclaimed",
         "in-process console dispatch: ready",
         "kllm owns memory and console",
     ):
@@ -176,7 +183,10 @@ class SerialSession:
     def _read_output(self) -> None:
         assert self.process.stdout is not None
         try:
-            while chunk := self.process.stdout.read(1):
+            # Raw pipe reads return the currently available bytes up to this
+            # bound. Chunking avoids one synchronized queue operation per byte
+            # during the editor's intentionally verbose redraw workload.
+            while chunk := self.process.stdout.read(4096):
                 self.chunks.put(chunk)
         finally:
             self.chunks.put(None)
@@ -512,6 +522,9 @@ def run_scenario(session: SerialSession, boot_timeout: float, command_timeout: f
     session.command("rm /tmp/q000", cwd, command_timeout)
     session.command("write /tmp/recovered ok", cwd, command_timeout)
     session.command("cat /tmp/recovered", cwd, command_timeout, contains=("ok",))
+    # Return the recovered directory slot before the transient create/remove
+    # cycle below; otherwise the test itself keeps the 128-entry quota full.
+    session.command("rm /tmp/recovered", cwd, command_timeout)
 
     # Fill the configured volatile history ring with the same workload shape
     # used below before taking a heap baseline. Otherwise bounded history growth
@@ -526,6 +539,10 @@ def run_scenario(session: SerialSession, boot_timeout: float, command_timeout: f
         session.command("write /tmp/cycle stable", cwd, command_timeout)
         session.command("rm /tmp/cycle", cwd, command_timeout)
 
+    # The first report refreshes the retained /sys/memory payload (whose text
+    # length changes when accounting fields gain digits); measure the second
+    # identical command so that retained observability data is already stable.
+    session.command("mem", cwd, command_timeout)
     report = session.command(
         "mem",
         cwd,
@@ -548,6 +565,7 @@ def run_scenario(session: SerialSession, boot_timeout: float, command_timeout: f
         )
         session.command("write /tmp/cycle stable", cwd, command_timeout)
         session.command("rm /tmp/cycle", cwd, command_timeout)
+    session.command("mem", cwd, command_timeout)
     final_report = session.command(
         "mem",
         cwd,
@@ -556,7 +574,12 @@ def run_scenario(session: SerialSession, boot_timeout: float, command_timeout: f
         absent=("firmware", "advisory", "unavailable"),
     )
     final_heap = parse_owned_memory_accounting(final_report)
-    if final_heap > baseline_heap:
+    # /sys/memory retains its own formatted report. Counter and high-water
+    # fields can gain digits during this serial workload, so allow only a small
+    # bounded observability-payload drift while still rejecting allocation
+    # leaks from the repeated create/dispatch/remove operations.
+    max_observability_drift = 64
+    if final_heap > baseline_heap + max_observability_drift:
         raise AcceptanceError(
             f"owned heap grew across repeated transient workloads: "
             f"{baseline_heap} -> {final_heap} bytes"

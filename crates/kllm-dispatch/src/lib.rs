@@ -30,6 +30,62 @@ pub struct Handle {
     generation: u32,
 }
 
+/// Principal that owns one handle and must lose it during task teardown.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum HandleOwner {
+    /// Kernel-internal endpoint not tied to an isolated task lifetime.
+    #[default]
+    Kernel,
+    /// Monotonic isolated-task identity supplied by the scheduler.
+    IsolatedTask(u32),
+}
+
+impl HandleOwner {
+    /// Construct an isolated owner from a nonzero monotonic task identity.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero, which is reserved and never assigned by the scheduler.
+    pub const fn isolated(task_id: u32) -> Result<Self, DispatchError> {
+        if task_id == 0 {
+            return Err(DispatchError::InvalidOwner);
+        }
+        Ok(Self::IsolatedTask(task_id))
+    }
+}
+
+/// Immutable, kernel-owned copy made at an untrusted address-space boundary.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CopiedMessage {
+    bytes: Vec<u8>,
+}
+
+impl CopiedMessage {
+    /// Copy a complete bounded message into kernel-owned storage.
+    ///
+    /// # Errors
+    ///
+    /// Rejects oversize input or allocation failure without retaining a
+    /// partial message.
+    pub fn copy_from_untrusted(bytes: &[u8]) -> Result<Self, DispatchError> {
+        if bytes.len() > MAX_MESSAGE_BYTES {
+            return Err(DispatchError::MessageTooLarge);
+        }
+        let mut owned = Vec::new();
+        owned
+            .try_reserve_exact(bytes.len())
+            .map_err(|_| DispatchError::MetadataExhausted)?;
+        owned.extend_from_slice(bytes);
+        Ok(Self { bytes: owned })
+    }
+
+    /// Copied message bytes, independent of the source address space.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 /// Rights attached to a client handle.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Rights(u8);
@@ -177,6 +233,8 @@ pub trait Service {
 pub enum DispatchError {
     /// A configured table bound is zero or exceeds its hard ceiling.
     InvalidCapacity,
+    /// A zero or otherwise reserved task owner was supplied.
+    InvalidOwner,
     /// Bounded metadata allocation failed.
     MetadataExhausted,
     /// No reusable port slot remains.
@@ -199,6 +257,7 @@ impl fmt::Display for DispatchError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidCapacity => formatter.write_str("dispatch capacity is invalid"),
+            Self::InvalidOwner => formatter.write_str("handle owner is invalid"),
             Self::MetadataExhausted => formatter.write_str("dispatch metadata allocation failed"),
             Self::PortCapacityExhausted => formatter.write_str("service port capacity exhausted"),
             Self::HandleCapacityExhausted => {
@@ -223,6 +282,7 @@ struct PortSlot {
 struct HandleBinding {
     port: PortId,
     rights: Rights,
+    owner: HandleOwner,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -249,9 +309,9 @@ pub struct DispatchStats {
 ///
 /// Requests borrow their payload only for the duration of [`Self::call`]. A
 /// call either returns one owned reply or a typed mechanism failure. There is no
-/// queued or cancellable state in Stage 5: closing before delivery invalidates
-/// a handle, while closing during a synchronous call is impossible through the
-/// exclusive dispatcher borrow.
+/// queued or cancellable state: closing before delivery invalidates a handle,
+/// while closing during a synchronous call is impossible through the exclusive
+/// dispatcher borrow. Stage 6 additionally revokes handles by task owner.
 pub struct Dispatcher {
     ports: Vec<PortSlot>,
     handles: Vec<HandleSlot>,
@@ -321,6 +381,26 @@ impl Dispatcher {
     ///
     /// Rejects a stale port or exhausted handle table.
     pub fn open(&mut self, port: PortId, rights: Rights) -> Result<Handle, DispatchError> {
+        self.open_owned(port, rights, HandleOwner::Kernel)
+    }
+
+    /// Mint an explicitly owned handle to a live port.
+    ///
+    /// Isolated ownership lets teardown revoke every authority retained by one
+    /// task even when copies of opaque handle values still exist.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a stale port, invalid owner, or exhausted handle table.
+    pub fn open_owned(
+        &mut self,
+        port: PortId,
+        rights: Rights,
+        owner: HandleOwner,
+    ) -> Result<Handle, DispatchError> {
+        if matches!(owner, HandleOwner::IsolatedTask(0)) {
+            return Err(DispatchError::InvalidOwner);
+        }
         self.validate_port(port)?;
         if let Some((index, slot)) = self
             .handles
@@ -328,7 +408,11 @@ impl Dispatcher {
             .enumerate()
             .find(|(_, slot)| slot.binding.is_none() && !slot.retired)
         {
-            slot.binding = Some(HandleBinding { port, rights });
+            slot.binding = Some(HandleBinding {
+                port,
+                rights,
+                owner,
+            });
             return Ok(Handle {
                 slot: u16::try_from(index).map_err(|_| DispatchError::AccountingOverflow)?,
                 generation: slot.generation,
@@ -341,7 +425,11 @@ impl Dispatcher {
         self.handles.push(HandleSlot {
             generation: 1,
             retired: false,
-            binding: Some(HandleBinding { port, rights }),
+            binding: Some(HandleBinding {
+                port,
+                rights,
+                owner,
+            }),
         });
         Ok(Handle {
             slot: u16::try_from(index).map_err(|_| DispatchError::AccountingOverflow)?,
@@ -362,6 +450,37 @@ impl Dispatcher {
             None => slot.retired = true,
         }
         Ok(())
+    }
+
+    /// Revoke every live handle owned by one isolated task.
+    ///
+    /// Each matching slot advances its generation before this method returns,
+    /// so all outstanding copied values fail closed. Kernel-owned and other
+    /// tasks' handles are unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a non-task owner or a revocation count that cannot be represented.
+    pub fn close_owner(&mut self, owner: HandleOwner) -> Result<u16, DispatchError> {
+        if !matches!(owner, HandleOwner::IsolatedTask(id) if id != 0) {
+            return Err(DispatchError::InvalidOwner);
+        }
+        let matching = self
+            .handles
+            .iter()
+            .filter(|slot| slot.binding.is_some_and(|binding| binding.owner == owner))
+            .count();
+        let matching = u16::try_from(matching).map_err(|_| DispatchError::AccountingOverflow)?;
+        for slot in &mut self.handles {
+            if slot.binding.is_some_and(|binding| binding.owner == owner) {
+                slot.binding = None;
+                match slot.generation.checked_add(1) {
+                    Some(generation) => slot.generation = generation,
+                    None => slot.retired = true,
+                }
+            }
+        }
+        Ok(matching)
     }
 
     /// Close a service port and every handle bound to it.
@@ -599,8 +718,8 @@ mod tests {
     extern crate std;
 
     use super::{
-        ConsoleService, DispatchError, DispatchedOutput, Dispatcher, MAX_MESSAGE_BYTES,
-        ReplyStatus, Request, Rights, Service, ServiceReply,
+        ConsoleService, CopiedMessage, DispatchError, DispatchedOutput, Dispatcher, HandleOwner,
+        MAX_MESSAGE_BYTES, ReplyStatus, Request, Rights, Service, ServiceReply,
     };
     use alloc::boxed::Box;
     use alloc::rc::Rc;
@@ -741,6 +860,44 @@ mod tests {
 
         assert_eq!(*direct_bytes.borrow(), *dispatched_bytes.borrow());
         assert_eq!(dispatcher.stats().calls, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn copied_messages_detach_from_untrusted_storage_atomically() -> Result<(), DispatchError> {
+        let mut source = vec![1_u8, 2, 3, 4];
+        let copied = CopiedMessage::copy_from_untrusted(&source)?;
+        source.fill(9);
+        assert_eq!(copied.as_bytes(), &[1, 2, 3, 4]);
+        assert_eq!(
+            CopiedMessage::copy_from_untrusted(&vec![0; MAX_MESSAGE_BYTES + 1]),
+            Err(DispatchError::MessageTooLarge)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn owner_teardown_revokes_only_one_tasks_handles() -> Result<(), DispatchError> {
+        let mut dispatcher = Dispatcher::new(1, 4)?;
+        let (port, kernel) = dispatcher.register(Box::new(EchoService), Rights::CALL)?;
+        let first_owner = HandleOwner::isolated(7)?;
+        let second_owner = HandleOwner::isolated(8)?;
+        let first = dispatcher.open_owned(port, Rights::CALL, first_owner)?;
+        let second = dispatcher.open_owned(port, Rights::CALL, second_owner)?;
+
+        assert_eq!(dispatcher.close_owner(first_owner), Ok(1));
+        assert_eq!(
+            dispatcher.call(first, 7, b"revoked"),
+            Err(DispatchError::InvalidHandle)
+        );
+        assert_eq!(dispatcher.call(second, 7, b"second")?.payload(), b"second");
+        assert_eq!(dispatcher.call(kernel, 7, b"kernel")?.payload(), b"kernel");
+        assert_eq!(dispatcher.close_owner(first_owner), Ok(0));
+        assert_eq!(
+            dispatcher.close_owner(HandleOwner::Kernel),
+            Err(DispatchError::InvalidOwner)
+        );
+        assert_eq!(HandleOwner::isolated(0), Err(DispatchError::InvalidOwner));
         Ok(())
     }
 }
