@@ -10,6 +10,7 @@ license.workspace = true
 acceptance-probes = ["kllm-machine/acceptance-probes"]
 
 [dependencies]
+kllm-application = { path = "../crates/kllm-application" }
 kllm-core = { path = "../crates/kllm-core" }
 kllm-dispatch = { path = "../crates/kllm-dispatch" }
 kllm-driver = { path = "../crates/kllm-driver" }

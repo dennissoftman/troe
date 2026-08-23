@@ -920,8 +920,9 @@ explicit, and all owned resources are revoked, zeroed, and reclaimed.
 ### Stage 7 — Loadable applications
 
 **Status:** design accepted by
-[ADR 0015](docs/adr/0015-kex-application-abi-and-execution-bounds.md); not
-implemented.
+[ADR 0015](docs/adr/0015-kex-application-abi-and-execution-bounds.md). The
+portable KEX parser and load-plan policy are implemented; native loading and
+execution are not.
 
 - Load target-specific static KEX v1 artifacts selected by ADR 0015; keep ELF as
   a hosted toolchain interchange format rather than a kernel input.

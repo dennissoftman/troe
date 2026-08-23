@@ -16,6 +16,8 @@ historical review evidence.
   project-authored unsafe surface through Stage 6.
 - [KEFS v1](formats/kefs-v1.md) defines the implemented embedded-filesystem
   format.
+- [KEX v1](formats/kex-v1.md) defines the implemented portable executable
+  parser format; native application loading is not implemented yet.
 
 The repository root [README](../README.md), [security policy](../SECURITY.md),
 [contribution guide](../CONTRIBUTING.md), and [third-party inventory](../THIRD_PARTY.md)
@@ -44,7 +46,8 @@ ADR 0014 governs the completed Stage 6 unprivileged address-space,
 copied-message, contained-fault, and transactional teardown boundary.
 [ADR 0015](adr/0015-kex-application-abi-and-execution-bounds.md) accepts the KEX
 v1 container, application ABI 1.0, profile memory ceilings, and bounded
-execution-lease policy for Stage 7. Stage 7 implementation has not yet begun.
+execution-lease policy for Stage 7. The portable parser is implemented; native
+staging, mapping, entry, ABI calls, and execution-lease enforcement remain.
 
 ## Evaluations
 

@@ -1,0 +1,10 @@
+[package]
+name = "kllm-application"
+description = "Bounded KEX executable parser and application load-plan policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

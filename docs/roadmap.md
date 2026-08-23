@@ -193,15 +193,20 @@ teardown boundary required by a loader.
 small static KEX v1 container, application ABI 1.0, per-profile staging and
 resident-memory ceilings, and a 50 ms maximum uninterrupted user lease
 terminated by an owned timer. Those choices are intentionally independent of
-the internal Stage 6 probe format. Implementation has not begun.
+the internal Stage 6 probe format.
 
-The first implementation must parse and validate artifacts into kernel-owned
-staging state before mapping any application page; reject unsupported headers,
-segments, permissions, alignments, relocations, entry points, and address
-ranges atomically; grant only explicit initial handles; and reuse the Stage 6
-one-shot root, copied-message, fault containment, zeroization, and reclamation
-paths. The same bounded format parser and rejection corpus should run on the
-host and both native targets.
+The first implementation slice has landed: `kllm-application` provides the
+allocation-free KEX v1 parser, fixed profile limits, bounded load plans, exact
+and conservative page charges, and a shared host-test rejection corpus. The
+crate also compiles as a direct native-kernel dependency. Kernel-owned staging,
+frame allocation, mapping, startup-page construction, ABI entry/calls, and the
+owned execution timer remain to be implemented.
+
+The next kernel slice must copy artifacts into kernel-owned staging, consume the
+portable plan before mapping any application page, grant only explicit initial
+handles, and reuse the Stage 6 one-shot root, copied-message, fault containment,
+zeroization, and reclamation paths. The rejection corpus must then run through
+the native load boundary on both targets in addition to its host coverage.
 
 Exit: a valid target-specific static application can start, call a documented
 minimal ABI, exit or fault without harming the kernel or another service, and

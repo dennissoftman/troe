@@ -22,6 +22,9 @@ requiring a custom compiler or linker.
 
 ### KEX v1 container
 
+The exact byte offsets and numeric encodings are fixed by the
+[KEX v1 format specification](../formats/kex-v1.md).
+
 KEX v1 is little-endian and consists of one fixed header, a fixed-width load
 record table, and segment payload bytes. Its eight-byte magic is the ASCII byte
 sequence `KLLMKEX` followed by zero. The header contains:

@@ -9,7 +9,8 @@ Statically linked recovery built-ins still share the privileged kernel address
 space. Stage 6 additionally runs bounded test tasks in fresh ring-3/EL0 address
 spaces; their typed handles, memory faults, and teardown now form a hardware
 security boundary. Loadable applications and a public userspace ABI begin in
-Stage 7 and are not implemented yet.
+Stage 7. The bounded KEX v1 parser is implemented; native loading and the public
+userspace ABI are not yet active.
 
 ## What works now
 
@@ -26,6 +27,8 @@ Stage 7 and are not implemented yet.
   messages, and a dispatched native console output path;
 - per-task ring-3/EL0 address spaces, copied user messages, contained task
   faults, owner-wide handle revocation, zeroization, and physical-frame reuse;
+- allocation-free KEX v1 validation with target, ABI, W^X, canonical-layout,
+  entry-point, and per-profile memory-budget checks;
 - owned receive interrupts through q35 LAPIC/I/O APIC and AArch64 GICv2,
   bounded raw-event delivery, and race-free `hlt`/`wfi` shell idle;
 - project-owned polling 16550 and PL011 early/fatal recovery output, plus an
@@ -121,8 +124,8 @@ serial-first.
 
 ## Repository map
 
-- `crates`: portable byte streams, memory models, shell, VFS, terminal/editor,
-  accounting, and the isolated native machine mechanism crate;
+- `crates`: portable byte streams, KEX parsing, memory models, shell, VFS,
+  terminal/editor, accounting, and the isolated native machine mechanism crate;
 - `host`: Stage 0 composition and acceptance runner;
 - `kernel`: UEFI bootstrap and Stage 6 isolated owned-machine composition root;
 - `rootfs`, `assets`: source tree and generated KEFS image;
