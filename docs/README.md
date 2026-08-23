@@ -35,7 +35,8 @@ must be resolved before persistent security metadata or foreign-filesystem
 writes. ADR 0009 is an accepted future storage direction, not implemented
 filesystem support. ADR 0012 governs the completed Stage 5.1 terminal and
 framebuffer increment; AArch64 native keyboard input remains a later
-virtio-input transport decision.
+virtio-input transport decision. ADR 0013 governs the in-progress Stage 5.2
+interrupt-driven input and bounded driver-resource increment.
 
 ## Evaluations
 

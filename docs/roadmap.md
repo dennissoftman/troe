@@ -144,7 +144,22 @@ keyboard input is a later virtio-input increment; serial input and owned ramfb
 output are covered now.
 See [ADR 0012](adr/0012-native-text-console-and-editor-policy.md).
 
-## Stage 6: optional isolation (planned after Stage 5.1)
+## Stage 5.2: interrupt-driven input and driver resources (in progress)
+
+Introduce a bounded raw-input event queue and resource-oriented driver
+configuration; take ownership of q35 LAPIC/I/O APIC and AArch64 `virt` GICv2;
+route PS/2, 16550, and PL011 receive interrupts; and replace the shell's busy
+poll loop with race-free `hlt`/`wfi` idle. Bootstrap and fatal recovery retain
+direct polling, and the cooperative scheduler remains non-preemptive.
+
+Exit: both QEMU architectures receive serial shell input only through owned
+interrupt delivery after initialization; x86 native keyboard input uses IRQ1;
+all ISR loops and retained events obey selected profile bounds; overflow and
+interrupt counters are observable; idle wakeups cannot be lost; and fault,
+terminal, and recovery-console acceptance remains green. See
+[ADR 0013](adr/0013-interrupt-driven-input-and-driver-resources.md).
+
+## Stage 6: optional isolation (planned after Stage 5.2)
 
 Introduce per-task address spaces, copied messages or validated shared-memory
 transfer, fault containment, and resource teardown without weakening the
