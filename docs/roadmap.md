@@ -232,6 +232,43 @@ execution with no partial mappings. Dynamic linking, POSIX compatibility,
 preemption, persistence, and a public package registry are not part of the
 Stage 7 implementation.
 
+### Deferred Stage 7 integration
+
+The Stage 7 kernel and security exit criterion is complete. Preserve these
+product-facing integration items for later work; they do not block beginning
+Stage 8:
+
+1. load KEX files from a mounted filesystem or an explicit shell command;
+2. provide SDK and hosted `build`, `run`, and `inspect` tooling; and
+3. define versioned package-manifest and target-specific lock formats.
+
+Storage should land before the native KEX discovery/launch path so executable
+artifacts have a real bounded source. Manifest and tooling work remains on the
+separate packaging track described below.
+
+## Next-session handoff: starting Stage 8
+
+Begin Stage 8 in this order:
+
+1. introduce bounded block-device and block-region capabilities with host-test
+   doubles and explicit request, transfer, alignment, and queue ceilings;
+2. add read-only GPT discovery over whole-device regions, including malformed
+   metadata, overlap, arithmetic, and entry-count rejection tests;
+3. resolve [ADR 0007](adr/0007-identity-and-foreign-filesystem-mapping.md)
+   before accepting persistent ownership metadata or enabling writes to a
+   foreign filesystem;
+4. add the first selected filesystem provider behind the VFS and mount it
+   read-only before adding mutation;
+5. define a versioned, bounded configuration and service-startup schema with
+   explicit recovery behavior; and
+6. add filesystem writes, corruption recovery, and persistent configuration
+   only after the read-only and configuration boundaries pass native and host
+   acceptance.
+
+Do not start with a filesystem parser coupled directly to a hardware driver or
+the shell. The block transport, region discovery, filesystem provider, VFS,
+configuration policy, and command surface must remain independently testable.
+
 ## Deferred tooling and packaging track
 
 The tooling/package architecture is documented now so early formats and

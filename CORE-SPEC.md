@@ -931,6 +931,13 @@ portable KEX plan, native transaction, complete ABI 1.0 gate, scheduler-owned
 resume, copied handle dispatch, contained call/fault fates, and execution lease
 are active on both primary architectures.
 
+The kernel/security exit criterion is complete. Loading KEX files from a
+mounted filesystem or shell command, providing hosted SDK `build`/`run`/`inspect`
+flows, and defining package-manifest and target-lock formats are explicitly
+deferred integration work. They do not block Stage 8; the authoritative order
+for resuming work is recorded in
+[docs/roadmap.md](docs/roadmap.md#next-session-handoff-starting-stage-8).
+
 - Load target-specific static KEX v1 artifacts selected by ADR 0015; keep ELF as
   a hosted toolchain interchange format rather than a kernel input.
 - Validate every header, segment, permission, alignment, relocation, entry point, and address range before mapping.
@@ -939,13 +946,13 @@ are active on both primary architectures.
 - Provide application startup, exit status, fault reporting, and resource reclamation.
 - Support architecture-native binaries; cross-architecture instruction emulation is not required.
 - Keep static built-ins available for recovery and constrained builds.
-- Define a versioned application/package manifest and a target-specific lock
-  format before released tooling consumes either one.
-- Validate immutable package artifacts on the host first, then reuse the same
-  format parser and validation rules at the native load boundary.
+- Before released tooling consumes them, define a versioned
+  application/package manifest and target-specific lock format and validate
+  immutable artifacts on the host using the native boundary's rules.
 - Introduce the first native SDK and hosted `<cli> build`, `<cli> run`,
   `<cli> inspect`, and `<cli> explain` flows without granting the tooling client
-  ambient system authority.
+  ambient system authority; this is deferred integration rather than part of
+  the completed kernel exit criterion.
 
 Dynamic linking is optional and SHOULD follow a working static executable format rather than ship with the first loader.
 
