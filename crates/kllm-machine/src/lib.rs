@@ -11,10 +11,10 @@ mod mmu;
 
 #[cfg(target_os = "uefi")]
 pub use mechanism::{
-    HeapStats, StackSwitchError, current_stack_pointer, enter_owned_stack,
+    HeapStats, StackSwitchError, TaskStackError, current_stack_pointer, enter_owned_stack,
     exit_boot_services_after_protocols, heap_stats, initialize_console, initialize_heap,
-    mark_firmware_exited, park, probe_allocation_failure, read_byte, take_interrupt_ownership,
-    write,
+    mark_firmware_exited, park, probe_allocation_failure, read_byte, run_task_step,
+    take_interrupt_ownership, write,
 };
 
 #[cfg(any(test, target_os = "uefi"))]

@@ -75,7 +75,13 @@ def main() -> int:
             image = REPO_ROOT / "build" / f"kllm-{architecture}{suffix}.img"
             if not args.acceptance_probes:
                 efi_bytes = efi.read_bytes()
-                forbidden = (b"mmu-probe", b"probing read-only", b"probing non-executable")
+                forbidden = (
+                    b"mmu-probe",
+                    b"task-probe",
+                    b"probing read-only",
+                    b"probing non-executable",
+                    b"probing task stack guard",
+                )
                 if any(marker in efi_bytes for marker in forbidden):
                     raise RuntimeError(f"production EFI contains acceptance probe marker: {efi}")
             run(

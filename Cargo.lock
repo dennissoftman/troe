@@ -47,6 +47,7 @@ dependencies = [
  "kllm-machine",
  "kllm-memory",
  "kllm-shell",
+ "kllm-task",
  "kllm-vfs",
  "uefi",
 ]
@@ -56,6 +57,7 @@ name = "kllm-machine"
 version = "0.1.0"
 dependencies = [
  "kllm-memory",
+ "kllm-task",
  "rlsf",
  "uefi",
 ]
@@ -71,6 +73,10 @@ dependencies = [
  "kllm-core",
  "kllm-vfs",
 ]
+
+[[package]]
+name = "kllm-task"
+version = "0.1.0"
 
 [[package]]
 name = "kllm-vfs"

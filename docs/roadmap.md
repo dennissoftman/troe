@@ -71,7 +71,7 @@ Clippy gates, production/acceptance builds, and the pinned dependency audit pass
 The exhaustive normal-boot, write-fault, execute-fault, native-exception,
 fatal-state, and terminal-halt matrix passes on both targets with QEMU 11.1.0.
 
-## Stage 4: cooperative tasks (next)
+## Stage 4: cooperative tasks (complete)
 
 Introduce bounded task records, explicit owned stacks with guard pages,
 cooperative yield, task lifecycle accounting, and capability-scoped dispatch
@@ -80,6 +80,24 @@ without adding preemption or per-task address spaces.
 Exit: multiple tasks yield and terminate deterministically, stack guards reach
 native fault diagnostics, and task-owned resources are reclaimed without
 changing the single-address-space authority model.
+
+Landed: `kllm-task` provides a 16-record hard ceiling, monotonic task IDs,
+round-robin ready/running/exited transitions, typed capability sets, explicit
+yield/exit accounting, and reaping that returns the exact guarded-stack slot.
+The kernel reserves three 32 KiB task payloads, each between two unmapped 4 KiB
+guards. Architecture-local trampolines run one explicit continuation step on a
+task stack and restore the scheduler stack on yield or exit. Boot acceptance
+executes two interleaved services, checks five deterministic yields, reaps both,
+reuses a returned slot, then dispatches the console/filesystem/machine-control
+shell task only with its declared capabilities. Feature-only acceptance images
+write a task guard and reach the same terminal native fault state on both
+architectures; production images exclude that dispatch string.
+
+The continuation model deliberately stores durable state in an explicitly
+owned continuation object, accounts for it through the bounded task record, and
+discards native frames at each yield. It does not add preemption, saved
+arbitrary call stacks, per-task address spaces, or a hardware isolation claim.
+See [ADR 0010](adr/0010-cooperative-tasks-and-guarded-stacks.md).
 
 ## Deferred tooling and packaging track
 

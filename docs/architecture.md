@@ -82,8 +82,25 @@ validated in fresh QEMU boots for both architectures.
 
 The post-handoff shell invokes no firmware protocol or allocator and cannot
 manipulate page tables or exception vectors. Authorized halt parks the CPU.
-Per-task stacks and guard pages begin with the cooperative-task stage. The
-Stage 3 dispatcher already uses an explicitly bounded owned RW/NX stack.
+Stage 4 adds a bounded cooperative scheduler policy in `kllm-task`. Task IDs
+are monotonic, records have ready/running/exited lifecycles, capability sets are
+checked during dispatch, and a record retains its stack resource until explicit
+reaping. The native mechanism executes one continuation step synchronously on
+the task's mapped payload stack; yielding returns a typed result and keeps all
+durable state in an explicitly owned continuation object rather than retaining
+arbitrary native frames. The scheduler record accounts for that continuation's
+identity, authority, lifecycle, and stack resource.
+This makes every scheduling boundary explicit and keeps architecture register
+state out of portable code.
+
+The boot arena contains three reusable 32 KiB task payload slots. Each has an
+unmapped 4 KiB page on both sides, while the payload is RW/NX. Boot verification
+interleaves two services, checks deterministic yield/exit counts, reaps their
+records, and reuses a returned slot before launching the shell on the third.
+The shell record alone carries console, filesystem, and machine-control
+capabilities. Cooperative scheduling still provides no preemption or hardware
+isolation: code that never yields can monopolize the CPU, and privileged memory
+unsafety can corrupt any task.
 
 ## Future persistent-storage boundary
 

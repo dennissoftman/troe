@@ -16,14 +16,16 @@ use core::ptr;
 use core::ptr::NonNull;
 #[cfg(target_os = "uefi")]
 use core::sync::atomic::{AtomicBool, Ordering};
-#[cfg(target_os = "uefi")]
+#[cfg(any(test, target_os = "uefi"))]
 use kllm_memory::PhysicalRange;
+#[cfg(target_os = "uefi")]
+use kllm_task::TaskStep;
 #[cfg(target_os = "uefi")]
 use uefi::mem::memory_map::MemoryMapOwned;
 
 #[cfg(target_os = "uefi")]
 const UART_SPIN_LIMIT: usize = 1_000_000;
-#[cfg(target_os = "uefi")]
+#[cfg(any(test, target_os = "uefi"))]
 const MIN_OWNED_STACK_BYTES: u64 = 16 * 1024;
 
 /// Failure to validate an owned stack before the one-way stack transition.
@@ -38,10 +40,28 @@ pub enum StackSwitchError {
     Unaligned,
 }
 
+/// Failure to validate a guarded cooperative-task stack payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(any(test, target_os = "uefi"))]
+pub enum TaskStackError {
+    /// The mapped payload is too small for a bounded task continuation step.
+    TooSmall,
+    /// The range end cannot be represented by the active architecture.
+    AddressUnsupported,
+    /// The stack top would violate the common platform ABI alignment.
+    Unaligned,
+}
+
 #[cfg(target_os = "uefi")]
 struct StackLaunch<T: 'static> {
     context: *mut T,
     entry: fn(&mut T) -> !,
+}
+
+#[cfg(target_os = "uefi")]
+struct TaskCall<T> {
+    context: *mut T,
+    step: fn(&mut T) -> TaskStep,
 }
 
 type OwnedTlsf = rlsf::Tlsf<'static, u32, u16, 20, 16>;
@@ -321,6 +341,65 @@ extern "C" fn stack_trampoline<T: 'static>(launch: usize) -> ! {
     (launch.entry)(context)
 }
 
+/// Execute one explicit continuation step on a task-owned guarded stack.
+///
+/// Cooperative tasks retain durable state in `context`. A yielded step returns
+/// through this synchronous boundary, discarding only that step's native stack
+/// frames. The scheduler can later invoke the continuation again on the same
+/// stack. This keeps context switching architecture-local without exposing raw
+/// saved-register state to portable code.
+///
+/// # Errors
+///
+/// Rejects a mapped stack payload that is too small, unrepresentable, or
+/// improperly aligned. Guard pages are omitted from `stack` and remain the
+/// mapping owner's responsibility.
+#[cfg(target_os = "uefi")]
+pub fn run_task_step<T>(
+    stack: PhysicalRange,
+    context: &mut T,
+    step: fn(&mut T) -> TaskStep,
+) -> Result<TaskStep, TaskStackError> {
+    let stack_top = validate_task_stack(stack)?;
+    let mut call = TaskCall {
+        context: ptr::from_mut(context),
+        step,
+    };
+    let raw = architecture_run_task_step(
+        stack_top,
+        ptr::from_mut(&mut call).cast::<()>() as usize,
+        task_step_trampoline::<T> as *const () as usize,
+    );
+    match raw {
+        0 => Ok(TaskStep::Yield),
+        1 => Ok(TaskStep::ExitSuccess),
+        _ => Ok(TaskStep::ExitFailure),
+    }
+}
+
+#[cfg(target_os = "uefi")]
+extern "C" fn task_step_trampoline<T>(call: usize) -> usize {
+    // SAFETY: `run_task_step` supplies a unique live `TaskCall<T>` and waits
+    // synchronously for this trampoline before accessing either value again.
+    let call = unsafe { &mut *(call as *mut TaskCall<T>) };
+    // SAFETY: The originating unique borrow of `context` remains suspended
+    // across this stack call and the trampoline is its only active accessor.
+    let context = unsafe { &mut *call.context };
+    (call.step)(context) as usize
+}
+
+#[cfg(any(test, target_os = "uefi"))]
+fn validate_task_stack(stack: PhysicalRange) -> Result<usize, TaskStackError> {
+    if stack.byte_count() < MIN_OWNED_STACK_BYTES {
+        return Err(TaskStackError::TooSmall);
+    }
+    let stack_top = usize::try_from(stack.end()).map_err(|_| TaskStackError::AddressUnsupported)?;
+    if !stack_top.is_multiple_of(16) {
+        return Err(TaskStackError::Unaligned);
+    }
+    Ok(stack_top)
+}
+
 /// Mask architecture interrupts before replacing firmware exception state.
 #[cfg(target_os = "uefi")]
 pub fn take_interrupt_ownership() {
@@ -456,6 +535,32 @@ fn architecture_enter_owned_stack(stack_top: usize, launch: usize, entry: usize)
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn architecture_run_task_step(stack_top: usize, call: usize, entry: usize) -> usize {
+    let result: usize;
+    // SAFETY: `stack_top` is a validated, exclusively task-owned mapped range.
+    // The old RSP is stored above the x64 ABI shadow space, the callback gets
+    // the sole live call record in RCX, and RSP is restored before Rust resumes.
+    unsafe {
+        core::arch::asm!(
+            "mov rax, rsp",
+            "mov rsp, r8",
+            "and rsp, -16",
+            "sub rsp, 48",
+            "mov [rsp + 32], rax",
+            "mov rcx, r9",
+            "call r10",
+            "mov rsp, [rsp + 32]",
+            in("r8") stack_top,
+            in("r9") call,
+            in("r10") entry,
+            lateout("rax") result,
+            clobber_abi("C"),
+        );
+    }
+    result
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 unsafe fn port_read(port: u16) -> u8 {
     let value: u8;
     // SAFETY: The caller establishes that `port` is valid for byte input.
@@ -586,6 +691,30 @@ fn architecture_enter_owned_stack(stack_top: usize, launch: usize, entry: usize)
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn architecture_run_task_step(stack_top: usize, call: usize, entry: usize) -> usize {
+    let result: usize;
+    // SAFETY: `stack_top` is a validated, exclusively task-owned mapped range.
+    // The old SP is stored in the new stack's top frame and restored after the
+    // AAPCS64 callback returns; the unique call record is passed in X0.
+    unsafe {
+        core::arch::asm!(
+            "mov x9, sp",
+            "mov sp, x11",
+            "sub sp, sp, #16",
+            "str x9, [sp]",
+            "blr x10",
+            "ldr x9, [sp]",
+            "mov sp, x9",
+            inlateout("x0") call => result,
+            in("x10") entry,
+            in("x11") stack_top,
+            clobber_abi("C"),
+        );
+    }
+    result
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 unsafe fn mmio_read(offset: usize) -> u32 {
     // SAFETY: The caller supplies a valid aligned PL011 register offset.
     unsafe { ptr::read_volatile((PL011_BASE + offset) as *const u32) }
@@ -599,8 +728,9 @@ unsafe fn mmio_write(offset: usize, value: u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::HeapState;
+    use super::{HeapState, TaskStackError, validate_task_stack};
     use core::alloc::Layout;
+    use kllm_memory::PhysicalRange;
 
     #[repr(align(4096))]
     struct TestArena([u8; 4096]);
@@ -645,5 +775,19 @@ mod tests {
         assert!(heap.allocate(oversized).is_null());
         assert_eq!(heap.stats().used_bytes, 0);
         assert_eq!(heap.stats().failed_allocations, 1);
+    }
+
+    #[test]
+    fn task_stack_validation_enforces_size_and_alignment() {
+        let Ok(too_small) = PhysicalRange::from_pages(0x1000, 1) else {
+            return;
+        };
+        assert_eq!(
+            validate_task_stack(too_small),
+            Err(TaskStackError::TooSmall)
+        );
+
+        let accepted = PhysicalRange::from_pages(0x20_0000, 8).unwrap_or(too_small);
+        assert_eq!(validate_task_stack(accepted), Ok(0x20_8000));
     }
 }

@@ -104,6 +104,9 @@ def assert_owned_boot(session: "SerialSession") -> None:
         "exception vectors: ready",
         "owned page tables: ready",
         "W^X mappings: active",
+        "cooperative tasks: deterministic",
+        "task stack guards: active",
+        "task resources: reclaimed",
         "kllm owns memory and console",
     ):
         if marker not in transcript:
@@ -499,13 +502,16 @@ def run_fault_scenario(
     session.wait_for(b"kllm:/> ", boot_timeout)
     assert_owned_boot(session)
     start = len(session.output)
-    session.send(f"mmu-probe {fault}", command_timeout)
+    command = "task-probe guard" if fault == "guard" else f"mmu-probe {fault}"
+    session.send(command, command_timeout)
     if fault == "exception":
         expected = b"fault: native exception\n"
     elif fault == "fatal":
         expected = b"fatal: acceptance post-handoff failure\n"
-    else:
+    elif fault in ("write", "execute"):
         expected = f"fault: {fault} permission violation\n".encode()
+    else:
+        expected = b"fault: write permission violation\n"
     marker_end = session.wait_for(expected, command_timeout, start)
     session.assert_terminal(marker_end, min(command_timeout, 1.0))
 
@@ -534,7 +540,7 @@ def test_architecture(
     finally:
         session.close()
     if not args.smoke:
-        for fault in ("write", "execute", "exception", "fatal"):
+        for fault in ("write", "execute", "guard", "exception", "fatal"):
             command = prepare_qemu_command(
                 architecture,
                 args.firmware_code,

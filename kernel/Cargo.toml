@@ -13,6 +13,7 @@ acceptance-probes = ["kllm-machine/acceptance-probes"]
 kllm-core = { path = "../crates/kllm-core" }
 kllm-memory = { path = "../crates/kllm-memory" }
 kllm-shell = { path = "../crates/kllm-shell" }
+kllm-task = { path = "../crates/kllm-task" }
 kllm-vfs = { path = "../crates/kllm-vfs" }
 
 [target.'cfg(target_os = "uefi")'.dependencies]

@@ -27,6 +27,7 @@ mod firmware {
         MemoryMapStats, MemoryRegion, NormalizedMemoryMap, PhysicalRange, RegionKind,
     };
     use kllm_shell::Shell;
+    use kllm_task::{Capabilities, Scheduler, StackResource, TaskId, TaskStep};
     use kllm_vfs::{Namespace, RamFsQuota};
     use uefi::boot;
     use uefi::mem::memory_map::{MemoryMap, MemoryMapOwned};
@@ -37,9 +38,16 @@ mod firmware {
     const PAGE_TABLE_BYTES: u64 = 2 * 1024 * 1024;
     const OWNED_STACK_BYTES: u64 = 128 * 1024;
     const EXCEPTION_STACK_BYTES: u64 = 16 * 1024;
-    const BOOT_ARENA_PAGES: usize =
-        ((OWNED_HEAP_BYTES + PAGE_TABLE_BYTES + OWNED_STACK_BYTES + EXCEPTION_STACK_BYTES)
-            / BASE_PAGE_SIZE) as usize;
+    const TASK_STACK_BYTES: u64 = 32 * 1024;
+    const TASK_GUARD_BYTES: u64 = BASE_PAGE_SIZE;
+    const TASK_STACK_PAGES: u16 = 8;
+    const TASK_STACK_COUNT: usize = 3;
+    const BOOT_ARENA_PAGES: usize = ((OWNED_HEAP_BYTES
+        + PAGE_TABLE_BYTES
+        + OWNED_STACK_BYTES
+        + EXCEPTION_STACK_BYTES
+        + (TASK_STACK_BYTES + 2 * TASK_GUARD_BYTES) * TASK_STACK_COUNT as u64)
+        / BASE_PAGE_SIZE) as usize;
 
     struct FirmwareConsole;
 
@@ -90,16 +98,35 @@ mod firmware {
         frames: FrameAllocator,
         #[cfg(feature = "acceptance-probes")]
         execute_probe_address: usize,
+        task_stacks: [TaskStackLayout; TASK_STACK_COUNT],
+    }
+
+    #[derive(Clone, Copy)]
+    struct TaskStackLayout {
+        lower_guard: PhysicalRange,
+        stack: PhysicalRange,
+        upper_guard: PhysicalRange,
     }
 
     #[derive(Clone, Copy)]
     struct BootMemory {
         arena: PhysicalRange,
-        #[cfg(feature = "acceptance-probes")]
         heap: PhysicalRange,
         page_tables: PhysicalRange,
         stack: PhysicalRange,
         exception_stack: PhysicalRange,
+        task_stacks: [TaskStackLayout; TASK_STACK_COUNT],
+    }
+
+    struct CooperativeService {
+        remaining_yields: u8,
+        completed_steps: u8,
+    }
+
+    struct ShellTask<'a> {
+        accounting: &'a OwnedAccounting,
+        capabilities: Capabilities,
+        stack: PhysicalRange,
     }
 
     struct PreparedHandoff {
@@ -164,11 +191,8 @@ mod firmware {
     ) -> Result<OwnedAccounting, ()> {
         let reservations = [prepared.boot_memory.arena];
         let normalized = normalize_final_map(&final_map, &reservations)?;
-        let mapping_plan = build_mapping_plan(
-            &final_map,
-            &prepared.image_layout,
-            prepared.boot_memory.arena,
-        )?;
+        let mapping_plan =
+            build_mapping_plan(&final_map, &prepared.image_layout, &prepared.boot_memory)?;
         // The final-map buffer is LoaderData recorded as reserved in the map.
         // It must remain live because boot services can no longer free it.
         core::mem::forget(final_map);
@@ -207,6 +231,7 @@ mod firmware {
             #[cfg(feature = "acceptance-probes")]
             execute_probe_address: usize::try_from(prepared.boot_memory.heap.start())
                 .map_err(|_| ())?,
+            task_stacks: prepared.boot_memory.task_stacks,
         })
     }
 
@@ -233,18 +258,21 @@ mod firmware {
         let exception_stack = allocator
             .allocate(EXCEPTION_STACK_BYTES, BASE_PAGE_SIZE)
             .map_err(|_| ())?;
+        let task_stacks = [
+            allocate_task_stack(&mut allocator)?,
+            allocate_task_stack(&mut allocator)?,
+            allocate_task_stack(&mut allocator)?,
+        ];
         allocator.seal();
         let heap_start = usize::try_from(heap.start()).map_err(|_| ())?;
         let heap_bytes = usize::try_from(heap.byte_count()).map_err(|_| ())?;
         if !kllm_machine::initialize_heap(heap_start, heap_bytes) {
             return Err(());
         }
-        #[cfg(feature = "acceptance-probes")]
         let heap_pages = heap.byte_count() / BASE_PAGE_SIZE;
         let table_pages = page_tables.byte_count() / BASE_PAGE_SIZE;
         Ok(BootMemory {
             arena,
-            #[cfg(feature = "acceptance-probes")]
             heap: PhysicalRange::from_pages(heap.start(), heap_pages).map_err(|_| ())?,
             page_tables: PhysicalRange::from_pages(page_tables.start(), table_pages)
                 .map_err(|_| ())?,
@@ -255,13 +283,36 @@ mod firmware {
                 exception_stack.byte_count() / BASE_PAGE_SIZE,
             )
             .map_err(|_| ())?,
+            task_stacks,
         })
+    }
+
+    fn allocate_task_stack(allocator: &mut BootAllocator) -> Result<TaskStackLayout, ()> {
+        let lower_guard = allocator
+            .allocate(TASK_GUARD_BYTES, BASE_PAGE_SIZE)
+            .map_err(|_| ())?;
+        let stack = allocator
+            .allocate(TASK_STACK_BYTES, BASE_PAGE_SIZE)
+            .map_err(|_| ())?;
+        let upper_guard = allocator
+            .allocate(TASK_GUARD_BYTES, BASE_PAGE_SIZE)
+            .map_err(|_| ())?;
+        Ok(TaskStackLayout {
+            lower_guard: allocation_range(lower_guard)?,
+            stack: allocation_range(stack)?,
+            upper_guard: allocation_range(upper_guard)?,
+        })
+    }
+
+    fn allocation_range(allocation: kllm_memory::BootAllocation) -> Result<PhysicalRange, ()> {
+        PhysicalRange::from_pages(allocation.start(), allocation.byte_count() / BASE_PAGE_SIZE)
+            .map_err(|_| ())
     }
 
     fn build_mapping_plan(
         memory_map: &MemoryMapOwned,
         image: &kllm_machine::ImageLayout,
-        boot_arena: PhysicalRange,
+        boot_memory: &BootMemory,
     ) -> Result<MappingPlan, ()> {
         let mut plan = MappingPlan::new();
         for descriptor in memory_map.entries() {
@@ -278,13 +329,29 @@ mod firmware {
                 MappingOwner::KernelRuntime,
             )?;
         }
-        insert_identity(
-            &mut plan,
-            boot_arena,
-            MappingPermissions::READ_WRITE,
-            MappingMemoryType::Normal,
-            MappingOwner::KernelRuntime,
-        )?;
+        for range in [
+            boot_memory.heap,
+            boot_memory.page_tables,
+            boot_memory.stack,
+            boot_memory.exception_stack,
+        ] {
+            insert_identity(
+                &mut plan,
+                range,
+                MappingPermissions::READ_WRITE,
+                MappingMemoryType::Normal,
+                MappingOwner::KernelRuntime,
+            )?;
+        }
+        for task_stack in boot_memory.task_stacks {
+            insert_identity(
+                &mut plan,
+                task_stack.stack,
+                MappingPermissions::READ_WRITE,
+                MappingMemoryType::Normal,
+                MappingOwner::KernelRuntime,
+            )?;
+        }
         for index in 0..image.region_count() {
             let region = image.region(index).ok_or(())?;
             insert_identity(
@@ -371,13 +438,200 @@ mod firmware {
     }
 
     fn run_owned(accounting: &OwnedAccounting) -> ! {
+        let mut scheduler = Scheduler::new(TASK_STACK_COUNT)
+            .unwrap_or_else(|_| fatal(b"fatal: cannot create task scheduler\n"));
+        run_cooperative_services(&mut scheduler, accounting)
+            .unwrap_or_else(|()| fatal(b"fatal: cooperative task verification failed\n"));
+        if !kllm_machine::write(b"cooperative tasks: deterministic\n")
+            || !kllm_machine::write(b"task stack guards: active\n")
+            || !kllm_machine::write(b"task resources: reclaimed\n")
+        {
+            fatal(b"fatal: task diagnostic failed\n");
+        }
+
+        let capabilities = Capabilities::CONSOLE
+            .union(Capabilities::FILESYSTEM)
+            .union(Capabilities::MACHINE_CONTROL);
+        let stack_resource = StackResource::new(2, TASK_STACK_PAGES)
+            .unwrap_or_else(|_| fatal(b"fatal: invalid shell task stack\n"));
+        let shell_id = scheduler
+            .spawn(capabilities, stack_resource)
+            .unwrap_or_else(|_| fatal(b"fatal: cannot spawn shell task\n"));
+        let dispatched = scheduler
+            .dispatch_next(capabilities)
+            .unwrap_or_else(|_| fatal(b"fatal: shell task dispatch failed\n"));
+        if dispatched != Some(shell_id)
+            || scheduler.stats().owned_stack_pages != u32::from(TASK_STACK_PAGES)
+        {
+            fatal(b"fatal: shell task accounting failed\n");
+        }
+        let stack = accounting.task_stacks[2].stack;
+        let mut shell_task = ShellTask {
+            accounting,
+            capabilities,
+            stack,
+        };
+        let result = kllm_machine::run_task_step(stack, &mut shell_task, run_shell_task);
+        if result.is_err() {
+            fatal(b"fatal: shell task stack rejected\n");
+        }
+        fatal(b"fatal: shell task returned\n")
+    }
+
+    fn run_cooperative_services(
+        scheduler: &mut Scheduler,
+        accounting: &OwnedAccounting,
+    ) -> Result<(), ()> {
+        for layout in accounting.task_stacks {
+            if layout.lower_guard.end() != layout.stack.start()
+                || layout.stack.end() != layout.upper_guard.start()
+                || layout.lower_guard.page_count() != 1
+                || layout.stack.page_count() != u64::from(TASK_STACK_PAGES)
+                || layout.upper_guard.page_count() != 1
+            {
+                return Err(());
+            }
+        }
+
+        let first_resource = StackResource::new(0, TASK_STACK_PAGES).map_err(|_| ())?;
+        let second_resource = StackResource::new(1, TASK_STACK_PAGES).map_err(|_| ())?;
+        let first = scheduler
+            .spawn(Capabilities::SERVICE, first_resource)
+            .map_err(|_| ())?;
+        let second = scheduler
+            .spawn(Capabilities::SERVICE, second_resource)
+            .map_err(|_| ())?;
+        let mut first_service = CooperativeService {
+            remaining_yields: 2,
+            completed_steps: 0,
+        };
+        let mut second_service = CooperativeService {
+            remaining_yields: 3,
+            completed_steps: 0,
+        };
+        let mut completed = 0_u8;
+        let mut reusable = None;
+        while completed < 2 {
+            let id = scheduler
+                .dispatch_next(Capabilities::SERVICE)
+                .map_err(|_| ())?
+                .ok_or(())?;
+            let step = if id == first {
+                kllm_machine::run_task_step(
+                    accounting.task_stacks[0].stack,
+                    &mut first_service,
+                    cooperative_service_step,
+                )
+                .map_err(|_| ())?
+            } else if id == second {
+                kllm_machine::run_task_step(
+                    accounting.task_stacks[1].stack,
+                    &mut second_service,
+                    cooperative_service_step,
+                )
+                .map_err(|_| ())?
+            } else {
+                return Err(());
+            };
+            if complete_task_step(scheduler, id, step, &mut reusable)? {
+                completed = completed.checked_add(1).ok_or(())?;
+            }
+        }
+        let stats = scheduler.stats();
+        if stats.yields != 5
+            || stats.reaped != 2
+            || stats.owned_stack_pages != 0
+            || first_service.completed_steps != 3
+            || second_service.completed_steps != 4
+        {
+            return Err(());
+        }
+
+        let reusable = reusable.ok_or(())?;
+        let slot = usize::from(reusable.slot());
+        let reused = scheduler
+            .spawn(Capabilities::SERVICE, reusable)
+            .map_err(|_| ())?;
+        let dispatched = scheduler
+            .dispatch_next(Capabilities::SERVICE)
+            .map_err(|_| ())?;
+        if dispatched != Some(reused) || slot >= accounting.task_stacks.len() {
+            return Err(());
+        }
+        let mut reuse_service = CooperativeService {
+            remaining_yields: 0,
+            completed_steps: 0,
+        };
+        let step = kllm_machine::run_task_step(
+            accounting.task_stacks[slot].stack,
+            &mut reuse_service,
+            cooperative_service_step,
+        )
+        .map_err(|_| ())?;
+        let mut ignored = None;
+        if !complete_task_step(scheduler, reused, step, &mut ignored)?
+            || scheduler.stats().reaped != 3
+            || scheduler.stats().owned_stack_pages != 0
+        {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    fn cooperative_service_step(service: &mut CooperativeService) -> TaskStep {
+        service.completed_steps = service.completed_steps.saturating_add(1);
+        if service.remaining_yields == 0 {
+            TaskStep::ExitSuccess
+        } else {
+            service.remaining_yields -= 1;
+            TaskStep::Yield
+        }
+    }
+
+    fn complete_task_step(
+        scheduler: &mut Scheduler,
+        id: TaskId,
+        step: TaskStep,
+        reusable: &mut Option<StackResource>,
+    ) -> Result<bool, ()> {
+        match step {
+            TaskStep::Yield => {
+                scheduler.yield_current(id).map_err(|_| ())?;
+                Ok(false)
+            }
+            TaskStep::ExitSuccess | TaskStep::ExitFailure => {
+                let status = u8::from(step != TaskStep::ExitSuccess);
+                scheduler.exit_current(id, status).map_err(|_| ())?;
+                let reaped = scheduler.reap(id).map_err(|_| ())?;
+                if reaped.exit_status != status {
+                    return Err(());
+                }
+                if reusable.is_none() {
+                    *reusable = Some(reaped.stack);
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    fn run_shell_task(task: &mut ShellTask<'_>) -> TaskStep {
+        let stack_pointer = usize_as_u64(kllm_machine::current_stack_pointer());
+        if !task.stack.contains(stack_pointer)
+            || !task.capabilities.contains(Capabilities::CONSOLE)
+            || !task.capabilities.contains(Capabilities::FILESYSTEM)
+        {
+            fatal(b"fatal: shell task authority or stack invalid\n");
+        }
         let mut console = NativeConsole;
         let mut namespace = Namespace::new(RamFsQuota::default());
         if namespace.mount_embedded(ROOTFS).is_err() {
             fatal(b"fatal: cannot mount embedded root\n");
         }
-        let initial_snapshot = machine_snapshot(accounting);
-        let Ok(mut shell) = Shell::new(namespace, architecture(), initial_snapshot, true) else {
+        let initial_snapshot = machine_snapshot(task.accounting);
+        let machine_control = task.capabilities.contains(Capabilities::MACHINE_CONTROL);
+        let Ok(mut shell) =
+            Shell::new(namespace, architecture(), initial_snapshot, machine_control)
+        else {
             fatal(b"fatal: cannot compose namespace\n");
         };
         let mut editor = LineEditor {
@@ -389,7 +643,7 @@ mod firmware {
         }
 
         loop {
-            shell.set_machine_memory(machine_snapshot(accounting));
+            shell.set_machine_memory(machine_snapshot(task.accounting));
             if write_all(&mut console, b"kllm:").is_err()
                 || write_all(&mut console, shell.cwd().as_bytes()).is_err()
                 || write_all(&mut console, b"> ").is_err()
@@ -407,7 +661,7 @@ mod firmware {
             #[cfg(feature = "acceptance-probes")]
             if line == "mmu-probe execute" {
                 let _result = write_all(&mut console, b"probing non-executable mapping\n");
-                kllm_machine::trigger_execute_fault(accounting.execute_probe_address);
+                kllm_machine::trigger_execute_fault(task.accounting.execute_probe_address);
             }
             #[cfg(feature = "acceptance-probes")]
             if line == "mmu-probe exception" {
@@ -417,6 +671,14 @@ mod firmware {
             #[cfg(feature = "acceptance-probes")]
             if line == "mmu-probe fatal" {
                 fatal(b"fatal: acceptance post-handoff failure\n");
+            }
+            #[cfg(feature = "acceptance-probes")]
+            if line == "task-probe guard" {
+                let _result = write_all(&mut console, b"probing task stack guard\n");
+                let guard = task.accounting.task_stacks[2].lower_guard.start();
+                let guard = usize::try_from(guard)
+                    .unwrap_or_else(|_| fatal(b"fatal: guard address unsupported\n"));
+                kllm_machine::trigger_write_fault(guard);
             }
             let mut input = EmptyInput;
             let mut error = NativeConsole;

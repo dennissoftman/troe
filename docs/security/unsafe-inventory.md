@@ -1,6 +1,6 @@
 # Unsafe inventory
 
-Stage 3 contains exactly 80 project-authored Rust `unsafe` tokens, all in the
+Stage 4 contains exactly 84 project-authored Rust `unsafe` tokens, all in the
 two audited modules of `crates/kllm-machine`. The verification gate fails if
 this count changes without a same-change inventory review. Portable crates and
 the kernel composition root continue to forbid unsafe code.
@@ -9,6 +9,7 @@ the kernel composition root continue to forbid unsafe code.
 |---|---:|---|
 | TLSF pool and hybrid global allocator | 16 | One fresh, page-aligned LoaderData range is transferred once; a spin lock serializes metadata; `GlobalAlloc` layouts match; non-heap loader pointers are never returned through exited firmware. |
 | Owned-stack and interrupt transition | 8 | A checked, reserved stack receives one leaked continuation record; architecture trampolines replace SP/RSP once and cannot return; x86 IF and AArch64 DAIF are masked before firmware exception state is replaced. |
+| Cooperative task-stack calls | 4 | One unique call record and task state borrow remain live while an architecture trampoline replaces SP/RSP synchronously; the old stack is saved inside the mapped task payload and restored before Rust resumes. |
 | x86-64 16550 and `hlt` | 10 | The pinned q35 profile owns COM1 at `0x3f8`; byte I/O uses readiness bits and bounded transmit polling; halt is terminal. |
 | AArch64 PL011 and `wfe` | 10 | The pinned virt profile owns PL011 at `0x09000000`; aligned volatile accesses target documented registers; transmit polling is bounded; park is terminal. |
 | Heap host tests | 4 | Test arenas remain live, exclusively borrowed, and allocations are deallocated once with their original layouts. |
@@ -23,7 +24,10 @@ owned heap, and transferred to a reserved 128 KiB stack. The successful call
 enters a non-returning continuation, masks interrupts, and never invokes boot
 services afterward. The retained final-map buffer lives inside mapped owned
 memory. Stage 3 then replaces firmware translation and exception state before
-entering the shell; stack and table arenas are permanent LoaderData reservations.
+entering the task scheduler; table, kernel-stack, and guarded task-stack pool
+arenas are permanent LoaderData reservations. Task payload slots are returned
+to the bounded pool when a record is reaped; their surrounding pages remain
+unmapped under the owned page tables.
 
 Transitive unsafe implementation also exists in pinned `uefi`, `rlsf`, and
 their bindings/dependencies. Their APIs, licenses, and boundary assumptions are
