@@ -919,12 +919,15 @@ explicit, and all owned resources are revoked, zeroed, and reclaimed.
 
 ### Stage 7 — Loadable applications
 
-**Status:** not implemented.
+**Status:** design accepted by
+[ADR 0015](docs/adr/0015-kex-application-abi-and-execution-bounds.md); not
+implemented.
 
-- Load ELF or another small, versioned binary container selected through an architecture decision record.
+- Load target-specific static KEX v1 artifacts selected by ADR 0015; keep ELF as
+  a hosted toolchain interchange format rather than a kernel input.
 - Validate every header, segment, permission, alignment, relocation, entry point, and address range before mapping.
 - Give each application an explicit set of handles/capabilities and a bounded memory budget.
-- Define a small native application ABI independently of POSIX.
+- Implement the small versioned application ABI 1.0 independently of POSIX.
 - Provide application startup, exit status, fault reporting, and resource reclamation.
 - Support architecture-native binaries; cross-architecture instruction emulation is not required.
 - Keep static built-ins available for recovery and constrained builds.
@@ -1056,14 +1059,11 @@ A feature belongs in the project only when its value exceeds its cost in code si
 
 ## 28. Open decisions
 
-Decisions resolved through Stage 6 are recorded in
+Decisions resolved through the Stage 7 design are recorded in
 [docs/adr](docs/adr) and summarized in [docs/roadmap.md](docs/roadmap.md).
 The following later-stage choices remain open and require short architecture
 decision records before implementation:
 
-- the Stage 7 executable container, application ABI, loader, and policy for
-  non-yielding untrusted code (the Stage 6 privilege/message/teardown boundary
-  is fixed by ADR 0014);
 - canonical package-artifact encoding and digest/signature scope;
 - dependency/version semantics and multi-target lock-file representation;
 - content-store layout, generation activation record, and recovery protocol;

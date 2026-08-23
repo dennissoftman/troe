@@ -185,14 +185,15 @@ copy or net frame loss, reuses the returned physical range, then enters the
 ordinary shell. See
 [ADR 0014](adr/0014-unprivileged-task-isolation-and-teardown.md).
 
-## Stage 7: loadable applications (next; design required)
+## Stage 7: loadable applications (next; design accepted)
 
 Stage 6 supplies the privilege, copied-message, fault-fate, and transactional
-teardown boundary required by a loader. Stage 7 may begin after one accepted ADR
-fixes the executable container, versioned startup/call ABI, application memory
-budgets, and the fate of code that never returns through the cooperative gate.
-Those choices are intentionally not inferred from the internal Stage 6 probe
-format.
+teardown boundary required by a loader.
+[ADR 0015](adr/0015-kex-application-abi-and-execution-bounds.md) selects the
+small static KEX v1 container, application ABI 1.0, per-profile staging and
+resident-memory ceilings, and a 50 ms maximum uninterrupted user lease
+terminated by an owned timer. Those choices are intentionally independent of
+the internal Stage 6 probe format. Implementation has not begun.
 
 The first implementation must parse and validate artifacts into kernel-owned
 staging state before mapping any application page; reject unsupported headers,
