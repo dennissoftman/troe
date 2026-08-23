@@ -10,7 +10,7 @@ historical review evidence.
 - [Architecture](architecture.md) describes the current Stage 5 composition and
   its boundaries.
 - [Unsafe inventory](security/unsafe-inventory.md) records the current audited
-  project-authored unsafe surface.
+  project-authored unsafe surface through Stage 5.1.
 - [KEFS v1](formats/kefs-v1.md) defines the implemented embedded-filesystem
   format.
 
@@ -33,9 +33,9 @@ not deprecated merely because their stage has completed; later implementation
 notes identify decisions that were revisited. ADR 0007 remains proposed and
 must be resolved before persistent security metadata or foreign-filesystem
 writes. ADR 0009 is an accepted future storage direction, not implemented
-filesystem support. ADR 0012 governs the in-progress Stage 5.1 terminal and
-framebuffer increment; its accepted behavior is not part of the current Stage 5
-release until the roadmap marks that increment complete.
+filesystem support. ADR 0012 governs the completed Stage 5.1 terminal and
+framebuffer increment; AArch64 native keyboard input remains a later
+virtio-input transport decision.
 
 ## Evaluations
 

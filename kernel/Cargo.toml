@@ -15,6 +15,7 @@ kllm-dispatch = { path = "../crates/kllm-dispatch" }
 kllm-memory = { path = "../crates/kllm-memory" }
 kllm-shell = { path = "../crates/kllm-shell" }
 kllm-task = { path = "../crates/kllm-task" }
+kllm-terminal = { path = "../crates/kllm-terminal" }
 kllm-vfs = { path = "../crates/kllm-vfs" }
 
 [target.'cfg(target_os = "uefi")'.dependencies]

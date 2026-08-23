@@ -7,8 +7,10 @@ import argparse
 import concurrent.futures
 import queue
 import re
+import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -46,6 +48,16 @@ def parse_args() -> argparse.Namespace:
         "--skip-build",
         action="store_true",
         help="use boot images already present under build/",
+    )
+    parser.add_argument(
+        "--framebuffer-console",
+        action="store_true",
+        help="attach a headless ramfb and require owned text-console activation",
+    )
+    parser.add_argument(
+        "--native-keyboard",
+        action="store_true",
+        help="drive the x86_64 native PS/2 keyboard through a QEMU monitor",
     )
     parser.add_argument(
         "--boot-timeout",
@@ -167,8 +179,8 @@ class SerialSession:
                 )
             self.output.extend(chunk)
 
-    def send(self, command: str, timeout: float, line_ending: bytes = b"\n") -> None:
-        """Send one console line after a prompt has been observed."""
+    def send(self, command: str, timeout: float, line_ending: bytes = b"\n") -> int:
+        """Send one console line and return the transcript offset after its newline."""
         if self.process.stdin is None:
             raise AcceptanceError("QEMU serial input is unavailable")
         try:
@@ -182,7 +194,7 @@ class SerialSession:
             start = len(self.output)
             self.process.stdin.write(line_ending)
             self.process.stdin.flush()
-            self.wait_for(b"\n", timeout, start)
+            return self.wait_for(b"\n", timeout, start)
         except (BrokenPipeError, OSError) as error:
             raise AcceptanceError(f"cannot write QEMU serial input: {error}") from error
 
@@ -240,18 +252,66 @@ class SerialSession:
                 self.process.stdin.flush()
                 self.wait_for(bytes((byte,)), timeout, character_start)
 
+            submit_start = len(self.output)
             self.process.stdin.write(b"\n")
             self.process.stdin.flush()
+            submitted = self.wait_for(b"\n", timeout, submit_start)
         except (BrokenPipeError, OSError) as error:
             raise AcceptanceError(f"cannot write QEMU serial input: {error}") from error
 
         prompt = f"kllm:{cwd}> ".encode()
-        end = self.wait_for(prompt, timeout, start)
+        end = self.wait_for(prompt, timeout, submitted)
         text = normalize(bytes(self.output[start : end - len(prompt)]))
         if expected not in text:
             raise AcceptanceError(
                 f"backspace-edited command did not produce {expected!r}; "
                 f"command output was {text!r}"
+            )
+
+    def edited_command(
+        self,
+        prefix: str,
+        edit: bytes,
+        suffix: str,
+        cwd: str,
+        timeout: float,
+        expected: str,
+    ) -> None:
+        """Execute a command containing one raw editor-key sequence."""
+        if self.process.stdin is None:
+            raise AcceptanceError("QEMU serial input is unavailable")
+        start = len(self.output)
+        try:
+            for byte in prefix.encode("utf-8"):
+                character_start = len(self.output)
+                self.process.stdin.write(bytes((byte,)))
+                self.process.stdin.flush()
+                self.wait_for(bytes((byte,)), timeout, character_start)
+
+            edit_start = len(self.output)
+            self.process.stdin.write(edit)
+            self.process.stdin.flush()
+            self.wait_for(b"\x1b[K", timeout, edit_start)
+
+            for byte in suffix.encode("utf-8"):
+                character_start = len(self.output)
+                self.process.stdin.write(bytes((byte,)))
+                self.process.stdin.flush()
+                self.wait_for(bytes((byte,)), timeout, character_start)
+
+            submit_start = len(self.output)
+            self.process.stdin.write(b"\n")
+            self.process.stdin.flush()
+            submitted = self.wait_for(b"\n", timeout, submit_start)
+        except (BrokenPipeError, OSError) as error:
+            raise AcceptanceError(f"cannot write QEMU serial input: {error}") from error
+
+        prompt = f"kllm:{cwd}> ".encode()
+        end = self.wait_for(prompt, timeout, submitted)
+        text = normalize(bytes(self.output[start : end - len(prompt)]))
+        if expected not in text:
+            raise AcceptanceError(
+                f"edited command did not produce {expected!r}; output was {text!r}"
             )
 
     def command(
@@ -267,12 +327,11 @@ class SerialSession:
         line_ending: bytes = b"\n",
     ) -> str:
         """Execute a line, wait for the next prompt, and assert its output."""
-        start = len(self.output)
-        self.send(command, timeout, line_ending)
+        submitted = self.send(command, timeout, line_ending)
         resulting_cwd = cwd if next_cwd is None else next_cwd
         prompt = f"kllm:{resulting_cwd}> ".encode()
-        end = self.wait_for(prompt, timeout, start)
-        raw = bytes(self.output[start : end - len(prompt)])
+        end = self.wait_for(prompt, timeout, submitted)
+        raw = bytes(self.output[submitted : end - len(prompt)])
         text = normalize(raw)
         echoed = f"{command}\n"
         if text.startswith(echoed):
@@ -345,6 +404,16 @@ def run_scenario(session: SerialSession, boot_timeout: float, command_timeout: f
     session.backspace_command(
         "echo brokeX", "n", cwd, command_timeout, expected="\nbroken\n"
     )
+    session.edited_command(
+        "echo ac", b"\x1b[D", "b", cwd, command_timeout, expected="\nabc\n"
+    )
+    session.command("echo history-ready", cwd, command_timeout, contains=("history-ready\n",))
+    session.edited_command(
+        "", b"\x1b[A", "", cwd, command_timeout, expected="\nhistory-ready\n"
+    )
+    session.edited_command(
+        "pw", b"\t", "", cwd, command_timeout, expected="\n/\n"
+    )
     session.command(
         "echo crlf-ready",
         cwd,
@@ -416,6 +485,20 @@ def run_scenario(session: SerialSession, boot_timeout: float, command_timeout: f
     session.command("rm /tmp/q000", cwd, command_timeout)
     session.command("write /tmp/recovered ok", cwd, command_timeout)
     session.command("cat /tmp/recovered", cwd, command_timeout, contains=("ok",))
+
+    # Fill the configured volatile history ring with the same workload shape
+    # used below before taking a heap baseline. Otherwise bounded history growth
+    # is indistinguishable from a transient-allocation leak in this assertion.
+    for _ in range(16):
+        session.command(
+            "echo allocation-cycle | grep cycle",
+            cwd,
+            command_timeout,
+            contains=("allocation-cycle\n",),
+        )
+        session.command("write /tmp/cycle stable", cwd, command_timeout)
+        session.command("rm /tmp/cycle", cwd, command_timeout)
+
     report = session.command(
         "mem",
         cwd,
@@ -467,6 +550,16 @@ def run_smoke_scenario(
     session.backspace_command(
         "echo brokeX", "n", cwd, command_timeout, expected="\nbroken\n"
     )
+    session.edited_command(
+        "echo ac", b"\x1b[D", "b", cwd, command_timeout, expected="\nabc\n"
+    )
+    session.command("echo history-ready", cwd, command_timeout, contains=("history-ready\n",))
+    session.edited_command(
+        "", b"\x1b[A", "", cwd, command_timeout, expected="\nhistory-ready\n"
+    )
+    session.edited_command(
+        "pw", b"\t", "", cwd, command_timeout, expected="\n/\n"
+    )
     session.command(
         "clear", cwd, command_timeout, raw_contains=(b"\x1b[2J",)
     )
@@ -491,6 +584,75 @@ def run_smoke_scenario(
     start = len(session.output)
     session.send("halt", command_timeout)
     session.wait_for(b"halting: parking CPU", command_timeout, start)
+
+
+def run_native_keyboard_scenario(args: argparse.Namespace) -> None:
+    """Drive the q35 i8042 path independently of serial input."""
+    command = prepare_qemu_command(
+        "x86_64",
+        args.firmware_code,
+        args.firmware_vars,
+        skip_version_check=args.skip_version_check,
+        build=False,
+        acceptance_probes=False,
+        framebuffer=args.framebuffer_console,
+    )
+    # Keep this below macOS's short AF_UNIX path limit even when TMPDIR points
+    # into a deeply nested per-user directory.
+    with tempfile.TemporaryDirectory(prefix="kllm-monitor-", dir="/tmp") as directory:
+        monitor_path = str(Path(directory) / "qemu.sock")
+        monitor_index = command.index("-monitor") + 1
+        command[monitor_index] = f"unix:{monitor_path},server=on,wait=off"
+        session = SerialSession(command, "x86_64")
+        monitor = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            deadline = time.monotonic() + args.boot_timeout
+            while True:
+                try:
+                    monitor.connect(monitor_path)
+                    break
+                except (FileNotFoundError, ConnectionRefusedError):
+                    status = session.process.poll()
+                    if status is not None:
+                        raise AcceptanceError(
+                            f"QEMU exited with status {status} before its monitor was ready"
+                        )
+                    if time.monotonic() >= deadline:
+                        raise AcceptanceError("timed out connecting to QEMU monitor")
+                    time.sleep(0.01)
+
+            session.wait_for(b"kllm:/> ", args.boot_timeout)
+            keys = (
+                ("e", b"e"),
+                ("c", b"c"),
+                ("h", b"h"),
+                ("o", b"o"),
+                ("spc", b" "),
+                ("p", b"p"),
+                ("s", b"s"),
+                ("2", b"2"),
+                ("minus", b"-"),
+                ("r", b"r"),
+                ("e", b"e"),
+                ("a", b"a"),
+                ("d", b"d"),
+                ("y", b"y"),
+            )
+            for key, echoed in keys:
+                start = len(session.output)
+                monitor.sendall(f"sendkey {key}\n".encode())
+                session.wait_for(echoed, args.command_timeout, start)
+            start = len(session.output)
+            monitor.sendall(b"sendkey ret\n")
+            session.wait_for(b"ps2-ready\n", args.command_timeout, start)
+            session.wait_for(b"kllm:/> ", args.command_timeout, start)
+        except Exception:
+            print("--- x86_64 native keyboard transcript ---", file=sys.stderr)
+            print(session.transcript(), file=sys.stderr)
+            raise
+        finally:
+            monitor.close()
+            session.close()
 
 
 def run_fault_scenario(
@@ -528,11 +690,16 @@ def test_architecture(
         skip_version_check=args.skip_version_check,
         build=False,
         acceptance_probes=False,
+        framebuffer=args.framebuffer_console,
     )
     session = SerialSession(command, architecture)
     try:
         scenario = run_smoke_scenario if args.smoke else run_scenario
         scenario(session, args.boot_timeout, args.command_timeout)
+        if args.framebuffer_console and b"owned framebuffer text console: ready" not in session.output:
+            raise AcceptanceError(
+                f"{architecture} did not activate the owned framebuffer text console"
+            )
     except Exception:
         print(f"--- {architecture} QEMU transcript ---", file=sys.stderr)
         print(session.transcript(), file=sys.stderr)
@@ -549,6 +716,7 @@ def test_architecture(
                 skip_version_check=args.skip_version_check,
                 build=False,
                 acceptance_probes=True,
+                framebuffer=args.framebuffer_console,
             )
             fault_session = SerialSession(command, architecture)
             try:
@@ -567,6 +735,8 @@ def test_architecture(
                 raise
             finally:
                 fault_session.close()
+    if args.native_keyboard and architecture == "x86_64":
+        run_native_keyboard_scenario(args)
     suite = "smoke" if args.smoke else "acceptance"
     print(f"QEMU {suite} ({architecture}): passed")
 

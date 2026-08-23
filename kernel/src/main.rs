@@ -16,23 +16,27 @@ mod firmware {
     use alloc::string::String;
     use alloc::vec::Vec;
     use core::fmt::Write as _;
+    use core::hint::spin_loop;
     use core::panic::PanicInfo;
 
-    use kllm_core::{
-        Input, MAX_LINE_BYTES, MachineMemorySnapshot, Output, StreamError, is_backspace,
-    };
+    use kllm_core::{Input, MAX_LINE_BYTES, MachineMemorySnapshot, Output, StreamError};
     use kllm_dispatch::{ConsoleService, DispatchedOutput, Dispatcher, Rights};
     use kllm_memory::{
         BASE_PAGE_SIZE, BootAllocator, FrameAllocator, MAX_FIRMWARE_REGIONS, Mapping,
         MappingLifetime, MappingMemoryType, MappingOwner, MappingPermissions, MappingPlan,
         MemoryMapStats, MemoryRegion, NormalizedMemoryMap, PhysicalRange, RegionKind,
     };
-    use kllm_shell::Shell;
+    use kllm_shell::{CompletionConfig, Shell};
     use kllm_task::{Capabilities, Scheduler, StackResource, TaskId, TaskStep};
+    use kllm_terminal::{
+        EditorConfig, EditorOutcome, FramebufferDescriptor, FramebufferPixelFormat, InputDecoder,
+        KeyboardConfig, LineEditor, Ps2Set1Decoder, TextConsole, TextConsoleConfig,
+    };
     use kllm_vfs::{Namespace, RamFsQuota};
     use uefi::boot;
     use uefi::mem::memory_map::{MemoryMap, MemoryMapOwned};
     use uefi::prelude::*;
+    use uefi::proto::console::gop::{GraphicsOutput, PixelFormat as GopPixelFormat};
 
     const ROOTFS: &[u8] = include_bytes!("../../assets/root.kefs");
     const OWNED_HEAP_BYTES: u64 = 6 * 1024 * 1024;
@@ -82,6 +86,52 @@ mod firmware {
         }
     }
 
+    enum NativeShellConsole {
+        Serial(NativeConsole),
+        Mirrored {
+            serial: NativeConsole,
+            framebuffer: TextConsole<kllm_machine::OwnedFramebuffer>,
+        },
+    }
+
+    impl NativeShellConsole {
+        fn new(framebuffer: Option<FramebufferDescriptor>) -> Self {
+            let Some(framebuffer) = framebuffer else {
+                return Self::Serial(NativeConsole);
+            };
+            let Ok(surface) = kllm_machine::OwnedFramebuffer::new(framebuffer) else {
+                return Self::Serial(NativeConsole);
+            };
+            let Ok(framebuffer) = TextConsole::new(surface, TextConsoleConfig::tiny()) else {
+                return Self::Serial(NativeConsole);
+            };
+            Self::Mirrored {
+                serial: NativeConsole,
+                framebuffer,
+            }
+        }
+
+        const fn has_framebuffer(&self) -> bool {
+            matches!(self, Self::Mirrored { .. })
+        }
+    }
+
+    impl Output for NativeShellConsole {
+        fn write(&mut self, bytes: &[u8]) -> Result<usize, StreamError> {
+            match self {
+                Self::Serial(serial) => serial.write(bytes),
+                Self::Mirrored {
+                    serial,
+                    framebuffer,
+                } => {
+                    let count = serial.write(bytes)?;
+                    let _mirrored = framebuffer.write(&bytes[..count]);
+                    Ok(count)
+                }
+            }
+        }
+    }
+
     struct EmptyInput;
 
     impl Input for EmptyInput {
@@ -90,16 +140,13 @@ mod firmware {
         }
     }
 
-    struct LineEditor {
-        discard_leading_lf: bool,
-    }
-
     struct OwnedAccounting {
         map: MemoryMapStats,
         frames: FrameAllocator,
         #[cfg(feature = "acceptance-probes")]
         execute_probe_address: usize,
         task_stacks: [TaskStackLayout; TASK_STACK_COUNT],
+        framebuffer: Option<FramebufferDescriptor>,
     }
 
     #[derive(Clone, Copy)]
@@ -133,6 +180,7 @@ mod firmware {
     struct PreparedHandoff {
         image_layout: kllm_machine::ImageLayout,
         boot_memory: BootMemory,
+        framebuffer: Option<FramebufferDescriptor>,
     }
 
     #[entry]
@@ -159,6 +207,7 @@ mod firmware {
         write_all(console, b"preparing owned memory and native console\n")?;
 
         let image_layout = kllm_machine::loaded_image_layout().map_err(|_| ())?;
+        let framebuffer = capture_framebuffer();
         let boot_memory = reserve_and_install_heap()?;
         kllm_machine::initialize_console();
         if !kllm_machine::write(b"native console: ready\n") {
@@ -167,6 +216,7 @@ mod firmware {
         Ok(PreparedHandoff {
             image_layout,
             boot_memory,
+            framebuffer,
         })
     }
 
@@ -192,14 +242,24 @@ mod firmware {
     ) -> Result<OwnedAccounting, ()> {
         let reservations = [prepared.boot_memory.arena];
         let normalized = normalize_final_map(&final_map, &reservations)?;
-        let mapping_plan =
-            build_mapping_plan(&final_map, &prepared.image_layout, &prepared.boot_memory)?;
+        let framebuffer = prepared.framebuffer;
+        let mapping_plan = build_mapping_plan(
+            &final_map,
+            &prepared.image_layout,
+            &prepared.boot_memory,
+            framebuffer,
+        )?;
         // The final-map buffer is LoaderData recorded as reserved in the map.
         // It must remain live because boot services can no longer free it.
         core::mem::forget(final_map);
 
         let map = normalized.stats();
         let mut frames = FrameAllocator::from_map(&normalized).map_err(|_| ())?;
+        if let Some(framebuffer) = framebuffer {
+            frames
+                .reserve_range(framebuffer_device_range(framebuffer)?)
+                .map_err(|_| ())?;
+        }
         let probe = frames.allocate().map_err(|_| ())?;
         frames.free(probe).map_err(|_| ())?;
         if !kllm_machine::write(b"frame bitmap: ready\n") {
@@ -233,6 +293,7 @@ mod firmware {
             execute_probe_address: usize::try_from(prepared.boot_memory.heap.start())
                 .map_err(|_| ())?,
             task_stacks: prepared.boot_memory.task_stacks,
+            framebuffer,
         })
     }
 
@@ -314,21 +375,17 @@ mod firmware {
         memory_map: &MemoryMapOwned,
         image: &kllm_machine::ImageLayout,
         boot_memory: &BootMemory,
+        framebuffer: Option<FramebufferDescriptor>,
     ) -> Result<MappingPlan, ()> {
         let mut plan = MappingPlan::new();
+        let framebuffer_range = framebuffer.map(framebuffer_device_range).transpose()?;
         for descriptor in memory_map.entries() {
             if !is_runtime_ram(descriptor.ty) {
                 continue;
             }
             let range = PhysicalRange::from_pages(descriptor.phys_start, descriptor.page_count)
                 .map_err(|_| ())?;
-            insert_identity(
-                &mut plan,
-                range,
-                MappingPermissions::READ_WRITE,
-                MappingMemoryType::Normal,
-                MappingOwner::KernelRuntime,
-            )?;
+            insert_runtime_excluding(&mut plan, range, framebuffer_range)?;
         }
         for range in [
             boot_memory.heap,
@@ -372,7 +429,90 @@ mod firmware {
                 MappingOwner::MachineDevice,
             )?;
         }
+        if let Some(framebuffer) = framebuffer {
+            insert_identity(
+                &mut plan,
+                framebuffer_device_range(framebuffer)?,
+                MappingPermissions::READ_WRITE,
+                MappingMemoryType::Device,
+                MappingOwner::MachineDevice,
+            )?;
+        }
         Ok(plan)
+    }
+
+    fn capture_framebuffer() -> Option<FramebufferDescriptor> {
+        let handle = boot::get_handle_for_protocol::<GraphicsOutput>().ok()?;
+        let mut graphics = boot::open_protocol_exclusive::<GraphicsOutput>(handle).ok()?;
+        let info = graphics.current_mode_info();
+        let pixel_format = match info.pixel_format() {
+            GopPixelFormat::Rgb => FramebufferPixelFormat::Rgb,
+            GopPixelFormat::Bgr => FramebufferPixelFormat::Bgr,
+            GopPixelFormat::Bitmask | GopPixelFormat::BltOnly => return None,
+        };
+        let (width, height) = info.resolution();
+        let stride = info.stride();
+        let mut buffer = graphics.frame_buffer();
+        let base = u64::try_from(buffer.as_mut_ptr() as usize).ok()?;
+        FramebufferDescriptor::new(base, buffer.size(), width, height, stride, pixel_format).ok()
+    }
+
+    fn framebuffer_device_range(framebuffer: FramebufferDescriptor) -> Result<PhysicalRange, ()> {
+        let page_mask = BASE_PAGE_SIZE - 1;
+        let start = framebuffer.base_address() & !page_mask;
+        let byte_len = u64::try_from(framebuffer.byte_len()).map_err(|_| ())?;
+        let end = framebuffer.base_address().checked_add(byte_len).ok_or(())?;
+        let aligned_end = end.checked_add(page_mask).ok_or(())? & !page_mask;
+        let page_count = aligned_end.checked_sub(start).ok_or(())? / BASE_PAGE_SIZE;
+        PhysicalRange::from_pages(start, page_count).map_err(|_| ())
+    }
+
+    fn insert_runtime_excluding(
+        plan: &mut MappingPlan,
+        range: PhysicalRange,
+        excluded: Option<PhysicalRange>,
+    ) -> Result<(), ()> {
+        let Some(excluded) = excluded else {
+            return insert_identity(
+                plan,
+                range,
+                MappingPermissions::READ_WRITE,
+                MappingMemoryType::Normal,
+                MappingOwner::KernelRuntime,
+            );
+        };
+        if range.end() <= excluded.start() || range.start() >= excluded.end() {
+            return insert_identity(
+                plan,
+                range,
+                MappingPermissions::READ_WRITE,
+                MappingMemoryType::Normal,
+                MappingOwner::KernelRuntime,
+            );
+        }
+        if range.start() < excluded.start() {
+            let page_count = (excluded.start() - range.start()) / BASE_PAGE_SIZE;
+            let before = PhysicalRange::from_pages(range.start(), page_count).map_err(|_| ())?;
+            insert_identity(
+                plan,
+                before,
+                MappingPermissions::READ_WRITE,
+                MappingMemoryType::Normal,
+                MappingOwner::KernelRuntime,
+            )?;
+        }
+        if range.end() > excluded.end() {
+            let page_count = (range.end() - excluded.end()) / BASE_PAGE_SIZE;
+            let after = PhysicalRange::from_pages(excluded.end(), page_count).map_err(|_| ())?;
+            insert_identity(
+                plan,
+                after,
+                MappingPermissions::READ_WRITE,
+                MappingMemoryType::Normal,
+                MappingOwner::KernelRuntime,
+            )?;
+        }
+        Ok(())
     }
 
     fn insert_identity(
@@ -625,12 +765,19 @@ mod firmware {
         }
         let mut dispatcher = Dispatcher::new(1, 1)
             .unwrap_or_else(|_| fatal(b"fatal: cannot create service dispatcher\n"));
+        let shell_console = NativeShellConsole::new(task.accounting.framebuffer);
+        let framebuffer_ready = shell_console.has_framebuffer();
         let (_console_port, console_handle) = dispatcher
-            .register(Box::new(ConsoleService::new(NativeConsole)), Rights::CALL)
+            .register(Box::new(ConsoleService::new(shell_console)), Rights::CALL)
             .unwrap_or_else(|_| fatal(b"fatal: cannot register console service\n"));
         let mut console = DispatchedOutput::new(&mut dispatcher, console_handle);
         if write_all(&mut console, b"in-process console dispatch: ready\n").is_err() {
             fatal(b"fatal: console service request failed\n");
+        }
+        if framebuffer_ready
+            && write_all(&mut console, b"owned framebuffer text console: ready\n").is_err()
+        {
+            fatal(b"fatal: framebuffer console write failed\n");
         }
         let mut namespace = Namespace::new(RamFsQuota::default());
         if namespace.mount_embedded(ROOTFS).is_err() {
@@ -643,9 +790,14 @@ mod firmware {
         else {
             fatal(b"fatal: cannot compose namespace\n");
         };
-        let mut editor = LineEditor {
-            discard_leading_lf: false,
-        };
+        let editor_config = EditorConfig::tiny();
+        if editor_config.max_line_bytes() > MAX_LINE_BYTES {
+            fatal(b"fatal: editor line policy exceeds shell parser policy\n");
+        }
+        let completion_config = CompletionConfig::tiny();
+        let mut decoder = InputDecoder::new(editor_config.input());
+        let mut keyboard = Ps2Set1Decoder::new(KeyboardConfig::tiny());
+        let mut editor = LineEditor::new(editor_config);
 
         if write_all(&mut console, b"kllm owns memory and console; type 'help'\n").is_err() {
             fatal(b"fatal: native console write failed\n");
@@ -653,13 +805,21 @@ mod firmware {
 
         loop {
             shell.set_machine_memory(machine_snapshot(task.accounting));
-            if write_all(&mut console, b"kllm:").is_err()
-                || write_all(&mut console, shell.cwd().as_bytes()).is_err()
-                || write_all(&mut console, b"> ").is_err()
-            {
+            let mut prompt = String::from("kllm:");
+            prompt.push_str(shell.cwd());
+            prompt.push_str("> ");
+            if write_all(&mut console, prompt.as_bytes()).is_err() {
                 fatal(b"fatal: native console write failed\n");
             }
-            let Ok(line) = editor.read_line(&mut console) else {
+            let Ok(line) = read_edited_line(
+                &mut editor,
+                &mut decoder,
+                &mut keyboard,
+                &shell,
+                completion_config,
+                &prompt,
+                &mut console,
+            ) else {
                 fatal(b"fatal: native console input failed\n");
             };
             #[cfg(feature = "acceptance-probes")]
@@ -699,46 +859,109 @@ mod firmware {
         }
     }
 
-    impl LineEditor {
-        fn read_line(&mut self, console: &mut dyn Output) -> Result<String, ()> {
-            let mut line = String::new();
-            let mut overflow = false;
-            loop {
-                let byte = kllm_machine::read_byte();
-                if self.discard_leading_lf && byte == b'\n' {
-                    self.discard_leading_lf = false;
-                    continue;
+    fn read_edited_line(
+        editor: &mut LineEditor,
+        decoder: &mut InputDecoder,
+        keyboard: &mut Ps2Set1Decoder,
+        shell: &Shell,
+        completion_config: CompletionConfig,
+        prompt: &str,
+        console: &mut dyn Output,
+    ) -> Result<String, ()> {
+        loop {
+            let key = loop {
+                if let Some(scan_code) = kllm_machine::try_read_keyboard_scancode()
+                    && let Some(key) = keyboard.push(scan_code)
+                {
+                    break key;
                 }
-                self.discard_leading_lf = false;
-                match byte {
-                    b'\r' | b'\n' => {
-                        self.discard_leading_lf = byte == b'\r';
-                        write_all(console, b"\n")?;
-                        if overflow {
-                            write_all(console, b"input: line exceeded 512 bytes; discarded\n")?;
-                            line.clear();
-                            overflow = false;
-                            continue;
-                        }
-                        return Ok(line);
-                    }
-                    value if is_backspace(char::from(value)) => {
-                        if line.pop().is_some() {
-                            write_all(console, b"\x08 \x08")?;
-                        }
-                    }
-                    0x20..=0x7e if !overflow => {
-                        if line.len() == MAX_LINE_BYTES {
-                            overflow = true;
-                        } else {
-                            line.push(char::from(byte));
-                            write_all(console, &[byte])?;
-                        }
-                    }
-                    _ => {}
+                if let Some(byte) = kllm_machine::try_read_byte()
+                    && let Some(key) = decoder.push(byte)
+                {
+                    break key;
                 }
+                spin_loop();
+            };
+            match editor.handle(key) {
+                EditorOutcome::Changed => redraw_editor(editor, prompt, console)?,
+                EditorOutcome::Submitted(line) => {
+                    write_all(console, b"\n")?;
+                    return Ok(line);
+                }
+                EditorOutcome::Cancelled => {
+                    write_all(console, b"^C\n")?;
+                    return Ok(String::new());
+                }
+                EditorOutcome::ClearRequested => {
+                    write_all(console, b"\x1b[2J\x1b[H")?;
+                    redraw_editor(editor, prompt, console)?;
+                }
+                EditorOutcome::CompletionRequested => {
+                    complete_editor(editor, shell, completion_config, prompt, console)?;
+                }
+                EditorOutcome::LimitReached => write_all(console, b"\x07")?,
+                EditorOutcome::Ignored => {}
             }
         }
+    }
+
+    fn redraw_editor(
+        editor: &LineEditor,
+        prompt: &str,
+        console: &mut dyn Output,
+    ) -> Result<(), ()> {
+        write_all(console, b"\r")?;
+        write_all(console, prompt.as_bytes())?;
+        write_all(console, editor.line().as_bytes())?;
+        write_all(console, b"\x1b[K")?;
+        let suffix_characters = editor.line()[editor.cursor()..].chars().count();
+        if suffix_characters != 0 {
+            let mut movement = String::new();
+            write!(movement, "\x1b[{suffix_characters}D").map_err(|_| ())?;
+            write_all(console, movement.as_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn complete_editor(
+        editor: &mut LineEditor,
+        shell: &Shell,
+        config: CompletionConfig,
+        prompt: &str,
+        console: &mut dyn Output,
+    ) -> Result<(), ()> {
+        let completion = shell.complete(editor.line(), editor.cursor(), config);
+        if completion.candidates.is_empty() {
+            write_all(console, b"\x07")?;
+            return Ok(());
+        }
+        let current = &editor.line()[completion.replacement_start..completion.replacement_end];
+        let Some(replacement) = completion.common_replacement() else {
+            return Ok(());
+        };
+        let can_apply = !completion.truncated
+            && (completion.candidates.len() == 1 || replacement.len() > current.len());
+        if can_apply {
+            let _outcome = editor.replace_range(
+                completion.replacement_start,
+                completion.replacement_end,
+                replacement,
+            );
+            return redraw_editor(editor, prompt, console);
+        }
+
+        write_all(console, b"\n")?;
+        for candidate in &completion.candidates {
+            write_all(console, candidate.display.as_bytes())?;
+            write_all(console, b"\n")?;
+        }
+        if completion.truncated {
+            write_all(
+                console,
+                b"... completion list truncated by profile limits\n",
+            )?;
+        }
+        redraw_editor(editor, prompt, console)
     }
 
     fn machine_snapshot(accounting: &OwnedAccounting) -> MachineMemorySnapshot {

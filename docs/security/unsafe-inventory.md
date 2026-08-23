@@ -1,6 +1,6 @@
 # Unsafe inventory
 
-Stage 5 contains exactly 84 project-authored Rust `unsafe` tokens, all in the
+Stage 5.1 contains exactly 87 project-authored Rust `unsafe` tokens, all in the
 two audited modules of `crates/kllm-machine`. The verification gate fails if
 this count changes without a same-change inventory review. Portable crates and
 the kernel composition root continue to forbid unsafe code.
@@ -10,7 +10,8 @@ the kernel composition root continue to forbid unsafe code.
 | TLSF pool and hybrid global allocator | 16 | One fresh, page-aligned LoaderData range is transferred once; a spin lock serializes metadata; `GlobalAlloc` layouts match; non-heap loader pointers are never returned through exited firmware. |
 | Owned-stack and interrupt transition | 8 | A checked, reserved stack receives one leaked continuation record; architecture trampolines replace SP/RSP once and cannot return; x86 IF and AArch64 DAIF are masked before firmware exception state is replaced. |
 | Cooperative task-stack calls | 4 | One unique call record and task state borrow remain live while an architecture trampoline replaces SP/RSP synchronously; the old stack is saved inside the mapped task payload and restored before Rust resumes. |
-| x86-64 16550 and `hlt` | 10 | The pinned q35 profile owns COM1 at `0x3f8`; byte I/O uses readiness bits and bounded transmit polling; halt is terminal. |
+| Owned framebuffer writes | 1 | GOP scalar metadata is checked before handoff; page-rounded bytes are allocator-reserved and mapped RW/NX as device memory; checked pixel offsets precede each volatile byte write. |
+| x86-64 16550, i8042, and `hlt` | 12 | The pinned q35 profile owns COM1 at `0x3f8` and the PS/2 controller at `0x60`/`0x64`; byte I/O checks readiness/status bits, ignores auxiliary-device data, and bounds transmit polling; halt is terminal. |
 | AArch64 PL011 and `wfe` | 10 | The pinned virt profile owns PL011 at `0x09000000`; aligned volatile accesses target documented registers; transmit polling is bounded; park is terminal. |
 | Heap host tests | 4 | Test arenas remain live, exclusively borrowed, and allocations are deallocated once with their original layouts. |
 | Loaded PE view and terminal acceptance probes | 6 | Checked protocol metadata proves every raw-slice bound; feature-only probes target validated mappings or raise one native exception and never return. |

@@ -873,6 +873,53 @@ impl FrameAllocator {
         Err(FrameAllocationError::Exhausted)
     }
 
+    /// Mark every currently free allocator-owned frame in `range` unavailable.
+    ///
+    /// Frames outside usable spans are ignored, and reserving the same range
+    /// repeatedly is idempotent. The returned count is the number of frames
+    /// newly removed from the free pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns an arithmetic error if the allocator's internal accounting
+    /// cannot represent the reservation.
+    pub fn reserve_range(&mut self, range: PhysicalRange) -> Result<u64, FrameAllocationError> {
+        let mut reserved = 0_u64;
+        for span_index in 0..self.spans.len() {
+            let span = self.spans[span_index];
+            let overlap_start = span.range.start.max(range.start);
+            let overlap_end = span.range.end.min(range.end);
+            if overlap_start >= overlap_end {
+                continue;
+            }
+
+            let first = span
+                .first_frame
+                .checked_add((overlap_start - span.range.start) / BASE_PAGE_SIZE)
+                .ok_or(FrameAllocationError::Overflow)?;
+            let page_count = (overlap_end - overlap_start) / BASE_PAGE_SIZE;
+            let end = first
+                .checked_add(page_count)
+                .ok_or(FrameAllocationError::Overflow)?;
+            for frame_index in first..end {
+                if self.is_allocated(frame_index)? {
+                    continue;
+                }
+                let next_free = self
+                    .free_frames
+                    .checked_sub(1)
+                    .ok_or(FrameAllocationError::Overflow)?;
+                let next_reserved = reserved
+                    .checked_add(1)
+                    .ok_or(FrameAllocationError::Overflow)?;
+                self.set_allocated(frame_index, true)?;
+                self.free_frames = next_free;
+                reserved = next_reserved;
+            }
+        }
+        Ok(reserved)
+    }
+
     /// Return one previously allocated physical frame to the bitmap.
     ///
     /// # Errors
@@ -1348,6 +1395,25 @@ mod tests {
             allocator.free(BASE_PAGE_SIZE + 1),
             Err(FrameAllocationError::InvalidFrame)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn frame_bitmap_reserves_overlapping_device_pages_idempotently()
+    -> Result<(), FrameAllocationError> {
+        let map = NormalizedMemoryMap::build(&[region(1, 8, RegionKind::Usable)], &[])
+            .map_err(|_| FrameAllocationError::Overflow)?;
+        let mut allocator = FrameAllocator::from_map(&map)?;
+        let device = PhysicalRange::from_pages(3 * BASE_PAGE_SIZE, 3)
+            .map_err(|_| FrameAllocationError::Overflow)?;
+
+        assert_eq!(allocator.reserve_range(device), Ok(3));
+        assert_eq!(allocator.reserve_range(device), Ok(0));
+        assert_eq!(allocator.free_frames(), 5);
+
+        while let Ok(frame) = allocator.allocate() {
+            assert!(!device.contains(frame));
+        }
         Ok(())
     }
 

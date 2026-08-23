@@ -16,8 +16,10 @@ state must enforce the supplied limits atomically.
 
 Input transports produce architecture-independent key events. The serial
 decoder consumes complete ANSI CSI/SS3 sequences and discards unknown sequences
-without leaking their printable tails into the command line. A future native
-keyboard driver produces the same events. The editor owns bounded cursor-aware
+without leaking their printable tails into the command line. The x86-64 q35
+profile polls i8042 and decodes PC scan-code set 1 into the same events under a
+selected US-layout policy. AArch64 native keyboard input is deferred until a
+bounded virtio-input transport exists. The editor owns bounded cursor-aware
 editing and session history; shell-aware completion remains in `kllm-shell` so
 it can use the authoritative command registry and VFS namespace without giving
 the terminal ambient filesystem authority.
@@ -39,9 +41,10 @@ scrolling, UTF-8 decoding with a replacement glyph, and the small control/CSI
 subset required by the shell and editor. Scrollback, font loading, rich color,
 windowing, USB HID, and a general display API are outside this increment.
 
-QEMU keeps a deterministic headless profile using serial stdio and gains an
+QEMU keeps a deterministic headless profile using serial stdio and has an
 explicit graphical profile. Host tests cover terminal parsing, editor bounds,
 history eviction, completion budgets, framebuffer arithmetic, pixel formats,
-and rendering. QEMU acceptance continues to use UART so graphical availability
-cannot hide a broken recovery console.
-
+and rendering. QEMU acceptance continues to drive UART so graphical
+availability cannot hide a broken recovery console; additional smoke checks
+require framebuffer activation on both architectures and inject native PS/2
+keys on x86-64.

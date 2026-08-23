@@ -8,6 +8,7 @@ members = [
     "crates/kllm-vfs",
     "crates/kllm-shell",
     "crates/kllm-task",
+    "crates/kllm-terminal",
     "host",
     "kernel",
     "xtask",
@@ -19,6 +20,7 @@ default-members = [
     "crates/kllm-vfs",
     "crates/kllm-shell",
     "crates/kllm-task",
+    "crates/kllm-terminal",
     "host",
 ]
 

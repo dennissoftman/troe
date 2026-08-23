@@ -41,6 +41,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="build the image and print the QEMU command without starting it",
     )
+    parser.add_argument(
+        "--graphical",
+        action="store_true",
+        help="open the owned framebuffer console while preserving serial stdio",
+    )
     return parser.parse_args()
 
 
@@ -52,6 +57,7 @@ def main() -> int:
             args.firmware_code,
             args.firmware_vars,
             skip_version_check=args.skip_version_check,
+            graphical=args.graphical,
         )
         if args.dry_run:
             print(shlex.join(command))

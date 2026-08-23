@@ -81,7 +81,7 @@ def main() -> int:
             TOOLS_DIR / "check_unsafe.py",
             REPO_ROOT,
             "--expected",
-            "84",
+            "87",
         ),
         (
             "cargo",

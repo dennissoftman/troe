@@ -21,6 +21,10 @@ use kllm_memory::PhysicalRange;
 #[cfg(target_os = "uefi")]
 use kllm_task::TaskStep;
 #[cfg(target_os = "uefi")]
+use kllm_terminal::{
+    Color, FramebufferDescriptor, FramebufferPixelFormat, PixelSurface, SurfaceError,
+};
+#[cfg(target_os = "uefi")]
 use uefi::mem::memory_map::MemoryMapOwned;
 
 #[cfg(target_os = "uefi")]
@@ -77,6 +81,74 @@ pub struct HeapStats {
     pub high_water_bytes: usize,
     /// Allocation requests rejected by the owned heap.
     pub failed_allocations: usize,
+}
+
+/// Failure to establish checked post-handoff framebuffer access.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(target_os = "uefi")]
+pub enum FramebufferError {
+    /// The physical base cannot be represented by the active architecture.
+    AddressUnsupported,
+}
+
+/// Exclusively owned post-handoff framebuffer surface.
+#[derive(Debug)]
+#[cfg(target_os = "uefi")]
+pub struct OwnedFramebuffer {
+    descriptor: FramebufferDescriptor,
+    base: usize,
+}
+
+#[cfg(target_os = "uefi")]
+impl OwnedFramebuffer {
+    /// Construct access from previously validated copied GOP metadata.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the framebuffer base is not representable on this target.
+    pub fn new(descriptor: FramebufferDescriptor) -> Result<Self, FramebufferError> {
+        let base = usize::try_from(descriptor.base_address())
+            .map_err(|_| FramebufferError::AddressUnsupported)?;
+        Ok(Self { descriptor, base })
+    }
+}
+
+#[cfg(target_os = "uefi")]
+impl PixelSurface for OwnedFramebuffer {
+    fn dimensions(&self) -> (usize, usize) {
+        (self.descriptor.width(), self.descriptor.height())
+    }
+
+    fn write_pixel(&mut self, x: usize, y: usize, color: Color) -> Result<(), SurfaceError> {
+        if x >= self.descriptor.width() || y >= self.descriptor.height() {
+            return Err(SurfaceError::Bounds);
+        }
+        let pixel = y
+            .checked_mul(self.descriptor.stride())
+            .and_then(|row| row.checked_add(x))
+            .ok_or(SurfaceError::Overflow)?;
+        let offset = pixel.checked_mul(4).ok_or(SurfaceError::Overflow)?;
+        let end = offset.checked_add(4).ok_or(SurfaceError::Overflow)?;
+        if end > self.descriptor.byte_len() {
+            return Err(SurfaceError::Bounds);
+        }
+        let bytes = match self.descriptor.pixel_format() {
+            FramebufferPixelFormat::Rgb => [color.red, color.green, color.blue, 0],
+            FramebufferPixelFormat::Bgr => [color.blue, color.green, color.red, 0],
+        };
+        for (index, byte) in bytes.into_iter().enumerate() {
+            let address = self
+                .base
+                .checked_add(offset)
+                .and_then(|value| value.checked_add(index))
+                .ok_or(SurfaceError::Overflow)?;
+            // SAFETY: FramebufferDescriptor construction proved the complete
+            // byte range and geometry, the checked offset is within that range,
+            // the MMU maps it RW/NX, and this owned surface is the sole writer.
+            unsafe { ptr::write_volatile(address as *mut u8, byte) };
+        }
+        Ok(())
+    }
 }
 
 struct HeapState {
@@ -440,6 +512,39 @@ pub fn read_byte() -> u8 {
     }
 }
 
+/// Poll one byte from the architecture-native UART without blocking.
+#[must_use]
+#[cfg(target_os = "uefi")]
+pub fn try_read_byte() -> Option<u8> {
+    architecture_try_read_byte()
+}
+
+/// Poll one native keyboard scan-code byte without blocking.
+///
+/// The pinned x86-64 q35 profile exposes a first PS/2 controller. The current
+/// `AArch64` `virt` profile has no architecture-neutral keyboard transport yet.
+#[must_use]
+#[cfg(target_os = "uefi")]
+pub fn try_read_keyboard_scancode() -> Option<u8> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        const PS2_DATA: u16 = 0x0060;
+        const PS2_STATUS: u16 = 0x0064;
+        // SAFETY: The pinned q35 profile owns the legacy i8042 controller.
+        let status = unsafe { port_read(PS2_STATUS) };
+        if status & 1 == 0 || status & (1 << 5) != 0 {
+            None
+        } else {
+            // SAFETY: The status register reports one keyboard byte available.
+            Some(unsafe { port_read(PS2_DATA) })
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        None
+    }
+}
+
 /// Park the current CPU permanently after an authorized halt.
 #[cfg(target_os = "uefi")]
 pub fn park() -> ! {
@@ -480,7 +585,7 @@ fn write_byte(byte: u8) -> bool {
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
-fn try_read_byte() -> Option<u8> {
+fn architecture_try_read_byte() -> Option<u8> {
     // SAFETY: The pinned q35 profile assigns COM1 at this legacy I/O range.
     if unsafe { port_read(SERIAL_PORT + 5) } & 1 == 0 {
         None
@@ -637,7 +742,7 @@ fn write_byte(byte: u8) -> bool {
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
-fn try_read_byte() -> Option<u8> {
+fn architecture_try_read_byte() -> Option<u8> {
     // SAFETY: The pinned virt profile maps PL011 registers at this address.
     if unsafe { mmio_read(PL011_FLAGS) } & (1 << 4) != 0 {
         None

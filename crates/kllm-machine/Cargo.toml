@@ -12,6 +12,7 @@ acceptance-probes = []
 [dependencies]
 kllm-memory = { path = "../kllm-memory" }
 kllm-task = { path = "../kllm-task" }
+kllm-terminal = { path = "../kllm-terminal" }
 rlsf = { version = "=0.2.3", default-features = false }
 
 [target.'cfg(target_os = "uefi")'.dependencies]

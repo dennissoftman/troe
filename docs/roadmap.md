@@ -125,17 +125,23 @@ dispatcher failure cannot recurse through itself. Both QEMU targets require the
 dispatch-ready boot marker. See
 [ADR 0011](adr/0011-bounded-in-process-message-dispatch.md).
 
-## Stage 5.1: native text console and shell usability (in progress)
+## Stage 5.1: native text console and shell usability — complete
 
-Extract a portable, configurable terminal-input and line-editor core; add
-bounded session history and command/VFS completion; copy and validate UEFI GOP
-metadata before handoff; and add an owned framebuffer text renderer while
-retaining UART for early, fatal, headless, and acceptance paths.
+The portable `kllm-terminal` crate now provides configurable input decoding,
+cursor-aware line editing, bounded volatile history, set-1 keyboard decoding,
+and fixed-glyph framebuffer rendering. `kllm-shell` provides bounded
+command/VFS completion from one authoritative command registry. The kernel
+copies and validates UEFI GOP metadata before handoff and mirrors normal output
+to an owned RW/NX device mapping while retaining UART for early, fatal,
+headless, and acceptance paths.
 
 Exit: both architectures can display and edit a shell line through the owned
 text-console abstraction; every retained-entry and byte budget comes from a
 validated selected profile; unknown serial escape sequences cannot corrupt the
 line; and the existing deterministic UART acceptance matrix remains available.
+The x86-64 q35 profile also accepts a native PS/2 keyboard. AArch64 native
+keyboard input is a later virtio-input increment; serial input and owned ramfb
+output are covered now.
 See [ADR 0012](adr/0012-native-text-console-and-editor-policy.md).
 
 ## Stage 6: optional isolation (planned after Stage 5.1)

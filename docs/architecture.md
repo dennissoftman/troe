@@ -3,9 +3,9 @@
 The same portable graph is linked into two composition roots:
 
 ```text
-host stdin/stdout ─┐                 ┌─ hosted process
-                   ├─ shell ─ VFS ──┤
-native UART ───────┘                 └─ owned-machine kernel
+host stdin/stdout ───────────┐                 ┌─ hosted process
+                             ├─ shell ─ VFS ──┤
+serial / PS/2 → editor ──────┘                 └─ UART + GOP text console
 ```
 
 Stage 5 keeps the graph in one address space but can route selected edges
@@ -20,7 +20,10 @@ statically linked recovery shell.
 
 ## Input-to-output trace
 
-1. A composition root owns line editing and enforces the 512-byte line bound.
+1. A composition root selects a validated editor policy. The portable editor
+   enforces its UTF-8 byte bound, cursor-aware editing, volatile history limits,
+   and decoded key events; ANSI serial input and x86 set-1 PS/2 input feed the
+   same event type.
 2. The shell crate tokenizes iteratively. Quotes group bytes; no expansion,
    recursion, substitution, environment lookup, or globbing occurs.
 3. The pipeline executor finds a statically linked command by name. Commands
@@ -29,8 +32,10 @@ statically linked recovery shell.
    frozen result through `SliceInput`; a stage cannot observe mutable internals.
 5. Filesystem commands ask `Namespace` to canonicalize from the logical cwd.
    Immutable KEFS nodes and writable `/tmp` nodes share one object model.
-6. The final output capability writes either host bytes or the polling native
-   UART. UEFI text output is confined to the pre-handoff banner.
+6. The final output capability writes host bytes or the polling native UART.
+   When validated GOP metadata is available, normal native shell output is also
+   rendered into an owned fixed-glyph framebuffer console. UEFI text output is
+   confined to the pre-handoff banner.
 
 Pipelines remain sequential even though cooperative tasks now exist. This makes
 backpressure an explicit capacity error rather than requiring hidden scheduling.
@@ -69,8 +74,11 @@ reserves 128 KiB/16 KiB kernel and emergency stacks. It installs polling
 enters a non-returning `ExitBootServices` continuation. Interrupts are masked
 before exception state changes. Only then does the kernel reclassify expired
 boot-services code/data as usable and build a compact bitmap over genuinely
-allocatable pages. `mem` and `/sys/memory` publish owned-map bytes, free/total
-frames, and live heap use, capacity, high-water, and failure counts.
+allocatable pages. Any usable frames overlapping the page-rounded GOP aperture
+are marked unavailable in that bitmap; the aperture is mapped RW/NX as device
+memory and never aliases a normal-memory mapping. `mem` and `/sys/memory`
+publish owned-map bytes, free/total frames, and live heap use, capacity,
+high-water, and failure counts.
 
 Stage 3 adds a pure, bounded mapping plan. The composition root identity-maps
 only runtime RAM, PE-classified image sections, the boot arena, and the AArch64
@@ -121,6 +129,16 @@ Fatal diagnostics and polling input remain direct machine mechanisms. This is
 still in-process dispatch, not IPC: service code shares the caller's privileged
 address space, borrowed request bytes are not a wire format, and service faults
 are not contained.
+
+Stage 5.1 adds `kllm-terminal`, which keeps transport-independent input
+decoding, line editing, history, and fixed-glyph text rendering outside the
+machine mechanism. `kllm-shell` owns completion because it has the authoritative
+command registry and VFS namespace; both command candidates and directory
+listings are returned under caller-selected count and byte budgets. The native
+composition root currently selects the named `tiny` policies. x86-64 polls the
+q35 i8042 controller and decodes US set-1 scan codes, while both architectures
+retain serial input. AArch64 native keyboard input is deferred to a bounded
+virtio-input transport rather than adding a firmware dependency after handoff.
 
 ## Future persistent-storage boundary
 

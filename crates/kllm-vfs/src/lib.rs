@@ -106,6 +106,15 @@ pub struct DirEntry {
     pub kind: NodeKind,
 }
 
+/// Bounded directory query result.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectoryListing {
+    /// Matching entries retained within the requested budgets.
+    pub entries: Vec<DirEntry>,
+    /// Whether at least one matching entry was omitted by a budget.
+    pub truncated: bool,
+}
+
 /// Unified immutable-root and writable-RAM namespace.
 #[derive(Clone, Debug)]
 pub struct Namespace {
@@ -348,6 +357,69 @@ impl Namespace {
         Ok(entries)
     }
 
+    /// List matching immediate children without exceeding caller-supplied budgets.
+    ///
+    /// Entry names, rather than allocator metadata, are charged to `max_bytes`.
+    /// A zero entry or byte budget returns no entries and reports truncation when
+    /// the directory contains a match.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the path is invalid, missing, or not a directory.
+    pub fn list_matching_bounded(
+        &self,
+        cwd: &str,
+        path: &str,
+        name_prefix: &str,
+        directories_only: bool,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> Result<DirectoryListing, FsError> {
+        let path = canonicalize(cwd, path)?;
+        match self.nodes.get(&path) {
+            Some(Node::Directory) => {}
+            Some(Node::File { .. }) => return Err(FsError::WrongType),
+            None => return Err(FsError::NotFound),
+        }
+        let prefix = if path == "/" {
+            "/".to_string()
+        } else {
+            let mut prefix = path;
+            prefix.push('/');
+            prefix
+        };
+        let mut entries = Vec::new();
+        let mut retained_bytes = 0_usize;
+        let mut truncated = false;
+        for (candidate, node) in self.nodes.range(prefix.clone()..) {
+            if !candidate.starts_with(&prefix) {
+                break;
+            }
+            let suffix = &candidate[prefix.len()..];
+            if suffix.is_empty()
+                || suffix.contains('/')
+                || !suffix.starts_with(name_prefix)
+                || (directories_only && node.kind() != NodeKind::Directory)
+            {
+                continue;
+            }
+            let Some(next_bytes) = retained_bytes.checked_add(suffix.len()) else {
+                truncated = true;
+                break;
+            };
+            if entries.len() >= max_entries || next_bytes > max_bytes {
+                truncated = true;
+                break;
+            }
+            entries.push(DirEntry {
+                name: suffix.to_string(),
+                kind: node.kind(),
+            });
+            retained_bytes = next_bytes;
+        }
+        Ok(DirectoryListing { entries, truncated })
+    }
+
     /// Resolve a path and require it to be a directory.
     ///
     /// # Errors
@@ -524,7 +596,7 @@ fn read_u32(image: &[u8], offset: usize) -> Result<u32, FsError> {
 #[cfg(test)]
 mod tests {
     use super::{FsError, Namespace, NodeKind, RamFsQuota, canonicalize};
-    use alloc::vec;
+    use alloc::{vec, vec::Vec};
 
     #[test]
     fn paths_are_bounded_and_cannot_escape_root() {
@@ -558,6 +630,32 @@ mod tests {
         assert_eq!(list[0].name, "a");
         assert_eq!(list[0].kind, NodeKind::File);
         assert_eq!(list[1].name, "z");
+    }
+
+    #[test]
+    fn matching_listing_obeys_injected_entry_and_byte_budgets() {
+        let mut fs = Namespace::new(RamFsQuota::default());
+        assert_eq!(fs.write_file("/", "/tmp/alpha", b""), Ok(()));
+        assert_eq!(fs.write_file("/", "/tmp/alpine", b""), Ok(()));
+        assert_eq!(fs.write_file("/", "/tmp/beta", b""), Ok(()));
+        let listing = fs
+            .list_matching_bounded("/", "/tmp", "al", false, 1, 16)
+            .unwrap_or_else(|_| super::DirectoryListing {
+                entries: Vec::new(),
+                truncated: false,
+            });
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].name, "alpha");
+        assert!(listing.truncated);
+
+        let disabled = fs
+            .list_matching_bounded("/", "/tmp", "a", false, 0, 0)
+            .unwrap_or_else(|_| super::DirectoryListing {
+                entries: Vec::new(),
+                truncated: false,
+            });
+        assert!(disabled.entries.is_empty());
+        assert!(disabled.truncated);
     }
 
     #[test]

@@ -91,6 +91,8 @@ def prepare_qemu_command(
     skip_version_check: bool = False,
     build: bool = True,
     acceptance_probes: bool = False,
+    graphical: bool = False,
+    framebuffer: bool = False,
 ) -> list[str]:
     """Build an image, copy a disposable variable store, and return QEMU arguments."""
     executable_name = QEMU_EXECUTABLES[architecture]
@@ -133,13 +135,15 @@ def prepare_qemu_command(
         executable,
         "-machine",
         "q35" if architecture == "x86_64" else "virt",
-        "-display",
-        "none",
         "-monitor",
         "none",
         "-serial",
         "stdio",
     ]
+    if not graphical:
+        command.extend(("-display", "none"))
+    if (graphical or framebuffer) and architecture == "aarch64":
+        command.extend(("-device", "ramfb"))
     if architecture == "aarch64":
         command.extend(("-cpu", "cortex-a72"))
     command.extend(

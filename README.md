@@ -22,7 +22,10 @@ use rather than providing a hardware security boundary.
   yield/exit/reap accounting, and guarded 32 KiB task stacks;
 - generation-checked service handles, bounded synchronous request/reply
   messages, and a dispatched native console output path;
-- project-owned polling 16550 and PL011 consoles after boot services exit;
+- project-owned polling 16550 and PL011 recovery consoles after boot services
+  exit, plus an owned GOP framebuffer text console on both architectures;
+- configurable cursor-aware UTF-8 line editing, volatile bounded history,
+  command/VFS completion, ANSI serial-key decoding, and x86-64 PS/2 input;
 - single/double quotes and pipelines of up to eight stages;
 - 64 KiB bounded intermediate byte streams;
 - `cat`, `echo`, literal `grep`, `ls`, `pwd`, `cd`, `help`, `mem`, `clear`,
@@ -84,6 +87,14 @@ Build the x86-64 image and open it in QEMU:
 cargo qemu
 ```
 
+Open the owned framebuffer console while retaining serial stdio as the recovery
+transport:
+
+```console
+cargo qemu --graphical
+cargo qemu --architecture aarch64 --graphical
+```
+
 The launcher discovers firmware bundled with QEMU in conventional installation
 locations. Select AArch64 with `cargo qemu --architecture aarch64`. If QEMU does
 not bundle firmware, provide code and variable-store images from rust-osdev
@@ -93,14 +104,16 @@ not bundle firmware, provide code and variable-store images from rust-osdev
 The launcher and acceptance harness refuse a QEMU version other than 11.1.0 unless
 `--skip-version-check` is supplied deliberately. Firmware is not silently
 downloaded. UEFI Simple Text Output carries only the bootstrap banner. The image
-then initializes and exclusively uses its polling 16550 backend on x86-64 or
-PL011 backend on AArch64, moves to an explicitly reserved kernel stack, captures
-the final map, and exits boot services through a non-returning continuation.
+then initializes its polling 16550 backend on x86-64 or PL011 backend on
+AArch64, copies validated GOP metadata, moves to an explicitly reserved kernel
+stack, captures the final map, and exits boot services through a non-returning
+continuation. Normal shell output is mirrored to the owned framebuffer when GOP
+is available; early and fatal diagnostics remain serial-first.
 
 ## Repository map
 
-- `crates`: portable byte streams, memory models, shell, VFS, accounting, and
-  the isolated native machine mechanism crate;
+- `crates`: portable byte streams, memory models, shell, VFS, terminal/editor,
+  accounting, and the isolated native machine mechanism crate;
 - `host`: Stage 0 composition and acceptance runner;
 - `kernel`: UEFI bootstrap and Stage 5 dispatched owned-machine composition root;
 - `rootfs`, `assets`: source tree and generated KEFS image;
@@ -121,10 +134,14 @@ notes by purpose and status.
 The design defines three future build-time profiles rather than a continuous
 ladder of subtly different defaults: `micro` for MCU-class systems without an
 MMU assumption, `tiny` for constrained machines, and `full` for larger systems.
-The current QEMU images use one fixed, explicitly bounded configuration; profile
-selection is not implemented yet. When it lands, profiles will select capacities
-and compiled hardware capabilities while preserving the same shell, stream,
-VFS, and authority semantics.
+The current QEMU images select the named `tiny` configuration in their
+composition root; command-line profile selection is not implemented yet. The
+terminal/editor and completion crates expose validated constructors for line,
+history-entry, history-byte, escape-sequence, completion-candidate,
+completion-byte, text-cell, tab-width, color, and keyboard-layout policy, so
+these tunables are not scattered kernel literals. Future build profiles can
+replace that selection while preserving the same shell, stream, VFS, and
+authority semantics.
 
 ## Naming
 

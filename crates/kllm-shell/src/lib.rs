@@ -55,78 +55,217 @@ enum Quote {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CommandSpec {
+    id: CommandId,
     name: &'static str,
     synopsis: &'static str,
     requires_machine_control: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CommandId {
+    Cat,
+    Cd,
+    Clear,
+    Echo,
+    Grep,
+    Halt,
+    Help,
+    Hexdump,
+    Ls,
+    Mem,
+    Pwd,
+    Rm,
+    Write,
+}
+
 const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
+        id: CommandId::Cat,
         name: "cat",
         synopsis: "cat [FILE...]",
         requires_machine_control: false,
     },
     CommandSpec {
+        id: CommandId::Cd,
         name: "cd",
         synopsis: "cd PATH",
         requires_machine_control: false,
     },
     CommandSpec {
+        id: CommandId::Clear,
         name: "clear",
         synopsis: "clear",
         requires_machine_control: false,
     },
     CommandSpec {
+        id: CommandId::Echo,
         name: "echo",
         synopsis: "echo [ARG...]",
         requires_machine_control: false,
     },
     CommandSpec {
+        id: CommandId::Grep,
         name: "grep",
         synopsis: "grep PATTERN [FILE...]",
         requires_machine_control: false,
     },
     CommandSpec {
+        id: CommandId::Halt,
         name: "halt",
         synopsis: "halt",
         requires_machine_control: true,
     },
     CommandSpec {
+        id: CommandId::Help,
         name: "help",
         synopsis: "help [COMMAND]",
         requires_machine_control: false,
     },
     CommandSpec {
+        id: CommandId::Hexdump,
         name: "hexdump",
         synopsis: "hexdump [FILE]",
         requires_machine_control: false,
     },
     CommandSpec {
+        id: CommandId::Ls,
         name: "ls",
         synopsis: "ls [PATH]",
         requires_machine_control: false,
     },
     CommandSpec {
+        id: CommandId::Mem,
         name: "mem",
         synopsis: "mem",
         requires_machine_control: false,
     },
     CommandSpec {
+        id: CommandId::Pwd,
         name: "pwd",
         synopsis: "pwd",
         requires_machine_control: false,
     },
     CommandSpec {
+        id: CommandId::Rm,
         name: "rm",
         synopsis: "rm FILE",
         requires_machine_control: false,
     },
     CommandSpec {
+        id: CommandId::Write,
         name: "write",
         synopsis: "write FILE [TEXT...]",
         requires_machine_control: false,
     },
 ];
+
+/// Invalid shell-completion resource policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CompletionConfigError {
+    /// Candidate count and byte budgets must both be zero or both be non-zero.
+    InconsistentCapacity,
+}
+
+/// Bounded shell-completion resource policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CompletionConfig {
+    max_candidates: usize,
+    max_bytes: usize,
+}
+
+impl CompletionConfig {
+    /// Construct a completion policy. Two zero values disable completion.
+    ///
+    /// # Errors
+    ///
+    /// Fails if exactly one capacity is zero.
+    pub const fn new(
+        max_candidates: usize,
+        max_bytes: usize,
+    ) -> Result<Self, CompletionConfigError> {
+        if (max_candidates == 0) != (max_bytes == 0) {
+            return Err(CompletionConfigError::InconsistentCapacity);
+        }
+        Ok(Self {
+            max_candidates,
+            max_bytes,
+        })
+    }
+
+    /// A disabled completion policy.
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            max_candidates: 0,
+            max_bytes: 0,
+        }
+    }
+
+    /// Default completion policy for the `tiny` resource profile.
+    #[must_use]
+    pub const fn tiny() -> Self {
+        Self {
+            max_candidates: 64,
+            max_bytes: 4 * 1024,
+        }
+    }
+
+    /// Maximum returned candidate count.
+    #[must_use]
+    pub const fn max_candidates(self) -> usize {
+        self.max_candidates
+    }
+
+    /// Maximum returned candidate payload bytes.
+    #[must_use]
+    pub const fn max_bytes(self) -> usize {
+        self.max_bytes
+    }
+
+    /// Whether completion is disabled.
+    #[must_use]
+    pub const fn is_disabled(self) -> bool {
+        self.max_candidates == 0
+    }
+}
+
+/// One display and insertion value proposed by shell completion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompletionCandidate {
+    /// Candidate text shown when alternatives are listed.
+    pub display: String,
+    /// Text that replaces the incomplete token.
+    pub replacement: String,
+}
+
+/// Bounded completion result for one editable token.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Completion {
+    /// UTF-8 byte offset at which token replacement begins.
+    pub replacement_start: usize,
+    /// UTF-8 byte offset at which token replacement ends.
+    pub replacement_end: usize,
+    /// Lexically ordered retained candidates.
+    pub candidates: Vec<CompletionCandidate>,
+    /// Whether configured budgets omitted at least one candidate.
+    pub truncated: bool,
+}
+
+impl Completion {
+    /// Longest UTF-8-safe replacement prefix shared by every candidate.
+    #[must_use]
+    pub fn common_replacement(&self) -> Option<&str> {
+        let first = self.candidates.first()?.replacement.as_str();
+        let mut length = first.len();
+        for candidate in &self.candidates[1..] {
+            length = common_prefix_bytes(first, &candidate.replacement, length);
+        }
+        while !first.is_char_boundary(length) {
+            length = length.saturating_sub(1);
+        }
+        Some(&first[..length])
+    }
+}
 
 /// Parse quoting and `|` separators without expansion or recursion.
 ///
@@ -267,6 +406,35 @@ impl Shell {
         &self.cwd
     }
 
+    /// Complete the token ending at `cursor` without exceeding caller budgets.
+    ///
+    /// Incomplete quoted tokens are left unchanged in this first completion
+    /// profile. Candidate insertion never performs shell expansion.
+    #[must_use]
+    pub fn complete(&self, line: &str, cursor: usize, config: CompletionConfig) -> Completion {
+        if config.is_disabled()
+            || cursor > line.len()
+            || !line.is_char_boundary(cursor)
+            || cursor > MAX_LINE_BYTES
+        {
+            return Completion::default();
+        }
+        let Some(context) = completion_context(line, cursor) else {
+            return Completion::default();
+        };
+        if context.word_index == 0 {
+            return complete_commands(context, config);
+        }
+        if context.command == Some("help") && context.word_index == 1 {
+            return complete_commands(context, config);
+        }
+        let Some(directories_only) = path_completion_mode(context.command, context.word_index)
+        else {
+            return Completion::default();
+        };
+        self.complete_paths(context, directories_only, config)
+    }
+
     /// Replace the machine-accounting snapshot used by `mem` and `/sys/memory`.
     pub const fn set_machine_memory(&mut self, snapshot: MachineMemorySnapshot) {
         self.machine_memory = snapshot;
@@ -330,25 +498,84 @@ impl Shell {
             return CommandStatus::Success;
         };
         let args = &words[1..];
-        match command {
-            "cat" => self.command_cat(args, stdin, stdout, stderr),
-            "echo" => command_echo(args, stdout, stderr),
-            "grep" => self.command_grep(args, stdin, stdout, stderr),
-            "ls" => self.command_ls(args, stdout, stderr),
-            "pwd" => self.command_pwd(args, stdout, stderr),
-            "cd" => self.command_cd(args, stderr),
-            "help" => command_help(args, stdout, stderr),
-            "mem" => self.command_mem(args, stdout, stderr),
-            "clear" => command_clear(args, stdout, stderr),
-            "halt" => self.command_halt(args, stderr),
-            "write" => self.command_write(args, stdin, stderr),
-            "rm" => self.command_rm(args, stderr),
-            "hexdump" => self.command_hexdump(args, stdin, stdout, stderr),
-            _ => {
-                let _ignored = write_error(stderr, command, "unknown command");
-                CommandStatus::NotFound
-            }
+        let Some(spec) = COMMANDS.iter().find(|spec| spec.name == command) else {
+            let _ignored = write_error(stderr, command, "unknown command");
+            return CommandStatus::NotFound;
+        };
+        match spec.id {
+            CommandId::Cat => self.command_cat(args, stdin, stdout, stderr),
+            CommandId::Cd => self.command_cd(args, stderr),
+            CommandId::Clear => command_clear(args, stdout, stderr),
+            CommandId::Echo => command_echo(args, stdout, stderr),
+            CommandId::Grep => self.command_grep(args, stdin, stdout, stderr),
+            CommandId::Halt => self.command_halt(args, stderr),
+            CommandId::Help => command_help(args, stdout, stderr),
+            CommandId::Hexdump => self.command_hexdump(args, stdin, stdout, stderr),
+            CommandId::Ls => self.command_ls(args, stdout, stderr),
+            CommandId::Mem => self.command_mem(args, stdout, stderr),
+            CommandId::Pwd => self.command_pwd(args, stdout, stderr),
+            CommandId::Rm => self.command_rm(args, stderr),
+            CommandId::Write => self.command_write(args, stdin, stderr),
         }
+    }
+
+    fn complete_paths(
+        &self,
+        context: CompletionContext<'_>,
+        directories_only: bool,
+        config: CompletionConfig,
+    ) -> Completion {
+        let (directory, displayed_parent, name_prefix) = split_completion_path(context.prefix);
+        let Ok(listing) = self.namespace.list_matching_bounded(
+            &self.cwd,
+            directory,
+            name_prefix,
+            directories_only,
+            config.max_candidates(),
+            config.max_bytes(),
+        ) else {
+            return Completion::default();
+        };
+        let mut completion = Completion {
+            replacement_start: context.start,
+            replacement_end: context.end,
+            candidates: Vec::new(),
+            truncated: listing.truncated,
+        };
+        let mut retained_bytes = 0_usize;
+        for entry in listing.entries {
+            if !is_bare_word_component(&entry.name) {
+                completion.truncated = true;
+                continue;
+            }
+            let suffix = if entry.kind == NodeKind::Directory {
+                "/"
+            } else {
+                ""
+            };
+            let display = format!("{displayed_parent}{}{suffix}", entry.name);
+            let replacement = if entry.kind == NodeKind::Directory {
+                display.clone()
+            } else {
+                format!("{display} ")
+            };
+            let Some(next_bytes) = retained_bytes.checked_add(replacement.len()) else {
+                completion.truncated = true;
+                break;
+            };
+            if completion.candidates.len() >= config.max_candidates()
+                || next_bytes > config.max_bytes()
+            {
+                completion.truncated = true;
+                break;
+            }
+            completion.candidates.push(CompletionCandidate {
+                display,
+                replacement,
+            });
+            retained_bytes = next_bytes;
+        }
+        completion
     }
 
     fn command_cat(
@@ -597,6 +824,152 @@ impl Shell {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CompletionContext<'a> {
+    start: usize,
+    end: usize,
+    prefix: &'a str,
+    word_index: usize,
+    command: Option<&'a str>,
+}
+
+fn completion_context(line: &str, cursor: usize) -> Option<CompletionContext<'_>> {
+    let mut quote = Quote::None;
+    let mut word_started = false;
+    let mut word_start = 0_usize;
+    let mut word_quoted = false;
+    let mut word_index = 0_usize;
+    let mut command = None;
+
+    for (index, character) in line[..cursor].char_indices() {
+        match quote {
+            Quote::Single => {
+                if character == '\'' {
+                    quote = Quote::None;
+                }
+            }
+            Quote::Double => {
+                if character == '"' {
+                    quote = Quote::None;
+                }
+            }
+            Quote::None => match character {
+                '\'' | '"' => {
+                    if !word_started {
+                        word_started = true;
+                        word_start = index;
+                    }
+                    word_quoted = true;
+                    quote = if character == '\'' {
+                        Quote::Single
+                    } else {
+                        Quote::Double
+                    };
+                }
+                '|' => {
+                    word_started = false;
+                    word_quoted = false;
+                    word_index = 0;
+                    command = None;
+                }
+                value if value.is_whitespace() => {
+                    if word_started {
+                        if word_index == 0 && !word_quoted {
+                            command = Some(&line[word_start..index]);
+                        }
+                        word_index = word_index.saturating_add(1);
+                        word_started = false;
+                        word_quoted = false;
+                    }
+                }
+                _ => {
+                    if !word_started {
+                        word_started = true;
+                        word_start = index;
+                    }
+                }
+            },
+        }
+    }
+    if quote != Quote::None || word_quoted {
+        return None;
+    }
+    let start = if word_started { word_start } else { cursor };
+    Some(CompletionContext {
+        start,
+        end: cursor,
+        prefix: &line[start..cursor],
+        word_index,
+        command,
+    })
+}
+
+fn complete_commands(context: CompletionContext<'_>, config: CompletionConfig) -> Completion {
+    let mut completion = Completion {
+        replacement_start: context.start,
+        replacement_end: context.end,
+        candidates: Vec::new(),
+        truncated: false,
+    };
+    let mut retained_bytes = 0_usize;
+    for spec in COMMANDS
+        .iter()
+        .filter(|spec| spec.name.starts_with(context.prefix))
+    {
+        let replacement = format!("{} ", spec.name);
+        let Some(next_bytes) = retained_bytes.checked_add(replacement.len()) else {
+            completion.truncated = true;
+            break;
+        };
+        if completion.candidates.len() >= config.max_candidates() || next_bytes > config.max_bytes()
+        {
+            completion.truncated = true;
+            break;
+        }
+        completion.candidates.push(CompletionCandidate {
+            display: spec.name.to_string(),
+            replacement,
+        });
+        retained_bytes = next_bytes;
+    }
+    completion
+}
+
+fn path_completion_mode(command: Option<&str>, word_index: usize) -> Option<bool> {
+    match (command, word_index) {
+        (Some("cd"), 1) => Some(true),
+        (Some("cat"), 1..) | (Some("grep"), 2..) | (Some("hexdump" | "ls" | "rm" | "write"), 1) => {
+            Some(false)
+        }
+        _ => None,
+    }
+}
+
+fn split_completion_path(prefix: &str) -> (&str, &str, &str) {
+    match prefix.rfind('/') {
+        None => (".", "", prefix),
+        Some(0) => ("/", "/", &prefix[1..]),
+        Some(index) => (&prefix[..index], &prefix[..=index], &prefix[index + 1..]),
+    }
+}
+
+fn is_bare_word_component(name: &str) -> bool {
+    !name
+        .chars()
+        .any(|character| character.is_whitespace() || matches!(character, '\'' | '"' | '|'))
+}
+
+fn common_prefix_bytes(first: &str, candidate: &str, limit: usize) -> usize {
+    let maximum = first.len().min(candidate.len()).min(limit);
+    first
+        .as_bytes()
+        .iter()
+        .zip(candidate.as_bytes())
+        .take(maximum)
+        .position(|(left, right)| left != right)
+        .unwrap_or(maximum)
+}
+
 fn optional_bytes(value: Option<u64>) -> String {
     match value {
         Some(bytes) => bytes.to_string(),
@@ -788,7 +1161,7 @@ const fn parse_error_text(error: ParseError) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{ParseError, Shell, parse_line};
+    use super::{CompletionConfig, CompletionConfigError, ParseError, Shell, parse_line};
     use alloc::string::ToString;
     use kllm_core::{BoundedOutput, MachineMemorySnapshot, SliceInput};
     use kllm_vfs::{Namespace, RamFsQuota};
@@ -871,6 +1244,50 @@ mod tests {
         assert_eq!(
             core::str::from_utf8(error.as_slice()).unwrap_or_default(),
             "nope: unknown command\n".to_string()
+        );
+    }
+
+    #[test]
+    fn completion_uses_command_pipeline_and_vfs_context() {
+        let shell = shell();
+        let command = shell.complete("he", 2, CompletionConfig::tiny());
+        assert_eq!(command.candidates.len(), 2);
+        assert_eq!(command.common_replacement(), Some("he"));
+        assert_eq!(command.candidates[0].display, "help");
+        assert_eq!(command.candidates[1].display, "hexdump");
+
+        let pipeline = shell.complete("echo x | pw", 11, CompletionConfig::tiny());
+        assert_eq!(pipeline.candidates.len(), 1);
+        assert_eq!(pipeline.candidates[0].replacement, "pwd ");
+
+        let directory = shell.complete("cd /he", 6, CompletionConfig::tiny());
+        assert_eq!(directory.candidates.len(), 1);
+        assert_eq!(directory.candidates[0].replacement, "/help/");
+
+        let file = shell.complete("cat /help/r", 11, CompletionConfig::tiny());
+        assert_eq!(file.candidates.len(), 1);
+        assert_eq!(file.candidates[0].replacement, "/help/readme ");
+    }
+
+    #[test]
+    fn completion_configuration_is_validated_and_enforced() {
+        assert_eq!(
+            CompletionConfig::new(1, 0),
+            Err(CompletionConfigError::InconsistentCapacity)
+        );
+        let shell = shell();
+        let bounded = shell.complete(
+            "",
+            0,
+            CompletionConfig::new(1, 16).unwrap_or_else(|_| CompletionConfig::disabled()),
+        );
+        assert_eq!(bounded.candidates.len(), 1);
+        assert!(bounded.truncated);
+        assert!(
+            shell
+                .complete("c", 1, CompletionConfig::disabled())
+                .candidates
+                .is_empty()
         );
     }
 
