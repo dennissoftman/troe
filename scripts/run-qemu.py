@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build and run a kllm boot image with QEMU 11.1.0."""
+"""Build and run the boot image with QEMU 11.1.0."""
 
 from __future__ import annotations
 

@@ -27,7 +27,9 @@ The exact byte offsets and numeric encodings are fixed by the
 
 KEX v1 is little-endian and consists of one fixed header, a fixed-width load
 record table, and segment payload bytes. Its eight-byte magic is the ASCII byte
-sequence `KLLMKEX` followed by zero. The header contains:
+sequence `KEX`, zero, `FMT`, zero. It is a format identity, not a product or
+vendor identity, so changing the project name cannot invalidate executables.
+The header contains:
 
 - the eight-byte KEX magic and container major/minor;
 - a closed target value for x86-64 or AArch64;

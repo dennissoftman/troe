@@ -7,6 +7,12 @@ fixed 1.44 MiB FAT12 boot container containing only the architecture-native UEFI
 fallback executable. Builders are dependency-free Python and perform an exact
 round-trip verification.
 
+KEFS magic bytes and FAT OEM/volume metadata are format-specific and
+product-name-independent. The pre-release KEFS v1 magic was corrected in place
+before a supported external artifact contract existed; generated roots must be
+rebuilt. The FAT container uses neutral `UEFIBOOT`/`UEFI BOOT` metadata. Neither
+format changes when the project eventually receives a public name.
+
 Embedding source files directly with many `include_bytes!` calls was rejected
 because it has no independently fuzzable/versioned mount boundary. General FAT
 libraries remain a good option when the boot container needs more files;

@@ -41,7 +41,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(code) => ExitCode::from(code),
         Err(message) => {
-            let _ignored = writeln!(io::stderr(), "kllm-host: {message}");
+            let _ignored = writeln!(io::stderr(), "host model: {message}");
             ExitCode::FAILURE
         }
     }
@@ -63,13 +63,13 @@ fn run() -> Result<u8, String> {
     let arguments: Vec<String> = env::args().skip(1).collect();
     if arguments.first().is_some_and(|value| value == "--command") {
         if arguments.len() != 2 {
-            return Err("usage: kllm-host --command 'COMMAND'".into());
+            return Err("usage: host-model --command 'COMMAND'".into());
         }
         return Ok(execute_line(&mut shell, &arguments[1]));
     }
     if arguments.first().is_some_and(|value| value == "--script") {
         if arguments.len() != 2 {
-            return Err("usage: kllm-host --script FILE".into());
+            return Err("usage: host-model --script FILE".into());
         }
         let script = fs::read_to_string(&arguments[1])
             .map_err(|error| format!("cannot read {}: {error}", arguments[1]))?;
@@ -86,13 +86,13 @@ fn run() -> Result<u8, String> {
         return Ok(last);
     }
     if !arguments.is_empty() {
-        return Err("usage: kllm-host [--command 'COMMAND' | --script FILE]".into());
+        return Err("usage: host-model [--command 'COMMAND' | --script FILE]".into());
     }
 
-    println!("kllm 0.1.0 hosted model ({})", env::consts::ARCH);
+    println!("hosted model 0.1.0 ({})", env::consts::ARCH);
     println!("type 'help' for commands; quoting and bounded pipelines are enabled");
     loop {
-        print!("kllm:{}> ", shell.cwd());
+        print!("shell:{}> ", shell.cwd());
         io::stdout()
             .flush()
             .map_err(|error| format!("cannot flush prompt: {error}"))?;

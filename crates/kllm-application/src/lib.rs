@@ -12,6 +12,8 @@ pub const KEX_V1_IMAGE_BASE: u64 = 0x0000_4000_0000_0000;
 pub const KEX_V1_HEADER_BYTES: usize = 64;
 /// KEX v1 load-record length in bytes.
 pub const KEX_V1_LOAD_RECORD_BYTES: usize = 40;
+/// Product-name-independent KEX v1 format identifier.
+pub const KEX_V1_MAGIC: [u8; 8] = *b"KEX\0FMT\0";
 /// Maximum load records accepted by any compiled profile.
 pub const MAX_LOAD_RECORDS: usize = 16;
 /// Application ABI major implemented by this parser.
@@ -19,7 +21,6 @@ pub const ABI_MAJOR: u16 = 1;
 /// First application ABI minor implemented by this parser.
 pub const ABI_MINOR: u16 = 0;
 
-const KEX_MAGIC: &[u8; 8] = b"KLLMKEX\0";
 const CONTAINER_MAJOR: u16 = 1;
 const CONTAINER_MINOR: u16 = 0;
 const STARTUP_PAGES: u64 = 1;
@@ -573,7 +574,7 @@ fn parse_header(
     let header = artifact
         .get(..KEX_V1_HEADER_BYTES)
         .ok_or(ParseError::TruncatedHeader)?;
-    if header.get(..KEX_MAGIC.len()) != Some(KEX_MAGIC.as_slice()) {
+    if header.get(..KEX_V1_MAGIC.len()) != Some(KEX_V1_MAGIC.as_slice()) {
         return Err(ParseError::InvalidMagic);
     }
     if read_u16(header, HEADER_CONTAINER_MAJOR)? != CONTAINER_MAJOR
@@ -868,7 +869,7 @@ mod tests {
         let payload_offset = KEX_V1_HEADER_BYTES + segments.len() * KEX_V1_LOAD_RECORD_BYTES;
         let artifact_bytes = payload_offset + payload_bytes;
         let mut bytes = vec![0_u8; artifact_bytes];
-        bytes[..8].copy_from_slice(KEX_MAGIC);
+        bytes[..8].copy_from_slice(&KEX_V1_MAGIC);
         put_u16(&mut bytes, HEADER_CONTAINER_MAJOR, CONTAINER_MAJOR);
         put_u16(&mut bytes, HEADER_CONTAINER_MINOR, CONTAINER_MINOR);
         put_u16(&mut bytes, HEADER_TARGET, target as u16);
@@ -991,6 +992,11 @@ mod tests {
         assert_eq!(full.load_records(), 16);
         assert_eq!(full.resident_pages(), 16_384);
         assert_eq!(full.initial_handles(), 32);
+    }
+
+    #[test]
+    fn format_identifier_is_product_name_independent() {
+        assert_eq!(KEX_V1_MAGIC, *b"KEX\0FMT\0");
     }
 
     #[test]

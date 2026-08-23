@@ -1,4 +1,4 @@
-kllm is a tiny Rust operating environment.
+This is a tiny Rust operating environment.
 
 Try:
   help
@@ -10,4 +10,3 @@ Try:
 
 Input lines, argument counts, pipeline stages, intermediate streams, paths,
 file sizes, RAMFS bytes, and RAMFS node counts are all explicitly bounded.
-

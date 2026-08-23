@@ -154,7 +154,7 @@ def assert_owned_boot(session: "SerialSession") -> None:
         "isolated faults: contained",
         "isolated resources: reclaimed",
         "in-process console dispatch: ready",
-        "kllm owns memory and console",
+        "memory and console: owned",
     ):
         if marker not in transcript:
             raise AcceptanceError(
@@ -255,7 +255,7 @@ class SerialSession:
         if self.process.poll() is not None:
             raise AcceptanceError("QEMU exited instead of remaining in the fatal state")
         tail = normalize(bytes(self.output[start:]))
-        if "kllm 0.1.0 UEFI bootstrap" in tail or "kllm:/> " in tail:
+        if "UEFI bootstrap: ready" in tail or "shell:/> " in tail:
             raise AcceptanceError(f"machine rebooted after fatal marker: {tail!r}")
 
     def backspace_command(
@@ -296,7 +296,7 @@ class SerialSession:
         except (BrokenPipeError, OSError) as error:
             raise AcceptanceError(f"cannot write QEMU serial input: {error}") from error
 
-        prompt = f"kllm:{cwd}> ".encode()
+        prompt = f"shell:{cwd}> ".encode()
         end = self.wait_for(prompt, timeout, submitted)
         text = normalize(bytes(self.output[start : end - len(prompt)]))
         if expected not in text:
@@ -343,7 +343,7 @@ class SerialSession:
         except (BrokenPipeError, OSError) as error:
             raise AcceptanceError(f"cannot write QEMU serial input: {error}") from error
 
-        prompt = f"kllm:{cwd}> ".encode()
+        prompt = f"shell:{cwd}> ".encode()
         end = self.wait_for(prompt, timeout, submitted)
         text = normalize(bytes(self.output[start : end - len(prompt)]))
         if expected not in text:
@@ -366,7 +366,7 @@ class SerialSession:
         """Execute a line, wait for the next prompt, and assert its output."""
         submitted = self.send(command, timeout, line_ending)
         resulting_cwd = cwd if next_cwd is None else next_cwd
-        prompt = f"kllm:{resulting_cwd}> ".encode()
+        prompt = f"shell:{resulting_cwd}> ".encode()
         end = self.wait_for(prompt, timeout, submitted)
         raw = bytes(self.output[submitted : end - len(prompt)])
         text = normalize(raw)
@@ -413,7 +413,7 @@ class SerialSession:
 
 def run_scenario(session: SerialSession, boot_timeout: float, command_timeout: float) -> None:
     """Exercise every required built-in plus bounded failure behavior."""
-    session.wait_for(b"kllm:/> ", boot_timeout)
+    session.wait_for(b"shell:/> ", boot_timeout)
     assert_owned_boot(session)
     cwd = "/"
 
@@ -463,7 +463,7 @@ def run_scenario(session: SerialSession, boot_timeout: float, command_timeout: f
         "cat /etc/motd",
         cwd,
         command_timeout,
-        contains=("Welcome to kllm 0.1.0.",),
+        contains=("Welcome to the tiny Rust operating environment.",),
     )
     session.command("echo alpha beta", cwd, command_timeout, contains=("alpha beta\n",))
     session.command(
@@ -594,7 +594,7 @@ def run_smoke_scenario(
     session: SerialSession, boot_timeout: float, command_timeout: float
 ) -> None:
     """Exercise the interactive console path without the exhaustive quota workload."""
-    session.wait_for(b"kllm:/> ", boot_timeout)
+    session.wait_for(b"shell:/> ", boot_timeout)
     assert_owned_boot(session)
     cwd = "/"
     session.backspace_command(
@@ -649,7 +649,7 @@ def run_native_keyboard_scenario(args: argparse.Namespace) -> None:
     )
     # Keep this below macOS's short AF_UNIX path limit even when TMPDIR points
     # into a deeply nested per-user directory.
-    with tempfile.TemporaryDirectory(prefix="kllm-monitor-", dir="/tmp") as directory:
+    with tempfile.TemporaryDirectory(prefix="qemu-monitor-", dir="/tmp") as directory:
         monitor_path = str(Path(directory) / "qemu.sock")
         monitor_index = command.index("-monitor") + 1
         command[monitor_index] = f"unix:{monitor_path},server=on,wait=off"
@@ -671,7 +671,7 @@ def run_native_keyboard_scenario(args: argparse.Namespace) -> None:
                         raise AcceptanceError("timed out connecting to QEMU monitor")
                     time.sleep(0.01)
 
-            session.wait_for(b"kllm:/> ", args.boot_timeout)
+            session.wait_for(b"shell:/> ", args.boot_timeout)
             keys = (
                 ("e", b"e"),
                 ("c", b"c"),
@@ -695,7 +695,7 @@ def run_native_keyboard_scenario(args: argparse.Namespace) -> None:
             start = len(session.output)
             monitor.sendall(b"sendkey ret\n")
             session.wait_for(b"ps2-ready\n", args.command_timeout, start)
-            session.wait_for(b"kllm:/> ", args.command_timeout, start)
+            session.wait_for(b"shell:/> ", args.command_timeout, start)
         except Exception:
             print("--- x86_64 native keyboard transcript ---", file=sys.stderr)
             print(session.transcript(), file=sys.stderr)
@@ -712,7 +712,7 @@ def run_fault_scenario(
     fault: str,
 ) -> None:
     """Prove that one forbidden access reaches the native fatal vector."""
-    session.wait_for(b"kllm:/> ", boot_timeout)
+    session.wait_for(b"shell:/> ", boot_timeout)
     assert_owned_boot(session)
     start = len(session.output)
     command = "task-probe guard" if fault == "guard" else f"mmu-probe {fault}"

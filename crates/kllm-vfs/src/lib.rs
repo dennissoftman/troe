@@ -16,7 +16,8 @@ pub const MAX_PATH_BYTES: usize = 256;
 pub const MAX_NAME_BYTES: usize = 64;
 /// Maximum normalized path depth.
 pub const MAX_PATH_DEPTH: usize = 16;
-const KEFS_MAGIC: &[u8; 8] = b"KLLMFS1\0";
+/// Product-name-independent KEFS v1 format identifier.
+pub const KEFS_V1_MAGIC: [u8; 8] = *b"KEFSv1\0\0";
 const KEFS_HEADER_LEN: usize = 16;
 
 /// Node kind visible through the namespace.
@@ -519,7 +520,7 @@ struct EmbeddedEntry {
 
 fn parse_embedded(image: &[u8]) -> Result<Vec<EmbeddedEntry>, FsError> {
     if image.len() < KEFS_HEADER_LEN
-        || &image[..8] != KEFS_MAGIC
+        || image[..8] != KEFS_V1_MAGIC
         || image.get(10..12) != Some(&[0, 0])
     {
         return Err(FsError::Invalid);
@@ -595,7 +596,7 @@ fn read_u32(image: &[u8], offset: usize) -> Result<u32, FsError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FsError, Namespace, NodeKind, RamFsQuota, canonicalize};
+    use super::{FsError, KEFS_V1_MAGIC, Namespace, NodeKind, RamFsQuota, canonicalize};
     use alloc::{vec, vec::Vec};
 
     #[test]
@@ -661,11 +662,16 @@ mod tests {
     #[test]
     fn corrupt_embedded_image_is_rejected_without_partial_mount() {
         let mut image = vec![0_u8; 16];
-        image[..8].copy_from_slice(b"KLLMFS1\0");
+        image[..8].copy_from_slice(&KEFS_V1_MAGIC);
         image[8..10].copy_from_slice(&1_u16.to_le_bytes());
         image[12..16].copy_from_slice(&16_u32.to_le_bytes());
         let mut fs = Namespace::new(RamFsQuota::default());
         assert_eq!(fs.mount_embedded(&image), Err(FsError::Invalid));
         assert!(fs.list("/", "/").is_ok());
+    }
+
+    #[test]
+    fn format_identifier_is_product_name_independent() {
+        assert_eq!(KEFS_V1_MAGIC, *b"KEFSv1\0\0");
     }
 }

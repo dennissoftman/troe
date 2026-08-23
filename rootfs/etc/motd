@@ -1,2 +1,2 @@
-Welcome to kllm 0.1.0.
+Welcome to the tiny Rust operating environment.
 Memory and the native serial console are kernel-owned after UEFI handoff.

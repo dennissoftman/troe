@@ -17,6 +17,9 @@ ROOT_SECTORS = 14
 FIRST_DATA_SECTOR = 1 + 2 * FAT_SECTORS + ROOT_SECTORS
 IMAGE_SIZE = SECTOR * TOTAL_SECTORS
 END_OF_CHAIN = 0xFFF
+OEM_IDENTIFIER = b"UEFIBOOT"
+VOLUME_IDENTIFIER = 0x5545_4649
+VOLUME_LABEL = b"UEFI BOOT  "
 
 
 def directory_entry(name: bytes, attributes: int, cluster: int, size: int) -> bytes:
@@ -70,13 +73,13 @@ def build(efi: bytes, boot_name: bytes) -> bytes:
     image = bytearray(IMAGE_SIZE)
     boot = memoryview(image)[:SECTOR]
     boot[0:3] = b"\xEB\x3C\x90"
-    boot[3:11] = b"KLLMBOOT"
+    boot[3:11] = OEM_IDENTIFIER
     struct.pack_into("<HBHBHHBHHHII", boot, 11, SECTOR, 1, 1, 2, ROOT_ENTRIES,
                      TOTAL_SECTORS, 0xF0, FAT_SECTORS, 18, 2, 0, 0)
     boot[36] = 0
     boot[38] = 0x29
-    struct.pack_into("<I", boot, 39, 0x4B4C4C4D)
-    boot[43:54] = b"KLLM BOOT  "
+    struct.pack_into("<I", boot, 39, VOLUME_IDENTIFIER)
+    boot[43:54] = VOLUME_LABEL
     boot[54:62] = b"FAT12   "
     boot[510:512] = b"\x55\xAA"
 
@@ -119,6 +122,12 @@ def build(efi: bytes, boot_name: bytes) -> bytes:
 def extract(image: bytes, boot_name: bytes) -> bytes:
     if len(image) != IMAGE_SIZE or image[510:512] != b"\x55\xAA":
         raise ValueError("invalid FAT12 image size or boot signature")
+    if (
+        image[3:11] != OEM_IDENTIFIER
+        or struct.unpack_from("<I", image, 39)[0] != VOLUME_IDENTIFIER
+        or image[43:54] != VOLUME_LABEL
+    ):
+        raise ValueError("unexpected FAT12 format identifiers")
     expected_bpb = struct.unpack_from("<HBHBHHBHHHII", image, 11)
     if expected_bpb[:8] != (SECTOR, 1, 1, 2, ROOT_ENTRIES, TOTAL_SECTORS, 0xF0, FAT_SECTORS):
         raise ValueError("unexpected FAT12 geometry")

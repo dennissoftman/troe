@@ -6,14 +6,18 @@
 **Future targets:** raw x86-64 PCs, raw AArch64 systems  
 **Implementation language:** Rust (`no_std`)  
 
-**Implementation status:** Stages 0–6 are implemented. Stage 7 loadable
-applications are the next milestone; later-stage requirements remain design
-constraints, not current functionality. See
-[docs/roadmap.md](docs/roadmap.md).
+**Implementation status:** Stages 0–6 are implemented. Stage 7 has an accepted
+design plus its portable KEX parser and load-plan policy; native loading and
+execution are the next milestone. Later-stage requirements remain design
+constraints, not current functionality. See [docs/roadmap.md](docs/roadmap.md).
 
 The product and CLI names are intentionally unset. This document uses “the
 project” and “the system” in prose. `<cli>` denotes the future control-plane
 executable without proposing its eventual name.
+
+Serialized format identifiers name only their technical formats and versions.
+They MUST NOT embed a product, repository, vendor, or future CLI name. A project
+rename must not invalidate KEX, KEFS, or boot-container artifacts.
 
 The future developer tooling and package-composition model is specified in
 [TOOLING-PACKAGING-SPEC.md](TOOLING-PACKAGING-SPEC.md). That document

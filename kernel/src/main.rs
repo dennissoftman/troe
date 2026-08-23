@@ -278,7 +278,7 @@ mod firmware {
     }
 
     fn prepare_handoff(console: &mut FirmwareConsole) -> Result<PreparedHandoff, ()> {
-        write_all(console, b"kllm 0.1.0 UEFI bootstrap\n")?;
+        write_all(console, b"UEFI bootstrap: ready\n")?;
         write_all(console, b"preparing owned memory and native console\n")?;
 
         let image_layout = kllm_machine::loaded_image_layout().map_err(|_| ())?;
@@ -1482,13 +1482,13 @@ mod firmware {
         let mut keyboard = Ps2Set1Decoder::new(KeyboardConfig::tiny());
         let mut editor = LineEditor::new(editor_config);
 
-        if write_all(&mut console, b"kllm owns memory and console; type 'help'\n").is_err() {
+        if write_all(&mut console, b"memory and console: owned; type 'help'\n").is_err() {
             fatal(b"fatal: native console write failed\n");
         }
 
         loop {
             refresh_shell_stats(&mut shell, task.accounting);
-            let mut prompt = String::from("kllm:");
+            let mut prompt = String::from("shell:");
             prompt.push_str(shell.cwd());
             prompt.push_str("> ");
             if write_all(&mut console, prompt.as_bytes()).is_err() {

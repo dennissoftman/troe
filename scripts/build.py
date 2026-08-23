@@ -70,9 +70,9 @@ def main() -> int:
                 cargo_command.extend(("--features", "acceptance-probes"))
             run(*cargo_command)
 
-            efi = REPO_ROOT / "target" / target / "release" / "kllm-kernel.efi"
+            efi = REPO_ROOT / "target" / target / "release" / "kernel.efi"
             suffix = "-acceptance" if args.acceptance_probes else ""
-            image = REPO_ROOT / "build" / f"kllm-{architecture}{suffix}.img"
+            image = REPO_ROOT / "build" / f"boot-{architecture}{suffix}.img"
             if not args.acceptance_probes:
                 efi_bytes = efi.read_bytes()
                 forbidden = (

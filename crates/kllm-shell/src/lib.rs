@@ -383,7 +383,7 @@ impl Shell {
         machine_control: bool,
     ) -> Result<Self, FsError> {
         namespace.set_system_file("/sys/arch", format!("{architecture}\n").as_bytes())?;
-        namespace.set_system_file("/sys/version", b"kllm 0.1.0\n")?;
+        namespace.set_system_file("/sys/version", b"0.1.0\n")?;
         let mut shell = Self {
             namespace,
             cwd: "/".to_string(),

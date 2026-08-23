@@ -8,7 +8,7 @@ import struct
 import sys
 from pathlib import Path
 
-MAGIC = b"KLLMFS1\0"
+MAGIC = b"KEFSv1\0\0"
 HEADER_SIZE = 16
 MAX_ENTRIES = 0xFFFF
 MAX_PATH = 256
@@ -84,4 +84,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

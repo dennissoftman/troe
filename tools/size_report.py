@@ -48,7 +48,7 @@ def main() -> int:
         container = args.image.read_bytes()
         sections = pe_sections(efi)
         debug = sum(raw for name, raw, _ in sections if "debug" in name.lower())
-        print(f"kllm size report ({args.arch})")
+        print(f"boot image size report ({args.arch})")
         print(f"  boot container:             {len(container):>8} bytes")
         print(f"  EFI executable:             {len(efi):>8} bytes")
         for name, raw_size, virtual_size in sections:
@@ -67,4 +67,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

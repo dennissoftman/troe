@@ -3,8 +3,8 @@
 KEX v1 is the canonical static executable input for the Stage 7 application
 loader selected by
 [ADR 0015](../adr/0015-kex-application-abi-and-execution-bounds.md). The
-portable `kllm-application` crate is the authoritative parser. This document
-fixes its byte representation for SDK converters and rejection-corpus tools.
+portable application-format parser is authoritative. This document fixes its
+byte representation for SDK converters and rejection-corpus tools.
 
 All integers are unsigned little-endian values. KEX structures are decoded from
 bytes and have no Rust or C in-memory-layout contract. The v1 base page size is
@@ -17,7 +17,7 @@ The header is exactly 64 bytes.
 
 | Offset | Bytes | Field | KEX v1 rule |
 | ---: | ---: | --- | --- |
-| 0 | 8 | magic | `KLLMKEX` followed by zero |
+| 0 | 8 | magic | `KEX`, zero, `FMT`, zero (`4b 45 58 00 46 4d 54 00`) |
 | 8 | 2 | container major | 1 |
 | 10 | 2 | container minor | 0 |
 | 12 | 2 | target | 1 = x86-64, 2 = AArch64 |
@@ -38,7 +38,8 @@ The header is exactly 64 bytes.
 
 Header sizes and offsets are exact canonical values, not forward-extension
 fields. Unknown container versions, targets, flags, and ABI requirements are
-rejected.
+rejected. The magic identifies KEX itself and deliberately contains no product,
+repository, or vendor name.
 
 ## Load records
 

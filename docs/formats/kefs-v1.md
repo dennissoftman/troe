@@ -6,7 +6,7 @@ Header (16 bytes):
 
 | Offset | Size | Meaning |
 |---:|---:|---|
-| 0 | 8 | `4b 4c 4c 4d 46 53 31 00` magic/version bytes |
+| 0 | 8 | `4b 45 46 53 76 31 00 00` (`KEFSv1`, then two zero bytes) |
 | 8 | 2 | record count |
 | 10 | 2 | reserved, zero |
 | 12 | 4 | exact total image length |
@@ -21,6 +21,10 @@ The reader checks every addition and slice boundary before access, requires
 exact end-of-image consumption, parses into temporary owned records, and only
 then mutates the namespace. A malformed image therefore cannot cause an
 out-of-bounds read or partial mount.
+
+The magic identifies the KEFS format and version only. It intentionally embeds
+no product, repository, or vendor name, so a project rename does not change the
+filesystem contract.
 
 `tools/mkefs.py` is the canonical builder. It rejects symlinks and unsupported
 filesystem objects so host-specific link behavior cannot enter an image.

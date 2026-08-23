@@ -125,7 +125,7 @@ def prepare_qemu_command(
         )
 
     suffix = "-acceptance" if acceptance_probes else ""
-    image = REPO_ROOT / "build" / f"kllm-{architecture}{suffix}.img"
+    image = REPO_ROOT / "build" / f"boot-{architecture}{suffix}.img"
     if not image.is_file():
         raise FileNotFoundError(f"boot image not found: {image}")
     variables = REPO_ROOT / "build" / f"qemu-vars-{architecture}.fd"

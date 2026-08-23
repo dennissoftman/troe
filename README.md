@@ -159,8 +159,9 @@ while preserving the same shell, stream, VFS, and authority semantics.
 
 The public project and CLI names are intentionally unset. Documentation uses
 neutral terms and explicit metavariables until naming, trademark, and package
-availability checks are complete. Existing repository identifiers and on-disk
-magic are provisional implementation/compatibility details, not public naming
-contracts.
+availability checks are complete. KEX, KEFS, and FAT wire identifiers are
+product-name-independent and remain valid across a project rename. Existing
+Cargo package, crate, repository, and build-artifact names are provisional
+implementation identifiers rather than format contracts.
 
 Licensed under Apache-2.0.
