@@ -205,11 +205,21 @@ from the portable plan, grants one explicit owner-scoped handle, and then proves
 revocation, zeroization, exact reclamation, and malformed-input rejection on
 both targets. No external artifact byte is executed in this slice.
 
-The next kernel slice is application entry and ABI 1.0 calls. It must reset the
-documented register/control state, pass the immutable startup page, implement
-exit/yield/copied handle calls, and arm the owned 50 ms timer before any external
-KEX instruction executes. Native acceptance must then cover valid execution,
-all contained fault/call fates, and lease expiry.
+The third slice makes the boundary runnable. Both architectures reset documented
+application-visible integer, floating-point/SIMD, and control state; pass the
+immutable startup pair; enable interrupt delivery; implement ABI call 0 exit;
+and arm a 50 ms one-shot before external KEX instructions execute. x86 uses an
+owned local-APIC timer calibrated from typed PIT channel-2 resources; AArch64
+uses the generic physical timer through owned GICv2 PPI 30. Native boot runs a
+target-specific exit application and terminates a spinning application by lease
+expiry, then proves stale-handle rejection, exact frame return, and allocation
+reuse on both targets.
+
+The next kernel slice is resumable ABI execution: `yield` and copied
+`handle_call`. It requires a bounded saved user context, scheduler-controlled
+resume leases, complete request/reply range validation, and reply copy-out only
+after successful dispatch. Invalid-call and unexpected-return acceptance cases
+must land with that gate.
 
 Exit: a valid target-specific static application can start, call a documented
 minimal ABI, exit or fault without harming the kernel or another service, and

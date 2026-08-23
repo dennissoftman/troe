@@ -20,13 +20,13 @@ pub use mechanism::{
 };
 
 #[cfg(any(test, target_os = "uefi"))]
-pub use mmu::{ImageLayout, ImageRegion, MmuError, MmuStats};
+pub use mmu::{ApplicationOutcome, IsolatedFault, IsolatedOutcome, UserAddressSpace};
 #[cfg(any(test, target_os = "uefi"))]
-pub use mmu::{IsolatedFault, IsolatedOutcome, UserAddressSpace};
+pub use mmu::{ImageLayout, ImageRegion, MmuError, MmuStats};
 #[cfg(target_os = "uefi")]
 pub use mmu::{
     build_user_address_space, install_exception_vectors, install_mmu, loaded_image_layout,
-    run_isolated,
+    run_application, run_isolated,
 };
 #[cfg(all(target_os = "uefi", feature = "acceptance-probes"))]
 pub use mmu::{trigger_execute_fault, trigger_native_exception, trigger_write_fault};

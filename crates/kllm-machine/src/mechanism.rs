@@ -130,6 +130,18 @@ pub enum InputInterruptError {
     InterruptLineUnavailable,
 }
 
+/// Failure to arm the architecture-owned application execution timer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(target_os = "uefi")]
+pub enum ExecutionTimerError {
+    /// The pinned CPU does not expose the required deadline facility.
+    Unsupported,
+    /// Frequency or deadline arithmetic could not be represented safely.
+    InvalidFrequency,
+    /// A required interrupt-controller resource is unavailable.
+    InterruptUnavailable,
+}
+
 #[cfg(target_os = "uefi")]
 impl From<QueueError> for InputInterruptError {
     fn from(_error: QueueError) -> Self {
@@ -730,13 +742,45 @@ pub fn input_interrupt_stats() -> Option<InputQueueStats> {
 }
 
 /// Dispatch one owned architecture interrupt into the bounded raw-event queue.
-#[cfg(target_os = "uefi")]
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 pub(crate) fn handle_input_interrupt() {
     // SAFETY: Architecture interrupt gates enter with IRQ delivery masked and
     // initialization enables a source only after installing this queue.
     if let Some(queue) = unsafe { input_queue_mut() } {
-        architecture_handle_input_interrupt(queue);
+        let _timer = architecture_handle_input_interrupt(queue);
     }
+}
+
+/// Dispatch an interrupt taken during unprivileged application execution.
+///
+/// Returns `true` only for the owned execution-lease timer. Input interrupts
+/// are serviced normally and return `false` so the application can resume.
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+pub(crate) fn handle_application_interrupt() -> bool {
+    // SAFETY: The native interrupt entry masks nested IRQ delivery and the
+    // single boot CPU is the only producer or consumer at this boundary.
+    unsafe { input_queue_mut() }.is_some_and(architecture_handle_input_interrupt)
+}
+
+/// Arm a one-shot execution lease for unprivileged application code.
+#[cfg(target_os = "uefi")]
+pub(crate) fn arm_execution_timer(milliseconds: u32) -> Result<(), ExecutionTimerError> {
+    if milliseconds == 0 {
+        return Err(ExecutionTimerError::InvalidFrequency);
+    }
+    architecture_arm_execution_timer(milliseconds)
+}
+
+/// Disable the one-shot execution timer before doing kernel work.
+#[cfg(target_os = "uefi")]
+pub(crate) fn disarm_execution_timer() {
+    architecture_disarm_execution_timer();
+}
+
+/// Complete controller acknowledgement for an execution-timer interrupt.
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+pub(crate) fn acknowledge_execution_timer_interrupt() {
+    architecture_acknowledge_execution_timer_interrupt();
 }
 
 #[cfg(target_os = "uefi")]
@@ -776,6 +820,8 @@ pub(crate) const X86_KEYBOARD_VECTOR: u8 = 0x31;
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 pub(crate) const X86_SERIAL_VECTOR: u8 = 0x34;
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+pub(crate) const X86_TIMER_VECTOR: u8 = 0x30;
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 pub(crate) const X86_SPURIOUS_VECTOR: u8 = 0xff;
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
@@ -784,6 +830,8 @@ struct X86InputProfile {
     ioapic: MmioResource,
     keyboard_ports: IoPortResource,
     serial_ports: IoPortResource,
+    pit_ports: IoPortResource,
+    system_control_port: IoPortResource,
     keyboard_interrupt: InterruptResource,
     serial_interrupt: InterruptResource,
 }
@@ -798,6 +846,10 @@ fn x86_input_profile() -> Result<X86InputProfile, InputInterruptError> {
         keyboard_ports: IoPortResource::new(0x0060, 5)
             .map_err(|_| InputInterruptError::InvalidResource)?,
         serial_ports: IoPortResource::new(0x03f8, 8)
+            .map_err(|_| InputInterruptError::InvalidResource)?,
+        pit_ports: IoPortResource::new(0x0040, 4)
+            .map_err(|_| InputInterruptError::InvalidResource)?,
+        system_control_port: IoPortResource::new(0x0061, 1)
             .map_err(|_| InputInterruptError::InvalidResource)?,
         keyboard_interrupt: InterruptResource::new(1, X86_KEYBOARD_VECTOR)
             .map_err(|_| InputInterruptError::InvalidResource)?,
@@ -872,7 +924,7 @@ fn architecture_initialize_input_interrupts(
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
-fn architecture_handle_input_interrupt(queue: &mut BoundedInputQueue) {
+fn architecture_handle_input_interrupt(queue: &mut BoundedInputQueue) -> bool {
     const LAPIC_EOI: usize = 0x0b0;
     queue.record_interrupt();
     x86_drain_input_devices(queue);
@@ -881,6 +933,99 @@ fn architecture_handle_input_interrupt(queue: &mut BoundedInputQueue) {
     {
         // SAFETY: Every routed input interrupt requires one LAPIC EOI write.
         unsafe { mmio_write32(lapic_base + LAPIC_EOI, 0) };
+    }
+    false
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn architecture_arm_execution_timer(milliseconds: u32) -> Result<(), ExecutionTimerError> {
+    const LAPIC_LVT_TIMER: usize = 0x320;
+    const LAPIC_INITIAL_COUNT: usize = 0x380;
+    const LAPIC_CURRENT_COUNT: usize = 0x390;
+    const LAPIC_DIVIDE_CONFIG: usize = 0x3e0;
+    const LAPIC_MASKED: u32 = 1 << 16;
+    const LAPIC_DIVIDE_BY_ONE: u32 = 0b1011;
+    const PIT_CHANNEL_2_COMMAND: u8 = 0xb0;
+    const PIT_TEN_MILLISECONDS: u16 = 11_932;
+    const PIT_GATE_2: u8 = 1;
+    const PIT_OUT_2: u8 = 1 << 5;
+    const CALIBRATION_SPIN_LIMIT: usize = 10_000_000;
+    let profile = x86_input_profile().map_err(|_| ExecutionTimerError::InterruptUnavailable)?;
+    let lapic = usize::try_from(profile.lapic.base_address())
+        .map_err(|_| ExecutionTimerError::InterruptUnavailable)?;
+    let pit_channel = profile.pit_ports.base_port() + 2;
+    let pit_command = profile.pit_ports.base_port() + 3;
+    let system_control = profile.system_control_port.base_port();
+    // SAFETY: The typed PIT and system-control resources are owned by the
+    // pinned q35 profile. Channel 2 is gated low while its one-shot is loaded.
+    let original_control = unsafe { port_read(system_control) };
+    unsafe {
+        port_write(system_control, original_control & !PIT_GATE_2);
+        port_write(pit_command, PIT_CHANNEL_2_COMMAND);
+        port_write(pit_channel, PIT_TEN_MILLISECONDS.to_le_bytes()[0]);
+        port_write(pit_channel, PIT_TEN_MILLISECONDS.to_le_bytes()[1]);
+        mmio_write32(lapic + LAPIC_LVT_TIMER, LAPIC_MASKED);
+        mmio_write32(lapic + LAPIC_DIVIDE_CONFIG, LAPIC_DIVIDE_BY_ONE);
+        mmio_write32(lapic + LAPIC_INITIAL_COUNT, u32::MAX);
+        port_write(system_control, (original_control & !0b10) | PIT_GATE_2);
+    }
+    let mut completed = false;
+    for _ in 0..CALIBRATION_SPIN_LIMIT {
+        // SAFETY: Polling the owned read-only channel-2 output latch.
+        if unsafe { port_read(system_control) } & PIT_OUT_2 != 0 {
+            completed = true;
+            break;
+        }
+        spin_loop();
+    }
+    // SAFETY: Restore the exact pre-calibration system-control byte.
+    unsafe { port_write(system_control, original_control) };
+    if !completed {
+        architecture_disarm_execution_timer();
+        return Err(ExecutionTimerError::Unsupported);
+    }
+    // SAFETY: Reading the owned LAPIC current-count register has no side effect.
+    let current = unsafe { mmio_read32(lapic + LAPIC_CURRENT_COUNT) };
+    let elapsed = u64::from(u32::MAX - current);
+    let lease_ticks = elapsed
+        .checked_mul(u64::from(milliseconds))
+        .and_then(|ticks| ticks.checked_div(10))
+        .and_then(|ticks| u32::try_from(ticks).ok())
+        .filter(|ticks| *ticks != 0)
+        .ok_or(ExecutionTimerError::InvalidFrequency)?;
+    // SAFETY: The vector is installed, divide state is fixed, and the checked
+    // nonzero initial count selects one-shot mode by leaving mode bits clear.
+    unsafe {
+        mmio_write32(lapic + LAPIC_LVT_TIMER, u32::from(X86_TIMER_VECTOR));
+        mmio_write32(lapic + LAPIC_INITIAL_COUNT, lease_ticks);
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn architecture_disarm_execution_timer() {
+    const LAPIC_LVT_TIMER: usize = 0x320;
+    const LAPIC_INITIAL_COUNT: usize = 0x380;
+    const LAPIC_MASKED: u32 = 1 << 16;
+    if let Ok(profile) = x86_input_profile()
+        && let Ok(lapic) = usize::try_from(profile.lapic.base_address())
+    {
+        // SAFETY: The kernel owns the LAPIC timer registers.
+        unsafe {
+            mmio_write32(lapic + LAPIC_LVT_TIMER, LAPIC_MASKED);
+            mmio_write32(lapic + LAPIC_INITIAL_COUNT, 0);
+        }
+    }
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn architecture_acknowledge_execution_timer_interrupt() {
+    const LAPIC_EOI: usize = 0x0b0;
+    if let Ok(profile) = x86_input_profile()
+        && let Ok(lapic) = usize::try_from(profile.lapic.base_address())
+    {
+        // SAFETY: The active LAPIC timer interrupt requires one EOI write.
+        unsafe { mmio_write32(lapic + LAPIC_EOI, 0) };
     }
 }
 
@@ -1220,21 +1365,24 @@ fn architecture_initialize_input_interrupts(
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
-fn architecture_handle_input_interrupt(queue: &mut BoundedInputQueue) {
+fn architecture_handle_input_interrupt(queue: &mut BoundedInputQueue) -> bool {
     const GICC_IAR: usize = 0x00c;
     const GICC_EOIR: usize = 0x010;
     const GIC_CPU_OFFSET: usize = 0x1_0000;
     let Ok(profile) = aarch64_input_profile() else {
-        return;
+        return false;
     };
     let Ok(distributor) = usize::try_from(profile.gic.base_address()) else {
-        return;
+        return false;
     };
     let cpu = distributor + GIC_CPU_OFFSET;
     // SAFETY: GICC_IAR acknowledges the highest-priority pending interrupt.
     let acknowledge = unsafe { mmio_read32(cpu + GICC_IAR) };
     let intid = acknowledge & 0x03ff;
-    if intid == profile.serial_interrupt.line() {
+    let execution_timer = intid == AARCH64_EXECUTION_TIMER_INTID;
+    if execution_timer {
+        architecture_disarm_execution_timer();
+    } else if intid == profile.serial_interrupt.line() {
         queue.record_interrupt();
         // Acknowledge the latched sources before draining. A byte arriving
         // after this write either joins the drain or asserts a fresh source;
@@ -1251,6 +1399,72 @@ fn architecture_handle_input_interrupt(queue: &mut BoundedInputQueue) {
     if intid < 1020 {
         // SAFETY: A non-spurious IAR value must be returned verbatim to EOIR.
         unsafe { mmio_write32(cpu + GICC_EOIR, acknowledge) };
+    }
+    execution_timer
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+const AARCH64_EXECUTION_TIMER_INTID: u32 = 30;
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn architecture_arm_execution_timer(milliseconds: u32) -> Result<(), ExecutionTimerError> {
+    const GICD_IGROUPR: usize = 0x080;
+    const GICD_ISENABLER: usize = 0x100;
+    const GICD_IPRIORITYR: usize = 0x400;
+    const GICD_ICFGR: usize = 0xc00;
+    let profile = aarch64_input_profile().map_err(|_| ExecutionTimerError::InterruptUnavailable)?;
+    let distributor = usize::try_from(profile.gic.base_address())
+        .map_err(|_| ExecutionTimerError::InterruptUnavailable)?;
+    let intid = usize::try_from(AARCH64_EXECUTION_TIMER_INTID)
+        .map_err(|_| ExecutionTimerError::InterruptUnavailable)?;
+    let word = intid / 32;
+    let bit = 1_u32 << (intid % 32);
+    // SAFETY: PPI 30 is the architected non-secure physical timer interrupt;
+    // the kernel owns the GIC distributor and configures it level-sensitive.
+    unsafe {
+        let group = mmio_read32(distributor + GICD_IGROUPR + word * 4);
+        mmio_write32(distributor + GICD_IGROUPR + word * 4, group & !bit);
+        gicv2_update_byte(distributor + GICD_IPRIORITYR, intid, 0x20);
+        let config_address = distributor + GICD_ICFGR + (intid / 16) * 4;
+        let config_shift = (intid % 16) * 2;
+        let config = mmio_read32(config_address) & !(0b10 << config_shift);
+        mmio_write32(distributor + GICD_ICFGR + (intid / 16) * 4, config);
+        mmio_write32(distributor + GICD_ISENABLER + word * 4, bit);
+    }
+    let frequency: u64;
+    let counter: u64;
+    // SAFETY: CNTFRQ_EL0 and CNTPCT_EL0 are read-only at EL1.
+    unsafe {
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frequency, options(nomem, nostack));
+        core::arch::asm!("mrs {}, cntpct_el0", out(reg) counter, options(nomem, nostack));
+    }
+    if frequency == 0 {
+        return Err(ExecutionTimerError::Unsupported);
+    }
+    let ticks = frequency
+        .checked_mul(u64::from(milliseconds))
+        .and_then(|value| value.checked_div(1_000))
+        .filter(|ticks| *ticks != 0)
+        .ok_or(ExecutionTimerError::InvalidFrequency)?;
+    let deadline = counter
+        .checked_add(ticks)
+        .ok_or(ExecutionTimerError::InvalidFrequency)?;
+    // SAFETY: The checked deadline is programmed before enabling the EL1-owned
+    // physical timer; ISB makes the one-shot state visible before user entry.
+    unsafe {
+        core::arch::asm!("msr cntp_cval_el0, {}", in(reg) deadline, options(nostack));
+        core::arch::asm!("msr cntp_ctl_el0, {}", in(reg) 1_u64, options(nostack));
+        core::arch::asm!("isb", options(nostack));
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn architecture_disarm_execution_timer() {
+    // SAFETY: EL1 owns the physical timer control for application leases.
+    unsafe {
+        core::arch::asm!("msr cntp_ctl_el0, {}", in(reg) 0_u64, options(nostack));
+        core::arch::asm!("isb", options(nostack));
     }
 }
 

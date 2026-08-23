@@ -132,6 +132,8 @@ pub enum TaskFault {
     IllegalInstruction,
     /// The task invoked an unknown call or supplied an invalid message range.
     InvalidCall,
+    /// The task exhausted its bounded uninterrupted execution lease.
+    ExecutionLeaseExpired,
 }
 
 impl StackResource {
@@ -194,7 +196,7 @@ pub struct TaskSnapshot {
     stack: StackResource,
     dispatches: u32,
     yields: u32,
-    exit_status: Option<u8>,
+    exit_status: Option<u32>,
     isolation: Option<IsolationResource>,
     fault: Option<TaskFault>,
 }
@@ -238,7 +240,7 @@ impl TaskSnapshot {
 
     /// Stable process-style completion status, once exited.
     #[must_use]
-    pub const fn exit_status(self) -> Option<u8> {
+    pub const fn exit_status(self) -> Option<u32> {
         self.exit_status
     }
 
@@ -263,7 +265,7 @@ pub struct ReapedTask {
     /// Guarded-stack slot returned to its owner pool.
     pub stack: StackResource,
     /// Final task status.
-    pub exit_status: u8,
+    pub exit_status: u32,
     /// Isolated resources returned for zeroization, handle revocation, and
     /// physical-frame reclamation.
     pub isolation: Option<IsolationResource>,
@@ -539,7 +541,7 @@ impl Scheduler {
     /// # Errors
     ///
     /// Rejects an unknown, non-running, or non-current identity.
-    pub fn exit_current(&mut self, id: TaskId, status: u8) -> Result<(), TaskError> {
+    pub fn exit_current(&mut self, id: TaskId, status: u32) -> Result<(), TaskError> {
         if self.current != Some(id) {
             return Err(TaskError::InvalidState);
         }
@@ -562,7 +564,7 @@ impl Scheduler {
     /// # Errors
     ///
     /// Rejects unknown, non-ready, or non-isolated tasks.
-    pub fn cancel_ready(&mut self, id: TaskId, status: u8) -> Result<(), TaskError> {
+    pub fn cancel_ready(&mut self, id: TaskId, status: u32) -> Result<(), TaskError> {
         let record = self.record_mut(id)?;
         if record.snapshot.state != TaskState::Ready || record.snapshot.isolation.is_none() {
             return Err(TaskError::InvalidState);
@@ -728,13 +730,13 @@ mod tests {
             scheduler.dispatch_next(Capabilities::SERVICE),
             Ok(Some(second))
         );
-        assert_eq!(scheduler.exit_current(second, 7), Ok(()));
+        assert_eq!(scheduler.exit_current(second, 0x1_0007), Ok(()));
         assert_eq!(scheduler.dispatch_next(Capabilities::SERVICE), Ok(None));
 
         assert_eq!(scheduler.task(first).map(TaskSnapshot::yields), Ok(1));
         assert_eq!(
             scheduler.task(second).map(TaskSnapshot::exit_status),
-            Ok(Some(7))
+            Ok(Some(0x1_0007))
         );
         assert_eq!(scheduler.stats().yields, 2);
         Ok(())

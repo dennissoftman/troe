@@ -155,6 +155,8 @@ def assert_owned_boot(session: "SerialSession") -> None:
         "isolated resources: reclaimed",
         "KEX staging: owned and bounded",
         "KEX load plans: mapped atomically",
+        "application ABI exit: active",
+        "execution lease: enforced",
         "application resources: reclaimed",
         "in-process console dispatch: ready",
         "memory and console: owned",

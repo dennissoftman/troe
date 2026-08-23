@@ -226,6 +226,21 @@ mod firmware {
         stack: PhysicalRange,
     }
 
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum ApplicationProbe {
+        Exit,
+        Spin,
+    }
+
+    impl ApplicationProbe {
+        const fn expected_fault(self) -> Option<TaskFault> {
+            match self {
+                Self::Exit => None,
+                Self::Spin => Some(TaskFault::ExecutionLeaseExpired),
+            }
+        }
+    }
+
     struct EchoService;
 
     #[derive(Clone, Copy, Eq, PartialEq)]
@@ -712,6 +727,8 @@ mod firmware {
             .unwrap_or_else(|()| fatal(b"fatal: Stage 7 load-boundary verification failed\n"));
         if !kllm_machine::write(b"KEX staging: owned and bounded\n")
             || !kllm_machine::write(b"KEX load plans: mapped atomically\n")
+            || !kllm_machine::write(b"application ABI exit: active\n")
+            || !kllm_machine::write(b"execution lease: enforced\n")
             || !kllm_machine::write(b"application resources: reclaimed\n")
         {
             fatal(b"fatal: application loader diagnostic failed\n");
@@ -1036,6 +1053,9 @@ mod firmware {
                             TaskFault::IllegalInstruction
                         }
                         kllm_machine::IsolatedFault::InvalidCall => TaskFault::InvalidCall,
+                        kllm_machine::IsolatedFault::ExecutionLeaseExpired => {
+                            TaskFault::ExecutionLeaseExpired
+                        }
                     };
                     if fault != expected || copied_bytes.iter().any(|byte| *byte != 0) {
                         return Err(());
@@ -1092,7 +1112,7 @@ mod firmware {
         scheduler: &mut Scheduler,
         accounting: &mut OwnedAccounting,
     ) -> Result<(), ()> {
-        let artifact = native_kex_artifact()?;
+        let artifact = native_kex_artifact(ApplicationProbe::Exit)?;
         let baseline_frames = accounting.frames.free_frames();
         let baseline_tasks = scheduler.stats();
         let mut dispatcher = Dispatcher::new(1, 2).map_err(|_| ())?;
@@ -1100,11 +1120,30 @@ mod firmware {
             .register(Box::new(EchoService), Rights::CALL)
             .map_err(|_| ())?;
 
-        load_and_reclaim_application(scheduler, accounting, &mut dispatcher, port, &artifact)?;
+        let first = load_and_reclaim_application(
+            scheduler,
+            accounting,
+            &mut dispatcher,
+            port,
+            &artifact,
+            ApplicationProbe::Exit,
+        )?;
+        let spinning = native_kex_artifact(ApplicationProbe::Spin)?;
+        let reused = load_and_reclaim_application(
+            scheduler,
+            accounting,
+            &mut dispatcher,
+            port,
+            &spinning,
+            ApplicationProbe::Spin,
+        )?;
         if accounting.frames.free_frames() != baseline_frames
+            || reused != first
             || scheduler.stats().owned_address_spaces != baseline_tasks.owned_address_spaces
             || scheduler.stats().owned_isolation_pages != baseline_tasks.owned_isolation_pages
             || scheduler.stats().owned_handles != baseline_tasks.owned_handles
+            || scheduler.stats().contained_faults
+                != baseline_tasks.contained_faults.checked_add(1).ok_or(())?
             || dispatcher.stats().live_handles != 1
         {
             return Err(());
@@ -1149,14 +1188,15 @@ mod firmware {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::drop_non_drop, clippy::too_many_lines)]
     fn load_and_reclaim_application(
         scheduler: &mut Scheduler,
         accounting: &mut OwnedAccounting,
         dispatcher: &mut Dispatcher,
         port: kllm_dispatch::PortId,
         source: &[u8],
-    ) -> Result<(), ()> {
+        probe: ApplicationProbe,
+    ) -> Result<u64, ()> {
         let limits = ApplicationLimits::for_profile(ResourceProfile::Tiny);
         if source.len() > limits.encoded_bytes() {
             return Err(());
@@ -1217,8 +1257,11 @@ mod firmware {
             reclaim_application(&mut accounting.frames, allocation)?;
             return Err(());
         };
+        let entry = plan.entry_address();
+        let layout = plan.layout();
+        let allocation_start = allocation.complete.start();
         let mut live_owner = None;
-        let committed = (|| -> Result<(), ()> {
+        let setup = (|| -> Result<(_, _), ()> {
             let owner = HandleOwner::isolated(task_id.get()).map_err(|_| ())?;
             let handle = dispatcher
                 .open_owned(port, Rights::CALL, owner)
@@ -1241,6 +1284,53 @@ mod firmware {
             )
             .map_err(|_| ())?;
             kllm_machine::copy_to_physical(allocation.startup, 0, &startup).map_err(|_| ())?;
+            Ok((owner, handle))
+        })();
+        let Ok((owner, handle)) = setup else {
+            rollback_application_task(
+                scheduler,
+                task_id,
+                dispatcher,
+                live_owner,
+                &mut accounting.frames,
+                allocation,
+            )?;
+            return Err(());
+        };
+        drop(plan);
+        drop(staging);
+        drop(mapping_plan);
+        let committed = (|| -> Result<(), ()> {
+            if scheduler
+                .dispatch_next(Capabilities::SERVICE)
+                .map_err(|_| ())?
+                != Some(task_id)
+            {
+                return Err(());
+            }
+            let outcome = kllm_machine::run_application(
+                address_space,
+                entry,
+                layout.stack_top(),
+                layout.startup_address(),
+                PAGE_BYTES,
+            )
+            .map_err(|_| ())?;
+            match (probe, outcome) {
+                (
+                    ApplicationProbe::Exit,
+                    kllm_machine::ApplicationOutcome::Exited { status: 0 },
+                ) => scheduler.exit_current(task_id, 0).map_err(|_| ())?,
+                (
+                    ApplicationProbe::Spin,
+                    kllm_machine::ApplicationOutcome::Faulted(
+                        kllm_machine::IsolatedFault::ExecutionLeaseExpired,
+                    ),
+                ) => scheduler
+                    .fault_current(task_id, TaskFault::ExecutionLeaseExpired)
+                    .map_err(|_| ())?,
+                _ => return Err(()),
+            }
             if dispatcher.close_owner(owner).map_err(|_| ())? != 1 {
                 return Err(());
             }
@@ -1250,7 +1340,6 @@ mod firmware {
             {
                 return Err(());
             }
-            scheduler.cancel_ready(task_id, 0).map_err(|_| ())?;
             Ok(())
         })();
         if committed.is_err() {
@@ -1277,12 +1366,12 @@ mod firmware {
         };
         let valid_reap = reaped.isolation == Some(isolation)
             && reaped.stack.mapped_pages() == stack_pages
-            && reaped.fault.is_none();
+            && reaped.fault == probe.expected_fault();
         reclaim_application(&mut accounting.frames, allocation)?;
         if !valid_reap {
             return Err(());
         }
-        Ok(())
+        Ok(allocation_start)
     }
 
     fn allocate_application(
@@ -1471,11 +1560,26 @@ mod firmware {
         }
     }
 
-    fn native_kex_artifact() -> Result<Vec<u8>, ()> {
+    fn native_kex_artifact(probe: ApplicationProbe) -> Result<Vec<u8>, ()> {
         #[cfg(target_arch = "x86_64")]
-        let payload: &[u8] = &[0x90];
+        let payload: &[u8] = match probe {
+            ApplicationProbe::Exit => &[
+                0x83, 0x3f, 0x58, 0x48, 0x81, 0xfe, 0x00, 0x10, 0x00, 0x00, 0x75, 0x06, 0x31, 0xff,
+                0x31, 0xc0, 0xcd, 0x80, 0xbf, 0x01, 0x00, 0x00, 0x00, 0x31, 0xc0, 0xcd, 0x80, 0x0f,
+                0x0b,
+            ],
+            ApplicationProbe::Spin => &[0xeb, 0xfe],
+        };
         #[cfg(target_arch = "aarch64")]
-        let payload: &[u8] = &[0x1f, 0x20, 0x03, 0xd5];
+        let payload: &[u8] = match probe {
+            ApplicationProbe::Exit => &[
+                0x09, 0x00, 0x40, 0xb9, 0x3f, 0x61, 0x01, 0x71, 0xc1, 0x00, 0x00, 0x54, 0x3f, 0x04,
+                0x40, 0xf1, 0x81, 0x00, 0x00, 0x54, 0xe0, 0x03, 0x1f, 0xaa, 0xe8, 0x03, 0x1f, 0xaa,
+                0x01, 0x00, 0x00, 0xd4, 0x20, 0x00, 0x80, 0xd2, 0xe8, 0x03, 0x1f, 0xaa, 0x01, 0x00,
+                0x00, 0xd4, 0x00, 0x00, 0x20, 0xd4,
+            ],
+            ApplicationProbe::Spin => &[0x00, 0x00, 0x00, 0x14],
+        };
         let payload_offset = 64_usize.checked_add(40).ok_or(())?;
         let artifact_bytes = payload_offset.checked_add(payload.len()).ok_or(())?;
         let mut bytes = Vec::new();
@@ -1904,9 +2008,11 @@ mod firmware {
             }
             TaskStep::ExitSuccess | TaskStep::ExitFailure => {
                 let status = u8::from(step != TaskStep::ExitSuccess);
-                scheduler.exit_current(id, status).map_err(|_| ())?;
+                scheduler
+                    .exit_current(id, u32::from(status))
+                    .map_err(|_| ())?;
                 let reaped = scheduler.reap(id).map_err(|_| ())?;
-                if reaped.exit_status != status {
+                if reaped.exit_status != u32::from(status) {
                     return Err(());
                 }
                 if reusable.is_none() {

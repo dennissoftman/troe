@@ -28,6 +28,12 @@ const MAX_USER_REGIONS: usize = 19;
 #[cfg(target_os = "uefi")]
 const ISOLATED_EXIT_CALL: u64 = 1;
 #[cfg(target_os = "uefi")]
+const APPLICATION_EXIT_CALL: u64 = 0;
+#[cfg(target_os = "uefi")]
+const APPLICATION_LEASE_MILLISECONDS: u32 = 50;
+#[cfg(target_os = "uefi")]
+const APPLICATION_STARTUP_BYTES: usize = 4096;
+#[cfg(target_os = "uefi")]
 const OUTCOME_FAULT_BIT: u64 = 1 << 63;
 
 /// Native fault category contained at the user/kernel boundary.
@@ -41,6 +47,8 @@ pub enum IsolatedFault {
     IllegalInstruction,
     /// The task supplied an unknown call or invalid message range.
     InvalidCall,
+    /// The task exhausted its maximum uninterrupted execution lease.
+    ExecutionLeaseExpired,
 }
 
 /// Terminal result from one bounded cooperative unprivileged execution step.
@@ -54,6 +62,18 @@ pub enum IsolatedOutcome {
         message_bytes: usize,
     },
     /// Native fault or invalid call was contained and returned to the kernel.
+    Faulted(IsolatedFault),
+}
+
+/// Terminal result from the first bounded application ABI execution lease.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ApplicationOutcome {
+    /// The application invoked ABI call 0 with a fixed-width status.
+    Exited {
+        /// Caller-selected application status.
+        status: u32,
+    },
+    /// A native fault, invalid ABI call, or lease expiry was contained.
     Faulted(IsolatedFault),
 }
 
@@ -82,10 +102,18 @@ struct UserRegion {
 
 #[cfg(target_os = "uefi")]
 struct IsolatedRunState {
+    kind: RunKind,
     regions: [Option<UserRegion>; MAX_USER_REGIONS],
     region_count: usize,
     destination: *mut u8,
     destination_len: usize,
+}
+
+#[cfg(target_os = "uefi")]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum RunKind {
+    Stage6Probe,
+    Application,
 }
 
 #[cfg(target_os = "uefi")]
@@ -178,6 +206,8 @@ pub enum MmuError {
     InvalidUserContext,
     /// Another unprivileged execution boundary is already active.
     IsolationBusy,
+    /// The architecture could not establish the bounded execution lease.
+    ExecutionTimerUnavailable,
 }
 
 impl fmt::Display for MmuError {
@@ -191,6 +221,9 @@ impl fmt::Display for MmuError {
             Self::UnsupportedCpu => formatter.write_str("required MMU feature is unavailable"),
             Self::InvalidUserContext => formatter.write_str("isolated user context is invalid"),
             Self::IsolationBusy => formatter.write_str("isolated execution is already active"),
+            Self::ExecutionTimerUnavailable => {
+                formatter.write_str("application execution timer is unavailable")
+            }
         }
     }
 }
@@ -595,6 +628,7 @@ pub fn run_isolated(
     // live and inaccessible to safe Rust across that synchronous boundary.
     unsafe {
         *ISOLATED_RUN.0.get() = Some(IsolatedRunState {
+            kind: RunKind::Stage6Probe,
             regions,
             region_count,
             destination: message_destination.as_mut_ptr(),
@@ -610,16 +644,86 @@ pub fn run_isolated(
     decode_isolated_outcome(raw)
 }
 
+/// Enter an ABI 1.0 application with an armed 50 ms one-shot execution lease.
+///
+/// The startup page and entry point must be readable user mappings, the entry
+/// must be executable, and the guarded stack must end at a 16-byte boundary.
+/// The architecture boundary resets application-visible registers and enables
+/// interrupt delivery only for the owned lease and already-owned input paths.
+///
+/// # Errors
+///
+/// Rejects an invalid context, unavailable execution timer, nested launch, or
+/// malformed native completion before activating application code.
+#[cfg(target_os = "uefi")]
+#[allow(clippy::needless_pass_by_value)]
+pub fn run_application(
+    address_space: UserAddressSpace,
+    entry: u64,
+    stack_top: u64,
+    startup_address: u64,
+    startup_bytes: usize,
+) -> Result<ApplicationOutcome, MmuError> {
+    let UserAddressSpace {
+        root,
+        regions,
+        region_count,
+        stats: _,
+    } = address_space;
+    let user_stack = stack_top
+        .checked_sub(8)
+        .ok_or(MmuError::InvalidUserContext)?;
+    if startup_bytes != APPLICATION_STARTUP_BYTES
+        || KERNEL_ROOT.load(Ordering::Acquire) == 0
+        || !user_range_contains(&regions, region_count, entry, 1, false, true)
+        || !user_range_contains(
+            &regions,
+            region_count,
+            startup_address,
+            startup_bytes,
+            false,
+            false,
+        )
+        || !stack_top.is_multiple_of(16)
+        || !user_range_contains(&regions, region_count, user_stack, 8, true, false)
+    {
+        return Err(MmuError::InvalidUserContext);
+    }
+    if ISOLATED_ACTIVE
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(MmuError::IsolationBusy);
+    }
+    // SAFETY: The active transition gives this call exclusive state ownership
+    // until the architecture completion path restores the kernel root.
+    unsafe {
+        *ISOLATED_RUN.0.get() = Some(IsolatedRunState {
+            kind: RunKind::Application,
+            regions,
+            region_count,
+            destination: ptr::null_mut(),
+            destination_len: 0,
+        });
+    }
+    if crate::mechanism::arm_execution_timer(APPLICATION_LEASE_MILLISECONDS).is_err() {
+        // SAFETY: No user entry occurred and this call still owns the state.
+        unsafe { *ISOLATED_RUN.0.get() = None };
+        ISOLATED_ACTIVE.store(false, Ordering::Release);
+        return Err(MmuError::ExecutionTimerUnavailable);
+    }
+    let raw = architecture_run_application(root, entry, user_stack, startup_address, startup_bytes);
+    crate::mechanism::disarm_execution_timer();
+    // SAFETY: Native completion restored the kernel root and unique call frame.
+    unsafe { *ISOLATED_RUN.0.get() = None };
+    ISOLATED_ACTIVE.store(false, Ordering::Release);
+    decode_application_outcome(raw)
+}
+
 #[cfg(target_os = "uefi")]
 fn decode_isolated_outcome(raw: u64) -> Result<IsolatedOutcome, MmuError> {
     if raw & OUTCOME_FAULT_BIT != 0 {
-        let fault = match raw & 0xff {
-            1 => IsolatedFault::Translation,
-            2 => IsolatedFault::Permission,
-            3 => IsolatedFault::IllegalInstruction,
-            4 => IsolatedFault::InvalidCall,
-            _ => return Err(MmuError::InvalidUserContext),
-        };
+        let fault = decode_fault(raw)?;
         return Ok(IsolatedOutcome::Faulted(fault));
     }
     let status = u8::try_from((raw >> 32) & 0xff).map_err(|_| MmuError::InvalidUserContext)?;
@@ -629,6 +733,27 @@ fn decode_isolated_outcome(raw: u64) -> Result<IsolatedOutcome, MmuError> {
         status,
         message_bytes,
     })
+}
+
+#[cfg(target_os = "uefi")]
+fn decode_application_outcome(raw: u64) -> Result<ApplicationOutcome, MmuError> {
+    if raw & OUTCOME_FAULT_BIT != 0 {
+        return Ok(ApplicationOutcome::Faulted(decode_fault(raw)?));
+    }
+    let status = u32::try_from(raw).map_err(|_| MmuError::InvalidUserContext)?;
+    Ok(ApplicationOutcome::Exited { status })
+}
+
+#[cfg(target_os = "uefi")]
+fn decode_fault(raw: u64) -> Result<IsolatedFault, MmuError> {
+    match raw & 0xff {
+        1 => Ok(IsolatedFault::Translation),
+        2 => Ok(IsolatedFault::Permission),
+        3 => Ok(IsolatedFault::IllegalInstruction),
+        4 => Ok(IsolatedFault::InvalidCall),
+        5 => Ok(IsolatedFault::ExecutionLeaseExpired),
+        _ => Err(MmuError::InvalidUserContext),
+    }
 }
 
 #[cfg(target_os = "uefi")]
@@ -694,6 +819,25 @@ fn isolated_syscall(opcode: u64, address: u64, length: u64, status: u64) -> u64 
     (status << 32) | length as u64
 }
 
+#[cfg(target_os = "uefi")]
+fn application_syscall(opcode: u64, status: u64) -> u64 {
+    crate::mechanism::disarm_execution_timer();
+    if opcode != APPLICATION_EXIT_CALL {
+        return encoded_fault(IsolatedFault::InvalidCall);
+    }
+    match u32::try_from(status) {
+        Ok(status) => u64::from(status),
+        Err(_) => encoded_fault(IsolatedFault::InvalidCall),
+    }
+}
+
+#[cfg(target_os = "uefi")]
+fn active_run_kind() -> Option<RunKind> {
+    // SAFETY: Native exception entries run with nested delivery masked while
+    // the unique synchronous launcher retains the active state.
+    unsafe { (&*ISOLATED_RUN.0.get()).as_ref().map(|state| state.kind) }
+}
+
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 unsafe fn architecture_read_user_byte(address: usize) -> u8 {
     let value: u64;
@@ -746,6 +890,7 @@ const fn encoded_fault(fault: IsolatedFault) -> u64 {
             IsolatedFault::Permission => 2,
             IsolatedFault::IllegalInstruction => 3,
             IsolatedFault::InvalidCall => 4,
+            IsolatedFault::ExecutionLeaseExpired => 5,
         }
 }
 
@@ -1222,6 +1367,9 @@ fn architecture_install_exception_vectors(exception_stack: PhysicalRange) -> Res
         ] {
             (*X86_IDT.0.get()).0[usize::from(vector)] = x86_interrupt_gate(input, 0);
         }
+        let timer = x86_execution_timer_entry as *const () as usize as u64;
+        (*X86_IDT.0.get()).0[usize::from(crate::mechanism::X86_TIMER_VECTOR)] =
+            x86_interrupt_gate(timer, 0);
         let spurious = x86_spurious_interrupt_entry as *const () as usize as u64;
         (*X86_IDT.0.get()).0[usize::from(crate::mechanism::X86_SPURIOUS_VECTOR)] =
             x86_interrupt_gate(spurious, 0);
@@ -1274,6 +1422,27 @@ fn architecture_run_isolated(root: u64, entry: u64, stack_top: u64) -> u64 {
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn architecture_run_application(
+    root: u64,
+    entry: u64,
+    stack_top: u64,
+    startup_address: u64,
+    startup_bytes: usize,
+) -> u64 {
+    // SAFETY: `run_application` validated the complete entry, startup, and
+    // stack mappings and installed the unique active application state.
+    unsafe {
+        x86_enter_application(
+            root,
+            entry,
+            stack_top,
+            startup_address,
+            startup_bytes as u64,
+        )
+    }
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 #[unsafe(naked)]
 unsafe extern "C" fn x86_enter_isolated(_root: u64, _entry: u64, _stack_top: u64) -> u64 {
     core::arch::naked_asm!(
@@ -1304,6 +1473,89 @@ unsafe extern "C" fn x86_enter_isolated(_root: u64, _entry: u64, _stack_top: u64
         "mov cr3, rcx",
         "iretq",
         context = sym X86_KERNEL_CONTEXT,
+        user_data = const X86_USER_DATA_SELECTOR,
+        user_code = const X86_USER_CODE_SELECTOR,
+    );
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+static X86_DEFAULT_MXCSR: u32 = 0x1f80;
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+#[unsafe(naked)]
+unsafe extern "C" fn x86_enter_application(
+    _root: u64,
+    _entry: u64,
+    _stack_top: u64,
+    _startup_address: u64,
+    _startup_bytes: u64,
+) -> u64 {
+    core::arch::naked_asm!(
+        "mov r10, r9",
+        "mov r11, [rsp + 40]",
+        "push rbx",
+        "push rbp",
+        "push rdi",
+        "push rsi",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov rax, rsp",
+        "sub rsp, 544",
+        "and rsp, -16",
+        "fxsave64 [rsp]",
+        "mov [rsp + 512], rax",
+        "pushfq",
+        "pop rax",
+        "mov [rsp + 520], rax",
+        "mov [rsp + 528], r10",
+        "mov [rsp + 536], r11",
+        "lea rax, [rip + {context}]",
+        "mov [rax], rsp",
+        "mov rdi, [rsp + 528]",
+        "mov rsi, [rsp + 536]",
+        "push {user_data}",
+        "push r8",
+        "push 0x202",
+        "push {user_code}",
+        "push rdx",
+        "cli",
+        "mov cr3, rcx",
+        "fninit",
+        "ldmxcsr [rip + {default_mxcsr}]",
+        "pxor xmm0, xmm0",
+        "pxor xmm1, xmm1",
+        "pxor xmm2, xmm2",
+        "pxor xmm3, xmm3",
+        "pxor xmm4, xmm4",
+        "pxor xmm5, xmm5",
+        "pxor xmm6, xmm6",
+        "pxor xmm7, xmm7",
+        "pxor xmm8, xmm8",
+        "pxor xmm9, xmm9",
+        "pxor xmm10, xmm10",
+        "pxor xmm11, xmm11",
+        "pxor xmm12, xmm12",
+        "pxor xmm13, xmm13",
+        "pxor xmm14, xmm14",
+        "pxor xmm15, xmm15",
+        "xor eax, eax",
+        "xor ebx, ebx",
+        "xor ebp, ebp",
+        "xor ecx, ecx",
+        "xor edx, edx",
+        "xor r8d, r8d",
+        "xor r9d, r9d",
+        "xor r10d, r10d",
+        "xor r11d, r11d",
+        "xor r12d, r12d",
+        "xor r13d, r13d",
+        "xor r14d, r14d",
+        "xor r15d, r15d",
+        "iretq",
+        context = sym X86_KERNEL_CONTEXT,
+        default_mxcsr = sym X86_DEFAULT_MXCSR,
         user_data = const X86_USER_DATA_SELECTOR,
         user_code = const X86_USER_CODE_SELECTOR,
     );
@@ -1370,7 +1622,43 @@ extern "C" fn x86_isolated_syscall_handler(
     if !ISOLATED_ACTIVE.load(Ordering::Acquire) {
         x86_exception_fatal();
     }
-    isolated_syscall(opcode, address, length, status)
+    match active_run_kind() {
+        Some(RunKind::Stage6Probe) => isolated_syscall(opcode, address, length, status),
+        Some(RunKind::Application) => application_syscall(opcode, address),
+        None => x86_exception_fatal(),
+    }
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+#[unsafe(naked)]
+extern "C" fn x86_execution_timer_entry() -> ! {
+    core::arch::naked_asm!(
+        "cld",
+        "pushfq",
+        "btr qword ptr [rsp], 18",
+        "popfq",
+        "mov rcx, [rsp + 8]",
+        "and rsp, -16",
+        "sub rsp, 32",
+        "call {handler}",
+        "jmp {complete}",
+        handler = sym x86_execution_timer_handler,
+        complete = sym x86_isolated_complete,
+    );
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+extern "C" fn x86_execution_timer_handler(code_selector: u64) -> u64 {
+    crate::mechanism::disarm_execution_timer();
+    crate::mechanism::acknowledge_execution_timer_interrupt();
+    if code_selector & 3 == 3
+        && ISOLATED_ACTIVE.load(Ordering::Acquire)
+        && active_run_kind() == Some(RunKind::Application)
+    {
+        encoded_fault(IsolatedFault::ExecutionLeaseExpired)
+    } else {
+        x86_exception_fatal()
+    }
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
@@ -1726,6 +2014,27 @@ fn architecture_run_isolated(root: u64, entry: u64, stack_top: u64) -> u64 {
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn architecture_run_application(
+    root: u64,
+    entry: u64,
+    stack_top: u64,
+    startup_address: u64,
+    startup_bytes: usize,
+) -> u64 {
+    // SAFETY: `run_application` validated the complete entry, startup, and
+    // stack mappings and installed the unique active application state.
+    unsafe {
+        aarch64_enter_application(
+            root,
+            entry,
+            stack_top,
+            startup_address,
+            startup_bytes as u64,
+        )
+    }
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 #[unsafe(naked)]
 unsafe extern "C" fn aarch64_enter_isolated(_root: u64, _entry: u64, _stack_top: u64) -> u64 {
     core::arch::naked_asm!(
@@ -1762,6 +2071,120 @@ unsafe extern "C" fn aarch64_enter_isolated(_root: u64, _entry: u64, _stack_top:
         "msr elr_el1, x1",
         "mov x9, #0x3c0",
         "msr spsr_el1, x9",
+        "eret",
+        context = sym AARCH64_KERNEL_CONTEXT,
+    );
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+#[unsafe(naked)]
+#[allow(clippy::too_many_lines)]
+unsafe extern "C" fn aarch64_enter_application(
+    _root: u64,
+    _entry: u64,
+    _stack_top: u64,
+    _startup_address: u64,
+    _startup_bytes: u64,
+) -> u64 {
+    core::arch::naked_asm!(
+        "sub sp, sp, #272",
+        "stp x19, x20, [sp, #0]",
+        "stp x21, x22, [sp, #16]",
+        "stp x23, x24, [sp, #32]",
+        "stp x25, x26, [sp, #48]",
+        "stp x27, x28, [sp, #64]",
+        "stp x29, x30, [sp, #80]",
+        "stp q8, q9, [sp, #96]",
+        "stp q10, q11, [sp, #128]",
+        "stp q12, q13, [sp, #160]",
+        "stp q14, q15, [sp, #192]",
+        "mrs x9, fpcr",
+        "mrs x10, fpsr",
+        "str x9, [sp, #224]",
+        "str x10, [sp, #232]",
+        "mrs x9, daif",
+        "str x9, [sp, #240]",
+        "mrs x9, sp_el0",
+        "str x9, [sp, #248]",
+        "mrs x9, tpidr_el0",
+        "str x9, [sp, #256]",
+        "adr x9, {context}",
+        "mov x10, sp",
+        "str x10, [x9]",
+        "msr ttbr0_el1, x0",
+        "dsb sy",
+        "tlbi vmalle1",
+        "dsb sy",
+        "isb",
+        "msr sp_el0, x2",
+        "msr elr_el1, x1",
+        "msr spsr_el1, xzr",
+        "msr fpcr, xzr",
+        "msr fpsr, xzr",
+        "msr tpidr_el0, xzr",
+        "movi v0.16b, #0",
+        "movi v1.16b, #0",
+        "movi v2.16b, #0",
+        "movi v3.16b, #0",
+        "movi v4.16b, #0",
+        "movi v5.16b, #0",
+        "movi v6.16b, #0",
+        "movi v7.16b, #0",
+        "movi v8.16b, #0",
+        "movi v9.16b, #0",
+        "movi v10.16b, #0",
+        "movi v11.16b, #0",
+        "movi v12.16b, #0",
+        "movi v13.16b, #0",
+        "movi v14.16b, #0",
+        "movi v15.16b, #0",
+        "movi v16.16b, #0",
+        "movi v17.16b, #0",
+        "movi v18.16b, #0",
+        "movi v19.16b, #0",
+        "movi v20.16b, #0",
+        "movi v21.16b, #0",
+        "movi v22.16b, #0",
+        "movi v23.16b, #0",
+        "movi v24.16b, #0",
+        "movi v25.16b, #0",
+        "movi v26.16b, #0",
+        "movi v27.16b, #0",
+        "movi v28.16b, #0",
+        "movi v29.16b, #0",
+        "movi v30.16b, #0",
+        "movi v31.16b, #0",
+        "mov x0, x3",
+        "mov x1, x4",
+        "mov x2, xzr",
+        "mov x3, xzr",
+        "mov x4, xzr",
+        "mov x5, xzr",
+        "mov x6, xzr",
+        "mov x7, xzr",
+        "mov x8, xzr",
+        "mov x9, xzr",
+        "mov x10, xzr",
+        "mov x11, xzr",
+        "mov x12, xzr",
+        "mov x13, xzr",
+        "mov x14, xzr",
+        "mov x15, xzr",
+        "mov x16, xzr",
+        "mov x17, xzr",
+        "mov x18, xzr",
+        "mov x19, xzr",
+        "mov x20, xzr",
+        "mov x21, xzr",
+        "mov x22, xzr",
+        "mov x23, xzr",
+        "mov x24, xzr",
+        "mov x25, xzr",
+        "mov x26, xzr",
+        "mov x27, xzr",
+        "mov x28, xzr",
+        "mov x29, xzr",
+        "mov x30, xzr",
         "eret",
         context = sym AARCH64_KERNEL_CONTEXT,
     );
@@ -1867,6 +2290,7 @@ core::arch::global_asm!(
     "b kllm_aarch64_isolated_complete_entry",
     "1:",
     "mov x4, x9",
+    "mov x5, x8",
     "bl kllm_aarch64_isolated_syscall",
     "b kllm_aarch64_isolated_complete_entry",
     "kllm_aarch64_isolated_complete_entry:",
@@ -1912,6 +2336,7 @@ core::arch::global_asm!(
     "str x9, [sp, #248]",
     "str x10, [sp, #256]",
     "bl kllm_aarch64_input_interrupt",
+    "cbnz x0, kllm_aarch64_isolated_complete_entry",
     "ldr x9, [sp, #248]",
     "ldr x10, [sp, #256]",
     "msr fpcr, x9",
@@ -1992,8 +2417,18 @@ fn architecture_trigger_native_exception() -> ! {
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 #[unsafe(no_mangle)]
-extern "C" fn kllm_aarch64_input_interrupt() {
-    crate::mechanism::handle_input_interrupt();
+extern "C" fn kllm_aarch64_input_interrupt() -> u64 {
+    if crate::mechanism::handle_application_interrupt() {
+        if ISOLATED_ACTIVE.load(Ordering::Acquire)
+            && active_run_kind() == Some(RunKind::Application)
+        {
+            encoded_fault(IsolatedFault::ExecutionLeaseExpired)
+        } else {
+            kllm_aarch64_exception_fatal(0, 0)
+        }
+    } else {
+        0
+    }
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
@@ -2004,6 +2439,7 @@ extern "C" fn kllm_aarch64_isolated_syscall(
     length: u64,
     status: u64,
     syndrome: u64,
+    call_number: u64,
 ) -> u64 {
     if !ISOLATED_ACTIVE.load(Ordering::Acquire) {
         kllm_aarch64_exception_fatal(0, 0);
@@ -2011,7 +2447,11 @@ extern "C" fn kllm_aarch64_isolated_syscall(
     if syndrome & 0xffff != 0 {
         encoded_fault(IsolatedFault::InvalidCall)
     } else {
-        isolated_syscall(opcode, address, length, status)
+        match active_run_kind() {
+            Some(RunKind::Stage6Probe) => isolated_syscall(opcode, address, length, status),
+            Some(RunKind::Application) => application_syscall(call_number, opcode),
+            None => kllm_aarch64_exception_fatal(0, 0),
+        }
     }
 }
 

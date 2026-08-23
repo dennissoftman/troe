@@ -195,8 +195,13 @@ the general free-RAM identity map. This keeps both backends within the tiny
 profile's 64-page table ceiling. A provisional task receives only the
 loader-selected handle; boot acceptance then revokes it,
 reaps the record, zeroes every provisional frame, and verifies exact reuse.
-Malformed native corpus cases fail before frame allocation. User entry remains
-disabled until ABI 1.0 gates and the owned execution timer land.
+Malformed native corpus cases fail before frame allocation. Application entry
+now resets visible register/control state, passes only the startup address and
+length, and enables IRQs after arming a 50 ms one-shot. ABI call 0 exits through
+the owned gate. A separate spinning KEX is terminated by the x86 local-APIC or
+AArch64 generic physical timer, recorded as `execution-lease-expired`, and
+reclaimed transactionally. Resumable yield and copied handle calls remain the
+next increment.
 
 ## Future persistent-storage boundary
 

@@ -6,9 +6,11 @@ Implementation note, 2026-08-23: the portable parser, canonical virtual layout,
 startup-page encoder, and native owned-staging/validate/map/reclaim transaction
 are implemented. The native root maps only the supervisor image, devices, and
 explicit boot-arena runtime ranges needed across an isolated transition, keeping
-both backends inside the tiny profile's table ceiling. Native roots remain
-inactive; application entry, ABI gates, and the owned execution timer are
-intentionally still pending.
+both backends inside the tiny profile's table ceiling. A subsequent increment
+added reset ring-3/EL0 entry, ABI call 0 exit, and enforced 50 ms one-shot leases
+using the x86 local APIC calibrated by typed PIT resources and the AArch64
+generic physical timer through GICv2 PPI 30. Resumable yield and copied handle
+calls remain pending.
 
 ## Decision
 
@@ -132,7 +134,8 @@ application-visible register.
 
 ABI 1.0 defines exactly three calls:
 
-0. `exit(status)` terminates the application and never resumes it;
+0. `exit(status)` takes one unsigned 32-bit status, terminates the application,
+   and never resumes it;
 1. `yield()` returns control to the scheduler voluntarily and resumes only if
    the scheduler selects the application again; and
 2. `handle_call(handle, request_address, request_bytes, reply_address,

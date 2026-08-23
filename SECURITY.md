@@ -3,10 +3,13 @@
 ## Current boundary
 
 The hosted model has the security properties of its host process. The native
-image exits UEFI boot services but remains single-address-space: all commands
-execute with kernel privilege. There is no userspace isolation, secure boot
-integration, persistent storage parser, network stack, or untrusted executable
-loading in this milestone.
+image exits UEFI boot services. Recovery commands remain privileged, while
+validated KEX applications receive fresh ring-3/EL0 roots, explicit handles,
+bounded memory, contained fault fate, and zeroized teardown. The current native
+acceptance artifacts exercise ABI exit and lease expiry; no shell/package path
+loads arbitrary external applications yet. There is no secure-boot integration,
+persistent storage parser, network stack, multi-user boundary, or mutually
+isolated privileged built-ins in this milestone.
 
 The portable crates forbid unsafe Rust. Project-authored unsafe operations are
 confined to `kllm-machine`, counted by the verification gate, and documented in
@@ -38,6 +41,11 @@ untrusted and bounded.
   deterministic lifecycle accounting, and guarded native stack payloads;
 - dispatch: at most 16 ports and 32 handles, generation-checked identities,
   explicit call rights, and 4 KiB request/reply limits;
+- KEX: exact target/version/layout validation before allocation, closed R/RX/RW
+  permissions, fixed profile ceilings, kernel-owned staging, canonical startup
+  pages, explicit initial handles, and transactional zeroized reclamation;
+- application execution: reset ring-3/EL0 register state, ABI call 0 exit, and
+  an architecture-owned 50 ms one-shot that terminates non-returning code;
 - dependencies: complete `Cargo.lock` checked by pinned `cargo-audit` against the
   exact RustSec database revision in `tools/rustsec-advisory-db.rev`.
 

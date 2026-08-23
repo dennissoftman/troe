@@ -13,11 +13,11 @@ historical review evidence.
   x86-64 and AArch64 interrupt, idle, and controller invariants that portable
   refactors must not erase.
 - [Unsafe inventory](security/unsafe-inventory.md) records the current audited
-  project-authored unsafe surface through Stage 6.
+  project-authored unsafe surface through the runnable Stage 7 increment.
 - [KEFS v1](formats/kefs-v1.md) defines the implemented embedded-filesystem
   format.
 - [KEX v1](formats/kex-v1.md) defines the implemented portable executable
-  parser format; native application loading is not implemented yet.
+  parser, native loader, startup layout, and first runnable ABI increment.
 
 The repository root [README](../README.md), [security policy](../SECURITY.md),
 [contribution guide](../CONTRIBUTING.md), and [third-party inventory](../THIRD_PARTY.md)
@@ -47,8 +47,9 @@ copied-message, contained-fault, and transactional teardown boundary.
 [ADR 0015](adr/0015-kex-application-abi-and-execution-bounds.md) accepts the KEX
 v1 container, application ABI 1.0, profile memory ceilings, and bounded
 execution-lease policy for Stage 7. Portable parsing plus native owned staging,
-mapping, startup-page construction, explicit handle grant, and rollback are
-implemented; entry, ABI calls, and execution-lease enforcement remain.
+mapping, startup-page construction, explicit handle grant, ABI entry/exit, and
+execution-lease enforcement are implemented; resumable yield and copied handle
+calls remain.
 
 ## Evaluations
 
