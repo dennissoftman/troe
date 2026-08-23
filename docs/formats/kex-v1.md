@@ -87,6 +87,42 @@ pages plus the profile's complete page-table ceiling. Native table construction
 may refine that reservation downward but may not exceed either the table or
 aggregate resident ceiling.
 
+## ABI 1.0 virtual layout and startup page
+
+The portable plan fixes the non-image virtual regions so every native backend
+consumes identical checked address arithmetic. The startup page begins at
+`image base + profile image-span ceiling`. The heap slot follows it and reserves
+the profile's maximum heap span in virtual space, although only the requested
+prefix is mapped. One unmapped lower guard follows the heap slot. The fixed
+maximum stack slot follows that guard; the requested stack pages are mapped at
+the top of the slot so they end immediately before an unmapped upper guard.
+All unused heap and stack-slot pages remain unmapped.
+
+The startup page is 4 KiB, little-endian, and zero-padded. Its fixed header is
+64 bytes:
+
+| Offset | Bytes | Field |
+| ---: | ---: | --- |
+| 0 | 4 | encoded bytes: `64 + handle_count * 24` |
+| 4 | 2 | ABI major, 1 |
+| 6 | 2 | ABI minor, 0 |
+| 8 | 4 | page bytes, 4,096 |
+| 12 | 2 | resource profile: 1 micro, 2 tiny, 3 full |
+| 14 | 2 | initial handle count |
+| 16 | 8 | image base |
+| 24 | 8 | heap base |
+| 32 | 8 | mapped heap bytes |
+| 40 | 8 | mapped stack bottom |
+| 48 | 8 | mapped stack top / initial stack pointer |
+| 56 | 8 | monotonic nonzero task identity |
+
+Each 24-byte initial handle descriptor then contains an opaque handle value
+(`u64`), rights bits (`u32`), interface identifier (`u32`), interface major and
+minor (`u16` each), and four reserved zero bytes. Values must be nonzero and
+unique within the page. Handle count cannot exceed the selected profile. The
+kernel validates the complete descriptor set before clearing and encoding the
+destination, so rejection cannot leave a partial startup record.
+
 ## Deliberate omissions
 
 KEX v1 carries no sections, symbols, interpreter, dynamic metadata, imports,

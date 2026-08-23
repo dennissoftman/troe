@@ -6,8 +6,12 @@ use core::fmt;
 
 /// KEX v1 base page size in bytes.
 pub const PAGE_SIZE: u64 = 4096;
+/// KEX v1 base page size as a host slice length.
+pub const PAGE_BYTES: usize = 4096;
 /// Fixed virtual base of every separately isolated KEX v1 image.
 pub const KEX_V1_IMAGE_BASE: u64 = 0x0000_4000_0000_0000;
+/// Exclusive upper bound of the application half of the initial 48-bit roots.
+pub const KEX_V1_USER_END: u64 = 0x0000_8000_0000_0000;
 /// KEX v1 header length in bytes.
 pub const KEX_V1_HEADER_BYTES: usize = 64;
 /// KEX v1 load-record length in bytes.
@@ -24,6 +28,8 @@ pub const ABI_MINOR: u16 = 0;
 const CONTAINER_MAJOR: u16 = 1;
 const CONTAINER_MINOR: u16 = 0;
 const STARTUP_PAGES: u64 = 1;
+const STARTUP_FIXED_BYTES: usize = 64;
+const STARTUP_HANDLE_BYTES: usize = 24;
 
 const HEADER_CONTAINER_MAJOR: usize = 8;
 const HEADER_CONTAINER_MINOR: usize = 10;
@@ -296,6 +302,99 @@ pub struct LoadCharges {
     reserved_resident_pages: u64,
 }
 
+/// Canonical KEX v1 virtual placement outside the profile's image window.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ApplicationLayout {
+    startup_address: u64,
+    heap_address: u64,
+    heap_bytes: u64,
+    stack_bottom: u64,
+    stack_top: u64,
+    lower_guard_address: u64,
+    upper_guard_address: u64,
+}
+
+impl ApplicationLayout {
+    /// Address of the immutable one-page ABI startup record.
+    #[must_use]
+    pub const fn startup_address(self) -> u64 {
+        self.startup_address
+    }
+
+    /// First byte of the application's fixed zeroed heap.
+    #[must_use]
+    pub const fn heap_address(self) -> u64 {
+        self.heap_address
+    }
+
+    /// Number of initially mapped heap bytes.
+    #[must_use]
+    pub const fn heap_bytes(self) -> u64 {
+        self.heap_bytes
+    }
+
+    /// First mapped byte of the initial stack.
+    #[must_use]
+    pub const fn stack_bottom(self) -> u64 {
+        self.stack_bottom
+    }
+
+    /// Exclusive, 16-byte-aligned initial stack pointer.
+    #[must_use]
+    pub const fn stack_top(self) -> u64 {
+        self.stack_top
+    }
+
+    /// Page immediately below the profile's reserved stack slot.
+    #[must_use]
+    pub const fn lower_guard_address(self) -> u64 {
+        self.lower_guard_address
+    }
+
+    /// Page immediately above the mapped initial stack.
+    #[must_use]
+    pub const fn upper_guard_address(self) -> u64 {
+        self.upper_guard_address
+    }
+}
+
+/// One explicit initial authority descriptor encoded into the startup page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InitialHandle {
+    /// Opaque generation-checked handle value.
+    pub value: u64,
+    /// ABI-defined rights bits.
+    pub rights: u32,
+    /// ABI-defined service interface identifier.
+    pub interface: u32,
+    /// Required interface major version.
+    pub major: u16,
+    /// Required interface minor version.
+    pub minor: u16,
+}
+
+/// Values placed in the immutable ABI 1.0 startup page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StartupInfo<'handles> {
+    /// Monotonic nonzero task identity selected by the kernel.
+    pub task_id: u64,
+    /// Initial handles after loader-policy and launcher-authority intersection.
+    pub handles: &'handles [InitialHandle],
+}
+
+/// Failure to encode a canonical ABI startup page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartupPageError {
+    /// The task identity is the reserved zero value.
+    InvalidTaskId,
+    /// More initial handles were supplied than the selected profile permits.
+    TooManyHandles,
+    /// A descriptor used the reserved zero opaque-handle value.
+    InvalidHandle,
+    /// Two descriptors expose the same opaque handle value.
+    DuplicateHandle,
+}
+
 impl LoadCharges {
     /// Exact staged artifact bytes.
     #[must_use]
@@ -346,6 +445,7 @@ pub struct LoadPlan<'artifact> {
     segments: [Option<LoadSegment<'artifact>>; MAX_LOAD_RECORDS],
     segment_count: usize,
     charges: LoadCharges,
+    layout: ApplicationLayout,
 }
 
 impl<'artifact> LoadPlan<'artifact> {
@@ -397,6 +497,71 @@ impl<'artifact> LoadPlan<'artifact> {
     #[must_use]
     pub const fn charges(&self) -> LoadCharges {
         self.charges
+    }
+
+    /// Canonical startup, heap, guard, and stack virtual placement.
+    #[must_use]
+    pub const fn layout(&self) -> ApplicationLayout {
+        self.layout
+    }
+
+    /// Encode the immutable ABI 1.0 startup page into a zeroed base page.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a zero task identity, too many initial handles, or duplicate
+    /// opaque values before modifying the destination.
+    pub fn encode_startup_page(
+        &self,
+        info: StartupInfo<'_>,
+        destination: &mut [u8; PAGE_BYTES],
+    ) -> Result<(), StartupPageError> {
+        if info.task_id == 0 {
+            return Err(StartupPageError::InvalidTaskId);
+        }
+        let limits = ApplicationLimits::for_profile(self.profile);
+        if info.handles.len() > usize::from(limits.initial_handles) {
+            return Err(StartupPageError::TooManyHandles);
+        }
+        for (index, handle) in info.handles.iter().enumerate() {
+            if handle.value == 0 {
+                return Err(StartupPageError::InvalidHandle);
+            }
+            if info.handles[..index]
+                .iter()
+                .any(|existing| existing.value == handle.value)
+            {
+                return Err(StartupPageError::DuplicateHandle);
+            }
+        }
+
+        destination.fill(0);
+        let encoded_bytes = STARTUP_FIXED_BYTES + info.handles.len() * STARTUP_HANDLE_BYTES;
+        let encoded_bytes =
+            u32::try_from(encoded_bytes).map_err(|_| StartupPageError::TooManyHandles)?;
+        let handle_count =
+            u16::try_from(info.handles.len()).map_err(|_| StartupPageError::TooManyHandles)?;
+        write_u32(destination, 0, encoded_bytes);
+        write_u16(destination, 4, ABI_MAJOR);
+        write_u16(destination, 6, ABI_MINOR);
+        write_u32(destination, 8, 4096);
+        write_u16(destination, 12, self.profile as u16);
+        write_u16(destination, 14, handle_count);
+        write_u64(destination, 16, KEX_V1_IMAGE_BASE);
+        write_u64(destination, 24, self.layout.heap_address);
+        write_u64(destination, 32, self.layout.heap_bytes);
+        write_u64(destination, 40, self.layout.stack_bottom);
+        write_u64(destination, 48, self.layout.stack_top);
+        write_u64(destination, 56, info.task_id);
+        for (index, handle) in info.handles.iter().enumerate() {
+            let offset = STARTUP_FIXED_BYTES + index * STARTUP_HANDLE_BYTES;
+            write_u64(destination, offset, handle.value);
+            write_u32(destination, offset + 8, handle.rights);
+            write_u32(destination, offset + 12, handle.interface);
+            write_u16(destination, offset + 16, handle.major);
+            write_u16(destination, offset + 18, handle.minor);
+        }
+        Ok(())
     }
 }
 
@@ -532,6 +697,7 @@ fn parse_with_limits(
     if reserved_resident_pages > limits.resident_pages {
         return Err(ParseError::ResidentBudgetExceeded);
     }
+    let layout = application_layout(header.stack_pages, header.heap_pages, limits)?;
 
     Ok(LoadPlan {
         target: header.target,
@@ -550,6 +716,61 @@ fn parse_with_limits(
             private_pages,
             reserved_resident_pages,
         },
+        layout,
+    })
+}
+
+fn application_layout(
+    stack_pages: u64,
+    heap_pages: u64,
+    limits: ApplicationLimits,
+) -> Result<ApplicationLayout, ParseError> {
+    let startup_address = KEX_V1_IMAGE_BASE
+        .checked_add(limits.image_span_bytes)
+        .ok_or(ParseError::ArithmeticOverflow)?;
+    let heap_address = startup_address
+        .checked_add(PAGE_SIZE)
+        .ok_or(ParseError::ArithmeticOverflow)?;
+    let heap_bytes = heap_pages
+        .checked_mul(PAGE_SIZE)
+        .ok_or(ParseError::ArithmeticOverflow)?;
+    let heap_slot_bytes = limits
+        .heap_pages
+        .checked_mul(PAGE_SIZE)
+        .ok_or(ParseError::ArithmeticOverflow)?;
+    let lower_guard_address = heap_address
+        .checked_add(heap_slot_bytes)
+        .ok_or(ParseError::ArithmeticOverflow)?;
+    let stack_slot_address = lower_guard_address
+        .checked_add(PAGE_SIZE)
+        .ok_or(ParseError::ArithmeticOverflow)?;
+    let stack_slot_bytes = limits
+        .maximum_stack_pages
+        .checked_mul(PAGE_SIZE)
+        .ok_or(ParseError::ArithmeticOverflow)?;
+    let upper_guard_address = stack_slot_address
+        .checked_add(stack_slot_bytes)
+        .ok_or(ParseError::ArithmeticOverflow)?;
+    let stack_bytes = stack_pages
+        .checked_mul(PAGE_SIZE)
+        .ok_or(ParseError::ArithmeticOverflow)?;
+    let stack_bottom = upper_guard_address
+        .checked_sub(stack_bytes)
+        .ok_or(ParseError::ArithmeticOverflow)?;
+    let user_end = upper_guard_address
+        .checked_add(PAGE_SIZE)
+        .ok_or(ParseError::ArithmeticOverflow)?;
+    if user_end > KEX_V1_USER_END {
+        return Err(ParseError::ArithmeticOverflow);
+    }
+    Ok(ApplicationLayout {
+        startup_address,
+        heap_address,
+        heap_bytes,
+        stack_bottom,
+        stack_top: upper_guard_address,
+        lower_guard_address,
+        upper_guard_address,
     })
 }
 
@@ -820,6 +1041,18 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, ParseError> {
     ]))
 }
 
+fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
@@ -969,7 +1202,119 @@ mod tests {
             assert_eq!(plan.charges().image_pages(), 2);
             assert_eq!(plan.charges().private_pages(), 7);
             assert_eq!(plan.charges().reserved_resident_pages(), 71);
+            let layout = plan.layout();
+            assert_eq!(
+                layout.startup_address(),
+                KEX_V1_IMAGE_BASE + 4 * 1024 * 1024
+            );
+            assert_eq!(layout.heap_bytes(), 0);
+            assert_eq!(layout.stack_top() - layout.stack_bottom(), 4 * PAGE_SIZE);
+            assert_eq!(layout.upper_guard_address(), layout.stack_top());
+            assert!(layout.lower_guard_address() < layout.stack_bottom());
         }
+    }
+
+    #[test]
+    fn startup_page_is_canonical_and_rejections_are_atomic() {
+        let bytes = valid_artifact(Target::X86_64);
+        let plan = parse_tiny(&bytes, Target::X86_64).unwrap_or_else(|_| unreachable!());
+        let handles = [
+            InitialHandle {
+                value: 0x1000_0001,
+                rights: 1,
+                interface: 7,
+                major: 1,
+                minor: 0,
+            },
+            InitialHandle {
+                value: 0x1000_0002,
+                rights: 3,
+                interface: 9,
+                major: 2,
+                minor: 4,
+            },
+        ];
+        let mut page = [0xa5_u8; PAGE_BYTES];
+        plan.encode_startup_page(
+            StartupInfo {
+                task_id: 42,
+                handles: &handles,
+            },
+            &mut page,
+        )
+        .unwrap_or_else(|_| unreachable!());
+
+        assert_eq!(read_u32(&page, 0), Ok(112));
+        assert_eq!(read_u16(&page, 4), Ok(ABI_MAJOR));
+        assert_eq!(read_u16(&page, 6), Ok(ABI_MINOR));
+        assert_eq!(read_u32(&page, 8), Ok(4096));
+        assert_eq!(read_u16(&page, 12), Ok(ResourceProfile::Tiny as u16));
+        assert_eq!(read_u16(&page, 14), Ok(2));
+        assert_eq!(read_u64(&page, 16), Ok(KEX_V1_IMAGE_BASE));
+        assert_eq!(read_u64(&page, 24), Ok(plan.layout().heap_address()));
+        assert_eq!(read_u64(&page, 40), Ok(plan.layout().stack_bottom()));
+        assert_eq!(read_u64(&page, 48), Ok(plan.layout().stack_top()));
+        assert_eq!(read_u64(&page, 56), Ok(42));
+        assert_eq!(read_u64(&page, 64), Ok(handles[0].value));
+        assert_eq!(read_u32(&page, 72), Ok(handles[0].rights));
+        assert_eq!(read_u64(&page, 88), Ok(handles[1].value));
+        assert!(page[112..].iter().all(|byte| *byte == 0));
+
+        let original = [0x5a_u8; PAGE_BYTES];
+        let mut rejected = original;
+        assert_eq!(
+            plan.encode_startup_page(
+                StartupInfo {
+                    task_id: 0,
+                    handles: &[],
+                },
+                &mut rejected,
+            ),
+            Err(StartupPageError::InvalidTaskId)
+        );
+        assert_eq!(rejected, original);
+
+        let zero = [InitialHandle {
+            value: 0,
+            ..handles[0]
+        }];
+        assert_eq!(
+            plan.encode_startup_page(
+                StartupInfo {
+                    task_id: 1,
+                    handles: &zero,
+                },
+                &mut rejected,
+            ),
+            Err(StartupPageError::InvalidHandle)
+        );
+        assert_eq!(rejected, original);
+
+        let duplicate = [handles[0], handles[0]];
+        assert_eq!(
+            plan.encode_startup_page(
+                StartupInfo {
+                    task_id: 1,
+                    handles: &duplicate,
+                },
+                &mut rejected,
+            ),
+            Err(StartupPageError::DuplicateHandle)
+        );
+        assert_eq!(rejected, original);
+
+        let too_many = [handles[0]; 9];
+        assert_eq!(
+            plan.encode_startup_page(
+                StartupInfo {
+                    task_id: 1,
+                    handles: &too_many,
+                },
+                &mut rejected,
+            ),
+            Err(StartupPageError::TooManyHandles)
+        );
+        assert_eq!(rejected, original);
     }
 
     #[test]

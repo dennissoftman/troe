@@ -153,6 +153,9 @@ def assert_owned_boot(session: "SerialSession") -> None:
         "copied task messages: bounded",
         "isolated faults: contained",
         "isolated resources: reclaimed",
+        "KEX staging: owned and bounded",
+        "KEX load plans: mapped atomically",
+        "application resources: reclaimed",
         "in-process console dispatch: ready",
         "memory and console: owned",
     ):

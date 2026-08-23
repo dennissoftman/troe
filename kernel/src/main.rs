@@ -1,4 +1,4 @@
-//! UEFI-bootstrapped Stage 6 isolated owned-machine image.
+//! UEFI-bootstrapped owned-machine image with a staged Stage 7 load boundary.
 #![cfg_attr(target_os = "uefi", no_std)]
 #![cfg_attr(target_os = "uefi", no_main)]
 #![forbid(unsafe_code)]
@@ -18,6 +18,10 @@ mod firmware {
     use core::fmt::Write as _;
     use core::panic::PanicInfo;
 
+    use kllm_application::{
+        ABI_MINOR, ApplicationLimits, InitialHandle, LoadPlan, PAGE_BYTES, ParseError,
+        ResourceProfile, SegmentPermissions, StartupInfo, Target, parse_kex,
+    };
     use kllm_core::{Input, MAX_LINE_BYTES, MachineMemorySnapshot, Output, StreamError};
     use kllm_dispatch::{
         ConsoleService, CopiedMessage, DispatchedOutput, Dispatcher, HandleOwner, ReplyStatus,
@@ -60,6 +64,8 @@ mod firmware {
     const ISOLATED_PRIVATE_PAGES: u64 =
         ISOLATED_CODE_PAGES + ISOLATED_DATA_PAGES + ISOLATED_STACK_PAGES;
     const ISOLATED_RESOURCE_PAGES: u64 = ISOLATED_TABLE_PAGES + ISOLATED_PRIVATE_PAGES;
+    const APPLICATION_TABLE_PAGES: u64 = 64;
+    const APPLICATION_INTERFACE_ECHO: u32 = 1;
     const USER_CODE_BASE: u64 = 0x0000_4000_0000_0000;
     const USER_DATA_BASE: u64 = USER_CODE_BASE + BASE_PAGE_SIZE;
     const USER_STACK_BASE: u64 = USER_CODE_BASE + 0x1_0000;
@@ -165,6 +171,7 @@ mod firmware {
         execute_probe_address: usize,
         task_stacks: [TaskStackLayout; TASK_STACK_COUNT],
         framebuffer: Option<FramebufferDescriptor>,
+        kernel_runtime: PhysicalRange,
         kernel_plan: MappingPlan,
     }
 
@@ -207,6 +214,15 @@ mod firmware {
         tables: PhysicalRange,
         code: PhysicalRange,
         data: PhysicalRange,
+        stack: PhysicalRange,
+    }
+
+    struct ApplicationAllocation {
+        complete: PhysicalRange,
+        tables: PhysicalRange,
+        image: PhysicalRange,
+        startup: PhysicalRange,
+        heap: Option<PhysicalRange>,
         stack: PhysicalRange,
     }
 
@@ -373,6 +389,7 @@ mod firmware {
                 .map_err(|_| ())?,
             task_stacks: prepared.boot_memory.task_stacks,
             framebuffer,
+            kernel_runtime: prepared.boot_memory.arena,
             kernel_plan: mapping_plan,
         })
     }
@@ -690,6 +707,14 @@ mod firmware {
             || !kllm_machine::write(b"isolated resources: reclaimed\n")
         {
             fatal(b"fatal: isolation diagnostic failed\n");
+        }
+        run_application_load_verification(&mut scheduler, &mut accounting)
+            .unwrap_or_else(|()| fatal(b"fatal: Stage 7 load-boundary verification failed\n"));
+        if !kllm_machine::write(b"KEX staging: owned and bounded\n")
+            || !kllm_machine::write(b"KEX load plans: mapped atomically\n")
+            || !kllm_machine::write(b"application resources: reclaimed\n")
+        {
+            fatal(b"fatal: application loader diagnostic failed\n");
         }
 
         let capabilities = Capabilities::CONSOLE
@@ -1061,6 +1086,460 @@ mod firmware {
             return Err(());
         }
         Ok(allocation_start)
+    }
+
+    fn run_application_load_verification(
+        scheduler: &mut Scheduler,
+        accounting: &mut OwnedAccounting,
+    ) -> Result<(), ()> {
+        let artifact = native_kex_artifact()?;
+        let baseline_frames = accounting.frames.free_frames();
+        let baseline_tasks = scheduler.stats();
+        let mut dispatcher = Dispatcher::new(1, 2).map_err(|_| ())?;
+        let (port, _kernel_handle) = dispatcher
+            .register(Box::new(EchoService), Rights::CALL)
+            .map_err(|_| ())?;
+
+        load_and_reclaim_application(scheduler, accounting, &mut dispatcher, port, &artifact)?;
+        if accounting.frames.free_frames() != baseline_frames
+            || scheduler.stats().owned_address_spaces != baseline_tasks.owned_address_spaces
+            || scheduler.stats().owned_isolation_pages != baseline_tasks.owned_isolation_pages
+            || scheduler.stats().owned_handles != baseline_tasks.owned_handles
+            || dispatcher.stats().live_handles != 1
+        {
+            return Err(());
+        }
+
+        let mut invalid = artifact.clone();
+        invalid[0] ^= 0xff;
+        require_staged_rejection(&invalid, ParseError::InvalidMagic)?;
+        invalid.clone_from(&artifact);
+        invalid[22] = 1;
+        require_staged_rejection(&invalid, ParseError::NonzeroReserved)?;
+        invalid.clone_from(&artifact);
+        invalid[12] = if native_application_target() == Target::X86_64 {
+            Target::Aarch64 as u8
+        } else {
+            Target::X86_64 as u8
+        };
+        invalid[13] = 0;
+        require_staged_rejection(&invalid, ParseError::WrongTarget)?;
+        invalid.clone_from(&artifact);
+        invalid[64 + 32] = 0;
+        require_staged_rejection(&invalid, ParseError::InvalidPermissions)?;
+        require_staged_rejection(&artifact[..63], ParseError::TruncatedHeader)?;
+        if accounting.frames.free_frames() != baseline_frames {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    fn require_staged_rejection(source: &[u8], expected: ParseError) -> Result<(), ()> {
+        let mut staging = Vec::new();
+        staging.try_reserve_exact(source.len()).map_err(|_| ())?;
+        staging.extend_from_slice(source);
+        match parse_kex(
+            &staging,
+            native_application_target(),
+            ResourceProfile::Tiny,
+            ABI_MINOR,
+        ) {
+            Err(error) if error == expected => Ok(()),
+            _ => Err(()),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn load_and_reclaim_application(
+        scheduler: &mut Scheduler,
+        accounting: &mut OwnedAccounting,
+        dispatcher: &mut Dispatcher,
+        port: kllm_dispatch::PortId,
+        source: &[u8],
+    ) -> Result<(), ()> {
+        let limits = ApplicationLimits::for_profile(ResourceProfile::Tiny);
+        if source.len() > limits.encoded_bytes() {
+            return Err(());
+        }
+        let mut staging = Vec::new();
+        staging.try_reserve_exact(source.len()).map_err(|_| ())?;
+        staging.extend_from_slice(source);
+        let plan = parse_kex(
+            &staging,
+            native_application_target(),
+            ResourceProfile::Tiny,
+            ABI_MINOR,
+        )
+        .map_err(|_| ())?;
+        let private_pages = u16::try_from(plan.charges().private_pages()).map_err(|_| ())?;
+        let stack_pages = u16::try_from(plan.stack_pages()).map_err(|_| ())?;
+
+        let allocation = allocate_application(&mut accounting.frames, &plan)?;
+        if prepare_application_memory(&allocation, &plan).is_err() {
+            reclaim_application(&mut accounting.frames, allocation)?;
+            return Err(());
+        }
+        let Ok(mapping_plan) = build_application_plan(
+            &accounting.kernel_plan,
+            accounting.kernel_runtime,
+            &allocation,
+            &plan,
+        ) else {
+            reclaim_application(&mut accounting.frames, allocation)?;
+            return Err(());
+        };
+        let Ok(address_space) =
+            kllm_machine::build_user_address_space(&mapping_plan, allocation.tables)
+        else {
+            reclaim_application(&mut accounting.frames, allocation)?;
+            return Err(());
+        };
+        let table_pages = address_space.stats().table_pages;
+        if table_pages == 0 || table_pages > APPLICATION_TABLE_PAGES {
+            reclaim_application(&mut accounting.frames, allocation)?;
+            return Err(());
+        }
+        let Ok(table_pages) = u16::try_from(table_pages) else {
+            reclaim_application(&mut accounting.frames, allocation)?;
+            return Err(());
+        };
+        let Ok(isolation) = IsolationResource::new(0, table_pages, private_pages, 1) else {
+            reclaim_application(&mut accounting.frames, allocation)?;
+            return Err(());
+        };
+        let Ok(stack_resource) = StackResource::new(0, stack_pages) else {
+            reclaim_application(&mut accounting.frames, allocation)?;
+            return Err(());
+        };
+        let Ok(task_id) =
+            scheduler.spawn_isolated(Capabilities::SERVICE, stack_resource, isolation)
+        else {
+            reclaim_application(&mut accounting.frames, allocation)?;
+            return Err(());
+        };
+        let mut live_owner = None;
+        let committed = (|| -> Result<(), ()> {
+            let owner = HandleOwner::isolated(task_id.get()).map_err(|_| ())?;
+            let handle = dispatcher
+                .open_owned(port, Rights::CALL, owner)
+                .map_err(|_| ())?;
+            live_owner = Some(owner);
+            let initial_handles = [InitialHandle {
+                value: handle.abi_value(),
+                rights: Rights::CALL.bits(),
+                interface: APPLICATION_INTERFACE_ECHO,
+                major: 1,
+                minor: 0,
+            }];
+            let mut startup = [0_u8; PAGE_BYTES];
+            plan.encode_startup_page(
+                StartupInfo {
+                    task_id: u64::from(task_id.get()),
+                    handles: &initial_handles,
+                },
+                &mut startup,
+            )
+            .map_err(|_| ())?;
+            kllm_machine::copy_to_physical(allocation.startup, 0, &startup).map_err(|_| ())?;
+            if dispatcher.close_owner(owner).map_err(|_| ())? != 1 {
+                return Err(());
+            }
+            live_owner = None;
+            if dispatcher.call(handle, 1, b"stale")
+                != Err(kllm_dispatch::DispatchError::InvalidHandle)
+            {
+                return Err(());
+            }
+            scheduler.cancel_ready(task_id, 0).map_err(|_| ())?;
+            Ok(())
+        })();
+        if committed.is_err() {
+            rollback_application_task(
+                scheduler,
+                task_id,
+                dispatcher,
+                live_owner,
+                &mut accounting.frames,
+                allocation,
+            )?;
+            return Err(());
+        }
+        let Ok(reaped) = scheduler.reap(task_id) else {
+            rollback_application_task(
+                scheduler,
+                task_id,
+                dispatcher,
+                live_owner,
+                &mut accounting.frames,
+                allocation,
+            )?;
+            return Err(());
+        };
+        let valid_reap = reaped.isolation == Some(isolation)
+            && reaped.stack.mapped_pages() == stack_pages
+            && reaped.fault.is_none();
+        reclaim_application(&mut accounting.frames, allocation)?;
+        if !valid_reap {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    fn allocate_application(
+        frames: &mut FrameAllocator,
+        plan: &LoadPlan<'_>,
+    ) -> Result<ApplicationAllocation, ()> {
+        let resource_pages = APPLICATION_TABLE_PAGES
+            .checked_add(plan.charges().private_pages())
+            .ok_or(())?;
+        let complete = frames
+            .allocate_contiguous(resource_pages, 1)
+            .map_err(|_| ())?;
+        let derived = (|| {
+            let tables = PhysicalRange::from_pages(complete.start(), APPLICATION_TABLE_PAGES)
+                .map_err(|_| ())?;
+            let private = PhysicalRange::from_pages(tables.end(), plan.charges().private_pages())
+                .map_err(|_| ())?;
+            let image = PhysicalRange::from_pages(private.start(), plan.charges().image_pages())
+                .map_err(|_| ())?;
+            let startup = PhysicalRange::from_pages(image.end(), 1).map_err(|_| ())?;
+            let heap = if plan.heap_pages() == 0 {
+                None
+            } else {
+                Some(PhysicalRange::from_pages(startup.end(), plan.heap_pages()).map_err(|_| ())?)
+            };
+            let stack_start = heap.map_or(startup.end(), PhysicalRange::end);
+            let stack =
+                PhysicalRange::from_pages(stack_start, plan.stack_pages()).map_err(|_| ())?;
+            if stack.end() != complete.end() {
+                return Err(());
+            }
+            Ok(ApplicationAllocation {
+                complete,
+                tables,
+                image,
+                startup,
+                heap,
+                stack,
+            })
+        })();
+        if derived.is_err() {
+            frames.free_range(complete).map_err(|_| ())?;
+        }
+        derived
+    }
+
+    fn prepare_application_memory(
+        allocation: &ApplicationAllocation,
+        plan: &LoadPlan<'_>,
+    ) -> Result<(), ()> {
+        kllm_machine::zero_physical_range(allocation.complete).map_err(|_| ())?;
+        let mut physical_start = allocation.image.start();
+        for segment in plan.segments() {
+            let physical =
+                PhysicalRange::from_pages(physical_start, segment.memory_bytes() / BASE_PAGE_SIZE)
+                    .map_err(|_| ())?;
+            kllm_machine::copy_to_physical(physical, 0, segment.file_bytes()).map_err(|_| ())?;
+            physical_start = physical.end();
+        }
+        if physical_start != allocation.image.end() {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    fn build_application_plan(
+        kernel: &MappingPlan,
+        kernel_runtime: PhysicalRange,
+        allocation: &ApplicationAllocation,
+        application: &LoadPlan<'_>,
+    ) -> Result<MappingPlan, ()> {
+        let mut plan = MappingPlan::new();
+        for mapping in kernel.mappings() {
+            let physical = mapping.physical_range();
+            let needed_while_isolated = mapping.owner() != MappingOwner::KernelRuntime
+                || (physical.start() >= kernel_runtime.start()
+                    && physical.end() <= kernel_runtime.end());
+            if needed_while_isolated {
+                plan.insert(*mapping).map_err(|_| ())?;
+            }
+        }
+
+        let mut physical_start = allocation.image.start();
+        for segment in application.segments() {
+            let physical =
+                PhysicalRange::from_pages(physical_start, segment.memory_bytes() / BASE_PAGE_SIZE)
+                    .map_err(|_| ())?;
+            let permissions = match segment.permissions() {
+                SegmentPermissions::ReadOnly => MappingPermissions::READ_ONLY,
+                SegmentPermissions::ReadExecute => MappingPermissions::READ_EXECUTE,
+                SegmentPermissions::ReadWrite => MappingPermissions::READ_WRITE,
+            };
+            insert_application_mapping(
+                &mut plan,
+                segment.virtual_address(),
+                physical,
+                permissions,
+            )?;
+            physical_start = physical.end();
+        }
+        if physical_start != allocation.image.end() {
+            return Err(());
+        }
+        insert_application_mapping(
+            &mut plan,
+            application.layout().startup_address(),
+            allocation.startup,
+            MappingPermissions::READ_ONLY,
+        )?;
+        if let Some(heap) = allocation.heap {
+            insert_application_mapping(
+                &mut plan,
+                application.layout().heap_address(),
+                heap,
+                MappingPermissions::READ_WRITE,
+            )?;
+        }
+        insert_application_mapping(
+            &mut plan,
+            application.layout().stack_bottom(),
+            allocation.stack,
+            MappingPermissions::READ_WRITE,
+        )?;
+        if !plan.enforces_global_w_xor_x() {
+            return Err(());
+        }
+        Ok(plan)
+    }
+
+    fn insert_application_mapping(
+        plan: &mut MappingPlan,
+        virtual_start: u64,
+        physical: PhysicalRange,
+        permissions: MappingPermissions,
+    ) -> Result<(), ()> {
+        let virtual_range =
+            VirtualRange::from_pages(virtual_start, physical.page_count()).map_err(|_| ())?;
+        let mapping = Mapping::user(
+            virtual_range,
+            physical,
+            permissions,
+            MappingOwner::IsolatedTask,
+            MappingLifetime::Task,
+        )
+        .map_err(|_| ())?;
+        plan.insert(mapping).map_err(|_| ())
+    }
+
+    fn rollback_application_task(
+        scheduler: &mut Scheduler,
+        task_id: TaskId,
+        dispatcher: &mut Dispatcher,
+        owner: Option<HandleOwner>,
+        frames: &mut FrameAllocator,
+        allocation: ApplicationAllocation,
+    ) -> Result<(), ()> {
+        if let Some(owner) = owner {
+            dispatcher.close_owner(owner).map_err(|_| ())?;
+        }
+        match scheduler.task(task_id).map_err(|_| ())?.state() {
+            TaskState::Ready => scheduler.cancel_ready(task_id, 1).map_err(|_| ())?,
+            TaskState::Running => scheduler.exit_current(task_id, 1).map_err(|_| ())?,
+            TaskState::Exited | TaskState::Faulted => {}
+        }
+        scheduler.reap(task_id).map_err(|_| ())?;
+        reclaim_application(frames, allocation)
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn reclaim_application(
+        frames: &mut FrameAllocator,
+        allocation: ApplicationAllocation,
+    ) -> Result<(), ()> {
+        kllm_machine::zero_physical_range(allocation.complete).map_err(|_| ())?;
+        frames.free_range(allocation.complete).map_err(|_| ())
+    }
+
+    const fn native_application_target() -> Target {
+        #[cfg(target_arch = "x86_64")]
+        {
+            Target::X86_64
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            Target::Aarch64
+        }
+    }
+
+    fn native_kex_artifact() -> Result<Vec<u8>, ()> {
+        #[cfg(target_arch = "x86_64")]
+        let payload: &[u8] = &[0x90];
+        #[cfg(target_arch = "aarch64")]
+        let payload: &[u8] = &[0x1f, 0x20, 0x03, 0xd5];
+        let payload_offset = 64_usize.checked_add(40).ok_or(())?;
+        let artifact_bytes = payload_offset.checked_add(payload.len()).ok_or(())?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(artifact_bytes).map_err(|_| ())?;
+        bytes.resize(artifact_bytes, 0);
+        bytes[..8].copy_from_slice(b"KEX\0FMT\0");
+        put_kex_u16(&mut bytes, 8, 1)?;
+        put_kex_u16(&mut bytes, 10, 0)?;
+        put_kex_u16(&mut bytes, 12, native_application_target() as u16)?;
+        put_kex_u16(&mut bytes, 14, 64)?;
+        put_kex_u16(&mut bytes, 16, 40)?;
+        put_kex_u16(&mut bytes, 18, 1)?;
+        put_kex_u16(&mut bytes, 20, 0)?;
+        put_kex_u16(&mut bytes, 32, 1)?;
+        put_kex_u32(&mut bytes, 36, 4)?;
+        put_kex_u32(&mut bytes, 44, 64)?;
+        put_kex_u32(
+            &mut bytes,
+            48,
+            u32::try_from(payload_offset).map_err(|_| ())?,
+        )?;
+        put_kex_u64(
+            &mut bytes,
+            56,
+            u64::try_from(artifact_bytes).map_err(|_| ())?,
+        )?;
+        put_kex_u64(
+            &mut bytes,
+            64 + 8,
+            u64::try_from(payload_offset).map_err(|_| ())?,
+        )?;
+        put_kex_u64(
+            &mut bytes,
+            64 + 16,
+            u64::try_from(payload.len()).map_err(|_| ())?,
+        )?;
+        put_kex_u64(&mut bytes, 64 + 24, BASE_PAGE_SIZE)?;
+        put_kex_u32(&mut bytes, 64 + 32, SegmentPermissions::ReadExecute as u32)?;
+        bytes[payload_offset..].copy_from_slice(payload);
+        Ok(bytes)
+    }
+
+    fn put_kex_u16(bytes: &mut [u8], offset: usize, value: u16) -> Result<(), ()> {
+        bytes
+            .get_mut(offset..offset.checked_add(2).ok_or(())?)
+            .ok_or(())?
+            .copy_from_slice(&value.to_le_bytes());
+        Ok(())
+    }
+
+    fn put_kex_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), ()> {
+        bytes
+            .get_mut(offset..offset.checked_add(4).ok_or(())?)
+            .ok_or(())?
+            .copy_from_slice(&value.to_le_bytes());
+        Ok(())
+    }
+
+    fn put_kex_u64(bytes: &mut [u8], offset: usize, value: u64) -> Result<(), ()> {
+        bytes
+            .get_mut(offset..offset.checked_add(8).ok_or(())?)
+            .ok_or(())?
+            .copy_from_slice(&value.to_le_bytes());
+        Ok(())
     }
 
     fn rollback_isolated_task(

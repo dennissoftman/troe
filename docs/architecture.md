@@ -161,8 +161,9 @@ fatal recovery, and no timer or preemption is introduced. `mem` and
 idle, and wakeup accounting; byte-valued memory counters retain exact values
 and add binary IEC `KiB`/`MiB`/`GiB` displays.
 
-Stage 6 adds fresh task roots built from the supervisor kernel plan plus at most
-eight explicit normal-RAM user regions. x86 page-table traversal and leaves use
+Stage 6 adds fresh task roots built from the supervisor kernel plan. Stage 7
+raises the bounded user-region summary to nineteen: at most sixteen KEX image
+segments plus startup, heap, and stack. x86 page-table traversal and leaves use
 U/S and enter through a DPL-3 gate with TSS RSP0; AArch64 leaves use AP/PXN/UXN
 and enter EL0t through the lower-EL vector with SP_EL1. The native boundary
 preserves ABI callee-saved integer and floating-point/SIMD state and masks
@@ -182,6 +183,20 @@ production boot exercises all fault classes, checks zero partial delivery and
 zero frame loss, proves the same physical allocation can be reused, then enters
 the shell. See
 [ADR 0014](adr/0014-unprivileged-task-isolation-and-teardown.md).
+
+The first native Stage 7 boundary copies KEX bytes into bounded kernel staging
+and consumes the complete portable plan before allocating or mapping. It packs
+fresh physical image pages behind a separate table reservation, maps sparse
+image virtual ranges with their closed R/RX/RW permissions, places the startup,
+heap, guards, and stack canonically, and keeps the root inactive. The root
+retains supervisor mappings for the kernel image, devices, and only the explicit
+boot-arena runtime ranges needed across an isolated transition; it does not copy
+the general free-RAM identity map. This keeps both backends within the tiny
+profile's 64-page table ceiling. A provisional task receives only the
+loader-selected handle; boot acceptance then revokes it,
+reaps the record, zeroes every provisional frame, and verifies exact reuse.
+Malformed native corpus cases fail before frame allocation. User entry remains
+disabled until ABI 1.0 gates and the owned execution timer land.
 
 ## Future persistent-storage boundary
 

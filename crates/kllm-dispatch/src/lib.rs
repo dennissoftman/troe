@@ -30,6 +30,17 @@ pub struct Handle {
     generation: u32,
 }
 
+impl Handle {
+    /// Stable opaque value exported through the application ABI.
+    ///
+    /// The low 16 bits encode a one-based slot and the high bits encode its
+    /// generation. Applications must treat the result as an indivisible token.
+    #[must_use]
+    pub const fn abi_value(self) -> u64 {
+        ((self.generation as u64) << 16) | (self.slot as u64 + 1)
+    }
+}
+
 /// Principal that owns one handle and must lose it during task teardown.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum HandleOwner {
@@ -106,6 +117,12 @@ impl Rights {
     #[must_use]
     pub const fn contains(self, requested: Self) -> bool {
         self.0 & requested.0 == requested.0
+    }
+
+    /// Fixed ABI bit representation carried by an initial handle descriptor.
+    #[must_use]
+    pub const fn bits(self) -> u32 {
+        self.0 as u32
     }
 }
 
@@ -764,6 +781,18 @@ mod tests {
         assert_eq!(second.payload(), b"beta");
         assert_eq!(dispatcher.stats().calls, 2);
         assert_eq!(dispatcher.stats().replies, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn application_handle_tokens_are_nonzero_and_generation_checked() -> Result<(), DispatchError> {
+        let mut dispatcher = Dispatcher::new(1, 2)?;
+        let (port, first) = dispatcher.register(Box::new(EchoService), Rights::CALL)?;
+        assert_ne!(first.abi_value(), 0);
+        assert_eq!(Rights::CALL.bits(), 1);
+        dispatcher.close(first)?;
+        let replacement = dispatcher.open(port, Rights::CALL)?;
+        assert_ne!(replacement.abi_value(), first.abi_value());
         Ok(())
     }
 

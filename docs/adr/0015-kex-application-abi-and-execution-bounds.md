@@ -2,6 +2,14 @@
 
 Status: accepted, 2026-08-23.
 
+Implementation note, 2026-08-23: the portable parser, canonical virtual layout,
+startup-page encoder, and native owned-staging/validate/map/reclaim transaction
+are implemented. The native root maps only the supervisor image, devices, and
+explicit boot-arena runtime ranges needed across an isolated transition, keeping
+both backends inside the tiny profile's table ceiling. Native roots remain
+inactive; application entry, ABI gates, and the owned execution timer are
+intentionally still pending.
+
 ## Decision
 
 Stage 7 introduces a project-owned, target-specific static executable container

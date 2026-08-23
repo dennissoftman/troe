@@ -185,7 +185,7 @@ copy or net frame loss, reuses the returned physical range, then enters the
 ordinary shell. See
 [ADR 0014](adr/0014-unprivileged-task-isolation-and-teardown.md).
 
-## Stage 7: loadable applications (next; design accepted)
+## Stage 7: loadable applications (in progress; design accepted)
 
 Stage 6 supplies the privilege, copied-message, fault-fate, and transactional
 teardown boundary required by a loader.
@@ -195,18 +195,21 @@ resident-memory ceilings, and a 50 ms maximum uninterrupted user lease
 terminated by an owned timer. Those choices are intentionally independent of
 the internal Stage 6 probe format.
 
-The first implementation slice has landed: `kllm-application` provides the
+Two implementation slices have landed. `kllm-application` provides the
 allocation-free KEX v1 parser, fixed profile limits, bounded load plans, exact
-and conservative page charges, and a shared host-test rejection corpus. The
-crate also compiles as a direct native-kernel dependency. Kernel-owned staging,
-frame allocation, mapping, startup-page construction, ABI entry/calls, and the
-owned execution timer remain to be implemented.
+and conservative page charges, canonical virtual placement, and ABI 1.0 startup
+page encoding. The native composition copies each artifact into bounded
+kernel-owned staging before parsing, allocates exact private pages plus the
+profile's table reservation, initializes fresh frames, builds an inactive root
+from the portable plan, grants one explicit owner-scoped handle, and then proves
+revocation, zeroization, exact reclamation, and malformed-input rejection on
+both targets. No external artifact byte is executed in this slice.
 
-The next kernel slice must copy artifacts into kernel-owned staging, consume the
-portable plan before mapping any application page, grant only explicit initial
-handles, and reuse the Stage 6 one-shot root, copied-message, fault containment,
-zeroization, and reclamation paths. The rejection corpus must then run through
-the native load boundary on both targets in addition to its host coverage.
+The next kernel slice is application entry and ABI 1.0 calls. It must reset the
+documented register/control state, pass the immutable startup page, implement
+exit/yield/copied handle calls, and arm the owned 50 ms timer before any external
+KEX instruction executes. Native acceptance must then cover valid execution,
+all contained fault/call fates, and lease expiry.
 
 Exit: a valid target-specific static application can start, call a documented
 minimal ABI, exit or fault without harming the kernel or another service, and

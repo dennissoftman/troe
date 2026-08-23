@@ -22,7 +22,9 @@ const OPTIONAL_SIZE_OF_IMAGE_OFFSET: usize = 56;
 const SECTION_HEADER_BYTES: usize = 40;
 const SECTION_EXECUTE: u32 = 0x2000_0000;
 const SECTION_WRITE: u32 = 0x8000_0000;
-const MAX_USER_REGIONS: usize = 8;
+// Tiny KEX permits eight image segments plus startup, heap, and stack regions.
+// Full uses at most sixteen image segments plus the same three fixed regions.
+const MAX_USER_REGIONS: usize = 19;
 #[cfg(target_os = "uefi")]
 const ISOLATED_EXIT_CALL: u64 = 1;
 #[cfg(target_os = "uefi")]

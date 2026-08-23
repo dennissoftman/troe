@@ -7,9 +7,11 @@
 **Implementation language:** Rust (`no_std`)  
 
 **Implementation status:** Stages 0–6 are implemented. Stage 7 has an accepted
-design plus its portable KEX parser and load-plan policy; native loading and
-execution are the next milestone. Later-stage requirements remain design
-constraints, not current functionality. See [docs/roadmap.md](docs/roadmap.md).
+design, its portable KEX parser/load-plan policy, and a native staged
+validate/map/reclaim transaction. Application entry, ABI calls, and execution
+lease enforcement are the next milestone. Later-stage requirements remain
+design constraints, not current functionality. See
+[docs/roadmap.md](docs/roadmap.md).
 
 The product and CLI names are intentionally unset. This document uses “the
 project” and “the system” in prose. `<cli>` denotes the future control-plane
@@ -925,8 +927,8 @@ explicit, and all owned resources are revoked, zeroed, and reclaimed.
 
 **Status:** design accepted by
 [ADR 0015](docs/adr/0015-kex-application-abi-and-execution-bounds.md). The
-portable KEX parser and load-plan policy are implemented; native loading and
-execution are not.
+portable KEX plan and native validate/map/reclaim transaction are implemented;
+application entry, ABI calls, and lease enforcement are not.
 
 - Load target-specific static KEX v1 artifacts selected by ADR 0015; keep ELF as
   a hosted toolchain interchange format rather than a kernel input.

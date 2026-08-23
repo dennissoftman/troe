@@ -46,8 +46,9 @@ ADR 0014 governs the completed Stage 6 unprivileged address-space,
 copied-message, contained-fault, and transactional teardown boundary.
 [ADR 0015](adr/0015-kex-application-abi-and-execution-bounds.md) accepts the KEX
 v1 container, application ABI 1.0, profile memory ceilings, and bounded
-execution-lease policy for Stage 7. The portable parser is implemented; native
-staging, mapping, entry, ABI calls, and execution-lease enforcement remain.
+execution-lease policy for Stage 7. Portable parsing plus native owned staging,
+mapping, startup-page construction, explicit handle grant, and rollback are
+implemented; entry, ABI calls, and execution-lease enforcement remain.
 
 ## Evaluations
 
