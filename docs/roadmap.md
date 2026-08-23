@@ -99,6 +99,32 @@ discards native frames at each yield. It does not add preemption, saved
 arbitrary call stacks, per-task address spaces, or a hardware isolation claim.
 See [ADR 0010](adr/0010-cooperative-tasks-and-guarded-stacks.md).
 
+## Stage 5: in-process message dispatch (complete)
+
+Introduce handles, ports, bounded messages, request/reply semantics, and a
+service adapter that can replace a selected direct call without changing its
+conceptual API.
+
+Exit: a filesystem or console service can switch between direct and dispatched
+implementations in tests.
+
+Landed: `kllm-dispatch` provides generation-checked opaque port and handle
+identities, per-handle call rights, hard ceilings of 16 ports, 32 handles, and
+4 KiB per request or reply, monotonic request IDs, owned bounded replies, typed
+service statuses, explicit close/invalidation, and live call/reply accounting.
+Requests borrow immutable bytes only for one synchronous call; no queued state,
+blocking, cancellation race, shared-memory contract, or wire ABI is implied.
+
+`ConsoleService` and `DispatchedOutput` preserve the existing byte-oriented
+`Output` interface. Host tests send the same payload through direct and
+dispatched console implementations and compare exact bytes, including a payload
+that requires multiple bounded calls. The native shell registers one console
+port and emits prompts and normal stdout through its one explicitly granted call
+handle. Native fatal output and polling input stay at the machine boundary so a
+dispatcher failure cannot recurse through itself. Both QEMU targets require the
+dispatch-ready boot marker. See
+[ADR 0011](adr/0011-bounded-in-process-message-dispatch.md).
+
 ## Deferred tooling and packaging track
 
 The tooling/package architecture is documented now so early formats and

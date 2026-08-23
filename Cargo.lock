@@ -31,6 +31,13 @@ name = "kllm-core"
 version = "0.1.0"
 
 [[package]]
+name = "kllm-dispatch"
+version = "0.1.0"
+dependencies = [
+ "kllm-core",
+]
+
+[[package]]
 name = "kllm-host"
 version = "0.1.0"
 dependencies = [
@@ -44,6 +51,7 @@ name = "kllm-kernel"
 version = "0.1.0"
 dependencies = [
  "kllm-core",
+ "kllm-dispatch",
  "kllm-machine",
  "kllm-memory",
  "kllm-shell",

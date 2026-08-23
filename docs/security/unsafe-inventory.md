@@ -1,6 +1,6 @@
 # Unsafe inventory
 
-Stage 4 contains exactly 84 project-authored Rust `unsafe` tokens, all in the
+Stage 5 contains exactly 84 project-authored Rust `unsafe` tokens, all in the
 two audited modules of `crates/kllm-machine`. The verification gate fails if
 this count changes without a same-change inventory review. Portable crates and
 the kernel composition root continue to forbid unsafe code.

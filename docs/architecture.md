@@ -8,8 +8,9 @@ host stdin/stdout ─┐                 ┌─ hosted process
 native UART ───────┘                 └─ owned-machine kernel
 ```
 
-The graph is intentionally direct today. Interfaces are shaped so a later
-dispatcher can replace calls without exposing implementation pointers.
+Stage 5 keeps the graph in one address space but can route selected edges
+through bounded synchronous message dispatch without exposing implementation
+pointers.
 
 Repository `scripts` and Cargo commands are bootstrap developer tooling, not a
 package manager or a privileged system-control plane. The future CLI described
@@ -101,6 +102,25 @@ The shell record alone carries console, filesystem, and machine-control
 capabilities. Cooperative scheduling still provides no preemption or hardware
 isolation: code that never yields can monopolize the CPU, and privileged memory
 unsafety can corrupt any task.
+
+Stage 5 adds `kllm-dispatch` between selected clients and services. A port names
+one registered service; a generation-checked handle names explicit call
+authority to that port. Tables are bounded to 16 ports and 32 live handles, and
+stale identities remain invalid when slots are reused. One synchronous request
+borrows at most 4 KiB of immutable input and produces at most 4 KiB of owned
+reply bytes with a matching monotonic request ID and typed service status.
+Because the dispatcher is exclusively borrowed for delivery, Stage 5 has no
+queued cancellation state: closing before a call invalidates the handle, and a
+delivered call completes before another mutation can occur.
+
+The first switched edge is native console output. `ConsoleService` converts a
+bounded write request into the existing `Output` operation, while
+`DispatchedOutput` presents the same byte-stream trait to the shell. Requests
+larger than one message are split through ordinary partial-write semantics.
+Fatal diagnostics and polling input remain direct machine mechanisms. This is
+still in-process dispatch, not IPC: service code shares the caller's privileged
+address space, borrowed request bytes are not a wire format, and service faults
+are not contained.
 
 ## Future persistent-storage boundary
 

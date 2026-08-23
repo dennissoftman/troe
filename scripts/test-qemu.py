@@ -107,6 +107,7 @@ def assert_owned_boot(session: "SerialSession") -> None:
         "cooperative tasks: deterministic",
         "task stack guards: active",
         "task resources: reclaimed",
+        "in-process console dispatch: ready",
         "kllm owns memory and console",
     ):
         if marker not in transcript:

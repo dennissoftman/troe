@@ -20,6 +20,8 @@ use rather than providing a hardware security boundary.
   RW/NX runtime memory, typed device mappings, and native fault vectors;
 - bounded cooperative task records, capability-scoped dispatch, deterministic
   yield/exit/reap accounting, and guarded 32 KiB task stacks;
+- generation-checked service handles, bounded synchronous request/reply
+  messages, and a dispatched native console output path;
 - project-owned polling 16550 and PL011 consoles after boot services exit;
 - single/double quotes and pipelines of up to eight stages;
 - 64 KiB bounded intermediate byte streams;
@@ -100,7 +102,7 @@ the final map, and exits boot services through a non-returning continuation.
 - `crates`: portable byte streams, memory models, shell, VFS, accounting, and
   the isolated native machine mechanism crate;
 - `host`: Stage 0 composition and acceptance runner;
-- `kernel`: UEFI bootstrap and Stage 4 cooperative owned-machine composition root;
+- `kernel`: UEFI bootstrap and Stage 5 dispatched owned-machine composition root;
 - `rootfs`, `assets`: source tree and generated KEFS image;
 - `tools`: dependency-free deterministic image builders;
 - `scripts`: build, verification, and emulator entry points;

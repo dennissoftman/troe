@@ -21,6 +21,7 @@ mod firmware {
     use kllm_core::{
         Input, MAX_LINE_BYTES, MachineMemorySnapshot, Output, StreamError, is_backspace,
     };
+    use kllm_dispatch::{ConsoleService, DispatchedOutput, Dispatcher, Rights};
     use kllm_memory::{
         BASE_PAGE_SIZE, BootAllocator, FrameAllocator, MAX_FIRMWARE_REGIONS, Mapping,
         MappingLifetime, MappingMemoryType, MappingOwner, MappingPermissions, MappingPlan,
@@ -622,7 +623,15 @@ mod firmware {
         {
             fatal(b"fatal: shell task authority or stack invalid\n");
         }
-        let mut console = NativeConsole;
+        let mut dispatcher = Dispatcher::new(1, 1)
+            .unwrap_or_else(|_| fatal(b"fatal: cannot create service dispatcher\n"));
+        let (_console_port, console_handle) = dispatcher
+            .register(Box::new(ConsoleService::new(NativeConsole)), Rights::CALL)
+            .unwrap_or_else(|_| fatal(b"fatal: cannot register console service\n"));
+        let mut console = DispatchedOutput::new(&mut dispatcher, console_handle);
+        if write_all(&mut console, b"in-process console dispatch: ready\n").is_err() {
+            fatal(b"fatal: console service request failed\n");
+        }
         let mut namespace = Namespace::new(RamFsQuota::default());
         if namespace.mount_embedded(ROOTFS).is_err() {
             fatal(b"fatal: cannot mount embedded root\n");
@@ -691,7 +700,7 @@ mod firmware {
     }
 
     impl LineEditor {
-        fn read_line(&mut self, console: &mut NativeConsole) -> Result<String, ()> {
+        fn read_line(&mut self, console: &mut dyn Output) -> Result<String, ()> {
             let mut line = String::new();
             let mut overflow = false;
             loop {
