@@ -6,11 +6,11 @@
 **Future targets:** raw x86-64 PCs, raw AArch64 systems  
 **Implementation language:** Rust (`no_std`)  
 
-**Implementation status:** Stages 0–6 are implemented. Stage 7 has an accepted
-design, its portable KEX parser/load-plan policy, a native staged
-validate/map/reclaim transaction, ABI call 0 exit, and enforced 50 ms execution
-leases. Resumable yield and copied handle calls are the next milestone.
-Later-stage requirements remain design constraints, not current functionality. See
+**Implementation status:** Stages 0–7 are implemented. Stage 7 includes the
+portable KEX parser/load-plan policy, native validate/map/reclaim transactions,
+all three ABI 1.0 calls, contained fault fates, and enforced 50 ms execution
+leases. Later-stage requirements remain design constraints, not current
+functionality. See
 [docs/roadmap.md](docs/roadmap.md).
 
 The product and CLI names are intentionally unset. This document uses “the
@@ -925,11 +925,11 @@ explicit, and all owned resources are revoked, zeroed, and reclaimed.
 
 ### Stage 7 — Loadable applications
 
-**Status:** design accepted by
+**Status:** implemented from the design accepted by
 [ADR 0015](docs/adr/0015-kex-application-abi-and-execution-bounds.md). The
-portable KEX plan, native validate/map/reclaim transaction, ABI entry/exit, and
-execution-lease enforcement are implemented; resumable yield and copied handle
-calls are not.
+portable KEX plan, native transaction, complete ABI 1.0 gate, scheduler-owned
+resume, copied handle dispatch, contained call/fault fates, and execution lease
+are active on both primary architectures.
 
 - Load target-specific static KEX v1 artifacts selected by ADR 0015; keep ELF as
   a hosted toolchain interchange format rather than a kernel input.

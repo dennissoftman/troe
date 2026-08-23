@@ -185,7 +185,7 @@ copy or net frame loss, reuses the returned physical range, then enters the
 ordinary shell. See
 [ADR 0014](adr/0014-unprivileged-task-isolation-and-teardown.md).
 
-## Stage 7: loadable applications (in progress; design accepted)
+## Stage 7: loadable applications (complete)
 
 Stage 6 supplies the privilege, copied-message, fault-fate, and transactional
 teardown boundary required by a loader.
@@ -195,7 +195,8 @@ resident-memory ceilings, and a 50 ms maximum uninterrupted user lease
 terminated by an owned timer. Those choices are intentionally independent of
 the internal Stage 6 probe format.
 
-Two implementation slices have landed. `kllm-application` provides the
+The first two implementation slices established the loader.
+`kllm-application` provides the
 allocation-free KEX v1 parser, fixed profile limits, bounded load plans, exact
 and conservative page charges, canonical virtual placement, and ABI 1.0 startup
 page encoding. The native composition copies each artifact into bounded
@@ -215,18 +216,21 @@ target-specific exit application and terminates a spinning application by lease
 expiry, then proves stale-handle rejection, exact frame return, and allocation
 reuse on both targets.
 
-The next kernel slice is resumable ABI execution: `yield` and copied
-`handle_call`. It requires a bounded saved user context, scheduler-controlled
-resume leases, complete request/reply range validation, and reply copy-out only
-after successful dispatch. Invalid-call and unexpected-return acceptance cases
-must land with that gate.
+The fourth slice completes ABI 1.0. Architecture gates capture bounded full user
+contexts at `yield` and `handle_call`; the scheduler explicitly reselects a
+yielded task; every resume receives a fresh lease. Handle calls validate complete
+non-overlapping request/reply ranges, copy the opcode-prefixed request, prove the
+opaque handle still belongs to the task, synchronously dispatch it, and copy out
+only a successful bounded reply. Native acceptance checks register preservation,
+reply bytes, unknown-call fate, attempted-return fate, exact teardown, and frame
+reuse on both targets.
 
 Exit: a valid target-specific static application can start, call a documented
 minimal ABI, exit or fault without harming the kernel or another service, and
 leave no memory or handle ownership behind. Malformed artifacts fail before
 execution with no partial mappings. Dynamic linking, POSIX compatibility,
 preemption, persistence, and a public package registry are not part of the
-first Stage 7 increment.
+Stage 7 implementation.
 
 ## Deferred tooling and packaging track
 

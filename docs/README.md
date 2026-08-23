@@ -7,7 +7,7 @@ historical review evidence.
 
 - [Implementation roadmap](roadmap.md) is the source of truth for landed stages
   and the next kernel milestone.
-- [Architecture](architecture.md) describes the current Stage 6 composition and
+- [Architecture](architecture.md) describes the current Stage 7 composition and
   its boundaries.
 - [Architecture-specific notes](architecture-specific-notes.md) preserve the
   x86-64 and AArch64 interrupt, idle, and controller invariants that portable
@@ -17,7 +17,7 @@ historical review evidence.
 - [KEFS v1](formats/kefs-v1.md) defines the implemented embedded-filesystem
   format.
 - [KEX v1](formats/kex-v1.md) defines the implemented portable executable
-  parser, native loader, startup layout, and first runnable ABI increment.
+  parser, native loader, startup layout, and complete ABI 1.0 boundary.
 
 The repository root [README](../README.md), [security policy](../SECURITY.md),
 [contribution guide](../CONTRIBUTING.md), and [third-party inventory](../THIRD_PARTY.md)
@@ -46,10 +46,9 @@ ADR 0014 governs the completed Stage 6 unprivileged address-space,
 copied-message, contained-fault, and transactional teardown boundary.
 [ADR 0015](adr/0015-kex-application-abi-and-execution-bounds.md) accepts the KEX
 v1 container, application ABI 1.0, profile memory ceilings, and bounded
-execution-lease policy for Stage 7. Portable parsing plus native owned staging,
-mapping, startup-page construction, explicit handle grant, ABI entry/exit, and
-execution-lease enforcement are implemented; resumable yield and copied handle
-calls remain.
+execution-lease policy for the completed Stage 7. Portable parsing, native
+owned loading, explicit handle grant, all ABI 1.0 calls, resume leases, copied
+dispatch, contained call/fault fates, and zeroized teardown are implemented.
 
 ## Evaluations
 

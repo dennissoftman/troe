@@ -9,8 +9,10 @@ explicit boot-arena runtime ranges needed across an isolated transition, keeping
 both backends inside the tiny profile's table ceiling. A subsequent increment
 added reset ring-3/EL0 entry, ABI call 0 exit, and enforced 50 ms one-shot leases
 using the x86 local APIC calibrated by typed PIT resources and the AArch64
-generic physical timer through GICv2 PPI 30. Resumable yield and copied handle
-calls remain pending.
+generic physical timer through GICv2 PPI 30. The final Stage 7 increment added
+bounded full-context suspension, scheduler-selected yield resume, owner-checked
+copied handle calls, reply copy-out, and native invalid-call/unexpected-return
+acceptance on both primary architectures.
 
 ## Decision
 
@@ -141,6 +143,10 @@ ABI 1.0 defines exactly three calls:
 2. `handle_call(handle, request_address, request_bytes, reply_address,
    reply_capacity)` performs one synchronous request/reply through a granted
    handle and returns a typed status plus reply length.
+
+The copied request begins with a little-endian unsigned 16-bit service opcode;
+the remaining bytes are the service payload. The reply buffer receives only
+the service payload.
 
 Requests and replies are each limited to the existing 4 KiB dispatch bound.
 The kernel validates the complete request range, reply range, handle ownership,

@@ -200,8 +200,12 @@ now resets visible register/control state, passes only the startup address and
 length, and enables IRQs after arming a 50 ms one-shot. ABI call 0 exits through
 the owned gate. A separate spinning KEX is terminated by the x86 local-APIC or
 AArch64 generic physical timer, recorded as `execution-lease-expired`, and
-reclaimed transactionally. Resumable yield and copied handle calls remain the
-next increment.
+reclaimed transactionally. ABI gates capture a bounded full user context;
+`yield` returns through the cooperative scheduler, while `handle_call` validates
+complete non-overlapping ranges, copies a two-byte opcode-prefixed request,
+checks task handle ownership, and copies a successful bounded reply before a
+fresh leased resume. Unknown calls and an attempted `_start` return are
+contained and reclaimed as invalid-call and translation faults.
 
 ## Future persistent-storage boundary
 

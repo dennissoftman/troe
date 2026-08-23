@@ -1,6 +1,6 @@
 # Unsafe inventory
 
-Stage 7 contains exactly 184 project-authored Rust `unsafe` tokens, all in the
+Stage 7 contains exactly 199 project-authored Rust `unsafe` tokens, all in the
 two audited modules of `crates/kllm-machine`. The verification gate fails if
 this count changes without a same-change inventory review. Portable crates and
 the kernel composition root continue to forbid unsafe code.
@@ -22,9 +22,9 @@ the kernel composition root continue to forbid unsafe code.
 | x86-64 MMU controls and fault vectors | 14 | CPUID proves NX, the physical width, SMEP, and SMAP; EFER.NXE, CR0.WP, and supported supervisor protections enforce permissions; fixed GDT selectors, a TSS/IST emergency stack, and all exception gates are installed before CR3 receives the owned root. |
 | AArch64 MMU controls and fault vectors | 5 | EL1, PARange, and 4 KiB granule support are verified; TCR.IPS matches accepted table/leaf addresses; the complete VBAR table receives every exception class. |
 | Isolated physical-page lifecycle | 2 | Checked identity-mapped ranges are zeroed before user exposure and before atomic frame return; initialized code/data copies prove complete non-overlapping bounds first. |
-| Isolated run state and copied-user access | 14 | One single-CPU active flag grants unique access to a synchronous raw-pointer record; the record distinguishes the internal Stage 6 probe gate from ABI 1.0 execution; entry, startup, stack, source, and destination ranges are fully validated; invalid calls copy no bytes; the cell is cleared before borrowed or application-owned state expires. |
-| x86-64 ring-3 mappings and entries | 11 | Every user leaf and traversal level carries U/S while supervisor leaves do not; DPL-3 gates and TSS RSP0 enter the kernel; application entry resets visible GPR/SSE/x87 state, enables IRQ delivery, and passes only the startup pair; all kernel callee-saved state survives the root switch; faults and timer expiry return only through the saved kernel context. |
-| AArch64 EL0 mappings and entries | 9 | AP, PXN, and UXN distinguish EL0 code/data from EL1 mappings; the lower-EL vector handles only an active task; application entry resets visible GPR/SIMD/FP/thread state, enables IRQ delivery, and passes only the startup pair; LDTRB honors user access under PAN; all kernel AAPCS64 state survives TTBR0 replacement. |
+| Isolated run state and copied-user access | 21 | One single-CPU active flag grants unique access to a synchronous raw-pointer record; the record distinguishes the internal Stage 6 probe gate from ABI 1.0 execution and retains at most one bounded context/call pair. Entry and message ranges are validated completely before physical translation; suspended task pages remain allocated and identity-mapped only to the supervisor; invalid calls copy no bytes and successful replies are checked before any copy-out. |
+| x86-64 ring-3 mappings and entries | 15 | Every user leaf and traversal level carries U/S while supervisor leaves do not; DPL-3 gates and TSS RSP0 enter the kernel; application entry resets visible GPR/SSE/x87 state, and the syscall gate captures a compile-time-checked 672-byte full context for leased resume; all kernel callee-saved state survives root switches; faults and timer expiry return only through the saved kernel context. |
+| AArch64 EL0 mappings and entries | 13 | AP, PXN, and UXN distinguish EL0 code/data from EL1 mappings; application entry resets visible GPR/SIMD/FP/thread state, and the lower-EL gate captures a compile-time-checked 816-byte full context for leased resume; LDTRB honors user access under PAN; all kernel AAPCS64 state survives TTBR0 replacement. |
 
 The UEFI ExitBootServices call is inside the mechanism module. Its sole call
 site has ended protocol borrows, installed native console/fatal output and the

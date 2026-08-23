@@ -19,14 +19,15 @@ pub use mechanism::{
     try_read_byte, try_read_keyboard_scancode, wait_for_input_event, write, zero_physical_range,
 };
 
+#[cfg(target_os = "uefi")]
+pub use mmu::{
+    ApplicationCall, ApplicationResume, ApplicationSession, build_user_address_space,
+    install_exception_vectors, install_mmu, loaded_image_layout, resume_application,
+    run_application, run_isolated,
+};
 #[cfg(any(test, target_os = "uefi"))]
 pub use mmu::{ApplicationOutcome, IsolatedFault, IsolatedOutcome, UserAddressSpace};
 #[cfg(any(test, target_os = "uefi"))]
 pub use mmu::{ImageLayout, ImageRegion, MmuError, MmuStats};
-#[cfg(target_os = "uefi")]
-pub use mmu::{
-    build_user_address_space, install_exception_vectors, install_mmu, loaded_image_layout,
-    run_application, run_isolated,
-};
 #[cfg(all(target_os = "uefi", feature = "acceptance-probes"))]
 pub use mmu::{trigger_execute_fault, trigger_native_exception, trigger_write_fault};

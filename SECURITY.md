@@ -44,8 +44,9 @@ untrusted and bounded.
 - KEX: exact target/version/layout validation before allocation, closed R/RX/RW
   permissions, fixed profile ceilings, kernel-owned staging, canonical startup
   pages, explicit initial handles, and transactional zeroized reclamation;
-- application execution: reset ring-3/EL0 register state, ABI call 0 exit, and
-  an architecture-owned 50 ms one-shot that terminates non-returning code;
+- application execution: reset ring-3/EL0 state, bounded saved contexts,
+  scheduler-selected resume, copied owner-checked request/reply calls, and an
+  architecture-owned 50 ms one-shot that terminates non-returning code;
 - dependencies: complete `Cargo.lock` checked by pinned `cargo-audit` against the
   exact RustSec database revision in `tools/rustsec-advisory-db.rev`.
 

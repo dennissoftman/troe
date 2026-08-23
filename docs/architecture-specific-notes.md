@@ -48,7 +48,9 @@ inventory, and both exhaustive QEMU suites together.
   or reordering those instructions recreates a lost-wakeup window.
 - User mappings require U/S on every traversal entry and terminal PTE; sibling
   supervisor leaves remain protected by their terminal U/S bit. The DPL-3
-  `int 0x80` gate is the only current user entry and terminates the continuation.
+  `int 0x80` gate is the ABI entry. Exit terminates the continuation; yield and
+  handle calls capture a compile-time-checked 672-byte GPR/FXSAVE/return frame
+  that only the scheduler-controlled leased resume path can consume.
 - TSS RSP0 and the user code/data descriptors must be installed before ring-3
   entry. The boundary preserves callee-saved GPRs and the full FXSAVE area,
   restores CR3 and kernel RFLAGS before returning, clears DF on every user
@@ -89,11 +91,16 @@ inventory, and both exhaustive QEMU suites together.
 - EL0 mappings use AP plus distinct PXN/UXN policy: kernel pages are EL0
   inaccessible and UXN, user code is EL0 RO/X and PXN, and user data/stack are
   EL0 RW/NX and PXN. The lower-EL synchronous vector is separate from current-EL
-  fatal handling.
+  fatal handling. SVC entry captures a compile-time-checked 816-byte
+  x0-x30/q0-q31/control/return frame for yield and handle-call resume.
 - The copied-message path uses `LDTRB` so its source access keeps unprivileged
   semantics even when PAN is active. The entry/return boundary preserves
   x19-x30, q8-q15, FPCR, FPSR, DAIF, SP_EL0, and TPIDR_EL0, restores TTBR0_EL1,
   and completes a global TLB invalidation before returning to Rust.
+- Suspended application handle calls translate only previously validated user
+  ranges to retained task-owned physical pages. The supervisor kernel root
+  identity-maps those allocated pages for the bounded request and reply copies;
+  the EL0 root is inactive and cannot race the copy.
 
 ## Regression evidence
 

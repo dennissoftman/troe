@@ -228,15 +228,19 @@ mod firmware {
 
     #[derive(Clone, Copy, Eq, PartialEq)]
     enum ApplicationProbe {
-        Exit,
+        Calls,
         Spin,
+        InvalidCall,
+        UnexpectedReturn,
     }
 
     impl ApplicationProbe {
         const fn expected_fault(self) -> Option<TaskFault> {
             match self {
-                Self::Exit => None,
+                Self::Calls => None,
                 Self::Spin => Some(TaskFault::ExecutionLeaseExpired),
+                Self::InvalidCall => Some(TaskFault::InvalidCall),
+                Self::UnexpectedReturn => Some(TaskFault::Translation),
             }
         }
     }
@@ -728,6 +732,8 @@ mod firmware {
         if !kllm_machine::write(b"KEX staging: owned and bounded\n")
             || !kllm_machine::write(b"KEX load plans: mapped atomically\n")
             || !kllm_machine::write(b"application ABI exit: active\n")
+            || !kllm_machine::write(b"application ABI resume: active\n")
+            || !kllm_machine::write(b"copied handle calls: active\n")
             || !kllm_machine::write(b"execution lease: enforced\n")
             || !kllm_machine::write(b"application resources: reclaimed\n")
         {
@@ -1112,7 +1118,7 @@ mod firmware {
         scheduler: &mut Scheduler,
         accounting: &mut OwnedAccounting,
     ) -> Result<(), ()> {
-        let artifact = native_kex_artifact(ApplicationProbe::Exit)?;
+        let artifact = native_kex_artifact(ApplicationProbe::Calls)?;
         let baseline_frames = accounting.frames.free_frames();
         let baseline_tasks = scheduler.stats();
         let mut dispatcher = Dispatcher::new(1, 2).map_err(|_| ())?;
@@ -1126,7 +1132,7 @@ mod firmware {
             &mut dispatcher,
             port,
             &artifact,
-            ApplicationProbe::Exit,
+            ApplicationProbe::Calls,
         )?;
         let spinning = native_kex_artifact(ApplicationProbe::Spin)?;
         let reused = load_and_reclaim_application(
@@ -1137,13 +1143,34 @@ mod firmware {
             &spinning,
             ApplicationProbe::Spin,
         )?;
+        let invalid_call = native_kex_artifact(ApplicationProbe::InvalidCall)?;
+        let invalid_reused = load_and_reclaim_application(
+            scheduler,
+            accounting,
+            &mut dispatcher,
+            port,
+            &invalid_call,
+            ApplicationProbe::InvalidCall,
+        )?;
+        let unexpected_return = native_kex_artifact(ApplicationProbe::UnexpectedReturn)?;
+        let return_reused = load_and_reclaim_application(
+            scheduler,
+            accounting,
+            &mut dispatcher,
+            port,
+            &unexpected_return,
+            ApplicationProbe::UnexpectedReturn,
+        )?;
         if accounting.frames.free_frames() != baseline_frames
             || reused != first
+            || invalid_reused != first
+            || return_reused != first
             || scheduler.stats().owned_address_spaces != baseline_tasks.owned_address_spaces
             || scheduler.stats().owned_isolation_pages != baseline_tasks.owned_isolation_pages
             || scheduler.stats().owned_handles != baseline_tasks.owned_handles
+            || scheduler.stats().yields != baseline_tasks.yields.checked_add(1).ok_or(())?
             || scheduler.stats().contained_faults
-                != baseline_tasks.contained_faults.checked_add(1).ok_or(())?
+                != baseline_tasks.contained_faults.checked_add(3).ok_or(())?
             || dispatcher.stats().live_handles != 1
         {
             return Err(());
@@ -1308,7 +1335,7 @@ mod firmware {
             {
                 return Err(());
             }
-            let outcome = kllm_machine::run_application(
+            let mut outcome = kllm_machine::run_application(
                 address_space,
                 entry,
                 layout.stack_top(),
@@ -1316,20 +1343,101 @@ mod firmware {
                 PAGE_BYTES,
             )
             .map_err(|_| ())?;
-            match (probe, outcome) {
-                (
-                    ApplicationProbe::Exit,
-                    kllm_machine::ApplicationOutcome::Exited { status: 0 },
-                ) => scheduler.exit_current(task_id, 0).map_err(|_| ())?,
-                (
-                    ApplicationProbe::Spin,
-                    kllm_machine::ApplicationOutcome::Faulted(
-                        kllm_machine::IsolatedFault::ExecutionLeaseExpired,
-                    ),
-                ) => scheduler
-                    .fault_current(task_id, TaskFault::ExecutionLeaseExpired)
-                    .map_err(|_| ())?,
-                _ => return Err(()),
+            let mut observed_yield = false;
+            let mut observed_call = false;
+            loop {
+                match (probe, outcome) {
+                    (
+                        ApplicationProbe::Calls,
+                        kllm_machine::ApplicationOutcome::Yielded(application),
+                    ) if !observed_yield && !observed_call => {
+                        scheduler.yield_current(task_id).map_err(|_| ())?;
+                        if scheduler
+                            .dispatch_next(Capabilities::SERVICE)
+                            .map_err(|_| ())?
+                            != Some(task_id)
+                        {
+                            return Err(());
+                        }
+                        observed_yield = true;
+                        outcome = kllm_machine::resume_application(
+                            application,
+                            kllm_machine::ApplicationResume::Yield,
+                        )
+                        .map_err(|_| ())?;
+                    }
+                    (
+                        ApplicationProbe::Calls,
+                        kllm_machine::ApplicationOutcome::HandleCall { application, call },
+                    ) if observed_yield && !observed_call => {
+                        let mut request = Vec::new();
+                        request
+                            .try_reserve_exact(call.request_bytes())
+                            .map_err(|_| ())?;
+                        request.resize(call.request_bytes(), 0);
+                        application.copy_request(&mut request).map_err(|_| ())?;
+                        let opcode = u16::from_le_bytes([request[0], request[1]]);
+                        let reply = dispatcher
+                            .call_owned_abi(owner, call.handle(), opcode, &request[2..])
+                            .map_err(|_| ())?;
+                        if reply.status() != ReplyStatus::Success
+                            || reply.payload() != b"ping"
+                            || reply.payload().len() > call.reply_capacity()
+                        {
+                            return Err(());
+                        }
+                        observed_call = true;
+                        outcome = kllm_machine::resume_application(
+                            application,
+                            kllm_machine::ApplicationResume::HandleReply {
+                                status: reply.status().abi_value(),
+                                reply: reply.payload(),
+                            },
+                        )
+                        .map_err(|_| ())?;
+                    }
+                    (
+                        ApplicationProbe::Calls,
+                        kllm_machine::ApplicationOutcome::Exited { status: 0 },
+                    ) if observed_yield && observed_call => {
+                        scheduler.exit_current(task_id, 0).map_err(|_| ())?;
+                        break;
+                    }
+                    (
+                        ApplicationProbe::Spin,
+                        kllm_machine::ApplicationOutcome::Faulted(
+                            kllm_machine::IsolatedFault::ExecutionLeaseExpired,
+                        ),
+                    ) => {
+                        scheduler
+                            .fault_current(task_id, TaskFault::ExecutionLeaseExpired)
+                            .map_err(|_| ())?;
+                        break;
+                    }
+                    (
+                        ApplicationProbe::InvalidCall,
+                        kllm_machine::ApplicationOutcome::Faulted(
+                            kllm_machine::IsolatedFault::InvalidCall,
+                        ),
+                    ) => {
+                        scheduler
+                            .fault_current(task_id, TaskFault::InvalidCall)
+                            .map_err(|_| ())?;
+                        break;
+                    }
+                    (
+                        ApplicationProbe::UnexpectedReturn,
+                        kllm_machine::ApplicationOutcome::Faulted(
+                            kllm_machine::IsolatedFault::Translation,
+                        ),
+                    ) => {
+                        scheduler
+                            .fault_current(task_id, TaskFault::Translation)
+                            .map_err(|_| ())?;
+                        break;
+                    }
+                    _ => return Err(()),
+                }
             }
             if dispatcher.close_owner(owner).map_err(|_| ())? != 1 {
                 return Err(());
@@ -1563,22 +1671,45 @@ mod firmware {
     fn native_kex_artifact(probe: ApplicationProbe) -> Result<Vec<u8>, ()> {
         #[cfg(target_arch = "x86_64")]
         let payload: &[u8] = match probe {
-            ApplicationProbe::Exit => &[
-                0x83, 0x3f, 0x58, 0x48, 0x81, 0xfe, 0x00, 0x10, 0x00, 0x00, 0x75, 0x06, 0x31, 0xff,
-                0x31, 0xc0, 0xcd, 0x80, 0xbf, 0x01, 0x00, 0x00, 0x00, 0x31, 0xc0, 0xcd, 0x80, 0x0f,
-                0x0b,
+            ApplicationProbe::Calls => &[
+                0x83, 0x3f, 0x58, 0x75, 0x76, 0x48, 0x81, 0xfe, 0x00, 0x10, 0x00, 0x00, 0x75, 0x6d,
+                0x4c, 0x8b, 0x67, 0x40, 0xbb, 0x78, 0x56, 0x34, 0x12, 0xb8, 0x01, 0x00, 0x00, 0x00,
+                0xcd, 0x80, 0x85, 0xc0, 0x75, 0x59, 0x85, 0xd2, 0x75, 0x55, 0x48, 0x81, 0xfb, 0x78,
+                0x56, 0x34, 0x12, 0x75, 0x4c, 0x48, 0x83, 0xec, 0x20, 0x66, 0xc7, 0x04, 0x24, 0x01,
+                0x00, 0xc7, 0x44, 0x24, 0x02, 0x70, 0x69, 0x6e, 0x67, 0x4c, 0x89, 0xe7, 0x48, 0x89,
+                0xe6, 0xba, 0x06, 0x00, 0x00, 0x00, 0x4c, 0x8d, 0x54, 0x24, 0x10, 0x41, 0xb8, 0x04,
+                0x00, 0x00, 0x00, 0xb8, 0x02, 0x00, 0x00, 0x00, 0xcd, 0x80, 0x85, 0xc0, 0x75, 0x19,
+                0x83, 0xfa, 0x04, 0x75, 0x14, 0x81, 0x7c, 0x24, 0x10, 0x70, 0x69, 0x6e, 0x67, 0x75,
+                0x0a, 0x48, 0x83, 0xc4, 0x20, 0x31, 0xff, 0x31, 0xc0, 0xcd, 0x80, 0xbf, 0x01, 0x00,
+                0x00, 0x00, 0x31, 0xc0, 0xcd, 0x80, 0x0f, 0x0b,
             ],
             ApplicationProbe::Spin => &[0xeb, 0xfe],
+            ApplicationProbe::InvalidCall => {
+                &[0xb8, 0x03, 0x00, 0x00, 0x00, 0xcd, 0x80, 0x0f, 0x0b]
+            }
+            ApplicationProbe::UnexpectedReturn => &[0xc3],
         };
         #[cfg(target_arch = "aarch64")]
         let payload: &[u8] = match probe {
-            ApplicationProbe::Exit => &[
-                0x09, 0x00, 0x40, 0xb9, 0x3f, 0x61, 0x01, 0x71, 0xc1, 0x00, 0x00, 0x54, 0x3f, 0x04,
-                0x40, 0xf1, 0x81, 0x00, 0x00, 0x54, 0xe0, 0x03, 0x1f, 0xaa, 0xe8, 0x03, 0x1f, 0xaa,
-                0x01, 0x00, 0x00, 0xd4, 0x20, 0x00, 0x80, 0xd2, 0xe8, 0x03, 0x1f, 0xaa, 0x01, 0x00,
+            ApplicationProbe::Calls => &[
+                0x09, 0x00, 0x40, 0xb9, 0x3f, 0x61, 0x01, 0x71, 0x41, 0x04, 0x00, 0x54, 0x3f, 0x04,
+                0x40, 0xf1, 0x01, 0x04, 0x00, 0x54, 0x13, 0x20, 0x40, 0xf9, 0x74, 0x24, 0x80, 0xd2,
+                0x28, 0x00, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4, 0x60, 0x03, 0x00, 0xb5, 0x41, 0x03,
+                0x00, 0xb5, 0x9f, 0x8e, 0x04, 0xf1, 0x01, 0x03, 0x00, 0x54, 0xff, 0x83, 0x00, 0xd1,
+                0x29, 0x00, 0x80, 0x52, 0xe9, 0x03, 0x00, 0x79, 0x09, 0x2e, 0x8d, 0x52, 0xc9, 0xed,
+                0xac, 0x72, 0xe9, 0x23, 0x00, 0xb8, 0xe0, 0x03, 0x13, 0xaa, 0xe1, 0x03, 0x00, 0x91,
+                0xc2, 0x00, 0x80, 0xd2, 0xe3, 0x43, 0x00, 0x91, 0x84, 0x00, 0x80, 0xd2, 0x48, 0x00,
+                0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4, 0x40, 0x01, 0x00, 0xb5, 0x3f, 0x10, 0x00, 0xf1,
+                0x01, 0x01, 0x00, 0x54, 0xea, 0x13, 0x40, 0xb9, 0x5f, 0x01, 0x09, 0x6b, 0xa1, 0x00,
+                0x00, 0x54, 0xff, 0x83, 0x00, 0x91, 0x00, 0x00, 0x80, 0xd2, 0x08, 0x00, 0x80, 0xd2,
+                0x01, 0x00, 0x00, 0xd4, 0x20, 0x00, 0x80, 0xd2, 0x08, 0x00, 0x80, 0xd2, 0x01, 0x00,
                 0x00, 0xd4, 0x00, 0x00, 0x20, 0xd4,
             ],
             ApplicationProbe::Spin => &[0x00, 0x00, 0x00, 0x14],
+            ApplicationProbe::InvalidCall => &[
+                0x68, 0x00, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4, 0x00, 0x00, 0x20, 0xd4,
+            ],
+            ApplicationProbe::UnexpectedReturn => &[0xc0, 0x03, 0x5f, 0xd6],
         };
         let payload_offset = 64_usize.checked_add(40).ok_or(())?;
         let artifact_bytes = payload_offset.checked_add(payload.len()).ok_or(())?;

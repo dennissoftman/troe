@@ -10,9 +10,9 @@ space. Stage 6 additionally runs bounded test tasks in fresh ring-3/EL0 address
 spaces; their typed handles, memory faults, and teardown now form a hardware
 security boundary. Loadable applications and a public userspace ABI begin in
 Stage 7. The bounded KEX v1 parser and native validate/map/reclaim boundary are
-implemented. Target-native KEX code can enter with reset register state, exit
-through ABI call 0, or be terminated by the 50 ms execution lease. Resumable
-`yield` and `handle_call` remain pending.
+implemented. Target-native KEX code enters with reset register state, exits,
+yields through scheduler-controlled re-entry, performs owner-checked copied
+handle calls, or is terminated by the 50 ms execution lease.
 
 ## What works now
 
@@ -33,8 +33,8 @@ through ABI call 0, or be terminated by the 50 ms execution lease. Resumable
   entry-point, and per-profile memory-budget checks;
 - kernel-owned KEX staging, canonical startup pages, validate-before-map native
   load transactions, explicit initial handles, and zeroized rollback;
-- ring-3/EL0 ABI entry with reset application-visible state, ABI call 0 exit,
-  and owned x86 local-APIC/AArch64 generic-timer lease enforcement;
+- complete ring-3/EL0 ABI 1.0 entry, exit, resumable yield, and owner-checked
+  copied handle calls, with owned x86 local-APIC/AArch64 timer leases;
 - owned receive interrupts through q35 LAPIC/I/O APIC and AArch64 GICv2,
   bounded raw-event delivery, and race-free `hlt`/`wfi` shell idle;
 - project-owned polling 16550 and PL011 early/fatal recovery output, plus an

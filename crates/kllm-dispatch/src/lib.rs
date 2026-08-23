@@ -39,6 +39,30 @@ impl Handle {
     pub const fn abi_value(self) -> u64 {
         ((self.generation as u64) << 16) | (self.slot as u64 + 1)
     }
+
+    /// Decode a stable ABI token without granting or validating authority.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero, non-canonical high bits, a zero generation, or an encoded
+    /// slot outside the dispatcher hard ceiling.
+    pub fn from_abi_value(value: u64) -> Result<Self, DispatchError> {
+        let encoded_slot = value & 0xffff;
+        let generation = (value >> 16) & u64::from(u32::MAX);
+        if encoded_slot == 0
+            || encoded_slot > MAX_HANDLES as u64
+            || generation == 0
+            || value >> 48 != 0
+        {
+            return Err(DispatchError::InvalidHandle);
+        }
+        let slot = u16::try_from(encoded_slot).map_err(|_| DispatchError::InvalidHandle)?;
+        let generation = u32::try_from(generation).map_err(|_| DispatchError::InvalidHandle)?;
+        Ok(Self {
+            slot: slot - 1,
+            generation,
+        })
+    }
 }
 
 /// Principal that owns one handle and must lose it during task teardown.
@@ -138,6 +162,14 @@ pub enum ReplyStatus {
     NotFound = 2,
     /// The service could not complete the operation.
     Failure = 3,
+}
+
+impl ReplyStatus {
+    /// Stable fixed-width value returned by the application ABI.
+    #[must_use]
+    pub const fn abi_value(self) -> u32 {
+        self as u32
+    }
 }
 
 /// Borrowed request delivered synchronously to one service.
@@ -586,6 +618,30 @@ impl Dispatcher {
         })
     }
 
+    /// Deliver one ABI call only when the opaque handle remains owned by the
+    /// supplied isolated task.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed, stale, foreign, or insufficient-rights handles
+    /// before service delivery, in addition to the ordinary call failures.
+    pub fn call_owned_abi(
+        &mut self,
+        owner: HandleOwner,
+        value: u64,
+        opcode: u16,
+        payload: &[u8],
+    ) -> Result<Reply, DispatchError> {
+        if !matches!(owner, HandleOwner::IsolatedTask(id) if id != 0) {
+            return Err(DispatchError::InvalidOwner);
+        }
+        let handle = Handle::from_abi_value(value)?;
+        if self.handle_binding(handle)?.owner != owner {
+            return Err(DispatchError::InvalidHandle);
+        }
+        self.call(handle, opcode, payload)
+    }
+
     /// Snapshot live endpoint and completed request/reply counters.
     #[must_use]
     pub fn stats(&self) -> DispatchStats {
@@ -787,12 +843,25 @@ mod tests {
     #[test]
     fn application_handle_tokens_are_nonzero_and_generation_checked() -> Result<(), DispatchError> {
         let mut dispatcher = Dispatcher::new(1, 2)?;
-        let (port, first) = dispatcher.register(Box::new(EchoService), Rights::CALL)?;
+        let (port, kernel) = dispatcher.register(Box::new(EchoService), Rights::CALL)?;
+        let owner = HandleOwner::isolated(9)?;
+        let first = dispatcher.open_owned(port, Rights::CALL, owner)?;
         assert_ne!(first.abi_value(), 0);
         assert_eq!(Rights::CALL.bits(), 1);
+        let reply = dispatcher.call_owned_abi(owner, first.abi_value(), 7, b"owned")?;
+        assert_eq!(reply.payload(), b"owned");
+        assert_eq!(
+            dispatcher.call_owned_abi(HandleOwner::isolated(10)?, first.abi_value(), 7, b"foreign"),
+            Err(DispatchError::InvalidHandle)
+        );
+        assert_eq!(
+            dispatcher.call_owned_abi(owner, first.abi_value() | (1_u64 << 63), 7, b"bad"),
+            Err(DispatchError::InvalidHandle)
+        );
         dispatcher.close(first)?;
-        let replacement = dispatcher.open(port, Rights::CALL)?;
+        let replacement = dispatcher.open_owned(port, Rights::CALL, owner)?;
         assert_ne!(replacement.abi_value(), first.abi_value());
+        dispatcher.close(kernel)?;
         Ok(())
     }
 

@@ -30,11 +30,19 @@ const ISOLATED_EXIT_CALL: u64 = 1;
 #[cfg(target_os = "uefi")]
 const APPLICATION_EXIT_CALL: u64 = 0;
 #[cfg(target_os = "uefi")]
+const APPLICATION_YIELD_CALL: u64 = 1;
+#[cfg(target_os = "uefi")]
+const APPLICATION_HANDLE_CALL: u64 = 2;
+#[cfg(target_os = "uefi")]
 const APPLICATION_LEASE_MILLISECONDS: u32 = 50;
 #[cfg(target_os = "uefi")]
 const APPLICATION_STARTUP_BYTES: usize = 4096;
 #[cfg(target_os = "uefi")]
 const OUTCOME_FAULT_BIT: u64 = 1 << 63;
+#[cfg(target_os = "uefi")]
+const OUTCOME_APPLICATION_YIELD: u64 = 1 << 62;
+#[cfg(target_os = "uefi")]
+const OUTCOME_APPLICATION_HANDLE_CALL: u64 = 1 << 61;
 
 /// Native fault category contained at the user/kernel boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -66,12 +74,23 @@ pub enum IsolatedOutcome {
 }
 
 /// Terminal result from the first bounded application ABI execution lease.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum ApplicationOutcome {
     /// The application invoked ABI call 0 with a fixed-width status.
     Exited {
         /// Caller-selected application status.
         status: u32,
+    },
+    /// The application invoked ABI call 1 and retained a bounded saved context.
+    #[cfg(target_os = "uefi")]
+    Yielded(ApplicationSession),
+    /// The application invoked ABI call 2 with fully validated user ranges.
+    #[cfg(target_os = "uefi")]
+    HandleCall {
+        /// Opaque resumable task and address-space state.
+        application: ApplicationSession,
+        /// Copied-call source and destination metadata.
+        call: ApplicationCall,
     },
     /// A native fault, invalid ABI call, or lease expiry was contained.
     Faulted(IsolatedFault),
@@ -97,7 +116,156 @@ impl UserAddressSpace {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct UserRegion {
     range: VirtualRange,
+    physical: PhysicalRange,
     permissions: MappingPermissions,
+}
+
+/// Fully validated metadata for one suspended ABI handle call.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(target_os = "uefi")]
+pub struct ApplicationCall {
+    handle: u64,
+    request_address: u64,
+    request_bytes: usize,
+    reply_address: u64,
+    reply_capacity: usize,
+}
+
+#[cfg(target_os = "uefi")]
+impl ApplicationCall {
+    /// Opaque owner-scoped handle token supplied by the application.
+    #[must_use]
+    pub const fn handle(self) -> u64 {
+        self.handle
+    }
+
+    /// Complete encoded request length, including the two-byte opcode prefix.
+    #[must_use]
+    pub const fn request_bytes(self) -> usize {
+        self.request_bytes
+    }
+
+    /// Maximum reply bytes accepted by the application.
+    #[must_use]
+    pub const fn reply_capacity(self) -> usize {
+        self.reply_capacity
+    }
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[repr(C, align(16))]
+struct ArchitectureApplicationContext {
+    floating_point: [u8; 512],
+    rax: u64,
+    rbx: u64,
+    rcx: u64,
+    rdx: u64,
+    rbp: u64,
+    rsi: u64,
+    rdi: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+    instruction: u64,
+    code_selector: u64,
+    flags: u64,
+    stack: u64,
+    stack_selector: u64,
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+const _: () = {
+    assert!(core::mem::size_of::<ArchitectureApplicationContext>() == 672);
+    assert!(core::mem::offset_of!(ArchitectureApplicationContext, rax) == 512);
+    assert!(core::mem::offset_of!(ArchitectureApplicationContext, r10) == 584);
+    assert!(core::mem::offset_of!(ArchitectureApplicationContext, instruction) == 632);
+    assert!(core::mem::offset_of!(ArchitectureApplicationContext, flags) == 648);
+    assert!(core::mem::offset_of!(ArchitectureApplicationContext, stack) == 656);
+};
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[repr(C, align(16))]
+struct ArchitectureApplicationContext {
+    general: [u64; 31],
+    general_padding: u64,
+    floating_point: [[u8; 16]; 32],
+    fpcr: u64,
+    fpsr: u64,
+    instruction: u64,
+    status: u64,
+    stack: u64,
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+const _: () = {
+    assert!(core::mem::size_of::<ArchitectureApplicationContext>() == 816);
+    assert!(core::mem::offset_of!(ArchitectureApplicationContext, floating_point) == 256);
+    assert!(core::mem::offset_of!(ArchitectureApplicationContext, fpcr) == 768);
+    assert!(core::mem::offset_of!(ArchitectureApplicationContext, instruction) == 784);
+    assert!(core::mem::offset_of!(ArchitectureApplicationContext, stack) == 800);
+};
+
+/// Opaque saved application context, address-space root, and pending ABI call.
+#[derive(Debug, Eq, PartialEq)]
+#[cfg(target_os = "uefi")]
+pub struct ApplicationSession {
+    address_space: UserAddressSpace,
+    context: ArchitectureApplicationContext,
+    pending: ApplicationPending,
+}
+
+/// Kernel-selected completion supplied before resuming a suspended ABI call.
+#[cfg(target_os = "uefi")]
+pub enum ApplicationResume<'reply> {
+    /// Complete one cooperative yield with zero-valued ABI results.
+    Yield,
+    /// Copy one successful dispatch reply and publish its typed result.
+    HandleReply {
+        /// Stable service reply status.
+        status: u32,
+        /// Complete kernel-owned reply payload.
+        reply: &'reply [u8],
+    },
+}
+
+#[cfg(target_os = "uefi")]
+impl ApplicationSession {
+    /// Copy the complete pending request from task-owned physical pages.
+    ///
+    /// The application is suspended and the kernel root retains identity
+    /// mappings for allocated RAM, so the source cannot change during copy.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a non-call session or a destination of the wrong length.
+    pub fn copy_request(&self, destination: &mut [u8]) -> Result<(), MmuError> {
+        let ApplicationPending::HandleCall(call) = self.pending else {
+            return Err(MmuError::InvalidUserContext);
+        };
+        if destination.len() != call.request_bytes {
+            return Err(MmuError::InvalidUserContext);
+        }
+        copy_user_from_physical(
+            &self.address_space.regions,
+            self.address_space.region_count,
+            call.request_address,
+            destination,
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(target_os = "uefi")]
+enum ApplicationPending {
+    Yield,
+    HandleCall(ApplicationCall),
 }
 
 #[cfg(target_os = "uefi")]
@@ -107,6 +275,8 @@ struct IsolatedRunState {
     region_count: usize,
     destination: *mut u8,
     destination_len: usize,
+    application_context: Option<ArchitectureApplicationContext>,
+    pending_application: Option<ApplicationPending>,
 }
 
 #[cfg(target_os = "uefi")]
@@ -514,6 +684,7 @@ pub fn build_user_address_space(
         writable |= permissions.write;
         regions[region_count] = Some(UserRegion {
             range: mapping.virtual_range(),
+            physical: mapping.physical_range(),
             permissions,
         });
         region_count += 1;
@@ -633,6 +804,8 @@ pub fn run_isolated(
             region_count,
             destination: message_destination.as_mut_ptr(),
             destination_len: message_destination.len(),
+            application_context: None,
+            pending_application: None,
         });
     }
     let raw = architecture_run_isolated(root, entry, stack_top);
@@ -668,7 +841,7 @@ pub fn run_application(
         root,
         regions,
         region_count,
-        stats: _,
+        stats,
     } = address_space;
     let user_stack = stack_top
         .checked_sub(8)
@@ -704,6 +877,8 @@ pub fn run_application(
             region_count,
             destination: ptr::null_mut(),
             destination_len: 0,
+            application_context: None,
+            pending_application: None,
         });
     }
     if crate::mechanism::arm_execution_timer(APPLICATION_LEASE_MILLISECONDS).is_err() {
@@ -715,9 +890,108 @@ pub fn run_application(
     let raw = architecture_run_application(root, entry, user_stack, startup_address, startup_bytes);
     crate::mechanism::disarm_execution_timer();
     // SAFETY: Native completion restored the kernel root and unique call frame.
-    unsafe { *ISOLATED_RUN.0.get() = None };
+    let state = unsafe { (*ISOLATED_RUN.0.get()).take() };
     ISOLATED_ACTIVE.store(false, Ordering::Release);
-    decode_application_outcome(raw)
+    let state = state.ok_or(MmuError::InvalidUserContext)?;
+    decode_application_outcome(
+        raw,
+        UserAddressSpace {
+            root,
+            regions,
+            region_count,
+            stats,
+        },
+        state,
+    )
+}
+
+/// Resume one scheduler-selected application with a fresh 50 ms lease.
+///
+/// # Errors
+///
+/// Rejects a mismatched completion, oversized reply, invalid retained context,
+/// unavailable execution timer, or nested application execution.
+#[cfg(target_os = "uefi")]
+#[allow(clippy::needless_pass_by_value)]
+pub fn resume_application(
+    application: ApplicationSession,
+    completion: ApplicationResume<'_>,
+) -> Result<ApplicationOutcome, MmuError> {
+    let ApplicationSession {
+        address_space,
+        mut context,
+        pending,
+    } = application;
+    match (pending, completion) {
+        (ApplicationPending::Yield, ApplicationResume::Yield) => {
+            application_context_set_results(&mut context, 0, 0);
+        }
+        (
+            ApplicationPending::HandleCall(call),
+            ApplicationResume::HandleReply { status, reply },
+        ) => {
+            if reply.len() > call.reply_capacity {
+                return Err(MmuError::InvalidUserContext);
+            }
+            copy_user_to_physical(
+                &address_space.regions,
+                address_space.region_count,
+                call.reply_address,
+                reply,
+            )?;
+            let reply_bytes =
+                u32::try_from(reply.len()).map_err(|_| MmuError::InvalidUserContext)?;
+            application_context_set_results(&mut context, status, reply_bytes);
+        }
+        _ => return Err(MmuError::InvalidUserContext),
+    }
+    if ISOLATED_ACTIVE
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err(MmuError::IsolationBusy);
+    }
+    let UserAddressSpace {
+        root,
+        regions,
+        region_count,
+        stats,
+    } = address_space;
+    // SAFETY: The active transition grants unique state ownership until the
+    // architecture completion path restores the kernel root.
+    unsafe {
+        *ISOLATED_RUN.0.get() = Some(IsolatedRunState {
+            kind: RunKind::Application,
+            regions,
+            region_count,
+            destination: ptr::null_mut(),
+            destination_len: 0,
+            application_context: None,
+            pending_application: None,
+        });
+    }
+    if crate::mechanism::arm_execution_timer(APPLICATION_LEASE_MILLISECONDS).is_err() {
+        // SAFETY: No user re-entry occurred and this call still owns the state.
+        unsafe { *ISOLATED_RUN.0.get() = None };
+        ISOLATED_ACTIVE.store(false, Ordering::Release);
+        return Err(MmuError::ExecutionTimerUnavailable);
+    }
+    let raw = architecture_resume_application(root, &context);
+    crate::mechanism::disarm_execution_timer();
+    // SAFETY: Native completion restored the kernel root and unique call frame.
+    let state = unsafe { (*ISOLATED_RUN.0.get()).take() };
+    ISOLATED_ACTIVE.store(false, Ordering::Release);
+    let state = state.ok_or(MmuError::InvalidUserContext)?;
+    decode_application_outcome(
+        raw,
+        UserAddressSpace {
+            root,
+            regions,
+            region_count,
+            stats,
+        },
+        state,
+    )
 }
 
 #[cfg(target_os = "uefi")]
@@ -736,9 +1010,37 @@ fn decode_isolated_outcome(raw: u64) -> Result<IsolatedOutcome, MmuError> {
 }
 
 #[cfg(target_os = "uefi")]
-fn decode_application_outcome(raw: u64) -> Result<ApplicationOutcome, MmuError> {
+fn decode_application_outcome(
+    raw: u64,
+    address_space: UserAddressSpace,
+    mut state: IsolatedRunState,
+) -> Result<ApplicationOutcome, MmuError> {
     if raw & OUTCOME_FAULT_BIT != 0 {
         return Ok(ApplicationOutcome::Faulted(decode_fault(raw)?));
+    }
+    if raw == OUTCOME_APPLICATION_YIELD || raw == OUTCOME_APPLICATION_HANDLE_CALL {
+        let context = state
+            .application_context
+            .take()
+            .ok_or(MmuError::InvalidUserContext)?;
+        let pending = state
+            .pending_application
+            .take()
+            .ok_or(MmuError::InvalidUserContext)?;
+        let application = ApplicationSession {
+            address_space,
+            context,
+            pending,
+        };
+        return match (raw, pending) {
+            (OUTCOME_APPLICATION_YIELD, ApplicationPending::Yield) => {
+                Ok(ApplicationOutcome::Yielded(application))
+            }
+            (OUTCOME_APPLICATION_HANDLE_CALL, ApplicationPending::HandleCall(call)) => {
+                Ok(ApplicationOutcome::HandleCall { application, call })
+            }
+            _ => Err(MmuError::InvalidUserContext),
+        };
     }
     let status = u32::try_from(raw).map_err(|_| MmuError::InvalidUserContext)?;
     Ok(ApplicationOutcome::Exited { status })
@@ -781,6 +1083,114 @@ fn user_range_contains(
 }
 
 #[cfg(target_os = "uefi")]
+fn user_range_valid(
+    regions: &[Option<UserRegion>; MAX_USER_REGIONS],
+    count: usize,
+    start: u64,
+    byte_count: usize,
+    require_write: bool,
+) -> bool {
+    byte_count == 0 || user_range_contains(regions, count, start, byte_count, require_write, false)
+}
+
+#[cfg(target_os = "uefi")]
+fn user_ranges_overlap(first: u64, first_bytes: usize, second: u64, second_bytes: usize) -> bool {
+    if first_bytes == 0 || second_bytes == 0 {
+        return false;
+    }
+    let Ok(first_bytes) = u64::try_from(first_bytes) else {
+        return true;
+    };
+    let Ok(second_bytes) = u64::try_from(second_bytes) else {
+        return true;
+    };
+    let Some(first_end) = first.checked_add(first_bytes) else {
+        return true;
+    };
+    let Some(second_end) = second.checked_add(second_bytes) else {
+        return true;
+    };
+    first < second_end && second < first_end
+}
+
+#[cfg(target_os = "uefi")]
+fn copy_user_from_physical(
+    regions: &[Option<UserRegion>; MAX_USER_REGIONS],
+    count: usize,
+    start: u64,
+    destination: &mut [u8],
+) -> Result<(), MmuError> {
+    if destination.is_empty() {
+        return Ok(());
+    }
+    let byte_count = u64::try_from(destination.len()).map_err(|_| MmuError::InvalidUserContext)?;
+    let end = start
+        .checked_add(byte_count)
+        .ok_or(MmuError::InvalidUserContext)?;
+    let region = regions[..count]
+        .iter()
+        .flatten()
+        .find(|region| start >= region.range.start() && end <= region.range.end())
+        .ok_or(MmuError::InvalidUserContext)?;
+    let offset = start
+        .checked_sub(region.range.start())
+        .ok_or(MmuError::InvalidUserContext)?;
+    let physical = region
+        .physical
+        .start()
+        .checked_add(offset)
+        .and_then(|address| usize::try_from(address).ok())
+        .ok_or(MmuError::InvalidUserContext)?;
+    for (index, byte) in destination.iter_mut().enumerate() {
+        // SAFETY: The application remains suspended, the complete translated
+        // physical range belongs to its retained allocation, and the kernel
+        // root identity-maps allocated normal RAM.
+        *byte = unsafe { ptr::read_volatile((physical + index) as *const u8) };
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "uefi")]
+fn copy_user_to_physical(
+    regions: &[Option<UserRegion>; MAX_USER_REGIONS],
+    count: usize,
+    start: u64,
+    source: &[u8],
+) -> Result<(), MmuError> {
+    if source.is_empty() {
+        return Ok(());
+    }
+    if !user_range_contains(regions, count, start, source.len(), true, false) {
+        return Err(MmuError::InvalidUserContext);
+    }
+    let byte_count = u64::try_from(source.len()).map_err(|_| MmuError::InvalidUserContext)?;
+    let end = start
+        .checked_add(byte_count)
+        .ok_or(MmuError::InvalidUserContext)?;
+    let region = regions[..count]
+        .iter()
+        .flatten()
+        .find(|region| start >= region.range.start() && end <= region.range.end())
+        .ok_or(MmuError::InvalidUserContext)?;
+    let offset = start
+        .checked_sub(region.range.start())
+        .ok_or(MmuError::InvalidUserContext)?;
+    let physical = region
+        .physical
+        .start()
+        .checked_add(offset)
+        .and_then(|address| usize::try_from(address).ok())
+        .ok_or(MmuError::InvalidUserContext)?;
+    for (index, byte) in source.iter().copied().enumerate() {
+        // SAFETY: The application remains suspended, the complete destination
+        // is a retained writable task mapping, and kernel identity mappings
+        // cover its allocated normal RAM.
+        unsafe { ptr::write_volatile((physical + index) as *mut u8, byte) };
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "uefi")]
 fn isolated_syscall(opcode: u64, address: u64, length: u64, status: u64) -> u64 {
     if opcode != ISOLATED_EXIT_CALL || status > u64::from(u8::MAX) {
         return OUTCOME_FAULT_BIT | 4;
@@ -820,15 +1230,115 @@ fn isolated_syscall(opcode: u64, address: u64, length: u64, status: u64) -> u64 
 }
 
 #[cfg(target_os = "uefi")]
-fn application_syscall(opcode: u64, status: u64) -> u64 {
+fn application_syscall(
+    call_number: u64,
+    arguments: [u64; 5],
+    context: ArchitectureApplicationContext,
+) -> u64 {
     crate::mechanism::disarm_execution_timer();
-    if opcode != APPLICATION_EXIT_CALL {
+    match call_number {
+        APPLICATION_EXIT_CALL => match u32::try_from(arguments[0]) {
+            Ok(status) => u64::from(status),
+            Err(_) => encoded_fault(IsolatedFault::InvalidCall),
+        },
+        APPLICATION_YIELD_CALL => suspend_application(
+            context,
+            ApplicationPending::Yield,
+            OUTCOME_APPLICATION_YIELD,
+        ),
+        APPLICATION_HANDLE_CALL => {
+            let Ok(request_bytes) = usize::try_from(arguments[2]) else {
+                return encoded_fault(IsolatedFault::InvalidCall);
+            };
+            let Ok(reply_capacity) = usize::try_from(arguments[4]) else {
+                return encoded_fault(IsolatedFault::InvalidCall);
+            };
+            // The copied request begins with one little-endian u16 service
+            // opcode. The remaining bytes are the service payload.
+            if !(2..=4 * 1024).contains(&request_bytes)
+                || reply_capacity > 4 * 1024
+                || arguments[0] == 0
+                || user_ranges_overlap(arguments[1], request_bytes, arguments[3], reply_capacity)
+            {
+                return encoded_fault(IsolatedFault::InvalidCall);
+            }
+            // SAFETY: The single native exception path uniquely accesses the
+            // active state while nested exception delivery remains masked.
+            let Some(state) = (unsafe { &mut *ISOLATED_RUN.0.get() }).as_ref() else {
+                return encoded_fault(IsolatedFault::InvalidCall);
+            };
+            if !user_range_valid(
+                &state.regions,
+                state.region_count,
+                arguments[1],
+                request_bytes,
+                false,
+            ) || !user_range_valid(
+                &state.regions,
+                state.region_count,
+                arguments[3],
+                reply_capacity,
+                true,
+            ) {
+                return encoded_fault(IsolatedFault::InvalidCall);
+            }
+            let call = ApplicationCall {
+                handle: arguments[0],
+                request_address: arguments[1],
+                request_bytes,
+                reply_address: arguments[3],
+                reply_capacity,
+            };
+            suspend_application(
+                context,
+                ApplicationPending::HandleCall(call),
+                OUTCOME_APPLICATION_HANDLE_CALL,
+            )
+        }
+        _ => encoded_fault(IsolatedFault::InvalidCall),
+    }
+}
+
+#[cfg(target_os = "uefi")]
+fn suspend_application(
+    context: ArchitectureApplicationContext,
+    pending: ApplicationPending,
+    outcome: u64,
+) -> u64 {
+    // SAFETY: The active exception path has exclusive access and returns to
+    // the kernel immediately after installing this bounded saved context.
+    let Some(state) = (unsafe { &mut *ISOLATED_RUN.0.get() }).as_mut() else {
+        return encoded_fault(IsolatedFault::InvalidCall);
+    };
+    if state.kind != RunKind::Application
+        || state.application_context.is_some()
+        || state.pending_application.is_some()
+    {
         return encoded_fault(IsolatedFault::InvalidCall);
     }
-    match u32::try_from(status) {
-        Ok(status) => u64::from(status),
-        Err(_) => encoded_fault(IsolatedFault::InvalidCall),
-    }
+    state.application_context = Some(context);
+    state.pending_application = Some(pending);
+    outcome
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn application_context_set_results(
+    context: &mut ArchitectureApplicationContext,
+    status: u32,
+    secondary: u32,
+) {
+    context.rax = u64::from(status);
+    context.rdx = u64::from(secondary);
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn application_context_set_results(
+    context: &mut ArchitectureApplicationContext,
+    status: u32,
+    secondary: u32,
+) {
+    context.general[0] = u64::from(status);
+    context.general[1] = u64::from(secondary);
 }
 
 #[cfg(target_os = "uefi")]
@@ -1442,6 +1952,20 @@ fn architecture_run_application(
     }
 }
 
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn architecture_resume_application(root: u64, context: &ArchitectureApplicationContext) -> u64 {
+    // SAFETY: `resume_application` owns the saved context, validated root, and
+    // unique active run state for the complete synchronous transition.
+    unsafe { aarch64_resume_application(root, ptr::from_ref(context)) }
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn architecture_resume_application(root: u64, context: &ArchitectureApplicationContext) -> u64 {
+    // SAFETY: `resume_application` owns the saved context, validated root, and
+    // unique active run state for the complete synchronous transition.
+    unsafe { x86_resume_application(root, ptr::from_ref(context)) }
+}
+
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 #[unsafe(naked)]
 unsafe extern "C" fn x86_enter_isolated(_root: u64, _entry: u64, _stack_top: u64) -> u64 {
@@ -1563,6 +2087,64 @@ unsafe extern "C" fn x86_enter_application(
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 #[unsafe(naked)]
+unsafe extern "C" fn x86_resume_application(
+    _root: u64,
+    _context: *const ArchitectureApplicationContext,
+) -> u64 {
+    core::arch::naked_asm!(
+        "mov r10, rdx",
+        "push rbx",
+        "push rbp",
+        "push rdi",
+        "push rsi",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov rax, rsp",
+        "sub rsp, 544",
+        "and rsp, -16",
+        "fxsave64 [rsp]",
+        "mov [rsp + 512], rax",
+        "pushfq",
+        "pop rax",
+        "mov [rsp + 520], rax",
+        "mov [rsp + 528], r10",
+        "lea rax, [rip + {kernel_context}]",
+        "mov [rax], rsp",
+        "mov r10, [rsp + 528]",
+        "push {user_data}",
+        "push qword ptr [r10 + 656]",
+        "push qword ptr [r10 + 648]",
+        "push {user_code}",
+        "push qword ptr [r10 + 632]",
+        "cli",
+        "mov cr3, rcx",
+        "fxrstor64 [r10]",
+        "mov rax, [r10 + 512]",
+        "mov rbx, [r10 + 520]",
+        "mov rcx, [r10 + 528]",
+        "mov rdx, [r10 + 536]",
+        "mov rbp, [r10 + 544]",
+        "mov rsi, [r10 + 552]",
+        "mov rdi, [r10 + 560]",
+        "mov r8, [r10 + 568]",
+        "mov r9, [r10 + 576]",
+        "mov r11, [r10 + 592]",
+        "mov r12, [r10 + 600]",
+        "mov r13, [r10 + 608]",
+        "mov r14, [r10 + 616]",
+        "mov r15, [r10 + 624]",
+        "mov r10, [r10 + 584]",
+        "iretq",
+        kernel_context = sym X86_KERNEL_CONTEXT,
+        user_data = const X86_USER_DATA_SELECTOR,
+        user_code = const X86_USER_CODE_SELECTOR,
+    );
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+#[unsafe(naked)]
 extern "C" fn x86_isolated_complete() -> ! {
     core::arch::naked_asm!(
         "mov r11, rax",
@@ -1595,15 +2177,28 @@ extern "C" fn x86_isolated_complete() -> ! {
 #[unsafe(naked)]
 extern "C" fn x86_isolated_syscall_entry() -> ! {
     core::arch::naked_asm!(
+        "push r15",
+        "push r14",
+        "push r13",
+        "push r12",
+        "push r11",
+        "push r10",
+        "push r9",
+        "push r8",
+        "push rdi",
+        "push rsi",
+        "push rbp",
+        "push rdx",
+        "push rcx",
+        "push rbx",
+        "push rax",
+        "sub rsp, 512",
+        "fxsave64 [rsp]",
         "cld",
         "pushfq",
         "btr qword ptr [rsp], 18",
         "popfq",
-        "mov r8, rsi",
-        "mov r9, rdx",
-        "mov rdx, rdi",
-        "mov rcx, rax",
-        "and rsp, -16",
+        "mov rcx, rsp",
         "sub rsp, 32",
         "call {handler}",
         "jmp {complete}",
@@ -1613,18 +2208,20 @@ extern "C" fn x86_isolated_syscall_entry() -> ! {
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
-extern "C" fn x86_isolated_syscall_handler(
-    opcode: u64,
-    address: u64,
-    length: u64,
-    status: u64,
-) -> u64 {
+extern "C" fn x86_isolated_syscall_handler(frame: *const ArchitectureApplicationContext) -> u64 {
     if !ISOLATED_ACTIVE.load(Ordering::Acquire) {
         x86_exception_fatal();
     }
+    // SAFETY: The naked gate constructed one complete aligned frame on the
+    // owned kernel stack and retains it for this synchronous handler call.
+    let frame = unsafe { &*frame };
     match active_run_kind() {
-        Some(RunKind::Stage6Probe) => isolated_syscall(opcode, address, length, status),
-        Some(RunKind::Application) => application_syscall(opcode, address),
+        Some(RunKind::Stage6Probe) => isolated_syscall(frame.rax, frame.rdi, frame.rsi, frame.rdx),
+        Some(RunKind::Application) => application_syscall(
+            frame.rax,
+            [frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8],
+            frame.clone(),
+        ),
         None => x86_exception_fatal(),
     }
 }
@@ -2192,6 +2789,92 @@ unsafe extern "C" fn aarch64_enter_application(
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 #[unsafe(naked)]
+#[allow(clippy::too_many_lines)]
+unsafe extern "C" fn aarch64_resume_application(
+    _root: u64,
+    _context: *const ArchitectureApplicationContext,
+) -> u64 {
+    core::arch::naked_asm!(
+        "mov x11, x1",
+        "sub sp, sp, #272",
+        "stp x19, x20, [sp, #0]",
+        "stp x21, x22, [sp, #16]",
+        "stp x23, x24, [sp, #32]",
+        "stp x25, x26, [sp, #48]",
+        "stp x27, x28, [sp, #64]",
+        "stp x29, x30, [sp, #80]",
+        "stp q8, q9, [sp, #96]",
+        "stp q10, q11, [sp, #128]",
+        "stp q12, q13, [sp, #160]",
+        "stp q14, q15, [sp, #192]",
+        "mrs x9, fpcr",
+        "mrs x10, fpsr",
+        "str x9, [sp, #224]",
+        "str x10, [sp, #232]",
+        "mrs x9, daif",
+        "str x9, [sp, #240]",
+        "mrs x9, sp_el0",
+        "str x9, [sp, #248]",
+        "mrs x9, tpidr_el0",
+        "str x9, [sp, #256]",
+        "adr x9, {kernel_context}",
+        "mov x10, sp",
+        "str x10, [x9]",
+        "msr ttbr0_el1, x0",
+        "dsb sy",
+        "tlbi vmalle1",
+        "dsb sy",
+        "isb",
+        "ldr x9, [x11, #800]",
+        "msr sp_el0, x9",
+        "ldr x9, [x11, #784]",
+        "msr elr_el1, x9",
+        "ldr x9, [x11, #792]",
+        "msr spsr_el1, x9",
+        "ldr x9, [x11, #768]",
+        "ldr x10, [x11, #776]",
+        "msr fpcr, x9",
+        "msr fpsr, x10",
+        "ldp q0, q1, [x11, #256]",
+        "ldp q2, q3, [x11, #288]",
+        "ldp q4, q5, [x11, #320]",
+        "ldp q6, q7, [x11, #352]",
+        "ldp q8, q9, [x11, #384]",
+        "ldp q10, q11, [x11, #416]",
+        "ldp q12, q13, [x11, #448]",
+        "ldp q14, q15, [x11, #480]",
+        "ldp q16, q17, [x11, #512]",
+        "ldp q18, q19, [x11, #544]",
+        "ldp q20, q21, [x11, #576]",
+        "ldp q22, q23, [x11, #608]",
+        "ldp q24, q25, [x11, #640]",
+        "ldp q26, q27, [x11, #672]",
+        "ldp q28, q29, [x11, #704]",
+        "ldp q30, q31, [x11, #736]",
+        "mov x30, x11",
+        "ldp x0, x1, [x30, #0]",
+        "ldp x2, x3, [x30, #16]",
+        "ldp x4, x5, [x30, #32]",
+        "ldp x6, x7, [x30, #48]",
+        "ldp x8, x9, [x30, #64]",
+        "ldp x10, x11, [x30, #80]",
+        "ldp x12, x13, [x30, #96]",
+        "ldp x14, x15, [x30, #112]",
+        "ldp x16, x17, [x30, #128]",
+        "ldp x18, x19, [x30, #144]",
+        "ldp x20, x21, [x30, #160]",
+        "ldp x22, x23, [x30, #176]",
+        "ldp x24, x25, [x30, #192]",
+        "ldp x26, x27, [x30, #208]",
+        "ldp x28, x29, [x30, #224]",
+        "ldr x30, [x30, #240]",
+        "eret",
+        kernel_context = sym AARCH64_KERNEL_CONTEXT,
+    );
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+#[unsafe(naked)]
 extern "C" fn aarch64_isolated_complete() -> ! {
     core::arch::naked_asm!(
         "mov x11, x0",
@@ -2280,6 +2963,49 @@ core::arch::global_asm!(
     ".balign 128",
     "kllm_aarch64_lower_sync_entry:",
     "msr daifset, #0xf",
+    "sub sp, sp, #816",
+    "stp x0, x1, [sp, #0]",
+    "stp x2, x3, [sp, #16]",
+    "stp x4, x5, [sp, #32]",
+    "stp x6, x7, [sp, #48]",
+    "stp x8, x9, [sp, #64]",
+    "stp x10, x11, [sp, #80]",
+    "stp x12, x13, [sp, #96]",
+    "stp x14, x15, [sp, #112]",
+    "stp x16, x17, [sp, #128]",
+    "stp x18, x19, [sp, #144]",
+    "stp x20, x21, [sp, #160]",
+    "stp x22, x23, [sp, #176]",
+    "stp x24, x25, [sp, #192]",
+    "stp x26, x27, [sp, #208]",
+    "stp x28, x29, [sp, #224]",
+    "str x30, [sp, #240]",
+    "stp q0, q1, [sp, #256]",
+    "stp q2, q3, [sp, #288]",
+    "stp q4, q5, [sp, #320]",
+    "stp q6, q7, [sp, #352]",
+    "stp q8, q9, [sp, #384]",
+    "stp q10, q11, [sp, #416]",
+    "stp q12, q13, [sp, #448]",
+    "stp q14, q15, [sp, #480]",
+    "stp q16, q17, [sp, #512]",
+    "stp q18, q19, [sp, #544]",
+    "stp q20, q21, [sp, #576]",
+    "stp q22, q23, [sp, #608]",
+    "stp q24, q25, [sp, #640]",
+    "stp q26, q27, [sp, #672]",
+    "stp q28, q29, [sp, #704]",
+    "stp q30, q31, [sp, #736]",
+    "mrs x9, fpcr",
+    "mrs x10, fpsr",
+    "str x9, [sp, #768]",
+    "str x10, [sp, #776]",
+    "mrs x9, elr_el1",
+    "mrs x10, spsr_el1",
+    "str x9, [sp, #784]",
+    "str x10, [sp, #792]",
+    "mrs x9, sp_el0",
+    "str x9, [sp, #800]",
     "mrs x9, esr_el1",
     "lsr x10, x9, #26",
     "cmp x10, #0x15",
@@ -2289,8 +3015,8 @@ core::arch::global_asm!(
     "bl kllm_aarch64_isolated_fault",
     "b kllm_aarch64_isolated_complete_entry",
     "1:",
-    "mov x4, x9",
-    "mov x5, x8",
+    "mov x0, sp",
+    "mov x1, x9",
     "bl kllm_aarch64_isolated_syscall",
     "b kllm_aarch64_isolated_complete_entry",
     "kllm_aarch64_isolated_complete_entry:",
@@ -2434,12 +3160,8 @@ extern "C" fn kllm_aarch64_input_interrupt() -> u64 {
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 #[unsafe(no_mangle)]
 extern "C" fn kllm_aarch64_isolated_syscall(
-    opcode: u64,
-    address: u64,
-    length: u64,
-    status: u64,
+    frame: *const ArchitectureApplicationContext,
     syndrome: u64,
-    call_number: u64,
 ) -> u64 {
     if !ISOLATED_ACTIVE.load(Ordering::Acquire) {
         kllm_aarch64_exception_fatal(0, 0);
@@ -2447,9 +3169,27 @@ extern "C" fn kllm_aarch64_isolated_syscall(
     if syndrome & 0xffff != 0 {
         encoded_fault(IsolatedFault::InvalidCall)
     } else {
+        // SAFETY: The lower-EL gate constructed one complete aligned frame on
+        // the owned kernel stack and retains it for this synchronous call.
+        let frame = unsafe { &*frame };
         match active_run_kind() {
-            Some(RunKind::Stage6Probe) => isolated_syscall(opcode, address, length, status),
-            Some(RunKind::Application) => application_syscall(call_number, opcode),
+            Some(RunKind::Stage6Probe) => isolated_syscall(
+                frame.general[0],
+                frame.general[1],
+                frame.general[2],
+                frame.general[3],
+            ),
+            Some(RunKind::Application) => application_syscall(
+                frame.general[8],
+                [
+                    frame.general[0],
+                    frame.general[1],
+                    frame.general[2],
+                    frame.general[3],
+                    frame.general[4],
+                ],
+                frame.clone(),
+            ),
             None => kllm_aarch64_exception_fatal(0, 0),
         }
     }
