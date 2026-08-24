@@ -44,6 +44,10 @@ direction; its serialized formats remain gated before persistent writes. ADR
 FAT32, and first constrained ext4 slices are implemented, while mutation
 remains open. [ADR 0017](adr/0017-constrained-ext4-read-only-profile.md) fixes
 the exact clean read-only ext4 v1 feature bitmap and parser bounds.
+[ADR 0018](adr/0018-volume-namespace-and-root-discovery.md) reserves the
+`/vol/root` and `/vol/boot` roles, keeps KEFS as the diskless recovery root, and
+requires deterministic root selection through a boot-side manifest and stable
+disk, partition, and filesystem identities.
 ADR 0012 governs the completed Stage 5.1 terminal and
 framebuffer increment; AArch64 native keyboard input remains a later
 virtio-input transport decision. ADR 0013 governs the completed Stage 5.2

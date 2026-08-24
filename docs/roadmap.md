@@ -340,6 +340,15 @@ native block transport is active, FAT32 and ext4 remain read-only, configuration
 is not persistently activated, and networking,
 the content store, generation activation, and rollback are still absent.
 
+ADR 0018 fixes the bootstrap semantics for the next storage increments. KEFS
+provides the immutable `/`, `/vol/root` is the selected persistent ext4 role,
+`/vol/boot` is the normally read-only EFI system partition, and additional
+configured media mounts below `/vol/<name>`. Host or installer tooling creates
+the filesystems and a bounded boot-side mount manifest. Native discovery must
+match its stable disk, partition, and filesystem identities exactly; no disk,
+several disks, duplicate identities, and missing/corrupt root media all retain
+the KEFS recovery shell without guessing from enumeration order or labels.
+
 Continue Stage 8 in this order:
 
 1. add bounded native block transports behind Stage 7.5 platform profiles:
@@ -354,6 +363,21 @@ Continue Stage 8 in this order:
    set before TCP; and
 5. add the content store, immutable generation construction, health activation,
    predecessor rollback, and garbage-collection bounds.
+
+### Next-session handoff
+
+Start with item 1 above: add the first discoverable VM block transport behind
+the existing `troe-block` capability and platform-profile boundary. Keep the
+filesystem providers unaware of the transport, and prove a native path from a
+bounded whole device through GPT to the existing read-only FAT32/ext4 mounts.
+
+Before persistent mount activation, specify and implement the small checksummed
+boot mount manifest required by ADR 0018. Its parser should be portable and
+host-tested first. Include bounded entry/name counts, an explicit whole-device
+versus GPT selector, access and availability policy, duplicate-selector
+rejection, exact multi-identity matching, and diskless/ambiguous recovery test
+cases. Keep it separate from SCFG so SCFG activation cannot become a root
+discovery prerequisite.
 
 Do not start with a filesystem parser coupled directly to a hardware driver or
 the shell. The block transport, region discovery, filesystem provider, VFS,
