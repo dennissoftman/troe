@@ -128,8 +128,13 @@ version = "0.1.0"
 name = "troe-config"
 version = "0.1.0"
 dependencies = [
+ "troe-content",
  "troe-vfs",
 ]
+
+[[package]]
+name = "troe-content"
+version = "0.1.0"
 
 [[package]]
 name = "troe-core"
@@ -185,6 +190,7 @@ dependencies = [
  "troe-application",
  "troe-block",
  "troe-config",
+ "troe-content",
  "troe-core",
  "troe-dispatch",
  "troe-driver",

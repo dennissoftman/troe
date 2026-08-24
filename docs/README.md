@@ -28,6 +28,8 @@ historical review evidence.
   gates native writable authority for a TXSLOT region.
 - [SACT v1](formats/sact-v1.md) defines the active and predecessor SCFG content
   references committed as a TXSLOT payload.
+- [CSPK v1](formats/cspk-v1.md) defines bounded SHA-256-addressed immutable
+  object packs and their verify-before-publish collection contract.
 
 The repository root [README](../README.md), [security policy](../SECURITY.md),
 [contribution guide](../CONTRIBUTING.md), and [third-party inventory](../THIRD_PARTY.md)
@@ -63,6 +65,9 @@ virtio PCI transports, including their DMA lifetime and reset-on-timeout rules.
 portable writable transaction and its exact write/flush recovery contract;
 strict PRGN-selected GPT media now exercise it through both native virtio
 transports.
+[ADR 0021](adr/0021-immutable-content-store-and-generation-rollback.md) fixes
+the bounded SHA-256-addressed immutable store, predecessor retention, and
+mark-and-copy garbage-collection direction.
 ADR 0012 governs the completed Stage 5.1 terminal and
 framebuffer increment; AArch64 native keyboard input remains a later
 virtio-input transport decision. ADR 0013 governs the completed Stage 5.2

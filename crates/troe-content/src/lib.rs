@@ -1,0 +1,570 @@
+//! Bounded immutable SHA-256-addressed content packs.
+#![no_std]
+#![forbid(unsafe_code)]
+
+extern crate alloc;
+#[cfg(test)]
+extern crate std;
+
+use alloc::vec::Vec;
+
+/// Product-independent immutable content-pack identifier.
+pub const CONTENT_PACK_MAGIC: [u8; 8] = *b"CSPKv1\0\0";
+/// Fixed CSPK header size.
+pub const HEADER_BYTES: usize = 64;
+/// Fixed CSPK object-record size.
+pub const RECORD_BYTES: usize = 64;
+/// Hard maximum encoded pack size.
+pub const MAX_PACK_BYTES: usize = 4 * 1024 * 1024;
+/// Hard maximum retained object count.
+pub const MAX_OBJECTS: usize = 64;
+/// Hard maximum size of one immutable object.
+pub const MAX_OBJECT_BYTES: usize = 1024 * 1024;
+
+const CHECKSUM_OFFSET: usize = 20;
+
+/// SHA-256 content identity.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ContentDigest([u8; 32]);
+
+impl ContentDigest {
+    /// Hash exact object bytes.
+    #[must_use]
+    pub fn of(bytes: &[u8]) -> Self {
+        Self(sha256(bytes))
+    }
+
+    /// Construct from exact digest bytes.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
+    /// Return exact digest bytes.
+    #[must_use]
+    pub const fn bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+/// Closed immutable object roles.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ObjectKind {
+    /// Canonical SCFG image.
+    SystemConfig = 1,
+    /// Canonical KEX application artifact.
+    Application = 2,
+    /// Desired-system generation manifest.
+    GenerationManifest = 3,
+    /// Opaque immutable service data.
+    Data = 4,
+}
+
+impl ObjectKind {
+    fn parse(value: u8) -> Result<Self, ContentError> {
+        match value {
+            1 => Ok(Self::SystemConfig),
+            2 => Ok(Self::Application),
+            3 => Ok(Self::GenerationManifest),
+            4 => Ok(Self::Data),
+            _ => Err(ContentError::InvalidRecord),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Record {
+    digest: ContentDigest,
+    kind: ObjectKind,
+    offset: usize,
+    length: usize,
+}
+
+/// One verified immutable object borrowed from a pack.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ContentObject<'a> {
+    /// Verified SHA-256 identity.
+    pub digest: ContentDigest,
+    /// Declared object role.
+    pub kind: ObjectKind,
+    /// Exact immutable bytes.
+    pub bytes: &'a [u8],
+}
+
+/// Fully verified bounded immutable content pack.
+pub struct ContentPack<'a> {
+    image: &'a [u8],
+    records: Vec<Record>,
+}
+
+impl<'a> ContentPack<'a> {
+    /// Parse and verify a canonical CSPK v1 image.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid headers/checksums, resource ceilings, noncanonical
+    /// records/layout, duplicate or unsorted identities, and any object whose
+    /// bytes fail its SHA-256 identity.
+    pub fn parse(image: &'a [u8]) -> Result<Self, ContentError> {
+        if !(HEADER_BYTES..=MAX_PACK_BYTES).contains(&image.len())
+            || image.get(..8) != Some(&CONTENT_PACK_MAGIC)
+            || read_u16(image, 8)? != 1
+            || read_u16(image, 10)? != 0
+            || read_u16(image, 12)? != 64
+            || read_u16(image, 14)? != 64
+            || usize::try_from(read_u32(image, 16)?).map_err(|_| ContentError::InvalidHeader)?
+                != image.len()
+            || image[26..HEADER_BYTES].iter().any(|byte| *byte != 0)
+        {
+            return Err(ContentError::InvalidHeader);
+        }
+        let count = usize::from(read_u16(image, 24)?);
+        if count == 0 || count > MAX_OBJECTS {
+            return Err(ContentError::LimitExceeded);
+        }
+        let table_end = HEADER_BYTES
+            .checked_add(
+                count
+                    .checked_mul(RECORD_BYTES)
+                    .ok_or(ContentError::LimitExceeded)?,
+            )
+            .ok_or(ContentError::LimitExceeded)?;
+        if table_end > image.len() || crc32_zeroed(image) != read_u32(image, CHECKSUM_OFFSET)? {
+            return Err(ContentError::Checksum);
+        }
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(count)
+            .map_err(|_| ContentError::MetadataExhausted)?;
+        let mut expected_offset = table_end;
+        for index in 0..count {
+            let start = HEADER_BYTES + index * RECORD_BYTES;
+            let raw = &image[start..start + RECORD_BYTES];
+            if raw[33..40].iter().chain(&raw[48..]).any(|byte| *byte != 0) {
+                return Err(ContentError::InvalidRecord);
+            }
+            let mut digest = [0_u8; 32];
+            digest.copy_from_slice(&raw[..32]);
+            let digest = ContentDigest(digest);
+            let kind = ObjectKind::parse(raw[32])?;
+            let offset =
+                usize::try_from(read_u32(raw, 40)?).map_err(|_| ContentError::InvalidRecord)?;
+            let length =
+                usize::try_from(read_u32(raw, 44)?).map_err(|_| ContentError::InvalidRecord)?;
+            let end = offset
+                .checked_add(length)
+                .ok_or(ContentError::InvalidRecord)?;
+            if length == 0
+                || length > MAX_OBJECT_BYTES
+                || offset != expected_offset
+                || end > image.len()
+                || records
+                    .last()
+                    .is_some_and(|prior: &Record| prior.digest >= digest)
+                || ContentDigest::of(&image[offset..end]) != digest
+            {
+                return Err(ContentError::InvalidRecord);
+            }
+            records.push(Record {
+                digest,
+                kind,
+                offset,
+                length,
+            });
+            expected_offset = end;
+        }
+        if expected_offset != image.len() {
+            return Err(ContentError::InvalidRecord);
+        }
+        Ok(Self { image, records })
+    }
+
+    /// Number of verified objects.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Whether the pack contains no object (canonical packs never do).
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    /// Resolve one exact digest with logarithmic bounded lookup.
+    #[must_use]
+    pub fn get(&self, digest: ContentDigest) -> Option<ContentObject<'a>> {
+        let index = self
+            .records
+            .binary_search_by(|record| record.digest.cmp(&digest))
+            .ok()?;
+        let record = self.records[index];
+        Some(ContentObject {
+            digest: record.digest,
+            kind: record.kind,
+            bytes: &self.image[record.offset..record.offset + record.length],
+        })
+    }
+
+    /// Rebuild a canonical pack containing exactly the requested identities.
+    ///
+    /// This is the bounded mark-and-copy publication primitive. Input roots
+    /// may be unordered or repeated; output is digest-sorted and deduplicated.
+    /// The caller must add transitive manifest dependencies to `roots` before
+    /// publication.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty/missing roots, policy above hard ceilings, output above
+    /// the declared byte/object budgets, and allocation failure.
+    pub fn retain(
+        &self,
+        roots: &[ContentDigest],
+        max_objects: usize,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, ContentError> {
+        if roots.is_empty()
+            || max_objects == 0
+            || max_objects > MAX_OBJECTS
+            || !(HEADER_BYTES + RECORD_BYTES + 1..=MAX_PACK_BYTES).contains(&max_bytes)
+        {
+            return Err(ContentError::LimitExceeded);
+        }
+        let mut identities = Vec::new();
+        identities
+            .try_reserve_exact(roots.len().min(max_objects))
+            .map_err(|_| ContentError::MetadataExhausted)?;
+        for digest in roots {
+            if self.get(*digest).is_none() {
+                return Err(ContentError::MissingObject);
+            }
+            if !identities.contains(digest) {
+                if identities.len() == max_objects {
+                    return Err(ContentError::LimitExceeded);
+                }
+                identities.push(*digest);
+            }
+        }
+        identities.sort_unstable();
+        let table_end = HEADER_BYTES
+            .checked_add(
+                identities
+                    .len()
+                    .checked_mul(RECORD_BYTES)
+                    .ok_or(ContentError::LimitExceeded)?,
+            )
+            .ok_or(ContentError::LimitExceeded)?;
+        let mut total = table_end;
+        for digest in &identities {
+            total = total
+                .checked_add(
+                    self.get(*digest)
+                        .ok_or(ContentError::MissingObject)?
+                        .bytes
+                        .len(),
+                )
+                .ok_or(ContentError::LimitExceeded)?;
+        }
+        if total > max_bytes {
+            return Err(ContentError::LimitExceeded);
+        }
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(total)
+            .map_err(|_| ContentError::MetadataExhausted)?;
+        output.resize(total, 0);
+        output[..8].copy_from_slice(&CONTENT_PACK_MAGIC);
+        write_u16(&mut output, 8, 1);
+        write_u16(&mut output, 12, 64);
+        write_u16(&mut output, 14, 64);
+        write_u32(
+            &mut output,
+            16,
+            u32::try_from(total).map_err(|_| ContentError::LimitExceeded)?,
+        );
+        write_u16(
+            &mut output,
+            24,
+            u16::try_from(identities.len()).map_err(|_| ContentError::LimitExceeded)?,
+        );
+        let mut offset = table_end;
+        for (index, digest) in identities.iter().enumerate() {
+            let object = self.get(*digest).ok_or(ContentError::MissingObject)?;
+            let record = HEADER_BYTES + index * RECORD_BYTES;
+            output[record..record + 32].copy_from_slice(&digest.bytes());
+            output[record + 32] = object.kind as u8;
+            write_u32(
+                &mut output,
+                record + 40,
+                u32::try_from(offset).map_err(|_| ContentError::LimitExceeded)?,
+            );
+            write_u32(
+                &mut output,
+                record + 44,
+                u32::try_from(object.bytes.len()).map_err(|_| ContentError::LimitExceeded)?,
+            );
+            output[offset..offset + object.bytes.len()].copy_from_slice(object.bytes);
+            offset += object.bytes.len();
+        }
+        let checksum = crc32_zeroed(&output);
+        write_u32(&mut output, CHECKSUM_OFFSET, checksum);
+        Ok(output)
+    }
+}
+
+/// Stable CSPK rejection reason.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ContentError {
+    /// Magic, version, sizes, total length, or reserved header bytes failed.
+    InvalidHeader,
+    /// Whole-pack CRC32 failed.
+    Checksum,
+    /// Object count, pack bytes, or object bytes exceeded a hard ceiling.
+    LimitExceeded,
+    /// An object role, layout, order, digest, or reserved field failed.
+    InvalidRecord,
+    /// Bounded record retention failed.
+    MetadataExhausted,
+    /// A requested retained identity was absent from the verified source pack.
+    MissingObject,
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, ContentError> {
+    let raw = bytes
+        .get(offset..offset + 2)
+        .ok_or(ContentError::InvalidHeader)?;
+    Ok(u16::from_le_bytes([raw[0], raw[1]]))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, ContentError> {
+    let raw = bytes
+        .get(offset..offset + 4)
+        .ok_or(ContentError::InvalidHeader)?;
+    Ok(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+}
+
+fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
+fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn crc32_zeroed(bytes: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for (index, byte) in bytes.iter().copied().enumerate() {
+        crc ^= u32::from(if (CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4).contains(&index) {
+            0
+        } else {
+            byte
+        });
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & 0_u32.wrapping_sub(crc & 1));
+        }
+    }
+    !crc
+}
+
+// FIPS 180-4 SHA-256 with fixed stack state and no allocation.
+#[allow(
+    clippy::many_single_char_names,
+    clippy::unreadable_literal,
+    clippy::comparison_chain
+)] // Names and constants follow the FIPS 180-4 compression function.
+fn sha256(input: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let bit_len = u64::try_from(input.len())
+        .unwrap_or(u64::MAX)
+        .wrapping_mul(8);
+    let blocks = (input.len() + 9).div_ceil(64);
+    let mut state: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    for block_index in 0..blocks {
+        let mut block = [0_u8; 64];
+        for (index, byte) in block.iter_mut().enumerate() {
+            let absolute = block_index * 64 + index;
+            *byte = if absolute < input.len() {
+                input[absolute]
+            } else if absolute == input.len() {
+                0x80
+            } else {
+                0
+            };
+        }
+        if block_index + 1 == blocks {
+            block[56..].copy_from_slice(&bit_len.to_be_bytes());
+        }
+        let mut w = [0_u32; 64];
+        for (index, chunk) in block.chunks_exact(4).enumerate() {
+            w[index] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        for index in 16..64 {
+            let s0 = w[index - 15].rotate_right(7)
+                ^ w[index - 15].rotate_right(18)
+                ^ (w[index - 15] >> 3);
+            let s1 = w[index - 2].rotate_right(17)
+                ^ w[index - 2].rotate_right(19)
+                ^ (w[index - 2] >> 10);
+            w[index] = w[index - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[index - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = state;
+        for index in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ (!e & g);
+            let t1 = h
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[index])
+                .wrapping_add(w[index]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (slot, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *slot = (*slot).wrapping_add(value);
+        }
+    }
+    let mut output = [0_u8; 32];
+    for (chunk, value) in output.chunks_exact_mut(4).zip(state) {
+        chunk.copy_from_slice(&value.to_be_bytes());
+    }
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use alloc::vec;
+    use alloc::vec::Vec;
+
+    use super::{
+        CONTENT_PACK_MAGIC, ContentDigest, ContentError, ContentPack, HEADER_BYTES, ObjectKind,
+        RECORD_BYTES, crc32_zeroed,
+    };
+
+    fn pack(objects: &[(ObjectKind, &[u8])]) -> Vec<u8> {
+        let mut sorted: Vec<_> = objects
+            .iter()
+            .map(|(kind, bytes)| (ContentDigest::of(bytes), *kind, *bytes))
+            .collect();
+        sorted.sort_by_key(|(digest, _, _)| *digest);
+        let payload_bytes: usize = sorted.iter().map(|(_, _, bytes)| bytes.len()).sum();
+        let table_end = HEADER_BYTES + sorted.len() * RECORD_BYTES;
+        let mut image = vec![0_u8; table_end + payload_bytes];
+        let image_bytes = u32::try_from(image.len()).unwrap_or(0);
+        image[..8].copy_from_slice(&CONTENT_PACK_MAGIC);
+        image[8..10].copy_from_slice(&1_u16.to_le_bytes());
+        image[12..14].copy_from_slice(&64_u16.to_le_bytes());
+        image[14..16].copy_from_slice(&64_u16.to_le_bytes());
+        image[16..20].copy_from_slice(&image_bytes.to_le_bytes());
+        image[24..26].copy_from_slice(&u16::try_from(sorted.len()).unwrap_or(0).to_le_bytes());
+        let mut offset = table_end;
+        for (index, (digest, kind, bytes)) in sorted.iter().enumerate() {
+            let record = HEADER_BYTES + index * RECORD_BYTES;
+            image[record..record + 32].copy_from_slice(&digest.bytes());
+            image[record + 32] = *kind as u8;
+            image[record + 40..record + 44]
+                .copy_from_slice(&u32::try_from(offset).unwrap_or(0).to_le_bytes());
+            image[record + 44..record + 48]
+                .copy_from_slice(&u32::try_from(bytes.len()).unwrap_or(0).to_le_bytes());
+            image[offset..offset + bytes.len()].copy_from_slice(bytes);
+            offset += bytes.len();
+        }
+        let checksum = crc32_zeroed(&image);
+        image[20..24].copy_from_slice(&checksum.to_le_bytes());
+        image
+    }
+
+    #[test]
+    fn sha256_matches_fips_vectors() {
+        assert_eq!(
+            ContentDigest::of(b"").bytes(),
+            [
+                0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f,
+                0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b,
+                0x78, 0x52, 0xb8, 0x55
+            ]
+        );
+    }
+
+    #[test]
+    fn canonical_pack_verifies_and_resolves() -> Result<(), ContentError> {
+        let image = pack(&[
+            (ObjectKind::SystemConfig, b"config"),
+            (ObjectKind::Data, b"data"),
+        ]);
+        let parsed = ContentPack::parse(&image)?;
+        assert_eq!(parsed.len(), 2);
+        let object = parsed
+            .get(ContentDigest::of(b"config"))
+            .ok_or(ContentError::InvalidRecord)?;
+        assert_eq!(object.kind, ObjectKind::SystemConfig);
+        assert_eq!(object.bytes, b"config");
+        Ok(())
+    }
+
+    #[test]
+    fn corruption_and_duplicate_content_fail_closed() {
+        let mut corrupt = pack(&[(ObjectKind::Data, b"data")]);
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 1;
+        assert!(matches!(
+            ContentPack::parse(&corrupt),
+            Err(ContentError::Checksum)
+        ));
+
+        let duplicate = pack(&[(ObjectKind::Data, b"same"), (ObjectKind::Data, b"same")]);
+        assert!(matches!(
+            ContentPack::parse(&duplicate),
+            Err(ContentError::InvalidRecord)
+        ));
+    }
+
+    #[test]
+    fn retain_is_bounded_deduplicated_and_reverified() -> Result<(), ContentError> {
+        let image = pack(&[
+            (ObjectKind::SystemConfig, b"config"),
+            (ObjectKind::Data, b"keep"),
+            (ObjectKind::Data, b"discard"),
+        ]);
+        let source = ContentPack::parse(&image)?;
+        let config = ContentDigest::of(b"config");
+        let keep = ContentDigest::of(b"keep");
+        let rebuilt = source.retain(&[keep, config, keep], 2, 1024)?;
+        let retained = ContentPack::parse(&rebuilt)?;
+        assert_eq!(retained.len(), 2);
+        assert!(retained.get(config).is_some());
+        assert!(retained.get(keep).is_some());
+        assert!(retained.get(ContentDigest::of(b"discard")).is_none());
+        assert_eq!(
+            source.retain(&[ContentDigest::of(b"missing")], 2, 1024),
+            Err(ContentError::MissingObject)
+        );
+        Ok(())
+    }
+}

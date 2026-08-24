@@ -6,6 +6,7 @@ extern crate alloc;
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use troe_content::ContentDigest;
 use troe_vfs::{MAX_PATH_BYTES, canonicalize};
 
 /// Product-name-independent system-configuration v1 format identifier.
@@ -13,7 +14,7 @@ pub const CONFIG_V1_MAGIC: [u8; 8] = *b"SCFGv1\0\0";
 /// Product-name-independent SCFG activation-pointer identifier.
 pub const ACTIVATION_V1_MAGIC: [u8; 8] = *b"SACTv1\0\0";
 /// Exact encoded activation-pointer size.
-pub const ACTIVATION_V1_BYTES: usize = 64;
+pub const ACTIVATION_V1_BYTES: usize = 128;
 const HEADER_BYTES: usize = 64;
 const RECORD_BYTES: usize = 64;
 const MAX_CONFIG_BYTES: usize = 16 * 1024;
@@ -28,7 +29,7 @@ const FLAG_FALLBACK_PREVIOUS: u8 = 1 << 0;
 const FLAG_RECOVERY_SHELL: u8 = 1 << 1;
 const KNOWN_FLAGS: u8 = FLAG_FALLBACK_PREVIOUS | FLAG_RECOVERY_SHELL;
 const ACTIVATION_PREVIOUS: u16 = 1;
-const ACTIVATION_CHECKSUM_OFFSET: usize = 48;
+const ACTIVATION_CHECKSUM_OFFSET: usize = 112;
 
 /// Immutable identity of one fully validated SCFG image.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -36,6 +37,7 @@ pub struct ConfigReference {
     generation: u64,
     byte_count: u32,
     checksum: u32,
+    digest: ContentDigest,
 }
 
 impl ConfigReference {
@@ -50,6 +52,7 @@ impl ConfigReference {
             generation: config.generation(),
             byte_count: u32::try_from(bytes.len()).map_err(|_| ConfigError::InvalidHeader)?,
             checksum: read_u32(bytes, 20)?,
+            digest: ContentDigest::of(bytes),
         })
     }
 
@@ -69,6 +72,12 @@ impl ConfigReference {
     #[must_use]
     pub const fn checksum(self) -> u32 {
         self.checksum
+    }
+
+    /// SHA-256 immutable content-store address.
+    #[must_use]
+    pub const fn digest(self) -> ContentDigest {
+        self.digest
     }
 
     /// Whether bytes parse canonically and reproduce this exact identity.
@@ -114,12 +123,12 @@ impl ActivationPointer {
             || bytes.get(..8) != Some(&ACTIVATION_V1_MAGIC)
             || read_activation_u16(bytes, 8)? != 1
             || read_activation_u16(bytes, 10)? != 0
-            || read_activation_u16(bytes, 12)? != 64
+            || read_activation_u16(bytes, 12)? != 128
         {
             return Err(ActivationError::InvalidHeader);
         }
         let flags = read_activation_u16(bytes, 14)?;
-        if flags & !ACTIVATION_PREVIOUS != 0 || bytes[52..].iter().any(|byte| *byte != 0) {
+        if flags & !ACTIVATION_PREVIOUS != 0 || bytes[116..].iter().any(|byte| *byte != 0) {
             return Err(ActivationError::InvalidHeader);
         }
         let mut checked = [0_u8; ACTIVATION_V1_BYTES];
@@ -130,9 +139,9 @@ impl ActivationPointer {
         }
         let active = read_reference(bytes, 16)?;
         let previous = if flags & ACTIVATION_PREVIOUS != 0 {
-            Some(read_reference(bytes, 32)?)
+            Some(read_reference(bytes, 64)?)
         } else {
-            if bytes[32..48].iter().any(|byte| *byte != 0) {
+            if bytes[64..112].iter().any(|byte| *byte != 0) {
                 return Err(ActivationError::InvalidPredecessor);
             }
             None
@@ -146,13 +155,13 @@ impl ActivationPointer {
         let mut bytes = [0_u8; ACTIVATION_V1_BYTES];
         bytes[..8].copy_from_slice(&ACTIVATION_V1_MAGIC);
         bytes[8..10].copy_from_slice(&1_u16.to_le_bytes());
-        bytes[12..14].copy_from_slice(&64_u16.to_le_bytes());
+        bytes[12..14].copy_from_slice(&128_u16.to_le_bytes());
         if self.previous.is_some() {
             bytes[14..16].copy_from_slice(&ACTIVATION_PREVIOUS.to_le_bytes());
         }
         write_reference(&mut bytes, 16, self.active);
         if let Some(previous) = self.previous {
-            write_reference(&mut bytes, 32, previous);
+            write_reference(&mut bytes, 64, previous);
         }
         let checksum = crc32(&bytes);
         bytes[ACTIVATION_CHECKSUM_OFFSET..ACTIVATION_CHECKSUM_OFFSET + 4]
@@ -682,11 +691,21 @@ fn read_reference(bytes: &[u8], offset: usize) -> Result<ConfigReference, Activa
         generation: read_activation_u64(bytes, offset)?,
         byte_count: read_activation_u32(bytes, offset + 8)?,
         checksum: read_activation_u32(bytes, offset + 12)?,
+        digest: {
+            let mut digest = [0_u8; 32];
+            digest.copy_from_slice(
+                bytes
+                    .get(offset + 16..offset + 48)
+                    .ok_or(ActivationError::InvalidHeader)?,
+            );
+            ContentDigest::from_bytes(digest)
+        },
     };
     if reference.generation == 0
         || usize::try_from(reference.byte_count).map_or(true, |count| {
             !(HEADER_BYTES..=MAX_CONFIG_BYTES).contains(&count)
         })
+        || reference.digest.bytes().iter().all(|byte| *byte == 0)
     {
         return Err(ActivationError::InvalidHeader);
     }
@@ -697,6 +716,7 @@ fn write_reference(bytes: &mut [u8], offset: usize, reference: ConfigReference) 
     bytes[offset..offset + 8].copy_from_slice(&reference.generation.to_le_bytes());
     bytes[offset + 8..offset + 12].copy_from_slice(&reference.byte_count.to_le_bytes());
     bytes[offset + 12..offset + 16].copy_from_slice(&reference.checksum.to_le_bytes());
+    bytes[offset + 16..offset + 48].copy_from_slice(&reference.digest.bytes());
 }
 
 fn crc32(bytes: &[u8]) -> u32 {
@@ -718,8 +738,8 @@ mod tests {
 
     use super::{
         ACTIVATION_V1_BYTES, ActivationError, ActivationPointer, CONFIG_V1_MAGIC, ConfigError,
-        ConfigReference, FailureAction, HEADER_BYTES, RECORD_BYTES, StartupMode, crc32,
-        parse_config,
+        ConfigReference, ContentDigest, FailureAction, HEADER_BYTES, RECORD_BYTES, StartupMode,
+        crc32, parse_config,
     };
 
     fn valid_config() -> Vec<u8> {
@@ -872,6 +892,7 @@ mod tests {
             generation: 6,
             byte_count: 64,
             checksum: 0x1234_5678,
+            digest: ContentDigest::of(b"previous"),
         };
         let pointer = ActivationPointer::new(active, Some(previous))
             .map_err(|_| ConfigError::InvalidRecoveryPolicy)?;

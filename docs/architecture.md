@@ -215,19 +215,24 @@ contained and reclaimed as invalid-call and translation faults.
 
 ## Stage 8 persistent-storage boundary
 
-The portable block-region, GPT, VFS-provider, read-only FAT32, and constrained
-read-only ext4 pieces now preserve this dependency direction. Native block
-transports and durable mutation remain future Stage 8 increments. A transport
-provides bounded block-region capabilities; partition discovery turns a whole
-device into non-overlapping regions; independently selected filesystem
-providers expose VFS objects. Format-specific structures do not enter the
-machine backend, block transport, partition layer, or kernel composition root.
+The portable block-region, GPT, VFS-provider, read-only FAT32, constrained
+read-only ext4, native virtio transport, and dual-slot durability pieces now
+preserve this dependency direction. General filesystem mutation remains a
+future Stage 8 increment. A transport provides bounded block-region
+capabilities; partition discovery turns a whole device into non-overlapping
+regions; independently selected filesystem providers expose VFS objects.
+Format-specific structures do not enter the machine backend, block transport,
+partition layer, or kernel composition root.
 
 ```text
 block transport -> bounded region -> filesystem provider -> VFS namespace
                          ^
                   whole device or GPT
 ```
+
+CSPK immutable objects sit above the selected provider. SACT is the separate
+mutable publication pointer committed through a PRGN-selected dual-slot block
+region; it names verified CSPK objects by SHA-256 and never turns them mutable.
 
 KEFS is the intentionally built-in recovery exception. The current FAT12 image
 is read by firmware. General FAT12/16/32, exFAT, the default persistent ext4

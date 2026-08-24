@@ -67,6 +67,14 @@ def main() -> int:
             "--output",
             REPO_ROOT / "assets" / "system.scfg",
         )
+        run(
+            sys.executable,
+            TOOLS_DIR / "mkcontent.py",
+            "--config",
+            REPO_ROOT / "assets" / "system.scfg",
+            "--output",
+            REPO_ROOT / "assets" / "system.cspk",
+        )
 
         for architecture in architectures:
             target = TARGETS[architecture]

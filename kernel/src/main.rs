@@ -28,6 +28,8 @@ mod firmware {
     use troe_block::{BlockDevice, BlockLimits};
     #[cfg(feature = "acceptance-probes")]
     use troe_config::{ActivationPointer, ConfigReference};
+    #[cfg(feature = "acceptance-probes")]
+    use troe_content::{ContentPack, ObjectKind};
     use troe_core::{Input, MAX_LINE_BYTES, MachineMemorySnapshot, Output, StreamError};
     use troe_dispatch::{
         ConsoleService, CopiedMessage, DispatchedOutput, Dispatcher, HandleOwner, ReplyStatus,
@@ -68,6 +70,8 @@ mod firmware {
     const PERSISTENCE_SELECTOR: &[u8] = include_bytes!("../../assets/persist.prgn");
     #[cfg(feature = "acceptance-probes")]
     const SYSTEM_CONFIG: &[u8] = include_bytes!("../../assets/system.scfg");
+    #[cfg(feature = "acceptance-probes")]
+    const SYSTEM_CONTENT: &[u8] = include_bytes!("../../assets/system.cspk");
     const OWNED_HEAP_BYTES: u64 = 6 * 1024 * 1024;
     const PAGE_TABLE_BYTES: u64 = 2 * 1024 * 1024;
     const OWNED_STACK_BYTES: u64 = 128 * 1024;
@@ -520,6 +524,11 @@ mod firmware {
         .map_err(|_| ())?;
         let mut store = DualSlotStore::open(region).map_err(|_| ())?;
         let active = ConfigReference::from_bytes(SYSTEM_CONFIG).map_err(|_| ())?;
+        let content = ContentPack::parse(SYSTEM_CONTENT).map_err(|_| ())?;
+        let object = content.get(active.digest()).ok_or(())?;
+        if object.kind != ObjectKind::SystemConfig || object.bytes != SYSTEM_CONFIG {
+            return Err(());
+        }
         let pointer = ActivationPointer::new(active, None).map_err(|_| ())?;
         if let Some(payload) = store.payload() {
             let recovered = ActivationPointer::parse(payload).map_err(|_| ())?;

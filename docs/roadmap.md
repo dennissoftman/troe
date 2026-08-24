@@ -357,15 +357,21 @@ The first portable storage/configuration boundary is landed:
   PRGN v1 selects a strict four-block GPT partition by exact disk, unique
   partition, and partition-type GUIDs; dedicated per-architecture QEMU media
   exercise real native virtio writes and flushes across five process
-  termination/reopen cycles; and SACT v1 now binds the TXSLOT payload to an
-  exact canonical SCFG generation, length, and checksum and revalidates that
-  immutable configuration after every reopen.
+  termination/reopen cycles; SACT v1 now binds the TXSLOT payload to an exact
+  canonical SCFG generation, length, checksum, and SHA-256 content address and
+  revalidates that immutable configuration after every reopen; and
+- `troe-content` implements the bounded CSPK v1 immutable object pack with
+  canonical SHA-256 addressing, strict whole-pack and per-object verification,
+  binary lookup, deduplication, and budgeted mark-and-copy retention. Both
+  native acceptance paths resolve the digest-bound SCFG from a verified pack
+  before publishing or recovering its SACT pointer.
 
 These mechanisms are host verified; both VM transports, read-only mount
-activation, and the bounded TXSLOT transaction are QEMU verified. Stage 8 is
-not complete: FAT32 and ext4 remain read-only, configuration is not
-persistently activated, and networking, the content store, generation
-activation, and rollback are still absent.
+activation, the bounded TXSLOT transaction, and digest-bound CSPK/SACT recovery
+are QEMU verified. Stage 8 is not complete: FAT32 and ext4 remain read-only,
+the verified content pack is still embedded in the acceptance image rather
+than loaded from `/vol/root`, and generation health rollback and networking
+are still absent.
 
 ADR 0018 fixes the bootstrap semantics for the next storage increments. KEFS
 provides the immutable `/`, `/vol/root` is the selected persistent ext4 role,
@@ -378,22 +384,23 @@ the KEFS recovery shell without guessing from enumeration order or labels.
 
 Continue Stage 8 in this order:
 
-1. use the PRGN-selected transaction for an SCFG activation pointer, then define
-   registry/mapping serialized formats and predecessor/recovery selection;
+1. load the CSPK pack from the exactly selected `/vol/root`, construct active
+   and predecessor generations, and exercise health-triggered rollback through
+   SACT while preserving the verified mark-and-copy bounds;
 2. add filesystem mutation only with exact flush/FUA, dirty-state, corruption,
    power-loss, and recovery tests;
 3. add bounded network-device capabilities and the minimal configured protocol
    set before TCP; and
-4. add the content store, immutable generation construction, health activation,
-   predecessor rollback, and garbage-collection bounds.
+4. define the registry/mapping serialized formats and integrate them with the
+   persistent generation and recovery selection paths.
 
 ### Next-session handoff
 
-Continue the durability increment by using the PRGN-selected TXSLOT record for
-an SCFG activation pointer. In parallel, make the EFI boot-source manifest load
-replace the embedded QEMU fixture without changing BMNT or PRGN matching. Do
-not interpret this small transaction record as permission to expose ext4 or
-FAT mutation yet.
+Continue the generation increment by loading the verified CSPK pack through the
+BMNT-selected ext4 provider instead of embedding it in the acceptance image,
+then make the active/predecessor health transition explicit. Do not interpret
+the small SACT transaction record as permission to expose general ext4 or FAT
+mutation.
 
 Do not start with a filesystem parser coupled directly to a hardware driver or
 the shell. The block transport, region discovery, filesystem provider, VFS,
