@@ -18,6 +18,8 @@ historical review evidence.
   format.
 - [KEX v1](formats/kex-v1.md) defines the implemented portable executable
   parser, native loader, startup layout, and complete ABI 1.0 boundary.
+- [SCFG v1](formats/scfg-v1.md) defines the implemented portable desired-system
+  and bounded service-startup parser for the first Stage 8 slice.
 
 The repository root [README](../README.md), [security policy](../SECURITY.md),
 [contribution guide](../CONTRIBUTING.md), and [third-party inventory](../THIRD_PARTY.md)
@@ -35,10 +37,12 @@ are also current operational documentation.
 
 Files under [adr](adr) preserve decisions and their context. Accepted ADRs are
 not deprecated merely because their stage has completed; later implementation
-notes identify decisions that were revisited. ADR 0007 remains proposed and
-must be resolved before persistent security metadata or foreign-filesystem
-writes. ADR 0009 is an accepted future storage direction, not implemented
-filesystem support. ADR 0012 governs the completed Stage 5.1 terminal and
+notes identify decisions that were revisited. ADR 0007 now fixes the Stage 8
+native-principal, foreign-identity, mapping, mount-policy, and fail-closed ACL
+direction; its serialized formats remain gated before persistent writes. ADR
+0009 is the accepted storage direction; its block, GPT, VFS-provider, and first
+read-only FAT32 slices are implemented, while ext4 and mutation remain open.
+ADR 0012 governs the completed Stage 5.1 terminal and
 framebuffer increment; AArch64 native keyboard input remains a later
 virtio-input transport decision. ADR 0013 governs the completed Stage 5.2
 interrupt-driven input and bounded driver-resource increment.

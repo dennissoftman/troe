@@ -1,0 +1,8 @@
+NAME
+    clear - clear the terminal display
+
+SYNOPSIS
+    clear
+
+DESCRIPTION
+    Emits the configured minimal ANSI clear-and-home sequence.

@@ -90,7 +90,7 @@ fn run() -> Result<u8, String> {
     }
 
     println!("hosted model 0.1.0 ({})", env::consts::ARCH);
-    println!("type 'help' for commands; quoting and bounded pipelines are enabled");
+    println!("Tab completes commands; use 'man COMMAND' for manuals");
     loop {
         print!("shell:{}> ", shell.cwd());
         io::stdout()

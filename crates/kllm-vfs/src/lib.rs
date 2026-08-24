@@ -4,11 +4,12 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::{fmt, str};
-use kllm_core::MemoryStats;
+use kllm_core::{MemoryStats, PIPE_CAPACITY};
 
 /// Maximum encoded path length.
 pub const MAX_PATH_BYTES: usize = 256;
@@ -19,6 +20,9 @@ pub const MAX_PATH_DEPTH: usize = 16;
 /// Product-name-independent KEFS v1 format identifier.
 pub const KEFS_V1_MAGIC: [u8; 8] = *b"KEFSv1\0\0";
 const KEFS_HEADER_LEN: usize = 16;
+const PROVIDER_READ_CHUNK: usize = 4 * 1024;
+const MAX_PROVIDER_DIRECTORY_ENTRIES: usize = 1024;
+const MAX_PROVIDER_DIRECTORY_BYTES: usize = 64 * 1024;
 
 /// Node kind visible through the namespace.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,6 +50,12 @@ pub enum FsError {
     Overflow,
     /// A node already exists.
     Exists,
+    /// Persistent provider metadata is malformed or internally inconsistent.
+    Corrupt,
+    /// The provider's bounded transport failed.
+    Io,
+    /// The media uses a feature outside the selected provider profile.
+    Unsupported,
 }
 
 impl fmt::Display for FsError {
@@ -58,8 +68,79 @@ impl fmt::Display for FsError {
             Self::NoSpace => f.write_str("filesystem quota exceeded"),
             Self::Overflow => f.write_str("filesystem size overflow"),
             Self::Exists => f.write_str("already exists"),
+            Self::Corrupt => f.write_str("filesystem metadata is corrupt"),
+            Self::Io => f.write_str("filesystem transport failed"),
+            Self::Unsupported => f.write_str("filesystem feature is unsupported"),
         }
     }
+}
+
+/// Provider-independent metadata returned without exposing format structures.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FileMetadata {
+    /// Visible object kind.
+    pub kind: NodeKind,
+    /// Exact file payload bytes, or zero for a directory.
+    pub byte_count: u64,
+}
+
+/// One bounded page of a provider directory traversal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderListing {
+    /// Entries retained within the caller's count and byte ceilings.
+    pub entries: Vec<DirEntry>,
+    /// Opaque provider cursor for the next page, or `None` at end-of-directory.
+    pub next_cursor: Option<u64>,
+}
+
+/// Narrow read-only filesystem-provider interface consumed by the VFS.
+///
+/// Paths are absolute within the provider root and must already satisfy the
+/// VFS normalization bounds. Providers independently validate them because a
+/// capability client must not be able to bypass the namespace layer.
+pub trait ReadOnlyFileSystem: fmt::Debug {
+    /// Resolve one path without reading file payload data.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid or missing paths, wrong types, corrupt or unsupported
+    /// media, transport failures, and provider resource exhaustion.
+    fn metadata(&mut self, path: &str) -> Result<FileMetadata, FsError>;
+
+    /// Read at most `destination.len()` bytes at an exact file offset.
+    ///
+    /// A successful zero return is EOF. Providers must either fill the returned
+    /// prefix completely or fail without claiming those bytes.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid or non-file paths, offset arithmetic, requests above the
+    /// provider profile, corrupt or unsupported media, and transport failures.
+    fn read_file(
+        &mut self,
+        path: &str,
+        offset: u64,
+        destination: &mut [u8],
+    ) -> Result<usize, FsError>;
+
+    /// Return a bounded lexical page of immediate directory children.
+    ///
+    /// `cursor` is zero for the first page and otherwise must be a value returned
+    /// by the same provider instance. Entry-name bytes are charged to
+    /// `max_name_bytes`; a zero budget returns an empty page and, when entries
+    /// remain, a continuation cursor.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid cursors or paths, non-directories, corrupt or unsupported
+    /// media, transport failures, and provider resource exhaustion.
+    fn list(
+        &mut self,
+        path: &str,
+        cursor: u64,
+        max_entries: usize,
+        max_name_bytes: usize,
+    ) -> Result<ProviderListing, FsError>;
 }
 
 #[derive(Clone, Debug)]
@@ -117,9 +198,17 @@ pub struct DirectoryListing {
 }
 
 /// Unified immutable-root and writable-RAM namespace.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
+struct ProviderMount {
+    path: String,
+    provider: Box<dyn ReadOnlyFileSystem>,
+}
+
+/// Unified immutable-root, writable-RAM, and mounted-provider namespace.
+#[derive(Debug)]
 pub struct Namespace {
     nodes: BTreeMap<String, Node>,
+    mounts: Vec<ProviderMount>,
     quota: RamFsQuota,
     ramfs_bytes: usize,
     ramfs_nodes: usize,
@@ -136,6 +225,7 @@ impl Namespace {
         nodes.insert("/sys".to_string(), Node::Directory);
         Self {
             nodes,
+            mounts: Vec::new(),
             quota,
             ramfs_bytes: 0,
             ramfs_nodes: 0,
@@ -150,6 +240,9 @@ impl Namespace {
     /// Fails for an invalid, duplicate, root, or parentless path.
     pub fn add_read_only_dir(&mut self, path: &str) -> Result<(), FsError> {
         let path = canonicalize("/", path)?;
+        if self.mount_for_path(&path).is_some() {
+            return Err(FsError::ReadOnly);
+        }
         self.insert_composed(path, Node::Directory)
     }
 
@@ -160,6 +253,9 @@ impl Namespace {
     /// Fails for an invalid, duplicate, root, or parentless path.
     pub fn add_read_only_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), FsError> {
         let path = canonicalize("/", path)?;
+        if self.mount_for_path(&path).is_some() {
+            return Err(FsError::ReadOnly);
+        }
         self.insert_composed(
             path,
             Node::File {
@@ -215,14 +311,57 @@ impl Namespace {
     /// Fails atomically if metadata, bounds, ordering, paths, or parents are invalid.
     pub fn mount_embedded(&mut self, image: &[u8]) -> Result<(), FsError> {
         let parsed = parse_embedded(image)?;
-        let mut staged = self.clone();
+        let mut staged = self.nodes.clone();
         for entry in parsed {
-            match entry.kind {
-                NodeKind::Directory => staged.add_read_only_dir(&entry.path)?,
-                NodeKind::File => staged.add_read_only_file(&entry.path, &entry.data)?,
+            if self.mount_for_path(&entry.path).is_some() {
+                return Err(FsError::ReadOnly);
             }
+            let node = match entry.kind {
+                NodeKind::Directory => Node::Directory,
+                NodeKind::File => Node::File {
+                    bytes: entry.data,
+                    writable: false,
+                },
+            };
+            insert_node(&mut staged, entry.path, node)?;
         }
-        *self = staged;
+        self.nodes = staged;
+        Ok(())
+    }
+
+    /// Attach a validated read-only provider at one empty namespace path.
+    ///
+    /// # Errors
+    ///
+    /// Rejects root, invalid or duplicate mount paths, missing internal parent
+    /// directories, nested mounts, and providers whose root is not a directory.
+    pub fn mount_read_only(
+        &mut self,
+        path: &str,
+        mut provider: Box<dyn ReadOnlyFileSystem>,
+    ) -> Result<(), FsError> {
+        let path = canonicalize("/", path)?;
+        if path == "/" || self.nodes.contains_key(&path) || self.mount_for_path(&path).is_some() {
+            return Err(FsError::Exists);
+        }
+        let parent = parent_path(&path).ok_or(FsError::Invalid)?;
+        if !matches!(self.nodes.get(parent), Some(Node::Directory))
+            || self.mount_for_path(parent).is_some()
+        {
+            return Err(FsError::NotFound);
+        }
+        if provider.metadata("/")?.kind != NodeKind::Directory {
+            return Err(FsError::WrongType);
+        }
+        self.nodes.insert(path.clone(), Node::Directory);
+        self.mounts.push(ProviderMount { path, provider });
+        self.mounts.sort_unstable_by(|left, right| {
+            right
+                .path
+                .len()
+                .cmp(&left.path.len())
+                .then_with(|| left.path.cmp(&right.path))
+        });
         Ok(())
     }
 
@@ -231,10 +370,41 @@ impl Namespace {
     /// # Errors
     ///
     /// Fails if the path is invalid, missing, or not a file.
-    pub fn read_file<'a>(&'a self, cwd: &str, path: &str) -> Result<&'a [u8], FsError> {
+    pub fn read_file(&mut self, cwd: &str, path: &str) -> Result<Vec<u8>, FsError> {
         let path = canonicalize(cwd, path)?;
+        if let Some((index, relative)) = self.mount_for_path(&path) {
+            let metadata = self.mounts[index].provider.metadata(&relative)?;
+            if metadata.kind != NodeKind::File {
+                return Err(FsError::WrongType);
+            }
+            let byte_count = usize::try_from(metadata.byte_count).map_err(|_| FsError::NoSpace)?;
+            if byte_count > PIPE_CAPACITY {
+                return Err(FsError::NoSpace);
+            }
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(byte_count)
+                .map_err(|_| FsError::NoSpace)?;
+            bytes.resize(byte_count, 0);
+            let mut offset = 0_usize;
+            while offset < bytes.len() {
+                let end = offset
+                    .checked_add(PROVIDER_READ_CHUNK)
+                    .map_or(bytes.len(), |candidate| candidate.min(bytes.len()));
+                let count = self.mounts[index].provider.read_file(
+                    &relative,
+                    u64::try_from(offset).map_err(|_| FsError::Overflow)?,
+                    &mut bytes[offset..end],
+                )?;
+                if count == 0 || count > end - offset {
+                    return Err(FsError::Corrupt);
+                }
+                offset = offset.checked_add(count).ok_or(FsError::Overflow)?;
+            }
+            return Ok(bytes);
+        }
         match self.nodes.get(&path) {
-            Some(Node::File { bytes, .. }) => Ok(bytes),
+            Some(Node::File { bytes, .. }) => Ok(bytes.clone()),
             Some(Node::Directory) => Err(FsError::WrongType),
             None => Err(FsError::NotFound),
         }
@@ -247,6 +417,9 @@ impl Namespace {
     /// Fails for invalid paths, immutable targets, missing parents, or quota exhaustion.
     pub fn write_file(&mut self, cwd: &str, path: &str, bytes: &[u8]) -> Result<(), FsError> {
         let path = canonicalize(cwd, path)?;
+        if self.mount_for_path(&path).is_some() {
+            return Err(FsError::ReadOnly);
+        }
         if !is_under_tmp(&path) {
             return Err(FsError::ReadOnly);
         }
@@ -304,6 +477,9 @@ impl Namespace {
     /// Fails if the path is invalid, missing, immutable, or not a file.
     pub fn remove_file(&mut self, cwd: &str, path: &str) -> Result<(), FsError> {
         let path = canonicalize(cwd, path)?;
+        if self.mount_for_path(&path).is_some() {
+            return Err(FsError::ReadOnly);
+        }
         match self.nodes.get(&path) {
             Some(Node::File {
                 bytes,
@@ -328,8 +504,20 @@ impl Namespace {
     /// # Errors
     ///
     /// Fails if the path is invalid, missing, or not a directory.
-    pub fn list(&self, cwd: &str, path: &str) -> Result<Vec<DirEntry>, FsError> {
+    pub fn list(&mut self, cwd: &str, path: &str) -> Result<Vec<DirEntry>, FsError> {
         let path = canonicalize(cwd, path)?;
+        if let Some((index, relative)) = self.mount_for_path(&path) {
+            let listing = self.mounts[index].provider.list(
+                &relative,
+                0,
+                MAX_PROVIDER_DIRECTORY_ENTRIES,
+                MAX_PROVIDER_DIRECTORY_BYTES,
+            )?;
+            if listing.next_cursor.is_some() {
+                return Err(FsError::NoSpace);
+            }
+            return Ok(listing.entries);
+        }
         match self.nodes.get(&path) {
             Some(Node::Directory) => {}
             Some(Node::File { .. }) => return Err(FsError::WrongType),
@@ -368,7 +556,7 @@ impl Namespace {
     ///
     /// Fails if the path is invalid, missing, or not a directory.
     pub fn list_matching_bounded(
-        &self,
+        &mut self,
         cwd: &str,
         path: &str,
         name_prefix: &str,
@@ -377,6 +565,47 @@ impl Namespace {
         max_bytes: usize,
     ) -> Result<DirectoryListing, FsError> {
         let path = canonicalize(cwd, path)?;
+        if let Some((index, relative)) = self.mount_for_path(&path) {
+            let mut cursor = 0_u64;
+            let mut entries = Vec::new();
+            let mut retained_bytes = 0_usize;
+            let mut truncated = false;
+            let mut scanned = 0_usize;
+            loop {
+                let page = self.mounts[index].provider.list(
+                    &relative,
+                    cursor,
+                    32,
+                    MAX_PROVIDER_DIRECTORY_BYTES,
+                )?;
+                let page_len = page.entries.len();
+                for entry in page.entries {
+                    scanned = scanned.checked_add(1).ok_or(FsError::Overflow)?;
+                    if scanned > MAX_PROVIDER_DIRECTORY_ENTRIES {
+                        return Err(FsError::NoSpace);
+                    }
+                    if !entry.name.starts_with(name_prefix)
+                        || (directories_only && entry.kind != NodeKind::Directory)
+                    {
+                        continue;
+                    }
+                    let next_bytes = retained_bytes
+                        .checked_add(entry.name.len())
+                        .ok_or(FsError::Overflow)?;
+                    if entries.len() >= max_entries || next_bytes > max_bytes {
+                        truncated = true;
+                        return Ok(DirectoryListing { entries, truncated });
+                    }
+                    retained_bytes = next_bytes;
+                    entries.push(entry);
+                }
+                match page.next_cursor {
+                    Some(next) if next != cursor && page_len != 0 => cursor = next,
+                    Some(_) => return Err(FsError::Corrupt),
+                    None => return Ok(DirectoryListing { entries, truncated }),
+                }
+            }
+        }
         match self.nodes.get(&path) {
             Some(Node::Directory) => {}
             Some(Node::File { .. }) => return Err(FsError::WrongType),
@@ -426,8 +655,14 @@ impl Namespace {
     /// # Errors
     ///
     /// Fails if the path is invalid, missing, or not a directory.
-    pub fn resolve_dir(&self, cwd: &str, path: &str) -> Result<String, FsError> {
+    pub fn resolve_dir(&mut self, cwd: &str, path: &str) -> Result<String, FsError> {
         let path = canonicalize(cwd, path)?;
+        if let Some((index, relative)) = self.mount_for_path(&path) {
+            return match self.mounts[index].provider.metadata(&relative)?.kind {
+                NodeKind::Directory => Ok(path),
+                NodeKind::File => Err(FsError::WrongType),
+            };
+        }
         match self.nodes.get(&path) {
             Some(Node::Directory) => Ok(path),
             Some(Node::File { .. }) => Err(FsError::WrongType),
@@ -445,6 +680,34 @@ impl Namespace {
             ..MemoryStats::default()
         }
     }
+
+    fn mount_for_path(&self, path: &str) -> Option<(usize, String)> {
+        self.mounts.iter().enumerate().find_map(|(index, mount)| {
+            if path == mount.path {
+                Some((index, "/".to_string()))
+            } else {
+                path.strip_prefix(&mount.path)
+                    .filter(|suffix| suffix.starts_with('/'))
+                    .map(|suffix| (index, suffix.to_string()))
+            }
+        })
+    }
+}
+
+fn insert_node(
+    nodes: &mut BTreeMap<String, Node>,
+    path: String,
+    node: Node,
+) -> Result<(), FsError> {
+    if path == "/" || nodes.contains_key(&path) {
+        return Err(FsError::Exists);
+    }
+    let parent = parent_path(&path).ok_or(FsError::Invalid)?;
+    if !matches!(nodes.get(parent), Some(Node::Directory)) {
+        return Err(FsError::NotFound);
+    }
+    nodes.insert(path, node);
+    Ok(())
 }
 
 /// Normalize an absolute or cwd-relative path without permitting root escape.
@@ -596,8 +859,80 @@ fn read_u32(image: &[u8], offset: usize) -> Result<u32, FsError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{FsError, KEFS_V1_MAGIC, Namespace, NodeKind, RamFsQuota, canonicalize};
-    use alloc::{vec, vec::Vec};
+    use super::{
+        DirEntry, FileMetadata, FsError, KEFS_V1_MAGIC, Namespace, NodeKind, ProviderListing,
+        RamFsQuota, ReadOnlyFileSystem, canonicalize,
+    };
+    use alloc::{boxed::Box, vec, vec::Vec};
+
+    #[derive(Debug)]
+    struct TestProvider;
+
+    impl ReadOnlyFileSystem for TestProvider {
+        fn metadata(&mut self, path: &str) -> Result<FileMetadata, FsError> {
+            match path {
+                "/" => Ok(FileMetadata {
+                    kind: NodeKind::Directory,
+                    byte_count: 0,
+                }),
+                "/data" => Ok(FileMetadata {
+                    kind: NodeKind::File,
+                    byte_count: 7,
+                }),
+                _ => Err(FsError::NotFound),
+            }
+        }
+
+        fn read_file(
+            &mut self,
+            path: &str,
+            offset: u64,
+            destination: &mut [u8],
+        ) -> Result<usize, FsError> {
+            if path != "/data" {
+                return Err(FsError::NotFound);
+            }
+            let bytes = b"mounted";
+            let offset = usize::try_from(offset).map_err(|_| FsError::Overflow)?;
+            if offset >= bytes.len() {
+                return Ok(0);
+            }
+            let count = destination.len().min(bytes.len() - offset);
+            destination[..count].copy_from_slice(&bytes[offset..offset + count]);
+            Ok(count)
+        }
+
+        fn list(
+            &mut self,
+            path: &str,
+            cursor: u64,
+            max_entries: usize,
+            max_name_bytes: usize,
+        ) -> Result<ProviderListing, FsError> {
+            if path != "/" || cursor > 1 {
+                return Err(FsError::Invalid);
+            }
+            if cursor == 1 {
+                return Ok(ProviderListing {
+                    entries: Vec::new(),
+                    next_cursor: None,
+                });
+            }
+            if max_entries == 0 || max_name_bytes < 4 {
+                return Ok(ProviderListing {
+                    entries: Vec::new(),
+                    next_cursor: Some(0),
+                });
+            }
+            Ok(ProviderListing {
+                entries: vec![DirEntry {
+                    name: "data".into(),
+                    kind: NodeKind::File,
+                }],
+                next_cursor: None,
+            })
+        }
+    }
 
     #[test]
     fn paths_are_bounded_and_cannot_escape_root() {
@@ -673,5 +1008,29 @@ mod tests {
     #[test]
     fn format_identifier_is_product_name_independent() {
         assert_eq!(KEFS_V1_MAGIC, *b"KEFSv1\0\0");
+    }
+
+    #[test]
+    fn mounted_providers_are_routed_and_remain_read_only() {
+        let mut fs = Namespace::new(RamFsQuota::default());
+        assert_eq!(fs.mount_read_only("/media", Box::new(TestProvider)), Ok(()));
+        assert_eq!(fs.read_file("/", "/media/data"), Ok(b"mounted".to_vec()));
+        assert_eq!(fs.resolve_dir("/", "/media"), Ok("/media".into()));
+        assert_eq!(fs.list("/", "/media").map(|entries| entries.len()), Ok(1));
+        assert_eq!(
+            fs.list_matching_bounded("/", "/media", "da", false, 1, 4)
+                .map(|listing| listing.entries.len()),
+            Ok(1)
+        );
+        assert_eq!(
+            fs.write_file("/", "/media/data", b"changed"),
+            Err(FsError::ReadOnly)
+        );
+        assert_eq!(fs.remove_file("/", "/media/data"), Err(FsError::ReadOnly));
+        assert!(fs.list("/", "/").is_ok_and(|entries| {
+            entries
+                .iter()
+                .any(|entry| entry.name == "media" && entry.kind == NodeKind::Directory)
+        }));
     }
 }

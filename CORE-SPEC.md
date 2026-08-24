@@ -6,11 +6,12 @@
 **Future targets:** raw x86-64 PCs, raw AArch64 systems  
 **Implementation language:** Rust (`no_std`)  
 
-**Implementation status:** Stages 0–7 are implemented. Stage 7 includes the
-portable KEX parser/load-plan policy, native validate/map/reclaim transactions,
-all three ABI 1.0 calls, contained fault fates, and enforced 50 ms execution
-leases. Later-stage requirements remain design constraints, not current
-functionality. See
+**Implementation status:** Stages 0–7 are implemented. The first portable Stage
+8 storage/configuration boundary (bounded block regions, strict read-only GPT,
+read-only FAT32 behind VFS, and SCFG v1 parsing) is implemented, but Stage 8 is
+not complete. Stage 7 includes the portable KEX parser/load-plan policy, native
+validate/map/reclaim transactions, all three ABI 1.0 calls, contained fault
+fates, and enforced 50 ms execution leases. See
 [docs/roadmap.md](docs/roadmap.md).
 
 The product and CLI names are intentionally unset. This document uses “the
@@ -308,6 +309,15 @@ each intermediate stream is capped at 64 KiB; overflow fails explicitly.
 
 Commands MUST be linked at build time and registered statically. Each command declares its name, synopsis, required capabilities, and entry point. Unknown commands return a stable error and do not terminate the shell.
 
+`cd` and `halt` are permanent shell intrinsics and their names MUST NOT be
+shadowed or replaced by a KEX application. `cd` mutates shell-owned session
+state and therefore executes in the invoking shell. `halt` remains behind the
+shell's explicit machine-control capability; ordinary KEX applications cannot
+acquire that authority or invoke the intrinsic through application ABI 1.0.
+Other statically linked commands are recovery implementations and MAY later be
+resolved to capability-bounded KEX applications while retaining their built-in
+fallbacks.
+
 ### 11.3 Required commands
 
 | Command | Minimum semantics |
@@ -318,7 +328,7 @@ Commands MUST be linked at build time and registered statically. Each command de
 | `ls [PATH]` | List one directory in deterministic lexical order. |
 | `pwd` | Print the logical current directory. |
 | `cd PATH` | Change the shell's current directory. |
-| `help [COMMAND]` | List commands or show a command synopsis. |
+| `man COMMAND` | Read the embedded manual page for one registered command. |
 | `mem` | Report memory totals, free pages, heap use, caches, and high-water marks. |
 | `clear` | MAY emit a minimal ANSI clear sequence when enabled. |
 | `halt` | Halt only when the shell possesses the machine-control capability. |
@@ -359,7 +369,7 @@ These signatures are illustrative, not frozen ABI. The implementation SHOULD avo
 
 ```text
 /
-├── help/        embedded read-only documentation
+├── man/         embedded read-only command manual pages
 ├── etc/         embedded read-only configuration
 ├── tmp/         writable RAMFS
 ├── sys/         generated system-information nodes
@@ -960,7 +970,10 @@ Dynamic linking is optional and SHOULD follow a working static executable format
 
 ### Stage 8 — Networking and persistent operation
 
-**Status:** not implemented.
+**Status:** in progress. Portable block-region, GPT, read-only FAT32/VFS mount,
+identity-policy, and SCFG v1 boundaries are implemented and host verified.
+Native block transports, ext4, writes/recovery, networking, persistent
+activation, content storage, and rollback remain unimplemented.
 
 - Introduce network-device capabilities and a bounded-buffer network stack.
 - Begin with a small practical protocol set such as Ethernet, ARP/NDP as appropriate, IPv4 and/or IPv6, ICMP, UDP, DHCP or static configuration, and DNS.
@@ -1047,7 +1060,7 @@ Release 0.1 is complete when:
 
 - separate x86-64 and AArch64 images boot under pinned QEMU configurations;
 - each reaches an interactive recovery prompt;
-- `cat`, `echo`, literal `grep`, `ls`, `pwd`, `cd`, `help`, `mem`, and `halt` work as specified;
+- `cat`, `echo`, literal `grep`, `ls`, `pwd`, `cd`, `man`, `mem`, and `halt` work as specified;
 - `/` includes an embedded read-only filesystem and `/tmp` is a quota-bound RAMFS;
 - `/sys/arch`, `/sys/version`, and `/sys/memory` are readable through the VFS;
 - malformed input, nonexistent paths, oversized input, and memory exhaustion fail cleanly;

@@ -1,2 +1,3 @@
 Welcome to the tiny Rust operating environment.
 Memory and the native serial console are kernel-owned after UEFI handoff.
+Tab completes commands; use 'man COMMAND' for manuals.

@@ -1,0 +1,9 @@
+NAME
+    rm - remove a writable file
+
+SYNOPSIS
+    rm FILE
+
+DESCRIPTION
+    Removes one file from writable RAMFS content and returns its quota charge.
+    Immutable and mounted read-only content cannot be removed.

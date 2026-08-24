@@ -54,6 +54,12 @@ Privileged recovery built-ins still rely on typed authority rather than a
 hardware boundary. Stage 6 task mappings and handles are additionally enforced
 by ring-3/EL0 page permissions and generation-revoked ownership.
 
+The shell reserves `cd` and `halt` as non-shadowable intrinsics. `cd` owns the
+logical working-directory transition, and `halt` consumes only the shell's
+machine-control grant. Future KEX command discovery may replace ordinary
+command implementations, but it cannot intercept either intrinsic name and ABI
+1.0 exposes no machine-halt operation.
+
 ## Allocation
 
 Portable components use `alloc` but every untrusted growth path has a local
@@ -207,9 +213,11 @@ checks task handle ownership, and copies a successful bounded reply before a
 fresh leased resume. Unknown calls and an attempted `_start` return are
 contained and reclaimed as invalid-call and translation faults.
 
-## Future persistent-storage boundary
+## Stage 8 persistent-storage boundary
 
-Persistent storage preserves the same dependency direction. A transport
+The portable block-region, GPT, VFS-provider, and read-only FAT32 pieces now
+preserve this dependency direction. Native block transports, ext4, and durable
+mutation remain future Stage 8 increments. A transport
 provides bounded block-region capabilities; partition discovery turns a whole
 device into non-overlapping regions; independently selected filesystem
 providers expose VFS objects. Format-specific structures do not enter the

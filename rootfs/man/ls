@@ -1,0 +1,9 @@
+NAME
+    ls - list one directory
+
+SYNOPSIS
+    ls [PATH]
+
+DESCRIPTION
+    Lists immediate children in deterministic lexical order. Directories have
+    a trailing slash. PATH defaults to the current directory.

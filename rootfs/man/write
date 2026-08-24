@@ -1,0 +1,10 @@
+NAME
+    write - atomically create or replace a writable file
+
+SYNOPSIS
+    write FILE [TEXT...]
+
+DESCRIPTION
+    Writes TEXT arguments joined by spaces, or standard input when TEXT is
+    omitted. The replacement is atomic within the bounded RAMFS. Persistent
+    disk mutation is not implied.

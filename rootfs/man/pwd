@@ -1,0 +1,8 @@
+NAME
+    pwd - print the shell working directory
+
+SYNOPSIS
+    pwd
+
+DESCRIPTION
+    Writes the current logical working directory followed by one newline.

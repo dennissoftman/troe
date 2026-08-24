@@ -1,0 +1,9 @@
+NAME
+    mem - report memory and resource accounting
+
+SYNOPSIS
+    mem
+
+DESCRIPTION
+    Prints current machine-memory, allocator, input-queue, RAMFS, cache, and
+    pressure counters and refreshes /sys/memory.

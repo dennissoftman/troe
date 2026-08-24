@@ -424,27 +424,18 @@ def run_scenario(session: SerialSession, boot_timeout: float, command_timeout: f
     assert_owned_boot(session)
     cwd = "/"
 
+    session.edited_command(
+        "", b"\t", "", cwd, command_timeout, expected="\ncat\n"
+    )
     session.command(
-        "help",
+        "man echo",
         cwd,
         command_timeout,
-        contains=(
-            "cat",
-            "echo",
-            "grep",
-            "ls",
-            "pwd",
-            "cd",
-            "help",
-            "mem",
-            "clear",
-            "halt",
-            "write",
-            "rm",
-            "hexdump",
-        ),
+        contains=("NAME\n    echo - write arguments", "SYNOPSIS\n    echo [ARG...]"),
     )
-    session.command("help echo", cwd, command_timeout, contains=("echo [ARG...]",))
+    session.command(
+        "help", cwd, command_timeout, contains=("help: unknown command",)
+    )
     session.backspace_command(
         "echo brokeX", "n", cwd, command_timeout, expected="\nbroken\n"
     )
@@ -465,7 +456,7 @@ def run_scenario(session: SerialSession, boot_timeout: float, command_timeout: f
         contains=("crlf-ready\n",),
         line_ending=b"\r\n",
     )
-    session.command("ls /", cwd, command_timeout, contains=("etc/", "help/", "sys/", "tmp/"))
+    session.command("ls /", cwd, command_timeout, contains=("etc/", "man/", "sys/", "tmp/"))
     session.command(
         "cat /etc/motd",
         cwd,
@@ -478,14 +469,14 @@ def run_scenario(session: SerialSession, boot_timeout: float, command_timeout: f
     )
     session.command("cat /tmp/result", cwd, command_timeout, contains=("alpha beta\n",))
     session.command("pwd", cwd, command_timeout, contains=("/\n",))
-    session.command("cd /help", cwd, command_timeout, next_cwd="/help")
-    cwd = "/help"
-    session.command("pwd", cwd, command_timeout, contains=("/help\n",))
+    session.command("cd /man", cwd, command_timeout, next_cwd="/man")
+    cwd = "/man"
+    session.command("pwd", cwd, command_timeout, contains=("/man\n",))
     session.command(
-        "grep bounded pipelines",
+        "grep bounded cat",
         cwd,
         command_timeout,
-        contains=("bounded byte streams",),
+        contains=("Reads are bounded",),
     )
     session.command("cd /", cwd, command_timeout, next_cwd="/")
     cwd = "/"

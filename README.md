@@ -35,6 +35,9 @@ handle calls, or is terminated by the 50 ms execution lease.
   load transactions, explicit initial handles, and zeroized rollback;
 - complete ring-3/EL0 ABI 1.0 entry, exit, resumable yield, and owner-checked
   copied handle calls, with owned x86 local-APIC/AArch64 timer leases;
+- portable bounded block-region capabilities, strict primary/backup GPT
+  discovery, a read-only FAT32 VFS provider, and checksummed SCFG v1 service
+  startup policy (native storage transports and persistence remain Stage 8 work);
 - owned receive interrupts through q35 LAPIC/I/O APIC and AArch64 GICv2,
   bounded raw-event delivery, and race-free `hlt`/`wfi` shell idle;
 - project-owned polling 16550 and PL011 early/fatal recovery output, plus an
@@ -43,7 +46,7 @@ handle calls, or is terminated by the 50 ms execution lease.
   command/VFS completion, ANSI serial-key decoding, and x86-64 PS/2 input;
 - single/double quotes and pipelines of up to eight stages;
 - 64 KiB bounded intermediate byte streams;
-- `cat`, `echo`, literal `grep`, `ls`, `pwd`, `cd`, `help`, `mem`, `clear`,
+- `cat`, `echo`, literal `grep`, `ls`, `pwd`, `cd`, `man`, `mem`, `clear`,
   `halt`, `write`, `rm`, and `hexdump`;
 - deterministic 1.44 MiB FAT12 images for both primary architectures;
 - host/unit/smoke gates and prompt-synchronized QEMU acceptance on both
@@ -130,8 +133,9 @@ serial-first.
 
 ## Repository map
 
-- `crates`: portable byte streams, KEX parsing, memory models, shell, VFS,
-  terminal/editor, accounting, and the isolated native machine mechanism crate;
+- `crates`: portable byte streams, KEX/config/GPT/FAT parsing, block regions,
+  memory models, shell, VFS/provider mounts, terminal/editor, accounting, and
+  the isolated native machine mechanism crate;
 - `host`: Stage 0 composition and acceptance runner;
 - `kernel`: UEFI bootstrap and Stage 6 isolated owned-machine composition root;
 - `rootfs`, `assets`: source tree and generated KEFS image;

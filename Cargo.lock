@@ -31,6 +31,17 @@ name = "kllm-application"
 version = "0.1.0"
 
 [[package]]
+name = "kllm-block"
+version = "0.1.0"
+
+[[package]]
+name = "kllm-config"
+version = "0.1.0"
+dependencies = [
+ "kllm-vfs",
+]
+
+[[package]]
 name = "kllm-core"
 version = "0.1.0"
 
@@ -44,6 +55,21 @@ dependencies = [
 [[package]]
 name = "kllm-driver"
 version = "0.1.0"
+
+[[package]]
+name = "kllm-fat"
+version = "0.1.0"
+dependencies = [
+ "kllm-block",
+ "kllm-vfs",
+]
+
+[[package]]
+name = "kllm-gpt"
+version = "0.1.0"
+dependencies = [
+ "kllm-block",
+]
 
 [[package]]
 name = "kllm-host"

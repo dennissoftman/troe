@@ -1,0 +1,10 @@
+NAME
+    cat - copy file or input bytes
+
+SYNOPSIS
+    cat [FILE...]
+
+DESCRIPTION
+    Copies each file to standard output in argument order. With no file,
+    copies standard input. Reads are bounded by the mounted filesystem and
+    shell stream limits.

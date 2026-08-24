@@ -1,0 +1,9 @@
+NAME
+    man - read a command manual page
+
+SYNOPSIS
+    man COMMAND
+
+DESCRIPTION
+    Reads the exact manual page for a registered command. Press Tab while
+    entering COMMAND to complete or list matching command names.

@@ -60,6 +60,16 @@ struct CommandSpec {
     name: &'static str,
     synopsis: &'static str,
     requires_machine_control: bool,
+    class: CommandClass,
+}
+
+/// Stable execution placement for a shell command name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CommandClass {
+    /// Shell-owned behavior that cannot be replaced by an application.
+    Intrinsic,
+    /// Statically linked recovery implementation that may later prefer KEX.
+    ReplaceableBuiltin,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -70,9 +80,9 @@ enum CommandId {
     Echo,
     Grep,
     Halt,
-    Help,
     Hexdump,
     Ls,
+    Man,
     Mem,
     Pwd,
     Rm,
@@ -85,80 +95,114 @@ const COMMANDS: &[CommandSpec] = &[
         name: "cat",
         synopsis: "cat [FILE...]",
         requires_machine_control: false,
+        class: CommandClass::ReplaceableBuiltin,
     },
     CommandSpec {
         id: CommandId::Cd,
         name: "cd",
         synopsis: "cd PATH",
         requires_machine_control: false,
+        class: CommandClass::Intrinsic,
     },
     CommandSpec {
         id: CommandId::Clear,
         name: "clear",
         synopsis: "clear",
         requires_machine_control: false,
+        class: CommandClass::ReplaceableBuiltin,
     },
     CommandSpec {
         id: CommandId::Echo,
         name: "echo",
         synopsis: "echo [ARG...]",
         requires_machine_control: false,
+        class: CommandClass::ReplaceableBuiltin,
     },
     CommandSpec {
         id: CommandId::Grep,
         name: "grep",
         synopsis: "grep PATTERN [FILE...]",
         requires_machine_control: false,
+        class: CommandClass::ReplaceableBuiltin,
     },
     CommandSpec {
         id: CommandId::Halt,
         name: "halt",
         synopsis: "halt",
         requires_machine_control: true,
-    },
-    CommandSpec {
-        id: CommandId::Help,
-        name: "help",
-        synopsis: "help [COMMAND]",
-        requires_machine_control: false,
+        class: CommandClass::Intrinsic,
     },
     CommandSpec {
         id: CommandId::Hexdump,
         name: "hexdump",
         synopsis: "hexdump [FILE]",
         requires_machine_control: false,
+        class: CommandClass::ReplaceableBuiltin,
     },
     CommandSpec {
         id: CommandId::Ls,
         name: "ls",
         synopsis: "ls [PATH]",
         requires_machine_control: false,
+        class: CommandClass::ReplaceableBuiltin,
+    },
+    CommandSpec {
+        id: CommandId::Man,
+        name: "man",
+        synopsis: "man COMMAND",
+        requires_machine_control: false,
+        class: CommandClass::ReplaceableBuiltin,
     },
     CommandSpec {
         id: CommandId::Mem,
         name: "mem",
         synopsis: "mem",
         requires_machine_control: false,
+        class: CommandClass::ReplaceableBuiltin,
     },
     CommandSpec {
         id: CommandId::Pwd,
         name: "pwd",
         synopsis: "pwd",
         requires_machine_control: false,
+        class: CommandClass::ReplaceableBuiltin,
     },
     CommandSpec {
         id: CommandId::Rm,
         name: "rm",
         synopsis: "rm FILE",
         requires_machine_control: false,
+        class: CommandClass::ReplaceableBuiltin,
     },
     CommandSpec {
         id: CommandId::Write,
         name: "write",
         synopsis: "write FILE [TEXT...]",
         requires_machine_control: false,
+        class: CommandClass::ReplaceableBuiltin,
     },
 ];
+
+/// Return the reserved execution placement for a registered command name.
+///
+/// External command discovery must consult this classification before trying
+/// to resolve a KEX application. Intrinsic names always retain shell dispatch.
+#[must_use]
+pub fn command_class(name: &str) -> Option<CommandClass> {
+    COMMANDS
+        .iter()
+        .find(|command| command.name == name)
+        .map(|command| command.class)
+}
+
+/// Return the concise synopsis associated with a registered command name.
+#[must_use]
+pub fn command_synopsis(name: &str) -> Option<&'static str> {
+    COMMANDS
+        .iter()
+        .find(|command| command.name == name)
+        .map(|command| command.synopsis)
+}
 
 /// Invalid shell-completion resource policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -414,7 +458,7 @@ impl Shell {
     /// Incomplete quoted tokens are left unchanged in this first completion
     /// profile. Candidate insertion never performs shell expansion.
     #[must_use]
-    pub fn complete(&self, line: &str, cursor: usize, config: CompletionConfig) -> Completion {
+    pub fn complete(&mut self, line: &str, cursor: usize, config: CompletionConfig) -> Completion {
         if config.is_disabled()
             || cursor > line.len()
             || !line.is_char_boundary(cursor)
@@ -428,7 +472,7 @@ impl Shell {
         if context.word_index == 0 {
             return complete_commands(context, config);
         }
-        if context.command == Some("help") && context.word_index == 1 {
+        if context.command == Some("man") && context.word_index == 1 {
             return complete_commands(context, config);
         }
         let Some(directories_only) = path_completion_mode(context.command, context.word_index)
@@ -510,6 +554,10 @@ impl Shell {
             let _ignored = write_error(stderr, command, "unknown command");
             return CommandStatus::NotFound;
         };
+        if spec.requires_machine_control && !self.machine_control {
+            let _ignored = write_error(stderr, command, "machine-control capability denied");
+            return CommandStatus::Denied;
+        }
         match spec.id {
             CommandId::Cat => self.command_cat(args, stdin, stdout, stderr),
             CommandId::Cd => self.command_cd(args, stderr),
@@ -517,9 +565,9 @@ impl Shell {
             CommandId::Echo => command_echo(args, stdout, stderr),
             CommandId::Grep => self.command_grep(args, stdin, stdout, stderr),
             CommandId::Halt => self.command_halt(args, stderr),
-            CommandId::Help => command_help(args, stdout, stderr),
             CommandId::Hexdump => self.command_hexdump(args, stdin, stdout, stderr),
             CommandId::Ls => self.command_ls(args, stdout, stderr),
+            CommandId::Man => self.command_man(args, stdout, stderr),
             CommandId::Mem => self.command_mem(args, stdout, stderr),
             CommandId::Pwd => self.command_pwd(args, stdout, stderr),
             CommandId::Rm => self.command_rm(args, stderr),
@@ -528,7 +576,7 @@ impl Shell {
     }
 
     fn complete_paths(
-        &self,
+        &mut self,
         context: CompletionContext<'_>,
         directories_only: bool,
         config: CompletionConfig,
@@ -604,7 +652,7 @@ impl Shell {
                 Ok(value) => value,
                 Err(error) => return fs_failure(stderr, "cat", path, error),
             };
-            if write_all(stdout, bytes).is_err() {
+            if write_all(stdout, &bytes).is_err() {
                 let _ignored = write_error(stderr, "cat", "output failed");
                 return CommandStatus::Failure;
             }
@@ -613,7 +661,7 @@ impl Shell {
     }
 
     fn command_grep(
-        &self,
+        &mut self,
         args: &[String],
         stdin: &mut dyn Input,
         stdout: &mut dyn Output,
@@ -630,7 +678,7 @@ impl Shell {
                 Ok(value) => value,
                 Err(error) => return fs_failure(stderr, "grep", path, error),
             };
-            let mut input = SliceInput::with_max_chunk(bytes, 17);
+            let mut input = SliceInput::with_max_chunk(&bytes, 17);
             let status = grep_stream(&mut input, pattern.as_bytes(), stdout, stderr);
             if status != CommandStatus::Success {
                 return status;
@@ -640,7 +688,7 @@ impl Shell {
     }
 
     fn command_ls(
-        &self,
+        &mut self,
         args: &[String],
         stdout: &mut dyn Output,
         stderr: &mut dyn Output,
@@ -729,6 +777,35 @@ impl Shell {
         CommandStatus::Success
     }
 
+    fn command_man(
+        &mut self,
+        args: &[String],
+        stdout: &mut dyn Output,
+        stderr: &mut dyn Output,
+    ) -> CommandStatus {
+        if args.len() != 1 {
+            return usage(stderr, "man", "man COMMAND");
+        }
+        let name = &args[0];
+        if command_class(name).is_none() {
+            let _ignored = write_error(stderr, "man", "no manual entry for command");
+            return CommandStatus::NotFound;
+        }
+        let path = format!("/man/{name}");
+        let page = match self.namespace.read_file("/", &path) {
+            Ok(page) => page,
+            Err(FsError::NotFound) => {
+                let _ignored = write_error(stderr, "man", "manual page is unavailable");
+                return CommandStatus::NotFound;
+            }
+            Err(error) => return fs_failure(stderr, "man", &path, error),
+        };
+        if write_all(stdout, &page).is_err() {
+            return stream_failure(stderr, "man");
+        }
+        CommandStatus::Success
+    }
+
     fn command_write(
         &mut self,
         args: &[String],
@@ -763,7 +840,7 @@ impl Shell {
     }
 
     fn command_hexdump(
-        &self,
+        &mut self,
         args: &[String],
         stdin: &mut dyn Input,
         stdout: &mut dyn Output,
@@ -774,7 +851,7 @@ impl Shell {
         }
         let data = if let Some(path) = args.first() {
             match self.namespace.read_file(&self.cwd, path) {
-                Ok(value) => value.to_vec(),
+                Ok(value) => value,
                 Err(error) => return fs_failure(stderr, "hexdump", path, error),
             }
         } else {
@@ -1087,42 +1164,6 @@ fn command_clear(
     CommandStatus::Success
 }
 
-fn command_help(
-    args: &[String],
-    stdout: &mut dyn Output,
-    stderr: &mut dyn Output,
-) -> CommandStatus {
-    if args.len() > 1 {
-        return usage(stderr, "help", "help [COMMAND]");
-    }
-    if let Some(name) = args.first() {
-        if let Some(spec) = COMMANDS.iter().find(|spec| spec.name == name) {
-            if write_all(stdout, format!("{}\n", spec.synopsis).as_bytes()).is_err() {
-                return stream_failure(stderr, "help");
-            }
-            return CommandStatus::Success;
-        }
-        let _ignored = write_error(stderr, "help", "unknown command");
-        return CommandStatus::NotFound;
-    }
-    for spec in COMMANDS {
-        let authority = if spec.requires_machine_control {
-            " [machine-control]"
-        } else {
-            ""
-        };
-        if write_all(
-            stdout,
-            format!("{:<9} {}{authority}\n", spec.name, spec.synopsis).as_bytes(),
-        )
-        .is_err()
-        {
-            return stream_failure(stderr, "help");
-        }
-    }
-    CommandStatus::Success
-}
-
 fn grep_stream(
     input: &mut dyn Input,
     pattern: &[u8],
@@ -1237,8 +1278,12 @@ const fn parse_error_text(error: ParseError) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{CompletionConfig, CompletionConfigError, ParseError, Shell, parse_line};
+    use super::{
+        COMMANDS, CommandClass, CompletionConfig, CompletionConfigError, ParseError, Shell,
+        command_class, command_synopsis, parse_line,
+    };
     use alloc::string::ToString;
+    use alloc::vec::Vec;
     use kllm_core::{BoundedOutput, MachineMemorySnapshot, SliceInput};
     use kllm_driver::InputQueueStats;
     use kllm_vfs::{Namespace, RamFsQuota};
@@ -1248,6 +1293,14 @@ mod tests {
         assert_eq!(namespace.add_read_only_dir("/help"), Ok(()));
         assert_eq!(
             namespace.add_read_only_file("/help/readme", b"alpha\nbeta alpha\n"),
+            Ok(())
+        );
+        assert_eq!(namespace.add_read_only_dir("/man"), Ok(()));
+        assert_eq!(
+            namespace.add_read_only_file(
+                "/man/echo",
+                b"NAME\n    echo - write arguments\n\nSYNOPSIS\n    echo [ARG...]\n",
+            ),
             Ok(())
         );
         match Shell::new(namespace, "test", MachineMemorySnapshot::hosted(), true) {
@@ -1325,13 +1378,52 @@ mod tests {
     }
 
     #[test]
+    fn only_cd_and_halt_are_non_shadowable_intrinsics() {
+        assert_eq!(command_class("cd"), Some(CommandClass::Intrinsic));
+        assert_eq!(command_class("halt"), Some(CommandClass::Intrinsic));
+        assert_eq!(command_class("cat"), Some(CommandClass::ReplaceableBuiltin));
+        assert_eq!(command_class("man"), Some(CommandClass::ReplaceableBuiltin));
+        assert_eq!(command_class("help"), None);
+        assert_eq!(command_class("unknown"), None);
+        assert_eq!(command_synopsis("man"), Some("man COMMAND"));
+
+        let intrinsic_names: Vec<&str> = COMMANDS
+            .iter()
+            .filter(|command| command.class == CommandClass::Intrinsic)
+            .map(|command| command.name)
+            .collect();
+        assert_eq!(intrinsic_names, ["cd", "halt"]);
+    }
+
+    #[test]
+    fn man_reads_a_real_page_and_help_is_not_a_command() {
+        let mut shell = shell();
+        let mut input = SliceInput::new(b"");
+        let mut output = BoundedOutput::new(256);
+        let mut error = BoundedOutput::new(256);
+        let status = shell.execute("man echo", &mut input, &mut output, &mut error);
+        assert_eq!(status.code(), 0);
+        assert!(output.as_slice().starts_with(b"NAME\n    echo"));
+        assert!(error.as_slice().is_empty());
+
+        let mut output = BoundedOutput::new(64);
+        let mut error = BoundedOutput::new(64);
+        let status = shell.execute("help", &mut input, &mut output, &mut error);
+        assert_eq!(status.code(), 3);
+        assert_eq!(error.as_slice(), b"help: unknown command\n");
+    }
+
+    #[test]
     fn completion_uses_command_pipeline_and_vfs_context() {
-        let shell = shell();
+        let mut shell = shell();
         let command = shell.complete("he", 2, CompletionConfig::tiny());
-        assert_eq!(command.candidates.len(), 2);
-        assert_eq!(command.common_replacement(), Some("he"));
-        assert_eq!(command.candidates[0].display, "help");
-        assert_eq!(command.candidates[1].display, "hexdump");
+        assert_eq!(command.candidates.len(), 1);
+        assert_eq!(command.common_replacement(), Some("hexdump "));
+        assert_eq!(command.candidates[0].display, "hexdump");
+
+        let manual = shell.complete("man ec", 6, CompletionConfig::tiny());
+        assert_eq!(manual.candidates.len(), 1);
+        assert_eq!(manual.candidates[0].replacement, "echo ");
 
         let pipeline = shell.complete("echo x | pw", 11, CompletionConfig::tiny());
         assert_eq!(pipeline.candidates.len(), 1);
@@ -1352,7 +1444,7 @@ mod tests {
             CompletionConfig::new(1, 0),
             Err(CompletionConfigError::InconsistentCapacity)
         );
-        let shell = shell();
+        let mut shell = shell();
         let bounded = shell.complete(
             "",
             0,

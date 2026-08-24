@@ -1,0 +1,10 @@
+NAME
+    cd - change the shell working directory
+
+SYNOPSIS
+    cd PATH
+
+DESCRIPTION
+    Resolves PATH and updates the invoking shell session. cd is a permanent,
+    non-shadowable shell intrinsic because an application cannot mutate its
+    parent shell's working directory.

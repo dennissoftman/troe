@@ -2,9 +2,13 @@
 resolver = "3"
 members = [
     "crates/kllm-application",
+    "crates/kllm-block",
+    "crates/kllm-config",
     "crates/kllm-core",
     "crates/kllm-dispatch",
     "crates/kllm-driver",
+    "crates/kllm-fat",
+    "crates/kllm-gpt",
     "crates/kllm-machine",
     "crates/kllm-memory",
     "crates/kllm-vfs",
@@ -17,9 +21,13 @@ members = [
 ]
 default-members = [
     "crates/kllm-application",
+    "crates/kllm-block",
+    "crates/kllm-config",
     "crates/kllm-core",
     "crates/kllm-dispatch",
     "crates/kllm-driver",
+    "crates/kllm-fat",
+    "crates/kllm-gpt",
     "crates/kllm-memory",
     "crates/kllm-vfs",
     "crates/kllm-shell",

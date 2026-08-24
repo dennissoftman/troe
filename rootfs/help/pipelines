@@ -1,8 +1,0 @@
-Pipelines connect built-ins with bounded byte streams.
-
-Example: cat /etc/motd | grep Welcome | hexdump
-
-The first command reads the shell input when it has no file operand. Each
-intermediate stream is capped at 64 KiB. Overflow fails the pipeline instead
-of allocating without limit. There are no expansions or redirections yet;
-write FILE consumes pipeline input and provides deliberate persistence.

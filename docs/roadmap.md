@@ -242,28 +242,59 @@ Stage 8:
 2. provide SDK and hosted `build`, `run`, and `inspect` tooling; and
 3. define versioned package-manifest and target-specific lock formats.
 
+KEX command discovery excludes the permanently intrinsic `cd` and `halt`
+names. `cd` remains shell-session state transition; `halt` remains a
+machine-control-capability operation unavailable to application ABI 1.0.
+
 Storage should land before the native KEX discovery/launch path so executable
 artifacts have a real bounded source. Manifest and tooling work remains on the
 separate packaging track described below.
 
-## Next-session handoff: starting Stage 8
+The shell keeps bounded command-name and path completion, including candidate
+listing for an empty or partial command and command-name completion after
+`man`. Rich Bash/Zsh-style option, argument, provider, and application-aware
+completion is a later usability increment; it must use explicit schemas and
+retain deterministic candidate-count and byte ceilings.
 
-Begin Stage 8 in this order:
+## Stage 8: networking and persistent operation (in progress)
 
-1. introduce bounded block-device and block-region capabilities with host-test
-   doubles and explicit request, transfer, alignment, and queue ceilings;
-2. add read-only GPT discovery over whole-device regions, including malformed
-   metadata, overlap, arithmetic, and entry-count rejection tests;
-3. resolve [ADR 0007](adr/0007-identity-and-foreign-filesystem-mapping.md)
-   before accepting persistent ownership metadata or enabling writes to a
-   foreign filesystem;
-4. add the first selected filesystem provider behind the VFS and mount it
-   read-only before adding mutation;
-5. define a versioned, bounded configuration and service-startup schema with
-   explicit recovery behavior; and
-6. add filesystem writes, corruption recovery, and persistent configuration
-   only after the read-only and configuration boundaries pass native and host
-   acceptance.
+The first portable storage/configuration boundary is landed:
+
+- `kllm-block` provides owned or borrowed synchronous device capabilities,
+  checked subregions, exact request buffers, read/write authority, transfer and
+  alignment ceilings, explicit flush/FUA properties, and a one-request queue
+  bound enforced by exclusive borrowing;
+- `kllm-gpt` performs bounded read-only GPT discovery with a canonical
+  protective MBR, independently checksummed primary and backup headers/arrays,
+  copy consistency, duplicate-ID and overlap rejection, strict entry bounds,
+  and validated UTF-16 names;
+- ADR 0007 now accepts native-principal, foreign-identity, mapping,
+  mount-policy, ACL, and fail-closed recovery rules before persistent writes;
+- `kllm-vfs` exposes a bounded read-only provider contract and namespace mount
+  routing; `kllm-fat` implements the first strict read-only FAT32 provider with
+  mirrored FAT, BPB/backup/FSInfo, cycle, short-name, and LFN validation; and
+- `kllm-config` implements checksummed SCFG v1 desired-system/service startup
+  policy with canonical dependencies, bounded health/restart behavior, explicit
+  predecessor fallback, and a mandatory static recovery shell.
+
+These are portable, host-verified mechanisms. Stage 8 is not complete: no
+native block transport is active, FAT32 remains read-only, constrained ext4 is
+not implemented, configuration is not persistently activated, and networking,
+the content store, generation activation, and rollback are still absent.
+
+Continue Stage 8 in this order:
+
+1. specify and implement the exact constrained ext4 read-only feature profile;
+2. add bounded native block transports for pinned q35 and AArch64 `virt`, then
+   exercise GPT plus read-only mounts in both QEMU targets;
+3. define SCFG activation plus registry/mapping/mount serialized formats and
+   crash-consistent predecessor/recovery selection;
+4. add filesystem mutation only with exact flush/FUA, dirty-state, corruption,
+   power-loss, and recovery tests;
+5. add bounded network-device capabilities and the minimal configured protocol
+   set before TCP; and
+6. add the content store, immutable generation construction, health activation,
+   predecessor rollback, and garbage-collection bounds.
 
 Do not start with a filesystem parser coupled directly to a hardware driver or
 the shell. The block transport, region discovery, filesystem provider, VFS,

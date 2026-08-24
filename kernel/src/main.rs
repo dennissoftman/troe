@@ -2154,6 +2154,14 @@ mod firmware {
         }
     }
 
+    fn write_shell_banner(console: &mut dyn Output) -> bool {
+        write_all(
+            console,
+            b"memory and console: owned; Tab: commands; man COMMAND: manual\n",
+        )
+        .is_ok()
+    }
+
     fn run_shell_task(task: &mut ShellTask<'_>) -> TaskStep {
         let stack_pointer = usize_as_u64(kllm_machine::current_stack_pointer());
         if !task.stack.contains(stack_pointer)
@@ -2198,7 +2206,7 @@ mod firmware {
         let mut keyboard = Ps2Set1Decoder::new(KeyboardConfig::tiny());
         let mut editor = LineEditor::new(editor_config);
 
-        if write_all(&mut console, b"memory and console: owned; type 'help'\n").is_err() {
+        if !write_shell_banner(&mut console) {
             fatal(b"fatal: native console write failed\n");
         }
 
@@ -2214,7 +2222,7 @@ mod firmware {
                 &mut editor,
                 &mut decoder,
                 &mut keyboard,
-                &shell,
+                &mut shell,
                 completion_config,
                 &prompt,
                 &mut console,
@@ -2268,7 +2276,7 @@ mod firmware {
         editor: &mut LineEditor,
         decoder: &mut InputDecoder,
         keyboard: &mut Ps2Set1Decoder,
-        shell: &Shell,
+        shell: &mut Shell,
         completion_config: CompletionConfig,
         prompt: &str,
         console: &mut dyn Output,
@@ -2327,7 +2335,7 @@ mod firmware {
 
     fn complete_editor(
         editor: &mut LineEditor,
-        shell: &Shell,
+        shell: &mut Shell,
         config: CompletionConfig,
         prompt: &str,
         console: &mut dyn Output,

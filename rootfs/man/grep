@@ -1,0 +1,9 @@
+NAME
+    grep - print lines containing a literal pattern
+
+SYNOPSIS
+    grep PATTERN [FILE...]
+
+DESCRIPTION
+    Prints each input line containing PATTERN as literal bytes. With only a
+    pattern, reads standard input. Regular expressions are not implemented.

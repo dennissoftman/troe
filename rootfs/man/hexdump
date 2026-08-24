@@ -1,0 +1,9 @@
+NAME
+    hexdump - display bytes in hexadecimal
+
+SYNOPSIS
+    hexdump [FILE]
+
+DESCRIPTION
+    Renders one file, or standard input when omitted, as bounded hexadecimal
+    rows with byte offsets.

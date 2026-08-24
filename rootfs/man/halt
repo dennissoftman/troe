@@ -1,0 +1,10 @@
+NAME
+    halt - stop the machine
+
+SYNOPSIS
+    halt
+
+DESCRIPTION
+    Requests a terminal machine halt. halt is a permanent, non-shadowable
+    shell intrinsic and succeeds only when the shell holds the machine-control
+    capability. KEX application ABI 1.0 cannot invoke it.
