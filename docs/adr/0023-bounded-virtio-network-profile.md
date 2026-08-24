@@ -37,3 +37,10 @@ loopback host peer. The peer sends unrelated datagrams first. Five independent
 guest processes per architecture must complete the exchange alongside durable
 rollback/state recovery, and the host independently requires exactly five
 requests.
+
+This is presently an `acceptance-probes` composition, not an ambient production
+network stack or shell API. The ordinary QEMU profile attaches no NIC and no
+application receives a network handle. Consequently `ping` and URL fetching are
+not claimed: the former requires an accepted bounded ICMP echo path, while the
+latter requires at least bounded TCP and HTTP plus explicit DNS/TLS policy when
+names or HTTPS are supported.

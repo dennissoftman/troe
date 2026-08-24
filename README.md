@@ -71,6 +71,16 @@ handle calls, or is terminated by the 50 ms execution lease.
 - host/unit/smoke gates and prompt-synchronized QEMU acceptance on both
   architectures.
 
+### Current networking scope
+
+The native NIC and protocol path is currently composed by the
+`acceptance-probes` images, which attach a modern virtio-net device, use the
+static QEMU user-network address, resolve its gateway with ARP, and exchange a
+bounded UDP request/reply with the host harness. This proves the Stage 8 device
+and packet boundary; it is not yet a user-facing socket service. Production
+images do not configure a NIC, and the shell has no `ping` or `fetch` command.
+ICMP, DHCP, DNS, TCP, HTTP, and TLS remain explicit later increments.
+
 ## Quick start
 
 Host model:

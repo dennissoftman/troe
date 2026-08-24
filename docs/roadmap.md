@@ -384,6 +384,8 @@ The first portable storage/configuration boundary is landed:
   modern virtio-net queues run through q35 PCI and AArch64 MMIO; both QEMU
   profiles resolve the gateway by ARP and exchange UDP with a host peer on each
   of five independent process boots while rejecting unrelated traffic first.
+  This is the bounded `acceptance-probes` composition; production network
+  service handles and shell commands begin in a later usability increment.
 - `troe-identity` implements canonical checksummed IREG registry, IMAP foreign
   mapping, IMNT mount-policy, and IACL native ACL formats under the accepted
   `tiny` and `full` ceilings. It rejects every truncated/corrupted fixture,
