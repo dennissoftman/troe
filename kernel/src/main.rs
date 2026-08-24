@@ -51,13 +51,17 @@ mod firmware {
         MemoryMapStats, MemoryRegion, NormalizedMemoryMap, PhysicalRange, RegionKind, VirtualRange,
     };
     use troe_mount::{BootMountManifest, parse_manifest};
-    #[cfg(feature = "acceptance-probes")]
     use troe_net::{
-        Ipv4Address, MacAddress, NetworkDevice, build_arp_request, build_udp, parse_arp, parse_udp,
+        DhcpMessageType, Ipv4Address, MAX_UDP_PAYLOAD_BYTES, MacAddress, NetError, NetworkDevice,
+        build_arp_reply, build_arp_request, build_dhcp_discover, build_dhcp_request,
+        build_icmp_echo, build_udp, parse_arp, parse_dhcp, parse_icmp_echo, parse_udp,
     };
     #[cfg(feature = "acceptance-probes")]
     use troe_persist::{DualSlotStore, RegionSelector, TRANSACTION_BLOCKS};
-    use troe_shell::{CompletionConfig, Shell};
+    use troe_shell::{
+        CompletionConfig, NetworkControl, NetworkError, NetworkStatus, PingReply, ReceivedUdp,
+        Shell,
+    };
     #[cfg(feature = "acceptance-probes")]
     use troe_statefs::{STATE_PATH, StateFs};
     #[cfg(feature = "acceptance-probes")]
@@ -89,9 +93,9 @@ mod firmware {
     const PAGE_TABLE_BYTES: u64 = 2 * 1024 * 1024;
     const OWNED_STACK_BYTES: u64 = 128 * 1024;
     const EXCEPTION_STACK_BYTES: u64 = 16 * 1024;
-    const TASK_STACK_BYTES: u64 = 32 * 1024;
+    const TASK_STACK_BYTES: u64 = 64 * 1024;
     const TASK_GUARD_BYTES: u64 = BASE_PAGE_SIZE;
-    const TASK_STACK_PAGES: u16 = 8;
+    const TASK_STACK_PAGES: u16 = 16;
     const TASK_STACK_COUNT: usize = 3;
     const ISOLATED_TABLE_PAGES: u64 = PAGE_TABLE_BYTES / BASE_PAGE_SIZE;
     const ISOLATED_CODE_PAGES: u64 = 1;
@@ -113,6 +117,10 @@ mod firmware {
         + EXCEPTION_STACK_BYTES
         + (TASK_STACK_BYTES + 2 * TASK_GUARD_BYTES) * TASK_STACK_COUNT as u64)
         / BASE_PAGE_SIZE) as usize;
+    const BOOT_STATUS_WIDTH: usize = 54;
+    const BOOT_MEMORY_LABEL: &str = "Initializing memory and protection";
+    const BOOT_DEVICES_LABEL: &str = "Starting devices and input";
+    const BOOT_RUNTIME_LABEL: &str = "Starting task and application runtime";
 
     struct FirmwareConsole;
 
@@ -173,6 +181,18 @@ mod firmware {
 
         const fn has_framebuffer(&self) -> bool {
             matches!(self, Self::Mirrored { .. })
+        }
+
+        fn replay_completed_boot(&mut self) -> Result<(), StreamError> {
+            let Self::Mirrored { framebuffer, .. } = self else {
+                return Ok(());
+            };
+            write_boot_status(framebuffer, BOOT_MEMORY_LABEL, true)
+                .map_err(|()| StreamError::Device)?;
+            write_boot_status(framebuffer, BOOT_DEVICES_LABEL, true)
+                .map_err(|()| StreamError::Device)?;
+            write_boot_status(framebuffer, BOOT_RUNTIME_LABEL, true)
+                .map_err(|()| StreamError::Device)
         }
     }
 
@@ -245,6 +265,32 @@ mod firmware {
         accounting: &'a OwnedAccounting,
         capabilities: Capabilities,
         stack: PhysicalRange,
+    }
+
+    #[derive(Clone, Copy)]
+    struct Ipv4Configuration {
+        address: Ipv4Address,
+        subnet_mask: Ipv4Address,
+        gateway: Ipv4Address,
+        lease_seconds: Option<u32>,
+    }
+
+    struct KernelNetwork {
+        device: troe_machine::NativeVirtioNetwork,
+        configuration: Option<Ipv4Configuration>,
+        next_sequence: u16,
+        next_port: u16,
+        dhcp_generation: u16,
+    }
+
+    impl core::fmt::Debug for KernelNetwork {
+        fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            formatter
+                .debug_struct("KernelNetwork")
+                .field("mac", &self.device.mac_address().bytes())
+                .field("configured", &self.configuration.is_some())
+                .finish_non_exhaustive()
+        }
     }
 
     struct PreparedHandoff {
@@ -344,31 +390,27 @@ mod firmware {
             return Status::DEVICE_ERROR;
         }
         let mut firmware_console = FirmwareConsole;
-        match prepare_handoff(&mut firmware_console) {
-            Ok(prepared) => {
-                let stack = prepared.boot_memory.stack;
-                let prepared = Box::leak(Box::new(prepared));
-                match troe_machine::enter_owned_stack(stack, prepared, post_handoff) {
-                    Err(_) => Status::ABORTED,
-                    Ok(never) => match never {},
-                }
+        if let Ok(prepared) = prepare_handoff(&mut firmware_console) {
+            let stack = prepared.boot_memory.stack;
+            let prepared = Box::leak(Box::new(prepared));
+            match troe_machine::enter_owned_stack(stack, prepared, post_handoff) {
+                Err(_) => Status::ABORTED,
+                Ok(never) => match never {},
             }
-            Err(()) => Status::ABORTED,
+        } else {
+            let _ignored = write_boot_status(&mut firmware_console, "TROE initialization", false);
+            Status::ABORTED
         }
     }
 
     fn prepare_handoff(console: &mut FirmwareConsole) -> Result<PreparedHandoff, ()> {
-        write_all(console, b"UEFI bootstrap: ready\n")?;
-        write_all(console, b"preparing owned memory and native console\n")?;
+        write_all(console, b"\x1b[2J\x1b[H")?;
 
         let image_layout = troe_machine::loaded_image_layout().map_err(|_| ())?;
         let framebuffer = capture_framebuffer();
         let boot_memory = reserve_and_install_heap()?;
         let boot_mount_manifest = parse_manifest(BOOT_MOUNT_MANIFEST).map_err(|_| ())?;
         troe_machine::initialize_console();
-        if !troe_machine::write(b"native console: ready\n") {
-            return Err(());
-        }
         Ok(PreparedHandoff {
             image_layout,
             boot_memory,
@@ -384,9 +426,6 @@ mod firmware {
         let stack_pointer = usize_as_u64(troe_machine::current_stack_pointer());
         if !prepared.boot_memory.stack.contains(stack_pointer) {
             fatal(b"fatal: active stack is not kernel-owned\n");
-        }
-        if !troe_machine::write(b"boot services: exited\n") {
-            fatal(b"fatal: post-handoff console failed\n");
         }
         let accounting = complete_handoff(prepared, final_map)
             .unwrap_or_else(|()| fatal(b"fatal: post-handoff initialization failed\n"));
@@ -419,35 +458,24 @@ mod firmware {
         }
         let probe = frames.allocate().map_err(|_| ())?;
         frames.free(probe).map_err(|_| ())?;
-        if !troe_machine::write(b"frame bitmap: ready\n") {
-            return Err(());
-        }
         if !troe_machine::probe_allocation_failure() {
-            return Err(());
-        }
-        if !troe_machine::write(b"allocation failure path: bounded\n") {
             return Err(());
         }
         troe_machine::install_exception_vectors(prepared.boot_memory.exception_stack)
             .map_err(|_| ())?;
-        if !troe_machine::write(b"exception vectors: ready\n") {
-            return Err(());
-        }
         let mmu = troe_machine::install_mmu(&mapping_plan, prepared.boot_memory.page_tables)
             .map_err(|_| ())?;
         if mmu.mapped_pages == 0 || mmu.table_pages == 0 {
             return Err(());
         }
-        if !troe_machine::write(b"owned page tables: ready\n")
-            || !troe_machine::write(b"W^X mappings: active\n")
-        {
+        if !write_machine_boot_status(BOOT_MEMORY_LABEL, true) {
             return Err(());
         }
         let boot_mount_manifest = prepared.boot_mount_manifest.as_ref().ok_or(())?;
         let (native_blocks, native_statefs) = initialize_native_blocks(boot_mount_manifest)?;
         let boot_mount_manifest = prepared.boot_mount_manifest.take().ok_or(())?;
         troe_machine::initialize_input_interrupts(InputQueueConfig::tiny()).map_err(|_| ())?;
-        if !troe_machine::write(b"interrupt-driven input: ready\n") {
+        if !write_machine_boot_status(BOOT_DEVICES_LABEL, true) {
             return Err(());
         }
         Ok(OwnedAccounting {
@@ -489,13 +517,6 @@ mod firmware {
         probe_native_network()?;
         #[cfg(not(feature = "acceptance-probes"))]
         let statefs = None;
-        if devices.is_empty() {
-            if !troe_machine::write(b"native virtio block: no devices\n") {
-                return Err(());
-            }
-        } else if !troe_machine::write(b"native virtio block: ready\n") {
-            return Err(());
-        }
         Ok((devices, statefs))
     }
 
@@ -1182,31 +1203,11 @@ mod firmware {
             .unwrap_or_else(|_| fatal(b"fatal: cannot create task scheduler\n"));
         run_cooperative_services(&mut scheduler, &accounting)
             .unwrap_or_else(|()| fatal(b"fatal: cooperative task verification failed\n"));
-        if !troe_machine::write(b"cooperative tasks: deterministic\n")
-            || !troe_machine::write(b"task stack guards: active\n")
-            || !troe_machine::write(b"task resources: reclaimed\n")
-        {
-            fatal(b"fatal: task diagnostic failed\n");
-        }
         run_isolation_verification(&mut scheduler, &mut accounting)
             .unwrap_or_else(|()| fatal(b"fatal: Stage 6 isolation verification failed\n"));
-        if !troe_machine::write(b"isolated address spaces: active\n")
-            || !troe_machine::write(b"copied task messages: bounded\n")
-            || !troe_machine::write(b"isolated faults: contained\n")
-            || !troe_machine::write(b"isolated resources: reclaimed\n")
-        {
-            fatal(b"fatal: isolation diagnostic failed\n");
-        }
         run_application_load_verification(&mut scheduler, &mut accounting)
             .unwrap_or_else(|()| fatal(b"fatal: Stage 7 load-boundary verification failed\n"));
-        if !troe_machine::write(b"KEX staging: owned and bounded\n")
-            || !troe_machine::write(b"KEX load plans: mapped atomically\n")
-            || !troe_machine::write(b"application ABI exit: active\n")
-            || !troe_machine::write(b"application ABI resume: active\n")
-            || !troe_machine::write(b"copied handle calls: active\n")
-            || !troe_machine::write(b"execution lease: enforced\n")
-            || !troe_machine::write(b"application resources: reclaimed\n")
-        {
+        if !write_machine_boot_status(BOOT_RUNTIME_LABEL, true) {
             fatal(b"fatal: application loader diagnostic failed\n");
         }
 
@@ -2596,6 +2597,49 @@ mod firmware {
         }
     }
 
+    fn write_boot_status(output: &mut dyn Output, label: &str, ok: bool) -> Result<(), ()> {
+        let mut line = String::from(" * ");
+        line.push_str(label);
+        line.push(' ');
+        while line.len() < BOOT_STATUS_WIDTH {
+            line.push('.');
+        }
+        if ok {
+            line.push_str(" [ OK ]\n");
+        } else {
+            line.push_str(" [ ERR ]\n");
+        }
+        write_all(output, line.as_bytes())
+    }
+
+    fn write_machine_boot_status(label: &str, ok: bool) -> bool {
+        write_boot_status(&mut NativeConsole, label, ok).is_ok()
+    }
+
+    fn write_ipv4(output: &mut String, address: [u8; 4]) -> core::fmt::Result {
+        write!(
+            output,
+            "{}.{}.{}.{}",
+            address[0], address[1], address[2], address[3]
+        )
+    }
+
+    fn subnet_prefix(mask: [u8; 4]) -> u32 {
+        mask.into_iter().map(u8::count_ones).sum()
+    }
+
+    fn network_boot_label(status: NetworkStatus) -> String {
+        let mut label = String::from("Configuring network");
+        if let Some(address) = status.address {
+            label.push_str(": ");
+            let _formatted = write_ipv4(&mut label, address);
+            if let Some(mask) = status.subnet_mask {
+                let _formatted = write!(&mut label, "/{}", subnet_prefix(mask));
+            }
+        }
+        label
+    }
+
     fn complete_task_step(
         scheduler: &mut Scheduler,
         id: TaskId,
@@ -2624,19 +2668,46 @@ mod firmware {
         }
     }
 
-    fn write_shell_banner(console: &mut dyn Output) -> bool {
-        write_all(
-            console,
-            b"memory and console: owned; Tab: commands; man COMMAND: manual\n",
-        )
-        .is_ok()
+    fn write_shell_banner(
+        console: &mut dyn Output,
+        motd: &[u8],
+        native_root: bool,
+        network: Option<NetworkStatus>,
+    ) -> bool {
+        if write_all(console, b"\n").is_err()
+            || write_all(console, motd).is_err()
+            || !motd.ends_with(b"\n") && write_all(console, b"\n").is_err()
+            || write_all(console, b"\n").is_err()
+        {
+            return false;
+        }
+
+        let root = if native_root {
+            "/vol/root (read-only)"
+        } else {
+            "recovery root (read-only)"
+        };
+        let mut summary = String::new();
+        let _formatted = write!(&mut summary, "{} | {root} | ", architecture());
+        if let Some(address) = network.and_then(|status| status.address) {
+            let _formatted = write_ipv4(&mut summary, address);
+            if let Some(mask) = network.and_then(|status| status.subnet_mask) {
+                let _formatted = write!(&mut summary, "/{}", subnet_prefix(mask));
+            }
+        } else {
+            summary.push_str("network unavailable");
+        }
+        summary.push_str(
+            "\n\nWelcome to TROE.\nType `man COMMAND` for help. Tab completes commands.\n\n",
+        );
+        write_all(console, summary.as_bytes()).is_ok()
     }
 
     fn activate_native_storage(
         accounting: &OwnedAccounting,
         namespace: &mut Namespace,
         console: &mut dyn Output,
-    ) {
+    ) -> bool {
         let limits = native_activation_limits()
             .unwrap_or_else(|()| fatal(b"fatal: invalid native storage limits\n"));
         let devices = core::mem::take(&mut *accounting.native_blocks.borrow_mut());
@@ -2655,21 +2726,373 @@ mod firmware {
                 .unwrap_or_else(|_| fatal(b"fatal: cannot attach native state filesystem\n"));
         }
         if desired_system_available && mount_count != 0 {
-            if write_all(console, b"native storage: /vol/root read-only\n").is_err() {
+            if write_boot_status(console, "Mounting /vol/root read-only", true).is_err() {
                 fatal(b"fatal: native storage diagnostic failed\n");
             }
-        } else if write_all(console, b"native storage: recovery root\n").is_err() {
-            fatal(b"fatal: native storage diagnostic failed\n");
+            true
+        } else {
+            if write_boot_status(console, "Mounting recovery root read-only", true).is_err() {
+                fatal(b"fatal: native storage diagnostic failed\n");
+            }
+            false
         }
     }
 
-    fn compose_namespace(accounting: &OwnedAccounting, console: &mut dyn Output) -> Namespace {
+    fn compose_namespace(
+        accounting: &OwnedAccounting,
+        console: &mut dyn Output,
+    ) -> (Namespace, bool) {
         let mut namespace = Namespace::new(RamFsQuota::default());
         if namespace.mount_embedded(ROOTFS).is_err() {
             fatal(b"fatal: cannot mount embedded root\n");
         }
-        activate_native_storage(accounting, &mut namespace, console);
-        namespace
+        let native_root = activate_native_storage(accounting, &mut namespace, console);
+        (namespace, native_root)
+    }
+
+    impl KernelNetwork {
+        const POLL_ATTEMPTS: usize = 128;
+
+        fn new(device: troe_machine::NativeVirtioNetwork) -> Self {
+            Self {
+                device,
+                configuration: None,
+                next_sequence: 1,
+                next_port: 49_152,
+                dhcp_generation: 0,
+            }
+        }
+
+        fn shell_status(&self) -> NetworkStatus {
+            NetworkStatus {
+                mac: self.device.mac_address().bytes(),
+                address: self.configuration.map(|value| value.address.bytes()),
+                subnet_mask: self.configuration.map(|value| value.subnet_mask.bytes()),
+                gateway: self.configuration.map(|value| value.gateway.bytes()),
+                lease_seconds: self.configuration.and_then(|value| value.lease_seconds),
+            }
+        }
+
+        fn next_dhcp_transaction(&mut self) -> u32 {
+            self.dhcp_generation = self.dhcp_generation.wrapping_add(1);
+            let mac = self.device.mac_address().bytes();
+            u32::from_be_bytes([mac[2], mac[3], mac[4], mac[5]])
+                ^ u32::from(self.dhcp_generation)
+                ^ 0x5452_4f45
+        }
+
+        fn configure_dhcp(&mut self) -> Result<NetworkStatus, NetworkError> {
+            let transaction_id = self.next_dhcp_transaction();
+            let mac = self.device.mac_address();
+            let discover = build_dhcp_discover(mac, transaction_id).map_err(map_network_error)?;
+            self.device.transmit(&discover).map_err(map_network_error)?;
+            let offer = self.wait_for_dhcp(transaction_id, DhcpMessageType::Offer)?;
+            let server = offer.server_identifier.ok_or(NetworkError::Protocol)?;
+            let request = build_dhcp_request(mac, transaction_id, offer.your_ip, server)
+                .map_err(map_network_error)?;
+            self.device.transmit(&request).map_err(map_network_error)?;
+            let acknowledgement =
+                self.wait_for_dhcp(transaction_id, DhcpMessageType::Acknowledge)?;
+            let subnet_mask = acknowledgement
+                .subnet_mask
+                .or(offer.subnet_mask)
+                .ok_or(NetworkError::Protocol)?;
+            let gateway = acknowledgement
+                .router
+                .or(offer.router)
+                .ok_or(NetworkError::Protocol)?;
+            let address = acknowledgement.your_ip;
+            if address.bytes() == [0; 4] {
+                return Err(NetworkError::Protocol);
+            }
+            self.configuration = Some(Ipv4Configuration {
+                address,
+                subnet_mask,
+                gateway,
+                lease_seconds: acknowledgement.lease_seconds.or(offer.lease_seconds),
+            });
+            Ok(self.shell_status())
+        }
+
+        fn wait_for_dhcp(
+            &mut self,
+            transaction_id: u32,
+            wanted: DhcpMessageType,
+        ) -> Result<troe_net::DhcpPacket, NetworkError> {
+            for _ in 0..Self::POLL_ATTEMPTS {
+                let Some(frame) = self.device.receive().map_err(map_network_error)? else {
+                    continue;
+                };
+                let Ok(packet) = parse_dhcp(&frame) else {
+                    continue;
+                };
+                if packet.transaction_id != transaction_id
+                    || packet.client_mac != self.device.mac_address()
+                {
+                    continue;
+                }
+                if packet.message_type == DhcpMessageType::NegativeAcknowledge {
+                    return Err(NetworkError::Protocol);
+                }
+                if packet.message_type == wanted {
+                    return Ok(packet);
+                }
+            }
+            Err(NetworkError::Timeout)
+        }
+
+        fn resolve(&mut self, destination: Ipv4Address) -> Result<MacAddress, NetworkError> {
+            let configuration = self.configuration.ok_or(NetworkError::NotConfigured)?;
+            let next_hop = if same_subnet(
+                configuration.address,
+                destination,
+                configuration.subnet_mask,
+            ) {
+                destination
+            } else {
+                configuration.gateway
+            };
+            let request =
+                build_arp_request(self.device.mac_address(), configuration.address, next_hop)
+                    .map_err(map_network_error)?;
+            self.device.transmit(&request).map_err(map_network_error)?;
+            for _ in 0..Self::POLL_ATTEMPTS {
+                let Some(frame) = self.device.receive().map_err(map_network_error)? else {
+                    continue;
+                };
+                if let Ok(arp) = parse_arp(&frame)
+                    && arp.operation == 2
+                    && arp.sender_ip == next_hop
+                    && arp.target_ip == configuration.address
+                    && arp.target_mac == self.device.mac_address().bytes()
+                {
+                    return Ok(arp.sender_mac);
+                }
+                self.handle_control_frame(&frame)?;
+            }
+            Err(NetworkError::Timeout)
+        }
+
+        fn handle_control_frame(&mut self, frame: &[u8]) -> Result<(), NetworkError> {
+            let Some(configuration) = self.configuration else {
+                return Ok(());
+            };
+            if let Ok(arp) = parse_arp(frame) {
+                if arp.operation == 1 && arp.target_ip == configuration.address {
+                    let reply = build_arp_reply(
+                        self.device.mac_address(),
+                        configuration.address,
+                        arp.sender_mac,
+                        arp.sender_ip,
+                    )
+                    .map_err(map_network_error)?;
+                    self.device.transmit(&reply).map_err(map_network_error)?;
+                }
+                return Ok(());
+            }
+            if let Ok(echo) = parse_icmp_echo(frame)
+                && echo.kind == 8
+                && echo.destination_ip == configuration.address
+            {
+                let reply = build_icmp_echo(
+                    self.device.mac_address(),
+                    echo.source_mac,
+                    configuration.address,
+                    echo.source_ip,
+                    0,
+                    echo.identifier,
+                    echo.sequence,
+                    echo.payload,
+                )
+                .map_err(map_network_error)?;
+                self.device.transmit(&reply).map_err(map_network_error)?;
+            }
+            Ok(())
+        }
+    }
+
+    impl NetworkControl for KernelNetwork {
+        fn status(&self) -> NetworkStatus {
+            self.shell_status()
+        }
+
+        fn dhcp(&mut self) -> Result<NetworkStatus, NetworkError> {
+            self.configure_dhcp()
+        }
+
+        fn ping(&mut self, destination: [u8; 4]) -> Result<PingReply, NetworkError> {
+            let configuration = self.configuration.ok_or(NetworkError::NotConfigured)?;
+            let destination = Ipv4Address::new(destination);
+            if destination == configuration.address {
+                let sequence = self.next_sequence;
+                self.next_sequence = self.next_sequence.wrapping_add(1);
+                return Ok(PingReply {
+                    source: destination.bytes(),
+                    sequence,
+                    bytes: 9,
+                });
+            }
+            let destination_mac = self.resolve(destination)?;
+            let sequence = self.next_sequence;
+            self.next_sequence = self.next_sequence.wrapping_add(1);
+            let request = build_icmp_echo(
+                self.device.mac_address(),
+                destination_mac,
+                configuration.address,
+                destination,
+                8,
+                0x5452,
+                sequence,
+                b"troe-ping",
+            )
+            .map_err(map_network_error)?;
+            self.device.transmit(&request).map_err(map_network_error)?;
+            for _ in 0..Self::POLL_ATTEMPTS {
+                let Some(frame) = self.device.receive().map_err(map_network_error)? else {
+                    continue;
+                };
+                if let Ok(echo) = parse_icmp_echo(&frame)
+                    && echo.kind == 0
+                    && echo.source_ip == destination
+                    && echo.destination_ip == configuration.address
+                    && echo.identifier == 0x5452
+                    && echo.sequence == sequence
+                {
+                    return Ok(PingReply {
+                        source: echo.source_ip.bytes(),
+                        sequence,
+                        bytes: echo.payload.len(),
+                    });
+                }
+                self.handle_control_frame(&frame)?;
+            }
+            Err(NetworkError::Timeout)
+        }
+
+        fn send_udp(
+            &mut self,
+            destination: [u8; 4],
+            destination_port: u16,
+            payload: &[u8],
+        ) -> Result<u16, NetworkError> {
+            if payload.len() > MAX_UDP_PAYLOAD_BYTES {
+                return Err(NetworkError::TooLarge);
+            }
+            let configuration = self.configuration.ok_or(NetworkError::NotConfigured)?;
+            let destination = Ipv4Address::new(destination);
+            let destination_mac = self.resolve(destination)?;
+            let source_port = self.next_port;
+            self.next_port = if self.next_port == u16::MAX {
+                49_152
+            } else {
+                self.next_port + 1
+            };
+            let datagram = build_udp(
+                self.device.mac_address(),
+                destination_mac,
+                configuration.address,
+                destination,
+                source_port,
+                destination_port,
+                payload,
+            )
+            .map_err(map_network_error)?;
+            self.device.transmit(&datagram).map_err(map_network_error)?;
+            Ok(source_port)
+        }
+
+        fn receive_udp(&mut self, local_port: u16) -> Result<ReceivedUdp, NetworkError> {
+            let configuration = self.configuration.ok_or(NetworkError::NotConfigured)?;
+            for _ in 0..Self::POLL_ATTEMPTS {
+                let Some(frame) = self.device.receive().map_err(map_network_error)? else {
+                    continue;
+                };
+                if let Ok(datagram) = parse_udp(&frame)
+                    && datagram.destination_ip == configuration.address
+                    && datagram.destination_port == local_port
+                {
+                    let mut payload = Vec::new();
+                    payload
+                        .try_reserve_exact(datagram.payload.len())
+                        .map_err(|_| NetworkError::TooLarge)?;
+                    payload.extend_from_slice(datagram.payload);
+                    return Ok(ReceivedUdp {
+                        source: datagram.source_ip.bytes(),
+                        source_port: datagram.source_port,
+                        payload,
+                    });
+                }
+                self.handle_control_frame(&frame)?;
+            }
+            Err(NetworkError::Timeout)
+        }
+    }
+
+    fn same_subnet(left: Ipv4Address, right: Ipv4Address, mask: Ipv4Address) -> bool {
+        left.bytes()
+            .iter()
+            .zip(right.bytes())
+            .zip(mask.bytes())
+            .all(|((left, right), mask)| *left & mask == right & mask)
+    }
+
+    const fn map_network_error(error: NetError) -> NetworkError {
+        match error {
+            NetError::Invalid
+            | NetError::Truncated
+            | NetError::Checksum
+            | NetError::Unsupported => NetworkError::Protocol,
+            NetError::Exhausted => NetworkError::TooLarge,
+            NetError::Device => NetworkError::Device,
+            NetError::Timeout => NetworkError::Timeout,
+        }
+    }
+
+    fn discover_shell_network() -> Option<KernelNetwork> {
+        #[cfg(target_arch = "aarch64")]
+        let device = troe_machine::discover_virtio_mmio_network()
+            .ok()
+            .flatten()?;
+        #[cfg(target_arch = "x86_64")]
+        let device = troe_machine::discover_virtio_pci_network().ok().flatten()?;
+        Some(KernelNetwork::new(device))
+    }
+
+    fn install_shell_network(shell: &mut Shell, console: &mut dyn Output) -> Option<NetworkStatus> {
+        if let Some(mut network) = discover_shell_network() {
+            let status = network.configure_dhcp().ok();
+            let label =
+                status.map_or_else(|| String::from("Configuring network"), network_boot_label);
+            if write_boot_status(console, &label, status.is_some()).is_err() {
+                fatal(b"fatal: native network diagnostic failed\n");
+            }
+            shell.set_network(Box::new(network));
+            status
+        } else {
+            if write_boot_status(console, "Configuring network", false).is_err() {
+                fatal(b"fatal: native network diagnostic failed\n");
+            }
+            None
+        }
+    }
+
+    fn finish_shell_startup(
+        shell: &mut Shell,
+        console: &mut dyn Output,
+        motd: &[u8],
+        native_root: bool,
+    ) {
+        let network_status = install_shell_network(shell, console);
+        if !write_shell_banner(console, motd, native_root, network_status) {
+            fatal(b"fatal: native console write failed\n");
+        }
+    }
+
+    fn shell_prompt(shell: &Shell) -> String {
+        let mut prompt = String::from("sh:");
+        prompt.push_str(shell.cwd());
+        prompt.push_str("> ");
+        prompt
     }
 
     fn run_shell_task(task: &mut ShellTask<'_>) -> TaskStep {
@@ -2682,21 +3105,27 @@ mod firmware {
         }
         let mut dispatcher = Dispatcher::new(1, 1)
             .unwrap_or_else(|_| fatal(b"fatal: cannot create service dispatcher\n"));
-        let shell_console = NativeShellConsole::new(task.accounting.framebuffer);
+        let mut shell_console = NativeShellConsole::new(task.accounting.framebuffer);
         let framebuffer_ready = shell_console.has_framebuffer();
+        if shell_console.replay_completed_boot().is_err() {
+            fatal(b"fatal: framebuffer boot replay failed\n");
+        }
         let (_console_port, console_handle) = dispatcher
             .register(Box::new(ConsoleService::new(shell_console)), Rights::CALL)
             .unwrap_or_else(|_| fatal(b"fatal: cannot register console service\n"));
         let mut console = DispatchedOutput::new(&mut dispatcher, console_handle);
-        if write_all(&mut console, b"in-process console dispatch: ready\n").is_err() {
-            fatal(b"fatal: console service request failed\n");
-        }
-        if framebuffer_ready
-            && write_all(&mut console, b"owned framebuffer text console: ready\n").is_err()
-        {
+        let console_label = if framebuffer_ready {
+            "Starting console and framebuffer"
+        } else {
+            "Starting console"
+        };
+        if write_boot_status(&mut console, console_label, true).is_err() {
             fatal(b"fatal: framebuffer console write failed\n");
         }
-        let namespace = compose_namespace(task.accounting, &mut console);
+        let (mut namespace, native_root) = compose_namespace(task.accounting, &mut console);
+        let motd = namespace
+            .read_file("/", "/etc/motd")
+            .unwrap_or_else(|_| fatal(b"fatal: cannot read /etc/motd\n"));
         let initial_snapshot = machine_snapshot(task.accounting);
         let machine_control = task.capabilities.contains(Capabilities::MACHINE_CONTROL);
         let Ok(mut shell) =
@@ -2704,6 +3133,7 @@ mod firmware {
         else {
             fatal(b"fatal: cannot compose namespace\n");
         };
+        finish_shell_startup(&mut shell, &mut console, &motd, native_root);
         let editor_config = EditorConfig::tiny();
         if editor_config.max_line_bytes() > MAX_LINE_BYTES {
             fatal(b"fatal: editor line policy exceeds shell parser policy\n");
@@ -2713,15 +3143,9 @@ mod firmware {
         let mut keyboard = Ps2Set1Decoder::new(KeyboardConfig::tiny());
         let mut editor = LineEditor::new(editor_config);
 
-        if !write_shell_banner(&mut console) {
-            fatal(b"fatal: native console write failed\n");
-        }
-
         loop {
             refresh_shell_stats(&mut shell, task.accounting);
-            let mut prompt = String::from("shell:");
-            prompt.push_str(shell.cwd());
-            prompt.push_str("> ");
+            let prompt = shell_prompt(&shell);
             if write_all(&mut console, prompt.as_bytes()).is_err() {
                 fatal(b"fatal: native console write failed\n");
             }
@@ -2904,6 +3328,7 @@ mod firmware {
     }
 
     fn fatal(message: &[u8]) -> ! {
+        let _status = write_machine_boot_status("TROE initialization", false);
         let _written = troe_machine::write(message);
         troe_machine::park()
     }

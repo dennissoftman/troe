@@ -1,0 +1,9 @@
+NAME
+    ping - send one ICMP echo request
+
+SYNOPSIS
+    ping ADDRESS
+
+DESCRIPTION
+    Resolves the next hop with ARP, sends one checksummed ICMP echo request, and
+    waits boundedly for the matching reply. ADDRESS must be dotted-decimal IPv4.

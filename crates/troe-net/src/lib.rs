@@ -29,7 +29,12 @@ pub const NETWORK_QUEUE_SIZE: u16 = 8;
 pub const VIRTIO_NET_HEADER_BYTES: usize = 12;
 const ETHERTYPE_IPV4: u16 = 0x0800;
 const ETHERTYPE_ARP: u16 = 0x0806;
+const IP_PROTOCOL_ICMP: u8 = 1;
 const IP_PROTOCOL_UDP: u8 = 17;
+const DHCP_CLIENT_PORT: u16 = 68;
+const DHCP_SERVER_PORT: u16 = 67;
+const DHCP_FIXED_BYTES: usize = 240;
+const DHCP_MAGIC_COOKIE: [u8; 4] = [99, 130, 83, 99];
 
 /// Stable network parse, construction, or resource failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -300,6 +305,57 @@ pub struct UdpDatagram<'a> {
     pub payload: &'a [u8],
 }
 
+/// Accepted ICMP echo message borrowed from one Ethernet frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IcmpEcho<'a> {
+    /// Ethernet source.
+    pub source_mac: MacAddress,
+    /// IPv4 source.
+    pub source_ip: Ipv4Address,
+    /// IPv4 destination.
+    pub destination_ip: Ipv4Address,
+    /// Eight for an echo request and zero for an echo reply.
+    pub kind: u8,
+    /// Caller-selected echo identifier.
+    pub identifier: u16,
+    /// Caller-selected echo sequence number.
+    pub sequence: u16,
+    /// Exact echo data following the ICMP header.
+    pub payload: &'a [u8],
+}
+
+/// DHCP message kind used by the initial four-message client exchange.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DhcpMessageType {
+    /// Server address proposal.
+    Offer,
+    /// Server acknowledgement of the requested lease.
+    Acknowledge,
+    /// Server rejection of the requested lease.
+    NegativeAcknowledge,
+}
+
+/// Verified DHCP server message and the bounded configuration options TROE uses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DhcpPacket {
+    /// DHCP transaction identifier.
+    pub transaction_id: u32,
+    /// Client hardware address echoed by the server.
+    pub client_mac: MacAddress,
+    /// Address offered or assigned to the client.
+    pub your_ip: Ipv4Address,
+    /// DHCP message kind.
+    pub message_type: DhcpMessageType,
+    /// Server identifier option, when present.
+    pub server_identifier: Option<Ipv4Address>,
+    /// IPv4 subnet mask option, when present.
+    pub subnet_mask: Option<Ipv4Address>,
+    /// First default-router option, when present.
+    pub router: Option<Ipv4Address>,
+    /// Lease duration in seconds, when present.
+    pub lease_seconds: Option<u32>,
+}
+
 /// Build a broadcast ARP request for one configured IPv4 address.
 ///
 /// # Errors
@@ -311,6 +367,27 @@ pub fn build_arp_request(
     target_ip: Ipv4Address,
 ) -> Result<Vec<u8>, NetError> {
     build_arp(source_mac, source_ip, [0; 6], target_ip, 1, [0xff; 6])
+}
+
+/// Build a unicast ARP reply for this host's configured IPv4 address.
+///
+/// # Errors
+///
+/// Allocation failure is reported before returning a partial frame.
+pub fn build_arp_reply(
+    source_mac: MacAddress,
+    source_ip: Ipv4Address,
+    target_mac: MacAddress,
+    target_ip: Ipv4Address,
+) -> Result<Vec<u8>, NetError> {
+    build_arp(
+        source_mac,
+        source_ip,
+        target_mac.bytes(),
+        target_ip,
+        2,
+        target_mac.bytes(),
+    )
 }
 
 fn build_arp(
@@ -385,34 +462,42 @@ pub fn build_udp(
     destination_port: u16,
     payload: &[u8],
 ) -> Result<Vec<u8>, NetError> {
+    build_udp_to(
+        source_mac,
+        destination_mac.bytes(),
+        source_ip,
+        destination_ip,
+        source_port,
+        destination_port,
+        payload,
+    )
+}
+
+fn build_udp_to(
+    source_mac: MacAddress,
+    destination_mac: [u8; 6],
+    source_ip: Ipv4Address,
+    destination_ip: Ipv4Address,
+    source_port: u16,
+    destination_port: u16,
+    payload: &[u8],
+) -> Result<Vec<u8>, NetError> {
     if source_port == 0 || destination_port == 0 || payload.len() > MAX_UDP_PAYLOAD_BYTES {
         return Err(NetError::Invalid);
     }
     let udp_len = 8_usize
         .checked_add(payload.len())
         .ok_or(NetError::Invalid)?;
-    let ip_len = 20_usize.checked_add(udp_len).ok_or(NetError::Invalid)?;
-    let wire_len = ETHERNET_HEADER_BYTES
-        .checked_add(ip_len)
-        .ok_or(NetError::Invalid)?;
-    let mut frame = allocate_frame(wire_len.max(MIN_FRAME_BYTES))?;
-    frame[..6].copy_from_slice(&destination_mac.bytes());
-    frame[6..12].copy_from_slice(&source_mac.bytes());
-    frame[12..14].copy_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
+    let mut frame = build_ipv4_frame(
+        source_mac,
+        destination_mac,
+        source_ip,
+        destination_ip,
+        IP_PROTOCOL_UDP,
+        udp_len,
+    )?;
+    frame[..6].copy_from_slice(&destination_mac);
     let ip = ETHERNET_HEADER_BYTES;
-    frame[ip] = 0x45;
-    frame[ip + 2..ip + 4].copy_from_slice(
-        &u16::try_from(ip_len)
-            .map_err(|_| NetError::Invalid)?
-            .to_be_bytes(),
-    );
-    frame[ip + 6..ip + 8].copy_from_slice(&0x4000_u16.to_be_bytes());
-    frame[ip + 8] = 64;
-    frame[ip + 9] = IP_PROTOCOL_UDP;
-    frame[ip + 12..ip + 16].copy_from_slice(&source_ip.bytes());
-    frame[ip + 16..ip + 20].copy_from_slice(&destination_ip.bytes());
-    let header_checksum = checksum(&frame[ip..ip + 20]);
-    frame[ip + 10..ip + 12].copy_from_slice(&header_checksum.to_be_bytes());
     let udp = ip + 20;
     frame[udp..udp + 2].copy_from_slice(&source_port.to_be_bytes());
     frame[udp + 2..udp + 4].copy_from_slice(&destination_port.to_be_bytes());
@@ -425,6 +510,313 @@ pub fn build_udp(
     let udp_checksum = udp_checksum(source_ip, destination_ip, &frame[udp..udp + udp_len]);
     frame[udp + 6..udp + 8].copy_from_slice(&udp_checksum.to_be_bytes());
     Ok(frame)
+}
+
+/// Build a DHCP discover broadcast from the unconfigured IPv4 address.
+///
+/// # Errors
+///
+/// Reports invalid size or bounded allocation failure.
+pub fn build_dhcp_discover(
+    source_mac: MacAddress,
+    transaction_id: u32,
+) -> Result<Vec<u8>, NetError> {
+    let payload = build_dhcp_client_payload(source_mac, transaction_id, None)?;
+    build_udp_to(
+        source_mac,
+        [0xff; 6],
+        Ipv4Address::new([0; 4]),
+        Ipv4Address::new([255; 4]),
+        DHCP_CLIENT_PORT,
+        DHCP_SERVER_PORT,
+        &payload,
+    )
+}
+
+/// Build a DHCP request broadcast selecting one offer and server.
+///
+/// # Errors
+///
+/// Reports invalid size or bounded allocation failure.
+pub fn build_dhcp_request(
+    source_mac: MacAddress,
+    transaction_id: u32,
+    requested_ip: Ipv4Address,
+    server_identifier: Ipv4Address,
+) -> Result<Vec<u8>, NetError> {
+    let payload = build_dhcp_client_payload(
+        source_mac,
+        transaction_id,
+        Some((requested_ip, server_identifier)),
+    )?;
+    build_udp_to(
+        source_mac,
+        [0xff; 6],
+        Ipv4Address::new([0; 4]),
+        Ipv4Address::new([255; 4]),
+        DHCP_CLIENT_PORT,
+        DHCP_SERVER_PORT,
+        &payload,
+    )
+}
+
+/// Parse one DHCP offer, acknowledgement, or negative acknowledgement.
+///
+/// # Errors
+///
+/// Rejects malformed BOOTP fields, invalid options, unknown message kinds,
+/// transport corruption, and replies not addressed to the DHCP client port.
+pub fn parse_dhcp(frame: &[u8]) -> Result<DhcpPacket, NetError> {
+    let datagram = parse_udp(frame)?;
+    if datagram.source_port != DHCP_SERVER_PORT
+        || datagram.destination_port != DHCP_CLIENT_PORT
+        || datagram.payload.len() < DHCP_FIXED_BYTES
+    {
+        return Err(NetError::Unsupported);
+    }
+    let bytes = datagram.payload;
+    if bytes[0] != 2
+        || bytes[1] != 1
+        || bytes[2] != 6
+        || bytes[3] != 0
+        || bytes[236..240] != DHCP_MAGIC_COOKIE
+    {
+        return Err(NetError::Unsupported);
+    }
+    let transaction_id = u32::from_be_bytes(copy_array(bytes, 4)?);
+    let your_ip = Ipv4Address::new(copy_array(bytes, 16)?);
+    let client_mac = MacAddress::new(copy_array(bytes, 28)?)?;
+    let mut message_type = None;
+    let mut server_identifier = None;
+    let mut subnet_mask = None;
+    let mut router = None;
+    let mut lease_seconds = None;
+    let mut offset = DHCP_FIXED_BYTES;
+    while offset < bytes.len() {
+        let kind = bytes[offset];
+        offset = offset.checked_add(1).ok_or(NetError::Invalid)?;
+        if kind == 0 {
+            continue;
+        }
+        if kind == 255 {
+            break;
+        }
+        let length = usize::from(*bytes.get(offset).ok_or(NetError::Truncated)?);
+        offset = offset.checked_add(1).ok_or(NetError::Invalid)?;
+        let end = offset.checked_add(length).ok_or(NetError::Invalid)?;
+        let value = bytes.get(offset..end).ok_or(NetError::Truncated)?;
+        match (kind, value) {
+            (53, [2]) => message_type = Some(DhcpMessageType::Offer),
+            (53, [5]) => message_type = Some(DhcpMessageType::Acknowledge),
+            (53, [6]) => message_type = Some(DhcpMessageType::NegativeAcknowledge),
+            (53, [_]) => return Err(NetError::Unsupported),
+            (1, [a, b, c, d]) => subnet_mask = Some(Ipv4Address::new([*a, *b, *c, *d])),
+            (3, [a, b, c, d, ..]) => router = Some(Ipv4Address::new([*a, *b, *c, *d])),
+            (51, [a, b, c, d]) => lease_seconds = Some(u32::from_be_bytes([*a, *b, *c, *d])),
+            (54, [a, b, c, d]) => {
+                server_identifier = Some(Ipv4Address::new([*a, *b, *c, *d]));
+            }
+            _ => {}
+        }
+        offset = end;
+    }
+    Ok(DhcpPacket {
+        transaction_id,
+        client_mac,
+        your_ip,
+        message_type: message_type.ok_or(NetError::Unsupported)?,
+        server_identifier,
+        subnet_mask,
+        router,
+        lease_seconds,
+    })
+}
+
+/// Build an ICMP echo request or reply.
+///
+/// # Errors
+///
+/// Rejects kinds other than zero/eight, oversized data, and allocation failure.
+#[allow(clippy::too_many_arguments)] // Complete L2/L3 identity plus the three ICMP echo fields.
+pub fn build_icmp_echo(
+    source_mac: MacAddress,
+    destination_mac: MacAddress,
+    source_ip: Ipv4Address,
+    destination_ip: Ipv4Address,
+    kind: u8,
+    identifier: u16,
+    sequence: u16,
+    payload: &[u8],
+) -> Result<Vec<u8>, NetError> {
+    if (kind != 0 && kind != 8) || payload.len() > MAX_UDP_PAYLOAD_BYTES {
+        return Err(NetError::Invalid);
+    }
+    let icmp_len = 8_usize
+        .checked_add(payload.len())
+        .ok_or(NetError::Invalid)?;
+    let mut frame = build_ipv4_frame(
+        source_mac,
+        destination_mac.bytes(),
+        source_ip,
+        destination_ip,
+        IP_PROTOCOL_ICMP,
+        icmp_len,
+    )?;
+    let icmp = ETHERNET_HEADER_BYTES + 20;
+    frame[icmp] = kind;
+    frame[icmp + 4..icmp + 6].copy_from_slice(&identifier.to_be_bytes());
+    frame[icmp + 6..icmp + 8].copy_from_slice(&sequence.to_be_bytes());
+    frame[icmp + 8..icmp + icmp_len].copy_from_slice(payload);
+    let icmp_checksum = checksum(&frame[icmp..icmp + icmp_len]);
+    frame[icmp + 2..icmp + 4].copy_from_slice(&icmp_checksum.to_be_bytes());
+    Ok(frame)
+}
+
+/// Parse a checksummed, unfragmented IPv4 ICMP echo request or reply.
+///
+/// # Errors
+///
+/// Rejects options, fragments, other ICMP kinds/codes, corrupt checksums,
+/// invalid padding, and truncated frames.
+pub fn parse_icmp_echo(frame: &[u8]) -> Result<IcmpEcho<'_>, NetError> {
+    if frame.len() < ETHERNET_HEADER_BYTES + 28 || frame.len() > MAX_FRAME_BYTES {
+        return Err(NetError::Truncated);
+    }
+    if read_be16(frame, 12)? != ETHERTYPE_IPV4 {
+        return Err(NetError::Unsupported);
+    }
+    let source_mac = MacAddress::new(copy_array(frame, 6)?)?;
+    let ip = ETHERNET_HEADER_BYTES;
+    if frame[ip] != 0x45 || frame[ip + 9] != IP_PROTOCOL_ICMP {
+        return Err(NetError::Unsupported);
+    }
+    let ip_len = usize::from(read_be16(frame, ip + 2)?);
+    if ip_len < 28 || ip + ip_len > frame.len() || read_be16(frame, ip + 6)? & 0x3fff != 0 {
+        return Err(NetError::Truncated);
+    }
+    if checksum(&frame[ip..ip + 20]) != 0 {
+        return Err(NetError::Checksum);
+    }
+    let icmp = ip + 20;
+    let icmp_len = ip_len - 20;
+    if (frame[icmp] != 0 && frame[icmp] != 8)
+        || frame[icmp + 1] != 0
+        || checksum(&frame[icmp..icmp + icmp_len]) != 0
+    {
+        return Err(NetError::Checksum);
+    }
+    if frame[ip + ip_len..].iter().any(|byte| *byte != 0) {
+        return Err(NetError::Invalid);
+    }
+    Ok(IcmpEcho {
+        source_mac,
+        source_ip: Ipv4Address::new(copy_array(frame, ip + 12)?),
+        destination_ip: Ipv4Address::new(copy_array(frame, ip + 16)?),
+        kind: frame[icmp],
+        identifier: read_be16(frame, icmp + 4)?,
+        sequence: read_be16(frame, icmp + 6)?,
+        payload: &frame[icmp + 8..icmp + icmp_len],
+    })
+}
+
+fn build_ipv4_frame(
+    source_mac: MacAddress,
+    destination_mac: [u8; 6],
+    source_ip: Ipv4Address,
+    destination_ip: Ipv4Address,
+    protocol: u8,
+    payload_bytes: usize,
+) -> Result<Vec<u8>, NetError> {
+    let ip_len = 20_usize
+        .checked_add(payload_bytes)
+        .ok_or(NetError::Invalid)?;
+    let wire_len = ETHERNET_HEADER_BYTES
+        .checked_add(ip_len)
+        .ok_or(NetError::Invalid)?;
+    let mut frame = allocate_frame(wire_len.max(MIN_FRAME_BYTES))?;
+    frame[..6].copy_from_slice(&destination_mac);
+    frame[6..12].copy_from_slice(&source_mac.bytes());
+    frame[12..14].copy_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
+    let ip = ETHERNET_HEADER_BYTES;
+    frame[ip] = 0x45;
+    frame[ip + 2..ip + 4].copy_from_slice(
+        &u16::try_from(ip_len)
+            .map_err(|_| NetError::Invalid)?
+            .to_be_bytes(),
+    );
+    frame[ip + 6..ip + 8].copy_from_slice(&0x4000_u16.to_be_bytes());
+    frame[ip + 8] = 64;
+    frame[ip + 9] = protocol;
+    frame[ip + 12..ip + 16].copy_from_slice(&source_ip.bytes());
+    frame[ip + 16..ip + 20].copy_from_slice(&destination_ip.bytes());
+    let header_checksum = checksum(&frame[ip..ip + 20]);
+    frame[ip + 10..ip + 12].copy_from_slice(&header_checksum.to_be_bytes());
+    Ok(frame)
+}
+
+fn build_dhcp_client_payload(
+    source_mac: MacAddress,
+    transaction_id: u32,
+    request: Option<(Ipv4Address, Ipv4Address)>,
+) -> Result<Vec<u8>, NetError> {
+    let option_bytes = if request.is_some() { 30 } else { 18 };
+    let mut bytes = allocate_bytes(DHCP_FIXED_BYTES + option_bytes)?;
+    bytes[0] = 1;
+    bytes[1] = 1;
+    bytes[2] = 6;
+    bytes[4..8].copy_from_slice(&transaction_id.to_be_bytes());
+    bytes[10..12].copy_from_slice(&0x8000_u16.to_be_bytes());
+    bytes[28..34].copy_from_slice(&source_mac.bytes());
+    bytes[236..240].copy_from_slice(&DHCP_MAGIC_COOKIE);
+    let mut offset = DHCP_FIXED_BYTES;
+    bytes[offset..offset + 3].copy_from_slice(&[53, 1, if request.is_some() { 3 } else { 1 }]);
+    offset += 3;
+    bytes[offset..offset + 9].copy_from_slice(&[
+        61,
+        7,
+        1,
+        source_mac.bytes()[0],
+        source_mac.bytes()[1],
+        source_mac.bytes()[2],
+        source_mac.bytes()[3],
+        source_mac.bytes()[4],
+        source_mac.bytes()[5],
+    ]);
+    offset += 9;
+    if let Some((requested_ip, server_identifier)) = request {
+        bytes[offset..offset + 6].copy_from_slice(&[
+            50,
+            4,
+            requested_ip.bytes()[0],
+            requested_ip.bytes()[1],
+            requested_ip.bytes()[2],
+            requested_ip.bytes()[3],
+        ]);
+        offset += 6;
+        bytes[offset..offset + 6].copy_from_slice(&[
+            54,
+            4,
+            server_identifier.bytes()[0],
+            server_identifier.bytes()[1],
+            server_identifier.bytes()[2],
+            server_identifier.bytes()[3],
+        ]);
+        offset += 6;
+    }
+    bytes[offset] = 55;
+    bytes[offset + 1] = 3;
+    bytes[offset + 2..offset + 5].copy_from_slice(&[1, 3, 51]);
+    bytes[offset + 5] = 255;
+    Ok(bytes)
+}
+
+fn allocate_bytes(bytes: usize) -> Result<Vec<u8>, NetError> {
+    let mut value = Vec::new();
+    value
+        .try_reserve_exact(bytes)
+        .map_err(|_| NetError::Exhausted)?;
+    value.resize(bytes, 0);
+    Ok(value)
 }
 
 /// Parse one initial-profile Ethernet/IPv4/UDP frame.
@@ -548,8 +940,9 @@ fn finalize_sum(mut sum: u32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Admission, Ipv4Address, MacAddress, NetError, ReceiveLimits, ReceiveQueue,
-        build_arp_request, build_udp, parse_arp, parse_udp,
+        Admission, DhcpMessageType, Ipv4Address, MacAddress, NetError, ReceiveLimits, ReceiveQueue,
+        build_arp_reply, build_arp_request, build_dhcp_discover, build_dhcp_request,
+        build_icmp_echo, build_udp, parse_arp, parse_dhcp, parse_icmp_echo, parse_udp,
     };
 
     fn mac(bytes: [u8; 6]) -> Result<MacAddress, NetError> {
@@ -567,6 +960,10 @@ mod tests {
         assert_eq!(parsed_arp.operation, 1);
         assert_eq!(parsed_arp.sender_mac, source_mac);
         assert_eq!(parsed_arp.target_ip, destination_ip);
+        let arp_reply = build_arp_reply(source_mac, source_ip, destination_mac, destination_ip)?;
+        let parsed_reply = parse_arp(&arp_reply)?;
+        assert_eq!(parsed_reply.operation, 2);
+        assert_eq!(parsed_reply.target_mac, destination_mac.bytes());
 
         let udp = build_udp(
             source_mac,
@@ -581,6 +978,54 @@ mod tests {
         assert_eq!(parsed_udp.source_port, 49152);
         assert_eq!(parsed_udp.destination_port, 40123);
         assert_eq!(parsed_udp.payload, b"stage8");
+        Ok(())
+    }
+
+    #[test]
+    fn icmp_echo_and_dhcp_profile_round_trip() -> Result<(), NetError> {
+        let client_mac = mac([0x02, 0, 0, 0, 0, 1])?;
+        let server_mac = mac([0x02, 0, 0, 0, 0, 2])?;
+        let client_ip = Ipv4Address::new([10, 0, 2, 15]);
+        let server_ip = Ipv4Address::new([10, 0, 2, 2]);
+        let echo = build_icmp_echo(
+            server_mac, client_mac, server_ip, client_ip, 0, 0x1234, 7, b"alive",
+        )?;
+        let parsed_echo = parse_icmp_echo(&echo)?;
+        assert_eq!(parsed_echo.kind, 0);
+        assert_eq!(parsed_echo.identifier, 0x1234);
+        assert_eq!(parsed_echo.sequence, 7);
+        assert_eq!(parsed_echo.payload, b"alive");
+
+        let transaction_id = 0x5452_4f45;
+        assert!(build_dhcp_discover(client_mac, transaction_id)?.len() >= 60);
+        assert!(build_dhcp_request(client_mac, transaction_id, client_ip, server_ip)?.len() >= 60);
+        let mut payload = alloc::vec![0_u8; 240 + 28];
+        payload[0] = 2;
+        payload[1] = 1;
+        payload[2] = 6;
+        payload[4..8].copy_from_slice(&transaction_id.to_be_bytes());
+        payload[16..20].copy_from_slice(&client_ip.bytes());
+        payload[28..34].copy_from_slice(&client_mac.bytes());
+        payload[236..240].copy_from_slice(&[99, 130, 83, 99]);
+        payload[240..].copy_from_slice(&[
+            53, 1, 5, 54, 4, 10, 0, 2, 2, 1, 4, 255, 255, 255, 0, 3, 4, 10, 0, 2, 2, 51, 4, 0, 0,
+            14, 16, 255,
+        ]);
+        let ack = build_udp(
+            server_mac, client_mac, server_ip, client_ip, 67, 68, &payload,
+        )?;
+        let parsed = parse_dhcp(&ack)?;
+        assert_eq!(parsed.transaction_id, transaction_id);
+        assert_eq!(parsed.client_mac, client_mac);
+        assert_eq!(parsed.your_ip, client_ip);
+        assert_eq!(parsed.message_type, DhcpMessageType::Acknowledge);
+        assert_eq!(parsed.server_identifier, Some(server_ip));
+        assert_eq!(
+            parsed.subnet_mask,
+            Some(Ipv4Address::new([255, 255, 255, 0]))
+        );
+        assert_eq!(parsed.router, Some(server_ip));
+        assert_eq!(parsed.lease_seconds, Some(3600));
         Ok(())
     }
 

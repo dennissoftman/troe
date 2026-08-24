@@ -28,7 +28,6 @@ def run(*command: str | Path) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--architecture",
         "--arch",
         choices=("all", *TARGETS),
         default="all",
@@ -44,7 +43,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    architectures = TARGETS if args.architecture == "all" else (args.architecture,)
+    architectures = TARGETS if args.arch == "all" else (args.arch,)
 
     try:
         run(

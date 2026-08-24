@@ -99,7 +99,7 @@ def main() -> int:
             "troe-host",
             "--",
             "--script",
-            REPO_ROOT / "tests" / "smoke.ksh",
+            REPO_ROOT / "tests" / "smoke.sh",
         ),
         (sys.executable, REPO_ROOT / "scripts" / "build.py"),
         (

@@ -1,3 +1,8 @@
-Welcome to the tiny Rust operating environment.
-Memory and the native serial console are kernel-owned after UEFI handoff.
-Tab completes commands; use 'man COMMAND' for manuals.
+  ______  ____   ____  ______
+ /_  __/ / __ \ / __ \ / ____/
+  / /   / /_/ // / / // __/
+ / /   / _, _// /_/ // /___
+/_/   /_/ |_| \____//_____/
+
+Tiny Rust Operating Environment 0.1.0
+Small by design. Alive on the wire.

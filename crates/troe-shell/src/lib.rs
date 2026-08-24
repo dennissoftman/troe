@@ -6,6 +6,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
@@ -84,8 +85,12 @@ enum CommandId {
     Ls,
     Man,
     Mem,
+    Net,
+    Dhcp,
+    Ping,
     Pwd,
     Rm,
+    Udp,
     Write,
 }
 
@@ -108,6 +113,13 @@ const COMMANDS: &[CommandSpec] = &[
         id: CommandId::Clear,
         name: "clear",
         synopsis: "clear",
+        requires_machine_control: false,
+        class: CommandClass::ReplaceableBuiltin,
+    },
+    CommandSpec {
+        id: CommandId::Dhcp,
+        name: "dhcp",
+        synopsis: "dhcp",
         requires_machine_control: false,
         class: CommandClass::ReplaceableBuiltin,
     },
@@ -161,9 +173,30 @@ const COMMANDS: &[CommandSpec] = &[
         class: CommandClass::ReplaceableBuiltin,
     },
     CommandSpec {
+        id: CommandId::Net,
+        name: "net",
+        synopsis: "net",
+        requires_machine_control: false,
+        class: CommandClass::ReplaceableBuiltin,
+    },
+    CommandSpec {
+        id: CommandId::Ping,
+        name: "ping",
+        synopsis: "ping ADDRESS",
+        requires_machine_control: false,
+        class: CommandClass::ReplaceableBuiltin,
+    },
+    CommandSpec {
         id: CommandId::Pwd,
         name: "pwd",
         synopsis: "pwd",
+        requires_machine_control: false,
+        class: CommandClass::ReplaceableBuiltin,
+    },
+    CommandSpec {
+        id: CommandId::Udp,
+        name: "udp",
+        synopsis: "udp send ADDRESS PORT [TEXT...] | udp recv PORT",
         requires_machine_control: false,
         class: CommandClass::ReplaceableBuiltin,
     },
@@ -182,6 +215,95 @@ const COMMANDS: &[CommandSpec] = &[
         class: CommandClass::ReplaceableBuiltin,
     },
 ];
+
+/// Stable failures returned by the shell's replaceable network capability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NetworkError {
+    /// No usable NIC is attached.
+    Unavailable,
+    /// IPv4 configuration has not completed.
+    NotConfigured,
+    /// A bounded receive or resolution attempt expired.
+    Timeout,
+    /// The native device failed an operation.
+    Device,
+    /// A received packet or configuration exchange was invalid.
+    Protocol,
+    /// The requested packet exceeded the initial profile.
+    TooLarge,
+}
+
+/// Current bounded IPv4 configuration presented to users and future KEX apps.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NetworkStatus {
+    /// Attached NIC address.
+    pub mac: [u8; 6],
+    /// Configured IPv4 address, if DHCP has completed.
+    pub address: Option<[u8; 4]>,
+    /// Configured subnet mask.
+    pub subnet_mask: Option<[u8; 4]>,
+    /// Configured default gateway.
+    pub gateway: Option<[u8; 4]>,
+    /// DHCP lease duration in seconds.
+    pub lease_seconds: Option<u32>,
+}
+
+/// Successful ICMP echo result.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PingReply {
+    /// Reply source address.
+    pub source: [u8; 4],
+    /// Echo sequence number.
+    pub sequence: u16,
+    /// Echo data byte count.
+    pub bytes: usize,
+}
+
+/// One bounded UDP datagram returned to the shell.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReceivedUdp {
+    /// Datagram source address.
+    pub source: [u8; 4],
+    /// Datagram source port.
+    pub source_port: u16,
+    /// Exact UDP payload.
+    pub payload: Vec<u8>,
+}
+
+/// Hardware-independent networking authority used by temporary shell built-ins.
+pub trait NetworkControl: core::fmt::Debug {
+    /// Return current link and IPv4 state.
+    fn status(&self) -> NetworkStatus;
+    /// Perform a bounded DHCP discover/request exchange.
+    ///
+    /// # Errors
+    ///
+    /// Reports device, timeout, protocol, and resource failures.
+    fn dhcp(&mut self) -> Result<NetworkStatus, NetworkError>;
+    /// Send one ICMP echo and wait boundedly for its reply.
+    ///
+    /// # Errors
+    ///
+    /// Reports absent configuration, resolution timeout, or device failure.
+    fn ping(&mut self, destination: [u8; 4]) -> Result<PingReply, NetworkError>;
+    /// Send one UDP datagram from an implementation-selected ephemeral port.
+    ///
+    /// # Errors
+    ///
+    /// Reports absent configuration, invalid size, resolution, or device failure.
+    fn send_udp(
+        &mut self,
+        destination: [u8; 4],
+        destination_port: u16,
+        payload: &[u8],
+    ) -> Result<u16, NetworkError>;
+    /// Wait boundedly for one datagram addressed to `local_port`.
+    ///
+    /// # Errors
+    ///
+    /// Reports absent configuration, receive timeout, or device failure.
+    fn receive_udp(&mut self, local_port: u16) -> Result<ReceivedUdp, NetworkError>;
+}
 
 /// Return the reserved execution placement for a registered command name.
 ///
@@ -410,6 +532,7 @@ pub struct Shell {
     architecture: String,
     machine_memory: MachineMemorySnapshot,
     machine_input: Option<InputQueueStats>,
+    network: Option<Box<dyn NetworkControl>>,
     machine_control: bool,
     halt_requested: bool,
 }
@@ -434,11 +557,17 @@ impl Shell {
             architecture: architecture.to_string(),
             machine_memory,
             machine_input: None,
+            network: None,
             machine_control,
             halt_requested: false,
         };
         shell.refresh_memory_node()?;
         Ok(shell)
+    }
+
+    /// Install an owned network capability for the temporary built-in commands.
+    pub fn set_network(&mut self, network: Box<dyn NetworkControl>) {
+        self.network = Some(network);
     }
 
     /// Whether an authorized `halt` command completed.
@@ -562,6 +691,7 @@ impl Shell {
             CommandId::Cat => self.command_cat(args, stdin, stdout, stderr),
             CommandId::Cd => self.command_cd(args, stderr),
             CommandId::Clear => command_clear(args, stdout, stderr),
+            CommandId::Dhcp => self.command_dhcp(args, stdout, stderr),
             CommandId::Echo => command_echo(args, stdout, stderr),
             CommandId::Grep => self.command_grep(args, stdin, stdout, stderr),
             CommandId::Halt => self.command_halt(args, stderr),
@@ -569,9 +699,163 @@ impl Shell {
             CommandId::Ls => self.command_ls(args, stdout, stderr),
             CommandId::Man => self.command_man(args, stdout, stderr),
             CommandId::Mem => self.command_mem(args, stdout, stderr),
+            CommandId::Net => self.command_net(args, stdout, stderr),
+            CommandId::Ping => self.command_ping(args, stdout, stderr),
             CommandId::Pwd => self.command_pwd(args, stdout, stderr),
             CommandId::Rm => self.command_rm(args, stderr),
+            CommandId::Udp => self.command_udp(args, stdin, stdout, stderr),
             CommandId::Write => self.command_write(args, stdin, stderr),
+        }
+    }
+
+    fn command_net(
+        &mut self,
+        args: &[String],
+        stdout: &mut dyn Output,
+        stderr: &mut dyn Output,
+    ) -> CommandStatus {
+        if !args.is_empty() {
+            return usage(stderr, "net", "net");
+        }
+        let Some(network) = self.network.as_ref() else {
+            let _ignored = write_error(stderr, "net", "no network device");
+            return CommandStatus::NotFound;
+        };
+        write_network_status(stdout, network.status(), stderr)
+    }
+
+    fn command_dhcp(
+        &mut self,
+        args: &[String],
+        stdout: &mut dyn Output,
+        stderr: &mut dyn Output,
+    ) -> CommandStatus {
+        if !args.is_empty() {
+            return usage(stderr, "dhcp", "dhcp");
+        }
+        let Some(network) = self.network.as_mut() else {
+            return network_failure(stderr, "dhcp", NetworkError::Unavailable);
+        };
+        match network.dhcp() {
+            Ok(status) => write_network_status(stdout, status, stderr),
+            Err(error) => network_failure(stderr, "dhcp", error),
+        }
+    }
+
+    fn command_ping(
+        &mut self,
+        args: &[String],
+        stdout: &mut dyn Output,
+        stderr: &mut dyn Output,
+    ) -> CommandStatus {
+        if args.len() != 1 {
+            return usage(stderr, "ping", "ping ADDRESS");
+        }
+        let Some(destination) = parse_ipv4(&args[0]) else {
+            return usage(stderr, "ping", "invalid IPv4 address");
+        };
+        let Some(network) = self.network.as_mut() else {
+            return network_failure(stderr, "ping", NetworkError::Unavailable);
+        };
+        match network.ping(destination) {
+            Ok(reply) => {
+                let line = format!(
+                    "reply from {}: icmp_seq={} bytes={}\n",
+                    format_ipv4(reply.source),
+                    reply.sequence,
+                    reply.bytes
+                );
+                if write_all(stdout, line.as_bytes()).is_err() {
+                    stream_failure(stderr, "ping")
+                } else {
+                    CommandStatus::Success
+                }
+            }
+            Err(error) => network_failure(stderr, "ping", error),
+        }
+    }
+
+    fn command_udp(
+        &mut self,
+        args: &[String],
+        stdin: &mut dyn Input,
+        stdout: &mut dyn Output,
+        stderr: &mut dyn Output,
+    ) -> CommandStatus {
+        let Some(operation) = args.first().map(String::as_str) else {
+            return usage(
+                stderr,
+                "udp",
+                "udp send ADDRESS PORT [TEXT...] | udp recv PORT",
+            );
+        };
+        match operation {
+            "send" if args.len() >= 3 => {
+                let Some(destination) = parse_ipv4(&args[1]) else {
+                    return usage(stderr, "udp", "invalid IPv4 address");
+                };
+                let Some(port) = parse_port(&args[2]) else {
+                    return usage(stderr, "udp", "invalid UDP port");
+                };
+                let payload = if args.len() > 3 {
+                    args[3..].join(" ").into_bytes()
+                } else {
+                    match read_bounded(stdin, PIPE_CAPACITY) {
+                        Ok(value) => value,
+                        Err(_) => return stream_failure(stderr, "udp"),
+                    }
+                };
+                let Some(network) = self.network.as_mut() else {
+                    return network_failure(stderr, "udp", NetworkError::Unavailable);
+                };
+                match network.send_udp(destination, port, &payload) {
+                    Ok(source_port) => {
+                        let line = format!(
+                            "sent {} bytes from port {source_port} to {}:{port}\n",
+                            payload.len(),
+                            format_ipv4(destination)
+                        );
+                        if write_all(stdout, line.as_bytes()).is_err() {
+                            stream_failure(stderr, "udp")
+                        } else {
+                            CommandStatus::Success
+                        }
+                    }
+                    Err(error) => network_failure(stderr, "udp", error),
+                }
+            }
+            "recv" if args.len() == 2 => {
+                let Some(port) = parse_port(&args[1]) else {
+                    return usage(stderr, "udp", "invalid UDP port");
+                };
+                let Some(network) = self.network.as_mut() else {
+                    return network_failure(stderr, "udp", NetworkError::Unavailable);
+                };
+                match network.receive_udp(port) {
+                    Ok(datagram) => {
+                        let header = format!(
+                            "from {}:{} bytes={}\n",
+                            format_ipv4(datagram.source),
+                            datagram.source_port,
+                            datagram.payload.len()
+                        );
+                        if write_all(stdout, header.as_bytes()).is_err()
+                            || write_all(stdout, &datagram.payload).is_err()
+                            || write_all(stdout, b"\n").is_err()
+                        {
+                            stream_failure(stderr, "udp")
+                        } else {
+                            CommandStatus::Success
+                        }
+                    }
+                    Err(error) => network_failure(stderr, "udp", error),
+                }
+            }
+            _ => usage(
+                stderr,
+                "udp",
+                "udp send ADDRESS PORT [TEXT...] | udp recv PORT",
+            ),
         }
     }
 
@@ -1248,6 +1532,79 @@ fn usage(stderr: &mut dyn Output, command: &str, synopsis: &str) -> CommandStatu
     CommandStatus::Usage
 }
 
+fn parse_ipv4(text: &str) -> Option<[u8; 4]> {
+    let mut parts = text.split('.');
+    let address = [
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+        parts.next()?.parse().ok()?,
+    ];
+    if parts.next().is_some() {
+        None
+    } else {
+        Some(address)
+    }
+}
+
+fn parse_port(text: &str) -> Option<u16> {
+    let port = text.parse().ok()?;
+    (port != 0).then_some(port)
+}
+
+fn format_ipv4(address: [u8; 4]) -> String {
+    format!(
+        "{}.{}.{}.{}",
+        address[0], address[1], address[2], address[3]
+    )
+}
+
+fn write_network_status(
+    stdout: &mut dyn Output,
+    status: NetworkStatus,
+    stderr: &mut dyn Output,
+) -> CommandStatus {
+    let address = status
+        .address
+        .map_or_else(|| "unconfigured".to_string(), format_ipv4);
+    let subnet = status
+        .subnet_mask
+        .map_or_else(|| "unconfigured".to_string(), format_ipv4);
+    let gateway = status
+        .gateway
+        .map_or_else(|| "unconfigured".to_string(), format_ipv4);
+    let lease = status.lease_seconds.map_or_else(
+        || "unconfigured".to_string(),
+        |seconds| format!("{seconds} seconds"),
+    );
+    let report = format!(
+        "link: ready\nmac: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\nipv4: {address}\nsubnet: {subnet}\ngateway: {gateway}\nlease: {lease}\n",
+        status.mac[0], status.mac[1], status.mac[2], status.mac[3], status.mac[4], status.mac[5]
+    );
+    if write_all(stdout, report.as_bytes()).is_err() {
+        stream_failure(stderr, "net")
+    } else {
+        CommandStatus::Success
+    }
+}
+
+fn network_failure(stderr: &mut dyn Output, command: &str, error: NetworkError) -> CommandStatus {
+    let message = match error {
+        NetworkError::Unavailable => "no network device",
+        NetworkError::NotConfigured => "IPv4 is not configured; run dhcp",
+        NetworkError::Timeout => "operation timed out",
+        NetworkError::Device => "network device failed",
+        NetworkError::Protocol => "invalid network response",
+        NetworkError::TooLarge => "packet exceeds network profile",
+    };
+    let _ignored = write_error(stderr, command, message);
+    if error == NetworkError::Unavailable {
+        CommandStatus::NotFound
+    } else {
+        CommandStatus::Failure
+    }
+}
+
 fn fs_failure(stderr: &mut dyn Output, command: &str, path: &str, error: FsError) -> CommandStatus {
     let _ignored = write_all(stderr, format!("{command}: {path}: {error}\n").as_bytes());
     if error == FsError::NotFound {
@@ -1279,9 +1636,11 @@ const fn parse_error_text(error: ParseError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMMANDS, CommandClass, CompletionConfig, CompletionConfigError, ParseError, Shell,
-        command_class, command_synopsis, parse_line,
+        COMMANDS, CommandClass, CompletionConfig, CompletionConfigError, NetworkControl,
+        NetworkError, NetworkStatus, ParseError, PingReply, ReceivedUdp, Shell, command_class,
+        command_synopsis, parse_line,
     };
+    use alloc::boxed::Box;
     use alloc::string::ToString;
     use alloc::vec::Vec;
     use troe_core::{BoundedOutput, MachineMemorySnapshot, SliceInput};
@@ -1306,6 +1665,58 @@ mod tests {
         match Shell::new(namespace, "test", MachineMemorySnapshot::hosted(), true) {
             Ok(value) => value,
             Err(_error) => std::process::abort(),
+        }
+    }
+
+    #[derive(Debug)]
+    struct FakeNetwork;
+
+    impl NetworkControl for FakeNetwork {
+        fn status(&self) -> NetworkStatus {
+            fake_network_status()
+        }
+
+        fn dhcp(&mut self) -> Result<NetworkStatus, NetworkError> {
+            Ok(fake_network_status())
+        }
+
+        fn ping(&mut self, destination: [u8; 4]) -> Result<PingReply, NetworkError> {
+            Ok(PingReply {
+                source: destination,
+                sequence: 1,
+                bytes: 9,
+            })
+        }
+
+        fn send_udp(
+            &mut self,
+            _destination: [u8; 4],
+            _destination_port: u16,
+            payload: &[u8],
+        ) -> Result<u16, NetworkError> {
+            if payload.len() > 1472 {
+                Err(NetworkError::TooLarge)
+            } else {
+                Ok(49_152)
+            }
+        }
+
+        fn receive_udp(&mut self, _local_port: u16) -> Result<ReceivedUdp, NetworkError> {
+            Ok(ReceivedUdp {
+                source: [10, 0, 2, 2],
+                source_port: 40123,
+                payload: b"hello".to_vec(),
+            })
+        }
+    }
+
+    const fn fake_network_status() -> NetworkStatus {
+        NetworkStatus {
+            mac: [0x52, 0x54, 0, 0x12, 0x34, 0x56],
+            address: Some([10, 0, 2, 15]),
+            subnet_mask: Some([255, 255, 255, 0]),
+            gateway: Some([10, 0, 2, 2]),
+            lease_seconds: Some(86_400),
         }
     }
 
@@ -1335,6 +1746,31 @@ mod tests {
         let text = core::str::from_utf8(output.as_slice()).unwrap_or_default();
         assert!(text.contains("62 65 74 61"));
         assert!(error.as_slice().is_empty());
+    }
+
+    #[test]
+    fn replaceable_network_commands_use_the_explicit_capability() {
+        let mut shell = shell();
+        shell.set_network(Box::new(FakeNetwork));
+        for (command, expected) in [
+            ("net", "ipv4: 10.0.2.15"),
+            ("dhcp", "lease: 86400 seconds"),
+            ("ping 10.0.2.2", "reply from 10.0.2.2"),
+            (
+                "udp send 10.0.2.2 40123 alive",
+                "sent 5 bytes from port 49152",
+            ),
+            ("udp recv 40000", "hello"),
+        ] {
+            let mut input = SliceInput::new(b"");
+            let mut output = BoundedOutput::new(1024);
+            let mut error = BoundedOutput::new(1024);
+            let status = shell.execute(command, &mut input, &mut output, &mut error);
+            assert_eq!(status.code(), 0, "{command}");
+            let text = core::str::from_utf8(output.as_slice()).unwrap_or_default();
+            assert!(text.contains(expected), "{command}: {text}");
+            assert!(error.as_slice().is_empty());
+        }
     }
 
     #[test]

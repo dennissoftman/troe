@@ -378,14 +378,14 @@ The first portable storage/configuration boundary is landed:
   TXSLOT publication and explicit flushes. It mounts at `/vol/state`; both QEMU
   profiles mutate it across five process terminations while the harness
   independently checks transaction generation, STFS checksum, and file bytes.
-- `troe-net` supplies safe bounded Ethernet/ARP/IPv4/UDP construction, parsing,
-  checksum and fragment rejection, plus a count-and-byte-bounded receive FIFO.
-  Truncation and 10,000-frame flood tests are host verified. Native fixed-buffer
-  modern virtio-net queues run through q35 PCI and AArch64 MMIO; both QEMU
-  profiles resolve the gateway by ARP and exchange UDP with a host peer on each
-  of five independent process boots while rejecting unrelated traffic first.
-  This is the bounded `acceptance-probes` composition; production network
-  service handles and shell commands begin in a later usability increment.
+- `troe-net` supplies safe bounded Ethernet/ARP/IPv4/ICMP/UDP and DHCP
+  construction and parsing, checksum and fragment rejection, plus a
+  count-and-byte-bounded receive FIFO. Truncation and 10,000-frame flood tests
+  are host verified. Native fixed-buffer modern virtio-net queues run through
+  q35 PCI and AArch64 MMIO. Normal QEMU compositions now acquire an IPv4 lease,
+  answer ARP and ICMP echo requests while servicing network operations, and
+  expose replaceable `net`, `dhcp`, `ping`, and `udp` shell built-ins. The
+  independent acceptance peer exchange remains the transport regression gate.
 - `troe-identity` implements canonical checksummed IREG registry, IMAP foreign
   mapping, IMNT mount-policy, and IACL native ACL formats under the accepted
   `tiny` and `full` ceilings. It rejects every truncated/corrupted fixture,

@@ -202,7 +202,6 @@ def assert_rolled_back_sact(architecture: str, payload: bytes) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--architecture",
         "--arch",
         choices=("all", *QEMU_EXECUTABLES),
         default="all",
@@ -304,42 +303,23 @@ def parse_owned_memory_accounting(report: str) -> int:
 
 
 def assert_owned_boot(session: "SerialSession") -> None:
-    """Require every marker emitted across the one-way ownership handoff."""
+    """Require the concise statuses emitted across the ownership handoff."""
     transcript = session.transcript()
     for marker in (
-        "native console: ready",
-        "boot services: exited",
-        "frame bitmap: ready",
-        "allocation failure path: bounded",
-        "exception vectors: ready",
-        "owned page tables: ready",
-        "W^X mappings: active",
-        "interrupt-driven input: ready",
-        "cooperative tasks: deterministic",
-        "task stack guards: active",
-        "task resources: reclaimed",
-        "isolated address spaces: active",
-        "copied task messages: bounded",
-        "isolated faults: contained",
-        "isolated resources: reclaimed",
-        "KEX staging: owned and bounded",
-        "KEX load plans: mapped atomically",
-        "application ABI exit: active",
-        "application ABI resume: active",
-        "copied handle calls: active",
-        "execution lease: enforced",
-        "application resources: reclaimed",
-        "in-process console dispatch: ready",
-        "memory and console: owned",
+        "Initializing memory and protection",
+        "Starting devices and input",
+        "Starting task and application runtime",
+        "Starting console",
+        "Mounting /vol/root read-only",
+        "Configuring network: 10.0.2.15/24",
+        "Tiny Rust Operating Environment 0.1.0",
+        "Small by design. Alive on the wire.",
+        "Welcome to TROE.",
     ):
         if marker not in transcript:
             raise AcceptanceError(
                 f"{session.architecture} boot missed ownership marker {marker!r}"
             )
-    if "native storage: /vol/root read-only" not in transcript:
-        raise AcceptanceError(
-            f"{session.architecture} boot did not activate the BMNT-selected ext4 root volume"
-        )
 
 
 class SerialSession:
@@ -435,7 +415,7 @@ class SerialSession:
         if self.process.poll() is not None:
             raise AcceptanceError("QEMU exited instead of remaining in the fatal state")
         tail = normalize(bytes(self.output[start:]))
-        if "UEFI bootstrap: ready" in tail or "shell:/> " in tail:
+        if "Initializing memory and protection" in tail or "sh:/> " in tail:
             raise AcceptanceError(f"machine rebooted after fatal marker: {tail!r}")
 
     def backspace_command(
@@ -476,7 +456,7 @@ class SerialSession:
         except (BrokenPipeError, OSError) as error:
             raise AcceptanceError(f"cannot write QEMU serial input: {error}") from error
 
-        prompt = f"shell:{cwd}> ".encode()
+        prompt = f"sh:{cwd}> ".encode()
         end = self.wait_for(prompt, timeout, submitted)
         text = normalize(bytes(self.output[start : end - len(prompt)]))
         if expected not in text:
@@ -523,7 +503,7 @@ class SerialSession:
         except (BrokenPipeError, OSError) as error:
             raise AcceptanceError(f"cannot write QEMU serial input: {error}") from error
 
-        prompt = f"shell:{cwd}> ".encode()
+        prompt = f"sh:{cwd}> ".encode()
         end = self.wait_for(prompt, timeout, submitted)
         text = normalize(bytes(self.output[start : end - len(prompt)]))
         if expected not in text:
@@ -546,7 +526,7 @@ class SerialSession:
         """Execute a line, wait for the next prompt, and assert its output."""
         submitted = self.send(command, timeout, line_ending)
         resulting_cwd = cwd if next_cwd is None else next_cwd
-        prompt = f"shell:{resulting_cwd}> ".encode()
+        prompt = f"sh:{resulting_cwd}> ".encode()
         end = self.wait_for(prompt, timeout, submitted)
         raw = bytes(self.output[submitted : end - len(prompt)])
         text = normalize(raw)
@@ -593,9 +573,22 @@ class SerialSession:
 
 def run_scenario(session: SerialSession, boot_timeout: float, command_timeout: float) -> None:
     """Exercise every required built-in plus bounded failure behavior."""
-    session.wait_for(b"shell:/> ", boot_timeout)
+    session.wait_for(b"sh:/> ", boot_timeout)
     assert_owned_boot(session)
     cwd = "/"
+
+    session.command(
+        "net",
+        cwd,
+        command_timeout,
+        contains=("link: ready", "ipv4: 10.0.2.15", "gateway: 10.0.2.2"),
+    )
+    session.command(
+        "ping 10.0.2.2",
+        cwd,
+        command_timeout,
+        contains=("reply from 10.0.2.2", "bytes=9"),
+    )
 
     session.edited_command(
         "", b"\t", "", cwd, command_timeout, expected="\ncat\n"
@@ -634,7 +627,10 @@ def run_scenario(session: SerialSession, boot_timeout: float, command_timeout: f
         "cat /etc/motd",
         cwd,
         command_timeout,
-        contains=("Welcome to the tiny Rust operating environment.",),
+        contains=(
+            "Tiny Rust Operating Environment 0.1.0",
+            "Small by design. Alive on the wire.",
+        ),
     )
     session.command(
         "cat /vol/root/hello.txt",
@@ -771,9 +767,21 @@ def run_smoke_scenario(
     session: SerialSession, boot_timeout: float, command_timeout: float
 ) -> None:
     """Exercise the interactive console path without the exhaustive quota workload."""
-    session.wait_for(b"shell:/> ", boot_timeout)
+    session.wait_for(b"sh:/> ", boot_timeout)
     assert_owned_boot(session)
     cwd = "/"
+    session.command(
+        "net",
+        cwd,
+        command_timeout,
+        contains=("link: ready", "ipv4: 10.0.2.15", "gateway: 10.0.2.2"),
+    )
+    session.command(
+        "ping 10.0.2.2",
+        cwd,
+        command_timeout,
+        contains=("reply from 10.0.2.2", "bytes=9"),
+    )
     session.backspace_command(
         "echo brokeX", "n", cwd, command_timeout, expected="\nbroken\n"
     )
@@ -848,7 +856,7 @@ def run_native_keyboard_scenario(args: argparse.Namespace) -> None:
                         raise AcceptanceError("timed out connecting to QEMU monitor")
                     time.sleep(0.01)
 
-            session.wait_for(b"shell:/> ", args.boot_timeout)
+            session.wait_for(b"sh:/> ", args.boot_timeout)
             keys = (
                 ("e", b"e"),
                 ("c", b"c"),
@@ -872,7 +880,7 @@ def run_native_keyboard_scenario(args: argparse.Namespace) -> None:
             start = len(session.output)
             monitor.sendall(b"sendkey ret\n")
             session.wait_for(b"ps2-ready\n", args.command_timeout, start)
-            session.wait_for(b"shell:/> ", args.command_timeout, start)
+            session.wait_for(b"sh:/> ", args.command_timeout, start)
         except Exception:
             print("--- x86_64 native keyboard transcript ---", file=sys.stderr)
             print(session.transcript(), file=sys.stderr)
@@ -889,7 +897,7 @@ def run_fault_scenario(
     fault: str,
 ) -> None:
     """Prove that one forbidden access reaches the native fatal vector."""
-    session.wait_for(b"shell:/> ", boot_timeout)
+    session.wait_for(b"sh:/> ", boot_timeout)
     assert_owned_boot(session)
     if "native persistence: committed and flushed" not in session.transcript():
         raise AcceptanceError(
@@ -949,7 +957,7 @@ def test_architecture(
     try:
         scenario = run_smoke_scenario if args.smoke else run_scenario
         scenario(session, args.boot_timeout, args.command_timeout)
-        if args.framebuffer_console and b"owned framebuffer text console: ready" not in session.output:
+        if args.framebuffer_console and b"Starting console and framebuffer" not in session.output:
             raise AcceptanceError(
                 f"{architecture} did not activate the owned framebuffer text console"
             )
@@ -1039,8 +1047,8 @@ def main() -> int:
     if args.boot_timeout <= 0 or args.command_timeout <= 0:
         print("QEMU acceptance failed: timeouts must be positive", file=sys.stderr)
         return 2
-    architectures = QEMU_EXECUTABLES if args.architecture == "all" else (args.architecture,)
-    if args.architecture == "all" and (
+    architectures = QEMU_EXECUTABLES if args.arch == "all" else (args.arch,)
+    if args.arch == "all" and (
         args.firmware_code is not None or args.firmware_vars is not None
     ):
         print(
@@ -1051,12 +1059,12 @@ def main() -> int:
 
     try:
         if not args.skip_build:
-            build_architecture = args.architecture
+            build_architecture = args.arch
             subprocess.run(
                 [
                     sys.executable,
                     str(REPO_ROOT / "scripts" / "build.py"),
-                    "--architecture",
+                    "--arch",
                     build_architecture,
                 ],
                 cwd=REPO_ROOT,
@@ -1067,7 +1075,7 @@ def main() -> int:
                     [
                         sys.executable,
                         str(REPO_ROOT / "scripts" / "build.py"),
-                        "--architecture",
+                        "--arch",
                         build_architecture,
                         "--acceptance-probes",
                     ],

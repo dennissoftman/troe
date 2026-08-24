@@ -1,6 +1,7 @@
 # ADR 0023: bounded virtio network and minimal protocol profile
 
-Status: accepted and implemented for Stage 8, 2026-08-24.
+Status: accepted and implemented for Stage 8; amended by the networking
+usability increment, 2026-08-24.
 
 The first supported NIC is modern virtio-net on the existing AArch64 MMIO and
 x86-64 PCI buses. The initial device profile negotiates no checksum, segment,
@@ -38,9 +39,10 @@ guest processes per architecture must complete the exchange alongside durable
 rollback/state recovery, and the host independently requires exactly five
 requests.
 
-This is presently an `acceptance-probes` composition, not an ambient production
-network stack or shell API. The ordinary QEMU profile attaches no NIC and no
-application receives a network handle. Consequently `ping` and URL fetching are
-not claimed: the former requires an accepted bounded ICMP echo path, while the
-latter requires at least bounded TCP and HTTP plus explicit DNS/TLS policy when
-names or HTTPS are supported.
+The networking usability increment promotes the same device boundary into the
+ordinary QEMU composition. A bounded DHCP discover/request exchange supplies
+one IPv4 address, subnet mask, router, and lease; ARP replies and ICMP echo are
+accepted; and a small hardware-independent capability backs replaceable
+`net`, `dhcp`, `ping`, and `udp` shell commands. Work remains command-driven in
+this increment rather than a general socket API. URL fetching is still not
+claimed because TCP, HTTP, DNS, and TLS policy remain explicitly deferred.

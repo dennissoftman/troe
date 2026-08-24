@@ -92,7 +92,7 @@ fn run() -> Result<u8, String> {
     println!("hosted model 0.1.0 ({})", env::consts::ARCH);
     println!("Tab completes commands; use 'man COMMAND' for manuals");
     loop {
-        print!("shell:{}> ", shell.cwd());
+        print!("sh:{}> ", shell.cwd());
         io::stdout()
             .flush()
             .map_err(|error| format!("cannot flush prompt: {error}"))?;

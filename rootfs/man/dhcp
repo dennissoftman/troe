@@ -1,0 +1,9 @@
+NAME
+    dhcp - acquire an IPv4 lease
+
+SYNOPSIS
+    dhcp
+
+DESCRIPTION
+    Performs one bounded DHCP discover, offer, request, and acknowledgement
+    exchange. A successful lease replaces the current volatile IPv4 settings.

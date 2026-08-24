@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import platform
 import re
 import shutil
 import subprocess
@@ -16,6 +17,25 @@ QEMU_EXECUTABLES = {
     "x86_64": "qemu-system-x86_64",
     "aarch64": "qemu-system-aarch64",
 }
+
+
+def host_architecture() -> str:
+    """Return the supported TROE architecture matching the current host CPU."""
+    machine = platform.machine().lower()
+    aliases = {
+        "aarch64": "aarch64",
+        "arm64": "aarch64",
+        "amd64": "x86_64",
+        "x86_64": "x86_64",
+    }
+    try:
+        return aliases[machine]
+    except KeyError as error:
+        raise RuntimeError(
+            f"unsupported host architecture {machine!r}; pass --arch explicitly"
+        ) from error
+
+
 FIRMWARE_FILENAMES = {
     "x86_64": {
         "code": ("edk2-x86_64-code.fd", "OVMF_CODE.fd", "OVMF_CODE_4M.fd"),
@@ -116,7 +136,7 @@ def prepare_qemu_command(
             [
                 sys.executable,
                 str(REPO_ROOT / "scripts" / "build.py"),
-                "--architecture",
+                "--arch",
                 architecture,
                 *(("--acceptance-probes",) if acceptance_probes else ()),
             ],
@@ -224,17 +244,16 @@ def prepare_qemu_command(
             "-no-reboot",
         )
     )
-    if acceptance_probes:
-        network_device = (
-            "virtio-net-pci,disable-legacy=on"
-            if architecture == "x86_64"
-            else "virtio-net-device"
-        )
-        mac = "52:54:00:12:34:56" if architecture == "x86_64" else "52:54:00:12:34:57"
-        command[-1:-1] = [
-            "-netdev",
-            "user,id=troe-net",
-            "-device",
-            f"{network_device},netdev=troe-net,mac={mac}",
-        ]
+    network_device = (
+        "virtio-net-pci,disable-legacy=on"
+        if architecture == "x86_64"
+        else "virtio-net-device"
+    )
+    mac = "52:54:00:12:34:56" if architecture == "x86_64" else "52:54:00:12:34:57"
+    command[-1:-1] = [
+        "-netdev",
+        "user,id=troe-net",
+        "-device",
+        f"{network_device},netdev=troe-net,mac={mac}",
+    ]
     return command

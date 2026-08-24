@@ -73,13 +73,14 @@ handle calls, or is terminated by the 50 ms execution lease.
 
 ### Current networking scope
 
-The native NIC and protocol path is currently composed by the
-`acceptance-probes` images, which attach a modern virtio-net device, use the
-static QEMU user-network address, resolve its gateway with ARP, and exchange a
-bounded UDP request/reply with the host harness. This proves the Stage 8 device
-and packet boundary; it is not yet a user-facing socket service. Production
-images do not configure a NIC, and the shell has no `ping` or `fetch` command.
-ICMP, DHCP, DNS, TCP, HTTP, and TLS remain explicit later increments.
+Normal QEMU images attach one modern virtio-net device and acquire an IPv4
+address, subnet mask, default gateway, and lease through a bounded DHCP
+discover/request exchange. The recovery shell exposes `net`, `dhcp`, `ping`,
+and `udp send`/`udp recv`; ARP resolution, ARP replies, ICMP echo requests and
+replies, and checksummed UDP run through the same bounded native path on both
+architectures. These built-ins intentionally use a narrow replaceable network
+capability so they can move to KEX applications later. DNS, IPv6, TCP, HTTP,
+TLS, fragmentation, and general sockets remain outside this milestone.
 
 ## Quick start
 
@@ -88,7 +89,7 @@ Host model:
 ```console
 cargo run --manifest-path host/Cargo.toml
 cargo run --manifest-path host/Cargo.toml -- --command "echo ready | grep ready"
-cargo run --manifest-path host/Cargo.toml -- --script tests/smoke.ksh
+cargo run --manifest-path host/Cargo.toml -- --script tests/smoke.sh
 ```
 
 Build both boot images:
@@ -159,11 +160,12 @@ transport:
 
 ```console
 cargo qemu --graphical
-cargo qemu --architecture aarch64 --graphical
+cargo qemu --arch aarch64 --graphical
 ```
 
 The launcher discovers firmware bundled with QEMU in conventional installation
-locations. Select AArch64 with `cargo qemu --architecture aarch64`. If QEMU does
+locations. The launcher defaults to the host CPU architecture; select another
+target explicitly with `cargo qemu --arch ARCH`. If QEMU does
 not bundle firmware, provide code and variable-store images from rust-osdev
 `ovmf-prebuilt` release `edk2-stable202605-r1` using `--firmware-code` and
 `--firmware-vars`.

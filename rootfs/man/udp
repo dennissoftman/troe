@@ -1,0 +1,13 @@
+NAME
+    udp - send or receive one UDP datagram
+
+SYNOPSIS
+    udp send ADDRESS PORT [TEXT...]
+    udp recv PORT
+
+DESCRIPTION
+    Sends one checksummed datagram from a reported ephemeral port, using
+    standard input when TEXT is omitted, or waits boundedly for one datagram on
+    PORT. Use the reported source port to receive a reply. Receive output
+    includes the peer and exact payload. DNS and general sockets are not part
+    of this command.
