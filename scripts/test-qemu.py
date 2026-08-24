@@ -527,7 +527,10 @@ class SerialSession:
             edit_start = len(self.output)
             self.process.stdin.write(edit)
             self.process.stdin.flush()
-            self.wait_for(b"\x1b[K", timeout, edit_start)
+            # Pure horizontal cursor motion now uses the terminal's native
+            # relative-movement sequence instead of repainting the whole line.
+            marker = edit if edit in (b"\x1b[D", b"\x1b[C") else b"\x1b[K"
+            self.wait_for(marker, timeout, edit_start)
 
             for byte in suffix.encode("utf-8"):
                 character_start = len(self.output)

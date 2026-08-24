@@ -8,7 +8,7 @@ use core::cell::UnsafeCell;
 use core::fmt;
 use core::hint::spin_loop;
 use core::ptr;
-use core::sync::atomic::{Ordering, compiler_fence, fence};
+use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence, fence};
 
 use troe_block::BlockError;
 use troe_memory::{BASE_PAGE_SIZE, PhysicalRange};
@@ -30,6 +30,7 @@ const PCI_DEVICE_MODERN_BLOCK: u16 = 0x1042;
 const PCI_STATUS_CAPABILITIES: u16 = 1 << 4;
 const PCI_COMMAND_MEMORY: u16 = 1 << 1;
 const PCI_COMMAND_BUS_MASTER: u16 = 1 << 2;
+const PCI_COMMAND_INTERRUPT_DISABLE: u16 = 1 << 10;
 const PCI_CAP_VENDOR_SPECIFIC: u8 = 0x09;
 const PCI_CAP_COMMON: u8 = 1;
 const PCI_CAP_NOTIFY: u8 = 2;
@@ -70,6 +71,10 @@ const NO_VECTOR: u16 = u16::MAX;
 const DESCRIPTOR_NEXT: u16 = 1;
 const DESCRIPTOR_WRITE: u16 = 2;
 const NO_INTERRUPT: u16 = 1;
+const PCI_INTERRUPT_LINE: u8 = 0x3c;
+const PCI_INTERRUPT_PIN: u8 = 0x3d;
+
+static NETWORK_ISR_ADDRESS: AtomicUsize = AtomicUsize::new(0);
 
 /// Bounded q35 virtio PCI initialization failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -97,6 +102,7 @@ pub type NativeVirtioBlock = VirtioBlock<VirtioPciTransport>;
 
 /// One initialized q35 modern virtio network device.
 pub struct NativeVirtioNetwork {
+    address: PciAddress,
     common: MmioRegion,
     isr: MmioRegion,
     receive_notify: usize,
@@ -108,6 +114,7 @@ pub struct NativeVirtioNetwork {
     receive_used: u16,
     transmit_available: u16,
     transmit_used: u16,
+    interrupt_line: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -535,6 +542,7 @@ fn initialize_network_device(
         return Err(VirtioPciError::DeviceState);
     }
     let mut network = NativeVirtioNetwork {
+        address: capabilities.address,
         common: capabilities.common,
         isr: capabilities.isr,
         receive_notify,
@@ -546,6 +554,7 @@ fn initialize_network_device(
         receive_used: 0,
         transmit_available: 0,
         transmit_used: 0,
+        interrupt_line: pci_interrupt_line(capabilities.address)?,
     };
     network
         .post_receive()
@@ -582,7 +591,12 @@ fn configure_network_queue(
         common + COMMON_QUEUE_DEVICE,
         queue.address(queue.layout.used_offset())?,
     );
-    queue.write_u16(queue.layout.available_offset(), NO_INTERRUPT);
+    let flags = if index == RECEIVE_QUEUE_INDEX {
+        0
+    } else {
+        NO_INTERRUPT
+    };
+    queue.write_u16(queue.layout.available_offset(), flags);
     dma_publish();
     mmio_write_u16(common + COMMON_QUEUE_ENABLE, 1);
     if mmio_read_u16(common + COMMON_QUEUE_ENABLE) != 1 {
@@ -872,33 +886,44 @@ impl NetworkDevice for NativeVirtioNetwork {
 
     fn receive(&mut self) -> Result<Option<Vec<u8>>, NetError> {
         let expected = self.receive_used.wrapping_add(1);
-        for _ in 0..REGISTER_SPIN_LIMIT {
-            if self.receive.read_u16(self.receive.layout.used_offset() + 2) != expected {
-                spin_loop();
-                continue;
-            }
-            dma_observe();
-            let (head, bytes) = self.receive.used_element(self.receive_used)?;
-            self.receive_used = expected;
-            let _acknowledged = mmio_read_u8(self.isr.address);
-            let bytes = usize::try_from(bytes).map_err(|_| NetError::Device)?;
-            if head != 0
-                || !(VIRTIO_NET_HEADER_BYTES + ETHERNET_HEADER_BYTES
-                    ..=VIRTIO_NET_HEADER_BYTES + MAX_FRAME_BYTES)
-                    .contains(&bytes)
-                || !self.receive.header_is_zero()
-            {
-                return Err(NetError::Device);
-            }
-            let frame = self.receive.copy_frame(bytes - VIRTIO_NET_HEADER_BYTES)?;
-            self.post_receive()?;
-            return Ok(Some(frame));
+        if self.receive.read_u16(self.receive.layout.used_offset() + 2) != expected {
+            return Ok(None);
         }
-        Ok(None)
+        dma_observe();
+        let (head, bytes) = self.receive.used_element(self.receive_used)?;
+        self.receive_used = expected;
+        let bytes = usize::try_from(bytes).map_err(|_| NetError::Device)?;
+        if head != 0
+            || !(VIRTIO_NET_HEADER_BYTES + ETHERNET_HEADER_BYTES
+                ..=VIRTIO_NET_HEADER_BYTES + MAX_FRAME_BYTES)
+                .contains(&bytes)
+            || !self.receive.header_is_zero()
+        {
+            return Err(NetError::Device);
+        }
+        let frame = self.receive.copy_frame(bytes - VIRTIO_NET_HEADER_BYTES)?;
+        self.post_receive()?;
+        Ok(Some(frame))
     }
 }
 
 impl NativeVirtioNetwork {
+    /// Connect this device's legacy `INTx` completion source to the owned I/O APIC.
+    ///
+    /// Packet processing remains in cooperative kernel context; the interrupt
+    /// path only acknowledges the device and marks bounded work pending.
+    ///
+    /// # Errors
+    ///
+    /// Returns a resource error when the advertised PCI line cannot be routed.
+    pub fn enable_interrupts(&mut self) -> Result<(), VirtioPciError> {
+        let command = pci_read16(self.address, 4);
+        pci_write16(self.address, 4, command & !PCI_COMMAND_INTERRUPT_DISABLE);
+        NETWORK_ISR_ADDRESS.store(self.isr.address, Ordering::Release);
+        crate::mechanism::initialize_network_interrupt(u32::from(self.interrupt_line))
+            .map_err(|_| VirtioPciError::InvalidResource)
+    }
+
     fn post_receive(&mut self) -> Result<(), NetError> {
         self.receive.prepare_receive()?;
         publish_network_descriptor(
@@ -908,6 +933,20 @@ impl NativeVirtioNetwork {
             self.receive_notify,
         )
     }
+}
+
+pub(crate) fn acknowledge_network_interrupt_from_isr() -> bool {
+    let address = NETWORK_ISR_ADDRESS.load(Ordering::Acquire);
+    address != 0 && mmio_read_u8(address) & 1 != 0
+}
+
+fn pci_interrupt_line(address: PciAddress) -> Result<u8, VirtioPciError> {
+    let line = pci_read8(address, PCI_INTERRUPT_LINE);
+    let pin = pci_read8(address, PCI_INTERRUPT_PIN);
+    if line == u8::MAX || pin == 0 {
+        return Err(VirtioPciError::InvalidResource);
+    }
+    Ok(line)
 }
 
 impl Drop for NativeVirtioNetwork {

@@ -1874,6 +1874,7 @@ fn architecture_install_exception_vectors(exception_stack: PhysicalRange) -> Res
         for vector in [
             crate::mechanism::X86_KEYBOARD_VECTOR,
             crate::mechanism::X86_SERIAL_VECTOR,
+            crate::mechanism::X86_NETWORK_VECTOR,
         ] {
             (*X86_IDT.0.get()).0[usize::from(vector)] = x86_interrupt_gate(input, 0);
         }

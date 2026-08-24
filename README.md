@@ -81,7 +81,9 @@ service answers ARP and ICMP while the prompt or a cooperative command is idle,
 retains eight ARP neighbors, and owns eight persistent UDP ports with four
 datagrams and 4 KiB per-port receive capacity. Commands use a boot-relative
 monotonic clock and explicit cancellation checkpoints; Ctrl-C cancels waits and
-`sleep` without introducing background jobs. DNS, IPv6, TCP, HTTP, TLS,
+`sleep` without introducing background jobs. Receive completions wake the
+ambient service through bounded q35 INTx or GICv2 handlers; an empty receive
+check never spins. DNS, IPv6, TCP, HTTP, TLS,
 fragmentation, and general sockets remain outside this milestone.
 
 ## Quick start

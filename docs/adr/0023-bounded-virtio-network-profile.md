@@ -45,8 +45,13 @@ one IPv4 address, subnet mask, router, and lease; ARP replies and ICMP echo are
 accepted; and a small hardware-independent capability backs replaceable
 `net`, `dhcp`, `ping`, and `udp` shell commands.
 
-The runtime-service amendment moves NIC polling behind a shared single-CPU
-service checkpoint. Each checkpoint processes at most eight frames. The
+The runtime-service amendment moves packet processing behind a shared
+single-CPU service checkpoint. Virtio receive queues expose used-buffer
+interrupts through q35 INTx/IOAPIC or the `virt` GICv2 SPI. Their bounded ISR
+only acknowledges the transport and coalesces a pending-work bit; parsing and
+allocation remain in cooperative context, where one poll processes at most
+eight frames. Empty receive checks never spin, and prompt idle uses the same
+lost-wakeup-safe `hlt`/`wfi` boundary as input. The
 service retains eight least-recently-observed ARP entries, eight persistent UDP
 port bindings, and at most four datagrams/4 KiB per port, dropping newest input
 at capacity. It answers local ARP and ICMP echo requests during prompt idle and

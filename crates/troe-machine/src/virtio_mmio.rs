@@ -8,6 +8,7 @@ use core::cell::UnsafeCell;
 use core::fmt;
 use core::hint::spin_loop;
 use core::ptr;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use troe_block::BlockError;
 use troe_memory::{BASE_PAGE_SIZE, PhysicalRange};
@@ -70,6 +71,9 @@ const STATUS_FAILED: u32 = 128;
 const DESCRIPTOR_NEXT: u16 = 1;
 const DESCRIPTOR_WRITE: u16 = 2;
 const NO_INTERRUPT: u16 = 1;
+const VIRTIO_MMIO_FIRST_INTID: u32 = 48;
+
+static NETWORK_INTERRUPT_BASE: AtomicUsize = AtomicUsize::new(0);
 
 /// Bounded native virtio-MMIO initialization failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -263,7 +267,12 @@ fn configure_network_queue(
         MMIO_QUEUE_DEVICE_HIGH,
         queue.address(queue.layout.used_offset())?,
     );
-    queue.write_u16(queue.layout.available_offset(), NO_INTERRUPT);
+    let flags = if index == RECEIVE_QUEUE_INDEX {
+        0
+    } else {
+        NO_INTERRUPT
+    };
+    queue.write_u16(queue.layout.available_offset(), flags);
     dma_publish();
     mmio_write(base, MMIO_QUEUE_READY, 1);
     if mmio_read(base, MMIO_QUEUE_READY) != 1 {
@@ -591,33 +600,54 @@ impl NetworkDevice for NativeVirtioNetwork {
 
     fn receive(&mut self) -> Result<Option<Vec<u8>>, NetError> {
         let expected = self.receive_used.wrapping_add(1);
-        for _ in 0..REGISTER_SPIN_LIMIT {
-            if self.receive.read_u16(self.receive.layout.used_offset() + 2) != expected {
-                spin_loop();
-                continue;
-            }
-            dma_observe();
-            let (head, bytes) = self.receive.used_element(self.receive_used)?;
-            self.receive_used = expected;
-            acknowledge_network_interrupt(self.base);
-            let bytes = usize::try_from(bytes).map_err(|_| NetError::Device)?;
-            if head != 0
-                || !(VIRTIO_NET_HEADER_BYTES + ETHERNET_HEADER_BYTES
-                    ..=VIRTIO_NET_HEADER_BYTES + MAX_FRAME_BYTES)
-                    .contains(&bytes)
-                || !self.receive.header_is_zero()
-            {
-                return Err(NetError::Device);
-            }
-            let frame = self.receive.copy_frame(bytes - VIRTIO_NET_HEADER_BYTES)?;
-            self.post_receive()?;
-            return Ok(Some(frame));
+        if self.receive.read_u16(self.receive.layout.used_offset() + 2) != expected {
+            return Ok(None);
         }
-        Ok(None)
+        dma_observe();
+        let (head, bytes) = self.receive.used_element(self.receive_used)?;
+        self.receive_used = expected;
+        let bytes = usize::try_from(bytes).map_err(|_| NetError::Device)?;
+        if head != 0
+            || !(VIRTIO_NET_HEADER_BYTES + ETHERNET_HEADER_BYTES
+                ..=VIRTIO_NET_HEADER_BYTES + MAX_FRAME_BYTES)
+                .contains(&bytes)
+            || !self.receive.header_is_zero()
+        {
+            return Err(NetError::Device);
+        }
+        let frame = self.receive.copy_frame(bytes - VIRTIO_NET_HEADER_BYTES)?;
+        self.post_receive()?;
+        Ok(Some(frame))
     }
 }
 
 impl NativeVirtioNetwork {
+    /// Connect this slot's completion source to the owned `GICv2` distributor.
+    ///
+    /// The IRQ handler only acknowledges the MMIO source and schedules a
+    /// bounded cooperative poll; it never parses or allocates packets.
+    ///
+    /// # Errors
+    ///
+    /// Returns a resource error when the slot cannot map to an implemented SPI.
+    pub fn enable_interrupts(&mut self) -> Result<(), VirtioMmioError> {
+        let offset = u64::try_from(self.base)
+            .ok()
+            .and_then(|base| base.checked_sub(VIRTIO_MMIO_BASE))
+            .ok_or(VirtioMmioError::InvalidResource)?;
+        if !offset.is_multiple_of(VIRTIO_MMIO_SLOT_BYTES) {
+            return Err(VirtioMmioError::InvalidResource);
+        }
+        let slot = u32::try_from(offset / VIRTIO_MMIO_SLOT_BYTES)
+            .map_err(|_| VirtioMmioError::InvalidResource)?;
+        let intid = VIRTIO_MMIO_FIRST_INTID
+            .checked_add(slot)
+            .ok_or(VirtioMmioError::InvalidResource)?;
+        NETWORK_INTERRUPT_BASE.store(self.base, Ordering::Release);
+        crate::mechanism::initialize_network_interrupt(intid)
+            .map_err(|_| VirtioMmioError::InvalidResource)
+    }
+
     fn post_receive(&mut self) -> Result<(), NetError> {
         self.receive.prepare_receive()?;
         publish_network_descriptor(
@@ -627,6 +657,18 @@ impl NativeVirtioNetwork {
             self.base,
         )
     }
+}
+
+pub(crate) fn acknowledge_network_interrupt_from_isr() -> bool {
+    let base = NETWORK_INTERRUPT_BASE.load(Ordering::Acquire);
+    if base == 0 {
+        return false;
+    }
+    let status = mmio_read(base, MMIO_INTERRUPT_STATUS) & 0x3;
+    if status != 0 {
+        mmio_write(base, MMIO_INTERRUPT_ACK, status);
+    }
+    status & 1 != 0
 }
 
 impl Drop for NativeVirtioNetwork {

@@ -76,7 +76,7 @@ mod firmware {
     };
     use troe_terminal::{
         EditorConfig, EditorOutcome, FramebufferDescriptor, FramebufferPixelFormat, InputDecoder,
-        KeyboardConfig, LineEditor, Ps2Set1Decoder, TextConsole, TextConsoleConfig,
+        KeyEvent, KeyboardConfig, LineEditor, Ps2Set1Decoder, TextConsole, TextConsoleConfig,
     };
     use troe_vfs::{Namespace, RamFsQuota, ReadOnlyFileSystem};
     use uefi::boot;
@@ -310,7 +310,6 @@ mod firmware {
         deferred_input: VecDeque<InputEvent>,
         control_down: bool,
         last_millis: Cell<u64>,
-        last_network_poll: u64,
     }
 
     type SharedRuntime = Rc<RefCell<KernelRuntime>>;
@@ -523,9 +522,9 @@ mod firmware {
             return Err(());
         }
         let boot_mount_manifest = prepared.boot_mount_manifest.as_ref().ok_or(())?;
+        troe_machine::initialize_input_interrupts(InputQueueConfig::tiny()).map_err(|_| ())?;
         let (native_blocks, native_statefs) = initialize_native_blocks(boot_mount_manifest)?;
         let boot_mount_manifest = prepared.boot_mount_manifest.take().ok_or(())?;
-        troe_machine::initialize_input_interrupts(InputQueueConfig::tiny()).map_err(|_| ())?;
         if !write_machine_boot_status(BOOT_DEVICES_LABEL, true) {
             return Err(());
         }
@@ -581,6 +580,8 @@ mod firmware {
         let mut network = troe_machine::discover_virtio_pci_network()
             .map_err(|_| ())?
             .ok_or(())?;
+        network.enable_interrupts().map_err(|_| ())?;
+        let _initial_poll = troe_machine::take_network_interrupt();
         if !troe_machine::write(b"native network: device ready\n") {
             return Err(());
         }
@@ -615,6 +616,7 @@ mod firmware {
         }
         for _ in 0..64 {
             let Some(frame) = network.receive().map_err(|_| ())? else {
+                wait_for_network_completion();
                 continue;
             };
             if frame.get(..6) != Some(&network.mac_address().bytes()) {
@@ -649,7 +651,10 @@ mod firmware {
         for _ in 0..64 {
             let frame = match network.receive() {
                 Ok(Some(frame)) => frame,
-                Ok(None) => continue,
+                Ok(None) => {
+                    wait_for_network_completion();
+                    continue;
+                }
                 Err(_) => {
                     let _ignored = troe_machine::write(b"native network: RX completion invalid\n");
                     return Err(());
@@ -676,6 +681,12 @@ mod firmware {
             let _ignored = troe_machine::write(b"native network: ARP identity mismatch\n");
         }
         Err(())
+    }
+
+    #[cfg(feature = "acceptance-probes")]
+    fn wait_for_network_completion() {
+        troe_machine::wait_for_runtime_event();
+        let _completion = troe_machine::take_network_interrupt();
     }
 
     #[cfg(feature = "acceptance-probes")]
@@ -3283,7 +3294,6 @@ mod firmware {
     impl KernelRuntime {
         const DEFERRED_INPUT_CAPACITY: usize = 128;
         const INPUT_CHECKPOINT_BUDGET: usize = 32;
-        const NETWORK_POLL_INTERVAL_MILLIS: u64 = 10;
 
         fn new(network: Option<SharedNetwork>) -> Result<Self, RuntimeInitError> {
             let initial = troe_machine::monotonic_millis().ok_or(RuntimeInitError::Clock)?;
@@ -3296,7 +3306,6 @@ mod firmware {
                 deferred_input,
                 control_down: false,
                 last_millis: Cell::new(initial),
-                last_network_poll: initial.saturating_sub(Self::NETWORK_POLL_INTERVAL_MILLIS),
             })
         }
 
@@ -3310,12 +3319,10 @@ mod firmware {
         }
 
         fn checkpoint(&mut self) -> Result<(), Cancelled> {
-            let now = self.now().as_millis();
-            if now.saturating_sub(self.last_network_poll) >= Self::NETWORK_POLL_INTERVAL_MILLIS {
-                if let Some(network) = &self.network {
-                    let _bounded_poll = network.borrow_mut().poll();
-                }
-                self.last_network_poll = now;
+            if troe_machine::take_network_interrupt()
+                && let Some(network) = &self.network
+            {
+                let _bounded_poll = network.borrow_mut().poll();
             }
             for _ in 0..Self::INPUT_CHECKPOINT_BUDGET {
                 let Some(event) = troe_machine::try_input_event() else {
@@ -3343,6 +3350,11 @@ mod firmware {
 
         fn next_input_event(&mut self) -> Option<InputEvent> {
             let _cancel_at_prompt = self.checkpoint();
+            if let Some(event) = self.deferred_input.pop_front() {
+                return Some(event);
+            }
+            troe_machine::wait_for_runtime_event();
+            let _cancel_at_prompt = self.checkpoint();
             self.deferred_input.pop_front()
         }
     }
@@ -3359,11 +3371,12 @@ mod firmware {
 
     fn discover_network_service() -> Option<SharedNetwork> {
         #[cfg(target_arch = "aarch64")]
-        let device = troe_machine::discover_virtio_mmio_network()
+        let mut device = troe_machine::discover_virtio_mmio_network()
             .ok()
             .flatten()?;
         #[cfg(target_arch = "x86_64")]
-        let device = troe_machine::discover_virtio_pci_network().ok().flatten()?;
+        let mut device = troe_machine::discover_virtio_pci_network().ok().flatten()?;
+        device.enable_interrupts().ok()?;
         let service = KernelNetworkService::new(device).ok()?;
         Some(Rc::new(RefCell::new(service)))
     }
@@ -3563,7 +3576,6 @@ mod firmware {
                     if let Some(event) = runtime.borrow_mut().next_input_event() {
                         break event;
                     }
-                    core::hint::spin_loop();
                 };
                 let key = match event.source() {
                     InputSource::Serial => decoder.push(event.byte()),
@@ -3574,7 +3586,11 @@ mod firmware {
                 }
             };
             match editor.handle(key) {
-                EditorOutcome::Changed => redraw_editor(editor, prompt, console)?,
+                EditorOutcome::Changed => match key {
+                    KeyEvent::Left => write_all(console, b"\x1b[D")?,
+                    KeyEvent::Right => write_all(console, b"\x1b[C")?,
+                    _ => redraw_editor(editor, prompt, console)?,
+                },
                 EditorOutcome::Submitted(line) => {
                     write_all(console, b"\n")?;
                     return Ok(line);

@@ -14,6 +14,8 @@ use core::cell::UnsafeCell;
 use core::hint::spin_loop;
 use core::ptr;
 use core::ptr::NonNull;
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+use core::sync::atomic::AtomicU32;
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 use core::sync::atomic::AtomicU64;
 #[cfg(target_os = "uefi")]
@@ -162,6 +164,12 @@ unsafe impl Sync for InputQueueCell {}
 
 #[cfg(target_os = "uefi")]
 static INPUT_QUEUE: InputQueueCell = InputQueueCell(UnsafeCell::new(None));
+
+#[cfg(target_os = "uefi")]
+static NETWORK_INTERRUPT_PENDING: AtomicBool = AtomicBool::new(false);
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+static AARCH64_NETWORK_INTERRUPT_INTID: AtomicU32 = AtomicU32::new(u32::MAX);
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 static X86_TSC_TICKS_PER_MILLISECOND: AtomicU64 = AtomicU64::new(0);
@@ -735,6 +743,40 @@ pub fn wait_for_input_event() -> InputEvent {
     }
 }
 
+/// Sleep until either bounded input or ambient network work is pending.
+///
+/// The check is performed with architecture IRQ delivery masked, closing the
+/// lost-wakeup window before the architecture idle instruction.
+#[cfg(target_os = "uefi")]
+pub fn wait_for_runtime_event() {
+    architecture_mask_input_interrupts();
+    loop {
+        // SAFETY: IRQ delivery is masked on the single boot CPU.
+        let input_pending =
+            unsafe { input_queue_mut() }.is_some_and(|queue| queue.stats().queued != 0);
+        if input_pending || NETWORK_INTERRUPT_PENDING.load(Ordering::Acquire) {
+            architecture_enable_input_interrupts();
+            return;
+        }
+        // SAFETY: Main context has exclusive access while IRQs are masked.
+        if let Some(queue) = unsafe { input_queue_mut() } {
+            queue.record_idle_wait();
+        }
+        architecture_wait_for_input_interrupt();
+        // SAFETY: The architecture wait helper returns with IRQs masked.
+        if let Some(queue) = unsafe { input_queue_mut() } {
+            queue.record_wakeup();
+        }
+    }
+}
+
+/// Consume the coalesced indication that a network completion needs polling.
+#[must_use]
+#[cfg(target_os = "uefi")]
+pub fn take_network_interrupt() -> bool {
+    NETWORK_INTERRUPT_PENDING.swap(false, Ordering::AcqRel)
+}
+
 /// Return one queued input event without blocking.
 #[cfg(target_os = "uefi")]
 pub fn try_input_event() -> Option<InputEvent> {
@@ -787,6 +829,11 @@ pub(crate) fn handle_input_interrupt() {
     if let Some(queue) = unsafe { input_queue_mut() } {
         let _timer = architecture_handle_input_interrupt(queue);
     }
+}
+
+#[cfg(target_os = "uefi")]
+pub(crate) fn initialize_network_interrupt(line: u32) -> Result<(), InputInterruptError> {
+    architecture_initialize_network_interrupt(line)
 }
 
 /// Dispatch an interrupt taken during unprivileged application execution.
@@ -877,6 +924,8 @@ fn resource_page_range(resource: MmioResource) -> Result<PhysicalRange, InputInt
 pub(crate) const X86_KEYBOARD_VECTOR: u8 = 0x31;
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 pub(crate) const X86_SERIAL_VECTOR: u8 = 0x34;
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+pub(crate) const X86_NETWORK_VECTOR: u8 = 0x35;
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 pub(crate) const X86_TIMER_VECTOR: u8 = 0x30;
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
@@ -970,7 +1019,7 @@ fn architecture_initialize_input_interrupts(
     // Retain bytes already present before enabling receive notification.
     // SAFETY: Initialization still runs with CPU interrupts masked.
     if let Some(queue) = unsafe { input_queue_mut() } {
-        x86_drain_input_devices(queue);
+        let _drained = x86_drain_input_devices(queue);
     }
     // SAFETY: COM1's interrupt-enable register is owned by the pinned profile.
     unsafe {
@@ -984,8 +1033,12 @@ fn architecture_initialize_input_interrupts(
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 fn architecture_handle_input_interrupt(queue: &mut BoundedInputQueue) -> bool {
     const LAPIC_EOI: usize = 0x0b0;
-    queue.record_interrupt();
-    x86_drain_input_devices(queue);
+    if x86_drain_input_devices(queue) {
+        queue.record_interrupt();
+    }
+    if crate::virtio_pci::acknowledge_network_interrupt_from_isr() {
+        NETWORK_INTERRUPT_PENDING.store(true, Ordering::Release);
+    }
     if let Ok(profile) = x86_input_profile()
         && let Ok(lapic_base) = usize::try_from(profile.lapic.base_address())
     {
@@ -1164,19 +1217,23 @@ fn architecture_acknowledge_execution_timer_interrupt() {
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
-fn x86_drain_input_devices(queue: &mut BoundedInputQueue) {
+fn x86_drain_input_devices(queue: &mut BoundedInputQueue) -> bool {
     let budget = queue.config().max_drain_per_interrupt();
+    let mut drained = false;
     for _ in 0..budget {
         if let Some(byte) = try_read_keyboard_scancode() {
             let _result = queue.push(InputEvent::new(InputSource::Keyboard, byte));
+            drained = true;
             continue;
         }
         if let Some(byte) = architecture_try_read_byte() {
             let _result = queue.push(InputEvent::new(InputSource::Serial, byte));
+            drained = true;
             continue;
         }
         break;
     }
+    drained
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
@@ -1185,6 +1242,39 @@ fn x86_route_ioapic(ioapic: MmioResource, interrupt: InterruptResource, apic_id:
     x86_ioapic_write(ioapic, register, 1 << 16);
     x86_ioapic_write(ioapic, register + 1, apic_id << 24);
     x86_ioapic_write(ioapic, register, u32::from(interrupt.vector()));
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn architecture_initialize_network_interrupt(line: u32) -> Result<(), InputInterruptError> {
+    const LAPIC_ID: usize = 0x020;
+    const IOAPIC_ACTIVE_LOW: u32 = 1 << 13;
+    const IOAPIC_LEVEL_TRIGGERED: u32 = 1 << 15;
+    let profile = x86_input_profile()?;
+    architecture_mask_input_interrupts();
+    let result = (|| {
+        let maximum_entry = (x86_ioapic_read(profile.ioapic, 1) >> 16) & 0xff;
+        if line > maximum_entry {
+            return Err(InputInterruptError::InterruptLineUnavailable);
+        }
+        let lapic_base = usize::try_from(profile.lapic.base_address())
+            .map_err(|_| InputInterruptError::InvalidResource)?;
+        // SAFETY: The mapped LAPIC ID register belongs to the boot CPU.
+        let apic_id = unsafe { mmio_read32(lapic_base + LAPIC_ID) } >> 24;
+        let register = 0x10 + line * 2;
+        x86_ioapic_write(profile.ioapic, register, 1 << 16);
+        x86_ioapic_write(profile.ioapic, register + 1, apic_id << 24);
+        x86_ioapic_write(
+            profile.ioapic,
+            register,
+            u32::from(X86_NETWORK_VECTOR) | IOAPIC_ACTIVE_LOW | IOAPIC_LEVEL_TRIGGERED,
+        );
+        Ok(())
+    })();
+    if result.is_ok() {
+        NETWORK_INTERRUPT_PENDING.store(true, Ordering::Release);
+    }
+    architecture_enable_input_interrupts();
+    result
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
@@ -1541,6 +1631,10 @@ fn architecture_handle_input_interrupt(queue: &mut BoundedInputQueue) -> bool {
     let execution_timer = intid == AARCH64_EXECUTION_TIMER_INTID;
     if execution_timer {
         architecture_disarm_execution_timer();
+    } else if intid == AARCH64_NETWORK_INTERRUPT_INTID.load(Ordering::Acquire) {
+        if crate::virtio_mmio::acknowledge_network_interrupt_from_isr() {
+            NETWORK_INTERRUPT_PENDING.store(true, Ordering::Release);
+        }
     } else if intid == profile.serial_interrupt.line() {
         queue.record_interrupt();
         // Acknowledge the latched sources before draining. A byte arriving
@@ -1564,6 +1658,54 @@ fn architecture_handle_input_interrupt(queue: &mut BoundedInputQueue) -> bool {
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 const AARCH64_EXECUTION_TIMER_INTID: u32 = 30;
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn architecture_initialize_network_interrupt(intid: u32) -> Result<(), InputInterruptError> {
+    const GICD_TYPER: usize = 0x004;
+    const GICD_IGROUPR: usize = 0x080;
+    const GICD_ISENABLER: usize = 0x100;
+    const GICD_IPRIORITYR: usize = 0x400;
+    const GICD_ITARGETSR: usize = 0x800;
+    const GICD_ICFGR: usize = 0xc00;
+    let profile = aarch64_input_profile()?;
+    architecture_mask_input_interrupts();
+    let result = (|| {
+        let distributor = usize::try_from(profile.gic.base_address())
+            .map_err(|_| InputInterruptError::InvalidResource)?;
+        // SAFETY: GICD_TYPER is a read-only register in the mapped aperture.
+        let count = usize::try_from((unsafe { mmio_read32(distributor + GICD_TYPER) } & 0x1f) + 1)
+            .map_err(|_| InputInterruptError::InvalidResource)?
+            .checked_mul(32)
+            .ok_or(InputInterruptError::InvalidResource)?;
+        let intid_index =
+            usize::try_from(intid).map_err(|_| InputInterruptError::InvalidResource)?;
+        if intid_index < 32 || intid_index >= count {
+            return Err(InputInterruptError::InterruptLineUnavailable);
+        }
+        let word = intid_index / 32;
+        let bit = 1_u32 << (intid_index % 32);
+        // SAFETY: TYPER bounds the selected SPI registers; IRQs are masked.
+        unsafe {
+            let group = mmio_read32(distributor + GICD_IGROUPR + word * 4);
+            mmio_write32(distributor + GICD_IGROUPR + word * 4, group & !bit);
+            gicv2_update_byte(distributor + GICD_IPRIORITYR, intid_index, 0x40);
+            gicv2_update_byte(distributor + GICD_ITARGETSR, intid_index, 0x01);
+            let address = distributor + GICD_ICFGR + (intid_index / 16) * 4;
+            let shift = (intid_index % 16) * 2;
+            let config = mmio_read32(address) & !(0b10 << shift);
+            mmio_write32(address, config);
+            mmio_write32(distributor + GICD_ISENABLER + word * 4, bit);
+            core::arch::asm!("dsb sy", "isb", options(nomem, nostack));
+        }
+        AARCH64_NETWORK_INTERRUPT_INTID.store(intid, Ordering::Release);
+        Ok(())
+    })();
+    if result.is_ok() {
+        NETWORK_INTERRUPT_PENDING.store(true, Ordering::Release);
+    }
+    architecture_enable_input_interrupts();
+    result
+}
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 fn architecture_monotonic_millis() -> Option<u64> {

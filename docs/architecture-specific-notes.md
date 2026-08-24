@@ -54,8 +54,11 @@ x86-64 or AArch64 platform contracts.
   initial NIC profile owns one eight-entry RX queue and one TX queue, publishes
   only one fixed complete-frame buffer per queue, uses the 12-byte modern v1
   header, and negotiates no offload, mergeable-buffer, control, or multiqueue
-  features. AArch64 applies the identical queue contract through modern
-  virtio-MMIO with outer-shareable DMA barriers.
+  features. Its receive queue permits used-buffer notification through the
+  validated PCI interrupt pin/line, routed active-low and level-triggered to a
+  dedicated IDT vector. The ISR capability read deasserts INTx and only sets a
+  coalesced service-work bit. AArch64 applies the identical queue contract
+  through modern virtio-MMIO with outer-shareable DMA barriers.
 - Terminal machine control is profile-owned: `poweroff` writes the q35 ICH9
   PM1 control register at `0x604` with SLP_EN set for its S5 type, while
   `reboot` requests a full reset through q35 reset control at `0xcf9`. These
@@ -125,6 +128,10 @@ x86-64 or AArch64 platform contracts.
   `dmb oshld` follows used-index observation. A timed-out request resets and
   confirms the device before returning; failure to confirm reset parks forever
   because returning could let DMA outlive the borrowed payload.
+- A virtio-net slot derives its QEMU `virt` SPI from the fixed slot-to-INTID
+  profile, validates it against `GICD_TYPER`, and enables it as a level source.
+  The IRQ path acknowledges only the MMIO status and coalesces cooperative
+  service work. Empty receive checks are constant-time and never spin.
 - The pinned QEMU `virt` command explicitly disables legacy virtio-MMIO. Its
   secondary read-only fixture contains deterministic primary/backup GPT copies
   and a constrained ext4 volume; acceptance reaches that volume only through
@@ -133,9 +140,10 @@ x86-64 or AArch64 platform contracts.
   `reboot` therefore issue `SYSTEM_OFF` and `SYSTEM_RESET`; an unexpected PSCI
   return falls back to the terminal CPU park path.
 - Polling block completion suppresses used interrupts and acknowledges any
-  observed transport status. GIC initialization keeps virtio SPIs masked; a
+  observed transport status. GIC initialization keeps unrelated virtio SPIs
+  masked; the network profile explicitly enables its one completion SPI. A
   later interrupt-driven block profile must add explicit routing, ISR budgets,
-  and teardown synchronization rather than reusing the input path implicitly.
+  and teardown synchronization rather than reusing the network path implicitly.
 - Suspended application handle calls translate only previously validated user
   ranges to retained task-owned physical pages. The supervisor kernel root
   identity-maps those allocated pages for the bounded request and reply copies;
