@@ -350,7 +350,10 @@ The first portable storage/configuration boundary is landed:
   `/vol/root` and read it through the live shell; and
 - the q35 front end discovers modern virtio PCI capabilities, validates and
   maps their sized BAR regions, and drives the shared synchronous queue without
-  exposing PCI details above `troe-machine`.
+  exposing PCI details above `troe-machine`; and
+- `troe-persist` implements the first writable durability primitive: a
+  four-block dual-slot record with data/flush/commit/flush ordering, exact
+  generation/checksum recovery, and host fault injection at every boundary.
 
 These mechanisms are host verified; both VM transports and read-only mount
 activation are QEMU verified. Stage 8 is not complete: FAT32 and ext4 remain
@@ -383,12 +386,12 @@ Continue Stage 8 in this order:
 
 ### Next-session handoff
 
-Continue with the first durability increment: specify a small mutation target
-and its exact write/flush ordering, dirty-state, interruption, and recovery
-contract before exposing any writable mount. In parallel, make the EFI
-boot-source manifest load replace the embedded QEMU fixture without changing
-BMNT matching. Keep filesystem providers unaware of either transport and keep
-BMNT separate from SCFG.
+Continue the durability increment by allocating a dedicated writable QEMU
+region for TXSLOT v1, running the real virtio write/flush sequence on both
+transports, and adding process-cut/reopen acceptance before using it for an SCFG
+activation pointer. In parallel, make the EFI boot-source manifest load replace
+the embedded QEMU fixture without changing BMNT matching. Do not interpret this
+small transaction record as permission to expose ext4 or FAT mutation yet.
 
 Do not start with a filesystem parser coupled directly to a hardware driver or
 the shell. The block transport, region discovery, filesystem provider, VFS,

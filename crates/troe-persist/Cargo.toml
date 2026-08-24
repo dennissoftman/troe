@@ -1,0 +1,13 @@
+[package]
+name = "troe-persist"
+description = "Bounded crash-consistent dual-slot persistence transactions for TROE"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+troe-block = { path = "../troe-block" }
+
+[lints]
+workspace = true
