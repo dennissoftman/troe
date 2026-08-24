@@ -346,14 +346,16 @@ The first portable storage/configuration boundary is landed:
   in QEMU acceptance; and
 - `troe-storage` shares native devices across exclusive synchronous region
   capabilities, validates exact BMNT-selected GPT/ext4 identities, and prepares
-  only read-only providers. The AArch64 QEMU fixture now mounts the matched
-  volume at `/vol/root` and reads it through the live shell.
+  only read-only providers. Both QEMU fixtures mount the matched volume at
+  `/vol/root` and read it through the live shell; and
+- the q35 front end discovers modern virtio PCI capabilities, validates and
+  maps their sized BAR regions, and drives the shared synchronous queue without
+  exposing PCI details above `troe-machine`.
 
-These mechanisms are host verified; the first native transport and read-only
-mount activation are QEMU verified. Stage 8 is not complete: q35 virtio PCI is
-absent, FAT32 and ext4 remain read-only, configuration is not persistently
-activated, and networking, the content store, generation activation, and
-rollback are still absent.
+These mechanisms are host verified; both VM transports and read-only mount
+activation are QEMU verified. Stage 8 is not complete: FAT32 and ext4 remain
+read-only, configuration is not persistently activated, and networking, the
+content store, generation activation, and rollback are still absent.
 
 ADR 0018 fixes the bootstrap semantics for the next storage increments. KEFS
 provides the immutable `/`, `/vol/root` is the selected persistent ext4 role,
@@ -381,11 +383,12 @@ Continue Stage 8 in this order:
 
 ### Next-session handoff
 
-Continue item 1 above: add the modern virtio PCI front end for q35 over the
-landed shared core and feed it into the transport-independent storage activation
-layer. Then make the EFI boot-source manifest load replace the embedded QEMU
-fixture without changing BMNT matching. Keep filesystem providers unaware of
-either transport and keep BMNT separate from SCFG.
+Continue with the first durability increment: specify a small mutation target
+and its exact write/flush ordering, dirty-state, interruption, and recovery
+contract before exposing any writable mount. In parallel, make the EFI
+boot-source manifest load replace the embedded QEMU fixture without changing
+BMNT matching. Keep filesystem providers unaware of either transport and keep
+BMNT separate from SCFG.
 
 Do not start with a filesystem parser coupled directly to a hardware driver or
 the shell. The block transport, region discovery, filesystem provider, VFS,

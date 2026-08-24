@@ -167,8 +167,10 @@ def assert_owned_boot(session: "SerialSession") -> None:
             raise AcceptanceError(
                 f"{session.architecture} boot missed ownership marker {marker!r}"
             )
-    if session.architecture == "aarch64" and "native storage: /vol/root read-only" not in transcript:
-        raise AcceptanceError("aarch64 boot did not activate the BMNT-selected ext4 root volume")
+    if "native storage: /vol/root read-only" not in transcript:
+        raise AcceptanceError(
+            f"{session.architecture} boot did not activate the BMNT-selected ext4 root volume"
+        )
 
 
 class SerialSession:
@@ -465,13 +467,12 @@ def run_scenario(session: SerialSession, boot_timeout: float, command_timeout: f
         command_timeout,
         contains=("Welcome to the tiny Rust operating environment.",),
     )
-    if session.architecture == "aarch64":
-        session.command(
-            "cat /vol/root/hello.txt",
-            cwd,
-            command_timeout,
-            contains=("native ext4 mount\n",),
-        )
+    session.command(
+        "cat /vol/root/hello.txt",
+        cwd,
+        command_timeout,
+        contains=("native ext4 mount\n",),
+    )
     session.command("echo alpha beta", cwd, command_timeout, contains=("alpha beta\n",))
     session.command(
         "echo alpha beta | grep beta | write /tmp/result", cwd, command_timeout

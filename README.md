@@ -39,10 +39,10 @@ handle calls, or is terminated by the 50 ms execution lease.
   discovery, read-only FAT32 and constrained checksummed ext4 VFS providers,
   checksummed SCFG v1 service startup policy, and a checksummed BMNT v1 boot
   mount manifest with deterministic stable-identity resolution;
-- a bounded modern virtio block core and native AArch64 `virtio-mmio` transport
-  with QEMU-proven post-handoff GPT discovery, exact BMNT disk/partition/ext4
-  identity selection, and a live read-only `/vol/root` mount (q35 virtio PCI
-  and filesystem mutation remain Stage 8 work);
+- a bounded modern virtio block core with native AArch64 `virtio-mmio` and
+  x86-64 q35 virtio PCI transports; both have QEMU-proven post-handoff GPT
+  discovery, exact BMNT disk/partition/ext4 identity selection, and a live
+  read-only `/vol/root` mount (filesystem mutation remains Stage 8 work);
 - owned receive interrupts through q35 LAPIC/I/O APIC and AArch64 GICv2,
   bounded raw-event delivery, and race-free `hlt`/`wfi` shell idle;
 - project-owned polling 16550 and PL011 early/fatal recovery output, plus an

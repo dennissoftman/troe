@@ -1,8 +1,8 @@
 # ADR 0019: bounded modern virtio block transport
 
-Status: accepted and first transport implemented, 2026-08-24. The shared core
-and AArch64 QEMU `virtio-mmio` transport are active; modern virtio PCI remains
-the corresponding q35 implementation task.
+Status: accepted and both QEMU transports implemented, 2026-08-24. The shared
+core, AArch64 `virtio-mmio`, and x86-64 q35 modern virtio PCI transports are
+active and feed the same storage-activation layer.
 
 ## Context
 
@@ -51,6 +51,15 @@ It validates magic, modern version, block device ID, stable configuration
 generation, `FEATURES_OK`, queue capacity/readiness, and `DRIVER_OK` in the
 required order.
 
+The q35 implementation scans only PCI bus zero's bounded 32-by-8 function
+space and accepts the modern block device identifier. It detects capability
+loops and duplicates, ignores unrelated vendor capabilities, sizes referenced
+memory BARs with decode disabled and exact state restoration, maps only the
+page-rounded common/notify/ISR/device regions, and validates every capability
+offset and length against its BAR. Initialization enables memory decode and bus
+mastering, disables MSI-X vectors for the polling profile, and uses the same
+feature, queue, completion, timeout, and reset contracts as MMIO.
+
 One page-aligned allocation retains each split queue, request header, and status
 for the complete initialized-device lifetime. Payloads are exclusively borrowed
 identity-mapped kernel buffers; an IOMMU or non-identity DMA profile will require
@@ -63,10 +72,10 @@ return can revoke the outstanding DMA pointer.
 ## Consequences
 
 - Filesystem and partition crates remain independent of virtio and QEMU.
-- MMIO and PCI can share request, geometry, and completion validation while
-  keeping discovery and register layouts separate.
-- The AArch64 production image now proves a native post-handoff block read in
-  QEMU acceptance.
+- MMIO and PCI share request, geometry, completion, and storage-policy
+  validation while keeping discovery and register layouts separate.
+- Both QEMU production images now prove native post-handoff GPT/BMNT/ext4
+  selection and a read-only provider read.
 - The synchronous profile is simple enough to audit but does not yet offer
   interrupt-driven throughput.
 - Enabling an IOMMU, packed queues, multiple in-flight requests, or untrusted

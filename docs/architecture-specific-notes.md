@@ -44,6 +44,12 @@ x86-64 or AArch64 platform contracts.
   `fxsave64` does not preserve extended AVX state.
 - Drain the device before writing LAPIC EOI. A normal routed interrupt needs one
   EOI; the LAPIC spurious vector must return without one.
+- The q35 storage profile scans only bus zero through PCI configuration
+  mechanism 1. It accepts modern virtio block functions, bounds and de-loops the
+  capability chain, probes referenced memory BAR sizes with decode disabled,
+  restores every BAR/command field exactly, and maps only page-rounded
+  common/notify/ISR/device capability spans. The polling queue masks MSI-X and
+  uses bus-master DMA only after owned mappings are active.
 - Keep the empty-queue transition as `sti; hlt; cli`. x86 delays maskable
   interrupt recognition until after the instruction following `sti`, so `hlt`
   cannot sleep after an input IRQ has already run and filled the queue. Splitting

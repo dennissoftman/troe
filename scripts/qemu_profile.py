@@ -181,7 +181,11 @@ def prepare_qemu_command(
             "-drive",
             f"if=none,format=raw,readonly=on,id=troe-root,file={storage}",
             "-device",
-            ("virtio-blk-pci" if architecture == "x86_64" else "virtio-blk-device")
+            (
+                "virtio-blk-pci,disable-legacy=on"
+                if architecture == "x86_64"
+                else "virtio-blk-device"
+            )
             + ",drive=troe-root",
             "-no-reboot",
         )

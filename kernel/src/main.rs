@@ -15,7 +15,6 @@ mod firmware {
     use alloc::boxed::Box;
     use alloc::string::String;
     use alloc::vec::Vec;
-    #[cfg(target_arch = "aarch64")]
     use core::cell::RefCell;
     use core::fmt::Write as _;
     use core::panic::PanicInfo;
@@ -24,7 +23,6 @@ mod firmware {
         ABI_MINOR, ApplicationLimits, InitialHandle, LoadPlan, PAGE_BYTES, ParseError,
         ResourceProfile, SegmentPermissions, StartupInfo, Target, parse_kex,
     };
-    #[cfg(target_arch = "aarch64")]
     use troe_block::{BlockDevice, BlockLimits};
     use troe_core::{Input, MAX_LINE_BYTES, MachineMemorySnapshot, Output, StreamError};
     use troe_dispatch::{
@@ -32,19 +30,15 @@ mod firmware {
         Request, Rights, Service, ServiceReply,
     };
     use troe_driver::{InputQueueConfig, InputSource};
-    #[cfg(target_arch = "aarch64")]
     use troe_ext4::Ext4Limits;
-    #[cfg(target_arch = "aarch64")]
     use troe_gpt::GptLimits;
     use troe_memory::{
         BASE_PAGE_SIZE, BootAllocator, FrameAllocator, MAX_FIRMWARE_REGIONS, Mapping,
         MappingLifetime, MappingMemoryType, MappingOwner, MappingPermissions, MappingPlan,
         MemoryMapStats, MemoryRegion, NormalizedMemoryMap, PhysicalRange, RegionKind, VirtualRange,
     };
-    #[cfg(target_arch = "aarch64")]
     use troe_mount::{BootMountManifest, parse_manifest};
     use troe_shell::{CompletionConfig, Shell};
-    #[cfg(target_arch = "aarch64")]
     use troe_storage::{ActivationLimits, prepare_read_only};
     use troe_task::{
         Capabilities, IsolationResource, Scheduler, StackResource, TaskFault, TaskId, TaskState,
@@ -61,7 +55,6 @@ mod firmware {
     use uefi::proto::console::gop::{GraphicsOutput, PixelFormat as GopPixelFormat};
 
     const ROOTFS: &[u8] = include_bytes!("../../assets/root.kefs");
-    #[cfg(target_arch = "aarch64")]
     const BOOT_MOUNT_MANIFEST: &[u8] = include_bytes!("../../assets/boot.bmnt");
     const OWNED_HEAP_BYTES: u64 = 6 * 1024 * 1024;
     const PAGE_TABLE_BYTES: u64 = 2 * 1024 * 1024;
@@ -187,9 +180,7 @@ mod firmware {
         framebuffer: Option<FramebufferDescriptor>,
         kernel_runtime: PhysicalRange,
         kernel_plan: MappingPlan,
-        #[cfg(target_arch = "aarch64")]
         native_blocks: RefCell<Vec<troe_machine::NativeVirtioBlock>>,
-        #[cfg(target_arch = "aarch64")]
         boot_mount_manifest: BootMountManifest,
     }
 
@@ -225,7 +216,6 @@ mod firmware {
         image_layout: troe_machine::ImageLayout,
         boot_memory: BootMemory,
         framebuffer: Option<FramebufferDescriptor>,
-        #[cfg(target_arch = "aarch64")]
         boot_mount_manifest: Option<BootMountManifest>,
     }
 
@@ -339,7 +329,6 @@ mod firmware {
         let image_layout = troe_machine::loaded_image_layout().map_err(|_| ())?;
         let framebuffer = capture_framebuffer();
         let boot_memory = reserve_and_install_heap()?;
-        #[cfg(target_arch = "aarch64")]
         let boot_mount_manifest = parse_manifest(BOOT_MOUNT_MANIFEST).map_err(|_| ())?;
         troe_machine::initialize_console();
         if !troe_machine::write(b"native console: ready\n") {
@@ -349,7 +338,6 @@ mod firmware {
             image_layout,
             boot_memory,
             framebuffer,
-            #[cfg(target_arch = "aarch64")]
             boot_mount_manifest: Some(boot_mount_manifest),
         })
     }
@@ -420,9 +408,7 @@ mod firmware {
         {
             return Err(());
         }
-        #[cfg(target_arch = "aarch64")]
         let native_blocks = initialize_native_blocks()?;
-        #[cfg(target_arch = "aarch64")]
         let boot_mount_manifest = prepared.boot_mount_manifest.take().ok_or(())?;
         troe_machine::initialize_input_interrupts(InputQueueConfig::tiny()).map_err(|_| ())?;
         if !troe_machine::write(b"interrupt-driven input: ready\n") {
@@ -438,16 +424,16 @@ mod firmware {
             framebuffer,
             kernel_runtime: prepared.boot_memory.arena,
             kernel_plan: mapping_plan,
-            #[cfg(target_arch = "aarch64")]
             native_blocks: RefCell::new(native_blocks),
-            #[cfg(target_arch = "aarch64")]
             boot_mount_manifest,
         })
     }
 
-    #[cfg(target_arch = "aarch64")]
     fn initialize_native_blocks() -> Result<Vec<troe_machine::NativeVirtioBlock>, ()> {
+        #[cfg(target_arch = "aarch64")]
         let mut devices = troe_machine::discover_virtio_mmio_blocks().map_err(|_| ())?;
+        #[cfg(target_arch = "x86_64")]
+        let mut devices = troe_machine::discover_virtio_pci_blocks().map_err(|_| ())?;
         for device in &mut devices {
             let block_bytes =
                 usize::try_from(device.geometry().logical_block_bytes()).map_err(|_| ())?;
@@ -621,6 +607,16 @@ mod firmware {
                 MappingOwner::MachineDevice,
             )?;
         }
+        #[cfg(target_arch = "x86_64")]
+        for device in troe_machine::virtio_pci_device_ranges().map_err(|_| ())? {
+            insert_identity(
+                &mut plan,
+                device,
+                MappingPermissions::READ_WRITE,
+                MappingMemoryType::Device,
+                MappingOwner::MachineDevice,
+            )?;
+        }
         if let Some(framebuffer) = framebuffer {
             insert_identity(
                 &mut plan,
@@ -771,7 +767,6 @@ mod firmware {
     }
 
     fn run_owned(mut accounting: OwnedAccounting) -> ! {
-        #[cfg(target_arch = "aarch64")]
         if accounting.native_blocks.borrow().len() > 8 {
             fatal(b"fatal: native block device accounting exceeded\n");
         }
@@ -2229,7 +2224,6 @@ mod firmware {
         .is_ok()
     }
 
-    #[cfg(target_arch = "aarch64")]
     fn activate_native_storage(
         accounting: &OwnedAccounting,
         namespace: &mut Namespace,
@@ -2265,13 +2259,10 @@ mod firmware {
     }
 
     fn compose_namespace(accounting: &OwnedAccounting, console: &mut dyn Output) -> Namespace {
-        #[cfg(not(target_arch = "aarch64"))]
-        let _ = (accounting, console);
         let mut namespace = Namespace::new(RamFsQuota::default());
         if namespace.mount_embedded(ROOTFS).is_err() {
             fatal(b"fatal: cannot mount embedded root\n");
         }
-        #[cfg(target_arch = "aarch64")]
         activate_native_storage(accounting, &mut namespace, console);
         namespace
     }

@@ -11,6 +11,9 @@ mod mmu;
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 #[allow(unsafe_code)]
 mod virtio_mmio;
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+#[allow(unsafe_code)]
+mod virtio_pci;
 
 #[cfg(target_os = "uefi")]
 pub use mechanism::{
@@ -38,4 +41,8 @@ pub use mmu::{trigger_execute_fault, trigger_native_exception, trigger_write_fau
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 pub use virtio_mmio::{
     NativeVirtioBlock, VirtioMmioError, discover_virtio_mmio_blocks, virtio_mmio_device_ranges,
+};
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+pub use virtio_pci::{
+    NativeVirtioBlock, VirtioPciError, discover_virtio_pci_blocks, virtio_pci_device_ranges,
 };
