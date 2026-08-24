@@ -61,6 +61,12 @@ def main() -> int:
             "--persistence-selector",
             REPO_ROOT / "assets" / "persist.prgn",
         )
+        run(
+            sys.executable,
+            TOOLS_DIR / "mkconfig.py",
+            "--output",
+            REPO_ROOT / "assets" / "system.scfg",
+        )
 
         for architecture in architectures:
             target = TARGETS[architecture]

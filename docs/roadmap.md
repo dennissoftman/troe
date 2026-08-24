@@ -357,7 +357,9 @@ The first portable storage/configuration boundary is landed:
   PRGN v1 selects a strict four-block GPT partition by exact disk, unique
   partition, and partition-type GUIDs; dedicated per-architecture QEMU media
   exercise real native virtio writes and flushes across five process
-  termination/reopen cycles.
+  termination/reopen cycles; and SACT v1 now binds the TXSLOT payload to an
+  exact canonical SCFG generation, length, and checksum and revalidates that
+  immutable configuration after every reopen.
 
 These mechanisms are host verified; both VM transports, read-only mount
 activation, and the bounded TXSLOT transaction are QEMU verified. Stage 8 is

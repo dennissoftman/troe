@@ -1016,8 +1016,10 @@ activation, content storage, and rollback remain incomplete. The portable
 four-block dual-slot write/flush transaction has host boundary-fault coverage
 and is connected to a PRGN-selected exact GPT partition on a dedicated native
 QEMU writable device; both virtio transports prove completed commits survive
-process termination and reopen. It is not yet an SCFG activation pointer or
-permission for filesystem mutation.
+process termination and reopen. SACT v1 binds the persisted active reference to
+an exact canonical SCFG generation, byte length, and checksum and supports a
+strictly older predecessor reference. Immutable content storage, live service
+health activation, and filesystem mutation remain incomplete.
 
 - Introduce network-device capabilities and a bounded-buffer network stack.
 - Begin with a small practical protocol set such as Ethernet, ARP/NDP as appropriate, IPv4 and/or IPv6, ICMP, UDP, DHCP or static configuration, and DNS.

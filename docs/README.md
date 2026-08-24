@@ -26,6 +26,8 @@ historical review evidence.
   dual-slot durability transaction and predecessor recovery rules.
 - [PRGN v1](formats/prgn-v1.md) defines the exact GPT identity selector that
   gates native writable authority for a TXSLOT region.
+- [SACT v1](formats/sact-v1.md) defines the active and predecessor SCFG content
+  references committed as a TXSLOT payload.
 
 The repository root [README](../README.md), [security policy](../SECURITY.md),
 [contribution guide](../CONTRIBUTING.md), and [third-party inventory](../THIRD_PARTY.md)

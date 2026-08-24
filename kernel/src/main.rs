@@ -26,6 +26,8 @@ mod firmware {
     #[cfg(feature = "acceptance-probes")]
     use troe_block::{BlockAccess, BlockRegion};
     use troe_block::{BlockDevice, BlockLimits};
+    #[cfg(feature = "acceptance-probes")]
+    use troe_config::{ActivationPointer, ConfigReference};
     use troe_core::{Input, MAX_LINE_BYTES, MachineMemorySnapshot, Output, StreamError};
     use troe_dispatch::{
         ConsoleService, CopiedMessage, DispatchedOutput, Dispatcher, HandleOwner, ReplyStatus,
@@ -64,6 +66,8 @@ mod firmware {
     const BOOT_MOUNT_MANIFEST: &[u8] = include_bytes!("../../assets/boot.bmnt");
     #[cfg(feature = "acceptance-probes")]
     const PERSISTENCE_SELECTOR: &[u8] = include_bytes!("../../assets/persist.prgn");
+    #[cfg(feature = "acceptance-probes")]
+    const SYSTEM_CONFIG: &[u8] = include_bytes!("../../assets/system.scfg");
     const OWNED_HEAP_BYTES: u64 = 6 * 1024 * 1024;
     const PAGE_TABLE_BYTES: u64 = 2 * 1024 * 1024;
     const OWNED_STACK_BYTES: u64 = 128 * 1024;
@@ -515,7 +519,15 @@ mod firmware {
         )
         .map_err(|_| ())?;
         let mut store = DualSlotStore::open(region).map_err(|_| ())?;
-        store.commit(b"native virtio persistence").map_err(|_| ())?;
+        let active = ConfigReference::from_bytes(SYSTEM_CONFIG).map_err(|_| ())?;
+        let pointer = ActivationPointer::new(active, None).map_err(|_| ())?;
+        if let Some(payload) = store.payload() {
+            let recovered = ActivationPointer::parse(payload).map_err(|_| ())?;
+            if recovered != pointer || !recovered.active().matches(SYSTEM_CONFIG) {
+                return Err(());
+            }
+        }
+        store.commit(&pointer.encode()).map_err(|_| ())?;
         if !troe_machine::write(b"native persistence: committed and flushed\n") {
             return Err(());
         }

@@ -10,6 +10,10 @@ use troe_vfs::{MAX_PATH_BYTES, canonicalize};
 
 /// Product-name-independent system-configuration v1 format identifier.
 pub const CONFIG_V1_MAGIC: [u8; 8] = *b"SCFGv1\0\0";
+/// Product-name-independent SCFG activation-pointer identifier.
+pub const ACTIVATION_V1_MAGIC: [u8; 8] = *b"SACTv1\0\0";
+/// Exact encoded activation-pointer size.
+pub const ACTIVATION_V1_BYTES: usize = 64;
 const HEADER_BYTES: usize = 64;
 const RECORD_BYTES: usize = 64;
 const MAX_CONFIG_BYTES: usize = 16 * 1024;
@@ -23,6 +27,162 @@ const MAX_INITIAL_HANDLES: u8 = 8;
 const FLAG_FALLBACK_PREVIOUS: u8 = 1 << 0;
 const FLAG_RECOVERY_SHELL: u8 = 1 << 1;
 const KNOWN_FLAGS: u8 = FLAG_FALLBACK_PREVIOUS | FLAG_RECOVERY_SHELL;
+const ACTIVATION_PREVIOUS: u16 = 1;
+const ACTIVATION_CHECKSUM_OFFSET: usize = 48;
+
+/// Immutable identity of one fully validated SCFG image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConfigReference {
+    generation: u64,
+    byte_count: u32,
+    checksum: u32,
+}
+
+impl ConfigReference {
+    /// Validate an SCFG image and retain its exact content identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying canonical SCFG parse failure.
+    pub fn from_bytes(bytes: &[u8]) -> Result<Self, ConfigError> {
+        let config = parse_config(bytes)?;
+        Ok(Self {
+            generation: config.generation(),
+            byte_count: u32::try_from(bytes.len()).map_err(|_| ConfigError::InvalidHeader)?,
+            checksum: read_u32(bytes, 20)?,
+        })
+    }
+
+    /// SCFG generation identity.
+    #[must_use]
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    /// Exact encoded SCFG length.
+    #[must_use]
+    pub const fn byte_count(self) -> u32 {
+        self.byte_count
+    }
+
+    /// Canonical SCFG CRC32 field.
+    #[must_use]
+    pub const fn checksum(self) -> u32 {
+        self.checksum
+    }
+
+    /// Whether bytes parse canonically and reproduce this exact identity.
+    #[must_use]
+    pub fn matches(self, bytes: &[u8]) -> bool {
+        Self::from_bytes(bytes) == Ok(self)
+    }
+}
+
+/// Crash-consistent active and predecessor SCFG references stored in TXSLOT.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ActivationPointer {
+    active: ConfigReference,
+    previous: Option<ConfigReference>,
+}
+
+impl ActivationPointer {
+    /// Construct a canonical activation pointer.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a predecessor that is not strictly older than the active SCFG.
+    pub const fn new(
+        active: ConfigReference,
+        previous: Option<ConfigReference>,
+    ) -> Result<Self, ActivationError> {
+        if let Some(predecessor) = previous
+            && predecessor.generation >= active.generation
+        {
+            return Err(ActivationError::InvalidPredecessor);
+        }
+        Ok(Self { active, previous })
+    }
+
+    /// Parse one exact checksummed SACT v1 record.
+    ///
+    /// # Errors
+    ///
+    /// Rejects noncanonical headers, checksum/reserved failures, empty
+    /// references, and invalid predecessor ordering.
+    pub fn parse(bytes: &[u8]) -> Result<Self, ActivationError> {
+        if bytes.len() != ACTIVATION_V1_BYTES
+            || bytes.get(..8) != Some(&ACTIVATION_V1_MAGIC)
+            || read_activation_u16(bytes, 8)? != 1
+            || read_activation_u16(bytes, 10)? != 0
+            || read_activation_u16(bytes, 12)? != 64
+        {
+            return Err(ActivationError::InvalidHeader);
+        }
+        let flags = read_activation_u16(bytes, 14)?;
+        if flags & !ACTIVATION_PREVIOUS != 0 || bytes[52..].iter().any(|byte| *byte != 0) {
+            return Err(ActivationError::InvalidHeader);
+        }
+        let mut checked = [0_u8; ACTIVATION_V1_BYTES];
+        checked.copy_from_slice(bytes);
+        checked[ACTIVATION_CHECKSUM_OFFSET..ACTIVATION_CHECKSUM_OFFSET + 4].fill(0);
+        if crc32(&checked) != read_activation_u32(bytes, ACTIVATION_CHECKSUM_OFFSET)? {
+            return Err(ActivationError::Checksum);
+        }
+        let active = read_reference(bytes, 16)?;
+        let previous = if flags & ACTIVATION_PREVIOUS != 0 {
+            Some(read_reference(bytes, 32)?)
+        } else {
+            if bytes[32..48].iter().any(|byte| *byte != 0) {
+                return Err(ActivationError::InvalidPredecessor);
+            }
+            None
+        };
+        Self::new(active, previous)
+    }
+
+    /// Encode the canonical checksummed SACT v1 record.
+    #[must_use]
+    pub fn encode(self) -> [u8; ACTIVATION_V1_BYTES] {
+        let mut bytes = [0_u8; ACTIVATION_V1_BYTES];
+        bytes[..8].copy_from_slice(&ACTIVATION_V1_MAGIC);
+        bytes[8..10].copy_from_slice(&1_u16.to_le_bytes());
+        bytes[12..14].copy_from_slice(&64_u16.to_le_bytes());
+        if self.previous.is_some() {
+            bytes[14..16].copy_from_slice(&ACTIVATION_PREVIOUS.to_le_bytes());
+        }
+        write_reference(&mut bytes, 16, self.active);
+        if let Some(previous) = self.previous {
+            write_reference(&mut bytes, 32, previous);
+        }
+        let checksum = crc32(&bytes);
+        bytes[ACTIVATION_CHECKSUM_OFFSET..ACTIVATION_CHECKSUM_OFFSET + 4]
+            .copy_from_slice(&checksum.to_le_bytes());
+        bytes
+    }
+
+    /// Selected active configuration identity.
+    #[must_use]
+    pub const fn active(self) -> ConfigReference {
+        self.active
+    }
+
+    /// Optional rollback predecessor identity.
+    #[must_use]
+    pub const fn previous(self) -> Option<ConfigReference> {
+        self.previous
+    }
+}
+
+/// Stable SACT parse or construction failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActivationError {
+    /// Header, flags, reserved bytes, or a reference was malformed.
+    InvalidHeader,
+    /// Whole-record CRC32 failed.
+    Checksum,
+    /// The predecessor was absent-but-nonzero or not strictly older.
+    InvalidPredecessor,
+}
 
 /// When one configured service becomes eligible for startup.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -276,7 +436,7 @@ pub fn parse_config(bytes: &[u8]) -> Result<SystemConfig, ConfigError> {
         .checked_add(record_bytes)
         .ok_or(ConfigError::InvalidHeader)?;
     if generation == 0
-        || previous_raw == generation
+        || (previous_raw != 0 && previous_raw >= generation)
         || service_count > MAX_SERVICES
         || string_start.checked_add(string_bytes) != Some(bytes.len())
         || flags & !KNOWN_FLAGS != 0
@@ -494,6 +654,51 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, ConfigError> {
     Ok(u64::from_le_bytes(value))
 }
 
+fn read_activation_u16(bytes: &[u8], offset: usize) -> Result<u16, ActivationError> {
+    let raw = bytes
+        .get(offset..offset + 2)
+        .ok_or(ActivationError::InvalidHeader)?;
+    Ok(u16::from_le_bytes([raw[0], raw[1]]))
+}
+
+fn read_activation_u32(bytes: &[u8], offset: usize) -> Result<u32, ActivationError> {
+    let raw = bytes
+        .get(offset..offset + 4)
+        .ok_or(ActivationError::InvalidHeader)?;
+    Ok(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+}
+
+fn read_activation_u64(bytes: &[u8], offset: usize) -> Result<u64, ActivationError> {
+    let raw = bytes
+        .get(offset..offset + 8)
+        .ok_or(ActivationError::InvalidHeader)?;
+    Ok(u64::from_le_bytes([
+        raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+    ]))
+}
+
+fn read_reference(bytes: &[u8], offset: usize) -> Result<ConfigReference, ActivationError> {
+    let reference = ConfigReference {
+        generation: read_activation_u64(bytes, offset)?,
+        byte_count: read_activation_u32(bytes, offset + 8)?,
+        checksum: read_activation_u32(bytes, offset + 12)?,
+    };
+    if reference.generation == 0
+        || usize::try_from(reference.byte_count).map_or(true, |count| {
+            !(HEADER_BYTES..=MAX_CONFIG_BYTES).contains(&count)
+        })
+    {
+        return Err(ActivationError::InvalidHeader);
+    }
+    Ok(reference)
+}
+
+fn write_reference(bytes: &mut [u8], offset: usize, reference: ConfigReference) {
+    bytes[offset..offset + 8].copy_from_slice(&reference.generation.to_le_bytes());
+    bytes[offset + 8..offset + 12].copy_from_slice(&reference.byte_count.to_le_bytes());
+    bytes[offset + 12..offset + 16].copy_from_slice(&reference.checksum.to_le_bytes());
+}
+
 fn crc32(bytes: &[u8]) -> u32 {
     let mut crc = u32::MAX;
     for byte in bytes {
@@ -512,8 +717,9 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::{
-        CONFIG_V1_MAGIC, ConfigError, FailureAction, HEADER_BYTES, RECORD_BYTES, StartupMode,
-        crc32, parse_config,
+        ACTIVATION_V1_BYTES, ActivationError, ActivationPointer, CONFIG_V1_MAGIC, ConfigError,
+        ConfigReference, FailureAction, HEADER_BYTES, RECORD_BYTES, StartupMode, crc32,
+        parse_config,
     };
 
     fn valid_config() -> Vec<u8> {
@@ -631,6 +837,14 @@ mod tests {
             parse_config(&no_previous),
             Err(ConfigError::InvalidRecoveryPolicy)
         );
+
+        let mut forward_previous = valid_config();
+        put_u64(&mut forward_previous, 32, 8);
+        refresh_crc(&mut forward_previous);
+        assert_eq!(
+            parse_config(&forward_previous),
+            Err(ConfigError::InvalidRecoveryPolicy)
+        );
     }
 
     #[test]
@@ -647,5 +861,43 @@ mod tests {
         put_u32(&mut alias[128..192], 40, 0);
         refresh_crc(&mut alias);
         assert_eq!(parse_config(&alias), Err(ConfigError::InvalidString));
+    }
+
+    #[test]
+    fn activation_pointer_round_trips_exact_config_identities() -> Result<(), ConfigError> {
+        let config = valid_config();
+        let active = ConfigReference::from_bytes(&config)?;
+        assert!(active.matches(&config));
+        let previous = ConfigReference {
+            generation: 6,
+            byte_count: 64,
+            checksum: 0x1234_5678,
+        };
+        let pointer = ActivationPointer::new(active, Some(previous))
+            .map_err(|_| ConfigError::InvalidRecoveryPolicy)?;
+        let encoded = pointer.encode();
+        assert_eq!(encoded.len(), ACTIVATION_V1_BYTES);
+        assert_eq!(ActivationPointer::parse(&encoded), Ok(pointer));
+        assert_eq!(pointer.active(), active);
+        assert_eq!(pointer.previous(), Some(previous));
+        Ok(())
+    }
+
+    #[test]
+    fn activation_pointer_checksum_and_predecessor_fail_closed() -> Result<(), ConfigError> {
+        let active = ConfigReference::from_bytes(&valid_config())?;
+        assert_eq!(
+            ActivationPointer::new(active, Some(active)),
+            Err(ActivationError::InvalidPredecessor)
+        );
+        let pointer =
+            ActivationPointer::new(active, None).map_err(|_| ConfigError::InvalidRecoveryPolicy)?;
+        let mut encoded = pointer.encode();
+        encoded[24] ^= 1;
+        assert_eq!(
+            ActivationPointer::parse(&encoded),
+            Err(ActivationError::Checksum)
+        );
+        Ok(())
     }
 }
