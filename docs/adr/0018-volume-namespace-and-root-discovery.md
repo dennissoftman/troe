@@ -1,7 +1,8 @@
 # ADR 0018: volume namespace and deterministic root discovery
 
-Status: accepted direction, 2026-08-24; boot-manifest serialization remains a
-Stage 8 implementation task.
+Status: accepted, 2026-08-24; BMNT v1 serialization, parsing, and portable
+stable-identity resolution are implemented. Native discovery and mount
+activation remain Stage 8 work.
 
 ## Context
 

@@ -20,6 +20,8 @@ historical review evidence.
   parser, native loader, startup layout, and complete ABI 1.0 boundary.
 - [SCFG v1](formats/scfg-v1.md) defines the implemented portable desired-system
   and bounded service-startup parser for the first Stage 8 slice.
+- [BMNT v1](formats/bmnt-v1.md) defines the implemented boot-side mount manifest
+  and deterministic stable-identity volume resolution policy.
 
 The repository root [README](../README.md), [security policy](../SECURITY.md),
 [contribution guide](../CONTRIBUTING.md), and [third-party inventory](../THIRD_PARTY.md)
@@ -46,8 +48,8 @@ remains open. [ADR 0017](adr/0017-constrained-ext4-read-only-profile.md) fixes
 the exact clean read-only ext4 v1 feature bitmap and parser bounds.
 [ADR 0018](adr/0018-volume-namespace-and-root-discovery.md) reserves the
 `/vol/root` and `/vol/boot` roles, keeps KEFS as the diskless recovery root, and
-requires deterministic root selection through a boot-side manifest and stable
-disk, partition, and filesystem identities.
+requires deterministic root selection through the now-implemented BMNT v1
+boot-side manifest and stable disk, partition, and filesystem identities.
 ADR 0012 governs the completed Stage 5.1 terminal and
 framebuffer increment; AArch64 native keyboard input remains a later
 virtio-input transport decision. ADR 0013 governs the completed Stage 5.2

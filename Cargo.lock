@@ -212,6 +212,10 @@ name = "troe-memory"
 version = "0.1.0"
 
 [[package]]
+name = "troe-mount"
+version = "0.1.0"
+
+[[package]]
 name = "troe-shell"
 version = "0.1.0"
 dependencies = [

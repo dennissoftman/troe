@@ -333,7 +333,12 @@ The first portable storage/configuration boundary is landed:
   before the ext4/FAT32 providers mount, list, and read them; and
 - `troe-config` implements checksummed SCFG v1 desired-system/service startup
   policy with canonical dependencies, bounded health/restart behavior, explicit
-  predecessor fallback, and a mandatory static recovery shell.
+  predecessor fallback, and a mandatory static recovery shell; and
+- `troe-mount` implements the checksummed BMNT v1 boot-side mount manifest,
+  bounded canonical role names, explicit whole-device/GPT selectors, access and
+  availability policy, duplicate-selector rejection, and deterministic exact
+  stable-identity resolution for diskless, matched, missing, and ambiguous
+  media.
 
 These are portable, host-verified mechanisms. Stage 8 is not complete: no
 native block transport is active, FAT32 and ext4 remain read-only, configuration
@@ -371,13 +376,11 @@ the existing `troe-block` capability and platform-profile boundary. Keep the
 filesystem providers unaware of the transport, and prove a native path from a
 bounded whole device through GPT to the existing read-only FAT32/ext4 mounts.
 
-Before persistent mount activation, specify and implement the small checksummed
-boot mount manifest required by ADR 0018. Its parser should be portable and
-host-tested first. Include bounded entry/name counts, an explicit whole-device
-versus GPT selector, access and availability policy, duplicate-selector
-rejection, exact multi-identity matching, and diskless/ambiguous recovery test
-cases. Keep it separate from SCFG so SCFG activation cannot become a root
-discovery prerequisite.
+BMNT v1 now completes the portable boot-manifest prerequisite from ADR 0018.
+Wire native discovery into it only after transport geometry and GPT validation;
+then pass only an exactly matched block-region capability to the selected
+FAT32/ext4 provider. Keep BMNT separate from SCFG so SCFG activation cannot
+become a root-discovery prerequisite.
 
 Do not start with a filesystem parser coupled directly to a hardware driver or
 the shell. The block transport, region discovery, filesystem provider, VFS,

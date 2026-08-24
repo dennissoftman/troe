@@ -1008,9 +1008,10 @@ crates or architecture-wide mechanisms.
 ### Stage 8 — Networking and persistent operation
 
 **Status:** in progress. Portable block-region, GPT, read-only FAT32/ext4 VFS
-mount, identity-policy, and SCFG v1 boundaries are implemented and host
-verified. Native block transports, writes/recovery, networking, persistent
-activation, content storage, and rollback remain unimplemented.
+mount, identity-policy, SCFG v1, and BMNT v1 deterministic volume-selection
+boundaries are implemented and host verified. Native block transports,
+writes/recovery, networking, persistent activation, content storage, and
+rollback remain unimplemented.
 
 - Introduce network-device capabilities and a bounded-buffer network stack.
 - Begin with a small practical protocol set such as Ethernet, ARP/NDP as appropriate, IPv4 and/or IPv6, ICMP, UDP, DHCP or static configuration, and DNS.

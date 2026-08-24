@@ -37,8 +37,9 @@ handle calls, or is terminated by the 50 ms execution lease.
   copied handle calls, with owned x86 local-APIC/AArch64 timer leases;
 - portable bounded block-region capabilities, strict primary/backup GPT
   discovery, read-only FAT32 and constrained checksummed ext4 VFS providers,
-  and checksummed SCFG v1 service startup policy (native storage transports and
-  persistence remain Stage 8 work);
+  checksummed SCFG v1 service startup policy, and a checksummed BMNT v1 boot
+  mount manifest with deterministic stable-identity resolution (native storage
+  transports and persistence remain Stage 8 work);
 - owned receive interrupts through q35 LAPIC/I/O APIC and AArch64 GICv2,
   bounded raw-event delivery, and race-free `hlt`/`wfi` shell idle;
 - project-owned polling 16550 and PL011 early/fatal recovery output, plus an
