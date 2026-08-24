@@ -1,2 +1,2 @@
 [alias]
-qemu = "run --quiet --package kllm-xtask --"
+qemu = "run --quiet --package troe-xtask --"

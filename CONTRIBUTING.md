@@ -11,6 +11,11 @@ an owner, hard cap, eviction policy, pressure behavior, and accounting. New
 unsafe code requires a `SAFETY:` comment, an audit note under `docs/security`,
 and a narrowly scoped crate boundary.
 
+Storage-provider changes should also run
+`python3 scripts/test.py --skip-qemu --require-filesystem-tools` with
+e2fsprogs, dosfstools, and mtools installed. This makes absence of the external
+format/check oracles a failure instead of silently skipping interoperability.
+
 During interactive-console development,
 `python3 scripts/test-qemu.py --smoke` provides a fast concurrent boot check for
 both architectures. It does not replace the exhaustive gate.

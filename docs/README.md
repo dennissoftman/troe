@@ -40,8 +40,10 @@ not deprecated merely because their stage has completed; later implementation
 notes identify decisions that were revisited. ADR 0007 now fixes the Stage 8
 native-principal, foreign-identity, mapping, mount-policy, and fail-closed ACL
 direction; its serialized formats remain gated before persistent writes. ADR
-0009 is the accepted storage direction; its block, GPT, VFS-provider, and first
-read-only FAT32 slices are implemented, while ext4 and mutation remain open.
+0009 is the accepted storage direction; its block, GPT, VFS-provider, read-only
+FAT32, and first constrained ext4 slices are implemented, while mutation
+remains open. [ADR 0017](adr/0017-constrained-ext4-read-only-profile.md) fixes
+the exact clean read-only ext4 v1 feature bitmap and parser bounds.
 ADR 0012 governs the completed Stage 5.1 terminal and
 framebuffer increment; AArch64 native keyboard input remains a later
 virtio-input transport decision. ADR 0013 governs the completed Stage 5.2
@@ -53,6 +55,11 @@ v1 container, application ABI 1.0, profile memory ceilings, and bounded
 execution-lease policy for the completed Stage 7. Portable parsing, native
 owned loading, explicit handle grant, all ABI 1.0 calls, resume leases, copied
 dispatch, contained call/fault fates, and zeroized teardown are implemented.
+[ADR 0016](adr/0016-hardware-targets-and-emulator-role.md) separates CPU
+architecture, board/platform, and emulator roles for planned Stage 7.5 physical
+machine support. It retains q35 and `virt` as deterministic QEMU test profiles,
+selects Raspberry Pi 4 as the first AArch64 hardware reference without limiting
+other AArch64 boards, and requires a separately documented x86-64 UEFI PC.
 
 ## Evaluations
 

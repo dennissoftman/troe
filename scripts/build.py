@@ -61,7 +61,7 @@ def main() -> int:
                 "build",
                 "--locked",
                 "-p",
-                "kllm-kernel",
+                "troe-kernel",
                 "--release",
                 "--target",
                 target,

@@ -1,7 +1,7 @@
 # Unsafe inventory
 
 Stage 7 contains exactly 199 project-authored Rust `unsafe` tokens, all in the
-two audited modules of `crates/kllm-machine`. The verification gate fails if
+two audited modules of `crates/troe-machine`. The verification gate fails if
 this count changes without a same-change inventory review. Portable crates and
 the kernel composition root continue to forbid unsafe code.
 

@@ -20,7 +20,7 @@ without leaking their printable tails into the command line. The x86-64 q35
 profile polls i8042 and decodes PC scan-code set 1 into the same events under a
 selected US-layout policy. AArch64 native keyboard input is deferred until a
 bounded virtio-input transport exists. The editor owns bounded cursor-aware
-editing and session history; shell-aware completion remains in `kllm-shell` so
+editing and session history; shell-aware completion remains in `troe-shell` so
 it can use the authoritative command registry and VFS namespace without giving
 the terminal ambient filesystem authority.
 

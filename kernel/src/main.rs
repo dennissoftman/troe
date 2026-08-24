@@ -18,31 +18,31 @@ mod firmware {
     use core::fmt::Write as _;
     use core::panic::PanicInfo;
 
-    use kllm_application::{
+    use troe_application::{
         ABI_MINOR, ApplicationLimits, InitialHandle, LoadPlan, PAGE_BYTES, ParseError,
         ResourceProfile, SegmentPermissions, StartupInfo, Target, parse_kex,
     };
-    use kllm_core::{Input, MAX_LINE_BYTES, MachineMemorySnapshot, Output, StreamError};
-    use kllm_dispatch::{
+    use troe_core::{Input, MAX_LINE_BYTES, MachineMemorySnapshot, Output, StreamError};
+    use troe_dispatch::{
         ConsoleService, CopiedMessage, DispatchedOutput, Dispatcher, HandleOwner, ReplyStatus,
         Request, Rights, Service, ServiceReply,
     };
-    use kllm_driver::{InputQueueConfig, InputSource};
-    use kllm_memory::{
+    use troe_driver::{InputQueueConfig, InputSource};
+    use troe_memory::{
         BASE_PAGE_SIZE, BootAllocator, FrameAllocator, MAX_FIRMWARE_REGIONS, Mapping,
         MappingLifetime, MappingMemoryType, MappingOwner, MappingPermissions, MappingPlan,
         MemoryMapStats, MemoryRegion, NormalizedMemoryMap, PhysicalRange, RegionKind, VirtualRange,
     };
-    use kllm_shell::{CompletionConfig, Shell};
-    use kllm_task::{
+    use troe_shell::{CompletionConfig, Shell};
+    use troe_task::{
         Capabilities, IsolationResource, Scheduler, StackResource, TaskFault, TaskId, TaskState,
         TaskStep,
     };
-    use kllm_terminal::{
+    use troe_terminal::{
         EditorConfig, EditorOutcome, FramebufferDescriptor, FramebufferPixelFormat, InputDecoder,
         KeyboardConfig, LineEditor, Ps2Set1Decoder, TextConsole, TextConsoleConfig,
     };
-    use kllm_vfs::{Namespace, RamFsQuota};
+    use troe_vfs::{Namespace, RamFsQuota};
     use uefi::boot;
     use uefi::mem::memory_map::{MemoryMap, MemoryMapOwned};
     use uefi::prelude::*;
@@ -102,7 +102,7 @@ mod firmware {
 
     impl Output for NativeConsole {
         fn write(&mut self, bytes: &[u8]) -> Result<usize, StreamError> {
-            if kllm_machine::write(bytes) {
+            if troe_machine::write(bytes) {
                 Ok(bytes.len())
             } else {
                 Err(StreamError::Device)
@@ -114,7 +114,7 @@ mod firmware {
         Serial(NativeConsole),
         Mirrored {
             serial: NativeConsole,
-            framebuffer: TextConsole<kllm_machine::OwnedFramebuffer>,
+            framebuffer: TextConsole<troe_machine::OwnedFramebuffer>,
         },
     }
 
@@ -123,7 +123,7 @@ mod firmware {
             let Some(framebuffer) = framebuffer else {
                 return Self::Serial(NativeConsole);
             };
-            let Ok(surface) = kllm_machine::OwnedFramebuffer::new(framebuffer) else {
+            let Ok(surface) = troe_machine::OwnedFramebuffer::new(framebuffer) else {
                 return Self::Serial(NativeConsole);
             };
             let Ok(framebuffer) = TextConsole::new(surface, TextConsoleConfig::tiny()) else {
@@ -204,7 +204,7 @@ mod firmware {
     }
 
     struct PreparedHandoff {
-        image_layout: kllm_machine::ImageLayout,
+        image_layout: troe_machine::ImageLayout,
         boot_memory: BootMemory,
         framebuffer: Option<FramebufferDescriptor>,
     }
@@ -285,7 +285,7 @@ mod firmware {
         fn call(
             &mut self,
             request: Request<'_>,
-        ) -> Result<ServiceReply, kllm_dispatch::DispatchError> {
+        ) -> Result<ServiceReply, troe_dispatch::DispatchError> {
             if request.opcode() != 1 {
                 return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
             }
@@ -303,7 +303,7 @@ mod firmware {
             Ok(prepared) => {
                 let stack = prepared.boot_memory.stack;
                 let prepared = Box::leak(Box::new(prepared));
-                match kllm_machine::enter_owned_stack(stack, prepared, post_handoff) {
+                match troe_machine::enter_owned_stack(stack, prepared, post_handoff) {
                     Err(_) => Status::ABORTED,
                     Ok(never) => match never {},
                 }
@@ -316,11 +316,11 @@ mod firmware {
         write_all(console, b"UEFI bootstrap: ready\n")?;
         write_all(console, b"preparing owned memory and native console\n")?;
 
-        let image_layout = kllm_machine::loaded_image_layout().map_err(|_| ())?;
+        let image_layout = troe_machine::loaded_image_layout().map_err(|_| ())?;
         let framebuffer = capture_framebuffer();
         let boot_memory = reserve_and_install_heap()?;
-        kllm_machine::initialize_console();
-        if !kllm_machine::write(b"native console: ready\n") {
+        troe_machine::initialize_console();
+        if !troe_machine::write(b"native console: ready\n") {
             return Err(());
         }
         Ok(PreparedHandoff {
@@ -331,14 +331,14 @@ mod firmware {
     }
 
     fn post_handoff(prepared: &mut PreparedHandoff) -> ! {
-        let final_map = kllm_machine::exit_boot_services_after_protocols();
-        kllm_machine::mark_firmware_exited();
-        kllm_machine::take_interrupt_ownership();
-        let stack_pointer = usize_as_u64(kllm_machine::current_stack_pointer());
+        let final_map = troe_machine::exit_boot_services_after_protocols();
+        troe_machine::mark_firmware_exited();
+        troe_machine::take_interrupt_ownership();
+        let stack_pointer = usize_as_u64(troe_machine::current_stack_pointer());
         if !prepared.boot_memory.stack.contains(stack_pointer) {
             fatal(b"fatal: active stack is not kernel-owned\n");
         }
-        if !kllm_machine::write(b"boot services: exited\n") {
+        if !troe_machine::write(b"boot services: exited\n") {
             fatal(b"fatal: post-handoff console failed\n");
         }
         let accounting = complete_handoff(prepared, final_map)
@@ -372,32 +372,32 @@ mod firmware {
         }
         let probe = frames.allocate().map_err(|_| ())?;
         frames.free(probe).map_err(|_| ())?;
-        if !kllm_machine::write(b"frame bitmap: ready\n") {
+        if !troe_machine::write(b"frame bitmap: ready\n") {
             return Err(());
         }
-        if !kllm_machine::probe_allocation_failure() {
+        if !troe_machine::probe_allocation_failure() {
             return Err(());
         }
-        if !kllm_machine::write(b"allocation failure path: bounded\n") {
+        if !troe_machine::write(b"allocation failure path: bounded\n") {
             return Err(());
         }
-        kllm_machine::install_exception_vectors(prepared.boot_memory.exception_stack)
+        troe_machine::install_exception_vectors(prepared.boot_memory.exception_stack)
             .map_err(|_| ())?;
-        if !kllm_machine::write(b"exception vectors: ready\n") {
+        if !troe_machine::write(b"exception vectors: ready\n") {
             return Err(());
         }
-        let mmu = kllm_machine::install_mmu(&mapping_plan, prepared.boot_memory.page_tables)
+        let mmu = troe_machine::install_mmu(&mapping_plan, prepared.boot_memory.page_tables)
             .map_err(|_| ())?;
         if mmu.mapped_pages == 0 || mmu.table_pages == 0 {
             return Err(());
         }
-        if !kllm_machine::write(b"owned page tables: ready\n")
-            || !kllm_machine::write(b"W^X mappings: active\n")
+        if !troe_machine::write(b"owned page tables: ready\n")
+            || !troe_machine::write(b"W^X mappings: active\n")
         {
             return Err(());
         }
-        kllm_machine::initialize_input_interrupts(InputQueueConfig::tiny()).map_err(|_| ())?;
-        if !kllm_machine::write(b"interrupt-driven input: ready\n") {
+        troe_machine::initialize_input_interrupts(InputQueueConfig::tiny()).map_err(|_| ())?;
+        if !troe_machine::write(b"interrupt-driven input: ready\n") {
             return Err(());
         }
         Ok(OwnedAccounting {
@@ -444,7 +444,7 @@ mod firmware {
         allocator.seal();
         let heap_start = usize::try_from(heap.start()).map_err(|_| ())?;
         let heap_bytes = usize::try_from(heap.byte_count()).map_err(|_| ())?;
-        if !kllm_machine::initialize_heap(heap_start, heap_bytes) {
+        if !troe_machine::initialize_heap(heap_start, heap_bytes) {
             return Err(());
         }
         let heap_pages = heap.byte_count() / BASE_PAGE_SIZE;
@@ -482,14 +482,14 @@ mod firmware {
         })
     }
 
-    fn allocation_range(allocation: kllm_memory::BootAllocation) -> Result<PhysicalRange, ()> {
+    fn allocation_range(allocation: troe_memory::BootAllocation) -> Result<PhysicalRange, ()> {
         PhysicalRange::from_pages(allocation.start(), allocation.byte_count() / BASE_PAGE_SIZE)
             .map_err(|_| ())
     }
 
     fn build_mapping_plan(
         memory_map: &MemoryMapOwned,
-        image: &kllm_machine::ImageLayout,
+        image: &troe_machine::ImageLayout,
         boot_memory: &BootMemory,
         framebuffer: Option<FramebufferDescriptor>,
     ) -> Result<MappingPlan, ()> {
@@ -545,7 +545,7 @@ mod firmware {
                 MappingOwner::MachineDevice,
             )?;
         }
-        for device in kllm_machine::input_device_ranges()
+        for device in troe_machine::input_device_ranges()
             .map_err(|_| ())?
             .into_iter()
             .flatten()
@@ -712,30 +712,30 @@ mod firmware {
             .unwrap_or_else(|_| fatal(b"fatal: cannot create task scheduler\n"));
         run_cooperative_services(&mut scheduler, &accounting)
             .unwrap_or_else(|()| fatal(b"fatal: cooperative task verification failed\n"));
-        if !kllm_machine::write(b"cooperative tasks: deterministic\n")
-            || !kllm_machine::write(b"task stack guards: active\n")
-            || !kllm_machine::write(b"task resources: reclaimed\n")
+        if !troe_machine::write(b"cooperative tasks: deterministic\n")
+            || !troe_machine::write(b"task stack guards: active\n")
+            || !troe_machine::write(b"task resources: reclaimed\n")
         {
             fatal(b"fatal: task diagnostic failed\n");
         }
         run_isolation_verification(&mut scheduler, &mut accounting)
             .unwrap_or_else(|()| fatal(b"fatal: Stage 6 isolation verification failed\n"));
-        if !kllm_machine::write(b"isolated address spaces: active\n")
-            || !kllm_machine::write(b"copied task messages: bounded\n")
-            || !kllm_machine::write(b"isolated faults: contained\n")
-            || !kllm_machine::write(b"isolated resources: reclaimed\n")
+        if !troe_machine::write(b"isolated address spaces: active\n")
+            || !troe_machine::write(b"copied task messages: bounded\n")
+            || !troe_machine::write(b"isolated faults: contained\n")
+            || !troe_machine::write(b"isolated resources: reclaimed\n")
         {
             fatal(b"fatal: isolation diagnostic failed\n");
         }
         run_application_load_verification(&mut scheduler, &mut accounting)
             .unwrap_or_else(|()| fatal(b"fatal: Stage 7 load-boundary verification failed\n"));
-        if !kllm_machine::write(b"KEX staging: owned and bounded\n")
-            || !kllm_machine::write(b"KEX load plans: mapped atomically\n")
-            || !kllm_machine::write(b"application ABI exit: active\n")
-            || !kllm_machine::write(b"application ABI resume: active\n")
-            || !kllm_machine::write(b"copied handle calls: active\n")
-            || !kllm_machine::write(b"execution lease: enforced\n")
-            || !kllm_machine::write(b"application resources: reclaimed\n")
+        if !troe_machine::write(b"KEX staging: owned and bounded\n")
+            || !troe_machine::write(b"KEX load plans: mapped atomically\n")
+            || !troe_machine::write(b"application ABI exit: active\n")
+            || !troe_machine::write(b"application ABI resume: active\n")
+            || !troe_machine::write(b"copied handle calls: active\n")
+            || !troe_machine::write(b"execution lease: enforced\n")
+            || !troe_machine::write(b"application resources: reclaimed\n")
         {
             fatal(b"fatal: application loader diagnostic failed\n");
         }
@@ -762,7 +762,7 @@ mod firmware {
             capabilities,
             stack,
         };
-        let result = kllm_machine::run_task_step(stack, &mut shell_task, run_shell_task);
+        let result = troe_machine::run_task_step(stack, &mut shell_task, run_shell_task);
         if result.is_err() {
             fatal(b"fatal: shell task stack rejected\n");
         }
@@ -808,14 +808,14 @@ mod firmware {
                 .map_err(|_| ())?
                 .ok_or(())?;
             let step = if id == first {
-                kllm_machine::run_task_step(
+                troe_machine::run_task_step(
                     accounting.task_stacks[0].stack,
                     &mut first_service,
                     cooperative_service_step,
                 )
                 .map_err(|_| ())?
             } else if id == second {
-                kllm_machine::run_task_step(
+                troe_machine::run_task_step(
                     accounting.task_stacks[1].stack,
                     &mut second_service,
                     cooperative_service_step,
@@ -853,7 +853,7 @@ mod firmware {
             remaining_yields: 0,
             completed_steps: 0,
         };
-        let step = kllm_machine::run_task_step(
+        let step = troe_machine::run_task_step(
             accounting.task_stacks[slot].stack,
             &mut reuse_service,
             cooperative_service_step,
@@ -963,7 +963,7 @@ mod firmware {
         scheduler: &mut Scheduler,
         accounting: &mut OwnedAccounting,
         dispatcher: &mut Dispatcher,
-        port: kllm_dispatch::PortId,
+        port: troe_dispatch::PortId,
         probe: IsolationProbe,
         address_space_slot: u8,
     ) -> Result<u64, ()> {
@@ -983,7 +983,7 @@ mod firmware {
             reclaim_isolated(&mut accounting.frames, allocation)?;
             return Err(());
         };
-        let Ok(address_space) = kllm_machine::build_user_address_space(&plan, allocation.tables)
+        let Ok(address_space) = troe_machine::build_user_address_space(&plan, allocation.tables)
         else {
             reclaim_isolated(&mut accounting.frames, allocation)?;
             return Err(());
@@ -1015,11 +1015,11 @@ mod firmware {
                 .map_err(|_| ())?;
             live_owner = Some(owner);
 
-            let mut copied_bytes = [0_u8; kllm_dispatch::MAX_MESSAGE_BYTES];
+            let mut copied_bytes = [0_u8; troe_dispatch::MAX_MESSAGE_BYTES];
             let stack_top = USER_STACK_BASE
                 .checked_add(ISOLATED_STACK_PAGES.checked_mul(BASE_PAGE_SIZE).ok_or(())?)
                 .ok_or(())?;
-            let outcome = kllm_machine::run_isolated(
+            let outcome = troe_machine::run_isolated(
                 address_space,
                 USER_CODE_BASE,
                 stack_top,
@@ -1029,7 +1029,7 @@ mod firmware {
             match (probe.expected_fault(), outcome) {
                 (
                     None,
-                    kllm_machine::IsolatedOutcome::Exited {
+                    troe_machine::IsolatedOutcome::Exited {
                         status,
                         message_bytes,
                     },
@@ -1051,15 +1051,15 @@ mod firmware {
                     }
                     scheduler.exit_current(task_id, 0).map_err(|_| ())?;
                 }
-                (Some(expected), kllm_machine::IsolatedOutcome::Faulted(fault)) => {
+                (Some(expected), troe_machine::IsolatedOutcome::Faulted(fault)) => {
                     let fault = match fault {
-                        kllm_machine::IsolatedFault::Translation => TaskFault::Translation,
-                        kllm_machine::IsolatedFault::Permission => TaskFault::Permission,
-                        kllm_machine::IsolatedFault::IllegalInstruction => {
+                        troe_machine::IsolatedFault::Translation => TaskFault::Translation,
+                        troe_machine::IsolatedFault::Permission => TaskFault::Permission,
+                        troe_machine::IsolatedFault::IllegalInstruction => {
                             TaskFault::IllegalInstruction
                         }
-                        kllm_machine::IsolatedFault::InvalidCall => TaskFault::InvalidCall,
-                        kllm_machine::IsolatedFault::ExecutionLeaseExpired => {
+                        troe_machine::IsolatedFault::InvalidCall => TaskFault::InvalidCall,
+                        troe_machine::IsolatedFault::ExecutionLeaseExpired => {
                             TaskFault::ExecutionLeaseExpired
                         }
                     };
@@ -1075,7 +1075,7 @@ mod firmware {
             }
             live_owner = None;
             if dispatcher.call(handle, 1, b"stale")
-                != Err(kllm_dispatch::DispatchError::InvalidHandle)
+                != Err(troe_dispatch::DispatchError::InvalidHandle)
             {
                 return Err(());
             }
@@ -1220,7 +1220,7 @@ mod firmware {
         scheduler: &mut Scheduler,
         accounting: &mut OwnedAccounting,
         dispatcher: &mut Dispatcher,
-        port: kllm_dispatch::PortId,
+        port: troe_dispatch::PortId,
         source: &[u8],
         probe: ApplicationProbe,
     ) -> Result<u64, ()> {
@@ -1256,7 +1256,7 @@ mod firmware {
             return Err(());
         };
         let Ok(address_space) =
-            kllm_machine::build_user_address_space(&mapping_plan, allocation.tables)
+            troe_machine::build_user_address_space(&mapping_plan, allocation.tables)
         else {
             reclaim_application(&mut accounting.frames, allocation)?;
             return Err(());
@@ -1310,7 +1310,7 @@ mod firmware {
                 &mut startup,
             )
             .map_err(|_| ())?;
-            kllm_machine::copy_to_physical(allocation.startup, 0, &startup).map_err(|_| ())?;
+            troe_machine::copy_to_physical(allocation.startup, 0, &startup).map_err(|_| ())?;
             Ok((owner, handle))
         })();
         let Ok((owner, handle)) = setup else {
@@ -1335,7 +1335,7 @@ mod firmware {
             {
                 return Err(());
             }
-            let mut outcome = kllm_machine::run_application(
+            let mut outcome = troe_machine::run_application(
                 address_space,
                 entry,
                 layout.stack_top(),
@@ -1349,7 +1349,7 @@ mod firmware {
                 match (probe, outcome) {
                     (
                         ApplicationProbe::Calls,
-                        kllm_machine::ApplicationOutcome::Yielded(application),
+                        troe_machine::ApplicationOutcome::Yielded(application),
                     ) if !observed_yield && !observed_call => {
                         scheduler.yield_current(task_id).map_err(|_| ())?;
                         if scheduler
@@ -1360,15 +1360,15 @@ mod firmware {
                             return Err(());
                         }
                         observed_yield = true;
-                        outcome = kllm_machine::resume_application(
+                        outcome = troe_machine::resume_application(
                             application,
-                            kllm_machine::ApplicationResume::Yield,
+                            troe_machine::ApplicationResume::Yield,
                         )
                         .map_err(|_| ())?;
                     }
                     (
                         ApplicationProbe::Calls,
-                        kllm_machine::ApplicationOutcome::HandleCall { application, call },
+                        troe_machine::ApplicationOutcome::HandleCall { application, call },
                     ) if observed_yield && !observed_call => {
                         let mut request = Vec::new();
                         request
@@ -1387,9 +1387,9 @@ mod firmware {
                             return Err(());
                         }
                         observed_call = true;
-                        outcome = kllm_machine::resume_application(
+                        outcome = troe_machine::resume_application(
                             application,
-                            kllm_machine::ApplicationResume::HandleReply {
+                            troe_machine::ApplicationResume::HandleReply {
                                 status: reply.status().abi_value(),
                                 reply: reply.payload(),
                             },
@@ -1398,15 +1398,15 @@ mod firmware {
                     }
                     (
                         ApplicationProbe::Calls,
-                        kllm_machine::ApplicationOutcome::Exited { status: 0 },
+                        troe_machine::ApplicationOutcome::Exited { status: 0 },
                     ) if observed_yield && observed_call => {
                         scheduler.exit_current(task_id, 0).map_err(|_| ())?;
                         break;
                     }
                     (
                         ApplicationProbe::Spin,
-                        kllm_machine::ApplicationOutcome::Faulted(
-                            kllm_machine::IsolatedFault::ExecutionLeaseExpired,
+                        troe_machine::ApplicationOutcome::Faulted(
+                            troe_machine::IsolatedFault::ExecutionLeaseExpired,
                         ),
                     ) => {
                         scheduler
@@ -1416,8 +1416,8 @@ mod firmware {
                     }
                     (
                         ApplicationProbe::InvalidCall,
-                        kllm_machine::ApplicationOutcome::Faulted(
-                            kllm_machine::IsolatedFault::InvalidCall,
+                        troe_machine::ApplicationOutcome::Faulted(
+                            troe_machine::IsolatedFault::InvalidCall,
                         ),
                     ) => {
                         scheduler
@@ -1427,8 +1427,8 @@ mod firmware {
                     }
                     (
                         ApplicationProbe::UnexpectedReturn,
-                        kllm_machine::ApplicationOutcome::Faulted(
-                            kllm_machine::IsolatedFault::Translation,
+                        troe_machine::ApplicationOutcome::Faulted(
+                            troe_machine::IsolatedFault::Translation,
                         ),
                     ) => {
                         scheduler
@@ -1444,7 +1444,7 @@ mod firmware {
             }
             live_owner = None;
             if dispatcher.call(handle, 1, b"stale")
-                != Err(kllm_dispatch::DispatchError::InvalidHandle)
+                != Err(troe_dispatch::DispatchError::InvalidHandle)
             {
                 return Err(());
             }
@@ -1530,13 +1530,13 @@ mod firmware {
         allocation: &ApplicationAllocation,
         plan: &LoadPlan<'_>,
     ) -> Result<(), ()> {
-        kllm_machine::zero_physical_range(allocation.complete).map_err(|_| ())?;
+        troe_machine::zero_physical_range(allocation.complete).map_err(|_| ())?;
         let mut physical_start = allocation.image.start();
         for segment in plan.segments() {
             let physical =
                 PhysicalRange::from_pages(physical_start, segment.memory_bytes() / BASE_PAGE_SIZE)
                     .map_err(|_| ())?;
-            kllm_machine::copy_to_physical(physical, 0, segment.file_bytes()).map_err(|_| ())?;
+            troe_machine::copy_to_physical(physical, 0, segment.file_bytes()).map_err(|_| ())?;
             physical_start = physical.end();
         }
         if physical_start != allocation.image.end() {
@@ -1653,7 +1653,7 @@ mod firmware {
         frames: &mut FrameAllocator,
         allocation: ApplicationAllocation,
     ) -> Result<(), ()> {
-        kllm_machine::zero_physical_range(allocation.complete).map_err(|_| ())?;
+        troe_machine::zero_physical_range(allocation.complete).map_err(|_| ())?;
         frames.free_range(allocation.complete).map_err(|_| ())
     }
 
@@ -1831,9 +1831,9 @@ mod firmware {
         allocation: &IsolatedAllocation,
         probe: IsolationProbe,
     ) -> Result<(), ()> {
-        kllm_machine::zero_physical_range(allocation.complete).map_err(|_| ())?;
+        troe_machine::zero_physical_range(allocation.complete).map_err(|_| ())?;
         let code = isolated_program(probe)?;
-        kllm_machine::copy_to_physical(allocation.code, 0, &code).map_err(|_| ())?;
+        troe_machine::copy_to_physical(allocation.code, 0, &code).map_err(|_| ())?;
         if matches!(
             probe,
             IsolationProbe::Success
@@ -1843,7 +1843,7 @@ mod firmware {
                 | IsolationProbe::OversizeMessage
                 | IsolationProbe::InvalidStatus
         ) {
-            kllm_machine::copy_to_physical(allocation.data, 0, ISOLATED_MESSAGE).map_err(|_| ())?;
+            troe_machine::copy_to_physical(allocation.data, 0, ISOLATED_MESSAGE).map_err(|_| ())?;
         }
         Ok(())
     }
@@ -1853,7 +1853,7 @@ mod firmware {
         frames: &mut FrameAllocator,
         allocation: IsolatedAllocation,
     ) -> Result<(), ()> {
-        kllm_machine::zero_physical_range(allocation.complete).map_err(|_| ())?;
+        troe_machine::zero_physical_range(allocation.complete).map_err(|_| ())?;
         frames.free_range(allocation.complete).map_err(|_| ())
     }
 
@@ -2088,7 +2088,7 @@ mod firmware {
             IsolationProbe::OversizeMessage => (
                 1,
                 USER_DATA_BASE,
-                u32::try_from(kllm_dispatch::MAX_MESSAGE_BYTES + 1).map_err(|_| ())?,
+                u32::try_from(troe_dispatch::MAX_MESSAGE_BYTES + 1).map_err(|_| ())?,
                 0,
             ),
             IsolationProbe::InvalidStatus => (1, USER_DATA_BASE, message_len, 256),
@@ -2163,7 +2163,7 @@ mod firmware {
     }
 
     fn run_shell_task(task: &mut ShellTask<'_>) -> TaskStep {
-        let stack_pointer = usize_as_u64(kllm_machine::current_stack_pointer());
+        let stack_pointer = usize_as_u64(troe_machine::current_stack_pointer());
         if !task.stack.contains(stack_pointer)
             || !task.capabilities.contains(Capabilities::CONSOLE)
             || !task.capabilities.contains(Capabilities::FILESYSTEM)
@@ -2233,17 +2233,17 @@ mod firmware {
             #[cfg(feature = "acceptance-probes")]
             if line == "mmu-probe write" {
                 let _result = write_all(&mut console, b"probing read-only mapping\n");
-                kllm_machine::trigger_write_fault(ROOTFS.as_ptr() as usize);
+                troe_machine::trigger_write_fault(ROOTFS.as_ptr() as usize);
             }
             #[cfg(feature = "acceptance-probes")]
             if line == "mmu-probe execute" {
                 let _result = write_all(&mut console, b"probing non-executable mapping\n");
-                kllm_machine::trigger_execute_fault(task.accounting.execute_probe_address);
+                troe_machine::trigger_execute_fault(task.accounting.execute_probe_address);
             }
             #[cfg(feature = "acceptance-probes")]
             if line == "mmu-probe exception" {
                 let _result = write_all(&mut console, b"probing native exception vector\n");
-                kllm_machine::trigger_native_exception();
+                troe_machine::trigger_native_exception();
             }
             #[cfg(feature = "acceptance-probes")]
             if line == "mmu-probe fatal" {
@@ -2255,21 +2255,21 @@ mod firmware {
                 let guard = task.accounting.task_stacks[2].lower_guard.start();
                 let guard = usize::try_from(guard)
                     .unwrap_or_else(|_| fatal(b"fatal: guard address unsupported\n"));
-                kllm_machine::trigger_write_fault(guard);
+                troe_machine::trigger_write_fault(guard);
             }
             let mut input = EmptyInput;
             let mut error = NativeConsole;
             let _status = shell.execute(&line, &mut input, &mut console, &mut error);
             if shell.halt_requested() {
                 let _result = write_all(&mut console, b"halting: parking CPU\n");
-                kllm_machine::park();
+                troe_machine::park();
             }
         }
     }
 
     fn refresh_shell_stats(shell: &mut Shell, accounting: &OwnedAccounting) {
         shell.set_machine_memory(machine_snapshot(accounting));
-        shell.set_machine_input(kllm_machine::input_interrupt_stats());
+        shell.set_machine_input(troe_machine::input_interrupt_stats());
     }
 
     fn read_edited_line(
@@ -2283,7 +2283,7 @@ mod firmware {
     ) -> Result<String, ()> {
         loop {
             let key = loop {
-                let event = kllm_machine::wait_for_input_event();
+                let event = troe_machine::wait_for_input_event();
                 let key = match event.source() {
                     InputSource::Serial => decoder.push(event.byte()),
                     InputSource::Keyboard => keyboard.push(event.byte()),
@@ -2375,7 +2375,7 @@ mod firmware {
     }
 
     fn machine_snapshot(accounting: &OwnedAccounting) -> MachineMemorySnapshot {
-        let heap = kllm_machine::heap_stats();
+        let heap = troe_machine::heap_stats();
         MachineMemorySnapshot::kernel(
             accounting.map.usable_bytes(),
             accounting.map.reserved_bytes(),
@@ -2393,12 +2393,12 @@ mod firmware {
     }
 
     fn write_all(output: &mut dyn Output, bytes: &[u8]) -> Result<(), ()> {
-        kllm_core::write_all(output, bytes).map_err(|_| ())
+        troe_core::write_all(output, bytes).map_err(|_| ())
     }
 
     fn fatal(message: &[u8]) -> ! {
-        let _written = kllm_machine::write(message);
-        kllm_machine::park()
+        let _written = troe_machine::write(message);
+        troe_machine::park()
     }
 
     const fn architecture() -> &'static str {

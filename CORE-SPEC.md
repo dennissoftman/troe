@@ -1,4 +1,4 @@
-# Tiny Rust Operating Environment Specification
+# TROE Core Specification
 
 **Status:** Draft design specification  
 **Version:** 0.1.0  
@@ -8,18 +8,19 @@
 
 **Implementation status:** Stages 0–7 are implemented. The first portable Stage
 8 storage/configuration boundary (bounded block regions, strict read-only GPT,
-read-only FAT32 behind VFS, and SCFG v1 parsing) is implemented, but Stage 8 is
-not complete. Stage 7 includes the portable KEX parser/load-plan policy, native
+read-only FAT32 and constrained ext4 behind VFS, and SCFG v1 parsing) is
+implemented, but Stage 8 is not complete. Stage 7 includes the portable KEX
+parser/load-plan policy, native
 validate/map/reclaim transactions, all three ABI 1.0 calls, contained fault
 fates, and enforced 50 ms execution leases. See
 [docs/roadmap.md](docs/roadmap.md).
 
-The product and CLI names are intentionally unset. This document uses “the
-project” and “the system” in prose. `<cli>` denotes the future control-plane
-executable without proposing its eventual name.
+The product name is TROE (Tiny Rust Operating Environment), and `troe` is the
+reserved CLI executable name. This document also uses “the project” and “the
+system” in prose.
 
 Serialized format identifiers name only their technical formats and versions.
-They MUST NOT embed a product, repository, vendor, or future CLI name. A project
+They MUST NOT embed a product, repository, vendor, or TROE CLI name. A project
 rename must not invalidate KEX, KEFS, or boot-container artifacts.
 
 The future developer tooling and package-composition model is specified in
@@ -217,14 +218,26 @@ A backend owns:
 
 The portable core MUST NOT contain architecture-specific registers, assembly, MMIO addresses, page-table bit encodings, or interrupt numbers.
 
-### 8.3 Initial target profiles
+### 8.3 Target and test profiles
 
-| Target | Initial machine | Console | Boot | MMU page size |
+CPU architecture, machine platform, and execution environment are independent
+axes. An architecture backend owns instruction-set mechanisms; a platform
+profile supplies validated firmware, memory discovery, interrupt, timer,
+console, bus, boot-media, and power resources. Selecting `x86_64` or `aarch64`
+MUST NOT silently imply q35, QEMU `virt`, Raspberry Pi, or another board.
+
+| Profile | Role | Console | Boot | MMU page size |
 |---|---|---|---|---|
-| `x86_64` | QEMU `q35` or documented equivalent | UEFI bootstrap; owned 16550 after handoff | UEFI/OVMF | 4 KiB |
-| `aarch64` | QEMU `virt` | UEFI bootstrap; owned PL011 after handoff | UEFI/AAVMF | 4 KiB |
+| `x86_64-q35-uefi` | implemented QEMU acceptance | UEFI bootstrap; owned 16550 after handoff | UEFI/OVMF | 4 KiB |
+| `aarch64-virt-uefi` | implemented QEMU acceptance | UEFI bootstrap; owned PL011 after handoff | UEFI/AAVMF | 4 KiB |
+| `aarch64-rpi4-uefi` | planned first AArch64 hardware reference | serial-first; framebuffer when validated | pinned UEFI and SD/USB media | 4 KiB |
+| `x86_64-pc-uefi` | planned first documented PC reference | documented serial/recovery path | UEFI and USB media | 4 KiB |
 
-Exact QEMU invocations and device selections belong in target documentation and MUST be pinned in CI scripts.
+Exact emulator invocations MUST be pinned in CI scripts. Every physical profile
+MUST instead pin the board/revision, firmware, boot media, required peripherals,
+and recovery procedure used for acceptance. Raspberry Pi 4 is one common
+AArch64 validation board, not an AArch64 compatibility boundary. See
+[ADR 0016](docs/adr/0016-hardware-targets-and-emulator-role.md).
 
 ## 9. Core object and authority model
 
@@ -751,15 +764,15 @@ These are planning budgets, not ABI guarantees. Code clarity MUST NOT be sacrifi
 Current workspace structure:
 
 ```text
-<repository>/
+troe/
 ├── crates/
-│   ├── kllm-core/        portable types and bounded streams
-│   ├── kllm-dispatch/    bounded synchronous service dispatch
-│   ├── kllm-machine/     audited x86-64/AArch64 mechanisms
-│   ├── kllm-memory/      memory-map, frame, and mapping models
-│   ├── kllm-shell/       parser, pipelines, and built-ins
-│   ├── kllm-task/        cooperative task policy
-│   └── kllm-vfs/         KEFS, RAMFS, namespace, and generated nodes
+│   ├── troe-core/        portable types and bounded streams
+│   ├── troe-dispatch/    bounded synchronous service dispatch
+│   ├── troe-machine/     audited x86-64/AArch64 mechanisms
+│   ├── troe-memory/      memory-map, frame, and mapping models
+│   ├── troe-shell/       parser, pipelines, and built-ins
+│   ├── troe-task/        cooperative task policy
+│   └── troe-vfs/         KEFS, RAMFS, namespace, and generated nodes
 ├── host/                 hosted composition and acceptance runner
 ├── kernel/               native UEFI entry and composition root
 ├── xtask/                Cargo QEMU launcher shim
@@ -944,9 +957,9 @@ are active on both primary architectures.
 The kernel/security exit criterion is complete. Loading KEX files from a
 mounted filesystem or shell command, providing hosted SDK `build`/`run`/`inspect`
 flows, and defining package-manifest and target-lock formats are explicitly
-deferred integration work. They do not block Stage 8; the authoritative order
-for resuming work is recorded in
-[docs/roadmap.md](docs/roadmap.md#next-session-handoff-starting-stage-8).
+deferred integration work. They do not block Stage 7.5 or Stage 8; the
+authoritative order for resuming work is recorded in
+[docs/roadmap.md](docs/roadmap.md#stage-75-platform-separation-and-physical-machine-bring-up-planned).
 
 - Load target-specific static KEX v1 artifacts selected by ADR 0015; keep ELF as
   a hosted toolchain interchange format rather than a kernel input.
@@ -959,8 +972,8 @@ for resuming work is recorded in
 - Before released tooling consumes them, define a versioned
   application/package manifest and target-specific lock format and validate
   immutable artifacts on the host using the native boundary's rules.
-- Introduce the first native SDK and hosted `<cli> build`, `<cli> run`,
-  `<cli> inspect`, and `<cli> explain` flows without granting the tooling client
+- Introduce the first native SDK and hosted `troe build`, `troe run`,
+  `troe inspect`, and `troe explain` flows without granting the tooling client
   ambient system authority; this is deferred integration rather than part of
   the completed kernel exit criterion.
 
@@ -968,11 +981,35 @@ Dynamic linking is optional and SHOULD follow a working static executable format
 
 **Exit criterion:** an untrusted test application can be loaded, run, exit, and fault without corrupting the kernel, while malformed binaries are rejected deterministically.
 
+### Stage 7.5 — Platform separation and physical-machine bring-up
+
+**Status:** planned; accepted by
+[ADR 0016](docs/adr/0016-hardware-targets-and-emulator-role.md).
+
+- Separate reusable x86-64/AArch64 CPU mechanisms from platform integration and
+  execution-environment selection.
+- Preserve q35 and QEMU `virt` as pinned deterministic test profiles without
+  treating their devices, addresses, or firmware behavior as architecture
+  contracts.
+- Validate platform resources from an explicit profile, ACPI, device tree, or
+  UEFI handoff before constructing typed machine resources.
+- Add USB/SD-suitable GPT/ESP boot media alongside the small emulator image.
+- Use Raspberry Pi 4 as the first AArch64 physical reference, while keeping
+  other AArch64 boards independently addable.
+- Select one documented UEFI/ACPI x86-64 PC as the first physical PC reference.
+- Retain exhaustive host/QEMU fault tests and add serial-driven hardware smoke
+  evidence that records the exact board, revision, firmware, and peripherals.
+
+**Exit criterion:** both pinned QEMU profiles, the selected Raspberry Pi
+reference, and one documented x86-64 UEFI PC reach the recovery shell and pass
+bounded serial smoke tests without introducing board assumptions into portable
+crates or architecture-wide mechanisms.
+
 ### Stage 8 — Networking and persistent operation
 
-**Status:** in progress. Portable block-region, GPT, read-only FAT32/VFS mount,
-identity-policy, and SCFG v1 boundaries are implemented and host verified.
-Native block transports, ext4, writes/recovery, networking, persistent
+**Status:** in progress. Portable block-region, GPT, read-only FAT32/ext4 VFS
+mount, identity-policy, and SCFG v1 boundaries are implemented and host
+verified. Native block transports, writes/recovery, networking, persistent
 activation, content storage, and rollback remain unimplemented.
 
 - Introduce network-device capabilities and a bounded-buffer network stack.

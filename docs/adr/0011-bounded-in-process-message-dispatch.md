@@ -4,7 +4,7 @@ Status: accepted, 2026-08-23.
 
 ## Decision
 
-Stage 5 introduces a portable `kllm-dispatch` crate with a synchronous
+Stage 5 introduces a portable `troe-dispatch` crate with a synchronous
 request/reply model. A dispatcher owns at most 16 service ports and 32 client
 handles. Ports and handles are opaque slot-plus-generation identities. Closing
 an endpoint invalidates every copied stale identity, and a recycled slot receives

@@ -9,7 +9,7 @@ profile is QEMU 11.1.0 with rust-osdev ovmf-prebuilt
 `cortex-a72`, 128 MiB on AArch64. Firmware Simple Text I/O is attached to host standard I/O
 through the 16550-backed console on x86-64 and the PL011-backed console on
 AArch64, with the QEMU monitor disabled. This is firmware console routing, not
-direct UART ownership by kllm.
+direct UART ownership by TROE.
 
 This firmware-hosted behavior remains the historical Stage 1 contract. Stage 2
 keeps the same pinned boot profile but uses Simple Text Output only for its
@@ -19,6 +19,11 @@ userspace or hardware isolation.
 
 Revisit exact machine versions only through this ADR and update transcript
 goldens at the same time.
+
+Scope note, 2026-08-24: [ADR 0016](0016-hardware-targets-and-emulator-role.md)
+retains this exact profile as deterministic historical and regression evidence,
+but rejects QEMU devices as the general x86-64 or AArch64 hardware contract.
+New emulator and physical-board profiles are independently named and reviewed.
 
 Implementation note, 2026-08-23: Stage 6 explicitly selected QEMU's `max` x86
 TCG CPU so acceptance exercises CPUID-reported SMEP/SMAP rather than silently

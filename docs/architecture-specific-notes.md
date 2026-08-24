@@ -3,8 +3,10 @@
 This page records machine details that are easy to erase accidentally during a
 portable refactor. These are current implementation invariants, not generic
 driver policy. Any change to interrupt entry, idle waiting, controller setup,
-or the pinned QEMU profiles must review this page, ADR 0013, ADR 0014, the unsafe
-inventory, and both exhaustive QEMU suites together.
+or a current machine profile must review this page, ADR 0013, ADR 0014, ADR
+0016, the unsafe inventory, and both exhaustive QEMU suites together. The q35
+and `virt` sections describe implemented test profiles; they are not generic
+x86-64 or AArch64 platform contracts.
 
 ## Shared ordering rules
 
@@ -26,7 +28,7 @@ inventory, and both exhaustive QEMU suites together.
   mapping metadata. Invalid calls must not copy a prefix. Never expose device
   mappings or a writable/executable physical alias at user privilege.
 
-## x86-64 q35
+## x86-64 q35 test profile
 
 - Mask both legacy 8259 PICs before enabling LAPIC/I/O APIC routing. Leaving a
   firmware PIC route live can deliver an unexpected legacy vector into the
@@ -62,7 +64,7 @@ inventory, and both exhaustive QEMU suites together.
   protection-key state is rejected before descriptor/page-table replacement
   because this backend does not yet own those modes.
 
-## AArch64 QEMU `virt`
+## AArch64 QEMU `virt` test profile
 
 - Keep the machine profile pinned to GICv2 while using the memory-mapped
   distributor and CPU interface implemented here. GICv3 system-register setup
@@ -101,6 +103,25 @@ inventory, and both exhaustive QEMU suites together.
   ranges to retained task-owned physical pages. The supervisor kernel root
   identity-maps those allocated pages for the bounded request and reply copies;
   the EL0 root is inactive and cannot race the copy.
+
+## Stage 7.5 platform separation
+
+New machine support must separate reusable CPU mechanisms, device drivers, and
+board integration. `cfg(target_arch)` selects instruction-set mechanisms; it
+must not silently select q35, QEMU `virt`, Raspberry Pi, or any other board.
+Each platform profile supplies or validates its own firmware contract, device
+resources, interrupt topology, timer, console, boot media, and power behavior.
+
+The planned Raspberry Pi 4 profile is the first common AArch64 hardware
+acceptance machine. It does not replace the generic AArch64/UEFI direction and
+does not make Raspberry Pi peripherals architectural requirements. Likewise,
+q35 remains one x86-64 emulator profile rather than a PC compatibility promise.
+Where firmware can describe resources through ACPI, device tree, or UEFI,
+bring-up must validate those descriptions before constructing typed resources;
+fixed constants belong only in an explicitly identified board profile.
+
+See [ADR 0016](adr/0016-hardware-targets-and-emulator-role.md) for the profile
+boundary and hardware acceptance policy.
 
 ## Regression evidence
 

@@ -1,15 +1,15 @@
 [package]
-name = "kllm-host"
-description = "Hosted Stage 0 runner for kllm"
+name = "troe-host"
+description = "Hosted Stage 0 runner for TROE"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-kllm-core = { path = "../crates/kllm-core" }
-kllm-shell = { path = "../crates/kllm-shell" }
-kllm-vfs = { path = "../crates/kllm-vfs" }
+troe-core = { path = "../crates/troe-core" }
+troe-shell = { path = "../crates/troe-shell" }
+troe-vfs = { path = "../crates/troe-vfs" }
 
 [lints]
 workspace = true

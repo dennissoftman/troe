@@ -1,0 +1,15 @@
+[package]
+name = "troe-shell"
+description = "Bounded parser, pipeline executor, and built-ins for TROE"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+troe-core = { path = "../troe-core" }
+troe-driver = { path = "../troe-driver" }
+troe-vfs = { path = "../troe-vfs" }
+
+[lints]
+workspace = true

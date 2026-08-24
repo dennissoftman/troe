@@ -14,7 +14,7 @@ through generation-owned synchronous message dispatch without exposing kernel
 pointers.
 
 Repository `scripts` and Cargo commands are bootstrap developer tooling, not a
-package manager or a privileged system-control plane. The future CLI described
+package manager or a privileged system-control plane. The planned TROE CLI described
 in [../TOOLING-PACKAGING-SPEC.md](../TOOLING-PACKAGING-SPEC.md) must sit
 above versioned libraries and service interfaces. It does not replace the
 statically linked recovery shell.
@@ -70,7 +70,7 @@ permanently disabled. Pre-arena loader allocations, if any, are retained rather
 than passed to dead boot services.
 
 Stage 2 begins with an architecture-independent memory-map model in
-`kllm-memory`. It validates checked 4 KiB ranges, normalizes unordered firmware
+`troe-memory`. It validates checked 4 KiB ranges, normalizes unordered firmware
 descriptors, overlays bounded explicit reservations, and reports usable and
 reserved bytes. It also models checked, aligned monotonic allocation over one
 explicitly reserved boot arena, including padding, exhaustion, and sealing
@@ -103,7 +103,7 @@ validated in fresh QEMU boots for both architectures.
 
 The post-handoff shell invokes no firmware protocol or allocator and cannot
 manipulate page tables or exception vectors. Authorized halt parks the CPU.
-Stage 4 adds a bounded cooperative scheduler policy in `kllm-task`. Task IDs
+Stage 4 adds a bounded cooperative scheduler policy in `troe-task`. Task IDs
 are monotonic, records have ready/running/exited lifecycles, capability sets are
 checked during dispatch, and a record retains its stack resource until explicit
 reaping. The native mechanism executes one continuation step synchronously on
@@ -123,7 +123,7 @@ capabilities. Cooperative scheduling still provides no preemption or hardware
 isolation: code that never yields can monopolize the CPU, and privileged memory
 unsafety can corrupt any task.
 
-Stage 5 adds `kllm-dispatch` between selected clients and services. A port names
+Stage 5 adds `troe-dispatch` between selected clients and services. A port names
 one registered service; a generation-checked handle names explicit call
 authority to that port. Tables are bounded to 16 ports and 32 live handles, and
 stale identities remain invalid when slots are reused. One synchronous request
@@ -142,9 +142,9 @@ still in-process dispatch, not IPC: service code shares the caller's privileged
 address space, borrowed request bytes are not a wire format, and service faults
 are not contained.
 
-Stage 5.1 adds `kllm-terminal`, which keeps transport-independent input
+Stage 5.1 adds `troe-terminal`, which keeps transport-independent input
 decoding, line editing, history, and fixed-glyph text rendering outside the
-machine mechanism. `kllm-shell` owns completion because it has the authoritative
+machine mechanism. `troe-shell` owns completion because it has the authoritative
 command registry and VFS namespace; both command candidates and directory
 listings are returned under caller-selected count and byte budgets. The native
 composition root currently selects the named `tiny` policies. x86-64 decodes
@@ -152,7 +152,7 @@ US set-1 scan codes from q35 i8042, while both architectures retain serial
 input. AArch64 native keyboard input is deferred to a bounded
 virtio-input transport rather than adding a firmware dependency after handoff.
 
-Stage 5.2 adds the portable `kllm-driver` resource and event boundary. The
+Stage 5.2 adds the portable `troe-driver` resource and event boundary. The
 selected queue capacity, maximum ISR drain, and programmable controller
 priority come from validated profile configuration. The pinned x86-64 profile
 masks the legacy PIC, owns LAPIC/I/O APIC, and routes COM1 and keyboard receive
@@ -215,9 +215,9 @@ contained and reclaimed as invalid-call and translation faults.
 
 ## Stage 8 persistent-storage boundary
 
-The portable block-region, GPT, VFS-provider, and read-only FAT32 pieces now
-preserve this dependency direction. Native block transports, ext4, and durable
-mutation remain future Stage 8 increments. A transport
+The portable block-region, GPT, VFS-provider, read-only FAT32, and constrained
+read-only ext4 pieces now preserve this dependency direction. Native block
+transports and durable mutation remain future Stage 8 increments. A transport
 provides bounded block-region capabilities; partition discovery turns a whole
 device into non-overlapping regions; independently selected filesystem
 providers expose VFS objects. Format-specific structures do not enter the
@@ -231,7 +231,8 @@ block transport -> bounded region -> filesystem provider -> VFS namespace
 
 KEFS is the intentionally built-in recovery exception. The current FAT12 image
 is read by firmware. General FAT12/16/32, exFAT, the default persistent ext4
-profile, and later NTFS support are separate providers; before dynamic loading
+profile, and later NTFS support are separate providers; the first exact ext4
+read-only subset is fixed by ADR 0017. Before dynamic loading
 they may be statically selected crates, and later writable providers should run
 as capability-scoped services. An image does not carry providers it did not
 select.

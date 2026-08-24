@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -20,6 +21,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="skip boot acceptance when the pinned QEMU/firmware pair is unavailable",
     )
+    parser.add_argument(
+        "--require-filesystem-tools",
+        action="store_true",
+        help="require and run e2fsprogs, dosfstools, and mtools interoperability tests",
+    )
     return parser.parse_args()
 
 
@@ -32,6 +38,8 @@ def run(*command: str | Path) -> None:
 
 def main() -> int:
     args = parse_args()
+    if args.require_filesystem_tools:
+        os.environ["TROE_REQUIRE_FS_TOOLS"] = "1"
     commands: list[tuple[str | Path, ...]] = [
         ("cargo", "fmt", "--all", "--", "--check"),
         (
@@ -47,7 +55,7 @@ def main() -> int:
             "cargo",
             "clippy",
             "-p",
-            "kllm-kernel",
+            "troe-kernel",
             "--target",
             "x86_64-unknown-uefi",
             "--all-features",
@@ -59,7 +67,7 @@ def main() -> int:
             "cargo",
             "clippy",
             "-p",
-            "kllm-kernel",
+            "troe-kernel",
             "--target",
             "aarch64-unknown-uefi",
             "--all-features",
@@ -88,7 +96,7 @@ def main() -> int:
             "run",
             "--quiet",
             "-p",
-            "kllm-host",
+            "troe-host",
             "--",
             "--script",
             REPO_ROOT / "tests" / "smoke.ksh",

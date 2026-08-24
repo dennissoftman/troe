@@ -1,27 +1,27 @@
 [package]
-name = "kllm-kernel"
-description = "Firmware-hosted kllm image composition root"
+name = "troe-kernel"
+description = "Firmware-hosted TROE image composition root"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [features]
-acceptance-probes = ["kllm-machine/acceptance-probes"]
+acceptance-probes = ["troe-machine/acceptance-probes"]
 
 [dependencies]
-kllm-application = { path = "../crates/kllm-application" }
-kllm-core = { path = "../crates/kllm-core" }
-kllm-dispatch = { path = "../crates/kllm-dispatch" }
-kllm-driver = { path = "../crates/kllm-driver" }
-kllm-memory = { path = "../crates/kllm-memory" }
-kllm-shell = { path = "../crates/kllm-shell" }
-kllm-task = { path = "../crates/kllm-task" }
-kllm-terminal = { path = "../crates/kllm-terminal" }
-kllm-vfs = { path = "../crates/kllm-vfs" }
+troe-application = { path = "../crates/troe-application" }
+troe-core = { path = "../crates/troe-core" }
+troe-dispatch = { path = "../crates/troe-dispatch" }
+troe-driver = { path = "../crates/troe-driver" }
+troe-memory = { path = "../crates/troe-memory" }
+troe-shell = { path = "../crates/troe-shell" }
+troe-task = { path = "../crates/troe-task" }
+troe-terminal = { path = "../crates/troe-terminal" }
+troe-vfs = { path = "../crates/troe-vfs" }
 
 [target.'cfg(target_os = "uefi")'.dependencies]
-kllm-machine = { path = "../crates/kllm-machine" }
+troe-machine = { path = "../crates/troe-machine" }
 uefi = { version = "=0.39.0" }
 
 [lints]

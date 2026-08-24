@@ -1,4 +1,4 @@
-# Tooling & Package Management Specification
+# TROE Tooling & Package Management Specification
 
 **Status:** Draft post-MVP architecture; no implementation is implied
 
@@ -6,12 +6,11 @@
 
 **Out of scope:** Kernel architecture, scheduler, IPC implementation, VM internals, and other kernel mechanisms covered by [CORE-SPEC.md](CORE-SPEC.md).
 
-**Naming convention:** The product and CLI names are intentionally unset.
-`<cli>` is a metavariable for the eventual executable, not a proposed literal
-command. `<project-manifest>`, `<lockfile>`, and `<system-manifest>` likewise
-stand for filenames to be selected when the project receives a stable name.
-Examples containing angle-bracketed names are illustrative and are not meant
-to be pasted verbatim.
+**Naming convention:** The product is TROE and the CLI executable is `troe`.
+Command examples use `troe` literally. The reserved manifest filenames are
+`troe.toml`, `troe.lock`, and `troe-system.toml`; their schemas remain draft
+until separately accepted. Other angle-bracketed names describe domain values
+or types, not placeholders for the TROE name.
 
 This document extends the core specification; it does not replace it. The core
 specification and accepted ADRs define the current execution, authority,
@@ -37,33 +36,33 @@ The guiding principle is:
 A developer should be able to go from source code to a running isolated service with almost no knowledge of the underlying system:
 
 ```bash
-<cli> new web-api --python
+troe new web-api --python
 cd web-api
-<cli> run
+troe run
 ```
 
 Likewise, writing a driver should feel surprisingly close to writing an ordinary application:
 
 ```bash
-<cli> new driver e1000
-<cli> dev
+troe new driver e1000
+troe dev
 ```
 
 Installing software should be declarative and transactional:
 
 ```bash
-<cli> add redis
-<cli> apply
+troe add redis
+troe apply
 ```
 
 And understanding the machine should not require memorizing dozens of unrelated utilities:
 
 ```bash
-<cli> status
-<cli> inspect web-api
-<cli> explain web-api
-<cli> logs web-api
-<cli> doctor
+troe status
+troe inspect web-api
+troe explain web-api
+troe logs web-api
+troe doctor
 ```
 
 The CLI, SDK, package manager, build system and documentation are therefore **one product**, not independent projects.
@@ -169,13 +168,13 @@ Once the package-capable tooling layer exists, it should expose **one canonical
 control-plane command**:
 
 ```bash
-<cli>
+troe
 ```
 
 Subcommands provide the rest of the interface.
 
 ```text
-<cli>
+troe
 ├── new
 ├── run
 ├── build
@@ -204,17 +203,17 @@ The underlying libraries must remain independently usable through the SDK. The C
 
 This prevents the CLI from becoming an irreplaceable monolith.
 
-This future CLI is distinct from the current statically linked recovery shell.
+The planned TROE CLI is distinct from the current statically linked recovery shell.
 The shell continues to dispatch small statically linked commands such as
 `cat`, `mem`, and `halt` directly; those commands are part of the tiny recovery
-environment and are not rewritten as `<cli> cat`, `<cli> mem`, or similar
+environment and are not rewritten as `troe cat`, `troe mem`, or similar
 subcommands.
 
 During the early roadmap, repository scripts and Cargo remain the bootstrap
 developer interface. They MUST remain deterministic and auditable, and they
 MUST NOT pretend that package transactions or application isolation exist
 before the corresponding system mechanisms land. A hosted implementation of
-the future CLI MAY arrive first, but it must call the same libraries and consume
+the planned TROE CLI MAY arrive first, but it must call the same libraries and consume
 the same versioned formats intended for the native client.
 
 ---
@@ -225,7 +224,7 @@ A native project contains a manifest:
 
 ```text
 my-service/
-├── <project-manifest>
+├── troe.toml
 ├── src/
 ├── tests/
 └── README.md
@@ -234,15 +233,15 @@ my-service/
 Creation:
 
 ```bash
-<cli> new my-service --rust
+troe new my-service --rust
 ```
 
 or:
 
 ```bash
-<cli> new my-service --python
-<cli> new my-service --go
-<cli> new my-service --c
+troe new my-service --python
+troe new my-service --go
+troe new my-service --c
 ```
 
 Templates are extensible packages themselves.
@@ -250,9 +249,9 @@ Templates are extensible packages themselves.
 Eventually:
 
 ```bash
-<cli> new my-service --template fastapi
-<cli> new my-service --template grpc-rust
-<cli> new driver --template pci
+troe new my-service --template fastapi
+troe new my-service --template grpc-rust
+troe new driver --template pci
 ```
 
 Third parties can publish templates without changing the CLI.
@@ -261,7 +260,7 @@ Third parties can publish templates without changing the CLI.
 
 ## 5. Manifest Design
 
-`<project-manifest>` should be the canonical description of package/application intent.
+`troe.toml` should be the canonical description of package/application intent.
 
 Example:
 
@@ -307,9 +306,9 @@ The tooling model uses separate documents for separate kinds of state:
 
 | Document | Meaning | May contain resolved artifact identities? |
 |---|---|---:|
-| `<project-manifest>` | project and package intent | no |
-| `<lockfile>` | exact, target-specific dependency resolution | yes |
-| `<system-manifest>` | desired packages, services, policy, and persistent-volume declarations | no |
+| `troe.toml` | project and package intent | no |
+| `troe.lock` | exact, target-specific dependency resolution | yes |
+| `troe-system.toml` | desired packages, services, policy, and persistent-volume declarations | no |
 | generation record | immutable result of resolving and composing a system | yes |
 
 All four formats MUST be versioned before they are consumed by a released
@@ -429,7 +428,7 @@ This allows implementations to evolve without packages depending unnecessarily o
 Every successful system change creates a generation.
 
 ```bash
-<cli> apply
+troe apply
 ```
 
 might produce:
@@ -458,13 +457,13 @@ Activation should be atomic.
 Previous generations remain available:
 
 ```bash
-<cli> system generations
+troe system generations
 ```
 
 and:
 
 ```bash
-<cli> rollback
+troe rollback
 ```
 
 should be boringly reliable.
@@ -516,7 +515,7 @@ The tooling can supplement them with local observations.
 For example:
 
 ```bash
-<cli> explain redis
+troe explain redis
 ```
 
 could show:
@@ -554,7 +553,7 @@ This makes resource usage visible instead of mysterious.
 `explain` should become one of the project's signature features.
 
 ```bash
-<cli> explain my-api
+troe explain my-api
 ```
 
 Example:
@@ -599,10 +598,10 @@ Not granted:
 The system should be able to explain **why almost anything exists**.
 
 ```bash
-<cli> explain package openssl
-<cli> explain capability network.raw
-<cli> explain service network.tcp
-<cli> explain memory my-api
+troe explain package openssl
+troe explain capability network.raw
+troe explain service network.tcp
+troe explain memory my-api
 ```
 
 ---
@@ -614,7 +613,7 @@ The tooling should make reproducible development environments trivial.
 ```bash
 git clone ...
 cd project
-<cli> dev
+troe dev
 ```
 
 The project manifest defines the environment.
@@ -633,7 +632,7 @@ python = "3.14"
 lldb = true
 ```
 
-`<cli> dev` creates an isolated environment using the same package infrastructure as production.
+`troe dev` creates an isolated environment using the same package infrastructure as production.
 
 Therefore:
 
@@ -641,7 +640,7 @@ Therefore:
 
 This eliminates an entire class of “works on my machine” problems.
 
-Before the system supports isolated applications, `<cli> dev` MAY compose a
+Before the system supports isolated applications, `troe dev` MAY compose a
 hosted environment. The command must state where execution occurs and which
 guarantees are unavailable; a host process is not to be presented as
 system-enforced isolation.
@@ -699,14 +698,14 @@ underlying task, address-space, and device-authority mechanisms exist.
 Driver development should receive the same attention as application development.
 
 ```bash
-<cli> new driver e1000 --pci
+troe new driver e1000 --pci
 ```
 
 generates:
 
 ```text
 e1000/
-├── <project-manifest>
+├── troe.toml
 ├── src/
 │   └── main.rs
 ├── tests/
@@ -732,25 +731,25 @@ interrupts = true
 Development:
 
 ```bash
-<cli> dev
+troe dev
 ```
 
 Testing:
 
 ```bash
-<cli> test --qemu
+troe test --qemu
 ```
 
 Tracing:
 
 ```bash
-<cli> trace driver:e1000
+troe trace driver:e1000
 ```
 
 Inspection:
 
 ```bash
-<cli> inspect driver:e1000
+troe inspect driver:e1000
 ```
 
 A driver should receive only the hardware resources it needs.
@@ -775,7 +774,7 @@ memory = "64MiB"
 Then:
 
 ```bash
-<cli> test
+troe test
 ```
 
 can:
@@ -792,7 +791,7 @@ can:
 Eventually:
 
 ```bash
-<cli> test --hardware pci:01:00.0
+troe test --hardware pci:01:00.0
 ```
 
 could safely run selected tests against real hardware.
@@ -806,7 +805,7 @@ Debugging must not be added years later.
 The project should define structured tracing immediately.
 
 ```bash
-<cli> trace my-api
+troe trace my-api
 ```
 
 could expose:
@@ -823,15 +822,15 @@ ipc.call
 Filtering:
 
 ```bash
-<cli> trace my-api --ipc
-<cli> trace my-api --network
-<cli> trace driver:nvidia --device
+troe trace my-api --ipc
+troe trace my-api --network
+troe trace driver:nvidia --device
 ```
 
 Performance:
 
 ```bash
-<cli> profile my-api
+troe profile my-api
 ```
 
 might report:
@@ -867,7 +866,7 @@ A stable public API is not considered complete until it has:
 For example:
 
 ```bash
-<cli> docs fs.open
+troe docs fs.open
 ```
 
 could display:
@@ -927,13 +926,13 @@ Public APIs should carry structured metadata from which documentation can be gen
 That enables:
 
 ```bash
-<cli> docs
+troe docs
 ```
 
 but also:
 
 ```bash
-<cli> sdk describe fs.open --json
+troe sdk describe fs.open --json
 ```
 
 IDE integration can consume the same information.
@@ -964,7 +963,7 @@ If the manifest doesn't grant it:
 ```text
 ⚠ Application does not declare network.connect.
 
-Add capability to <project-manifest>?
+Add capability to troe.toml?
 ```
 
 The IDE could therefore understand not just syntax and types, but **OS authority**.
@@ -1028,19 +1027,19 @@ Registry entry
 Search becomes richer:
 
 ```bash
-<cli> search http-server
+troe search http-server
 ```
 
 and potentially:
 
 ```bash
-<cli> search http-server --memory '<10MiB'
+troe search http-server --memory '<10MiB'
 ```
 
 or:
 
 ```bash
-<cli> search database --arch aarch64
+troe search database --arch aarch64
 ```
 
 ---
@@ -1076,7 +1075,7 @@ No reliance on whatever version happens to exist on the build machine.
 Every package should be able to answer:
 
 ```bash
-<cli> inspect python --provenance
+troe inspect python --provenance
 ```
 
 with something conceptually like:
@@ -1098,7 +1097,7 @@ Build:
     reproducible
 
 Signature:
-    <core-registry>
+    troe-core-registry
 
 Source available:
     yes
@@ -1113,7 +1112,7 @@ The ecosystem should make supply-chain inspection normal rather than specialist 
 Applications receive a lock file:
 
 ```text
-<lockfile>
+troe.lock
 ```
 
 It records exact artifact identities rather than merely versions.
@@ -1121,7 +1120,7 @@ It records exact artifact identities rather than merely versions.
 Therefore:
 
 ```bash
-<cli> build --locked
+troe build --locked
 ```
 
 six months later should resolve the same environment.
@@ -1143,7 +1142,7 @@ rather than consult an unrecorded source or silently rewrite the lock file.
 Updates should be previewable.
 
 ```bash
-<cli> update --plan
+troe update --plan
 ```
 
 Example:
@@ -1177,7 +1176,7 @@ Expected downtime:
 Then:
 
 ```bash
-<cli> apply
+troe apply
 ```
 
 ---
@@ -1249,7 +1248,7 @@ Old protocol implementations can coexist temporarily if necessary.
 The tooling should expose why:
 
 ```bash
-<cli> explain interface network.tcp@1
+troe explain interface network.tcp@1
 ```
 
 ```text
@@ -1271,13 +1270,13 @@ This prevents mysterious compatibility baggage from accumulating.
 Because packages and generations are immutable, cleanup becomes explicit:
 
 ```bash
-<cli> gc
+troe gc
 ```
 
 Preview:
 
 ```bash
-<cli> gc --plan
+troe gc --plan
 ```
 
 ```text
@@ -1302,7 +1301,7 @@ The tooling should support self-contained application descriptions without dupli
 For distribution:
 
 ```bash
-<cli> package
+troe package
 ```
 
 produces a package descriptor/artifact.
@@ -1310,7 +1309,7 @@ produces a package descriptor/artifact.
 Deployment:
 
 ```bash
-<cli> deploy server.example
+troe deploy server.example
 ```
 
 The receiving machine resolves content it already possesses and transfers only missing artifacts.
@@ -1324,7 +1323,7 @@ Remote machines should use the same model as local machines.
 Conceptually:
 
 ```bash
-<cli> deploy prod
+troe deploy prod
 ```
 
 should perform:
@@ -1356,9 +1355,9 @@ The CLI itself must not become a bottleneck.
 Extensions can provide namespaced commands:
 
 ```bash
-<cli> gpu ...
-<cli> cloud ...
-<cli> python ...
+troe gpu ...
+troe cloud ...
+troe python ...
 ```
 
 But extensions should interact through stable APIs.
@@ -1369,7 +1368,7 @@ Example:
 
 ```toml
 [extension]
-name = "<vendor-extension>"
+name = "example-vendor"
 
 [commands]
 provides = ["gpu"]
@@ -1416,7 +1415,7 @@ immutable environment
 Thus:
 
 ```bash
-<cli> add python:fastapi
+troe add python:fastapi
 ```
 
 could eventually integrate PyPI without turning the machine into an unmanaged `pip` environment.
@@ -1430,11 +1429,11 @@ Python should be a flagship compatibility target.
 For example:
 
 ```bash
-<cli> new api --python
+troe new api --python
 cd api
-<cli> add python:fastapi
-<cli> add python:uvicorn
-<cli> run
+troe add python:fastapi
+troe add python:uvicorn
+troe run
 ```
 
 The developer shouldn't need to manually create a virtual environment.
@@ -1452,7 +1451,7 @@ may eventually exist.
 But native project workflows should prefer:
 
 ```bash
-<cli> add python:...
+troe add python:...
 ```
 
 because that keeps dependency state reproducible.
@@ -1464,13 +1463,13 @@ because that keeps dependency state reproducible.
 Rust can receive especially deep integration.
 
 ```bash
-<cli> new daemon --rust
+troe new daemon --rust
 ```
 
 Tooling automatically selects the project target.
 
 ```bash
-<cli> build
+troe build
 ```
 
 handles:
@@ -1500,7 +1499,7 @@ There should be one command for answering:
 > Why isn't this working?
 
 ```bash
-<cli> doctor
+troe doctor
 ```
 
 Examples:
@@ -1522,19 +1521,19 @@ Examples:
 
 Suggested fix:
 
-    <cli> volume create data
+    troe volume create data
 ```
 
 For a specific application:
 
 ```bash
-<cli> doctor python-api
+troe doctor python-api
 ```
 
 For hardware:
 
 ```bash
-<cli> doctor gpu0
+troe doctor gpu0
 ```
 
 This should be treated as a core feature, not a collection of ad-hoc diagnostics.
@@ -1570,11 +1569,11 @@ It requires:
 
 To grant it:
 
-    <cli> capability add weather-api \
+    troe capability add weather-api \
         network.connect api.example.com:443
 
 Documentation:
-    <cli> docs network.connect
+    troe docs network.connect
 ```
 
 Developer experience should extend all the way into runtime failures.
@@ -1586,10 +1585,10 @@ Developer experience should extend all the way into runtime failures.
 Every important command should support structured output:
 
 ```bash
-<cli> status --json
-<cli> inspect --json
-<cli> explain --json
-<cli> profile --json
+troe status --json
+troe inspect --json
+troe explain --json
+troe profile --json
 ```
 
 The human-readable CLI must never become the API.
@@ -1661,7 +1660,7 @@ The project should record what software has actually been tested.
 For example:
 
 ```bash
-<cli> compat python
+troe compat python
 ```
 
 ```text
@@ -1683,9 +1682,9 @@ Tests:
 Eventually:
 
 ```bash
-<cli> compat pytorch
-<cli> compat postgres
-<cli> compat redis
+troe compat pytorch
+troe compat postgres
+troe compat redis
 ```
 
 This is much better than vague statements such as “probably POSIX compatible.”
@@ -1697,7 +1696,7 @@ This is much better than vague statements such as “probably POSIX compatible.�
 Package publication should support automated compatibility tests.
 
 ```bash
-<cli> package test
+troe package test
 ```
 
 could verify:
@@ -1795,24 +1794,24 @@ A package requesting something forbidden should fail during planning, before act
 The tooling can provide convenient predefined system presets without changing the underlying model.
 
 ```bash
-<cli> system init --preset tiny-vps
+troe system init --preset tiny-vps
 ```
 
 or:
 
 ```bash
-<cli> system init --preset developer
+troe system init --preset developer
 ```
 
 or eventually:
 
 ```bash
-<cli> system init --preset workstation
-<cli> system init --preset cuda
+troe system init --preset workstation
+troe system init --preset cuda
 ```
 
 System presets are simply versioned configuration expanded into ordinary
-`<system-manifest>` intent. They are not additional resource profiles.
+`troe-system.toml` intent. They are not additional resource profiles.
 
 The only build-time resource profiles are the `micro`, `tiny`, and `full`
 profiles accepted in ADR 0006. A preset such as `tiny-vps` must select one of
@@ -1830,7 +1829,7 @@ The system should appear magical because **the abstractions line up**, not becau
 For example:
 
 ```bash
-<cli> add postgres
+troe add postgres
 ```
 
 may automatically determine:
@@ -1852,7 +1851,7 @@ service registration
 But:
 
 ```bash
-<cli> add postgres --plan
+troe add postgres --plan
 ```
 
 must reveal every decision.
@@ -1928,7 +1927,7 @@ Tooling should extend the current workspace rather than begin as a disconnected
 product repository. Logical boundaries may eventually look like:
 
 ```text
-<repository>/
+troe/
 ├── crates/                  current portable system crates
 ├── host/                    current hosted composition root
 ├── kernel/                  current firmware/native composition root
@@ -2026,16 +2025,16 @@ without claiming installation:
 git clone hello-service
 cd hello-service
 
-<cli> package check
-<cli> build --locked
+troe package check
+troe build --locked
 ```
 
 Then:
 
 ```bash
-<cli> inspect hello-service
-<cli> explain hello-service
-<cli> package
+troe inspect hello-service
+troe explain hello-service
+troe package
 ```
 
 Its exit criteria are:
@@ -2051,19 +2050,19 @@ After Stages 7 and 8 provide real application loading and persistent system
 composition, the native extension of this milestone is:
 
 ```bash
-<cli> run
-<cli> add ./hello-service.pkg
-<cli> apply --plan
-<cli> apply
+troe run
+troe add ./hello-service.pkg
+troe apply --plan
+troe apply
 ```
 
 It must install into a clean VM, run with declared authority, remove cleanly,
 and roll back to the prior bootable generation:
 
 ```bash
-<cli> remove hello-service
-<cli> apply
-<cli> rollback
+troe remove hello-service
+troe apply
+troe rollback
 ```
 
 At no point should unexplained mutable state remain behind.
@@ -2075,16 +2074,16 @@ At no point should unexplained mutable state remain behind.
 The first major compatibility demonstration:
 
 ```bash
-<cli> new api --python
-<cli> add python:fastapi
-<cli> add python:uvicorn
-<cli> run
+troe new api --python
+troe add python:fastapi
+troe add python:uvicorn
+troe run
 ```
 
 Then:
 
 ```bash
-<cli> explain api
+troe explain api
 ```
 
 should provide a complete picture of:
@@ -2106,9 +2105,9 @@ The benchmark can then compare the identical application on this system and conv
 A small virtual device driver demonstrates that the tooling is not only pleasant for applications.
 
 ```bash
-<cli> new driver example --pci
+troe new driver example --pci
 
-<cli> test --qemu
+troe test --qemu
 ```
 
 The entire build → boot → hardware emulation → integration-test → diagnostics cycle should require essentially no manual VM configuration.
@@ -2122,10 +2121,10 @@ If this experience is good early, complex future ports such as networking, stora
 Eventually a developer should be able to type:
 
 ```bash
-<cli> add nvidia-driver
-<cli> add cuda
-<cli> add python:pytorch
-<cli> apply
+troe add nvidia-driver
+troe add cuda
+troe add python:pytorch
+troe apply
 ```
 
 and have the tooling resolve:

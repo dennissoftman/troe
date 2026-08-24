@@ -1,9 +1,9 @@
-# Tiny Rust Operating Environment
+# TROE
 
-This project is a tiny Rust operating environment: a bounded command shell, a
-small VFS, and just enough machine layer to grow into an owned kernel. The
-current slice runs as a normal host program and as native x86-64/AArch64 UEFI
-images.
+TROE (Tiny Rust Operating Environment) is a tiny Rust operating system: a
+bounded command shell, a small VFS, and an owned kernel that is growing toward
+useful virtual-machine and physical-machine deployments. The current slice runs
+as a normal host program and as native x86-64/AArch64 UEFI images.
 
 Statically linked recovery built-ins still share the privileged kernel address
 space. Stage 6 additionally runs bounded test tasks in fresh ring-3/EL0 address
@@ -36,8 +36,9 @@ handle calls, or is terminated by the 50 ms execution lease.
 - complete ring-3/EL0 ABI 1.0 entry, exit, resumable yield, and owner-checked
   copied handle calls, with owned x86 local-APIC/AArch64 timer leases;
 - portable bounded block-region capabilities, strict primary/backup GPT
-  discovery, a read-only FAT32 VFS provider, and checksummed SCFG v1 service
-  startup policy (native storage transports and persistence remain Stage 8 work);
+  discovery, read-only FAT32 and constrained checksummed ext4 VFS providers,
+  and checksummed SCFG v1 service startup policy (native storage transports and
+  persistence remain Stage 8 work);
 - owned receive interrupts through q35 LAPIC/I/O APIC and AArch64 GICv2,
   bounded raw-event delivery, and race-free `hlt`/`wfi` shell idle;
 - project-owned polling 16550 and PL011 early/fatal recovery output, plus an
@@ -86,6 +87,24 @@ QEMU/firmware pair is not installed, run the non-emulator gates explicitly with
 their images have been built. For a quick terminal-focused iteration, use
 `python3 scripts/test-qemu.py --smoke`; the exhaustive suite remains the standard
 gate.
+
+The FAT32 and ext4 providers include optional real-tool interoperability tests.
+On macOS, install their independent image builders/checkers with:
+
+```console
+brew install e2fsprogs dosfstools mtools
+```
+
+They run automatically when discovered. To make missing tools a test failure,
+add `--require-filesystem-tools`; for example:
+
+```console
+python3 scripts/test.py --skip-qemu --require-filesystem-tools
+```
+
+The tests build temporary images only: dosfstools/mtools create nested FAT32
+content and e2fsprogs creates the exact ADR 0017 ext4 profile. The corresponding
+host checker must accept each image before TROE mounts, lists, and reads it.
 
 The dependency gate requires exactly `cargo-audit 0.22.1` and checks the full
 lockfile against the RustSec database revision committed in
@@ -137,7 +156,7 @@ serial-first.
   memory models, shell, VFS/provider mounts, terminal/editor, accounting, and
   the isolated native machine mechanism crate;
 - `host`: Stage 0 composition and acceptance runner;
-- `kernel`: UEFI bootstrap and Stage 6 isolated owned-machine composition root;
+- `kernel`: UEFI bootstrap and Stage 7 isolated owned-machine composition root;
 - `rootfs`, `assets`: source tree and generated KEFS image;
 - `tools`: dependency-free deterministic image builders;
 - `scripts`: build, verification, and emulator entry points;
@@ -165,13 +184,23 @@ per-interrupt drain, and interrupt-priority policy, so these tunables are not
 scattered kernel literals. Future build profiles can replace that selection
 while preserving the same shell, stream, VFS, and authority semantics.
 
-## Naming
+## Hardware direction
 
-The public project and CLI names are intentionally unset. Documentation uses
-neutral terms and explicit metavariables until naming, trademark, and package
-availability checks are complete. KEX, KEFS, and FAT wire identifiers are
-product-name-independent and remain valid across a project rename. Existing
-Cargo package, crate, repository, and build-artifact names are provisional
-implementation identifiers rather than format contracts.
+QEMU remains a pinned, deterministic acceptance environment, but it is not the
+hardware contract. Stage 7.5 separates CPU architecture, machine platform, and
+execution environment so the kernel can support documented physical machines
+without treating QEMU devices as architectural facts. The first planned
+AArch64 hardware reference is Raspberry Pi 4, chosen as a common bring-up and
+regression machine; it is one board profile among future AArch64 targets, not a
+limit on the architecture. A documented UEFI x86-64 PC reference is planned in
+the same stage. See the [implementation roadmap](docs/roadmap.md) and
+[ADR 0016](docs/adr/0016-hardware-targets-and-emulator-role.md).
+
+## Name
+
+The public project name is **TROE**, expanded as **Tiny Rust Operating
+Environment**. Cargo packages, crate directories, Rust identifiers, assembly
+symbols, documentation, and test-only volume labels use the `troe`/`TROE`
+forms. KEX, KEFS, and SCFG remain product-name-independent wire formats.
 
 Licensed under Apache-2.0.

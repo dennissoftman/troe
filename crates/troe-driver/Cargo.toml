@@ -1,0 +1,10 @@
+[package]
+name = "troe-driver"
+description = "Bounded portable driver resources and input event queues for TROE"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

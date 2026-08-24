@@ -6,9 +6,9 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
 
-use kllm_core::{Input, MAX_LINE_BYTES, MachineMemorySnapshot, Output, StreamError};
-use kllm_shell::Shell;
-use kllm_vfs::{Namespace, RamFsQuota};
+use troe_core::{Input, MAX_LINE_BYTES, MachineMemorySnapshot, Output, StreamError};
+use troe_shell::Shell;
+use troe_vfs::{Namespace, RamFsQuota};
 
 const ROOTFS: &[u8] = include_bytes!("../../assets/root.kefs");
 

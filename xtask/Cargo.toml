@@ -1,5 +1,5 @@
 [package]
-name = "kllm-xtask"
+name = "troe-xtask"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,5 +7,5 @@ license.workspace = true
 publish = false
 
 [[bin]]
-name = "kllm-xtask"
+name = "troe-xtask"
 path = "src/main.rs"

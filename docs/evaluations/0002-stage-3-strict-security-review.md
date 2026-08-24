@@ -31,7 +31,7 @@ final remediated form is preserved by commit `3b0762c`. At review time, moving
 the work to another machine required transferring modified and untracked files,
 especially:
 
-- `crates/kllm-machine/src/mmu.rs`
+- `crates/troe-machine/src/mmu.rs`
 - `docs/adr/0008-owned-page-tables-and-wx.md`
 - all modified files reported by `git status --short`
 
@@ -112,7 +112,7 @@ Acceptance criteria:
 ### 2. Do not expose the live firmware stack through the frame allocator
 
 Location: `kernel/src/main.rs:282-303` and
-`crates/kllm-memory/src/lib.rs:779-823`
+`crates/troe-memory/src/lib.rs:779-823`
 
 `EfiBootServicesCode` and `EfiBootServicesData` are reclassified as usable, and
 `NormalizedMemoryMap::build(&regions, &[])` supplies no reservations. The frame
@@ -148,7 +148,7 @@ Acceptance criteria:
 
 ### 3. Own x86 interrupt state before installing the minimal IDT
 
-Location: `crates/kllm-machine/src/mmu.rs:556-603`
+Location: `crates/troe-machine/src/mmu.rs:556-603`
 
 The replacement IDT is zero-initialized and only vector 14 is installed. Nothing
 clears `RFLAGS.IF` before `lidt`. The UEFI x64 execution environment enters with
@@ -184,7 +184,7 @@ Acceptance criteria:
 
 ### 4. Enforce W^X across physical aliases
 
-Location: `crates/kllm-memory/src/lib.rs:350-403`
+Location: `crates/troe-memory/src/lib.rs:350-403`
 
 `MappingPlan::insert` rejects virtual overlap only. `enforces_w_xor_x()` checks
 each mapping independently. Two disjoint virtual ranges can therefore map the
@@ -211,7 +211,7 @@ Acceptance criteria:
 
 ### 5. Do not assume firmware uses selector `0x38`
 
-Location: `crates/kllm-machine/src/mmu.rs:556-591`
+Location: `crates/troe-machine/src/mmu.rs:556-591`
 
 The new GDT initializes only entries 6 and 7, corresponding to selectors `0x30`
 and `0x38`. The page-fault gate copies the current CS selector without proving
@@ -235,7 +235,7 @@ Acceptance criteria:
 
 ### 6. Match AArch64 address validation to `TCR_EL1.IPS`
 
-Location: `crates/kllm-machine/src/mmu.rs:650-742`
+Location: `crates/troe-machine/src/mmu.rs:650-742`
 
 The page mapper accepts physical addresses below `2^48`, but `TCR_EL1.IPS` is
 hard-coded to `0b010`, which describes a 40-bit/1 TiB output space. The backend
@@ -264,7 +264,7 @@ Acceptance criteria:
 
 ### 7. Establish every `slice::from_raw_parts` safety precondition
 
-Location: `crates/kllm-machine/src/mmu.rs:249-263`
+Location: `crates/troe-machine/src/mmu.rs:249-263`
 
 `loaded_image_layout` checks non-null and non-zero length, but does not check
 that `byte_count <= isize::MAX` or that `base + byte_count` does not wrap the

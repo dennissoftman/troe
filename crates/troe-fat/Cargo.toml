@@ -1,0 +1,14 @@
+[package]
+name = "troe-fat"
+description = "Strict bounded FAT32 filesystem provider for TROE"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+troe-block = { path = "../troe-block" }
+troe-vfs = { path = "../troe-vfs" }
+
+[lints]
+workspace = true

@@ -12,7 +12,7 @@ persistent storage parser, network stack, multi-user boundary, or mutually
 isolated privileged built-ins in this milestone.
 
 The portable crates forbid unsafe Rust. Project-authored unsafe operations are
-confined to `kllm-machine`, counted by the verification gate, and documented in
+confined to `troe-machine`, counted by the verification gate, and documented in
 the unsafe inventory. Transitive unsafe code is limited to the pinned UEFI and
 TLSF boundaries. Console input and both filesystem image formats are treated as
 untrusted and bounded.

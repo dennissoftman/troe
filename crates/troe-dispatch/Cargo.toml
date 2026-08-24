@@ -1,0 +1,13 @@
+[package]
+name = "troe-dispatch"
+description = "Bounded in-process request/reply dispatch for TROE services"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+troe-core = { path = "../troe-core" }
+
+[lints]
+workspace = true

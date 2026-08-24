@@ -27,124 +27,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b396d1f76d455557e1218ec8066ae14bba60b4b36ecd55577ba979f5db7ecaa"
 
 [[package]]
-name = "kllm-application"
-version = "0.1.0"
-
-[[package]]
-name = "kllm-block"
-version = "0.1.0"
-
-[[package]]
-name = "kllm-config"
-version = "0.1.0"
-dependencies = [
- "kllm-vfs",
-]
-
-[[package]]
-name = "kllm-core"
-version = "0.1.0"
-
-[[package]]
-name = "kllm-dispatch"
-version = "0.1.0"
-dependencies = [
- "kllm-core",
-]
-
-[[package]]
-name = "kllm-driver"
-version = "0.1.0"
-
-[[package]]
-name = "kllm-fat"
-version = "0.1.0"
-dependencies = [
- "kllm-block",
- "kllm-vfs",
-]
-
-[[package]]
-name = "kllm-gpt"
-version = "0.1.0"
-dependencies = [
- "kllm-block",
-]
-
-[[package]]
-name = "kllm-host"
-version = "0.1.0"
-dependencies = [
- "kllm-core",
- "kllm-shell",
- "kllm-vfs",
-]
-
-[[package]]
-name = "kllm-kernel"
-version = "0.1.0"
-dependencies = [
- "kllm-application",
- "kllm-core",
- "kllm-dispatch",
- "kllm-driver",
- "kllm-machine",
- "kllm-memory",
- "kllm-shell",
- "kllm-task",
- "kllm-terminal",
- "kllm-vfs",
- "uefi",
-]
-
-[[package]]
-name = "kllm-machine"
-version = "0.1.0"
-dependencies = [
- "kllm-driver",
- "kllm-memory",
- "kllm-task",
- "kllm-terminal",
- "rlsf",
- "uefi",
-]
-
-[[package]]
-name = "kllm-memory"
-version = "0.1.0"
-
-[[package]]
-name = "kllm-shell"
-version = "0.1.0"
-dependencies = [
- "kllm-core",
- "kllm-driver",
- "kllm-vfs",
-]
-
-[[package]]
-name = "kllm-task"
-version = "0.1.0"
-
-[[package]]
-name = "kllm-terminal"
-version = "0.1.0"
-dependencies = [
- "kllm-core",
-]
-
-[[package]]
-name = "kllm-vfs"
-version = "0.1.0"
-dependencies = [
- "kllm-core",
-]
-
-[[package]]
-name = "kllm-xtask"
-version = "0.1.0"
-
-[[package]]
 name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -233,6 +115,132 @@ dependencies = [
  "quote",
  "unicode-ident",
 ]
+
+[[package]]
+name = "troe-application"
+version = "0.1.0"
+
+[[package]]
+name = "troe-block"
+version = "0.1.0"
+
+[[package]]
+name = "troe-config"
+version = "0.1.0"
+dependencies = [
+ "troe-vfs",
+]
+
+[[package]]
+name = "troe-core"
+version = "0.1.0"
+
+[[package]]
+name = "troe-dispatch"
+version = "0.1.0"
+dependencies = [
+ "troe-core",
+]
+
+[[package]]
+name = "troe-driver"
+version = "0.1.0"
+
+[[package]]
+name = "troe-ext4"
+version = "0.1.0"
+dependencies = [
+ "troe-block",
+ "troe-vfs",
+]
+
+[[package]]
+name = "troe-fat"
+version = "0.1.0"
+dependencies = [
+ "troe-block",
+ "troe-vfs",
+]
+
+[[package]]
+name = "troe-gpt"
+version = "0.1.0"
+dependencies = [
+ "troe-block",
+]
+
+[[package]]
+name = "troe-host"
+version = "0.1.0"
+dependencies = [
+ "troe-core",
+ "troe-shell",
+ "troe-vfs",
+]
+
+[[package]]
+name = "troe-kernel"
+version = "0.1.0"
+dependencies = [
+ "troe-application",
+ "troe-core",
+ "troe-dispatch",
+ "troe-driver",
+ "troe-machine",
+ "troe-memory",
+ "troe-shell",
+ "troe-task",
+ "troe-terminal",
+ "troe-vfs",
+ "uefi",
+]
+
+[[package]]
+name = "troe-machine"
+version = "0.1.0"
+dependencies = [
+ "rlsf",
+ "troe-driver",
+ "troe-memory",
+ "troe-task",
+ "troe-terminal",
+ "uefi",
+]
+
+[[package]]
+name = "troe-memory"
+version = "0.1.0"
+
+[[package]]
+name = "troe-shell"
+version = "0.1.0"
+dependencies = [
+ "troe-core",
+ "troe-driver",
+ "troe-vfs",
+]
+
+[[package]]
+name = "troe-task"
+version = "0.1.0"
+
+[[package]]
+name = "troe-terminal"
+version = "0.1.0"
+dependencies = [
+ "troe-core",
+]
+
+[[package]]
+name = "troe-vfs"
+version = "0.1.0"
+dependencies = [
+ "troe-core",
+]
+
+[[package]]
+name = "troe-xtask"
+version = "0.1.0"
 
 [[package]]
 name = "ucs2"

@@ -5,7 +5,7 @@ Status: accepted, 2026-08-22.
 ## Decision
 
 Stage 3 keeps the existing low identity layout but replaces firmware page
-tables on both primary architectures. A pure `kllm-memory` mapping plan records
+tables on both primary architectures. A pure `troe-memory` mapping plan records
 virtual and physical ranges, read/write/execute permissions, normal or device
 memory type, owner, lifetime, and remapping policy. It is bounded to 512 sorted
 records and rejects overlap, checked-arithmetic failure, unequal range lengths,

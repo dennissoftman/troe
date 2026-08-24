@@ -4,7 +4,7 @@ Status: accepted, 2026-08-23.
 
 ## Decision
 
-Stage 4 introduces an architecture-independent `kllm-task` policy crate. One
+Stage 4 introduces an architecture-independent `troe-task` policy crate. One
 scheduler retains at most 16 records, assigns non-reused monotonic identities,
 and permits only ready, running, and exited lifecycle states. Exactly one task
 may be running on the single CPU. Selection is deterministic round robin and
