@@ -75,6 +75,8 @@ mark-and-copy garbage-collection direction.
 [ADR 0022](adr/0022-bounded-single-file-state-filesystem.md) fixes the narrow
 writable VFS provider, exact block authority, and crash-recovery contract for
 the first selected persistent filesystem mutation.
+[ADR 0023](adr/0023-bounded-virtio-network-profile.md) fixes the modern
+virtio-net queue and minimal Ethernet/ARP/IPv4/UDP profile plus flood bounds.
 ADR 0012 governs the completed Stage 5.1 terminal and
 framebuffer increment; AArch64 native keyboard input remains a later
 virtio-input transport decision. ADR 0013 governs the completed Stage 5.2

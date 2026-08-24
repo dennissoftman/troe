@@ -378,6 +378,10 @@ The first portable storage/configuration boundary is landed:
   TXSLOT publication and explicit flushes. It mounts at `/vol/state`; both QEMU
   profiles mutate it across five process terminations while the harness
   independently checks transaction generation, STFS checksum, and file bytes.
+- `troe-net` supplies safe bounded Ethernet/ARP/IPv4/UDP construction, parsing,
+  checksum and fragment rejection, plus a count-and-byte-bounded receive FIFO.
+  Truncation and 10,000-frame flood tests are host verified; native virtio-net
+  transport and host exchange remain in progress.
 
 These mechanisms are host verified; both VM transports, read-only mount
 activation, the bounded TXSLOT transaction, and digest-bound ext4 CSPK/SACT

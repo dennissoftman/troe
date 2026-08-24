@@ -232,6 +232,10 @@ name = "troe-mount"
 version = "0.1.0"
 
 [[package]]
+name = "troe-net"
+version = "0.1.0"
+
+[[package]]
 name = "troe-persist"
 version = "0.1.0"
 dependencies = [
