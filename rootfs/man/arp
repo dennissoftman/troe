@@ -1,0 +1,9 @@
+NAME
+    arp - show the bounded neighbor cache
+
+SYNOPSIS
+    arp
+
+DESCRIPTION
+    Prints the at-most-eight IPv4-to-Ethernet records learned by the ambient
+    network service. The least-recently-observed record is replaced at capacity.

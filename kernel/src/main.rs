@@ -13,9 +13,11 @@ mod firmware {
     extern crate alloc;
 
     use alloc::boxed::Box;
+    use alloc::collections::VecDeque;
+    use alloc::rc::Rc;
     use alloc::string::String;
     use alloc::vec::Vec;
-    use core::cell::RefCell;
+    use core::cell::{Cell, RefCell};
     use core::fmt::Write as _;
     use core::panic::PanicInfo;
 
@@ -38,7 +40,7 @@ mod firmware {
         ConsoleService, CopiedMessage, DispatchedOutput, Dispatcher, HandleOwner, ReplyStatus,
         Request, Rights, Service, ServiceReply,
     };
-    use troe_driver::{InputQueueConfig, InputSource};
+    use troe_driver::{InputEvent, InputQueueConfig, InputSource};
     use troe_ext4::Ext4Limits;
     use troe_gpt::GptLimits;
     #[cfg(feature = "acceptance-probes")]
@@ -52,15 +54,16 @@ mod firmware {
     };
     use troe_mount::{BootMountManifest, parse_manifest};
     use troe_net::{
-        DhcpMessageType, Ipv4Address, MAX_UDP_PAYLOAD_BYTES, MacAddress, NetError, NetworkDevice,
-        build_arp_reply, build_arp_request, build_dhcp_discover, build_dhcp_request,
-        build_icmp_echo, build_udp, parse_arp, parse_dhcp, parse_icmp_echo, parse_udp,
+        ArpCache, DhcpMessageType, DhcpPacket, Ipv4Address, MAX_UDP_PAYLOAD_BYTES, MacAddress,
+        NetError, NetworkDevice, NetworkServiceStats, UdpAdmission, UdpPortTable, build_arp_reply,
+        build_arp_request, build_dhcp_discover, build_dhcp_request, build_icmp_echo, build_udp,
+        parse_arp, parse_dhcp, parse_icmp_echo, parse_udp,
     };
     #[cfg(feature = "acceptance-probes")]
     use troe_persist::{DualSlotStore, RegionSelector, TRANSACTION_BLOCKS};
     use troe_shell::{
-        CompletionConfig, NetworkControl, NetworkError, NetworkStatus, PingReply, ReceivedUdp,
-        Shell,
+        ArpEntry, CompletionConfig, NetworkControl, NetworkError, NetworkStats, NetworkStatus,
+        PingReply, ReceivedUdp, Shell,
     };
     #[cfg(feature = "acceptance-probes")]
     use troe_statefs::{STATE_PATH, StateFs};
@@ -68,8 +71,8 @@ mod firmware {
     use troe_storage::read_selected_file;
     use troe_storage::{ActivationLimits, prepare_read_only};
     use troe_task::{
-        Capabilities, IsolationResource, Scheduler, StackResource, TaskFault, TaskId, TaskState,
-        TaskStep,
+        Cancelled, Capabilities, CooperativeRuntime, IsolationResource, MonotonicMillis, Scheduler,
+        StackResource, TaskFault, TaskId, TaskState, TaskStep,
     };
     use troe_terminal::{
         EditorConfig, EditorOutcome, FramebufferDescriptor, FramebufferPixelFormat, InputDecoder,
@@ -275,21 +278,60 @@ mod firmware {
         lease_seconds: Option<u32>,
     }
 
-    struct KernelNetwork {
+    struct KernelNetworkService {
         device: troe_machine::NativeVirtioNetwork,
         configuration: Option<Ipv4Configuration>,
         next_sequence: u16,
         next_port: u16,
         dhcp_generation: u16,
+        arp: ArpCache,
+        udp: UdpPortTable,
+        dhcp_inbox: VecDeque<DhcpPacket>,
+        echo_inbox: VecDeque<EchoReply>,
+        stats: NetworkServiceStats,
+    }
+
+    #[derive(Clone, Copy)]
+    struct EchoReply {
+        source: Ipv4Address,
+        identifier: u16,
+        sequence: u16,
+        bytes: usize,
+    }
+
+    type SharedNetwork = Rc<RefCell<KernelNetworkService>>;
+
+    struct KernelNetwork {
+        service: SharedNetwork,
+    }
+
+    struct KernelRuntime {
+        network: Option<SharedNetwork>,
+        deferred_input: VecDeque<InputEvent>,
+        control_down: bool,
+        last_millis: Cell<u64>,
+    }
+
+    type SharedRuntime = Rc<RefCell<KernelRuntime>>;
+
+    struct KernelRuntimeCapability {
+        runtime: SharedRuntime,
     }
 
     impl core::fmt::Debug for KernelNetwork {
         fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            let service = self.service.borrow();
             formatter
                 .debug_struct("KernelNetwork")
-                .field("mac", &self.device.mac_address().bytes())
-                .field("configured", &self.configuration.is_some())
+                .field("mac", &service.device.mac_address().bytes())
+                .field("configured", &service.configuration.is_some())
                 .finish_non_exhaustive()
+        }
+    }
+
+    impl core::fmt::Debug for KernelRuntimeCapability {
+        fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            formatter.write_str("KernelRuntimeCapability")
         }
     }
 
@@ -2750,17 +2792,31 @@ mod firmware {
         (namespace, native_root)
     }
 
-    impl KernelNetwork {
-        const POLL_ATTEMPTS: usize = 128;
+    impl KernelNetworkService {
+        const POLL_BUDGET: usize = 8;
+        const INBOX_CAPACITY: usize = 4;
 
-        fn new(device: troe_machine::NativeVirtioNetwork) -> Self {
-            Self {
+        fn new(device: troe_machine::NativeVirtioNetwork) -> Result<Self, NetError> {
+            let mut dhcp_inbox = VecDeque::new();
+            dhcp_inbox
+                .try_reserve_exact(Self::INBOX_CAPACITY)
+                .map_err(|_| NetError::Exhausted)?;
+            let mut echo_inbox = VecDeque::new();
+            echo_inbox
+                .try_reserve_exact(Self::INBOX_CAPACITY)
+                .map_err(|_| NetError::Exhausted)?;
+            Ok(Self {
                 device,
                 configuration: None,
                 next_sequence: 1,
                 next_port: 49_152,
                 dhcp_generation: 0,
-            }
+                arp: ArpCache::new(),
+                udp: UdpPortTable::new()?,
+                dhcp_inbox,
+                echo_inbox,
+                stats: NetworkServiceStats::default(),
+            })
         }
 
         fn shell_status(&self) -> NetworkStatus {
@@ -2781,18 +2837,160 @@ mod firmware {
                 ^ 0x5452_4f45
         }
 
-        fn configure_dhcp(&mut self) -> Result<NetworkStatus, NetworkError> {
-            let transaction_id = self.next_dhcp_transaction();
-            let mac = self.device.mac_address();
+        fn transmit(&mut self, frame: &[u8]) -> Result<(), NetworkError> {
+            match self.device.transmit(frame) {
+                Ok(()) => {
+                    self.stats.transmitted_frames = self.stats.transmitted_frames.saturating_add(1);
+                    Ok(())
+                }
+                Err(error) => {
+                    self.stats.errors = self.stats.errors.saturating_add(1);
+                    Err(map_network_error(error))
+                }
+            }
+        }
+
+        fn poll(&mut self) -> Result<(), NetworkError> {
+            self.stats.checkpoints = self.stats.checkpoints.saturating_add(1);
+            for _ in 0..Self::POLL_BUDGET {
+                let frame = match self.device.receive() {
+                    Ok(Some(frame)) => frame,
+                    Ok(None) => break,
+                    Err(error) => {
+                        self.stats.errors = self.stats.errors.saturating_add(1);
+                        return Err(map_network_error(error));
+                    }
+                };
+                self.stats.received_frames = self.stats.received_frames.saturating_add(1);
+                if self.handle_frame(&frame).is_err() {
+                    self.stats.errors = self.stats.errors.saturating_add(1);
+                }
+            }
+            Ok(())
+        }
+
+        fn handle_frame(&mut self, frame: &[u8]) -> Result<(), NetworkError> {
+            if let Ok(packet) = parse_dhcp(frame) {
+                if self.dhcp_inbox.len() < Self::INBOX_CAPACITY {
+                    self.dhcp_inbox.push_back(packet);
+                }
+                return Ok(());
+            }
+            if let Ok(arp) = parse_arp(frame) {
+                self.arp.learn(arp.sender_ip, arp.sender_mac);
+                let Some(configuration) = self.configuration else {
+                    return Ok(());
+                };
+                if arp.operation == 1 && arp.target_ip == configuration.address {
+                    let reply = build_arp_reply(
+                        self.device.mac_address(),
+                        configuration.address,
+                        arp.sender_mac,
+                        arp.sender_ip,
+                    )
+                    .map_err(map_network_error)?;
+                    self.transmit(&reply)?;
+                    self.stats.arp_replies = self.stats.arp_replies.saturating_add(1);
+                }
+                return Ok(());
+            }
+            let Some(configuration) = self.configuration else {
+                self.stats.ignored_frames = self.stats.ignored_frames.saturating_add(1);
+                return Ok(());
+            };
+            if let Ok(echo) = parse_icmp_echo(frame)
+                && echo.destination_ip == configuration.address
+            {
+                self.arp.learn(echo.source_ip, echo.source_mac);
+                if echo.kind == 8 {
+                    let reply = build_icmp_echo(
+                        self.device.mac_address(),
+                        echo.source_mac,
+                        configuration.address,
+                        echo.source_ip,
+                        0,
+                        echo.identifier,
+                        echo.sequence,
+                        echo.payload,
+                    )
+                    .map_err(map_network_error)?;
+                    self.transmit(&reply)?;
+                    self.stats.icmp_replies = self.stats.icmp_replies.saturating_add(1);
+                } else if echo.kind == 0 && self.echo_inbox.len() < Self::INBOX_CAPACITY {
+                    self.echo_inbox.push_back(EchoReply {
+                        source: echo.source_ip,
+                        identifier: echo.identifier,
+                        sequence: echo.sequence,
+                        bytes: echo.payload.len(),
+                    });
+                }
+                return Ok(());
+            }
+            if let Ok(datagram) = parse_udp(frame)
+                && datagram.destination_ip == configuration.address
+            {
+                self.arp.learn(datagram.source_ip, datagram.source_mac);
+                match self.udp.admit(datagram).map_err(map_network_error)? {
+                    UdpAdmission::Retained => {
+                        self.stats.udp_retained = self.stats.udp_retained.saturating_add(1);
+                    }
+                    UdpAdmission::Unbound => {
+                        self.stats.udp_unbound = self.stats.udp_unbound.saturating_add(1);
+                    }
+                    UdpAdmission::Dropped => {
+                        self.stats.udp_dropped = self.stats.udp_dropped.saturating_add(1);
+                    }
+                }
+                return Ok(());
+            }
+            self.stats.ignored_frames = self.stats.ignored_frames.saturating_add(1);
+            Ok(())
+        }
+
+        fn take_dhcp(&mut self, transaction_id: u32) -> Option<DhcpPacket> {
+            let index = self.dhcp_inbox.iter().position(|packet| {
+                packet.transaction_id == transaction_id
+                    && packet.client_mac == self.device.mac_address()
+            })?;
+            self.dhcp_inbox.remove(index)
+        }
+
+        fn take_echo(&mut self, identifier: u16, sequence: u16) -> Option<EchoReply> {
+            let index = self
+                .echo_inbox
+                .iter()
+                .position(|reply| reply.identifier == identifier && reply.sequence == sequence)?;
+            self.echo_inbox.remove(index)
+        }
+    }
+
+    impl KernelNetwork {
+        const WAIT_MILLISECONDS: u64 = 2_000;
+
+        fn new(service: SharedNetwork) -> Self {
+            Self { service }
+        }
+
+        fn configure_dhcp(
+            &mut self,
+            runtime: &mut dyn CooperativeRuntime,
+        ) -> Result<NetworkStatus, NetworkError> {
+            let (transaction_id, mac) = {
+                let mut service = self.service.borrow_mut();
+                (
+                    service.next_dhcp_transaction(),
+                    service.device.mac_address(),
+                )
+            };
             let discover = build_dhcp_discover(mac, transaction_id).map_err(map_network_error)?;
-            self.device.transmit(&discover).map_err(map_network_error)?;
-            let offer = self.wait_for_dhcp(transaction_id, DhcpMessageType::Offer)?;
+            self.service.borrow_mut().transmit(&discover)?;
+            let offer = self.wait_for_dhcp(transaction_id, DhcpMessageType::Offer, runtime)?;
             let server = offer.server_identifier.ok_or(NetworkError::Protocol)?;
             let request = build_dhcp_request(mac, transaction_id, offer.your_ip, server)
                 .map_err(map_network_error)?;
-            self.device.transmit(&request).map_err(map_network_error)?;
+            self.service.borrow_mut().transmit(&request)?;
             let acknowledgement =
-                self.wait_for_dhcp(transaction_id, DhcpMessageType::Acknowledge)?;
+                self.wait_for_dhcp(transaction_id, DhcpMessageType::Acknowledge, runtime)?;
             let subnet_mask = acknowledgement
                 .subnet_mask
                 .or(offer.subnet_mask)
@@ -2805,138 +3003,148 @@ mod firmware {
             if address.bytes() == [0; 4] {
                 return Err(NetworkError::Protocol);
             }
-            self.configuration = Some(Ipv4Configuration {
+            let mut service = self.service.borrow_mut();
+            service.configuration = Some(Ipv4Configuration {
                 address,
                 subnet_mask,
                 gateway,
                 lease_seconds: acknowledgement.lease_seconds.or(offer.lease_seconds),
             });
-            Ok(self.shell_status())
+            Ok(service.shell_status())
         }
 
         fn wait_for_dhcp(
-            &mut self,
+            &self,
             transaction_id: u32,
             wanted: DhcpMessageType,
-        ) -> Result<troe_net::DhcpPacket, NetworkError> {
-            for _ in 0..Self::POLL_ATTEMPTS {
-                let Some(frame) = self.device.receive().map_err(map_network_error)? else {
-                    continue;
-                };
-                let Ok(packet) = parse_dhcp(&frame) else {
-                    continue;
-                };
-                if packet.transaction_id != transaction_id
-                    || packet.client_mac != self.device.mac_address()
-                {
-                    continue;
-                }
-                if packet.message_type == DhcpMessageType::NegativeAcknowledge {
-                    return Err(NetworkError::Protocol);
-                }
-                if packet.message_type == wanted {
-                    return Ok(packet);
+            runtime: &mut dyn CooperativeRuntime,
+        ) -> Result<DhcpPacket, NetworkError> {
+            let deadline = runtime.now().saturating_add(Self::WAIT_MILLISECONDS);
+            while runtime.now() < deadline {
+                runtime.checkpoint().map_err(|_| NetworkError::Cancelled)?;
+                if let Some(packet) = self.service.borrow_mut().take_dhcp(transaction_id) {
+                    if packet.message_type == DhcpMessageType::NegativeAcknowledge {
+                        return Err(NetworkError::Protocol);
+                    }
+                    if packet.message_type == wanted {
+                        return Ok(packet);
+                    }
                 }
             }
             Err(NetworkError::Timeout)
         }
 
-        fn resolve(&mut self, destination: Ipv4Address) -> Result<MacAddress, NetworkError> {
-            let configuration = self.configuration.ok_or(NetworkError::NotConfigured)?;
-            let next_hop = if same_subnet(
-                configuration.address,
-                destination,
-                configuration.subnet_mask,
-            ) {
-                destination
-            } else {
-                configuration.gateway
-            };
-            let request =
-                build_arp_request(self.device.mac_address(), configuration.address, next_hop)
-                    .map_err(map_network_error)?;
-            self.device.transmit(&request).map_err(map_network_error)?;
-            for _ in 0..Self::POLL_ATTEMPTS {
-                let Some(frame) = self.device.receive().map_err(map_network_error)? else {
-                    continue;
-                };
-                if let Ok(arp) = parse_arp(&frame)
-                    && arp.operation == 2
-                    && arp.sender_ip == next_hop
-                    && arp.target_ip == configuration.address
-                    && arp.target_mac == self.device.mac_address().bytes()
-                {
-                    return Ok(arp.sender_mac);
-                }
-                self.handle_control_frame(&frame)?;
-            }
-            Err(NetworkError::Timeout)
-        }
-
-        fn handle_control_frame(&mut self, frame: &[u8]) -> Result<(), NetworkError> {
-            let Some(configuration) = self.configuration else {
-                return Ok(());
-            };
-            if let Ok(arp) = parse_arp(frame) {
-                if arp.operation == 1 && arp.target_ip == configuration.address {
-                    let reply = build_arp_reply(
-                        self.device.mac_address(),
-                        configuration.address,
-                        arp.sender_mac,
-                        arp.sender_ip,
-                    )
-                    .map_err(map_network_error)?;
-                    self.device.transmit(&reply).map_err(map_network_error)?;
-                }
-                return Ok(());
-            }
-            if let Ok(echo) = parse_icmp_echo(frame)
-                && echo.kind == 8
-                && echo.destination_ip == configuration.address
-            {
-                let reply = build_icmp_echo(
-                    self.device.mac_address(),
-                    echo.source_mac,
+        fn resolve(
+            &self,
+            destination: Ipv4Address,
+            runtime: &mut dyn CooperativeRuntime,
+        ) -> Result<MacAddress, NetworkError> {
+            let (next_hop, request) = {
+                let service = self.service.borrow();
+                let configuration = service.configuration.ok_or(NetworkError::NotConfigured)?;
+                let next_hop = if same_subnet(
                     configuration.address,
-                    echo.source_ip,
-                    0,
-                    echo.identifier,
-                    echo.sequence,
-                    echo.payload,
+                    destination,
+                    configuration.subnet_mask,
+                ) {
+                    destination
+                } else {
+                    configuration.gateway
+                };
+                if let Some(mac) = service.arp.lookup(next_hop) {
+                    return Ok(mac);
+                }
+                let request = build_arp_request(
+                    service.device.mac_address(),
+                    configuration.address,
+                    next_hop,
                 )
                 .map_err(map_network_error)?;
-                self.device.transmit(&reply).map_err(map_network_error)?;
+                (next_hop, request)
+            };
+            self.service.borrow_mut().transmit(&request)?;
+            let deadline = runtime.now().saturating_add(Self::WAIT_MILLISECONDS);
+            while runtime.now() < deadline {
+                runtime.checkpoint().map_err(|_| NetworkError::Cancelled)?;
+                if let Some(mac) = self.service.borrow().arp.lookup(next_hop) {
+                    return Ok(mac);
+                }
             }
-            Ok(())
+            Err(NetworkError::Timeout)
         }
     }
 
     impl NetworkControl for KernelNetwork {
         fn status(&self) -> NetworkStatus {
-            self.shell_status()
+            self.service.borrow().shell_status()
         }
 
-        fn dhcp(&mut self) -> Result<NetworkStatus, NetworkError> {
-            self.configure_dhcp()
+        fn stats(&self) -> NetworkStats {
+            let service = self.service.borrow();
+            NetworkStats {
+                received_frames: service.stats.received_frames,
+                transmitted_frames: service.stats.transmitted_frames,
+                arp_replies: service.stats.arp_replies,
+                icmp_replies: service.stats.icmp_replies,
+                udp_retained: service.stats.udp_retained,
+                udp_unbound: service.stats.udp_unbound,
+                udp_dropped: service.stats.udp_dropped,
+                arp_entries: service.arp.len(),
+                udp_ports: service.udp.len(),
+                checkpoints: service.stats.checkpoints,
+                errors: service.stats.errors,
+            }
         }
 
-        fn ping(&mut self, destination: [u8; 4]) -> Result<PingReply, NetworkError> {
-            let configuration = self.configuration.ok_or(NetworkError::NotConfigured)?;
+        fn arp_entries(&self) -> Vec<ArpEntry> {
+            self.service
+                .borrow()
+                .arp
+                .entries()
+                .map(|entry| ArpEntry {
+                    address: entry.address.bytes(),
+                    mac: entry.mac.bytes(),
+                })
+                .collect()
+        }
+
+        fn dhcp(
+            &mut self,
+            runtime: &mut dyn CooperativeRuntime,
+        ) -> Result<NetworkStatus, NetworkError> {
+            self.configure_dhcp(runtime)
+        }
+
+        fn ping(
+            &mut self,
+            destination: [u8; 4],
+            runtime: &mut dyn CooperativeRuntime,
+        ) -> Result<PingReply, NetworkError> {
+            let configuration = self
+                .service
+                .borrow()
+                .configuration
+                .ok_or(NetworkError::NotConfigured)?;
             let destination = Ipv4Address::new(destination);
             if destination == configuration.address {
-                let sequence = self.next_sequence;
-                self.next_sequence = self.next_sequence.wrapping_add(1);
+                let mut service = self.service.borrow_mut();
+                let sequence = service.next_sequence;
+                service.next_sequence = service.next_sequence.wrapping_add(1);
                 return Ok(PingReply {
                     source: destination.bytes(),
                     sequence,
                     bytes: 9,
                 });
             }
-            let destination_mac = self.resolve(destination)?;
-            let sequence = self.next_sequence;
-            self.next_sequence = self.next_sequence.wrapping_add(1);
+            let destination_mac = self.resolve(destination, runtime)?;
+            let (source_mac, sequence) = {
+                let mut service = self.service.borrow_mut();
+                let sequence = service.next_sequence;
+                service.next_sequence = service.next_sequence.wrapping_add(1);
+                (service.device.mac_address(), sequence)
+            };
             let request = build_icmp_echo(
-                self.device.mac_address(),
+                source_mac,
                 destination_mac,
                 configuration.address,
                 destination,
@@ -2946,49 +3154,65 @@ mod firmware {
                 b"troe-ping",
             )
             .map_err(map_network_error)?;
-            self.device.transmit(&request).map_err(map_network_error)?;
-            for _ in 0..Self::POLL_ATTEMPTS {
-                let Some(frame) = self.device.receive().map_err(map_network_error)? else {
-                    continue;
-                };
-                if let Ok(echo) = parse_icmp_echo(&frame)
-                    && echo.kind == 0
-                    && echo.source_ip == destination
-                    && echo.destination_ip == configuration.address
-                    && echo.identifier == 0x5452
-                    && echo.sequence == sequence
+            self.service.borrow_mut().transmit(&request)?;
+            let deadline = runtime.now().saturating_add(Self::WAIT_MILLISECONDS);
+            while runtime.now() < deadline {
+                runtime.checkpoint().map_err(|_| NetworkError::Cancelled)?;
+                if let Some(echo) = self.service.borrow_mut().take_echo(0x5452, sequence)
+                    && echo.source == destination
                 {
                     return Ok(PingReply {
-                        source: echo.source_ip.bytes(),
+                        source: echo.source.bytes(),
                         sequence,
-                        bytes: echo.payload.len(),
+                        bytes: echo.bytes,
                     });
                 }
-                self.handle_control_frame(&frame)?;
             }
             Err(NetworkError::Timeout)
         }
 
         fn send_udp(
             &mut self,
+            source_port: Option<u16>,
             destination: [u8; 4],
             destination_port: u16,
             payload: &[u8],
+            runtime: &mut dyn CooperativeRuntime,
         ) -> Result<u16, NetworkError> {
             if payload.len() > MAX_UDP_PAYLOAD_BYTES {
                 return Err(NetworkError::TooLarge);
             }
-            let configuration = self.configuration.ok_or(NetworkError::NotConfigured)?;
+            let configuration = self
+                .service
+                .borrow()
+                .configuration
+                .ok_or(NetworkError::NotConfigured)?;
             let destination = Ipv4Address::new(destination);
-            let destination_mac = self.resolve(destination)?;
-            let source_port = self.next_port;
-            self.next_port = if self.next_port == u16::MAX {
-                49_152
+            let destination_mac = self.resolve(destination, runtime)?;
+            let source_port = if let Some(port) = source_port {
+                self.service
+                    .borrow_mut()
+                    .udp
+                    .bind(port)
+                    .map_err(map_network_error)?;
+                port
             } else {
-                self.next_port + 1
+                let mut service = self.service.borrow_mut();
+                let mut selected = None;
+                for _ in 0..troe_net::MAX_UDP_PORTS {
+                    let port = service.next_port;
+                    service.next_port = if port == u16::MAX { 49_152 } else { port + 1 };
+                    if !service.udp.is_bound(port) {
+                        service.udp.bind(port).map_err(map_network_error)?;
+                        selected = Some(port);
+                        break;
+                    }
+                }
+                selected.ok_or(NetworkError::Exhausted)?
             };
+            let source_mac = self.service.borrow().device.mac_address();
             let datagram = build_udp(
-                self.device.mac_address(),
+                source_mac,
                 destination_mac,
                 configuration.address,
                 destination,
@@ -2997,34 +3221,33 @@ mod firmware {
                 payload,
             )
             .map_err(map_network_error)?;
-            self.device.transmit(&datagram).map_err(map_network_error)?;
+            self.service.borrow_mut().transmit(&datagram)?;
             Ok(source_port)
         }
 
-        fn receive_udp(&mut self, local_port: u16) -> Result<ReceivedUdp, NetworkError> {
-            let configuration = self.configuration.ok_or(NetworkError::NotConfigured)?;
-            for _ in 0..Self::POLL_ATTEMPTS {
-                let Some(frame) = self.device.receive().map_err(map_network_error)? else {
-                    continue;
-                };
-                if let Ok(datagram) = parse_udp(&frame)
-                    && datagram.destination_ip == configuration.address
-                    && datagram.destination_port == local_port
-                {
-                    let mut payload = Vec::new();
-                    payload
-                        .try_reserve_exact(datagram.payload.len())
-                        .map_err(|_| NetworkError::TooLarge)?;
-                    payload.extend_from_slice(datagram.payload);
+        fn listen_udp(
+            &mut self,
+            local_port: u16,
+            runtime: &mut dyn CooperativeRuntime,
+        ) -> Result<ReceivedUdp, NetworkError> {
+            if self.service.borrow().configuration.is_none() {
+                return Err(NetworkError::NotConfigured);
+            }
+            self.service
+                .borrow_mut()
+                .udp
+                .bind(local_port)
+                .map_err(map_network_error)?;
+            loop {
+                if let Some(datagram) = self.service.borrow_mut().udp.receive(local_port) {
                     return Ok(ReceivedUdp {
                         source: datagram.source_ip.bytes(),
                         source_port: datagram.source_port,
-                        payload,
+                        payload: datagram.payload,
                     });
                 }
-                self.handle_control_frame(&frame)?;
+                runtime.checkpoint().map_err(|_| NetworkError::Cancelled)?;
             }
-            Err(NetworkError::Timeout)
         }
     }
 
@@ -3042,37 +3265,124 @@ mod firmware {
             | NetError::Truncated
             | NetError::Checksum
             | NetError::Unsupported => NetworkError::Protocol,
-            NetError::Exhausted => NetworkError::TooLarge,
+            NetError::Exhausted => NetworkError::Exhausted,
             NetError::Device => NetworkError::Device,
             NetError::Timeout => NetworkError::Timeout,
         }
     }
 
-    fn discover_shell_network() -> Option<KernelNetwork> {
+    impl KernelRuntime {
+        const DEFERRED_INPUT_CAPACITY: usize = 128;
+        const INPUT_CHECKPOINT_BUDGET: usize = 32;
+
+        fn new(network: Option<SharedNetwork>) -> Result<Self, ()> {
+            let initial = troe_machine::monotonic_millis().ok_or(())?;
+            let mut deferred_input = VecDeque::new();
+            deferred_input
+                .try_reserve_exact(Self::DEFERRED_INPUT_CAPACITY)
+                .map_err(|_| ())?;
+            Ok(Self {
+                network,
+                deferred_input,
+                control_down: false,
+                last_millis: Cell::new(initial),
+            })
+        }
+
+        fn now(&self) -> MonotonicMillis {
+            let previous = self.last_millis.get();
+            let current = troe_machine::monotonic_millis()
+                .unwrap_or(previous)
+                .max(previous);
+            self.last_millis.set(current);
+            MonotonicMillis::from_millis(current)
+        }
+
+        fn checkpoint(&mut self) -> Result<(), Cancelled> {
+            if let Some(network) = &self.network {
+                let _bounded_poll = network.borrow_mut().poll();
+            }
+            for _ in 0..Self::INPUT_CHECKPOINT_BUDGET {
+                let Some(event) = troe_machine::try_input_event() else {
+                    break;
+                };
+                match event.source() {
+                    InputSource::Serial if event.byte() == 3 => return Err(Cancelled),
+                    InputSource::Keyboard if event.byte() == 0x1d => {
+                        self.control_down = true;
+                    }
+                    InputSource::Keyboard if event.byte() == 0x9d => {
+                        self.control_down = false;
+                    }
+                    InputSource::Keyboard if self.control_down && event.byte() == 0x2e => {
+                        return Err(Cancelled);
+                    }
+                    _ if self.deferred_input.len() < Self::DEFERRED_INPUT_CAPACITY => {
+                        self.deferred_input.push_back(event);
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        }
+
+        fn next_input_event(&mut self) -> Option<InputEvent> {
+            let _cancel_at_prompt = self.checkpoint();
+            self.deferred_input.pop_front()
+        }
+    }
+
+    impl CooperativeRuntime for KernelRuntimeCapability {
+        fn now(&self) -> MonotonicMillis {
+            self.runtime.borrow().now()
+        }
+
+        fn checkpoint(&mut self) -> Result<(), Cancelled> {
+            self.runtime.borrow_mut().checkpoint()
+        }
+    }
+
+    fn discover_network_service() -> Option<SharedNetwork> {
         #[cfg(target_arch = "aarch64")]
         let device = troe_machine::discover_virtio_mmio_network()
             .ok()
             .flatten()?;
         #[cfg(target_arch = "x86_64")]
         let device = troe_machine::discover_virtio_pci_network().ok().flatten()?;
-        Some(KernelNetwork::new(device))
+        let service = KernelNetworkService::new(device).ok()?;
+        Some(Rc::new(RefCell::new(service)))
     }
 
-    fn install_shell_network(shell: &mut Shell, console: &mut dyn Output) -> Option<NetworkStatus> {
-        if let Some(mut network) = discover_shell_network() {
-            let status = network.configure_dhcp().ok();
+    fn install_shell_runtime(
+        shell: &mut Shell,
+        console: &mut dyn Output,
+    ) -> (Option<NetworkStatus>, SharedRuntime) {
+        let service = discover_network_service();
+        let runtime = Rc::new(RefCell::new(
+            KernelRuntime::new(service.clone())
+                .unwrap_or_else(|()| fatal(b"fatal: monotonic runtime unavailable\n")),
+        ));
+        shell.set_runtime(Box::new(KernelRuntimeCapability {
+            runtime: runtime.clone(),
+        }));
+        if let Some(service) = service {
+            let mut network = KernelNetwork::new(service);
+            let mut bootstrap_runtime = KernelRuntimeCapability {
+                runtime: runtime.clone(),
+            };
+            let status = network.configure_dhcp(&mut bootstrap_runtime).ok();
             let label =
                 status.map_or_else(|| String::from("Configuring network"), network_boot_label);
             if write_boot_status(console, &label, status.is_some()).is_err() {
                 fatal(b"fatal: native network diagnostic failed\n");
             }
             shell.set_network(Box::new(network));
-            status
+            (status, runtime)
         } else {
             if write_boot_status(console, "Configuring network", false).is_err() {
                 fatal(b"fatal: native network diagnostic failed\n");
             }
-            None
+            (None, runtime)
         }
     }
 
@@ -3081,11 +3391,12 @@ mod firmware {
         console: &mut dyn Output,
         motd: &[u8],
         native_root: bool,
-    ) {
-        let network_status = install_shell_network(shell, console);
+    ) -> SharedRuntime {
+        let (network_status, runtime) = install_shell_runtime(shell, console);
         if !write_shell_banner(console, motd, native_root, network_status) {
             fatal(b"fatal: native console write failed\n");
         }
+        runtime
     }
 
     fn shell_prompt(shell: &Shell) -> String {
@@ -3133,7 +3444,7 @@ mod firmware {
         else {
             fatal(b"fatal: cannot compose namespace\n");
         };
-        finish_shell_startup(&mut shell, &mut console, &motd, native_root);
+        let runtime = finish_shell_startup(&mut shell, &mut console, &motd, native_root);
         let editor_config = EditorConfig::tiny();
         if editor_config.max_line_bytes() > MAX_LINE_BYTES {
             fatal(b"fatal: editor line policy exceeds shell parser policy\n");
@@ -3154,6 +3465,7 @@ mod firmware {
                 &mut decoder,
                 &mut keyboard,
                 &mut shell,
+                &runtime,
                 completion_config,
                 &prompt,
                 &mut console,
@@ -3203,18 +3515,25 @@ mod firmware {
         shell.set_machine_input(troe_machine::input_interrupt_stats());
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn read_edited_line(
         editor: &mut LineEditor,
         decoder: &mut InputDecoder,
         keyboard: &mut Ps2Set1Decoder,
         shell: &mut Shell,
+        runtime: &SharedRuntime,
         completion_config: CompletionConfig,
         prompt: &str,
         console: &mut dyn Output,
     ) -> Result<String, ()> {
         loop {
             let key = loop {
-                let event = troe_machine::wait_for_input_event();
+                let event = loop {
+                    if let Some(event) = runtime.borrow_mut().next_input_event() {
+                        break event;
+                    }
+                    core::hint::spin_loop();
+                };
                 let key = match event.source() {
                     InputSource::Serial => decoder.push(event.byte()),
                     InputSource::Keyboard => keyboard.push(event.byte()),

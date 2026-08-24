@@ -383,9 +383,14 @@ The first portable storage/configuration boundary is landed:
   count-and-byte-bounded receive FIFO. Truncation and 10,000-frame flood tests
   are host verified. Native fixed-buffer modern virtio-net queues run through
   q35 PCI and AArch64 MMIO. Normal QEMU compositions now acquire an IPv4 lease,
-  answer ARP and ICMP echo requests while servicing network operations, and
-  expose replaceable `net`, `dhcp`, `ping`, and `udp` shell built-ins. The
-  independent acceptance peer exchange remains the transport regression gate.
+  run one ambient eight-frame checkpoint service that answers ARP and ICMP at
+  the idle prompt. Eight ARP records and eight persistent UDP ports are fixed
+  ceilings; every port drops newest beyond four datagrams or 4 KiB. Replaceable
+  `arp`, `net stats`, `udp send --source-port`, and cancellable `udp listen`
+  surfaces sit on the same service. A monotonic millisecond clock, cooperative
+  `sleep`, and Ctrl-C checkpoints prepare later applications and jobs without
+  adding them. The independent acceptance peer exchange remains the transport
+  regression gate.
 - `troe-identity` implements canonical checksummed IREG registry, IMAP foreign
   mapping, IMNT mount-policy, and IACL native ACL formats under the accepted
   `tiny` and `full` ceilings. It rejects every truncated/corrupted fixture,

@@ -730,6 +730,27 @@ pub fn wait_for_input_event() -> InputEvent {
     }
 }
 
+/// Return one queued input event without blocking.
+#[cfg(target_os = "uefi")]
+pub fn try_input_event() -> Option<InputEvent> {
+    architecture_mask_input_interrupts();
+    // SAFETY: IRQ delivery is masked on the single boot CPU.
+    let event = unsafe { input_queue_mut() }.and_then(BoundedInputQueue::pop);
+    architecture_enable_input_interrupts();
+    event
+}
+
+/// Read milliseconds elapsed on the architecture monotonic counter.
+///
+/// Returns `None` when the pinned CPU does not report a usable counter
+/// frequency. The value has no wall-clock meaning and is stable only for this
+/// boot.
+#[must_use]
+#[cfg(target_os = "uefi")]
+pub fn monotonic_millis() -> Option<u64> {
+    architecture_monotonic_millis()
+}
+
 /// Snapshot interrupt input accounting without racing an interrupt producer.
 #[must_use]
 #[cfg(target_os = "uefi")]
@@ -935,6 +956,43 @@ fn architecture_handle_input_interrupt(queue: &mut BoundedInputQueue) -> bool {
         unsafe { mmio_write32(lapic_base + LAPIC_EOI, 0) };
     }
     false
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn architecture_monotonic_millis() -> Option<u64> {
+    let maximum = core::arch::x86_64::__cpuid(0).eax;
+    let frequency = if maximum >= 0x15 {
+        let ratio = core::arch::x86_64::__cpuid(0x15);
+        if ratio.eax != 0 && ratio.ebx != 0 && ratio.ecx != 0 {
+            u64::from(ratio.ecx)
+                .checked_mul(u64::from(ratio.ebx))?
+                .checked_div(u64::from(ratio.eax))?
+        } else if maximum >= 0x16 {
+            u64::from(core::arch::x86_64::__cpuid(0x16).eax).checked_mul(1_000_000)?
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
+    if frequency < 1_000 {
+        return None;
+    }
+    let ticks: u64;
+    // SAFETY: RDTSC reads the monotonically increasing invariant counter in
+    // the pinned single-vCPU profiles. LFENCE orders it after prior work.
+    unsafe {
+        core::arch::asm!(
+            "lfence",
+            "rdtsc",
+            "shl rdx, 32",
+            "or rax, rdx",
+            out("rax") ticks,
+            out("rdx") _,
+            options(nomem, nostack)
+        );
+    }
+    ticks.checked_mul(1_000)?.checked_div(frequency)
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
@@ -1405,6 +1463,22 @@ fn architecture_handle_input_interrupt(queue: &mut BoundedInputQueue) -> bool {
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 const AARCH64_EXECUTION_TIMER_INTID: u32 = 30;
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn architecture_monotonic_millis() -> Option<u64> {
+    let frequency: u64;
+    let counter: u64;
+    // SAFETY: CNTFRQ_EL0 and CNTPCT_EL0 are read-only at EL1 and the generic
+    // counter is monotonic across the pinned single-vCPU profile.
+    unsafe {
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frequency, options(nomem, nostack));
+        core::arch::asm!("mrs {}, cntpct_el0", out(reg) counter, options(nomem, nostack));
+    }
+    if frequency < 1_000 {
+        return None;
+    }
+    counter.checked_mul(1_000)?.checked_div(frequency)
+}
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 fn architecture_arm_execution_timer(milliseconds: u32) -> Result<(), ExecutionTimerError> {

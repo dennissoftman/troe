@@ -3,7 +3,9 @@ NAME
 
 SYNOPSIS
     net
+    net stats
 
 DESCRIPTION
     Prints the NIC address and current DHCP-provided IPv4 address, subnet mask,
-    default gateway, and lease duration.
+    default gateway, and lease duration. `net stats` prints ambient frame,
+    protocol, queue, checkpoint, and error counters.

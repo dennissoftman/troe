@@ -1,0 +1,9 @@
+NAME
+    sleep - wait cooperatively on the monotonic clock
+
+SYNOPSIS
+    sleep MILLISECONDS
+
+DESCRIPTION
+    Waits for a boot-relative monotonic interval while servicing bounded
+    ambient work. Ctrl-C cancels the wait. This is not a background job.

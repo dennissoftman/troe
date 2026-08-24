@@ -43,6 +43,15 @@ The networking usability increment promotes the same device boundary into the
 ordinary QEMU composition. A bounded DHCP discover/request exchange supplies
 one IPv4 address, subnet mask, router, and lease; ARP replies and ICMP echo are
 accepted; and a small hardware-independent capability backs replaceable
-`net`, `dhcp`, `ping`, and `udp` shell commands. Work remains command-driven in
-this increment rather than a general socket API. URL fetching is still not
-claimed because TCP, HTTP, DNS, and TLS policy remain explicitly deferred.
+`net`, `dhcp`, `ping`, and `udp` shell commands.
+
+The runtime-service amendment moves NIC polling behind a shared single-CPU
+service checkpoint. Each checkpoint processes at most eight frames. The
+service retains eight least-recently-observed ARP entries, eight persistent UDP
+port bindings, and at most four datagrams/4 KiB per port, dropping newest input
+at capacity. It answers local ARP and ICMP echo requests during prompt idle and
+cooperative command waits. `udp send --source-port`, `udp listen`, `net stats`,
+and `arp` expose that state without adding background jobs or shell loops.
+Command waits use a boot-relative monotonic clock and observe Ctrl-C only at
+explicit checkpoints. TCP, TLS, DNS, background jobs, and general sockets
+remain explicitly deferred.

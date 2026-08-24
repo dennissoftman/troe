@@ -76,11 +76,13 @@ handle calls, or is terminated by the 50 ms execution lease.
 Normal QEMU images attach one modern virtio-net device and acquire an IPv4
 address, subnet mask, default gateway, and lease through a bounded DHCP
 discover/request exchange. The recovery shell exposes `net`, `dhcp`, `ping`,
-and `udp send`/`udp recv`; ARP resolution, ARP replies, ICMP echo requests and
-replies, and checksummed UDP run through the same bounded native path on both
-architectures. These built-ins intentionally use a narrow replaceable network
-capability so they can move to KEX applications later. DNS, IPv6, TCP, HTTP,
-TLS, fragmentation, and general sockets remain outside this milestone.
+`arp`, `net stats`, `udp send --source-port`, and `udp listen`. A shared ambient
+service answers ARP and ICMP while the prompt or a cooperative command is idle,
+retains eight ARP neighbors, and owns eight persistent UDP ports with four
+datagrams and 4 KiB per-port receive capacity. Commands use a boot-relative
+monotonic clock and explicit cancellation checkpoints; Ctrl-C cancels waits and
+`sleep` without introducing background jobs. DNS, IPv6, TCP, HTTP, TLS,
+fragmentation, and general sockets remain outside this milestone.
 
 ## Quick start
 

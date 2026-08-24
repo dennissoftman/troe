@@ -27,6 +27,14 @@ pub const TRANSMIT_QUEUE_INDEX: u16 = 1;
 pub const NETWORK_QUEUE_SIZE: u16 = 8;
 /// Modern virtio-net v1 header bytes, including the reserved buffer-count field.
 pub const VIRTIO_NET_HEADER_BYTES: usize = 12;
+/// Maximum retained IPv4-to-Ethernet neighbor records.
+pub const MAX_ARP_CACHE_ENTRIES: usize = 8;
+/// Maximum persistent local UDP port bindings.
+pub const MAX_UDP_PORTS: usize = 8;
+/// Maximum datagrams retained for one bound UDP port.
+pub const UDP_QUEUE_DATAGRAMS: usize = 4;
+/// Maximum payload bytes retained for one bound UDP port.
+pub const UDP_QUEUE_BYTES: usize = 4 * 1024;
 const ETHERTYPE_IPV4: u16 = 0x0800;
 const ETHERTYPE_ARP: u16 = 0x0806;
 const IP_PROTOCOL_ICMP: u8 = 1;
@@ -271,6 +279,297 @@ impl ReceiveQueue {
     pub const fn dropped(&self) -> u64 {
         self.dropped
     }
+}
+
+/// One retained ARP neighbor record.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArpCacheEntry {
+    /// Neighbor IPv4 address.
+    pub address: Ipv4Address,
+    /// Most recently observed unicast Ethernet address.
+    pub mac: MacAddress,
+    generation: u64,
+}
+
+/// Fixed-size least-recently-observed ARP cache.
+#[derive(Debug)]
+pub struct ArpCache {
+    entries: [Option<ArpCacheEntry>; MAX_ARP_CACHE_ENTRIES],
+    generation: u64,
+}
+
+impl Default for ArpCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ArpCache {
+    /// Construct an empty cache without allocation.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            entries: [None; MAX_ARP_CACHE_ENTRIES],
+            generation: 0,
+        }
+    }
+
+    /// Learn or refresh one validated neighbor, evicting the oldest at capacity.
+    pub fn learn(&mut self, address: Ipv4Address, mac: MacAddress) {
+        if address.bytes() == [0; 4] {
+            return;
+        }
+        self.generation = self.generation.saturating_add(1);
+        let generation = self.generation;
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .flatten()
+            .find(|entry| entry.address == address)
+        {
+            *entry = ArpCacheEntry {
+                address,
+                mac,
+                generation,
+            };
+            return;
+        }
+        let index = self
+            .entries
+            .iter()
+            .position(Option::is_none)
+            .unwrap_or_else(|| {
+                self.entries
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, entry)| entry.map(|entry| (index, entry.generation)))
+                    .min_by_key(|(_, generation)| *generation)
+                    .map_or(0, |(index, _)| index)
+            });
+        self.entries[index] = Some(ArpCacheEntry {
+            address,
+            mac,
+            generation,
+        });
+    }
+
+    /// Look up a retained neighbor without changing replacement order.
+    #[must_use]
+    pub fn lookup(&self, address: Ipv4Address) -> Option<MacAddress> {
+        self.entries
+            .iter()
+            .flatten()
+            .find(|entry| entry.address == address)
+            .map(|entry| entry.mac)
+    }
+
+    /// Iterate over the at-most-eight retained entries.
+    pub fn entries(&self) -> impl Iterator<Item = ArpCacheEntry> + '_ {
+        self.entries.iter().flatten().copied()
+    }
+
+    /// Current retained entry count.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.iter().flatten().count()
+    }
+
+    /// Whether no neighbor record is retained.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// One owned UDP datagram admitted to a bound port.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OwnedUdpDatagram {
+    /// Peer IPv4 address.
+    pub source_ip: Ipv4Address,
+    /// Peer UDP source port.
+    pub source_port: u16,
+    /// Exact bounded payload.
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct UdpBinding {
+    port: u16,
+    queue: VecDeque<OwnedUdpDatagram>,
+    bytes: usize,
+    dropped: u64,
+}
+
+/// Admission result for a persistent per-port receive queue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UdpAdmission {
+    /// Datagram was retained by the matching bound port.
+    Retained,
+    /// No local binding matched the destination port.
+    Unbound,
+    /// Matching queue was full and dropped the newest datagram.
+    Dropped,
+}
+
+/// Snapshot of one persistent local UDP binding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UdpPortSnapshot {
+    /// Bound local port.
+    pub port: u16,
+    /// Retained datagram count.
+    pub datagrams: usize,
+    /// Retained payload bytes.
+    pub bytes: usize,
+    /// Datagrams dropped at this queue's ceiling.
+    pub dropped: u64,
+}
+
+/// Fixed-count persistent UDP bindings with independent receive queues.
+#[derive(Debug)]
+pub struct UdpPortTable {
+    bindings: Vec<UdpBinding>,
+}
+
+impl UdpPortTable {
+    /// Preallocate binding metadata for the complete hard ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetError::Exhausted`] if metadata cannot be reserved.
+    pub fn new() -> Result<Self, NetError> {
+        let mut bindings = Vec::new();
+        bindings
+            .try_reserve_exact(MAX_UDP_PORTS)
+            .map_err(|_| NetError::Exhausted)?;
+        Ok(Self { bindings })
+    }
+
+    /// Persistently bind a nonzero local port. Rebinding is idempotent.
+    ///
+    /// # Errors
+    ///
+    /// Rejects port zero and binding-table or metadata exhaustion.
+    pub fn bind(&mut self, port: u16) -> Result<(), NetError> {
+        if port == 0 {
+            return Err(NetError::Invalid);
+        }
+        if self.bindings.iter().any(|binding| binding.port == port) {
+            return Ok(());
+        }
+        if self.bindings.len() == MAX_UDP_PORTS {
+            return Err(NetError::Exhausted);
+        }
+        let mut queue = VecDeque::new();
+        queue
+            .try_reserve_exact(UDP_QUEUE_DATAGRAMS)
+            .map_err(|_| NetError::Exhausted)?;
+        self.bindings.push(UdpBinding {
+            port,
+            queue,
+            bytes: 0,
+            dropped: 0,
+        });
+        Ok(())
+    }
+
+    /// Whether a local port remains bound.
+    #[must_use]
+    pub fn is_bound(&self, port: u16) -> bool {
+        self.bindings.iter().any(|binding| binding.port == port)
+    }
+
+    /// Copy one parsed datagram into its destination port's bounded queue.
+    ///
+    /// # Errors
+    ///
+    /// Reports payload or allocation failure without exceeding queue ceilings.
+    pub fn admit(&mut self, datagram: UdpDatagram<'_>) -> Result<UdpAdmission, NetError> {
+        let Some(binding) = self
+            .bindings
+            .iter_mut()
+            .find(|binding| binding.port == datagram.destination_port)
+        else {
+            return Ok(UdpAdmission::Unbound);
+        };
+        let next_bytes = binding
+            .bytes
+            .checked_add(datagram.payload.len())
+            .ok_or(NetError::Invalid)?;
+        if binding.queue.len() == UDP_QUEUE_DATAGRAMS || next_bytes > UDP_QUEUE_BYTES {
+            binding.dropped = binding.dropped.saturating_add(1);
+            return Ok(UdpAdmission::Dropped);
+        }
+        let mut payload = Vec::new();
+        payload
+            .try_reserve_exact(datagram.payload.len())
+            .map_err(|_| NetError::Exhausted)?;
+        payload.extend_from_slice(datagram.payload);
+        binding.queue.push_back(OwnedUdpDatagram {
+            source_ip: datagram.source_ip,
+            source_port: datagram.source_port,
+            payload,
+        });
+        binding.bytes = next_bytes;
+        Ok(UdpAdmission::Retained)
+    }
+
+    /// Remove the oldest datagram from one bound port.
+    pub fn receive(&mut self, port: u16) -> Option<OwnedUdpDatagram> {
+        let binding = self
+            .bindings
+            .iter_mut()
+            .find(|binding| binding.port == port)?;
+        let datagram = binding.queue.pop_front()?;
+        binding.bytes = binding.bytes.saturating_sub(datagram.payload.len());
+        Some(datagram)
+    }
+
+    /// Iterate over bounded per-port queue snapshots.
+    pub fn snapshots(&self) -> impl Iterator<Item = UdpPortSnapshot> + '_ {
+        self.bindings.iter().map(|binding| UdpPortSnapshot {
+            port: binding.port,
+            datagrams: binding.queue.len(),
+            bytes: binding.bytes,
+            dropped: binding.dropped,
+        })
+    }
+
+    /// Current number of persistent bindings.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.bindings.len()
+    }
+
+    /// Whether no local port is bound.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.bindings.is_empty()
+    }
+}
+
+/// Ambient network service counters.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NetworkServiceStats {
+    /// Complete Ethernet frames received from the device.
+    pub received_frames: u64,
+    /// Complete Ethernet frames successfully submitted to the device.
+    pub transmitted_frames: u64,
+    /// ARP requests answered for the configured local address.
+    pub arp_replies: u64,
+    /// ICMP echo requests answered for the configured local address.
+    pub icmp_replies: u64,
+    /// UDP datagrams retained by bound-port queues.
+    pub udp_retained: u64,
+    /// UDP datagrams arriving at unbound local ports.
+    pub udp_unbound: u64,
+    /// UDP datagrams dropped at a per-port queue ceiling.
+    pub udp_dropped: u64,
+    /// Frames ignored because no supported ambient protocol accepted them.
+    pub ignored_frames: u64,
+    /// Device or packet-processing failures observed by ambient polling.
+    pub errors: u64,
+    /// Bounded service checkpoints completed.
+    pub checkpoints: u64,
 }
 
 /// Verified ARP Ethernet/IPv4 message.
@@ -940,7 +1239,8 @@ fn finalize_sum(mut sum: u32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Admission, DhcpMessageType, Ipv4Address, MacAddress, NetError, ReceiveLimits, ReceiveQueue,
+        Admission, ArpCache, DhcpMessageType, Ipv4Address, MAX_ARP_CACHE_ENTRIES, MacAddress,
+        NetError, ReceiveLimits, ReceiveQueue, UDP_QUEUE_DATAGRAMS, UdpAdmission, UdpPortTable,
         build_arp_reply, build_arp_request, build_dhcp_discover, build_dhcp_request,
         build_icmp_echo, build_udp, parse_arp, parse_dhcp, parse_icmp_echo, parse_udp,
     };
@@ -1072,6 +1372,64 @@ mod tests {
         assert_eq!(queue.dropped(), 9_996);
         while queue.pop().is_some() {}
         assert_eq!(queue.usage(), (0, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn arp_cache_is_fixed_and_evicts_the_oldest_neighbor() -> Result<(), NetError> {
+        let mut cache = ArpCache::new();
+        for index in 0..=MAX_ARP_CACHE_ENTRIES {
+            cache.learn(
+                Ipv4Address::new([10, 0, 0, u8::try_from(index + 1).unwrap_or(u8::MAX)]),
+                mac([0x02, 0, 0, 0, 0, u8::try_from(index + 1).unwrap_or(u8::MAX)])?,
+            );
+        }
+        assert_eq!(cache.len(), MAX_ARP_CACHE_ENTRIES);
+        assert_eq!(cache.lookup(Ipv4Address::new([10, 0, 0, 1])), None);
+        assert!(cache.lookup(Ipv4Address::new([10, 0, 0, 9])).is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn persistent_udp_ports_drop_newest_at_per_port_ceiling() -> Result<(), NetError> {
+        let source_mac = mac([0x02, 0, 0, 0, 0, 1])?;
+        let destination_mac = mac([0x02, 0, 0, 0, 0, 2])?;
+        let source_ip = Ipv4Address::new([10, 0, 2, 2]);
+        let destination_ip = Ipv4Address::new([10, 0, 2, 15]);
+        let mut ports = UdpPortTable::new()?;
+        ports.bind(40_000)?;
+        ports.bind(40_000)?;
+        assert_eq!(ports.len(), 1);
+        for index in 0..UDP_QUEUE_DATAGRAMS + 2 {
+            let frame = build_udp(
+                source_mac,
+                destination_mac,
+                source_ip,
+                destination_ip,
+                49_152,
+                40_000,
+                &[u8::try_from(index).unwrap_or(u8::MAX)],
+            )?;
+            assert_eq!(
+                ports.admit(parse_udp(&frame)?)?,
+                if index < UDP_QUEUE_DATAGRAMS {
+                    UdpAdmission::Retained
+                } else {
+                    UdpAdmission::Dropped
+                }
+            );
+        }
+        let snapshot = ports.snapshots().next().ok_or(NetError::Invalid)?;
+        assert_eq!(snapshot.datagrams, UDP_QUEUE_DATAGRAMS);
+        assert_eq!(snapshot.dropped, 2);
+        for expected in 0..UDP_QUEUE_DATAGRAMS {
+            let received = ports.receive(40_000).ok_or(NetError::Invalid)?;
+            assert_eq!(
+                received.payload,
+                [u8::try_from(expected).unwrap_or(u8::MAX)]
+            );
+        }
+        assert!(ports.receive(40_000).is_none());
         Ok(())
     }
 }

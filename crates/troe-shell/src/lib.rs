@@ -17,6 +17,7 @@ use troe_core::{
     write_all,
 };
 use troe_driver::InputQueueStats;
+use troe_task::CooperativeRuntime;
 use troe_vfs::{FsError, Namespace, NodeKind};
 
 /// Shell parse failures caused by untrusted command input.
@@ -75,6 +76,7 @@ pub enum CommandClass {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CommandId {
+    Arp,
     Cat,
     Cd,
     Clear,
@@ -90,11 +92,19 @@ enum CommandId {
     Ping,
     Pwd,
     Rm,
+    Sleep,
     Udp,
     Write,
 }
 
 const COMMANDS: &[CommandSpec] = &[
+    CommandSpec {
+        id: CommandId::Arp,
+        name: "arp",
+        synopsis: "arp",
+        requires_machine_control: false,
+        class: CommandClass::ReplaceableBuiltin,
+    },
     CommandSpec {
         id: CommandId::Cat,
         name: "cat",
@@ -175,7 +185,7 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         id: CommandId::Net,
         name: "net",
-        synopsis: "net",
+        synopsis: "net | net stats",
         requires_machine_control: false,
         class: CommandClass::ReplaceableBuiltin,
     },
@@ -196,7 +206,7 @@ const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         id: CommandId::Udp,
         name: "udp",
-        synopsis: "udp send ADDRESS PORT [TEXT...] | udp recv PORT",
+        synopsis: "udp send [--source-port PORT] ADDRESS PORT [TEXT...] | udp listen PORT",
         requires_machine_control: false,
         class: CommandClass::ReplaceableBuiltin,
     },
@@ -204,6 +214,13 @@ const COMMANDS: &[CommandSpec] = &[
         id: CommandId::Rm,
         name: "rm",
         synopsis: "rm FILE",
+        requires_machine_control: false,
+        class: CommandClass::ReplaceableBuiltin,
+    },
+    CommandSpec {
+        id: CommandId::Sleep,
+        name: "sleep",
+        synopsis: "sleep MILLISECONDS",
         requires_machine_control: false,
         class: CommandClass::ReplaceableBuiltin,
     },
@@ -231,6 +248,46 @@ pub enum NetworkError {
     Protocol,
     /// The requested packet exceeded the initial profile.
     TooLarge,
+    /// A bounded socket, cache, or queue resource is exhausted.
+    Exhausted,
+    /// Cooperative execution was cancelled.
+    Cancelled,
+}
+
+/// Snapshot of ambient network service activity and resource use.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NetworkStats {
+    /// Complete received frames.
+    pub received_frames: u64,
+    /// Complete transmitted frames.
+    pub transmitted_frames: u64,
+    /// ARP requests answered while commands or the prompt were idle.
+    pub arp_replies: u64,
+    /// ICMP echo requests answered while commands or the prompt were idle.
+    pub icmp_replies: u64,
+    /// UDP datagrams retained in per-port queues.
+    pub udp_retained: u64,
+    /// UDP datagrams dropped because no port was bound.
+    pub udp_unbound: u64,
+    /// UDP datagrams dropped at queue ceilings.
+    pub udp_dropped: u64,
+    /// Currently retained ARP entries.
+    pub arp_entries: usize,
+    /// Persistent bound UDP ports.
+    pub udp_ports: usize,
+    /// Ambient service checkpoints.
+    pub checkpoints: u64,
+    /// Device or packet-processing errors.
+    pub errors: u64,
+}
+
+/// One printable entry from the bounded ARP cache.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ArpEntry {
+    /// Neighbor IPv4 address.
+    pub address: [u8; 4],
+    /// Neighbor Ethernet address.
+    pub mac: [u8; 6],
 }
 
 /// Current bounded IPv4 configuration presented to users and future KEX apps.
@@ -279,13 +336,22 @@ pub trait NetworkControl: core::fmt::Debug {
     /// # Errors
     ///
     /// Reports device, timeout, protocol, and resource failures.
-    fn dhcp(&mut self) -> Result<NetworkStatus, NetworkError>;
+    fn dhcp(&mut self, runtime: &mut dyn CooperativeRuntime)
+    -> Result<NetworkStatus, NetworkError>;
+    /// Snapshot ambient counters and bounded resource use.
+    fn stats(&self) -> NetworkStats;
+    /// Copy the at-most-eight retained ARP entries.
+    fn arp_entries(&self) -> Vec<ArpEntry>;
     /// Send one ICMP echo and wait boundedly for its reply.
     ///
     /// # Errors
     ///
     /// Reports absent configuration, resolution timeout, or device failure.
-    fn ping(&mut self, destination: [u8; 4]) -> Result<PingReply, NetworkError>;
+    fn ping(
+        &mut self,
+        destination: [u8; 4],
+        runtime: &mut dyn CooperativeRuntime,
+    ) -> Result<PingReply, NetworkError>;
     /// Send one UDP datagram from an implementation-selected ephemeral port.
     ///
     /// # Errors
@@ -293,16 +359,22 @@ pub trait NetworkControl: core::fmt::Debug {
     /// Reports absent configuration, invalid size, resolution, or device failure.
     fn send_udp(
         &mut self,
+        source_port: Option<u16>,
         destination: [u8; 4],
         destination_port: u16,
         payload: &[u8],
+        runtime: &mut dyn CooperativeRuntime,
     ) -> Result<u16, NetworkError>;
     /// Wait boundedly for one datagram addressed to `local_port`.
     ///
     /// # Errors
     ///
     /// Reports absent configuration, receive timeout, or device failure.
-    fn receive_udp(&mut self, local_port: u16) -> Result<ReceivedUdp, NetworkError>;
+    fn listen_udp(
+        &mut self,
+        local_port: u16,
+        runtime: &mut dyn CooperativeRuntime,
+    ) -> Result<ReceivedUdp, NetworkError>;
 }
 
 /// Return the reserved execution placement for a registered command name.
@@ -533,6 +605,7 @@ pub struct Shell {
     machine_memory: MachineMemorySnapshot,
     machine_input: Option<InputQueueStats>,
     network: Option<Box<dyn NetworkControl>>,
+    runtime: Option<Box<dyn CooperativeRuntime>>,
     machine_control: bool,
     halt_requested: bool,
 }
@@ -558,6 +631,7 @@ impl Shell {
             machine_memory,
             machine_input: None,
             network: None,
+            runtime: None,
             machine_control,
             halt_requested: false,
         };
@@ -568,6 +642,11 @@ impl Shell {
     /// Install an owned network capability for the temporary built-in commands.
     pub fn set_network(&mut self, network: Box<dyn NetworkControl>) {
         self.network = Some(network);
+    }
+
+    /// Install cooperative clock, ambient-work, and cancellation authority.
+    pub fn set_runtime(&mut self, runtime: Box<dyn CooperativeRuntime>) {
+        self.runtime = Some(runtime);
     }
 
     /// Whether an authorized `halt` command completed.
@@ -642,6 +721,14 @@ impl Shell {
 
         let mut previous = Vec::new();
         for (index, stage) in pipeline.stages.iter().enumerate() {
+            if self
+                .runtime
+                .as_mut()
+                .is_some_and(|runtime| runtime.checkpoint().is_err())
+            {
+                let _ignored = write_error(stderr, "shell", "cancelled");
+                return CommandStatus::Cancelled;
+            }
             let last = index + 1 == pipeline.stages.len();
             if last {
                 let status = if index == 0 {
@@ -688,6 +775,7 @@ impl Shell {
             return CommandStatus::Denied;
         }
         match spec.id {
+            CommandId::Arp => self.command_arp(args, stdout, stderr),
             CommandId::Cat => self.command_cat(args, stdin, stdout, stderr),
             CommandId::Cd => self.command_cd(args, stderr),
             CommandId::Clear => command_clear(args, stdout, stderr),
@@ -703,6 +791,7 @@ impl Shell {
             CommandId::Ping => self.command_ping(args, stdout, stderr),
             CommandId::Pwd => self.command_pwd(args, stdout, stderr),
             CommandId::Rm => self.command_rm(args, stderr),
+            CommandId::Sleep => self.command_sleep(args, stderr),
             CommandId::Udp => self.command_udp(args, stdin, stdout, stderr),
             CommandId::Write => self.command_write(args, stdin, stderr),
         }
@@ -714,14 +803,74 @@ impl Shell {
         stdout: &mut dyn Output,
         stderr: &mut dyn Output,
     ) -> CommandStatus {
-        if !args.is_empty() {
-            return usage(stderr, "net", "net");
-        }
         let Some(network) = self.network.as_ref() else {
             let _ignored = write_error(stderr, "net", "no network device");
             return CommandStatus::NotFound;
         };
-        write_network_status(stdout, network.status(), stderr)
+        match args {
+            [] => write_network_status(stdout, network.status(), stderr),
+            [operation] if operation == "stats" => {
+                let stats = network.stats();
+                let report = format!(
+                    "rx frames: {}\ntx frames: {}\narp replies: {}\nicmp replies: {}\nudp retained: {}\nudp unbound: {}\nudp dropped: {}\narp entries: {}\nudp ports: {}\ncheckpoints: {}\nerrors: {}\n",
+                    stats.received_frames,
+                    stats.transmitted_frames,
+                    stats.arp_replies,
+                    stats.icmp_replies,
+                    stats.udp_retained,
+                    stats.udp_unbound,
+                    stats.udp_dropped,
+                    stats.arp_entries,
+                    stats.udp_ports,
+                    stats.checkpoints,
+                    stats.errors
+                );
+                if write_all(stdout, report.as_bytes()).is_err() {
+                    stream_failure(stderr, "net")
+                } else {
+                    CommandStatus::Success
+                }
+            }
+            _ => usage(stderr, "net", "net | net stats"),
+        }
+    }
+
+    fn command_arp(
+        &mut self,
+        args: &[String],
+        stdout: &mut dyn Output,
+        stderr: &mut dyn Output,
+    ) -> CommandStatus {
+        if !args.is_empty() {
+            return usage(stderr, "arp", "arp");
+        }
+        let Some(network) = self.network.as_ref() else {
+            return network_failure(stderr, "arp", NetworkError::Unavailable);
+        };
+        let entries = network.arp_entries();
+        if entries.is_empty() {
+            return if write_all(stdout, b"ARP cache empty\n").is_err() {
+                stream_failure(stderr, "arp")
+            } else {
+                CommandStatus::Success
+            };
+        }
+        for entry in entries {
+            let line = format!(
+                "{} {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
+                format_ipv4(entry.address),
+                entry.mac[0],
+                entry.mac[1],
+                entry.mac[2],
+                entry.mac[3],
+                entry.mac[4],
+                entry.mac[5]
+            );
+            if write_all(stdout, line.as_bytes()).is_err() {
+                return stream_failure(stderr, "arp");
+            }
+        }
+        CommandStatus::Success
     }
 
     fn command_dhcp(
@@ -733,10 +882,10 @@ impl Shell {
         if !args.is_empty() {
             return usage(stderr, "dhcp", "dhcp");
         }
-        let Some(network) = self.network.as_mut() else {
+        let (Some(network), Some(runtime)) = (self.network.as_mut(), self.runtime.as_mut()) else {
             return network_failure(stderr, "dhcp", NetworkError::Unavailable);
         };
-        match network.dhcp() {
+        match network.dhcp(runtime.as_mut()) {
             Ok(status) => write_network_status(stdout, status, stderr),
             Err(error) => network_failure(stderr, "dhcp", error),
         }
@@ -754,10 +903,10 @@ impl Shell {
         let Some(destination) = parse_ipv4(&args[0]) else {
             return usage(stderr, "ping", "invalid IPv4 address");
         };
-        let Some(network) = self.network.as_mut() else {
+        let (Some(network), Some(runtime)) = (self.network.as_mut(), self.runtime.as_mut()) else {
             return network_failure(stderr, "ping", NetworkError::Unavailable);
         };
-        match network.ping(destination) {
+        match network.ping(destination, runtime.as_mut()) {
             Ok(reply) => {
                 let line = format!(
                     "reply from {}: icmp_seq={} bytes={}\n",
@@ -786,29 +935,43 @@ impl Shell {
             return usage(
                 stderr,
                 "udp",
-                "udp send ADDRESS PORT [TEXT...] | udp recv PORT",
+                "udp send [--source-port PORT] ADDRESS PORT [TEXT...] | udp listen PORT",
             );
         };
         match operation {
             "send" if args.len() >= 3 => {
-                let Some(destination) = parse_ipv4(&args[1]) else {
+                let (source_port, address_index) =
+                    if args.get(1).is_some_and(|arg| arg == "--source-port") {
+                        let Some(port) = args.get(2).and_then(|arg| parse_port(arg)) else {
+                            return usage(stderr, "udp", "invalid UDP source port");
+                        };
+                        (Some(port), 3)
+                    } else {
+                        (None, 1)
+                    };
+                let Some(destination_text) = args.get(address_index) else {
+                    return usage(stderr, "udp", "missing IPv4 address");
+                };
+                let Some(destination) = parse_ipv4(destination_text) else {
                     return usage(stderr, "udp", "invalid IPv4 address");
                 };
-                let Some(port) = parse_port(&args[2]) else {
+                let Some(port) = args.get(address_index + 1).and_then(|arg| parse_port(arg)) else {
                     return usage(stderr, "udp", "invalid UDP port");
                 };
-                let payload = if args.len() > 3 {
-                    args[3..].join(" ").into_bytes()
+                let payload_index = address_index + 2;
+                let payload = if args.len() > payload_index {
+                    args[payload_index..].join(" ").into_bytes()
                 } else {
                     match read_bounded(stdin, PIPE_CAPACITY) {
                         Ok(value) => value,
                         Err(_) => return stream_failure(stderr, "udp"),
                     }
                 };
-                let Some(network) = self.network.as_mut() else {
+                let (Some(network), Some(runtime)) = (self.network.as_mut(), self.runtime.as_mut())
+                else {
                     return network_failure(stderr, "udp", NetworkError::Unavailable);
                 };
-                match network.send_udp(destination, port, &payload) {
+                match network.send_udp(source_port, destination, port, &payload, runtime.as_mut()) {
                     Ok(source_port) => {
                         let line = format!(
                             "sent {} bytes from port {source_port} to {}:{port}\n",
@@ -824,14 +987,15 @@ impl Shell {
                     Err(error) => network_failure(stderr, "udp", error),
                 }
             }
-            "recv" if args.len() == 2 => {
+            "listen" | "recv" if args.len() == 2 => {
                 let Some(port) = parse_port(&args[1]) else {
                     return usage(stderr, "udp", "invalid UDP port");
                 };
-                let Some(network) = self.network.as_mut() else {
+                let (Some(network), Some(runtime)) = (self.network.as_mut(), self.runtime.as_mut())
+                else {
                     return network_failure(stderr, "udp", NetworkError::Unavailable);
                 };
-                match network.receive_udp(port) {
+                match network.listen_udp(port, runtime.as_mut()) {
                     Ok(datagram) => {
                         let header = format!(
                             "from {}:{} bytes={}\n",
@@ -854,8 +1018,27 @@ impl Shell {
             _ => usage(
                 stderr,
                 "udp",
-                "udp send ADDRESS PORT [TEXT...] | udp recv PORT",
+                "udp send [--source-port PORT] ADDRESS PORT [TEXT...] | udp listen PORT",
             ),
+        }
+    }
+
+    fn command_sleep(&mut self, args: &[String], stderr: &mut dyn Output) -> CommandStatus {
+        if args.len() != 1 {
+            return usage(stderr, "sleep", "sleep MILLISECONDS");
+        }
+        let Ok(milliseconds) = args[0].parse::<u64>() else {
+            return usage(stderr, "sleep", "invalid millisecond interval");
+        };
+        let Some(runtime) = self.runtime.as_mut() else {
+            let _ignored = write_error(stderr, "sleep", "runtime unavailable");
+            return CommandStatus::Failure;
+        };
+        if runtime.sleep(milliseconds).is_ok() {
+            CommandStatus::Success
+        } else {
+            let _ignored = write_error(stderr, "sleep", "cancelled");
+            CommandStatus::Cancelled
         }
     }
 
@@ -1596,10 +1779,14 @@ fn network_failure(stderr: &mut dyn Output, command: &str, error: NetworkError) 
         NetworkError::Device => "network device failed",
         NetworkError::Protocol => "invalid network response",
         NetworkError::TooLarge => "packet exceeds network profile",
+        NetworkError::Exhausted => "bounded network resources exhausted",
+        NetworkError::Cancelled => "cancelled",
     };
     let _ignored = write_error(stderr, command, message);
     if error == NetworkError::Unavailable {
         CommandStatus::NotFound
+    } else if error == NetworkError::Cancelled {
+        CommandStatus::Cancelled
     } else {
         CommandStatus::Failure
     }
@@ -1636,15 +1823,16 @@ const fn parse_error_text(error: ParseError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMMANDS, CommandClass, CompletionConfig, CompletionConfigError, NetworkControl,
-        NetworkError, NetworkStatus, ParseError, PingReply, ReceivedUdp, Shell, command_class,
-        command_synopsis, parse_line,
+        ArpEntry, COMMANDS, CommandClass, CompletionConfig, CompletionConfigError, NetworkControl,
+        NetworkError, NetworkStats, NetworkStatus, ParseError, PingReply, ReceivedUdp, Shell,
+        command_class, command_synopsis, parse_line,
     };
     use alloc::boxed::Box;
     use alloc::string::ToString;
     use alloc::vec::Vec;
     use troe_core::{BoundedOutput, MachineMemorySnapshot, SliceInput};
     use troe_driver::InputQueueStats;
+    use troe_task::{Cancelled, CooperativeRuntime, MonotonicMillis};
     use troe_vfs::{Namespace, RamFsQuota};
 
     fn shell() -> Shell {
@@ -1671,16 +1859,55 @@ mod tests {
     #[derive(Debug)]
     struct FakeNetwork;
 
+    #[derive(Debug, Default)]
+    struct FakeRuntime {
+        now: u64,
+    }
+
+    impl CooperativeRuntime for FakeRuntime {
+        fn now(&self) -> MonotonicMillis {
+            MonotonicMillis::from_millis(self.now)
+        }
+
+        fn checkpoint(&mut self) -> Result<(), Cancelled> {
+            self.now = self.now.saturating_add(1);
+            Ok(())
+        }
+    }
+
     impl NetworkControl for FakeNetwork {
         fn status(&self) -> NetworkStatus {
             fake_network_status()
         }
 
-        fn dhcp(&mut self) -> Result<NetworkStatus, NetworkError> {
+        fn dhcp(
+            &mut self,
+            _runtime: &mut dyn CooperativeRuntime,
+        ) -> Result<NetworkStatus, NetworkError> {
             Ok(fake_network_status())
         }
 
-        fn ping(&mut self, destination: [u8; 4]) -> Result<PingReply, NetworkError> {
+        fn stats(&self) -> NetworkStats {
+            NetworkStats {
+                received_frames: 7,
+                udp_ports: 1,
+                checkpoints: 9,
+                ..NetworkStats::default()
+            }
+        }
+
+        fn arp_entries(&self) -> Vec<ArpEntry> {
+            alloc::vec![ArpEntry {
+                address: [10, 0, 2, 2],
+                mac: [0x52, 0x55, 0x0a, 0, 2, 2],
+            }]
+        }
+
+        fn ping(
+            &mut self,
+            destination: [u8; 4],
+            _runtime: &mut dyn CooperativeRuntime,
+        ) -> Result<PingReply, NetworkError> {
             Ok(PingReply {
                 source: destination,
                 sequence: 1,
@@ -1690,18 +1917,24 @@ mod tests {
 
         fn send_udp(
             &mut self,
+            source_port: Option<u16>,
             _destination: [u8; 4],
             _destination_port: u16,
             payload: &[u8],
+            _runtime: &mut dyn CooperativeRuntime,
         ) -> Result<u16, NetworkError> {
             if payload.len() > 1472 {
                 Err(NetworkError::TooLarge)
             } else {
-                Ok(49_152)
+                Ok(source_port.unwrap_or(49_152))
             }
         }
 
-        fn receive_udp(&mut self, _local_port: u16) -> Result<ReceivedUdp, NetworkError> {
+        fn listen_udp(
+            &mut self,
+            _local_port: u16,
+            _runtime: &mut dyn CooperativeRuntime,
+        ) -> Result<ReceivedUdp, NetworkError> {
             Ok(ReceivedUdp {
                 source: [10, 0, 2, 2],
                 source_port: 40123,
@@ -1752,15 +1985,23 @@ mod tests {
     fn replaceable_network_commands_use_the_explicit_capability() {
         let mut shell = shell();
         shell.set_network(Box::new(FakeNetwork));
+        shell.set_runtime(Box::new(FakeRuntime::default()));
         for (command, expected) in [
             ("net", "ipv4: 10.0.2.15"),
+            ("net stats", "rx frames: 7"),
+            ("arp", "10.0.2.2"),
             ("dhcp", "lease: 86400 seconds"),
             ("ping 10.0.2.2", "reply from 10.0.2.2"),
             (
                 "udp send 10.0.2.2 40123 alive",
                 "sent 5 bytes from port 49152",
             ),
-            ("udp recv 40000", "hello"),
+            (
+                "udp send --source-port 40000 10.0.2.2 40123 fixed",
+                "from port 40000",
+            ),
+            ("udp listen 40000", "hello"),
+            ("sleep 2", ""),
         ] {
             let mut input = SliceInput::new(b"");
             let mut output = BoundedOutput::new(1024);

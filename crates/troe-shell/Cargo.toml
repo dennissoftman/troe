@@ -9,6 +9,7 @@ license.workspace = true
 [dependencies]
 troe-core = { path = "../troe-core" }
 troe-driver = { path = "../troe-driver" }
+troe-task = { path = "../troe-task" }
 troe-vfs = { path = "../troe-vfs" }
 
 [lints]

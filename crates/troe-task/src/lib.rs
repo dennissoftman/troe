@@ -7,6 +7,76 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::fmt;
 
+/// Milliseconds elapsed on the machine's monotonic clock.
+///
+/// Values have no wall-clock meaning and may be compared only within one boot.
+#[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
+pub struct MonotonicMillis(u64);
+
+impl MonotonicMillis {
+    /// Construct a boot-relative monotonic timestamp.
+    #[must_use]
+    pub const fn from_millis(milliseconds: u64) -> Self {
+        Self(milliseconds)
+    }
+
+    /// Exact boot-relative millisecond count.
+    #[must_use]
+    pub const fn as_millis(self) -> u64 {
+        self.0
+    }
+
+    /// Form a deadline without wrapping at the representable ceiling.
+    #[must_use]
+    pub const fn saturating_add(self, milliseconds: u64) -> Self {
+        Self(self.0.saturating_add(milliseconds))
+    }
+}
+
+/// Cooperative execution was cancelled at an explicit checkpoint.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Cancelled;
+
+/// Runtime hook shared by commands, services, and future applications.
+///
+/// Implementations must bound the work performed by one checkpoint. Sleeping
+/// remains cooperative: ambient services and cancellation are checked until
+/// the monotonic deadline is reached.
+pub trait CooperativeRuntime: fmt::Debug {
+    /// Read the boot-relative monotonic clock.
+    fn now(&self) -> MonotonicMillis;
+
+    /// Yield to bounded ambient work and observe cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Cancelled`] after the active invocation receives a request.
+    fn checkpoint(&mut self) -> Result<(), Cancelled>;
+
+    /// Cooperatively wait until `deadline`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Cancelled`] if cancellation is observed before the deadline.
+    fn sleep_until(&mut self, deadline: MonotonicMillis) -> Result<(), Cancelled> {
+        while self.now() < deadline {
+            self.checkpoint()?;
+            core::hint::spin_loop();
+        }
+        Ok(())
+    }
+
+    /// Cooperatively wait for a relative millisecond interval.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Cancelled`] if cancellation is observed before completion.
+    fn sleep(&mut self, milliseconds: u64) -> Result<(), Cancelled> {
+        let deadline = self.now().saturating_add(milliseconds);
+        self.sleep_until(deadline)
+    }
+}
+
 /// Maximum number of live or unreaped cooperative task records.
 pub const MAX_TASKS: usize = 16;
 
@@ -697,12 +767,50 @@ impl Scheduler {
 #[cfg(test)]
 mod tests {
     use super::{
-        Capabilities, IsolationResource, MAX_TASKS, Scheduler, StackResource, TaskError, TaskFault,
-        TaskSnapshot, TaskState,
+        Cancelled, Capabilities, CooperativeRuntime, IsolationResource, MAX_TASKS, MonotonicMillis,
+        Scheduler, StackResource, TaskError, TaskFault, TaskSnapshot, TaskState,
     };
+
+    #[derive(Debug)]
+    struct FakeRuntime {
+        now: u64,
+        checkpoints: u8,
+        cancel_at: Option<u8>,
+    }
+
+    impl CooperativeRuntime for FakeRuntime {
+        fn now(&self) -> MonotonicMillis {
+            MonotonicMillis::from_millis(self.now)
+        }
+
+        fn checkpoint(&mut self) -> Result<(), Cancelled> {
+            self.checkpoints = self.checkpoints.saturating_add(1);
+            if self.cancel_at == Some(self.checkpoints) {
+                return Err(Cancelled);
+            }
+            self.now = self.now.saturating_add(1);
+            Ok(())
+        }
+    }
 
     fn stack(slot: u8) -> Result<StackResource, TaskError> {
         StackResource::new(slot, 8)
+    }
+
+    #[test]
+    fn cooperative_sleep_uses_monotonic_deadlines_and_cancellation() {
+        let mut runtime = FakeRuntime {
+            now: 40,
+            checkpoints: 0,
+            cancel_at: None,
+        };
+        assert_eq!(runtime.sleep(3), Ok(()));
+        assert_eq!(runtime.now(), MonotonicMillis::from_millis(43));
+        assert_eq!(runtime.checkpoints, 3);
+
+        runtime.cancel_at = Some(5);
+        assert_eq!(runtime.sleep(10), Err(Cancelled));
+        assert_eq!(runtime.now(), MonotonicMillis::from_millis(44));
     }
 
     #[test]

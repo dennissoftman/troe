@@ -1,13 +1,14 @@
 NAME
-    udp - send or receive one UDP datagram
+    udp - send or listen for bounded UDP datagrams
 
 SYNOPSIS
-    udp send ADDRESS PORT [TEXT...]
-    udp recv PORT
+    udp send [--source-port PORT] ADDRESS PORT [TEXT...]
+    udp listen PORT
 
 DESCRIPTION
-    Sends one checksummed datagram from a reported ephemeral port, using
-    standard input when TEXT is omitted, or waits boundedly for one datagram on
-    PORT. Use the reported source port to receive a reply. Receive output
-    includes the peer and exact payload. DNS and general sockets are not part
-    of this command.
+    Sends one checksummed datagram from a persistent ephemeral or selected
+    source port, using standard input when TEXT is omitted. listen persistently
+    binds PORT and waits cooperatively for its oldest queued datagram. Each of
+    at most eight ports retains four datagrams and 4 KiB; newest input is
+    dropped at capacity. Ctrl-C cancels the wait. DNS and general sockets are
+    not part of this command.

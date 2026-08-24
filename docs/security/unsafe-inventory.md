@@ -1,6 +1,6 @@
 # Unsafe inventory
 
-The current kernel contains exactly 223 project-authored Rust `unsafe` tokens,
+The current kernel contains exactly 226 project-authored Rust `unsafe` tokens,
 all in the four audited modules of `crates/troe-machine`. The verification gate
 fails if this count changes without a same-change inventory review. Portable
 crates and the kernel composition root continue to forbid unsafe code.
@@ -11,7 +11,8 @@ crates and the kernel composition root continue to forbid unsafe code.
 | Owned-stack and interrupt transition | 8 | A checked, reserved stack receives one leaked continuation record; architecture trampolines replace SP/RSP once and cannot return; x86 IF and AArch64 DAIF are masked before firmware exception state is replaced. |
 | Cooperative task-stack calls | 4 | One unique call record and task state borrow remain live while an architecture trampoline replaces SP/RSP synchronously; the old stack is saved inside the mapped task payload and restored before Rust resumes. |
 | Owned framebuffer writes | 1 | GOP scalar metadata is checked before handoff; page-rounded bytes are allocator-reserved and mapped RW/NX as device memory; checked pixel offsets precede each volatile byte write. |
-| Bounded input-queue synchronization | 10 | The boot CPU initializes one preallocated queue before IRQ enablement; the current single-CPU profile masks owned IRQ delivery around main-context access, while interrupt gates enter masked, so the audited `UnsafeCell` never yields overlapping mutable references. Application IRQ dispatch uses the same unique queue access. |
+| Bounded input-queue synchronization | 11 | The boot CPU initializes one preallocated queue before IRQ enablement; the current single-CPU profile masks owned IRQ delivery around main-context access, while interrupt gates enter masked, so the audited `UnsafeCell` never yields overlapping mutable references. Application IRQ dispatch and nonblocking cooperative cancellation use the same unique queue access. |
+| Architecture monotonic counters | 2 | The pinned single-vCPU x86-64 profile reads its invariant TSC only after CPUID supplies a nonzero frequency; AArch64 reads the architected physical counter and frequency at EL1. Checked scaling produces boot-relative milliseconds and runtime state clamps observations against regression. |
 | x86-64 APIC input/timer delivery and entry | 25 | Mapped LAPIC/I/O APIC registers and owned PIC/UART/PIT ports are accessed only from the pinned q35 profile; PIT channel 2 calibrates a masked local-APIC one-shot before the 50 ms lease is armed; explicit IDT gates preserve interrupted integer and floating-point state; `sti; hlt; cli` closes the empty-check sleep race. |
 | AArch64 GICv2 input/timer delivery and entry | 24 | The pinned `virt` GICv2 aperture is mapped RW/NX as device memory; distributor/CPU-interface operations are bounded by `GICD_TYPER`; PPI 30 carries the checked generic physical-timer deadline; the IRQ vector preserves all general and SIMD state; IRQ-masked `dsb; wfi` closes the pre-sleep handler race before pending dispatch returns to masked queue access. |
 | x86-64 16550, i8042, and `hlt` | 12 | The pinned q35 profile owns COM1 at `0x3f8` and the PS/2 controller at `0x60`/`0x64`; byte I/O checks readiness/status bits, ignores auxiliary-device data, and bounds transmit polling; halt is terminal. |

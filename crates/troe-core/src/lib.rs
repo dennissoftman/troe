@@ -187,6 +187,8 @@ pub enum CommandStatus {
     Failure,
     /// The command was not granted the requested authority.
     Denied,
+    /// Cooperative execution was cancelled by the user.
+    Cancelled,
 }
 
 impl CommandStatus {
@@ -199,6 +201,7 @@ impl CommandStatus {
             Self::NotFound => 3,
             Self::Failure => 1,
             Self::Denied => 126,
+            Self::Cancelled => 130,
         }
     }
 }
