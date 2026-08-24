@@ -131,6 +131,10 @@ def prepare_qemu_command(
                 str(REPO_ROOT / "assets" / "boot.bmnt"),
                 "--output",
                 str(REPO_ROOT / "build" / "storage-root.img"),
+                "--persistence-selector",
+                str(REPO_ROOT / "assets" / "persist.prgn"),
+                "--txslot-output",
+                str(REPO_ROOT / "build" / f"storage-txslot-{architecture}.img"),
             ],
             cwd=REPO_ROOT,
             check=True,
@@ -144,9 +148,7 @@ def prepare_qemu_command(
     if not storage.is_file():
         raise FileNotFoundError(f"storage fixture not found: {storage}")
     txslot = REPO_ROOT / "build" / f"storage-txslot-{architecture}.img"
-    if build:
-        txslot.write_bytes(bytes(4 * 512))
-    if not txslot.is_file() or txslot.stat().st_size != 4 * 512:
+    if not txslot.is_file() or txslot.stat().st_size != 4_096 * 512:
         raise FileNotFoundError(f"TXSLOT fixture not found or invalid: {txslot}")
     variables = REPO_ROOT / "build" / f"qemu-vars-{architecture}.fd"
     shutil.copyfile(vars_source, variables)

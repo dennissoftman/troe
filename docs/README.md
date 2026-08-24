@@ -24,6 +24,8 @@ historical review evidence.
   and deterministic stable-identity volume resolution policy.
 - [TXSLOT v1](formats/txslot-v1.md) defines the implemented four-block
   dual-slot durability transaction and predecessor recovery rules.
+- [PRGN v1](formats/prgn-v1.md) defines the exact GPT identity selector that
+  gates native writable authority for a TXSLOT region.
 
 The repository root [README](../README.md), [security policy](../SECURITY.md),
 [contribution guide](../CONTRIBUTING.md), and [third-party inventory](../THIRD_PARTY.md)
@@ -57,7 +59,8 @@ single-request virtio block core and the native AArch64 `virtio-mmio` and q35
 virtio PCI transports, including their DMA lifetime and reset-on-timeout rules.
 [ADR 0020](adr/0020-dual-slot-durability-transaction.md) fixes the first
 portable writable transaction and its exact write/flush recovery contract;
-dedicated QEMU media now exercise it through both native virtio transports.
+strict PRGN-selected GPT media now exercise it through both native virtio
+transports.
 ADR 0012 governs the completed Stage 5.1 terminal and
 framebuffer increment; AArch64 native keyboard input remains a later
 virtio-input transport decision. ADR 0013 governs the completed Stage 5.2

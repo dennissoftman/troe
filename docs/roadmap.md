@@ -354,14 +354,16 @@ The first portable storage/configuration boundary is landed:
 - `troe-persist` implements the first writable durability primitive: a
   four-block dual-slot record with data/flush/commit/flush ordering, exact
   generation/checksum recovery, and host fault injection at every boundary;
-  dedicated per-architecture QEMU media exercise real native virtio writes and
-  flushes across five process termination/reopen cycles.
+  PRGN v1 selects a strict four-block GPT partition by exact disk, unique
+  partition, and partition-type GUIDs; dedicated per-architecture QEMU media
+  exercise real native virtio writes and flushes across five process
+  termination/reopen cycles.
 
 These mechanisms are host verified; both VM transports, read-only mount
 activation, and the bounded TXSLOT transaction are QEMU verified. Stage 8 is
-not complete: FAT32 and ext4 remain read-only, TXSLOT has no installed-media
-selector, configuration is not persistently activated, and networking, the
-content store, generation activation, and rollback are still absent.
+not complete: FAT32 and ext4 remain read-only, configuration is not
+persistently activated, and networking, the content store, generation
+activation, and rollback are still absent.
 
 ADR 0018 fixes the bootstrap semantics for the next storage increments. KEFS
 provides the immutable `/`, `/vol/root` is the selected persistent ext4 role,
@@ -374,25 +376,22 @@ the KEFS recovery shell without guessing from enumeration order or labels.
 
 Continue Stage 8 in this order:
 
-1. allocate TXSLOT through a versioned installed-media selector rather than the
-   acceptance-only exact-capacity device profile;
-2. use that selected transaction for an SCFG activation pointer, then define
+1. use the PRGN-selected transaction for an SCFG activation pointer, then define
    registry/mapping serialized formats and predecessor/recovery selection;
-3. add filesystem mutation only with exact flush/FUA, dirty-state, corruption,
+2. add filesystem mutation only with exact flush/FUA, dirty-state, corruption,
    power-loss, and recovery tests;
-4. add bounded network-device capabilities and the minimal configured protocol
+3. add bounded network-device capabilities and the minimal configured protocol
    set before TCP; and
-5. add the content store, immutable generation construction, health activation,
+4. add the content store, immutable generation construction, health activation,
    predecessor rollback, and garbage-collection bounds.
 
 ### Next-session handoff
 
-Continue the durability increment by replacing the acceptance-only exact-size
-TXSLOT device match with a versioned installed-media selector, then use the
-selected record for an SCFG activation pointer. In parallel, make the EFI
-boot-source manifest load replace the embedded QEMU fixture without changing
-BMNT matching. Do not interpret this small transaction record as permission to
-expose ext4 or FAT mutation yet.
+Continue the durability increment by using the PRGN-selected TXSLOT record for
+an SCFG activation pointer. In parallel, make the EFI boot-source manifest load
+replace the embedded QEMU fixture without changing BMNT or PRGN matching. Do
+not interpret this small transaction record as permission to expose ext4 or
+FAT mutation yet.
 
 Do not start with a filesystem parser coupled directly to a hardware driver or
 the shell. The block transport, region discovery, filesystem provider, VFS,

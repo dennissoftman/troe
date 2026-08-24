@@ -41,7 +41,8 @@ handle calls, or is terminated by the 50 ms execution lease.
   mount manifest with deterministic stable-identity resolution;
 - a four-block dual-slot persistence transaction with exact
   data/flush/commit/flush ordering, host fault injection at every boundary,
-  and native process-reopen recovery on both QEMU transports;
+  a checksummed exact-GPT-identity region selector, and native process-reopen
+  recovery on both QEMU transports;
 - a bounded modern virtio block core with native AArch64 `virtio-mmio` and
   x86-64 q35 virtio PCI transports; both have QEMU-proven post-handoff GPT
   discovery, exact BMNT disk/partition/ext4 identity selection, and a live

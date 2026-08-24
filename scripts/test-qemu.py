@@ -26,6 +26,8 @@ BOOT_TIMEOUT_SECONDS = 30.0
 # other guest is producing a framebuffer-sized memory report. Keep the bound
 # finite, but large enough that host scheduling jitter is not a kernel failure.
 COMMAND_TIMEOUT_SECONDS = 10.0
+TXSLOT_DISK_BYTES = 4_096 * 512
+TXSLOT_PARTITION_OFFSET = 2_048 * 512
 TXSLOT_BYTES = 4 * 512
 TXSLOT_CHECKSUM_OFFSET = 20
 
@@ -42,15 +44,28 @@ def txslot_path(architecture: str) -> Path:
 def reset_txslot(architecture: str) -> None:
     """Start one architecture's process-reopen sequence from empty media."""
     path = txslot_path(architecture)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_bytes(bytes(TXSLOT_BYTES))
+    subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "tools" / "mkstorage.py"),
+            "--manifest",
+            str(REPO_ROOT / "assets" / "boot.bmnt"),
+            "--persistence-selector",
+            str(REPO_ROOT / "assets" / "persist.prgn"),
+            "--txslot-output",
+            str(path),
+        ],
+        cwd=REPO_ROOT,
+        check=True,
+    )
 
 
 def txslot_generation(architecture: str) -> int:
     """Validate TXSLOT v1 on disk and return its newest committed generation."""
     image = txslot_path(architecture).read_bytes()
-    if len(image) != TXSLOT_BYTES:
+    if len(image) != TXSLOT_DISK_BYTES:
         raise AcceptanceError(f"{architecture} TXSLOT image has invalid length")
+    image = image[TXSLOT_PARTITION_OFFSET:TXSLOT_PARTITION_OFFSET + TXSLOT_BYTES]
     generations: list[int] = []
     for slot in range(2):
         data = image[slot * 1024:slot * 1024 + 512]

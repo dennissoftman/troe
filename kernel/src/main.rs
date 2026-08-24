@@ -34,6 +34,8 @@ mod firmware {
     use troe_driver::{InputQueueConfig, InputSource};
     use troe_ext4::Ext4Limits;
     use troe_gpt::GptLimits;
+    #[cfg(feature = "acceptance-probes")]
+    use troe_gpt::{GptGuid, discover};
     use troe_memory::{
         BASE_PAGE_SIZE, BootAllocator, FrameAllocator, MAX_FIRMWARE_REGIONS, Mapping,
         MappingLifetime, MappingMemoryType, MappingOwner, MappingPermissions, MappingPlan,
@@ -41,7 +43,7 @@ mod firmware {
     };
     use troe_mount::{BootMountManifest, parse_manifest};
     #[cfg(feature = "acceptance-probes")]
-    use troe_persist::{DualSlotStore, TRANSACTION_BLOCKS};
+    use troe_persist::{DualSlotStore, RegionSelector, TRANSACTION_BLOCKS};
     use troe_shell::{CompletionConfig, Shell};
     use troe_storage::{ActivationLimits, prepare_read_only};
     use troe_task::{
@@ -60,6 +62,8 @@ mod firmware {
 
     const ROOTFS: &[u8] = include_bytes!("../../assets/root.kefs");
     const BOOT_MOUNT_MANIFEST: &[u8] = include_bytes!("../../assets/boot.bmnt");
+    #[cfg(feature = "acceptance-probes")]
+    const PERSISTENCE_SELECTOR: &[u8] = include_bytes!("../../assets/persist.prgn");
     const OWNED_HEAP_BYTES: u64 = 6 * 1024 * 1024;
     const PAGE_TABLE_BYTES: u64 = 2 * 1024 * 1024;
     const OWNED_STACK_BYTES: u64 = 128 * 1024;
@@ -462,22 +466,54 @@ mod firmware {
     fn probe_native_persistence(
         devices: &mut Vec<troe_machine::NativeVirtioBlock>,
     ) -> Result<(), ()> {
+        let selector = RegionSelector::parse(PERSISTENCE_SELECTOR).map_err(|_| ())?;
+        let discovery_limits = BlockLimits::new(32, 16 * 1024, 1).map_err(|_| ())?;
+        let gpt_limits = GptLimits::new(128, 16 * 1024, 4).map_err(|_| ())?;
         let mut selected = None;
-        for (index, device) in devices.iter().enumerate() {
+        for (index, device) in devices.iter_mut().enumerate() {
             let geometry = device.geometry();
-            if geometry.logical_block_bytes() == 512
-                && geometry.block_count() == TRANSACTION_BLOCKS
-                && geometry.supports_flush()
-                && !device.profile().read_only()
-                && selected.replace(index).is_some()
+            if geometry.logical_block_bytes() != 512
+                || !geometry.supports_flush()
+                || device.profile().read_only()
             {
+                continue;
+            }
+            let Ok(mut whole) =
+                BlockRegion::whole_device(device, BlockAccess::ReadOnly, discovery_limits)
+            else {
+                continue;
+            };
+            let Ok(gpt) = discover(&mut whole, gpt_limits) else {
+                continue;
+            };
+            if gpt.disk_guid().disk_bytes() != selector.disk_guid() {
+                continue;
+            }
+            let Some(partition) =
+                gpt.partition_by_unique_guid(GptGuid::from_disk_bytes(selector.partition_guid()))
+            else {
+                continue;
+            };
+            if partition.type_guid().disk_bytes() != selector.partition_type_guid()
+                || partition.block_count() != TRANSACTION_BLOCKS
+            {
+                continue;
+            }
+            if selected.replace((index, partition.first_lba())).is_some() {
                 return Err(());
             }
         }
-        let device = devices.remove(selected.ok_or(())?);
+        let (index, first_lba) = selected.ok_or(())?;
+        let device = devices.remove(index);
         let limits = BlockLimits::new(1, 512, 1).map_err(|_| ())?;
-        let region =
-            BlockRegion::whole_device(device, BlockAccess::ReadWrite, limits).map_err(|_| ())?;
+        let region = BlockRegion::new(
+            device,
+            first_lba,
+            TRANSACTION_BLOCKS,
+            BlockAccess::ReadWrite,
+            limits,
+        )
+        .map_err(|_| ())?;
         let mut store = DualSlotStore::open(region).map_err(|_| ())?;
         store.commit(b"native virtio persistence").map_err(|_| ())?;
         if !troe_machine::write(b"native persistence: committed and flushed\n") {

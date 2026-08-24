@@ -28,9 +28,10 @@ for a small activation pointer or registry root; it does not by itself make
 ext4, FAT, arbitrary application data, or directory operations crash-safe.
 
 Host fault tests interrupt every write/flush boundary and reopen from only
-durable bytes. QEMU acceptance assigns each architecture a private exact-size
-writable device, executes the real virtio data/flush/commit/flush sequence,
-terminates the process, reopens it in a fresh VM, and validates the on-media
-generation after each boot. The exact-size device match is an acceptance-only
-fixture profile; a versioned installed-media allocation and stable selector
-remain required before this carries an SCFG activation pointer.
+durable bytes. QEMU acceptance assigns each architecture a private GPT disk,
+uses a checksummed PRGN v1 record to match its exact disk, partition, and type
+GUIDs, requires the selected partition to be exactly four blocks, and executes
+the real virtio data/flush/commit/flush sequence. It then terminates the
+process, reopens the medium in a fresh VM, and validates the on-media generation
+after each boot. Using the selected record for an SCFG activation pointer
+remains the next increment.

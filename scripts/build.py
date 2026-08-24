@@ -58,6 +58,8 @@ def main() -> int:
             TOOLS_DIR / "mkstorage.py",
             "--manifest",
             REPO_ROOT / "assets" / "boot.bmnt",
+            "--persistence-selector",
+            REPO_ROOT / "assets" / "persist.prgn",
         )
 
         for architecture in architectures:
