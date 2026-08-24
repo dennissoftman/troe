@@ -14,6 +14,8 @@ use core::cell::UnsafeCell;
 use core::hint::spin_loop;
 use core::ptr;
 use core::ptr::NonNull;
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+use core::sync::atomic::AtomicU64;
 #[cfg(target_os = "uefi")]
 use core::sync::atomic::{AtomicBool, Ordering};
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
@@ -160,6 +162,9 @@ unsafe impl Sync for InputQueueCell {}
 
 #[cfg(target_os = "uefi")]
 static INPUT_QUEUE: InputQueueCell = InputQueueCell(UnsafeCell::new(None));
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+static X86_TSC_TICKS_PER_MILLISECOND: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_os = "uefi")]
 impl OwnedFramebuffer {
@@ -751,6 +756,18 @@ pub fn monotonic_millis() -> Option<u64> {
     architecture_monotonic_millis()
 }
 
+/// Establish the architecture monotonic-counter frequency before firmware
+/// boot services are released.
+///
+/// x86 uses CPUID when complete and otherwise measures TSC advancement across
+/// one firmware-provided 10 ms stall. `AArch64` validates its architected counter
+/// frequency directly.
+#[must_use]
+#[cfg(target_os = "uefi")]
+pub fn initialize_monotonic_clock() -> bool {
+    architecture_initialize_monotonic_clock()
+}
+
 /// Snapshot interrupt input accounting without racing an interrupt producer.
 #[must_use]
 #[cfg(target_os = "uefi")]
@@ -960,24 +977,63 @@ fn architecture_handle_input_interrupt(queue: &mut BoundedInputQueue) -> bool {
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 fn architecture_monotonic_millis() -> Option<u64> {
-    let maximum = core::arch::x86_64::__cpuid(0).eax;
-    let frequency = if maximum >= 0x15 {
-        let ratio = core::arch::x86_64::__cpuid(0x15);
-        if ratio.eax != 0 && ratio.ebx != 0 && ratio.ecx != 0 {
-            u64::from(ratio.ecx)
-                .checked_mul(u64::from(ratio.ebx))?
-                .checked_div(u64::from(ratio.eax))?
-        } else if maximum >= 0x16 {
-            u64::from(core::arch::x86_64::__cpuid(0x16).eax).checked_mul(1_000_000)?
-        } else {
-            return None;
-        }
+    let cached = X86_TSC_TICKS_PER_MILLISECOND.load(Ordering::Relaxed);
+    let ticks_per_millisecond = if cached == 0 {
+        let detected = x86_cpuid_tsc_frequency()
+            .and_then(|frequency| frequency.checked_div(1_000))
+            .filter(|ticks| *ticks != 0)?;
+        X86_TSC_TICKS_PER_MILLISECOND.store(detected, Ordering::Relaxed);
+        detected
     } else {
-        return None;
+        cached
     };
-    if frequency < 1_000 {
+    x86_read_tsc().checked_div(ticks_per_millisecond)
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn architecture_initialize_monotonic_clock() -> bool {
+    if let Some(ticks) = x86_cpuid_tsc_frequency()
+        .and_then(|frequency| frequency.checked_div(1_000))
+        .filter(|ticks| *ticks != 0)
+    {
+        X86_TSC_TICKS_PER_MILLISECOND.store(ticks, Ordering::Relaxed);
+        return true;
+    }
+    let start = x86_read_tsc();
+    uefi::boot::stall(core::time::Duration::from_millis(10));
+    let Some(ticks_per_millisecond) = x86_read_tsc()
+        .checked_sub(start)
+        .and_then(|ticks| ticks.checked_div(10))
+    else {
+        return false;
+    };
+    if ticks_per_millisecond == 0 {
+        return false;
+    }
+    X86_TSC_TICKS_PER_MILLISECOND.store(ticks_per_millisecond, Ordering::Relaxed);
+    true
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn x86_cpuid_tsc_frequency() -> Option<u64> {
+    let maximum = core::arch::x86_64::__cpuid(0).eax;
+    if maximum < 0x15 {
         return None;
     }
+    let ratio = core::arch::x86_64::__cpuid(0x15);
+    if ratio.eax != 0 && ratio.ebx != 0 && ratio.ecx != 0 {
+        return u64::from(ratio.ecx)
+            .checked_mul(u64::from(ratio.ebx))?
+            .checked_div(u64::from(ratio.eax));
+    }
+    if maximum < 0x16 {
+        return None;
+    }
+    u64::from(core::arch::x86_64::__cpuid(0x16).eax).checked_mul(1_000_000)
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn x86_read_tsc() -> u64 {
     let ticks: u64;
     // SAFETY: RDTSC reads the monotonically increasing invariant counter in
     // the pinned single-vCPU profiles. LFENCE orders it after prior work.
@@ -992,7 +1048,7 @@ fn architecture_monotonic_millis() -> Option<u64> {
             options(nomem, nostack)
         );
     }
-    ticks.checked_mul(1_000)?.checked_div(frequency)
+    ticks
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
@@ -1478,6 +1534,11 @@ fn architecture_monotonic_millis() -> Option<u64> {
         return None;
     }
     counter.checked_mul(1_000)?.checked_div(frequency)
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn architecture_initialize_monotonic_clock() -> bool {
+    architecture_monotonic_millis().is_some()
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]

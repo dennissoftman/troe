@@ -310,12 +310,18 @@ mod firmware {
         deferred_input: VecDeque<InputEvent>,
         control_down: bool,
         last_millis: Cell<u64>,
+        last_network_poll: u64,
     }
 
     type SharedRuntime = Rc<RefCell<KernelRuntime>>;
 
     struct KernelRuntimeCapability {
         runtime: SharedRuntime,
+    }
+
+    enum RuntimeInitError {
+        Clock,
+        InputMetadata,
     }
 
     impl core::fmt::Debug for KernelNetwork {
@@ -453,6 +459,9 @@ mod firmware {
         let boot_memory = reserve_and_install_heap()?;
         let boot_mount_manifest = parse_manifest(BOOT_MOUNT_MANIFEST).map_err(|_| ())?;
         troe_machine::initialize_console();
+        if !troe_machine::initialize_monotonic_clock() {
+            return Err(());
+        }
         Ok(PreparedHandoff {
             image_layout,
             boot_memory,
@@ -3274,18 +3283,20 @@ mod firmware {
     impl KernelRuntime {
         const DEFERRED_INPUT_CAPACITY: usize = 128;
         const INPUT_CHECKPOINT_BUDGET: usize = 32;
+        const NETWORK_POLL_INTERVAL_MILLIS: u64 = 10;
 
-        fn new(network: Option<SharedNetwork>) -> Result<Self, ()> {
-            let initial = troe_machine::monotonic_millis().ok_or(())?;
+        fn new(network: Option<SharedNetwork>) -> Result<Self, RuntimeInitError> {
+            let initial = troe_machine::monotonic_millis().ok_or(RuntimeInitError::Clock)?;
             let mut deferred_input = VecDeque::new();
             deferred_input
                 .try_reserve_exact(Self::DEFERRED_INPUT_CAPACITY)
-                .map_err(|_| ())?;
+                .map_err(|_| RuntimeInitError::InputMetadata)?;
             Ok(Self {
                 network,
                 deferred_input,
                 control_down: false,
                 last_millis: Cell::new(initial),
+                last_network_poll: initial.saturating_sub(Self::NETWORK_POLL_INTERVAL_MILLIS),
             })
         }
 
@@ -3299,8 +3310,12 @@ mod firmware {
         }
 
         fn checkpoint(&mut self) -> Result<(), Cancelled> {
-            if let Some(network) = &self.network {
-                let _bounded_poll = network.borrow_mut().poll();
+            let now = self.now().as_millis();
+            if now.saturating_sub(self.last_network_poll) >= Self::NETWORK_POLL_INTERVAL_MILLIS {
+                if let Some(network) = &self.network {
+                    let _bounded_poll = network.borrow_mut().poll();
+                }
+                self.last_network_poll = now;
             }
             for _ in 0..Self::INPUT_CHECKPOINT_BUDGET {
                 let Some(event) = troe_machine::try_input_event() else {
@@ -3358,10 +3373,14 @@ mod firmware {
         console: &mut dyn Output,
     ) -> (Option<NetworkStatus>, SharedRuntime) {
         let service = discover_network_service();
-        let runtime = Rc::new(RefCell::new(
-            KernelRuntime::new(service.clone())
-                .unwrap_or_else(|()| fatal(b"fatal: monotonic runtime unavailable\n")),
-        ));
+        let runtime_state = match KernelRuntime::new(service.clone()) {
+            Ok(runtime) => runtime,
+            Err(RuntimeInitError::Clock) => fatal(b"fatal: monotonic runtime unavailable\n"),
+            Err(RuntimeInitError::InputMetadata) => {
+                fatal(b"fatal: runtime input metadata exhausted\n")
+            }
+        };
+        let runtime = Rc::new(RefCell::new(runtime_state));
         shell.set_runtime(Box::new(KernelRuntimeCapability {
             runtime: runtime.clone(),
         }));

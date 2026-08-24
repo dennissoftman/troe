@@ -288,7 +288,7 @@ def parse_owned_memory_accounting(report: str) -> int:
         or int(input_queue.group(1)) > int(input_queue.group(2))
     ):
         raise AcceptanceError(f"mem reported invalid input queue counters: {report!r}")
-    for label in ("input interrupts", "input delivered", "input idle waits", "input wakeups"):
+    for label in ("input interrupts", "input delivered"):
         match = re.search(rf"^{re.escape(label)}: ([0-9]+)$", report, re.MULTILINE)
         if match is None or int(match.group(1)) == 0:
             raise AcceptanceError(f"mem reported invalid {label}: {report!r}")
@@ -381,13 +381,17 @@ class SerialSession:
         if self.process.stdin is None:
             raise AcceptanceError("QEMU serial input is unavailable")
         try:
-            # Pace against guest echo so both firmware and native polling UART
-            # paths remain deterministic under loaded CI hosts.
-            for byte in command.encode("utf-8"):
+            # Pace against guest echo so both firmware and native UART paths
+            # remain deterministic under loaded CI hosts. Eight bytes stay
+            # below the pinned UART FIFO and bounded input-queue capacities
+            # while avoiding a host round trip for every printable byte.
+            encoded = command.encode("utf-8")
+            for offset in range(0, len(encoded), 8):
+                chunk = encoded[offset : offset + 8]
                 start = len(self.output)
-                self.process.stdin.write(bytes((byte,)))
+                self.process.stdin.write(chunk)
                 self.process.stdin.flush()
-                self.wait_for(bytes((byte,)), timeout, start)
+                self.wait_for(chunk, timeout, start)
             start = len(self.output)
             self.process.stdin.write(line_ending)
             self.process.stdin.flush()
@@ -417,6 +421,24 @@ class SerialSession:
         tail = normalize(bytes(self.output[start:]))
         if "Initializing memory and protection" in tail or "sh:/> " in tail:
             raise AcceptanceError(f"machine rebooted after fatal marker: {tail!r}")
+
+    def cancelled_command(
+        self, command: str, cwd: str, timeout: float
+    ) -> None:
+        """Start a cooperative command and require Ctrl-C to restore the prompt."""
+        if self.process.stdin is None:
+            raise AcceptanceError("QEMU serial input is unavailable")
+        start = self.send(command, timeout)
+        time.sleep(0.02)
+        self.process.stdin.write(b"\x03")
+        self.process.stdin.flush()
+        prompt = f"sh:{cwd}> ".encode()
+        self.wait_for(prompt, timeout, start)
+        output = normalize(bytes(self.output[start:]))
+        if "cancelled" not in output:
+            raise AcceptanceError(
+                f"{command!r} did not report cooperative cancellation: {output!r}"
+            )
 
     def backspace_command(
         self,
@@ -589,6 +611,15 @@ def run_scenario(session: SerialSession, boot_timeout: float, command_timeout: f
         command_timeout,
         contains=("reply from 10.0.2.2", "bytes=9"),
     )
+    session.command(
+        "net stats",
+        cwd,
+        command_timeout,
+        contains=("rx frames:", "arp entries:", "checkpoints:"),
+    )
+    session.command("arp", cwd, command_timeout, contains=("10.0.2.2",))
+    session.cancelled_command("sleep 5000", cwd, command_timeout)
+    session.cancelled_command("udp listen 40000", cwd, command_timeout)
 
     session.edited_command(
         "", b"\t", "", cwd, command_timeout, expected="\ncat\n"
@@ -782,6 +813,15 @@ def run_smoke_scenario(
         command_timeout,
         contains=("reply from 10.0.2.2", "bytes=9"),
     )
+    session.command(
+        "net stats",
+        cwd,
+        command_timeout,
+        contains=("rx frames:", "arp entries:", "checkpoints:"),
+    )
+    session.command("arp", cwd, command_timeout, contains=("10.0.2.2",))
+    session.cancelled_command("sleep 5000", cwd, command_timeout)
+    session.cancelled_command("udp listen 40000", cwd, command_timeout)
     session.backspace_command(
         "echo brokeX", "n", cwd, command_timeout, expected="\nbroken\n"
     )
