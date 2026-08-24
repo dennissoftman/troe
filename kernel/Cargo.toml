@@ -29,6 +29,7 @@ troe-terminal = { path = "../crates/troe-terminal" }
 troe-vfs = { path = "../crates/troe-vfs" }
 troe-ext4 = { path = "../crates/troe-ext4" }
 troe-gpt = { path = "../crates/troe-gpt" }
+troe-identity = { path = "../crates/troe-identity" }
 
 [target.'cfg(target_os = "uefi")'.dependencies]
 troe-machine = { path = "../crates/troe-machine" }

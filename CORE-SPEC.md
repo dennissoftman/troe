@@ -6,11 +6,11 @@
 **Future targets:** raw x86-64 PCs, raw AArch64 systems  
 **Implementation language:** Rust (`no_std`)  
 
-**Implementation status:** Stages 0–7 are implemented. The first portable Stage
-8 storage/configuration boundary (bounded block regions, strict read-only GPT,
-read-only FAT32 and constrained ext4 behind VFS, and SCFG v1 parsing) is
-implemented, but Stage 8 is not complete. Stage 7 includes the portable KEX
-parser/load-plan policy, native
+**Implementation status:** Stages 0–8 are implemented. Stage 8 includes bounded
+native block/network transports, deterministic persistent-volume selection,
+immutable generation content, crash-consistent activation/rollback and selected
+state mutation, plus generation-bound identity/mapping metadata. Stage 7 includes
+the portable KEX parser/load-plan policy, native
 validate/map/reclaim transactions, all three ABI 1.0 calls, contained fault
 fates, and enforced 50 ms execution leases. See
 [docs/roadmap.md](docs/roadmap.md).
@@ -1007,19 +1007,13 @@ crates or architecture-wide mechanisms.
 
 ### Stage 8 — Networking and persistent operation
 
-**Status:** in progress. Portable block-region, GPT, read-only FAT32/ext4 VFS
-mount, identity-policy, SCFG v1, and BMNT v1 deterministic volume-selection
-boundaries are implemented and host verified. The AArch64 virtio-MMIO and q35
-virtio PCI paths, exact GPT/BMNT/ext4 selection, and read-only `/vol/root`
-activation are also QEMU verified. Writes/recovery, networking, SCFG persistent
-activation, content storage, and rollback remain incomplete. The portable
-four-block dual-slot write/flush transaction has host boundary-fault coverage
-and is connected to a PRGN-selected exact GPT partition on a dedicated native
-QEMU writable device; both virtio transports prove completed commits survive
-process termination and reopen. SACT v1 binds the persisted active reference to
-an exact canonical SCFG generation, byte length, and checksum and supports a
-strictly older predecessor reference. Immutable content storage, live service
-health activation, and filesystem mutation remain incomplete.
+**Status:** implemented. Portable block/GPT/VFS/config/content/identity layers
+are host verified. Both native virtio block and network transports are QEMU
+verified on x86-64 PCI and AArch64 MMIO. Exact BMNT/GPT/ext4 selection activates
+`/vol/root`; PRGN/TXSLOT persists SACT activation and a separate STFS mutation
+through real flush/reopen cycles. CSPK/GMAN/ISEC bind SCFG plus identity registry,
+foreign mapping, mount policy, and native ACL objects to immutable generations.
+Configured health failure rolls generation 2 back durably to generation 1.
 
 - Introduce network-device capabilities and a bounded-buffer network stack.
 - Begin with a small practical protocol set such as Ethernet, ARP/NDP as appropriate, IPv4 and/or IPv6, ICMP, UDP, DHCP or static configuration, and DNS.
@@ -1030,10 +1024,11 @@ health activation, and filesystem mutation remain incomplete.
   writes.
 - Add bounded block I/O and block-region capabilities, whole-device volumes,
   and read-only GPT discovery without an in-kernel partition editor.
-- Add the constrained ext4 provider as the default persistent data volume.
-  Add read/write FAT12/16/32 for EFI and broad/legacy interchange, add
-  read/write exFAT for large removable media, and defer NTFS as an optional
-  foreign provider; do not link unselected providers into the image.
+- Add the constrained ext4 provider as the default selected persistent content
+  volume and prove a bounded writable filesystem through the same block/VFS
+  capability boundary. Broader read/write ext4, FAT, and exFAT providers are
+  deployment/usability expansions after this stage and remain independently
+  selectable; NTFS remains optional and foreign.
 - Define configuration, service startup, and recovery behavior suitable for unattended use.
 - Add the persistent content store and desired-system manifest only after their
   on-disk formats, bounds, corruption behavior, and recovery paths are tested.

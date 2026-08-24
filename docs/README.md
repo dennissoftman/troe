@@ -7,13 +7,13 @@ historical review evidence.
 
 - [Implementation roadmap](roadmap.md) is the source of truth for landed stages
   and the next kernel milestone.
-- [Architecture](architecture.md) describes the current Stage 7 composition and
+- [Architecture](architecture.md) describes the current Stage 8 composition and
   its boundaries.
 - [Architecture-specific notes](architecture-specific-notes.md) preserve the
   x86-64 and AArch64 interrupt, idle, and controller invariants that portable
   refactors must not erase.
 - [Unsafe inventory](security/unsafe-inventory.md) records the current audited
-  project-authored unsafe surface through the runnable Stage 7 increment.
+  project-authored unsafe surface through the runnable Stage 8 increment.
 - [KEFS v1](formats/kefs-v1.md) defines the implemented embedded-filesystem
   format.
 - [KEX v1](formats/kex-v1.md) defines the implemented portable executable
@@ -34,6 +34,8 @@ historical review evidence.
   roots and their bounded chain/garbage-collection traversal.
 - [STFS v1](formats/stfs-v1.md) defines the crash-consistent single-file
   persistent state filesystem committed through TXSLOT.
+- [Identity security v1](formats/identity-v1.md) defines IREG, IMAP, IMNT,
+  IACL, ISEC, profile ceilings, cross-validation, and provisioning rules.
 
 The repository root [README](../README.md), [security policy](../SECURITY.md),
 [contribution guide](../CONTRIBUTING.md), and [third-party inventory](../THIRD_PARTY.md)
@@ -53,10 +55,10 @@ Files under [adr](adr) preserve decisions and their context. Accepted ADRs are
 not deprecated merely because their stage has completed; later implementation
 notes identify decisions that were revisited. ADR 0007 now fixes the Stage 8
 native-principal, foreign-identity, mapping, mount-policy, and fail-closed ACL
-direction; its serialized formats remain gated before persistent writes. ADR
+direction; its serialized formats and generation binding are implemented. ADR
 0009 is the accepted storage direction; its block, GPT, VFS-provider, read-only
-FAT32, and first constrained ext4 slices are implemented, while mutation
-remains open. [ADR 0017](adr/0017-constrained-ext4-read-only-profile.md) fixes
+FAT32/constrained ext4, and selected STFS mutation slices are implemented.
+[ADR 0017](adr/0017-constrained-ext4-read-only-profile.md) fixes
 the exact clean read-only ext4 v1 feature bitmap and parser bounds.
 [ADR 0018](adr/0018-volume-namespace-and-root-discovery.md) reserves the
 `/vol/root` and `/vol/boot` roles, keeps KEFS as the diskless recovery root, and

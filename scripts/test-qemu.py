@@ -899,6 +899,10 @@ def run_fault_scenario(
         raise AcceptanceError(
             f"{session.architecture} did not verify selected ext4 content"
         )
+    if "native identity: generation snapshot verified" not in session.transcript():
+        raise AcceptanceError(
+            f"{session.architecture} did not validate generation-bound identity metadata"
+        )
     if "native statefs: mutation committed and flushed" not in session.transcript():
         raise AcceptanceError(
             f"{session.architecture} did not commit persistent filesystem mutation"

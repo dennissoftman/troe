@@ -31,6 +31,7 @@ mod firmware {
     #[cfg(feature = "acceptance-probes")]
     use troe_content::{
         ContentDigest, ContentPack, GenerationManifest, MAX_PACK_BYTES, ObjectKind,
+        SecurityManifest,
     };
     use troe_core::{Input, MAX_LINE_BYTES, MachineMemorySnapshot, Output, StreamError};
     use troe_dispatch::{
@@ -42,6 +43,8 @@ mod firmware {
     use troe_gpt::GptLimits;
     #[cfg(feature = "acceptance-probes")]
     use troe_gpt::{GptGuid, discover};
+    #[cfg(feature = "acceptance-probes")]
+    use troe_identity::{IdentityLimits, MountIdentityMode, validate_snapshot};
     use troe_memory::{
         BASE_PAGE_SIZE, BootAllocator, FrameAllocator, MAX_FIRMWARE_REGIONS, Mapping,
         MappingLifetime, MappingMemoryType, MappingOwner, MappingPermissions, MappingPlan,
@@ -647,6 +650,9 @@ mod firmware {
                 }
             }
         }
+        if !troe_machine::write(b"native identity: generation snapshot verified\n") {
+            return Err(());
+        }
         if !troe_machine::write(b"native content: selected ext4 CSPK verified\n") {
             return Err(());
         }
@@ -772,7 +778,7 @@ mod firmware {
         let roots = content
             .generation_roots(active_manifest_digest, 2)
             .map_err(|_| ())?;
-        if roots.len() < 2 || roots.len() > 4 {
+        if roots.len() < 7 || roots.len() > 14 {
             return Err(());
         }
         Ok(rollback_required)
@@ -801,7 +807,50 @@ mod firmware {
             }
         }
         let (manifest_digest, manifest) = found.ok_or(())?;
+        validate_generation_security(content, manifest)?;
         Ok((manifest_digest, manifest, config.bytes))
+    }
+
+    #[cfg(feature = "acceptance-probes")]
+    fn validate_generation_security(
+        content: &ContentPack<'_>,
+        generation: GenerationManifest,
+    ) -> Result<(), ()> {
+        let security = content.get(generation.security().ok_or(())?).ok_or(())?;
+        if security.kind != ObjectKind::SecurityManifest {
+            return Err(());
+        }
+        let security = SecurityManifest::parse(security.bytes).map_err(|_| ())?;
+        if security.generation() != generation.generation() {
+            return Err(());
+        }
+        let registry = content.get(security.registry()).ok_or(())?;
+        let mapping = content.get(security.mapping()).ok_or(())?;
+        let mount = content.get(security.mount()).ok_or(())?;
+        let acl = content.get(security.acl()).ok_or(())?;
+        if registry.kind != ObjectKind::IdentityRegistry
+            || mapping.kind != ObjectKind::IdentityMapping
+            || mount.kind != ObjectKind::MountPolicy
+            || acl.kind != ObjectKind::NativeAcl
+        {
+            return Err(());
+        }
+        let snapshot = validate_snapshot(
+            registry.bytes,
+            mapping.bytes,
+            mount.bytes,
+            acl.bytes,
+            generation.generation(),
+            IdentityLimits::tiny(),
+        )
+        .map_err(|_| ())?;
+        if snapshot.mount.role() != "root"
+            || snapshot.mount.mode() != MountIdentityMode::ExplicitMapping
+            || !snapshot.mount.raw_metadata_lossless()
+        {
+            return Err(());
+        }
+        Ok(())
     }
 
     fn native_activation_limits() -> Result<ActivationLimits, ()> {

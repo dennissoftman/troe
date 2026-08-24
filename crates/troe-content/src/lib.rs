@@ -22,11 +22,16 @@ pub const MAX_OBJECTS: usize = 64;
 pub const MAX_OBJECT_BYTES: usize = 1024 * 1024;
 /// Exact encoded generation-manifest size.
 pub const GENERATION_MANIFEST_BYTES: usize = 128;
+/// Exact encoded identity-security manifest size.
+pub const SECURITY_MANIFEST_BYTES: usize = 192;
 
 const CHECKSUM_OFFSET: usize = 20;
 const GENERATION_CHECKSUM_OFFSET: usize = 88;
 const GENERATION_PREVIOUS: u16 = 1;
+const GENERATION_SECURITY: u16 = 1 << 1;
 const GENERATION_MAGIC: [u8; 8] = *b"GMANv1\0\0";
+const SECURITY_CHECKSUM_OFFSET: usize = 152;
+const SECURITY_MAGIC: [u8; 8] = *b"ISECv1\0\0";
 
 /// SHA-256 content identity.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -58,6 +63,7 @@ pub struct GenerationManifest {
     generation: u64,
     config: ContentDigest,
     previous: Option<ContentDigest>,
+    security: Option<ContentDigest>,
 }
 
 impl GenerationManifest {
@@ -81,7 +87,21 @@ impl GenerationManifest {
             generation,
             config,
             previous,
+            security: None,
         })
+    }
+
+    /// Bind one exact immutable identity-security manifest to this generation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a zero content identity.
+    pub fn with_security(mut self, security: ContentDigest) -> Result<Self, ContentError> {
+        if security.bytes() == [0; 32] {
+            return Err(ContentError::InvalidManifest);
+        }
+        self.security = Some(security);
+        Ok(self)
     }
 
     /// Parse one exact checksummed GMAN v1 object.
@@ -96,12 +116,12 @@ impl GenerationManifest {
             || read_u16(bytes, 8)? != 1
             || read_u16(bytes, 10)? != 0
             || read_u16(bytes, 12)? != 128
-            || bytes[92..].iter().any(|byte| *byte != 0)
+            || bytes[92..96].iter().any(|byte| *byte != 0)
         {
             return Err(ContentError::InvalidManifest);
         }
         let flags = read_u16(bytes, 14)?;
-        if flags & !GENERATION_PREVIOUS != 0
+        if flags & !(GENERATION_PREVIOUS | GENERATION_SECURITY) != 0
             || crc32_with_zeroed(bytes, GENERATION_CHECKSUM_OFFSET)
                 != read_u32(bytes, GENERATION_CHECKSUM_OFFSET)?
         {
@@ -119,11 +139,25 @@ impl GenerationManifest {
             }
             None
         };
-        Self::new(
+        let security = if flags & GENERATION_SECURITY != 0 {
+            let mut digest = [0_u8; 32];
+            digest.copy_from_slice(&bytes[96..128]);
+            Some(ContentDigest::from_bytes(digest))
+        } else {
+            if bytes[96..128].iter().any(|byte| *byte != 0) {
+                return Err(ContentError::InvalidManifest);
+            }
+            None
+        };
+        let manifest = Self::new(
             read_u64(bytes, 16)?,
             ContentDigest::from_bytes(config),
             previous,
-        )
+        )?;
+        match security {
+            Some(digest) => manifest.with_security(digest),
+            None => Ok(manifest),
+        }
     }
 
     /// Encode this manifest as canonical checksummed GMAN v1 bytes.
@@ -133,13 +167,21 @@ impl GenerationManifest {
         bytes[..8].copy_from_slice(&GENERATION_MAGIC);
         write_u16(&mut bytes, 8, 1);
         write_u16(&mut bytes, 12, 128);
+        let mut flags = 0_u16;
         if self.previous.is_some() {
-            write_u16(&mut bytes, 14, GENERATION_PREVIOUS);
+            flags |= GENERATION_PREVIOUS;
         }
+        if self.security.is_some() {
+            flags |= GENERATION_SECURITY;
+        }
+        write_u16(&mut bytes, 14, flags);
         write_u64(&mut bytes, 16, self.generation);
         bytes[24..56].copy_from_slice(&self.config.bytes());
         if let Some(previous) = self.previous {
             bytes[56..88].copy_from_slice(&previous.bytes());
+        }
+        if let Some(security) = self.security {
+            bytes[96..128].copy_from_slice(&security.bytes());
         }
         let checksum = crc32_with_zeroed(&bytes, GENERATION_CHECKSUM_OFFSET);
         write_u32(&mut bytes, GENERATION_CHECKSUM_OFFSET, checksum);
@@ -163,6 +205,125 @@ impl GenerationManifest {
     pub const fn previous(self) -> Option<ContentDigest> {
         self.previous
     }
+
+    /// Optional immutable identity-security manifest identity.
+    #[must_use]
+    pub const fn security(self) -> Option<ContentDigest> {
+        self.security
+    }
+}
+
+/// Immutable root for the four canonical identity-security metadata objects.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SecurityManifest {
+    generation: u64,
+    registry: ContentDigest,
+    mapping: ContentDigest,
+    mount: ContentDigest,
+    acl: ContentDigest,
+}
+
+impl SecurityManifest {
+    /// Construct one complete security root.
+    ///
+    /// # Errors
+    ///
+    /// Rejects generation zero, zero identities, and repeated identities.
+    pub fn new(
+        generation: u64,
+        registry: ContentDigest,
+        mapping: ContentDigest,
+        mount: ContentDigest,
+        acl: ContentDigest,
+    ) -> Result<Self, ContentError> {
+        let digests = [registry, mapping, mount, acl];
+        if generation == 0
+            || digests.iter().any(|digest| digest.bytes() == [0; 32])
+            || digests
+                .iter()
+                .enumerate()
+                .any(|(index, digest)| digests[..index].contains(digest))
+        {
+            return Err(ContentError::InvalidManifest);
+        }
+        Ok(Self {
+            generation,
+            registry,
+            mapping,
+            mount,
+            acl,
+        })
+    }
+
+    /// Parse one exact checksummed ISEC v1 object.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed versions, lengths, checksum, reserved bytes, or roots.
+    pub fn parse(bytes: &[u8]) -> Result<Self, ContentError> {
+        if bytes.len() != SECURITY_MANIFEST_BYTES
+            || bytes.get(..8) != Some(&SECURITY_MAGIC)
+            || read_u16(bytes, 8)? != 1
+            || read_u16(bytes, 10)? != 0
+            || usize::from(read_u16(bytes, 12)?) != SECURITY_MANIFEST_BYTES
+            || read_u16(bytes, 14)? != 0
+            || bytes[156..].iter().any(|byte| *byte != 0)
+            || crc32_with_zeroed(bytes, SECURITY_CHECKSUM_OFFSET)
+                != read_u32(bytes, SECURITY_CHECKSUM_OFFSET)?
+        {
+            return Err(ContentError::InvalidManifest);
+        }
+        Self::new(
+            read_u64(bytes, 16)?,
+            ContentDigest::from_bytes(copy_digest(bytes, 24)?),
+            ContentDigest::from_bytes(copy_digest(bytes, 56)?),
+            ContentDigest::from_bytes(copy_digest(bytes, 88)?),
+            ContentDigest::from_bytes(copy_digest(bytes, 120)?),
+        )
+    }
+
+    /// Encode canonical checksummed ISEC v1 bytes.
+    #[must_use]
+    pub fn encode(self) -> [u8; SECURITY_MANIFEST_BYTES] {
+        let mut bytes = [0_u8; SECURITY_MANIFEST_BYTES];
+        bytes[..8].copy_from_slice(&SECURITY_MAGIC);
+        write_u16(&mut bytes, 8, 1);
+        write_u16(&mut bytes, 12, 192);
+        write_u64(&mut bytes, 16, self.generation);
+        bytes[24..56].copy_from_slice(&self.registry.bytes());
+        bytes[56..88].copy_from_slice(&self.mapping.bytes());
+        bytes[88..120].copy_from_slice(&self.mount.bytes());
+        bytes[120..152].copy_from_slice(&self.acl.bytes());
+        let checksum = crc32_with_zeroed(&bytes, SECURITY_CHECKSUM_OFFSET);
+        write_u32(&mut bytes, SECURITY_CHECKSUM_OFFSET, checksum);
+        bytes
+    }
+
+    /// Bound system generation.
+    #[must_use]
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+    /// Native identity registry object.
+    #[must_use]
+    pub const fn registry(self) -> ContentDigest {
+        self.registry
+    }
+    /// Foreign mapping snapshot object.
+    #[must_use]
+    pub const fn mapping(self) -> ContentDigest {
+        self.mapping
+    }
+    /// Mount identity-policy object.
+    #[must_use]
+    pub const fn mount(self) -> ContentDigest {
+        self.mount
+    }
+    /// Native ACL object.
+    #[must_use]
+    pub const fn acl(self) -> ContentDigest {
+        self.acl
+    }
 }
 
 /// Closed immutable object roles.
@@ -177,6 +338,16 @@ pub enum ObjectKind {
     GenerationManifest = 3,
     /// Opaque immutable service data.
     Data = 4,
+    /// Canonical native identity registry.
+    IdentityRegistry = 5,
+    /// Canonical foreign identity mapping snapshot.
+    IdentityMapping = 6,
+    /// Canonical persistent mount identity policy.
+    MountPolicy = 7,
+    /// Canonical native ACL.
+    NativeAcl = 8,
+    /// Security root referencing registry, mapping, mount, and ACL objects.
+    SecurityManifest = 9,
 }
 
 impl ObjectKind {
@@ -186,6 +357,11 @@ impl ObjectKind {
             2 => Ok(Self::Application),
             3 => Ok(Self::GenerationManifest),
             4 => Ok(Self::Data),
+            5 => Ok(Self::IdentityRegistry),
+            6 => Ok(Self::IdentityMapping),
+            7 => Ok(Self::MountPolicy),
+            8 => Ok(Self::NativeAcl),
+            9 => Ok(Self::SecurityManifest),
             _ => Err(ContentError::InvalidRecord),
         }
     }
@@ -286,6 +462,8 @@ impl<'a> ContentPack<'a> {
             }
             if kind == ObjectKind::GenerationManifest {
                 GenerationManifest::parse(&image[offset..end])?;
+            } else if kind == ObjectKind::SecurityManifest {
+                SecurityManifest::parse(&image[offset..end])?;
             }
             records.push(Record {
                 digest,
@@ -339,7 +517,8 @@ impl<'a> ContentPack<'a> {
 
     /// Resolve a bounded active/predecessor generation chain into GC roots.
     ///
-    /// Each retained generation contributes its manifest and SCFG object.
+    /// Each retained generation contributes its manifest and SCFG object plus,
+    /// when present, a security manifest and its four declared typed objects.
     /// Manifest links must be acyclic, strictly generation-descending, and
     /// reference objects of the declared kinds.
     ///
@@ -352,17 +531,19 @@ impl<'a> ContentPack<'a> {
         active_manifest: ContentDigest,
         max_generations: usize,
     ) -> Result<Vec<ContentDigest>, ContentError> {
-        if max_generations == 0 || max_generations > MAX_OBJECTS / 2 {
+        const MAX_ROOTS_PER_GENERATION: usize = 7;
+        if max_generations == 0 || max_generations > MAX_OBJECTS / MAX_ROOTS_PER_GENERATION {
             return Err(ContentError::LimitExceeded);
         }
         let mut roots = Vec::new();
         roots
-            .try_reserve_exact(max_generations.saturating_mul(2))
+            .try_reserve_exact(max_generations.saturating_mul(MAX_ROOTS_PER_GENERATION))
             .map_err(|_| ContentError::MetadataExhausted)?;
         let mut next = Some(active_manifest);
         let mut newer_generation = None;
+        let mut generation_count = 0_usize;
         while let Some(digest) = next {
-            if roots.len() / 2 == max_generations || roots.contains(&digest) {
+            if generation_count == max_generations || roots.contains(&digest) {
                 return Err(ContentError::InvalidManifest);
             }
             let object = self.get(digest).ok_or(ContentError::MissingObject)?;
@@ -381,6 +562,33 @@ impl<'a> ContentPack<'a> {
             }
             roots.push(digest);
             roots.push(manifest.config());
+            generation_count += 1;
+            if let Some(security_digest) = manifest.security() {
+                let security_object = self
+                    .get(security_digest)
+                    .ok_or(ContentError::MissingObject)?;
+                if security_object.kind != ObjectKind::SecurityManifest {
+                    return Err(ContentError::InvalidManifest);
+                }
+                let security = SecurityManifest::parse(security_object.bytes)?;
+                if security.generation() != manifest.generation() {
+                    return Err(ContentError::InvalidManifest);
+                }
+                let typed = [
+                    (security.registry(), ObjectKind::IdentityRegistry),
+                    (security.mapping(), ObjectKind::IdentityMapping),
+                    (security.mount(), ObjectKind::MountPolicy),
+                    (security.acl(), ObjectKind::NativeAcl),
+                ];
+                roots.push(security_digest);
+                for (identity, expected_kind) in typed {
+                    let referenced = self.get(identity).ok_or(ContentError::MissingObject)?;
+                    if referenced.kind != expected_kind {
+                        return Err(ContentError::InvalidManifest);
+                    }
+                    roots.push(identity);
+                }
+            }
             newer_generation = Some(manifest.generation());
             next = manifest.previous();
         }
@@ -535,6 +743,14 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, ContentError> {
     Ok(u64::from_le_bytes(value))
 }
 
+fn copy_digest(bytes: &[u8], offset: usize) -> Result<[u8; 32], ContentError> {
+    bytes
+        .get(offset..offset + 32)
+        .ok_or(ContentError::InvalidManifest)?
+        .try_into()
+        .map_err(|_| ContentError::InvalidManifest)
+}
+
 fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
     bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
 }
@@ -663,7 +879,7 @@ mod tests {
 
     use super::{
         CONTENT_PACK_MAGIC, ContentDigest, ContentError, ContentPack, GenerationManifest,
-        HEADER_BYTES, ObjectKind, RECORD_BYTES, crc32_zeroed,
+        HEADER_BYTES, ObjectKind, RECORD_BYTES, SecurityManifest, crc32_zeroed,
     };
 
     fn pack(objects: &[(ObjectKind, &[u8])]) -> Vec<u8> {
@@ -746,6 +962,57 @@ mod tests {
             ContentPack::parse(&malformed_pack),
             Err(ContentError::InvalidManifest)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn security_manifest_is_typed_generation_bound_and_gc_rooted() -> Result<(), ContentError> {
+        let config = b"config";
+        let registry = b"registry";
+        let mapping = b"mapping";
+        let mount = b"mount";
+        let acl = b"acl";
+        let security = SecurityManifest::new(
+            1,
+            ContentDigest::of(registry),
+            ContentDigest::of(mapping),
+            ContentDigest::of(mount),
+            ContentDigest::of(acl),
+        )?
+        .encode();
+        let generation = GenerationManifest::new(1, ContentDigest::of(config), None)?
+            .with_security(ContentDigest::of(&security))?
+            .encode();
+        let image = pack(&[
+            (ObjectKind::SystemConfig, config),
+            (ObjectKind::IdentityRegistry, registry),
+            (ObjectKind::IdentityMapping, mapping),
+            (ObjectKind::MountPolicy, mount),
+            (ObjectKind::NativeAcl, acl),
+            (ObjectKind::SecurityManifest, &security),
+            (ObjectKind::GenerationManifest, &generation),
+        ]);
+        let store = ContentPack::parse(&image)?;
+        let roots = store.generation_roots(ContentDigest::of(&generation), 1)?;
+        assert_eq!(roots.len(), 7);
+        assert_eq!(
+            ContentPack::parse(&store.retain(&roots, 7, image.len())?)?.len(),
+            7
+        );
+
+        let wrong_kind = pack(&[
+            (ObjectKind::SystemConfig, config),
+            (ObjectKind::Data, registry),
+            (ObjectKind::IdentityMapping, mapping),
+            (ObjectKind::MountPolicy, mount),
+            (ObjectKind::NativeAcl, acl),
+            (ObjectKind::SecurityManifest, &security),
+            (ObjectKind::GenerationManifest, &generation),
+        ]);
+        assert_eq!(
+            ContentPack::parse(&wrong_kind)?.generation_roots(ContentDigest::of(&generation), 1),
+            Err(ContentError::InvalidManifest)
+        );
         Ok(())
     }
 

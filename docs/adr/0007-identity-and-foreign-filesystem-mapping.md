@@ -1,8 +1,6 @@
 # ADR 0007: identity and foreign filesystem mapping
 
-Status: accepted for Stage 8, 2026-08-24. Serialized registry, mapping-table,
-mount-record, and ACL formats still require versioned format records before a
-persistent writer consumes them.
+Status: accepted and implemented for Stage 8, 2026-08-24.
 
 ## Context
 
@@ -163,27 +161,28 @@ is available losslessly. Providers may not invent an implicit fallback.
   identity.
 - Copy and backup operations surface their security-metadata fidelity result.
 
-## Format work required before writes
+## Implemented format gate and future writers
 
-Before a persistent writer consumes this model, define and test:
+IREG, IMAP, IMNT, IACL, and ISEC v1 now provide the canonical records below;
+their exact layouts and installer entropy procedure are fixed in
+[identity-v1.md](../formats/identity-v1.md). `troe-identity` applies the `tiny`
+and `full` ceilings, strict parsing, iterative membership-cycle checks, and
+cross-object referential validation. GMAN/CSPK activation binds the complete
+typed snapshot to one generation and includes it in rollback and GC roots.
 
-- canonical serialized registry, mapping-snapshot, mount-record, and native ACL
-  encodings, each with magic, major/minor version, exact length, integrity
-  coverage, reserved-zero fields, and profile ceilings;
-- the installation entropy source and identifier-provisioning procedure for
-  each supported deployment;
-- crash-consistent generation activation and recovery tests shared with the
-  Stage 8 configuration store;
-- exact ext4 UID/GID, mode, POSIX ACL, and xattr feature validation in the
-  constrained ext4 format ADR; and
-- stable inspection APIs that return both native resolution and raw source
-  identity without treating display names as keys.
+The format/version/integrity ceilings, host-CSPRNG provisioning rule,
+crash-consistent generation recovery, and parser inspection APIs are now
+implemented and tested. Before a future multi-principal filesystem writer
+consumes them, its format ADR must additionally fix and test the provider's
+exact raw UID/GID, mode, POSIX ACL, xattr, and fidelity behavior. In particular,
+a writable ext4 expansion must not infer those rules from the current read-only
+subset.
 
 The owner-less KEFS image and single-session RAMFS remain unchanged because
 they are bootstrap formats with no multi-user security claim. Read-only
 filesystem experiments are permitted when they retain raw metadata and do not
 treat it as native authority. No persistent writer or stable VFS
-security-metadata ABI may land until its applicable format work above is
+security-metadata ABI may land until its provider-specific write rules are
 accepted.
 
 [ADR 0009](0009-persistent-filesystems-and-partitions.md) selects constrained

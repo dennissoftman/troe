@@ -308,7 +308,7 @@ remain the exhaustive safety gates; hardware runs add evidence for real
 firmware, memory maps, interrupts, timers, devices, and boot media. See
 [ADR 0016](adr/0016-hardware-targets-and-emulator-role.md).
 
-## Stage 8: networking and persistent operation (in progress)
+## Stage 8: networking and persistent operation (verified)
 
 The first portable storage/configuration boundary is landed:
 
@@ -384,13 +384,21 @@ The first portable storage/configuration boundary is landed:
   modern virtio-net queues run through q35 PCI and AArch64 MMIO; both QEMU
   profiles resolve the gateway by ARP and exchange UDP with a host peer on each
   of five independent process boots while rejecting unrelated traffic first.
+- `troe-identity` implements canonical checksummed IREG registry, IMAP foreign
+  mapping, IMNT mount-policy, and IACL native ACL formats under the accepted
+  `tiny` and `full` ceilings. It rejects every truncated/corrupted fixture,
+  duplicate compatibility and foreign keys, invalid SID/POSIX encodings,
+  missing or kind-incompatible principals, and iterative membership cycles.
+  ISEC v1 binds the four typed CSPK objects to GMAN; activation validates the
+  complete active and predecessor snapshots, and generation GC retains them as
+  transitive roots.
 
 These mechanisms are host verified; both VM block and network transports,
 read-only mount activation, the bounded TXSLOT transaction, digest-bound ext4
-CSPK/SACT recovery, selected state-filesystem mutation, and host UDP exchange
-are QEMU verified. Stage 8 is not complete until the accepted identity registry
-and foreign-mapping snapshots have canonical serialized formats integrated
-with generation and recovery selection.
+CSPK/SACT/ISEC recovery, selected state-filesystem mutation, and host UDP
+exchange are QEMU verified. Five independent acceptance processes per
+architecture revalidate the rolled-back generation-1 security snapshot and
+persist incremented state after deliberate terminal faults.
 
 ADR 0018 fixes the bootstrap semantics for the next storage increments. KEFS
 provides the immutable `/`, `/vol/root` is the selected persistent ext4 role,
@@ -401,19 +409,14 @@ match its stable disk, partition, and filesystem identities exactly; no disk,
 several disks, duplicate identities, and missing/corrupt root media all retain
 the KEFS recovery shell without guessing from enumeration order or labels.
 
-Continue Stage 8 by defining the registry/mapping serialized formats and
-integrating them with the persistent generation and recovery selection paths.
-
-### Next-session handoff
-
-Define the canonical identity-registry and foreign-mapping snapshot formats,
-then make the selected generation validate their immutable content addresses
-before activation. Keep parse ceilings, referential integrity, predecessor
-rollback, and malformed snapshots independently testable.
-
-Do not start with a filesystem parser coupled directly to a hardware driver or
-the shell. The block transport, region discovery, filesystem provider, VFS,
-configuration policy, and command surface must remain independently testable.
+Exit audit: the system boots both primary targets, configures one supported
+modern virtio NIC, exchanges UDP data with an independent host peer, persists
+activation and selected filesystem state across process termination/reopen, and
+holds declared memory ceilings under exhaustive truncation/checksum cases and a
+10,000-frame flood. Stage 8 is complete. Stage 9 deployment, update trust,
+diagnostics, migration, and broader filesystem/provider work must preserve the
+independently testable transport, region, provider, VFS, configuration, content,
+identity, and command boundaries established here.
 
 ## Deferred tooling and packaging track
 

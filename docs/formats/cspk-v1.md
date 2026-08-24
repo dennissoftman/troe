@@ -9,7 +9,8 @@ The header carries `CSPKv1\0\0`, version 1.0, 64-byte header and record sizes,
 exact total bytes, a whole-pack CRC32 at offset 20, object count at offset 24,
 and zero reserved bytes through offset 64. Each record contains SHA-256 at
 offset 0, object kind at 32, object offset/length at 40/44, and zero elsewhere.
-Kinds are SCFG, KEX application, generation manifest, and immutable data.
+Kinds are SCFG, KEX application, generation manifest, immutable data, identity
+registry, foreign mapping, mount policy, native ACL, and security manifest.
 
 Parsing verifies the whole-pack CRC, exact gapless layout, strict digest order,
 unique identities, all ceilings, and every object's SHA-256 before exposing a
@@ -18,6 +19,7 @@ deduplicates and sorts it, copies only verified objects, and produces a pack
 that must parse again before publication.
 
 GMAN v1 objects are parsed canonically during pack verification. Generation
-root traversal follows only explicit predecessor-manifest and SCFG digests,
-requires strictly descending generations and exact object kinds, and stops at
-the caller's hard generation ceiling before feeding mark-and-copy retention.
+root traversal follows explicit predecessor, SCFG, and optional ISEC digests.
+ISEC traversal adds its four exact typed identity objects. Resolution requires
+strictly descending generations and exact object kinds and stops at the caller's
+hard generation ceiling before feeding mark-and-copy retention.

@@ -184,6 +184,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "troe-identity"
+version = "0.1.0"
+
+[[package]]
 name = "troe-kernel"
 version = "0.1.0"
 dependencies = [
@@ -196,6 +200,7 @@ dependencies = [
  "troe-driver",
  "troe-ext4",
  "troe-gpt",
+ "troe-identity",
  "troe-machine",
  "troe-memory",
  "troe-mount",

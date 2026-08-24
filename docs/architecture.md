@@ -216,9 +216,9 @@ contained and reclaimed as invalid-call and translation faults.
 ## Stage 8 persistent-storage boundary
 
 The portable block-region, GPT, VFS-provider, read-only FAT32, constrained
-read-only ext4, native virtio transport, and dual-slot durability pieces now
-preserve this dependency direction. General filesystem mutation remains a
-future Stage 8 increment. A transport provides bounded block-region
+read-only ext4, native virtio transport, dual-slot durability, and selected
+STFS mutation pieces preserve this dependency direction. Broader filesystem
+mutation is a later provider expansion. A transport provides bounded block-region
 capabilities; partition discovery turns a whole device into non-overlapping
 regions; independently selected filesystem providers expose VFS objects.
 Format-specific structures do not enter the machine backend, block transport,
@@ -236,6 +236,13 @@ region; it names verified CSPK objects by SHA-256 and never turns them mutable.
 Early activation borrows the exactly BMNT-selected ext4 provider to read the
 bounded pack before normal namespace attachment, preserving ownership of both
 the root-volume device and the separately selected writable transaction device.
+
+Each GMAN optionally names one ISEC security root for the same generation. ISEC
+names exact typed IREG registry, IMAP foreign mapping, IMNT mount-policy, and
+IACL native ACL objects. `troe-identity` parses and cross-validates the complete
+snapshot before activation; partial objects, wrong kinds, generation mismatch,
+unresolved principals, or membership cycles reject the generation. Predecessor
+traversal and mark-and-copy retention carry all five security objects together.
 
 STFS is the separate narrow mutation provider. It consumes its own exact
 PRGN-selected writable region, commits the entire single-file filesystem

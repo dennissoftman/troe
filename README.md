@@ -50,6 +50,9 @@ handle calls, or is terminated by the 50 ms execution lease.
 - bounded Ethernet/ARP/IPv4/UDP primitives and native fixed-buffer modern
   virtio-net PCI/MMIO transports, with checksum/fragment/truncation rejection,
   a 10,000-frame resource-ceiling test, and QEMU-proven host UDP exchange;
+- canonical bounded identity registry, foreign mapping, mount-policy, and
+  native ACL snapshots, bound as typed immutable roots to active/predecessor
+  generations and revalidated through QEMU rollback/reopen;
 - a bounded modern virtio block core with native AArch64 `virtio-mmio` and
   x86-64 q35 virtio PCI transports; both have QEMU-proven post-handoff GPT
   discovery, exact BMNT disk/partition/ext4 identity selection, and a live
@@ -173,7 +176,7 @@ serial-first.
   memory models, shell, VFS/provider mounts, terminal/editor, accounting, and
   the isolated native machine mechanism crate;
 - `host`: Stage 0 composition and acceptance runner;
-- `kernel`: UEFI bootstrap and Stage 7 isolated owned-machine composition root;
+- `kernel`: UEFI bootstrap and Stage 8 owned-machine composition root;
 - `rootfs`, `assets`: source tree and generated KEFS image;
 - `tools`: dependency-free deterministic image builders;
 - `scripts`: build, verification, and emulator entry points;

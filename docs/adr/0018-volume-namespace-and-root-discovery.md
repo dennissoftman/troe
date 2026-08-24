@@ -3,8 +3,9 @@
 Status: accepted, 2026-08-24; BMNT v1 parsing and portable stable-identity
 resolution are implemented. The AArch64 QEMU profile now validates its embedded
 BMNT fixture before handoff and activates an exactly matched GPT/ext4 provider.
-Loading an installed manifest from the EFI system partition remains Stage 8
-installer/boot-source work.
+Loading an installed manifest from the EFI system partition belongs to Stage 9
+deployment tooling; the Stage 8 QEMU fixture validates the identical owned BMNT
+record and post-handoff selection rules.
 
 ## Context
 
