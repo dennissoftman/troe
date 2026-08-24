@@ -22,6 +22,7 @@ troe-mount = { path = "../crates/troe-mount" }
 troe-persist = { path = "../crates/troe-persist" }
 troe-shell = { path = "../crates/troe-shell" }
 troe-storage = { path = "../crates/troe-storage" }
+troe-statefs = { path = "../crates/troe-statefs" }
 troe-task = { path = "../crates/troe-task" }
 troe-terminal = { path = "../crates/troe-terminal" }
 troe-vfs = { path = "../crates/troe-vfs" }

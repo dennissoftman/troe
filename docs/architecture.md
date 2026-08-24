@@ -237,6 +237,11 @@ Early activation borrows the exactly BMNT-selected ext4 provider to read the
 bounded pack before normal namespace attachment, preserving ownership of both
 the root-volume device and the separately selected writable transaction device.
 
+STFS is the separate narrow mutation provider. It consumes its own exact
+PRGN-selected writable region, commits the entire single-file filesystem
+through TXSLOT, and attaches at `/vol/state`. The VFS mount records writable
+authority explicitly; ext4 and FAT retain read-only default mutation methods.
+
 KEFS is the intentionally built-in recovery exception. The current FAT12 image
 is read by firmware. General FAT12/16/32, exFAT, the default persistent ext4
 profile, and later NTFS support are separate providers; the first exact ext4

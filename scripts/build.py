@@ -60,6 +60,8 @@ def main() -> int:
             REPO_ROOT / "assets" / "boot.bmnt",
             "--persistence-selector",
             REPO_ROOT / "assets" / "persist.prgn",
+            "--state-selector",
+            REPO_ROOT / "assets" / "state.prgn",
         )
         run(
             sys.executable,

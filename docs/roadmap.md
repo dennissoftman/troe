@@ -373,11 +373,16 @@ The first portable storage/configuration boundary is landed:
   generation 2, applies its configured health failure, durably rolls back to
   generation 1, and verifies the exact recovered SACT payload after every
   subsequent process termination.
+- STFS v1 supplies the first writable filesystem provider: one bounded
+  `/state.bin` on its own exact PRGN-selected GPT region, with whole-filesystem
+  TXSLOT publication and explicit flushes. It mounts at `/vol/state`; both QEMU
+  profiles mutate it across five process terminations while the harness
+  independently checks transaction generation, STFS checksum, and file bytes.
 
 These mechanisms are host verified; both VM transports, read-only mount
 activation, the bounded TXSLOT transaction, and digest-bound ext4 CSPK/SACT
-recovery are QEMU verified. Stage 8 is not complete: FAT32 and ext4 remain
-read-only, and networking is still absent.
+recovery and selected state-filesystem mutation are QEMU verified. Stage 8 is
+not complete: FAT32 and ext4 remain read-only, and networking is still absent.
 
 ADR 0018 fixes the bootstrap semantics for the next storage increments. KEFS
 provides the immutable `/`, `/vol/root` is the selected persistent ext4 role,
@@ -390,18 +395,16 @@ the KEFS recovery shell without guessing from enumeration order or labels.
 
 Continue Stage 8 in this order:
 
-1. add filesystem mutation only with exact flush/FUA, dirty-state, corruption,
-   power-loss, and recovery tests;
-2. add bounded network-device capabilities and the minimal configured protocol
+1. add bounded network-device capabilities and the minimal configured protocol
    set before TCP; and
-3. define the registry/mapping serialized formats and integrate them with the
+2. define the registry/mapping serialized formats and integrate them with the
    persistent generation and recovery selection paths.
 
 ### Next-session handoff
 
-Continue with one deliberately narrow filesystem-mutation transaction, keeping
-exact flush/FUA, dirty-state, corruption, power-loss, and recovery behavior
-separate from general ext4 or FAT mutation.
+Continue with bounded network-device capabilities and the minimal configured
+protocol set before TCP. Keep packet parsing, queue ownership, and malformed or
+high-volume input ceilings independently testable.
 
 Do not start with a filesystem parser coupled directly to a hardware driver or
 the shell. The block transport, region discovery, filesystem provider, VFS,

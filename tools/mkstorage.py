@@ -47,6 +47,9 @@ TXSLOT_LAST_USABLE_LBA = TXSLOT_BACKUP_ARRAY_LBA - 1
 TXSLOT_DISK_GUID = bytes.fromhex("76543210fedcba9889abcdef01234567")
 TXSLOT_PARTITION_GUID = bytes.fromhex("67452301efcdab8998badcfe10325476")
 TXSLOT_TYPE_GUID = bytes.fromhex("8e5f0f3f1bde4fcbbf3d5d8a7ec96a21")
+STATEFS_DISK_GUID = bytes.fromhex("112233445566778899aabbccddeeff00")
+STATEFS_PARTITION_GUID = bytes.fromhex("2233445566778899aabbccddeeff0011")
+STATEFS_TYPE_GUID = bytes.fromhex("33445566778899aabbccddeeff001122")
 
 BMNT_HEADER_BYTES = 64
 BMNT_RECORD_BYTES = 96
@@ -84,14 +87,14 @@ def build_manifest() -> bytes:
     return bytes(image)
 
 
-def build_persistence_selector() -> bytes:
+def build_region_selector(disk_guid: bytes, partition_guid: bytes, type_guid: bytes) -> bytes:
     """Encode one exact GPT persistence-region selector."""
     image = bytearray(PRGN_BYTES)
     image[:8] = b"PRGNv1\0\0"
     struct.pack_into("<HHHHI", image, 8, 1, 0, PRGN_BYTES, 0, PRGN_BYTES)
-    image[24:40] = TXSLOT_DISK_GUID
-    image[40:56] = TXSLOT_PARTITION_GUID
-    image[56:72] = TXSLOT_TYPE_GUID
+    image[24:40] = disk_guid
+    image[40:56] = partition_guid
+    image[56:72] = type_guid
     checked = bytearray(image)
     checked[PRGN_CHECKSUM_OFFSET:PRGN_CHECKSUM_OFFSET + 4] = b"\0" * 4
     struct.pack_into("<I", image, PRGN_CHECKSUM_OFFSET, zlib.crc32(checked))
@@ -159,15 +162,17 @@ def build_gpt(filesystem: bytes) -> bytes:
     return bytes(image)
 
 
-def build_txslot_gpt() -> bytes:
+def build_small_gpt(
+    disk_guid: bytes, partition_guid: bytes, type_guid: bytes, name_text: str
+) -> bytes:
     """Create an empty four-block TXSLOT partition inside strict GPT metadata."""
     entries = bytearray(GPT_ARRAY_BYTES)
-    entries[:16] = TXSLOT_TYPE_GUID
-    entries[16:32] = TXSLOT_PARTITION_GUID
+    entries[:16] = type_guid
+    entries[16:32] = partition_guid
     struct.pack_into(
         "<QQQ", entries, 32, TXSLOT_PARTITION_START, TXSLOT_PARTITION_END, 0
     )
-    name = "state".encode("utf-16-le")
+    name = name_text.encode("utf-16-le")
     entries[56:56 + len(name)] = name
     entry_crc = zlib.crc32(entries)
 
@@ -178,7 +183,7 @@ def build_txslot_gpt() -> bytes:
     protective[510:512] = b"\x55\xaa"
     image[SECTOR_BYTES:2 * SECTOR_BYTES] = gpt_header(
         1, TXSLOT_BACKUP_HEADER_LBA, 2, entry_crc, FIRST_USABLE_LBA,
-        TXSLOT_LAST_USABLE_LBA, TXSLOT_DISK_GUID
+        TXSLOT_LAST_USABLE_LBA, disk_guid
     )
     image[2 * SECTOR_BYTES:2 * SECTOR_BYTES + GPT_ARRAY_BYTES] = entries
     backup_entries = TXSLOT_BACKUP_ARRAY_LBA * SECTOR_BYTES
@@ -186,7 +191,7 @@ def build_txslot_gpt() -> bytes:
     backup_header = TXSLOT_BACKUP_HEADER_LBA * SECTOR_BYTES
     image[backup_header:backup_header + SECTOR_BYTES] = gpt_header(
         TXSLOT_BACKUP_HEADER_LBA, 1, TXSLOT_BACKUP_ARRAY_LBA, entry_crc,
-        FIRST_USABLE_LBA, TXSLOT_LAST_USABLE_LBA, TXSLOT_DISK_GUID
+        FIRST_USABLE_LBA, TXSLOT_LAST_USABLE_LBA, disk_guid
     )
     return bytes(image)
 
@@ -278,6 +283,8 @@ def main() -> int:
     parser.add_argument("--content", type=Path, help="install CSPK bytes at /system.cspk")
     parser.add_argument("--persistence-selector", type=Path)
     parser.add_argument("--txslot-output", type=Path)
+    parser.add_argument("--state-selector", type=Path)
+    parser.add_argument("--statefs-output", type=Path)
     args = parser.parse_args()
     try:
         manifest = build_manifest()
@@ -286,7 +293,9 @@ def main() -> int:
         args.manifest.write_bytes(manifest)
         print(f"BMNT v1: {len(manifest)} bytes -> {args.manifest}")
         if args.persistence_selector is not None:
-            selector = build_persistence_selector()
+            selector = build_region_selector(
+                TXSLOT_DISK_GUID, TXSLOT_PARTITION_GUID, TXSLOT_TYPE_GUID
+            )
             args.persistence_selector.parent.mkdir(parents=True, exist_ok=True)
             args.persistence_selector.write_bytes(selector)
             print(f"PRGN v1: {len(selector)} bytes -> {args.persistence_selector}")
@@ -297,10 +306,26 @@ def main() -> int:
             args.output.write_bytes(disk)
             print(f"GPT/ext4 fixture: {len(disk)} bytes -> {args.output}")
         if args.txslot_output is not None:
-            txslot = build_txslot_gpt()
+            txslot = build_small_gpt(
+                TXSLOT_DISK_GUID, TXSLOT_PARTITION_GUID, TXSLOT_TYPE_GUID, "activation"
+            )
             args.txslot_output.parent.mkdir(parents=True, exist_ok=True)
             args.txslot_output.write_bytes(txslot)
             print(f"GPT/TXSLOT fixture: {len(txslot)} bytes -> {args.txslot_output}")
+        if args.state_selector is not None:
+            selector = build_region_selector(
+                STATEFS_DISK_GUID, STATEFS_PARTITION_GUID, STATEFS_TYPE_GUID
+            )
+            args.state_selector.parent.mkdir(parents=True, exist_ok=True)
+            args.state_selector.write_bytes(selector)
+            print(f"PRGN v1 statefs: {len(selector)} bytes -> {args.state_selector}")
+        if args.statefs_output is not None:
+            statefs = build_small_gpt(
+                STATEFS_DISK_GUID, STATEFS_PARTITION_GUID, STATEFS_TYPE_GUID, "statefs"
+            )
+            args.statefs_output.parent.mkdir(parents=True, exist_ok=True)
+            args.statefs_output.write_bytes(statefs)
+            print(f"GPT/statefs fixture: {len(statefs)} bytes -> {args.statefs_output}")
         return 0
     except (FileNotFoundError, OSError, ValueError, subprocess.CalledProcessError) as error:
         print(f"mkstorage: {error}", file=sys.stderr)

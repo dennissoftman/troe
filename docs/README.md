@@ -32,6 +32,8 @@ historical review evidence.
   object packs and their verify-before-publish collection contract.
 - [GMAN v1](formats/gman-v1.md) defines immutable active/predecessor generation
   roots and their bounded chain/garbage-collection traversal.
+- [STFS v1](formats/stfs-v1.md) defines the crash-consistent single-file
+  persistent state filesystem committed through TXSLOT.
 
 The repository root [README](../README.md), [security policy](../SECURITY.md),
 [contribution guide](../CONTRIBUTING.md), and [third-party inventory](../THIRD_PARTY.md)
@@ -70,6 +72,9 @@ transports.
 [ADR 0021](adr/0021-immutable-content-store-and-generation-rollback.md) fixes
 the bounded SHA-256-addressed immutable store, predecessor retention, and
 mark-and-copy garbage-collection direction.
+[ADR 0022](adr/0022-bounded-single-file-state-filesystem.md) fixes the narrow
+writable VFS provider, exact block authority, and crash-recovery contract for
+the first selected persistent filesystem mutation.
 ADR 0012 governs the completed Stage 5.1 terminal and
 framebuffer increment; AArch64 native keyboard input remains a later
 virtio-input transport decision. ADR 0013 governs the completed Stage 5.2

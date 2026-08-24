@@ -93,7 +93,7 @@ pub struct ProviderListing {
     pub next_cursor: Option<u64>,
 }
 
-/// Narrow read-only filesystem-provider interface consumed by the VFS.
+/// Narrow filesystem-provider interface consumed by the VFS.
 ///
 /// Paths are absolute within the provider root and must already satisfy the
 /// VFS normalization bounds. Providers independently validate them because a
@@ -141,6 +141,31 @@ pub trait ReadOnlyFileSystem: fmt::Debug {
         max_entries: usize,
         max_name_bytes: usize,
     ) -> Result<ProviderListing, FsError>;
+
+    /// Atomically create or replace one complete regular file.
+    ///
+    /// Read-only providers retain this default. A writable provider must not
+    /// report success until its declared durability transaction completes.
+    ///
+    /// # Errors
+    ///
+    /// The default rejects every request as read-only. Writable providers
+    /// report their bounded path, space, corruption, or transport failures.
+    fn write_file(&mut self, _path: &str, _bytes: &[u8]) -> Result<(), FsError> {
+        Err(FsError::ReadOnly)
+    }
+
+    /// Atomically remove one regular file.
+    ///
+    /// Read-only providers retain this default.
+    ///
+    /// # Errors
+    ///
+    /// The default rejects every request as read-only. Writable providers
+    /// report their bounded path, corruption, or transport failures.
+    fn remove_file(&mut self, _path: &str) -> Result<(), FsError> {
+        Err(FsError::ReadOnly)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -202,6 +227,7 @@ pub struct DirectoryListing {
 struct ProviderMount {
     path: String,
     provider: Box<dyn ReadOnlyFileSystem>,
+    writable: bool,
 }
 
 /// Unified immutable-root, writable-RAM, and mounted-provider namespace.
@@ -338,7 +364,30 @@ impl Namespace {
     pub fn mount_read_only(
         &mut self,
         path: &str,
+        provider: Box<dyn ReadOnlyFileSystem>,
+    ) -> Result<(), FsError> {
+        self.mount_provider(path, provider, false)
+    }
+
+    /// Attach a validated writable provider at one empty namespace path.
+    ///
+    /// # Errors
+    ///
+    /// Applies the same path, collision, nesting, and provider-root checks as
+    /// [`Self::mount_read_only`].
+    pub fn mount_writable(
+        &mut self,
+        path: &str,
+        provider: Box<dyn ReadOnlyFileSystem>,
+    ) -> Result<(), FsError> {
+        self.mount_provider(path, provider, true)
+    }
+
+    fn mount_provider(
+        &mut self,
+        path: &str,
         mut provider: Box<dyn ReadOnlyFileSystem>,
+        writable: bool,
     ) -> Result<(), FsError> {
         let path = canonicalize("/", path)?;
         if path == "/" || self.mount_for_path(&path).is_some() {
@@ -368,7 +417,11 @@ impl Namespace {
         if !target_exists {
             self.nodes.insert(path.clone(), Node::Directory);
         }
-        self.mounts.push(ProviderMount { path, provider });
+        self.mounts.push(ProviderMount {
+            path,
+            provider,
+            writable,
+        });
         self.mounts.sort_unstable_by(|left, right| {
             right
                 .path
@@ -431,8 +484,11 @@ impl Namespace {
     /// Fails for invalid paths, immutable targets, missing parents, or quota exhaustion.
     pub fn write_file(&mut self, cwd: &str, path: &str, bytes: &[u8]) -> Result<(), FsError> {
         let path = canonicalize(cwd, path)?;
-        if self.mount_for_path(&path).is_some() {
-            return Err(FsError::ReadOnly);
+        if let Some((index, relative)) = self.mount_for_path(&path) {
+            if !self.mounts[index].writable {
+                return Err(FsError::ReadOnly);
+            }
+            return self.mounts[index].provider.write_file(&relative, bytes);
         }
         if !is_under_tmp(&path) {
             return Err(FsError::ReadOnly);
@@ -491,8 +547,11 @@ impl Namespace {
     /// Fails if the path is invalid, missing, immutable, or not a file.
     pub fn remove_file(&mut self, cwd: &str, path: &str) -> Result<(), FsError> {
         let path = canonicalize(cwd, path)?;
-        if self.mount_for_path(&path).is_some() {
-            return Err(FsError::ReadOnly);
+        if let Some((index, relative)) = self.mount_for_path(&path) {
+            if !self.mounts[index].writable {
+                return Err(FsError::ReadOnly);
+            }
+            return self.mounts[index].provider.remove_file(&relative);
         }
         match self.nodes.get(&path) {
             Some(Node::File {

@@ -137,6 +137,10 @@ def prepare_qemu_command(
                 str(REPO_ROOT / "assets" / "persist.prgn"),
                 "--txslot-output",
                 str(REPO_ROOT / "build" / f"storage-txslot-{architecture}.img"),
+                "--state-selector",
+                str(REPO_ROOT / "assets" / "state.prgn"),
+                "--statefs-output",
+                str(REPO_ROOT / "build" / f"storage-statefs-{architecture}.img"),
             ],
             cwd=REPO_ROOT,
             check=True,
@@ -152,6 +156,9 @@ def prepare_qemu_command(
     txslot = REPO_ROOT / "build" / f"storage-txslot-{architecture}.img"
     if not txslot.is_file() or txslot.stat().st_size != 4_096 * 512:
         raise FileNotFoundError(f"TXSLOT fixture not found or invalid: {txslot}")
+    statefs = REPO_ROOT / "build" / f"storage-statefs-{architecture}.img"
+    if not statefs.is_file() or statefs.stat().st_size != 4_096 * 512:
+        raise FileNotFoundError(f"statefs fixture not found or invalid: {statefs}")
     variables = REPO_ROOT / "build" / f"qemu-vars-{architecture}.fd"
     shutil.copyfile(vars_source, variables)
 
@@ -205,6 +212,15 @@ def prepare_qemu_command(
                 else "virtio-blk-device"
             )
             + ",drive=troe-txslot",
+            "-drive",
+            f"if=none,format=raw,cache=writeback,id=troe-statefs,file={statefs}",
+            "-device",
+            (
+                "virtio-blk-pci,disable-legacy=on"
+                if architecture == "x86_64"
+                else "virtio-blk-device"
+            )
+            + ",drive=troe-statefs",
             "-no-reboot",
         )
     )

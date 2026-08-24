@@ -52,6 +52,8 @@ mod firmware {
     use troe_persist::{DualSlotStore, RegionSelector, TRANSACTION_BLOCKS};
     use troe_shell::{CompletionConfig, Shell};
     #[cfg(feature = "acceptance-probes")]
+    use troe_statefs::{STATE_PATH, StateFs};
+    #[cfg(feature = "acceptance-probes")]
     use troe_storage::read_selected_file;
     use troe_storage::{ActivationLimits, prepare_read_only};
     use troe_task::{
@@ -62,7 +64,7 @@ mod firmware {
         EditorConfig, EditorOutcome, FramebufferDescriptor, FramebufferPixelFormat, InputDecoder,
         KeyboardConfig, LineEditor, Ps2Set1Decoder, TextConsole, TextConsoleConfig,
     };
-    use troe_vfs::{Namespace, RamFsQuota};
+    use troe_vfs::{Namespace, RamFsQuota, ReadOnlyFileSystem};
     use uefi::boot;
     use uefi::mem::memory_map::{MemoryMap, MemoryMapOwned};
     use uefi::prelude::*;
@@ -72,6 +74,8 @@ mod firmware {
     const BOOT_MOUNT_MANIFEST: &[u8] = include_bytes!("../../assets/boot.bmnt");
     #[cfg(feature = "acceptance-probes")]
     const PERSISTENCE_SELECTOR: &[u8] = include_bytes!("../../assets/persist.prgn");
+    #[cfg(feature = "acceptance-probes")]
+    const STATEFS_SELECTOR: &[u8] = include_bytes!("../../assets/state.prgn");
     #[cfg(feature = "acceptance-probes")]
     const INITIAL_ACTIVATION: &[u8] = include_bytes!("../../assets/system.sact");
     const OWNED_HEAP_BYTES: u64 = 6 * 1024 * 1024;
@@ -199,8 +203,14 @@ mod firmware {
         kernel_runtime: PhysicalRange,
         kernel_plan: MappingPlan,
         native_blocks: RefCell<Vec<troe_machine::NativeVirtioBlock>>,
+        native_statefs: RefCell<Option<Box<dyn ReadOnlyFileSystem>>>,
         boot_mount_manifest: BootMountManifest,
     }
+
+    type NativeBlockInitialization = (
+        Vec<troe_machine::NativeVirtioBlock>,
+        Option<Box<dyn ReadOnlyFileSystem>>,
+    );
 
     #[derive(Clone, Copy)]
     struct TaskStackLayout {
@@ -427,7 +437,7 @@ mod firmware {
             return Err(());
         }
         let boot_mount_manifest = prepared.boot_mount_manifest.as_ref().ok_or(())?;
-        let native_blocks = initialize_native_blocks(boot_mount_manifest)?;
+        let (native_blocks, native_statefs) = initialize_native_blocks(boot_mount_manifest)?;
         let boot_mount_manifest = prepared.boot_mount_manifest.take().ok_or(())?;
         troe_machine::initialize_input_interrupts(InputQueueConfig::tiny()).map_err(|_| ())?;
         if !troe_machine::write(b"interrupt-driven input: ready\n") {
@@ -444,13 +454,14 @@ mod firmware {
             kernel_runtime: prepared.boot_memory.arena,
             kernel_plan: mapping_plan,
             native_blocks: RefCell::new(native_blocks),
+            native_statefs: RefCell::new(native_statefs),
             boot_mount_manifest,
         })
     }
 
     fn initialize_native_blocks(
         boot_mount_manifest: &BootMountManifest,
-    ) -> Result<Vec<troe_machine::NativeVirtioBlock>, ()> {
+    ) -> Result<NativeBlockInitialization, ()> {
         #[cfg(not(feature = "acceptance-probes"))]
         let _ = boot_mount_manifest;
         #[cfg(target_arch = "aarch64")]
@@ -466,7 +477,9 @@ mod firmware {
             device.read_blocks(0, 1, &mut first_block).map_err(|_| ())?;
         }
         #[cfg(feature = "acceptance-probes")]
-        probe_native_persistence(&mut devices, boot_mount_manifest)?;
+        let statefs = Some(probe_native_persistence(&mut devices, boot_mount_manifest)?);
+        #[cfg(not(feature = "acceptance-probes"))]
+        let statefs = None;
         if devices.is_empty() {
             if !troe_machine::write(b"native virtio block: no devices\n") {
                 return Err(());
@@ -474,14 +487,14 @@ mod firmware {
         } else if !troe_machine::write(b"native virtio block: ready\n") {
             return Err(());
         }
-        Ok(devices)
+        Ok((devices, statefs))
     }
 
     #[cfg(feature = "acceptance-probes")]
     fn probe_native_persistence(
         devices: &mut Vec<troe_machine::NativeVirtioBlock>,
         boot_mount_manifest: &BootMountManifest,
-    ) -> Result<(), ()> {
+    ) -> Result<Box<dyn ReadOnlyFileSystem>, ()> {
         let activation_limits = native_activation_limits()?;
         let content_bytes = read_selected_file(
             boot_mount_manifest,
@@ -495,6 +508,71 @@ mod firmware {
         let content = ContentPack::parse(&content_bytes).map_err(|_| ())?;
         let bootstrap = ActivationPointer::parse(INITIAL_ACTIVATION).map_err(|_| ())?;
         let selector = RegionSelector::parse(PERSISTENCE_SELECTOR).map_err(|_| ())?;
+        let region = take_transaction_region(devices, selector)?;
+        let mut store = DualSlotStore::open(region).map_err(|_| ())?;
+        let recovered = store
+            .payload()
+            .map(ActivationPointer::parse)
+            .transpose()
+            .map_err(|_| ())?;
+        let mut pointer = recovered.unwrap_or(bootstrap);
+        let rollback_required = validate_generation_pointer(&content, pointer)?;
+        store.commit(&pointer.encode()).map_err(|_| ())?;
+        if recovered.is_none() {
+            if !troe_machine::write(b"native generation: candidate published\n") {
+                return Err(());
+            }
+            if rollback_required {
+                let previous = pointer.previous().ok_or(())?;
+                pointer = ActivationPointer::new(previous, None).map_err(|_| ())?;
+                if validate_generation_pointer(&content, pointer)? {
+                    return Err(());
+                }
+                store.commit(&pointer.encode()).map_err(|_| ())?;
+                if !troe_machine::write(b"native generation: health rollback committed\n") {
+                    return Err(());
+                }
+            }
+        }
+        if !troe_machine::write(b"native content: selected ext4 CSPK verified\n") {
+            return Err(());
+        }
+        if !troe_machine::write(b"native persistence: committed and flushed\n") {
+            return Err(());
+        }
+
+        let state_selector = RegionSelector::parse(STATEFS_SELECTOR).map_err(|_| ())?;
+        let state_region = take_transaction_region(devices, state_selector)?;
+        let mut statefs = StateFs::mount(state_region).map_err(|_| ())?;
+        let mut prior = [0_u8; 8];
+        let next = match statefs.read_file(STATE_PATH, 0, &mut prior) {
+            Ok(8) => u64::from_le_bytes(prior).checked_add(1).ok_or(())?,
+            Err(troe_vfs::FsError::NotFound) => 1,
+            _ => return Err(()),
+        };
+        statefs
+            .write_file(STATE_PATH, &next.to_le_bytes())
+            .map_err(|_| ())?;
+        let mut verified = [0_u8; 8];
+        if statefs
+            .read_file(STATE_PATH, 0, &mut verified)
+            .map_err(|_| ())?
+            != 8
+            || u64::from_le_bytes(verified) != next
+        {
+            return Err(());
+        }
+        if !troe_machine::write(b"native statefs: mutation committed and flushed\n") {
+            return Err(());
+        }
+        Ok(Box::new(statefs))
+    }
+
+    #[cfg(feature = "acceptance-probes")]
+    fn take_transaction_region(
+        devices: &mut Vec<troe_machine::NativeVirtioBlock>,
+        selector: RegionSelector,
+    ) -> Result<BlockRegion<troe_machine::NativeVirtioBlock>, ()> {
         let discovery_limits = BlockLimits::new(32, 16 * 1024, 1).map_err(|_| ())?;
         let gpt_limits = GptLimits::new(128, 16 * 1024, 4).map_err(|_| ())?;
         let mut selected = None;
@@ -542,38 +620,7 @@ mod firmware {
             limits,
         )
         .map_err(|_| ())?;
-        let mut store = DualSlotStore::open(region).map_err(|_| ())?;
-        let recovered = store
-            .payload()
-            .map(ActivationPointer::parse)
-            .transpose()
-            .map_err(|_| ())?;
-        let mut pointer = recovered.unwrap_or(bootstrap);
-        let rollback_required = validate_generation_pointer(&content, pointer)?;
-        store.commit(&pointer.encode()).map_err(|_| ())?;
-        if recovered.is_none() {
-            if !troe_machine::write(b"native generation: candidate published\n") {
-                return Err(());
-            }
-            if rollback_required {
-                let previous = pointer.previous().ok_or(())?;
-                pointer = ActivationPointer::new(previous, None).map_err(|_| ())?;
-                if validate_generation_pointer(&content, pointer)? {
-                    return Err(());
-                }
-                store.commit(&pointer.encode()).map_err(|_| ())?;
-                if !troe_machine::write(b"native generation: health rollback committed\n") {
-                    return Err(());
-                }
-            }
-        }
-        if !troe_machine::write(b"native content: selected ext4 CSPK verified\n") {
-            return Err(());
-        }
-        if !troe_machine::write(b"native persistence: committed and flushed\n") {
-            return Err(());
-        }
-        Ok(())
+        Ok(region)
     }
 
     #[cfg(feature = "acceptance-probes")]
@@ -2439,6 +2486,11 @@ mod firmware {
             mount
                 .attach(namespace)
                 .unwrap_or_else(|_| fatal(b"fatal: cannot attach native filesystem provider\n"));
+        }
+        if let Some(statefs) = accounting.native_statefs.borrow_mut().take() {
+            namespace
+                .mount_writable("/vol/state", statefs)
+                .unwrap_or_else(|_| fatal(b"fatal: cannot attach native state filesystem\n"));
         }
         if desired_system_available && mount_count != 0 {
             if write_all(console, b"native storage: /vol/root read-only\n").is_err() {

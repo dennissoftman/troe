@@ -45,6 +45,8 @@ handle calls, or is terminated by the 50 ms execution lease.
   recovery on both QEMU transports; plus a bounded SHA-256-addressed immutable
   content pack loaded from the exactly selected ext4 root and a digest-bound
   active/predecessor SCFG publication pointer with QEMU-proven health rollback;
+- a bounded single-file persistent state filesystem mounted writable at
+  `/vol/state`, with native flush/reopen recovery on both architectures;
 - a bounded modern virtio block core with native AArch64 `virtio-mmio` and
   x86-64 q35 virtio PCI transports; both have QEMU-proven post-handoff GPT
   discovery, exact BMNT disk/partition/ext4 identity selection, and a live

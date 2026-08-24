@@ -41,6 +41,11 @@ def txslot_path(architecture: str) -> Path:
     return REPO_ROOT / "build" / f"storage-txslot-{architecture}.img"
 
 
+def statefs_path(architecture: str) -> Path:
+    """Return the architecture-private writable filesystem medium."""
+    return REPO_ROOT / "build" / f"storage-statefs-{architecture}.img"
+
+
 def reset_txslot(architecture: str) -> None:
     """Start one architecture's process-reopen sequence from empty media."""
     path = txslot_path(architecture)
@@ -54,15 +59,19 @@ def reset_txslot(architecture: str) -> None:
             str(REPO_ROOT / "assets" / "persist.prgn"),
             "--txslot-output",
             str(path),
+            "--state-selector",
+            str(REPO_ROOT / "assets" / "state.prgn"),
+            "--statefs-output",
+            str(statefs_path(architecture)),
         ],
         cwd=REPO_ROOT,
         check=True,
     )
 
 
-def txslot_state(architecture: str) -> tuple[int, bytes]:
+def dual_slot_state(architecture: str, path: Path) -> tuple[int, bytes]:
     """Validate TXSLOT v1 and return its newest generation and payload."""
-    image = txslot_path(architecture).read_bytes()
+    image = path.read_bytes()
     if len(image) != TXSLOT_DISK_BYTES:
         raise AcceptanceError(f"{architecture} TXSLOT image has invalid length")
     image = image[TXSLOT_PARTITION_OFFSET:TXSLOT_PARTITION_OFFSET + TXSLOT_BYTES]
@@ -99,6 +108,28 @@ def txslot_state(architecture: str) -> tuple[int, bytes]:
     if not generations or len(generation_numbers) != len(set(generation_numbers)):
         raise AcceptanceError(f"{architecture} TXSLOT has no unique committed generation")
     return max(generations, key=lambda state: state[0])
+
+
+def txslot_state(architecture: str) -> tuple[int, bytes]:
+    """Return the activation transaction state."""
+    return dual_slot_state(architecture, txslot_path(architecture))
+
+
+def statefs_counter(architecture: str) -> tuple[int, int]:
+    """Validate STFS v1 and return transaction generation and file counter."""
+    generation, payload = dual_slot_state(architecture, statefs_path(architecture))
+    if len(payload) != 40 or payload[:8] != b"STFSv1\0\0":
+        raise AcceptanceError(f"{architecture} statefs payload is malformed")
+    checked = bytearray(payload)
+    checked[20:24] = bytes(4)
+    valid = (
+        struct.unpack_from("<HHHHI", payload, 8) == (1, 0, 32, 1, 8)
+        and payload[24:32] == bytes(8)
+        and zlib.crc32(checked) == struct.unpack_from("<I", payload, 20)[0]
+    )
+    if not valid:
+        raise AcceptanceError(f"{architecture} statefs image failed validation")
+    return generation, struct.unpack_from("<Q", payload, 32)[0]
 
 
 def assert_rolled_back_sact(architecture: str, payload: bytes) -> None:
@@ -819,6 +850,16 @@ def run_fault_scenario(
         raise AcceptanceError(
             f"{session.architecture} did not verify selected ext4 content"
         )
+    if "native statefs: mutation committed and flushed" not in session.transcript():
+        raise AcceptanceError(
+            f"{session.architecture} did not commit persistent filesystem mutation"
+        )
+    session.command(
+        "hexdump /vol/state/state.bin",
+        "/",
+        command_timeout,
+        contains=("00000000  ",),
+    )
     start = len(session.output)
     command = "task-probe guard" if fault == "guard" else f"mmu-probe {fault}"
     session.send(command, command_timeout)
@@ -907,6 +948,13 @@ def test_architecture(
                     f"{actual_generation}, expected {expected_generation}"
                 )
             assert_rolled_back_sact(architecture, payload)
+            state_generation, counter = statefs_counter(architecture)
+            expected_state = expected_generation - 1
+            if state_generation != expected_state or counter != expected_state:
+                raise AcceptanceError(
+                    f"{architecture} statefs recovered generation {state_generation} "
+                    f"and counter {counter}, expected {expected_state}"
+                )
     if args.native_keyboard and architecture == "x86_64":
         run_native_keyboard_scenario(args)
     suite = "smoke" if args.smoke else "acceptance"

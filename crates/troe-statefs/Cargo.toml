@@ -1,0 +1,15 @@
+[package]
+name = "troe-statefs"
+description = "Bounded crash-consistent single-file persistent filesystem for TROE"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+troe-block = { path = "../troe-block" }
+troe-persist = { path = "../troe-persist" }
+troe-vfs = { path = "../troe-vfs" }
+
+[lints]
+workspace = true
