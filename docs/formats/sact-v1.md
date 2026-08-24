@@ -30,3 +30,7 @@ requires the referenced SCFG bytes to parse canonically and reproduce all
 four identity fields before activation. TXSLOT supplies atomic predecessor
 selection for pointer updates; SACT does not make the referenced immutable
 objects mutable.
+
+The initial installation may carry one 128-byte bootstrap SACT record in the
+boot image. TROE resolves its digest only from the exactly BMNT-selected CSPK;
+after the first durable publish, the PRGN-selected TXSLOT copy is authoritative.

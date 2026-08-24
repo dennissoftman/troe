@@ -43,7 +43,8 @@ handle calls, or is terminated by the 50 ms execution lease.
   data/flush/commit/flush ordering, host fault injection at every boundary,
   a checksummed exact-GPT-identity region selector, and native process-reopen
   recovery on both QEMU transports; plus a bounded SHA-256-addressed immutable
-  content pack and digest-bound active/predecessor SCFG publication pointer;
+  content pack loaded from the exactly selected ext4 root and a digest-bound
+  active/predecessor SCFG publication pointer;
 - a bounded modern virtio block core with native AArch64 `virtio-mmio` and
   x86-64 q35 virtio PCI transports; both have QEMU-proven post-handoff GPT
   discovery, exact BMNT disk/partition/ext4 identity selection, and a live

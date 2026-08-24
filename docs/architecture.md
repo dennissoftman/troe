@@ -233,6 +233,9 @@ block transport -> bounded region -> filesystem provider -> VFS namespace
 CSPK immutable objects sit above the selected provider. SACT is the separate
 mutable publication pointer committed through a PRGN-selected dual-slot block
 region; it names verified CSPK objects by SHA-256 and never turns them mutable.
+Early activation borrows the exactly BMNT-selected ext4 provider to read the
+bounded pack before normal namespace attachment, preserving ownership of both
+the root-volume device and the separately selected writable transaction device.
 
 KEFS is the intentionally built-in recovery exception. The current FAT12 image
 is read by firmware. General FAT12/16/32, exFAT, the default persistent ext4

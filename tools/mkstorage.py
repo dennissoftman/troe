@@ -191,7 +191,7 @@ def build_txslot_gpt() -> bytes:
     return bytes(image)
 
 
-def create_ext4() -> bytes:
+def create_ext4(content: bytes | None = None) -> bytes:
     """Build a clean, bounded ext4 v1 filesystem using e2fsprogs."""
     mke2fs = shutil.which("mke2fs")
     e2fsck = shutil.which("e2fsck")
@@ -205,8 +205,14 @@ def create_ext4() -> bytes:
         nested.mkdir(parents=True)
         (source / "hello.txt").write_bytes(b"native ext4 mount\n")
         (nested / "state.txt").write_bytes(b"read-only activation complete\n")
+        if content is not None:
+            (source / "system.cspk").write_bytes(content)
         timestamp = int(FAKE_TIME)
-        for path in (source / "hello.txt", nested / "state.txt", nested, source):
+        paths = [source / "hello.txt", nested / "state.txt"]
+        if content is not None:
+            paths.append(source / "system.cspk")
+        paths.extend((nested, source))
+        for path in paths:
             os.utime(path, (timestamp, timestamp))
 
         filesystem = root / "root.ext4"
@@ -269,6 +275,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--output", type=Path, help="also create the GPT/ext4 disk image")
+    parser.add_argument("--content", type=Path, help="install CSPK bytes at /system.cspk")
     parser.add_argument("--persistence-selector", type=Path)
     parser.add_argument("--txslot-output", type=Path)
     args = parser.parse_args()
@@ -284,7 +291,8 @@ def main() -> int:
             args.persistence_selector.write_bytes(selector)
             print(f"PRGN v1: {len(selector)} bytes -> {args.persistence_selector}")
         if args.output is not None:
-            disk = build_gpt(create_ext4())
+            content = args.content.read_bytes() if args.content is not None else None
+            disk = build_gpt(create_ext4(content))
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_bytes(disk)
             print(f"GPT/ext4 fixture: {len(disk)} bytes -> {args.output}")

@@ -796,6 +796,10 @@ def run_fault_scenario(
         raise AcceptanceError(
             f"{session.architecture} did not complete the native TXSLOT transaction"
         )
+    if "native content: selected ext4 CSPK verified" not in session.transcript():
+        raise AcceptanceError(
+            f"{session.architecture} did not verify selected ext4 content"
+        )
     start = len(session.output)
     command = "task-probe guard" if fault == "guard" else f"mmu-probe {fault}"
     session.send(command, command_timeout)
@@ -929,6 +933,8 @@ def main() -> int:
                     str(REPO_ROOT / "assets" / "boot.bmnt"),
                     "--output",
                     str(REPO_ROOT / "build" / "storage-root.img"),
+                    "--content",
+                    str(REPO_ROOT / "assets" / "system.cspk"),
                 ],
                 cwd=REPO_ROOT,
                 check=True,

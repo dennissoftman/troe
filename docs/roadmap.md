@@ -363,15 +363,15 @@ The first portable storage/configuration boundary is landed:
 - `troe-content` implements the bounded CSPK v1 immutable object pack with
   canonical SHA-256 addressing, strict whole-pack and per-object verification,
   binary lookup, deduplication, and budgeted mark-and-copy retention. Both
-  native acceptance paths resolve the digest-bound SCFG from a verified pack
-  before publishing or recovering its SACT pointer.
+  native acceptance paths borrow the BMNT-selected ext4 provider to read
+  `/system.cspk`, resolve its digest-bound SCFG, and only then publish or
+  recover its SACT pointer. The kernel embeds only the 128-byte bootstrap SACT
+  record, not the CSPK or SCFG bytes.
 
 These mechanisms are host verified; both VM transports, read-only mount
-activation, the bounded TXSLOT transaction, and digest-bound CSPK/SACT recovery
-are QEMU verified. Stage 8 is not complete: FAT32 and ext4 remain read-only,
-the verified content pack is still embedded in the acceptance image rather
-than loaded from `/vol/root`, and generation health rollback and networking
-are still absent.
+activation, the bounded TXSLOT transaction, and digest-bound ext4 CSPK/SACT
+recovery are QEMU verified. Stage 8 is not complete: FAT32 and ext4 remain
+read-only, and generation health rollback and networking are still absent.
 
 ADR 0018 fixes the bootstrap semantics for the next storage increments. KEFS
 provides the immutable `/`, `/vol/root` is the selected persistent ext4 role,
@@ -384,9 +384,9 @@ the KEFS recovery shell without guessing from enumeration order or labels.
 
 Continue Stage 8 in this order:
 
-1. load the CSPK pack from the exactly selected `/vol/root`, construct active
-   and predecessor generations, and exercise health-triggered rollback through
-   SACT while preserving the verified mark-and-copy bounds;
+1. construct active and predecessor generations from the selected CSPK and
+   exercise health-triggered rollback through SACT while preserving the
+   verified mark-and-copy bounds;
 2. add filesystem mutation only with exact flush/FUA, dirty-state, corruption,
    power-loss, and recovery tests;
 3. add bounded network-device capabilities and the minimal configured protocol
@@ -396,11 +396,10 @@ Continue Stage 8 in this order:
 
 ### Next-session handoff
 
-Continue the generation increment by loading the verified CSPK pack through the
-BMNT-selected ext4 provider instead of embedding it in the acceptance image,
-then make the active/predecessor health transition explicit. Do not interpret
-the small SACT transaction record as permission to expose general ext4 or FAT
-mutation.
+Continue the generation increment by making the active/predecessor health
+transition explicit against the CSPK now loaded through the BMNT-selected ext4
+provider. Do not interpret the small SACT transaction record as permission to
+expose general ext4 or FAT mutation.
 
 Do not start with a filesystem parser coupled directly to a hardware driver or
 the shell. The block transport, region discovery, filesystem provider, VFS,

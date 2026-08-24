@@ -131,6 +131,8 @@ def prepare_qemu_command(
                 str(REPO_ROOT / "assets" / "boot.bmnt"),
                 "--output",
                 str(REPO_ROOT / "build" / "storage-root.img"),
+                "--content",
+                str(REPO_ROOT / "assets" / "system.cspk"),
                 "--persistence-selector",
                 str(REPO_ROOT / "assets" / "persist.prgn"),
                 "--txslot-output",

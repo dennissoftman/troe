@@ -74,6 +74,8 @@ def main() -> int:
             REPO_ROOT / "assets" / "system.scfg",
             "--output",
             REPO_ROOT / "assets" / "system.cspk",
+            "--activation-output",
+            REPO_ROOT / "assets" / "system.sact",
         )
 
         for architecture in architectures:

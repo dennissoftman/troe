@@ -27,9 +27,9 @@ mod firmware {
     use troe_block::{BlockAccess, BlockRegion};
     use troe_block::{BlockDevice, BlockLimits};
     #[cfg(feature = "acceptance-probes")]
-    use troe_config::{ActivationPointer, ConfigReference};
+    use troe_config::ActivationPointer;
     #[cfg(feature = "acceptance-probes")]
-    use troe_content::{ContentPack, ObjectKind};
+    use troe_content::{ContentPack, MAX_PACK_BYTES, ObjectKind};
     use troe_core::{Input, MAX_LINE_BYTES, MachineMemorySnapshot, Output, StreamError};
     use troe_dispatch::{
         ConsoleService, CopiedMessage, DispatchedOutput, Dispatcher, HandleOwner, ReplyStatus,
@@ -49,6 +49,8 @@ mod firmware {
     #[cfg(feature = "acceptance-probes")]
     use troe_persist::{DualSlotStore, RegionSelector, TRANSACTION_BLOCKS};
     use troe_shell::{CompletionConfig, Shell};
+    #[cfg(feature = "acceptance-probes")]
+    use troe_storage::read_selected_file;
     use troe_storage::{ActivationLimits, prepare_read_only};
     use troe_task::{
         Capabilities, IsolationResource, Scheduler, StackResource, TaskFault, TaskId, TaskState,
@@ -69,9 +71,7 @@ mod firmware {
     #[cfg(feature = "acceptance-probes")]
     const PERSISTENCE_SELECTOR: &[u8] = include_bytes!("../../assets/persist.prgn");
     #[cfg(feature = "acceptance-probes")]
-    const SYSTEM_CONFIG: &[u8] = include_bytes!("../../assets/system.scfg");
-    #[cfg(feature = "acceptance-probes")]
-    const SYSTEM_CONTENT: &[u8] = include_bytes!("../../assets/system.cspk");
+    const INITIAL_ACTIVATION: &[u8] = include_bytes!("../../assets/system.sact");
     const OWNED_HEAP_BYTES: u64 = 6 * 1024 * 1024;
     const PAGE_TABLE_BYTES: u64 = 2 * 1024 * 1024;
     const OWNED_STACK_BYTES: u64 = 128 * 1024;
@@ -424,7 +424,8 @@ mod firmware {
         {
             return Err(());
         }
-        let native_blocks = initialize_native_blocks()?;
+        let boot_mount_manifest = prepared.boot_mount_manifest.as_ref().ok_or(())?;
+        let native_blocks = initialize_native_blocks(boot_mount_manifest)?;
         let boot_mount_manifest = prepared.boot_mount_manifest.take().ok_or(())?;
         troe_machine::initialize_input_interrupts(InputQueueConfig::tiny()).map_err(|_| ())?;
         if !troe_machine::write(b"interrupt-driven input: ready\n") {
@@ -445,7 +446,11 @@ mod firmware {
         })
     }
 
-    fn initialize_native_blocks() -> Result<Vec<troe_machine::NativeVirtioBlock>, ()> {
+    fn initialize_native_blocks(
+        boot_mount_manifest: &BootMountManifest,
+    ) -> Result<Vec<troe_machine::NativeVirtioBlock>, ()> {
+        #[cfg(not(feature = "acceptance-probes"))]
+        let _ = boot_mount_manifest;
         #[cfg(target_arch = "aarch64")]
         let mut devices = troe_machine::discover_virtio_mmio_blocks().map_err(|_| ())?;
         #[cfg(target_arch = "x86_64")]
@@ -459,7 +464,7 @@ mod firmware {
             device.read_blocks(0, 1, &mut first_block).map_err(|_| ())?;
         }
         #[cfg(feature = "acceptance-probes")]
-        probe_native_persistence(&mut devices)?;
+        probe_native_persistence(&mut devices, boot_mount_manifest)?;
         if devices.is_empty() {
             if !troe_machine::write(b"native virtio block: no devices\n") {
                 return Err(());
@@ -473,7 +478,20 @@ mod firmware {
     #[cfg(feature = "acceptance-probes")]
     fn probe_native_persistence(
         devices: &mut Vec<troe_machine::NativeVirtioBlock>,
+        boot_mount_manifest: &BootMountManifest,
     ) -> Result<(), ()> {
+        let activation_limits = native_activation_limits()?;
+        let content_bytes = read_selected_file(
+            boot_mount_manifest,
+            devices.as_mut_slice(),
+            "root",
+            "/system.cspk",
+            MAX_PACK_BYTES,
+            activation_limits,
+        )
+        .map_err(|_| ())?;
+        let content = ContentPack::parse(&content_bytes).map_err(|_| ())?;
+        let bootstrap = ActivationPointer::parse(INITIAL_ACTIVATION).map_err(|_| ())?;
         let selector = RegionSelector::parse(PERSISTENCE_SELECTOR).map_err(|_| ())?;
         let discovery_limits = BlockLimits::new(32, 16 * 1024, 1).map_err(|_| ())?;
         let gpt_limits = GptLimits::new(128, 16 * 1024, 4).map_err(|_| ())?;
@@ -523,24 +541,31 @@ mod firmware {
         )
         .map_err(|_| ())?;
         let mut store = DualSlotStore::open(region).map_err(|_| ())?;
-        let active = ConfigReference::from_bytes(SYSTEM_CONFIG).map_err(|_| ())?;
-        let content = ContentPack::parse(SYSTEM_CONTENT).map_err(|_| ())?;
-        let object = content.get(active.digest()).ok_or(())?;
-        if object.kind != ObjectKind::SystemConfig || object.bytes != SYSTEM_CONFIG {
+        let pointer = store
+            .payload()
+            .map(ActivationPointer::parse)
+            .transpose()
+            .map_err(|_| ())?
+            .unwrap_or(bootstrap);
+        let object = content.get(pointer.active().digest()).ok_or(())?;
+        if object.kind != ObjectKind::SystemConfig || !pointer.active().matches(object.bytes) {
             return Err(());
         }
-        let pointer = ActivationPointer::new(active, None).map_err(|_| ())?;
-        if let Some(payload) = store.payload() {
-            let recovered = ActivationPointer::parse(payload).map_err(|_| ())?;
-            if recovered != pointer || !recovered.active().matches(SYSTEM_CONFIG) {
-                return Err(());
-            }
-        }
         store.commit(&pointer.encode()).map_err(|_| ())?;
+        if !troe_machine::write(b"native content: selected ext4 CSPK verified\n") {
+            return Err(());
+        }
         if !troe_machine::write(b"native persistence: committed and flushed\n") {
             return Err(());
         }
         Ok(())
+    }
+
+    fn native_activation_limits() -> Result<ActivationLimits, ()> {
+        let block = BlockLimits::new(8, 4096, 1).map_err(|_| ())?;
+        let gpt = GptLimits::new(128, 16 * 1024, 16).map_err(|_| ())?;
+        let ext4 = Ext4Limits::new(8, 64, 256, 4096, 1024 * 1024, 4096, 64).map_err(|_| ())?;
+        Ok(ActivationLimits::new(block, gpt, ext4))
     }
 
     fn reserve_and_install_heap() -> Result<BootMemory, ()> {
@@ -2320,19 +2345,11 @@ mod firmware {
         namespace: &mut Namespace,
         console: &mut dyn Output,
     ) {
-        let block = BlockLimits::new(8, 4096, 1)
-            .unwrap_or_else(|_| fatal(b"fatal: invalid native block limits\n"));
-        let gpt = GptLimits::new(128, 16 * 1024, 16)
-            .unwrap_or_else(|_| fatal(b"fatal: invalid GPT limits\n"));
-        let ext4 = Ext4Limits::new(8, 64, 256, 4096, 1024 * 1024, 4096, 64)
-            .unwrap_or_else(|_| fatal(b"fatal: invalid ext4 limits\n"));
+        let limits = native_activation_limits()
+            .unwrap_or_else(|()| fatal(b"fatal: invalid native storage limits\n"));
         let devices = core::mem::take(&mut *accounting.native_blocks.borrow_mut());
-        let activation = prepare_read_only(
-            &accounting.boot_mount_manifest,
-            devices,
-            ActivationLimits::new(block, gpt, ext4),
-        )
-        .unwrap_or_else(|_| fatal(b"fatal: native storage activation failed\n"));
+        let activation = prepare_read_only(&accounting.boot_mount_manifest, devices, limits)
+            .unwrap_or_else(|_| fatal(b"fatal: native storage activation failed\n"));
         let desired_system_available = activation.desired_system_available();
         let mount_count = activation.mounts().len();
         for mount in activation.into_mounts() {

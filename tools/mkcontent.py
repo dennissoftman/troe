@@ -29,18 +29,42 @@ def build_pack(config: bytes) -> bytes:
     return bytes(image)
 
 
+def build_activation(config: bytes) -> bytes:
+    """Encode the bootstrap SACT pointer for the pack's SCFG object."""
+    if config[:8] != b"SCFGv1\0\0" or len(config) > 0xFFFF_FFFF:
+        raise ValueError("configuration is not a bounded SCFG v1 image")
+    generation = struct.unpack_from("<Q", config, 24)[0]
+    config_crc = struct.unpack_from("<I", config, 20)[0]
+    image = bytearray(128)
+    image[:8] = b"SACTv1\0\0"
+    struct.pack_into("<HHHH", image, 8, 1, 0, 128, 0)
+    struct.pack_into("<QII", image, 16, generation, len(config), config_crc)
+    image[32:64] = hashlib.sha256(config).digest()
+    checked = bytearray(image)
+    checked[112:116] = b"\0" * 4
+    struct.pack_into("<I", image, 112, zlib.crc32(checked))
+    return bytes(image)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--activation-output", type=Path)
     args = parser.parse_args()
     try:
-        pack = build_pack(args.config.read_bytes())
+        config = args.config.read_bytes()
+        pack = build_pack(config)
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_bytes(pack)
         print(f"CSPK v1: {len(pack)} bytes -> {args.output}")
+        if args.activation_output is not None:
+            activation = build_activation(config)
+            args.activation_output.parent.mkdir(parents=True, exist_ok=True)
+            args.activation_output.write_bytes(activation)
+            print(f"SACT v1: {len(activation)} bytes -> {args.activation_output}")
         return 0
-    except OSError as error:
+    except (OSError, ValueError) as error:
         print(f"mkcontent: {error}", file=sys.stderr)
         return 2
 

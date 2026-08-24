@@ -17,9 +17,12 @@ use troe_ext4::{Ext4, Ext4Limits};
 use troe_gpt::{GptLimits, discover};
 use troe_mount::{
     AccessMode, BootMountManifest, FilesystemProfile, MAX_DISCOVERED_VOLUMES, MatchState,
-    SelectorKind, VolumeSelector,
+    MountEntry, SelectorKind, VolumeSelector,
 };
-use troe_vfs::{FsError, Namespace, ReadOnlyFileSystem};
+use troe_vfs::{FsError, Namespace, NodeKind, ReadOnlyFileSystem};
+
+/// Hard ceiling for one early-activation file read.
+pub const MAX_SELECTED_FILE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Complete parser, request, and filesystem ceilings for one activation pass.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -150,6 +153,23 @@ pub enum ActivationError {
     MetadataExhausted,
     /// Manifest resolution rejected the bounded candidate set.
     Resolution,
+}
+
+/// Stable failure while reading one file from an exactly selected volume.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SelectedFileError {
+    /// Role, path, or byte ceiling was invalid or unsupported.
+    InvalidRequest,
+    /// No clean supported volume reproduced the role's stable identity.
+    Unavailable,
+    /// More than one volume reproduced the supposedly unique identity.
+    Ambiguous,
+    /// The selected file exceeds the caller or storage hard ceiling.
+    TooLarge,
+    /// Bounded output allocation failed.
+    MetadataExhausted,
+    /// The exact volume matched but the file was absent, corrupt, or unreadable.
+    Filesystem,
 }
 
 struct Candidate {
@@ -290,6 +310,152 @@ pub fn prepare_read_only<D: BlockDevice + 'static>(
         valid_gpt_disks,
         candidates: candidate_count,
     })
+}
+
+/// Read one complete bounded file from an exactly BMNT-selected ext4 role.
+///
+/// Devices are borrowed only for the duration of the read, so later activation
+/// may still consume them into namespace providers or a separate writable
+/// capability. Missing, foreign, dirty, and corrupt candidate media never
+/// provide bytes. Duplicate exact identities fail closed.
+///
+/// # Errors
+///
+/// Rejects invalid requests, absent or ambiguous selected media, files above
+/// either byte ceiling, bounded allocation failure, and provider failures.
+pub fn read_selected_file<D: BlockDevice>(
+    manifest: &BootMountManifest,
+    devices: &mut [D],
+    role: &str,
+    path: &str,
+    max_bytes: usize,
+    limits: ActivationLimits,
+) -> Result<Vec<u8>, SelectedFileError> {
+    if devices.len() > MAX_DISCOVERED_VOLUMES
+        || max_bytes == 0
+        || max_bytes > MAX_SELECTED_FILE_BYTES
+        || !path.starts_with('/')
+    {
+        return Err(SelectedFileError::InvalidRequest);
+    }
+    let mut entries = manifest
+        .entries()
+        .iter()
+        .filter(|entry| entry.name() == role);
+    let entry = entries.next().ok_or(SelectedFileError::InvalidRequest)?;
+    if entries.next().is_some()
+        || entry.access() != AccessMode::ReadOnly
+        || entry.filesystem() != FilesystemProfile::Ext4V1
+    {
+        return Err(SelectedFileError::InvalidRequest);
+    }
+
+    let mut selected = None;
+    for device in devices {
+        let Some(provider) = open_selected_provider(entry, device, limits) else {
+            continue;
+        };
+        if selected.is_some() {
+            return Err(SelectedFileError::Ambiguous);
+        }
+        selected = Some(read_provider_file(provider, path, max_bytes)?);
+    }
+    selected.ok_or(SelectedFileError::Unavailable)
+}
+
+fn open_selected_provider<'a, D: BlockDevice>(
+    entry: &MountEntry,
+    device: &'a mut D,
+    limits: ActivationLimits,
+) -> Option<Ext4<&'a mut D>> {
+    let selector = entry.selector();
+    match selector.kind() {
+        SelectorKind::WholeDevice => {
+            let region =
+                BlockRegion::whole_device(device, BlockAccess::ReadOnly, limits.block()).ok()?;
+            let ext4 = Ext4::mount(region, limits.ext4()).ok()?;
+            let discovered = VolumeSelector::whole_ext4(ext4.uuid().bytes()).ok()?;
+            (discovered == selector).then_some(ext4)
+        }
+        SelectorKind::GptPartition => {
+            let partition = {
+                let mut whole =
+                    BlockRegion::whole_device(&mut *device, BlockAccess::ReadOnly, limits.block())
+                        .ok()?;
+                let gpt = discover(&mut whole, limits.gpt()).ok()?;
+                if selector
+                    .disk_guid()
+                    .map(troe_mount::StableIdentifier::bytes)
+                    != Some(gpt.disk_guid().disk_bytes())
+                {
+                    return None;
+                }
+                let partition_guid = selector.partition_guid()?;
+                let partition = gpt.partition_by_unique_guid(
+                    troe_gpt::GptGuid::from_disk_bytes(partition_guid.bytes()),
+                )?;
+                (
+                    partition.first_lba(),
+                    partition.block_count(),
+                    partition.unique_guid().disk_bytes(),
+                    gpt.disk_guid().disk_bytes(),
+                )
+            };
+            let region = BlockRegion::new(
+                device,
+                partition.0,
+                partition.1,
+                BlockAccess::ReadOnly,
+                limits.block(),
+            )
+            .ok()?;
+            let ext4 = Ext4::mount(region, limits.ext4()).ok()?;
+            let discovered =
+                VolumeSelector::gpt_ext4(partition.3, partition.2, ext4.uuid().bytes()).ok()?;
+            (discovered == selector).then_some(ext4)
+        }
+    }
+}
+
+fn read_provider_file<D: BlockDevice>(
+    mut provider: Ext4<D>,
+    path: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, SelectedFileError> {
+    let metadata = provider
+        .metadata(path)
+        .map_err(|_| SelectedFileError::Filesystem)?;
+    if metadata.kind != NodeKind::File {
+        return Err(SelectedFileError::Filesystem);
+    }
+    let byte_count =
+        usize::try_from(metadata.byte_count).map_err(|_| SelectedFileError::TooLarge)?;
+    if byte_count > max_bytes || byte_count > MAX_SELECTED_FILE_BYTES {
+        return Err(SelectedFileError::TooLarge);
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(byte_count)
+        .map_err(|_| SelectedFileError::MetadataExhausted)?;
+    bytes.resize(byte_count, 0);
+    let mut offset = 0_usize;
+    while offset < byte_count {
+        let end = offset.saturating_add(4096).min(byte_count);
+        let read = provider
+            .read_file(
+                path,
+                u64::try_from(offset).map_err(|_| SelectedFileError::TooLarge)?,
+                &mut bytes[offset..end],
+            )
+            .map_err(|_| SelectedFileError::Filesystem)?;
+        if read == 0 || read > end - offset {
+            return Err(SelectedFileError::Filesystem);
+        }
+        offset = offset
+            .checked_add(read)
+            .ok_or(SelectedFileError::TooLarge)?;
+    }
+    Ok(bytes)
 }
 
 fn discover_device<D: BlockDevice + 'static>(
