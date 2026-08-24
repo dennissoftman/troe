@@ -30,6 +30,8 @@ historical review evidence.
   references committed as a TXSLOT payload.
 - [CSPK v1](formats/cspk-v1.md) defines bounded SHA-256-addressed immutable
   object packs and their verify-before-publish collection contract.
+- [GMAN v1](formats/gman-v1.md) defines immutable active/predecessor generation
+  roots and their bounded chain/garbage-collection traversal.
 
 The repository root [README](../README.md), [security policy](../SECURITY.md),
 [contribution guide](../CONTRIBUTING.md), and [third-party inventory](../THIRD_PARTY.md)

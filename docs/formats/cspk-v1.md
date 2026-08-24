@@ -16,3 +16,8 @@ unique identities, all ceilings, and every object's SHA-256 before exposing a
 lookup result. Mark-and-copy rebuilding accepts an explicitly bounded root set,
 deduplicates and sorts it, copies only verified objects, and produces a pack
 that must parse again before publication.
+
+GMAN v1 objects are parsed canonically during pack verification. Generation
+root traversal follows only explicit predecessor-manifest and SCFG digests,
+requires strictly descending generations and exact object kinds, and stops at
+the caller's hard generation ceiling before feeding mark-and-copy retention.

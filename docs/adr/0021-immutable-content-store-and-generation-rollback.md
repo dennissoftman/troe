@@ -10,6 +10,11 @@ object is verified against its SHA-256 identity before use. Duplicate digests,
 unknown kinds, aliases, gaps, trailing bytes, and objects outside declared size
 or count ceilings fail before returning a partial store.
 
+GMAN v1 is the immutable generation root. It names one SCFG digest and an
+optional predecessor GMAN digest. Traversal is explicitly bounded, acyclic,
+strictly generation-descending, and kind checked. Its resolved manifests and
+SCFG objects are the initial garbage-collection root set.
+
 The mutable SACT pointer remains outside the pack in PRGN-selected TXSLOT. It
 names the active SCFG and optional predecessor by exact immutable identity.
 Activation never edits an object. Construction writes and verifies a complete
@@ -24,6 +29,12 @@ transitive objects within explicit object/byte ceilings; construct a new pack;
 verify it completely; then atomically publish its root. Interruption leaves the
 old pack and pointer usable. Reclamation of the old allocation occurs only
 after the new root is durable and is never required for boot correctness.
+
+The native acceptance profile publishes generation 2 with generation 1 as its
+predecessor, applies the boot-required service's bounded `PreviousGeneration`
+health action, and atomically republishes generation 1. Process-reopen tests
+decode the durable SACT payload after each fault session and require the
+predecessor selection to survive.
 
 This decision does not authorize mutable executable objects, digest-only trust,
 or unbounded dependency traversal. Signatures and registry trust remain Stage 9;

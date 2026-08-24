@@ -366,12 +366,18 @@ The first portable storage/configuration boundary is landed:
   native acceptance paths borrow the BMNT-selected ext4 provider to read
   `/system.cspk`, resolve its digest-bound SCFG, and only then publish or
   recover its SACT pointer. The kernel embeds only the 128-byte bootstrap SACT
-  record, not the CSPK or SCFG bytes.
+  record, not the CSPK or SCFG bytes; and
+- GMAN v1 supplies checksummed immutable generation roots. Bounded traversal
+  rejects cycles, non-descending predecessors, missing objects, and kind
+  confusion before producing mark-and-copy roots. Native acceptance publishes
+  generation 2, applies its configured health failure, durably rolls back to
+  generation 1, and verifies the exact recovered SACT payload after every
+  subsequent process termination.
 
 These mechanisms are host verified; both VM transports, read-only mount
 activation, the bounded TXSLOT transaction, and digest-bound ext4 CSPK/SACT
 recovery are QEMU verified. Stage 8 is not complete: FAT32 and ext4 remain
-read-only, and generation health rollback and networking are still absent.
+read-only, and networking is still absent.
 
 ADR 0018 fixes the bootstrap semantics for the next storage increments. KEFS
 provides the immutable `/`, `/vol/root` is the selected persistent ext4 role,
@@ -384,22 +390,18 @@ the KEFS recovery shell without guessing from enumeration order or labels.
 
 Continue Stage 8 in this order:
 
-1. construct active and predecessor generations from the selected CSPK and
-   exercise health-triggered rollback through SACT while preserving the
-   verified mark-and-copy bounds;
-2. add filesystem mutation only with exact flush/FUA, dirty-state, corruption,
+1. add filesystem mutation only with exact flush/FUA, dirty-state, corruption,
    power-loss, and recovery tests;
-3. add bounded network-device capabilities and the minimal configured protocol
+2. add bounded network-device capabilities and the minimal configured protocol
    set before TCP; and
-4. define the registry/mapping serialized formats and integrate them with the
+3. define the registry/mapping serialized formats and integrate them with the
    persistent generation and recovery selection paths.
 
 ### Next-session handoff
 
-Continue the generation increment by making the active/predecessor health
-transition explicit against the CSPK now loaded through the BMNT-selected ext4
-provider. Do not interpret the small SACT transaction record as permission to
-expose general ext4 or FAT mutation.
+Continue with one deliberately narrow filesystem-mutation transaction, keeping
+exact flush/FUA, dirty-state, corruption, power-loss, and recovery behavior
+separate from general ext4 or FAT mutation.
 
 Do not start with a filesystem parser coupled directly to a hardware driver or
 the shell. The block transport, region discovery, filesystem provider, VFS,

@@ -66,12 +66,16 @@ def main() -> int:
             TOOLS_DIR / "mkconfig.py",
             "--output",
             REPO_ROOT / "assets" / "system.scfg",
+            "--previous-output",
+            REPO_ROOT / "assets" / "system-prev.scfg",
         )
         run(
             sys.executable,
             TOOLS_DIR / "mkcontent.py",
             "--config",
             REPO_ROOT / "assets" / "system.scfg",
+            "--previous-config",
+            REPO_ROOT / "assets" / "system-prev.scfg",
             "--output",
             REPO_ROOT / "assets" / "system.cspk",
             "--activation-output",

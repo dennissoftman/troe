@@ -20,8 +20,13 @@ pub const MAX_PACK_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_OBJECTS: usize = 64;
 /// Hard maximum size of one immutable object.
 pub const MAX_OBJECT_BYTES: usize = 1024 * 1024;
+/// Exact encoded generation-manifest size.
+pub const GENERATION_MANIFEST_BYTES: usize = 128;
 
 const CHECKSUM_OFFSET: usize = 20;
+const GENERATION_CHECKSUM_OFFSET: usize = 88;
+const GENERATION_PREVIOUS: u16 = 1;
+const GENERATION_MAGIC: [u8; 8] = *b"GMANv1\0\0";
 
 /// SHA-256 content identity.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -44,6 +49,119 @@ impl ContentDigest {
     #[must_use]
     pub const fn bytes(self) -> [u8; 32] {
         self.0
+    }
+}
+
+/// Canonical immutable desired-system generation root.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GenerationManifest {
+    generation: u64,
+    config: ContentDigest,
+    previous: Option<ContentDigest>,
+}
+
+impl GenerationManifest {
+    /// Construct a bounded generation root.
+    ///
+    /// # Errors
+    ///
+    /// Rejects generation zero and zero content identities.
+    pub fn new(
+        generation: u64,
+        config: ContentDigest,
+        previous: Option<ContentDigest>,
+    ) -> Result<Self, ContentError> {
+        if generation == 0
+            || config.bytes() == [0; 32]
+            || previous.is_some_and(|digest| digest.bytes() == [0; 32])
+        {
+            return Err(ContentError::InvalidManifest);
+        }
+        Ok(Self {
+            generation,
+            config,
+            previous,
+        })
+    }
+
+    /// Parse one exact checksummed GMAN v1 object.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed headers, flags, reserved bytes, checksum, generation,
+    /// or content identities.
+    pub fn parse(bytes: &[u8]) -> Result<Self, ContentError> {
+        if bytes.len() != GENERATION_MANIFEST_BYTES
+            || bytes.get(..8) != Some(&GENERATION_MAGIC)
+            || read_u16(bytes, 8)? != 1
+            || read_u16(bytes, 10)? != 0
+            || read_u16(bytes, 12)? != 128
+            || bytes[92..].iter().any(|byte| *byte != 0)
+        {
+            return Err(ContentError::InvalidManifest);
+        }
+        let flags = read_u16(bytes, 14)?;
+        if flags & !GENERATION_PREVIOUS != 0
+            || crc32_with_zeroed(bytes, GENERATION_CHECKSUM_OFFSET)
+                != read_u32(bytes, GENERATION_CHECKSUM_OFFSET)?
+        {
+            return Err(ContentError::InvalidManifest);
+        }
+        let mut config = [0_u8; 32];
+        config.copy_from_slice(&bytes[24..56]);
+        let mut previous = [0_u8; 32];
+        previous.copy_from_slice(&bytes[56..88]);
+        let previous = if flags & GENERATION_PREVIOUS != 0 {
+            Some(ContentDigest::from_bytes(previous))
+        } else {
+            if previous != [0; 32] {
+                return Err(ContentError::InvalidManifest);
+            }
+            None
+        };
+        Self::new(
+            read_u64(bytes, 16)?,
+            ContentDigest::from_bytes(config),
+            previous,
+        )
+    }
+
+    /// Encode this manifest as canonical checksummed GMAN v1 bytes.
+    #[must_use]
+    pub fn encode(self) -> [u8; GENERATION_MANIFEST_BYTES] {
+        let mut bytes = [0_u8; GENERATION_MANIFEST_BYTES];
+        bytes[..8].copy_from_slice(&GENERATION_MAGIC);
+        write_u16(&mut bytes, 8, 1);
+        write_u16(&mut bytes, 12, 128);
+        if self.previous.is_some() {
+            write_u16(&mut bytes, 14, GENERATION_PREVIOUS);
+        }
+        write_u64(&mut bytes, 16, self.generation);
+        bytes[24..56].copy_from_slice(&self.config.bytes());
+        if let Some(previous) = self.previous {
+            bytes[56..88].copy_from_slice(&previous.bytes());
+        }
+        let checksum = crc32_with_zeroed(&bytes, GENERATION_CHECKSUM_OFFSET);
+        write_u32(&mut bytes, GENERATION_CHECKSUM_OFFSET, checksum);
+        bytes
+    }
+
+    /// Monotonic desired-system generation number.
+    #[must_use]
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    /// SCFG object selected by this generation.
+    #[must_use]
+    pub const fn config(self) -> ContentDigest {
+        self.config
+    }
+
+    /// Optional predecessor generation-manifest identity.
+    #[must_use]
+    pub const fn previous(self) -> Option<ContentDigest> {
+        self.previous
     }
 }
 
@@ -166,6 +284,9 @@ impl<'a> ContentPack<'a> {
             {
                 return Err(ContentError::InvalidRecord);
             }
+            if kind == ObjectKind::GenerationManifest {
+                GenerationManifest::parse(&image[offset..end])?;
+            }
             records.push(Record {
                 digest,
                 kind,
@@ -205,6 +326,65 @@ impl<'a> ContentPack<'a> {
             kind: record.kind,
             bytes: &self.image[record.offset..record.offset + record.length],
         })
+    }
+
+    /// Iterate over every verified object in canonical digest order.
+    pub fn objects(&self) -> impl Iterator<Item = ContentObject<'a>> + '_ {
+        self.records.iter().map(|record| ContentObject {
+            digest: record.digest,
+            kind: record.kind,
+            bytes: &self.image[record.offset..record.offset + record.length],
+        })
+    }
+
+    /// Resolve a bounded active/predecessor generation chain into GC roots.
+    ///
+    /// Each retained generation contributes its manifest and SCFG object.
+    /// Manifest links must be acyclic, strictly generation-descending, and
+    /// reference objects of the declared kinds.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty or excessive policy, missing/wrong-kind objects, invalid
+    /// manifests, cycles, non-descending generations, and allocation failure.
+    pub fn generation_roots(
+        &self,
+        active_manifest: ContentDigest,
+        max_generations: usize,
+    ) -> Result<Vec<ContentDigest>, ContentError> {
+        if max_generations == 0 || max_generations > MAX_OBJECTS / 2 {
+            return Err(ContentError::LimitExceeded);
+        }
+        let mut roots = Vec::new();
+        roots
+            .try_reserve_exact(max_generations.saturating_mul(2))
+            .map_err(|_| ContentError::MetadataExhausted)?;
+        let mut next = Some(active_manifest);
+        let mut newer_generation = None;
+        while let Some(digest) = next {
+            if roots.len() / 2 == max_generations || roots.contains(&digest) {
+                return Err(ContentError::InvalidManifest);
+            }
+            let object = self.get(digest).ok_or(ContentError::MissingObject)?;
+            if object.kind != ObjectKind::GenerationManifest {
+                return Err(ContentError::InvalidManifest);
+            }
+            let manifest = GenerationManifest::parse(object.bytes)?;
+            if newer_generation.is_some_and(|newer| manifest.generation() >= newer) {
+                return Err(ContentError::InvalidManifest);
+            }
+            let config = self
+                .get(manifest.config())
+                .ok_or(ContentError::MissingObject)?;
+            if config.kind != ObjectKind::SystemConfig {
+                return Err(ContentError::InvalidManifest);
+            }
+            roots.push(digest);
+            roots.push(manifest.config());
+            newer_generation = Some(manifest.generation());
+            next = manifest.previous();
+        }
+        Ok(roots)
     }
 
     /// Rebuild a canonical pack containing exactly the requested identities.
@@ -324,6 +504,8 @@ pub enum ContentError {
     LimitExceeded,
     /// An object role, layout, order, digest, or reserved field failed.
     InvalidRecord,
+    /// A generation-manifest object was not canonical.
+    InvalidManifest,
     /// Bounded record retention failed.
     MetadataExhausted,
     /// A requested retained identity was absent from the verified source pack.
@@ -344,6 +526,15 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, ContentError> {
     Ok(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
 }
 
+fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, ContentError> {
+    let raw = bytes
+        .get(offset..offset + 8)
+        .ok_or(ContentError::InvalidManifest)?;
+    let mut value = [0_u8; 8];
+    value.copy_from_slice(raw);
+    Ok(u64::from_le_bytes(value))
+}
+
 fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
     bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
 }
@@ -352,10 +543,18 @@ fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
+fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
 fn crc32_zeroed(bytes: &[u8]) -> u32 {
+    crc32_with_zeroed(bytes, CHECKSUM_OFFSET)
+}
+
+fn crc32_with_zeroed(bytes: &[u8], zero_offset: usize) -> u32 {
     let mut crc = u32::MAX;
     for (index, byte) in bytes.iter().copied().enumerate() {
-        crc ^= u32::from(if (CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4).contains(&index) {
+        crc ^= u32::from(if (zero_offset..zero_offset + 4).contains(&index) {
             0
         } else {
             byte
@@ -463,8 +662,8 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::{
-        CONTENT_PACK_MAGIC, ContentDigest, ContentError, ContentPack, HEADER_BYTES, ObjectKind,
-        RECORD_BYTES, crc32_zeroed,
+        CONTENT_PACK_MAGIC, ContentDigest, ContentError, ContentPack, GenerationManifest,
+        HEADER_BYTES, ObjectKind, RECORD_BYTES, crc32_zeroed,
     };
 
     fn pack(objects: &[(ObjectKind, &[u8])]) -> Vec<u8> {
@@ -510,6 +709,44 @@ mod tests {
                 0x78, 0x52, 0xb8, 0x55
             ]
         );
+    }
+
+    #[test]
+    fn generation_chain_is_canonical_bounded_and_gc_rooted() -> Result<(), ContentError> {
+        let previous_config = b"previous config";
+        let active_config = b"active config";
+        let previous =
+            GenerationManifest::new(1, ContentDigest::of(previous_config), None)?.encode();
+        let active = GenerationManifest::new(
+            2,
+            ContentDigest::of(active_config),
+            Some(ContentDigest::of(&previous)),
+        )?
+        .encode();
+        let image = pack(&[
+            (ObjectKind::SystemConfig, previous_config.as_slice()),
+            (ObjectKind::SystemConfig, active_config.as_slice()),
+            (ObjectKind::GenerationManifest, previous.as_slice()),
+            (ObjectKind::GenerationManifest, active.as_slice()),
+        ]);
+        let store = ContentPack::parse(&image)?;
+        let roots = store.generation_roots(ContentDigest::of(&active), 2)?;
+        assert_eq!(roots.len(), 4);
+        let retained = store.retain(&roots, 4, image.len())?;
+        assert_eq!(ContentPack::parse(&retained)?.len(), 4);
+        assert_eq!(
+            store.generation_roots(ContentDigest::of(&active), 1),
+            Err(ContentError::InvalidManifest)
+        );
+
+        let mut malformed = active;
+        malformed[16..24].fill(0);
+        let malformed_pack = pack(&[(ObjectKind::GenerationManifest, &malformed)]);
+        assert!(matches!(
+            ContentPack::parse(&malformed_pack),
+            Err(ContentError::InvalidManifest)
+        ));
+        Ok(())
     }
 
     #[test]

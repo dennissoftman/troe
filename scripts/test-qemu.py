@@ -60,13 +60,13 @@ def reset_txslot(architecture: str) -> None:
     )
 
 
-def txslot_generation(architecture: str) -> int:
-    """Validate TXSLOT v1 on disk and return its newest committed generation."""
+def txslot_state(architecture: str) -> tuple[int, bytes]:
+    """Validate TXSLOT v1 and return its newest generation and payload."""
     image = txslot_path(architecture).read_bytes()
     if len(image) != TXSLOT_DISK_BYTES:
         raise AcceptanceError(f"{architecture} TXSLOT image has invalid length")
     image = image[TXSLOT_PARTITION_OFFSET:TXSLOT_PARTITION_OFFSET + TXSLOT_BYTES]
-    generations: list[int] = []
+    generations: list[tuple[int, bytes]] = []
     for slot in range(2):
         data = image[slot * 1024:slot * 1024 + 512]
         commit = image[slot * 1024 + 512:slot * 1024 + 1024]
@@ -94,10 +94,29 @@ def txslot_generation(architecture: str) -> int:
             == struct.unpack_from("<I", commit, TXSLOT_CHECKSUM_OFFSET)[0]
         )
         if valid:
-            generations.append(generation)
-    if not generations or len(generations) != len(set(generations)):
+            generations.append((generation, data[32:32 + length]))
+    generation_numbers = [generation for generation, _ in generations]
+    if not generations or len(generation_numbers) != len(set(generation_numbers)):
         raise AcceptanceError(f"{architecture} TXSLOT has no unique committed generation")
-    return max(generations)
+    return max(generations, key=lambda state: state[0])
+
+
+def assert_rolled_back_sact(architecture: str, payload: bytes) -> None:
+    """Require the durable SACT pointer to select generation one only."""
+    if len(payload) != 128 or payload[:8] != b"SACTv1\0\0":
+        raise AcceptanceError(f"{architecture} durable SACT payload is malformed")
+    checked = bytearray(payload)
+    checked[112:116] = bytes(4)
+    valid = (
+        struct.unpack_from("<HHH", payload, 8) == (1, 0, 128)
+        and struct.unpack_from("<H", payload, 14)[0] == 0
+        and struct.unpack_from("<Q", payload, 16)[0] == 1
+        and payload[64:112] == bytes(48)
+        and payload[116:] == bytes(12)
+        and zlib.crc32(checked) == struct.unpack_from("<I", payload, 112)[0]
+    )
+    if not valid:
+        raise AcceptanceError(f"{architecture} did not persist predecessor rollback")
 
 
 def parse_args() -> argparse.Namespace:
@@ -845,7 +864,7 @@ def test_architecture(
         session.close()
     if not args.smoke:
         for expected_generation, fault in enumerate(
-            ("write", "execute", "guard", "exception", "fatal"), start=1
+            ("write", "execute", "guard", "exception", "fatal"), start=2
         ):
             command = prepare_qemu_command(
                 architecture,
@@ -864,6 +883,14 @@ def test_architecture(
                     args.command_timeout,
                     fault,
                 )
+                if expected_generation == 2 and (
+                    "native generation: candidate published" not in fault_session.transcript()
+                    or "native generation: health rollback committed"
+                    not in fault_session.transcript()
+                ):
+                    raise AcceptanceError(
+                        f"{architecture} did not exercise health rollback"
+                    )
             except Exception:
                 print(
                     f"--- {architecture} {fault} fault transcript ---",
@@ -873,12 +900,13 @@ def test_architecture(
                 raise
             finally:
                 fault_session.close()
-            actual_generation = txslot_generation(architecture)
+            actual_generation, payload = txslot_state(architecture)
             if actual_generation != expected_generation:
                 raise AcceptanceError(
                     f"{architecture} TXSLOT recovered generation "
                     f"{actual_generation}, expected {expected_generation}"
                 )
+            assert_rolled_back_sact(architecture, payload)
     if args.native_keyboard and architecture == "x86_64":
         run_native_keyboard_scenario(args)
     suite = "smoke" if args.smoke else "acceptance"

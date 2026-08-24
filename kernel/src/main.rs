@@ -27,9 +27,11 @@ mod firmware {
     use troe_block::{BlockAccess, BlockRegion};
     use troe_block::{BlockDevice, BlockLimits};
     #[cfg(feature = "acceptance-probes")]
-    use troe_config::ActivationPointer;
+    use troe_config::{ActivationPointer, ConfigReference, FailureAction, parse_config};
     #[cfg(feature = "acceptance-probes")]
-    use troe_content::{ContentPack, MAX_PACK_BYTES, ObjectKind};
+    use troe_content::{
+        ContentDigest, ContentPack, GenerationManifest, MAX_PACK_BYTES, ObjectKind,
+    };
     use troe_core::{Input, MAX_LINE_BYTES, MachineMemorySnapshot, Output, StreamError};
     use troe_dispatch::{
         ConsoleService, CopiedMessage, DispatchedOutput, Dispatcher, HandleOwner, ReplyStatus,
@@ -541,17 +543,30 @@ mod firmware {
         )
         .map_err(|_| ())?;
         let mut store = DualSlotStore::open(region).map_err(|_| ())?;
-        let pointer = store
+        let recovered = store
             .payload()
             .map(ActivationPointer::parse)
             .transpose()
-            .map_err(|_| ())?
-            .unwrap_or(bootstrap);
-        let object = content.get(pointer.active().digest()).ok_or(())?;
-        if object.kind != ObjectKind::SystemConfig || !pointer.active().matches(object.bytes) {
-            return Err(());
-        }
+            .map_err(|_| ())?;
+        let mut pointer = recovered.unwrap_or(bootstrap);
+        let rollback_required = validate_generation_pointer(&content, pointer)?;
         store.commit(&pointer.encode()).map_err(|_| ())?;
+        if recovered.is_none() {
+            if !troe_machine::write(b"native generation: candidate published\n") {
+                return Err(());
+            }
+            if rollback_required {
+                let previous = pointer.previous().ok_or(())?;
+                pointer = ActivationPointer::new(previous, None).map_err(|_| ())?;
+                if validate_generation_pointer(&content, pointer)? {
+                    return Err(());
+                }
+                store.commit(&pointer.encode()).map_err(|_| ())?;
+                if !troe_machine::write(b"native generation: health rollback committed\n") {
+                    return Err(());
+                }
+            }
+        }
         if !troe_machine::write(b"native content: selected ext4 CSPK verified\n") {
             return Err(());
         }
@@ -559,6 +574,74 @@ mod firmware {
             return Err(());
         }
         Ok(())
+    }
+
+    #[cfg(feature = "acceptance-probes")]
+    fn validate_generation_pointer(
+        content: &ContentPack<'_>,
+        pointer: ActivationPointer,
+    ) -> Result<bool, ()> {
+        let (active_manifest_digest, active_manifest, active_bytes) =
+            resolve_generation(content, pointer.active())?;
+        let active_config = parse_config(active_bytes).map_err(|_| ())?;
+        let rollback_required = active_config
+            .services()
+            .iter()
+            .any(|service| service.failure_action() == FailureAction::PreviousGeneration);
+        match pointer.previous() {
+            Some(previous) => {
+                let (previous_manifest_digest, _, _) = resolve_generation(content, previous)?;
+                if active_manifest.previous() != Some(previous_manifest_digest)
+                    || active_config.previous_generation() != Some(previous.generation())
+                    || !active_config.recovery().fallback_previous()
+                    || !rollback_required
+                {
+                    return Err(());
+                }
+            }
+            None => {
+                if active_manifest.previous().is_some()
+                    || active_config.previous_generation().is_some()
+                    || active_config.recovery().fallback_previous()
+                    || rollback_required
+                {
+                    return Err(());
+                }
+            }
+        }
+        let roots = content
+            .generation_roots(active_manifest_digest, 2)
+            .map_err(|_| ())?;
+        if roots.len() < 2 || roots.len() > 4 {
+            return Err(());
+        }
+        Ok(rollback_required)
+    }
+
+    #[cfg(feature = "acceptance-probes")]
+    fn resolve_generation<'a>(
+        content: &'a ContentPack<'a>,
+        reference: ConfigReference,
+    ) -> Result<(ContentDigest, GenerationManifest, &'a [u8]), ()> {
+        let config = content.get(reference.digest()).ok_or(())?;
+        if config.kind != ObjectKind::SystemConfig || !reference.matches(config.bytes) {
+            return Err(());
+        }
+        let mut found = None;
+        for object in content.objects() {
+            if object.kind != ObjectKind::GenerationManifest {
+                continue;
+            }
+            let manifest = GenerationManifest::parse(object.bytes).map_err(|_| ())?;
+            if manifest.generation() == reference.generation()
+                && manifest.config() == reference.digest()
+                && found.replace((object.digest, manifest)).is_some()
+            {
+                return Err(());
+            }
+        }
+        let (manifest_digest, manifest) = found.ok_or(())?;
+        Ok((manifest_digest, manifest, config.bytes))
     }
 
     fn native_activation_limits() -> Result<ActivationLimits, ()> {
