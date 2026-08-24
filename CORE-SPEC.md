@@ -1012,9 +1012,12 @@ mount, identity-policy, SCFG v1, and BMNT v1 deterministic volume-selection
 boundaries are implemented and host verified. The AArch64 virtio-MMIO and q35
 virtio PCI paths, exact GPT/BMNT/ext4 selection, and read-only `/vol/root`
 activation are also QEMU verified. Writes/recovery, networking, SCFG persistent
-activation, content storage, and rollback remain unimplemented. A portable
-four-block dual-slot write/flush transaction and predecessor recovery model is
-host verified but is not yet connected to a native writable volume.
+activation, content storage, and rollback remain incomplete. The portable
+four-block dual-slot write/flush transaction has host boundary-fault coverage
+and is connected to a dedicated native QEMU writable device; both virtio
+transports prove completed commits survive process termination and reopen.
+It is not yet an installed-media SCFG activation pointer or permission for
+filesystem mutation.
 
 - Introduce network-device capabilities and a bounded-buffer network stack.
 - Begin with a small practical protocol set such as Ethernet, ARP/NDP as appropriate, IPv4 and/or IPv6, ICMP, UDP, DHCP or static configuration, and DNS.

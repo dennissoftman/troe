@@ -143,6 +143,11 @@ def prepare_qemu_command(
     storage = REPO_ROOT / "build" / "storage-root.img"
     if not storage.is_file():
         raise FileNotFoundError(f"storage fixture not found: {storage}")
+    txslot = REPO_ROOT / "build" / f"storage-txslot-{architecture}.img"
+    if build:
+        txslot.write_bytes(bytes(4 * 512))
+    if not txslot.is_file() or txslot.stat().st_size != 4 * 512:
+        raise FileNotFoundError(f"TXSLOT fixture not found or invalid: {txslot}")
     variables = REPO_ROOT / "build" / f"qemu-vars-{architecture}.fd"
     shutil.copyfile(vars_source, variables)
 
@@ -187,6 +192,15 @@ def prepare_qemu_command(
                 else "virtio-blk-device"
             )
             + ",drive=troe-root",
+            "-drive",
+            f"if=none,format=raw,cache=writeback,id=troe-txslot,file={txslot}",
+            "-device",
+            (
+                "virtio-blk-pci,disable-legacy=on"
+                if architecture == "x86_64"
+                else "virtio-blk-device"
+            )
+            + ",drive=troe-txslot",
             "-no-reboot",
         )
     )

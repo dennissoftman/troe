@@ -23,6 +23,8 @@ mod firmware {
         ABI_MINOR, ApplicationLimits, InitialHandle, LoadPlan, PAGE_BYTES, ParseError,
         ResourceProfile, SegmentPermissions, StartupInfo, Target, parse_kex,
     };
+    #[cfg(feature = "acceptance-probes")]
+    use troe_block::{BlockAccess, BlockRegion};
     use troe_block::{BlockDevice, BlockLimits};
     use troe_core::{Input, MAX_LINE_BYTES, MachineMemorySnapshot, Output, StreamError};
     use troe_dispatch::{
@@ -38,6 +40,8 @@ mod firmware {
         MemoryMapStats, MemoryRegion, NormalizedMemoryMap, PhysicalRange, RegionKind, VirtualRange,
     };
     use troe_mount::{BootMountManifest, parse_manifest};
+    #[cfg(feature = "acceptance-probes")]
+    use troe_persist::{DualSlotStore, TRANSACTION_BLOCKS};
     use troe_shell::{CompletionConfig, Shell};
     use troe_storage::{ActivationLimits, prepare_read_only};
     use troe_task::{
@@ -442,6 +446,8 @@ mod firmware {
             first_block.resize(block_bytes, 0);
             device.read_blocks(0, 1, &mut first_block).map_err(|_| ())?;
         }
+        #[cfg(feature = "acceptance-probes")]
+        probe_native_persistence(&mut devices)?;
         if devices.is_empty() {
             if !troe_machine::write(b"native virtio block: no devices\n") {
                 return Err(());
@@ -450,6 +456,34 @@ mod firmware {
             return Err(());
         }
         Ok(devices)
+    }
+
+    #[cfg(feature = "acceptance-probes")]
+    fn probe_native_persistence(
+        devices: &mut Vec<troe_machine::NativeVirtioBlock>,
+    ) -> Result<(), ()> {
+        let mut selected = None;
+        for (index, device) in devices.iter().enumerate() {
+            let geometry = device.geometry();
+            if geometry.logical_block_bytes() == 512
+                && geometry.block_count() == TRANSACTION_BLOCKS
+                && geometry.supports_flush()
+                && !device.profile().read_only()
+                && selected.replace(index).is_some()
+            {
+                return Err(());
+            }
+        }
+        let device = devices.remove(selected.ok_or(())?);
+        let limits = BlockLimits::new(1, 512, 1).map_err(|_| ())?;
+        let region =
+            BlockRegion::whole_device(device, BlockAccess::ReadWrite, limits).map_err(|_| ())?;
+        let mut store = DualSlotStore::open(region).map_err(|_| ())?;
+        store.commit(b"native virtio persistence").map_err(|_| ())?;
+        if !troe_machine::write(b"native persistence: committed and flushed\n") {
+            return Err(());
+        }
+        Ok(())
     }
 
     fn reserve_and_install_heap() -> Result<BootMemory, ()> {

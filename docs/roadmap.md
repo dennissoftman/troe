@@ -353,11 +353,14 @@ The first portable storage/configuration boundary is landed:
   exposing PCI details above `troe-machine`; and
 - `troe-persist` implements the first writable durability primitive: a
   four-block dual-slot record with data/flush/commit/flush ordering, exact
-  generation/checksum recovery, and host fault injection at every boundary.
+  generation/checksum recovery, and host fault injection at every boundary;
+  dedicated per-architecture QEMU media exercise real native virtio writes and
+  flushes across five process termination/reopen cycles.
 
-These mechanisms are host verified; both VM transports and read-only mount
-activation are QEMU verified. Stage 8 is not complete: FAT32 and ext4 remain
-read-only, configuration is not persistently activated, and networking, the
+These mechanisms are host verified; both VM transports, read-only mount
+activation, and the bounded TXSLOT transaction are QEMU verified. Stage 8 is
+not complete: FAT32 and ext4 remain read-only, TXSLOT has no installed-media
+selector, configuration is not persistently activated, and networking, the
 content store, generation activation, and rollback are still absent.
 
 ADR 0018 fixes the bootstrap semantics for the next storage increments. KEFS
@@ -371,12 +374,10 @@ the KEFS recovery shell without guessing from enumeration order or labels.
 
 Continue Stage 8 in this order:
 
-1. add bounded native block transports behind Stage 7.5 platform profiles:
-   begin with a discoverable VM transport, then add independently selected
-   transports for the physical reference machines; exercise GPT plus read-only
-   mounts without coupling filesystem code to q35, `virt`, or Raspberry Pi;
-2. define SCFG activation plus registry/mapping/mount serialized formats and
-   crash-consistent predecessor/recovery selection;
+1. allocate TXSLOT through a versioned installed-media selector rather than the
+   acceptance-only exact-capacity device profile;
+2. use that selected transaction for an SCFG activation pointer, then define
+   registry/mapping serialized formats and predecessor/recovery selection;
 3. add filesystem mutation only with exact flush/FUA, dirty-state, corruption,
    power-loss, and recovery tests;
 4. add bounded network-device capabilities and the minimal configured protocol
@@ -386,12 +387,12 @@ Continue Stage 8 in this order:
 
 ### Next-session handoff
 
-Continue the durability increment by allocating a dedicated writable QEMU
-region for TXSLOT v1, running the real virtio write/flush sequence on both
-transports, and adding process-cut/reopen acceptance before using it for an SCFG
-activation pointer. In parallel, make the EFI boot-source manifest load replace
-the embedded QEMU fixture without changing BMNT matching. Do not interpret this
-small transaction record as permission to expose ext4 or FAT mutation yet.
+Continue the durability increment by replacing the acceptance-only exact-size
+TXSLOT device match with a versioned installed-media selector, then use the
+selected record for an SCFG activation pointer. In parallel, make the EFI
+boot-source manifest load replace the embedded QEMU fixture without changing
+BMNT matching. Do not interpret this small transaction record as permission to
+expose ext4 or FAT mutation yet.
 
 Do not start with a filesystem parser coupled directly to a hardware driver or
 the shell. The block transport, region discovery, filesystem provider, VFS,

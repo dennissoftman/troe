@@ -1,6 +1,7 @@
 # ADR 0020: first dual-slot durability transaction
 
-Status: accepted and portable core implemented, 2026-08-24.
+Status: accepted; portable core and native QEMU acceptance implemented,
+2026-08-24.
 
 The first persistent writer is a four-logical-block dual-slot record, not an
 ext4 metadata writer. Each slot contains one checksummed data block and one
@@ -26,7 +27,10 @@ bounded to one logical block minus the fixed header. This format is suitable
 for a small activation pointer or registry root; it does not by itself make
 ext4, FAT, arbitrary application data, or directory operations crash-safe.
 
-Host fault tests must interrupt every write/flush boundary and reopen from only
-durable bytes before this primitive is connected to a native writable volume.
-QEMU power-cut acceptance and a versioned installed-media allocation remain the
-next durability increment.
+Host fault tests interrupt every write/flush boundary and reopen from only
+durable bytes. QEMU acceptance assigns each architecture a private exact-size
+writable device, executes the real virtio data/flush/commit/flush sequence,
+terminates the process, reopens it in a fresh VM, and validates the on-media
+generation after each boot. The exact-size device match is an acceptance-only
+fixture profile; a versioned installed-media allocation and stable selector
+remain required before this carries an SCFG activation pointer.

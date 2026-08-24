@@ -8,11 +8,13 @@ import concurrent.futures
 import queue
 import re
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
 import threading
 import time
+import zlib
 from pathlib import Path
 
 from qemu_profile import QEMU_EXECUTABLES, REPO_ROOT, prepare_qemu_command
@@ -24,10 +26,63 @@ BOOT_TIMEOUT_SECONDS = 30.0
 # other guest is producing a framebuffer-sized memory report. Keep the bound
 # finite, but large enough that host scheduling jitter is not a kernel failure.
 COMMAND_TIMEOUT_SECONDS = 10.0
+TXSLOT_BYTES = 4 * 512
+TXSLOT_CHECKSUM_OFFSET = 20
 
 
 class AcceptanceError(RuntimeError):
     """A boot, console, assertion, or timeout failure."""
+
+
+def txslot_path(architecture: str) -> Path:
+    """Return the architecture-private writable acceptance medium."""
+    return REPO_ROOT / "build" / f"storage-txslot-{architecture}.img"
+
+
+def reset_txslot(architecture: str) -> None:
+    """Start one architecture's process-reopen sequence from empty media."""
+    path = txslot_path(architecture)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(bytes(TXSLOT_BYTES))
+
+
+def txslot_generation(architecture: str) -> int:
+    """Validate TXSLOT v1 on disk and return its newest committed generation."""
+    image = txslot_path(architecture).read_bytes()
+    if len(image) != TXSLOT_BYTES:
+        raise AcceptanceError(f"{architecture} TXSLOT image has invalid length")
+    generations: list[int] = []
+    for slot in range(2):
+        data = image[slot * 1024:slot * 1024 + 512]
+        commit = image[slot * 1024 + 512:slot * 1024 + 1024]
+        if data == bytes(512) and commit == bytes(512):
+            continue
+        checked_data = bytearray(data)
+        checked_data[TXSLOT_CHECKSUM_OFFSET:TXSLOT_CHECKSUM_OFFSET + 4] = bytes(4)
+        data_checksum = struct.unpack_from("<I", data, TXSLOT_CHECKSUM_OFFSET)[0]
+        length = struct.unpack_from("<I", data, 16)[0]
+        generation = struct.unpack_from("<Q", data, 8)[0]
+        checked_commit = bytearray(commit)
+        checked_commit[TXSLOT_CHECKSUM_OFFSET:TXSLOT_CHECKSUM_OFFSET + 4] = bytes(4)
+        valid = (
+            data[:8] == b"TXDTv1\0\0"
+            and commit[:8] == b"TXCMv1\0\0"
+            and generation != 0
+            and length <= 512 - 32
+            and data[24:32] == bytes(8)
+            and data[32 + length:] == bytes(512 - 32 - length)
+            and zlib.crc32(checked_data) == data_checksum
+            and struct.unpack_from("<Q", commit, 8)[0] == generation
+            and struct.unpack_from("<I", commit, 16)[0] == data_checksum
+            and commit[24:] == bytes(512 - 24)
+            and zlib.crc32(checked_commit)
+            == struct.unpack_from("<I", commit, TXSLOT_CHECKSUM_OFFSET)[0]
+        )
+        if valid:
+            generations.append(generation)
+    if not generations or len(generations) != len(set(generations)):
+        raise AcceptanceError(f"{architecture} TXSLOT has no unique committed generation")
+    return max(generations)
 
 
 def parse_args() -> argparse.Namespace:
@@ -722,6 +777,10 @@ def run_fault_scenario(
     """Prove that one forbidden access reaches the native fatal vector."""
     session.wait_for(b"shell:/> ", boot_timeout)
     assert_owned_boot(session)
+    if "native persistence: committed and flushed" not in session.transcript():
+        raise AcceptanceError(
+            f"{session.architecture} did not complete the native TXSLOT transaction"
+        )
     start = len(session.output)
     command = "task-probe guard" if fault == "guard" else f"mmu-probe {fault}"
     session.send(command, command_timeout)
@@ -766,7 +825,9 @@ def test_architecture(
     finally:
         session.close()
     if not args.smoke:
-        for fault in ("write", "execute", "guard", "exception", "fatal"):
+        for expected_generation, fault in enumerate(
+            ("write", "execute", "guard", "exception", "fatal"), start=1
+        ):
             command = prepare_qemu_command(
                 architecture,
                 args.firmware_code,
@@ -793,6 +854,12 @@ def test_architecture(
                 raise
             finally:
                 fault_session.close()
+            actual_generation = txslot_generation(architecture)
+            if actual_generation != expected_generation:
+                raise AcceptanceError(
+                    f"{architecture} TXSLOT recovered generation "
+                    f"{actual_generation}, expected {expected_generation}"
+                )
     if args.native_keyboard and architecture == "x86_64":
         run_native_keyboard_scenario(args)
     suite = "smoke" if args.smoke else "acceptance"
@@ -851,6 +918,8 @@ def main() -> int:
                 cwd=REPO_ROOT,
                 check=True,
             )
+        for architecture in architectures:
+            reset_txslot(architecture)
         if len(architectures) == 1:
             test_architecture(architectures[0], args)
         else:

@@ -192,6 +192,7 @@ dependencies = [
  "troe-machine",
  "troe-memory",
  "troe-mount",
+ "troe-persist",
  "troe-shell",
  "troe-storage",
  "troe-task",

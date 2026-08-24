@@ -39,8 +39,9 @@ handle calls, or is terminated by the 50 ms execution lease.
   discovery, read-only FAT32 and constrained checksummed ext4 VFS providers,
   checksummed SCFG v1 service startup policy, and a checksummed BMNT v1 boot
   mount manifest with deterministic stable-identity resolution;
-- a host-verified four-block dual-slot persistence transaction with exact
-  data/flush/commit/flush ordering and predecessor recovery at every boundary;
+- a four-block dual-slot persistence transaction with exact
+  data/flush/commit/flush ordering, host fault injection at every boundary,
+  and native process-reopen recovery on both QEMU transports;
 - a bounded modern virtio block core with native AArch64 `virtio-mmio` and
   x86-64 q35 virtio PCI transports; both have QEMU-proven post-handoff GPT
   discovery, exact BMNT disk/partition/ext4 identity selection, and a live
@@ -79,7 +80,8 @@ Artifacts are written under `build/`, and the script reports their exact
 filenames. The build regenerates KEFS, uses Cargo's locked dependency graph,
 builds release EFI executables, constructs deterministic FAT images and the
 BMNT policy, and enforces the 16 MiB hard ceiling. QEMU acceptance additionally
-creates a reproducible GPT/ext4 storage disk with e2fsprogs.
+creates a reproducible GPT/ext4 storage disk with e2fsprogs plus separate
+four-block writable TXSLOT media for each architecture.
 
 Run all local gates:
 

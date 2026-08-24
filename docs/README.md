@@ -56,7 +56,8 @@ boot-side manifest and stable disk, partition, and filesystem identities.
 single-request virtio block core and the native AArch64 `virtio-mmio` and q35
 virtio PCI transports, including their DMA lifetime and reset-on-timeout rules.
 [ADR 0020](adr/0020-dual-slot-durability-transaction.md) fixes the first
-portable writable transaction and its exact write/flush recovery contract.
+portable writable transaction and its exact write/flush recovery contract;
+dedicated QEMU media now exercise it through both native virtio transports.
 ADR 0012 governs the completed Stage 5.1 terminal and
 framebuffer increment; AArch64 native keyboard input remains a later
 virtio-input transport decision. ADR 0013 governs the completed Stage 5.2
