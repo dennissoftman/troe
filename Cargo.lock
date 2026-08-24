@@ -187,9 +187,13 @@ dependencies = [
  "troe-core",
  "troe-dispatch",
  "troe-driver",
+ "troe-ext4",
+ "troe-gpt",
  "troe-machine",
  "troe-memory",
+ "troe-mount",
  "troe-shell",
+ "troe-storage",
  "troe-task",
  "troe-terminal",
  "troe-vfs",
@@ -224,6 +228,17 @@ version = "0.1.0"
 dependencies = [
  "troe-core",
  "troe-driver",
+ "troe-vfs",
+]
+
+[[package]]
+name = "troe-storage"
+version = "0.1.0"
+dependencies = [
+ "troe-block",
+ "troe-ext4",
+ "troe-gpt",
+ "troe-mount",
  "troe-vfs",
 ]
 

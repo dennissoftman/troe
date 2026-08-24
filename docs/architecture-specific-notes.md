@@ -108,6 +108,10 @@ x86-64 or AArch64 platform contracts.
   `dmb oshld` follows used-index observation. A timed-out request resets and
   confirms the device before returning; failure to confirm reset parks forever
   because returning could let DMA outlive the borrowed payload.
+- The pinned QEMU `virt` command explicitly disables legacy virtio-MMIO. Its
+  secondary read-only fixture contains deterministic primary/backup GPT copies
+  and a constrained ext4 volume; acceptance reaches that volume only through
+  the BMNT disk GUID, partition GUID, and filesystem UUID tuple.
 - Polling block completion suppresses used interrupts and acknowledges any
   observed transport status. GIC initialization keeps virtio SPIs masked; a
   later interrupt-driven block profile must add explicit routing, ISR budgets,

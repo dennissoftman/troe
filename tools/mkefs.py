@@ -12,6 +12,7 @@ MAGIC = b"KEFSv1\0\0"
 HEADER_SIZE = 16
 MAX_ENTRIES = 0xFFFF
 MAX_PATH = 256
+MOUNTPOINT_SENTINEL = ".mountpoint"
 
 
 def collect(root: Path) -> list[tuple[int, str, bytes]]:
@@ -21,6 +22,8 @@ def collect(root: Path) -> list[tuple[int, str, bytes]]:
     for candidate in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
         if candidate.is_symlink():
             raise ValueError(f"symbolic links are forbidden: {candidate}")
+        if candidate.is_file() and candidate.name == MOUNTPOINT_SENTINEL:
+            continue
         relative = candidate.relative_to(root).as_posix()
         encoded = ("/" + relative).encode("utf-8")
         if b"\0" in encoded or len(encoded) > MAX_PATH:

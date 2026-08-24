@@ -1,8 +1,10 @@
 # ADR 0018: volume namespace and deterministic root discovery
 
-Status: accepted, 2026-08-24; BMNT v1 serialization, parsing, and portable
-stable-identity resolution are implemented. Native discovery and mount
-activation remain Stage 8 work.
+Status: accepted, 2026-08-24; BMNT v1 parsing and portable stable-identity
+resolution are implemented. The AArch64 QEMU profile now validates its embedded
+BMNT fixture before handoff and activates an exactly matched GPT/ext4 provider.
+Loading an installed manifest from the EFI system partition remains Stage 8
+installer/boot-source work.
 
 ## Context
 
@@ -71,6 +73,12 @@ partition. The UEFI bootstrap reads and validates it before the one-way
 firmware handoff and copies the bounded result into owned memory. This keeps
 selection independent of the persistent volume and leaves no live firmware
 protocol dependency after handoff.
+
+The first QEMU acceptance fixture compiles that generated manifest into the EFI
+artifact and validates the owned parsed result before handoff. This exercises
+the complete post-handoff discovery policy without adding a live firmware
+dependency. Installed-media support must replace that fixture source with the
+loaded-image EFI system partition path; it must not change BMNT matching rules.
 
 The manifest is separate from SCFG. It answers only enough bootstrap questions
 to locate volumes; SCFG can then be loaded and activated from a selected,

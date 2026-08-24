@@ -40,8 +40,9 @@ handle calls, or is terminated by the 50 ms execution lease.
   checksummed SCFG v1 service startup policy, and a checksummed BMNT v1 boot
   mount manifest with deterministic stable-identity resolution;
 - a bounded modern virtio block core and native AArch64 `virtio-mmio` transport
-  with a QEMU-proven post-handoff read (q35 virtio PCI, mount activation, and
-  persistence remain Stage 8 work);
+  with QEMU-proven post-handoff GPT discovery, exact BMNT disk/partition/ext4
+  identity selection, and a live read-only `/vol/root` mount (q35 virtio PCI
+  and filesystem mutation remain Stage 8 work);
 - owned receive interrupts through q35 LAPIC/I/O APIC and AArch64 GICv2,
   bounded raw-event delivery, and race-free `hlt`/`wfi` shell idle;
 - project-owned polling 16550 and PL011 early/fatal recovery output, plus an
@@ -74,8 +75,9 @@ python3 scripts/build.py
 
 Artifacts are written under `build/`, and the script reports their exact
 filenames. The build regenerates KEFS, uses Cargo's locked dependency graph,
-builds release EFI executables, constructs deterministic FAT images, and
-enforces the 16 MiB hard ceiling.
+builds release EFI executables, constructs deterministic FAT images and the
+BMNT policy, and enforces the 16 MiB hard ceiling. QEMU acceptance additionally
+creates a reproducible GPT/ext4 storage disk with e2fsprogs.
 
 Run all local gates:
 

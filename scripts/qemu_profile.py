@@ -123,11 +123,26 @@ def prepare_qemu_command(
             cwd=REPO_ROOT,
             check=True,
         )
+        subprocess.run(
+            [
+                sys.executable,
+                str(REPO_ROOT / "tools" / "mkstorage.py"),
+                "--manifest",
+                str(REPO_ROOT / "assets" / "boot.bmnt"),
+                "--output",
+                str(REPO_ROOT / "build" / "storage-root.img"),
+            ],
+            cwd=REPO_ROOT,
+            check=True,
+        )
 
     suffix = "-acceptance" if acceptance_probes else ""
     image = REPO_ROOT / "build" / f"boot-{architecture}{suffix}.img"
     if not image.is_file():
         raise FileNotFoundError(f"boot image not found: {image}")
+    storage = REPO_ROOT / "build" / "storage-root.img"
+    if not storage.is_file():
+        raise FileNotFoundError(f"storage fixture not found: {storage}")
     variables = REPO_ROOT / "build" / f"qemu-vars-{architecture}.fd"
     shutil.copyfile(vars_source, variables)
 
@@ -150,6 +165,9 @@ def prepare_qemu_command(
         command.extend(("-cpu", "max"))
     else:
         command.extend(("-cpu", "cortex-a72"))
+        # Pin the normative modern virtio-MMIO register layout consumed by the
+        # post-handoff driver; QEMU otherwise exposes legacy version 1.
+        command.extend(("-global", "virtio-mmio.force-legacy=false"))
     command.extend(
         (
             "-m",
@@ -160,6 +178,11 @@ def prepare_qemu_command(
             f"if=pflash,format=raw,unit=1,file={variables}",
             "-drive",
             f"if=virtio,format=raw,file={image}",
+            "-drive",
+            f"if=none,format=raw,readonly=on,id=troe-root,file={storage}",
+            "-device",
+            ("virtio-blk-pci" if architecture == "x86_64" else "virtio-blk-device")
+            + ",drive=troe-root",
             "-no-reboot",
         )
     )

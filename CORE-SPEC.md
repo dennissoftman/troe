@@ -1009,10 +1009,10 @@ crates or architecture-wide mechanisms.
 
 **Status:** in progress. Portable block-region, GPT, read-only FAT32/ext4 VFS
 mount, identity-policy, SCFG v1, and BMNT v1 deterministic volume-selection
-boundaries are implemented and host verified, with the first AArch64
-virtio-MMIO path also QEMU verified. The q35 PCI front
-end, writes/recovery, networking, persistent activation, content storage, and
-rollback remain unimplemented.
+boundaries are implemented and host verified. The first AArch64 virtio-MMIO
+path, exact GPT/BMNT/ext4 selection, and read-only `/vol/root` activation are
+also QEMU verified. The q35 PCI front end, writes/recovery, networking, SCFG
+persistent activation, content storage, and rollback remain unimplemented.
 
 - Introduce network-device capabilities and a bounded-buffer network stack.
 - Begin with a small practical protocol set such as Ethernet, ARP/NDP as appropriate, IPv4 and/or IPv6, ICMP, UDP, DHCP or static configuration, and DNS.

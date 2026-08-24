@@ -25,19 +25,27 @@ mod firmware {
         ResourceProfile, SegmentPermissions, StartupInfo, Target, parse_kex,
     };
     #[cfg(target_arch = "aarch64")]
-    use troe_block::BlockDevice;
+    use troe_block::{BlockDevice, BlockLimits};
     use troe_core::{Input, MAX_LINE_BYTES, MachineMemorySnapshot, Output, StreamError};
     use troe_dispatch::{
         ConsoleService, CopiedMessage, DispatchedOutput, Dispatcher, HandleOwner, ReplyStatus,
         Request, Rights, Service, ServiceReply,
     };
     use troe_driver::{InputQueueConfig, InputSource};
+    #[cfg(target_arch = "aarch64")]
+    use troe_ext4::Ext4Limits;
+    #[cfg(target_arch = "aarch64")]
+    use troe_gpt::GptLimits;
     use troe_memory::{
         BASE_PAGE_SIZE, BootAllocator, FrameAllocator, MAX_FIRMWARE_REGIONS, Mapping,
         MappingLifetime, MappingMemoryType, MappingOwner, MappingPermissions, MappingPlan,
         MemoryMapStats, MemoryRegion, NormalizedMemoryMap, PhysicalRange, RegionKind, VirtualRange,
     };
+    #[cfg(target_arch = "aarch64")]
+    use troe_mount::{BootMountManifest, parse_manifest};
     use troe_shell::{CompletionConfig, Shell};
+    #[cfg(target_arch = "aarch64")]
+    use troe_storage::{ActivationLimits, prepare_read_only};
     use troe_task::{
         Capabilities, IsolationResource, Scheduler, StackResource, TaskFault, TaskId, TaskState,
         TaskStep,
@@ -53,6 +61,8 @@ mod firmware {
     use uefi::proto::console::gop::{GraphicsOutput, PixelFormat as GopPixelFormat};
 
     const ROOTFS: &[u8] = include_bytes!("../../assets/root.kefs");
+    #[cfg(target_arch = "aarch64")]
+    const BOOT_MOUNT_MANIFEST: &[u8] = include_bytes!("../../assets/boot.bmnt");
     const OWNED_HEAP_BYTES: u64 = 6 * 1024 * 1024;
     const PAGE_TABLE_BYTES: u64 = 2 * 1024 * 1024;
     const OWNED_STACK_BYTES: u64 = 128 * 1024;
@@ -179,6 +189,8 @@ mod firmware {
         kernel_plan: MappingPlan,
         #[cfg(target_arch = "aarch64")]
         native_blocks: RefCell<Vec<troe_machine::NativeVirtioBlock>>,
+        #[cfg(target_arch = "aarch64")]
+        boot_mount_manifest: BootMountManifest,
     }
 
     #[derive(Clone, Copy)]
@@ -213,6 +225,8 @@ mod firmware {
         image_layout: troe_machine::ImageLayout,
         boot_memory: BootMemory,
         framebuffer: Option<FramebufferDescriptor>,
+        #[cfg(target_arch = "aarch64")]
+        boot_mount_manifest: Option<BootMountManifest>,
     }
 
     struct IsolatedAllocation {
@@ -325,6 +339,8 @@ mod firmware {
         let image_layout = troe_machine::loaded_image_layout().map_err(|_| ())?;
         let framebuffer = capture_framebuffer();
         let boot_memory = reserve_and_install_heap()?;
+        #[cfg(target_arch = "aarch64")]
+        let boot_mount_manifest = parse_manifest(BOOT_MOUNT_MANIFEST).map_err(|_| ())?;
         troe_machine::initialize_console();
         if !troe_machine::write(b"native console: ready\n") {
             return Err(());
@@ -333,6 +349,8 @@ mod firmware {
             image_layout,
             boot_memory,
             framebuffer,
+            #[cfg(target_arch = "aarch64")]
+            boot_mount_manifest: Some(boot_mount_manifest),
         })
     }
 
@@ -353,7 +371,7 @@ mod firmware {
     }
 
     fn complete_handoff(
-        prepared: &PreparedHandoff,
+        prepared: &mut PreparedHandoff,
         final_map: MemoryMapOwned,
     ) -> Result<OwnedAccounting, ()> {
         let reservations = [prepared.boot_memory.arena];
@@ -404,6 +422,8 @@ mod firmware {
         }
         #[cfg(target_arch = "aarch64")]
         let native_blocks = initialize_native_blocks()?;
+        #[cfg(target_arch = "aarch64")]
+        let boot_mount_manifest = prepared.boot_mount_manifest.take().ok_or(())?;
         troe_machine::initialize_input_interrupts(InputQueueConfig::tiny()).map_err(|_| ())?;
         if !troe_machine::write(b"interrupt-driven input: ready\n") {
             return Err(());
@@ -420,6 +440,8 @@ mod firmware {
             kernel_plan: mapping_plan,
             #[cfg(target_arch = "aarch64")]
             native_blocks: RefCell::new(native_blocks),
+            #[cfg(target_arch = "aarch64")]
+            boot_mount_manifest,
         })
     }
 
@@ -2207,6 +2229,53 @@ mod firmware {
         .is_ok()
     }
 
+    #[cfg(target_arch = "aarch64")]
+    fn activate_native_storage(
+        accounting: &OwnedAccounting,
+        namespace: &mut Namespace,
+        console: &mut dyn Output,
+    ) {
+        let block = BlockLimits::new(8, 4096, 1)
+            .unwrap_or_else(|_| fatal(b"fatal: invalid native block limits\n"));
+        let gpt = GptLimits::new(128, 16 * 1024, 16)
+            .unwrap_or_else(|_| fatal(b"fatal: invalid GPT limits\n"));
+        let ext4 = Ext4Limits::new(8, 64, 256, 4096, 1024 * 1024, 4096, 64)
+            .unwrap_or_else(|_| fatal(b"fatal: invalid ext4 limits\n"));
+        let devices = core::mem::take(&mut *accounting.native_blocks.borrow_mut());
+        let activation = prepare_read_only(
+            &accounting.boot_mount_manifest,
+            devices,
+            ActivationLimits::new(block, gpt, ext4),
+        )
+        .unwrap_or_else(|_| fatal(b"fatal: native storage activation failed\n"));
+        let desired_system_available = activation.desired_system_available();
+        let mount_count = activation.mounts().len();
+        for mount in activation.into_mounts() {
+            mount
+                .attach(namespace)
+                .unwrap_or_else(|_| fatal(b"fatal: cannot attach native filesystem provider\n"));
+        }
+        if desired_system_available && mount_count != 0 {
+            if write_all(console, b"native storage: /vol/root read-only\n").is_err() {
+                fatal(b"fatal: native storage diagnostic failed\n");
+            }
+        } else if write_all(console, b"native storage: recovery root\n").is_err() {
+            fatal(b"fatal: native storage diagnostic failed\n");
+        }
+    }
+
+    fn compose_namespace(accounting: &OwnedAccounting, console: &mut dyn Output) -> Namespace {
+        #[cfg(not(target_arch = "aarch64"))]
+        let _ = (accounting, console);
+        let mut namespace = Namespace::new(RamFsQuota::default());
+        if namespace.mount_embedded(ROOTFS).is_err() {
+            fatal(b"fatal: cannot mount embedded root\n");
+        }
+        #[cfg(target_arch = "aarch64")]
+        activate_native_storage(accounting, &mut namespace, console);
+        namespace
+    }
+
     fn run_shell_task(task: &mut ShellTask<'_>) -> TaskStep {
         let stack_pointer = usize_as_u64(troe_machine::current_stack_pointer());
         if !task.stack.contains(stack_pointer)
@@ -2231,10 +2300,7 @@ mod firmware {
         {
             fatal(b"fatal: framebuffer console write failed\n");
         }
-        let mut namespace = Namespace::new(RamFsQuota::default());
-        if namespace.mount_embedded(ROOTFS).is_err() {
-            fatal(b"fatal: cannot mount embedded root\n");
-        }
+        let namespace = compose_namespace(task.accounting, &mut console);
         let initial_snapshot = machine_snapshot(task.accounting);
         let machine_control = task.capabilities.contains(Capabilities::MACHINE_CONTROL);
         let Ok(mut shell) =

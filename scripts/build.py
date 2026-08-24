@@ -53,6 +53,12 @@ def main() -> int:
             REPO_ROOT / "rootfs",
             REPO_ROOT / "assets" / "root.kefs",
         )
+        run(
+            sys.executable,
+            TOOLS_DIR / "mkstorage.py",
+            "--manifest",
+            REPO_ROOT / "assets" / "boot.bmnt",
+        )
 
         for architecture in architectures:
             target = TARGETS[architecture]

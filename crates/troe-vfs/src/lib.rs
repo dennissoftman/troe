@@ -341,9 +341,21 @@ impl Namespace {
         mut provider: Box<dyn ReadOnlyFileSystem>,
     ) -> Result<(), FsError> {
         let path = canonicalize("/", path)?;
-        if path == "/" || self.nodes.contains_key(&path) || self.mount_for_path(&path).is_some() {
+        if path == "/" || self.mount_for_path(&path).is_some() {
             return Err(FsError::Exists);
         }
+        let target_exists = match self.nodes.get(&path) {
+            None => false,
+            Some(Node::Directory)
+                if !self.nodes.keys().any(|candidate| {
+                    candidate != &path
+                        && parent_path(candidate).is_some_and(|parent| parent == path)
+                }) =>
+            {
+                true
+            }
+            Some(_) => return Err(FsError::Exists),
+        };
         let parent = parent_path(&path).ok_or(FsError::Invalid)?;
         if !matches!(self.nodes.get(parent), Some(Node::Directory))
             || self.mount_for_path(parent).is_some()
@@ -353,7 +365,9 @@ impl Namespace {
         if provider.metadata("/")?.kind != NodeKind::Directory {
             return Err(FsError::WrongType);
         }
-        self.nodes.insert(path.clone(), Node::Directory);
+        if !target_exists {
+            self.nodes.insert(path.clone(), Node::Directory);
+        }
         self.mounts.push(ProviderMount { path, provider });
         self.mounts.sort_unstable_by(|left, right| {
             right
@@ -1032,5 +1046,29 @@ mod tests {
                 .iter()
                 .any(|entry| entry.name == "media" && entry.kind == NodeKind::Directory)
         }));
+    }
+
+    #[test]
+    fn provider_can_overlay_only_an_empty_recovery_mountpoint() {
+        let mut fs = Namespace::new(RamFsQuota::default());
+        assert_eq!(fs.add_read_only_dir("/vol"), Ok(()));
+        assert_eq!(fs.add_read_only_dir("/vol/root"), Ok(()));
+        assert_eq!(
+            fs.mount_read_only("/vol/root", Box::new(TestProvider)),
+            Ok(())
+        );
+        assert_eq!(fs.read_file("/", "/vol/root/data"), Ok(b"mounted".to_vec()));
+
+        let mut occupied = Namespace::new(RamFsQuota::default());
+        assert_eq!(occupied.add_read_only_dir("/vol"), Ok(()));
+        assert_eq!(occupied.add_read_only_dir("/vol/root"), Ok(()));
+        assert_eq!(
+            occupied.add_read_only_file("/vol/root/local", b"reserved"),
+            Ok(())
+        );
+        assert_eq!(
+            occupied.mount_read_only("/vol/root", Box::new(TestProvider)),
+            Err(FsError::Exists)
+        );
     }
 }

@@ -1,0 +1,17 @@
+[package]
+name = "troe-storage"
+description = "Deterministic native-volume discovery and read-only mount activation for TROE"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+troe-block = { path = "../troe-block" }
+troe-ext4 = { path = "../troe-ext4" }
+troe-gpt = { path = "../troe-gpt" }
+troe-mount = { path = "../troe-mount" }
+troe-vfs = { path = "../troe-vfs" }
+
+[lints]
+workspace = true

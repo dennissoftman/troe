@@ -16,10 +16,14 @@ troe-core = { path = "../crates/troe-core" }
 troe-dispatch = { path = "../crates/troe-dispatch" }
 troe-driver = { path = "../crates/troe-driver" }
 troe-memory = { path = "../crates/troe-memory" }
+troe-mount = { path = "../crates/troe-mount" }
 troe-shell = { path = "../crates/troe-shell" }
+troe-storage = { path = "../crates/troe-storage" }
 troe-task = { path = "../crates/troe-task" }
 troe-terminal = { path = "../crates/troe-terminal" }
 troe-vfs = { path = "../crates/troe-vfs" }
+troe-ext4 = { path = "../crates/troe-ext4" }
+troe-gpt = { path = "../crates/troe-gpt" }
 
 [target.'cfg(target_os = "uefi")'.dependencies]
 troe-machine = { path = "../crates/troe-machine" }
