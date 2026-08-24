@@ -17,6 +17,7 @@ members = [
     "crates/troe-shell",
     "crates/troe-task",
     "crates/troe-terminal",
+    "crates/troe-virtio",
     "host",
     "kernel",
     "xtask",
@@ -37,6 +38,7 @@ default-members = [
     "crates/troe-shell",
     "crates/troe-task",
     "crates/troe-terminal",
+    "crates/troe-virtio",
     "host",
 ]
 

@@ -338,11 +338,17 @@ The first portable storage/configuration boundary is landed:
   bounded canonical role names, explicit whole-device/GPT selectors, access and
   availability policy, duplicate-selector rejection, and deterministic exact
   stable-identity resolution for diskless, matched, missing, and ambiguous
-  media.
+  media; and
+- `troe-virtio` implements the bounded modern single-request block profile, and
+  the AArch64 `virt` machine profile now discovers `virtio-mmio` block devices,
+  establishes an eight-entry split queue with explicit DMA ordering and
+  reset-before-return timeout safety, and completes a native post-handoff read
+  in QEMU acceptance.
 
-These are portable, host-verified mechanisms. Stage 8 is not complete: no
-native block transport is active, FAT32 and ext4 remain read-only, configuration
-is not persistently activated, and networking,
+These mechanisms are host verified and the first native transport is QEMU
+verified. Stage 8 is not complete: q35 virtio PCI and persistent mount activation
+are absent, FAT32 and ext4 remain read-only, configuration is not persistently
+activated, and networking,
 the content store, generation activation, and rollback are still absent.
 
 ADR 0018 fixes the bootstrap semantics for the next storage increments. KEFS
@@ -371,10 +377,10 @@ Continue Stage 8 in this order:
 
 ### Next-session handoff
 
-Start with item 1 above: add the first discoverable VM block transport behind
-the existing `troe-block` capability and platform-profile boundary. Keep the
-filesystem providers unaware of the transport, and prove a native path from a
-bounded whole device through GPT to the existing read-only FAT32/ext4 mounts.
+Continue item 1 above: add the modern virtio PCI front end for q35 over the
+landed shared core, then wire bounded native devices through GPT, BMNT exact
+selection, and the existing read-only FAT32/ext4 mounts. Keep filesystem
+providers unaware of either transport.
 
 BMNT v1 now completes the portable boot-manifest prerequisite from ADR 0018.
 Wire native discovery into it only after transport geometry and GPT validation;

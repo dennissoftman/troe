@@ -183,6 +183,7 @@ name = "troe-kernel"
 version = "0.1.0"
 dependencies = [
  "troe-application",
+ "troe-block",
  "troe-core",
  "troe-dispatch",
  "troe-driver",
@@ -200,10 +201,12 @@ name = "troe-machine"
 version = "0.1.0"
 dependencies = [
  "rlsf",
+ "troe-block",
  "troe-driver",
  "troe-memory",
  "troe-task",
  "troe-terminal",
+ "troe-virtio",
  "uefi",
 ]
 
@@ -240,6 +243,13 @@ name = "troe-vfs"
 version = "0.1.0"
 dependencies = [
  "troe-core",
+]
+
+[[package]]
+name = "troe-virtio"
+version = "0.1.0"
+dependencies = [
+ "troe-block",
 ]
 
 [[package]]

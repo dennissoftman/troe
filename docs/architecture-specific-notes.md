@@ -99,6 +99,19 @@ x86-64 or AArch64 platform contracts.
   semantics even when PAN is active. The entry/return boundary preserves
   x19-x30, q8-q15, FPCR, FPSR, DAIF, SP_EL0, and TPIDR_EL0, restores TTBR0_EL1,
   and completes a global TLB invalidation before returning to Rust.
+- The profile maps all 32 documented virtio-MMIO slots as one RW/NX device
+  aperture, then probes only modern magic/version/device identifiers. Block
+  devices negotiate `VERSION_1` plus the small understood feature subset and
+  use request queue zero with an eight-entry split ring and one request in
+  flight. Queue/header/status memory remains page-aligned, identity-mapped, and
+  live for the complete device lifetime. `dmb oshst` precedes notification and
+  `dmb oshld` follows used-index observation. A timed-out request resets and
+  confirms the device before returning; failure to confirm reset parks forever
+  because returning could let DMA outlive the borrowed payload.
+- Polling block completion suppresses used interrupts and acknowledges any
+  observed transport status. GIC initialization keeps virtio SPIs masked; a
+  later interrupt-driven block profile must add explicit routing, ISR budgets,
+  and teardown synchronization rather than reusing the input path implicitly.
 - Suspended application handle calls translate only previously validated user
   ranges to retained task-owned physical pages. The supervisor kernel root
   identity-maps those allocated pages for the bounded request and reply copies;

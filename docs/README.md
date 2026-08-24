@@ -50,6 +50,9 @@ the exact clean read-only ext4 v1 feature bitmap and parser bounds.
 `/vol/root` and `/vol/boot` roles, keeps KEFS as the diskless recovery root, and
 requires deterministic root selection through the now-implemented BMNT v1
 boot-side manifest and stable disk, partition, and filesystem identities.
+[ADR 0019](adr/0019-bounded-virtio-block-transport.md) fixes the modern,
+single-request virtio block core and the first native AArch64 `virtio-mmio`
+transport, including its DMA lifetime and reset-on-timeout rules.
 ADR 0012 governs the completed Stage 5.1 terminal and
 framebuffer increment; AArch64 native keyboard input remains a later
 virtio-input transport decision. ADR 0013 governs the completed Stage 5.2

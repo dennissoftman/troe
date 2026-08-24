@@ -8,6 +8,9 @@ mod mechanism;
 #[cfg(any(test, target_os = "uefi"))]
 #[allow(unsafe_code)]
 mod mmu;
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+#[allow(unsafe_code)]
+mod virtio_mmio;
 
 #[cfg(target_os = "uefi")]
 pub use mechanism::{
@@ -31,3 +34,8 @@ pub use mmu::{ApplicationOutcome, IsolatedFault, IsolatedOutcome, UserAddressSpa
 pub use mmu::{ImageLayout, ImageRegion, MmuError, MmuStats};
 #[cfg(all(target_os = "uefi", feature = "acceptance-probes"))]
 pub use mmu::{trigger_execute_fault, trigger_native_exception, trigger_write_fault};
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+pub use virtio_mmio::{
+    NativeVirtioBlock, VirtioMmioError, discover_virtio_mmio_blocks, virtio_mmio_device_ranges,
+};

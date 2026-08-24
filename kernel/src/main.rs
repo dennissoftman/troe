@@ -15,6 +15,8 @@ mod firmware {
     use alloc::boxed::Box;
     use alloc::string::String;
     use alloc::vec::Vec;
+    #[cfg(target_arch = "aarch64")]
+    use core::cell::RefCell;
     use core::fmt::Write as _;
     use core::panic::PanicInfo;
 
@@ -22,6 +24,8 @@ mod firmware {
         ABI_MINOR, ApplicationLimits, InitialHandle, LoadPlan, PAGE_BYTES, ParseError,
         ResourceProfile, SegmentPermissions, StartupInfo, Target, parse_kex,
     };
+    #[cfg(target_arch = "aarch64")]
+    use troe_block::BlockDevice;
     use troe_core::{Input, MAX_LINE_BYTES, MachineMemorySnapshot, Output, StreamError};
     use troe_dispatch::{
         ConsoleService, CopiedMessage, DispatchedOutput, Dispatcher, HandleOwner, ReplyStatus,
@@ -173,6 +177,8 @@ mod firmware {
         framebuffer: Option<FramebufferDescriptor>,
         kernel_runtime: PhysicalRange,
         kernel_plan: MappingPlan,
+        #[cfg(target_arch = "aarch64")]
+        native_blocks: RefCell<Vec<troe_machine::NativeVirtioBlock>>,
     }
 
     #[derive(Clone, Copy)]
@@ -396,6 +402,8 @@ mod firmware {
         {
             return Err(());
         }
+        #[cfg(target_arch = "aarch64")]
+        let native_blocks = initialize_native_blocks()?;
         troe_machine::initialize_input_interrupts(InputQueueConfig::tiny()).map_err(|_| ())?;
         if !troe_machine::write(b"interrupt-driven input: ready\n") {
             return Err(());
@@ -410,7 +418,30 @@ mod firmware {
             framebuffer,
             kernel_runtime: prepared.boot_memory.arena,
             kernel_plan: mapping_plan,
+            #[cfg(target_arch = "aarch64")]
+            native_blocks: RefCell::new(native_blocks),
         })
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn initialize_native_blocks() -> Result<Vec<troe_machine::NativeVirtioBlock>, ()> {
+        let mut devices = troe_machine::discover_virtio_mmio_blocks().map_err(|_| ())?;
+        for device in &mut devices {
+            let block_bytes =
+                usize::try_from(device.geometry().logical_block_bytes()).map_err(|_| ())?;
+            let mut first_block = Vec::new();
+            first_block.try_reserve_exact(block_bytes).map_err(|_| ())?;
+            first_block.resize(block_bytes, 0);
+            device.read_blocks(0, 1, &mut first_block).map_err(|_| ())?;
+        }
+        if devices.is_empty() {
+            if !troe_machine::write(b"native virtio block: no devices\n") {
+                return Err(());
+            }
+        } else if !troe_machine::write(b"native virtio block: ready\n") {
+            return Err(());
+        }
+        Ok(devices)
     }
 
     fn reserve_and_install_heap() -> Result<BootMemory, ()> {
@@ -550,6 +581,16 @@ mod firmware {
             .into_iter()
             .flatten()
         {
+            insert_identity(
+                &mut plan,
+                device,
+                MappingPermissions::READ_WRITE,
+                MappingMemoryType::Device,
+                MappingOwner::MachineDevice,
+            )?;
+        }
+        #[cfg(target_arch = "aarch64")]
+        for device in troe_machine::virtio_mmio_device_ranges().map_err(|_| ())? {
             insert_identity(
                 &mut plan,
                 device,
@@ -708,6 +749,10 @@ mod firmware {
     }
 
     fn run_owned(mut accounting: OwnedAccounting) -> ! {
+        #[cfg(target_arch = "aarch64")]
+        if accounting.native_blocks.borrow().len() > 8 {
+            fatal(b"fatal: native block device accounting exceeded\n");
+        }
         let mut scheduler = Scheduler::new(TASK_STACK_COUNT)
             .unwrap_or_else(|_| fatal(b"fatal: cannot create task scheduler\n"));
         run_cooperative_services(&mut scheduler, &accounting)

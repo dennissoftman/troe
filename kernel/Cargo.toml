@@ -11,6 +11,7 @@ acceptance-probes = ["troe-machine/acceptance-probes"]
 
 [dependencies]
 troe-application = { path = "../crates/troe-application" }
+troe-block = { path = "../crates/troe-block" }
 troe-core = { path = "../crates/troe-core" }
 troe-dispatch = { path = "../crates/troe-dispatch" }
 troe-driver = { path = "../crates/troe-driver" }
