@@ -1,6 +1,6 @@
 # Unsafe inventory
 
-The current kernel contains exactly 226 project-authored Rust `unsafe` tokens,
+The current kernel contains exactly 229 project-authored Rust `unsafe` tokens,
 all in the four audited modules of `crates/troe-machine`. The verification gate
 fails if this count changes without a same-change inventory review. Portable
 crates and the kernel composition root continue to forbid unsafe code.
@@ -15,8 +15,8 @@ crates and the kernel composition root continue to forbid unsafe code.
 | Architecture monotonic counters | 2 | The pinned single-vCPU x86-64 profile reads its invariant TSC after CPUID supplies a frequency or a pre-handoff firmware stall calibrates it; AArch64 reads the architected physical counter and frequency at EL1. Checked scaling produces boot-relative milliseconds and runtime state clamps observations against regression. |
 | x86-64 APIC input/timer delivery and entry | 25 | Mapped LAPIC/I/O APIC registers and owned PIC/UART/PIT ports are accessed only from the pinned q35 profile; PIT channel 2 calibrates a masked local-APIC one-shot before the 50 ms lease is armed; explicit IDT gates preserve interrupted integer and floating-point state; `sti; hlt; cli` closes the empty-check sleep race. |
 | AArch64 GICv2 input/timer delivery and entry | 24 | The pinned `virt` GICv2 aperture is mapped RW/NX as device memory; distributor/CPU-interface operations are bounded by `GICD_TYPER`; PPI 30 carries the checked generic physical-timer deadline; the IRQ vector preserves all general and SIMD state; IRQ-masked `dsb; wfi` closes the pre-sleep handler race before pending dispatch returns to masked queue access. |
-| x86-64 16550, i8042, and `hlt` | 12 | The pinned q35 profile owns COM1 at `0x3f8` and the PS/2 controller at `0x60`/`0x64`; byte I/O checks readiness/status bits, ignores auxiliary-device data, and bounds transmit polling; halt is terminal. |
-| AArch64 PL011 and `wfe` | 10 | The pinned virt profile owns PL011 at `0x09000000`; aligned volatile accesses target documented registers; transmit polling is bounded; park is terminal. |
+| x86-64 16550, i8042, q35 power control, and `hlt` | 14 | The pinned q35 profile owns COM1 at `0x3f8`, the PS/2 controller at `0x60`/`0x64`, ICH9 PM1 control at `0x604`, and reset control at `0xcf9`; byte I/O checks readiness/status bits, transmit polling is bounded, and terminal power/reset requests park if the platform unexpectedly returns. |
+| AArch64 PL011, PSCI, and `wfe` | 11 | The pinned virt profile owns PL011 at `0x09000000` and advertises PSCI 1.0 through HVC; aligned volatile UART access is bounded, terminal SYSTEM_OFF/SYSTEM_RESET calls take no borrowed memory, and park remains the fallback if firmware returns. |
 | AArch64 virtio-MMIO block/network DMA | 9 | The pinned `virt` aperture is mapped RW/NX before register access; page-aligned live allocations retain split queues and fixed buffers; descriptor payload addresses name exclusively borrowed or owned identity-mapped heap memory; outer-shareable barriers order publication and completion; bounded timeouts return only after confirmed reset, while failed reset parks forever so DMA cannot outlive Rust storage. |
 | x86-64 q35 virtio PCI block/network DMA | 15 | Bounded mechanism-1 configuration access scans bus zero only; capability loops, duplicates, BAR types/sizes, and offsets fail closed; BAR probing disables decode and restores configuration exactly; only validated capability pages are mapped RW/NX; bus mastering starts after mapping; page-aligned split queues, fixed network buffers, and confirmed-reset timeout rules keep DMA inside Rust lifetimes. |
 | Heap host tests | 4 | Test arenas remain live, exclusively borrowed, and allocations are deallocated once with their original layouts. |

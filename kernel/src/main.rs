@@ -62,8 +62,8 @@ mod firmware {
     #[cfg(feature = "acceptance-probes")]
     use troe_persist::{DualSlotStore, RegionSelector, TRANSACTION_BLOCKS};
     use troe_shell::{
-        ArpEntry, CompletionConfig, NetworkControl, NetworkError, NetworkStats, NetworkStatus,
-        PingReply, ReceivedUdp, Shell,
+        ArpEntry, CompletionConfig, MachineAction, NetworkControl, NetworkError, NetworkStats,
+        NetworkStatus, PingReply, ReceivedUdp, Shell,
     };
     #[cfg(feature = "acceptance-probes")]
     use troe_statefs::{STATE_PATH, StateFs};
@@ -3522,9 +3522,21 @@ mod firmware {
             let mut input = EmptyInput;
             let mut error = NativeConsole;
             let _status = shell.execute(&line, &mut input, &mut console, &mut error);
-            if shell.halt_requested() {
-                let _result = write_all(&mut console, b"halting: parking CPU\n");
-                troe_machine::park();
+            if let Some(action) = shell.machine_action() {
+                perform_machine_action(action, &mut console);
+            }
+        }
+    }
+
+    fn perform_machine_action(action: MachineAction, console: &mut dyn Output) -> ! {
+        match action {
+            MachineAction::PowerOff => {
+                let _result = write_all(console, b"poweroff: requesting soft off\n");
+                troe_machine::poweroff();
+            }
+            MachineAction::Reboot => {
+                let _result = write_all(console, b"reboot: requesting cold reset\n");
+                troe_machine::reboot();
             }
         }
     }

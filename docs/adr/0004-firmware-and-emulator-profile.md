@@ -13,9 +13,9 @@ direct UART ownership by TROE.
 
 This firmware-hosted behavior remains the historical Stage 1 contract. Stage 2
 keeps the same pinned boot profile but uses Simple Text Output only for its
-bootstrap banner, then initializes the native UART, exits boot services, and
-parks the CPU for authorized `halt`. The image still makes no claim of
-userspace or hardware isolation.
+bootstrap banner, then initializes the native UART and exits boot services.
+Authorized `poweroff` and `reboot` use profile-owned native control mechanisms.
+The image still makes no claim of userspace or hardware isolation.
 
 Revisit exact machine versions only through this ADR and update transcript
 goldens at the same time.

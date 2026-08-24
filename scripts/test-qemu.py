@@ -422,6 +422,23 @@ class SerialSession:
         if "Initializing memory and protection" in tail or "sh:/> " in tail:
             raise AcceptanceError(f"machine rebooted after fatal marker: {tail!r}")
 
+    def terminal_command(
+        self, command: str, marker: bytes, timeout: float
+    ) -> None:
+        """Require a platform-control command to emit its marker and exit QEMU."""
+        start = self.send(command, timeout)
+        self.wait_for(marker, timeout, start)
+        try:
+            status = self.process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            raise AcceptanceError(
+                f"{command!r} did not terminate the QEMU machine"
+            ) from error
+        if status != 0:
+            raise AcceptanceError(
+                f"{command!r} terminated QEMU with unexpected status {status}"
+            )
+
     def cancelled_command(
         self, command: str, cwd: str, timeout: float
     ) -> None:
@@ -789,9 +806,9 @@ def run_scenario(session: SerialSession, boot_timeout: float, command_timeout: f
             f"{baseline_heap} -> {final_heap} bytes"
         )
 
-    start = len(session.output)
-    session.send("halt", command_timeout)
-    session.wait_for(b"halting: parking CPU", command_timeout, start)
+    session.terminal_command(
+        "poweroff", b"poweroff: requesting soft off", command_timeout
+    )
 
 
 def run_smoke_scenario(
@@ -856,9 +873,20 @@ def run_smoke_scenario(
         absent=("firmware", "advisory", "unavailable"),
     )
     parse_owned_memory_accounting(report)
-    start = len(session.output)
-    session.send("halt", command_timeout)
-    session.wait_for(b"halting: parking CPU", command_timeout, start)
+    session.terminal_command(
+        "poweroff", b"poweroff: requesting soft off", command_timeout
+    )
+
+
+def run_reboot_scenario(
+    session: SerialSession, boot_timeout: float, command_timeout: float
+) -> None:
+    """Require the native reset request to terminate QEMU under -no-reboot."""
+    session.wait_for(b"sh:/> ", boot_timeout)
+    assert_owned_boot(session)
+    session.terminal_command(
+        "reboot", b"reboot: requesting cold reset", command_timeout
+    )
 
 
 def run_native_keyboard_scenario(args: argparse.Namespace) -> None:
@@ -1008,6 +1036,16 @@ def test_architecture(
         raise
     finally:
         session.close()
+    reboot_session = SerialSession(command, architecture)
+    try:
+        run_reboot_scenario(reboot_session, args.boot_timeout, args.command_timeout)
+    except Exception:
+        print(f"--- {architecture} reboot transcript ---", file=sys.stderr)
+        print(reboot_session.transcript(), file=sys.stderr)
+        raise
+    finally:
+        reboot_session.close()
+
     if not args.smoke:
         network_peer = UdpAcceptancePeer(architecture)
         network_peer.start()

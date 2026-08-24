@@ -49,16 +49,17 @@ preserve the current byte order, EOF, partial-I/O, and capacity-error semantics.
 
 There are no ambient device or reboot globals in portable crates. Only the UEFI
 composition root and isolated machine mechanism import firmware/hardware APIs.
-`Shell` receives a boolean machine-control grant; `halt` is denied without it.
+`Shell` receives a boolean machine-control grant; `poweroff` and `reboot` are
+denied without it.
 Privileged recovery built-ins still rely on typed authority rather than a
 hardware boundary. Stage 6 task mappings and handles are additionally enforced
 by ring-3/EL0 page permissions and generation-revoked ownership.
 
-The shell reserves `cd` and `halt` as non-shadowable intrinsics. `cd` owns the
-logical working-directory transition, and `halt` consumes only the shell's
-machine-control grant. Future KEX command discovery may replace ordinary
-command implementations, but it cannot intercept either intrinsic name and ABI
-1.0 exposes no machine-halt operation.
+The shell reserves `cd`, `poweroff`, and `reboot` as non-shadowable intrinsics.
+`cd` owns the logical working-directory transition, while both terminal machine
+actions consume only the shell's machine-control grant. Future KEX command
+discovery may replace ordinary command implementations, but it cannot intercept
+these intrinsic names and ABI 1.0 exposes no platform-transition operation.
 
 ## Allocation
 
@@ -102,7 +103,9 @@ runtime/device pages are NX. Deliberate write and execute violations are
 validated in fresh QEMU boots for both architectures.
 
 The post-handoff shell invokes no firmware protocol or allocator and cannot
-manipulate page tables or exception vectors. Authorized halt parks the CPU.
+manipulate page tables or exception vectors. Authorized `poweroff` and `reboot`
+use the pinned platform profile's native ACPI/PSCI control mechanism; a request
+that unexpectedly returns parks the CPU terminally.
 Stage 4 adds a bounded cooperative scheduler policy in `troe-task`. Task IDs
 are monotonic, records have ready/running/exited lifecycles, capability sets are
 checked during dispatch, and a record retains its stack resource until explicit

@@ -35,8 +35,8 @@ round-robin yields, exits and reaps both, and dispatches a third continuation on
 a returned slot. It then creates the shell task with only console, filesystem,
 and machine-control capabilities and dispatches it using that complete request.
 The shell asserts that its current stack pointer lies in its retained payload;
-its halt authority is derived from the task capability rather than an ambient
-composition-root boolean.
+its poweroff/reboot authority is derived from the task capability rather than
+an ambient composition-root boolean.
 
 ## Consequences
 

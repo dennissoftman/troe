@@ -10,7 +10,7 @@
 - Build, test, image, size, and QEMU entry points are repository scripts.
 - Prompt-synchronized QEMU acceptance drives both production images through all
   built-ins, failure cases, RAMFS quota exhaustion and recovery, memory
-  reporting, and authorized halt with bounded timeouts.
+  reporting, and authorized poweroff/reboot with bounded timeouts.
 
 ## Stage 2: owned machine (complete)
 
@@ -70,7 +70,7 @@ native-exception probes exist only in separate acceptance images; production
 images are scanned to exclude their command strings. Host tests, both target
 Clippy gates, production/acceptance builds, and the pinned dependency audit pass.
 The exhaustive normal-boot, write-fault, execute-fault, native-exception,
-fatal-state, and terminal-halt matrix passes on both targets with QEMU 11.1.0.
+fatal-state, poweroff, and reboot matrix passes on both targets with QEMU 11.1.0.
 
 ## Stage 4: cooperative tasks (complete)
 
@@ -242,9 +242,10 @@ Stage 8:
 2. provide SDK and hosted `build`, `run`, and `inspect` tooling; and
 3. define versioned package-manifest and target-specific lock formats.
 
-KEX command discovery excludes the permanently intrinsic `cd` and `halt`
-names. `cd` remains shell-session state transition; `halt` remains a
-machine-control-capability operation unavailable to application ABI 1.0.
+KEX command discovery excludes the permanently intrinsic `cd`, `poweroff`, and
+`reboot` names. `cd` remains a shell-session state transition; the platform
+transitions remain machine-control-capability operations unavailable to
+application ABI 1.0.
 
 Storage should land before the native KEX discovery/launch path so executable
 artifacts have a real bounded source. Manifest and tooling work remains on the
@@ -288,7 +289,7 @@ Proceed in this order:
    physical-machine requirement;
 5. bring up `aarch64-rpi4-uefi` through serial-first boot, owned memory/MMU,
    exceptions, timer, interrupts, framebuffer when available, shell input, and
-   controlled halt/reboot behavior;
+   controlled poweroff/reboot behavior;
 6. bring up one explicitly identified `x86_64-pc-uefi` reference with the same
    kernel invariants and a documented recovery console; and
 7. add a bounded hardware smoke harness with versioned serial transcripts and

@@ -28,7 +28,7 @@ TROE treats these as independent axes:
   context switching, and architecture timer primitives;
 - a **platform profile** owns the firmware contract, hardware description,
   memory discovery, interrupt topology, timer selection, UART, buses, boot
-  media, framebuffer/input integration, and halt/reboot mechanisms; and
+  media, framebuffer/input integration, and poweroff/reboot mechanisms; and
 - an **execution environment** says whether that platform runs in QEMU, another
   virtual machine, or physical hardware.
 
@@ -98,7 +98,7 @@ A hardware smoke run records:
 - bounded serial transcript and timeout results; and
 - at minimum, bootstrap, firmware exit, owned mappings/vectors, timer and
   interrupt initialization, recovery-shell input/output, memory reporting, and
-  controlled halt or reboot behavior.
+  controlled poweroff or reboot behavior.
 
 Destructive permission-fault, invalid-opcode, and fatal-state matrices remain
 in QEMU unless a dedicated recoverable hardware rig explicitly opts in.

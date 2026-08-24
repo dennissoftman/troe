@@ -827,12 +827,32 @@ unsafe fn input_queue_mut() -> Option<&'static mut BoundedInputQueue> {
     unsafe { (&mut *INPUT_QUEUE.0.get()).as_mut() }
 }
 
-/// Park the current CPU permanently after an authorized halt.
+/// Park the current CPU permanently after a terminal path.
 #[cfg(target_os = "uefi")]
 pub fn park() -> ! {
     loop {
         architecture_park();
     }
+}
+
+/// Request the pinned platform's soft-off transition.
+///
+/// If the platform rejects or unexpectedly returns from the request, the CPU
+/// enters the same terminal parked state used by fatal paths.
+#[cfg(target_os = "uefi")]
+pub fn poweroff() -> ! {
+    architecture_poweroff();
+    park()
+}
+
+/// Request a cold reset from the pinned platform.
+///
+/// If the platform rejects or unexpectedly returns from the request, the CPU
+/// enters the terminal parked state rather than resuming shell execution.
+#[cfg(target_os = "uefi")]
+pub fn reboot() -> ! {
+    architecture_reboot();
+    park()
 }
 
 #[cfg(target_os = "uefi")]
@@ -1259,6 +1279,31 @@ fn architecture_park() {
     // SAFETY: The terminal state owns interrupt policy and intentionally keeps
     // maskable interrupts disabled while halting forever.
     unsafe { core::arch::asm!("cli", "hlt", options(nomem, nostack)) };
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn architecture_poweroff() {
+    const Q35_PM1_CONTROL_PORT: u16 = 0x0604;
+    const ACPI_SLEEP_ENABLE: u16 = 1 << 13;
+    // SAFETY: The pinned q35 profile assigns the ICH9 PM1 control register at
+    // this 16-bit port. S5 uses sleep type zero in the QEMU q35 ACPI profile.
+    unsafe {
+        core::arch::asm!(
+            "out dx, ax",
+            in("dx") Q35_PM1_CONTROL_PORT,
+            in("ax") ACPI_SLEEP_ENABLE,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn architecture_reboot() {
+    const Q35_RESET_CONTROL_PORT: u16 = 0x0cf9;
+    const Q35_RESET_SYSTEM: u8 = 0x06;
+    // SAFETY: The pinned q35 profile assigns the reset-control port; requesting
+    // a full system reset is terminal and the caller parks if it returns.
+    unsafe { port_write(Q35_RESET_CONTROL_PORT, Q35_RESET_SYSTEM) };
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
@@ -1725,6 +1770,37 @@ fn architecture_park() {
     // SAFETY: WFE in the terminal state has no memory effects; the surrounding
     // loop repeats if an event wakes the CPU.
     unsafe { core::arch::asm!("wfe", options(nomem, nostack)) };
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn architecture_poweroff() {
+    const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
+    let _unexpected_return = psci_hvc(PSCI_SYSTEM_OFF);
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn architecture_reboot() {
+    const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
+    let _unexpected_return = psci_hvc(PSCI_SYSTEM_RESET);
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn psci_hvc(function_id: u64) -> u64 {
+    let mut result = function_id;
+    // SAFETY: The pinned QEMU virt profile advertises PSCI 1.0 with the HVC
+    // conduit. SYSTEM_OFF and SYSTEM_RESET take no arguments and are terminal
+    // on success; x0 carries a stable PSCI error if firmware rejects the call.
+    unsafe {
+        core::arch::asm!(
+            "hvc #0",
+            inout("x0") result,
+            out("x1") _,
+            out("x2") _,
+            out("x3") _,
+            options(nostack)
+        );
+    }
+    result
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]

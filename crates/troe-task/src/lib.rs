@@ -103,7 +103,7 @@ impl Capabilities {
     pub const CONSOLE: Self = Self(1 << 0);
     /// May access the mounted filesystem namespace.
     pub const FILESYSTEM: Self = Self(1 << 1);
-    /// May request terminal machine control such as halt.
+    /// May request terminal machine control such as poweroff or reboot.
     pub const MACHINE_CONTROL: Self = Self(1 << 2);
     /// May be dispatched as an internal cooperative service.
     pub const SERVICE: Self = Self(1 << 3);

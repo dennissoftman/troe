@@ -1,0 +1,11 @@
+NAME
+    poweroff - enter the platform soft-off state
+
+SYNOPSIS
+    poweroff
+
+DESCRIPTION
+    Flushes command-visible state and requests the platform's terminal soft-off
+    transition. poweroff is a permanent, non-shadowable shell intrinsic and
+    succeeds only when the shell holds the machine-control capability. KEX
+    application ABI 1.0 cannot invoke it.

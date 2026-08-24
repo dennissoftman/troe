@@ -66,7 +66,7 @@ handle calls, or is terminated by the 50 ms execution lease.
 - single/double quotes and pipelines of up to eight stages;
 - 64 KiB bounded intermediate byte streams;
 - `cat`, `echo`, literal `grep`, `ls`, `pwd`, `cd`, `man`, `mem`, `clear`,
-  `halt`, `write`, `rm`, and `hexdump`;
+  `poweroff`, `reboot`, `write`, `rm`, and `hexdump`;
 - deterministic 1.44 MiB FAT12 images for both primary architectures;
 - host/unit/smoke gates and prompt-synchronized QEMU acceptance on both
   architectures.

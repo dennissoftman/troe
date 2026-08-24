@@ -79,7 +79,7 @@ fn run() -> Result<u8, String> {
                 continue;
             }
             last = execute_line(&mut shell, line);
-            if last != 0 || shell.halt_requested() {
+            if last != 0 || shell.machine_action().is_some() {
                 break;
             }
         }
@@ -109,7 +109,7 @@ fn run() -> Result<u8, String> {
             continue;
         }
         let _status = execute_line(&mut shell, &line);
-        if shell.halt_requested() {
+        if shell.machine_action().is_some() {
             return Ok(0);
         }
     }

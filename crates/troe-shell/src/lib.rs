@@ -82,7 +82,6 @@ enum CommandId {
     Clear,
     Echo,
     Grep,
-    Halt,
     Hexdump,
     Ls,
     Man,
@@ -90,7 +89,9 @@ enum CommandId {
     Net,
     Dhcp,
     Ping,
+    PowerOff,
     Pwd,
+    Reboot,
     Rm,
     Sleep,
     Udp,
@@ -148,13 +149,6 @@ const COMMANDS: &[CommandSpec] = &[
         class: CommandClass::ReplaceableBuiltin,
     },
     CommandSpec {
-        id: CommandId::Halt,
-        name: "halt",
-        synopsis: "halt",
-        requires_machine_control: true,
-        class: CommandClass::Intrinsic,
-    },
-    CommandSpec {
         id: CommandId::Hexdump,
         name: "hexdump",
         synopsis: "hexdump [FILE]",
@@ -197,11 +191,25 @@ const COMMANDS: &[CommandSpec] = &[
         class: CommandClass::ReplaceableBuiltin,
     },
     CommandSpec {
+        id: CommandId::PowerOff,
+        name: "poweroff",
+        synopsis: "poweroff",
+        requires_machine_control: true,
+        class: CommandClass::Intrinsic,
+    },
+    CommandSpec {
         id: CommandId::Pwd,
         name: "pwd",
         synopsis: "pwd",
         requires_machine_control: false,
         class: CommandClass::ReplaceableBuiltin,
+    },
+    CommandSpec {
+        id: CommandId::Reboot,
+        name: "reboot",
+        synopsis: "reboot",
+        requires_machine_control: true,
+        class: CommandClass::Intrinsic,
     },
     CommandSpec {
         id: CommandId::Udp,
@@ -596,6 +604,15 @@ fn push_word(
     Ok(())
 }
 
+/// Terminal platform transition requested by an authorized intrinsic.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MachineAction {
+    /// Flush owned state and enter the platform soft-off state.
+    PowerOff,
+    /// Flush owned state and request a cold platform reset.
+    Reboot,
+}
+
 /// Stateful shell composition root. Authority is explicit in its fields.
 #[derive(Debug)]
 pub struct Shell {
@@ -607,7 +624,7 @@ pub struct Shell {
     network: Option<Box<dyn NetworkControl>>,
     runtime: Option<Box<dyn CooperativeRuntime>>,
     machine_control: bool,
-    halt_requested: bool,
+    machine_action: Option<MachineAction>,
 }
 
 impl Shell {
@@ -633,7 +650,7 @@ impl Shell {
             network: None,
             runtime: None,
             machine_control,
-            halt_requested: false,
+            machine_action: None,
         };
         shell.refresh_memory_node()?;
         Ok(shell)
@@ -649,10 +666,10 @@ impl Shell {
         self.runtime = Some(runtime);
     }
 
-    /// Whether an authorized `halt` command completed.
+    /// Terminal platform transition requested by an authorized command.
     #[must_use]
-    pub const fn halt_requested(&self) -> bool {
-        self.halt_requested
+    pub const fn machine_action(&self) -> Option<MachineAction> {
+        self.machine_action
     }
 
     /// Current logical directory.
@@ -782,14 +799,17 @@ impl Shell {
             CommandId::Dhcp => self.command_dhcp(args, stdout, stderr),
             CommandId::Echo => command_echo(args, stdout, stderr),
             CommandId::Grep => self.command_grep(args, stdin, stdout, stderr),
-            CommandId::Halt => self.command_halt(args, stderr),
             CommandId::Hexdump => self.command_hexdump(args, stdin, stdout, stderr),
             CommandId::Ls => self.command_ls(args, stdout, stderr),
             CommandId::Man => self.command_man(args, stdout, stderr),
             CommandId::Mem => self.command_mem(args, stdout, stderr),
             CommandId::Net => self.command_net(args, stdout, stderr),
             CommandId::Ping => self.command_ping(args, stdout, stderr),
+            CommandId::PowerOff => {
+                self.command_machine_action(args, stderr, MachineAction::PowerOff)
+            }
             CommandId::Pwd => self.command_pwd(args, stdout, stderr),
+            CommandId::Reboot => self.command_machine_action(args, stderr, MachineAction::Reboot),
             CommandId::Rm => self.command_rm(args, stderr),
             CommandId::Sleep => self.command_sleep(args, stderr),
             CommandId::Udp => self.command_udp(args, stdin, stdout, stderr),
@@ -1232,15 +1252,24 @@ impl Shell {
         CommandStatus::Success
     }
 
-    fn command_halt(&mut self, args: &[String], stderr: &mut dyn Output) -> CommandStatus {
+    fn command_machine_action(
+        &mut self,
+        args: &[String],
+        stderr: &mut dyn Output,
+        action: MachineAction,
+    ) -> CommandStatus {
+        let command = match action {
+            MachineAction::PowerOff => "poweroff",
+            MachineAction::Reboot => "reboot",
+        };
         if !args.is_empty() {
-            return usage(stderr, "halt", "halt");
+            return usage(stderr, command, command);
         }
         if !self.machine_control {
-            let _ignored = write_error(stderr, "halt", "machine-control capability denied");
+            let _ignored = write_error(stderr, command, "machine-control capability denied");
             return CommandStatus::Denied;
         }
-        self.halt_requested = true;
+        self.machine_action = Some(action);
         CommandStatus::Success
     }
 
@@ -1823,9 +1852,9 @@ const fn parse_error_text(error: ParseError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArpEntry, COMMANDS, CommandClass, CompletionConfig, CompletionConfigError, NetworkControl,
-        NetworkError, NetworkStats, NetworkStatus, ParseError, PingReply, ReceivedUdp, Shell,
-        command_class, command_synopsis, parse_line,
+        ArpEntry, COMMANDS, CommandClass, CompletionConfig, CompletionConfigError, MachineAction,
+        NetworkControl, NetworkError, NetworkStats, NetworkStatus, ParseError, PingReply,
+        ReceivedUdp, Shell, command_class, command_synopsis, parse_line,
     };
     use alloc::boxed::Box;
     use alloc::string::ToString;
@@ -2055,9 +2084,11 @@ mod tests {
     }
 
     #[test]
-    fn only_cd_and_halt_are_non_shadowable_intrinsics() {
+    fn machine_control_commands_are_non_shadowable_intrinsics() {
         assert_eq!(command_class("cd"), Some(CommandClass::Intrinsic));
-        assert_eq!(command_class("halt"), Some(CommandClass::Intrinsic));
+        assert_eq!(command_class("poweroff"), Some(CommandClass::Intrinsic));
+        assert_eq!(command_class("reboot"), Some(CommandClass::Intrinsic));
+        assert_eq!(command_class("halt"), None);
         assert_eq!(command_class("cat"), Some(CommandClass::ReplaceableBuiltin));
         assert_eq!(command_class("man"), Some(CommandClass::ReplaceableBuiltin));
         assert_eq!(command_class("help"), None);
@@ -2069,7 +2100,34 @@ mod tests {
             .filter(|command| command.class == CommandClass::Intrinsic)
             .map(|command| command.name)
             .collect();
-        assert_eq!(intrinsic_names, ["cd", "halt"]);
+        assert_eq!(intrinsic_names, ["cd", "poweroff", "reboot"]);
+    }
+
+    #[test]
+    fn machine_control_commands_request_exact_terminal_action() {
+        let mut poweroff_shell = shell();
+        let mut input = SliceInput::new(b"");
+        let mut output = BoundedOutput::new(64);
+        let mut error = BoundedOutput::new(64);
+        assert_eq!(
+            poweroff_shell
+                .execute("poweroff", &mut input, &mut output, &mut error)
+                .code(),
+            0
+        );
+        assert_eq!(
+            poweroff_shell.machine_action(),
+            Some(MachineAction::PowerOff)
+        );
+
+        let mut reboot_shell = shell();
+        assert_eq!(
+            reboot_shell
+                .execute("reboot", &mut input, &mut output, &mut error)
+                .code(),
+            0
+        );
+        assert_eq!(reboot_shell.machine_action(), Some(MachineAction::Reboot));
     }
 
     #[test]

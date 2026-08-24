@@ -371,7 +371,7 @@ Also verify manually:
 - ADR 0008 and `docs/architecture.md` describe actual behavior rather than the
   pre-fix design;
 - both QEMU targets pass normal boot, write-fault, execute-fault, fatal-state,
-  and halt scenarios.
+  and terminal platform-transition scenarios.
 
 ## Completion rule
 

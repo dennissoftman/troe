@@ -56,6 +56,11 @@ x86-64 or AArch64 platform contracts.
   header, and negotiates no offload, mergeable-buffer, control, or multiqueue
   features. AArch64 applies the identical queue contract through modern
   virtio-MMIO with outer-shareable DMA barriers.
+- Terminal machine control is profile-owned: `poweroff` writes the q35 ICH9
+  PM1 control register at `0x604` with SLP_EN set for its S5 type, while
+  `reboot` requests a full reset through q35 reset control at `0xcf9`. These
+  constants are not a generic x86-64 hardware contract; a physical PC profile
+  must derive equivalent resources from validated ACPI data.
 - Keep the empty-queue transition as `sti; hlt; cli`. x86 delays maskable
   interrupt recognition until after the instruction following `sti`, so `hlt`
   cannot sleep after an input IRQ has already run and filled the queue. Splitting
@@ -124,6 +129,9 @@ x86-64 or AArch64 platform contracts.
   secondary read-only fixture contains deterministic primary/backup GPT copies
   and a constrained ext4 volume; acceptance reaches that volume only through
   the BMNT disk GUID, partition GUID, and filesystem UUID tuple.
+- The profile advertises PSCI 1.0 with the HVC conduit. Terminal `poweroff` and
+  `reboot` therefore issue `SYSTEM_OFF` and `SYSTEM_RESET`; an unexpected PSCI
+  return falls back to the terminal CPU park path.
 - Polling block completion suppresses used interrupts and acknowledges any
   observed transport status. GIC initialization keeps virtio SPIs masked; a
   later interrupt-driven block profile must add explicit routing, ISR budgets,
