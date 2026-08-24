@@ -224,4 +224,17 @@ def prepare_qemu_command(
             "-no-reboot",
         )
     )
+    if acceptance_probes:
+        network_device = (
+            "virtio-net-pci,disable-legacy=on"
+            if architecture == "x86_64"
+            else "virtio-net-device"
+        )
+        mac = "52:54:00:12:34:56" if architecture == "x86_64" else "52:54:00:12:34:57"
+        command[-1:-1] = [
+            "-netdev",
+            "user,id=troe-net",
+            "-device",
+            f"{network_device},netdev=troe-net,mac={mac}",
+        ]
     return command

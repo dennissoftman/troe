@@ -13,6 +13,7 @@ acceptance-probes = []
 troe-block = { path = "../troe-block" }
 troe-driver = { path = "../troe-driver" }
 troe-memory = { path = "../troe-memory" }
+troe-net = { path = "../troe-net" }
 troe-task = { path = "../troe-task" }
 troe-terminal = { path = "../troe-terminal" }
 troe-virtio = { path = "../troe-virtio" }

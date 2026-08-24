@@ -242,6 +242,14 @@ PRGN-selected writable region, commits the entire single-file filesystem
 through TXSLOT, and attaches at `/vol/state`. The VFS mount records writable
 authority explicitly; ext4 and FAT retain read-only default mutation methods.
 
+The first network boundary is likewise split between safe protocol policy and
+machine transport. `troe-net` owns strict bounded Ethernet/ARP/IPv4/UDP parsing,
+construction, and count-plus-byte receive admission. `troe-machine` owns the
+fixed-buffer modern virtio-net queues for the pinned PCI and MMIO profiles.
+Acceptance resolves the QEMU gateway by ARP and completes a UDP exchange with a
+host peer after rejecting unrelated traffic; no packet-declared allocation or
+unbounded device wait enters either side of the boundary.
+
 KEFS is the intentionally built-in recovery exception. The current FAT12 image
 is read by firmware. General FAT12/16/32, exFAT, the default persistent ext4
 profile, and later NTFS support are separate providers; the first exact ext4

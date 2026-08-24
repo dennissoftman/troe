@@ -1,6 +1,6 @@
 # Unsafe inventory
 
-The current kernel contains exactly 219 project-authored Rust `unsafe` tokens,
+The current kernel contains exactly 223 project-authored Rust `unsafe` tokens,
 all in the four audited modules of `crates/troe-machine`. The verification gate
 fails if this count changes without a same-change inventory review. Portable
 crates and the kernel composition root continue to forbid unsafe code.
@@ -16,8 +16,8 @@ crates and the kernel composition root continue to forbid unsafe code.
 | AArch64 GICv2 input/timer delivery and entry | 24 | The pinned `virt` GICv2 aperture is mapped RW/NX as device memory; distributor/CPU-interface operations are bounded by `GICD_TYPER`; PPI 30 carries the checked generic physical-timer deadline; the IRQ vector preserves all general and SIMD state; IRQ-masked `dsb; wfi` closes the pre-sleep handler race before pending dispatch returns to masked queue access. |
 | x86-64 16550, i8042, and `hlt` | 12 | The pinned q35 profile owns COM1 at `0x3f8` and the PS/2 controller at `0x60`/`0x64`; byte I/O checks readiness/status bits, ignores auxiliary-device data, and bounds transmit polling; halt is terminal. |
 | AArch64 PL011 and `wfe` | 10 | The pinned virt profile owns PL011 at `0x09000000`; aligned volatile accesses target documented registers; transmit polling is bounded; park is terminal. |
-| AArch64 virtio-MMIO block DMA | 7 | The pinned `virt` aperture is mapped RW/NX before register access; one page-aligned live allocation retains the split queue, header, and status; descriptor payload addresses name exclusively borrowed identity-mapped heap buffers; outer-shareable barriers order publication and completion; timeout returns only after confirmed reset, while failed reset parks forever so DMA cannot outlive a Rust borrow. |
-| x86-64 q35 virtio PCI block DMA | 13 | Bounded mechanism-1 configuration access scans bus zero only; capability loops, duplicates, BAR types/sizes, and offsets fail closed; BAR probing disables decode and restores configuration exactly; only validated capability pages are mapped RW/NX; bus mastering starts after mapping; one live aligned split queue and confirmed-reset timeout rule keep DMA inside Rust lifetimes. |
+| AArch64 virtio-MMIO block/network DMA | 9 | The pinned `virt` aperture is mapped RW/NX before register access; page-aligned live allocations retain split queues and fixed buffers; descriptor payload addresses name exclusively borrowed or owned identity-mapped heap memory; outer-shareable barriers order publication and completion; bounded timeouts return only after confirmed reset, while failed reset parks forever so DMA cannot outlive Rust storage. |
+| x86-64 q35 virtio PCI block/network DMA | 15 | Bounded mechanism-1 configuration access scans bus zero only; capability loops, duplicates, BAR types/sizes, and offsets fail closed; BAR probing disables decode and restores configuration exactly; only validated capability pages are mapped RW/NX; bus mastering starts after mapping; page-aligned split queues, fixed network buffers, and confirmed-reset timeout rules keep DMA inside Rust lifetimes. |
 | Heap host tests | 4 | Test arenas remain live, exclusively borrowed, and allocations are deallocated once with their original layouts. |
 | Loaded PE view and terminal acceptance probes | 6 | Checked protocol metadata proves every raw-slice bound; feature-only probes target validated mappings or raise one native exception and never return. |
 | Page-table arena and native entries | 9 | One reserved, identity-mapped 2 MiB arena is exclusively zeroed and filled before activation; every table and leaf pointer is page/index checked; mapping-plan validation rejects virtual overlap, unsafe physical aliases, and W+X. |

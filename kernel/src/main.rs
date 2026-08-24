@@ -49,6 +49,10 @@ mod firmware {
     };
     use troe_mount::{BootMountManifest, parse_manifest};
     #[cfg(feature = "acceptance-probes")]
+    use troe_net::{
+        Ipv4Address, MacAddress, NetworkDevice, build_arp_request, build_udp, parse_arp, parse_udp,
+    };
+    #[cfg(feature = "acceptance-probes")]
     use troe_persist::{DualSlotStore, RegionSelector, TRANSACTION_BLOCKS};
     use troe_shell::{CompletionConfig, Shell};
     #[cfg(feature = "acceptance-probes")]
@@ -478,6 +482,8 @@ mod firmware {
         }
         #[cfg(feature = "acceptance-probes")]
         let statefs = Some(probe_native_persistence(&mut devices, boot_mount_manifest)?);
+        #[cfg(feature = "acceptance-probes")]
+        probe_native_network()?;
         #[cfg(not(feature = "acceptance-probes"))]
         let statefs = None;
         if devices.is_empty() {
@@ -488,6 +494,113 @@ mod firmware {
             return Err(());
         }
         Ok((devices, statefs))
+    }
+
+    #[cfg(feature = "acceptance-probes")]
+    fn probe_native_network() -> Result<(), ()> {
+        #[cfg(target_arch = "aarch64")]
+        let mut network = troe_machine::discover_virtio_mmio_network()
+            .map_err(|_| ())?
+            .ok_or(())?;
+        #[cfg(target_arch = "x86_64")]
+        let mut network = troe_machine::discover_virtio_pci_network()
+            .map_err(|_| ())?
+            .ok_or(())?;
+        if !troe_machine::write(b"native network: device ready\n") {
+            return Err(());
+        }
+        let guest_ip = Ipv4Address::new([10, 0, 2, 15]);
+        let host_ip = Ipv4Address::new([10, 0, 2, 2]);
+        let arp = build_arp_request(network.mac_address(), guest_ip, host_ip).map_err(|_| ())?;
+        network.transmit(&arp).map_err(|_| ())?;
+        if !troe_machine::write(b"native network: ARP request transmitted\n") {
+            return Err(());
+        }
+        let gateway_mac = receive_gateway_arp(&mut network, guest_ip, host_ip)?;
+        if !troe_machine::write(b"native network: ARP reply verified\n") {
+            return Err(());
+        }
+        #[cfg(target_arch = "x86_64")]
+        let host_port = 40_123;
+        #[cfg(target_arch = "aarch64")]
+        let host_port = 40_124;
+        let request = build_udp(
+            network.mac_address(),
+            gateway_mac,
+            guest_ip,
+            host_ip,
+            49_152,
+            host_port,
+            b"troe-stage8-request",
+        )
+        .map_err(|_| ())?;
+        network.transmit(&request).map_err(|_| ())?;
+        if !troe_machine::write(b"native network: UDP request transmitted\n") {
+            return Err(());
+        }
+        for _ in 0..64 {
+            let Some(frame) = network.receive().map_err(|_| ())? else {
+                continue;
+            };
+            if frame.get(..6) != Some(&network.mac_address().bytes()) {
+                continue;
+            }
+            let Ok(datagram) = parse_udp(&frame) else {
+                continue;
+            };
+            if datagram.source_ip == host_ip
+                && datagram.destination_ip == guest_ip
+                && datagram.source_port == host_port
+                && datagram.destination_port == 49_152
+                && datagram.payload == b"troe-stage8-reply"
+            {
+                if !troe_machine::write(b"native network: UDP host exchange complete\n") {
+                    return Err(());
+                }
+                return Ok(());
+            }
+        }
+        Err(())
+    }
+
+    #[cfg(feature = "acceptance-probes")]
+    fn receive_gateway_arp<D: NetworkDevice>(
+        network: &mut D,
+        guest_ip: Ipv4Address,
+        host_ip: Ipv4Address,
+    ) -> Result<MacAddress, ()> {
+        let mut saw_frame = false;
+        let mut saw_arp = false;
+        for _ in 0..64 {
+            let frame = match network.receive() {
+                Ok(Some(frame)) => frame,
+                Ok(None) => continue,
+                Err(_) => {
+                    let _ignored = troe_machine::write(b"native network: RX completion invalid\n");
+                    return Err(());
+                }
+            };
+            saw_frame = true;
+            let Ok(arp) = parse_arp(&frame) else {
+                continue;
+            };
+            saw_arp = true;
+            if arp.operation == 2
+                && arp.sender_ip == host_ip
+                && arp.target_ip == guest_ip
+                && arp.target_mac == network.mac_address().bytes()
+            {
+                return Ok(arp.sender_mac);
+            }
+        }
+        if !saw_frame {
+            let _ignored = troe_machine::write(b"native network: ARP RX timeout\n");
+        } else if !saw_arp {
+            let _ignored = troe_machine::write(b"native network: ARP frame rejected\n");
+        } else {
+            let _ignored = troe_machine::write(b"native network: ARP identity mismatch\n");
+        }
+        Err(())
     }
 
     #[cfg(feature = "acceptance-probes")]

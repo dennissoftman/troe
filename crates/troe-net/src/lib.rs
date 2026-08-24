@@ -17,6 +17,16 @@ pub const MAX_FRAME_BYTES: usize = 1514;
 pub const MIN_FRAME_BYTES: usize = 60;
 /// Maximum UDP payload under the 1500-byte IPv4 MTU.
 pub const MAX_UDP_PAYLOAD_BYTES: usize = 1472;
+/// Virtio network device type identifier.
+pub const VIRTIO_DEVICE_ID_NETWORK: u32 = 1;
+/// Initial RX virtqueue index.
+pub const RECEIVE_QUEUE_INDEX: u16 = 0;
+/// Initial TX virtqueue index.
+pub const TRANSMIT_QUEUE_INDEX: u16 = 1;
+/// Fixed power-of-two split-queue entry count.
+pub const NETWORK_QUEUE_SIZE: u16 = 8;
+/// Modern virtio-net v1 header bytes, including the reserved buffer-count field.
+pub const VIRTIO_NET_HEADER_BYTES: usize = 12;
 const ETHERTYPE_IPV4: u16 = 0x0800;
 const ETHERTYPE_ARP: u16 = 0x0806;
 const IP_PROTOCOL_UDP: u8 = 17;
@@ -34,6 +44,73 @@ pub enum NetError {
     Unsupported,
     /// Bounded packet allocation failed.
     Exhausted,
+    /// The native device rejected or failed an operation.
+    Device,
+    /// A bounded native completion did not arrive.
+    Timeout,
+}
+
+/// Feature subset and MAC accepted before native queue activation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct VirtioNetworkProfile {
+    features: u64,
+    mac: MacAddress,
+}
+
+impl VirtioNetworkProfile {
+    /// Negotiate the deliberately tiny modern virtio-net profile.
+    ///
+    /// # Errors
+    ///
+    /// Requires `VERSION_1` and `MAC`, rejects an invalid config MAC, and accepts
+    /// no device/guest offloads, mergeable buffers, control queues, or MQ.
+    pub fn negotiate(offered: u64, configuration: &[u8]) -> Result<Self, NetError> {
+        const FEATURE_MAC: u64 = 1 << 5;
+        const FEATURE_VERSION_1: u64 = 1 << 32;
+        if offered & FEATURE_VERSION_1 == 0 || offered & FEATURE_MAC == 0 {
+            return Err(NetError::Unsupported);
+        }
+        let mac = MacAddress::new(copy_array(configuration, 0)?)?;
+        Ok(Self {
+            features: FEATURE_VERSION_1 | FEATURE_MAC,
+            mac,
+        })
+    }
+
+    /// Exact accepted feature subset.
+    #[must_use]
+    pub const fn negotiated_features(self) -> u64 {
+        self.features
+    }
+
+    /// Stable configured unicast MAC.
+    #[must_use]
+    pub const fn mac(self) -> MacAddress {
+        self.mac
+    }
+}
+
+/// Bounded complete-frame network capability.
+pub trait NetworkDevice {
+    /// Stable unicast address selected during negotiation.
+    fn mac_address(&self) -> MacAddress;
+
+    /// Transmit one complete Ethernet frame.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid size and returns bounded device/timeout failures.
+    fn transmit(&mut self, frame: &[u8]) -> Result<(), NetError>;
+
+    /// Poll boundedly for one complete received Ethernet frame.
+    ///
+    /// `Ok(None)` means the bounded poll found no completion. Returned frames
+    /// are always within the initial Ethernet ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Reports invalid device completions and bounded allocation failure.
+    fn receive(&mut self) -> Result<Option<Vec<u8>>, NetError>;
 }
 
 /// Canonical unicast Ethernet address.

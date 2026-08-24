@@ -11,6 +11,11 @@ use core::ptr;
 
 use troe_block::BlockError;
 use troe_memory::{BASE_PAGE_SIZE, PhysicalRange};
+use troe_net::{
+    ETHERNET_HEADER_BYTES, MAX_FRAME_BYTES, MacAddress, NETWORK_QUEUE_SIZE, NetError,
+    NetworkDevice, RECEIVE_QUEUE_INDEX, TRANSMIT_QUEUE_INDEX, VIRTIO_DEVICE_ID_NETWORK,
+    VIRTIO_NET_HEADER_BYTES, VirtioNetworkProfile,
+};
 use troe_virtio::{
     REQUEST_HEADER_BYTES, REQUEST_QUEUE_INDEX, REQUEST_QUEUE_SIZE, RequestKind, RequestPlan,
     SplitQueueLayout, VIRTIO_DEVICE_ID_BLOCK, VirtioBlock, VirtioBlockProfile,
@@ -27,6 +32,8 @@ const CONFIG_READ_ATTEMPTS: usize = 8;
 const QUEUE_ALLOCATION_BYTES: usize = 4096;
 const REQUEST_HEADER_OFFSET: usize = 256;
 const REQUEST_STATUS_OFFSET: usize = REQUEST_HEADER_OFFSET + REQUEST_HEADER_BYTES as usize;
+const NETWORK_BUFFER_OFFSET: usize = 256;
+const NETWORK_BUFFER_BYTES: usize = VIRTIO_NET_HEADER_BYTES + MAX_FRAME_BYTES;
 
 const MMIO_MAGIC_VALUE: usize = 0x000;
 const MMIO_VERSION: usize = 0x004;
@@ -84,6 +91,18 @@ pub enum VirtioMmioError {
 /// One initialized `AArch64` `virt` block device behind the portable adapter.
 pub type NativeVirtioBlock = VirtioBlock<VirtioMmioTransport>;
 
+/// One initialized modern virtio-MMIO network device.
+pub struct NativeVirtioNetwork {
+    base: usize,
+    mac: MacAddress,
+    receive: Box<NetworkQueueMemory>,
+    transmit: Box<NetworkQueueMemory>,
+    receive_available: u16,
+    receive_used: u16,
+    transmit_available: u16,
+    transmit_used: u16,
+}
+
 /// Page-aligned MMIO apertures owned by the pinned `AArch64` `virt` profile.
 ///
 /// # Errors
@@ -139,6 +158,132 @@ pub fn discover_virtio_mmio_blocks() -> Result<Vec<NativeVirtioBlock>, VirtioMmi
         devices.push(initialize_device(base)?);
     }
     Ok(devices)
+}
+
+/// Discover exactly zero or one modern virtio-MMIO network device.
+///
+/// # Errors
+///
+/// Rejects multiple NICs and every device that cannot establish the minimal
+/// feature, MAC, two-queue, DMA, status, and reset profile.
+pub fn discover_virtio_mmio_network() -> Result<Option<NativeVirtioNetwork>, VirtioMmioError> {
+    let mut network = None;
+    for index in 0..VIRTIO_MMIO_SLOT_COUNT {
+        let address = VIRTIO_MMIO_BASE
+            .checked_add(
+                u64::try_from(index)
+                    .ok()
+                    .and_then(|slot| slot.checked_mul(VIRTIO_MMIO_SLOT_BYTES))
+                    .ok_or(VirtioMmioError::InvalidResource)?,
+            )
+            .ok_or(VirtioMmioError::InvalidResource)?;
+        let base = usize::try_from(address).map_err(|_| VirtioMmioError::InvalidResource)?;
+        if mmio_read(base, MMIO_MAGIC_VALUE) != VIRTIO_MAGIC
+            || mmio_read(base, MMIO_VERSION) != VIRTIO_MMIO_MODERN_VERSION
+            || mmio_read(base, MMIO_DEVICE_ID) != VIRTIO_DEVICE_ID_NETWORK
+        {
+            continue;
+        }
+        if network.is_some() {
+            return Err(VirtioMmioError::DeviceLimit);
+        }
+        network = Some(initialize_network_device(base)?);
+    }
+    Ok(network)
+}
+
+fn initialize_network_device(base: usize) -> Result<NativeVirtioNetwork, VirtioMmioError> {
+    reset_device(base)?;
+    write_status(base, STATUS_ACKNOWLEDGE);
+    write_status(base, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
+    let profile = VirtioNetworkProfile::negotiate(
+        read_features(base),
+        &read_stable_network_configuration(base)?,
+    )
+    .map_err(|_| VirtioMmioError::UnsupportedProfile)?;
+    write_features(base, profile.negotiated_features());
+    let feature_status = STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK;
+    write_status(base, feature_status);
+    if mmio_read(base, MMIO_STATUS) & STATUS_FEATURES_OK == 0 {
+        fail_and_reset(base);
+        return Err(VirtioMmioError::UnsupportedProfile);
+    }
+    let receive = Box::new(NetworkQueueMemory::new()?);
+    let transmit = Box::new(NetworkQueueMemory::new()?);
+    configure_network_queue(base, RECEIVE_QUEUE_INDEX, &receive)?;
+    configure_network_queue(base, TRANSMIT_QUEUE_INDEX, &transmit)?;
+    write_status(base, feature_status | STATUS_DRIVER_OK);
+    if mmio_read(base, MMIO_STATUS) & STATUS_DRIVER_OK == 0 {
+        fail_and_reset(base);
+        return Err(VirtioMmioError::DeviceState);
+    }
+    let mut network = NativeVirtioNetwork {
+        base,
+        mac: profile.mac(),
+        receive,
+        transmit,
+        receive_available: 0,
+        receive_used: 0,
+        transmit_available: 0,
+        transmit_used: 0,
+    };
+    network
+        .post_receive()
+        .map_err(|_| VirtioMmioError::InvalidQueue)?;
+    Ok(network)
+}
+
+fn configure_network_queue(
+    base: usize,
+    index: u16,
+    queue: &NetworkQueueMemory,
+) -> Result<(), VirtioMmioError> {
+    mmio_write(base, MMIO_QUEUE_SEL, u32::from(index));
+    if mmio_read(base, MMIO_QUEUE_READY) != 0
+        || mmio_read(base, MMIO_QUEUE_SIZE_MAX) < u32::from(NETWORK_QUEUE_SIZE)
+    {
+        return Err(VirtioMmioError::InvalidQueue);
+    }
+    mmio_write(base, MMIO_QUEUE_SIZE, u32::from(NETWORK_QUEUE_SIZE));
+    write_address_pair(
+        base,
+        MMIO_QUEUE_DESC_LOW,
+        MMIO_QUEUE_DESC_HIGH,
+        queue.address(queue.layout.descriptor_offset())?,
+    );
+    write_address_pair(
+        base,
+        MMIO_QUEUE_DRIVER_LOW,
+        MMIO_QUEUE_DRIVER_HIGH,
+        queue.address(queue.layout.available_offset())?,
+    );
+    write_address_pair(
+        base,
+        MMIO_QUEUE_DEVICE_LOW,
+        MMIO_QUEUE_DEVICE_HIGH,
+        queue.address(queue.layout.used_offset())?,
+    );
+    queue.write_u16(queue.layout.available_offset(), NO_INTERRUPT);
+    dma_publish();
+    mmio_write(base, MMIO_QUEUE_READY, 1);
+    if mmio_read(base, MMIO_QUEUE_READY) != 1 {
+        return Err(VirtioMmioError::InvalidQueue);
+    }
+    Ok(())
+}
+
+fn read_stable_network_configuration(base: usize) -> Result<[u8; 8], VirtioMmioError> {
+    for _ in 0..CONFIG_READ_ATTEMPTS {
+        let before = mmio_read(base, MMIO_CONFIG_GENERATION);
+        let mut configuration = [0_u8; 8];
+        for (index, chunk) in configuration.chunks_exact_mut(4).enumerate() {
+            chunk.copy_from_slice(&mmio_read(base, MMIO_CONFIG + index * 4).to_le_bytes());
+        }
+        if before == mmio_read(base, MMIO_CONFIG_GENERATION) {
+            return Ok(configuration);
+        }
+    }
+    Err(VirtioMmioError::DeviceState)
 }
 
 fn initialize_device(base: usize) -> Result<NativeVirtioBlock, VirtioMmioError> {
@@ -403,6 +548,254 @@ impl Drop for VirtioMmioTransport {
         if reset_device(self.base).is_err() {
             terminal_park();
         }
+    }
+}
+
+impl NetworkDevice for NativeVirtioNetwork {
+    fn mac_address(&self) -> MacAddress {
+        self.mac
+    }
+
+    fn transmit(&mut self, frame: &[u8]) -> Result<(), NetError> {
+        self.transmit.prepare_transmit(frame)?;
+        publish_network_descriptor(
+            &self.transmit,
+            &mut self.transmit_available,
+            TRANSMIT_QUEUE_INDEX,
+            self.base,
+        )?;
+        let expected = self.transmit_used.wrapping_add(1);
+        for _ in 0..REGISTER_SPIN_LIMIT {
+            if self
+                .transmit
+                .read_u16(self.transmit.layout.used_offset() + 2)
+                == expected
+            {
+                dma_observe();
+                let (head, bytes) = self.transmit.used_element(self.transmit_used)?;
+                self.transmit_used = expected;
+                acknowledge_network_interrupt(self.base);
+                return if head == 0 && bytes == 0 {
+                    Ok(())
+                } else {
+                    Err(NetError::Device)
+                };
+            }
+            spin_loop();
+        }
+        if reset_device(self.base).is_err() {
+            terminal_park();
+        }
+        Err(NetError::Timeout)
+    }
+
+    fn receive(&mut self) -> Result<Option<Vec<u8>>, NetError> {
+        let expected = self.receive_used.wrapping_add(1);
+        for _ in 0..REGISTER_SPIN_LIMIT {
+            if self.receive.read_u16(self.receive.layout.used_offset() + 2) != expected {
+                spin_loop();
+                continue;
+            }
+            dma_observe();
+            let (head, bytes) = self.receive.used_element(self.receive_used)?;
+            self.receive_used = expected;
+            acknowledge_network_interrupt(self.base);
+            let bytes = usize::try_from(bytes).map_err(|_| NetError::Device)?;
+            if head != 0
+                || !(VIRTIO_NET_HEADER_BYTES + ETHERNET_HEADER_BYTES
+                    ..=VIRTIO_NET_HEADER_BYTES + MAX_FRAME_BYTES)
+                    .contains(&bytes)
+                || !self.receive.header_is_zero()
+            {
+                return Err(NetError::Device);
+            }
+            let frame = self.receive.copy_frame(bytes - VIRTIO_NET_HEADER_BYTES)?;
+            self.post_receive()?;
+            return Ok(Some(frame));
+        }
+        Ok(None)
+    }
+}
+
+impl NativeVirtioNetwork {
+    fn post_receive(&mut self) -> Result<(), NetError> {
+        self.receive.prepare_receive()?;
+        publish_network_descriptor(
+            &self.receive,
+            &mut self.receive_available,
+            RECEIVE_QUEUE_INDEX,
+            self.base,
+        )
+    }
+}
+
+impl Drop for NativeVirtioNetwork {
+    fn drop(&mut self) {
+        if reset_device(self.base).is_err() {
+            terminal_park();
+        }
+    }
+}
+
+fn publish_network_descriptor(
+    queue: &NetworkQueueMemory,
+    available: &mut u16,
+    index: u16,
+    base: usize,
+) -> Result<(), NetError> {
+    let slot = usize::from(*available % NETWORK_QUEUE_SIZE);
+    let ring = queue
+        .layout
+        .available_offset()
+        .checked_add(4 + slot * 2)
+        .ok_or(NetError::Device)?;
+    queue.write_u16(ring, 0);
+    dma_publish();
+    *available = available.wrapping_add(1);
+    queue.write_u16(queue.layout.available_offset() + 2, *available);
+    dma_publish();
+    mmio_write(base, MMIO_QUEUE_NOTIFY, u32::from(index));
+    Ok(())
+}
+
+fn acknowledge_network_interrupt(base: usize) {
+    let status = mmio_read(base, MMIO_INTERRUPT_STATUS) & 0x3;
+    if status != 0 {
+        mmio_write(base, MMIO_INTERRUPT_ACK, status);
+    }
+}
+
+#[repr(C, align(4096))]
+struct NetworkQueueMemory {
+    bytes: [UnsafeCell<u8>; QUEUE_ALLOCATION_BYTES],
+    layout: SplitQueueLayout,
+}
+
+impl NetworkQueueMemory {
+    fn new() -> Result<Self, VirtioMmioError> {
+        let layout =
+            SplitQueueLayout::new(NETWORK_QUEUE_SIZE).map_err(|_| VirtioMmioError::InvalidQueue)?;
+        if layout.total_bytes() > NETWORK_BUFFER_OFFSET
+            || NETWORK_BUFFER_OFFSET + NETWORK_BUFFER_BYTES > QUEUE_ALLOCATION_BYTES
+        {
+            return Err(VirtioMmioError::InvalidQueue);
+        }
+        Ok(Self {
+            bytes: core::array::from_fn(|_| UnsafeCell::new(0)),
+            layout,
+        })
+    }
+
+    fn address(&self, offset: usize) -> Result<u64, VirtioMmioError> {
+        if offset >= QUEUE_ALLOCATION_BYTES {
+            return Err(VirtioMmioError::InvalidQueue);
+        }
+        u64::try_from(self.bytes[offset].get() as usize).map_err(|_| VirtioMmioError::InvalidQueue)
+    }
+
+    fn prepare_receive(&self) -> Result<(), NetError> {
+        for index in 0..NETWORK_BUFFER_BYTES {
+            self.write_u8(NETWORK_BUFFER_OFFSET + index, 0);
+        }
+        self.write_descriptor(
+            self.address(NETWORK_BUFFER_OFFSET)
+                .map_err(|_| NetError::Device)?,
+            u32::try_from(NETWORK_BUFFER_BYTES).map_err(|_| NetError::Device)?,
+            DESCRIPTOR_WRITE,
+        );
+        Ok(())
+    }
+
+    fn prepare_transmit(&self, frame: &[u8]) -> Result<(), NetError> {
+        if !(ETHERNET_HEADER_BYTES..=MAX_FRAME_BYTES).contains(&frame.len()) {
+            return Err(NetError::Invalid);
+        }
+        for index in 0..VIRTIO_NET_HEADER_BYTES {
+            self.write_u8(NETWORK_BUFFER_OFFSET + index, 0);
+        }
+        self.write_bytes(NETWORK_BUFFER_OFFSET + VIRTIO_NET_HEADER_BYTES, frame);
+        self.write_descriptor(
+            self.address(NETWORK_BUFFER_OFFSET)
+                .map_err(|_| NetError::Device)?,
+            u32::try_from(VIRTIO_NET_HEADER_BYTES + frame.len()).map_err(|_| NetError::Device)?,
+            0,
+        );
+        Ok(())
+    }
+
+    fn write_descriptor(&self, address: u64, len: u32, flags: u16) {
+        let offset = self.layout.descriptor_offset();
+        self.write_u64(offset, address);
+        self.write_u32(offset + 8, len);
+        self.write_u16(offset + 12, flags);
+        self.write_u16(offset + 14, 0);
+    }
+
+    fn used_element(&self, used: u16) -> Result<(u32, u32), NetError> {
+        let slot = usize::from(used % NETWORK_QUEUE_SIZE);
+        let offset = self
+            .layout
+            .used_offset()
+            .checked_add(4 + slot * 8)
+            .ok_or(NetError::Device)?;
+        Ok((self.read_u32(offset), self.read_u32(offset + 4)))
+    }
+
+    fn header_is_zero(&self) -> bool {
+        (0..VIRTIO_NET_HEADER_BYTES).all(|index| self.read_u8(NETWORK_BUFFER_OFFSET + index) == 0)
+    }
+
+    fn copy_frame(&self, bytes: usize) -> Result<Vec<u8>, NetError> {
+        let mut frame = Vec::new();
+        frame
+            .try_reserve_exact(bytes)
+            .map_err(|_| NetError::Exhausted)?;
+        for index in 0..bytes {
+            frame.push(self.read_u8(NETWORK_BUFFER_OFFSET + VIRTIO_NET_HEADER_BYTES + index));
+        }
+        Ok(frame)
+    }
+
+    fn write_bytes(&self, offset: usize, bytes: &[u8]) {
+        for (index, byte) in bytes.iter().copied().enumerate() {
+            self.write_u8(offset + index, byte);
+        }
+    }
+
+    fn read_u8(&self, offset: usize) -> u8 {
+        // SAFETY: All offsets are queue-layout or fixed-buffer checked and the
+        // aligned allocation remains alive while DMA is enabled.
+        unsafe { ptr::read_volatile(self.bytes[offset].get()) }
+    }
+
+    fn write_u8(&self, offset: usize, value: u8) {
+        // SAFETY: Driver-written queue and buffer offsets are checked above.
+        unsafe { ptr::write_volatile(self.bytes[offset].get(), value) };
+    }
+
+    fn read_u16(&self, offset: usize) -> u16 {
+        u16::from_le_bytes([self.read_u8(offset), self.read_u8(offset + 1)])
+    }
+
+    fn write_u16(&self, offset: usize, value: u16) {
+        self.write_bytes(offset, &value.to_le_bytes());
+    }
+
+    fn read_u32(&self, offset: usize) -> u32 {
+        u32::from_le_bytes([
+            self.read_u8(offset),
+            self.read_u8(offset + 1),
+            self.read_u8(offset + 2),
+            self.read_u8(offset + 3),
+        ])
+    }
+
+    fn write_u32(&self, offset: usize, value: u32) {
+        self.write_bytes(offset, &value.to_le_bytes());
+    }
+
+    fn write_u64(&self, offset: usize, value: u64) {
+        self.write_bytes(offset, &value.to_le_bytes());
     }
 }
 

@@ -40,9 +40,11 @@ pub use mmu::{trigger_execute_fault, trigger_native_exception, trigger_write_fau
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 pub use virtio_mmio::{
-    NativeVirtioBlock, VirtioMmioError, discover_virtio_mmio_blocks, virtio_mmio_device_ranges,
+    NativeVirtioBlock, NativeVirtioNetwork, VirtioMmioError, discover_virtio_mmio_blocks,
+    discover_virtio_mmio_network, virtio_mmio_device_ranges,
 };
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 pub use virtio_pci::{
-    NativeVirtioBlock, VirtioPciError, discover_virtio_pci_blocks, virtio_pci_device_ranges,
+    NativeVirtioBlock, NativeVirtioNetwork, VirtioPciError, discover_virtio_pci_blocks,
+    discover_virtio_pci_network, virtio_pci_device_ranges,
 };

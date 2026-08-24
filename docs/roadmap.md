@@ -380,13 +380,17 @@ The first portable storage/configuration boundary is landed:
   independently checks transaction generation, STFS checksum, and file bytes.
 - `troe-net` supplies safe bounded Ethernet/ARP/IPv4/UDP construction, parsing,
   checksum and fragment rejection, plus a count-and-byte-bounded receive FIFO.
-  Truncation and 10,000-frame flood tests are host verified; native virtio-net
-  transport and host exchange remain in progress.
+  Truncation and 10,000-frame flood tests are host verified. Native fixed-buffer
+  modern virtio-net queues run through q35 PCI and AArch64 MMIO; both QEMU
+  profiles resolve the gateway by ARP and exchange UDP with a host peer on each
+  of five independent process boots while rejecting unrelated traffic first.
 
-These mechanisms are host verified; both VM transports, read-only mount
-activation, the bounded TXSLOT transaction, and digest-bound ext4 CSPK/SACT
-recovery and selected state-filesystem mutation are QEMU verified. Stage 8 is
-not complete: FAT32 and ext4 remain read-only, and networking is still absent.
+These mechanisms are host verified; both VM block and network transports,
+read-only mount activation, the bounded TXSLOT transaction, digest-bound ext4
+CSPK/SACT recovery, selected state-filesystem mutation, and host UDP exchange
+are QEMU verified. Stage 8 is not complete until the accepted identity registry
+and foreign-mapping snapshots have canonical serialized formats integrated
+with generation and recovery selection.
 
 ADR 0018 fixes the bootstrap semantics for the next storage increments. KEFS
 provides the immutable `/`, `/vol/root` is the selected persistent ext4 role,
@@ -397,18 +401,15 @@ match its stable disk, partition, and filesystem identities exactly; no disk,
 several disks, duplicate identities, and missing/corrupt root media all retain
 the KEFS recovery shell without guessing from enumeration order or labels.
 
-Continue Stage 8 in this order:
-
-1. add bounded network-device capabilities and the minimal configured protocol
-   set before TCP; and
-2. define the registry/mapping serialized formats and integrate them with the
-   persistent generation and recovery selection paths.
+Continue Stage 8 by defining the registry/mapping serialized formats and
+integrating them with the persistent generation and recovery selection paths.
 
 ### Next-session handoff
 
-Continue with bounded network-device capabilities and the minimal configured
-protocol set before TCP. Keep packet parsing, queue ownership, and malformed or
-high-volume input ceilings independently testable.
+Define the canonical identity-registry and foreign-mapping snapshot formats,
+then make the selected generation validate their immutable content addresses
+before activation. Keep parse ceilings, referential integrity, predecessor
+rollback, and malformed snapshots independently testable.
 
 Do not start with a filesystem parser coupled directly to a hardware driver or
 the shell. The block transport, region discovery, filesystem provider, VFS,

@@ -50,6 +50,12 @@ x86-64 or AArch64 platform contracts.
   restores every BAR/command field exactly, and maps only page-rounded
   common/notify/ISR/device capability spans. The polling queue masks MSI-X and
   uses bus-master DMA only after owned mappings are active.
+- The same bounded q35 scanner recognizes modern virtio-net functions. The
+  initial NIC profile owns one eight-entry RX queue and one TX queue, publishes
+  only one fixed complete-frame buffer per queue, uses the 12-byte modern v1
+  header, and negotiates no offload, mergeable-buffer, control, or multiqueue
+  features. AArch64 applies the identical queue contract through modern
+  virtio-MMIO with outer-shareable DMA barriers.
 - Keep the empty-queue transition as `sti; hlt; cli`. x86 delays maskable
   interrupt recognition until after the instruction following `sti`, so `hlt`
   cannot sleep after an input IRQ has already run and filled the queue. Splitting

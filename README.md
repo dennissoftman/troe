@@ -47,10 +47,13 @@ handle calls, or is terminated by the 50 ms execution lease.
   active/predecessor SCFG publication pointer with QEMU-proven health rollback;
 - a bounded single-file persistent state filesystem mounted writable at
   `/vol/state`, with native flush/reopen recovery on both architectures;
+- bounded Ethernet/ARP/IPv4/UDP primitives and native fixed-buffer modern
+  virtio-net PCI/MMIO transports, with checksum/fragment/truncation rejection,
+  a 10,000-frame resource-ceiling test, and QEMU-proven host UDP exchange;
 - a bounded modern virtio block core with native AArch64 `virtio-mmio` and
   x86-64 q35 virtio PCI transports; both have QEMU-proven post-handoff GPT
   discovery, exact BMNT disk/partition/ext4 identity selection, and a live
-  read-only `/vol/root` mount (filesystem mutation remains Stage 8 work);
+  read-only `/vol/root` mount;
 - owned receive interrupts through q35 LAPIC/I/O APIC and AArch64 GICv2,
   bounded raw-event delivery, and race-free `hlt`/`wfi` shell idle;
 - project-owned polling 16550 and PL011 early/fatal recovery output, plus an

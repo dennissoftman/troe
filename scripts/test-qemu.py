@@ -30,10 +30,59 @@ TXSLOT_DISK_BYTES = 4_096 * 512
 TXSLOT_PARTITION_OFFSET = 2_048 * 512
 TXSLOT_BYTES = 4 * 512
 TXSLOT_CHECKSUM_OFFSET = 20
+NETWORK_PORTS = {"x86_64": 40123, "aarch64": 40124}
+NETWORK_REQUEST = b"troe-stage8-request"
+NETWORK_REPLY = b"troe-stage8-reply"
 
 
 class AcceptanceError(RuntimeError):
     """A boot, console, assertion, or timeout failure."""
+
+
+class UdpAcceptancePeer:
+    """Answer the guest's bounded Stage 8 UDP probe on the slirp host."""
+
+    def __init__(self, architecture: str) -> None:
+        self.architecture = architecture
+        self.received = 0
+        self.error: OSError | None = None
+        self._stop = threading.Event()
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._socket.settimeout(0.2)
+        self._socket.bind(("127.0.0.1", NETWORK_PORTS[architecture]))
+        self._thread = threading.Thread(
+            target=self._serve,
+            name=f"udp-acceptance-{architecture}",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _serve(self) -> None:
+        try:
+            while not self._stop.is_set():
+                try:
+                    payload, address = self._socket.recvfrom(256)
+                except socket.timeout:
+                    continue
+                if payload != NETWORK_REQUEST:
+                    continue
+                self.received += 1
+                # Exercise rejection of unrelated bounded traffic before the
+                # valid reply. The portable queue tests supply the 10k flood.
+                for _ in range(4):
+                    self._socket.sendto(b"troe-stage8-noise", address)
+                    time.sleep(0.005)
+                self._socket.sendto(NETWORK_REPLY, address)
+        except OSError as error:
+            if not self._stop.is_set():
+                self.error = error
+
+    def close(self) -> None:
+        self._stop.set()
+        self._socket.close()
+        self._thread.join(timeout=1.0)
 
 
 def txslot_path(architecture: str) -> Path:
@@ -854,6 +903,10 @@ def run_fault_scenario(
         raise AcceptanceError(
             f"{session.architecture} did not commit persistent filesystem mutation"
         )
+    if "native network: UDP host exchange complete" not in session.transcript():
+        raise AcceptanceError(
+            f"{session.architecture} did not complete the native UDP host exchange"
+        )
     session.command(
         "hexdump /vol/state/state.bin",
         "/",
@@ -904,57 +957,73 @@ def test_architecture(
     finally:
         session.close()
     if not args.smoke:
-        for expected_generation, fault in enumerate(
-            ("write", "execute", "guard", "exception", "fatal"), start=2
-        ):
-            command = prepare_qemu_command(
-                architecture,
-                args.firmware_code,
-                args.firmware_vars,
-                skip_version_check=args.skip_version_check,
-                build=False,
-                acceptance_probes=True,
-                framebuffer=args.framebuffer_console,
-            )
-            fault_session = SerialSession(command, architecture)
-            try:
-                run_fault_scenario(
-                    fault_session,
-                    args.boot_timeout,
-                    args.command_timeout,
-                    fault,
+        network_peer = UdpAcceptancePeer(architecture)
+        network_peer.start()
+        try:
+            for expected_generation, fault in enumerate(
+                ("write", "execute", "guard", "exception", "fatal"), start=2
+            ):
+                command = prepare_qemu_command(
+                    architecture,
+                    args.firmware_code,
+                    args.firmware_vars,
+                    skip_version_check=args.skip_version_check,
+                    build=False,
+                    acceptance_probes=True,
+                    framebuffer=args.framebuffer_console,
                 )
-                if expected_generation == 2 and (
-                    "native generation: candidate published" not in fault_session.transcript()
-                    or "native generation: health rollback committed"
-                    not in fault_session.transcript()
-                ):
-                    raise AcceptanceError(
-                        f"{architecture} did not exercise health rollback"
+                fault_session = SerialSession(command, architecture)
+                try:
+                    run_fault_scenario(
+                        fault_session,
+                        args.boot_timeout,
+                        args.command_timeout,
+                        fault,
                     )
-            except Exception:
-                print(
-                    f"--- {architecture} {fault} fault transcript ---",
-                    file=sys.stderr,
-                )
-                print(fault_session.transcript(), file=sys.stderr)
-                raise
-            finally:
-                fault_session.close()
-            actual_generation, payload = txslot_state(architecture)
-            if actual_generation != expected_generation:
-                raise AcceptanceError(
-                    f"{architecture} TXSLOT recovered generation "
-                    f"{actual_generation}, expected {expected_generation}"
-                )
-            assert_rolled_back_sact(architecture, payload)
-            state_generation, counter = statefs_counter(architecture)
-            expected_state = expected_generation - 1
-            if state_generation != expected_state or counter != expected_state:
-                raise AcceptanceError(
-                    f"{architecture} statefs recovered generation {state_generation} "
-                    f"and counter {counter}, expected {expected_state}"
-                )
+                    if expected_generation == 2 and (
+                        "native generation: candidate published"
+                        not in fault_session.transcript()
+                        or "native generation: health rollback committed"
+                        not in fault_session.transcript()
+                    ):
+                        raise AcceptanceError(
+                            f"{architecture} did not exercise health rollback"
+                        )
+                except Exception:
+                    print(
+                        f"--- {architecture} {fault} fault transcript ---",
+                        file=sys.stderr,
+                    )
+                    print(fault_session.transcript(), file=sys.stderr)
+                    raise
+                finally:
+                    fault_session.close()
+                actual_generation, payload = txslot_state(architecture)
+                if actual_generation != expected_generation:
+                    raise AcceptanceError(
+                        f"{architecture} TXSLOT recovered generation "
+                        f"{actual_generation}, expected {expected_generation}"
+                    )
+                assert_rolled_back_sact(architecture, payload)
+                state_generation, counter = statefs_counter(architecture)
+                expected_state = expected_generation - 1
+                if state_generation != expected_state or counter != expected_state:
+                    raise AcceptanceError(
+                        f"{architecture} statefs recovered generation "
+                        f"{state_generation} and counter {counter}, "
+                        f"expected {expected_state}"
+                    )
+        finally:
+            network_peer.close()
+        if network_peer.error is not None:
+            raise AcceptanceError(
+                f"{architecture} UDP acceptance peer failed: {network_peer.error}"
+            )
+        if network_peer.received != 5:
+            raise AcceptanceError(
+                f"{architecture} UDP acceptance peer received "
+                f"{network_peer.received} probes, expected 5"
+            )
     if args.native_keyboard and architecture == "x86_64":
         run_native_keyboard_scenario(args)
     suite = "smoke" if args.smoke else "acceptance"

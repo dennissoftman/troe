@@ -12,6 +12,11 @@ use core::sync::atomic::{Ordering, compiler_fence, fence};
 
 use troe_block::BlockError;
 use troe_memory::{BASE_PAGE_SIZE, PhysicalRange};
+use troe_net::{
+    ETHERNET_HEADER_BYTES, MAX_FRAME_BYTES, MacAddress, NETWORK_QUEUE_SIZE, NetError,
+    NetworkDevice, RECEIVE_QUEUE_INDEX, TRANSMIT_QUEUE_INDEX, VIRTIO_NET_HEADER_BYTES,
+    VirtioNetworkProfile,
+};
 use troe_virtio::{
     REQUEST_HEADER_BYTES, REQUEST_QUEUE_INDEX, REQUEST_QUEUE_SIZE, RequestKind, RequestPlan,
     SplitQueueLayout, VirtioBlock, VirtioBlockProfile, VirtioBlockTransport,
@@ -20,6 +25,7 @@ use troe_virtio::{
 const PCI_CONFIG_ADDRESS: u16 = 0x0cf8;
 const PCI_CONFIG_DATA: u16 = 0x0cfc;
 const PCI_VENDOR_VIRTIO: u16 = 0x1af4;
+const PCI_DEVICE_MODERN_NETWORK: u16 = 0x1041;
 const PCI_DEVICE_MODERN_BLOCK: u16 = 0x1042;
 const PCI_STATUS_CAPABILITIES: u16 = 1 << 4;
 const PCI_COMMAND_MEMORY: u16 = 1 << 1;
@@ -36,6 +42,8 @@ const CONFIG_READ_ATTEMPTS: usize = 8;
 const QUEUE_ALLOCATION_BYTES: usize = 4096;
 const REQUEST_HEADER_OFFSET: usize = 256;
 const REQUEST_STATUS_OFFSET: usize = REQUEST_HEADER_OFFSET + REQUEST_HEADER_BYTES as usize;
+const NETWORK_BUFFER_OFFSET: usize = 256;
+const NETWORK_BUFFER_BYTES: usize = VIRTIO_NET_HEADER_BYTES + MAX_FRAME_BYTES;
 
 const COMMON_DEVICE_FEATURE_SELECT: usize = 0;
 const COMMON_DEVICE_FEATURE: usize = 4;
@@ -87,6 +95,27 @@ pub enum VirtioPciError {
 /// One initialized q35 block device behind the portable virtio adapter.
 pub type NativeVirtioBlock = VirtioBlock<VirtioPciTransport>;
 
+/// One initialized q35 modern virtio network device.
+pub struct NativeVirtioNetwork {
+    common: MmioRegion,
+    isr: MmioRegion,
+    receive_notify: usize,
+    transmit_notify: usize,
+    mac: MacAddress,
+    receive: Box<NetworkQueueMemory>,
+    transmit: Box<NetworkQueueMemory>,
+    receive_available: u16,
+    receive_used: u16,
+    transmit_available: u16,
+    transmit_used: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeviceKind {
+    Network,
+    Block,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PciAddress {
     bus: u8,
@@ -109,6 +138,7 @@ struct BarInfo {
 #[derive(Clone, Copy, Debug)]
 struct PciCapabilities {
     address: PciAddress,
+    kind: DeviceKind,
     common: MmioRegion,
     notify: MmioRegion,
     notify_multiplier: u32,
@@ -186,10 +216,33 @@ pub fn discover_virtio_pci_blocks() -> Result<Vec<NativeVirtioBlock>, VirtioPciE
     devices
         .try_reserve_exact(locations.len())
         .map_err(|_| VirtioPciError::QueueAllocation)?;
-    for location in locations {
+    for location in locations
+        .into_iter()
+        .filter(|device| device.kind == DeviceKind::Block)
+    {
         devices.push(initialize_device(location)?);
     }
     Ok(devices)
+}
+
+/// Discover exactly zero or one q35 modern virtio network function.
+///
+/// # Errors
+///
+/// Rejects multiple NICs and every malformed capability, feature, MAC, queue,
+/// status, DMA, completion, timeout, or reset condition.
+pub fn discover_virtio_pci_network() -> Result<Option<NativeVirtioNetwork>, VirtioPciError> {
+    let mut network = None;
+    for capabilities in scan_devices()?
+        .into_iter()
+        .filter(|device| device.kind == DeviceKind::Network)
+    {
+        if network.is_some() {
+            return Err(VirtioPciError::DeviceLimit);
+        }
+        network = Some(initialize_network_device(capabilities)?);
+    }
+    Ok(network)
 }
 
 fn scan_devices() -> Result<Vec<PciCapabilities>, VirtioPciError> {
@@ -205,21 +258,27 @@ fn scan_devices() -> Result<Vec<PciCapabilities>, VirtioPciError> {
                 function,
             };
             let identity = pci_read32(address, 0);
-            if low_u16(identity) != PCI_VENDOR_VIRTIO
-                || high_u16(identity) != PCI_DEVICE_MODERN_BLOCK
-            {
+            if low_u16(identity) != PCI_VENDOR_VIRTIO {
                 continue;
             }
+            let kind = match high_u16(identity) {
+                PCI_DEVICE_MODERN_NETWORK => DeviceKind::Network,
+                PCI_DEVICE_MODERN_BLOCK => DeviceKind::Block,
+                _ => continue,
+            };
             if devices.len() >= MAX_NATIVE_BLOCK_DEVICES {
                 return Err(VirtioPciError::DeviceLimit);
             }
-            devices.push(parse_capabilities(address)?);
+            devices.push(parse_capabilities(address, kind)?);
         }
     }
     Ok(devices)
 }
 
-fn parse_capabilities(address: PciAddress) -> Result<PciCapabilities, VirtioPciError> {
+fn parse_capabilities(
+    address: PciAddress,
+    kind: DeviceKind,
+) -> Result<PciCapabilities, VirtioPciError> {
     if pci_read16(address, 6) & PCI_STATUS_CAPABILITIES == 0 {
         return Err(VirtioPciError::InvalidCapability);
     }
@@ -273,7 +332,8 @@ fn parse_capabilities(address: PciAddress) -> Result<PciCapabilities, VirtioPciE
                 }
                 PCI_CAP_DEVICE if length >= 16 => {
                     let region = capability_region(address, pointer)?;
-                    if region.length < 24 {
+                    let minimum = if kind == DeviceKind::Block { 24 } else { 8 };
+                    if region.length < minimum {
                         return Err(VirtioPciError::InvalidCapability);
                     }
                     set_once(&mut device, region)?;
@@ -284,6 +344,7 @@ fn parse_capabilities(address: PciAddress) -> Result<PciCapabilities, VirtioPciE
         if next == 0 {
             return Ok(PciCapabilities {
                 address,
+                kind,
                 common: common.ok_or(VirtioPciError::InvalidCapability)?,
                 notify: notify.ok_or(VirtioPciError::InvalidCapability)?,
                 notify_multiplier: notify_multiplier.ok_or(VirtioPciError::InvalidCapability)?,
@@ -437,6 +498,126 @@ fn initialize_device(capabilities: PciCapabilities) -> Result<NativeVirtioBlock,
         },
         profile,
     ))
+}
+
+fn initialize_network_device(
+    capabilities: PciCapabilities,
+) -> Result<NativeVirtioNetwork, VirtioPciError> {
+    let command = pci_read16(capabilities.address, 4);
+    pci_write16(
+        capabilities.address,
+        4,
+        command | PCI_COMMAND_MEMORY | PCI_COMMAND_BUS_MASTER,
+    );
+    reset_device(capabilities.common)?;
+    write_status(capabilities.common, STATUS_ACKNOWLEDGE);
+    write_status(capabilities.common, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
+    let profile = VirtioNetworkProfile::negotiate(
+        read_features(capabilities.common),
+        &read_stable_network_configuration(capabilities)?,
+    )
+    .map_err(|_| VirtioPciError::UnsupportedProfile)?;
+    write_features(capabilities.common, profile.negotiated_features());
+    let feature_status = STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK;
+    write_status(capabilities.common, feature_status);
+    if mmio_read_u8(capabilities.common.address + COMMON_DEVICE_STATUS) & STATUS_FEATURES_OK == 0 {
+        fail_and_reset(capabilities.common);
+        return Err(VirtioPciError::UnsupportedProfile);
+    }
+    mmio_write_u16(capabilities.common.address + COMMON_MSIX_CONFIG, NO_VECTOR);
+    let receive = Box::new(NetworkQueueMemory::new()?);
+    let transmit = Box::new(NetworkQueueMemory::new()?);
+    let receive_notify = configure_network_queue(capabilities, RECEIVE_QUEUE_INDEX, &receive)?;
+    let transmit_notify = configure_network_queue(capabilities, TRANSMIT_QUEUE_INDEX, &transmit)?;
+    write_status(capabilities.common, feature_status | STATUS_DRIVER_OK);
+    if mmio_read_u8(capabilities.common.address + COMMON_DEVICE_STATUS) & STATUS_DRIVER_OK == 0 {
+        fail_and_reset(capabilities.common);
+        return Err(VirtioPciError::DeviceState);
+    }
+    let mut network = NativeVirtioNetwork {
+        common: capabilities.common,
+        isr: capabilities.isr,
+        receive_notify,
+        transmit_notify,
+        mac: profile.mac(),
+        receive,
+        transmit,
+        receive_available: 0,
+        receive_used: 0,
+        transmit_available: 0,
+        transmit_used: 0,
+    };
+    network
+        .post_receive()
+        .map_err(|_| VirtioPciError::InvalidQueue)?;
+    Ok(network)
+}
+
+fn configure_network_queue(
+    capabilities: PciCapabilities,
+    index: u16,
+    queue: &NetworkQueueMemory,
+) -> Result<usize, VirtioPciError> {
+    let common = capabilities.common.address;
+    mmio_write_u16(common + COMMON_QUEUE_SELECT, index);
+    if mmio_read_u16(common + COMMON_QUEUE_ENABLE) != 0
+        || mmio_read_u16(common + COMMON_QUEUE_SIZE) < NETWORK_QUEUE_SIZE
+    {
+        return Err(VirtioPciError::InvalidQueue);
+    }
+    mmio_write_u16(common + COMMON_QUEUE_SIZE, NETWORK_QUEUE_SIZE);
+    mmio_write_u16(common + COMMON_QUEUE_MSIX_VECTOR, NO_VECTOR);
+    if mmio_read_u16(common + COMMON_QUEUE_MSIX_VECTOR) != NO_VECTOR {
+        return Err(VirtioPciError::InvalidQueue);
+    }
+    mmio_write_u64(
+        common + COMMON_QUEUE_DESC,
+        queue.address(queue.layout.descriptor_offset())?,
+    );
+    mmio_write_u64(
+        common + COMMON_QUEUE_DRIVER,
+        queue.address(queue.layout.available_offset())?,
+    );
+    mmio_write_u64(
+        common + COMMON_QUEUE_DEVICE,
+        queue.address(queue.layout.used_offset())?,
+    );
+    queue.write_u16(queue.layout.available_offset(), NO_INTERRUPT);
+    dma_publish();
+    mmio_write_u16(common + COMMON_QUEUE_ENABLE, 1);
+    if mmio_read_u16(common + COMMON_QUEUE_ENABLE) != 1 {
+        return Err(VirtioPciError::InvalidQueue);
+    }
+    let notify_offset = u64::from(mmio_read_u16(common + COMMON_QUEUE_NOTIFY_OFF))
+        .checked_mul(u64::from(capabilities.notify_multiplier))
+        .ok_or(VirtioPciError::InvalidQueue)?;
+    if notify_offset
+        .checked_add(2)
+        .is_none_or(|end| end > capabilities.notify.length as u64)
+    {
+        return Err(VirtioPciError::InvalidQueue);
+    }
+    capabilities
+        .notify
+        .address
+        .checked_add(usize::try_from(notify_offset).map_err(|_| VirtioPciError::InvalidQueue)?)
+        .ok_or(VirtioPciError::InvalidQueue)
+}
+
+fn read_stable_network_configuration(
+    capabilities: PciCapabilities,
+) -> Result<[u8; 8], VirtioPciError> {
+    for _ in 0..CONFIG_READ_ATTEMPTS {
+        let before = mmio_read_u8(capabilities.common.address + COMMON_CONFIG_GENERATION);
+        let mut configuration = [0_u8; 8];
+        for (index, byte) in configuration.iter_mut().enumerate() {
+            *byte = mmio_read_u8(capabilities.device.address + index);
+        }
+        if before == mmio_read_u8(capabilities.common.address + COMMON_CONFIG_GENERATION) {
+            return Ok(configuration);
+        }
+    }
+    Err(VirtioPciError::DeviceState)
 }
 
 fn configure_queue(
@@ -648,6 +829,247 @@ impl Drop for VirtioPciTransport {
         if reset_device(self.common).is_err() {
             terminal_park();
         }
+    }
+}
+
+impl NetworkDevice for NativeVirtioNetwork {
+    fn mac_address(&self) -> MacAddress {
+        self.mac
+    }
+
+    fn transmit(&mut self, frame: &[u8]) -> Result<(), NetError> {
+        self.transmit.prepare_transmit(frame)?;
+        publish_network_descriptor(
+            &self.transmit,
+            &mut self.transmit_available,
+            TRANSMIT_QUEUE_INDEX,
+            self.transmit_notify,
+        )?;
+        let expected = self.transmit_used.wrapping_add(1);
+        for _ in 0..REGISTER_SPIN_LIMIT {
+            if self
+                .transmit
+                .read_u16(self.transmit.layout.used_offset() + 2)
+                == expected
+            {
+                dma_observe();
+                let (head, bytes) = self.transmit.used_element(self.transmit_used)?;
+                self.transmit_used = expected;
+                let _acknowledged = mmio_read_u8(self.isr.address);
+                return if head == 0 && bytes == 0 {
+                    Ok(())
+                } else {
+                    Err(NetError::Device)
+                };
+            }
+            spin_loop();
+        }
+        if reset_device(self.common).is_err() {
+            terminal_park();
+        }
+        Err(NetError::Timeout)
+    }
+
+    fn receive(&mut self) -> Result<Option<Vec<u8>>, NetError> {
+        let expected = self.receive_used.wrapping_add(1);
+        for _ in 0..REGISTER_SPIN_LIMIT {
+            if self.receive.read_u16(self.receive.layout.used_offset() + 2) != expected {
+                spin_loop();
+                continue;
+            }
+            dma_observe();
+            let (head, bytes) = self.receive.used_element(self.receive_used)?;
+            self.receive_used = expected;
+            let _acknowledged = mmio_read_u8(self.isr.address);
+            let bytes = usize::try_from(bytes).map_err(|_| NetError::Device)?;
+            if head != 0
+                || !(VIRTIO_NET_HEADER_BYTES + ETHERNET_HEADER_BYTES
+                    ..=VIRTIO_NET_HEADER_BYTES + MAX_FRAME_BYTES)
+                    .contains(&bytes)
+                || !self.receive.header_is_zero()
+            {
+                return Err(NetError::Device);
+            }
+            let frame = self.receive.copy_frame(bytes - VIRTIO_NET_HEADER_BYTES)?;
+            self.post_receive()?;
+            return Ok(Some(frame));
+        }
+        Ok(None)
+    }
+}
+
+impl NativeVirtioNetwork {
+    fn post_receive(&mut self) -> Result<(), NetError> {
+        self.receive.prepare_receive()?;
+        publish_network_descriptor(
+            &self.receive,
+            &mut self.receive_available,
+            RECEIVE_QUEUE_INDEX,
+            self.receive_notify,
+        )
+    }
+}
+
+impl Drop for NativeVirtioNetwork {
+    fn drop(&mut self) {
+        if reset_device(self.common).is_err() {
+            terminal_park();
+        }
+    }
+}
+
+fn publish_network_descriptor(
+    queue: &NetworkQueueMemory,
+    available: &mut u16,
+    index: u16,
+    notify: usize,
+) -> Result<(), NetError> {
+    let slot = usize::from(*available % NETWORK_QUEUE_SIZE);
+    let ring = queue
+        .layout
+        .available_offset()
+        .checked_add(4 + slot * 2)
+        .ok_or(NetError::Device)?;
+    queue.write_u16(ring, 0);
+    dma_publish();
+    *available = available.wrapping_add(1);
+    queue.write_u16(queue.layout.available_offset() + 2, *available);
+    dma_publish();
+    mmio_write_u16(notify, index);
+    Ok(())
+}
+
+#[repr(C, align(4096))]
+struct NetworkQueueMemory {
+    bytes: [UnsafeCell<u8>; QUEUE_ALLOCATION_BYTES],
+    layout: SplitQueueLayout,
+}
+
+impl NetworkQueueMemory {
+    fn new() -> Result<Self, VirtioPciError> {
+        let layout =
+            SplitQueueLayout::new(NETWORK_QUEUE_SIZE).map_err(|_| VirtioPciError::InvalidQueue)?;
+        if layout.total_bytes() > NETWORK_BUFFER_OFFSET
+            || NETWORK_BUFFER_OFFSET + NETWORK_BUFFER_BYTES > QUEUE_ALLOCATION_BYTES
+        {
+            return Err(VirtioPciError::InvalidQueue);
+        }
+        Ok(Self {
+            bytes: core::array::from_fn(|_| UnsafeCell::new(0)),
+            layout,
+        })
+    }
+
+    fn address(&self, offset: usize) -> Result<u64, VirtioPciError> {
+        if offset >= QUEUE_ALLOCATION_BYTES {
+            return Err(VirtioPciError::InvalidQueue);
+        }
+        u64::try_from(self.bytes[offset].get() as usize).map_err(|_| VirtioPciError::InvalidQueue)
+    }
+
+    fn prepare_receive(&self) -> Result<(), NetError> {
+        for index in 0..NETWORK_BUFFER_BYTES {
+            self.write_u8(NETWORK_BUFFER_OFFSET + index, 0);
+        }
+        self.write_descriptor(
+            self.address(NETWORK_BUFFER_OFFSET)
+                .map_err(|_| NetError::Device)?,
+            u32::try_from(NETWORK_BUFFER_BYTES).map_err(|_| NetError::Device)?,
+            DESCRIPTOR_WRITE,
+        );
+        Ok(())
+    }
+
+    fn prepare_transmit(&self, frame: &[u8]) -> Result<(), NetError> {
+        if !(ETHERNET_HEADER_BYTES..=MAX_FRAME_BYTES).contains(&frame.len()) {
+            return Err(NetError::Invalid);
+        }
+        for index in 0..VIRTIO_NET_HEADER_BYTES {
+            self.write_u8(NETWORK_BUFFER_OFFSET + index, 0);
+        }
+        self.write_bytes(NETWORK_BUFFER_OFFSET + VIRTIO_NET_HEADER_BYTES, frame);
+        self.write_descriptor(
+            self.address(NETWORK_BUFFER_OFFSET)
+                .map_err(|_| NetError::Device)?,
+            u32::try_from(VIRTIO_NET_HEADER_BYTES + frame.len()).map_err(|_| NetError::Device)?,
+            0,
+        );
+        Ok(())
+    }
+
+    fn write_descriptor(&self, address: u64, len: u32, flags: u16) {
+        let offset = self.layout.descriptor_offset();
+        self.write_u64(offset, address);
+        self.write_u32(offset + 8, len);
+        self.write_u16(offset + 12, flags);
+        self.write_u16(offset + 14, 0);
+    }
+
+    fn used_element(&self, used: u16) -> Result<(u32, u32), NetError> {
+        let slot = usize::from(used % NETWORK_QUEUE_SIZE);
+        let offset = self
+            .layout
+            .used_offset()
+            .checked_add(4 + slot * 8)
+            .ok_or(NetError::Device)?;
+        Ok((self.read_u32(offset), self.read_u32(offset + 4)))
+    }
+
+    fn header_is_zero(&self) -> bool {
+        (0..VIRTIO_NET_HEADER_BYTES).all(|index| self.read_u8(NETWORK_BUFFER_OFFSET + index) == 0)
+    }
+
+    fn copy_frame(&self, bytes: usize) -> Result<Vec<u8>, NetError> {
+        let mut frame = Vec::new();
+        frame
+            .try_reserve_exact(bytes)
+            .map_err(|_| NetError::Exhausted)?;
+        for index in 0..bytes {
+            frame.push(self.read_u8(NETWORK_BUFFER_OFFSET + VIRTIO_NET_HEADER_BYTES + index));
+        }
+        Ok(frame)
+    }
+
+    fn write_bytes(&self, offset: usize, bytes: &[u8]) {
+        for (index, byte) in bytes.iter().copied().enumerate() {
+            self.write_u8(offset + index, byte);
+        }
+    }
+
+    fn read_u8(&self, offset: usize) -> u8 {
+        // SAFETY: Queue-layout and fixed-buffer offsets are checked and the
+        // aligned allocation remains alive while bus mastering is enabled.
+        unsafe { ptr::read_volatile(self.bytes[offset].get()) }
+    }
+
+    fn write_u8(&self, offset: usize, value: u8) {
+        // SAFETY: Driver-written queue and buffer offsets are checked above.
+        unsafe { ptr::write_volatile(self.bytes[offset].get(), value) };
+    }
+
+    fn read_u16(&self, offset: usize) -> u16 {
+        u16::from_le_bytes([self.read_u8(offset), self.read_u8(offset + 1)])
+    }
+
+    fn write_u16(&self, offset: usize, value: u16) {
+        self.write_bytes(offset, &value.to_le_bytes());
+    }
+
+    fn read_u32(&self, offset: usize) -> u32 {
+        u32::from_le_bytes([
+            self.read_u8(offset),
+            self.read_u8(offset + 1),
+            self.read_u8(offset + 2),
+            self.read_u8(offset + 3),
+        ])
+    }
+
+    fn write_u32(&self, offset: usize, value: u32) {
+        self.write_bytes(offset, &value.to_le_bytes());
+    }
+
+    fn write_u64(&self, offset: usize, value: u64) {
+        self.write_bytes(offset, &value.to_le_bytes());
     }
 }
 
