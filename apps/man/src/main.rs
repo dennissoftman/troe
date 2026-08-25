@@ -10,7 +10,7 @@ use troe_kex_sdk::{CommandContext, Error, INVOCATION_BUFFER_BYTES, entry, exit};
 
 const COMMANDS: &[&str] = &[
     "arp", "cat", "cd", "clear", "dhcp", "echo", "grep", "hexdump", "ls", "man", "mem", "net",
-    "ping", "poweroff", "pwd", "reboot", "rm", "sleep", "udp", "write",
+    "ping", "poweroff", "printf", "pwd", "reboot", "rm", "sleep", "udp", "write",
 ];
 
 fn main(command: &mut CommandContext) -> u32 {

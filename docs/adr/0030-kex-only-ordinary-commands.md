@@ -23,10 +23,11 @@ revokes all owner state before the shell resumes.
 The immutable target-selected KEFS root is the recovery command distribution:
 both supported images contain behavior-equivalent KEX apps for `arp`, `cat`,
 `clear`, `dhcp`, `echo`, `grep`, `hexdump`, `ls`, `man`, `mem`, `net`, `ping`,
-`pwd`, `rm`, `sleep`, `udp`, and `write`. Losing one artifact does not silently
-substitute privileged code with different authority or semantics. `cd` cannot
-be external because it mutates the shell session; poweroff and reboot remain
-intrinsic because ABI 1.0 intentionally exposes no machine-control service.
+`printf`, `pwd`, `rm`, `sleep`, `udp`, and `write`. Losing one artifact does not
+silently substitute privileged code with different authority or semantics.
+`cd` cannot be external because it mutates the shell session; poweroff and
+reboot remain intrinsic because ABI 1.0 intentionally exposes no
+machine-control service.
 
 ## Consequences
 

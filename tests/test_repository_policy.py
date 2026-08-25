@@ -135,6 +135,7 @@ class RepositoryPolicyTests(unittest.TestCase):
             "mem",
             "net",
             "ping",
+            "printf",
             "pwd",
             "rm",
             "sleep",

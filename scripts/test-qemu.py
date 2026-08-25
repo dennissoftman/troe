@@ -787,6 +787,12 @@ def run_scenario(
     )
     session.command("echo alpha beta", cwd, command_timeout, contains=("alpha beta\n",))
     session.command(
+        r"printf 'first\nsecond\t%s\n' value | grep second",
+        cwd,
+        command_timeout,
+        contains=("second\tvalue\n",),
+    )
+    session.command(
         "echo alpha beta | grep beta | write /tmp/result", cwd, command_timeout
     )
     session.command("cat /tmp/result", cwd, command_timeout, contains=("alpha beta\n",))
@@ -980,6 +986,12 @@ def run_smoke_scenario(
         cwd,
         command_timeout,
         contains=("qemu-smoke\n",),
+    )
+    session.command(
+        r"printf 'escape\nready\n' | grep ready",
+        cwd,
+        command_timeout,
+        contains=("ready\n",),
     )
     report = session.command(
         "mem",

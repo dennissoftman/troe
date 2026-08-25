@@ -1,0 +1,12 @@
+NAME
+    printf - write formatted text and escape sequences
+
+SYNOPSIS
+    printf FORMAT [ARG...]
+
+DESCRIPTION
+    Writes FORMAT without adding a newline. C-style escapes in FORMAT include
+    \\, \a, \b, \e, \f, \n, \r, \t, \v, octal, hexadecimal, and Unicode
+    escapes. \c stops output. %% writes %, %s writes an argument, and %b writes
+    an argument after interpreting its escapes. FORMAT repeats to consume extra
+    arguments used by %s or %b.

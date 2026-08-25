@@ -201,6 +201,12 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         intrinsic: None,
+        name: "printf",
+        synopsis: "printf FORMAT [ARG...]",
+        class: CommandClass::Application,
+    },
+    CommandSpec {
+        intrinsic: None,
         name: "pwd",
         synopsis: "pwd",
         class: CommandClass::Application,
@@ -1327,8 +1333,10 @@ mod tests {
         assert_eq!(command_class("reboot"), Some(CommandClass::Intrinsic));
         assert_eq!(command_class("cat"), Some(CommandClass::Application));
         assert_eq!(command_class("man"), Some(CommandClass::Application));
+        assert_eq!(command_class("printf"), Some(CommandClass::Application));
         assert_eq!(command_class("help"), None);
         assert_eq!(command_synopsis("man"), Some("man COMMAND"));
+        assert_eq!(command_synopsis("printf"), Some("printf FORMAT [ARG...]"));
 
         let intrinsic_names: Vec<&str> = COMMANDS
             .iter()
