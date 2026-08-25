@@ -206,7 +206,8 @@ terminal permission/exception probes. A build without `--acceptance-probes` is
 rejected if any probe marker is present; deployment status additionally requires
 an explicit non-fixture identity file.
 
-Build the default `x86_64-q35-uefi` image and open it in QEMU:
+Build the host-native image and open it in QEMU (`x86_64-q35-uefi` on x86-64,
+`aarch64-virt-uefi` on AArch64):
 
 ```console
 cargo qemu
@@ -226,10 +227,10 @@ cargo qemu --platform x86_64-q35-uefi --environment qemu --graphical
 cargo qemu --platform aarch64-virt-uefi --environment qemu --graphical
 ```
 
-The Cargo convenience wrapper supplies the named `x86_64-q35-uefi`/`qemu`
-default when either selector is omitted; the underlying launcher and all test
-APIs remain explicit. The launcher discovers firmware bundled with QEMU in
-conventional installation locations. Architecture, target triple, firmware
+The Cargo convenience wrapper supplies the host-native named platform and the
+`qemu` environment when either selector is omitted; the underlying launcher and
+all test APIs remain explicit. The launcher discovers firmware bundled with QEMU
+in conventional installation locations. Architecture, target triple, firmware
 family, machine type, CPU, RAM, and virtio transport derive from the selected
 named platform and are never inferred in the other direction.
 If QEMU does

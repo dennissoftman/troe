@@ -3,8 +3,17 @@ use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 
-const DEFAULT_PLATFORM: &str = "x86_64-q35-uefi";
 const DEFAULT_ENVIRONMENT: &str = "qemu";
+const X86_64_PLATFORM: &str = "x86_64-q35-uefi";
+const AARCH64_PLATFORM: &str = "aarch64-virt-uefi";
+
+fn default_platform(host_architecture: &str) -> Option<&'static str> {
+    match host_architecture {
+        "x86_64" => Some(X86_64_PLATFORM),
+        "aarch64" => Some(AARCH64_PLATFORM),
+        _ => None,
+    }
+}
 
 fn executable_on_path(name: &OsStr) -> OsString {
     let Some(path) = env::var_os("PATH") else {
@@ -31,23 +40,31 @@ fn has_option(arguments: &[OsString], name: &str) -> bool {
     })
 }
 
-fn with_interactive_defaults(arguments: Vec<OsString>) -> (Vec<OsString>, bool) {
-    let default_platform = !has_option(&arguments, "--platform");
+fn with_interactive_defaults(
+    arguments: Vec<OsString>,
+    host_architecture: &str,
+) -> Result<(Vec<OsString>, bool), String> {
+    let use_default_platform = !has_option(&arguments, "--platform");
     let default_environment = !has_option(&arguments, "--environment");
-    if !default_platform && !default_environment {
-        return (arguments, false);
+    if !use_default_platform && !default_environment {
+        return Ok((arguments, false));
     }
     let mut resolved = Vec::with_capacity(arguments.len() + 4);
-    if default_platform {
+    if use_default_platform {
+        let platform = default_platform(host_architecture).ok_or_else(|| {
+            format!(
+                "cannot select a native QEMU platform for unsupported host architecture {host_architecture:?}; pass --platform explicitly"
+            )
+        })?;
         resolved.push(OsString::from("--platform"));
-        resolved.push(OsString::from(DEFAULT_PLATFORM));
+        resolved.push(OsString::from(platform));
     }
     if default_environment {
         resolved.push(OsString::from("--environment"));
         resolved.push(OsString::from(DEFAULT_ENVIRONMENT));
     }
     resolved.extend(arguments);
-    (resolved, true)
+    Ok((resolved, true))
 }
 
 fn main() -> ExitCode {
@@ -65,11 +82,17 @@ fn main() -> ExitCode {
             executable_on_path(OsStr::new(if cfg!(windows) { "python" } else { "python3" }))
         });
 
-    let (arguments, defaulted) = with_interactive_defaults(env::args_os().skip(1).collect());
+    let host_architecture = env::consts::ARCH;
+    let (arguments, defaulted) =
+        match with_interactive_defaults(env::args_os().skip(1).collect(), host_architecture) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                eprintln!("cargo qemu: {error}");
+                return ExitCode::FAILURE;
+            }
+        };
     if defaulted {
-        eprintln!(
-            "cargo qemu: default platform={DEFAULT_PLATFORM} environment={DEFAULT_ENVIRONMENT}"
-        );
+        eprintln!("cargo qemu: using host architecture {host_architecture} for omitted defaults");
     }
 
     match Command::new(python)
@@ -89,22 +112,32 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_ENVIRONMENT, DEFAULT_PLATFORM, with_interactive_defaults};
+    use super::{
+        AARCH64_PLATFORM, DEFAULT_ENVIRONMENT, X86_64_PLATFORM, default_platform,
+        with_interactive_defaults,
+    };
     use std::ffi::OsString;
 
     #[test]
-    fn empty_invocation_selects_one_named_interactive_default() {
-        let (arguments, defaulted) = with_interactive_defaults(Vec::new());
+    fn empty_invocation_selects_aarch64_default_on_aarch64_hosts() {
+        let (arguments, defaulted) = with_interactive_defaults(Vec::new(), "aarch64").unwrap();
         assert!(defaulted);
         assert_eq!(
             arguments,
             [
                 OsString::from("--platform"),
-                OsString::from(DEFAULT_PLATFORM),
+                OsString::from(AARCH64_PLATFORM),
                 OsString::from("--environment"),
                 OsString::from(DEFAULT_ENVIRONMENT),
             ]
         );
+    }
+
+    #[test]
+    fn platform_default_follows_supported_host_architectures() {
+        assert_eq!(default_platform("x86_64"), Some(X86_64_PLATFORM));
+        assert_eq!(default_platform("aarch64"), Some(AARCH64_PLATFORM));
+        assert_eq!(default_platform("riscv64"), None);
     }
 
     #[test]
@@ -115,14 +148,25 @@ mod tests {
             OsString::from("qemu"),
             OsString::from("--graphical"),
         ];
-        let (arguments, defaulted) = with_interactive_defaults(explicit.clone());
+        let (arguments, defaulted) =
+            with_interactive_defaults(explicit.clone(), "unsupported").unwrap();
         assert!(!defaulted);
         assert_eq!(arguments, explicit);
 
-        let (arguments, defaulted) =
-            with_interactive_defaults(vec![OsString::from("--platform=aarch64-virt-uefi")]);
+        let (arguments, defaulted) = with_interactive_defaults(
+            vec![OsString::from("--platform=aarch64-virt-uefi")],
+            "unsupported",
+        )
+        .unwrap();
         assert!(defaulted);
         assert_eq!(arguments[0], OsString::from("--environment"));
         assert_eq!(arguments[1], OsString::from(DEFAULT_ENVIRONMENT));
+    }
+
+    #[test]
+    fn unsupported_host_requires_an_explicit_platform() {
+        let error = with_interactive_defaults(Vec::new(), "riscv64").unwrap_err();
+        assert!(error.contains("unsupported host architecture \"riscv64\""));
+        assert!(error.contains("pass --platform explicitly"));
     }
 }
