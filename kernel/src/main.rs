@@ -22,8 +22,8 @@ mod firmware {
     use core::panic::PanicInfo;
 
     use troe_abi::{
-        command, datagram, diagnostics, filesystem, filesystem_mutation, requirements, stream,
-        timer,
+        command, datagram, diagnostics, filesystem, filesystem_mutation, icmp_echo,
+        network_configuration, network_observation, requirements, stream, timer,
     };
     #[cfg(feature = "acceptance-probes")]
     use troe_application::ParseError;
@@ -405,6 +405,20 @@ mod firmware {
 
     struct ApplicationDiagnosticsService {
         snapshot: [u8; diagnostics::SNAPSHOT_BYTES],
+    }
+
+    struct ApplicationNetworkObservationService {
+        network: Option<SharedNetwork>,
+    }
+
+    struct ApplicationNetworkConfigurationService {
+        network: Option<SharedNetwork>,
+        runtime: SharedRuntime,
+    }
+
+    struct ApplicationIcmpEchoService {
+        network: Option<SharedNetwork>,
+        runtime: SharedRuntime,
     }
 
     struct PendingFileReplacement {
@@ -4133,6 +4147,156 @@ mod firmware {
         }
     }
 
+    fn encode_application_network_status(
+        status: NetworkStatus,
+    ) -> Result<[u8; network_observation::STATUS_BYTES], troe_dispatch::DispatchError> {
+        let configuration = match (status.address, status.subnet_mask, status.gateway) {
+            (Some(address), Some(subnet_mask), Some(gateway)) => {
+                Some(network_observation::Ipv4Configuration {
+                    address,
+                    subnet_mask,
+                    gateway,
+                    lease_seconds: status.lease_seconds,
+                })
+            }
+            (None, None, None) if status.lease_seconds.is_none() => None,
+            _ => return Err(troe_dispatch::DispatchError::AccountingOverflow),
+        };
+        network_observation::encode_status(network_observation::Status {
+            mac: status.mac,
+            configuration,
+        })
+        .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)
+    }
+
+    impl Service for ApplicationNetworkObservationService {
+        fn call(
+            &mut self,
+            request: Request<'_>,
+        ) -> Result<ServiceReply, troe_dispatch::DispatchError> {
+            if !request.payload().is_empty() {
+                return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+            }
+            let Some(network) = &self.network else {
+                return Ok(ServiceReply::empty(ReplyStatus::NotFound));
+            };
+            let service = network.borrow();
+            match request.opcode() {
+                network_observation::GET_STATUS => ServiceReply::with_payload(
+                    ReplyStatus::Success,
+                    &encode_application_network_status(service.shell_status())?,
+                ),
+                network_observation::GET_STATS => {
+                    let stats = network_observation::Stats {
+                        received_frames: service.stats.received_frames,
+                        transmitted_frames: service.stats.transmitted_frames,
+                        arp_replies: service.stats.arp_replies,
+                        icmp_replies: service.stats.icmp_replies,
+                        udp_retained: service.stats.udp_retained,
+                        udp_unbound: service.stats.udp_unbound,
+                        udp_dropped: service.stats.udp_dropped,
+                        arp_entries: u64::try_from(service.arp.len())
+                            .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?,
+                        udp_ports: u64::try_from(service.udp.len())
+                            .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?,
+                        checkpoints: service.stats.checkpoints,
+                        errors: service.stats.errors,
+                    };
+                    ServiceReply::with_payload(
+                        ReplyStatus::Success,
+                        &network_observation::encode_stats(stats)
+                            .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?,
+                    )
+                }
+                network_observation::GET_NEIGHBORS => {
+                    let mut entries = [network_observation::Neighbor::default();
+                        network_observation::MAX_NEIGHBORS];
+                    let mut count = 0;
+                    for entry in service.arp.entries() {
+                        let Some(destination) = entries.get_mut(count) else {
+                            return Err(troe_dispatch::DispatchError::AccountingOverflow);
+                        };
+                        *destination = network_observation::Neighbor {
+                            address: entry.address.bytes(),
+                            mac: entry.mac.bytes(),
+                        };
+                        count += 1;
+                    }
+                    let neighbors =
+                        network_observation::Neighbors::from_slice(&entries[..count])
+                            .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?;
+                    let mut encoded = [0_u8; network_observation::MAX_NEIGHBOR_REPLY_BYTES];
+                    let count = network_observation::encode_neighbors(neighbors, &mut encoded)
+                        .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?;
+                    ServiceReply::with_payload(ReplyStatus::Success, &encoded[..count])
+                }
+                _ => Ok(ServiceReply::empty(ReplyStatus::InvalidRequest)),
+            }
+        }
+    }
+
+    impl Service for ApplicationNetworkConfigurationService {
+        fn call(
+            &mut self,
+            request: Request<'_>,
+        ) -> Result<ServiceReply, troe_dispatch::DispatchError> {
+            if request.opcode() != network_configuration::DHCP || !request.payload().is_empty() {
+                return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+            }
+            let Some(network) = &self.network else {
+                return Ok(ServiceReply::empty(ReplyStatus::NotFound));
+            };
+            let mut network = KernelNetwork::new(network.clone());
+            let mut runtime = KernelRuntimeCapability {
+                runtime: self.runtime.clone(),
+            };
+            let status = match network.configure_dhcp(&mut runtime) {
+                Ok(status) => status,
+                Err(error) => {
+                    return Ok(ServiceReply::empty(application_network_status(error)));
+                }
+            };
+            ServiceReply::with_payload(
+                ReplyStatus::Success,
+                &encode_application_network_status(status)?,
+            )
+        }
+    }
+
+    impl Service for ApplicationIcmpEchoService {
+        fn call(
+            &mut self,
+            request: Request<'_>,
+        ) -> Result<ServiceReply, troe_dispatch::DispatchError> {
+            if request.opcode() != icmp_echo::ECHO {
+                return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+            }
+            let Ok(destination) = icmp_echo::decode_request(request.payload()) else {
+                return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+            };
+            let Some(network) = &self.network else {
+                return Ok(ServiceReply::empty(ReplyStatus::NotFound));
+            };
+            let mut network = KernelNetwork::new(network.clone());
+            let mut runtime = KernelRuntimeCapability {
+                runtime: self.runtime.clone(),
+            };
+            let reply = match network.ping(destination, &mut runtime) {
+                Ok(reply) => reply,
+                Err(error) => {
+                    return Ok(ServiceReply::empty(application_network_status(error)));
+                }
+            };
+            let reply = icmp_echo::Reply {
+                source: reply.source,
+                sequence: reply.sequence,
+                bytes: u16::try_from(reply.bytes)
+                    .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?,
+            };
+            ServiceReply::with_payload(ReplyStatus::Success, &icmp_echo::encode_reply(reply))
+        }
+    }
+
     const fn application_filesystem_status(error: FsError) -> ReplyStatus {
         match error {
             FsError::Invalid => ReplyStatus::InvalidPath,
@@ -4288,9 +4452,9 @@ mod firmware {
             NetworkError::TooLarge => ReplyStatus::TooLarge,
             NetworkError::Exhausted => ReplyStatus::Exhausted,
             NetworkError::Cancelled => ReplyStatus::Cancelled,
-            NetworkError::Unavailable | NetworkError::Device | NetworkError::Protocol => {
-                ReplyStatus::Failure
-            }
+            NetworkError::Unavailable => ReplyStatus::NotFound,
+            NetworkError::Protocol => ReplyStatus::NetworkProtocol,
+            NetworkError::Device => ReplyStatus::Failure,
         }
     }
 
@@ -4519,6 +4683,9 @@ mod firmware {
             let mut filesystem_mutation_required = false;
             let mut timer_required = false;
             let mut diagnostics_required = false;
+            let mut network_observation_required = false;
+            let mut network_configuration_required = false;
+            let mut icmp_echo_required = false;
             for requirement in capability_manifest.iter() {
                 if requirement.interface == troe_abi::interface::DATAGRAM
                     && requirement.major == datagram::MAJOR
@@ -4545,6 +4712,21 @@ mod firmware {
                     && requirement.minor == diagnostics::MINOR
                 {
                     diagnostics_required = true;
+                } else if requirement.interface == troe_abi::interface::NETWORK_OBSERVE
+                    && requirement.major == network_observation::MAJOR
+                    && requirement.minor == network_observation::MINOR
+                {
+                    network_observation_required = true;
+                } else if requirement.interface == troe_abi::interface::NETWORK_CONFIGURE
+                    && requirement.major == network_configuration::MAJOR
+                    && requirement.minor == network_configuration::MINOR
+                {
+                    network_configuration_required = true;
+                } else if requirement.interface == troe_abi::interface::ICMP_ECHO
+                    && requirement.major == icmp_echo::MAJOR
+                    && requirement.minor == icmp_echo::MINOR
+                {
+                    icmp_echo_required = true;
                 } else {
                     return Some(command_application_error(
                         stderr,
@@ -4599,8 +4781,9 @@ mod firmware {
             };
             let retained_stdout = SharedOutput::new(PIPE_CAPACITY);
             let retained_stderr = SharedOutput::new(PIPE_CAPACITY);
-            let network = if datagram_required {
-                let Some(network) = self.runtime.borrow().network.clone() else {
+            let application_network = self.runtime.borrow().network.clone();
+            let datagram_network = if datagram_required {
+                let Some(network) = application_network.clone() else {
                     return Some(command_application_error(
                         stderr,
                         command,
@@ -4616,7 +4799,10 @@ mod firmware {
                 + usize::from(filesystem_required)
                 + usize::from(filesystem_mutation_required)
                 + usize::from(timer_required)
-                + usize::from(diagnostics_required);
+                + usize::from(diagnostics_required)
+                + usize::from(network_observation_required)
+                + usize::from(network_configuration_required)
+                + usize::from(icmp_echo_required);
             let Some(handle_capacity) = service_count.checked_mul(2) else {
                 return Some(command_application_error(
                     stderr,
@@ -4672,7 +4858,7 @@ mod firmware {
                     major: stream::MAJOR,
                     minor: stream::MINOR,
                 });
-                if let Some(network) = network {
+                if let Some(network) = datagram_network {
                     services.push(CommandStartupService {
                         port: register_command_service(
                             &mut dispatcher,
@@ -4731,6 +4917,47 @@ mod firmware {
                         interface: troe_abi::interface::DIAGNOSTICS,
                         major: diagnostics::MAJOR,
                         minor: diagnostics::MINOR,
+                    });
+                }
+                if network_observation_required {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationNetworkObservationService {
+                                network: application_network.clone(),
+                            },
+                        )?,
+                        interface: troe_abi::interface::NETWORK_OBSERVE,
+                        major: network_observation::MAJOR,
+                        minor: network_observation::MINOR,
+                    });
+                }
+                if network_configuration_required {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationNetworkConfigurationService {
+                                network: application_network.clone(),
+                                runtime: self.runtime.clone(),
+                            },
+                        )?,
+                        interface: troe_abi::interface::NETWORK_CONFIGURE,
+                        major: network_configuration::MAJOR,
+                        minor: network_configuration::MINOR,
+                    });
+                }
+                if icmp_echo_required {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationIcmpEchoService {
+                                network: application_network.clone(),
+                                runtime: self.runtime.clone(),
+                            },
+                        )?,
+                        interface: troe_abi::interface::ICMP_ECHO,
+                        major: icmp_echo::MAJOR,
+                        minor: icmp_echo::MINOR,
                     });
                 }
                 Ok(services)

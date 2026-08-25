@@ -81,7 +81,7 @@ the 50 ms execution lease and transactionally reclaimed.
 
 Normal QEMU images attach one modern virtio-net device and acquire an IPv4
 address, subnet mask, default gateway, and lease through a bounded DHCP
-discover/request exchange. The recovery shell exposes `net`, `dhcp`, `ping`,
+discover/request exchange. The command environment exposes `net`, `dhcp`, `ping`,
 `arp`, `net stats`, `udp send --source-port`, and `udp listen`. A shared ambient
 service answers ARP and ICMP while the prompt or a cooperative command is idle,
 retains eight ARP neighbors, and owns eight persistent UDP ports with four
@@ -96,9 +96,11 @@ handles when their KCAP manifests request them. `cat`, `grep`, `hexdump`, `ls`,
 and `man` exercise generation-checked files, bounded reads, metadata, and
 lexically paginated directories. `write` and `rm` use a separate bounded,
 atomic complete-file mutation handle. `sleep.kex` uses only a cancellable
-boot-relative timer and `mem.kex` uses only an immutable typed snapshot. Typed
-route/DHCP/ARP/ICMP/stat services are the next lower-level migration boundary
-before TCP.
+boot-relative timer and `mem.kex` uses only an immutable typed snapshot.
+`net.kex` and `arp.kex` use read-only typed network observation, while
+`dhcp.kex` and `ping.kex` each receive only their one bounded cancellable
+protocol operation. The next network boundary is a separately designed bounded
+TCP state machine.
 
 ## Quick start
 

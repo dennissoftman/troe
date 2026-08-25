@@ -41,6 +41,6 @@ messages, exact version checks, and normal owner-wide handle revocation at
 application teardown.
 
 These contracts are suitable primitives for later bounded interpreters and TCP
-state machines, but do not define either. Typed route, DHCP, ARP, ICMP, and
-network-stat services remain the next command-migration boundary. TCP then
-requires a separate bounded connection/state/retransmission design.
+state machines, but do not define either. ADR 0029 separately supplies the
+typed observation, DHCP, and ICMP command boundary. TCP still requires a
+separate bounded connection/state/retransmission design.

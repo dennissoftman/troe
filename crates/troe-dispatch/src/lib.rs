@@ -195,6 +195,8 @@ pub enum ReplyStatus {
     Unsupported = 17,
     /// Filesystem arithmetic overflowed.
     Overflow = 18,
+    /// A network exchange returned an invalid protocol response.
+    NetworkProtocol = 19,
 }
 
 impl ReplyStatus {

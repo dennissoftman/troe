@@ -709,6 +709,12 @@ def run_scenario(
         contains=("link: ready", "ipv4: 10.0.2.15", "gateway: 10.0.2.2"),
     )
     session.command(
+        "dhcp",
+        cwd,
+        command_timeout,
+        contains=("ipv4: 10.0.2.15", "lease:"),
+    )
+    session.command(
         "ping 10.0.2.2",
         cwd,
         command_timeout,
@@ -924,6 +930,12 @@ def run_smoke_scenario(
         cwd,
         command_timeout,
         contains=("link: ready", "ipv4: 10.0.2.15", "gateway: 10.0.2.2"),
+    )
+    session.command(
+        "dhcp",
+        cwd,
+        command_timeout,
+        contains=("ipv4: 10.0.2.15", "lease:"),
     )
     session.command(
         "ping 10.0.2.2",

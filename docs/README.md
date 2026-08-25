@@ -94,6 +94,9 @@ and teardown-abort contract.
 [ADR 0028](adr/0028-kex-timer-and-diagnostics-services.md) fixes separate KEX
 boot-relative monotonic timer and immutable typed diagnostics authorities and
 the `sleep`/`mem` migration.
+[ADR 0029](adr/0029-kex-typed-network-services.md) splits KEX network authority
+into read-only observation, one bounded DHCP exchange, and one bounded ICMP
+echo exchange for the `net`, `arp`, `dhcp`, and `ping` migrations.
 ADR 0012 governs the completed Stage 5.1 terminal and
 framebuffer increment; AArch64 native keyboard input remains a later
 virtio-input transport decision. ADR 0013 governs the completed Stage 5.2

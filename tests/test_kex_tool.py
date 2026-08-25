@@ -68,6 +68,12 @@ class KexToolTests(unittest.TestCase):
                         expected = [(8, 1, 0)]
                     elif command == "mem":
                         expected = [(9, 1, 0)]
+                    elif command in {"arp", "net"}:
+                        expected = [(10, 1, 0)]
+                    elif command == "dhcp":
+                        expected = [(11, 1, 0)]
+                    elif command == "ping":
+                        expected = [(12, 1, 0)]
                     else:
                         expected = []
                     self.assertEqual(records, expected)

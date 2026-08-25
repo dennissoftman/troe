@@ -202,7 +202,8 @@ fn network_failure(command: &CommandContext, failure: Error) -> u32 {
         | Error::Corrupt
         | Error::Io
         | Error::Unsupported
-        | Error::Overflow => ("invalid network response", exit::FAILURE),
+        | Error::Overflow
+        | Error::NetworkProtocol => ("invalid network response", exit::FAILURE),
         Error::UnsupportedTarget => ("unsupported application target", exit::FAILURE),
     };
     let mut error = Writer(command.stderr());

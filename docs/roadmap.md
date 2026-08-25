@@ -238,9 +238,9 @@ The first product-facing integration is implemented. The shell resolves exact
 immutable `/bin/<command>.kex` artifacts from a target-selected root, stages
 them through bounded offset reads, and grants versioned
 command/stdin/stdout/stderr handles.
-`echo`, `clear`, and `pwd` are externally replaceable with static recovery
-fallbacks, while the unknown `kex-echo` name proves general discovery on every
-QEMU composition.
+`echo`, `clear`, and `pwd` established external-first execution with static
+recovery fallbacks, while the unknown `kex-echo` name proves general discovery
+on every QEMU composition.
 The repo-local Rust SDK, linker script, canonical dual-target build/inspect
 tool, canonical least-authority KCAP sidecars, example source, and concise
 authoring skill are checked in.
@@ -262,10 +262,12 @@ tokens, bounded offset reads and metadata, and lexical pagination. `cat`,
 `grep`, `hexdump`, `ls`, and `man` exercise it on every QEMU composition.
 Atomic complete-file mutation is now implemented and exercised by `write.kex`
 and `rm.kex`. Separate monotonic timer and immutable typed diagnostics services
-now back `sleep.kex` and `mem.kex`. Next sequence: migrate the remaining
-replaceable network utilities through typed route, DHCP, ARP, ICMP, and
-statistics capabilities. TCP follows only after those lower-level contracts and
-their adversarial portable tests are fixed.
+now back `sleep.kex` and `mem.kex`. Independent typed observation, DHCP, and ICMP
+echo services now back `net.kex`, `arp.kex`, `dhcp.kex`, and `ping.kex` without
+granting raw frames, routes, devices, or one another's authority. The remaining
+command step is removal of the ordinary-command recovery implementations; TCP
+then follows only under its own bounded state-machine, timer, ownership, and
+adversarial-test contract.
 DNS, TLS, jobs, and general sockets are not implied by these ABIs.
 
 The shell keeps bounded command-name and path completion, including candidate

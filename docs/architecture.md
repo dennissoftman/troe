@@ -242,8 +242,11 @@ are read from target-selected `/bin/<name>.kex`; only absence permits the static
 recovery fallback. Service replies, per-stream bytes, and total resumed steps
 all have hard ceilings. Optional interfaces expose only bounded IPv4/UDP
 send/receive, read-only VFS operations, one atomic complete-file mutation
-transaction, a boot-relative monotonic timer, and one immutable typed
-diagnostics snapshot. Datagram ports are exclusive to the launch; read-only
+transaction, a boot-relative monotonic timer, one immutable typed diagnostics
+snapshot, read-only typed network observation, one DHCP exchange, or one ICMP
+echo exchange. Network observation, configuration, echo, and datagrams are
+independent authorities; none exposes raw frames, routes, or devices. Datagram
+ports are exclusive to the launch; read-only
 open tokens are generation-checked and limited to eight; directory traversal is
 lexically paginated. Mutation staging is sequential, capped at 64 KiB, and
 discarded on teardown unless atomically committed. Timer waits are foreground

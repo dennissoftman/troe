@@ -45,6 +45,9 @@ Timer values are boot-relative monotonic milliseconds only. Request `timer`,
 form deadlines with saturation, and treat `sleep_until` as cancellable.
 Diagnostics is one immutable typed launch snapshot. Request `diagnostics` only
 for bounded reporting; it grants no mutable memory, input, or device access.
+Use `network-observe` only for status/stats/neighbors, `network-configure` only
+for cancellable DHCP, and `icmp-echo` only for one cancellable ping exchange.
+None grants raw Ethernet, routes, UDP, another network capability, or devices.
 
 ## Minimal crate
 

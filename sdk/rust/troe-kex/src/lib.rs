@@ -5,7 +5,7 @@ use core::{fmt, slice};
 
 pub use troe_abi::{
     ABI_MAJOR, ABI_MINOR, command, datagram, diagnostics, exit, filesystem, filesystem_mutation,
-    timer,
+    icmp_echo, network_configuration, network_observation, timer,
 };
 use troe_abi::{MAX_MESSAGE_BYTES, MAX_SERVICE_PAYLOAD_BYTES, interface, reply, stream};
 
@@ -85,6 +85,8 @@ pub enum Error {
     Unsupported,
     /// Filesystem arithmetic overflowed.
     Overflow,
+    /// A network exchange returned an invalid protocol response.
+    NetworkProtocol,
 }
 
 impl fmt::Display for Error {
@@ -112,6 +114,7 @@ impl fmt::Display for Error {
             Self::Io => "filesystem transport failed",
             Self::Unsupported => "filesystem feature is unsupported",
             Self::Overflow => "filesystem size overflow",
+            Self::NetworkProtocol => "invalid network response",
         })
     }
 }
@@ -127,6 +130,9 @@ pub struct CommandContext {
     filesystem_mutate: Option<Handle>,
     timer: Option<Handle>,
     diagnostics: Option<Handle>,
+    network_observation: Option<Handle>,
+    network_configuration: Option<Handle>,
+    icmp_echo: Option<Handle>,
 }
 
 impl CommandContext {
@@ -156,6 +162,21 @@ impl CommandContext {
                 interface::DIAGNOSTICS,
                 diagnostics::MAJOR,
                 diagnostics::MINOR,
+            )?,
+            network_observation: startup.optional_handle(
+                interface::NETWORK_OBSERVE,
+                network_observation::MAJOR,
+                network_observation::MINOR,
+            )?,
+            network_configuration: startup.optional_handle(
+                interface::NETWORK_CONFIGURE,
+                network_configuration::MAJOR,
+                network_configuration::MINOR,
+            )?,
+            icmp_echo: startup.optional_handle(
+                interface::ICMP_ECHO,
+                icmp_echo::MAJOR,
+                icmp_echo::MINOR,
             )?,
         })
     }
@@ -255,6 +276,42 @@ impl CommandContext {
         }
     }
 
+    /// Borrow the optional read-only typed network-observation capability.
+    ///
+    /// # Errors
+    ///
+    /// Reports that the package did not request or receive observation.
+    pub const fn network_observation(&self) -> Result<NetworkObservation, Error> {
+        match self.network_observation {
+            Some(handle) => Ok(NetworkObservation { handle }),
+            None => Err(Error::MissingAuthority),
+        }
+    }
+
+    /// Borrow the optional bounded network-configuration capability.
+    ///
+    /// # Errors
+    ///
+    /// Reports that the package did not request or receive configuration.
+    pub const fn network_configuration(&self) -> Result<NetworkConfiguration, Error> {
+        match self.network_configuration {
+            Some(handle) => Ok(NetworkConfiguration { handle }),
+            None => Err(Error::MissingAuthority),
+        }
+    }
+
+    /// Borrow the optional bounded ICMP echo capability.
+    ///
+    /// # Errors
+    ///
+    /// Reports that the package did not request or receive echo authority.
+    pub const fn icmp_echo(&self) -> Result<IcmpEcho, Error> {
+        match self.icmp_echo {
+            Some(handle) => Ok(IcmpEcho { handle }),
+            None => Err(Error::MissingAuthority),
+        }
+    }
+
     /// Yield cooperatively and resume only after kernel reselection.
     ///
     /// # Errors
@@ -350,6 +407,24 @@ pub struct Timer {
 /// Immutable diagnostics client scoped to one application lifetime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Diagnostics {
+    handle: Handle,
+}
+
+/// Read-only typed network-observation client.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NetworkObservation {
+    handle: Handle,
+}
+
+/// Bounded network-configuration client.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NetworkConfiguration {
+    handle: Handle,
+}
+
+/// Bounded ICMP echo client.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct IcmpEcho {
     handle: Handle,
 }
 
@@ -634,6 +709,80 @@ impl Diagnostics {
     }
 }
 
+impl NetworkObservation {
+    /// Read current link and optional IPv4 configuration.
+    ///
+    /// # Errors
+    ///
+    /// Reports device absence, service, decoding, or call-gate failure.
+    pub fn status(&mut self) -> Result<network_observation::Status, Error> {
+        let mut reply = [0_u8; network_observation::STATUS_BYTES];
+        let count = call(
+            self.handle,
+            network_observation::GET_STATUS,
+            &[],
+            &mut reply,
+        )?;
+        network_observation::decode_status(&reply[..count]).map_err(|_| Error::InvalidCall)
+    }
+
+    /// Read current ambient counters and bounded resource use.
+    ///
+    /// # Errors
+    ///
+    /// Reports device absence, service, decoding, or call-gate failure.
+    pub fn stats(&mut self) -> Result<network_observation::Stats, Error> {
+        let mut reply = [0_u8; network_observation::STATS_BYTES];
+        let count = call(self.handle, network_observation::GET_STATS, &[], &mut reply)?;
+        network_observation::decode_stats(&reply[..count]).map_err(|_| Error::InvalidCall)
+    }
+
+    /// Read the complete bounded neighbor cache.
+    ///
+    /// # Errors
+    ///
+    /// Reports device absence, service, decoding, or call-gate failure.
+    pub fn neighbors(&mut self) -> Result<network_observation::Neighbors, Error> {
+        let mut reply = [0_u8; network_observation::MAX_NEIGHBOR_REPLY_BYTES];
+        let count = call(
+            self.handle,
+            network_observation::GET_NEIGHBORS,
+            &[],
+            &mut reply,
+        )?;
+        network_observation::decode_neighbors(&reply[..count]).map_err(|_| Error::InvalidCall)
+    }
+}
+
+impl NetworkConfiguration {
+    /// Perform one bounded cancellable DHCP exchange.
+    ///
+    /// # Errors
+    ///
+    /// Reports device absence, cancellation, timeout, protocol, service,
+    /// decoding, or call-gate failure.
+    pub fn dhcp(&mut self) -> Result<network_observation::Status, Error> {
+        let mut reply = [0_u8; network_observation::STATUS_BYTES];
+        let count = call(self.handle, network_configuration::DHCP, &[], &mut reply)?;
+        network_observation::decode_status(&reply[..count]).map_err(|_| Error::InvalidCall)
+    }
+}
+
+impl IcmpEcho {
+    /// Send one bounded echo request and wait for its matching reply.
+    ///
+    /// # Errors
+    ///
+    /// Reports device/configuration absence, cancellation, timeout, protocol,
+    /// service, decoding, or call-gate failure.
+    pub fn echo(&mut self, destination: [u8; 4]) -> Result<icmp_echo::Reply, Error> {
+        let request = icmp_echo::encode_request(destination);
+        let mut reply = [0_u8; icmp_echo::REPLY_BYTES];
+        let count = call(self.handle, icmp_echo::ECHO, &request, &mut reply)?;
+        icmp_echo::decode_reply(&reply[..count]).map_err(|_| Error::InvalidCall)
+    }
+}
+
 impl Datagram {
     /// Send one bounded datagram and return the owned source port.
     ///
@@ -841,6 +990,7 @@ fn call(
         reply::IO => Err(Error::Io),
         reply::UNSUPPORTED => Err(Error::Unsupported),
         reply::OVERFLOW => Err(Error::Overflow),
+        reply::NETWORK_PROTOCOL => Err(Error::NetworkProtocol),
         _ => Err(Error::InvalidCall),
     }
 }
@@ -1102,6 +1252,9 @@ mod tests {
             interface::DATAGRAM,
             interface::TIMER,
             interface::DIAGNOSTICS,
+            interface::NETWORK_OBSERVE,
+            interface::NETWORK_CONFIGURE,
+            interface::ICMP_ECHO,
         ]);
         let startup = Startup::parse(&page);
         assert!(startup.is_ok());
@@ -1112,6 +1265,9 @@ mod tests {
                 assert!(command.datagram().is_ok());
                 assert!(command.timer().is_ok());
                 assert!(command.diagnostics().is_ok());
+                assert!(command.network_observation().is_ok());
+                assert!(command.network_configuration().is_ok());
+                assert!(command.icmp_echo().is_ok());
             }
         }
     }
