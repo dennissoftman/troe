@@ -31,7 +31,7 @@ in release 0.1.
 
 ## 1. Purpose
 
-The system is a tiny, autonomous command environment with just enough kernel beneath it to own a machine. It boots to a terminal, exposes a minimal filesystem, and provides a small set of composable built-in commands.
+The system is a tiny, autonomous command environment with just enough kernel beneath it to own a machine. It boots to a terminal, exposes a minimal filesystem, and provides a small set of composable isolated KEX commands.
 
 It is an experiment in whether an operating environment can be simultaneously:
 
@@ -69,7 +69,7 @@ The words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** descri
 1. Boot reproducibly under QEMU on x86-64 and AArch64.
 2. Present an interactive terminal and shell prompt.
 3. Provide a tiny VFS with an embedded read-only root and writable RAMFS.
-4. Provide built-in commands including `cat`, `echo`, `grep`, and `ls`.
+4. Provide KEX commands including `cat`, `echo`, `grep`, and `ls`.
 5. Keep the portable core independent of CPU, firmware, UART, and interrupt-controller details.
 6. Make memory consumption bounded, observable, and controlled by an explicit policy.
 7. Minimize trusted and unsafe code, and test portable logic on the host.
@@ -109,15 +109,15 @@ After the MVP proves the boot, memory, VFS, command, and architecture boundaries
 
 ## 6. System model
 
-The current native Stage 6 execution model remains deliberately narrow:
+The current native command execution model remains deliberately narrow:
 
 ```text
 +------------------------------------------+
-| privileged shell and recovery built-ins |
+| session shell: cd, poweroff, reboot      |
 +------------------------------------------+
 | scheduler | handles | copied call gate  |
 +------------------------------------------+
-| one bounded ring-3/EL0 continuation      |
+| one bounded ring-3/EL0 KEX application   |
 +------------------------------------------+
 | streams | VFS | memory | terminal       |
 +------------------------------------------+
@@ -137,13 +137,14 @@ There is:
 - one global physical-memory owner;
 - one command executing at a time;
 - a ring-3/EL0 memory and fault boundary for the bounded isolated continuation;
-- no hardware isolation between the privileged recovery built-ins themselves;
+- no application ABI for shell session or machine-control mutation;
 - cooperative continuations without preemption or protection from a task that
   never returns through the internal gate.
 
-Commands are statically linked privileged Rust functions, not executable files.
-The shell dispatches them through a fixed registry. Stage 6 isolated programs
-are boot-time verification payloads, not loadable applications or a public ABI.
+Ordinary commands are target-native immutable KEX files, not privileged shell
+functions. The shell registry retains only names/synopses and the three
+intrinsics; the kernel resolver validates, maps, services, and tears down each
+application through ABI 1.0.
 
 ## 7. Boot strategy
 
@@ -318,18 +319,19 @@ There are no shell expansions, redirections, variables, background jobs, or
 command substitution. Pipelines contain at most eight sequential stages and
 each intermediate stream is capped at 64 KiB; overflow fails explicitly.
 
-### 11.2 Built-in registry
+### 11.2 Command registry
 
-Commands MUST be linked at build time and registered statically. Each command declares its name, synopsis, required capabilities, and entry point. Unknown commands return a stable error and do not terminate the shell.
+Ordinary commands MUST be installed as immutable target-selected KEX artifacts.
+Each package declares its name, synopsis, required typed capabilities, and entry
+point. Unknown or unavailable commands return stable distinct errors and do not
+terminate the shell.
 
-`cd` and `halt` are permanent shell intrinsics and their names MUST NOT be
-shadowed or replaced by a KEX application. `cd` mutates shell-owned session
-state and therefore executes in the invoking shell. `halt` remains behind the
-shell's explicit machine-control capability; ordinary KEX applications cannot
-acquire that authority or invoke the intrinsic through application ABI 1.0.
-Other statically linked commands are recovery implementations and MAY later be
-resolved to capability-bounded KEX applications while retaining their built-in
-fallbacks.
+`cd`, `poweroff`, and `reboot` are the only permanent shell intrinsics and their
+names MUST NOT be shadowed or replaced by a KEX application. `cd` mutates
+shell-owned session state and therefore executes in the invoking shell. The two
+terminal actions remain behind the shell's explicit machine-control capability;
+ordinary KEX applications cannot acquire that authority or invoke an intrinsic
+through application ABI 1.0. No ordinary command has a privileged fallback.
 
 ### 11.3 Required commands
 
@@ -767,7 +769,7 @@ troe/
 │   ├── troe-dispatch/    bounded synchronous service dispatch
 │   ├── troe-machine/     audited x86-64/AArch64 mechanisms
 │   ├── troe-memory/      memory-map, frame, and mapping models
-│   ├── troe-shell/       parser, pipelines, and built-ins
+│   ├── troe-shell/       parser, pipelines, and session intrinsics
 │   ├── troe-task/        cooperative task policy
 │   └── troe-vfs/         KEFS, RAMFS, namespace, and generated nodes
 ├── host/                 hosted composition and acceptance runner
@@ -807,7 +809,7 @@ Property tests and fuzzing SHOULD target parsers, path handling, filesystem imag
 Each primary architecture MUST have automated tests that:
 
 1. boot to the prompt within a timeout;
-2. run every required built-in;
+2. run every required KEX application;
 3. read embedded files and write/read RAMFS files;
 4. exercise missing paths, malformed commands, and quota exhaustion;
 5. print memory accounting;
@@ -830,16 +832,15 @@ A release candidate MUST pass:
 
 ## 22. Security model
 
-Statically linked recovery built-ins execute with kernel privilege in the shared
-kernel address space. Typed capabilities reduce accidental authority between
-those components but do not contain their memory-safety failures. Stage 6 adds
-a hardware boundary only for its bounded ring-3/EL0 continuations: supervisor
-page permissions, copied messages, contained user faults, owner-revoked handles,
-and zeroized teardown protect the kernel from that execution context.
+Ordinary commands execute only as isolated KEX applications. Supervisor page
+permissions, copied messages, contained user faults, owner-revoked handles, and
+zeroized teardown protect the kernel from that execution context. The three
+intrinsics remain small kernel/session transitions and expose no general
+application-callable machine authority.
 
 Accordingly:
 
-- externally supplied executable code is not loaded before Stage 7;
+- executable code is loaded only after complete KEX/KCAP validation;
 - embedded FS input is treated as potentially malformed;
 - console input is untrusted and bounded;
 - external block filesystems remain optional until separately specified and fuzzed;
@@ -847,10 +848,9 @@ Accordingly:
 - no command may access raw memory or devices unless explicitly given that capability;
 - release documentation MUST state whether hardware isolation exists.
 
-Stage 6 isolation does not make privileged built-ins mutually isolated, provide
-preemption, or make the system multi-user secure. Stage 7 must reuse this
-boundary while treating every application artifact and application-controlled
-address as untrusted.
+Application isolation does not provide preemption or make the system multi-user
+secure. Every application artifact and application-controlled address remains
+untrusted.
 
 ## 23. Evolution roadmap
 
@@ -965,7 +965,7 @@ authoritative order for resuming work is recorded in
 - Implement the small versioned application ABI 1.0 independently of POSIX.
 - Provide application startup, exit status, fault reporting, and resource reclamation.
 - Support architecture-native binaries; cross-architecture instruction emulation is not required.
-- Keep static built-ins available for recovery and constrained builds.
+- Keep the immutable target-selected KEX root available for recovery.
 - Before released tooling consumes them, define a versioned
   application/package manifest and target-specific lock format and validate
   immutable artifacts on the host using the native boundary's rules.
@@ -1032,7 +1032,7 @@ Configured health failure rolls generation 2 back durably to generation 1.
   on-disk formats, bounds, corruption behavior, and recovery paths are tested.
 - Construct immutable system generations separately from mutable volumes and
   secrets; activate a generation through a crash-consistent pointer.
-- Preserve the previous bootable generation and the static recovery shell when
+- Preserve the previous bootable generation and immutable recovery KEX root when
   activation or bounded health checks fail.
 
 **Exit criterion:** the system can boot, configure a supported network device, exchange data with another host, persist selected state, and remain within declared memory budgets under malformed and high-volume input.

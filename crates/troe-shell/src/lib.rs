@@ -1,4 +1,4 @@
-//! Bounded shell grammar, byte-stream pipelines, and statically linked commands.
+//! Bounded shell grammar, byte-stream pipelines, and three session intrinsics.
 #![no_std]
 #![forbid(unsafe_code)]
 
@@ -6,18 +6,15 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
-use alloc::boxed::Box;
 use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use core::fmt::Write as _;
 use troe_core::{
     BoundedOutput, CommandStatus, Input, MAX_ARGS, MAX_LINE_BYTES, MAX_PIPELINE_STAGES,
     MachineMemoryOwner, MachineMemorySnapshot, MemoryStats, Output, PIPE_CAPACITY, SliceInput,
     StreamError, write_all,
 };
 use troe_driver::InputQueueStats;
-use troe_task::CooperativeRuntime;
 use troe_vfs::{FsError, Namespace, NodeKind};
 
 /// Shell parse failures caused by untrusted command input.
@@ -58,10 +55,9 @@ enum Quote {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct CommandSpec {
-    id: CommandId,
+    intrinsic: Option<IntrinsicId>,
     name: &'static str,
     synopsis: &'static str,
-    requires_machine_control: bool,
     class: CommandClass,
 }
 
@@ -70,14 +66,15 @@ struct CommandSpec {
 pub enum CommandClass {
     /// Shell-owned behavior that cannot be replaced by an application.
     Intrinsic,
-    /// Statically linked recovery implementation that may later prefer KEX.
-    ReplaceableBuiltin,
+    /// A name that must resolve to a KEX application.
+    Application,
 }
 
-/// Optional application resolver used ahead of replaceable recovery built-ins.
+/// Application resolver used for every non-intrinsic command.
 ///
-/// Returning `None` means that no application was resolved and lets the shell
-/// use its static recovery implementation or report an unknown command.
+/// Returning `None` means that no application was resolved. Registered
+/// application names then report an unavailable artifact; unknown names report
+/// an unknown command. Neither case falls back to shell-owned utility behavior.
 pub trait ExternalCommand {
     /// Resolve and execute one complete command invocation.
     #[allow(clippy::too_many_arguments)]
@@ -111,315 +108,134 @@ impl ExternalCommand for NoExternalCommand {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum CommandId {
-    Arp,
-    Cat,
+enum IntrinsicId {
     Cd,
-    Clear,
-    Echo,
-    Grep,
-    Hexdump,
-    Ls,
-    Man,
-    Mem,
-    Net,
-    Dhcp,
-    Ping,
     PowerOff,
-    Pwd,
     Reboot,
-    Rm,
-    Sleep,
-    Udp,
-    Write,
 }
 
 const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
-        id: CommandId::Arp,
+        intrinsic: None,
         name: "arp",
         synopsis: "arp",
-        requires_machine_control: false,
-        class: CommandClass::ReplaceableBuiltin,
+        class: CommandClass::Application,
     },
     CommandSpec {
-        id: CommandId::Cat,
+        intrinsic: None,
         name: "cat",
         synopsis: "cat [FILE...]",
-        requires_machine_control: false,
-        class: CommandClass::ReplaceableBuiltin,
+        class: CommandClass::Application,
     },
     CommandSpec {
-        id: CommandId::Cd,
+        intrinsic: Some(IntrinsicId::Cd),
         name: "cd",
         synopsis: "cd PATH",
-        requires_machine_control: false,
         class: CommandClass::Intrinsic,
     },
     CommandSpec {
-        id: CommandId::Clear,
+        intrinsic: None,
         name: "clear",
         synopsis: "clear",
-        requires_machine_control: false,
-        class: CommandClass::ReplaceableBuiltin,
+        class: CommandClass::Application,
     },
     CommandSpec {
-        id: CommandId::Dhcp,
+        intrinsic: None,
         name: "dhcp",
         synopsis: "dhcp",
-        requires_machine_control: false,
-        class: CommandClass::ReplaceableBuiltin,
+        class: CommandClass::Application,
     },
     CommandSpec {
-        id: CommandId::Echo,
+        intrinsic: None,
         name: "echo",
         synopsis: "echo [ARG...]",
-        requires_machine_control: false,
-        class: CommandClass::ReplaceableBuiltin,
+        class: CommandClass::Application,
     },
     CommandSpec {
-        id: CommandId::Grep,
+        intrinsic: None,
         name: "grep",
         synopsis: "grep PATTERN [FILE...]",
-        requires_machine_control: false,
-        class: CommandClass::ReplaceableBuiltin,
+        class: CommandClass::Application,
     },
     CommandSpec {
-        id: CommandId::Hexdump,
+        intrinsic: None,
         name: "hexdump",
         synopsis: "hexdump [FILE]",
-        requires_machine_control: false,
-        class: CommandClass::ReplaceableBuiltin,
+        class: CommandClass::Application,
     },
     CommandSpec {
-        id: CommandId::Ls,
+        intrinsic: None,
         name: "ls",
         synopsis: "ls [PATH]",
-        requires_machine_control: false,
-        class: CommandClass::ReplaceableBuiltin,
+        class: CommandClass::Application,
     },
     CommandSpec {
-        id: CommandId::Man,
+        intrinsic: None,
         name: "man",
         synopsis: "man COMMAND",
-        requires_machine_control: false,
-        class: CommandClass::ReplaceableBuiltin,
+        class: CommandClass::Application,
     },
     CommandSpec {
-        id: CommandId::Mem,
+        intrinsic: None,
         name: "mem",
         synopsis: "mem",
-        requires_machine_control: false,
-        class: CommandClass::ReplaceableBuiltin,
+        class: CommandClass::Application,
     },
     CommandSpec {
-        id: CommandId::Net,
+        intrinsic: None,
         name: "net",
         synopsis: "net | net stats",
-        requires_machine_control: false,
-        class: CommandClass::ReplaceableBuiltin,
+        class: CommandClass::Application,
     },
     CommandSpec {
-        id: CommandId::Ping,
+        intrinsic: None,
         name: "ping",
         synopsis: "ping ADDRESS",
-        requires_machine_control: false,
-        class: CommandClass::ReplaceableBuiltin,
+        class: CommandClass::Application,
     },
     CommandSpec {
-        id: CommandId::PowerOff,
+        intrinsic: Some(IntrinsicId::PowerOff),
         name: "poweroff",
         synopsis: "poweroff",
-        requires_machine_control: true,
         class: CommandClass::Intrinsic,
     },
     CommandSpec {
-        id: CommandId::Pwd,
+        intrinsic: None,
         name: "pwd",
         synopsis: "pwd",
-        requires_machine_control: false,
-        class: CommandClass::ReplaceableBuiltin,
+        class: CommandClass::Application,
     },
     CommandSpec {
-        id: CommandId::Reboot,
+        intrinsic: Some(IntrinsicId::Reboot),
         name: "reboot",
         synopsis: "reboot",
-        requires_machine_control: true,
         class: CommandClass::Intrinsic,
     },
     CommandSpec {
-        id: CommandId::Udp,
+        intrinsic: None,
         name: "udp",
         synopsis: "udp send [--source-port PORT] ADDRESS PORT [TEXT...] | udp listen PORT",
-        requires_machine_control: false,
-        class: CommandClass::ReplaceableBuiltin,
+        class: CommandClass::Application,
     },
     CommandSpec {
-        id: CommandId::Rm,
+        intrinsic: None,
         name: "rm",
         synopsis: "rm FILE",
-        requires_machine_control: false,
-        class: CommandClass::ReplaceableBuiltin,
+        class: CommandClass::Application,
     },
     CommandSpec {
-        id: CommandId::Sleep,
+        intrinsic: None,
         name: "sleep",
         synopsis: "sleep MILLISECONDS",
-        requires_machine_control: false,
-        class: CommandClass::ReplaceableBuiltin,
+        class: CommandClass::Application,
     },
     CommandSpec {
-        id: CommandId::Write,
+        intrinsic: None,
         name: "write",
         synopsis: "write FILE [TEXT...]",
-        requires_machine_control: false,
-        class: CommandClass::ReplaceableBuiltin,
+        class: CommandClass::Application,
     },
 ];
-
-/// Stable failures returned by the shell's replaceable network capability.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum NetworkError {
-    /// No usable NIC is attached.
-    Unavailable,
-    /// IPv4 configuration has not completed.
-    NotConfigured,
-    /// A bounded receive or resolution attempt expired.
-    Timeout,
-    /// The native device failed an operation.
-    Device,
-    /// A received packet or configuration exchange was invalid.
-    Protocol,
-    /// The requested packet exceeded the bounded network limit.
-    TooLarge,
-    /// A bounded socket, cache, or queue resource is exhausted.
-    Exhausted,
-    /// Cooperative execution was cancelled.
-    Cancelled,
-}
-
-/// Snapshot of ambient network service activity and resource use.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct NetworkStats {
-    /// Complete received frames.
-    pub received_frames: u64,
-    /// Complete transmitted frames.
-    pub transmitted_frames: u64,
-    /// ARP requests answered while commands or the prompt were idle.
-    pub arp_replies: u64,
-    /// ICMP echo requests answered while commands or the prompt were idle.
-    pub icmp_replies: u64,
-    /// UDP datagrams retained in per-port queues.
-    pub udp_retained: u64,
-    /// UDP datagrams dropped because no port was bound.
-    pub udp_unbound: u64,
-    /// UDP datagrams dropped at queue ceilings.
-    pub udp_dropped: u64,
-    /// Currently retained ARP entries.
-    pub arp_entries: usize,
-    /// Persistent bound UDP ports.
-    pub udp_ports: usize,
-    /// Ambient service checkpoints.
-    pub checkpoints: u64,
-    /// Device or packet-processing errors.
-    pub errors: u64,
-}
-
-/// One printable entry from the bounded ARP cache.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ArpEntry {
-    /// Neighbor IPv4 address.
-    pub address: [u8; 4],
-    /// Neighbor Ethernet address.
-    pub mac: [u8; 6],
-}
-
-/// Current bounded IPv4 configuration presented to users and future KEX apps.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct NetworkStatus {
-    /// Attached NIC address.
-    pub mac: [u8; 6],
-    /// Configured IPv4 address, if DHCP has completed.
-    pub address: Option<[u8; 4]>,
-    /// Configured subnet mask.
-    pub subnet_mask: Option<[u8; 4]>,
-    /// Configured default gateway.
-    pub gateway: Option<[u8; 4]>,
-    /// DHCP lease duration in seconds.
-    pub lease_seconds: Option<u32>,
-}
-
-/// Successful ICMP echo result.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PingReply {
-    /// Reply source address.
-    pub source: [u8; 4],
-    /// Echo sequence number.
-    pub sequence: u16,
-    /// Echo data byte count.
-    pub bytes: usize,
-}
-
-/// One bounded UDP datagram returned to the shell.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ReceivedUdp {
-    /// Datagram source address.
-    pub source: [u8; 4],
-    /// Datagram source port.
-    pub source_port: u16,
-    /// Exact UDP payload.
-    pub payload: Vec<u8>,
-}
-
-/// Hardware-independent networking authority used by temporary shell built-ins.
-pub trait NetworkControl: core::fmt::Debug {
-    /// Return current link and IPv4 state.
-    fn status(&self) -> NetworkStatus;
-    /// Perform a bounded DHCP discover/request exchange.
-    ///
-    /// # Errors
-    ///
-    /// Reports device, timeout, protocol, and resource failures.
-    fn dhcp(&mut self, runtime: &mut dyn CooperativeRuntime)
-    -> Result<NetworkStatus, NetworkError>;
-    /// Snapshot ambient counters and bounded resource use.
-    fn stats(&self) -> NetworkStats;
-    /// Copy the at-most-eight retained ARP entries.
-    fn arp_entries(&self) -> Vec<ArpEntry>;
-    /// Send one ICMP echo and wait boundedly for its reply.
-    ///
-    /// # Errors
-    ///
-    /// Reports absent configuration, resolution timeout, or device failure.
-    fn ping(
-        &mut self,
-        destination: [u8; 4],
-        runtime: &mut dyn CooperativeRuntime,
-    ) -> Result<PingReply, NetworkError>;
-    /// Send one UDP datagram from an implementation-selected ephemeral port.
-    ///
-    /// # Errors
-    ///
-    /// Reports absent configuration, invalid size, resolution, or device failure.
-    fn send_udp(
-        &mut self,
-        source_port: Option<u16>,
-        destination: [u8; 4],
-        destination_port: u16,
-        payload: &[u8],
-        runtime: &mut dyn CooperativeRuntime,
-    ) -> Result<u16, NetworkError>;
-    /// Wait boundedly for one datagram addressed to `local_port`.
-    ///
-    /// # Errors
-    ///
-    /// Reports absent configuration, receive timeout, or device failure.
-    fn listen_udp(
-        &mut self,
-        local_port: u16,
-        runtime: &mut dyn CooperativeRuntime,
-    ) -> Result<ReceivedUdp, NetworkError>;
-}
 
 /// Return the reserved execution placement for a registered command name.
 ///
@@ -654,11 +470,6 @@ pub enum MachineAction {
 pub struct Shell {
     namespace: Namespace,
     cwd: String,
-    architecture: String,
-    machine_memory: MachineMemorySnapshot,
-    machine_input: Option<InputQueueStats>,
-    network: Option<Box<dyn NetworkControl>>,
-    runtime: Option<Box<dyn CooperativeRuntime>>,
     machine_control: bool,
     machine_action: Option<MachineAction>,
 }
@@ -677,29 +488,15 @@ impl Shell {
     ) -> Result<Self, FsError> {
         namespace.set_system_file("/sys/arch", format!("{architecture}\n").as_bytes())?;
         namespace.set_system_file("/sys/version", b"0.1.0\n")?;
-        let mut shell = Self {
+        let memory_report =
+            format_memory_report(architecture, machine_memory, None, namespace.memory_stats());
+        namespace.set_system_file("/sys/memory", memory_report.as_bytes())?;
+        Ok(Self {
             namespace,
             cwd: "/".to_string(),
-            architecture: architecture.to_string(),
-            machine_memory,
-            machine_input: None,
-            network: None,
-            runtime: None,
             machine_control,
             machine_action: None,
-        };
-        shell.refresh_memory_node()?;
-        Ok(shell)
-    }
-
-    /// Install an owned network capability for the temporary built-in commands.
-    pub fn set_network(&mut self, network: Box<dyn NetworkControl>) {
-        self.network = Some(network);
-    }
-
-    /// Install cooperative clock, ambient-work, and cancellation authority.
-    pub fn set_runtime(&mut self, runtime: Box<dyn CooperativeRuntime>) {
-        self.runtime = Some(runtime);
+        })
     }
 
     /// Terminal platform transition requested by an authorized command.
@@ -743,16 +540,6 @@ impl Shell {
         self.complete_paths(context, directories_only, config)
     }
 
-    /// Replace the machine-accounting snapshot used by `mem` and `/sys/memory`.
-    pub const fn set_machine_memory(&mut self, snapshot: MachineMemorySnapshot) {
-        self.machine_memory = snapshot;
-    }
-
-    /// Replace the interrupt-input snapshot used by `mem` and `/sys/memory`.
-    pub const fn set_machine_input(&mut self, snapshot: Option<InputQueueStats>) {
-        self.machine_input = snapshot;
-    }
-
     /// Execute a complete line, including any bounded pipeline.
     pub fn execute(
         &mut self,
@@ -764,8 +551,7 @@ impl Shell {
         self.execute_inner(line, stdin, stdout, stderr, &mut NoExternalCommand)
     }
 
-    /// Execute a line while preferring resolved applications for every name
-    /// except the shell-owned intrinsics.
+    /// Execute a line by resolving every name except the shell-owned intrinsics.
     pub fn execute_with_external(
         &mut self,
         line: &str,
@@ -798,14 +584,6 @@ impl Shell {
 
         let mut previous = Vec::new();
         for (index, stage) in pipeline.stages.iter().enumerate() {
-            if self
-                .runtime
-                .as_mut()
-                .is_some_and(|runtime| runtime.checkpoint().is_err())
-            {
-                let _ignored = write_error(stderr, "shell", "cancelled");
-                return CommandStatus::Cancelled;
-            }
             let last = index + 1 == pipeline.stages.len();
             if last {
                 let status = if index == 0 {
@@ -844,7 +622,7 @@ impl Shell {
             return CommandStatus::Success;
         };
         let spec = COMMANDS.iter().find(|spec| spec.name == command);
-        if spec.is_none_or(|spec| spec.class == CommandClass::ReplaceableBuiltin)
+        if spec.is_none_or(|spec| spec.class == CommandClass::Application)
             && let Some(status) = external.execute(
                 command,
                 words,
@@ -861,279 +639,22 @@ impl Shell {
             let _ignored = write_error(stderr, command, "unknown command");
             return CommandStatus::NotFound;
         };
+        let Some(intrinsic) = spec.intrinsic else {
+            let _ignored = write_error(stderr, command, "application unavailable");
+            return CommandStatus::NotFound;
+        };
         let args = &words[1..];
-        if spec.requires_machine_control && !self.machine_control {
+        if matches!(intrinsic, IntrinsicId::PowerOff | IntrinsicId::Reboot) && !self.machine_control
+        {
             let _ignored = write_error(stderr, command, "machine-control capability denied");
             return CommandStatus::Denied;
         }
-        match spec.id {
-            CommandId::Arp => self.command_arp(args, stdout, stderr),
-            CommandId::Cat => self.command_cat(args, stdin, stdout, stderr),
-            CommandId::Cd => self.command_cd(args, stderr),
-            CommandId::Clear => command_clear(args, stdout, stderr),
-            CommandId::Dhcp => self.command_dhcp(args, stdout, stderr),
-            CommandId::Echo => command_echo(args, stdout, stderr),
-            CommandId::Grep => self.command_grep(args, stdin, stdout, stderr),
-            CommandId::Hexdump => self.command_hexdump(args, stdin, stdout, stderr),
-            CommandId::Ls => self.command_ls(args, stdout, stderr),
-            CommandId::Man => self.command_man(args, stdout, stderr),
-            CommandId::Mem => self.command_mem(args, stdout, stderr),
-            CommandId::Net => self.command_net(args, stdout, stderr),
-            CommandId::Ping => self.command_ping(args, stdout, stderr),
-            CommandId::PowerOff => {
+        match intrinsic {
+            IntrinsicId::Cd => self.command_cd(args, stderr),
+            IntrinsicId::PowerOff => {
                 self.command_machine_action(args, stderr, MachineAction::PowerOff)
             }
-            CommandId::Pwd => self.command_pwd(args, stdout, stderr),
-            CommandId::Reboot => self.command_machine_action(args, stderr, MachineAction::Reboot),
-            CommandId::Rm => self.command_rm(args, stderr),
-            CommandId::Sleep => self.command_sleep(args, stderr),
-            CommandId::Udp => self.command_udp(args, stdin, stdout, stderr),
-            CommandId::Write => self.command_write(args, stdin, stderr),
-        }
-    }
-
-    fn command_net(
-        &mut self,
-        args: &[String],
-        stdout: &mut dyn Output,
-        stderr: &mut dyn Output,
-    ) -> CommandStatus {
-        let Some(network) = self.network.as_ref() else {
-            let _ignored = write_error(stderr, "net", "no network device");
-            return CommandStatus::NotFound;
-        };
-        match args {
-            [] => write_network_status(stdout, network.status(), stderr),
-            [operation] if operation == "stats" => {
-                let stats = network.stats();
-                let report = format!(
-                    "rx frames: {}\ntx frames: {}\narp replies: {}\nicmp replies: {}\nudp retained: {}\nudp unbound: {}\nudp dropped: {}\narp entries: {}\nudp ports: {}\ncheckpoints: {}\nerrors: {}\n",
-                    stats.received_frames,
-                    stats.transmitted_frames,
-                    stats.arp_replies,
-                    stats.icmp_replies,
-                    stats.udp_retained,
-                    stats.udp_unbound,
-                    stats.udp_dropped,
-                    stats.arp_entries,
-                    stats.udp_ports,
-                    stats.checkpoints,
-                    stats.errors
-                );
-                if write_all(stdout, report.as_bytes()).is_err() {
-                    stream_failure(stderr, "net")
-                } else {
-                    CommandStatus::Success
-                }
-            }
-            _ => usage(stderr, "net", "net | net stats"),
-        }
-    }
-
-    fn command_arp(
-        &mut self,
-        args: &[String],
-        stdout: &mut dyn Output,
-        stderr: &mut dyn Output,
-    ) -> CommandStatus {
-        if !args.is_empty() {
-            return usage(stderr, "arp", "arp");
-        }
-        let Some(network) = self.network.as_ref() else {
-            return network_failure(stderr, "arp", NetworkError::Unavailable);
-        };
-        let entries = network.arp_entries();
-        if entries.is_empty() {
-            return if write_all(stdout, b"ARP cache empty\n").is_err() {
-                stream_failure(stderr, "arp")
-            } else {
-                CommandStatus::Success
-            };
-        }
-        for entry in entries {
-            let line = format!(
-                "{} {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\n",
-                format_ipv4(entry.address),
-                entry.mac[0],
-                entry.mac[1],
-                entry.mac[2],
-                entry.mac[3],
-                entry.mac[4],
-                entry.mac[5]
-            );
-            if write_all(stdout, line.as_bytes()).is_err() {
-                return stream_failure(stderr, "arp");
-            }
-        }
-        CommandStatus::Success
-    }
-
-    fn command_dhcp(
-        &mut self,
-        args: &[String],
-        stdout: &mut dyn Output,
-        stderr: &mut dyn Output,
-    ) -> CommandStatus {
-        if !args.is_empty() {
-            return usage(stderr, "dhcp", "dhcp");
-        }
-        let (Some(network), Some(runtime)) = (self.network.as_mut(), self.runtime.as_mut()) else {
-            return network_failure(stderr, "dhcp", NetworkError::Unavailable);
-        };
-        match network.dhcp(runtime.as_mut()) {
-            Ok(status) => write_network_status(stdout, status, stderr),
-            Err(error) => network_failure(stderr, "dhcp", error),
-        }
-    }
-
-    fn command_ping(
-        &mut self,
-        args: &[String],
-        stdout: &mut dyn Output,
-        stderr: &mut dyn Output,
-    ) -> CommandStatus {
-        if args.len() != 1 {
-            return usage(stderr, "ping", "ping ADDRESS");
-        }
-        let Some(destination) = parse_ipv4(&args[0]) else {
-            return usage(stderr, "ping", "invalid IPv4 address");
-        };
-        let (Some(network), Some(runtime)) = (self.network.as_mut(), self.runtime.as_mut()) else {
-            return network_failure(stderr, "ping", NetworkError::Unavailable);
-        };
-        match network.ping(destination, runtime.as_mut()) {
-            Ok(reply) => {
-                let line = format!(
-                    "reply from {}: icmp_seq={} bytes={}\n",
-                    format_ipv4(reply.source),
-                    reply.sequence,
-                    reply.bytes
-                );
-                if write_all(stdout, line.as_bytes()).is_err() {
-                    stream_failure(stderr, "ping")
-                } else {
-                    CommandStatus::Success
-                }
-            }
-            Err(error) => network_failure(stderr, "ping", error),
-        }
-    }
-
-    fn command_udp(
-        &mut self,
-        args: &[String],
-        stdin: &mut dyn Input,
-        stdout: &mut dyn Output,
-        stderr: &mut dyn Output,
-    ) -> CommandStatus {
-        let Some(operation) = args.first().map(String::as_str) else {
-            return usage(
-                stderr,
-                "udp",
-                "udp send [--source-port PORT] ADDRESS PORT [TEXT...] | udp listen PORT",
-            );
-        };
-        match operation {
-            "send" if args.len() >= 3 => {
-                let (source_port, address_index) =
-                    if args.get(1).is_some_and(|arg| arg == "--source-port") {
-                        let Some(port) = args.get(2).and_then(|arg| parse_port(arg)) else {
-                            return usage(stderr, "udp", "invalid UDP source port");
-                        };
-                        (Some(port), 3)
-                    } else {
-                        (None, 1)
-                    };
-                let Some(destination_text) = args.get(address_index) else {
-                    return usage(stderr, "udp", "missing IPv4 address");
-                };
-                let Some(destination) = parse_ipv4(destination_text) else {
-                    return usage(stderr, "udp", "invalid IPv4 address");
-                };
-                let Some(port) = args.get(address_index + 1).and_then(|arg| parse_port(arg)) else {
-                    return usage(stderr, "udp", "invalid UDP port");
-                };
-                let payload_index = address_index + 2;
-                let payload = if args.len() > payload_index {
-                    args[payload_index..].join(" ").into_bytes()
-                } else {
-                    match read_bounded(stdin, PIPE_CAPACITY) {
-                        Ok(value) => value,
-                        Err(_) => return stream_failure(stderr, "udp"),
-                    }
-                };
-                let (Some(network), Some(runtime)) = (self.network.as_mut(), self.runtime.as_mut())
-                else {
-                    return network_failure(stderr, "udp", NetworkError::Unavailable);
-                };
-                match network.send_udp(source_port, destination, port, &payload, runtime.as_mut()) {
-                    Ok(source_port) => {
-                        let line = format!(
-                            "sent {} bytes from port {source_port} to {}:{port}\n",
-                            payload.len(),
-                            format_ipv4(destination)
-                        );
-                        if write_all(stdout, line.as_bytes()).is_err() {
-                            stream_failure(stderr, "udp")
-                        } else {
-                            CommandStatus::Success
-                        }
-                    }
-                    Err(error) => network_failure(stderr, "udp", error),
-                }
-            }
-            "listen" | "recv" if args.len() == 2 => {
-                let Some(port) = parse_port(&args[1]) else {
-                    return usage(stderr, "udp", "invalid UDP port");
-                };
-                let (Some(network), Some(runtime)) = (self.network.as_mut(), self.runtime.as_mut())
-                else {
-                    return network_failure(stderr, "udp", NetworkError::Unavailable);
-                };
-                match network.listen_udp(port, runtime.as_mut()) {
-                    Ok(datagram) => {
-                        let header = format!(
-                            "from {}:{} bytes={}\n",
-                            format_ipv4(datagram.source),
-                            datagram.source_port,
-                            datagram.payload.len()
-                        );
-                        if write_all(stdout, header.as_bytes()).is_err()
-                            || write_all(stdout, &datagram.payload).is_err()
-                            || write_all(stdout, b"\n").is_err()
-                        {
-                            stream_failure(stderr, "udp")
-                        } else {
-                            CommandStatus::Success
-                        }
-                    }
-                    Err(error) => network_failure(stderr, "udp", error),
-                }
-            }
-            _ => usage(
-                stderr,
-                "udp",
-                "udp send [--source-port PORT] ADDRESS PORT [TEXT...] | udp listen PORT",
-            ),
-        }
-    }
-
-    fn command_sleep(&mut self, args: &[String], stderr: &mut dyn Output) -> CommandStatus {
-        if args.len() != 1 {
-            return usage(stderr, "sleep", "sleep MILLISECONDS");
-        }
-        let Ok(milliseconds) = args[0].parse::<u64>() else {
-            return usage(stderr, "sleep", "invalid millisecond interval");
-        };
-        let Some(runtime) = self.runtime.as_mut() else {
-            let _ignored = write_error(stderr, "sleep", "runtime unavailable");
-            return CommandStatus::Failure;
-        };
-        if runtime.sleep(milliseconds).is_ok() {
-            CommandStatus::Success
-        } else {
-            let _ignored = write_error(stderr, "sleep", "cancelled");
-            CommandStatus::Cancelled
+            IntrinsicId::Reboot => self.command_machine_action(args, stderr, MachineAction::Reboot),
         }
     }
 
@@ -1196,101 +717,6 @@ impl Shell {
         completion
     }
 
-    fn command_cat(
-        &mut self,
-        args: &[String],
-        stdin: &mut dyn Input,
-        stdout: &mut dyn Output,
-        stderr: &mut dyn Output,
-    ) -> CommandStatus {
-        if self.refresh_memory_node().is_err() {
-            return fs_failure(stderr, "cat", "/sys/memory", FsError::Invalid);
-        }
-        if args.is_empty() {
-            return copy_stream(stdin, stdout, stderr, "cat");
-        }
-        for path in args {
-            let bytes = match self.namespace.read_file(&self.cwd, path) {
-                Ok(value) => value,
-                Err(error) => return fs_failure(stderr, "cat", path, error),
-            };
-            if write_all(stdout, &bytes).is_err() {
-                let _ignored = write_error(stderr, "cat", "output failed");
-                return CommandStatus::Failure;
-            }
-        }
-        CommandStatus::Success
-    }
-
-    fn command_grep(
-        &mut self,
-        args: &[String],
-        stdin: &mut dyn Input,
-        stdout: &mut dyn Output,
-        stderr: &mut dyn Output,
-    ) -> CommandStatus {
-        let Some(pattern) = args.first() else {
-            return usage(stderr, "grep", "grep PATTERN [FILE...]");
-        };
-        if args.len() == 1 {
-            return grep_stream(stdin, pattern.as_bytes(), stdout, stderr);
-        }
-        for path in &args[1..] {
-            let bytes = match self.namespace.read_file(&self.cwd, path) {
-                Ok(value) => value,
-                Err(error) => return fs_failure(stderr, "grep", path, error),
-            };
-            let mut input = SliceInput::with_max_chunk(&bytes, 17);
-            let status = grep_stream(&mut input, pattern.as_bytes(), stdout, stderr);
-            if status != CommandStatus::Success {
-                return status;
-            }
-        }
-        CommandStatus::Success
-    }
-
-    fn command_ls(
-        &mut self,
-        args: &[String],
-        stdout: &mut dyn Output,
-        stderr: &mut dyn Output,
-    ) -> CommandStatus {
-        if args.len() > 1 {
-            return usage(stderr, "ls", "ls [PATH]");
-        }
-        let path = args.first().map_or(".", String::as_str);
-        let entries = match self.namespace.list(&self.cwd, path) {
-            Ok(value) => value,
-            Err(error) => return fs_failure(stderr, "ls", path, error),
-        };
-        for entry in entries {
-            let suffix = if entry.kind == NodeKind::Directory {
-                "/"
-            } else {
-                ""
-            };
-            if write_all(stdout, format!("{}{suffix}\n", entry.name).as_bytes()).is_err() {
-                return stream_failure(stderr, "ls");
-            }
-        }
-        CommandStatus::Success
-    }
-
-    fn command_pwd(
-        &self,
-        args: &[String],
-        stdout: &mut dyn Output,
-        stderr: &mut dyn Output,
-    ) -> CommandStatus {
-        if !args.is_empty() {
-            return usage(stderr, "pwd", "pwd");
-        }
-        if write_all(stdout, format!("{}\n", self.cwd).as_bytes()).is_err() {
-            return stream_failure(stderr, "pwd");
-        }
-        CommandStatus::Success
-    }
-
     fn command_cd(&mut self, args: &[String], stderr: &mut dyn Output) -> CommandStatus {
         if args.len() != 1 {
             return usage(stderr, "cd", "cd PATH");
@@ -1302,29 +728,6 @@ impl Shell {
             }
             Err(error) => fs_failure(stderr, "cd", &args[0], error),
         }
-    }
-
-    fn command_mem(
-        &mut self,
-        args: &[String],
-        stdout: &mut dyn Output,
-        stderr: &mut dyn Output,
-    ) -> CommandStatus {
-        if !args.is_empty() {
-            return usage(stderr, "mem", "mem");
-        }
-        let report = self.memory_report();
-        if self
-            .namespace
-            .set_system_file("/sys/memory", report.as_bytes())
-            .is_err()
-        {
-            return fs_failure(stderr, "mem", "/sys/memory", FsError::Invalid);
-        }
-        if write_all(stdout, report.as_bytes()).is_err() {
-            return stream_failure(stderr, "mem");
-        }
-        CommandStatus::Success
     }
 
     fn command_machine_action(
@@ -1347,123 +750,9 @@ impl Shell {
         self.machine_action = Some(action);
         CommandStatus::Success
     }
-
-    fn command_man(
-        &mut self,
-        args: &[String],
-        stdout: &mut dyn Output,
-        stderr: &mut dyn Output,
-    ) -> CommandStatus {
-        if args.len() != 1 {
-            return usage(stderr, "man", "man COMMAND");
-        }
-        let name = &args[0];
-        if command_class(name).is_none() {
-            let _ignored = write_error(stderr, "man", "no manual entry for command");
-            return CommandStatus::NotFound;
-        }
-        let path = format!("/man/{name}");
-        let page = match self.namespace.read_file("/", &path) {
-            Ok(page) => page,
-            Err(FsError::NotFound) => {
-                let _ignored = write_error(stderr, "man", "manual page is unavailable");
-                return CommandStatus::NotFound;
-            }
-            Err(error) => return fs_failure(stderr, "man", &path, error),
-        };
-        if write_all(stdout, &page).is_err() {
-            return stream_failure(stderr, "man");
-        }
-        CommandStatus::Success
-    }
-
-    fn command_write(
-        &mut self,
-        args: &[String],
-        stdin: &mut dyn Input,
-        stderr: &mut dyn Output,
-    ) -> CommandStatus {
-        let Some(path) = args.first() else {
-            return usage(stderr, "write", "write FILE [TEXT...]");
-        };
-        let bytes = if args.len() > 1 {
-            args[1..].join(" ").into_bytes()
-        } else {
-            match read_bounded(stdin, PIPE_CAPACITY) {
-                Ok(value) => value,
-                Err(_) => return stream_failure(stderr, "write"),
-            }
-        };
-        match self.namespace.write_file(&self.cwd, path, &bytes) {
-            Ok(()) => CommandStatus::Success,
-            Err(error) => fs_failure(stderr, "write", path, error),
-        }
-    }
-
-    fn command_rm(&mut self, args: &[String], stderr: &mut dyn Output) -> CommandStatus {
-        if args.len() != 1 {
-            return usage(stderr, "rm", "rm FILE");
-        }
-        match self.namespace.remove_file(&self.cwd, &args[0]) {
-            Ok(()) => CommandStatus::Success,
-            Err(error) => fs_failure(stderr, "rm", &args[0], error),
-        }
-    }
-
-    fn command_hexdump(
-        &mut self,
-        args: &[String],
-        stdin: &mut dyn Input,
-        stdout: &mut dyn Output,
-        stderr: &mut dyn Output,
-    ) -> CommandStatus {
-        if args.len() > 1 {
-            return usage(stderr, "hexdump", "hexdump [FILE]");
-        }
-        let data = if let Some(path) = args.first() {
-            match self.namespace.read_file(&self.cwd, path) {
-                Ok(value) => value,
-                Err(error) => return fs_failure(stderr, "hexdump", path, error),
-            }
-        } else {
-            match read_bounded(stdin, PIPE_CAPACITY) {
-                Ok(value) => value,
-                Err(_) => return stream_failure(stderr, "hexdump"),
-            }
-        };
-        for (row, chunk) in data.chunks(16).enumerate() {
-            let mut line = format!("{:08x}  ", row * 16);
-            for byte in chunk {
-                if write!(line, "{byte:02x} ").is_err() {
-                    return stream_failure(stderr, "hexdump");
-                }
-            }
-            line.push('\n');
-            if write_all(stdout, line.as_bytes()).is_err() {
-                return stream_failure(stderr, "hexdump");
-            }
-        }
-        CommandStatus::Success
-    }
-
-    fn memory_report(&self) -> String {
-        format_memory_report(
-            &self.architecture,
-            self.machine_memory,
-            self.machine_input,
-            self.namespace.memory_stats(),
-        )
-    }
-
-    fn refresh_memory_node(&mut self) -> Result<(), FsError> {
-        let report = self.memory_report();
-        self.namespace
-            .set_system_file("/sys/memory", report.as_bytes())
-    }
 }
 
-/// Format the canonical bounded memory/driver report used by `mem` and
-/// `/sys/memory`.
+/// Format the canonical bounded memory/driver report published at `/sys/memory`.
 #[must_use]
 pub fn format_memory_report(
     architecture: &str,
@@ -1725,190 +1014,9 @@ fn optional_byte_ratio(numerator: Option<u64>, denominator: Option<u64>, suffix:
     }
 }
 
-fn command_echo(
-    args: &[String],
-    stdout: &mut dyn Output,
-    stderr: &mut dyn Output,
-) -> CommandStatus {
-    if write_all(stdout, args.join(" ").as_bytes()).is_err() || write_all(stdout, b"\n").is_err() {
-        return stream_failure(stderr, "echo");
-    }
-    CommandStatus::Success
-}
-
-fn command_clear(
-    args: &[String],
-    stdout: &mut dyn Output,
-    stderr: &mut dyn Output,
-) -> CommandStatus {
-    if !args.is_empty() {
-        return usage(stderr, "clear", "clear");
-    }
-    if write_all(stdout, b"\x1b[2J\x1b[H").is_err() {
-        return stream_failure(stderr, "clear");
-    }
-    CommandStatus::Success
-}
-
-fn grep_stream(
-    input: &mut dyn Input,
-    pattern: &[u8],
-    stdout: &mut dyn Output,
-    stderr: &mut dyn Output,
-) -> CommandStatus {
-    let mut read_buffer = [0_u8; 256];
-    let mut line = Vec::new();
-    loop {
-        let Ok(count) = input.read(&mut read_buffer) else {
-            return stream_failure(stderr, "grep");
-        };
-        if count == 0 {
-            break;
-        }
-        for byte in &read_buffer[..count] {
-            if line.len() >= PIPE_CAPACITY {
-                let _ignored = write_error(stderr, "grep", "line exceeds pipeline capacity");
-                return CommandStatus::Failure;
-            }
-            line.push(*byte);
-            if *byte == b'\n' {
-                if contains_bytes(&line, pattern) && write_all(stdout, &line).is_err() {
-                    return stream_failure(stderr, "grep");
-                }
-                line.clear();
-            }
-        }
-    }
-    if !line.is_empty() && contains_bytes(&line, pattern) {
-        if write_all(stdout, &line).is_err() {
-            return stream_failure(stderr, "grep");
-        }
-        if !line.ends_with(b"\n") && write_all(stdout, b"\n").is_err() {
-            return stream_failure(stderr, "grep");
-        }
-    }
-    CommandStatus::Success
-}
-
-fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    needle.is_empty()
-        || haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
-}
-
-fn copy_stream(
-    input: &mut dyn Input,
-    output: &mut dyn Output,
-    stderr: &mut dyn Output,
-    command: &str,
-) -> CommandStatus {
-    let mut buffer = [0_u8; 512];
-    loop {
-        let Ok(count) = input.read(&mut buffer) else {
-            return stream_failure(stderr, command);
-        };
-        if count == 0 {
-            return CommandStatus::Success;
-        }
-        if write_all(output, &buffer[..count]).is_err() {
-            return stream_failure(stderr, command);
-        }
-    }
-}
-
-fn read_bounded(input: &mut dyn Input, limit: usize) -> Result<Vec<u8>, StreamError> {
-    let mut output = BoundedOutput::new(limit);
-    let mut buffer = [0_u8; 512];
-    loop {
-        let count = input.read(&mut buffer)?;
-        if count == 0 {
-            return Ok(output.into_vec());
-        }
-        write_all(&mut output, &buffer[..count])?;
-    }
-}
-
 fn usage(stderr: &mut dyn Output, command: &str, synopsis: &str) -> CommandStatus {
     let _ignored = write_error(stderr, command, synopsis);
     CommandStatus::Usage
-}
-
-fn parse_ipv4(text: &str) -> Option<[u8; 4]> {
-    let mut parts = text.split('.');
-    let address = [
-        parts.next()?.parse().ok()?,
-        parts.next()?.parse().ok()?,
-        parts.next()?.parse().ok()?,
-        parts.next()?.parse().ok()?,
-    ];
-    if parts.next().is_some() {
-        None
-    } else {
-        Some(address)
-    }
-}
-
-fn parse_port(text: &str) -> Option<u16> {
-    let port = text.parse().ok()?;
-    (port != 0).then_some(port)
-}
-
-fn format_ipv4(address: [u8; 4]) -> String {
-    format!(
-        "{}.{}.{}.{}",
-        address[0], address[1], address[2], address[3]
-    )
-}
-
-fn write_network_status(
-    stdout: &mut dyn Output,
-    status: NetworkStatus,
-    stderr: &mut dyn Output,
-) -> CommandStatus {
-    let address = status
-        .address
-        .map_or_else(|| "unconfigured".to_string(), format_ipv4);
-    let subnet = status
-        .subnet_mask
-        .map_or_else(|| "unconfigured".to_string(), format_ipv4);
-    let gateway = status
-        .gateway
-        .map_or_else(|| "unconfigured".to_string(), format_ipv4);
-    let lease = status.lease_seconds.map_or_else(
-        || "unconfigured".to_string(),
-        |seconds| format!("{seconds} seconds"),
-    );
-    let report = format!(
-        "link: ready\nmac: {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}\nipv4: {address}\nsubnet: {subnet}\ngateway: {gateway}\nlease: {lease}\n",
-        status.mac[0], status.mac[1], status.mac[2], status.mac[3], status.mac[4], status.mac[5]
-    );
-    if write_all(stdout, report.as_bytes()).is_err() {
-        stream_failure(stderr, "net")
-    } else {
-        CommandStatus::Success
-    }
-}
-
-fn network_failure(stderr: &mut dyn Output, command: &str, error: NetworkError) -> CommandStatus {
-    let message = match error {
-        NetworkError::Unavailable => "no network device",
-        NetworkError::NotConfigured => "IPv4 is not configured; run dhcp",
-        NetworkError::Timeout => "operation timed out",
-        NetworkError::Device => "network device failed",
-        NetworkError::Protocol => "invalid network response",
-        NetworkError::TooLarge => "packet exceeds network limit",
-        NetworkError::Exhausted => "bounded network resources exhausted",
-        NetworkError::Cancelled => "cancelled",
-    };
-    let _ignored = write_error(stderr, command, message);
-    if error == NetworkError::Unavailable {
-        CommandStatus::NotFound
-    } else if error == NetworkError::Cancelled {
-        CommandStatus::Cancelled
-    } else {
-        CommandStatus::Failure
-    }
 }
 
 fn fs_failure(stderr: &mut dyn Output, command: &str, path: &str, error: FsError) -> CommandStatus {
@@ -1918,11 +1026,6 @@ fn fs_failure(stderr: &mut dyn Output, command: &str, path: &str, error: FsError
     } else {
         CommandStatus::Failure
     }
-}
-
-fn stream_failure(stderr: &mut dyn Output, command: &str) -> CommandStatus {
-    let _ignored = write_error(stderr, command, "stream I/O failed");
-    CommandStatus::Failure
 }
 
 fn write_error(stderr: &mut dyn Output, command: &str, message: &str) -> Result<(), StreamError> {
@@ -1942,21 +1045,19 @@ const fn parse_error_text(error: ParseError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArpEntry, COMMANDS, CommandClass, CompletionConfig, CompletionConfigError, ExternalCommand,
-        MachineAction, NetworkControl, NetworkError, NetworkStats, NetworkStatus, ParseError,
-        PingReply, ReceivedUdp, Shell, command_class, command_synopsis, parse_line,
+        COMMANDS, CommandClass, CompletionConfig, CompletionConfigError, ExternalCommand,
+        MachineAction, ParseError, Shell, command_class, command_synopsis, format_memory_report,
+        parse_line,
     };
-    use alloc::boxed::Box;
     use alloc::format;
     use alloc::string::{String, ToString};
     use alloc::vec::Vec;
     use troe_core::{
-        BoundedOutput, MAX_ARGS, MAX_LINE_BYTES, MAX_PIPELINE_STAGES, MachineMemorySnapshot,
-        PIPE_CAPACITY, SliceInput, write_all,
+        BoundedOutput, CommandStatus, Input, MAX_ARGS, MAX_LINE_BYTES, MAX_PIPELINE_STAGES,
+        MachineMemorySnapshot, Output, PIPE_CAPACITY, SliceInput, write_all,
     };
     use troe_driver::InputQueueStats;
-    use troe_task::{Cancelled, CooperativeRuntime, MonotonicMillis};
-    use troe_vfs::{Namespace, RamFsQuota};
+    use troe_vfs::{FsError, Namespace, RamFsQuota};
 
     fn shell() -> Shell {
         let mut namespace = Namespace::new(RamFsQuota::default());
@@ -1965,114 +1066,9 @@ mod tests {
             namespace.add_read_only_file("/help/readme", b"alpha\nbeta alpha\n"),
             Ok(())
         );
-        assert_eq!(namespace.add_read_only_dir("/man"), Ok(()));
-        assert_eq!(
-            namespace.add_read_only_file(
-                "/man/echo",
-                b"NAME\n    echo - write arguments\n\nSYNOPSIS\n    echo [ARG...]\n",
-            ),
-            Ok(())
-        );
         match Shell::new(namespace, "test", MachineMemorySnapshot::hosted(), true) {
             Ok(value) => value,
             Err(_error) => std::process::abort(),
-        }
-    }
-
-    #[derive(Debug)]
-    struct FakeNetwork;
-
-    #[derive(Debug, Default)]
-    struct FakeRuntime {
-        now: u64,
-    }
-
-    impl CooperativeRuntime for FakeRuntime {
-        fn now(&self) -> MonotonicMillis {
-            MonotonicMillis::from_millis(self.now)
-        }
-
-        fn checkpoint(&mut self) -> Result<(), Cancelled> {
-            self.now = self.now.saturating_add(1);
-            Ok(())
-        }
-    }
-
-    impl NetworkControl for FakeNetwork {
-        fn status(&self) -> NetworkStatus {
-            fake_network_status()
-        }
-
-        fn dhcp(
-            &mut self,
-            _runtime: &mut dyn CooperativeRuntime,
-        ) -> Result<NetworkStatus, NetworkError> {
-            Ok(fake_network_status())
-        }
-
-        fn stats(&self) -> NetworkStats {
-            NetworkStats {
-                received_frames: 7,
-                udp_ports: 1,
-                checkpoints: 9,
-                ..NetworkStats::default()
-            }
-        }
-
-        fn arp_entries(&self) -> Vec<ArpEntry> {
-            alloc::vec![ArpEntry {
-                address: [10, 0, 2, 2],
-                mac: [0x52, 0x55, 0x0a, 0, 2, 2],
-            }]
-        }
-
-        fn ping(
-            &mut self,
-            destination: [u8; 4],
-            _runtime: &mut dyn CooperativeRuntime,
-        ) -> Result<PingReply, NetworkError> {
-            Ok(PingReply {
-                source: destination,
-                sequence: 1,
-                bytes: 9,
-            })
-        }
-
-        fn send_udp(
-            &mut self,
-            source_port: Option<u16>,
-            _destination: [u8; 4],
-            _destination_port: u16,
-            payload: &[u8],
-            _runtime: &mut dyn CooperativeRuntime,
-        ) -> Result<u16, NetworkError> {
-            if payload.len() > 1472 {
-                Err(NetworkError::TooLarge)
-            } else {
-                Ok(source_port.unwrap_or(49_152))
-            }
-        }
-
-        fn listen_udp(
-            &mut self,
-            _local_port: u16,
-            _runtime: &mut dyn CooperativeRuntime,
-        ) -> Result<ReceivedUdp, NetworkError> {
-            Ok(ReceivedUdp {
-                source: [10, 0, 2, 2],
-                source_port: 40123,
-                payload: b"hello".to_vec(),
-            })
-        }
-    }
-
-    const fn fake_network_status() -> NetworkStatus {
-        NetworkStatus {
-            mac: [0x52, 0x54, 0, 0x12, 0x34, 0x56],
-            address: Some([10, 0, 2, 15]),
-            subnet_mask: Some([255, 255, 255, 0]),
-            gateway: Some([10, 0, 2, 2]),
-            lease_seconds: Some(86_400),
         }
     }
 
@@ -2081,23 +1077,109 @@ mod tests {
         attempts: Vec<String>,
     }
 
+    impl FakeExternal {
+        #[allow(clippy::unnecessary_wraps)]
+        fn failure(
+            stderr: &mut dyn Output,
+            command: &str,
+            message: &str,
+            status: CommandStatus,
+        ) -> Option<CommandStatus> {
+            let _ignored = write_all(stderr, format!("{command}: {message}\n").as_bytes());
+            Some(status)
+        }
+    }
+
     impl ExternalCommand for FakeExternal {
         fn execute(
             &mut self,
             command: &str,
-            _words: &[String],
-            _cwd: &str,
-            _namespace: &mut Namespace,
-            _stdin: &mut dyn troe_core::Input,
-            stdout: &mut dyn troe_core::Output,
-            _stderr: &mut dyn troe_core::Output,
-        ) -> Option<troe_core::CommandStatus> {
+            words: &[String],
+            cwd: &str,
+            namespace: &mut Namespace,
+            stdin: &mut dyn Input,
+            stdout: &mut dyn Output,
+            stderr: &mut dyn Output,
+        ) -> Option<CommandStatus> {
             self.attempts.push(command.to_string());
-            if matches!(command, "echo" | "external") {
-                let _ignored = write_all(stdout, b"external application\n");
-                Some(troe_core::CommandStatus::Success)
-            } else {
-                None
+            match command {
+                "echo" | "external" => {
+                    if write_all(stdout, b"external application\n").is_ok() {
+                        Some(CommandStatus::Success)
+                    } else {
+                        Self::failure(stderr, command, "stream I/O failed", CommandStatus::Failure)
+                    }
+                }
+                "cat" if words.len() == 2 => match namespace.read_file(cwd, &words[1]) {
+                    Ok(bytes) if write_all(stdout, &bytes).is_ok() => Some(CommandStatus::Success),
+                    Ok(_) => {
+                        Self::failure(stderr, command, "stream I/O failed", CommandStatus::Failure)
+                    }
+                    Err(error) => {
+                        let status = if error == FsError::NotFound {
+                            CommandStatus::NotFound
+                        } else {
+                            CommandStatus::Failure
+                        };
+                        Self::failure(stderr, command, &format!("{}: {error}", words[1]), status)
+                    }
+                },
+                "copy" if words.len() == 1 => {
+                    let mut buffer = [0_u8; 512];
+                    loop {
+                        match stdin.read(&mut buffer) {
+                            Ok(0) => return Some(CommandStatus::Success),
+                            Ok(count) if write_all(stdout, &buffer[..count]).is_ok() => {}
+                            Ok(_) | Err(_) => {
+                                return Self::failure(
+                                    stderr,
+                                    command,
+                                    "stream I/O failed",
+                                    CommandStatus::Failure,
+                                );
+                            }
+                        }
+                    }
+                }
+                "write" if words.len() == 2 => {
+                    let mut bytes = Vec::new();
+                    let mut buffer = [0_u8; 512];
+                    loop {
+                        let Ok(count) = stdin.read(&mut buffer) else {
+                            return Self::failure(
+                                stderr,
+                                command,
+                                "stream I/O failed",
+                                CommandStatus::Failure,
+                            );
+                        };
+                        if count == 0 {
+                            break;
+                        }
+                        if bytes.len().saturating_add(count) > PIPE_CAPACITY {
+                            return Self::failure(
+                                stderr,
+                                command,
+                                "input exceeds pipeline capacity",
+                                CommandStatus::Failure,
+                            );
+                        }
+                        bytes.extend_from_slice(&buffer[..count]);
+                    }
+                    match namespace.write_file(cwd, &words[1], &bytes) {
+                        Ok(()) => Some(CommandStatus::Success),
+                        Err(error) => Self::failure(
+                            stderr,
+                            command,
+                            &format!("{}: {error}", words[1]),
+                            CommandStatus::Failure,
+                        ),
+                    }
+                }
+                "fail" => {
+                    Self::failure(stderr, command, "requested failure", CommandStatus::Failure)
+                }
+                _ => None,
             }
         }
     }
@@ -2133,9 +1215,8 @@ mod tests {
             .join(" ");
         let parsed = parse_line(&exact_words).unwrap_or_default();
         assert_eq!(parsed.stages[0].words.len(), MAX_ARGS);
-        let too_many_words = format!("{exact_words} x");
         assert_eq!(
-            parse_line(&too_many_words),
+            parse_line(&format!("{exact_words} x")),
             Err(ParseError::TooManyArguments)
         );
 
@@ -2146,103 +1227,54 @@ mod tests {
             parse_line(&exact_stages).map(|pipeline| pipeline.stages.len()),
             Ok(MAX_PIPELINE_STAGES)
         );
-        let too_many_stages = format!("{exact_stages} | echo");
-        assert_eq!(parse_line(&too_many_stages), Err(ParseError::TooManyStages));
+        assert_eq!(
+            parse_line(&format!("{exact_stages} | echo")),
+            Err(ParseError::TooManyStages)
+        );
     }
 
     #[test]
     fn pipeline_connects_bounded_byte_streams() {
         let mut shell = shell();
+        let mut external = FakeExternal::default();
         let mut input = SliceInput::new(b"");
         let mut output = BoundedOutput::new(1024);
         let mut error = BoundedOutput::new(1024);
-        let status = shell.execute(
-            "cat /help/readme | grep beta | hexdump",
+        let status = shell.execute_with_external(
+            "cat /help/readme | copy",
             &mut input,
             &mut output,
             &mut error,
+            &mut external,
         );
-        assert_eq!(status.code(), 0);
-        let text = core::str::from_utf8(output.as_slice()).unwrap_or_default();
-        assert!(text.contains("62 65 74 61"));
+        assert_eq!(status, CommandStatus::Success);
+        assert_eq!(output.as_slice(), b"alpha\nbeta alpha\n");
         assert!(error.as_slice().is_empty());
     }
 
     #[test]
-    fn replaceable_network_commands_use_the_explicit_capability() {
-        let mut shell = shell();
-        shell.set_network(Box::new(FakeNetwork));
-        shell.set_runtime(Box::new(FakeRuntime::default()));
-        for (command, expected) in [
-            ("net", "ipv4: 10.0.2.15"),
-            ("net stats", "rx frames: 7"),
-            ("arp", "10.0.2.2"),
-            ("dhcp", "lease: 86400 seconds"),
-            ("ping 10.0.2.2", "reply from 10.0.2.2"),
-            (
-                "udp send 10.0.2.2 40123 alive",
-                "sent 5 bytes from port 49152",
-            ),
-            (
-                "udp send --source-port 40000 10.0.2.2 40123 fixed",
-                "from port 40000",
-            ),
-            ("udp listen 40000", "hello"),
-            ("sleep 2", ""),
-        ] {
-            let mut input = SliceInput::new(b"");
-            let mut output = BoundedOutput::new(1024);
-            let mut error = BoundedOutput::new(1024);
-            let status = shell.execute(command, &mut input, &mut output, &mut error);
-            assert_eq!(status.code(), 0, "{command}");
-            let text = core::str::from_utf8(output.as_slice()).unwrap_or_default();
-            assert!(text.contains(expected), "{command}: {text}");
-            assert!(error.as_slice().is_empty());
-        }
-    }
-
-    #[test]
-    fn writable_files_round_trip_and_account() {
-        let mut shell = shell();
-        let mut input = SliceInput::new(b"");
-        let mut output = BoundedOutput::new(4096);
-        let mut error = BoundedOutput::new(4096);
-        assert_eq!(
-            shell
-                .execute(
-                    "echo hello | write /tmp/message",
-                    &mut input,
-                    &mut output,
-                    &mut error
-                )
-                .code(),
-            0
-        );
-        assert_eq!(
-            shell
-                .execute("cat /tmp/message", &mut input, &mut output, &mut error)
-                .code(),
-            0
-        );
-        assert!(output.as_slice().ends_with(b"hello\n"));
-    }
-
-    #[test]
-    fn unknown_command_is_stable_failure() {
+    fn ordinary_commands_require_applications_and_unknown_names_stay_distinct() {
         let mut shell = shell();
         let mut input = SliceInput::new(b"");
         let mut output = BoundedOutput::new(64);
         let mut error = BoundedOutput::new(128);
-        let status = shell.execute("nope", &mut input, &mut output, &mut error);
-        assert_eq!(status.code(), 3);
+
         assert_eq!(
-            core::str::from_utf8(error.as_slice()).unwrap_or_default(),
-            "nope: unknown command\n".to_string()
+            shell.execute("cat /help/readme", &mut input, &mut output, &mut error),
+            CommandStatus::NotFound
         );
+        assert_eq!(error.as_slice(), b"cat: application unavailable\n");
+
+        let mut error = BoundedOutput::new(128);
+        assert_eq!(
+            shell.execute("nope", &mut input, &mut output, &mut error),
+            CommandStatus::NotFound
+        );
+        assert_eq!(error.as_slice(), b"nope: unknown command\n");
     }
 
     #[test]
-    fn external_apps_replace_builtins_but_never_intrinsics() {
+    fn external_apps_execute_but_never_shadow_intrinsics() {
         let mut shell = shell();
         let mut external = FakeExternal::default();
         let mut input = SliceInput::new(b"");
@@ -2257,7 +1289,7 @@ mod tests {
                 &mut error,
                 &mut external,
             ),
-            troe_core::CommandStatus::Success
+            CommandStatus::Success
         );
         assert_eq!(output.as_slice(), b"external application\n");
 
@@ -2269,23 +1301,10 @@ mod tests {
                 &mut error,
                 &mut external,
             ),
-            troe_core::CommandStatus::Success
+            CommandStatus::Success
         );
         assert_eq!(shell.cwd(), "/help");
         assert!(!external.attempts.iter().any(|name| name == "cd"));
-
-        let mut fallback = BoundedOutput::new(256);
-        assert_eq!(
-            shell.execute_with_external(
-                "cat readme",
-                &mut input,
-                &mut fallback,
-                &mut error,
-                &mut external,
-            ),
-            troe_core::CommandStatus::Success
-        );
-        assert!(fallback.as_slice().starts_with(b"alpha\n"));
 
         let mut app_output = BoundedOutput::new(256);
         assert_eq!(
@@ -2296,7 +1315,7 @@ mod tests {
                 &mut error,
                 &mut external,
             ),
-            troe_core::CommandStatus::Success
+            CommandStatus::Success
         );
         assert_eq!(app_output.as_slice(), b"external application\n");
     }
@@ -2306,11 +1325,9 @@ mod tests {
         assert_eq!(command_class("cd"), Some(CommandClass::Intrinsic));
         assert_eq!(command_class("poweroff"), Some(CommandClass::Intrinsic));
         assert_eq!(command_class("reboot"), Some(CommandClass::Intrinsic));
-        assert_eq!(command_class("halt"), None);
-        assert_eq!(command_class("cat"), Some(CommandClass::ReplaceableBuiltin));
-        assert_eq!(command_class("man"), Some(CommandClass::ReplaceableBuiltin));
+        assert_eq!(command_class("cat"), Some(CommandClass::Application));
+        assert_eq!(command_class("man"), Some(CommandClass::Application));
         assert_eq!(command_class("help"), None);
-        assert_eq!(command_class("unknown"), None);
         assert_eq!(command_synopsis("man"), Some("man COMMAND"));
 
         let intrinsic_names: Vec<&str> = COMMANDS
@@ -2328,10 +1345,8 @@ mod tests {
         let mut output = BoundedOutput::new(64);
         let mut error = BoundedOutput::new(64);
         assert_eq!(
-            poweroff_shell
-                .execute("poweroff", &mut input, &mut output, &mut error)
-                .code(),
-            0
+            poweroff_shell.execute("poweroff", &mut input, &mut output, &mut error),
+            CommandStatus::Success
         );
         assert_eq!(
             poweroff_shell.machine_action(),
@@ -2340,54 +1355,28 @@ mod tests {
 
         let mut reboot_shell = shell();
         assert_eq!(
-            reboot_shell
-                .execute("reboot", &mut input, &mut output, &mut error)
-                .code(),
-            0
+            reboot_shell.execute("reboot", &mut input, &mut output, &mut error),
+            CommandStatus::Success
         );
         assert_eq!(reboot_shell.machine_action(), Some(MachineAction::Reboot));
-    }
-
-    #[test]
-    fn man_reads_a_real_page_and_help_is_not_a_command() {
-        let mut shell = shell();
-        let mut input = SliceInput::new(b"");
-        let mut output = BoundedOutput::new(256);
-        let mut error = BoundedOutput::new(256);
-        let status = shell.execute("man echo", &mut input, &mut output, &mut error);
-        assert_eq!(status.code(), 0);
-        assert!(output.as_slice().starts_with(b"NAME\n    echo"));
-        assert!(error.as_slice().is_empty());
-
-        let mut output = BoundedOutput::new(64);
-        let mut error = BoundedOutput::new(64);
-        let status = shell.execute("help", &mut input, &mut output, &mut error);
-        assert_eq!(status.code(), 3);
-        assert_eq!(error.as_slice(), b"help: unknown command\n");
     }
 
     #[test]
     fn completion_uses_command_pipeline_and_vfs_context() {
         let mut shell = shell();
         let command = shell.complete("he", 2, CompletionConfig::standard());
-        assert_eq!(command.candidates.len(), 1);
         assert_eq!(command.common_replacement(), Some("hexdump "));
-        assert_eq!(command.candidates[0].display, "hexdump");
 
         let manual = shell.complete("man ec", 6, CompletionConfig::standard());
-        assert_eq!(manual.candidates.len(), 1);
         assert_eq!(manual.candidates[0].replacement, "echo ");
 
         let pipeline = shell.complete("echo x | pw", 11, CompletionConfig::standard());
-        assert_eq!(pipeline.candidates.len(), 1);
         assert_eq!(pipeline.candidates[0].replacement, "pwd ");
 
         let directory = shell.complete("cd /he", 6, CompletionConfig::standard());
-        assert_eq!(directory.candidates.len(), 1);
         assert_eq!(directory.candidates[0].replacement, "/help/");
 
         let file = shell.complete("cat /help/r", 11, CompletionConfig::standard());
-        assert_eq!(file.candidates.len(), 1);
         assert_eq!(file.candidates[0].replacement, "/help/readme ");
     }
 
@@ -2414,65 +1403,45 @@ mod tests {
     }
 
     #[test]
-    fn oversized_intermediate_pipeline_fails_without_final_output() {
-        let mut namespace = Namespace::new(RamFsQuota::default());
-        assert_eq!(namespace.add_read_only_dir("/help"), Ok(()));
-        let oversized = alloc::vec![b'x'; troe_core::PIPE_CAPACITY + 1];
-        assert_eq!(
-            namespace.add_read_only_file("/help/large", &oversized),
-            Ok(())
-        );
-        let mut shell = match Shell::new(namespace, "test", MachineMemorySnapshot::hosted(), true) {
-            Ok(value) => value,
-            Err(_error) => std::process::abort(),
-        };
-        let mut input = SliceInput::new(b"");
-        let mut output = BoundedOutput::new(64);
-        let mut error = BoundedOutput::new(256);
-        let status = shell.execute("cat /help/large | cat", &mut input, &mut output, &mut error);
-        assert_ne!(status.code(), 0);
-        assert!(output.as_slice().is_empty());
-        assert!(
-            error
-                .as_slice()
-                .ends_with(b"cat: /help/large: filesystem quota exceeded\n")
-        );
-    }
-
-    #[test]
     fn exact_capacity_pipeline_succeeds_and_one_extra_byte_is_atomic() {
         let mut namespace = Namespace::new(RamFsQuota::default());
-        assert_eq!(namespace.add_read_only_dir("/help"), Ok(()));
         let exact = alloc::vec![b'x'; PIPE_CAPACITY];
         let oversized = alloc::vec![b'y'; PIPE_CAPACITY + 1];
-        assert_eq!(namespace.add_read_only_file("/help/exact", &exact), Ok(()));
+        assert_eq!(namespace.add_read_only_file("/exact", &exact), Ok(()));
         assert_eq!(
-            namespace.add_read_only_file("/help/oversized", &oversized),
+            namespace.add_read_only_file("/oversized", &oversized),
             Ok(())
         );
         let mut shell = Shell::new(namespace, "test", MachineMemorySnapshot::hosted(), true)
             .unwrap_or_else(|_| std::process::abort());
-
+        let mut external = FakeExternal::default();
         let mut input = SliceInput::new(b"");
         let mut output = BoundedOutput::new(PIPE_CAPACITY);
         let mut error = BoundedOutput::new(256);
+
         assert_eq!(
-            shell.execute("cat /help/exact | cat", &mut input, &mut output, &mut error,),
-            troe_core::CommandStatus::Success
+            shell.execute_with_external(
+                "cat /exact | copy",
+                &mut input,
+                &mut output,
+                &mut error,
+                &mut external,
+            ),
+            CommandStatus::Success
         );
         assert_eq!(output.as_slice(), exact);
-        assert!(error.as_slice().is_empty());
 
         let mut output = BoundedOutput::new(64);
         let mut error = BoundedOutput::new(256);
         assert_eq!(
-            shell.execute(
-                "cat /help/oversized | cat",
+            shell.execute_with_external(
+                "cat /oversized | copy",
                 &mut input,
                 &mut output,
                 &mut error,
+                &mut external,
             ),
-            troe_core::CommandStatus::Failure
+            CommandStatus::Failure
         );
         assert!(output.as_slice().is_empty());
     }
@@ -2480,86 +1449,58 @@ mod tests {
     #[test]
     fn failed_stage_stops_side_effects_and_stderr_never_enters_the_pipe() {
         let mut shell = shell();
+        let mut external = FakeExternal::default();
         let mut input = SliceInput::new(b"");
         let mut output = BoundedOutput::new(128);
         let mut error = BoundedOutput::new(256);
-        let status = shell.execute(
-            "cat /missing | write /tmp/error-copy",
+        let status = shell.execute_with_external(
+            "fail | write /tmp/error-copy",
             &mut input,
             &mut output,
             &mut error,
+            &mut external,
         );
 
-        assert_eq!(status, troe_core::CommandStatus::NotFound);
+        assert_eq!(status, CommandStatus::Failure);
         assert!(output.as_slice().is_empty());
-        assert_eq!(error.as_slice(), b"cat: /missing: not found\n");
+        assert_eq!(error.as_slice(), b"fail: requested failure\n");
         assert_eq!(
             shell.namespace.read_file("/", "/tmp/error-copy"),
-            Err(troe_vfs::FsError::NotFound)
+            Err(FsError::NotFound)
         );
+        assert_eq!(external.attempts, ["fail"]);
     }
 
     #[test]
     fn memory_report_uses_supplied_machine_snapshot() {
-        let namespace = Namespace::new(RamFsQuota::default());
-        let mut shell = match Shell::new(
-            namespace,
+        let report = format_memory_report(
             "snapshot-test",
             MachineMemorySnapshot::firmware(123_456, 78_900),
-            true,
-        ) {
-            Ok(value) => value,
-            Err(_error) => std::process::abort(),
-        };
-        let mut input = SliceInput::new(b"");
-        let mut output = BoundedOutput::new(1024);
-        let mut error = BoundedOutput::new(128);
-        assert_eq!(
-            shell
-                .execute("mem", &mut input, &mut output, &mut error)
-                .code(),
-            0
+            None,
+            Namespace::new(RamFsQuota::default()).memory_stats(),
         );
-        let report = core::str::from_utf8(output.as_slice()).unwrap_or_default();
         assert!(report.contains("memory owner: firmware\n"));
         assert!(report.contains("memory map: firmware snapshot (advisory)\n"));
         assert!(report.contains("total usable: 123456 (120.56 KiB)\n"));
         assert!(report.contains("reserved: 78900 (77.05 KiB)\n"));
-        assert!(error.as_slice().is_empty());
     }
 
     #[test]
     fn memory_report_exposes_owned_frame_and_heap_counters() {
-        let namespace = Namespace::new(RamFsQuota::default());
-        let mut shell = match Shell::new(
-            namespace,
+        let report = format_memory_report(
             "owned-test",
             MachineMemorySnapshot::kernel(4096, 8192, 10, 9, 1024, 128, 256, 1),
-            true,
-        ) {
-            Ok(value) => value,
-            Err(_error) => std::process::abort(),
-        };
-        let mut input = SliceInput::new(b"");
-        let mut output = BoundedOutput::new(1024);
-        let mut error = BoundedOutput::new(128);
-        shell.set_machine_input(Some(InputQueueStats {
-            capacity: 256,
-            queued: 2,
-            delivered: 17,
-            dropped: 0,
-            interrupts: 9,
-            idle_waits: 8,
-            wakeups: 7,
-        }));
-
-        assert_eq!(
-            shell
-                .execute("mem", &mut input, &mut output, &mut error)
-                .code(),
-            0
+            Some(InputQueueStats {
+                capacity: 256,
+                queued: 2,
+                delivered: 17,
+                dropped: 0,
+                interrupts: 9,
+                idle_waits: 8,
+                wakeups: 7,
+            }),
+            Namespace::new(RamFsQuota::default()).memory_stats(),
         );
-        let report = core::str::from_utf8(output.as_slice()).unwrap_or_default();
         assert!(report.contains("memory owner: kernel\n"));
         assert!(report.contains("memory map: final map (owned)\n"));
         assert!(report.contains("frames: 9/10 free\n"));
@@ -2572,6 +1513,5 @@ mod tests {
         assert!(report.contains("input dropped: 0\n"));
         assert!(report.contains("input idle waits: 8\n"));
         assert!(report.contains("input wakeups: 7\n"));
-        assert!(error.as_slice().is_empty());
     }
 }

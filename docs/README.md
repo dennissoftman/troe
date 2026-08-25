@@ -80,8 +80,8 @@ the first selected persistent filesystem mutation.
 [ADR 0023](adr/0023-bounded-virtio-network-profile.md) fixes the modern
 virtio-net queue and minimal Ethernet/ARP/IPv4/UDP profile plus flood bounds.
 [ADR 0024](adr/0024-kex-command-apps-and-sdk.md) fixes immutable command
-discovery, standard-stream services, intrinsic protection, recovery fallback,
-and the repo-local Rust SDK/build workflow.
+discovery, standard-stream services, intrinsic protection, and the repo-local
+Rust SDK/build workflow; ADR 0030 supersedes its recovery-fallback clause.
 [ADR 0025](adr/0025-kex-owned-datagram-service.md) fixes the optional KEX
 IPv4/UDP handle, exclusive local-port lifetime, cooperative cancellation,
 bounded receive queues, and teardown contract required before TCP.
@@ -97,6 +97,8 @@ the `sleep`/`mem` migration.
 [ADR 0029](adr/0029-kex-typed-network-services.md) splits KEX network authority
 into read-only observation, one bounded DHCP exchange, and one bounded ICMP
 echo exchange for the `net`, `arp`, `dhcp`, and `ping` migrations.
+[ADR 0030](adr/0030-kex-only-ordinary-commands.md) removes every ordinary shell
+implementation, retaining only `cd`, `poweroff`, and `reboot` as intrinsics.
 ADR 0012 governs the completed Stage 5.1 terminal and
 framebuffer increment; AArch64 native keyboard input remains a later
 virtio-input transport decision. ADR 0013 governs the completed Stage 5.2

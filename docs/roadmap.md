@@ -5,11 +5,11 @@
 - Stage 0 host runner and Stage 1 UEFI applications share portable code.
 - Both EFI targets compile on stable Rust and fit well below component budgets.
 - Root data is generated deterministically and validated again when mounted.
-- RAMFS mutation, deletion accounting, parser failures, partial reads, grep
-  boundary behavior, pipelines, and command status have host tests.
+- RAMFS mutation and deletion accounting have provider tests; parser failures,
+  pipelines, intrinsic behavior, and command status have host tests.
 - Build, test, image, size, and QEMU entry points are repository scripts.
 - Prompt-synchronized QEMU acceptance drives both production images through all
-  built-ins, failure cases, RAMFS quota exhaustion and recovery, memory
+  KEX apps, failure cases, RAMFS quota exhaustion and recovery, memory
   reporting, and authorized poweroff/reboot with bounded timeouts.
 
 ## Stage 2: owned machine (complete)
@@ -238,9 +238,9 @@ The first product-facing integration is implemented. The shell resolves exact
 immutable `/bin/<command>.kex` artifacts from a target-selected root, stages
 them through bounded offset reads, and grants versioned
 command/stdin/stdout/stderr handles.
-`echo`, `clear`, and `pwd` established external-first execution with static
-recovery fallbacks, while the unknown `kex-echo` name proves general discovery
-on every QEMU composition.
+`echo`, `clear`, and `pwd` established external execution, while the unknown
+`kex-echo` name proves general discovery on every QEMU composition. The complete
+ordinary command set now uses the same KEX-only path.
 The repo-local Rust SDK, linker script, canonical dual-target build/inspect
 tool, canonical least-authority KCAP sidecars, example source, and concise
 authoring skill are checked in.
@@ -250,7 +250,7 @@ KEX command discovery excludes the permanently intrinsic `cd`, `poweroff`, and
 transitions remain machine-control-capability operations unavailable to
 application ABI 1.0.
 
-Absent artifacts alone select recovery built-ins; present corrupt or faulting
+Absent artifacts report an unavailable application; present corrupt or faulting
 artifacts fail closed. Public package manifests, target locks, signatures, and
 content-store application publication remain on the packaging track.
 
@@ -265,8 +265,8 @@ and `rm.kex`. Separate monotonic timer and immutable typed diagnostics services
 now back `sleep.kex` and `mem.kex`. Independent typed observation, DHCP, and ICMP
 echo services now back `net.kex`, `arp.kex`, `dhcp.kex`, and `ping.kex` without
 granting raw frames, routes, devices, or one another's authority. The remaining
-command step is removal of the ordinary-command recovery implementations; TCP
-then follows only under its own bounded state-machine, timer, ownership, and
+ordinary-command recovery implementations are removed; TCP follows only under
+its own bounded state-machine, timer, ownership, and
 adversarial-test contract.
 DNS, TLS, jobs, and general sockets are not implied by these ABIs.
 
@@ -348,7 +348,7 @@ The first portable storage/configuration boundary is landed:
   before the ext4/FAT32 providers mount, list, and read them; and
 - `troe-config` implements checksummed SCFG v1 desired-system/service startup
   policy with canonical dependencies, bounded health/restart behavior, explicit
-  predecessor fallback, and a mandatory static recovery shell; and
+  predecessor fallback, and a mandatory immutable recovery environment; and
 - `troe-mount` implements the checksummed BMNT v1 boot-side mount manifest,
   bounded canonical role names, explicit whole-device/GPT selectors, access and
   availability policy, duplicate-selector rejection, and deterministic exact

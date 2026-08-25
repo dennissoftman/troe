@@ -121,6 +121,54 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn("troe_kex_sdk::entry!", source)
         self.assertIn("Do not infer POSIX behavior", source)
 
+    def test_every_ordinary_command_is_kex_only_on_both_targets(self) -> None:
+        ordinary = {
+            "arp",
+            "cat",
+            "clear",
+            "dhcp",
+            "echo",
+            "grep",
+            "hexdump",
+            "ls",
+            "man",
+            "mem",
+            "net",
+            "ping",
+            "pwd",
+            "rm",
+            "sleep",
+            "udp",
+            "write",
+        }
+        apps = {
+            path.name
+            for path in (REPO_ROOT / "apps").iterdir()
+            if path.is_dir() and (path / "Cargo.toml").is_file()
+        }
+        self.assertEqual(apps, ordinary)
+        for architecture in ("x86_64", "aarch64"):
+            installed = {
+                path.stem
+                for path in (REPO_ROOT / "rootfs/bin" / architecture).glob("*.kex")
+            }
+            self.assertEqual(installed, ordinary | {"kex-echo"})
+
+        shell = (REPO_ROOT / "crates/troe-shell/src/lib.rs").read_text(
+            encoding="utf-8"
+        )
+        self.assertEqual(shell.count("\n    fn command_"), 2)
+        self.assertIn("fn command_cd", shell)
+        self.assertIn("fn command_machine_action", shell)
+        for forbidden in (
+            "ReplaceableBuiltin",
+            "NetworkControl",
+            "set_network",
+            "set_runtime",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, shell)
+
     def test_superseded_resource_profiles_cannot_reenter_source_apis(self) -> None:
         forbidden_rust = ("ResourceProfile", "ResourcePolicy", "::tiny()", "::full()")
         for root in (REPO_ROOT / "crates", REPO_ROOT / "kernel"):

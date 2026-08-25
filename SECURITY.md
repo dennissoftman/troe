@@ -2,14 +2,14 @@
 
 ## Current boundary
 
-The hosted model has the security properties of its host process. The native
-image exits UEFI boot services. Recovery commands remain privileged, while
-validated KEX applications receive fresh ring-3/EL0 roots, explicit handles,
-bounded memory, contained fault fate, and zeroized teardown. The current native
-acceptance artifacts exercise ABI exit and lease expiry; no shell/package path
-loads arbitrary external applications yet. There is no secure-boot integration,
-persistent storage parser, network stack, multi-user boundary, or mutually
-isolated privileged built-ins in this milestone.
+The hosted model has the security properties of its host process and models
+only parsing, pipelines, completion, and the three session intrinsics. The
+native image exits UEFI boot services. Every ordinary command is a validated
+KEX application with a fresh ring-3/EL0 root, explicit typed handles, bounded
+memory, contained fault fate, and zeroized teardown; no privileged utility
+fallback exists. The shell retains only `cd`, `poweroff`, and `reboot`. There is
+no secure-boot integration or multi-user boundary in this milestone; package
+signing, TCP, DNS, TLS, jobs, and general sockets remain future decisions.
 
 The portable crates forbid unsafe Rust. Project-authored unsafe operations are
 confined to `troe-machine`, counted by the verification gate, and documented in

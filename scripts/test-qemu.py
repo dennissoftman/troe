@@ -689,7 +689,7 @@ def assert_storage_report(
 def run_scenario(
     session: SerialSession, boot_timeout: float, command_timeout: float
 ) -> None:
-    """Exercise every required built-in plus bounded failure behavior."""
+    """Exercise every required KEX app plus intrinsic and bounded failure behavior."""
     session.wait_for(b"sh:/> ", boot_timeout)
     assert_owned_boot(session)
     cwd = "/"

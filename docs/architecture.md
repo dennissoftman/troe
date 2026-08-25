@@ -8,16 +8,17 @@ host stdin/stdout ───────────┐                 ┌─ ho
 serial / PS/2 → IRQ → bounded queue → editor ─┘  └─ UART + GOP text console
 ```
 
-Recovery built-ins retain the direct graph. Ordinary commands may instead load
-an immutable architecture-specific KEX artifact into a fresh ring-3/EL0 address
-space and route cwd/argv and standard streams through generation-owned
-synchronous message dispatch without exposing kernel pointers.
+The shell owns parsing, pipelines, completion, cwd, and three intrinsics.
+Ordinary commands always load an immutable architecture-specific KEX artifact
+into a fresh ring-3/EL0 address space and route cwd/argv, standard streams, and
+declared optional services through generation-owned synchronous message dispatch
+without exposing kernel pointers.
 
 Repository `scripts` and Cargo commands are bootstrap developer tooling, not a
 package manager or a privileged system-control plane. The planned TROE CLI described
 in [../TOOLING-PACKAGING-SPEC.md](../TOOLING-PACKAGING-SPEC.md) must sit
 above versioned libraries and service interfaces. It does not replace the
-statically linked recovery shell.
+minimal session shell or the KEX command ABI.
 
 `troe-platform` defines immutable named VM descriptions independently of CPU
 architecture and execution environment. Build and launch tooling selects the
@@ -39,12 +40,12 @@ firmware fails before device publication or volatile I/O.
    same event type outside interrupt context.
 2. The shell crate tokenizes iteratively. Quotes group bytes; no expansion,
    recursion, substitution, environment lookup, or globbing occurs.
-3. The pipeline executor protects shell intrinsics, then tries the exact KEX
-   command path. Only an absent app selects a statically linked recovery
-   implementation. Both forms receive bounded stdin/stdout/stderr streams;
-   KEX may also receive declared optional owned IPv4/UDP, read-only VFS,
-   complete-file mutation, monotonic timer, or immutable typed diagnostics
-   handles, never ambient `Shell`, provider, block, or device authority.
+3. The pipeline executor protects shell intrinsics, then resolves the exact KEX
+   command path. Absence reports an unavailable application and never selects
+   privileged utility behavior. KEX receives bounded stdin/stdout/stderr streams
+   plus only declared optional datagram, read-only VFS, complete-file mutation,
+   monotonic timer, diagnostics, network-observation, DHCP, or ICMP handles;
+   never ambient `Shell`, provider, block, device, or machine authority.
 4. Each non-final command writes to a `BoundedOutput`. The next stage reads the
    frozen result through `SliceInput`; a stage cannot observe mutable internals.
 5. Filesystem commands ask `Namespace` to canonicalize from the logical cwd.
@@ -65,15 +66,15 @@ There are no ambient device or reboot globals in portable crates. Only the UEFI
 composition root and isolated machine mechanism import firmware/hardware APIs.
 `Shell` receives a boolean machine-control grant; `poweroff` and `reboot` are
 denied without it.
-Privileged recovery built-ins still rely on typed authority rather than a
-hardware boundary. Stage 6 task mappings and handles are additionally enforced
-by ring-3/EL0 page permissions and generation-revoked ownership.
+Ordinary commands have no shell-privileged implementation. Their task mappings
+and handles are enforced by ring-3/EL0 page permissions and generation-revoked
+ownership.
 
-The shell reserves `cd`, `poweroff`, and `reboot` as non-shadowable intrinsics.
+The shell reserves `cd`, `poweroff`, and `reboot` as its only non-shadowable intrinsics.
 `cd` owns the logical working-directory transition, while both terminal machine
 actions consume only the shell's machine-control grant. KEX command discovery
-now replaces ordinary command implementations from exact immutable
-architecture-specific paths, but cannot intercept intrinsic names; ABI 1.0
+resolves every ordinary command from exact immutable architecture-specific
+paths, but cannot intercept intrinsic names; ABI 1.0
 exposes no platform-transition operation.
 
 ## Allocation
@@ -238,9 +239,9 @@ The Stage 9 command slice layers four required ABI 1.0 services on that mechanis
 immutable cwd/argv, stdin, stdout, and stderr. The shell logically yields while
 one foreground application runs, then resumes only after owner-wide handle
 revocation, record reaping, page zeroization, and exact frame return. Artifacts
-are read from target-selected `/bin/<name>.kex`; only absence permits the static
-recovery fallback. Service replies, per-stream bytes, and total resumed steps
-all have hard ceilings. Optional interfaces expose only bounded IPv4/UDP
+are read from target-selected `/bin/<name>.kex`; absence is a terminal not-found
+result. Service replies, per-stream bytes, and total resumed steps all have hard
+ceilings. Optional interfaces expose only bounded IPv4/UDP
 send/receive, read-only VFS operations, one atomic complete-file mutation
 transaction, a boot-relative monotonic timer, one immutable typed diagnostics
 snapshot, read-only typed network observation, one DHCP exchange, or one ICMP

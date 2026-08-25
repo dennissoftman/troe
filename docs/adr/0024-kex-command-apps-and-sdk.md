@@ -1,7 +1,8 @@
 # ADR 0024: KEX command applications and build SDK
 
 Status: accepted and implemented for the Stage 9 application vertical slice,
-2026-08-25.
+2026-08-25. ADR 0030 supersedes only this ADR's absent-artifact recovery
+fallback; all ordinary commands are now KEX-only.
 
 ## Decision
 

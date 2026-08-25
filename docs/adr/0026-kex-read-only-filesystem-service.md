@@ -29,9 +29,9 @@ shell resumes. The manifest remains least-authority: packages without
 unsupported, or unavailable requirement rejects launch.
 
 The repo-local SDK exposes typed read-only operations and errors. `cat`,
-`grep`, `hexdump`, `ls`, and `man` are the first migrated consumers; their KEX
-artifacts execute on both targets while the static implementations remain only
-as absent-artifact recovery fallbacks.
+`grep`, `hexdump`, `ls`, and `man` are the first migrated consumers and their
+KEX artifacts execute on both targets. ADR 0030 later removed the temporary
+absent-artifact fallbacks.
 
 ## Security and sequencing consequences
 

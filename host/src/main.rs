@@ -95,7 +95,7 @@ fn run() -> Result<u8, String> {
     }
 
     println!("hosted model 0.1.0 ({})", env::consts::ARCH);
-    println!("Tab completes commands; use 'man COMMAND' for manuals");
+    println!("parser/session model only; boot QEMU to execute KEX applications");
     loop {
         print!("sh:{}> ", shell.cwd());
         io::stdout()

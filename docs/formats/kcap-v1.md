@@ -28,7 +28,7 @@ capabilities = ["datagram"]
 ```
 
 It writes `<command>.kex` and `<command>.kcap` together under the selected
-source architecture. KEFS projects both into flat runtime `/bin`. A missing,
-malformed, unknown, unsupported, or unavailable requirement rejects launch and
-never selects the recovery fallback. The four command/standard-stream handles
+source architecture. KEFS projects both into flat runtime `/bin`. A missing
+artifact or malformed, unknown, unsupported, or unavailable requirement rejects
+launch and never selects privileged fallback behavior. The four command/standard-stream handles
 are mandatory ABI context and therefore are not repeated in KCAP.

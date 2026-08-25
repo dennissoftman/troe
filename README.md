@@ -5,9 +5,9 @@ bounded command shell, a small VFS, and an owned kernel that is growing toward
 useful cloud virtual-machine deployments. The current slice runs as a normal
 host program and as native x86-64/AArch64 UEFI images.
 
-Statically linked recovery built-ins remain available, but ordinary shell names
-can now resolve immutable KEX command applications in fresh ring-3/EL0 address
-spaces. The repo-local Rust SDK and dual-target builder produce strict KEX v1;
+Every ordinary shell command is an immutable KEX application running in a fresh
+ring-3/EL0 address space; only `cd`, `poweroff`, and `reboot` remain
+non-shadowable shell intrinsics. The repo-local Rust SDK and dual-target builder produce strict KEX v1;
 the shell grants versioned cwd/argv and standard-stream handles plus only the
 optional capabilities declared by each package. Target-native code enters with
 reset register state, exits, yields through scheduler-
@@ -35,9 +35,9 @@ the 50 ms execution lease and transactionally reclaimed.
   load transactions, explicit initial handles, and zeroized rollback;
 - complete ring-3/EL0 ABI 1.0 entry, exit, resumable yield, and owner-checked
   copied handle calls, with owned x86 local-APIC/AArch64 timer leases;
-- exact `/bin/<command>.kex` shell discovery from a target-selected root, external-first
-  replaceable commands with static recovery fallback, four bounded command and
-  standard-stream services, optional owned datagram, read-only filesystem, and
+- exact `/bin/<command>.kex` shell discovery from a target-selected root with no
+  privileged ordinary-command fallback, four bounded command and standard-stream
+  services, optional owned datagram, read-only filesystem, and
   atomic filesystem-mutation services, separate monotonic-timer and immutable
   typed-diagnostics services, a repo-local Rust SDK/skill, and canonical
   dual-target build/check/inspect tooling;
@@ -71,8 +71,9 @@ the 50 ms execution lease and transactionally reclaimed.
   command/VFS completion, ANSI serial-key decoding, and x86-64 PS/2 input;
 - single/double quotes and pipelines of up to eight stages;
 - 64 KiB bounded intermediate byte streams;
-- `cat`, `echo`, literal `grep`, `ls`, `pwd`, `cd`, `man`, `mem`, `clear`,
-  `poweroff`, `reboot`, `write`, `rm`, `hexdump`, and `sleep`;
+- KEX apps for `arp`, `cat`, `clear`, `dhcp`, `echo`, literal `grep`, `hexdump`,
+  `ls`, `man`, `mem`, `net`, `ping`, `pwd`, `rm`, `sleep`, `udp`, and `write`,
+  plus intrinsic `cd`, `poweroff`, and `reboot`;
 - deterministic 1.44 MiB FAT12 images for both primary architectures;
 - host/unit/smoke gates and prompt-synchronized QEMU acceptance on both
   architectures.
@@ -104,12 +105,18 @@ TCP state machine.
 
 ## Quick start
 
-Host model:
+Hosted parser/session model (target KEX execution is intentionally unavailable):
 
 ```console
 cargo run --manifest-path host/Cargo.toml
-cargo run --manifest-path host/Cargo.toml -- --command "echo ready | grep ready"
+cargo run --manifest-path host/Cargo.toml -- --command "cd /etc"
 cargo run --manifest-path host/Cargo.toml -- --script tests/smoke.sh
+```
+
+Boot one default interactive VM and run the real KEX apps:
+
+```console
+cargo qemu
 ```
 
 Build and inspect the example KEX command for both native targets:

@@ -63,8 +63,7 @@ mod firmware {
     };
     use troe_persist::{DualSlotStore, RegionSelector, TRANSACTION_BLOCKS};
     use troe_shell::{
-        ArpEntry, CompletionConfig, ExternalCommand, MachineAction, NetworkControl, NetworkError,
-        NetworkStats, NetworkStatus, PingReply, ReceivedUdp, Shell, format_memory_report,
+        CompletionConfig, ExternalCommand, MachineAction, Shell, format_memory_report,
     };
     #[cfg(feature = "acceptance-probes")]
     use troe_statefs::STATE_PATH;
@@ -340,6 +339,39 @@ mod firmware {
         subnet_mask: Ipv4Address,
         gateway: Ipv4Address,
         lease_seconds: Option<u32>,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum NetworkError {
+        NotConfigured,
+        Timeout,
+        Device,
+        Protocol,
+        TooLarge,
+        Exhausted,
+        Cancelled,
+    }
+
+    #[derive(Clone, Copy)]
+    struct NetworkStatus {
+        mac: [u8; 6],
+        address: Option<[u8; 4]>,
+        subnet_mask: Option<[u8; 4]>,
+        gateway: Option<[u8; 4]>,
+        lease_seconds: Option<u32>,
+    }
+
+    #[derive(Clone, Copy)]
+    struct PingReply {
+        source: [u8; 4],
+        sequence: u16,
+        bytes: usize,
+    }
+
+    struct ReceivedUdp {
+        source: [u8; 4],
+        source_port: u16,
+        payload: Vec<u8>,
     }
 
     struct KernelNetworkService {
@@ -3580,47 +3612,7 @@ mod firmware {
         }
     }
 
-    impl NetworkControl for KernelNetwork {
-        fn status(&self) -> NetworkStatus {
-            self.service.borrow().shell_status()
-        }
-
-        fn stats(&self) -> NetworkStats {
-            let service = self.service.borrow();
-            NetworkStats {
-                received_frames: service.stats.received_frames,
-                transmitted_frames: service.stats.transmitted_frames,
-                arp_replies: service.stats.arp_replies,
-                icmp_replies: service.stats.icmp_replies,
-                udp_retained: service.stats.udp_retained,
-                udp_unbound: service.stats.udp_unbound,
-                udp_dropped: service.stats.udp_dropped,
-                arp_entries: service.arp.len(),
-                udp_ports: service.udp.len(),
-                checkpoints: service.stats.checkpoints,
-                errors: service.stats.errors,
-            }
-        }
-
-        fn arp_entries(&self) -> Vec<ArpEntry> {
-            self.service
-                .borrow()
-                .arp
-                .entries()
-                .map(|entry| ArpEntry {
-                    address: entry.address.bytes(),
-                    mac: entry.mac.bytes(),
-                })
-                .collect()
-        }
-
-        fn dhcp(
-            &mut self,
-            runtime: &mut dyn CooperativeRuntime,
-        ) -> Result<NetworkStatus, NetworkError> {
-            self.configure_dhcp(runtime)
-        }
-
+    impl KernelNetwork {
         fn ping(
             &mut self,
             destination: [u8; 4],
@@ -4452,7 +4444,6 @@ mod firmware {
             NetworkError::TooLarge => ReplyStatus::TooLarge,
             NetworkError::Exhausted => ReplyStatus::Exhausted,
             NetworkError::Cancelled => ReplyStatus::Cancelled,
-            NetworkError::Unavailable => ReplyStatus::NotFound,
             NetworkError::Protocol => ReplyStatus::NetworkProtocol,
             NetworkError::Device => ReplyStatus::Failure,
         }
@@ -4563,10 +4554,7 @@ mod firmware {
         Some(Rc::new(RefCell::new(service)))
     }
 
-    fn install_shell_runtime(
-        shell: &mut Shell,
-        console: &mut dyn Output,
-    ) -> (Option<NetworkStatus>, SharedRuntime) {
+    fn install_command_runtime(console: &mut dyn Output) -> (Option<NetworkStatus>, SharedRuntime) {
         let service = discover_network_service();
         let runtime_state = match KernelRuntime::new(service.clone()) {
             Ok(runtime) => runtime,
@@ -4576,9 +4564,6 @@ mod firmware {
             }
         };
         let runtime = Rc::new(RefCell::new(runtime_state));
-        shell.set_runtime(Box::new(KernelRuntimeCapability {
-            runtime: runtime.clone(),
-        }));
         if let Some(service) = service {
             let mut network = KernelNetwork::new(service);
             let mut bootstrap_runtime = KernelRuntimeCapability {
@@ -4590,7 +4575,6 @@ mod firmware {
             if write_boot_status(console, &label, status.is_some()).is_err() {
                 fatal(b"fatal: native network diagnostic failed\n");
             }
-            shell.set_network(Box::new(network));
             (status, runtime)
         } else {
             if write_boot_status(console, "Configuring network", false).is_err() {
@@ -4601,12 +4585,11 @@ mod firmware {
     }
 
     fn finish_shell_startup(
-        shell: &mut Shell,
         console: &mut dyn Output,
         motd: &[u8],
         native_root: bool,
     ) -> SharedRuntime {
-        let (network_status, runtime) = install_shell_runtime(shell, console);
+        let (network_status, runtime) = install_command_runtime(console);
         if !write_shell_banner(console, motd, native_root, network_status) {
             fatal(b"fatal: native console write failed\n");
         }
@@ -5101,7 +5084,7 @@ mod firmware {
         else {
             fatal(b"fatal: cannot compose namespace\n");
         };
-        let runtime = finish_shell_startup(&mut shell, &mut console, &motd, native_root);
+        let runtime = finish_shell_startup(&mut console, &motd, native_root);
         let editor_config = EditorConfig::standard();
         if editor_config.max_line_bytes() > MAX_LINE_BYTES {
             fatal(b"fatal: editor line policy exceeds shell parser policy\n");
@@ -5112,7 +5095,6 @@ mod firmware {
         let mut editor = LineEditor::new(editor_config);
 
         loop {
-            refresh_shell_stats(&mut shell, task.accounting);
             let prompt = shell_prompt(&shell);
             if write_all(&mut console, prompt.as_bytes()).is_err() {
                 fatal(b"fatal: native console write failed\n");
@@ -5129,7 +5111,6 @@ mod firmware {
             ) else {
                 fatal(b"fatal: native console input failed\n");
             };
-            refresh_shell_stats(&mut shell, task.accounting);
             #[cfg(feature = "acceptance-probes")]
             if line == "mmu-probe write" {
                 let _result = write_all(&mut console, b"probing read-only mapping\n");
@@ -5190,11 +5171,6 @@ mod firmware {
                 troe_machine::reboot();
             }
         }
-    }
-
-    fn refresh_shell_stats(shell: &mut Shell, accounting: &OwnedAccounting) {
-        shell.set_machine_memory(machine_snapshot(accounting));
-        shell.set_machine_input(troe_machine::input_interrupt_stats());
     }
 
     #[allow(clippy::too_many_arguments)]

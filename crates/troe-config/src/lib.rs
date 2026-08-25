@@ -250,7 +250,7 @@ pub enum StartupMode {
     BootOptional = 2,
     /// Started only by an explicitly authorized client.
     OnDemand = 3,
-    /// Eligible only while the static recovery environment is active.
+    /// Eligible only while the immutable recovery environment is active.
     RecoveryOnly = 4,
 }
 
@@ -264,7 +264,7 @@ pub enum FailureAction {
     Restart = 2,
     /// Reject this generation and activate its declared predecessor.
     PreviousGeneration = 3,
-    /// Reject this generation and enter the static recovery shell.
+    /// Reject this generation and enter the immutable recovery environment.
     RecoveryShell = 4,
 }
 
@@ -296,7 +296,7 @@ impl RecoveryPolicy {
         self.fallback_previous
     }
 
-    /// Whether the independent static recovery shell remains a final fallback.
+    /// Whether the independent immutable recovery environment remains a final fallback.
     #[must_use]
     pub const fn recovery_shell(self) -> bool {
         self.recovery_shell

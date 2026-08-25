@@ -203,11 +203,9 @@ The underlying libraries must remain independently usable through the SDK. The C
 
 This prevents the CLI from becoming an irreplaceable monolith.
 
-The planned TROE CLI is distinct from the current statically linked recovery shell.
-The shell continues to dispatch small statically linked commands such as
-`cat`, `mem`, and `halt` directly; those commands are part of the tiny recovery
-environment and are not rewritten as `troe cat`, `troe mem`, or similar
-subcommands.
+The planned TROE CLI is distinct from the minimal session shell and KEX command
+environment. `cat`, `mem`, and other utilities remain independent KEX apps;
+they are not rewritten as `troe cat`, `troe mem`, or similar subcommands.
 
 During the early roadmap, repository scripts and Cargo remain the bootstrap
 developer interface. They MUST remain deterministic and auditable, and they
@@ -490,8 +488,8 @@ must stop for explicit approval when safe rollback cannot be preserved.
 Activation SHOULD use a two-phase flow: construct and verify the candidate,
 then switch the active pointer and run bounded health checks. On boot or health
 failure, the system must retain a path to the previous generation and the
-statically linked recovery shell. Garbage collection treats bootable and
-operator-pinned generations as roots.
+immutable recovery KEX root plus minimal session shell. Garbage collection
+treats bootable and operator-pinned generations as roots.
 
 ---
 

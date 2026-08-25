@@ -30,8 +30,8 @@ port and discards retained datagrams before the shell resumes.
 The repo-local SDK exposes `CommandContext::datagram`, fixed receive storage,
 and typed `send`/`receive` methods. `apps/udp` is the first replacement app.
 Both native targets must prove an application send, cancellable receive, and a
-zero live-port count after each command; absence of `udp.kex` still selects the
-static recovery implementation under ADR 0024.
+zero live-port count after each command. ADR 0030 later removed the temporary
+absent-artifact fallback.
 
 ## Security and sequencing consequences
 
