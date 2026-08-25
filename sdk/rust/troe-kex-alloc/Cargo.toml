@@ -1,0 +1,23 @@
+[package]
+name = "troe-kex-alloc"
+description = "Bounded TLSF heap allocator for freestanding TROE KEX applications"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+rlsf = { version = "=0.2.3", default-features = false }
+troe-kex-sdk = { path = "../troe-kex" }
+
+[lints.rust]
+unsafe_code = "allow"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"

@@ -5,6 +5,7 @@ SCENARIO_IDS = (
     "network",
     "shell-terminal",
     "filesystem",
+    "lua",
     "quota-memory",
     "persistence",
     "fault-isolation",

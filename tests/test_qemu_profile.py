@@ -265,12 +265,14 @@ class FirmwareProfileTests(unittest.TestCase):
         self.assertEqual(
             (
                 discovered_x86.machine,
+                discovered_x86.memory,
                 discovered_x86.virtio_block_device,
                 discovered_x86.virtio_network_device,
                 discovered_x86.acceptance_udp_port,
             ),
             (
                 "q35",
+                "128M",
                 "virtio-blk-pci,disable-legacy=on",
                 "virtio-net-pci,disable-legacy=on",
                 40125,
@@ -665,6 +667,7 @@ class FirmwareProfileTests(unittest.TestCase):
             mock.patch.object(TEST_QEMU, "run_network_group") as network,
             mock.patch.object(TEST_QEMU, "run_shell_terminal_group") as shell,
             mock.patch.object(TEST_QEMU, "run_filesystem_group") as filesystem,
+            mock.patch.object(TEST_QEMU, "run_lua_group") as lua,
             mock.patch.object(TEST_QEMU, "run_quota_memory_group") as quota,
             mock.patch.object(TEST_QEMU, "request_poweroff") as poweroff,
         ):
@@ -681,6 +684,7 @@ class FirmwareProfileTests(unittest.TestCase):
         network.assert_called_once_with(session, 10.0, 40123)
         shell.assert_not_called()
         filesystem.assert_called_once_with(session, 10.0)
+        lua.assert_not_called()
         quota.assert_not_called()
         poweroff.assert_called_once_with(session, 10.0)
 

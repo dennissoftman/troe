@@ -123,7 +123,7 @@ RUNNER_PROFILES = {
         executable="qemu-system-x86_64",
         machine="q35",
         cpu="max",
-        memory="64M",
+        memory="128M",
         virtual_cpus=1,
         virtio_block_device="virtio-blk-pci,disable-legacy=on",
         virtio_network_device="virtio-net-pci,disable-legacy=on",

@@ -152,6 +152,10 @@ pointer is 16-byte aligned, all other application-visible general registers are
 zero, floating-point/SIMD registers and control state are reset to documented
 defaults, the x86 direction and alignment-check flags are clear, and application
 interrupt delivery is enabled so the execution lease can be enforced. The
+portable v1 CPU-state contract is x87 plus SSE/XMM on x86-64 and baseline
+FP/Advanced SIMD on AArch64. These complete states survive calls and yields;
+AVX/AVX-512/AMX and SVE/SME are not enabled because v1 has no feature
+negotiation or extended-state layout. The
 startup page uses fixed-width little-endian fields and contains:
 
 - its byte size and ABI major/minor;

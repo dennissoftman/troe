@@ -1,0 +1,36 @@
+[package]
+name = "troe-app-lua"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "Apache-2.0"
+publish = false
+build = "build.rs"
+
+[package.metadata.troe-kex]
+capabilities = ["filesystem-read"]
+stack-pages = 64
+heap-pages = 2048
+
+[[bin]]
+name = "troe-app-lua"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+libm = { version = "=0.2.16" }
+troe-kex-alloc = { path = "../../sdk/rust/troe-kex-alloc" }
+troe-kex-sdk = { path = "../../sdk/rust/troe-kex" }
+
+[profile.release]
+codegen-units = 1
+lto = false
+opt-level = "z"
+panic = "abort"
+strip = "none"
+
+[lints.rust]
+unsafe_code = "allow"
+
+[workspace]

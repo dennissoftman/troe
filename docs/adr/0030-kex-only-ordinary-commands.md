@@ -23,7 +23,7 @@ shell resumes.
 
 The immutable target-selected KEFS root is the recovery command distribution:
 both supported images contain behavior-equivalent KEX apps for `arp`, `cat`,
-`clear`, `dhcp`, `echo`, `grep`, `hexdump`, `ls`, `man`, `mem`, `net`, `ping`,
+`clear`, `dhcp`, `echo`, `grep`, `hexdump`, `ls`, `lua`, `man`, `mem`, `net`, `ping`,
 `printf`, `pwd`, `rm`, `sleep`, `tcp`, `udp`, and `write`. Losing one artifact does not
 silently substitute privileged code with different authority or semantics.
 `cd` cannot be external because it mutates the shell session; poweroff and
@@ -37,8 +37,8 @@ it does not emulate target-native KEX execution. Unit tests use an explicit
 external-runner fixture for pipeline invariants, while booted-image QEMU tests
 are the behavior and isolation gate for real command apps on both architectures.
 
-There is now one application path for small utilities and later larger programs
-such as Lua: the same startup ABI, typed least-authority services, memory limits,
+There is now one application path for small utilities and larger programs such
+as the shipped Lua interpreter: the same startup ABI, typed least-authority services, memory limits,
 cancellation, fault containment, and teardown apply. Recovery depends on the
 immutable KEX root and loader rather than privileged utility duplication.
 Package signing, generation publication, jobs, and interpreter-specific

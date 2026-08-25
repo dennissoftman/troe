@@ -30,6 +30,7 @@ members = [
     "host",
     "kernel",
     "sdk/rust/troe-kex",
+    "sdk/rust/troe-kex-alloc",
     "tools/troe-kex-tool",
     "xtask",
 ]
@@ -60,6 +61,7 @@ default-members = [
     "crates/troe-virtio",
     "host",
     "sdk/rust/troe-kex",
+    "sdk/rust/troe-kex-alloc",
 ]
 
 [workspace.package]

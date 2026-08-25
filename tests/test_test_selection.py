@@ -25,6 +25,7 @@ PACKAGES = {
     "troe-machine": package("troe-machine", "crates/troe-machine", "troe-kernel"),
     "troe-kernel": package("troe-kernel", "kernel"),
     "troe-kex": package("troe-kex", "sdk/rust/troe-kex"),
+    "troe-kex-alloc": package("troe-kex-alloc", "sdk/rust/troe-kex-alloc"),
     "troe-kex-tool": package("troe-kex-tool", "tools/troe-kex-tool"),
 }
 
@@ -85,6 +86,17 @@ class ChangedTestSelectionTests(unittest.TestCase):
         )
         self.assertEqual(printf_plan.qemu_scenarios, {"filesystem"})
         self.assertEqual(man_plan.qemu_scenarios, {"shell-terminal"})
+        lua_plan = test_changed.build_plan(
+            (PurePosixPath("apps/lua/src/main.rs"),), PACKAGES
+        )
+        self.assertEqual(lua_plan.qemu_scenarios, {"lua"})
+
+    def test_allocator_sdk_selects_lua_build_and_runtime_scenario(self) -> None:
+        plan = test_changed.build_plan(
+            (PurePosixPath("sdk/rust/troe-kex-alloc/src/lib.rs"),), PACKAGES
+        )
+        self.assertEqual(plan.applications, {"lua"})
+        self.assertEqual(plan.qemu_scenarios, {"lua"})
 
     def test_shared_sdk_selects_every_application_and_tool_regression(self) -> None:
         plan = test_changed.build_plan(
@@ -150,6 +162,7 @@ class ChangedTestSelectionTests(unittest.TestCase):
                     "network",
                     "shell-terminal",
                     "filesystem",
+                    "lua",
                     "quota-memory",
                     "persistence",
                     "fault-isolation",

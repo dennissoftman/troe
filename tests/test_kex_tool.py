@@ -60,10 +60,13 @@ class KexToolTests(unittest.TestCase):
                     self.assertEqual(report["executable_format"], "KEX v1")
                     self.assertEqual(report["abi"], "1.0")
                     self.assertEqual(report["target"], target)
-                    self.assertEqual(
-                        report["stack_pages"], 20 if command == "grep" else 4
+                    expected_stack_pages = (
+                        64 if command == "lua" else 20 if command == "grep" else 4
                     )
-                    self.assertEqual(report["heap_pages"], 0)
+                    self.assertEqual(report["stack_pages"], expected_stack_pages)
+                    self.assertEqual(
+                        report["heap_pages"], 2048 if command == "lua" else 0
+                    )
                     package_bytes = artifact.read_bytes()
                     self.assertEqual(package_bytes[:8], b"KEXPKG\0\0")
                     (
@@ -105,7 +108,7 @@ class KexToolTests(unittest.TestCase):
                     ]
                     if command == "udp":
                         expected = [(5, 1, 0)]
-                    elif command in {"cat", "grep", "hexdump", "ls", "man"}:
+                    elif command in {"cat", "grep", "hexdump", "ls", "lua", "man"}:
                         expected = [(6, 1, 0)]
                     elif command in {"rm", "write"}:
                         expected = [(7, 1, 0)]

@@ -74,6 +74,7 @@ PACKAGE_SCENARIOS = {
     "troe-host": {"shell-terminal", "filesystem"},
     "troe-kernel": set(ALL_QEMU_SCENARIOS),
     "troe-kex": set(ALL_QEMU_SCENARIOS),
+    "troe-kex-alloc": {"lua"},
     "troe-kex-tool": set(ALL_QEMU_SCENARIOS),
 }
 PYTHON_IMPACTS = {
@@ -315,6 +316,8 @@ def _classify_app(plan: TestPlan, path: PurePosixPath) -> bool:
         _add_qemu(plan, path, "quota-memory")
     elif application == "sleep":
         _add_qemu(plan, path, "network", "shell-terminal")
+    elif application == "lua":
+        _add_qemu(plan, path, "lua")
     elif application in TERMINAL_APPS:
         _add_qemu(plan, path, "shell-terminal")
     else:
@@ -353,6 +356,9 @@ def build_plan(
                 _add_python(plan, path, "test_kex_tool.py")
                 plan.all_applications = True
                 plan.note("kex:all", path)
+            elif package == "troe-kex-alloc":
+                plan.applications.add("lua")
+                plan.note("kex:lua", path)
             continue
 
         if _classify_app(plan, path):
@@ -505,7 +511,7 @@ def commands_for_plan(
                 str(REPO_ROOT / "tools" / "check_unsafe.py"),
                 str(REPO_ROOT),
                 "--expected",
-                "252",
+                "298",
             )
         )
     applications = (

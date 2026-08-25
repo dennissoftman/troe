@@ -1730,13 +1730,21 @@ fn architecture_activate(root: u64, capabilities: ArchitectureMmuCapabilities) {
         );
         let mut cr0: u64;
         core::arch::asm!("mov {}, cr0", out(reg) cr0, options(nostack));
-        cr0 |= 1 << 16;
+        // KEX v1 preserves the complete FXSAVE image across every transition.
+        // Normalize firmware state so x87 and baseline SSE are always usable,
+        // native floating-point exceptions are reported, and lazy-FPU state
+        // cannot fault after entering an application.
+        cr0 &= !((1 << 2) | (1 << 3)); // EM, TS
+        cr0 |= (1 << 1) | (1 << 5) | (1 << 16); // MP, NE, WP
         core::arch::asm!("mov cr0, {}", in(reg) cr0, options(nostack));
         let mut cr4: u64;
         core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nostack));
         // Normalize firmware-owned user-entry state, then enable supervisor
-        // execution/access protection only when CPUID proves support.
-        cr4 &= !((1 << 16) | (1 << 20) | (1 << 21) | (1 << 22));
+        // execution/access protection only when CPUID proves support. OSXSAVE
+        // stays disabled because KEX v1 deliberately saves x87/XMM state with
+        // FXSAVE, not the YMM/ZMM state required by AVX-family instructions.
+        cr4 &= !((1 << 16) | (1 << 18) | (1 << 20) | (1 << 21) | (1 << 22));
+        cr4 |= (1 << 9) | (1 << 10); // OSFXSR, OSXMMEXCPT
         if capabilities.smep {
             cr4 |= 1 << 20;
         }
@@ -2687,9 +2695,17 @@ fn architecture_activate(root: u64, capabilities: ArchitectureMmuCapabilities) {
     const TCR_BASE: u64 = 16 | (0b01 << 8) | (0b01 << 10) | (0b11 << 12) | (1 << 23);
     let tcr = TCR_BASE | (u64::from(capabilities.ips) << 32);
     let mut sctlr: u64;
+    let mut cpacr: u64;
     // SAFETY: EL1 and required translation features were checked before table
-    // construction; these are the architectural EL1 translation controls.
+    // construction; these are the architectural EL1 translation and SIMD/FP
+    // controls. KEX v1 preserves all 32 128-bit SIMD registers plus FPCR/FPSR,
+    // but not the larger optional SVE or SME state.
     unsafe {
+        core::arch::asm!("mrs {}, cpacr_el1", out(reg) cpacr, options(nomem, nostack));
+        cpacr &= !((0b11 << 16) | (0b11 << 24)); // ZEN, SMEN
+        cpacr |= 0b11 << 20; // FPEN: SIMD/FP at EL0 and EL1
+        core::arch::asm!("msr cpacr_el1, {}", in(reg) cpacr, options(nostack));
+        core::arch::asm!("isb", options(nostack));
         core::arch::asm!("mrs {}, sctlr_el1", out(reg) sctlr, options(nomem, nostack));
         core::arch::asm!("msr sctlr_el1, {}", in(reg) (sctlr & !1), options(nostack));
         core::arch::asm!("isb", options(nostack));

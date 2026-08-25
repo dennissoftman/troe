@@ -1,11 +1,12 @@
 # Unsafe inventory
 
-The repository contains exactly 252 project-authored Rust `unsafe` tokens.
+The repository contains exactly 298 project-authored Rust `unsafe` tokens.
 Executable occurrences are confined to five audited modules of
-`crates/troe-machine` and the freestanding KEX SDK; the count also includes one
-documentation occurrence in `troe-memory`. The verification gate fails if this
-count changes without a same-change inventory review. Portable mechanism-free
-crates and the kernel composition root continue to forbid unsafe code.
+`crates/troe-machine`, the freestanding KEX SDK and allocator, and the Lua KEX
+FFI boundary; the count also includes one documentation occurrence in
+`troe-memory`. The verification gate fails if this count changes without a
+same-change inventory review. Portable mechanism-free crates and the kernel
+composition root continue to forbid unsafe code.
 
 | Boundary | Tokens | Invariant |
 |---|---:|---|
@@ -22,6 +23,7 @@ crates and the kernel composition root continue to forbid unsafe code.
 | AArch64 virtio-MMIO block/network DMA | 8 | The pinned `virt` aperture is mapped RW/NX before register access; page-aligned live allocations retain split queues and fixed buffers; descriptor payload addresses name exclusively borrowed or owned identity-mapped heap memory; outer-shareable barriers order publication and completion; bounded timeouts return only after confirmed reset, while failed reset delegates to the audited machine park mechanism so DMA cannot outlive Rust storage. |
 | x86-64 q35-compatible virtio PCI block/network DMA | 15 | Pinned q35 uses its bounded mechanism-1 ports; the discoverable profile uses only its uniquely validated ACPI MCFG segment-zero ECAM window. Both scan bus zero only; ECAM and validated capability pages are mapped RW/NX before post-handoff access; capability loops, duplicates, BAR types/sizes, offsets, and aperture arithmetic fail closed; BAR probing disables decode and restores configuration exactly; bus mastering starts after mapping; page-aligned split queues, fixed network buffers, and confirmed-reset timeout rules keep DMA inside Rust lifetimes. |
 | Heap host tests | 4 | Test arenas remain live, exclusively borrowed, and allocations are deallocated once with their original layouts. |
+| KEX application TLSF allocator | 17 | A non-cloneable SDK token transfers one validated, writable, initially zeroed heap region into TLSF. All live pointers remain allocator-owned; deallocation and reallocation require their original 16-byte-aligned layouts, failed growth preserves the old allocation, and host tests cover alignment, prefix preservation, fragmentation recovery, atomic OOM, and exact release. |
 | Loaded PE view and terminal acceptance probes | 6 | Checked protocol metadata proves every raw-slice bound; feature-only probes target validated mappings or raise one native exception and never return. |
 | Firmware configuration-table physical view | 1 | Before `ExitBootServices`, one identity-addressed immutable slice is formed only after a fresh UEFI memory map proves the complete nonempty span lies within one allowed firmware-data descriptor. Free, code, unusable, reserved, and MMIO types are rejected; checked address/length conversion and the retained map bound the slice lifetime to the stable discovery transaction. |
 | Page-table arena and native entries | 9 | One reserved, identity-mapped 2 MiB arena is exclusively zeroed and filled before activation; every table and leaf pointer is page/index checked; mapping-plan validation rejects virtual overlap, unsafe physical aliases, and W+X. |
@@ -32,6 +34,7 @@ crates and the kernel composition root continue to forbid unsafe code.
 | x86-64 ring-3 mappings and entries | 15 | Every user leaf and traversal level carries U/S while supervisor leaves do not; DPL-3 gates and TSS RSP0 enter the kernel; application entry resets visible GPR/SSE/x87 state, and the syscall gate captures a compile-time-checked 672-byte full context for leased resume; all kernel callee-saved state survives root switches; faults and timer expiry return only through the saved kernel context. |
 | AArch64 EL0 mappings and entries | 13 | AP, PXN, and UXN distinguish EL0 code/data from EL1 mappings; application entry resets visible GPR/SIMD/FP/thread state, and the lower-EL gate captures a compile-time-checked 816-byte full context for leased resume; LDTRB honors user access under PAN; all kernel AAPCS64 state survives TTBR0 replacement. |
 | KEX SDK startup and call gates | 10 | The exported entry receives exactly one kernel-mapped startup page, validates its complete fixed layout before borrowing it, and retains no raw pointer. Architecture-specific inline assembly uses the documented ABI registers for copied handle calls, yield, and non-returning exit; the kernel validates every user range and opaque handle before use. Host builds execute only unsupported stubs. |
+| Lua KEX Rust/C boundary | 29 | One synchronous call pins the host vtable, source, argument, and runtime records. Each callback rejects nulls and invalid lengths before forming slices or mutable references; the allocator alone owns returned pointers; Lua closes before Rust inspects exact live-byte accounting. Bare-metal floating-point calls cross the C boundary only as integer bit patterns, and the sole result pointer is checked before writing. |
 
 The UEFI ExitBootServices call is inside the mechanism module. Its sole call
 site has ended protocol borrows, installed native console/fatal output and the

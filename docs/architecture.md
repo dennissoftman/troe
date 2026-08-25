@@ -226,7 +226,11 @@ loader-selected handle; boot acceptance then revokes it,
 reaps the record, zeroes every provisional frame, and verifies exact reuse.
 Malformed native corpus cases fail before frame allocation. Application entry
 now resets visible register/control state, passes only the startup address and
-length, and enables IRQs after arming a 50 ms one-shot. ABI call 0 exits through
+length, and enables IRQs after arming a 50 ms one-shot. x86 normalizes x87 and
+SSE operation and saves the complete FXSAVE image; AArch64 enables baseline
+FP/Advanced SIMD and saves all 32 128-bit vector registers plus FPCR/FPSR.
+Unsaved AVX-family, SVE, and SME state remains disabled rather than leaking or
+corrupting across tasks. ABI call 0 exits through
 the owned gate. A separate spinning KEX is terminated by the x86 local-APIC or
 AArch64 generic physical timer, recorded as `execution-lease-expired`, and
 reclaimed transactionally. ABI gates capture a bounded full user context;

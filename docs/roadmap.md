@@ -279,6 +279,36 @@ listing for an empty or partial command and command-name completion after
 completion is a later usability increment; it must use explicit schemas and
 retain deterministic candidate-count and byte ceilings.
 
+### Post-Stage 9: dynamic linking and reusable runtimes (planned)
+
+KEX applications are currently self-contained static images. That is a useful
+first trust boundary, but it duplicates large runtimes in every artifact and is
+not a satisfactory distribution model for a reusable libc, language runtimes,
+or a future Python port. A reviewed dynamic-linking design is therefore an
+explicit platform milestone rather than an untracked possibility.
+
+The milestone must preserve the properties of the current single-file KEX UX:
+
+- an application can ship as one self-contained package containing its native
+  image, manifest, and pinned shared objects, while an immutable
+  content-addressed store may deduplicate identical objects across packages;
+- dependency identity, architecture, ABI and symbol versions are explicit, and
+  resolution has hard depth, object-count, symbol-count, relocation-count, and
+  byte ceilings with deterministic cycle and missing-dependency failures;
+- relocation and mapping retain W^X, make read-only-after-relocation state
+  immutable, never grant capabilities to a library independently of its owning
+  application, and account/reclaim every private and shared page exactly;
+- x86-64 and AArch64 use documented relocation subsets and identical package
+  semantics, with negative corpus tests and native teardown/reuse gates; and
+- the SDK can build, inspect, bundle, and reproduce a package without relying on
+  ambient host libraries or paths.
+
+The design decision still needs to choose a bounded KEX container revision and
+whether relocation is performed by a small user-space runtime loader, by the
+host packaging tool, or by a narrowly scoped kernel mechanism. Importing a
+general ELF dynamic linker into the kernel is not implied. Until that decision
+lands, libc and Lua components remain statically linked into each `.kex`.
+
 ## Stage 7.5: cloud platform separation (Phases A and B verified)
 
 QEMU remains the fast, deterministic acceptance backend; it must not define the

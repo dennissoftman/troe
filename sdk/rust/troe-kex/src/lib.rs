@@ -13,6 +13,15 @@ const STARTUP_PAGE_BYTES: usize = 4096;
 const STARTUP_HEADER_BYTES: usize = 64;
 const STARTUP_HANDLE_BYTES: usize = 24;
 const CALL_RIGHT: u32 = 1;
+const KEX_IMAGE_BASE: u64 = 0x0000_4000_0000_0000;
+const KEX_IMAGE_SPAN_BYTES: u64 = 128 * 1024 * 1024;
+const KEX_HEAP_SLOT_BYTES: u64 = 4096 * STARTUP_PAGE_BYTES as u64;
+const KEX_MAXIMUM_STACK_BYTES: u64 = 256 * STARTUP_PAGE_BYTES as u64;
+const KEX_MINIMUM_STACK_BYTES: u64 = 4 * STARTUP_PAGE_BYTES as u64;
+const KEX_STARTUP_ADDRESS: u64 = KEX_IMAGE_BASE + KEX_IMAGE_SPAN_BYTES;
+const KEX_HEAP_ADDRESS: u64 = KEX_STARTUP_ADDRESS + STARTUP_PAGE_BYTES as u64;
+const KEX_STACK_TOP: u64 =
+    KEX_HEAP_ADDRESS + KEX_HEAP_SLOT_BYTES + STARTUP_PAGE_BYTES as u64 + KEX_MAXIMUM_STACK_BYTES;
 
 /// Maximum stack buffer needed to receive one command invocation.
 pub const INVOCATION_BUFFER_BYTES: usize = command::MAX_INVOCATION_BYTES;
@@ -25,6 +34,37 @@ pub const FILESYSTEM_LIST_BUFFER_BYTES: usize = filesystem::MAX_LIST_REPLY_BYTES
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Handle {
     value: u64,
+}
+
+/// Single-owner view of the application's validated, initially zeroed heap.
+///
+/// The startup page can describe at most one heap. This token is intentionally
+/// neither `Copy` nor `Clone`, so a runtime can consume it exactly once when it
+/// initializes an allocator.
+#[derive(Debug, Eq, PartialEq)]
+pub struct HeapRegion {
+    address: usize,
+    byte_len: usize,
+}
+
+impl HeapRegion {
+    /// Address of the first writable heap byte.
+    #[must_use]
+    pub const fn start_address(&self) -> usize {
+        self.address
+    }
+
+    /// Number of mapped writable heap bytes.
+    #[must_use]
+    pub const fn byte_len(&self) -> usize {
+        self.byte_len
+    }
+
+    /// Consume the single-owner token and return its writable address range.
+    #[must_use]
+    pub const fn into_raw_parts(self) -> (usize, usize) {
+        (self.address, self.byte_len)
+    }
 }
 
 /// Invalid startup page or missing command authority.
@@ -134,6 +174,7 @@ pub struct CommandContext {
     network_configuration: Option<Handle>,
     icmp_echo: Option<Handle>,
     tcp_connect: Option<Handle>,
+    heap: Option<HeapRegion>,
 }
 
 impl CommandContext {
@@ -184,7 +225,18 @@ impl CommandContext {
                 tcp_connect::MAJOR,
                 tcp_connect::MINOR,
             )?,
+            heap: startup.heap_region()?,
         })
+    }
+
+    /// Consume the application's validated heap token, if the package
+    /// requested a nonzero heap.
+    ///
+    /// A second call returns `None`. This makes allocator ownership explicit
+    /// and prevents two safe runtimes from independently managing the same
+    /// bytes.
+    pub fn take_heap(&mut self) -> Option<HeapRegion> {
+        self.heap.take()
     }
 
     /// Fetch and validate the one immutable invocation record.
@@ -336,8 +388,20 @@ impl CommandContext {
     ///
     /// Reports an invalid kernel completion or a non-freestanding host build.
     pub fn yield_now(&mut self) -> Result<(), Error> {
-        native_yield()
+        yield_now()
     }
+}
+
+/// Yield cooperatively and resume only after kernel reselection.
+///
+/// This free function is useful to language-runtime callbacks that cannot
+/// retain a mutable borrow of [`CommandContext`].
+///
+/// # Errors
+///
+/// Reports an invalid kernel completion or a non-freestanding host build.
+pub fn yield_now() -> Result<(), Error> {
+    native_yield()
 }
 
 /// Read-only standard-input client.
@@ -988,14 +1052,23 @@ impl<'a> Startup<'a> {
         }
         let handle_count = usize::from(read_u16(bytes, 14)?);
         let encoded_bytes = STARTUP_HEADER_BYTES + handle_count * STARTUP_HANDLE_BYTES;
+        let heap_address = read_u64(bytes, 24)?;
+        let heap_bytes = read_u64(bytes, 32)?;
+        let stack_bottom = read_u64(bytes, 40)?;
+        let stack_top = read_u64(bytes, 48)?;
         if handle_count > 32
             || encoded_bytes > bytes.len()
             || bytes[encoded_bytes..].iter().any(|byte| *byte != 0)
-            || read_u64(bytes, 16)? != 0x0000_4000_0000_0000
+            || read_u64(bytes, 16)? != KEX_IMAGE_BASE
+            || heap_address != KEX_HEAP_ADDRESS
+            || heap_bytes > KEX_HEAP_SLOT_BYTES
+            || !heap_bytes.is_multiple_of(STARTUP_PAGE_BYTES as u64)
             || read_u64(bytes, 56)? == 0
-            || !read_u64(bytes, 40)?.is_multiple_of(STARTUP_PAGE_BYTES as u64)
-            || !read_u64(bytes, 48)?.is_multiple_of(16)
-            || read_u64(bytes, 40)? >= read_u64(bytes, 48)?
+            || !stack_bottom.is_multiple_of(STARTUP_PAGE_BYTES as u64)
+            || stack_top != KEX_STACK_TOP
+            || stack_bottom >= stack_top
+            || stack_bottom < stack_top - KEX_MAXIMUM_STACK_BYTES
+            || stack_bottom > stack_top - KEX_MINIMUM_STACK_BYTES
         {
             return Err(StartupError::InvalidPage);
         }
@@ -1016,6 +1089,17 @@ impl<'a> Startup<'a> {
             }
         }
         Ok(startup)
+    }
+
+    fn heap_region(&self) -> Result<Option<HeapRegion>, StartupError> {
+        let byte_len =
+            usize::try_from(read_u64(self.bytes, 32)?).map_err(|_| StartupError::InvalidPage)?;
+        if byte_len == 0 {
+            return Ok(None);
+        }
+        let address =
+            usize::try_from(read_u64(self.bytes, 24)?).map_err(|_| StartupError::InvalidPage)?;
+        Ok(Some(HeapRegion { address, byte_len }))
     }
 
     fn required_handle(&self, wanted: u32) -> Result<Handle, StartupError> {
@@ -1332,8 +1416,9 @@ mod tests {
     extern crate std;
 
     use super::{
-        ABI_MAJOR, CommandContext, STARTUP_HANDLE_BYTES, STARTUP_HEADER_BYTES, STARTUP_PAGE_BYTES,
-        Startup, StartupError, interface,
+        ABI_MAJOR, CommandContext, HeapRegion, KEX_HEAP_ADDRESS, KEX_STACK_TOP,
+        STARTUP_HANDLE_BYTES, STARTUP_HEADER_BYTES, STARTUP_PAGE_BYTES, Startup, StartupError,
+        interface,
     };
 
     fn startup_page(interfaces: &[u32]) -> [u8; STARTUP_PAGE_BYTES] {
@@ -1348,8 +1433,11 @@ mod tests {
                 .to_le_bytes(),
         );
         page[16..24].copy_from_slice(&0x0000_4000_0000_0000_u64.to_le_bytes());
-        page[40..48].copy_from_slice(&0x5000_u64.to_le_bytes());
-        page[48..56].copy_from_slice(&0x9000_u64.to_le_bytes());
+        page[24..32].copy_from_slice(&KEX_HEAP_ADDRESS.to_le_bytes());
+        page[32..40].copy_from_slice(&(8 * STARTUP_PAGE_BYTES as u64).to_le_bytes());
+        page[40..48]
+            .copy_from_slice(&(KEX_STACK_TOP - 4 * STARTUP_PAGE_BYTES as u64).to_le_bytes());
+        page[48..56].copy_from_slice(&KEX_STACK_TOP.to_le_bytes());
         page[56..64].copy_from_slice(&7_u64.to_le_bytes());
         for (index, interface) in interfaces.iter().copied().enumerate() {
             let offset = STARTUP_HEADER_BYTES + index * STARTUP_HANDLE_BYTES;
@@ -1381,7 +1469,7 @@ mod tests {
         if let Ok(startup) = startup {
             let command = CommandContext::from_startup(&startup);
             assert!(command.is_ok());
-            if let Ok(command) = command {
+            if let Ok(mut command) = command {
                 assert!(command.datagram().is_ok());
                 assert!(command.timer().is_ok());
                 assert!(command.diagnostics().is_ok());
@@ -1389,8 +1477,48 @@ mod tests {
                 assert!(command.network_configuration().is_ok());
                 assert!(command.icmp_echo().is_ok());
                 assert!(command.tcp_connect().is_ok());
+                let heap = command.take_heap();
+                assert_eq!(
+                    heap.as_ref().map(HeapRegion::start_address),
+                    usize::try_from(KEX_HEAP_ADDRESS).ok()
+                );
+                assert_eq!(
+                    heap.as_ref().map(HeapRegion::byte_len),
+                    Some(8 * STARTUP_PAGE_BYTES)
+                );
+                assert!(command.take_heap().is_none());
             }
         }
+    }
+
+    #[test]
+    fn startup_rejects_noncanonical_memory_geometry() {
+        let interfaces = [
+            interface::COMMAND,
+            interface::STANDARD_INPUT,
+            interface::STANDARD_OUTPUT,
+            interface::STANDARD_ERROR,
+        ];
+        let mut page = startup_page(&interfaces);
+        page[24..32].copy_from_slice(&(KEX_HEAP_ADDRESS + STARTUP_PAGE_BYTES as u64).to_le_bytes());
+        assert!(matches!(
+            Startup::parse(&page),
+            Err(StartupError::InvalidPage)
+        ));
+
+        let mut page = startup_page(&interfaces);
+        page[32..40].copy_from_slice(&1_u64.to_le_bytes());
+        assert!(matches!(
+            Startup::parse(&page),
+            Err(StartupError::InvalidPage)
+        ));
+
+        let mut page = startup_page(&interfaces);
+        page[48..56].copy_from_slice(&(KEX_STACK_TOP - 16).to_le_bytes());
+        assert!(matches!(
+            Startup::parse(&page),
+            Err(StartupError::InvalidPage)
+        ));
     }
 
     #[test]

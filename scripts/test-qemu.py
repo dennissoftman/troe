@@ -947,6 +947,57 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
     session.command("rm /tmp/result", cwd, command_timeout)
 
 
+def run_lua_group(session: SerialSession, command_timeout: float) -> None:
+    """Exercise the freestanding Lua runtime, allocator, math, and loaders."""
+    cwd = "/"
+    session.command(
+        "lua --version",
+        cwd,
+        command_timeout,
+        contains=("Lua 5.5.1", "Lua.org, PUC-Rio"),
+    )
+    session.command(
+        "lua -e 'print(\"lua-inline\", math.floor(math.sin(0)), "
+        "string.format(\"%04d\", 7))'",
+        cwd,
+        command_timeout,
+        contains=("lua-inline\t0\t0007\n",),
+    )
+    session.command(
+        "lua -e 'local ok,e=pcall(function() error(\"jump-ok\") end); "
+        "print(\"lua-jump\", ok, type(e), e, e:match(\"jump%-ok\") ~= nil)'",
+        cwd,
+        command_timeout,
+        contains=("lua-jump\tfalse\tstring\t", "jump-ok\ttrue\n"),
+    )
+    session.command(
+        r'''printf 'print("lua-stdin", 6*7)\n' | lua -''',
+        cwd,
+        command_timeout,
+        contains=("lua-stdin\t42\n",),
+    )
+    session.command(
+        "lua /etc/lua-smoke.lua hello",
+        cwd,
+        command_timeout,
+        contains=("lua-file:hello sum=1250025000 sqrt=9 pow=1024",),
+    )
+    session.command(
+        "lua -e 'error(\"expected-error\")'",
+        cwd,
+        command_timeout,
+        contains=("expected-error", "stack traceback:"),
+    )
+    session.command(
+        "lua -e 'local ok=pcall(function() "
+        "string.rep(\"x\",16*1024*1024) end); collectgarbage(); "
+        "print(\"lua-oom\",ok)'",
+        cwd,
+        command_timeout,
+        contains=("lua-oom\tfalse\n",),
+    )
+
+
 def run_quota_memory_group(session: SerialSession, command_timeout: float) -> None:
     """Exercise the RAMFS quota and bounded transient-allocation accounting."""
     cwd = "/"
@@ -1045,6 +1096,8 @@ def run_scenario(
         run_shell_terminal_group(session, command_timeout)
     if "filesystem" in scenario_groups:
         run_filesystem_group(session, command_timeout)
+    if "lua" in scenario_groups:
+        run_lua_group(session, command_timeout)
     if "shell-terminal" in scenario_groups:
         session.command("clear", "/", command_timeout, raw_contains=(b"\x1b[2J",))
     if "quota-memory" in scenario_groups:

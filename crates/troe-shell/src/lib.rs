@@ -171,6 +171,12 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         intrinsic: None,
+        name: "lua",
+        synopsis: "lua [-e CODE | FILE | -] [ARG...]",
+        class: CommandClass::Application,
+    },
+    CommandSpec {
+        intrinsic: None,
         name: "man",
         synopsis: "man COMMAND",
         class: CommandClass::Application,
@@ -1346,10 +1352,15 @@ mod tests {
         assert_eq!(command_class("reboot"), Some(CommandClass::Intrinsic));
         assert_eq!(command_class("cat"), Some(CommandClass::Application));
         assert_eq!(command_class("man"), Some(CommandClass::Application));
+        assert_eq!(command_class("lua"), Some(CommandClass::Application));
         assert_eq!(command_class("printf"), Some(CommandClass::Application));
         assert_eq!(command_class("tcp"), Some(CommandClass::Application));
         assert_eq!(command_class("help"), None);
         assert_eq!(command_synopsis("man"), Some("man COMMAND"));
+        assert_eq!(
+            command_synopsis("lua"),
+            Some("lua [-e CODE | FILE | -] [ARG...]")
+        );
         assert_eq!(command_synopsis("printf"), Some("printf FORMAT [ARG...]"));
         assert_eq!(command_synopsis("tcp"), Some("tcp ADDRESS PORT [TEXT...]"));
         assert!(COMMANDS.windows(2).all(|pair| pair[0].name < pair[1].name));

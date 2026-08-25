@@ -93,6 +93,7 @@ class RepositoryPolicyTests(unittest.TestCase):
             actual,
             {
                 "troe-kernel": {("uefi", "=0.39.0", True)},
+                "troe-kex-alloc": {("rlsf", "=0.2.3", False)},
                 "troe-machine": {
                     ("rlsf", "=0.2.3", False),
                     ("uefi", "=0.39.0", True),
@@ -137,6 +138,7 @@ class RepositoryPolicyTests(unittest.TestCase):
             "grep",
             "hexdump",
             "ls",
+            "lua",
             "man",
             "mem",
             "net",

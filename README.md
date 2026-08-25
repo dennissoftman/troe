@@ -44,8 +44,8 @@ profiles. Small is a policy here, not just a current measurement.
   `/tmp`, live `/sys`, and crash-consistent state under `/vol/state`.
 - Ethernet, ARP, DHCP, IPv4, ICMP, UDP, and outbound TCP over virtio-net.
 - KEX applications for `arp`, `cat`, `clear`, `dhcp`, `echo`, `grep`, `hexdump`,
-  `ls`, `man`, `mem`, `net`, `ping`, `printf`, `pwd`, `rm`, `sleep`, `tcp`, `udp`,
-  and `write`.
+  `ls`, `lua`, `man`, `mem`, `net`, `ping`, `printf`, `pwd`, `rm`, `sleep`, `tcp`,
+  `udp`, and `write`.
 
 Only `cd`, `poweroff`, and `reboot` are privileged shell intrinsics. Everything
 else is an immutable KEX application discovered from `/bin`.
@@ -65,6 +65,9 @@ second  value
 sh:/> echo alpha beta | grep beta | write /tmp/result
 sh:/> cat /tmp/result
 alpha beta
+
+sh:/> lua -e 'print(string.format("Lua %.1f", math.sqrt(81)))'
+Lua 9.0
 ```
 
 ### Networking
@@ -107,6 +110,16 @@ $ cargo kex inspect rootfs/bin/x86_64/echo.kex
 
 Start exploring with [`apps/echo`](apps/echo) and the
 [`troe-kex` Rust SDK](sdk/rust/troe-kex).
+
+[`apps/lua`](apps/lua) is a complete freestanding Lua 5.5.1 interpreter. It
+streams source from `-e`, stdin, or the bounded read-only filesystem service,
+uses an 8 MiB TLSF application heap, and exposes only base, coroutine, table,
+string, math, and UTF-8 libraries. It has no ambient libc, environment,
+process, dynamic-module, OS, or raw filesystem access.
+
+KEX images are statically linked today. A bounded, single-package dynamic
+linking design for reusable libc and language runtimes is an explicit
+[post-Stage 9 roadmap milestone](docs/roadmap.md#post-stage-9-dynamic-linking-and-reusable-runtimes-planned).
 
 ## 🚀 Quick start
 

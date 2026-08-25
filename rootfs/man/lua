@@ -1,0 +1,21 @@
+NAME
+    lua - execute Lua 5.5 source code
+
+SYNOPSIS
+    lua [-e CODE | FILE | -] [ARG...]
+    lua --version
+
+DESCRIPTION
+    Runs Lua 5.5.1 source from an inline -e argument, a read-only filesystem
+    file, or standard input. Remaining arguments are available in the global
+    arg table, starting at arg[1]. With no source argument, reads standard
+    input.
+
+    The base, coroutine, table, string, math, and utf8 libraries are present.
+    package, io, os, debug, dynamic modules, environment access, and binary
+    bytecode are intentionally unavailable. The initial script file is read
+    through the declared filesystem capability.
+
+    Lua uses a bounded 8 MiB TLSF heap and periodically yields to the KEX
+    scheduler. Exhausting the heap raises a normal protected Lua memory error;
+    it cannot grow memory or access ambient host resources.

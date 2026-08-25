@@ -225,6 +225,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "troe-kex-alloc"
+version = "0.1.0"
+dependencies = [
+ "rlsf",
+ "troe-kex-sdk",
+]
+
+[[package]]
 name = "troe-kex-sdk"
 version = "0.1.0"
 dependencies = [

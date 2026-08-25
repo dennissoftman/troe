@@ -62,6 +62,7 @@ their canonical order during the same primary guest boot where possible.
 | `network` | Link and IPv4 state, DHCP, ICMP, ARP, cancellation, UDP, bounded TCP streams |
 | `shell-terminal` | Editing, completion, history, manuals, parsing, CRLF, and clear-screen behavior |
 | `filesystem` | KEFS/ext4 reads, paths, pipelines, RAMFS mutation, read-only and error behavior |
+| `lua` | Lua inline/stdin/file loading, protected errors, math/formatting, cooperative yields, fragmentation, and bounded OOM recovery |
 | `quota-memory` | 128-entry quota, recovery, repeated transient workloads, owned heap accounting |
 | `persistence` | A second boot and native cold-reset termination after the baseline durable boot |
 | `fault-isolation` | Write, execute, guard, exception, and fatal probes with rollback validation |

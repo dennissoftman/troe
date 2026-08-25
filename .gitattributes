@@ -1,0 +1,3 @@
+# Preserve byte-for-byte vendored releases even when upstream whitespace style
+# differs from TROE-authored source.
+apps/lua/vendor/** -whitespace

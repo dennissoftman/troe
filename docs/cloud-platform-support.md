@@ -11,6 +11,12 @@ machine-readable matrix is
 validator and deterministic packager are
 [`tools/mkcloud.py`](../tools/mkcloud.py).
 
+The accepted QEMU runner uses 128 MiB for the x86-64 combined-disk/ACPI
+composition. Its UEFI drivers and the embedded immutable application root must
+coexist before handoff; the smaller 64 MiB x86-64 split-disk regression runner
+does not establish enough headroom for that composition. AArch64 QEMU runners
+also use 128 MiB.
+
 ## Raw bundle v1
 
 One bundle contains exactly four files:
