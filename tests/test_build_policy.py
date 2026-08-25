@@ -37,6 +37,13 @@ class ProductionBuildPolicyTests(unittest.TestCase):
         self.assertEqual(parsed.platform, "all")
         self.assertTrue(parsed.fixture_identities)
         self.assertFalse(parsed.acceptance_probes)
+        self.assertFalse(parsed.all_variants)
+        all_variants = build.parse_args(
+            ["--platform", "all", "--fixture-identities", "--all-variants"]
+        )
+        self.assertTrue(all_variants.all_variants)
+        self.assertEqual(build.requested_variants(parsed), (False,))
+        self.assertEqual(build.requested_variants(all_variants), (False, True))
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
                 build.parse_args([])
@@ -46,6 +53,16 @@ class ProductionBuildPolicyTests(unittest.TestCase):
                 build.parse_args(["--platform", "unknown"])
             with self.assertRaises(SystemExit):
                 build.parse_args(["--platform", "all"])
+            with self.assertRaises(SystemExit):
+                build.parse_args(
+                    [
+                        "--platform",
+                        "all",
+                        "--fixture-identities",
+                        "--acceptance-probes",
+                        "--all-variants",
+                    ]
+                )
 
     def test_build_profiles_contain_no_execution_environment_facts(self) -> None:
         profile_fields = {
@@ -118,6 +135,15 @@ class ProductionBuildPolicyTests(unittest.TestCase):
             for profile in build.PLATFORM_PROFILES.values()
         ]
         self.assertEqual(verification.target_clippy_commands(), expected)
+
+    def test_full_gate_has_only_one_owner_for_both_image_variants(self) -> None:
+        without_qemu = verification.image_and_qemu_commands(skip_qemu=True)
+        with_qemu = verification.image_and_qemu_commands(skip_qemu=False)
+        self.assertEqual(len(without_qemu), 1)
+        self.assertIn("--all-variants", without_qemu[0])
+        self.assertEqual(len(with_qemu), 1)
+        self.assertIn("test-qemu.py", str(with_qemu[0][1]))
+        self.assertNotIn("build.py", str(with_qemu[0][1]))
 
     def test_rootfs_image_is_selected_only_by_architecture(self) -> None:
         for architecture in ("x86_64", "aarch64"):

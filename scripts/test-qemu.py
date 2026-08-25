@@ -35,6 +35,7 @@ from qemu_profile import (
     prepare_qemu_command,
     resolve_runner,
 )
+from test_scenarios import DEFAULT_SCENARIOS, SCENARIO_IDS
 
 
 ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[=>])")
@@ -307,6 +308,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="run a fast terminal-focused scenario instead of full acceptance",
     )
     parser.add_argument(
+        "--scenario",
+        action="append",
+        choices=SCENARIO_IDS,
+        help=(
+            "run one acceptance scenario group; repeat for multiple groups; "
+            "the default runs every group"
+        ),
+    )
+    parser.add_argument(
         "--skip-build",
         action="store_true",
         help="use boot images already present under build/",
@@ -334,6 +344,29 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=f"seconds to wait for each command (default: {COMMAND_TIMEOUT_SECONDS:g})",
     )
     return parser.parse_args(argv)
+
+
+def selected_scenarios(args: argparse.Namespace) -> frozenset[str]:
+    """Resolve explicit acceptance groups while keeping the default exhaustive."""
+    if args.smoke:
+        if args.scenario:
+            raise ValueError("--smoke and --scenario are mutually exclusive")
+        return frozenset()
+    return frozenset(args.scenario) if args.scenario else DEFAULT_SCENARIOS
+
+
+def apply_scenario_requirements(
+    args: argparse.Namespace, scenario_groups: frozenset[str]
+) -> None:
+    """Enable devices/assertions owned by an explicitly selected scenario."""
+    if "framebuffer-keyboard" in scenario_groups:
+        args.framebuffer_console = True
+        args.native_keyboard = True
+
+
+def requires_acceptance_images(scenario_groups: frozenset[str]) -> bool:
+    """Return whether selected groups execute destructive acceptance probes."""
+    return "fault-isolation" in scenario_groups
 
 
 def normalize(data: bytes) -> str:
@@ -746,14 +779,9 @@ def assert_storage_report(
     )
 
 
-def run_scenario(
-    session: SerialSession, boot_timeout: float, command_timeout: float, tcp_port: int
-) -> None:
-    """Exercise every required KEX app plus intrinsic and bounded failure behavior."""
-    session.wait_for(b"sh:/> ", boot_timeout)
-    assert_owned_boot(session)
+def run_boot_group(session: SerialSession, command_timeout: float) -> None:
+    """Validate owned boot storage and the baseline packaged KEX launch."""
     cwd = "/"
-
     assert_storage_report(session, cwd, command_timeout)
     session.command(
         "kex-echo application-ready",
@@ -762,6 +790,12 @@ def run_scenario(
         contains=("application-ready\n",),
     )
 
+
+def run_network_group(
+    session: SerialSession, command_timeout: float, tcp_port: int
+) -> None:
+    """Exercise bounded network observation, DHCP, ICMP, UDP, and TCP services."""
+    cwd = "/"
     session.command(
         "net",
         cwd,
@@ -792,9 +826,7 @@ def run_scenario(
         "udp send --source-port 40001 10.0.2.2 9 application-datagram",
         cwd,
         command_timeout,
-        contains=(
-            "sent 20 bytes from port 40001 to 10.0.2.2:9",
-        ),
+        contains=("sent 20 bytes from port 40001 to 10.0.2.2:9",),
     )
     session.cancelled_command("udp listen 40000", cwd, command_timeout)
     session.command("net stats", cwd, command_timeout, contains=("udp ports: 0",))
@@ -807,6 +839,10 @@ def run_scenario(
             contains=("troe-tcp-reply\n",),
         )
 
+
+def run_shell_terminal_group(session: SerialSession, command_timeout: float) -> None:
+    """Exercise editing, history, completion, help, manuals, and CRLF handling."""
+    cwd = "/"
     session.edited_command("", b"\t", "", cwd, command_timeout, expected="\ncat\n")
     session.command(
         "man echo",
@@ -835,6 +871,11 @@ def run_scenario(
         contains=("crlf-ready\n",),
         line_ending=b"\r\n",
     )
+
+
+def run_filesystem_group(session: SerialSession, command_timeout: float) -> None:
+    """Exercise mounted reads, pipelines, paths, and bounded file mutation."""
+    cwd = "/"
     session.command(
         "ls /", cwd, command_timeout, contains=("etc/", "man/", "sys/", "tmp/")
     )
@@ -903,9 +944,12 @@ def run_scenario(
         command_timeout,
         contains=("write: /etc/motd: read-only filesystem",),
     )
-    session.command("clear", cwd, command_timeout, raw_contains=(b"\x1b[2J",))
     session.command("rm /tmp/result", cwd, command_timeout)
 
+
+def run_quota_memory_group(session: SerialSession, command_timeout: float) -> None:
+    """Exercise the RAMFS quota and bounded transient-allocation accounting."""
+    cwd = "/"
     for index in range(128):
         session.command(f"write /tmp/q{index:03} x", cwd, command_timeout)
     session.command(
@@ -982,6 +1026,29 @@ def run_scenario(
             f"{baseline_heap} -> {final_heap} bytes"
         )
 
+
+def run_scenario(
+    session: SerialSession,
+    boot_timeout: float,
+    command_timeout: float,
+    tcp_port: int,
+    scenario_groups: frozenset[str] = DEFAULT_SCENARIOS,
+) -> None:
+    """Run selected groups in the same order used by exhaustive acceptance."""
+    session.wait_for(b"sh:/> ", boot_timeout)
+    assert_owned_boot(session)
+    if "boot" in scenario_groups:
+        run_boot_group(session, command_timeout)
+    if "network" in scenario_groups:
+        run_network_group(session, command_timeout, tcp_port)
+    if "shell-terminal" in scenario_groups:
+        run_shell_terminal_group(session, command_timeout)
+    if "filesystem" in scenario_groups:
+        run_filesystem_group(session, command_timeout)
+    if "shell-terminal" in scenario_groups:
+        session.command("clear", "/", command_timeout, raw_contains=(b"\x1b[2J",))
+    if "quota-memory" in scenario_groups:
+        run_quota_memory_group(session, command_timeout)
     request_poweroff(session, command_timeout)
 
 
@@ -1029,9 +1096,7 @@ def run_smoke_scenario(
         "udp send --source-port 40001 10.0.2.2 9 application-datagram",
         cwd,
         command_timeout,
-        contains=(
-            "sent 20 bytes from port 40001 to 10.0.2.2:9",
-        ),
+        contains=("sent 20 bytes from port 40001 to 10.0.2.2:9",),
     )
     session.cancelled_command("udp listen 40000", cwd, command_timeout)
     session.command("net stats", cwd, command_timeout, contains=("udp ports: 0",))
@@ -1226,6 +1291,7 @@ def test_platform(
     platform_id: str,
     args: argparse.Namespace,
 ) -> None:
+    scenario_groups = selected_scenarios(args)
     command = prepare_qemu_command(
         platform_id,
         args.environment,
@@ -1236,13 +1302,27 @@ def test_platform(
         acceptance_probes=False,
         framebuffer=args.framebuffer_console,
     )
-    tcp_peer = TcpAcceptancePeer(platform_id, args.environment)
-    tcp_peer.start()
+    network_selected = args.smoke or "network" in scenario_groups
+    tcp_peer = (
+        TcpAcceptancePeer(platform_id, args.environment) if network_selected else None
+    )
+    if tcp_peer is not None:
+        tcp_peer.start()
     session = SerialSession(command, platform_id)
     try:
-        scenario = run_smoke_scenario if args.smoke else run_scenario
         tcp_port = resolve_runner(platform_id, args.environment).acceptance_udp_port
-        scenario(session, args.boot_timeout, args.command_timeout, tcp_port)
+        if args.smoke:
+            run_smoke_scenario(
+                session, args.boot_timeout, args.command_timeout, tcp_port
+            )
+        else:
+            run_scenario(
+                session,
+                args.boot_timeout,
+                args.command_timeout,
+                tcp_port,
+                scenario_groups,
+            )
         if (
             args.framebuffer_console
             and b"Starting console and framebuffer" not in session.output
@@ -1257,28 +1337,30 @@ def test_platform(
         raise
     finally:
         session.close()
-        tcp_peer.close()
-    if tcp_peer.error is not None:
+        if tcp_peer is not None:
+            tcp_peer.close()
+    if tcp_peer is not None and tcp_peer.error is not None:
         raise AcceptanceError(
             f"{platform_id} TCP acceptance peer failed: {tcp_peer.error}"
         )
     expected_tcp_streams = 1 if args.smoke else 5
-    if tcp_peer.received != expected_tcp_streams:
+    if tcp_peer is not None and tcp_peer.received != expected_tcp_streams:
         raise AcceptanceError(
             f"{platform_id} TCP acceptance peer received "
             f"{tcp_peer.received} streams, expected {expected_tcp_streams}"
         )
-    reboot_session = SerialSession(command, platform_id)
-    try:
-        run_reboot_scenario(reboot_session, args.boot_timeout, args.command_timeout)
-    except Exception:
-        print(f"--- {platform_id} reboot transcript ---", file=sys.stderr)
-        print(reboot_session.transcript(), file=sys.stderr)
-        raise
-    finally:
-        reboot_session.close()
+    if args.smoke or "persistence" in scenario_groups:
+        reboot_session = SerialSession(command, platform_id)
+        try:
+            run_reboot_scenario(reboot_session, args.boot_timeout, args.command_timeout)
+        except Exception:
+            print(f"--- {platform_id} reboot transcript ---", file=sys.stderr)
+            print(reboot_session.transcript(), file=sys.stderr)
+            raise
+        finally:
+            reboot_session.close()
 
-    if not args.smoke:
+    if "fault-isolation" in scenario_groups:
         network_peer = UdpAcceptancePeer(platform_id, args.environment)
         network_peer.start()
         try:
@@ -1347,14 +1429,25 @@ def test_platform(
                 f"{platform_id} UDP acceptance peer received "
                 f"{network_peer.received} probes, expected 5"
             )
-    if args.native_keyboard and platform_id == X86_64_Q35_UEFI:
+    if (
+        args.native_keyboard
+        and (args.smoke or "framebuffer-keyboard" in scenario_groups)
+        and platform_id == X86_64_Q35_UEFI
+    ):
         run_native_keyboard_scenario(args)
     suite = "smoke" if args.smoke else "acceptance"
-    print(f"QEMU {suite} ({platform_id}): passed")
+    groups = "smoke" if args.smoke else ",".join(sorted(scenario_groups))
+    print(f"QEMU {suite} ({platform_id}; groups={groups}): passed")
 
 
 def main() -> int:
     args = parse_args()
+    try:
+        scenario_groups = selected_scenarios(args)
+    except ValueError as error:
+        print(f"QEMU acceptance failed: {error}", file=sys.stderr)
+        return 2
+    apply_scenario_requirements(args, scenario_groups)
     if args.boot_timeout <= 0 or args.command_timeout <= 0:
         print("QEMU acceptance failed: timeouts must be positive", file=sys.stderr)
         return 2
@@ -1373,6 +1466,11 @@ def main() -> int:
             resolve_runner(platform_id, args.environment)
         if not args.skip_build:
             build_platform = args.platform
+            variant_arguments = (
+                ("--all-variants",)
+                if requires_acceptance_images(scenario_groups)
+                else ()
+            )
             subprocess.run(
                 [
                     sys.executable,
@@ -1380,33 +1478,7 @@ def main() -> int:
                     "--platform",
                     build_platform,
                     "--fixture-identities",
-                ],
-                cwd=REPO_ROOT,
-                check=True,
-            )
-            if not args.smoke:
-                subprocess.run(
-                    [
-                        sys.executable,
-                        str(REPO_ROOT / "scripts" / "build.py"),
-                        "--platform",
-                        build_platform,
-                        "--fixture-identities",
-                        "--acceptance-probes",
-                    ],
-                    cwd=REPO_ROOT,
-                    check=True,
-                )
-            subprocess.run(
-                [
-                    sys.executable,
-                    str(REPO_ROOT / "tools" / "mkstorage.py"),
-                    "--manifest",
-                    str(REPO_ROOT / "assets" / "boot.bmnt"),
-                    "--output",
-                    str(REPO_ROOT / "build" / "storage-root.img"),
-                    "--content",
-                    str(REPO_ROOT / "assets" / "system.cspk"),
+                    *variant_arguments,
                 ],
                 cwd=REPO_ROOT,
                 check=True,
@@ -1418,7 +1490,7 @@ def main() -> int:
                 if runner.disk_layout != "cloud-bundle-v1":
                     continue
                 build_cloud_bundle(profile, args.environment)
-                if not args.smoke:
+                if requires_acceptance_images(scenario_groups):
                     build_cloud_bundle(
                         profile,
                         args.environment,

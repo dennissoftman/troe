@@ -77,8 +77,8 @@ the 50 ms execution lease and transactionally reclaimed.
   `write`,
   plus intrinsic `cd`, `poweroff`, and `reboot`;
 - deterministic 1.44 MiB FAT12 images for both primary architectures;
-- host/unit/smoke gates and prompt-synchronized QEMU acceptance on both
-  architectures.
+- host/unit/smoke gates and prompt-synchronized QEMU acceptance on all four
+  named platform profiles across both architectures.
 
 ### Current networking scope
 
@@ -168,14 +168,22 @@ Run all local gates:
 python3 scripts/test.py
 ```
 
-This includes the pinned x86-64 and AArch64 QEMU boot suites. If that exact
-QEMU/firmware pair is not installed, run the non-emulator gates explicitly with
-`python3 scripts/test.py --skip-qemu`. Run only the boot suites with
+For a conservative development loop that selects changed packages and reverse
+dependencies, owned Python suites, affected KEX apps, and granular QEMU
+scenarios, run `python3 scripts/test_changed.py --explain`. Unknown or global
+changes widen automatically to the full gate. The selector does not replace the
+full pre-merge run. See [`docs/testing.md`](docs/testing.md) for the scenario
+catalog and coding-agent instructions.
+
+This includes all four pinned QEMU platform suites across x86-64 and AArch64.
+If that exact QEMU/firmware pair is not installed, run the non-emulator gates
+explicitly with `python3 scripts/test.py --skip-qemu`. Run only QEMU acceptance with
 `python3 scripts/test-qemu.py --platform all --environment qemu`; all named
-platforms run concurrently after their images have been built. The complete
-repository gate also requires owned
-framebuffer activation on both architectures and native PS/2 input on x86-64.
-For a quick terminal-focused iteration, use
+platforms run concurrently after their images have been built. Omitting
+`--scenario` runs every group and enables owned framebuffer activation plus
+native PS/2 input on x86-64. Repeat `--scenario` for one or more focused groups
+as documented in [`docs/testing.md`](docs/testing.md). For a quick
+terminal-focused iteration, use
 `python3 scripts/test-qemu.py --platform all --environment qemu --smoke`; the
 exhaustive suite remains the standard gate.
 

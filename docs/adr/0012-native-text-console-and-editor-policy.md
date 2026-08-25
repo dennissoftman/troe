@@ -51,7 +51,7 @@ keys on x86-64.
 
 Implementation amendment, 2026-08-24: the repository's mandatory QEMU gate in
 `scripts/test.py` always passes `--framebuffer-console` and
-`--native-keyboard`. Consequently both architecture runs must report activation
-of the owned framebuffer console, and the x86-64 run must additionally complete
-a shell command delivered exclusively through the i8042 path. The serial-only
+`--native-keyboard`. Consequently all four named platform runs must report
+activation of the owned framebuffer console, and the q35 x86-64 run must
+additionally complete a shell command delivered exclusively through the i8042 path. The serial-only
 recovery path remains part of the same runs and is still used for assertions.

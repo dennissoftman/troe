@@ -53,7 +53,9 @@ import qemu_profile  # noqa: E402
 
 def load_script_module(name: str, filename: str):
     """Load a hyphenated CLI script so its pure argument parser can be tested."""
-    spec = importlib.util.spec_from_file_location(name, REPO_ROOT / "scripts" / filename)
+    spec = importlib.util.spec_from_file_location(
+        name, REPO_ROOT / "scripts" / filename
+    )
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load script module {filename}")
     module = importlib.util.module_from_spec(spec)
@@ -76,7 +78,9 @@ class FirmwareProfileTests(unittest.TestCase):
         self.assertEqual(int.from_bytes(table[4:8], "little"), len(table))
         self.assertEqual(sum(table) & 0xFF, 0)
         self.assertEqual(table[36], 0)
-        self.assertEqual(table[40:52], bytes((1, 8, 0, 1)) + (0x3F8).to_bytes(8, "little"))
+        self.assertEqual(
+            table[40:52], bytes((1, 8, 0, 1)) + (0x3F8).to_bytes(8, "little")
+        )
         self.assertEqual(table[52:58], bytes((3, 4, 4, 0, 0, 0)))
         self.assertEqual(table[64:68], b"\xff\xff\xff\xff")
 
@@ -108,9 +112,9 @@ class FirmwareProfileTests(unittest.TestCase):
         encoded = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
         self.assertEqual(PLATFORM_MANIFEST_PATH.read_text(encoding="utf-8"), encoded)
 
-        source = (
-            REPO_ROOT / "crates" / "troe-platform" / "src" / "lib.rs"
-        ).read_text(encoding="utf-8")
+        source = (REPO_ROOT / "crates" / "troe-platform" / "src" / "lib.rs").read_text(
+            encoding="utf-8"
+        )
         numeric_ids = {
             name: int(raw)
             for name, raw in re.findall(
@@ -360,12 +364,8 @@ class FirmwareProfileTests(unittest.TestCase):
             (alternate.platform_id, alternate.environment): alternate,
         }
         validate_runner_catalog(runners)
-        self.assertIs(
-            select_runner(runners, X86_64_Q35_UEFI, QEMU_ENVIRONMENT), qemu
-        )
-        self.assertIs(
-            select_runner(runners, X86_64_Q35_UEFI, "qemu-kvm"), alternate
-        )
+        self.assertIs(select_runner(runners, X86_64_Q35_UEFI, QEMU_ENVIRONMENT), qemu)
+        self.assertIs(select_runner(runners, X86_64_Q35_UEFI, "qemu-kvm"), alternate)
 
     def test_all_mutable_and_boot_artifacts_include_the_platform_id(self) -> None:
         for profile in PLATFORM_PROFILES.values():
@@ -376,21 +376,15 @@ class FirmwareProfileTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     boot_image_path(profile, acceptance_probes=True),
-                    REPO_ROOT
-                    / "build"
-                    / f"boot-{profile.identifier}-acceptance.img",
+                    REPO_ROOT / "build" / f"boot-{profile.identifier}-acceptance.img",
                 )
                 self.assertEqual(
                     txslot_image_path(profile),
-                    REPO_ROOT
-                    / "build"
-                    / f"storage-txslot-{profile.identifier}.img",
+                    REPO_ROOT / "build" / f"storage-txslot-{profile.identifier}.img",
                 )
                 self.assertEqual(
                     statefs_image_path(profile),
-                    REPO_ROOT
-                    / "build"
-                    / f"storage-statefs-{profile.identifier}.img",
+                    REPO_ROOT / "build" / f"storage-statefs-{profile.identifier}.img",
                 )
                 self.assertEqual(
                     variable_store_path(profile),
@@ -420,7 +414,9 @@ class FirmwareProfileTests(unittest.TestCase):
             bundle.mkdir()
             (bundle / "sentinel").write_text("last-good", encoding="utf-8")
             with (
-                mock.patch.object(qemu_profile, "cloud_bundle_path", return_value=bundle),
+                mock.patch.object(
+                    qemu_profile, "cloud_bundle_path", return_value=bundle
+                ),
                 mock.patch.object(
                     qemu_profile.subprocess,
                     "run",
@@ -564,7 +560,9 @@ class FirmwareProfileTests(unittest.TestCase):
             cloud_x86,
         )
 
-    def test_launcher_and_acceptance_clis_require_platform_and_environment(self) -> None:
+    def test_launcher_and_acceptance_clis_require_platform_and_environment(
+        self,
+    ) -> None:
         run_args = RUN_QEMU.parse_args(
             [
                 "--platform",
@@ -581,6 +579,56 @@ class FirmwareProfileTests(unittest.TestCase):
         )
         self.assertEqual(test_args.platform, "all")
         self.assertEqual(test_args.environment, QEMU_ENVIRONMENT)
+        self.assertEqual(
+            TEST_QEMU.selected_scenarios(test_args), TEST_QEMU.DEFAULT_SCENARIOS
+        )
+        focused_args = TEST_QEMU.parse_args(
+            [
+                "--platform",
+                X86_64_Q35_UEFI,
+                "--environment",
+                QEMU_ENVIRONMENT,
+                "--scenario",
+                "network",
+                "--scenario",
+                "shell-terminal",
+            ]
+        )
+        self.assertEqual(
+            TEST_QEMU.selected_scenarios(focused_args),
+            frozenset(("network", "shell-terminal")),
+        )
+        framebuffer_args = TEST_QEMU.parse_args(
+            [
+                "--platform",
+                X86_64_Q35_UEFI,
+                "--environment",
+                QEMU_ENVIRONMENT,
+                "--scenario",
+                "framebuffer-keyboard",
+            ]
+        )
+        framebuffer_groups = TEST_QEMU.selected_scenarios(framebuffer_args)
+        TEST_QEMU.apply_scenario_requirements(framebuffer_args, framebuffer_groups)
+        self.assertTrue(framebuffer_args.framebuffer_console)
+        self.assertTrue(framebuffer_args.native_keyboard)
+        self.assertFalse(TEST_QEMU.requires_acceptance_images(frozenset(("network",))))
+        self.assertTrue(
+            TEST_QEMU.requires_acceptance_images(frozenset(("boot", "fault-isolation")))
+        )
+        smoke_with_scenario = TEST_QEMU.parse_args(
+            [
+                "--platform",
+                X86_64_Q35_UEFI,
+                "--environment",
+                QEMU_ENVIRONMENT,
+                "--smoke",
+                "--scenario",
+                "network",
+            ]
+        )
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            TEST_QEMU.selected_scenarios(smoke_with_scenario)
 
         rejected_argv = (
             (RUN_QEMU, []),
@@ -608,6 +656,33 @@ class FirmwareProfileTests(unittest.TestCase):
                 with contextlib.redirect_stderr(io.StringIO()):
                     with self.assertRaises(SystemExit):
                         module.parse_args(list(argv))
+
+    def test_primary_scenario_dispatch_runs_only_selected_groups(self) -> None:
+        session = mock.Mock()
+        with (
+            mock.patch.object(TEST_QEMU, "assert_owned_boot") as owned_boot,
+            mock.patch.object(TEST_QEMU, "run_boot_group") as boot,
+            mock.patch.object(TEST_QEMU, "run_network_group") as network,
+            mock.patch.object(TEST_QEMU, "run_shell_terminal_group") as shell,
+            mock.patch.object(TEST_QEMU, "run_filesystem_group") as filesystem,
+            mock.patch.object(TEST_QEMU, "run_quota_memory_group") as quota,
+            mock.patch.object(TEST_QEMU, "request_poweroff") as poweroff,
+        ):
+            TEST_QEMU.run_scenario(
+                session,
+                30.0,
+                10.0,
+                40123,
+                frozenset(("network", "filesystem")),
+            )
+        session.wait_for.assert_called_once_with(b"sh:/> ", 30.0)
+        owned_boot.assert_called_once_with(session)
+        boot.assert_not_called()
+        network.assert_called_once_with(session, 10.0, 40123)
+        shell.assert_not_called()
+        filesystem.assert_called_once_with(session, 10.0)
+        quota.assert_not_called()
+        poweroff.assert_called_once_with(session, 10.0)
 
 
 if __name__ == "__main__":

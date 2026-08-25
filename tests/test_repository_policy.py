@@ -77,7 +77,11 @@ class RepositoryPolicyTests(unittest.TestCase):
         actual: dict[str, set[tuple[str, str, bool]]] = {}
         for package in metadata["packages"]:
             external = {
-                (dependency["name"], dependency["req"], dependency["uses_default_features"])
+                (
+                    dependency["name"],
+                    dependency["req"],
+                    dependency["uses_default_features"],
+                )
                 for dependency in package["dependencies"]
                 if dependency["source"] is not None
             }
@@ -120,6 +124,8 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn("cargo kex build", source)
         self.assertIn("troe_kex_sdk::entry!", source)
         self.assertIn("Do not infer POSIX behavior", source)
+        self.assertIn("scripts/test_changed.py", source)
+        self.assertIn("docs/testing.md", source)
 
     def test_every_ordinary_command_is_kex_only_on_both_targets(self) -> None:
         ordinary = {
@@ -151,16 +157,11 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertEqual(apps, ordinary)
         for architecture in ("x86_64", "aarch64"):
             root = REPO_ROOT / "rootfs" / "bin" / architecture
-            installed = {
-                path.stem
-                for path in root.glob("*.kex")
-            }
+            installed = {path.stem for path in root.glob("*.kex")}
             self.assertEqual(installed, ordinary | {"kex-echo"})
             self.assertEqual(list(root.glob("*.kcap")), [])
 
-        shell = (REPO_ROOT / "crates/troe-shell/src/lib.rs").read_text(
-            encoding="utf-8"
-        )
+        shell = (REPO_ROOT / "crates/troe-shell/src/lib.rs").read_text(encoding="utf-8")
         self.assertEqual(shell.count("\n    fn command_"), 2)
         self.assertIn("fn command_cd", shell)
         self.assertIn("fn command_machine_action", shell)
@@ -191,7 +192,9 @@ class RepositoryPolicyTests(unittest.TestCase):
             with self.subTest(path=relative):
                 self.assertNotIn("--profile", source)
 
-    def test_platform_facts_and_virtio_transport_selection_stay_below_kernel(self) -> None:
+    def test_platform_facts_and_virtio_transport_selection_stay_below_kernel(
+        self,
+    ) -> None:
         machine_sources = tuple((REPO_ROOT / "crates/troe-machine/src").glob("*.rs"))
         kernel_sources = tuple((REPO_ROOT / "kernel/src").glob("*.rs"))
         fixed_platform_literals = (

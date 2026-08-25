@@ -47,9 +47,7 @@ def parse_args() -> argparse.Namespace:
 
 def run(*command: str | Path) -> None:
     """Run a verification command from the repository root."""
-    subprocess.run(
-        [str(argument) for argument in command], cwd=REPO_ROOT, check=True
-    )
+    subprocess.run([str(argument) for argument in command], cwd=REPO_ROOT, check=True)
 
 
 def target_clippy_commands() -> list[tuple[str | Path, ...]]:
@@ -69,6 +67,33 @@ def target_clippy_commands() -> list[tuple[str | Path, ...]]:
             "warnings",
         )
         for profile in PLATFORM_PROFILES.values()
+    ]
+
+
+def image_and_qemu_commands(*, skip_qemu: bool) -> list[tuple[str | Path, ...]]:
+    """Return one owner for production/acceptance builds without duplication."""
+    if skip_qemu:
+        return [
+            (
+                sys.executable,
+                REPO_ROOT / "scripts" / "build.py",
+                "--platform",
+                "all",
+                "--fixture-identities",
+                "--all-variants",
+            )
+        ]
+    return [
+        (
+            sys.executable,
+            REPO_ROOT / "scripts" / "test-qemu.py",
+            "--platform",
+            "all",
+            "--environment",
+            QEMU_ENVIRONMENT,
+            "--framebuffer-console",
+            "--native-keyboard",
+        )
     ]
 
 
@@ -157,41 +182,16 @@ def main() -> int:
             "--script",
             REPO_ROOT / "tests" / "smoke.sh",
         ),
-        (
-            sys.executable,
-            REPO_ROOT / "scripts" / "build.py",
-            "--platform",
-            "all",
-            "--fixture-identities",
-        ),
-        (
-            sys.executable,
-            REPO_ROOT / "scripts" / "build.py",
-            "--platform",
-            "all",
-            "--fixture-identities",
-            "--acceptance-probes",
-        ),
     ]
-    if not args.skip_qemu:
-        commands.append(
-            (
-                sys.executable,
-                REPO_ROOT / "scripts" / "test-qemu.py",
-                "--platform",
-                "all",
-                "--environment",
-                QEMU_ENVIRONMENT,
-                "--framebuffer-console",
-                "--native-keyboard",
-            )
-        )
+    commands.extend(image_and_qemu_commands(skip_qemu=args.skip_qemu))
 
     try:
         for command in commands:
             run(*command)
     except FileNotFoundError as error:
-        print(f"verification failed: command not found: {error.filename}", file=sys.stderr)
+        print(
+            f"verification failed: command not found: {error.filename}", file=sys.stderr
+        )
         return 1
     except OSError as error:
         print(f"verification failed: {error}", file=sys.stderr)

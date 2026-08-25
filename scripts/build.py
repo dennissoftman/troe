@@ -87,10 +87,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         required=True,
         help="named platform to build, or explicit 'all'",
     )
-    parser.add_argument(
+    variants = parser.add_mutually_exclusive_group()
+    variants.add_argument(
         "--acceptance-probes",
         action="store_true",
         help="build a separate image containing terminal MMU acceptance probes",
+    )
+    variants.add_argument(
+        "--all-variants",
+        action="store_true",
+        help="build production and acceptance images after generating shared inputs once",
     )
     identity_source = parser.add_mutually_exclusive_group(required=True)
     identity_source.add_argument(
@@ -104,6 +110,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="deployment identities created exclusively by tools/mkidentity.py",
     )
     return parser.parse_args(argv)
+
+
+def requested_variants(args: argparse.Namespace) -> tuple[bool, ...]:
+    """Return production/acceptance variants after shared inputs are generated."""
+    return (False, True) if args.all_variants else (args.acceptance_probes,)
 
 
 def main() -> int:
@@ -173,40 +184,39 @@ def main() -> int:
             REPO_ROOT / "assets" / "system.cspk",
         )
 
-        for platform_id in platform_ids:
-            profile = PLATFORM_PROFILES[platform_id]
-            run(*cargo_build_command(profile, acceptance_probes=args.acceptance_probes))
+        for acceptance_probes in requested_variants(args):
+            for platform_id in platform_ids:
+                profile = PLATFORM_PROFILES[platform_id]
+                run(*cargo_build_command(profile, acceptance_probes=acceptance_probes))
 
-            efi = REPO_ROOT / "target" / profile.target / "release" / "kernel.efi"
-            image = boot_image_path(
-                profile, acceptance_probes=args.acceptance_probes
-            )
-            if not args.acceptance_probes:
-                verify_production_efi(efi)
-            run(
-                sys.executable,
-                TOOLS_DIR / "mkfat.py",
-                "--arch",
-                profile.architecture,
-                "--efi",
-                efi,
-                "--output",
-                image,
-            )
-            run(
-                sys.executable,
-                TOOLS_DIR / "size_report.py",
-                "--arch",
-                profile.architecture,
-                "--efi",
-                efi,
-                "--rootfs",
-                rootfs_image_path(profile.architecture),
-                "--image",
-                image,
-            )
-            if image.stat().st_size > IMAGE_SIZE_LIMIT:
-                raise RuntimeError(f"image exceeds the 16 MiB ceiling: {image}")
+                efi = REPO_ROOT / "target" / profile.target / "release" / "kernel.efi"
+                image = boot_image_path(profile, acceptance_probes=acceptance_probes)
+                if not acceptance_probes:
+                    verify_production_efi(efi)
+                run(
+                    sys.executable,
+                    TOOLS_DIR / "mkfat.py",
+                    "--arch",
+                    profile.architecture,
+                    "--efi",
+                    efi,
+                    "--output",
+                    image,
+                )
+                run(
+                    sys.executable,
+                    TOOLS_DIR / "size_report.py",
+                    "--arch",
+                    profile.architecture,
+                    "--efi",
+                    efi,
+                    "--rootfs",
+                    rootfs_image_path(profile.architecture),
+                    "--image",
+                    image,
+                )
+                if image.stat().st_size > IMAGE_SIZE_LIMIT:
+                    raise RuntimeError(f"image exceeds the 16 MiB ceiling: {image}")
     except (FileNotFoundError, OSError, RuntimeError) as error:
         print(f"build failed: {error}", file=sys.stderr)
         return 1

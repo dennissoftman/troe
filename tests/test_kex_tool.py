@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import struct
 import subprocess
 import tempfile
@@ -18,12 +19,18 @@ KEX_APPLICATION_NAMES = tuple(
         if path.is_dir() and (path / "Cargo.toml").is_file()
     )
 )
+KEX_TOOL = Path(os.environ.get("CARGO_TARGET_DIR", REPO_ROOT / "target"))
+if not KEX_TOOL.is_absolute():
+    KEX_TOOL = REPO_ROOT / KEX_TOOL
+KEX_TOOL = (
+    KEX_TOOL / "debug" / ("troe-kex-tool.exe" if os.name == "nt" else "troe-kex-tool")
+)
 
 
 def cargo_kex(*arguments: object) -> subprocess.CompletedProcess[bytes]:
-    """Run the repository's canonical Cargo alias without a shell."""
+    """Run the already-built canonical CLI without one Cargo process per case."""
     return subprocess.run(
-        ("cargo", "kex", *(str(argument) for argument in arguments)),
+        (KEX_TOOL, *(str(argument) for argument in arguments)),
         cwd=REPO_ROOT,
         check=False,
         capture_output=True,
@@ -32,6 +39,14 @@ def cargo_kex(*arguments: object) -> subprocess.CompletedProcess[bytes]:
 
 class KexToolTests(unittest.TestCase):
     """Keep canonical build, inspection, and installed bytes stable."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        subprocess.run(
+            ("cargo", "build", "--quiet", "--package", "troe-kex-tool"),
+            cwd=REPO_ROOT,
+            check=True,
+        )
 
     def test_installed_example_artifacts_are_canonical_for_each_target(self) -> None:
         for command in KEX_APPLICATION_NAMES:
@@ -45,7 +60,9 @@ class KexToolTests(unittest.TestCase):
                     self.assertEqual(report["executable_format"], "KEX v1")
                     self.assertEqual(report["abi"], "1.0")
                     self.assertEqual(report["target"], target)
-                    self.assertEqual(report["stack_pages"], 20 if command == "grep" else 4)
+                    self.assertEqual(
+                        report["stack_pages"], 20 if command == "grep" else 4
+                    )
                     self.assertEqual(report["heap_pages"], 0)
                     package_bytes = artifact.read_bytes()
                     self.assertEqual(package_bytes[:8], b"KEXPKG\0\0")
@@ -63,9 +80,13 @@ class KexToolTests(unittest.TestCase):
                     ) = struct.unpack_from("<HHHHIIIIQQ", package_bytes, 8)
                     self.assertEqual((major, minor, header_bytes, flags), (1, 0, 48, 0))
                     self.assertEqual(capability_offset, header_bytes)
-                    self.assertEqual(executable_offset, capability_offset + capability_bytes)
+                    self.assertEqual(
+                        executable_offset, capability_offset + capability_bytes
+                    )
                     self.assertEqual(reserved, 0)
-                    self.assertEqual(executable_offset + executable_bytes, len(package_bytes))
+                    self.assertEqual(
+                        executable_offset + executable_bytes, len(package_bytes)
+                    )
                     self.assertEqual(encoded_bytes, len(package_bytes))
                     self.assertEqual(report["bytes"], len(package_bytes))
                     self.assertEqual(report["executable_bytes"], executable_bytes)
@@ -107,9 +128,7 @@ class KexToolTests(unittest.TestCase):
                     self.assertFalse(artifact.with_suffix(".kcap").exists())
 
     def test_build_check_uses_pinned_app_contract(self) -> None:
-        checked = cargo_kex(
-            "build", "apps/echo", "--target", "x86_64", "--check"
-        )
+        checked = cargo_kex("build", "apps/echo", "--target", "x86_64", "--check")
         self.assertEqual(checked.returncode, 0, checked.stderr.decode())
         self.assertIn(b"KEX package verified", checked.stdout)
 

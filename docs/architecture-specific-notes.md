@@ -4,7 +4,8 @@ This page records machine details that are easy to erase accidentally during a
 portable refactor. These are current implementation invariants, not generic
 driver policy. Any change to interrupt entry, idle waiting, controller setup,
 or a current machine profile must review this page, ADR 0013, ADR 0014, ADR
-0016, the unsafe inventory, and both exhaustive QEMU suites together. The q35
+0016, the unsafe inventory, and all four exhaustive QEMU platform suites
+together. The q35
 and `virt` sections describe implemented test profiles; they are not generic
 x86-64 or AArch64 platform contracts.
 

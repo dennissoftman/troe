@@ -8,8 +8,9 @@
 - RAMFS mutation and deletion accounting have provider tests; parser failures,
   pipelines, intrinsic behavior, and command status have host tests.
 - Build, test, image, size, and QEMU entry points are repository scripts.
-- Prompt-synchronized QEMU acceptance drives both production images through all
-  KEX apps, failure cases, RAMFS quota exhaustion and recovery, memory
+- Prompt-synchronized QEMU acceptance drives every named production platform
+  image through all KEX apps, failure cases, RAMFS quota exhaustion and
+  recovery, memory
   reporting, and authorized poweroff/reboot with bounded timeouts.
 
 ## Stage 2: owned machine (complete)
@@ -40,7 +41,8 @@ and allocation failure reaches a bounded diagnostic path.
 
 Landed: `rlsf` TLSF was selected and measured, the final map is retained and
 normalized, every console/fatal path is native, boot services are exited, and
-`mem` exposes owned frame and heap counters. Dual-QEMU acceptance proves no net
+`mem` exposes owned frame and heap counters. Multi-platform QEMU acceptance
+proves no net
 heap growth across repeated transient workloads and exercises the bounded
 allocation-failure probe.
 
@@ -423,8 +425,8 @@ The first portable storage/configuration boundary is landed:
 These mechanisms are host verified; both VM block and network transports,
 read-only mount activation, the bounded TXSLOT transaction, digest-bound ext4
 CSPK/SACT/ISEC recovery, selected state-filesystem mutation, and host UDP
-exchange are QEMU verified. Five independent acceptance processes per
-architecture revalidate the rolled-back generation-1 security snapshot and
+exchange are QEMU verified. Five independent fault-isolation processes per
+named platform revalidate the rolled-back generation-1 security snapshot and
 persist incremented state after deliberate terminal faults.
 
 ADR 0018 fixes the bootstrap semantics for the next storage increments. KEFS

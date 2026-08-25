@@ -110,11 +110,11 @@ installs one architecture-specific `.kex` package.
 Never copy one architecture's artifact to the other. KEFS assembly projects the
 selected source directory into flat runtime `/bin`; verify both target roots.
 
-Before handing off, run formatting, app/library tests, both KEX byte checks, and
-the narrowest relevant kernel/QEMU gate. For a new command name, acceptance must
-execute that unknown-to-the-shell name; for replacement, also test fallback
-when the artifact is absent and confirm intrinsics remain non-shadowable.
-
+After updating artifacts, run `python3 scripts/test_changed.py --dry-run --explain`,
+then run it without `--dry-run`; never remove a selected gate. Add
+new-command behavior to the proper `scripts/test-qemu.py` group and selector
+test. Before merge, require `full-test` or run `python3 scripts/test.py`; see
+`docs/testing.md`.
 If a required capability is absent, stop and propose a versioned interface in
 `troe-abi` plus a bounded kernel service. Do not smuggle authority through raw
 pointers, magic opcodes, writable executable paths, or ad-hoc syscalls.

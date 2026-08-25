@@ -9,6 +9,8 @@ historical review evidence.
   and the next kernel milestone.
 - [Architecture](architecture.md) describes the current Stage 9 composition and
   its boundaries.
+- [Testing and impact selection](testing.md) defines the exhaustive gate,
+  focused changed-path workflow, QEMU scenario groups, and coding-agent rules.
 - [Architecture-specific notes](architecture-specific-notes.md) preserve the
   x86-64 and AArch64 interrupt, idle, and controller invariants that portable
   refactors must not erase.

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import struct
 import subprocess
 import sys
@@ -12,8 +13,25 @@ from pathlib import Path
 from tools import elf2kex, gen_kex_corpus
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+KEX_TOOL = Path(os.environ.get("CARGO_TARGET_DIR", REPO_ROOT / "target"))
+if not KEX_TOOL.is_absolute():
+    KEX_TOOL = REPO_ROOT / KEX_TOOL
+KEX_TOOL = (
+    KEX_TOOL / "debug" / ("troe-kex-tool.exe" if os.name == "nt" else "troe-kex-tool")
+)
+
+
 class Elf2KexTests(unittest.TestCase):
     """Exercise both targets and the converter's closed ELF rejection surface."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        subprocess.run(
+            ("cargo", "build", "--quiet", "--package", "troe-kex-tool"),
+            cwd=REPO_ROOT,
+            check=True,
+        )
 
     @staticmethod
     def make_elf(
@@ -179,8 +197,7 @@ class Elf2KexTests(unittest.TestCase):
                     source.write_bytes(image)
                     converted = subprocess.run(
                         (
-                            "cargo",
-                            "kex",
+                            str(KEX_TOOL),
                             "convert",
                             str(source),
                             str(output),
@@ -191,9 +208,7 @@ class Elf2KexTests(unittest.TestCase):
                         check=False,
                         capture_output=True,
                     )
-                    self.assertEqual(
-                        converted.returncode, 0, converted.stderr.decode()
-                    )
+                    self.assertEqual(converted.returncode, 0, converted.stderr.decode())
                     self.assertEqual(
                         output.read_bytes(),
                         elf2kex.convert_elf(image, expected_target=target),
@@ -210,8 +225,7 @@ class Elf2KexTests(unittest.TestCase):
                 output.unlink(missing_ok=True)
                 converted = subprocess.run(
                     (
-                        "cargo",
-                        "kex",
+                        str(KEX_TOOL),
                         "convert",
                         str(source),
                         str(output),
@@ -251,11 +265,7 @@ class Elf2KexTests(unittest.TestCase):
                     )
             assert_rust_rejects(
                 self.make_elf(
-                    load_flags=(
-                        elf2kex.ELF_PF_R
-                        | elf2kex.ELF_PF_W
-                        | elf2kex.ELF_PF_X
-                    )
+                    load_flags=(elf2kex.ELF_PF_R | elf2kex.ELF_PF_W | elf2kex.ELF_PF_X)
                 )
             )
             assert_rust_rejects(self.make_elf() + b"\0")

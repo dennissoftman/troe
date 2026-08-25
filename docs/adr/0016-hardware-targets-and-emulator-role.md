@@ -118,7 +118,7 @@ device/controller composition before machine mutation. The machine crate
 consumes the validated description and dispatches native virtio without a
 kernel transport branch. Build artifacts select a platform explicitly; runner
 records select the execution environment independently. Host policy tests and
-both pinned QEMU gates enforce the boundary.
+all four pinned QEMU platform suites enforce the boundary.
 
 Phase B adds bounded, allocation-free ACPI and FDT discovery. The x86 discovery
 contract validates ACPI topology, ECAM, serial, PM timer, reset, and legacy
