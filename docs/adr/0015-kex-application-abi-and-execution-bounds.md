@@ -14,11 +14,13 @@ bounded full-context suspension, scheduler-selected yield resume, owner-checked
 copied handle calls, reply copy-out, and native invalid-call/unexpected-return
 acceptance on both primary architectures.
 
-Closure note, 2026-08-25: `tools/elf2kex.py` now provides the dependency-free
-hosted ELF64-to-KEX conversion boundary and independently decodes every artifact
-it emits. `tools/gen_kex_corpus.py` deterministically generates the shared
-x86-64/AArch64 acceptance, rejection, native-exercise, and exact-budget corpus
-consumed by both hosted tests and the portable Rust parser. The kernel's
+Closure note, 2026-08-25: `tools/troe-kex-tool` now provides the dependency-free
+Rust ELF64-to-KEX conversion boundary and validates every artifact it emits
+through the portable parser. The prior `tools/elf2kex.py` remains an independent
+parity oracle during migration. `tools/gen_kex_corpus.py` deterministically
+generates the shared x86-64/AArch64 acceptance, rejection, native-exercise,
+and exact-budget corpus consumed by both hosted tests and the portable Rust
+parser. The kernel's
 production Stage 7 exercise embeds only the generated valid call/yield/exit
 artifact. Malformed, spinning, invalid-call, and unexpected-return artifacts
 are compiled only with `acceptance-probes`; every destructive artifact carries

@@ -41,9 +41,9 @@ preemption.
 `crates/troe-abi` is the allocation-free wire contract. The repo-local Rust SDK
 in `sdk/rust/troe-kex` owns startup validation and architecture call gates, and
 applications use its `entry!` macro instead of defining raw syscalls. The
-dependency-free `tools/kex.py` command builds both pinned `*-unknown-none`
-targets with `sdk/kex.ld`, passes the resulting ELF through the strict existing
-converter, and can byte-check or inspect installed output. Example source lives
+dependency-free Rust `troe-kex-tool` command builds both pinned `*-unknown-none`
+targets with `sdk/kex.ld`, passes the resulting ELF through its strict converter,
+and can byte-check or inspect installed output. Example source lives
 under `apps/`; canonical generated artifacts are committed under `rootfs/bin`
 until the signed content-store packaging decision replaces that bootstrap
 distribution path.

@@ -168,6 +168,101 @@ class Elf2KexTests(unittest.TestCase):
                 self.assertEqual(struct.unpack_from("<I", first, 104 + 32)[0], 3)
                 self.assertEqual(struct.unpack_from("<Q", first, 104 + 24)[0], 8192)
 
+    def test_rust_converter_is_byte_exact_with_python_oracle(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for target in elf2kex.KEX_TARGETS:
+                with self.subTest(target=target):
+                    source = root / f"{target}.elf"
+                    output = root / f"{target}.kex"
+                    image = self.make_elf(target, second_load=True)
+                    source.write_bytes(image)
+                    converted = subprocess.run(
+                        (
+                            "cargo",
+                            "kex",
+                            "convert",
+                            str(source),
+                            str(output),
+                            "--target",
+                            target,
+                        ),
+                        cwd=Path(__file__).resolve().parents[1],
+                        check=False,
+                        capture_output=True,
+                    )
+                    self.assertEqual(
+                        converted.returncode, 0, converted.stderr.decode()
+                    )
+                    self.assertEqual(
+                        output.read_bytes(),
+                        elf2kex.convert_elf(image, expected_target=target),
+                    )
+
+    def test_rust_converter_matches_closed_python_rejections(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "rejected.elf"
+            output = root / "rejected.kex"
+
+            def assert_rust_rejects(image: bytes, *options: str) -> None:
+                source.write_bytes(image)
+                output.unlink(missing_ok=True)
+                converted = subprocess.run(
+                    (
+                        "cargo",
+                        "kex",
+                        "convert",
+                        str(source),
+                        str(output),
+                        *options,
+                    ),
+                    cwd=Path(__file__).resolve().parents[1],
+                    check=False,
+                    capture_output=True,
+                )
+                self.assertNotEqual(converted.returncode, 0)
+                self.assertFalse(output.exists())
+
+            for kind in (
+                elf2kex.ELF_PT_DYNAMIC,
+                elf2kex.ELF_PT_INTERP,
+                elf2kex.ELF_PT_TLS,
+                elf2kex.ELF_PT_NOTE,
+                elf2kex.ELF_PT_GNU_EH_FRAME,
+                elf2kex.ELF_PT_GNU_RELRO,
+                elf2kex.ELF_PT_GNU_PROPERTY,
+            ):
+                with self.subTest(program_type=kind):
+                    assert_rust_rejects(self.make_elf(extra_program_type=kind))
+            for kind, flags in (
+                (elf2kex.ELF_SHT_REL, 0),
+                (elf2kex.ELF_SHT_RELA, 0),
+                (elf2kex.ELF_SHT_RELR, 0),
+                (elf2kex.ELF_SHT_DYNAMIC, 0),
+                (elf2kex.ELF_SHT_DYNSYM, 0),
+                (elf2kex.ELF_SHT_NOTE, 0),
+                (elf2kex.ELF_SHT_INIT_ARRAY, 0),
+                (elf2kex.ELF_SHT_NOBITS, elf2kex.ELF_SHF_TLS),
+            ):
+                with self.subTest(section_type=kind, flags=flags):
+                    assert_rust_rejects(
+                        self.make_elf(section_type=kind, section_flags=flags)
+                    )
+            assert_rust_rejects(
+                self.make_elf(
+                    load_flags=(
+                        elf2kex.ELF_PF_R
+                        | elf2kex.ELF_PF_W
+                        | elf2kex.ELF_PF_X
+                    )
+                )
+            )
+            assert_rust_rejects(self.make_elf() + b"\0")
+            assert_rust_rejects(self.make_elf(), "--target", "aarch64")
+            assert_rust_rejects(self.make_elf(), "--stack-pages", "3")
+            assert_rust_rejects(self.make_elf(), "--heap-pages", "4097")
+
     def test_dynamic_interpreter_tls_notes_relro_and_relocations_are_rejected(
         self,
     ) -> None:

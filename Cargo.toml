@@ -30,6 +30,7 @@ members = [
     "host",
     "kernel",
     "sdk/rust/troe-kex",
+    "tools/troe-kex-tool",
     "xtask",
 ]
 default-members = [

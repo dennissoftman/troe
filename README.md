@@ -106,9 +106,9 @@ cargo run --manifest-path host/Cargo.toml -- --script tests/smoke.sh
 Build and inspect the example KEX command for both native targets:
 
 ```console
-python3 tools/kex.py build apps/echo --target all
-python3 tools/kex.py build apps/echo --target all --check
-python3 tools/kex.py inspect rootfs/bin/x86_64/echo.kex
+cargo kex build apps/echo --target all
+cargo kex build apps/echo --target all --check
+cargo kex inspect rootfs/bin/x86_64/echo.kex
 ```
 
 Build deterministic local/QEMU images with reserved test identities:

@@ -117,7 +117,7 @@ class RepositoryPolicyTests(unittest.TestCase):
         source = (root / "SKILL.md").read_text(encoding="utf-8")
         self.assertLessEqual(len(source.splitlines()), 120)
         self.assertTrue(source.startswith("---\nname: write-kex-apps\ndescription: "))
-        self.assertIn("python3 tools/kex.py build", source)
+        self.assertIn("cargo kex build", source)
         self.assertIn("troe_kex_sdk::entry!", source)
         self.assertIn("Do not infer POSIX behavior", source)
 

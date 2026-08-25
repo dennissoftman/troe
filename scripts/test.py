@@ -113,8 +113,8 @@ def main() -> int:
             "252",
         ),
         (
-            sys.executable,
-            TOOLS_DIR / "kex.py",
+            "cargo",
+            "kex",
             "build",
             REPO_ROOT / "apps" / "echo",
             "--target",
@@ -122,8 +122,8 @@ def main() -> int:
             "--check",
         ),
         (
-            sys.executable,
-            TOOLS_DIR / "kex.py",
+            "cargo",
+            "kex",
             "build",
             REPO_ROOT / "apps" / "udp",
             "--target",
@@ -131,8 +131,8 @@ def main() -> int:
             "--check",
         ),
         (
-            sys.executable,
-            TOOLS_DIR / "kex.py",
+            "cargo",
+            "kex",
             "build",
             REPO_ROOT / "apps" / "echo",
             "--name",

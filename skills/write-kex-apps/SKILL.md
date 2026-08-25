@@ -1,6 +1,6 @@
 ---
 name: write-kex-apps
-description: Write, review, build, or debug secure TROE KEX command applications using the repo-local Rust SDK and canonical builder. Use for work under apps/, SDK-facing ABI questions, KEX command replacement, or generated rootfs/bin artifacts.
+description: Write, review, build, or debug secure TROE KEX command applications using the repo-local Rust SDK and canonical Rust builder. Use for work under apps/, SDK-facing ABI questions, KEX command replacement, or generated rootfs/bin artifacts.
 ---
 
 # Write TROE KEX apps
@@ -34,7 +34,7 @@ reports Ctrl-C as `Error::Cancelled`. Treat `command.datagram()` as optional.
 ## Minimal crate
 
 Create a standalone crate under `apps/<command>` (include an empty `[workspace]`
-table) and depend on:
+table), commit its `Cargo.lock` (`cargo kex` is locked), and depend on:
 
 ```toml
 [dependencies]
@@ -79,10 +79,10 @@ with a measured, reviewed reason.
 The installed name must match `[a-z0-9][a-z0-9_-]*`:
 
 ```sh
-python3 tools/kex.py build apps/<command> --target all
-python3 tools/kex.py build apps/<command> --target all --check
-python3 tools/kex.py inspect rootfs/bin/x86_64/<command>.kex
-python3 tools/kex.py inspect rootfs/bin/aarch64/<command>.kex
+cargo kex build apps/<command> --target all
+cargo kex build apps/<command> --target all --check
+cargo kex inspect rootfs/bin/x86_64/<command>.kex
+cargo kex inspect rootfs/bin/aarch64/<command>.kex
 ```
 
 The builder pins the freestanding targets and linker policy, validates the ELF,

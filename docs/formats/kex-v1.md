@@ -89,8 +89,8 @@ aggregate resident ceiling.
 
 ## Hosted ELF input contract
 
-`tools/elf2kex.py` is the canonical dependency-free hosted converter. Its input
-is a final, statically linked, little-endian System V ELF64 `ET_EXEC` for
+`tools/troe-kex-tool` is the canonical dependency-free Rust converter. Its
+input is a final, statically linked, little-endian System V ELF64 `ET_EXEC` for
 x86-64 or AArch64 at the fixed KEX image base. Program headers begin at byte 64
 and use 56-byte records. `PT_LOAD` records use 4 KiB-aligned file and virtual
 addresses, are ordered and page-disjoint, and request only R, RX, or RW. The
@@ -110,9 +110,12 @@ validated loads and rechecks canonical layout and exact standard budgets.
 Create or verify an artifact with:
 
 ```console
-python3 tools/elf2kex.py app.elf app.kex --target x86_64
-python3 tools/elf2kex.py app.elf app.kex --target x86_64 --check
+cargo kex convert app.elf app.kex --target x86_64
+cargo kex convert app.elf app.kex --target x86_64 --check
 ```
+
+The prior `tools/elf2kex.py` implementation remains an independent parity and
+rejection oracle during the Rust-tool migration; it is not the build entrypoint.
 
 The shared generated corpus lives under `tests/kex-corpus`; its exact file set
 and bytes are checked with `python3 tools/gen_kex_corpus.py --check`.
