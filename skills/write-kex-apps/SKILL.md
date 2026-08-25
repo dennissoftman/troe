@@ -16,6 +16,8 @@ only as needed. Do not infer POSIX behavior.
   `troe_kex_sdk::exit`.
 - Get `cwd`/`argv` with `CommandContext::invocation`; use only granted
   `stdin`, `stdout`, `stderr`, optional `datagram`, and cooperative `yield_now`.
+- Declare every optional authority in `[package.metadata.troe-kex]`
+  `capabilities`; use `[]` or omit the table when none is needed.
 - No filesystem, environment, clock, raw sockets/device access, threads,
   process spawning, dynamic linking, TLS, signals, or allocator is granted.
 - Never hand-code call gates, startup parsing, handle values, ELF layout, or
@@ -86,7 +88,8 @@ cargo kex inspect rootfs/bin/aarch64/<command>.kex
 ```
 
 The builder pins the freestanding targets and linker policy, validates the ELF,
-converts through strict KEX v1, and installs architecture-specific artifacts.
+converts through strict KEX v1, and installs architecture-specific `.kex` plus
+least-authority `.kcap` artifacts.
 Never copy one architecture's artifact to the other. KEFS assembly projects the
 selected source directory into flat runtime `/bin`; verify both target roots.
 

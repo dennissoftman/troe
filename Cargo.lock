@@ -235,6 +235,7 @@ dependencies = [
 name = "troe-kex-tool"
 version = "0.1.0"
 dependencies = [
+ "troe-abi",
  "troe-application",
 ]
 

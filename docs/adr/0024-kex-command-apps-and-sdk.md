@@ -52,10 +52,15 @@ Repository build outputs remain target-qualified under
 `rootfs/bin/<architecture>/`. KEFS assembly selects exactly one architecture,
 flattens its files into runtime `/bin`, and excludes every other architecture;
 the target-specific kernel still validates the KEX target field before loading.
+Each executable has a canonical KCAP v1 sidecar declaring only its optional
+versioned startup interfaces. Missing, malformed, unsupported, or unavailable
+requirements reject launch; mandatory command and standard-stream context is
+not repeated in the package manifest.
 
 ## Security and efficiency consequences
 
-Authority comes only from startup handles. The SDK exposes no ambient POSIX
+Authority comes only from startup handles selected from the validated package
+manifest. The SDK exposes no ambient POSIX
 environment, dynamic linker, TLS, filesystem, network, clock, allocator, or
 machine-control interface. Apps are `no_std`, abort on panic, use a fixed image
 base, request explicit stack/heap pages, and are statically linked. The hosted

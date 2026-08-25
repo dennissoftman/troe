@@ -112,6 +112,9 @@ cargo kex build apps/echo --target all --check
 cargo kex inspect rootfs/bin/x86_64/echo.kex
 ```
 
+Each installed `.kex` has a canonical `.kcap` sidecar; app manifests declare
+only the optional versioned interfaces they require.
+
 Build deterministic local/QEMU images with reserved test identities:
 
 ```console

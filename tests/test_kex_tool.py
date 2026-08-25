@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import struct
 import subprocess
 import tempfile
 import unittest
@@ -45,6 +46,20 @@ class KexToolTests(unittest.TestCase):
                     self.assertEqual(report["target"], target)
                     self.assertEqual(report["stack_pages"], 4)
                     self.assertEqual(report["heap_pages"], 0)
+                    capability_path = artifact.with_suffix(".kcap")
+                    capability_bytes = capability_path.read_bytes()
+                    self.assertEqual(capability_bytes[:8], b"KCAPv1\0\0")
+                    count, reserved, encoded_bytes = struct.unpack_from(
+                        "<HHI", capability_bytes, 8
+                    )
+                    self.assertEqual(reserved, 0)
+                    self.assertEqual(encoded_bytes, len(capability_bytes))
+                    records = [
+                        struct.unpack_from("<IHH", capability_bytes, 16 + index * 8)
+                        for index in range(count)
+                    ]
+                    expected = [(5, 1, 0)] if command == "udp" else []
+                    self.assertEqual(records, expected)
 
     def test_build_check_uses_pinned_app_contract(self) -> None:
         checked = cargo_kex(

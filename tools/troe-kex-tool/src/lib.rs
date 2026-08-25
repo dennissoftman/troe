@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub use elf::convert_elf;
+use troe_abi::{datagram, interface, requirements};
 use troe_application::{
     ABI_MINOR, ApplicationLimits, KEX_V1_HEADER_BYTES, KEX_V1_IMAGE_BASE, Target, parse_kex,
 };
@@ -87,6 +88,7 @@ struct AppManifest {
     directory: PathBuf,
     binary: String,
     command: String,
+    requirements: Vec<requirements::Requirement>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -324,6 +326,55 @@ fn parse_simple_string(line: &str, key: &str) -> ToolResult<Option<String>> {
     Ok(Some(body.to_owned()))
 }
 
+fn parse_simple_string_array(line: &str, key: &str) -> ToolResult<Option<Vec<String>>> {
+    let Some((candidate, value)) = line.split_once('=') else {
+        return Ok(None);
+    };
+    if candidate.trim() != key {
+        return Ok(None);
+    }
+    let value = value.trim();
+    if !value.starts_with('[') || !value.ends_with(']') {
+        return Err(ToolError::new(format!(
+            "manifest {key} must be one simple string array"
+        )));
+    }
+    let body = value[1..value.len() - 1].trim();
+    if body.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+    let mut values = Vec::new();
+    for raw in body.split(',') {
+        let raw = raw.trim();
+        if raw.len() < 2 || !raw.starts_with('"') || !raw.ends_with('"') {
+            return Err(ToolError::new(format!(
+                "manifest {key} must contain only quoted strings"
+            )));
+        }
+        let value = &raw[1..raw.len() - 1];
+        if value.is_empty() || value.contains(['\\', '"']) {
+            return Err(ToolError::new(format!(
+                "manifest {key} uses unsupported string syntax"
+            )));
+        }
+        values.push(value.to_owned());
+    }
+    Ok(Some(values))
+}
+
+fn capability_requirement(name: &str) -> ToolResult<requirements::Requirement> {
+    match name {
+        "datagram" => Ok(requirements::Requirement {
+            interface: interface::DATAGRAM,
+            major: datagram::MAJOR,
+            minor: datagram::MINOR,
+        }),
+        _ => Err(ToolError::new(format!(
+            "unknown TROE KEX capability '{name}'"
+        ))),
+    }
+}
+
 fn valid_command_name(name: &str) -> bool {
     let mut bytes = name.bytes();
     bytes
@@ -363,6 +414,7 @@ fn read_manifest(app: &Path, requested_command: Option<&str>) -> ToolResult<AppM
     let mut binary = None;
     let mut bin_tables = 0_u8;
     let mut workspace = false;
+    let mut capabilities = None;
     for raw_line in source.lines() {
         let line = raw_line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -390,6 +442,14 @@ fn read_manifest(app: &Path, requested_command: Option<&str>) -> ToolResult<AppM
             && let Some(name) = parse_simple_string(line, "name")?
         {
             binary = Some(name);
+        } else if section == "[package.metadata.troe-kex]"
+            && let Some(names) = parse_simple_string_array(line, "capabilities")?
+        {
+            if capabilities.replace(names).is_some() {
+                return Err(ToolError::new(
+                    "manifest declares capabilities more than once",
+                ));
+            }
         }
     }
     if !workspace {
@@ -413,10 +473,20 @@ fn read_manifest(app: &Path, requested_command: Option<&str>) -> ToolResult<AppM
             "command name must contain only lowercase ASCII, digits, '_' or '-'",
         ));
     }
+    let mut required = capabilities
+        .unwrap_or_default()
+        .iter()
+        .map(|name| capability_requirement(name))
+        .collect::<ToolResult<Vec<_>>>()?;
+    required.sort_unstable_by_key(|requirement| requirement.interface);
+    let mut encoded = [0_u8; requirements::MAX_MANIFEST_BYTES];
+    requirements::encode(&required, &mut encoded)
+        .map_err(|_| ToolError::new("manifest capabilities must be unique and bounded"))?;
     Ok(AppManifest {
         directory,
         binary,
         command,
+        requirements: required,
     })
 }
 
@@ -513,7 +583,17 @@ fn build_one(
     let output = output
         .join(target_name(target))
         .join(format!("{}.kex", manifest.command));
-    write_or_check(&output, &artifact, check, "KEX app")
+    write_or_check(&output, &artifact, check, "KEX app")?;
+    let mut capability_bytes = [0_u8; requirements::MAX_MANIFEST_BYTES];
+    let count = requirements::encode(&manifest.requirements, &mut capability_bytes)
+        .map_err(|_| ToolError::new("cannot encode capability manifest"))?;
+    let capability_output = output.with_extension("kcap");
+    write_or_check(
+        &capability_output,
+        &capability_bytes[..count],
+        check,
+        "KEX capabilities",
+    )
 }
 
 fn execute_build(options: &BuildOptions) -> ToolResult<()> {

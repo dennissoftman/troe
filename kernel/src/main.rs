@@ -21,7 +21,7 @@ mod firmware {
     use core::fmt::Write as _;
     use core::panic::PanicInfo;
 
-    use troe_abi::datagram;
+    use troe_abi::{command, datagram, requirements, stream};
     #[cfg(feature = "acceptance-probes")]
     use troe_application::ParseError;
     use troe_application::{
@@ -320,6 +320,14 @@ mod firmware {
     enum CommandApplicationOutcome {
         Exited(u32),
         Faulted(TaskFault),
+    }
+
+    #[derive(Clone, Copy)]
+    struct CommandStartupService {
+        port: troe_dispatch::PortId,
+        interface: u32,
+        major: u16,
+        minor: u16,
     }
 
     #[derive(Clone, Copy)]
@@ -2107,7 +2115,7 @@ mod firmware {
         scheduler: &mut Scheduler,
         accounting: &mut OwnedAccounting,
         dispatcher: &mut Dispatcher,
-        services: &[(troe_dispatch::PortId, u32)],
+        services: &[CommandStartupService],
         source: &[u8],
     ) -> Result<CommandApplicationOutcome, ()> {
         if services.is_empty() || services.len() > troe_dispatch::MAX_HANDLES {
@@ -2222,16 +2230,16 @@ mod firmware {
             startup_handles
                 .try_reserve_exact(services.len())
                 .map_err(|_| ())?;
-            for (port, interface) in services {
+            for service in services {
                 let handle = dispatcher
-                    .open_owned(*port, Rights::CALL, owner)
+                    .open_owned(service.port, Rights::CALL, owner)
                     .map_err(|_| ())?;
                 startup_handles.push(InitialHandle {
                     value: handle.abi_value(),
                     rights: Rights::CALL.bits(),
-                    interface: *interface,
-                    major: 1,
-                    minor: 0,
+                    interface: service.interface,
+                    major: service.major,
+                    minor: service.minor,
                 });
             }
             transaction
@@ -4043,6 +4051,43 @@ mod firmware {
                     "artifact staging failed",
                 ));
             };
+            let capability_path = alloc::format!("/bin/{command}.kcap");
+            let capability_bytes = match namespace.read_file_bounded(
+                "/",
+                &capability_path,
+                requirements::MAX_MANIFEST_BYTES,
+            ) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return Some(command_application_error(
+                        stderr,
+                        command,
+                        "capability manifest unavailable",
+                    ));
+                }
+            };
+            let Ok(capability_manifest) = requirements::Manifest::parse(&capability_bytes) else {
+                return Some(command_application_error(
+                    stderr,
+                    command,
+                    "capability manifest rejected",
+                ));
+            };
+            let mut datagram_required = false;
+            for requirement in capability_manifest.iter() {
+                if requirement.interface == troe_abi::interface::DATAGRAM
+                    && requirement.major == datagram::MAJOR
+                    && requirement.minor == datagram::MINOR
+                {
+                    datagram_required = true;
+                } else {
+                    return Some(command_application_error(
+                        stderr,
+                        command,
+                        "unsupported capability requirement",
+                    ));
+                }
+            }
             let Ok(input) = read_command_input(stdin) else {
                 return Some(command_application_error(
                     stderr,
@@ -4052,50 +4097,79 @@ mod firmware {
             };
             let retained_stdout = SharedOutput::new(PIPE_CAPACITY);
             let retained_stderr = SharedOutput::new(PIPE_CAPACITY);
-            let network = self.runtime.borrow().network.clone();
-            let Ok(mut dispatcher) = Dispatcher::new(5, 10) else {
+            let network = if datagram_required {
+                let Some(network) = self.runtime.borrow().network.clone() else {
+                    return Some(command_application_error(
+                        stderr,
+                        command,
+                        "required capability unavailable",
+                    ));
+                };
+                Some(network)
+            } else {
+                None
+            };
+            let service_count = 4 + usize::from(datagram_required);
+            let Some(handle_capacity) = service_count.checked_mul(2) else {
                 return Some(command_application_error(
                     stderr,
                     command,
                     "service resources exhausted",
                 ));
             };
-            let services = (|| -> Result<Vec<(troe_dispatch::PortId, u32)>, ()> {
+            let Ok(mut dispatcher) = Dispatcher::new(service_count, handle_capacity) else {
+                return Some(command_application_error(
+                    stderr,
+                    command,
+                    "service resources exhausted",
+                ));
+            };
+            let services = (|| -> Result<Vec<CommandStartupService>, ()> {
                 let mut services = Vec::new();
-                services.try_reserve_exact(5).map_err(|_| ())?;
-                services.push((
-                    register_command_service(
+                services.try_reserve_exact(service_count).map_err(|_| ())?;
+                services.push(CommandStartupService {
+                    port: register_command_service(
                         &mut dispatcher,
                         CommandInvocationService::new(cwd, words).map_err(|_| ())?,
                     )?,
-                    troe_abi::interface::COMMAND,
-                ));
-                services.push((
-                    register_command_service(&mut dispatcher, ByteInputService::new(input))?,
-                    troe_abi::interface::STANDARD_INPUT,
-                ));
-                services.push((
-                    register_command_service(
+                    interface: troe_abi::interface::COMMAND,
+                    major: command::MAJOR,
+                    minor: command::MINOR,
+                });
+                services.push(CommandStartupService {
+                    port: register_command_service(&mut dispatcher, ByteInputService::new(input))?,
+                    interface: troe_abi::interface::STANDARD_INPUT,
+                    major: stream::MAJOR,
+                    minor: stream::MINOR,
+                });
+                services.push(CommandStartupService {
+                    port: register_command_service(
                         &mut dispatcher,
                         ByteOutputService::new(retained_stdout.clone()),
                     )?,
-                    troe_abi::interface::STANDARD_OUTPUT,
-                ));
-                services.push((
-                    register_command_service(
+                    interface: troe_abi::interface::STANDARD_OUTPUT,
+                    major: stream::MAJOR,
+                    minor: stream::MINOR,
+                });
+                services.push(CommandStartupService {
+                    port: register_command_service(
                         &mut dispatcher,
                         ByteOutputService::new(retained_stderr.clone()),
                     )?,
-                    troe_abi::interface::STANDARD_ERROR,
-                ));
+                    interface: troe_abi::interface::STANDARD_ERROR,
+                    major: stream::MAJOR,
+                    minor: stream::MINOR,
+                });
                 if let Some(network) = network {
-                    services.push((
-                        register_command_service(
+                    services.push(CommandStartupService {
+                        port: register_command_service(
                             &mut dispatcher,
                             ApplicationDatagramService::new(network, self.runtime.clone()),
                         )?,
-                        troe_abi::interface::DATAGRAM,
-                    ));
+                        interface: troe_abi::interface::DATAGRAM,
+                        major: datagram::MAJOR,
+                        minor: datagram::MINOR,
+                    });
                 }
                 Ok(services)
             })();

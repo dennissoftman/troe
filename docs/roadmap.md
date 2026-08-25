@@ -242,7 +242,8 @@ command/stdin/stdout/stderr handles.
 fallbacks, while the unknown `kex-echo` name proves general discovery on every
 QEMU composition.
 The repo-local Rust SDK, linker script, canonical dual-target build/inspect
-tool, example source, and concise authoring skill are checked in.
+tool, canonical least-authority KCAP sidecars, example source, and concise
+authoring skill are checked in.
 
 KEX command discovery excludes the permanently intrinsic `cd`, `poweroff`, and
 `reboot` names. `cd` remains a shell-session state transition; the platform
