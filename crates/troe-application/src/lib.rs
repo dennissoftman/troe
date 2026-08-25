@@ -371,7 +371,7 @@ impl ApplicationLayout {
         self.startup_address
     }
 
-    /// First byte of the application's fixed zeroed heap.
+    /// First byte of the application's initially mapped, growable zeroed heap.
     #[must_use]
     pub const fn heap_address(self) -> u64 {
         self.heap_address
@@ -423,7 +423,7 @@ pub struct InitialHandle {
     pub minor: u16,
 }
 
-/// Values placed in the immutable ABI 1.0 startup page.
+/// Values placed in the immutable ABI 1.x startup page.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StartupInfo<'handles> {
     /// Monotonic nonzero task identity selected by the kernel.
@@ -702,7 +702,7 @@ impl<'artifact> LoadPlan<'artifact> {
         self.layout
     }
 
-    /// Encode the immutable ABI 1.0 startup page into a zeroed base page.
+    /// Encode the immutable ABI 1.x startup page into a zeroed base page.
     ///
     /// # Errors
     ///
@@ -740,7 +740,7 @@ impl<'artifact> LoadPlan<'artifact> {
             u16::try_from(info.handles.len()).map_err(|_| StartupPageError::TooManyHandles)?;
         write_u32(destination, 0, encoded_bytes);
         write_u16(destination, 4, ABI_MAJOR);
-        write_u16(destination, 6, ABI_MINOR);
+        write_u16(destination, 6, self.abi_minor);
         write_u32(destination, 8, 4096);
         write_u16(destination, 12, 0);
         write_u16(destination, 14, handle_count);
@@ -1109,7 +1109,12 @@ fn parse_with_limits(
     if reserved_resident_pages > limits.resident_pages {
         return Err(ParseError::ResidentBudgetExceeded);
     }
-    let layout = application_layout(header.stack_pages, header.heap_pages, limits)?;
+    let layout = application_layout(
+        header.stack_pages,
+        header.heap_pages,
+        header.abi_minor,
+        limits,
+    )?;
 
     Ok(LoadPlan {
         target: header.target,
@@ -1134,6 +1139,7 @@ fn parse_with_limits(
 fn application_layout(
     stack_pages: u64,
     heap_pages: u64,
+    abi_minor: u16,
     limits: ApplicationLimits,
 ) -> Result<ApplicationLayout, ParseError> {
     let startup_address = KEX_V1_IMAGE_BASE
@@ -1145,23 +1151,33 @@ fn application_layout(
     let heap_bytes = heap_pages
         .checked_mul(PAGE_SIZE)
         .ok_or(ParseError::ArithmeticOverflow)?;
-    let heap_slot_bytes = limits
-        .heap_pages
-        .checked_mul(PAGE_SIZE)
-        .ok_or(ParseError::ArithmeticOverflow)?;
-    let lower_guard_address = heap_address
-        .checked_add(heap_slot_bytes)
-        .ok_or(ParseError::ArithmeticOverflow)?;
-    let stack_slot_address = lower_guard_address
-        .checked_add(PAGE_SIZE)
-        .ok_or(ParseError::ArithmeticOverflow)?;
     let stack_slot_bytes = limits
         .maximum_stack_pages
         .checked_mul(PAGE_SIZE)
         .ok_or(ParseError::ArithmeticOverflow)?;
-    let upper_guard_address = stack_slot_address
-        .checked_add(stack_slot_bytes)
-        .ok_or(ParseError::ArithmeticOverflow)?;
+    let (lower_guard_address, upper_guard_address) = if abi_minor == 0 {
+        let heap_slot_bytes = limits
+            .heap_pages
+            .checked_mul(PAGE_SIZE)
+            .ok_or(ParseError::ArithmeticOverflow)?;
+        let lower_guard_address = heap_address
+            .checked_add(heap_slot_bytes)
+            .ok_or(ParseError::ArithmeticOverflow)?;
+        let upper_guard_address = lower_guard_address
+            .checked_add(PAGE_SIZE)
+            .and_then(|stack_slot| stack_slot.checked_add(stack_slot_bytes))
+            .ok_or(ParseError::ArithmeticOverflow)?;
+        (lower_guard_address, upper_guard_address)
+    } else {
+        let upper_guard_address = KEX_V1_USER_END
+            .checked_sub(PAGE_SIZE)
+            .ok_or(ParseError::ArithmeticOverflow)?;
+        let lower_guard_address = upper_guard_address
+            .checked_sub(stack_slot_bytes)
+            .and_then(|stack_slot| stack_slot.checked_sub(PAGE_SIZE))
+            .ok_or(ParseError::ArithmeticOverflow)?;
+        (lower_guard_address, upper_guard_address)
+    };
     let stack_bytes = stack_pages
         .checked_mul(PAGE_SIZE)
         .ok_or(ParseError::ArithmeticOverflow)?;
@@ -1171,7 +1187,10 @@ fn application_layout(
     let user_end = upper_guard_address
         .checked_add(PAGE_SIZE)
         .ok_or(ParseError::ArithmeticOverflow)?;
-    if user_end > KEX_V1_USER_END {
+    let initial_heap_end = heap_address
+        .checked_add(heap_bytes)
+        .ok_or(ParseError::ArithmeticOverflow)?;
+    if initial_heap_end > lower_guard_address || user_end > KEX_V1_USER_END {
         return Err(ParseError::ArithmeticOverflow);
     }
     Ok(ApplicationLayout {
@@ -1712,7 +1731,7 @@ mod tests {
             let segments = plan.segments().collect::<Vec<_>>();
 
             assert_eq!(plan.target(), target);
-            assert_eq!(plan.abi_minor(), 0);
+            assert_eq!(plan.abi_minor(), ABI_MINOR);
             assert_eq!(plan.entry_address(), KEX_V1_IMAGE_BASE);
             assert_eq!(segments.len(), 2);
             assert_eq!(segments[0].file_bytes(), [0x90, 0xc3]);
@@ -1837,6 +1856,34 @@ mod tests {
             Err(StartupPageError::TooManyHandles)
         );
         assert_eq!(rejected, original);
+    }
+
+    #[test]
+    fn legacy_startup_page_retains_abi_and_layout() {
+        let current_bytes = valid_artifact(Target::X86_64);
+        let current =
+            parse_standard(&current_bytes, Target::X86_64).unwrap_or_else(|_| unreachable!());
+        let mut legacy_bytes = current_bytes.clone();
+        put_u16(&mut legacy_bytes, HEADER_ABI_MINOR, 0);
+        let legacy =
+            parse_standard(&legacy_bytes, Target::X86_64).unwrap_or_else(|_| unreachable!());
+        let mut legacy_page = [0_u8; PAGE_BYTES];
+        legacy
+            .encode_startup_page(
+                StartupInfo {
+                    task_id: 43,
+                    handles: &[],
+                },
+                &mut legacy_page,
+            )
+            .unwrap_or_else(|_| unreachable!());
+
+        assert_eq!(read_u16(&legacy_page, 6), Ok(0));
+        assert_ne!(legacy.layout().stack_top(), current.layout().stack_top());
+        assert_eq!(
+            legacy.layout().lower_guard_address(),
+            legacy.layout().heap_address() + 4096 * PAGE_SIZE
+        );
     }
 
     #[test]

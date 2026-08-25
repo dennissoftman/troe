@@ -198,7 +198,11 @@ def _rejections(target: str, base: bytes) -> dict[str, tuple[bytes, str]]:
     add("header-reserved32", _put_u32(bytearray(base), 52, 1), "NonzeroReserved")
     add("record-reserved", _put_u32(bytearray(base), 64 + 36, 1), "NonzeroReserved")
     add("abi-major", _put_u16(bytearray(base), 18, 2), "UnsupportedAbi")
-    add("abi-minor", _put_u16(bytearray(base), 20, 1), "UnsupportedAbi")
+    add(
+        "abi-minor",
+        _put_u16(bytearray(base), 20, elf2kex.KEX_ABI_MINOR + 1),
+        "UnsupportedAbi",
+    )
     add(
         "length-mismatch",
         _put_u64(bytearray(base), 56, len(base) + 1),

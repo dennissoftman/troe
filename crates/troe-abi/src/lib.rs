@@ -10,7 +10,7 @@ use core::str;
 /// Application ABI major implemented by the current kernel and SDK.
 pub const ABI_MAJOR: u16 = 1;
 /// Highest compatible application ABI minor implemented by the current kernel and SDK.
-pub const ABI_MINOR: u16 = 0;
+pub const ABI_MINOR: u16 = 1;
 /// Maximum complete request or reply crossing the application call gate.
 pub const MAX_MESSAGE_BYTES: usize = 4 * 1024;
 /// Maximum service payload after the required two-byte opcode.
@@ -265,6 +265,14 @@ pub mod reply {
     pub const OVERFLOW: u32 = 18;
     /// A network exchange returned an invalid protocol response.
     pub const NETWORK_PROTOCOL: u32 = 19;
+}
+
+/// Stable results returned by ABI `grow_heap` (call 3).
+pub mod heap_growth {
+    /// The requested pages were committed and the returned byte length is current.
+    pub const SUCCESS: u32 = 0;
+    /// The per-application resident limit or system frame pool is exhausted.
+    pub const EXHAUSTED: u32 = 1;
 }
 
 /// Stable command exit values understood by the recovery shell.

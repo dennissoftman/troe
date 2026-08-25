@@ -113,7 +113,8 @@ Start exploring with [`apps/echo`](apps/echo) and the
 
 [`apps/lua`](apps/lua) is a complete freestanding Lua 5.5.1 interpreter. It
 streams source from `-e`, stdin, or the bounded read-only filesystem service,
-uses an 8 MiB TLSF application heap, and exposes only base, coroutine, table,
+starts with a 1 MiB TLSF application heap that commits more physical memory on
+demand, and exposes only base, coroutine, table,
 string, math, and UTF-8 libraries. It has no ambient libc, environment,
 process, dynamic-module, OS, or raw filesystem access.
 

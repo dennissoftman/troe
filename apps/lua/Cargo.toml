@@ -10,7 +10,7 @@ build = "build.rs"
 [package.metadata.troe-kex]
 capabilities = ["filesystem-read"]
 stack-pages = 64
-heap-pages = 2048
+heap-pages = 256
 
 [[bin]]
 name = "troe-app-lua"

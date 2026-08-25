@@ -1,11 +1,131 @@
-//! Bounded constant-time allocation for freestanding KEX applications.
+//! Constant-time TLSF allocation over runtime-selected growable backing.
 #![no_std]
 
 use core::{alloc::Layout, ptr::NonNull};
-use rlsf::Tlsf;
+use rlsf::{FlexSource, FlexTlsf};
 use troe_kex_sdk::HeapRegion;
 
-type ApplicationTlsf = Tlsf<'static, u32, u16, 20, 16>;
+const PAGE_BYTES: usize = 4096;
+const GROWTH_QUANTUM_PAGES: usize = 64;
+type ApplicationTlsf<S> = FlexTlsf<S, u32, u16, 20, 16>;
+
+/// Backing-store contract used by the shared KEX heap.
+///
+/// Implementations may commit memory through the KEX ABI, a hosted test pool,
+/// or a future libc virtual-memory layer. The reported capacity must cover the
+/// complete contiguous allocation returned to TLSF.
+///
+/// # Safety
+///
+/// Implementations must uphold [`FlexSource`]'s ownership and in-place growth
+/// contracts and keep every reported byte writable for the heap lifetime.
+pub unsafe trait HeapSource: FlexSource {
+    /// Complete currently committed byte length.
+    fn capacity_bytes(&self) -> usize;
+
+    /// Number of successful backing-store growth operations.
+    fn growths(&self) -> u64;
+}
+
+/// Runtime-neutral source backed by one KEX application's virtual heap slot.
+#[derive(Debug)]
+pub struct ApplicationHeapSource {
+    address: NonNull<u8>,
+    mapped_bytes: usize,
+    issued: bool,
+    growths: u64,
+}
+
+impl ApplicationHeapSource {
+    fn new(address: usize, mapped_bytes: usize) -> Result<Self, InitializationError> {
+        Ok(Self {
+            address: NonNull::new(address as *mut u8).ok_or(InitializationError::RegionTooSmall)?,
+            mapped_bytes,
+            issued: false,
+            growths: 0,
+        })
+    }
+
+    fn grow_to(&mut self, minimum_bytes: usize) -> Option<()> {
+        if minimum_bytes <= self.mapped_bytes {
+            return Some(());
+        }
+        let missing = minimum_bytes.checked_sub(self.mapped_bytes)?;
+        let pages = growth_request_pages(missing)?;
+        if pages == 0 {
+            return Some(());
+        }
+        // SAFETY: `Heap` consumes the unique `HeapRegion` token and serializes
+        // this source behind its mutable borrow. Every successful extension is
+        // immediately returned to the same FlexTLSF instance.
+        let mapped = unsafe { troe_kex_sdk::grow_heap(pages) }.ok()?;
+        if mapped < minimum_bytes || mapped < self.mapped_bytes {
+            return None;
+        }
+        self.mapped_bytes = mapped;
+        self.growths = self.growths.saturating_add(1);
+        Some(())
+    }
+}
+
+fn growth_request_pages(missing_bytes: usize) -> Option<usize> {
+    let required_pages = missing_bytes.checked_add(PAGE_BYTES - 1)? / PAGE_BYTES;
+    Some(required_pages.max(GROWTH_QUANTUM_PAGES))
+}
+
+// SAFETY: The unique source owns one grow-only KEX virtual heap slot. The ABI
+// never moves or unmaps committed pages during the application lifetime.
+unsafe impl FlexSource for ApplicationHeapSource {
+    unsafe fn alloc(&mut self, minimum_bytes: usize) -> Option<NonNull<[u8]>> {
+        if self.issued {
+            return None;
+        }
+        self.grow_to(minimum_bytes)?;
+        self.issued = true;
+        Some(NonNull::slice_from_raw_parts(
+            self.address,
+            self.mapped_bytes,
+        ))
+    }
+
+    unsafe fn realloc_inplace_grow(
+        &mut self,
+        allocation: NonNull<[u8]>,
+        minimum_bytes: usize,
+    ) -> Option<usize> {
+        if allocation.as_ptr().cast::<u8>() != self.address.as_ptr()
+            || allocation.len() != self.mapped_bytes
+        {
+            return None;
+        }
+        self.grow_to(minimum_bytes)?;
+        Some(self.mapped_bytes)
+    }
+
+    fn supports_realloc_inplace_grow(&self) -> bool {
+        true
+    }
+
+    fn is_contiguous_growable(&self) -> bool {
+        true
+    }
+
+    fn min_align(&self) -> usize {
+        PAGE_BYTES
+    }
+}
+
+// SAFETY: Capacity and growth counters describe the same allocation managed by
+// the `FlexSource` implementation above.
+unsafe impl HeapSource for ApplicationHeapSource {
+    fn capacity_bytes(&self) -> usize {
+        self.mapped_bytes
+    }
+
+    fn growths(&self) -> u64 {
+        self.growths
+    }
+}
 
 /// Failure to initialize an allocator from the application's heap token.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,22 +153,24 @@ pub struct Statistics {
     pub deallocations: u64,
     /// Successful reallocations to nonzero sizes.
     pub reallocations: u64,
-    /// Allocation or reallocation requests rejected by the bounded pool.
+    /// Allocation or reallocation requests rejected after backing growth failed.
     pub failures: u64,
     /// Requested bytes copied when reallocation had to move a block.
     pub moved_bytes: u64,
+    /// Successful backing-store growth operations.
+    pub growths: u64,
 }
 
 /// One TLSF allocator owning one validated KEX heap region.
 ///
 /// Allocation and deallocation are constant time. Reallocation is constant
 /// time when it can resize in place and linear only when it must copy a block.
-pub struct Heap {
-    tlsf: ApplicationTlsf,
+pub struct Heap<S: HeapSource = ApplicationHeapSource> {
+    tlsf: ApplicationTlsf<S>,
     statistics: Statistics,
 }
 
-impl Heap {
+impl Heap<ApplicationHeapSource> {
     /// Consume a validated single-owner heap token and initialize TLSF in it.
     ///
     /// # Errors
@@ -64,17 +186,34 @@ impl Heap {
     }
 
     unsafe fn from_raw_parts(address: usize, byte_len: usize) -> Result<Self, InitializationError> {
-        let mut tlsf = ApplicationTlsf::new();
-        let start = NonNull::new(address as *mut u8).ok_or(InitializationError::RegionTooSmall)?;
-        let block = NonNull::slice_from_raw_parts(start, byte_len);
-        // SAFETY: The caller guarantees exclusive ownership of this writable
-        // region for the allocator's full lifetime.
-        let accepted = unsafe { tlsf.insert_free_block_ptr(block) }
+        let source = ApplicationHeapSource::new(address, byte_len)?;
+        Self::with_source(source)
+    }
+}
+
+impl<S: HeapSource> Heap<S> {
+    /// Initialize a heap from a runtime-specific growable backing store.
+    ///
+    /// This is the reusable construction point for libc and hosted tests.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InitializationError::RegionTooSmall`] when the source cannot
+    /// provide TLSF's minimum pool representation.
+    pub fn with_source(source: S) -> Result<Self, InitializationError> {
+        let mut tlsf = ApplicationTlsf::new(source);
+        let bootstrap_layout =
+            Layout::from_size_align(1, 1).map_err(|_| InitializationError::RegionTooSmall)?;
+        let bootstrap = tlsf
+            .allocate(bootstrap_layout)
             .ok_or(InitializationError::RegionTooSmall)?;
+        // SAFETY: `bootstrap` was just allocated with alignment one.
+        unsafe { tlsf.deallocate(bootstrap, 1) };
+        let capacity_bytes = tlsf.source_ref().capacity_bytes();
         Ok(Self {
             tlsf,
             statistics: Statistics {
-                capacity_bytes: accepted.get(),
+                capacity_bytes,
                 ..Statistics::default()
             },
         })
@@ -88,10 +227,12 @@ impl Heap {
 
     /// Allocate one block satisfying `layout`.
     ///
-    /// Returns `None` without changing existing allocations when the bounded
-    /// heap has insufficient contiguous space or the size cannot be represented.
+    /// Returns `None` without changing existing allocations when backing growth
+    /// cannot provide enough contiguous virtual space or the size cannot be
+    /// represented.
     pub fn allocate(&mut self, layout: Layout) -> Option<NonNull<u8>> {
         let pointer = self.tlsf.allocate(layout);
+        self.sync_source_statistics();
         if pointer.is_some() {
             self.statistics.allocations = self.statistics.allocations.saturating_add(1);
             self.add_live_bytes(layout.size());
@@ -140,6 +281,7 @@ impl Heap {
         };
         // SAFETY: The caller upholds TLSF's pointer and alignment contract.
         let resized = unsafe { self.tlsf.reallocate(pointer, new_layout) };
+        self.sync_source_statistics();
         let Some(new_pointer) = resized else {
             self.statistics.failures = self.statistics.failures.saturating_add(1);
             return None;
@@ -163,18 +305,86 @@ impl Heap {
             .high_water_bytes
             .max(self.statistics.live_bytes);
     }
+
+    fn sync_source_statistics(&mut self) {
+        self.statistics.capacity_bytes = self.tlsf.source_ref().capacity_bytes();
+        self.statistics.growths = self.tlsf.source_ref().growths();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     extern crate std;
 
-    use super::Heap;
+    use super::{Heap, HeapSource, growth_request_pages};
     use core::{alloc::Layout, mem::MaybeUninit, ptr::NonNull};
+    use rlsf::FlexSource;
     use std::vec::Vec;
 
-    #[repr(align(64))]
+    #[repr(align(4096))]
     struct Pool<const N: usize>([MaybeUninit<u8>; N]);
+
+    struct TestSource {
+        start: NonNull<u8>,
+        mapped: usize,
+        maximum: usize,
+        issued: bool,
+        growths: u64,
+    }
+
+    // SAFETY: Tests keep the aligned backing pool alive and access it only
+    // through the heap. Growth reveals an already allocated contiguous suffix.
+    unsafe impl FlexSource for TestSource {
+        unsafe fn alloc(&mut self, minimum: usize) -> Option<NonNull<[u8]>> {
+            if self.issued || minimum > self.mapped {
+                return None;
+            }
+            self.issued = true;
+            Some(NonNull::slice_from_raw_parts(self.start, self.mapped))
+        }
+
+        unsafe fn realloc_inplace_grow(
+            &mut self,
+            allocation: NonNull<[u8]>,
+            minimum: usize,
+        ) -> Option<usize> {
+            if allocation.as_ptr().cast::<u8>() != self.start.as_ptr()
+                || allocation.len() != self.mapped
+                || minimum > self.maximum
+            {
+                return None;
+            }
+            self.mapped = minimum.checked_add(4095)? / 4096 * 4096;
+            if self.mapped > self.maximum {
+                return None;
+            }
+            self.growths += 1;
+            Some(self.mapped)
+        }
+
+        fn supports_realloc_inplace_grow(&self) -> bool {
+            true
+        }
+
+        fn is_contiguous_growable(&self) -> bool {
+            true
+        }
+
+        fn min_align(&self) -> usize {
+            64
+        }
+    }
+
+    // SAFETY: Counters report the exact test allocation managed above.
+    unsafe impl HeapSource for TestSource {
+        fn capacity_bytes(&self) -> usize {
+            self.mapped
+        }
+
+        fn growths(&self) -> u64 {
+            self.growths
+        }
+    }
 
     fn heap<const N: usize>(pool: &mut Pool<N>) -> Heap {
         // SAFETY: Each test passes a unique, live, aligned pool which outlives
@@ -265,5 +475,60 @@ mod tests {
         assert!(unsafe { heap.reallocate(pointer, layout, 0) }.is_none());
         assert_eq!(heap.statistics().live_bytes, 0);
         assert_eq!(heap.statistics().deallocations, 1);
+    }
+
+    #[test]
+    fn grows_a_generic_backing_source_and_preserves_allocations() {
+        let mut pool = Pool([MaybeUninit::uninit(); 16 * 1024]);
+        let source = TestSource {
+            start: NonNull::new(pool.0.as_mut_ptr().cast::<u8>()).unwrap_or_else(|| unreachable!()),
+            mapped: 4096,
+            maximum: 16 * 1024,
+            issued: false,
+            growths: 0,
+        };
+        let mut heap = Heap::with_source(source).unwrap_or_else(|_| unreachable!());
+        let first_layout = Layout::from_size_align(3000, 16).unwrap_or_else(|_| unreachable!());
+        let first = heap
+            .allocate(first_layout)
+            .unwrap_or_else(|| unreachable!());
+        // SAFETY: `first` owns 3000 writable bytes.
+        unsafe { first.as_ptr().write_bytes(0xa5, first_layout.size()) };
+        let second_layout =
+            Layout::from_size_align(8 * 1024, 64).unwrap_or_else(|_| unreachable!());
+        let second = heap
+            .allocate(second_layout)
+            .unwrap_or_else(|| unreachable!());
+        assert!(second.as_ptr() as usize >= first.as_ptr() as usize + first_layout.size());
+        // SAFETY: The first allocation remains live across source growth.
+        let prefix = unsafe { core::slice::from_raw_parts(first.as_ptr(), first_layout.size()) };
+        assert!(prefix.iter().all(|byte| *byte == 0xa5));
+        assert!(heap.statistics().capacity_bytes > 4096);
+        assert_eq!(heap.statistics().growths, 1);
+    }
+
+    #[test]
+    fn oversized_growth_is_rejected_without_partial_capacity_change() {
+        let mut pool = Pool([MaybeUninit::uninit(); 16 * 1024]);
+        let source = TestSource {
+            start: NonNull::new(pool.0.as_mut_ptr().cast::<u8>()).unwrap_or_else(|| unreachable!()),
+            mapped: 4096,
+            maximum: 8 * 1024,
+            issued: false,
+            growths: 0,
+        };
+        let mut heap = Heap::with_source(source).unwrap_or_else(|_| unreachable!());
+        let oversized = Layout::from_size_align(12 * 1024, 64).unwrap_or_else(|_| unreachable!());
+        assert!(heap.allocate(oversized).is_none());
+        assert_eq!(heap.statistics().capacity_bytes, 4096);
+        assert_eq!(heap.statistics().growths, 0);
+        assert_eq!(heap.statistics().failures, 1);
+    }
+
+    #[test]
+    fn large_request_is_not_split_into_growth_quanta() {
+        assert_eq!(growth_request_pages(1), Some(64));
+        assert_eq!(growth_request_pages(256 * 1024), Some(64));
+        assert_eq!(growth_request_pages(100 * 1024 * 1024), Some(25_600));
     }
 }

@@ -17,8 +17,8 @@ use troe_abi::{
     network_configuration, network_observation, requirements, tcp_connect, timer,
 };
 use troe_application::{
-    ABI_MINOR, KEX_PACKAGE_V1_MAGIC, KEX_V1_HEADER_BYTES, KEX_V1_IMAGE_BASE, KEX_V1_MAGIC,
-    MAX_KEX_PACKAGE_BYTES, Target, encode_kex_package, parse_kex, parse_kex_package,
+    ABI_MAJOR, ABI_MINOR, KEX_PACKAGE_V1_MAGIC, KEX_V1_HEADER_BYTES, KEX_V1_IMAGE_BASE,
+    KEX_V1_MAGIC, MAX_KEX_PACKAGE_BYTES, Target, encode_kex_package, parse_kex, parse_kex_package,
 };
 
 const DEFAULT_STACK_PAGES: u32 = 4;
@@ -122,6 +122,7 @@ struct ConvertOptions {
 struct InspectReport {
     package: bool,
     target: Target,
+    abi_minor: u16,
     bytes: usize,
     executable_bytes: usize,
     requirements: usize,
@@ -775,6 +776,7 @@ fn inspect(path: &Path) -> ToolResult<InspectReport> {
     Ok(InspectReport {
         package,
         target,
+        abi_minor: plan.abi_minor(),
         bytes: artifact.len(),
         executable_bytes: executable.len(),
         requirements,
@@ -808,7 +810,8 @@ fn execute_inspect(arguments: &mut Arguments) -> ToolResult<()> {
     };
     if json {
         println!(
-            "{{\"abi\":\"1.0\",\"bytes\":{},\"entry_offset\":{},\"executable_bytes\":{},\"executable_format\":\"KEX v1\",\"format\":\"{format}\",\"heap_pages\":{},\"records\":{},\"requirements\":{},\"stack_pages\":{},\"target\":\"{}\"}}",
+            "{{\"abi\":\"{ABI_MAJOR}.{}\",\"bytes\":{},\"entry_offset\":{},\"executable_bytes\":{},\"executable_format\":\"KEX v1\",\"format\":\"{format}\",\"heap_pages\":{},\"records\":{},\"requirements\":{},\"stack_pages\":{},\"target\":\"{}\"}}",
+            report.abi_minor,
             report.bytes,
             report.entry_offset,
             report.executable_bytes,
@@ -820,8 +823,9 @@ fn execute_inspect(arguments: &mut Arguments) -> ToolResult<()> {
         );
     } else {
         println!(
-            "{format}; target={}; ABI=1.0; bytes={}; executable={} bytes; requirements={}; records={}; entry={:#x}; stack={} pages; heap={} pages",
+            "{format}; target={}; ABI={ABI_MAJOR}.{}; bytes={}; executable={} bytes; requirements={}; records={}; entry={:#x}; stack={} pages; heap={} pages",
             target_name(report.target),
+            report.abi_minor,
             report.bytes,
             report.executable_bytes,
             report.requirements,

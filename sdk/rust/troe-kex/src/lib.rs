@@ -7,7 +7,9 @@ pub use troe_abi::{
     ABI_MAJOR, ABI_MINOR, command, datagram, diagnostics, exit, filesystem, filesystem_mutation,
     icmp_echo, network_configuration, network_observation, tcp_connect, timer,
 };
-use troe_abi::{MAX_MESSAGE_BYTES, MAX_SERVICE_PAYLOAD_BYTES, interface, reply, stream};
+use troe_abi::{
+    MAX_MESSAGE_BYTES, MAX_SERVICE_PAYLOAD_BYTES, heap_growth, interface, reply, stream,
+};
 
 const STARTUP_PAGE_BYTES: usize = 4096;
 const STARTUP_HEADER_BYTES: usize = 64;
@@ -15,13 +17,15 @@ const STARTUP_HANDLE_BYTES: usize = 24;
 const CALL_RIGHT: u32 = 1;
 const KEX_IMAGE_BASE: u64 = 0x0000_4000_0000_0000;
 const KEX_IMAGE_SPAN_BYTES: u64 = 128 * 1024 * 1024;
-const KEX_HEAP_SLOT_BYTES: u64 = 4096 * STARTUP_PAGE_BYTES as u64;
+const KEX_USER_END: u64 = 0x0000_8000_0000_0000;
 const KEX_MAXIMUM_STACK_BYTES: u64 = 256 * STARTUP_PAGE_BYTES as u64;
 const KEX_MINIMUM_STACK_BYTES: u64 = 4 * STARTUP_PAGE_BYTES as u64;
 const KEX_STARTUP_ADDRESS: u64 = KEX_IMAGE_BASE + KEX_IMAGE_SPAN_BYTES;
 const KEX_HEAP_ADDRESS: u64 = KEX_STARTUP_ADDRESS + STARTUP_PAGE_BYTES as u64;
-const KEX_STACK_TOP: u64 =
-    KEX_HEAP_ADDRESS + KEX_HEAP_SLOT_BYTES + STARTUP_PAGE_BYTES as u64 + KEX_MAXIMUM_STACK_BYTES;
+const KEX_STACK_TOP: u64 = KEX_USER_END - STARTUP_PAGE_BYTES as u64;
+const KEX_LOWER_STACK_GUARD: u64 =
+    KEX_STACK_TOP - KEX_MAXIMUM_STACK_BYTES - STARTUP_PAGE_BYTES as u64;
+const KEX_HEAP_SLOT_BYTES: u64 = KEX_LOWER_STACK_GUARD - KEX_HEAP_ADDRESS;
 
 /// Maximum stack buffer needed to receive one command invocation.
 pub const INVOCATION_BUFFER_BYTES: usize = command::MAX_INVOCATION_BYTES;
@@ -402,6 +406,43 @@ impl CommandContext {
 /// Reports an invalid kernel completion or a non-freestanding host build.
 pub fn yield_now() -> Result<(), Error> {
     native_yield()
+}
+
+/// Commit at least `minimum_additional_pages` after the currently mapped heap.
+///
+/// The operation is grow-only. Successful pages are zeroed by the kernel and
+/// the returned value is the complete current mapped heap length in bytes.
+/// This primitive is runtime-neutral; allocators and a future libc can build
+/// `sbrk`-like policy on it without exposing physical-memory layout.
+///
+/// # Safety
+///
+/// The caller must exclusively own the startup [`HeapRegion`], serialize all
+/// heap access, and incorporate every successful extension into the same
+/// allocator before requesting another one.
+///
+/// # Errors
+///
+/// Returns [`Error::Exhausted`] when system frames, commit metadata, or the
+/// remaining user virtual range are unavailable. Other failures indicate an
+/// invalid ABI completion or an unsupported hosted target.
+pub unsafe fn grow_heap(minimum_additional_pages: usize) -> Result<usize, Error> {
+    if minimum_additional_pages == 0 {
+        return Err(Error::InvalidCall);
+    }
+    let pages = u64::try_from(minimum_additional_pages).map_err(|_| Error::InvalidCall)?;
+    let (status, mapped_bytes) = native_grow_heap(pages)?;
+    match status {
+        heap_growth::SUCCESS
+            if mapped_bytes != 0
+                && u64::try_from(mapped_bytes).is_ok_and(|bytes| bytes <= KEX_HEAP_SLOT_BYTES)
+                && mapped_bytes.is_multiple_of(STARTUP_PAGE_BYTES) =>
+        {
+            Ok(mapped_bytes)
+        }
+        heap_growth::EXHAUSTED if mapped_bytes == 0 => Err(Error::Exhausted),
+        _ => Err(Error::InvalidCall),
+    }
 }
 
 /// Read-only standard-input client.
@@ -1356,6 +1397,53 @@ fn native_yield() -> Result<(), Error> {
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn native_grow_heap(minimum_pages: u64) -> Result<(u32, usize), Error> {
+    let mut status = 3_u64;
+    let mut mapped_bytes = 0_u64;
+    // SAFETY: Call 3 carries only scalar arguments. The kernel commits zeroed
+    // pages before returning the new mapped length under a fresh lease.
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") status,
+            in("rdi") minimum_pages,
+            in("rsi") 0_u64,
+            inlateout("rdx") mapped_bytes,
+            in("r10") 0_u64,
+            in("r8") 0_u64,
+            options(nostack),
+        );
+    }
+    Ok((status as u32, mapped_bytes as usize))
+}
+
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
+fn native_grow_heap(minimum_pages: u64) -> Result<(u32, usize), Error> {
+    let mut status = minimum_pages;
+    let mut mapped_bytes = 0_u64;
+    // SAFETY: Call 3 carries only scalar arguments. The kernel commits zeroed
+    // pages before returning the new mapped length under a fresh lease.
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") 3_u64,
+            inlateout("x0") status,
+            inlateout("x1") mapped_bytes,
+            in("x2") 0_u64,
+            in("x3") 0_u64,
+            in("x4") 0_u64,
+            options(nostack),
+        );
+    }
+    Ok((status as u32, mapped_bytes as usize))
+}
+
+#[cfg(not(target_os = "none"))]
+fn native_grow_heap(_minimum_pages: u64) -> Result<(u32, usize), Error> {
+    Err(Error::UnsupportedTarget)
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 fn native_exit(status: u32) -> ! {
     // SAFETY: Call 0 consumes only the scalar status and never resumes.
     unsafe {
@@ -1416,7 +1504,7 @@ mod tests {
     extern crate std;
 
     use super::{
-        ABI_MAJOR, CommandContext, HeapRegion, KEX_HEAP_ADDRESS, KEX_STACK_TOP,
+        ABI_MAJOR, ABI_MINOR, CommandContext, HeapRegion, KEX_HEAP_ADDRESS, KEX_STACK_TOP,
         STARTUP_HANDLE_BYTES, STARTUP_HEADER_BYTES, STARTUP_PAGE_BYTES, Startup, StartupError,
         interface,
     };
@@ -1426,6 +1514,7 @@ mod tests {
         let encoded = STARTUP_HEADER_BYTES + interfaces.len() * STARTUP_HANDLE_BYTES;
         page[0..4].copy_from_slice(&u32::try_from(encoded).unwrap_or(u32::MAX).to_le_bytes());
         page[4..6].copy_from_slice(&ABI_MAJOR.to_le_bytes());
+        page[6..8].copy_from_slice(&ABI_MINOR.to_le_bytes());
         page[8..12].copy_from_slice(&4096_u32.to_le_bytes());
         page[14..16].copy_from_slice(
             &u16::try_from(interfaces.len())

@@ -143,7 +143,8 @@ one ABI major and the minimum minor it needs. A kernel may load it only when the
 major is equal and the kernel's supported minor is at least the requested
 minor. Existing calls, layouts, status meanings, and rights may only be
 extended compatibly within a major. Removing or reinterpreting any of them
-requires a new major. The first implementation exposes ABI 1.0 only.
+requires a new major. The current implementation exposes ABI 1.1; applications
+requiring only 1.0 remain compatible.
 
 The kernel maps one immutable, read-only/non-executable startup page and enters
 the raw `_start(startup_address, startup_bytes) -> !` boundary. On x86-64,
@@ -166,7 +167,7 @@ startup page uses fixed-width little-endian fields and contains:
   handle value, rights, interface identifier, and interface major/minor.
 
 There are no ambient arguments, environment, filesystem namespace, devices, or
-kernel pointers in ABI 1.0. Initial handles are the intersection of explicit
+kernel pointers in ABI v1. Initial handles are the intersection of explicit
 loader policy and the launching principal's authority. KEX cannot grant or
 request authority by itself.
 
@@ -179,7 +180,7 @@ call numbers are unsigned fixed-width ABI values, not host `usize`, Rust enum,
 or POSIX errno representations. A returning call preserves every other
 application-visible register.
 
-ABI 1.0 defines exactly three calls:
+ABI 1.0 defines three calls:
 
 0. `exit(status)` takes one unsigned 32-bit status, terminates the application,
    and never resumes it;
@@ -188,6 +189,26 @@ ABI 1.0 defines exactly three calls:
 2. `handle_call(handle, request_address, request_bytes, reply_address,
    reply_capacity)` performs one synchronous request/reply through a granted
    handle and returns a typed status plus reply length.
+
+ABI 1.1 compatibly adds:
+
+3. `grow_heap(minimum_additional_pages)` commits at least the requested number
+   of zeroed base pages immediately after the mapped heap prefix and returns a
+   typed status plus the complete current mapped heap length in bytes.
+
+Heap growth is grow-only and all-or-nothing for ordinary exhaustion. The
+kernel first secures and zeroes every requested frame, preferring one physical
+extent and falling back to discontiguous extents, maps them into the already
+reserved contiguous virtual heap slot, updates retained task accounting, and
+only then resumes success. A request beyond the available frame pool or
+remaining user virtual address space returns `EXHAUSTED` with no new committed
+pages. A large allocation submits its complete page deficit in one call; only
+small requests are rounded up to the allocator's 256 KiB batching floor. There
+is no fixed lifetime heap-size policy: without swap or demand paging,
+successful growth is limited by physical frames actually available at commit
+time. An internal mapping or accounting failure is terminal and follows
+ordinary contained teardown rather than resuming a partially updated
+application.
 
 The copied request begins with a little-endian unsigned 16-bit service opcode;
 the remaining bytes are the service payload. The reply buffer receives only
@@ -209,12 +230,12 @@ reported as a contained unexpected-return fault. Applications must call
 
 ### Memory and retained-resource budgets
 
-All sizes below are hard compile-time ceilings. An application may request less
-stack or heap, and the loader may impose a smaller launch policy, but neither a
-manifest nor detected RAM may raise these limits. Guard pages consume virtual
-space but no frames. The total resident ceiling includes image, startup, heap,
-stack, and application page-table frames. Kernel staging is separately bounded
-and is released before entry.
+The launch-time sizes below are hard compile-time ceilings for staging and the
+initial image. An application may request less initial stack or heap. Guard
+pages and the growable heap gap consume virtual space but no frames. Runtime
+heap and supplemental page-table commits are instead limited by available
+physical memory and the remaining user virtual range. Kernel staging is
+separately bounded and is released before entry.
 
 | Limit | Standard |
 | --- | ---: |
@@ -224,18 +245,22 @@ and is released before entry.
 | Image virtual span | 128 MiB |
 | Mapped image pages | 8,192 |
 | Initial stack pages | 4–256 |
-| Zeroed heap pages | 0–4,096 |
-| Application page-table pages | 512 |
-| Total resident pages | 16,384 (64 MiB) |
+| Initially mapped heap pages | 0–4,096 (0–16 MiB) |
+| Runtime heap commit | available physical frames; no fixed lifetime byte cap |
+| Initial application page-table reservation | 512 pages; grows with mappings |
+| Initial resident-page admission | 16,384 (64 MiB) |
 | Initial handles | 32 |
 
-There is one application resource policy. These values are safety maxima, not
-boot-time reservations or a machine-size selector. Every launch charges its
+There is one initial application resource policy. These values are launch
+safety maxima, not a machine-size selector. Every launch charges its
 exact staging, image, startup, heap, and stack ownership, plus bounded table,
 task, address-space, and handle capacity before commit. There is no overcommit,
-demand paging, stack growth, `brk`, `mmap`, shared page, or runtime
-executable-memory operation in ABI 1.0. An SDK allocator may manage only the
-fixed zeroed heap described by the startup page.
+demand paging, stack growth, arbitrary `brk`, `mmap`, shared page, or runtime
+executable-memory operation in ABI v1. ABI 1.1's sole virtual-memory mutation
+is committed growth inside the unused virtual gap before the guarded stack.
+The startup page describes
+the initially mapped prefix; a shared allocator or future libc may request
+additional committed pages through call 3.
 
 The loader first copies at most the encoded-byte ceiling into kernel-owned
 staging memory, parses and validates the complete artifact into a bounded load
@@ -325,7 +350,7 @@ than reuse Stage 6's native isolation. An indefinitely cooperative policy was
 rejected because malformed external code would otherwise retain the only CPU
 without returning control to the scheduler.
 
-ABI 1.0 is deliberately sufficient for bounded service clients, not a POSIX
+ABI 1.1 is deliberately sufficient for bounded service clients, not a POSIX
 process model. Arguments, environment, persistent package identity, clocks,
 threads, shared memory, dynamic libraries, signals, executable memory, and
 driver/device ABIs require later decisions and compatible minor additions or a

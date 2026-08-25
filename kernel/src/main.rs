@@ -22,7 +22,7 @@ mod firmware {
     use core::panic::PanicInfo;
 
     use troe_abi::{
-        command, datagram, diagnostics, filesystem, filesystem_mutation, icmp_echo,
+        command, datagram, diagnostics, filesystem, filesystem_mutation, heap_growth, icmp_echo,
         network_configuration, network_observation, stream, tcp_connect, timer,
     };
     #[cfg(feature = "acceptance-probes")]
@@ -50,8 +50,8 @@ mod firmware {
     use troe_gpt::{GptGuid, GptLimits, discover};
     use troe_identity::IdentityLimits;
     use troe_memory::{
-        BASE_PAGE_SIZE, BootAllocator, FrameAllocator, MAX_FIRMWARE_REGIONS, Mapping,
-        MappingLifetime, MappingMemoryType, MappingOwner, MappingPermissions, MappingPlan,
+        BASE_PAGE_SIZE, BootAllocator, FrameAllocationError, FrameAllocator, MAX_FIRMWARE_REGIONS,
+        Mapping, MappingLifetime, MappingMemoryType, MappingOwner, MappingPermissions, MappingPlan,
         MemoryMapStats, MemoryRegion, NormalizedMemoryMap, PhysicalRange, RegionKind, VirtualRange,
     };
     use troe_mount::{BootMountManifest, parse_manifest};
@@ -534,7 +534,17 @@ mod firmware {
         image: PhysicalRange,
         startup: PhysicalRange,
         heap: Option<PhysicalRange>,
+        growth_ranges: Vec<PhysicalRange>,
+        growth_table_frames: Vec<u64>,
         stack: PhysicalRange,
+    }
+
+    enum ApplicationGrowth {
+        Committed {
+            stats: troe_machine::MmuStats,
+            mapped_bytes: u64,
+        },
+        Exhausted,
     }
 
     #[derive(Clone, Copy, Eq, PartialEq)]
@@ -704,6 +714,8 @@ mod firmware {
 
         let map = normalized.stats();
         let mut frames = FrameAllocator::from_map(&normalized).map_err(|_| ())?;
+        let null_page = PhysicalRange::from_pages(0, 1).map_err(|_| ())?;
+        frames.reserve_range(null_page).map_err(|_| ())?;
         if let Some(framebuffer) = framebuffer {
             frames
                 .reserve_range(framebuffer_device_range(framebuffer)?)
@@ -1630,8 +1642,8 @@ mod firmware {
         probe: IsolationProbe,
         address_space_slot: u8,
     ) -> Result<u64, ()> {
-        let table_pages = u16::try_from(ISOLATED_TABLE_PAGES).map_err(|_| ())?;
-        let private_pages = u16::try_from(ISOLATED_PRIVATE_PAGES).map_err(|_| ())?;
+        let table_pages = ISOLATED_TABLE_PAGES;
+        let private_pages = ISOLATED_PRIVATE_PAGES;
         let stack_pages = u16::try_from(ISOLATED_STACK_PAGES).map_err(|_| ())?;
         let isolation = IsolationResource::new(address_space_slot, table_pages, private_pages, 1)
             .map_err(|_| ())?;
@@ -1917,7 +1929,7 @@ mod firmware {
             .count()
             .checked_add(fixed_user_regions)
             .ok_or(())?;
-        let private_pages = u16::try_from(plan.charges().private_pages()).map_err(|_| ())?;
+        let private_pages = plan.charges().private_pages();
         let stack_pages = u16::try_from(plan.stack_pages()).map_err(|_| ())?;
 
         let Ok(allocation) = allocate_application(&mut accounting.frames, &plan) else {
@@ -1965,12 +1977,9 @@ mod firmware {
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         }
-        let Ok(table_pages) = u16::try_from(table_pages) else {
-            reclaim_application(&mut accounting.frames, allocation)?;
-            clear_provisional_loader_ownership(&mut transaction);
-            return Err(());
-        };
-        let Ok(isolation) = IsolationResource::new(0, table_pages, private_pages, 1) else {
+        let retained_table_pages = allocation.tables.page_count();
+        let Ok(isolation) = IsolationResource::new(0, retained_table_pages, private_pages, 1)
+        else {
             reclaim_application(&mut accounting.frames, allocation)?;
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
@@ -2245,10 +2254,17 @@ mod firmware {
             .count()
             .checked_add(fixed_user_regions)
             .ok_or(())?;
-        let private_pages = u16::try_from(plan.charges().private_pages()).map_err(|_| ())?;
+        let heap_start = plan.layout().heap_address();
+        let maximum_heap_pages = plan
+            .layout()
+            .lower_guard_address()
+            .checked_sub(heap_start)
+            .ok_or(())?
+            / BASE_PAGE_SIZE;
+        let private_pages = plan.charges().private_pages();
         let stack_pages = u16::try_from(plan.stack_pages()).map_err(|_| ())?;
 
-        let Ok(allocation) = allocate_application(&mut accounting.frames, &plan) else {
+        let Ok(mut allocation) = allocate_application(&mut accounting.frames, &plan) else {
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
@@ -2293,9 +2309,10 @@ mod firmware {
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         }
-        let table_pages = u16::try_from(table_pages).map_err(|_| ())?;
         let handle_count = u16::try_from(services.len()).map_err(|_| ())?;
-        let Ok(isolation) = IsolationResource::new(0, table_pages, private_pages, handle_count)
+        let retained_table_pages = allocation.tables.page_count();
+        let Ok(mut isolation) =
+            IsolationResource::new(0, retained_table_pages, private_pages, handle_count)
         else {
             reclaim_application(&mut accounting.frames, allocation)?;
             clear_provisional_loader_ownership(&mut transaction);
@@ -2471,6 +2488,68 @@ mod firmware {
                         )
                         .map_err(|_| ())?;
                     }
+                    troe_machine::ApplicationOutcome::HeapGrow {
+                        mut application,
+                        request,
+                    } => {
+                        match commit_application_heap_growth(
+                            &mut accounting.frames,
+                            &mut allocation,
+                            &mut application,
+                            heap_start,
+                            maximum_heap_pages,
+                            request.minimum_pages(),
+                        )? {
+                            ApplicationGrowth::Committed {
+                                stats,
+                                mapped_bytes,
+                            } => {
+                                let grown_private_pages = private_pages
+                                    .checked_add(application_growth_pages(&allocation)?)
+                                    .ok_or(())?;
+                                let grown_table_pages = allocation
+                                    .tables
+                                    .page_count()
+                                    .checked_add(
+                                        u64::try_from(allocation.growth_table_frames.len())
+                                            .map_err(|_| ())?,
+                                    )
+                                    .ok_or(())?;
+                                if stats.table_pages > grown_table_pages {
+                                    return Err(());
+                                }
+                                let grown_isolation = IsolationResource::new(
+                                    isolation.slot(),
+                                    grown_table_pages,
+                                    grown_private_pages,
+                                    isolation.handles(),
+                                )
+                                .map_err(|_| ())?;
+                                scheduler
+                                    .resize_current_isolation(task_id, grown_isolation)
+                                    .map_err(|_| ())?;
+                                isolation = grown_isolation;
+                                outcome = troe_machine::resume_application(
+                                    application,
+                                    troe_machine::ApplicationResume::HeapGrowth {
+                                        status: heap_growth::SUCCESS,
+                                        mapped_bytes,
+                                    },
+                                )
+                                .map_err(|_| ())?;
+                            }
+                            ApplicationGrowth::Exhausted => {
+                                outcome = troe_machine::resume_application(
+                                    application,
+                                    troe_machine::ApplicationResume::HeapGrowth {
+                                        status: heap_growth::EXHAUSTED,
+                                        mapped_bytes: 0,
+                                    },
+                                )
+                                .map_err(|_| ())?;
+                            }
+                        }
+                    }
                     troe_machine::ApplicationOutcome::Exited { status } => {
                         scheduler.exit_current(task_id, status).map_err(|_| ())?;
                         break CommandApplicationOutcome::Exited(status);
@@ -2534,6 +2613,172 @@ mod firmware {
         }
     }
 
+    fn commit_application_heap_growth(
+        frames: &mut FrameAllocator,
+        allocation: &mut ApplicationAllocation,
+        application: &mut troe_machine::ApplicationSession,
+        heap_start: u64,
+        maximum_heap_pages: u64,
+        minimum_pages: u64,
+    ) -> Result<ApplicationGrowth, ()> {
+        let initial_pages = allocation.heap.map_or(0, PhysicalRange::page_count);
+        let current_pages = initial_pages
+            .checked_add(application_growth_pages(allocation)?)
+            .ok_or(())?;
+        let remaining = maximum_heap_pages.checked_sub(current_pages).ok_or(())?;
+        if minimum_pages == 0 || minimum_pages > remaining {
+            return Ok(ApplicationGrowth::Exhausted);
+        }
+        if allocation.growth_ranges.try_reserve(1).is_err() {
+            return Ok(ApplicationGrowth::Exhausted);
+        }
+        let heap_virtual_start = heap_start
+            .checked_add(current_pages.checked_mul(BASE_PAGE_SIZE).ok_or(())?)
+            .ok_or(())?;
+        let required_new_tables = additional_table_pages(heap_virtual_start, minimum_pages)?;
+        let retained_table_pages = allocation
+            .tables
+            .page_count()
+            .checked_add(u64::try_from(allocation.growth_table_frames.len()).map_err(|_| ())?)
+            .ok_or(())?;
+        let available_table_pages = retained_table_pages
+            .checked_sub(application.stats().table_pages)
+            .ok_or(())?;
+        let table_deficit = required_new_tables.saturating_sub(available_table_pages);
+        let table_deficit = usize::try_from(table_deficit).map_err(|_| ())?;
+        if allocation
+            .growth_table_frames
+            .try_reserve_exact(table_deficit)
+            .is_err()
+        {
+            return Ok(ApplicationGrowth::Exhausted);
+        }
+        let needed_frames = minimum_pages
+            .checked_add(u64::try_from(table_deficit).map_err(|_| ())?)
+            .ok_or(())?;
+        if needed_frames > frames.free_frames() {
+            return Ok(ApplicationGrowth::Exhausted);
+        }
+        let start = allocation.growth_ranges.len();
+        let table_start = allocation.growth_table_frames.len();
+        for _ in 0..table_deficit {
+            let Ok(frame) = frames.allocate() else {
+                release_application_growth_suffix(frames, allocation, start, table_start)?;
+                return Ok(ApplicationGrowth::Exhausted);
+            };
+            allocation.growth_table_frames.push(frame);
+        }
+        match frames.allocate_contiguous(minimum_pages, 1) {
+            Ok(range) => {
+                if troe_machine::zero_physical_range(range).is_err() {
+                    frames.free_range(range).map_err(|_| ())?;
+                    release_application_growth_suffix(frames, allocation, start, table_start)?;
+                    return Err(());
+                }
+                allocation.growth_ranges.push(range);
+            }
+            Err(FrameAllocationError::Exhausted) => {
+                for _ in 0..minimum_pages {
+                    let Ok(frame) = frames.allocate() else {
+                        release_application_growth_suffix(frames, allocation, start, table_start)?;
+                        return Ok(ApplicationGrowth::Exhausted);
+                    };
+                    let range = PhysicalRange::from_pages(frame, 1).map_err(|_| ())?;
+                    if troe_machine::zero_physical_range(range).is_err() {
+                        frames.free(frame).map_err(|_| ())?;
+                        release_application_growth_suffix(frames, allocation, start, table_start)?;
+                        return Err(());
+                    }
+                    if !append_application_growth_frame(allocation, start, frame)? {
+                        frames.free(frame).map_err(|_| ())?;
+                        release_application_growth_suffix(frames, allocation, start, table_start)?;
+                        return Ok(ApplicationGrowth::Exhausted);
+                    }
+                }
+            }
+            Err(_) => {
+                release_application_growth_suffix(frames, allocation, start, table_start)?;
+                return Err(());
+            }
+        }
+        let new_ranges = &allocation.growth_ranges[start..];
+        let stats = application
+            .commit_heap_growth(heap_start, new_ranges, &allocation.growth_table_frames)
+            .map_err(|_| ())?;
+        let mapped_pages = current_pages.checked_add(minimum_pages).ok_or(())?;
+        let mapped_bytes = mapped_pages.checked_mul(BASE_PAGE_SIZE).ok_or(())?;
+        Ok(ApplicationGrowth::Committed {
+            stats,
+            mapped_bytes,
+        })
+    }
+
+    fn release_application_growth_suffix(
+        frames: &mut FrameAllocator,
+        allocation: &mut ApplicationAllocation,
+        retained: usize,
+        retained_tables: usize,
+    ) -> Result<(), ()> {
+        while allocation.growth_ranges.len() > retained {
+            let range = allocation.growth_ranges.pop().ok_or(())?;
+            troe_machine::zero_physical_range(range).map_err(|_| ())?;
+            frames.free_range(range).map_err(|_| ())?;
+        }
+        while allocation.growth_table_frames.len() > retained_tables {
+            let frame = allocation.growth_table_frames.pop().ok_or(())?;
+            let range = PhysicalRange::from_pages(frame, 1).map_err(|_| ())?;
+            troe_machine::zero_physical_range(range).map_err(|_| ())?;
+            frames.free(frame).map_err(|_| ())?;
+        }
+        Ok(())
+    }
+
+    fn application_growth_pages(allocation: &ApplicationAllocation) -> Result<u64, ()> {
+        allocation
+            .growth_ranges
+            .iter()
+            .try_fold(0_u64, |pages, range| pages.checked_add(range.page_count()))
+            .ok_or(())
+    }
+
+    fn append_application_growth_frame(
+        allocation: &mut ApplicationAllocation,
+        request_start: usize,
+        frame: u64,
+    ) -> Result<bool, ()> {
+        if allocation.growth_ranges.len() > request_start {
+            let last = allocation.growth_ranges.last_mut().ok_or(())?;
+            if last.end() == frame {
+                *last = PhysicalRange::from_pages(last.start(), last.page_count() + 1)
+                    .map_err(|_| ())?;
+                return Ok(true);
+            }
+        }
+        if allocation.growth_ranges.try_reserve(1).is_err() {
+            return Ok(false);
+        }
+        allocation
+            .growth_ranges
+            .push(PhysicalRange::from_pages(frame, 1).map_err(|_| ())?);
+        Ok(true)
+    }
+
+    fn additional_table_pages(virtual_start: u64, page_count: u64) -> Result<u64, ()> {
+        let start_page = virtual_start / BASE_PAGE_SIZE;
+        let end_page = start_page.checked_add(page_count).ok_or(())?;
+        if start_page == 0 || end_page <= start_page {
+            return Err(());
+        }
+        [512_u64, 512 * 512, 512 * 512 * 512]
+            .into_iter()
+            .try_fold(0_u64, |total, coverage| {
+                let before = (start_page - 1) / coverage;
+                let after = (end_page - 1) / coverage;
+                total.checked_add(after.checked_sub(before)?)
+            })
+            .ok_or(())
+    }
+
     fn allocate_application(
         frames: &mut FrameAllocator,
         plan: &LoadPlan<'_>,
@@ -2569,6 +2814,8 @@ mod firmware {
                 image,
                 startup,
                 heap,
+                growth_ranges: Vec::new(),
+                growth_table_frames: Vec::new(),
                 stack,
             })
         })();
@@ -2724,6 +2971,15 @@ mod firmware {
         frames: &mut FrameAllocator,
         allocation: ApplicationAllocation,
     ) -> Result<(), ()> {
+        for range in allocation.growth_ranges {
+            troe_machine::zero_physical_range(range).map_err(|_| ())?;
+            frames.free_range(range).map_err(|_| ())?;
+        }
+        for frame in allocation.growth_table_frames {
+            let range = PhysicalRange::from_pages(frame, 1).map_err(|_| ())?;
+            troe_machine::zero_physical_range(range).map_err(|_| ())?;
+            frames.free(frame).map_err(|_| ())?;
+        }
         troe_machine::zero_physical_range(allocation.complete).map_err(|_| ())?;
         frames.free_range(allocation.complete).map_err(|_| ())
     }
@@ -5404,9 +5660,19 @@ mod firmware {
             }
             Some(match outcome {
                 Ok(CommandApplicationOutcome::Exited(status)) => command_status(status),
-                Ok(CommandApplicationOutcome::Faulted(_)) => {
-                    command_application_error(stderr, command, "application faulted")
-                }
+                Ok(CommandApplicationOutcome::Faulted(fault)) => command_application_error(
+                    stderr,
+                    command,
+                    match fault {
+                        TaskFault::Translation => "application faulted: translation",
+                        TaskFault::Permission => "application faulted: permission",
+                        TaskFault::IllegalInstruction => "application faulted: illegal instruction",
+                        TaskFault::InvalidCall => "application faulted: invalid call",
+                        TaskFault::ExecutionLeaseExpired => {
+                            "application faulted: execution lease expired"
+                        }
+                    },
+                ),
                 Err(()) => command_application_error(stderr, command, "application rejected"),
             })
         }

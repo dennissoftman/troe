@@ -58,14 +58,14 @@ class KexToolTests(unittest.TestCase):
                     report = json.loads(inspected.stdout)
                     self.assertEqual(report["format"], "KEX package v1")
                     self.assertEqual(report["executable_format"], "KEX v1")
-                    self.assertEqual(report["abi"], "1.0")
+                    self.assertEqual(report["abi"], "1.1")
                     self.assertEqual(report["target"], target)
                     expected_stack_pages = (
                         64 if command == "lua" else 20 if command == "grep" else 4
                     )
                     self.assertEqual(report["stack_pages"], expected_stack_pages)
                     self.assertEqual(
-                        report["heap_pages"], 2048 if command == "lua" else 0
+                        report["heap_pages"], 256 if command == "lua" else 0
                     )
                     package_bytes = artifact.read_bytes()
                     self.assertEqual(package_bytes[:8], b"KEXPKG\0\0")

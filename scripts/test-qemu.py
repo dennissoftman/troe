@@ -1014,6 +1014,14 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
         ),
     )
     session.command(
+        "lua -e 'local t={}; local n=0; for i=1,6144 do "
+        "local s=string.rep(\"x\",1024); t[i]=s; n=n+#s end; "
+        "print(\"lua-grow\",#t,n)'",
+        cwd,
+        command_timeout,
+        contains=("lua-grow\t6144\t6291456\n",),
+    )
+    session.command(
         "lua -e 'error(\"expected-error\")'",
         cwd,
         command_timeout,
@@ -1021,7 +1029,7 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
     )
     session.command(
         "lua -e 'local ok=pcall(function() "
-        "string.rep(\"x\",16*1024*1024) end); collectgarbage(); "
+        "string.rep(\"x\",16*1024*1024*1024) end); collectgarbage(); "
         "print(\"lua-oom\",ok)'",
         cwd,
         command_timeout,

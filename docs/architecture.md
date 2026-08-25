@@ -244,6 +244,14 @@ complete non-overlapping ranges, copies a two-byte opcode-prefixed request,
 checks task handle ownership, and copies a successful bounded reply before a
 fresh leased resume. Unknown calls and an attempted `_start` return are
 contained and reclaimed as invalid-call and translation faults.
+ABI 1.1 also suspends on `grow_heap`; the kernel atomically commits owned,
+zeroed physical extents at the end of the virtual heap prefix, falling back to
+discontiguous frames when necessary, adds page-table frames as mappings
+require, updates scheduler ownership accounting, and resumes with the new
+mapped length. A large allocation requests its complete page deficit in one
+call; the allocator's 256 KiB quantum is only a batching floor for small
+requests. Expected physical-memory exhaustion leaves the mapping unchanged;
+no fixed lifetime heap-size policy is applied.
 
 The Stage 9 command slice installs one canonical package per command. Its KCAP
 manifest is validated from the same staged file before optional services are

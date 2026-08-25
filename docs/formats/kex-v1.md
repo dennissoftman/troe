@@ -26,7 +26,7 @@ The header is exactly 64 bytes.
 | 14 | 2 | header bytes | 64 |
 | 16 | 2 | load-record bytes | 40 |
 | 18 | 2 | ABI major | 1 |
-| 20 | 2 | minimum ABI minor | at most the kernel-supported minor; initially 0 |
+| 20 | 2 | minimum ABI minor | at most the kernel-supported minor; currently 1 |
 | 22 | 2 | flags | zero |
 | 24 | 8 | entry offset | image-relative byte inside an RX segment |
 | 32 | 2 | load-record count | bounded, nonzero |
@@ -81,13 +81,15 @@ and standard-policy arithmetic before allocating or mapping application memory.
 | Mapped image pages | 8,192 |
 | Stack pages | 4–256 |
 | Heap pages | 0–4,096 |
-| Page-table pages | 512 |
-| Resident pages | 16,384 |
+| Initial page-table reservation | 512 pages |
+| Initial resident admission | 16,384 pages |
 
-The preliminary portable plan charges exact image, startup, heap, and stack
-pages plus the standard page-table ceiling. Native table construction
-may refine that reservation downward but may not exceed either the table or
-aggregate resident ceiling.
+The preliminary portable plan charges exact image, startup, initial heap, and
+stack pages plus the standard initial page-table reservation. Native launch
+construction may refine that reservation downward but may not exceed either
+initial admission bound. ABI 1.1 runtime heap and supplemental page-table
+commits are outside those launch bounds and are limited by available physical
+memory and the remaining user virtual range.
 
 ## Hosted ELF input contract
 
@@ -122,16 +124,19 @@ rejection oracle during the Rust-tool migration; it is not the build entrypoint.
 The shared generated corpus lives under `tests/kex-corpus`; its exact file set
 and bytes are checked with `python3 tools/gen_kex_corpus.py --check`.
 
-## ABI 1.0 virtual layout and startup page
+## ABI 1.1 virtual layout and startup page
 
 The portable plan fixes the non-image virtual regions so every native backend
 consumes identical checked address arithmetic. The startup page begins at
-`image base + standard image-span ceiling`. The heap slot follows it and reserves
-the standard maximum heap span in virtual space, although only the requested
-prefix is mapped. One unmapped lower guard follows the heap slot. The fixed
-maximum stack slot follows that guard; the requested stack pages are mapped at
-the top of the slot so they end immediately before an unmapped upper guard.
-All unused heap and stack-slot pages remain unmapped.
+`image base + standard image-span ceiling`. For an application requiring ABI
+minor 1, the heap follows it and may grow through the otherwise unused user
+virtual-address gap. A lower guard and the fixed maximum stack slot are placed
+at the top of the user half; the requested stack pages are mapped at the top of
+that slot so they end immediately before an unmapped upper guard. All
+uncommitted heap-gap and unused stack-slot pages remain unmapped and consume no
+physical frames. ABI-minor-0 artifacts retain their original 16 MiB fixed heap
+slot and adjacent guarded stack layout, so an ABI 1.1 kernel remains compatible
+with existing binaries.
 
 The startup page is 4 KiB, little-endian, and zero-padded. Its fixed header is
 64 bytes:
@@ -140,13 +145,13 @@ The startup page is 4 KiB, little-endian, and zero-padded. Its fixed header is
 | ---: | ---: | --- |
 | 0 | 4 | encoded bytes: `64 + handle_count * 24` |
 | 4 | 2 | ABI major, 1 |
-| 6 | 2 | ABI minor, 0 |
+| 6 | 2 | negotiated ABI minor selected for this application |
 | 8 | 4 | page bytes, 4,096 |
 | 12 | 2 | reserved, zero |
 | 14 | 2 | initial handle count |
 | 16 | 8 | image base |
 | 24 | 8 | heap base |
-| 32 | 8 | mapped heap bytes |
+| 32 | 8 | initially mapped heap bytes |
 | 40 | 8 | mapped stack bottom |
 | 48 | 8 | mapped stack top / initial stack pointer |
 | 56 | 8 | monotonic nonzero task identity |
@@ -157,6 +162,13 @@ minor (`u16` each), and four reserved zero bytes. Values must be nonzero and
 unique within the page. Handle count cannot exceed the standard ceiling. The
 kernel validates the complete descriptor set before clearing and encoding the
 destination, so rejection cannot leave a partial startup record.
+
+ABI call 3 may grow the mapped heap prefix without moving its base. Each
+successful request commits actual zeroed frames and any supplemental page-table
+frames; physical backing may be non-contiguous. Ordinary exhaustion leaves the
+mapping unchanged. There is no format-level lifetime heap-byte ceiling other
+than the remaining v1 user virtual range; on the current no-swap system,
+available physical memory is the practical bound.
 
 ## Deliberate omissions
 

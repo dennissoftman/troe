@@ -132,8 +132,8 @@ pub struct StackResource {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IsolationResource {
     slot: u8,
-    table_pages: u16,
-    private_pages: u16,
+    table_pages: u64,
+    private_pages: u64,
     handles: u16,
 }
 
@@ -145,8 +145,8 @@ impl IsolationResource {
     /// Rejects resources without page tables or private user pages.
     pub const fn new(
         slot: u8,
-        table_pages: u16,
-        private_pages: u16,
+        table_pages: u64,
+        private_pages: u64,
         handles: u16,
     ) -> Result<Self, TaskError> {
         if table_pages == 0 || private_pages == 0 {
@@ -168,13 +168,13 @@ impl IsolationResource {
 
     /// Page-table frames retained until reaping.
     #[must_use]
-    pub const fn table_pages(self) -> u16 {
+    pub const fn table_pages(self) -> u64 {
         self.table_pages
     }
 
     /// Private code, data, and stack frames retained until reaping.
     #[must_use]
-    pub const fn private_pages(self) -> u16 {
+    pub const fn private_pages(self) -> u64 {
         self.private_pages
     }
 
@@ -186,8 +186,8 @@ impl IsolationResource {
 
     /// Total physical frames retained by the address space.
     #[must_use]
-    pub const fn total_pages(self) -> u32 {
-        self.table_pages as u32 + self.private_pages as u32
+    pub const fn total_pages(self) -> u64 {
+        self.table_pages.saturating_add(self.private_pages)
     }
 }
 
@@ -359,7 +359,7 @@ pub struct TaskStats {
     /// Isolated address spaces retained by live records.
     pub owned_address_spaces: u16,
     /// Page-table plus private frames retained by isolated records.
-    pub owned_isolation_pages: u32,
+    pub owned_isolation_pages: u64,
     /// Handles awaiting invalidation during isolated-task teardown.
     pub owned_handles: u32,
     /// Unprivileged task faults contained since scheduler creation.
@@ -637,6 +637,37 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Replace the resource accounting of the running isolated task.
+    ///
+    /// This is used after an atomic address-space growth commit. The address-
+    /// space slot and handle ownership cannot change through this operation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a non-current, non-running, non-isolated task, or a replacement
+    /// that changes its address-space identity or handle ownership.
+    pub fn resize_current_isolation(
+        &mut self,
+        id: TaskId,
+        replacement: IsolationResource,
+    ) -> Result<(), TaskError> {
+        if self.current != Some(id) {
+            return Err(TaskError::InvalidState);
+        }
+        let record = self.record_mut(id)?;
+        if record.snapshot.state != TaskState::Running {
+            return Err(TaskError::InvalidState);
+        }
+        let Some(current) = record.snapshot.isolation else {
+            return Err(TaskError::InvalidState);
+        };
+        if current.slot != replacement.slot || current.handles != replacement.handles {
+            return Err(TaskError::InvalidState);
+        }
+        record.snapshot.isolation = Some(replacement);
+        Ok(())
+    }
+
     /// Finish the running task and retain its resources for explicit reaping.
     ///
     /// # Errors
@@ -801,7 +832,7 @@ impl Scheduler {
         let (owned_isolation_pages, owned_handles) =
             self.records
                 .iter()
-                .fold((0_u32, 0_u32), |(pages, handles), record| {
+                .fold((0_u64, 0_u32), |(pages, handles), record| {
                     match record.snapshot.isolation {
                         Some(resource) => (
                             pages.saturating_add(resource.total_pages()),
@@ -1013,6 +1044,29 @@ mod tests {
         assert_eq!(stats.owned_isolation_pages, 0);
         assert_eq!(stats.owned_handles, 0);
         assert_eq!(stats.contained_faults, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn running_isolation_can_grow_without_changing_ownership() -> Result<(), TaskError> {
+        let mut scheduler = Scheduler::new(1)?;
+        let initial = IsolationResource::new(2, 4, 12, 3)?;
+        let grown = IsolationResource::new(2, 5, 28, 3)?;
+        let id = scheduler.spawn_isolated(Capabilities::SERVICE, stack(0)?, initial)?;
+        assert_eq!(scheduler.dispatch_next(Capabilities::SERVICE), Ok(Some(id)));
+        scheduler.resize_current_isolation(id, grown)?;
+        assert_eq!(scheduler.task(id)?.isolation(), Some(grown));
+        assert_eq!(scheduler.stats().owned_isolation_pages, 33);
+        assert_eq!(
+            scheduler.resize_current_isolation(id, IsolationResource::new(3, 5, 28, 3)?,),
+            Err(TaskError::InvalidState)
+        );
+        assert_eq!(
+            scheduler.resize_current_isolation(id, IsolationResource::new(2, 5, 28, 4)?,),
+            Err(TaskError::InvalidState)
+        );
+        scheduler.exit_current(id, 0)?;
+        assert_eq!(scheduler.reap(id)?.isolation, Some(grown));
         Ok(())
     }
 

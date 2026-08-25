@@ -19,7 +19,7 @@ historical review evidence.
 - [KEFS v1](formats/kefs-v1.md) defines the implemented embedded-filesystem
   format.
 - [KEX v1](formats/kex-v1.md) defines the implemented portable executable
-  parser, native loader, startup layout, and complete ABI 1.0 boundary.
+  parser, native loader, startup layout, and complete ABI 1.1 boundary.
 - [KEX package v1](formats/kex-package-v1.md) binds one KCAP manifest and one
   KEX executable into the single installed application file.
 - [SCFG v1](formats/scfg-v1.md) defines the implemented portable desired-system
@@ -119,9 +119,9 @@ interrupt-driven input and bounded driver-resource increment.
 ADR 0014 governs the completed Stage 6 unprivileged address-space,
 copied-message, contained-fault, and transactional teardown boundary.
 [ADR 0015](adr/0015-kex-application-abi-and-execution-bounds.md) accepts the KEX
-v1 container, application ABI 1.0, standard memory ceilings, and bounded
+v1 container, application ABI 1.1, initial memory ceilings, and bounded
 execution-lease policy for the completed Stage 7. Portable parsing, native
-owned loading, explicit handle grant, all ABI 1.0 calls, resume leases, copied
+owned loading, explicit handle grant, all ABI 1.1 calls, resume leases, copied
 dispatch, contained call/fault fates, and zeroized teardown are implemented.
 [ADR 0016](adr/0016-hardware-targets-and-emulator-role.md) separates CPU
 architecture, VM platform, and execution environment for Stage 7.5

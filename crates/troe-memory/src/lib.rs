@@ -17,8 +17,6 @@ pub const MAX_RESERVATIONS: usize = 64;
 pub const MAX_NORMALIZED_REGIONS: usize = 512;
 /// Maximum mappings accepted by the initial single-address-space plan.
 pub const MAX_MAPPINGS: usize = 512;
-/// Maximum physical frames tracked by the initial bitmap (256 GiB at 4 KiB).
-pub const MAX_MANAGED_FRAMES: u64 = 64 * 1024 * 1024;
 
 /// Failures produced while validating and normalizing physical memory.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -831,8 +829,6 @@ impl BootAllocator {
 pub enum FrameAllocationError {
     /// Frame-count or bitmap-size arithmetic overflowed.
     Overflow,
-    /// The configured bitmap capacity would be exceeded.
-    TooManyFrames,
     /// Bitmap metadata could not be allocated.
     MetadataExhausted,
     /// No free usable frame remains.
@@ -847,7 +843,6 @@ impl fmt::Display for FrameAllocationError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Overflow => formatter.write_str("frame allocator arithmetic overflowed"),
-            Self::TooManyFrames => formatter.write_str("frame bitmap capacity exceeded"),
             Self::MetadataExhausted => formatter.write_str("frame bitmap metadata exhausted"),
             Self::Exhausted => formatter.write_str("physical frames exhausted"),
             Self::InvalidFrame => formatter.write_str("physical frame is not allocator-owned"),
@@ -882,8 +877,9 @@ impl FrameAllocator {
     ///
     /// # Errors
     ///
-    /// Rejects checked arithmetic overflow, maps above the explicit bitmap
-    /// capacity, and fallible metadata allocation failure.
+    /// Rejects checked arithmetic overflow and fallible metadata allocation
+    /// failure. Bitmap storage is derived from the supplied usable memory; no
+    /// fixed physical-memory ceiling is imposed here.
     pub fn from_map(map: &NormalizedMemoryMap) -> Result<Self, FrameAllocationError> {
         let mut spans = Vec::new();
         spans
@@ -901,9 +897,6 @@ impl FrameAllocator {
             total_frames = total_frames
                 .checked_add(region.range.page_count())
                 .ok_or(FrameAllocationError::Overflow)?;
-            if total_frames > MAX_MANAGED_FRAMES {
-                return Err(FrameAllocationError::TooManyFrames);
-            }
         }
 
         let word_count = total_frames
@@ -1663,17 +1656,6 @@ mod tests {
             Err(FrameAllocationError::InvalidFrame)
         );
         assert_eq!(allocator, before);
-        Ok(())
-    }
-
-    #[test]
-    fn frame_bitmap_capacity_arithmetic_is_checked() -> Result<(), MemoryMapError> {
-        let huge = PhysicalRange::from_pages(0, super::MAX_MANAGED_FRAMES + 1)?;
-        let map = NormalizedMemoryMap::build(&[MemoryRegion::new(huge, RegionKind::Usable)], &[])?;
-        assert_eq!(
-            FrameAllocator::from_map(&map),
-            Err(FrameAllocationError::TooManyFrames)
-        );
         Ok(())
     }
 
