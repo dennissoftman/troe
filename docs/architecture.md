@@ -236,8 +236,11 @@ checks task handle ownership, and copies a successful bounded reply before a
 fresh leased resume. Unknown calls and an attempted `_start` return are
 contained and reclaimed as invalid-call and translation faults.
 
-The Stage 9 command slice layers four required ABI 1.0 services on that mechanism:
-immutable cwd/argv, stdin, stdout, and stderr. The shell logically yields while
+The Stage 9 command slice installs one canonical package per command. Its KCAP
+manifest is validated from the same staged file before optional services are
+constructed, and its embedded KEX v1 executable is validated before mapping.
+It layers four required ABI 1.0 services on that mechanism: immutable cwd/argv,
+stdin, stdout, and stderr. The shell logically yields while
 one foreground application runs, then resumes only after owner-wide handle
 revocation, record reaping, page zeroization, and exact frame return. Artifacts
 are read from target-selected `/bin/<name>.kex`; absence is a terminal not-found

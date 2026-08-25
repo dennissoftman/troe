@@ -7,7 +7,7 @@ use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::fs;
-use std::io::Read;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -17,7 +17,8 @@ use troe_abi::{
     network_configuration, network_observation, requirements, tcp_connect, timer,
 };
 use troe_application::{
-    ABI_MINOR, ApplicationLimits, KEX_V1_HEADER_BYTES, KEX_V1_IMAGE_BASE, Target, parse_kex,
+    ABI_MINOR, KEX_PACKAGE_V1_MAGIC, KEX_V1_HEADER_BYTES, KEX_V1_IMAGE_BASE, KEX_V1_MAGIC,
+    MAX_KEX_PACKAGE_BYTES, Target, encode_kex_package, parse_kex, parse_kex_package,
 };
 
 const DEFAULT_STACK_PAGES: u32 = 4;
@@ -119,8 +120,11 @@ struct ConvertOptions {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct InspectReport {
+    package: bool,
     target: Target,
     bytes: usize,
+    executable_bytes: usize,
+    requirements: usize,
     records: usize,
     entry_offset: u64,
     stack_pages: u64,
@@ -623,9 +627,9 @@ fn write_or_check(path: &Path, artifact: &[u8], check: bool, label: &str) -> Too
     if check {
         let existing = read_bounded(
             path,
-            u64::try_from(ApplicationLimits::standard().encoded_bytes())
-                .map_err(|_| ToolError::new("KEX size ceiling is not representable"))?,
-            "KEX artifact",
+            u64::try_from(MAX_KEX_PACKAGE_BYTES)
+                .map_err(|_| ToolError::new("KEX package ceiling is not representable"))?,
+            "KEX package",
         )?;
         if existing != artifact {
             return Err(ToolError::new(format!(
@@ -651,6 +655,25 @@ fn write_or_check(path: &Path, artifact: &[u8], check: bool, label: &str) -> Too
     Ok(())
 }
 
+fn remove_or_reject_legacy_sidecar(package: &Path, check: bool) -> ToolResult<()> {
+    let sidecar = package.with_extension("kcap");
+    if check {
+        if sidecar.exists() {
+            return Err(ToolError::new(format!(
+                "legacy capability sidecar is still installed: {}",
+                sidecar.display()
+            )));
+        }
+        return Ok(());
+    }
+    match fs::remove_file(&sidecar) {
+        Ok(()) => println!("removed legacy sidecar -> {}", sidecar.display()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(io_error("remove", &sidecar, &error)),
+    }
+    Ok(())
+}
+
 fn build_one(
     manifest: &AppManifest,
     target: Target,
@@ -661,21 +684,14 @@ fn build_one(
 ) -> ToolResult<()> {
     let executable = run_cargo(manifest, target)?;
     let image = read_bounded(&executable, ELF_MAX_BYTES, "ELF artifact")?;
-    let artifact = convert_elf(&image, Some(target), stack_pages, heap_pages)?;
+    let executable = convert_elf(&image, Some(target), stack_pages, heap_pages)?;
+    let package = encode_kex_package(&executable, &manifest.requirements)
+        .map_err(|_| ToolError::new("cannot encode KEX package"))?;
     let output = output
         .join(target_name(target))
         .join(format!("{}.kex", manifest.command));
-    write_or_check(&output, &artifact, check, "KEX app")?;
-    let mut capability_bytes = [0_u8; requirements::MAX_MANIFEST_BYTES];
-    let count = requirements::encode(&manifest.requirements, &mut capability_bytes)
-        .map_err(|_| ToolError::new("cannot encode capability manifest"))?;
-    let capability_output = output.with_extension("kcap");
-    write_or_check(
-        &capability_output,
-        &capability_bytes[..count],
-        check,
-        "KEX capabilities",
-    )
+    write_or_check(&output, &package, check, "KEX package")?;
+    remove_or_reject_legacy_sidecar(&output, check)
 }
 
 fn execute_build(options: &BuildOptions) -> ToolResult<()> {
@@ -727,27 +743,41 @@ fn execute_convert(options: &ConvertOptions) -> ToolResult<()> {
 fn inspect(path: &Path) -> ToolResult<InspectReport> {
     let artifact = read_bounded(
         path,
-        u64::try_from(ApplicationLimits::standard().encoded_bytes())
-            .map_err(|_| ToolError::new("KEX size ceiling is not representable"))?,
-        "KEX artifact",
+        u64::try_from(MAX_KEX_PACKAGE_BYTES)
+            .map_err(|_| ToolError::new("KEX package ceiling is not representable"))?,
+        "KEX package",
     )?;
-    if artifact.len() < KEX_V1_HEADER_BYTES {
-        return Err(ToolError::new("KEX header is truncated"));
+    let (package, executable, requirements) = if artifact.starts_with(&KEX_PACKAGE_V1_MAGIC) {
+        let package = parse_kex_package(&artifact)
+            .map_err(|error| ToolError::new(format!("invalid KEX package: {error}")))?;
+        (true, package.executable(), package.requirements().len())
+    } else if artifact.starts_with(&KEX_V1_MAGIC) {
+        (false, artifact.as_slice(), 0)
+    } else {
+        return Err(ToolError::new(
+            "artifact is neither a KEX package nor KEX v1",
+        ));
+    };
+    if executable.len() < KEX_V1_HEADER_BYTES {
+        return Err(ToolError::new("embedded KEX header is truncated"));
     }
-    let target = match u16::from_le_bytes([artifact[12], artifact[13]]) {
+    let target = match u16::from_le_bytes([executable[12], executable[13]]) {
         1 => Target::X86_64,
         2 => Target::Aarch64,
-        _ => return Err(ToolError::new("KEX target is unknown")),
+        _ => return Err(ToolError::new("embedded KEX target is unknown")),
     };
-    let plan = parse_kex(&artifact, target, ABI_MINOR)
-        .map_err(|error| ToolError::new(format!("invalid KEX artifact: {error}")))?;
+    let plan = parse_kex(executable, target, ABI_MINOR)
+        .map_err(|error| ToolError::new(format!("invalid embedded KEX executable: {error}")))?;
     let entry_offset = plan
         .entry_address()
         .checked_sub(KEX_V1_IMAGE_BASE)
         .ok_or_else(|| ToolError::new("KEX entry is below the image base"))?;
     Ok(InspectReport {
+        package,
         target,
         bytes: artifact.len(),
+        executable_bytes: executable.len(),
+        requirements,
         records: plan.segments().count(),
         entry_offset,
         stack_pages: plan.stack_pages(),
@@ -771,21 +801,30 @@ fn execute_inspect(arguments: &mut Arguments) -> ToolResult<()> {
         }
     }
     let report = inspect(&artifact)?;
+    let format = if report.package {
+        "KEX package v1"
+    } else {
+        "KEX v1"
+    };
     if json {
         println!(
-            "{{\"abi\":\"1.0\",\"bytes\":{},\"entry_offset\":{},\"format\":\"KEX v1\",\"heap_pages\":{},\"records\":{},\"stack_pages\":{},\"target\":\"{}\"}}",
+            "{{\"abi\":\"1.0\",\"bytes\":{},\"entry_offset\":{},\"executable_bytes\":{},\"executable_format\":\"KEX v1\",\"format\":\"{format}\",\"heap_pages\":{},\"records\":{},\"requirements\":{},\"stack_pages\":{},\"target\":\"{}\"}}",
             report.bytes,
             report.entry_offset,
+            report.executable_bytes,
             report.heap_pages,
             report.records,
+            report.requirements,
             report.stack_pages,
             target_name(report.target),
         );
     } else {
         println!(
-            "KEX v1; target={}; ABI=1.0; bytes={}; records={}; entry={:#x}; stack={} pages; heap={} pages",
+            "{format}; target={}; ABI=1.0; bytes={}; executable={} bytes; requirements={}; records={}; entry={:#x}; stack={} pages; heap={} pages",
             target_name(report.target),
             report.bytes,
+            report.executable_bytes,
+            report.requirements,
             report.records,
             report.entry_offset,
             report.stack_pages,

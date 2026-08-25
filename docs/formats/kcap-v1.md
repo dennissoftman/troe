@@ -1,9 +1,10 @@
 # KCAP v1 capability manifest
 
-KCAP v1 is the canonical package-side declaration of optional startup
-authorities for one KEX command. KEX remains an architecture-specific static
-executable with no embedded capabilities; the adjacent manifest is validated
-before any optional service is registered or any application page is mapped.
+KCAP v1 is the canonical embedded declaration of optional startup authorities
+for one KEX command. KEX remains an architecture-specific static executable
+with no embedded capabilities; the manifest is carried by the surrounding
+single-file KEX package and validated before any optional service is registered
+or any application page is mapped.
 
 All integers are unsigned little-endian. The 16-byte header is:
 
@@ -33,8 +34,8 @@ The implemented closed names are `datagram`, `filesystem-read`,
 interface; no name implies another. In particular, `tcp-connect` accepts only a
 literal IPv4 endpoint and does not grant DNS, TLS, listening, or raw packets.
 
-It writes `<command>.kex` and `<command>.kcap` together under the selected
-source architecture. KEFS projects both into flat runtime `/bin`. A missing
-artifact or malformed, unknown, unsupported, or unavailable requirement rejects
-launch and never selects privileged fallback behavior. The four command/standard-stream handles
-are mandatory ABI context and therefore are not repeated in KCAP.
+The builder embeds the encoded manifest before the executable in
+`<command>.kex`; no `.kcap` sidecar is installed. A malformed, unknown,
+unsupported, or unavailable requirement rejects launch and never selects
+privileged fallback behavior. The four command/standard-stream handles are
+mandatory ABI context and therefore are not repeated in KCAP.

@@ -4,7 +4,9 @@ KEX v1 is the canonical static executable input for the Stage 7 application
 loader selected by
 [ADR 0015](../adr/0015-kex-application-abi-and-execution-bounds.md). The
 portable application-format parser is authoritative. This document fixes its
-byte representation for SDK converters and rejection-corpus tools.
+byte representation for SDK converters and rejection-corpus tools. Installed
+commands carry this executable inside the
+[KEX package v1](kex-package-v1.md) single-file envelope.
 
 All integers are unsigned little-endian values. KEX structures are decoded from
 bytes and have no Rust or C in-memory-layout contract. The v1 base page size is

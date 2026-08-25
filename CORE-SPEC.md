@@ -840,7 +840,8 @@ application-callable machine authority.
 
 Accordingly:
 
-- executable code is loaded only after complete KEX/KCAP validation;
+- executable code is loaded only after complete KEX package, embedded KCAP,
+  and inner KEX validation;
 - embedded FS input is treated as potentially malformed;
 - console input is untrusted and bounded;
 - external block filesystems remain optional until separately specified and fuzzed;

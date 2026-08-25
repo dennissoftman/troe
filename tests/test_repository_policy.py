@@ -150,11 +150,13 @@ class RepositoryPolicyTests(unittest.TestCase):
         }
         self.assertEqual(apps, ordinary)
         for architecture in ("x86_64", "aarch64"):
+            root = REPO_ROOT / "rootfs" / "bin" / architecture
             installed = {
                 path.stem
-                for path in (REPO_ROOT / "rootfs/bin" / architecture).glob("*.kex")
+                for path in root.glob("*.kex")
             }
             self.assertEqual(installed, ordinary | {"kex-echo"})
+            self.assertEqual(list(root.glob("*.kcap")), [])
 
         shell = (REPO_ROOT / "crates/troe-shell/src/lib.rs").read_text(
             encoding="utf-8"

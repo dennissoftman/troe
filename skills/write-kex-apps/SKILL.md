@@ -105,8 +105,8 @@ cargo kex inspect rootfs/bin/aarch64/<command>.kex
 ```
 
 The builder pins the freestanding targets and linker policy, validates the ELF,
-converts through strict KEX v1, and installs architecture-specific `.kex` plus
-least-authority `.kcap` artifacts.
+converts through strict KEX v1, embeds the least-authority KCAP manifest, and
+installs one architecture-specific `.kex` package.
 Never copy one architecture's artifact to the other. KEFS assembly projects the
 selected source directory into flat runtime `/bin`; verify both target roots.
 

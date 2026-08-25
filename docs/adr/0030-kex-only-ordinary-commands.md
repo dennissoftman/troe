@@ -16,9 +16,10 @@ faulting, or over-budget application continues to fail closed.
 The shell retains only bounded parsing, sequential pipeline transport, logical
 working-directory state, command metadata/completion, and authorized terminal
 machine transitions. It owns no command filesystem, mutation, timer,
-diagnostics, or network capability. The kernel command runner validates KCAP,
-constructs only the declared typed services, executes the isolated task, and
-revokes all owner state before the shell resumes.
+diagnostics, or network capability. The kernel command runner validates the
+single-file package and its embedded KCAP, constructs only the declared typed
+services, executes the isolated task, and revokes all owner state before the
+shell resumes.
 
 The immutable target-selected KEFS root is the recovery command distribution:
 both supported images contain behavior-equivalent KEX apps for `arp`, `cat`,

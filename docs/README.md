@@ -18,6 +18,8 @@ historical review evidence.
   format.
 - [KEX v1](formats/kex-v1.md) defines the implemented portable executable
   parser, native loader, startup layout, and complete ABI 1.0 boundary.
+- [KEX package v1](formats/kex-package-v1.md) binds one KCAP manifest and one
+  KEX executable into the single installed application file.
 - [SCFG v1](formats/scfg-v1.md) defines the implemented portable desired-system
   and bounded service-startup parser for the first Stage 8 slice.
 - [BMNT v1](formats/bmnt-v1.md) defines the implemented boot-side mount manifest

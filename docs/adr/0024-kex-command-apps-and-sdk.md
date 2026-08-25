@@ -6,8 +6,9 @@ fallback; all ordinary commands are now KEX-only.
 
 ## Decision
 
-TROE command applications are immutable KEX v1 files installed at
-`/bin/<command>.kex`. A command is a lowercase ASCII name with
+TROE command applications are immutable KEX package v1 files installed at
+`/bin/<command>.kex`. Each single file contains one KCAP v1 manifest followed
+by one KEX v1 executable. A command is a lowercase ASCII name with
 digits, `_`, or `-`; applications do not receive arbitrary filesystem paths as
 implicit authority. `cd`, `poweroff`, and `reboot` remain non-shadowable shell
 intrinsics. For every other name the shell tries the KEX resolver first. An
@@ -53,10 +54,11 @@ Repository build outputs remain target-qualified under
 `rootfs/bin/<architecture>/`. KEFS assembly selects exactly one architecture,
 flattens its files into runtime `/bin`, and excludes every other architecture;
 the target-specific kernel still validates the KEX target field before loading.
-Each executable has a canonical KCAP v1 sidecar declaring only its optional
-versioned startup interfaces. Missing, malformed, unsupported, or unavailable
+Each package embeds one canonical KCAP v1 manifest declaring only its optional
+versioned startup interfaces. Malformed, unsupported, or unavailable
 requirements reject launch; mandatory command and standard-stream context is
-not repeated in the package manifest.
+not repeated in the package manifest. The builder removes and check mode
+rejects legacy `.kcap` sidecars.
 
 ## Security and efficiency consequences
 

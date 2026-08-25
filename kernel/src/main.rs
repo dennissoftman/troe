@@ -23,14 +23,14 @@ mod firmware {
 
     use troe_abi::{
         command, datagram, diagnostics, filesystem, filesystem_mutation, icmp_echo,
-        network_configuration, network_observation, requirements, stream, tcp_connect, timer,
+        network_configuration, network_observation, stream, tcp_connect, timer,
     };
     #[cfg(feature = "acceptance-probes")]
     use troe_application::ParseError;
     use troe_application::{
         ABI_MINOR, ApplicationLimits, InitialHandle, LoadPlan, LoaderResource, LoaderTransaction,
         MAX_LOAD_RECORDS, PAGE_BYTES, SegmentPermissions, StartupInfo, Target, parse_kex,
-        stage_artifact,
+        parse_kex_package, stage_artifact,
     };
     use troe_block::{BlockAccess, BlockRegion};
     use troe_block::{BlockDevice, BlockLimits};
@@ -5058,25 +5058,14 @@ mod firmware {
                     "artifact staging failed",
                 ));
             };
-            let capability_path = alloc::format!("/bin/{command}.kcap");
-            let Ok(capability_bytes) = namespace.read_file_bounded(
-                "/",
-                &capability_path,
-                requirements::MAX_MANIFEST_BYTES,
-            ) else {
+            let Ok(package) = parse_kex_package(&artifact) else {
                 return Some(command_application_error(
                     stderr,
                     command,
-                    "capability manifest unavailable",
+                    "application package rejected",
                 ));
             };
-            let Ok(capability_manifest) = requirements::Manifest::parse(&capability_bytes) else {
-                return Some(command_application_error(
-                    stderr,
-                    command,
-                    "capability manifest rejected",
-                ));
-            };
+            let capability_manifest = package.requirements();
             let mut datagram_required = false;
             let mut filesystem_required = false;
             let mut filesystem_mutation_required = false;
@@ -5397,7 +5386,7 @@ mod firmware {
                 self.accounting,
                 &mut dispatcher,
                 services.as_slice(),
-                &artifact,
+                package.executable(),
             );
             if self
                 .scheduler

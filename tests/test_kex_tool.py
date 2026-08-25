@@ -41,13 +41,37 @@ class KexToolTests(unittest.TestCase):
                     inspected = cargo_kex("inspect", artifact, "--json")
                     self.assertEqual(inspected.returncode, 0, inspected.stderr.decode())
                     report = json.loads(inspected.stdout)
-                    self.assertEqual(report["format"], "KEX v1")
+                    self.assertEqual(report["format"], "KEX package v1")
+                    self.assertEqual(report["executable_format"], "KEX v1")
                     self.assertEqual(report["abi"], "1.0")
                     self.assertEqual(report["target"], target)
                     self.assertEqual(report["stack_pages"], 20 if command == "grep" else 4)
                     self.assertEqual(report["heap_pages"], 0)
-                    capability_path = artifact.with_suffix(".kcap")
-                    capability_bytes = capability_path.read_bytes()
+                    package_bytes = artifact.read_bytes()
+                    self.assertEqual(package_bytes[:8], b"KEXPKG\0\0")
+                    (
+                        major,
+                        minor,
+                        header_bytes,
+                        flags,
+                        capability_offset,
+                        capability_bytes,
+                        executable_offset,
+                        reserved,
+                        executable_bytes,
+                        encoded_bytes,
+                    ) = struct.unpack_from("<HHHHIIIIQQ", package_bytes, 8)
+                    self.assertEqual((major, minor, header_bytes, flags), (1, 0, 48, 0))
+                    self.assertEqual(capability_offset, header_bytes)
+                    self.assertEqual(executable_offset, capability_offset + capability_bytes)
+                    self.assertEqual(reserved, 0)
+                    self.assertEqual(executable_offset + executable_bytes, len(package_bytes))
+                    self.assertEqual(encoded_bytes, len(package_bytes))
+                    self.assertEqual(report["bytes"], len(package_bytes))
+                    self.assertEqual(report["executable_bytes"], executable_bytes)
+                    capability_bytes = package_bytes[
+                        capability_offset:executable_offset
+                    ]
                     self.assertEqual(capability_bytes[:8], b"KCAPv1\0\0")
                     count, reserved, encoded_bytes = struct.unpack_from(
                         "<HHI", capability_bytes, 8
@@ -79,22 +103,36 @@ class KexToolTests(unittest.TestCase):
                     else:
                         expected = []
                     self.assertEqual(records, expected)
+                    self.assertEqual(report["requirements"], len(expected))
+                    self.assertFalse(artifact.with_suffix(".kcap").exists())
 
     def test_build_check_uses_pinned_app_contract(self) -> None:
         checked = cargo_kex(
             "build", "apps/echo", "--target", "x86_64", "--check"
         )
         self.assertEqual(checked.returncode, 0, checked.stderr.decode())
-        self.assertIn(b"KEX app verified", checked.stdout)
+        self.assertIn(b"KEX package verified", checked.stdout)
 
     def test_inspection_rejects_corruption_and_command_names_are_narrow(self) -> None:
         artifact = REPO_ROOT / "rootfs" / "bin" / "x86_64" / "echo.kex"
         with tempfile.TemporaryDirectory() as directory:
+            package_bytes = artifact.read_bytes()
+            executable_offset = struct.unpack_from("<I", package_bytes, 24)[0]
+            raw = Path(directory) / "raw.kex"
+            raw.write_bytes(package_bytes[executable_offset:])
+            raw_inspection = cargo_kex("inspect", raw, "--json")
+            self.assertEqual(
+                raw_inspection.returncode, 0, raw_inspection.stderr.decode()
+            )
+            raw_report = json.loads(raw_inspection.stdout)
+            self.assertEqual(raw_report["format"], "KEX v1")
+            self.assertEqual(raw_report["requirements"], 0)
+
             corrupt = Path(directory) / "corrupt.kex"
-            corrupt.write_bytes(artifact.read_bytes()[:-1])
+            corrupt.write_bytes(package_bytes[:-1])
             inspected = cargo_kex("inspect", corrupt)
             self.assertNotEqual(inspected.returncode, 0)
-            self.assertIn(b"invalid KEX artifact", inspected.stderr)
+            self.assertIn(b"invalid KEX package", inspected.stderr)
         for invalid in ("", "Echo", "../echo", "echo.kex", "écho"):
             with self.subTest(name=invalid):
                 rejected = cargo_kex(

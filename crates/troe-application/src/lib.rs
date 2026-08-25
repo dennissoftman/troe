@@ -1,4 +1,4 @@
-//! Bounded parser and load-plan policy for KEX application artifacts.
+//! Bounded package, executable, and load-plan policy for KEX application artifacts.
 #![no_std]
 #![forbid(unsafe_code)]
 
@@ -6,6 +6,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use core::fmt;
+use troe_abi::requirements;
 pub use troe_abi::{ABI_MAJOR, ABI_MINOR};
 
 /// KEX v1 base page size in bytes.
@@ -22,6 +23,10 @@ pub const KEX_V1_HEADER_BYTES: usize = 64;
 pub const KEX_V1_LOAD_RECORD_BYTES: usize = 40;
 /// Product-name-independent KEX v1 format identifier.
 pub const KEX_V1_MAGIC: [u8; 8] = *b"KEX\0FMT\0";
+/// KEX package v1 header length in bytes.
+pub const KEX_PACKAGE_V1_HEADER_BYTES: usize = 48;
+/// Canonical single-file KEX package identifier.
+pub const KEX_PACKAGE_V1_MAGIC: [u8; 8] = *b"KEXPKG\0\0";
 /// Maximum load records accepted by the standard application policy.
 pub const MAX_LOAD_RECORDS: usize = 16;
 const CONTAINER_MAJOR: u16 = 1;
@@ -54,6 +59,94 @@ const RECORD_FILE_BYTES: usize = 16;
 const RECORD_MEMORY_BYTES: usize = 24;
 const RECORD_PERMISSIONS: usize = 32;
 const RECORD_RESERVED: usize = 36;
+
+const PACKAGE_MAJOR: u16 = 1;
+const PACKAGE_MINOR: u16 = 0;
+const PACKAGE_HEADER_MAJOR: usize = 8;
+const PACKAGE_HEADER_MINOR: usize = 10;
+const PACKAGE_HEADER_BYTES: usize = 12;
+const PACKAGE_HEADER_FLAGS: usize = 14;
+const PACKAGE_HEADER_MANIFEST_OFFSET: usize = 16;
+const PACKAGE_HEADER_MANIFEST_BYTES: usize = 20;
+const PACKAGE_HEADER_EXECUTABLE_OFFSET: usize = 24;
+const PACKAGE_HEADER_RESERVED: usize = 28;
+const PACKAGE_HEADER_EXECUTABLE_BYTES: usize = 32;
+const PACKAGE_HEADER_PACKAGE_BYTES: usize = 40;
+
+/// Maximum complete package bytes admitted by the standard application policy.
+pub const MAX_KEX_PACKAGE_BYTES: usize = KEX_PACKAGE_V1_HEADER_BYTES
+    + requirements::MAX_MANIFEST_BYTES
+    + ApplicationLimits::STANDARD.encoded_bytes;
+
+/// One validated single-file package borrowing its manifest and KEX executable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KexPackage<'package> {
+    manifest: requirements::Manifest<'package>,
+    executable: &'package [u8],
+}
+
+impl<'package> KexPackage<'package> {
+    /// Optional startup interfaces required by this package.
+    #[must_use]
+    pub const fn requirements(self) -> requirements::Manifest<'package> {
+        self.manifest
+    }
+
+    /// Complete canonical KEX v1 executable contained by this package.
+    #[must_use]
+    pub const fn executable(self) -> &'package [u8] {
+        self.executable
+    }
+}
+
+/// Deterministic single-file package rejection category.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PackageError {
+    /// Input exceeds the complete package staging ceiling.
+    PackageTooLarge,
+    /// Input is shorter than the fixed package header.
+    TruncatedHeader,
+    /// Header magic is not the KEX package identifier.
+    InvalidMagic,
+    /// Package major or minor version is unsupported.
+    UnsupportedVersion,
+    /// Fixed header or embedded ranges are noncanonical.
+    InvalidLayout,
+    /// A package flag or reserved field is nonzero.
+    NonzeroReserved,
+    /// Declared package size differs from the exact input length.
+    LengthMismatch,
+    /// Embedded capability requirements are malformed.
+    InvalidManifest,
+}
+
+impl fmt::Display for PackageError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::PackageTooLarge => "KEX package exceeds the staging budget",
+            Self::TruncatedHeader => "KEX package header is truncated",
+            Self::InvalidMagic => "KEX package magic is invalid",
+            Self::UnsupportedVersion => "KEX package version is unsupported",
+            Self::InvalidLayout => "KEX package layout is noncanonical",
+            Self::NonzeroReserved => "KEX package reserved field or flag is nonzero",
+            Self::LengthMismatch => "KEX package declared length differs from its input length",
+            Self::InvalidManifest => "KEX package capability manifest is invalid",
+        })
+    }
+}
+
+/// Deterministic single-file package encoding failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PackageEncodeError {
+    /// The executable is empty or exceeds the KEX v1 ceiling.
+    InvalidExecutable,
+    /// The requirements are excessive, duplicate, unordered, or invalid.
+    InvalidManifest,
+    /// Checked package layout arithmetic overflowed.
+    ArithmeticOverflow,
+    /// Exact output allocation failed.
+    AllocationFailed,
+}
 
 /// Architecture encoded by one KEX artifact.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -747,10 +840,181 @@ impl fmt::Display for ParseError {
     }
 }
 
+/// Encode one canonical package containing requirements and a KEX v1 executable.
+///
+/// # Errors
+///
+/// Rejects empty or excessive executables, invalid requirements, checked
+/// arithmetic failure, and exact allocation failure without producing output.
+pub fn encode_kex_package(
+    executable: &[u8],
+    required: &[requirements::Requirement],
+) -> Result<Vec<u8>, PackageEncodeError> {
+    if executable.is_empty() || executable.len() > ApplicationLimits::standard().encoded_bytes() {
+        return Err(PackageEncodeError::InvalidExecutable);
+    }
+    let mut manifest = [0_u8; requirements::MAX_MANIFEST_BYTES];
+    let manifest_bytes = requirements::encode(required, &mut manifest)
+        .map_err(|_| PackageEncodeError::InvalidManifest)?;
+    let executable_offset = KEX_PACKAGE_V1_HEADER_BYTES
+        .checked_add(manifest_bytes)
+        .ok_or(PackageEncodeError::ArithmeticOverflow)?;
+    let package_bytes = executable_offset
+        .checked_add(executable.len())
+        .ok_or(PackageEncodeError::ArithmeticOverflow)?;
+    if package_bytes > MAX_KEX_PACKAGE_BYTES {
+        return Err(PackageEncodeError::InvalidExecutable);
+    }
+    let mut package = Vec::new();
+    package
+        .try_reserve_exact(package_bytes)
+        .map_err(|_| PackageEncodeError::AllocationFailed)?;
+    package.resize(package_bytes, 0);
+    package[..8].copy_from_slice(&KEX_PACKAGE_V1_MAGIC);
+    write_u16(&mut package, PACKAGE_HEADER_MAJOR, PACKAGE_MAJOR);
+    write_u16(&mut package, PACKAGE_HEADER_MINOR, PACKAGE_MINOR);
+    write_u16(
+        &mut package,
+        PACKAGE_HEADER_BYTES,
+        u16::try_from(KEX_PACKAGE_V1_HEADER_BYTES)
+            .map_err(|_| PackageEncodeError::ArithmeticOverflow)?,
+    );
+    write_u32(
+        &mut package,
+        PACKAGE_HEADER_MANIFEST_OFFSET,
+        u32::try_from(KEX_PACKAGE_V1_HEADER_BYTES)
+            .map_err(|_| PackageEncodeError::ArithmeticOverflow)?,
+    );
+    write_u32(
+        &mut package,
+        PACKAGE_HEADER_MANIFEST_BYTES,
+        u32::try_from(manifest_bytes).map_err(|_| PackageEncodeError::ArithmeticOverflow)?,
+    );
+    write_u32(
+        &mut package,
+        PACKAGE_HEADER_EXECUTABLE_OFFSET,
+        u32::try_from(executable_offset).map_err(|_| PackageEncodeError::ArithmeticOverflow)?,
+    );
+    write_u64(
+        &mut package,
+        PACKAGE_HEADER_EXECUTABLE_BYTES,
+        u64::try_from(executable.len()).map_err(|_| PackageEncodeError::ArithmeticOverflow)?,
+    );
+    write_u64(
+        &mut package,
+        PACKAGE_HEADER_PACKAGE_BYTES,
+        u64::try_from(package_bytes).map_err(|_| PackageEncodeError::ArithmeticOverflow)?,
+    );
+    package[KEX_PACKAGE_V1_HEADER_BYTES..executable_offset]
+        .copy_from_slice(&manifest[..manifest_bytes]);
+    package[executable_offset..].copy_from_slice(executable);
+    Ok(package)
+}
+
+/// Parse one exact single-file KEX application package without allocation.
+///
+/// This validates the envelope and capability manifest. Call [`parse_kex`] on
+/// [`KexPackage::executable`] before allocating or mapping application pages.
+///
+/// # Errors
+///
+/// Rejects every truncation, unsupported version, noncanonical range,
+/// reserved value, length mismatch, and malformed capability manifest.
+pub fn parse_kex_package(package: &[u8]) -> Result<KexPackage<'_>, PackageError> {
+    if package.len() > MAX_KEX_PACKAGE_BYTES {
+        return Err(PackageError::PackageTooLarge);
+    }
+    if package.len() < KEX_PACKAGE_V1_HEADER_BYTES {
+        return Err(PackageError::TruncatedHeader);
+    }
+    if package[..8] != KEX_PACKAGE_V1_MAGIC {
+        return Err(PackageError::InvalidMagic);
+    }
+    if read_package_u16(package, PACKAGE_HEADER_MAJOR)? != PACKAGE_MAJOR
+        || read_package_u16(package, PACKAGE_HEADER_MINOR)? != PACKAGE_MINOR
+    {
+        return Err(PackageError::UnsupportedVersion);
+    }
+    if read_package_u16(package, PACKAGE_HEADER_FLAGS)? != 0
+        || read_package_u32(package, PACKAGE_HEADER_RESERVED)? != 0
+    {
+        return Err(PackageError::NonzeroReserved);
+    }
+    let header_bytes = usize::from(read_package_u16(package, PACKAGE_HEADER_BYTES)?);
+    let manifest_offset =
+        usize::try_from(read_package_u32(package, PACKAGE_HEADER_MANIFEST_OFFSET)?)
+            .map_err(|_| PackageError::InvalidLayout)?;
+    let manifest_bytes = usize::try_from(read_package_u32(package, PACKAGE_HEADER_MANIFEST_BYTES)?)
+        .map_err(|_| PackageError::InvalidLayout)?;
+    let executable_offset =
+        usize::try_from(read_package_u32(package, PACKAGE_HEADER_EXECUTABLE_OFFSET)?)
+            .map_err(|_| PackageError::InvalidLayout)?;
+    let executable_bytes =
+        usize::try_from(read_package_u64(package, PACKAGE_HEADER_EXECUTABLE_BYTES)?)
+            .map_err(|_| PackageError::InvalidLayout)?;
+    let package_bytes = usize::try_from(read_package_u64(package, PACKAGE_HEADER_PACKAGE_BYTES)?)
+        .map_err(|_| PackageError::LengthMismatch)?;
+    if package_bytes != package.len() {
+        return Err(PackageError::LengthMismatch);
+    }
+    let manifest_end = manifest_offset
+        .checked_add(manifest_bytes)
+        .ok_or(PackageError::InvalidLayout)?;
+    let executable_end = executable_offset
+        .checked_add(executable_bytes)
+        .ok_or(PackageError::InvalidLayout)?;
+    if header_bytes != KEX_PACKAGE_V1_HEADER_BYTES
+        || manifest_offset != KEX_PACKAGE_V1_HEADER_BYTES
+        || manifest_bytes > requirements::MAX_MANIFEST_BYTES
+        || executable_offset != manifest_end
+        || executable_bytes == 0
+        || executable_bytes > ApplicationLimits::standard().encoded_bytes()
+        || executable_end != package.len()
+    {
+        return Err(PackageError::InvalidLayout);
+    }
+    let manifest = requirements::Manifest::parse(
+        package
+            .get(manifest_offset..manifest_end)
+            .ok_or(PackageError::InvalidLayout)?,
+    )
+    .map_err(|_| PackageError::InvalidManifest)?;
+    let executable = package
+        .get(executable_offset..executable_end)
+        .ok_or(PackageError::InvalidLayout)?;
+    Ok(KexPackage {
+        manifest,
+        executable,
+    })
+}
+
+fn read_package_u16(bytes: &[u8], offset: usize) -> Result<u16, PackageError> {
+    let value = bytes
+        .get(offset..offset + 2)
+        .ok_or(PackageError::InvalidLayout)?;
+    Ok(u16::from_le_bytes([value[0], value[1]]))
+}
+
+fn read_package_u32(bytes: &[u8], offset: usize) -> Result<u32, PackageError> {
+    let value = bytes
+        .get(offset..offset + 4)
+        .ok_or(PackageError::InvalidLayout)?;
+    Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+fn read_package_u64(bytes: &[u8], offset: usize) -> Result<u64, PackageError> {
+    let value = bytes
+        .get(offset..offset + 8)
+        .ok_or(PackageError::InvalidLayout)?;
+    Ok(u64::from_le_bytes([
+        value[0], value[1], value[2], value[3], value[4], value[5], value[6], value[7],
+    ]))
+}
+
 /// Failure while copying one externally stored artifact into kernel-owned staging.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StageError {
-    /// Source length is zero, not representable, or above the standard KEX ceiling.
+    /// Source length is zero, not representable, or above the package ceiling.
     InvalidLength,
     /// Exact staging allocation failed.
     AllocationFailed,
@@ -776,7 +1040,7 @@ pub fn stage_artifact(
     mut read_at: impl FnMut(u64, &mut [u8]) -> Result<usize, ()>,
 ) -> Result<Vec<u8>, StageError> {
     let byte_len = usize::try_from(byte_len).map_err(|_| StageError::InvalidLength)?;
-    if byte_len == 0 || byte_len > ApplicationLimits::standard().encoded_bytes() {
+    if byte_len == 0 || byte_len > MAX_KEX_PACKAGE_BYTES {
         return Err(StageError::InvalidLength);
     }
     let mut staging = Vec::new();
@@ -1326,6 +1590,118 @@ mod tests {
 
     fn parse_standard(bytes: &[u8], target: Target) -> Result<LoadPlan<'_>, ParseError> {
         parse_kex(bytes, target, ABI_MINOR)
+    }
+
+    #[test]
+    fn package_round_trip_binds_manifest_and_executable() {
+        let executable = valid_artifact(Target::X86_64);
+        let required = [requirements::Requirement {
+            interface: 6,
+            major: 1,
+            minor: 0,
+        }];
+        let bytes =
+            encode_kex_package(&executable, &required).unwrap_or_else(|_| std::process::abort());
+        let package = parse_kex_package(&bytes).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(package.executable(), executable);
+        assert_eq!(package.requirements().iter().collect::<Vec<_>>(), required);
+        assert!(parse_standard(package.executable(), Target::X86_64).is_ok());
+        assert_eq!(
+            bytes.len(),
+            KEX_PACKAGE_V1_HEADER_BYTES
+                + requirements::HEADER_BYTES
+                + requirements::RECORD_BYTES
+                + executable.len()
+        );
+    }
+
+    #[test]
+    fn package_parser_rejects_every_noncanonical_boundary() {
+        let executable = valid_artifact(Target::Aarch64);
+        let canonical =
+            encode_kex_package(&executable, &[]).unwrap_or_else(|_| std::process::abort());
+        for end in 0..canonical.len() {
+            assert!(parse_kex_package(&canonical[..end]).is_err());
+        }
+
+        let mut invalid = canonical.clone();
+        invalid[0] ^= 1;
+        assert_eq!(parse_kex_package(&invalid), Err(PackageError::InvalidMagic));
+        invalid = canonical.clone();
+        put_u16(&mut invalid, PACKAGE_HEADER_MAJOR, 2);
+        assert_eq!(
+            parse_kex_package(&invalid),
+            Err(PackageError::UnsupportedVersion)
+        );
+        invalid = canonical.clone();
+        put_u16(&mut invalid, PACKAGE_HEADER_FLAGS, 1);
+        assert_eq!(
+            parse_kex_package(&invalid),
+            Err(PackageError::NonzeroReserved)
+        );
+        invalid = canonical.clone();
+        put_u32(&mut invalid, PACKAGE_HEADER_MANIFEST_OFFSET, 0);
+        assert_eq!(
+            parse_kex_package(&invalid),
+            Err(PackageError::InvalidLayout)
+        );
+        invalid = canonical.clone();
+        invalid[KEX_PACKAGE_V1_HEADER_BYTES] ^= 1;
+        assert_eq!(
+            parse_kex_package(&invalid),
+            Err(PackageError::InvalidManifest)
+        );
+        invalid = canonical.clone();
+        put_u64(
+            &mut invalid,
+            PACKAGE_HEADER_PACKAGE_BYTES,
+            usize_u64(canonical.len() - 1),
+        );
+        assert_eq!(
+            parse_kex_package(&invalid),
+            Err(PackageError::LengthMismatch)
+        );
+        invalid = canonical.clone();
+        invalid.push(0);
+        assert_eq!(
+            parse_kex_package(&invalid),
+            Err(PackageError::LengthMismatch)
+        );
+
+        let executable_offset = usize::try_from(
+            read_package_u32(&canonical, PACKAGE_HEADER_EXECUTABLE_OFFSET)
+                .unwrap_or_else(|_| unreachable!()),
+        )
+        .unwrap_or_else(|_| unreachable!());
+        invalid = canonical;
+        invalid[executable_offset] ^= 1;
+        let package = parse_kex_package(&invalid).unwrap_or_else(|_| unreachable!());
+        assert!(parse_standard(package.executable(), Target::Aarch64).is_err());
+    }
+
+    #[test]
+    fn package_encoder_rejects_invalid_inputs_without_output() {
+        assert_eq!(
+            encode_kex_package(&[], &[]),
+            Err(PackageEncodeError::InvalidExecutable)
+        );
+        let executable = valid_artifact(Target::X86_64);
+        let duplicate = [
+            requirements::Requirement {
+                interface: 6,
+                major: 1,
+                minor: 0,
+            },
+            requirements::Requirement {
+                interface: 6,
+                major: 1,
+                minor: 0,
+            },
+        ];
+        assert_eq!(
+            encode_kex_package(&executable, &duplicate),
+            Err(PackageEncodeError::InvalidManifest)
+        );
     }
 
     #[test]
@@ -2014,7 +2390,7 @@ mod tests {
         );
         assert_eq!(
             stage_artifact(
-                ApplicationLimits::standard().encoded_bytes() as u64 + 1,
+                MAX_KEX_PACKAGE_BYTES as u64 + 1,
                 |_offset, _destination| Ok(0)
             ),
             Err(StageError::InvalidLength)

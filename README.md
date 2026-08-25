@@ -7,7 +7,8 @@ host program and as native x86-64/AArch64 UEFI images.
 
 Every ordinary shell command is an immutable KEX application running in a fresh
 ring-3/EL0 address space; only `cd`, `poweroff`, and `reboot` remain
-non-shadowable shell intrinsics. The repo-local Rust SDK and dual-target builder produce strict KEX v1;
+non-shadowable shell intrinsics. The repo-local Rust SDK and dual-target builder produce
+canonical single-file packages containing strict KEX v1 executables;
 the shell grants versioned cwd/argv and standard-stream handles plus only the
 optional capabilities declared by each package. Target-native code enters with
 reset register state, exits, yields through scheduler-
@@ -29,8 +30,8 @@ the 50 ms execution lease and transactionally reclaimed.
   messages, and a dispatched native console output path;
 - per-task ring-3/EL0 address spaces, copied user messages, contained task
   faults, owner-wide handle revocation, zeroization, and physical-frame reuse;
-- allocation-free KEX v1 validation with target, ABI, W^X, canonical-layout,
-  entry-point, and standard memory-budget checks;
+- allocation-free KEX package, embedded KCAP, and KEX v1 validation with target,
+  ABI, W^X, canonical-layout, entry-point, and standard memory-budget checks;
 - kernel-owned KEX staging, canonical startup pages, validate-before-map native
   load transactions, explicit initial handles, and zeroized rollback;
 - complete ring-3/EL0 ABI 1.0 entry, exit, resumable yield, and owner-checked
@@ -97,7 +98,8 @@ receive FIFO, exact sequence admission, and bounded retransmission. DNS, IPv6,
 HTTP, TLS, inbound TCP listening, fragmentation, and general sockets remain
 outside this milestone.
 KEX apps may receive optional owner-scoped IPv4/UDP and read-only filesystem
-handles when their KCAP manifests request them. `cat`, `grep`, `hexdump`, `ls`,
+handles when their embedded KCAP manifests request them. `cat`, `grep`,
+`hexdump`, `ls`,
 and `man` exercise generation-checked files, bounded reads, metadata, and
 lexically paginated directories. `write` and `rm` use a separate bounded,
 atomic complete-file mutation handle. `sleep.kex` uses only a cancellable
@@ -132,8 +134,9 @@ cargo kex build apps/echo --target all --check
 cargo kex inspect rootfs/bin/x86_64/echo.kex
 ```
 
-Each installed `.kex` has a canonical `.kcap` sidecar; app manifests declare
-only the optional versioned interfaces they require.
+Each installed `.kex` is one canonical package containing its KCAP manifest and
+KEX v1 executable; app manifests declare only the optional versioned interfaces
+they require.
 
 Build deterministic local/QEMU images with reserved test identities:
 
