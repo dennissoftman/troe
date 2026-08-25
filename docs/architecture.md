@@ -44,7 +44,8 @@ firmware fails before device publication or volatile I/O.
    command path. Absence reports an unavailable application and never selects
    privileged utility behavior. KEX receives bounded stdin/stdout/stderr streams
    plus only declared optional datagram, read-only VFS, complete-file mutation,
-   monotonic timer, diagnostics, network-observation, DHCP, or ICMP handles;
+   monotonic timer, diagnostics, network-observation, DHCP, ICMP, or outbound
+   TCP-connect handles;
    never ambient `Shell`, provider, block, device, or machine authority.
 4. Each non-final command writes to a `BoundedOutput`. The next stage reads the
    frozen result through `SliceInput`; a stage cannot observe mutable internals.
@@ -244,15 +245,19 @@ result. Service replies, per-stream bytes, and total resumed steps all have hard
 ceilings. Optional interfaces expose only bounded IPv4/UDP
 send/receive, read-only VFS operations, one atomic complete-file mutation
 transaction, a boot-relative monotonic timer, one immutable typed diagnostics
-snapshot, read-only typed network observation, one DHCP exchange, or one ICMP
-echo exchange. Network observation, configuration, echo, and datagrams are
-independent authorities; none exposes raw frames, routes, or devices. Datagram
+   snapshot, read-only typed network observation, one DHCP exchange, one ICMP
+   echo exchange, or one literal-IPv4 outbound TCP stream. Network observation,
+   configuration, echo, datagrams, and TCP are independent authorities; none
+   exposes raw frames, routes, DNS, TLS, or devices. Datagram
 ports are exclusive to the launch; read-only
 open tokens are generation-checked and limited to eight; directory traversal is
 lexically paginated. Mutation staging is sequential, capped at 64 KiB, and
 discarded on teardown unless atomically committed. Timer waits are foreground
 and cancellable; diagnostics retains fixed copied bytes rather than accounting
-borrows. Dispatcher teardown unbinds ports and invalidates every token. No
+   borrows. TCP retains at most one unacknowledged 1,460-byte segment and one
+   4 KiB receive FIFO per connection, retransmits four times on fixed timers,
+   and admits only the exact tuple and next sequence. Dispatcher teardown
+   unbinds ports, removes connections, and invalidates every token. No
 mount, raw-network, route-control, provider, block, device, or machine handle is
 granted.
 

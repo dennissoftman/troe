@@ -182,7 +182,6 @@ def main() -> int:
                 "all",
                 "--environment",
                 QEMU_ENVIRONMENT,
-                "--skip-build",
                 "--framebuffer-console",
                 "--native-keyboard",
             )

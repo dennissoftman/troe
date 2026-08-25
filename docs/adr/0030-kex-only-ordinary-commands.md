@@ -23,7 +23,7 @@ revokes all owner state before the shell resumes.
 The immutable target-selected KEFS root is the recovery command distribution:
 both supported images contain behavior-equivalent KEX apps for `arp`, `cat`,
 `clear`, `dhcp`, `echo`, `grep`, `hexdump`, `ls`, `man`, `mem`, `net`, `ping`,
-`printf`, `pwd`, `rm`, `sleep`, `udp`, and `write`. Losing one artifact does not
+`printf`, `pwd`, `rm`, `sleep`, `tcp`, `udp`, and `write`. Losing one artifact does not
 silently substitute privileged code with different authority or semantics.
 `cd` cannot be external because it mutates the shell session; poweroff and
 reboot remain intrinsic because ABI 1.0 intentionally exposes no
@@ -40,5 +40,6 @@ There is now one application path for small utilities and later larger programs
 such as Lua: the same startup ABI, typed least-authority services, memory limits,
 cancellation, fault containment, and teardown apply. Recovery depends on the
 immutable KEX root and loader rather than privileged utility duplication.
-Package signing, generation publication, TCP, jobs, and interpreter-specific
-resource policies remain separate decisions.
+Package signing, generation publication, jobs, and interpreter-specific
+resource policies remain separate decisions. ADR 0031 defines the bounded TCP
+authority used only by `tcp.kex`.

@@ -23,7 +23,7 @@ mod firmware {
 
     use troe_abi::{
         command, datagram, diagnostics, filesystem, filesystem_mutation, icmp_echo,
-        network_configuration, network_observation, requirements, stream, timer,
+        network_configuration, network_observation, requirements, stream, tcp_connect, timer,
     };
     #[cfg(feature = "acceptance-probes")]
     use troe_application::ParseError;
@@ -57,9 +57,10 @@ mod firmware {
     use troe_mount::{BootMountManifest, parse_manifest};
     use troe_net::{
         ArpCache, DhcpMessageType, DhcpPacket, Ipv4Address, MAX_UDP_PAYLOAD_BYTES, MacAddress,
-        NetError, NetworkDevice, NetworkServiceStats, UdpAdmission, UdpPortTable, build_arp_reply,
-        build_arp_request, build_dhcp_discover, build_dhcp_request, build_icmp_echo, build_udp,
-        parse_arp, parse_dhcp, parse_icmp_echo, parse_udp,
+        NetError, NetworkDevice, NetworkServiceStats, TcpConnection, TcpEndpoint, TcpError,
+        TcpSegment, UdpAdmission, UdpPortTable, build_arp_reply, build_arp_request,
+        build_dhcp_discover, build_dhcp_request, build_icmp_echo, build_tcp, build_udp, parse_arp,
+        parse_dhcp, parse_icmp_echo, parse_tcp, parse_udp,
     };
     use troe_persist::{DualSlotStore, RegionSelector, TRANSACTION_BLOCKS};
     use troe_shell::{
@@ -350,6 +351,7 @@ mod firmware {
         TooLarge,
         Exhausted,
         Cancelled,
+        Closed,
     }
 
     #[derive(Clone, Copy)]
@@ -379,11 +381,15 @@ mod firmware {
         configuration: Option<Ipv4Configuration>,
         next_sequence: u16,
         next_port: u16,
+        next_tcp_port: u16,
+        next_tcp_id: u64,
+        tcp_generation: u32,
         dhcp_generation: u16,
         arp: ArpCache,
         udp: UdpPortTable,
         dhcp_inbox: VecDeque<DhcpPacket>,
         echo_inbox: VecDeque<EchoReply>,
+        tcp: Vec<SharedTcpConnection>,
         stats: NetworkServiceStats,
     }
 
@@ -396,7 +402,15 @@ mod firmware {
     }
 
     type SharedNetwork = Rc<RefCell<KernelNetworkService>>;
+    type SharedTcpConnection = Rc<RefCell<KernelTcpConnection>>;
     type SharedNamespace<'namespace> = Rc<RefCell<&'namespace mut Namespace>>;
+
+    struct KernelTcpConnection {
+        id: u64,
+        local_port: u16,
+        peer_mac: MacAddress,
+        machine: TcpConnection,
+    }
 
     struct KernelNetwork {
         service: SharedNetwork,
@@ -451,6 +465,13 @@ mod firmware {
     struct ApplicationIcmpEchoService {
         network: Option<SharedNetwork>,
         runtime: SharedRuntime,
+    }
+
+    struct ApplicationTcpConnectService {
+        network: SharedNetwork,
+        runtime: SharedRuntime,
+        attempted: bool,
+        connection: Option<SharedTcpConnection>,
     }
 
     struct PendingFileReplacement {
@@ -3343,16 +3364,23 @@ mod firmware {
             echo_inbox
                 .try_reserve_exact(Self::INBOX_CAPACITY)
                 .map_err(|_| NetError::Exhausted)?;
+            let mut tcp = Vec::new();
+            tcp.try_reserve_exact(troe_net::MAX_TCP_CONNECTIONS)
+                .map_err(|_| NetError::Exhausted)?;
             Ok(Self {
                 device,
                 configuration: None,
                 next_sequence: 1,
                 next_port: 49_152,
+                next_tcp_port: 49_152,
+                next_tcp_id: 1,
+                tcp_generation: 0,
                 dhcp_generation: 0,
                 arp: ArpCache::new(),
                 udp: UdpPortTable::new()?,
                 dhcp_inbox,
                 echo_inbox,
+                tcp,
                 stats: NetworkServiceStats::default(),
             })
         }
@@ -3461,6 +3489,28 @@ mod firmware {
                         sequence: echo.sequence,
                         bytes: echo.payload.len(),
                     });
+                }
+                return Ok(());
+            }
+            if let Ok(segment) = parse_tcp(frame)
+                && segment.destination.address() == configuration.address
+            {
+                let source_mac = MacAddress::new(
+                    frame
+                        .get(6..12)
+                        .and_then(|bytes| bytes.try_into().ok())
+                        .ok_or(NetworkError::Protocol)?,
+                )
+                .map_err(map_network_error)?;
+                self.arp.learn(segment.source.address(), source_mac);
+                if let Some(connection) = self
+                    .tcp
+                    .iter()
+                    .find(|connection| connection.borrow().machine.accepts(segment))
+                {
+                    let _admission = connection.borrow_mut().machine.on_segment(segment);
+                } else {
+                    self.stats.ignored_frames = self.stats.ignored_frames.saturating_add(1);
                 }
                 return Ok(());
             }
@@ -4437,6 +4487,361 @@ mod firmware {
         }
     }
 
+    impl ApplicationTcpConnectService {
+        const OPERATION_MILLISECONDS: u64 = 4_000;
+        const FLUSH_BUDGET: usize = 2;
+
+        fn new(network: SharedNetwork, runtime: SharedRuntime) -> Self {
+            Self {
+                network,
+                runtime,
+                attempted: false,
+                connection: None,
+            }
+        }
+
+        fn connect(
+            &mut self,
+            destination: [u8; 4],
+            destination_port: u16,
+        ) -> Result<u16, NetworkError> {
+            if self.attempted {
+                return Err(NetworkError::Exhausted);
+            }
+            self.attempted = true;
+            let started = self.runtime.borrow().now();
+            let deadline = started.saturating_add(Self::OPERATION_MILLISECONDS);
+            let configuration = self
+                .network
+                .borrow()
+                .configuration
+                .ok_or(NetworkError::NotConfigured)?;
+            let destination = Ipv4Address::new(destination);
+            let peer_mac = {
+                let network = KernelNetwork::new(self.network.clone());
+                let mut runtime = KernelRuntimeCapability {
+                    runtime: self.runtime.clone(),
+                };
+                network.resolve(destination, &mut runtime)?
+            };
+            let now = self.runtime.borrow().now().as_millis();
+            let (id, local_port, initial_sequence) = {
+                let mut network = self.network.borrow_mut();
+                if network.tcp.len() == troe_net::MAX_TCP_CONNECTIONS {
+                    return Err(NetworkError::Exhausted);
+                }
+                let mut selected = None;
+                for _ in 0..=troe_net::MAX_TCP_CONNECTIONS {
+                    let port = network.next_tcp_port;
+                    network.next_tcp_port = if port == u16::MAX { 49_152 } else { port + 1 };
+                    if !network
+                        .tcp
+                        .iter()
+                        .any(|connection| connection.borrow().local_port == port)
+                    {
+                        selected = Some(port);
+                        break;
+                    }
+                }
+                let local_port = selected.ok_or(NetworkError::Exhausted)?;
+                let id = network.next_tcp_id;
+                network.next_tcp_id = network
+                    .next_tcp_id
+                    .checked_add(1)
+                    .ok_or(NetworkError::Exhausted)?;
+                network.tcp_generation = network.tcp_generation.wrapping_add(1);
+                let mac = network.device.mac_address().bytes();
+                let mac_word = u32::from_be_bytes([mac[2], mac[3], mac[4], mac[5]]);
+                let initial_sequence = u32::try_from(now & u64::from(u32::MAX)).unwrap_or(u32::MAX)
+                    ^ u32::try_from(now >> 32).unwrap_or(u32::MAX).rotate_left(7)
+                    ^ mac_word.rotate_left(13)
+                    ^ network.tcp_generation.wrapping_mul(0x9e37_79b9);
+                (id, local_port, initial_sequence)
+            };
+            let local =
+                TcpEndpoint::new(configuration.address, local_port).map_err(map_network_error)?;
+            let remote =
+                TcpEndpoint::new(destination, destination_port).map_err(map_network_error)?;
+            let machine =
+                TcpConnection::connect(local, remote, initial_sequence).map_err(map_tcp_error)?;
+            let connection = Rc::new(RefCell::new(KernelTcpConnection {
+                id,
+                local_port,
+                peer_mac,
+                machine,
+            }));
+            self.network.borrow_mut().tcp.push(connection.clone());
+            self.connection = Some(connection);
+
+            loop {
+                if let Err(error) = self.flush() {
+                    self.release();
+                    return Err(error);
+                }
+                let state = self.connection_state()?;
+                if state.0 {
+                    return Ok(local_port);
+                }
+                if state.1 {
+                    let error = self.connection_error().unwrap_or(NetworkError::Closed);
+                    self.release();
+                    return Err(error);
+                }
+                if self.runtime.borrow().now() >= deadline {
+                    self.release();
+                    return Err(NetworkError::Timeout);
+                }
+                if self.runtime.borrow_mut().checkpoint().is_err() {
+                    self.release();
+                    return Err(NetworkError::Cancelled);
+                }
+            }
+        }
+
+        fn write(&mut self, bytes: &[u8]) -> Result<(), NetworkError> {
+            let deadline = self
+                .runtime
+                .borrow()
+                .now()
+                .saturating_add(Self::OPERATION_MILLISECONDS);
+            let mut offset = 0;
+            while offset < bytes.len() {
+                let capacity = {
+                    let connection = self.connection.as_ref().ok_or(NetworkError::Closed)?;
+                    let connection = connection.borrow();
+                    if !connection.machine.is_established() {
+                        return Err(connection
+                            .machine
+                            .terminal_error()
+                            .map_or(NetworkError::Closed, map_tcp_error));
+                    }
+                    connection.machine.send_capacity()
+                };
+                if capacity == 0 {
+                    self.wait_checkpoint(deadline)?;
+                    continue;
+                }
+                let count = capacity.min(bytes.len() - offset);
+                self.connection
+                    .as_ref()
+                    .ok_or(NetworkError::Closed)?
+                    .borrow_mut()
+                    .machine
+                    .begin_send(&bytes[offset..offset + count])
+                    .map_err(map_tcp_error)?;
+                loop {
+                    self.flush()?;
+                    let complete = self
+                        .connection
+                        .as_ref()
+                        .ok_or(NetworkError::Closed)?
+                        .borrow()
+                        .machine
+                        .send_complete()
+                        .map_err(map_tcp_error)?;
+                    if complete {
+                        break;
+                    }
+                    self.wait_checkpoint(deadline)?;
+                }
+                offset += count;
+            }
+            Ok(())
+        }
+
+        fn read(&mut self, destination: &mut [u8]) -> Result<usize, NetworkError> {
+            let deadline = self
+                .runtime
+                .borrow()
+                .now()
+                .saturating_add(Self::OPERATION_MILLISECONDS);
+            loop {
+                let read = self
+                    .connection
+                    .as_ref()
+                    .ok_or(NetworkError::Closed)?
+                    .borrow_mut()
+                    .machine
+                    .read(destination)
+                    .map_err(map_tcp_error)?;
+                if let Some(count) = read {
+                    self.flush()?;
+                    return Ok(count);
+                }
+                self.wait_checkpoint(deadline)?;
+            }
+        }
+
+        fn close(&mut self) -> Result<(), NetworkError> {
+            let deadline = self
+                .runtime
+                .borrow()
+                .now()
+                .saturating_add(Self::OPERATION_MILLISECONDS);
+            let begin = {
+                let connection = self.connection.as_ref().ok_or(NetworkError::Closed)?;
+                let mut connection = connection.borrow_mut();
+                if connection.machine.is_closed() {
+                    connection
+                        .machine
+                        .terminal_error()
+                        .map_or(Ok(()), |error| Err(map_tcp_error(error)))
+                } else {
+                    connection.machine.begin_close().map_err(map_tcp_error)
+                }
+            };
+            if let Err(error) = begin {
+                self.release();
+                return Err(error);
+            }
+            loop {
+                if let Err(error) = self.flush() {
+                    self.release();
+                    return Err(error);
+                }
+                let closed = self
+                    .connection
+                    .as_ref()
+                    .is_none_or(|connection| connection.borrow().machine.is_closed());
+                if closed {
+                    self.release();
+                    return Ok(());
+                }
+                if let Err(error) = self.wait_checkpoint(deadline) {
+                    self.release();
+                    return Err(error);
+                }
+            }
+        }
+
+        fn wait_checkpoint(&mut self, deadline: MonotonicMillis) -> Result<(), NetworkError> {
+            if self.runtime.borrow().now() >= deadline {
+                return Err(NetworkError::Timeout);
+            }
+            self.runtime
+                .borrow_mut()
+                .checkpoint()
+                .map_err(|_| NetworkError::Cancelled)?;
+            self.flush()
+        }
+
+        fn flush(&mut self) -> Result<(), NetworkError> {
+            for _ in 0..Self::FLUSH_BUDGET {
+                let now = self.runtime.borrow().now().as_millis();
+                let frame = {
+                    let connection = self.connection.as_ref().ok_or(NetworkError::Closed)?;
+                    let mut connection = connection.borrow_mut();
+                    let peer_mac = connection.peer_mac;
+                    let Some(emission) = connection
+                        .machine
+                        .poll_emission(now)
+                        .map_err(map_tcp_error)?
+                    else {
+                        break;
+                    };
+                    let source_mac = self.network.borrow().device.mac_address();
+                    build_tcp(
+                        source_mac,
+                        peer_mac,
+                        TcpSegment {
+                            source: emission.source,
+                            destination: emission.destination,
+                            sequence: emission.sequence,
+                            acknowledgement: emission.acknowledgement,
+                            flags: emission.flags,
+                            window: emission.window,
+                            payload: emission.payload,
+                        },
+                    )
+                    .map_err(map_network_error)?
+                };
+                self.network.borrow_mut().transmit(&frame)?;
+            }
+            Ok(())
+        }
+
+        fn connection_state(&self) -> Result<(bool, bool), NetworkError> {
+            let connection = self.connection.as_ref().ok_or(NetworkError::Closed)?;
+            let machine = &connection.borrow().machine;
+            Ok((machine.is_established(), machine.is_closed()))
+        }
+
+        fn connection_error(&self) -> Option<NetworkError> {
+            self.connection
+                .as_ref()
+                .and_then(|connection| connection.borrow().machine.terminal_error())
+                .map(map_tcp_error)
+        }
+
+        fn release(&mut self) {
+            let Some(connection) = self.connection.take() else {
+                return;
+            };
+            let id = connection.borrow().id;
+            self.network
+                .borrow_mut()
+                .tcp
+                .retain(|candidate| candidate.borrow().id != id);
+        }
+    }
+
+    impl Service for ApplicationTcpConnectService {
+        fn call(
+            &mut self,
+            request: Request<'_>,
+        ) -> Result<ServiceReply, troe_dispatch::DispatchError> {
+            match request.opcode() {
+                tcp_connect::CONNECT => {
+                    let Ok(connect) = tcp_connect::decode_connect_request(request.payload()) else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    let local_port =
+                        match self.connect(connect.destination, connect.destination_port) {
+                            Ok(port) => port,
+                            Err(error) => {
+                                return Ok(ServiceReply::empty(application_network_status(error)));
+                            }
+                        };
+                    let reply = tcp_connect::encode_connect_reply(local_port)
+                        .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?;
+                    ServiceReply::with_payload(ReplyStatus::Success, &reply)
+                }
+                tcp_connect::WRITE => {
+                    let Ok(bytes) = tcp_connect::decode_write_request(request.payload()) else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    match self.write(bytes) {
+                        Ok(()) => Ok(ServiceReply::empty(ReplyStatus::Success)),
+                        Err(error) => Ok(ServiceReply::empty(application_network_status(error))),
+                    }
+                }
+                tcp_connect::READ => {
+                    let Ok(requested) = tcp_connect::decode_read_request(request.payload()) else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    let mut bytes = [0_u8; tcp_connect::MAX_READ_BYTES];
+                    match self.read(&mut bytes[..requested]) {
+                        Ok(count) => {
+                            ServiceReply::with_payload(ReplyStatus::Success, &bytes[..count])
+                        }
+                        Err(error) => Ok(ServiceReply::empty(application_network_status(error))),
+                    }
+                }
+                tcp_connect::CLOSE if request.payload().is_empty() => match self.close() {
+                    Ok(()) => Ok(ServiceReply::empty(ReplyStatus::Success)),
+                    Err(error) => Ok(ServiceReply::empty(application_network_status(error))),
+                },
+                _ => Ok(ServiceReply::empty(ReplyStatus::InvalidRequest)),
+            }
+        }
+    }
+
+    impl Drop for ApplicationTcpConnectService {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
     const fn application_network_status(error: NetworkError) -> ReplyStatus {
         match error {
             NetworkError::NotConfigured => ReplyStatus::NotConfigured,
@@ -4444,8 +4849,19 @@ mod firmware {
             NetworkError::TooLarge => ReplyStatus::TooLarge,
             NetworkError::Exhausted => ReplyStatus::Exhausted,
             NetworkError::Cancelled => ReplyStatus::Cancelled,
+            NetworkError::Closed | NetworkError::Device => ReplyStatus::Failure,
             NetworkError::Protocol => ReplyStatus::NetworkProtocol,
-            NetworkError::Device => ReplyStatus::Failure,
+        }
+    }
+
+    const fn map_tcp_error(error: TcpError) -> NetworkError {
+        match error {
+            TcpError::Invalid => NetworkError::Protocol,
+            TcpError::Busy | TcpError::WindowClosed | TcpError::Exhausted => {
+                NetworkError::Exhausted
+            }
+            TcpError::Timeout => NetworkError::Timeout,
+            TcpError::Reset | TcpError::Closed => NetworkError::Closed,
         }
     }
 
@@ -4669,6 +5085,7 @@ mod firmware {
             let mut network_observation_required = false;
             let mut network_configuration_required = false;
             let mut icmp_echo_required = false;
+            let mut tcp_connect_required = false;
             for requirement in capability_manifest.iter() {
                 if requirement.interface == troe_abi::interface::DATAGRAM
                     && requirement.major == datagram::MAJOR
@@ -4710,6 +5127,11 @@ mod firmware {
                     && requirement.minor == icmp_echo::MINOR
                 {
                     icmp_echo_required = true;
+                } else if requirement.interface == troe_abi::interface::TCP_CONNECT
+                    && requirement.major == tcp_connect::MAJOR
+                    && requirement.minor == tcp_connect::MINOR
+                {
+                    tcp_connect_required = true;
                 } else {
                     return Some(command_application_error(
                         stderr,
@@ -4765,7 +5187,7 @@ mod firmware {
             let retained_stdout = SharedOutput::new(PIPE_CAPACITY);
             let retained_stderr = SharedOutput::new(PIPE_CAPACITY);
             let application_network = self.runtime.borrow().network.clone();
-            let datagram_network = if datagram_required {
+            let application_transport_network = if datagram_required || tcp_connect_required {
                 let Some(network) = application_network.clone() else {
                     return Some(command_application_error(
                         stderr,
@@ -4785,7 +5207,8 @@ mod firmware {
                 + usize::from(diagnostics_required)
                 + usize::from(network_observation_required)
                 + usize::from(network_configuration_required)
-                + usize::from(icmp_echo_required);
+                + usize::from(icmp_echo_required)
+                + usize::from(tcp_connect_required);
             let Some(handle_capacity) = service_count.checked_mul(2) else {
                 return Some(command_application_error(
                     stderr,
@@ -4841,7 +5264,8 @@ mod firmware {
                     major: stream::MAJOR,
                     minor: stream::MINOR,
                 });
-                if let Some(network) = datagram_network {
+                if datagram_required {
+                    let network = application_transport_network.as_ref().ok_or(())?.clone();
                     services.push(CommandStartupService {
                         port: register_command_service(
                             &mut dispatcher,
@@ -4941,6 +5365,18 @@ mod firmware {
                         interface: troe_abi::interface::ICMP_ECHO,
                         major: icmp_echo::MAJOR,
                         minor: icmp_echo::MINOR,
+                    });
+                }
+                if tcp_connect_required {
+                    let network = application_transport_network.as_ref().ok_or(())?.clone();
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationTcpConnectService::new(network, self.runtime.clone()),
+                        )?,
+                        interface: troe_abi::interface::TCP_CONNECT,
+                        major: tcp_connect::MAJOR,
+                        minor: tcp_connect::MINOR,
                     });
                 }
                 Ok(services)

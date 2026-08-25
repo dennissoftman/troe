@@ -49,6 +49,8 @@ TXSLOT_BYTES = 4 * 512
 TXSLOT_CHECKSUM_OFFSET = 20
 NETWORK_REQUEST = b"troe-stage8-request"
 NETWORK_REPLY = b"troe-stage8-reply"
+TCP_REQUEST = b"troe-tcp-request"
+TCP_REPLY = b"troe-tcp-reply\n"
 
 
 class AcceptanceError(RuntimeError):
@@ -92,6 +94,64 @@ class UdpAcceptancePeer:
                     self._socket.sendto(b"troe-stage8-noise", address)
                     time.sleep(0.005)
                 self._socket.sendto(NETWORK_REPLY, address)
+        except OSError as error:
+            if not self._stop.is_set():
+                self.error = error
+
+    def close(self) -> None:
+        self._stop.set()
+        self._socket.close()
+        self._thread.join(timeout=1.0)
+
+
+class TcpAcceptancePeer:
+    """Answer one typed KEX TCP stream exchange on the slirp host."""
+
+    def __init__(self, platform_id: str, environment: str) -> None:
+        self.platform_id = platform_id
+        runner = resolve_runner(platform_id, environment)
+        self.received = 0
+        self.error: OSError | None = None
+        self._stop = threading.Event()
+        self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._socket.settimeout(0.2)
+        self._socket.bind(("127.0.0.1", runner.acceptance_udp_port))
+        self._socket.listen(1)
+        self._thread = threading.Thread(
+            target=self._serve,
+            name=f"tcp-acceptance-{platform_id}",
+            daemon=True,
+        )
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def _serve(self) -> None:
+        try:
+            while not self._stop.is_set():
+                try:
+                    connection, _address = self._socket.accept()
+                except socket.timeout:
+                    continue
+                with connection:
+                    connection.settimeout(0.5)
+                    payload = bytearray()
+                    try:
+                        while len(payload) < len(TCP_REQUEST):
+                            chunk = connection.recv(len(TCP_REQUEST) - len(payload))
+                            if not chunk:
+                                break
+                            payload.extend(chunk)
+                    except socket.timeout:
+                        # A no-payload connection is used to prove that
+                        # cancellation revokes owner state without blocking
+                        # the next bounded acceptance exchange.
+                        continue
+                    if bytes(payload) != TCP_REQUEST:
+                        continue
+                    self.received += 1
+                    connection.sendall(TCP_REPLY)
         except OSError as error:
             if not self._stop.is_set():
                 self.error = error
@@ -687,7 +747,7 @@ def assert_storage_report(
 
 
 def run_scenario(
-    session: SerialSession, boot_timeout: float, command_timeout: float
+    session: SerialSession, boot_timeout: float, command_timeout: float, tcp_port: int
 ) -> None:
     """Exercise every required KEX app plus intrinsic and bounded failure behavior."""
     session.wait_for(b"sh:/> ", boot_timeout)
@@ -738,6 +798,14 @@ def run_scenario(
     )
     session.cancelled_command("udp listen 40000", cwd, command_timeout)
     session.command("net stats", cwd, command_timeout, contains=("udp ports: 0",))
+    session.cancelled_command(f"tcp 10.0.2.2 {tcp_port}", cwd, command_timeout)
+    for _ in range(5):
+        session.command(
+            f"tcp 10.0.2.2 {tcp_port} troe-tcp-request",
+            cwd,
+            command_timeout,
+            contains=("troe-tcp-reply\n",),
+        )
 
     session.edited_command("", b"\t", "", cwd, command_timeout, expected="\ncat\n")
     session.command(
@@ -918,7 +986,7 @@ def run_scenario(
 
 
 def run_smoke_scenario(
-    session: SerialSession, boot_timeout: float, command_timeout: float
+    session: SerialSession, boot_timeout: float, command_timeout: float, tcp_port: int
 ) -> None:
     """Exercise the interactive console path without the exhaustive quota workload."""
     session.wait_for(b"sh:/> ", boot_timeout)
@@ -967,6 +1035,12 @@ def run_smoke_scenario(
     )
     session.cancelled_command("udp listen 40000", cwd, command_timeout)
     session.command("net stats", cwd, command_timeout, contains=("udp ports: 0",))
+    session.command(
+        f"tcp 10.0.2.2 {tcp_port} troe-tcp-request",
+        cwd,
+        command_timeout,
+        contains=("troe-tcp-reply\n",),
+    )
     session.backspace_command(
         "echo brokeX", "n", cwd, command_timeout, expected="\nbroken\n"
     )
@@ -1162,10 +1236,13 @@ def test_platform(
         acceptance_probes=False,
         framebuffer=args.framebuffer_console,
     )
+    tcp_peer = TcpAcceptancePeer(platform_id, args.environment)
+    tcp_peer.start()
     session = SerialSession(command, platform_id)
     try:
         scenario = run_smoke_scenario if args.smoke else run_scenario
-        scenario(session, args.boot_timeout, args.command_timeout)
+        tcp_port = resolve_runner(platform_id, args.environment).acceptance_udp_port
+        scenario(session, args.boot_timeout, args.command_timeout, tcp_port)
         if (
             args.framebuffer_console
             and b"Starting console and framebuffer" not in session.output
@@ -1180,6 +1257,17 @@ def test_platform(
         raise
     finally:
         session.close()
+        tcp_peer.close()
+    if tcp_peer.error is not None:
+        raise AcceptanceError(
+            f"{platform_id} TCP acceptance peer failed: {tcp_peer.error}"
+        )
+    expected_tcp_streams = 1 if args.smoke else 5
+    if tcp_peer.received != expected_tcp_streams:
+        raise AcceptanceError(
+            f"{platform_id} TCP acceptance peer received "
+            f"{tcp_peer.received} streams, expected {expected_tcp_streams}"
+        )
     reboot_session = SerialSession(command, platform_id)
     try:
         run_reboot_scenario(reboot_session, args.boot_timeout, args.command_timeout)

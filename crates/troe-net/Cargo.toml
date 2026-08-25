@@ -1,6 +1,6 @@
 [package]
 name = "troe-net"
-description = "Bounded Ethernet, ARP, IPv4, and UDP capabilities for TROE"
+description = "Bounded Ethernet, ARP, IPv4, UDP, and TCP capabilities for TROE"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

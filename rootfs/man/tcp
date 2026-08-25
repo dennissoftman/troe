@@ -1,0 +1,12 @@
+NAME
+    tcp - exchange one bounded outbound TCP stream chunk
+
+SYNOPSIS
+    tcp ADDRESS PORT [TEXT...]
+
+DESCRIPTION
+    Connects once to a literal dotted-decimal IPv4 address and nonzero port,
+    optionally writes TEXT, reads one bounded response, and closes. The command
+    owns one connection, one at-most-1,460-byte unacknowledged segment, and one
+    4 KiB receive FIFO. Each operation is bounded and cancellable. DNS, HTTP,
+    TLS, inbound listening, raw packets, and general sockets are not provided.

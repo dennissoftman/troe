@@ -74,6 +74,8 @@ class KexToolTests(unittest.TestCase):
                         expected = [(11, 1, 0)]
                     elif command == "ping":
                         expected = [(12, 1, 0)]
+                    elif command == "tcp":
+                        expected = [(13, 1, 0)]
                     else:
                         expected = []
                     self.assertEqual(records, expected)

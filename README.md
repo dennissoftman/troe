@@ -37,7 +37,7 @@ the 50 ms execution lease and transactionally reclaimed.
   copied handle calls, with owned x86 local-APIC/AArch64 timer leases;
 - exact `/bin/<command>.kex` shell discovery from a target-selected root with no
   privileged ordinary-command fallback, four bounded command and standard-stream
-  services, optional owned datagram, read-only filesystem, and
+  services, optional owned datagram, outbound TCP stream, read-only filesystem, and
   atomic filesystem-mutation services, separate monotonic-timer and immutable
   typed-diagnostics services, a repo-local Rust SDK/skill, and canonical
   dual-target build/check/inspect tooling;
@@ -53,9 +53,9 @@ the 50 ms execution lease and transactionally reclaimed.
   active/predecessor SCFG publication pointer with QEMU-proven health rollback;
 - a bounded single-file persistent state filesystem mounted writable at
   `/vol/state`, with native flush/reopen recovery on both architectures;
-- bounded Ethernet/ARP/IPv4/UDP primitives and native fixed-buffer modern
+- bounded Ethernet/ARP/IPv4/UDP/TCP primitives and native fixed-buffer modern
   virtio-net PCI/MMIO transports, with checksum/fragment/truncation rejection,
-  a 10,000-frame resource-ceiling test, and QEMU-proven host UDP exchange;
+  a 10,000-frame resource-ceiling test, and QEMU-proven host UDP/TCP exchange;
 - canonical bounded identity registry, foreign mapping, mount-policy, and
   native ACL snapshots, bound as typed immutable roots to active/predecessor
   generations and revalidated through QEMU rollback/reopen;
@@ -72,7 +72,8 @@ the 50 ms execution lease and transactionally reclaimed.
 - single/double quotes and pipelines of up to eight stages;
 - 64 KiB bounded intermediate byte streams;
 - KEX apps for `arp`, `cat`, `clear`, `dhcp`, `echo`, literal `grep`, `hexdump`,
-  `ls`, `man`, `mem`, `net`, `ping`, `pwd`, `rm`, `sleep`, `udp`, and `write`,
+  `ls`, `man`, `mem`, `net`, `ping`, `printf`, `pwd`, `rm`, `sleep`, `tcp`, `udp`, and
+  `write`,
   plus intrinsic `cd`, `poweroff`, and `reboot`;
 - deterministic 1.44 MiB FAT12 images for both primary architectures;
 - host/unit/smoke gates and prompt-synchronized QEMU acceptance on both
@@ -83,15 +84,18 @@ the 50 ms execution lease and transactionally reclaimed.
 Normal QEMU images attach one modern virtio-net device and acquire an IPv4
 address, subnet mask, default gateway, and lease through a bounded DHCP
 discover/request exchange. The command environment exposes `net`, `dhcp`, `ping`,
-`arp`, `net stats`, `udp send --source-port`, and `udp listen`. A shared ambient
+`arp`, `net stats`, `tcp`, `udp send --source-port`, and `udp listen`. A shared ambient
 service answers ARP and ICMP while the prompt or a cooperative command is idle,
 retains eight ARP neighbors, and owns eight persistent UDP ports with four
 datagrams and 4 KiB per-port receive capacity. Commands use a boot-relative
 monotonic clock and explicit cancellation checkpoints; Ctrl-C cancels waits and
 `sleep` without introducing background jobs. Receive completions wake the
 ambient service through bounded q35 INTx or GICv2 handlers; an empty receive
-check never spins. DNS, IPv6, TCP, HTTP, TLS,
-fragmentation, and general sockets remain outside this milestone.
+check never spins. Outbound TCP is one owner-scoped connection per declared
+`tcp-connect` handle, with one 1,460-byte unacknowledged segment, a 4 KiB
+receive FIFO, exact sequence admission, and bounded retransmission. DNS, IPv6,
+HTTP, TLS, inbound TCP listening, fragmentation, and general sockets remain
+outside this milestone.
 KEX apps may receive optional owner-scoped IPv4/UDP and read-only filesystem
 handles when their KCAP manifests request them. `cat`, `grep`, `hexdump`, `ls`,
 and `man` exercise generation-checked files, bounded reads, metadata, and
@@ -100,8 +104,9 @@ atomic complete-file mutation handle. `sleep.kex` uses only a cancellable
 boot-relative timer and `mem.kex` uses only an immutable typed snapshot.
 `net.kex` and `arp.kex` use read-only typed network observation, while
 `dhcp.kex` and `ping.kex` each receive only their one bounded cancellable
-protocol operation. The next network boundary is a separately designed bounded
-TCP state machine.
+protocol operation. `tcp.kex` receives only one literal-IPv4 outbound byte
+stream; it provides the transport groundwork for later HTTP clients without
+granting DNS, HTTP, TLS, raw-packet, or general-socket authority.
 
 ## Quick start
 

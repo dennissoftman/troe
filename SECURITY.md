@@ -9,7 +9,8 @@ KEX application with a fresh ring-3/EL0 root, explicit typed handles, bounded
 memory, contained fault fate, and zeroized teardown; no privileged utility
 fallback exists. The shell retains only `cd`, `poweroff`, and `reboot`. There is
 no secure-boot integration or multi-user boundary in this milestone; package
-signing, TCP, DNS, TLS, jobs, and general sockets remain future decisions.
+signing, DNS, TLS, inbound TCP listening, jobs, and general sockets remain
+future decisions.
 
 The portable crates forbid unsafe Rust. Project-authored unsafe operations are
 confined to `troe-machine`, counted by the verification gate, and documented in
@@ -47,6 +48,10 @@ untrusted and bounded.
 - application execution: reset ring-3/EL0 state, bounded saved contexts,
   scheduler-selected resume, copied owner-checked request/reply calls, and an
   architecture-owned 50 ms one-shot that terminates non-returning code;
+- outbound TCP: one connection per declared handle, four system-wide, one
+  1,460-byte unacknowledged segment and 4 KiB receive FIFO per connection,
+  exact-tuple/sequence admission, four retransmissions, four-second cancellable
+  operations, and owner-teardown removal; no DNS, TLS, listen, or raw packets;
 - dependencies: complete `Cargo.lock` checked by pinned `cargo-audit` against the
   exact RustSec database revision in `tools/rustsec-advisory-db.rev`.
 

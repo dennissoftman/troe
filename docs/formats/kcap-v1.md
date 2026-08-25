@@ -27,6 +27,12 @@ The repo-local builder reads the closed capability names from:
 capabilities = ["datagram"]
 ```
 
+The implemented closed names are `datagram`, `filesystem-read`,
+`filesystem-mutate`, `timer`, `diagnostics`, `network-observe`,
+`network-configure`, `icmp-echo`, and `tcp-connect`. Each selects one exact
+interface; no name implies another. In particular, `tcp-connect` accepts only a
+literal IPv4 endpoint and does not grant DNS, TLS, listening, or raw packets.
+
 It writes `<command>.kex` and `<command>.kcap` together under the selected
 source architecture. KEFS projects both into flat runtime `/bin`. A missing
 artifact or malformed, unknown, unsupported, or unavailable requirement rejects

@@ -5,7 +5,7 @@ use core::{fmt, slice};
 
 pub use troe_abi::{
     ABI_MAJOR, ABI_MINOR, command, datagram, diagnostics, exit, filesystem, filesystem_mutation,
-    icmp_echo, network_configuration, network_observation, timer,
+    icmp_echo, network_configuration, network_observation, tcp_connect, timer,
 };
 use troe_abi::{MAX_MESSAGE_BYTES, MAX_SERVICE_PAYLOAD_BYTES, interface, reply, stream};
 
@@ -133,6 +133,7 @@ pub struct CommandContext {
     network_observation: Option<Handle>,
     network_configuration: Option<Handle>,
     icmp_echo: Option<Handle>,
+    tcp_connect: Option<Handle>,
 }
 
 impl CommandContext {
@@ -177,6 +178,11 @@ impl CommandContext {
                 interface::ICMP_ECHO,
                 icmp_echo::MAJOR,
                 icmp_echo::MINOR,
+            )?,
+            tcp_connect: startup.optional_handle(
+                interface::TCP_CONNECT,
+                tcp_connect::MAJOR,
+                tcp_connect::MINOR,
             )?,
         })
     }
@@ -312,6 +318,18 @@ impl CommandContext {
         }
     }
 
+    /// Borrow the optional one-shot outbound TCP connect authority.
+    ///
+    /// # Errors
+    ///
+    /// Reports that the package did not request or receive TCP authority.
+    pub const fn tcp_connect(&self) -> Result<TcpConnect, Error> {
+        match self.tcp_connect {
+            Some(handle) => Ok(TcpConnect { handle }),
+            None => Err(Error::MissingAuthority),
+        }
+    }
+
     /// Yield cooperatively and resume only after kernel reselection.
     ///
     /// # Errors
@@ -426,6 +444,19 @@ pub struct NetworkConfiguration {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IcmpEcho {
     handle: Handle,
+}
+
+/// One-shot literal-IPv4 outbound TCP connect authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TcpConnect {
+    handle: Handle,
+}
+
+/// One connected bounded TCP byte stream.
+#[derive(Debug, Eq, PartialEq)]
+pub struct TcpConnection {
+    handle: Handle,
+    local_port: u16,
 }
 
 /// One pending complete-file replacement.
@@ -780,6 +811,94 @@ impl IcmpEcho {
         let mut reply = [0_u8; icmp_echo::REPLY_BYTES];
         let count = call(self.handle, icmp_echo::ECHO, &request, &mut reply)?;
         icmp_echo::decode_reply(&reply[..count]).map_err(|_| Error::InvalidCall)
+    }
+}
+
+impl TcpConnect {
+    /// Consume this authority to attempt one literal IPv4 connection.
+    ///
+    /// # Errors
+    ///
+    /// Reports invalid endpoints, device/configuration absence, cancellation,
+    /// timeout, reset, resource conflict/exhaustion, or call-gate failure.
+    pub fn connect(
+        self,
+        destination: [u8; 4],
+        destination_port: u16,
+    ) -> Result<TcpConnection, Error> {
+        let request = tcp_connect::encode_connect_request(destination, destination_port)
+            .map_err(|_| Error::InvalidCall)?;
+        let mut reply = [0_u8; tcp_connect::CONNECT_REPLY_BYTES];
+        let count = call(self.handle, tcp_connect::CONNECT, &request, &mut reply)?;
+        let local_port =
+            tcp_connect::decode_connect_reply(&reply[..count]).map_err(|_| Error::InvalidCall)?;
+        Ok(TcpConnection {
+            handle: self.handle,
+            local_port,
+        })
+    }
+}
+
+impl TcpConnection {
+    /// Kernel-selected nonzero local port for this connection.
+    #[must_use]
+    pub const fn local_port(&self) -> u16 {
+        self.local_port
+    }
+
+    /// Write the complete byte slice through acknowledged, at-most-MTU calls.
+    ///
+    /// # Errors
+    ///
+    /// Reports the first cancellation, timeout, reset, close, service, or
+    /// call-gate failure. An empty slice succeeds without a service call.
+    pub fn write_all(&mut self, mut bytes: &[u8]) -> Result<(), Error> {
+        let mut reply = [];
+        while !bytes.is_empty() {
+            let count = bytes.len().min(tcp_connect::MAX_WRITE_BYTES);
+            let reply_bytes = call(self.handle, tcp_connect::WRITE, &bytes[..count], &mut reply)?;
+            if reply_bytes != 0 {
+                return Err(Error::InvalidCall);
+            }
+            bytes = &bytes[count..];
+        }
+        Ok(())
+    }
+
+    /// Read up to `destination.len()` bytes; zero is orderly peer EOF.
+    ///
+    /// # Errors
+    ///
+    /// Reports cancellation, timeout, reset, service, or call-gate failure.
+    pub fn read(&mut self, destination: &mut [u8]) -> Result<usize, Error> {
+        if destination.is_empty() {
+            return Ok(0);
+        }
+        let requested = destination.len().min(tcp_connect::MAX_READ_BYTES);
+        let request =
+            tcp_connect::encode_read_request(requested).map_err(|_| Error::InvalidCall)?;
+        call(
+            self.handle,
+            tcp_connect::READ,
+            &request,
+            &mut destination[..requested],
+        )
+    }
+
+    /// Gracefully close the connection and consume the typed stream.
+    ///
+    /// # Errors
+    ///
+    /// Reports cancellation, timeout, reset, service, or call-gate failure.
+    /// Application teardown aborts the connection after any failure.
+    pub fn close(self) -> Result<(), Error> {
+        let mut reply = [];
+        let count = call(self.handle, tcp_connect::CLOSE, &[], &mut reply)?;
+        if count == 0 {
+            Ok(())
+        } else {
+            Err(Error::InvalidCall)
+        }
     }
 }
 
@@ -1255,6 +1374,7 @@ mod tests {
             interface::NETWORK_OBSERVE,
             interface::NETWORK_CONFIGURE,
             interface::ICMP_ECHO,
+            interface::TCP_CONNECT,
         ]);
         let startup = Startup::parse(&page);
         assert!(startup.is_ok());
@@ -1268,6 +1388,7 @@ mod tests {
                 assert!(command.network_observation().is_ok());
                 assert!(command.network_configuration().is_ok());
                 assert!(command.icmp_echo().is_ok());
+                assert!(command.tcp_connect().is_ok());
             }
         }
     }

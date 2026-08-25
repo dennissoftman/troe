@@ -219,12 +219,6 @@ const COMMANDS: &[CommandSpec] = &[
     },
     CommandSpec {
         intrinsic: None,
-        name: "udp",
-        synopsis: "udp send [--source-port PORT] ADDRESS PORT [TEXT...] | udp listen PORT",
-        class: CommandClass::Application,
-    },
-    CommandSpec {
-        intrinsic: None,
         name: "rm",
         synopsis: "rm FILE",
         class: CommandClass::Application,
@@ -233,6 +227,18 @@ const COMMANDS: &[CommandSpec] = &[
         intrinsic: None,
         name: "sleep",
         synopsis: "sleep MILLISECONDS",
+        class: CommandClass::Application,
+    },
+    CommandSpec {
+        intrinsic: None,
+        name: "tcp",
+        synopsis: "tcp ADDRESS PORT [TEXT...]",
+        class: CommandClass::Application,
+    },
+    CommandSpec {
+        intrinsic: None,
+        name: "udp",
+        synopsis: "udp send [--source-port PORT] ADDRESS PORT [TEXT...] | udp listen PORT",
         class: CommandClass::Application,
     },
     CommandSpec {
@@ -1273,6 +1279,13 @@ mod tests {
 
         let mut error = BoundedOutput::new(128);
         assert_eq!(
+            shell.execute("tcp 192.0.2.1 80", &mut input, &mut output, &mut error),
+            CommandStatus::NotFound
+        );
+        assert_eq!(error.as_slice(), b"tcp: application unavailable\n");
+
+        let mut error = BoundedOutput::new(128);
+        assert_eq!(
             shell.execute("nope", &mut input, &mut output, &mut error),
             CommandStatus::NotFound
         );
@@ -1334,9 +1347,12 @@ mod tests {
         assert_eq!(command_class("cat"), Some(CommandClass::Application));
         assert_eq!(command_class("man"), Some(CommandClass::Application));
         assert_eq!(command_class("printf"), Some(CommandClass::Application));
+        assert_eq!(command_class("tcp"), Some(CommandClass::Application));
         assert_eq!(command_class("help"), None);
         assert_eq!(command_synopsis("man"), Some("man COMMAND"));
         assert_eq!(command_synopsis("printf"), Some("printf FORMAT [ARG...]"));
+        assert_eq!(command_synopsis("tcp"), Some("tcp ADDRESS PORT [TEXT...]"));
+        assert!(COMMANDS.windows(2).all(|pair| pair[0].name < pair[1].name));
 
         let intrinsic_names: Vec<&str> = COMMANDS
             .iter()

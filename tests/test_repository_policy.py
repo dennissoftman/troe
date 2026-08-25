@@ -139,6 +139,7 @@ class RepositoryPolicyTests(unittest.TestCase):
             "pwd",
             "rm",
             "sleep",
+            "tcp",
             "udp",
             "write",
         }

@@ -16,7 +16,7 @@ only as needed. Do not infer POSIX behavior.
   `troe_kex_sdk::exit`.
 - Get `cwd`/`argv` with `CommandContext::invocation`; use only granted
   `stdin`, `stdout`, `stderr`, optional datagram/filesystem/mutation/timer/
-  diagnostics clients, and cooperative `yield_now`.
+  diagnostics/TCP clients, and cooperative `yield_now`.
 - Declare every optional authority in `[package.metadata.troe-kex]`
   `capabilities`; use `[]` or omit the table when none is needed.
 - No undeclared filesystem, environment, clock, raw sockets/device access,
@@ -47,7 +47,8 @@ Diagnostics is one immutable typed launch snapshot. Request `diagnostics` only
 for bounded reporting; it grants no mutable memory, input, or device access.
 Use `network-observe` only for status/stats/neighbors, `network-configure` only
 for cancellable DHCP, and `icmp-echo` only for one cancellable ping exchange.
-None grants raw Ethernet, routes, UDP, another network capability, or devices.
+Use `tcp-connect` only for one literal-IPv4 bounded stream per launch.
+None grants raw Ethernet, routes, DNS, TLS, another network capability, or devices.
 
 ## Minimal crate
 

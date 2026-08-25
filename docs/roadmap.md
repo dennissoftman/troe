@@ -264,11 +264,12 @@ Atomic complete-file mutation is now implemented and exercised by `write.kex`
 and `rm.kex`. Separate monotonic timer and immutable typed diagnostics services
 now back `sleep.kex` and `mem.kex`. Independent typed observation, DHCP, and ICMP
 echo services now back `net.kex`, `arp.kex`, `dhcp.kex`, and `ping.kex` without
-granting raw frames, routes, devices, or one another's authority. The remaining
-ordinary-command recovery implementations are removed; TCP follows only under
-its own bounded state-machine, timer, ownership, and
-adversarial-test contract.
-DNS, TLS, jobs, and general sockets are not implied by these ABIs.
+   granting raw frames, routes, devices, or one another's authority. The remaining
+   ordinary-command recovery implementations are removed. Interface 13 now
+   supplies one owner-scoped outbound TCP stream under fixed state, receive,
+   retransmission, timer, and teardown bounds; `tcp.kex` proves literal-IPv4
+   connect, transfer, close, and repeated owner cleanup. DNS, HTTP, TLS, inbound
+   listening, jobs, and general sockets are not implied by these ABIs.
 
 The shell keeps bounded command-name and path completion, including candidate
 listing for an empty or partial command and command-name completion after
@@ -393,7 +394,7 @@ The first portable storage/configuration boundary is landed:
   TXSLOT publication and explicit flushes. It mounts at `/vol/state`; both QEMU
   profiles mutate it across five process terminations while the harness
   independently checks transaction generation, STFS checksum, and file bytes.
-- `troe-net` supplies safe bounded Ethernet/ARP/IPv4/ICMP/UDP and DHCP
+- `troe-net` supplies safe bounded Ethernet/ARP/IPv4/ICMP/UDP/TCP and DHCP
   construction and parsing, checksum and fragment rejection, plus a
   count-and-byte-bounded receive FIFO. Truncation and 10,000-frame flood tests
   are host verified. Native fixed-buffer modern virtio-net queues run through
@@ -401,11 +402,15 @@ The first portable storage/configuration boundary is landed:
   run one ambient eight-frame checkpoint service that answers ARP and ICMP at
   the idle prompt. Eight ARP records and eight persistent UDP ports are fixed
   ceilings; every port drops newest beyond four datagrams or 4 KiB. Replaceable
-  `arp`, `net stats`, `udp send --source-port`, and cancellable `udp listen`
-  surfaces sit on the same service. A monotonic millisecond clock, cooperative
+  `arp`, `net stats`, `udp send --source-port`, cancellable `udp listen`, and
+  one-connection outbound `tcp` surfaces sit on typed independent services. TCP
+  has four live slots, a 4 KiB per-connection receive FIFO, one unacknowledged
+  segment, exact sequence admission, and four fixed retransmissions. A monotonic
+  millisecond clock, cooperative
   `sleep`, and Ctrl-C checkpoints prepare later applications and jobs without
   adding them. The independent acceptance peer exchange remains the transport
-  regression gate.
+  regression gate; a separate TCP peer proves stream transfer and repeated
+  teardown.
 - `troe-identity` implements canonical checksummed IREG registry, IMAP foreign
   mapping, IMNT mount-policy, and IACL native ACL formats under the accepted
   Standard ceilings. It rejects every truncated/corrupted fixture,

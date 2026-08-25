@@ -1,4 +1,4 @@
-//! Bounded Ethernet, ARP, IPv4, UDP, and receive-queue primitives.
+//! Bounded Ethernet, ARP, IPv4, UDP, TCP, and receive-queue primitives.
 #![no_std]
 #![forbid(unsafe_code)]
 
@@ -8,6 +8,14 @@ extern crate std;
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
+
+mod tcp;
+
+pub use tcp::{
+    MAX_TCP_CONNECTIONS, MAX_TCP_PAYLOAD_BYTES, MAX_TCP_RECEIVE_BYTES, TCP_TRANSMIT_ATTEMPTS,
+    TcpAdmission, TcpConnection, TcpEmission, TcpEndpoint, TcpError, TcpFlags, TcpSegment,
+    TcpState,
+};
 
 /// Ethernet header bytes without VLAN tags.
 pub const ETHERNET_HEADER_BYTES: usize = 14;
@@ -38,6 +46,7 @@ pub const UDP_QUEUE_BYTES: usize = 4 * 1024;
 const ETHERTYPE_IPV4: u16 = 0x0800;
 const ETHERTYPE_ARP: u16 = 0x0806;
 const IP_PROTOCOL_ICMP: u8 = 1;
+const IP_PROTOCOL_TCP: u8 = 6;
 const IP_PROTOCOL_UDP: u8 = 17;
 const DHCP_CLIENT_PORT: u16 = 68;
 const DHCP_SERVER_PORT: u16 = 67;
@@ -788,6 +797,56 @@ pub fn build_udp(
     )
 }
 
+/// Build one checksummed Ethernet/IPv4/TCP segment without protocol options.
+///
+/// # Errors
+///
+/// Rejects invalid endpoints, flags, acknowledgement fields, payload size, and
+/// allocation failure before returning a partial frame.
+pub fn build_tcp(
+    source_mac: MacAddress,
+    destination_mac: MacAddress,
+    segment: TcpSegment<'_>,
+) -> Result<Vec<u8>, NetError> {
+    let flags = TcpFlags::from_bits(segment.flags.bits())?;
+    if segment.source.port() == 0
+        || segment.destination.port() == 0
+        || segment.payload.len() > MAX_TCP_PAYLOAD_BYTES
+        || (!flags.contains(TcpFlags::ACK) && segment.acknowledgement != 0)
+        || (!segment.payload.is_empty()
+            && (flags.contains(TcpFlags::SYN) || flags.contains(TcpFlags::RST)))
+    {
+        return Err(NetError::Invalid);
+    }
+    let tcp_len = 20_usize
+        .checked_add(segment.payload.len())
+        .ok_or(NetError::Invalid)?;
+    let mut frame = build_ipv4_frame(
+        source_mac,
+        destination_mac.bytes(),
+        segment.source.address(),
+        segment.destination.address(),
+        IP_PROTOCOL_TCP,
+        tcp_len,
+    )?;
+    let tcp = ETHERNET_HEADER_BYTES + 20;
+    frame[tcp..tcp + 2].copy_from_slice(&segment.source.port().to_be_bytes());
+    frame[tcp + 2..tcp + 4].copy_from_slice(&segment.destination.port().to_be_bytes());
+    frame[tcp + 4..tcp + 8].copy_from_slice(&segment.sequence.to_be_bytes());
+    frame[tcp + 8..tcp + 12].copy_from_slice(&segment.acknowledgement.to_be_bytes());
+    frame[tcp + 12] = 5 << 4;
+    frame[tcp + 13] = flags.bits();
+    frame[tcp + 14..tcp + 16].copy_from_slice(&segment.window.to_be_bytes());
+    frame[tcp + 20..tcp + tcp_len].copy_from_slice(segment.payload);
+    let tcp_checksum = tcp_checksum(
+        segment.source.address(),
+        segment.destination.address(),
+        &frame[tcp..tcp + tcp_len],
+    );
+    frame[tcp + 16..tcp + 18].copy_from_slice(&tcp_checksum.to_be_bytes());
+    Ok(frame)
+}
+
 fn build_udp_to(
     source_mac: MacAddress,
     destination_mac: [u8; 6],
@@ -1194,6 +1253,105 @@ pub fn parse_udp(frame: &[u8]) -> Result<UdpDatagram<'_>, NetError> {
     })
 }
 
+/// Parse one checksummed, unfragmented Ethernet/IPv4/TCP segment.
+///
+/// # Errors
+///
+/// Rejects IPv4 options, fragmentation, invalid lengths/checksums, zero ports,
+/// unsupported flags or TCP options, invalid acknowledgement fields,
+/// oversized payloads, and nonzero Ethernet padding. A single well-formed MSS
+/// option is tolerated on SYN segments for interoperability but is not exposed.
+pub fn parse_tcp(frame: &[u8]) -> Result<TcpSegment<'_>, NetError> {
+    if frame.len() < ETHERNET_HEADER_BYTES + 40 || frame.len() > MAX_FRAME_BYTES {
+        return Err(NetError::Truncated);
+    }
+    if read_be16(frame, 12)? != ETHERTYPE_IPV4 {
+        return Err(NetError::Unsupported);
+    }
+    let ip = ETHERNET_HEADER_BYTES;
+    if frame[ip] != 0x45 || frame[ip + 9] != IP_PROTOCOL_TCP {
+        return Err(NetError::Unsupported);
+    }
+    let ip_len = usize::from(read_be16(frame, ip + 2)?);
+    if ip_len < 40 || ip + ip_len > frame.len() || read_be16(frame, ip + 6)? & 0x3fff != 0 {
+        return Err(NetError::Truncated);
+    }
+    if checksum(&frame[ip..ip + 20]) != 0 {
+        return Err(NetError::Checksum);
+    }
+    let source_ip = Ipv4Address::new(copy_array(frame, ip + 12)?);
+    let destination_ip = Ipv4Address::new(copy_array(frame, ip + 16)?);
+    let tcp = ip + 20;
+    let tcp_len = ip_len - 20;
+    let header_words = usize::from(frame[tcp + 12] >> 4);
+    if !(5..=15).contains(&header_words)
+        || frame[tcp + 12] & 0x0f != 0
+        || read_be16(frame, tcp + 18)? != 0
+    {
+        return Err(NetError::Unsupported);
+    }
+    let header_bytes = header_words.checked_mul(4).ok_or(NetError::Invalid)?;
+    if header_bytes > tcp_len {
+        return Err(NetError::Truncated);
+    }
+    let flags = TcpFlags::from_bits(frame[tcp + 13])?;
+    validate_tcp_syn_options(&frame[tcp + 20..tcp + header_bytes], flags)?;
+    let payload = &frame[tcp + header_bytes..tcp + tcp_len];
+    if payload.len() > MAX_TCP_PAYLOAD_BYTES
+        || (!flags.contains(TcpFlags::ACK) && read_be32(frame, tcp + 8)? != 0)
+        || (!payload.is_empty() && (flags.contains(TcpFlags::SYN) || flags.contains(TcpFlags::RST)))
+    {
+        return Err(NetError::Invalid);
+    }
+    if !tcp_checksum_valid(source_ip, destination_ip, &frame[tcp..tcp + tcp_len]) {
+        return Err(NetError::Checksum);
+    }
+    if frame[ip + ip_len..].iter().any(|byte| *byte != 0) {
+        return Err(NetError::Invalid);
+    }
+    Ok(TcpSegment {
+        source: TcpEndpoint::new(source_ip, read_be16(frame, tcp)?)?,
+        destination: TcpEndpoint::new(destination_ip, read_be16(frame, tcp + 2)?)?,
+        sequence: read_be32(frame, tcp + 4)?,
+        acknowledgement: read_be32(frame, tcp + 8)?,
+        flags,
+        window: read_be16(frame, tcp + 14)?,
+        payload,
+    })
+}
+
+fn validate_tcp_syn_options(options: &[u8], flags: TcpFlags) -> Result<(), NetError> {
+    if options.is_empty() {
+        return Ok(());
+    }
+    if !flags.contains(TcpFlags::SYN) {
+        return Err(NetError::Unsupported);
+    }
+    let mut offset = 0;
+    let mut saw_mss = false;
+    while offset < options.len() {
+        match options[offset] {
+            0 => {
+                if options[offset..].iter().any(|byte| *byte != 0) {
+                    return Err(NetError::Unsupported);
+                }
+                return Ok(());
+            }
+            1 => offset += 1,
+            2 => {
+                let option = options.get(offset..offset + 4).ok_or(NetError::Truncated)?;
+                if saw_mss || option[1] != 4 || u16::from_be_bytes([option[2], option[3]]) == 0 {
+                    return Err(NetError::Unsupported);
+                }
+                saw_mss = true;
+                offset += 4;
+            }
+            _ => return Err(NetError::Unsupported),
+        }
+    }
+    Ok(())
+}
+
 fn allocate_frame(bytes: usize) -> Result<Vec<u8>, NetError> {
     if bytes > MAX_FRAME_BYTES {
         return Err(NetError::Invalid);
@@ -1211,6 +1369,11 @@ fn read_be16(bytes: &[u8], offset: usize) -> Result<u16, NetError> {
     Ok(u16::from_be_bytes([raw[0], raw[1]]))
 }
 
+fn read_be32(bytes: &[u8], offset: usize) -> Result<u32, NetError> {
+    let raw = bytes.get(offset..offset + 4).ok_or(NetError::Truncated)?;
+    Ok(u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]))
+}
+
 fn copy_array<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], NetError> {
     let mut output = [0_u8; N];
     output.copy_from_slice(bytes.get(offset..offset + N).ok_or(NetError::Truncated)?);
@@ -1224,6 +1387,23 @@ fn checksum(bytes: &[u8]) -> u16 {
 fn udp_checksum(source: Ipv4Address, destination: Ipv4Address, udp: &[u8]) -> u16 {
     let result = finalize_sum(udp_sum(source, destination, udp));
     if result == 0 { 0xffff } else { result }
+}
+
+fn tcp_checksum(source: Ipv4Address, destination: Ipv4Address, tcp: &[u8]) -> u16 {
+    let result = finalize_sum(tcp_sum(source, destination, tcp));
+    if result == 0 { 0xffff } else { result }
+}
+
+fn tcp_checksum_valid(source: Ipv4Address, destination: Ipv4Address, tcp: &[u8]) -> bool {
+    finalize_sum(tcp_sum(source, destination, tcp)) == 0
+}
+
+fn tcp_sum(source: Ipv4Address, destination: Ipv4Address, tcp: &[u8]) -> u32 {
+    let mut sum = sum_words(0, &source.bytes());
+    sum = sum_words(sum, &destination.bytes());
+    sum = sum.wrapping_add(u32::from(IP_PROTOCOL_TCP));
+    sum = sum.wrapping_add(u32::try_from(tcp.len()).unwrap_or(u32::MAX));
+    sum_words(sum, tcp)
 }
 
 fn udp_sum(source: Ipv4Address, destination: Ipv4Address, udp: &[u8]) -> u32 {
@@ -1255,10 +1435,12 @@ fn finalize_sum(mut sum: u32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Admission, ArpCache, DhcpMessageType, Ipv4Address, MAX_ARP_CACHE_ENTRIES, MacAddress,
-        NetError, ReceiveLimits, ReceiveQueue, UDP_QUEUE_DATAGRAMS, UdpAdmission, UdpPortTable,
-        build_arp_reply, build_arp_request, build_dhcp_discover, build_dhcp_request,
-        build_icmp_echo, build_udp, parse_arp, parse_dhcp, parse_icmp_echo, parse_udp,
+        Admission, ArpCache, DhcpMessageType, ETHERNET_HEADER_BYTES, Ipv4Address,
+        MAX_ARP_CACHE_ENTRIES, MacAddress, NetError, ReceiveLimits, ReceiveQueue,
+        TCP_TRANSMIT_ATTEMPTS, TcpEndpoint, TcpFlags, TcpSegment, UDP_QUEUE_DATAGRAMS,
+        UdpAdmission, UdpPortTable, build_arp_reply, build_arp_request, build_dhcp_discover,
+        build_dhcp_request, build_icmp_echo, build_tcp, build_udp, checksum, parse_arp, parse_dhcp,
+        parse_icmp_echo, parse_tcp, parse_udp, tcp_checksum,
     };
 
     fn mac(bytes: [u8; 6]) -> Result<MacAddress, NetError> {
@@ -1365,6 +1547,91 @@ mod tests {
         let mut transport = frame;
         transport[42] ^= 1;
         assert_eq!(parse_udp(&transport), Err(NetError::Checksum));
+        Ok(())
+    }
+
+    #[test]
+    fn tcp_wire_profile_is_exact_and_corruption_closed() -> Result<(), NetError> {
+        let source_mac = mac([0x02, 1, 2, 3, 4, 5])?;
+        let destination_mac = mac([0x02, 6, 7, 8, 9, 10])?;
+        let source = TcpEndpoint::new(Ipv4Address::new([192, 0, 2, 1]), 49_152)?;
+        let destination = TcpEndpoint::new(Ipv4Address::new([192, 0, 2, 2]), 8080)?;
+        let segment = TcpSegment {
+            source,
+            destination,
+            sequence: 0xffff_fffe,
+            acknowledgement: 17,
+            flags: TcpFlags::PSH_ACK,
+            window: 4096,
+            payload: b"stream",
+        };
+        let frame = build_tcp(source_mac, destination_mac, segment)?;
+        let parsed = parse_tcp(&frame)?;
+        assert_eq!(parsed, segment);
+        assert_eq!(TCP_TRANSMIT_ATTEMPTS, 4);
+
+        for end in 0..54 {
+            assert!(parse_tcp(&frame[..end]).is_err());
+        }
+        let mut ip_corrupt = frame.clone();
+        ip_corrupt[24] ^= 1;
+        assert_eq!(parse_tcp(&ip_corrupt), Err(NetError::Checksum));
+        let mut tcp_corrupt = frame.clone();
+        tcp_corrupt[54] ^= 1;
+        assert_eq!(parse_tcp(&tcp_corrupt), Err(NetError::Checksum));
+        let mut fragment = frame.clone();
+        fragment[20..22].copy_from_slice(&0x2000_u16.to_be_bytes());
+        assert!(parse_tcp(&fragment).is_err());
+        let mut padded_syn = build_tcp(
+            source_mac,
+            destination_mac,
+            TcpSegment {
+                source,
+                destination,
+                sequence: 1,
+                acknowledgement: 0,
+                flags: TcpFlags::SYN,
+                window: 4096,
+                payload: &[],
+            },
+        )?;
+        let last = padded_syn.len() - 1;
+        padded_syn[last] = 1;
+        assert_eq!(parse_tcp(&padded_syn), Err(NetError::Invalid));
+
+        let mut mss_syn = build_tcp(
+            source_mac,
+            destination_mac,
+            TcpSegment {
+                source,
+                destination,
+                sequence: 2,
+                acknowledgement: 0,
+                flags: TcpFlags::SYN,
+                window: 4096,
+                payload: &[],
+            },
+        )?;
+        let ip = ETHERNET_HEADER_BYTES;
+        let tcp = ip + 20;
+        mss_syn[ip + 2..ip + 4].copy_from_slice(&44_u16.to_be_bytes());
+        mss_syn[tcp + 12] = 6 << 4;
+        mss_syn[tcp + 20..tcp + 24].copy_from_slice(&[2, 4, 0x05, 0xb4]);
+        mss_syn[ip + 10..ip + 12].fill(0);
+        let ip_checksum = checksum(&mss_syn[ip..ip + 20]);
+        mss_syn[ip + 10..ip + 12].copy_from_slice(&ip_checksum.to_be_bytes());
+        mss_syn[tcp + 16..tcp + 18].fill(0);
+        let transport_checksum = tcp_checksum(
+            source.address(),
+            destination.address(),
+            &mss_syn[tcp..tcp + 24],
+        );
+        mss_syn[tcp + 16..tcp + 18].copy_from_slice(&transport_checksum.to_be_bytes());
+        assert_eq!(parse_tcp(&mss_syn)?.flags, TcpFlags::SYN);
+
+        let mut option_on_ack = mss_syn;
+        option_on_ack[tcp + 13] = TcpFlags::ACK.bits();
+        assert_eq!(parse_tcp(&option_on_ack), Err(NetError::Unsupported));
         Ok(())
     }
 

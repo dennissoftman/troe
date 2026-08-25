@@ -99,6 +99,9 @@ into read-only observation, one bounded DHCP exchange, and one bounded ICMP
 echo exchange for the `net`, `arp`, `dhcp`, and `ping` migrations.
 [ADR 0030](adr/0030-kex-only-ordinary-commands.md) removes every ordinary shell
 implementation, retaining only `cd`, `poweroff`, and `reboot` as intrinsics.
+[ADR 0031](adr/0031-bounded-kex-tcp-connect-service.md) fixes the outbound-only
+literal-IPv4 TCP KEX authority, byte-stream operations, state/timer/resource
+bounds, and owner teardown without adding DNS, TLS, listen, or general sockets.
 ADR 0012 governs the completed Stage 5.1 terminal and
 framebuffer increment; AArch64 native keyboard input remains a later
 virtio-input transport decision. ADR 0013 governs the completed Stage 5.2

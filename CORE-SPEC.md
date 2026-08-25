@@ -1015,7 +1015,9 @@ Configured health failure rolls generation 2 back durably to generation 1.
 
 - Introduce network-device capabilities and a bounded-buffer network stack.
 - Begin with a small practical protocol set such as Ethernet, ARP/NDP as appropriate, IPv4 and/or IPv6, ICMP, UDP, DHCP or static configuration, and DNS.
-- Add TCP only when its state, timer, retransmission, and memory bounds are specified and tested.
+- Keep TCP behind the ADR 0031 typed outbound-connect service whose state,
+  timer, retransmission, and memory bounds are specified and adversarially
+  tested; do not widen it into a general socket interface.
 - Expose networking through handles or service interfaces rather than ambient global access.
 - Resolve the native-principal and foreign-filesystem identity-mapping ADR
   before accepting persistent VFS metadata or enabling foreign-filesystem
