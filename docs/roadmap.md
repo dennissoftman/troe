@@ -309,6 +309,46 @@ host packaging tool, or by a narrowly scoped kernel mechanism. Importing a
 general ELF dynamic linker into the kernel is not implied. Until that decision
 lands, libc and Lua components remain statically linked into each `.kex`.
 
+### Post-Stage 9: bounded waits and asynchronous mailboxes (proposed)
+
+[ADR 0032](adr/0032-bounded-wait-channels-and-asynchronous-mailboxes.md)
+records a documentation-only proposal derived from a review of BeOS/Haiku
+message ports, loopers, and media scheduling. It is not current behavior and is
+not yet an accepted implementation milestone.
+
+The review narrows the useful first step. Existing timer and network services
+already wait cooperatively, but they do so inside one synchronous service call
+while the sole application remains logically running. A real blocked state
+therefore requires a captured user context, copied request, deferred reply,
+generation-checked wait registration, cancellation fate, and owner-teardown
+rule outside arbitrary suspended kernel frames. The existing synchronous
+service `PortId` remains a service endpoint; a queued repository is named a
+mailbox rather than changing that established meaning.
+
+The proposed implementation sequence is:
+
+1. measure checkpoint spinning, idle/wakeup behavior, wait duration,
+   cancellation, and retained request bytes in the existing timer, UDP, and TCP
+   services;
+2. host-test portable wait keys, blocked lifecycle transitions, wake reasons,
+   pending calls, stale-generation rejection, and teardown without changing
+   native execution;
+3. retain suspended KEX contexts and pending ABI calls in a bounded
+   composition-owned table, then convert the timer wait and UDP receive as the
+   first two real consumers;
+4. prove single-CPU timeout, cancellation, close/revoke wakeup, exact
+   zeroization/frame return, and non-spinning idle behavior on both native
+   targets; and
+5. implement preallocated FIFO mailboxes only after two named non-test
+   consumers require queued complete messages.
+
+This proposal does not add preemption, SMP, shared memory, scheduling classes,
+background jobs, or concurrent shell pipelines. Concurrent pipelines require a
+separate decision because launching every stage together changes ADR 0002's
+first-failure and side-effect ordering even when byte order and EOF remain
+identical. Media-style buffer pools and BFS-style live catalog queries remain
+separate workload-triggered directions, not implied scope.
+
 ## Stage 7.5: cloud platform separation (Phases A and B verified)
 
 QEMU remains the fast, deterministic acceptance backend; it must not define the
