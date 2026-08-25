@@ -8,8 +8,9 @@ host program and as native x86-64/AArch64 UEFI images.
 Statically linked recovery built-ins remain available, but ordinary shell names
 can now resolve immutable KEX command applications in fresh ring-3/EL0 address
 spaces. The repo-local Rust SDK and dual-target builder produce strict KEX v1;
-the shell grants only versioned cwd/argv and standard-stream handles. Target-
-native code enters with reset register state, exits, yields through scheduler-
+the shell grants versioned cwd/argv and standard-stream handles plus only the
+optional capabilities declared by each package. Target-native code enters with
+reset register state, exits, yields through scheduler-
 controlled re-entry, performs owner-checked copied calls, or is terminated by
 the 50 ms execution lease and transactionally reclaimed.
 
@@ -36,8 +37,9 @@ the 50 ms execution lease and transactionally reclaimed.
   copied handle calls, with owned x86 local-APIC/AArch64 timer leases;
 - exact `/bin/<command>.kex` shell discovery from a target-selected root, external-first
   replaceable commands with static recovery fallback, four bounded command and
-  standard-stream services, a repo-local Rust SDK/skill, and canonical
-  dual-target build/check/inspect tooling;
+  standard-stream services, optional owned datagram and read-only filesystem
+  services, a repo-local Rust SDK/skill, and canonical dual-target
+  build/check/inspect tooling;
 - portable bounded block-region capabilities, strict primary/backup GPT
   discovery, read-only FAT32 and constrained checksummed ext4 VFS providers,
   checksummed SCFG v1 service startup policy, and a checksummed BMNT v1 boot
@@ -88,11 +90,11 @@ monotonic clock and explicit cancellation checkpoints; Ctrl-C cancels waits and
 ambient service through bounded q35 INTx or GICv2 handlers; an empty receive
 check never spins. DNS, IPv6, TCP, HTTP, TLS,
 fragmentation, and general sockets remain outside this milestone.
-KEX apps may receive one optional owner-scoped IPv4/UDP handle. The `echo`,
-`clear`, and `pwd` replacements use only command/stream authority; `udp` also
-proves bounded send, cancellable receive, exclusive port lifetime, and teardown
-back to zero live bindings. Filesystem, timer, diagnostics, and typed network
-capabilities are the next lower-level migration boundary before TCP.
+KEX apps may receive optional owner-scoped IPv4/UDP and read-only filesystem
+handles when their KCAP manifests request them. `cat`, `grep`, `hexdump`, `ls`,
+and `man` exercise generation-checked files, bounded reads, metadata, and
+lexically paginated directories. Mutation, timer, diagnostics, and typed
+network capabilities are the next lower-level migration boundaries before TCP.
 
 ## Quick start
 

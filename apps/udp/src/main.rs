@@ -191,9 +191,18 @@ fn network_failure(command: &CommandContext, failure: Error) -> u32 {
         }
         Error::Cancelled => ("cancelled", exit::CANCELLED),
         Error::Failure | Error::NotFound => ("network device failed", exit::FAILURE),
-        Error::InvalidCall | Error::InvalidRequest | Error::InvalidInvocation => {
-            ("invalid network response", exit::FAILURE)
-        }
+        Error::InvalidCall
+        | Error::InvalidRequest
+        | Error::InvalidInvocation
+        | Error::InvalidPath
+        | Error::WrongType
+        | Error::ReadOnly
+        | Error::NoSpace
+        | Error::Exists
+        | Error::Corrupt
+        | Error::Io
+        | Error::Unsupported
+        | Error::Overflow => ("invalid network response", exit::FAILURE),
         Error::UnsupportedTarget => ("unsupported application target", exit::FAILURE),
     };
     let mut error = Writer(command.stderr());

@@ -44,7 +44,7 @@ class KexToolTests(unittest.TestCase):
                     self.assertEqual(report["format"], "KEX v1")
                     self.assertEqual(report["abi"], "1.0")
                     self.assertEqual(report["target"], target)
-                    self.assertEqual(report["stack_pages"], 4)
+                    self.assertEqual(report["stack_pages"], 20 if command == "grep" else 4)
                     self.assertEqual(report["heap_pages"], 0)
                     capability_path = artifact.with_suffix(".kcap")
                     capability_bytes = capability_path.read_bytes()
@@ -58,7 +58,12 @@ class KexToolTests(unittest.TestCase):
                         struct.unpack_from("<IHH", capability_bytes, 16 + index * 8)
                         for index in range(count)
                     ]
-                    expected = [(5, 1, 0)] if command == "udp" else []
+                    if command == "udp":
+                        expected = [(5, 1, 0)]
+                    elif command in {"cat", "grep", "hexdump", "ls", "man"}:
+                        expected = [(6, 1, 0)]
+                    else:
+                        expected = []
                     self.assertEqual(records, expected)
 
     def test_build_check_uses_pinned_app_contract(self) -> None:

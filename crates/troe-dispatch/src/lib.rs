@@ -177,6 +177,24 @@ pub enum ReplyStatus {
     Conflict = 8,
     /// A service-domain payload ceiling was exceeded.
     TooLarge = 9,
+    /// A path or namespace request is syntactically invalid.
+    InvalidPath = 10,
+    /// A file was used as a directory or the reverse.
+    WrongType = 11,
+    /// Mutation targeted immutable filesystem content.
+    ReadOnly = 12,
+    /// A filesystem quota is exhausted.
+    NoSpace = 13,
+    /// A filesystem object already exists.
+    Exists = 14,
+    /// Filesystem metadata is corrupt.
+    Corrupt = 15,
+    /// The filesystem transport failed.
+    Io = 16,
+    /// The filesystem requires an unsupported feature.
+    Unsupported = 17,
+    /// Filesystem arithmetic overflowed.
+    Overflow = 18,
 }
 
 impl ReplyStatus {
@@ -336,10 +354,10 @@ impl fmt::Display for DispatchError {
     }
 }
 
-struct PortSlot {
+struct PortSlot<'service> {
     generation: u32,
     retired: bool,
-    service: Option<Box<dyn Service>>,
+    service: Option<Box<dyn Service + 'service>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -376,8 +394,8 @@ pub struct DispatchStats {
 /// queued or cancellable state: closing before delivery invalidates a handle,
 /// while closing during a synchronous call is impossible through the exclusive
 /// dispatcher borrow. Stage 6 additionally revokes handles by task owner.
-pub struct Dispatcher {
-    ports: Vec<PortSlot>,
+pub struct Dispatcher<'service> {
+    ports: Vec<PortSlot<'service>>,
     handles: Vec<HandleSlot>,
     port_capacity: usize,
     handle_capacity: usize,
@@ -386,7 +404,7 @@ pub struct Dispatcher {
     replies: u64,
 }
 
-impl Dispatcher {
+impl<'service> Dispatcher<'service> {
     /// Construct dispatcher tables with immutable capacities.
     ///
     /// # Errors
@@ -426,7 +444,7 @@ impl Dispatcher {
     /// Rejects exhausted port or handle tables.
     pub fn register(
         &mut self,
-        service: Box<dyn Service>,
+        service: Box<dyn Service + 'service>,
         rights: Rights,
     ) -> Result<(PortId, Handle), DispatchError> {
         let port = self.allocate_port(service)?;
@@ -678,7 +696,10 @@ impl Dispatcher {
         }
     }
 
-    fn allocate_port(&mut self, service: Box<dyn Service>) -> Result<PortId, DispatchError> {
+    fn allocate_port(
+        &mut self,
+        service: Box<dyn Service + 'service>,
+    ) -> Result<PortId, DispatchError> {
         if let Some((index, slot)) = self
             .ports
             .iter_mut()
@@ -912,20 +933,20 @@ impl<O: Output> Service for ConsoleService<O> {
 }
 
 /// Client adapter preserving the ordinary [`Output`] interface over dispatch.
-pub struct DispatchedOutput<'a> {
-    dispatcher: &'a mut Dispatcher,
+pub struct DispatchedOutput<'dispatcher, 'service> {
+    dispatcher: &'dispatcher mut Dispatcher<'service>,
     handle: Handle,
 }
 
-impl<'a> DispatchedOutput<'a> {
+impl<'dispatcher, 'service> DispatchedOutput<'dispatcher, 'service> {
     /// Bind an output client to one explicitly supplied handle.
     #[must_use]
-    pub const fn new(dispatcher: &'a mut Dispatcher, handle: Handle) -> Self {
+    pub const fn new(dispatcher: &'dispatcher mut Dispatcher<'service>, handle: Handle) -> Self {
         Self { dispatcher, handle }
     }
 }
 
-impl Output for DispatchedOutput<'_> {
+impl Output for DispatchedOutput<'_, '_> {
     fn write(&mut self, bytes: &[u8]) -> Result<usize, StreamError> {
         if bytes.is_empty() {
             return Ok(0);

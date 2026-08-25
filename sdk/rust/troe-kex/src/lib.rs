@@ -3,7 +3,7 @@
 
 use core::{fmt, slice};
 
-pub use troe_abi::{ABI_MAJOR, ABI_MINOR, command, datagram, exit};
+pub use troe_abi::{ABI_MAJOR, ABI_MINOR, command, datagram, exit, filesystem};
 use troe_abi::{MAX_MESSAGE_BYTES, MAX_SERVICE_PAYLOAD_BYTES, interface, reply, stream};
 
 const STARTUP_PAGE_BYTES: usize = 4096;
@@ -15,6 +15,8 @@ const CALL_RIGHT: u32 = 1;
 pub const INVOCATION_BUFFER_BYTES: usize = command::MAX_INVOCATION_BYTES;
 /// Maximum stack buffer needed to receive one datagram.
 pub const DATAGRAM_BUFFER_BYTES: usize = datagram::MAX_RECEIVE_REPLY_BYTES;
+/// Maximum stack buffer needed to receive one directory page.
+pub const FILESYSTEM_LIST_BUFFER_BYTES: usize = filesystem::MAX_LIST_REPLY_BYTES;
 
 /// One opaque application handle selected from the immutable startup page.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -62,6 +64,24 @@ pub enum Error {
     InvalidInvocation,
     /// This build target cannot execute the native KEX call gate.
     UnsupportedTarget,
+    /// A filesystem path was invalid.
+    InvalidPath,
+    /// A filesystem object had the wrong type.
+    WrongType,
+    /// A filesystem mutation targeted immutable content.
+    ReadOnly,
+    /// A filesystem quota was exhausted.
+    NoSpace,
+    /// A filesystem object already exists.
+    Exists,
+    /// Filesystem metadata was corrupt.
+    Corrupt,
+    /// A filesystem transport failed.
+    Io,
+    /// A filesystem feature is unsupported.
+    Unsupported,
+    /// Filesystem arithmetic overflowed.
+    Overflow,
 }
 
 impl fmt::Display for Error {
@@ -80,6 +100,15 @@ impl fmt::Display for Error {
             Self::MissingAuthority => "required application authority missing",
             Self::InvalidInvocation => "command invocation is invalid",
             Self::UnsupportedTarget => "KEX calls require a freestanding supported target",
+            Self::InvalidPath => "invalid path or filesystem image",
+            Self::WrongType => "wrong node type",
+            Self::ReadOnly => "read-only filesystem",
+            Self::NoSpace => "filesystem quota exceeded",
+            Self::Exists => "already exists",
+            Self::Corrupt => "filesystem metadata is corrupt",
+            Self::Io => "filesystem transport failed",
+            Self::Unsupported => "filesystem feature is unsupported",
+            Self::Overflow => "filesystem size overflow",
         })
     }
 }
@@ -91,6 +120,7 @@ pub struct CommandContext {
     stdout: Handle,
     stderr: Handle,
     datagram: Option<Handle>,
+    filesystem_read: Option<Handle>,
 }
 
 impl CommandContext {
@@ -104,6 +134,11 @@ impl CommandContext {
                 interface::DATAGRAM,
                 datagram::MAJOR,
                 datagram::MINOR,
+            )?,
+            filesystem_read: startup.optional_handle(
+                interface::FILESYSTEM_READ,
+                filesystem::MAJOR,
+                filesystem::MINOR,
             )?,
         })
     }
@@ -151,6 +186,18 @@ impl CommandContext {
     pub const fn datagram(&self) -> Result<Datagram, Error> {
         match self.datagram {
             Some(handle) => Ok(Datagram { handle }),
+            None => Err(Error::MissingAuthority),
+        }
+    }
+
+    /// Borrow the optional read-only filesystem capability.
+    ///
+    /// # Errors
+    ///
+    /// Reports that the package did not request or receive namespace authority.
+    pub const fn filesystem(&self) -> Result<ReadOnlyFilesystem, Error> {
+        match self.filesystem_read {
+            Some(handle) => Ok(ReadOnlyFilesystem { handle }),
             None => Err(Error::MissingAuthority),
         }
     }
@@ -227,6 +274,118 @@ impl StandardOutput {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Datagram {
     handle: Handle,
+}
+
+/// Read-only namespace client scoped to one application lifetime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReadOnlyFilesystem {
+    handle: Handle,
+}
+
+impl ReadOnlyFilesystem {
+    /// Resolve and open one regular file.
+    ///
+    /// # Errors
+    ///
+    /// Reports invalid/missing paths, wrong types, resource exhaustion, or a
+    /// service/call-gate failure.
+    pub fn open(&mut self, path: &str) -> Result<filesystem::OpenFile, Error> {
+        let mut request = [0_u8; filesystem::MAX_PATH_BYTES];
+        let count =
+            filesystem::encode_path_request(path, &mut request).map_err(|_| Error::InvalidCall)?;
+        let mut reply = [0_u8; filesystem::OPEN_REPLY_BYTES];
+        let count = call(self.handle, filesystem::OPEN, &request[..count], &mut reply)?;
+        filesystem::decode_open_reply(&reply[..count]).map_err(|_| Error::InvalidCall)
+    }
+
+    /// Read a bounded range through an open-file token; zero is EOF.
+    ///
+    /// # Errors
+    ///
+    /// Reports stale tokens, invalid offsets, filesystem failures, or a
+    /// service/call-gate failure.
+    pub fn read(
+        &mut self,
+        file: filesystem::OpenFile,
+        offset: u64,
+        destination: &mut [u8],
+    ) -> Result<usize, Error> {
+        if destination.is_empty() {
+            return Ok(0);
+        }
+        let requested = destination.len().min(MAX_SERVICE_PAYLOAD_BYTES);
+        let request = filesystem::encode_read_request(file, offset, requested)
+            .map_err(|_| Error::InvalidCall)?;
+        call(
+            self.handle,
+            filesystem::READ,
+            &request,
+            &mut destination[..requested],
+        )
+    }
+
+    /// Release one open-file token.
+    ///
+    /// # Errors
+    ///
+    /// Reports a stale token or service/call-gate failure.
+    pub fn close(&mut self, file: filesystem::OpenFile) -> Result<(), Error> {
+        let request = filesystem::encode_close_request(file);
+        let mut reply = [];
+        let count = call(self.handle, filesystem::CLOSE, &request, &mut reply)?;
+        if count == 0 {
+            Ok(())
+        } else {
+            Err(Error::InvalidCall)
+        }
+    }
+
+    /// Return metadata for one file or directory without opening it.
+    ///
+    /// # Errors
+    ///
+    /// Reports path, namespace, service, or call-gate failures.
+    pub fn metadata(&mut self, path: &str) -> Result<filesystem::Metadata, Error> {
+        let mut request = [0_u8; filesystem::MAX_PATH_BYTES];
+        let count =
+            filesystem::encode_path_request(path, &mut request).map_err(|_| Error::InvalidCall)?;
+        let mut reply = [0_u8; filesystem::METADATA_REPLY_BYTES];
+        let count = call(
+            self.handle,
+            filesystem::METADATA,
+            &request[..count],
+            &mut reply,
+        )?;
+        filesystem::decode_metadata_reply(&reply[..count]).map_err(|_| Error::InvalidCall)
+    }
+
+    /// Return one bounded lexical directory page.
+    ///
+    /// The reply borrows `buffer`; pass the returned cursor to the next call.
+    ///
+    /// # Errors
+    ///
+    /// Reports path/cursor/budget, namespace, service, or call-gate failures.
+    pub fn list<'buffer>(
+        &mut self,
+        path: &str,
+        cursor: u64,
+        max_entries: usize,
+        max_name_bytes: usize,
+        buffer: &'buffer mut [u8; FILESYSTEM_LIST_BUFFER_BYTES],
+    ) -> Result<filesystem::DirectoryPage<'buffer>, Error> {
+        let mut request = [0_u8; filesystem::MAX_LIST_REQUEST_BYTES];
+        let count = filesystem::encode_list_request(
+            cursor,
+            max_entries,
+            max_name_bytes,
+            path,
+            &mut request,
+        )
+        .map_err(|_| Error::InvalidCall)?;
+        let count = call(self.handle, filesystem::LIST, &request[..count], buffer)?;
+        filesystem::DirectoryPage::parse(&buffer[..count]).map_err(|_| Error::InvalidCall)
+    }
 }
 
 impl Datagram {
@@ -427,6 +586,15 @@ fn call(
         reply::TIMEOUT => Err(Error::Timeout),
         reply::CONFLICT => Err(Error::Conflict),
         reply::TOO_LARGE => Err(Error::TooLarge),
+        reply::INVALID_PATH => Err(Error::InvalidPath),
+        reply::WRONG_TYPE => Err(Error::WrongType),
+        reply::READ_ONLY => Err(Error::ReadOnly),
+        reply::NO_SPACE => Err(Error::NoSpace),
+        reply::EXISTS => Err(Error::Exists),
+        reply::CORRUPT => Err(Error::Corrupt),
+        reply::IO => Err(Error::Io),
+        reply::UNSUPPORTED => Err(Error::Unsupported),
+        reply::OVERFLOW => Err(Error::Overflow),
         _ => Err(Error::InvalidCall),
     }
 }

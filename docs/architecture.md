@@ -42,8 +42,8 @@ firmware fails before device publication or volatile I/O.
 3. The pipeline executor protects shell intrinsics, then tries the exact KEX
    command path. Only an absent app selects a statically linked recovery
    implementation. Both forms receive bounded stdin/stdout/stderr streams;
-   KEX may also receive an optional owned IPv4/UDP endpoint, never ambient
-   `Shell` or device authority.
+   KEX may also receive declared optional owned IPv4/UDP or read-only VFS
+   handles, never ambient `Shell`, provider, block, or device authority.
 4. Each non-final command writes to a `BoundedOutput`. The next stage reads the
    frozen result through `SliceInput`; a stage cannot observe mutable internals.
 5. Filesystem commands ask `Namespace` to canonicalize from the logical cwd.
@@ -239,10 +239,12 @@ one foreground application runs, then resumes only after owner-wide handle
 revocation, record reaping, page zeroization, and exact frame return. Artifacts
 are read from target-selected `/bin/<name>.kex`; only absence permits the static
 recovery fallback. Service replies, per-stream bytes, and total resumed steps
-all have hard ceilings. A fifth optional datagram handle exposes only bounded
-IPv4/UDP send/receive. Its local ports are exclusive to the launch, receive
-waits use cooperative cancellation, and dispatcher teardown unbinds all ports.
-No filesystem, raw-network, route-control, or machine handle is granted.
+all have hard ceilings. Optional interfaces expose only bounded IPv4/UDP
+send/receive and read-only VFS operations. Datagram ports are exclusive to the
+launch; read-only open tokens are generation-checked and limited to eight;
+directory traversal is lexically paginated. Dispatcher teardown unbinds ports
+and invalidates every open token. No mutation, raw-network, route-control,
+provider, block, device, or machine handle is granted.
 
 ## Stage 8 persistent-storage boundary
 

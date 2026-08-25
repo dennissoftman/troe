@@ -15,11 +15,13 @@ only as needed. Do not infer POSIX behavior.
 - Implement `fn main(&mut CommandContext) -> u32`; return a constant from
   `troe_kex_sdk::exit`.
 - Get `cwd`/`argv` with `CommandContext::invocation`; use only granted
-  `stdin`, `stdout`, `stderr`, optional `datagram`, and cooperative `yield_now`.
+  `stdin`, `stdout`, `stderr`, optional `datagram`/`filesystem`, and
+  cooperative `yield_now`.
 - Declare every optional authority in `[package.metadata.troe-kex]`
   `capabilities`; use `[]` or omit the table when none is needed.
-- No filesystem, environment, clock, raw sockets/device access, threads,
-  process spawning, dynamic linking, TLS, signals, or allocator is granted.
+- No filesystem mutation, environment, clock, raw sockets/device access,
+  threads, process spawning, dynamic linking, TLS, signals, or allocator is
+  granted.
 - Never hand-code call gates, startup parsing, handle values, ELF layout, or
   KEX bytes. Do not add `unsafe` unless a reviewed SDK change strictly needs it.
 - Treat every argument/input byte and every service result as untrusted. Check
@@ -32,6 +34,10 @@ either accepts the complete slice in bounded calls or returns an error.
 Datagrams are IPv4/UDP only, at most 1,472 payload bytes. Explicit ports are
 nonzero and exclusively owned until app teardown; `receive` is cancellable and
 reports Ctrl-C as `Error::Cancelled`. Treat `command.datagram()` as optional.
+Read-only filesystem paths are at most 256 bytes; opens are generation-checked
+and limited to eight. Reads may be partial. Close every open file. Directory
+pages are lexical and opaque-cursor based, with at most 64 entries, 64-byte
+names, and 3,072 aggregate name bytes. Request `filesystem-read` only when used.
 
 ## Minimal crate
 
@@ -73,8 +79,8 @@ entry!(main);
 
 Keep computation in a separate `no_std` library module when host unit tests are
 useful. Prefer fixed-size stack storage and streaming over buffering. Keep stack
-usage within the declared four-page default; request heap/stack increases only
-with a measured, reviewed reason.
+usage within the four-page default; declare `stack-pages` or `heap-pages` in
+package metadata only with a measured, reviewed reason.
 
 ## Build and verify
 

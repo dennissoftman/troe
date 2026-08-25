@@ -21,7 +21,7 @@ mod firmware {
     use core::fmt::Write as _;
     use core::panic::PanicInfo;
 
-    use troe_abi::{command, datagram, requirements, stream};
+    use troe_abi::{command, datagram, filesystem, requirements, stream};
     #[cfg(feature = "acceptance-probes")]
     use troe_application::ParseError;
     use troe_application::{
@@ -78,7 +78,7 @@ mod firmware {
         EditorConfig, EditorOutcome, FramebufferDescriptor, FramebufferPixelFormat, InputDecoder,
         KeyEvent, KeyboardConfig, LineEditor, Ps2Set1Decoder, TextConsole, TextConsoleConfig,
     };
-    use troe_vfs::{Namespace, NodeKind, RamFsQuota, ReadOnlyFileSystem};
+    use troe_vfs::{FsError, Namespace, NodeKind, RamFsQuota, ReadOnlyFileSystem};
     use uefi::boot;
     use uefi::mem::memory_map::{MemoryMap, MemoryMapOwned};
     use uefi::prelude::*;
@@ -379,6 +379,19 @@ mod firmware {
         runtime: SharedRuntime,
         ports: [u16; troe_net::MAX_UDP_PORTS],
         port_count: usize,
+    }
+
+    struct ApplicationFilesystemService<'namespace> {
+        namespace: &'namespace mut Namespace,
+        cwd: String,
+        files: [ApplicationFileSlot; filesystem::MAX_OPEN_FILES],
+    }
+
+    struct ApplicationFileSlot {
+        generation: u32,
+        retired: bool,
+        path: Option<String>,
+        byte_count: u64,
     }
 
     struct KernelRuntimeCapability {
@@ -1519,7 +1532,7 @@ mod firmware {
     fn run_one_isolated(
         scheduler: &mut Scheduler,
         accounting: &mut OwnedAccounting,
-        dispatcher: &mut Dispatcher,
+        dispatcher: &mut Dispatcher<'_>,
         port: troe_dispatch::PortId,
         probe: IsolationProbe,
         address_space_slot: u8,
@@ -1781,7 +1794,7 @@ mod firmware {
     fn load_and_reclaim_application(
         scheduler: &mut Scheduler,
         accounting: &mut OwnedAccounting,
-        dispatcher: &mut Dispatcher,
+        dispatcher: &mut Dispatcher<'_>,
         port: troe_dispatch::PortId,
         source: &[u8],
         probe: ApplicationProbe,
@@ -2114,7 +2127,7 @@ mod firmware {
     fn run_command_application(
         scheduler: &mut Scheduler,
         accounting: &mut OwnedAccounting,
-        dispatcher: &mut Dispatcher,
+        dispatcher: &mut Dispatcher<'_>,
         services: &[CommandStartupService],
         source: &[u8],
     ) -> Result<CommandApplicationOutcome, ()> {
@@ -2577,7 +2590,7 @@ mod firmware {
     fn rollback_application_task(
         scheduler: &mut Scheduler,
         task_id: TaskId,
-        dispatcher: &mut Dispatcher,
+        dispatcher: &mut Dispatcher<'_>,
         owner: Option<HandleOwner>,
         frames: &mut FrameAllocator,
         allocation: ApplicationAllocation,
@@ -2599,7 +2612,7 @@ mod firmware {
     fn terminate_revoke_and_reap_task(
         scheduler: &mut Scheduler,
         task_id: TaskId,
-        dispatcher: &mut Dispatcher,
+        dispatcher: &mut Dispatcher<'_>,
         owner: Option<HandleOwner>,
     ) -> Result<(), ()> {
         scheduler
@@ -2684,7 +2697,7 @@ mod firmware {
     fn rollback_isolated_task(
         scheduler: &mut Scheduler,
         task_id: TaskId,
-        dispatcher: &mut Dispatcher,
+        dispatcher: &mut Dispatcher<'_>,
         owner: Option<HandleOwner>,
         frames: &mut FrameAllocator,
         allocation: IsolatedAllocation,
@@ -3704,6 +3717,232 @@ mod firmware {
         }
     }
 
+    impl<'namespace> ApplicationFilesystemService<'namespace> {
+        fn new(namespace: &'namespace mut Namespace, cwd: &str) -> Result<Self, ()> {
+            let mut owned_cwd = String::new();
+            owned_cwd.try_reserve_exact(cwd.len()).map_err(|_| ())?;
+            owned_cwd.push_str(cwd);
+            Ok(Self {
+                namespace,
+                cwd: owned_cwd,
+                files: core::array::from_fn(|_| ApplicationFileSlot {
+                    generation: 1,
+                    retired: false,
+                    path: None,
+                    byte_count: 0,
+                }),
+            })
+        }
+
+        fn open(&mut self, path: &str) -> Result<filesystem::OpenFile, ReplyStatus> {
+            let metadata = self
+                .namespace
+                .metadata(&self.cwd, path)
+                .map_err(application_filesystem_status)?;
+            if metadata.kind != NodeKind::File {
+                return Err(ReplyStatus::WrongType);
+            }
+            let Some((index, slot)) = self
+                .files
+                .iter_mut()
+                .enumerate()
+                .find(|(_, slot)| slot.path.is_none() && !slot.retired)
+            else {
+                return Err(ReplyStatus::Exhausted);
+            };
+            if slot.generation > 0x00ff_ffff {
+                slot.retired = true;
+                return Err(ReplyStatus::Exhausted);
+            }
+            let mut owned_path = String::new();
+            owned_path
+                .try_reserve_exact(path.len())
+                .map_err(|_| ReplyStatus::Exhausted)?;
+            owned_path.push_str(path);
+            slot.path = Some(owned_path);
+            slot.byte_count = metadata.byte_count;
+            let token = (slot.generation << 8)
+                | u32::try_from(index + 1).map_err(|_| ReplyStatus::Failure)?;
+            filesystem::OpenFile::new(token, metadata.byte_count).map_err(|_| ReplyStatus::Failure)
+        }
+
+        fn slot(
+            files: &[ApplicationFileSlot; filesystem::MAX_OPEN_FILES],
+            token: u32,
+        ) -> Result<&ApplicationFileSlot, ReplyStatus> {
+            let encoded_slot = token & 0xff;
+            let generation = token >> 8;
+            if encoded_slot == 0 || generation == 0 {
+                return Err(ReplyStatus::InvalidRequest);
+            }
+            let slot = files
+                .get(usize::try_from(encoded_slot - 1).map_err(|_| ReplyStatus::InvalidRequest)?)
+                .ok_or(ReplyStatus::InvalidRequest)?;
+            if slot.generation != generation || slot.path.is_none() {
+                return Err(ReplyStatus::InvalidRequest);
+            }
+            Ok(slot)
+        }
+
+        fn close(&mut self, token: u32) -> Result<(), ReplyStatus> {
+            let encoded_slot = token & 0xff;
+            let generation = token >> 8;
+            if encoded_slot == 0 || generation == 0 {
+                return Err(ReplyStatus::InvalidRequest);
+            }
+            let slot = self
+                .files
+                .get_mut(
+                    usize::try_from(encoded_slot - 1).map_err(|_| ReplyStatus::InvalidRequest)?,
+                )
+                .ok_or(ReplyStatus::InvalidRequest)?;
+            if slot.generation != generation || slot.path.is_none() {
+                return Err(ReplyStatus::InvalidRequest);
+            }
+            slot.path = None;
+            slot.byte_count = 0;
+            match slot.generation.checked_add(1) {
+                Some(generation) if generation <= 0x00ff_ffff => slot.generation = generation,
+                _ => slot.retired = true,
+            }
+            Ok(())
+        }
+    }
+
+    impl Service for ApplicationFilesystemService<'_> {
+        #[allow(clippy::too_many_lines)]
+        fn call(
+            &mut self,
+            request: Request<'_>,
+        ) -> Result<ServiceReply, troe_dispatch::DispatchError> {
+            match request.opcode() {
+                filesystem::OPEN => {
+                    let Ok(path) = filesystem::decode_path_request(request.payload()) else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    let file = match self.open(path) {
+                        Ok(file) => file,
+                        Err(status) => return Ok(ServiceReply::empty(status)),
+                    };
+                    ServiceReply::with_payload(
+                        ReplyStatus::Success,
+                        &filesystem::encode_open_reply(file),
+                    )
+                }
+                filesystem::READ => {
+                    let Ok((token, offset, requested)) =
+                        filesystem::decode_read_request(request.payload())
+                    else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    let (files, namespace) = (&self.files, &mut self.namespace);
+                    let path = match Self::slot(files, token)
+                        .and_then(|slot| slot.path.as_deref().ok_or(ReplyStatus::InvalidRequest))
+                    {
+                        Ok(path) => path,
+                        Err(status) => return Ok(ServiceReply::empty(status)),
+                    };
+                    let mut bytes = [0_u8; troe_abi::MAX_SERVICE_PAYLOAD_BYTES];
+                    let count = match namespace.read_file_at(
+                        &self.cwd,
+                        path,
+                        offset,
+                        &mut bytes[..requested],
+                    ) {
+                        Ok(count) if count <= requested => count,
+                        Ok(_) => return Ok(ServiceReply::empty(ReplyStatus::Corrupt)),
+                        Err(error) => {
+                            return Ok(ServiceReply::empty(application_filesystem_status(error)));
+                        }
+                    };
+                    ServiceReply::with_payload(ReplyStatus::Success, &bytes[..count])
+                }
+                filesystem::CLOSE => {
+                    let Ok(token) = filesystem::decode_close_request(request.payload()) else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    match self.close(token) {
+                        Ok(()) => Ok(ServiceReply::empty(ReplyStatus::Success)),
+                        Err(status) => Ok(ServiceReply::empty(status)),
+                    }
+                }
+                filesystem::LIST => {
+                    let Ok(decoded) = filesystem::decode_list_request(request.payload()) else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    let listing = match self.namespace.list_bounded(
+                        &self.cwd,
+                        decoded.path,
+                        decoded.cursor,
+                        decoded.max_entries,
+                        decoded.max_name_bytes,
+                    ) {
+                        Ok(listing) => listing,
+                        Err(error) => {
+                            return Ok(ServiceReply::empty(application_filesystem_status(error)));
+                        }
+                    };
+                    let mut entries = Vec::new();
+                    entries
+                        .try_reserve_exact(listing.entries.len())
+                        .map_err(|_| troe_dispatch::DispatchError::MetadataExhausted)?;
+                    for entry in &listing.entries {
+                        entries.push(filesystem::DirectoryEntry {
+                            kind: match entry.kind {
+                                NodeKind::File => filesystem::NodeKind::File,
+                                NodeKind::Directory => filesystem::NodeKind::Directory,
+                            },
+                            name: &entry.name,
+                        });
+                    }
+                    let mut encoded = [0_u8; filesystem::MAX_LIST_REPLY_BYTES];
+                    let count =
+                        filesystem::encode_list_reply(listing.next_cursor, &entries, &mut encoded)
+                            .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?;
+                    ServiceReply::with_payload(ReplyStatus::Success, &encoded[..count])
+                }
+                filesystem::METADATA => {
+                    let Ok(path) = filesystem::decode_path_request(request.payload()) else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    let metadata = match self.namespace.metadata(&self.cwd, path) {
+                        Ok(metadata) => metadata,
+                        Err(error) => {
+                            return Ok(ServiceReply::empty(application_filesystem_status(error)));
+                        }
+                    };
+                    let metadata = filesystem::Metadata {
+                        kind: match metadata.kind {
+                            NodeKind::File => filesystem::NodeKind::File,
+                            NodeKind::Directory => filesystem::NodeKind::Directory,
+                        },
+                        byte_count: metadata.byte_count,
+                    };
+                    ServiceReply::with_payload(
+                        ReplyStatus::Success,
+                        &filesystem::encode_metadata_reply(metadata),
+                    )
+                }
+                _ => Ok(ServiceReply::empty(ReplyStatus::InvalidRequest)),
+            }
+        }
+    }
+
+    const fn application_filesystem_status(error: FsError) -> ReplyStatus {
+        match error {
+            FsError::Invalid => ReplyStatus::InvalidPath,
+            FsError::NotFound => ReplyStatus::NotFound,
+            FsError::WrongType => ReplyStatus::WrongType,
+            FsError::ReadOnly => ReplyStatus::ReadOnly,
+            FsError::NoSpace => ReplyStatus::NoSpace,
+            FsError::Overflow => ReplyStatus::Overflow,
+            FsError::Exists => ReplyStatus::Exists,
+            FsError::Corrupt => ReplyStatus::Corrupt,
+            FsError::Io => ReplyStatus::Io,
+            FsError::Unsupported => ReplyStatus::Unsupported,
+        }
+    }
+
     impl ApplicationDatagramService {
         fn new(network: SharedNetwork, runtime: SharedRuntime) -> Self {
             Self {
@@ -4052,19 +4291,16 @@ mod firmware {
                 ));
             };
             let capability_path = alloc::format!("/bin/{command}.kcap");
-            let capability_bytes = match namespace.read_file_bounded(
+            let Ok(capability_bytes) = namespace.read_file_bounded(
                 "/",
                 &capability_path,
                 requirements::MAX_MANIFEST_BYTES,
-            ) {
-                Ok(bytes) => bytes,
-                Err(_) => {
-                    return Some(command_application_error(
-                        stderr,
-                        command,
-                        "capability manifest unavailable",
-                    ));
-                }
+            ) else {
+                return Some(command_application_error(
+                    stderr,
+                    command,
+                    "capability manifest unavailable",
+                ));
             };
             let Ok(capability_manifest) = requirements::Manifest::parse(&capability_bytes) else {
                 return Some(command_application_error(
@@ -4074,12 +4310,18 @@ mod firmware {
                 ));
             };
             let mut datagram_required = false;
+            let mut filesystem_required = false;
             for requirement in capability_manifest.iter() {
                 if requirement.interface == troe_abi::interface::DATAGRAM
                     && requirement.major == datagram::MAJOR
                     && requirement.minor == datagram::MINOR
                 {
                     datagram_required = true;
+                } else if requirement.interface == troe_abi::interface::FILESYSTEM_READ
+                    && requirement.major == filesystem::MAJOR
+                    && requirement.minor == filesystem::MINOR
+                {
+                    filesystem_required = true;
                 } else {
                     return Some(command_application_error(
                         stderr,
@@ -4109,7 +4351,8 @@ mod firmware {
             } else {
                 None
             };
-            let service_count = 4 + usize::from(datagram_required);
+            let service_count =
+                4 + usize::from(datagram_required) + usize::from(filesystem_required);
             let Some(handle_capacity) = service_count.checked_mul(2) else {
                 return Some(command_application_error(
                     stderr,
@@ -4171,6 +4414,17 @@ mod firmware {
                         minor: datagram::MINOR,
                     });
                 }
+                if filesystem_required {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationFilesystemService::new(namespace, cwd)?,
+                        )?,
+                        interface: troe_abi::interface::FILESYSTEM_READ,
+                        major: filesystem::MAJOR,
+                        minor: filesystem::MINOR,
+                    });
+                }
                 Ok(services)
             })();
             let Ok(services) = services else {
@@ -4215,8 +4469,8 @@ mod firmware {
         }
     }
 
-    fn register_command_service<S: Service + 'static>(
-        dispatcher: &mut Dispatcher,
+    fn register_command_service<'service, S: Service + 'service>(
+        dispatcher: &mut Dispatcher<'service>,
         service: S,
     ) -> Result<troe_dispatch::PortId, ()> {
         let (port, kernel_handle) = dispatcher

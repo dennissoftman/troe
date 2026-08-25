@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub use elf::convert_elf;
-use troe_abi::{datagram, interface, requirements};
+use troe_abi::{datagram, filesystem, interface, requirements};
 use troe_application::{
     ABI_MINOR, ApplicationLimits, KEX_V1_HEADER_BYTES, KEX_V1_IMAGE_BASE, Target, parse_kex,
 };
@@ -89,6 +89,8 @@ struct AppManifest {
     binary: String,
     command: String,
     requirements: Vec<requirements::Requirement>,
+    stack_pages: u32,
+    heap_pages: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -97,8 +99,8 @@ struct BuildOptions {
     command: Option<String>,
     target: TargetSelection,
     output: PathBuf,
-    stack_pages: u32,
-    heap_pages: u32,
+    stack_pages: Option<u32>,
+    heap_pages: Option<u32>,
     check: bool,
 }
 
@@ -204,8 +206,8 @@ fn parse_build(arguments: &mut Arguments) -> ToolResult<BuildOptions> {
         command: None,
         target: TargetSelection::All,
         output: repo_root().join("rootfs/bin"),
-        stack_pages: DEFAULT_STACK_PAGES,
-        heap_pages: DEFAULT_HEAP_PAGES,
+        stack_pages: None,
+        heap_pages: None,
         check: false,
     };
     while let Some(option) = arguments.next() {
@@ -215,8 +217,12 @@ fn parse_build(arguments: &mut Arguments) -> ToolResult<BuildOptions> {
                 options.target = parse_target_selection(&arguments.string("--target")?)?;
             }
             Some("--output") => options.output = PathBuf::from(arguments.value("--output")?),
-            Some("--stack-pages") => options.stack_pages = arguments.number("--stack-pages")?,
-            Some("--heap-pages") => options.heap_pages = arguments.number("--heap-pages")?,
+            Some("--stack-pages") => {
+                options.stack_pages = Some(arguments.number("--stack-pages")?);
+            }
+            Some("--heap-pages") => {
+                options.heap_pages = Some(arguments.number("--heap-pages")?);
+            }
             Some("--check") => options.check = true,
             Some("--help" | "-h") => return Err(ToolError::new(HELP)),
             _ => {
@@ -362,12 +368,31 @@ fn parse_simple_string_array(line: &str, key: &str) -> ToolResult<Option<Vec<Str
     Ok(Some(values))
 }
 
+fn parse_simple_u32(line: &str, key: &str) -> ToolResult<Option<u32>> {
+    let Some((candidate, value)) = line.split_once('=') else {
+        return Ok(None);
+    };
+    if candidate.trim() != key {
+        return Ok(None);
+    }
+    value
+        .trim()
+        .parse::<u32>()
+        .map(Some)
+        .map_err(|_| ToolError::new(format!("manifest {key} must be an unsigned 32-bit integer")))
+}
+
 fn capability_requirement(name: &str) -> ToolResult<requirements::Requirement> {
     match name {
         "datagram" => Ok(requirements::Requirement {
             interface: interface::DATAGRAM,
             major: datagram::MAJOR,
             minor: datagram::MINOR,
+        }),
+        "filesystem-read" => Ok(requirements::Requirement {
+            interface: interface::FILESYSTEM_READ,
+            major: filesystem::MAJOR,
+            minor: filesystem::MINOR,
         }),
         _ => Err(ToolError::new(format!(
             "unknown TROE KEX capability '{name}'"
@@ -395,6 +420,7 @@ fn absolute(path: &Path) -> ToolResult<PathBuf> {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn read_manifest(app: &Path, requested_command: Option<&str>) -> ToolResult<AppManifest> {
     let root = repo_root()
         .canonicalize()
@@ -415,6 +441,8 @@ fn read_manifest(app: &Path, requested_command: Option<&str>) -> ToolResult<AppM
     let mut bin_tables = 0_u8;
     let mut workspace = false;
     let mut capabilities = None;
+    let mut stack_pages = None;
+    let mut heap_pages = None;
     for raw_line in source.lines() {
         let line = raw_line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -450,6 +478,20 @@ fn read_manifest(app: &Path, requested_command: Option<&str>) -> ToolResult<AppM
                     "manifest declares capabilities more than once",
                 ));
             }
+        } else if section == "[package.metadata.troe-kex]"
+            && let Some(value) = parse_simple_u32(line, "stack-pages")?
+            && stack_pages.replace(value).is_some()
+        {
+            return Err(ToolError::new(
+                "manifest declares stack-pages more than once",
+            ));
+        } else if section == "[package.metadata.troe-kex]"
+            && let Some(value) = parse_simple_u32(line, "heap-pages")?
+            && heap_pages.replace(value).is_some()
+        {
+            return Err(ToolError::new(
+                "manifest declares heap-pages more than once",
+            ));
         }
     }
     if !workspace {
@@ -487,6 +529,8 @@ fn read_manifest(app: &Path, requested_command: Option<&str>) -> ToolResult<AppM
         binary,
         command,
         requirements: required,
+        stack_pages: stack_pages.unwrap_or(DEFAULT_STACK_PAGES),
+        heap_pages: heap_pages.unwrap_or(DEFAULT_HEAP_PAGES),
     })
 }
 
@@ -605,16 +649,16 @@ fn execute_build(options: &BuildOptions) -> ToolResult<()> {
                 &manifest,
                 Target::X86_64,
                 &output,
-                options.stack_pages,
-                options.heap_pages,
+                options.stack_pages.unwrap_or(manifest.stack_pages),
+                options.heap_pages.unwrap_or(manifest.heap_pages),
                 options.check,
             )?;
             build_one(
                 &manifest,
                 Target::Aarch64,
                 &output,
-                options.stack_pages,
-                options.heap_pages,
+                options.stack_pages.unwrap_or(manifest.stack_pages),
+                options.heap_pages.unwrap_or(manifest.heap_pages),
                 options.check,
             )
         }
@@ -622,8 +666,8 @@ fn execute_build(options: &BuildOptions) -> ToolResult<()> {
             &manifest,
             target,
             &output,
-            options.stack_pages,
-            options.heap_pages,
+            options.stack_pages.unwrap_or(manifest.stack_pages),
+            options.heap_pages.unwrap_or(manifest.heap_pages),
             options.check,
         ),
     }

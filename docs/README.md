@@ -85,6 +85,9 @@ and the repo-local Rust SDK/build workflow.
 [ADR 0025](adr/0025-kex-owned-datagram-service.md) fixes the optional KEX
 IPv4/UDP handle, exclusive local-port lifetime, cooperative cancellation,
 bounded receive queues, and teardown contract required before TCP.
+[ADR 0026](adr/0026-kex-read-only-filesystem-service.md) fixes the optional KEX
+read-only VFS handle, generation-checked opens, bounded offset reads, and
+lexically paginated directory contract.
 ADR 0012 governs the completed Stage 5.1 terminal and
 framebuffer increment; AArch64 native keyboard input remains a later
 virtio-input transport decision. ADR 0013 governs the completed Stage 5.2

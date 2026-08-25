@@ -688,6 +688,93 @@ impl Namespace {
         Ok(entries)
     }
 
+    /// List one bounded lexical page of immediate children.
+    ///
+    /// The opaque cursor is zero for the first page and otherwise must be a
+    /// value returned by this method for the same directory and namespace
+    /// state. Entry-name bytes, rather than allocator metadata, are charged to
+    /// `max_name_bytes`.
+    ///
+    /// # Errors
+    ///
+    /// Fails for invalid paths/cursors, missing or non-directory nodes,
+    /// provider contract violations, arithmetic overflow, or allocation
+    /// failure within the supplied budgets.
+    pub fn list_bounded(
+        &mut self,
+        cwd: &str,
+        path: &str,
+        cursor: u64,
+        max_entries: usize,
+        max_name_bytes: usize,
+    ) -> Result<ProviderListing, FsError> {
+        let path = canonicalize(cwd, path)?;
+        if let Some((index, relative)) = self.mount_for_path(&path) {
+            let listing = self.mounts[index].provider.list(
+                &relative,
+                cursor,
+                max_entries.min(MAX_PROVIDER_DIRECTORY_ENTRIES),
+                max_name_bytes.min(MAX_PROVIDER_DIRECTORY_BYTES),
+            )?;
+            validate_listing(&listing, max_entries, max_name_bytes)?;
+            return Ok(listing);
+        }
+        match self.nodes.get(&path) {
+            Some(Node::Directory) => {}
+            Some(Node::File { .. }) => return Err(FsError::WrongType),
+            None => return Err(FsError::NotFound),
+        }
+        let start = usize::try_from(cursor).map_err(|_| FsError::Invalid)?;
+        let prefix = if path == "/" {
+            "/".to_string()
+        } else {
+            let mut prefix = path;
+            prefix.push('/');
+            prefix
+        };
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(max_entries.min(MAX_PROVIDER_DIRECTORY_ENTRIES))
+            .map_err(|_| FsError::NoSpace)?;
+        let mut child_index = 0_usize;
+        let mut retained_bytes = 0_usize;
+        for (candidate, node) in self.nodes.range(prefix.clone()..) {
+            if !candidate.starts_with(&prefix) {
+                break;
+            }
+            let name = &candidate[prefix.len()..];
+            if name.is_empty() || name.contains('/') {
+                continue;
+            }
+            if child_index < start {
+                child_index = child_index.checked_add(1).ok_or(FsError::Overflow)?;
+                continue;
+            }
+            let next_bytes = retained_bytes
+                .checked_add(name.len())
+                .ok_or(FsError::Overflow)?;
+            if entries.len() >= max_entries || next_bytes > max_name_bytes {
+                return Ok(ProviderListing {
+                    entries,
+                    next_cursor: Some(u64::try_from(child_index).map_err(|_| FsError::Overflow)?),
+                });
+            }
+            entries.push(DirEntry {
+                name: name.to_string(),
+                kind: node.kind(),
+            });
+            retained_bytes = next_bytes;
+            child_index = child_index.checked_add(1).ok_or(FsError::Overflow)?;
+        }
+        if child_index < start {
+            return Err(FsError::Invalid);
+        }
+        Ok(ProviderListing {
+            entries,
+            next_cursor: None,
+        })
+    }
+
     /// List matching immediate children without exceeding caller-supplied budgets.
     ///
     /// Entry names, rather than allocator metadata, are charged to `max_bytes`.
@@ -834,6 +921,36 @@ impl Namespace {
             }
         })
     }
+}
+
+fn validate_listing(
+    listing: &ProviderListing,
+    max_entries: usize,
+    max_name_bytes: usize,
+) -> Result<(), FsError> {
+    if listing.entries.len() > max_entries {
+        return Err(FsError::Corrupt);
+    }
+    let mut retained_bytes = 0_usize;
+    let mut previous: Option<&str> = None;
+    for entry in &listing.entries {
+        if entry.name.is_empty()
+            || entry.name.len() > MAX_NAME_BYTES
+            || entry.name.contains('/')
+            || matches!(entry.name.as_str(), "." | "..")
+            || previous.is_some_and(|name| name >= entry.name.as_str())
+        {
+            return Err(FsError::Corrupt);
+        }
+        retained_bytes = retained_bytes
+            .checked_add(entry.name.len())
+            .ok_or(FsError::Overflow)?;
+        if retained_bytes > max_name_bytes {
+            return Err(FsError::Corrupt);
+        }
+        previous = Some(entry.name.as_str());
+    }
+    Ok(())
 }
 
 fn insert_node(
@@ -1132,6 +1249,43 @@ mod tests {
         assert_eq!(list[0].name, "a");
         assert_eq!(list[0].kind, NodeKind::File);
         assert_eq!(list[1].name, "z");
+    }
+
+    #[test]
+    fn bounded_listing_cursor_is_opaque_progress_without_duplication() {
+        let mut fs = Namespace::new(RamFsQuota::default());
+        for name in ["alpha", "beta", "gamma"] {
+            assert_eq!(
+                fs.write_file("/", &alloc::format!("/tmp/{name}"), b""),
+                Ok(())
+            );
+        }
+        let first = fs
+            .list_bounded("/", "/tmp", 0, 1, 64)
+            .unwrap_or_else(|_| ProviderListing {
+                entries: Vec::new(),
+                next_cursor: None,
+            });
+        assert_eq!(first.entries[0].name, "alpha");
+        let second = fs
+            .list_bounded("/", "/tmp", first.next_cursor.unwrap_or(u64::MAX), 2, 64)
+            .unwrap_or_else(|_| ProviderListing {
+                entries: Vec::new(),
+                next_cursor: Some(u64::MAX),
+            });
+        assert_eq!(
+            second
+                .entries
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["beta", "gamma"]
+        );
+        assert_eq!(second.next_cursor, None);
+        assert_eq!(
+            fs.list_bounded("/", "/tmp", 4, 1, 64),
+            Err(FsError::Invalid)
+        );
     }
 
     #[test]
