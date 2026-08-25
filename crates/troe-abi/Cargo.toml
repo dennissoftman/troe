@@ -1,0 +1,10 @@
+[package]
+name = "troe-abi"
+description = "Stable bounded service protocols shared by TROE applications and the kernel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

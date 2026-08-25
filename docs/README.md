@@ -7,13 +7,13 @@ historical review evidence.
 
 - [Implementation roadmap](roadmap.md) is the source of truth for landed stages
   and the next kernel milestone.
-- [Architecture](architecture.md) describes the current Stage 8 composition and
+- [Architecture](architecture.md) describes the current Stage 9 composition and
   its boundaries.
 - [Architecture-specific notes](architecture-specific-notes.md) preserve the
   x86-64 and AArch64 interrupt, idle, and controller invariants that portable
   refactors must not erase.
 - [Unsafe inventory](security/unsafe-inventory.md) records the current audited
-  project-authored unsafe surface through the runnable Stage 8 increment.
+  project-authored unsafe surface through the runnable KEX command increment.
 - [KEFS v1](formats/kefs-v1.md) defines the implemented embedded-filesystem
   format.
 - [KEX v1](formats/kex-v1.md) defines the implemented portable executable
@@ -79,6 +79,12 @@ writable VFS provider, exact block authority, and crash-recovery contract for
 the first selected persistent filesystem mutation.
 [ADR 0023](adr/0023-bounded-virtio-network-profile.md) fixes the modern
 virtio-net queue and minimal Ethernet/ARP/IPv4/UDP profile plus flood bounds.
+[ADR 0024](adr/0024-kex-command-apps-and-sdk.md) fixes immutable command
+discovery, standard-stream services, intrinsic protection, recovery fallback,
+and the repo-local Rust SDK/build workflow.
+[ADR 0025](adr/0025-kex-owned-datagram-service.md) fixes the optional KEX
+IPv4/UDP handle, exclusive local-port lifetime, cooperative cancellation,
+bounded receive queues, and teardown contract required before TCP.
 ADR 0012 governs the completed Stage 5.1 terminal and
 framebuffer increment; AArch64 native keyboard input remains a later
 virtio-input transport decision. ADR 0013 governs the completed Stage 5.2

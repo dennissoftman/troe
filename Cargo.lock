@@ -117,8 +117,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "troe-abi"
+version = "0.1.0"
+
+[[package]]
 name = "troe-application"
 version = "0.1.0"
+dependencies = [
+ "troe-abi",
+]
 
 [[package]]
 name = "troe-block"
@@ -144,6 +151,7 @@ version = "0.1.0"
 name = "troe-dispatch"
 version = "0.1.0"
 dependencies = [
+ "troe-abi",
  "troe-core",
 ]
 
@@ -191,6 +199,7 @@ version = "0.1.0"
 name = "troe-kernel"
 version = "0.1.0"
 dependencies = [
+ "troe-abi",
  "troe-application",
  "troe-block",
  "troe-config",
@@ -213,6 +222,13 @@ dependencies = [
  "troe-terminal",
  "troe-vfs",
  "uefi",
+]
+
+[[package]]
+name = "troe-kex-sdk"
+version = "0.1.0"
+dependencies = [
+ "troe-abi",
 ]
 
 [[package]]

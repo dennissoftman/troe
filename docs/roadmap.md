@@ -232,24 +232,31 @@ execution with no partial mappings. Dynamic linking, POSIX compatibility,
 preemption, persistence, and a public package registry are not part of the
 Stage 7 implementation.
 
-### Deferred Stage 7 integration
+### Stage 9 command-application integration (complete vertical slice)
 
-The Stage 7 kernel and security exit criterion is complete. Preserve these
-product-facing integration items for later work; they do not block beginning
-Stage 8:
-
-1. load KEX files from a mounted filesystem or an explicit shell command;
-2. provide SDK and hosted `build`, `run`, and `inspect` tooling; and
-3. define versioned package-manifest and target-specific lock formats.
+The first product-facing integration is implemented. The shell resolves exact
+immutable `/bin/<architecture>/<command>.kex` artifacts, stages them through
+bounded offset reads, and grants versioned command/stdin/stdout/stderr handles.
+`echo` is externally replaceable with a static recovery fallback, while the
+unknown `kex-echo` name proves general discovery on every QEMU composition.
+The repo-local Rust SDK, linker script, canonical dual-target build/inspect
+tool, example source, and concise authoring skill are checked in.
 
 KEX command discovery excludes the permanently intrinsic `cd`, `poweroff`, and
 `reboot` names. `cd` remains a shell-session state transition; the platform
 transitions remain machine-control-capability operations unavailable to
 application ABI 1.0.
 
-Storage should land before the native KEX discovery/launch path so executable
-artifacts have a real bounded source. Manifest and tooling work remains on the
-separate packaging track described below.
+Absent artifacts alone select recovery built-ins; present corrupt or faulting
+artifacts fail closed. Public package manifests, target locks, signatures, and
+content-store application publication remain on the packaging track.
+
+The bounded UDP substrate is now exposed through the optional owner-scoped
+application datagram service. `udp.kex` proves send, receive backpressure,
+waiting/cancellation, and teardown to zero live ports on every QEMU composition.
+Next sequence: design TCP as its own bounded connection/timer state machine,
+then implement only after adversarial portable tests fix those limits. DNS,
+TLS, jobs, and general sockets are not implied by the datagram ABI.
 
 The shell keeps bounded command-name and path completion, including candidate
 listing for an empty or partial command and command-name completion after
@@ -389,7 +396,7 @@ The first portable storage/configuration boundary is landed:
   regression gate.
 - `troe-identity` implements canonical checksummed IREG registry, IMAP foreign
   mapping, IMNT mount-policy, and IACL native ACL formats under the accepted
-  `tiny` and `full` ceilings. It rejects every truncated/corrupted fixture,
+  Standard ceilings. It rejects every truncated/corrupted fixture,
   duplicate compatibility and foreign keys, invalid SID/POSIX encodings,
   missing or kind-incompatible principals, and iterative membership cycles.
   ISEC v1 binds the four typed CSPK objects to GMAN; activation validates the

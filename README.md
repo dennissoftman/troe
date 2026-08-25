@@ -5,14 +5,13 @@ bounded command shell, a small VFS, and an owned kernel that is growing toward
 useful cloud virtual-machine deployments. The current slice runs as a normal
 host program and as native x86-64/AArch64 UEFI images.
 
-Statically linked recovery built-ins still share the privileged kernel address
-space. Stage 6 additionally runs bounded test tasks in fresh ring-3/EL0 address
-spaces; their typed handles, memory faults, and teardown now form a hardware
-security boundary. Loadable applications and a public userspace ABI begin in
-Stage 7. The bounded KEX v1 parser and native validate/map/reclaim boundary are
-implemented. Target-native KEX code enters with reset register state, exits,
-yields through scheduler-controlled re-entry, performs owner-checked copied
-handle calls, or is terminated by the 50 ms execution lease.
+Statically linked recovery built-ins remain available, but ordinary shell names
+can now resolve immutable KEX command applications in fresh ring-3/EL0 address
+spaces. The repo-local Rust SDK and dual-target builder produce strict KEX v1;
+the shell grants only versioned cwd/argv and standard-stream handles. Target-
+native code enters with reset register state, exits, yields through scheduler-
+controlled re-entry, performs owner-checked copied calls, or is terminated by
+the 50 ms execution lease and transactionally reclaimed.
 
 ## What works now
 
@@ -35,6 +34,10 @@ handle calls, or is terminated by the 50 ms execution lease.
   load transactions, explicit initial handles, and zeroized rollback;
 - complete ring-3/EL0 ABI 1.0 entry, exit, resumable yield, and owner-checked
   copied handle calls, with owned x86 local-APIC/AArch64 timer leases;
+- exact `/bin/<architecture>/<command>.kex` shell discovery, external-first
+  replaceable commands with static recovery fallback, four bounded command and
+  standard-stream services, a repo-local Rust SDK/skill, and canonical
+  dual-target build/check/inspect tooling;
 - portable bounded block-region capabilities, strict primary/backup GPT
   discovery, read-only FAT32 and constrained checksummed ext4 VFS providers,
   checksummed SCFG v1 service startup policy, and a checksummed BMNT v1 boot
@@ -85,6 +88,10 @@ monotonic clock and explicit cancellation checkpoints; Ctrl-C cancels waits and
 ambient service through bounded q35 INTx or GICv2 handlers; an empty receive
 check never spins. DNS, IPv6, TCP, HTTP, TLS,
 fragmentation, and general sockets remain outside this milestone.
+KEX apps may receive one optional owner-scoped IPv4/UDP handle. The `udp` KEX
+replacement proves bounded send, cancellable receive, exclusive port lifetime,
+and teardown back to zero live bindings. TCP now needs its own bounded
+connection-state, timer, and adversarial-test design before implementation.
 
 ## Quick start
 
@@ -94,6 +101,14 @@ Host model:
 cargo run --manifest-path host/Cargo.toml
 cargo run --manifest-path host/Cargo.toml -- --command "echo ready | grep ready"
 cargo run --manifest-path host/Cargo.toml -- --script tests/smoke.sh
+```
+
+Build and inspect the example KEX command for both native targets:
+
+```console
+python3 tools/kex.py build apps/echo --target all
+python3 tools/kex.py build apps/echo --target all --check
+python3 tools/kex.py inspect rootfs/bin/x86_64/echo.kex
 ```
 
 Build deterministic local/QEMU images with reserved test identities:
@@ -172,7 +187,13 @@ terminal permission/exception probes. A build without `--acceptance-probes` is
 rejected if any probe marker is present; deployment status additionally requires
 an explicit non-fixture identity file.
 
-Build the x86-64 image and open it in QEMU:
+Build the default `x86_64-q35-uefi` image and open it in QEMU:
+
+```console
+cargo qemu
+```
+
+Select another exact platform when needed:
 
 ```console
 cargo qemu --platform x86_64-q35-uefi --environment qemu
@@ -186,10 +207,12 @@ cargo qemu --platform x86_64-q35-uefi --environment qemu --graphical
 cargo qemu --platform aarch64-virt-uefi --environment qemu --graphical
 ```
 
-The launcher discovers firmware bundled with QEMU in conventional installation
-locations. Platform and execution environment are always explicit; architecture,
-target triple, firmware family, machine type, CPU, RAM, and virtio transport
-derive from that named platform and are never inferred in the other direction.
+The Cargo convenience wrapper supplies the named `x86_64-q35-uefi`/`qemu`
+default when either selector is omitted; the underlying launcher and all test
+APIs remain explicit. The launcher discovers firmware bundled with QEMU in
+conventional installation locations. Architecture, target triple, firmware
+family, machine type, CPU, RAM, and virtio transport derive from the selected
+named platform and are never inferred in the other direction.
 If QEMU does
 not bundle firmware, provide code and variable-store images from rust-osdev
 `ovmf-prebuilt` release `edk2-stable202605-r1` using `--firmware-code` and
@@ -211,13 +234,15 @@ serial-first.
 
 ## Repository map
 
-- `crates`: portable byte streams, KEX/config/GPT/FAT parsing, block regions,
+- `crates`: portable byte streams, KEX/ABI/config/GPT/FAT parsing, block regions,
   memory models, shell, VFS/provider mounts, terminal/editor, accounting, and
   the isolated native machine mechanism crate;
 - `host`: Stage 0 composition and acceptance runner;
-- `kernel`: UEFI bootstrap and Stage 8 owned-machine composition root;
-- `rootfs`, `assets`: source tree and generated KEFS image;
-- `tools`: dependency-free deterministic image builders;
+- `kernel`: UEFI bootstrap and Stage 9 owned-machine composition root;
+- `apps`, `sdk`, `skills`: KEX examples, freestanding SDK, and concise authoring
+  guidance;
+- `rootfs`, `assets`: source tree, installed KEX files, and generated KEFS image;
+- `tools`: dependency-free deterministic image and KEX builders;
 - `scripts`: build, verification, and emulator entry points;
 - `docs`: ADRs, formats, security notes, and staged design.
 

@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
+exclude = ["apps/*"]
 members = [
+    "crates/troe-abi",
     "crates/troe-application",
     "crates/troe-block",
     "crates/troe-config",
@@ -27,9 +29,11 @@ members = [
     "crates/troe-virtio",
     "host",
     "kernel",
+    "sdk/rust/troe-kex",
     "xtask",
 ]
 default-members = [
+    "crates/troe-abi",
     "crates/troe-application",
     "crates/troe-block",
     "crates/troe-config",
@@ -54,6 +58,7 @@ default-members = [
     "crates/troe-terminal",
     "crates/troe-virtio",
     "host",
+    "sdk/rust/troe-kex",
 ]
 
 [workspace.package]

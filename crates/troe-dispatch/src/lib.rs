@@ -5,9 +5,12 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
+use alloc::rc::Rc;
 use alloc::vec::Vec;
+use core::cell::RefCell;
 use core::fmt;
-use troe_core::{Output, StreamError, write_all};
+use troe_abi::{MAX_SERVICE_PAYLOAD_BYTES, command, stream};
+use troe_core::{BoundedOutput, Output, StreamError, write_all};
 
 /// Hard ceiling for one request or reply payload.
 pub const MAX_MESSAGE_BYTES: usize = 4 * 1024;
@@ -162,6 +165,18 @@ pub enum ReplyStatus {
     NotFound = 2,
     /// The service could not complete the operation.
     Failure = 3,
+    /// A bounded service resource is exhausted.
+    Exhausted = 4,
+    /// Required network configuration is absent.
+    NotConfigured = 5,
+    /// Cooperative work was cancelled.
+    Cancelled = 6,
+    /// A bounded wait expired.
+    Timeout = 7,
+    /// The requested resource has another owner.
+    Conflict = 8,
+    /// A service-domain payload ceiling was exceeded.
+    TooLarge = 9,
 }
 
 impl ReplyStatus {
@@ -725,6 +740,147 @@ impl Dispatcher {
     }
 }
 
+/// Immutable command-invocation service for one application launch.
+pub struct CommandInvocationService {
+    bytes: Vec<u8>,
+}
+
+impl CommandInvocationService {
+    /// Encode one canonical current-directory and argument record.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invocation-policy excess or bounded allocation failure.
+    pub fn new<T: AsRef<str>>(cwd: &str, arguments: &[T]) -> Result<Self, DispatchError> {
+        let mut encoded = [0_u8; command::MAX_INVOCATION_BYTES];
+        let count = command::encode(cwd, arguments, &mut encoded)
+            .map_err(|_| DispatchError::MessageTooLarge)?;
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(count)
+            .map_err(|_| DispatchError::MetadataExhausted)?;
+        bytes.extend_from_slice(&encoded[..count]);
+        Ok(Self { bytes })
+    }
+}
+
+impl Service for CommandInvocationService {
+    fn call(&mut self, request: Request<'_>) -> Result<ServiceReply, DispatchError> {
+        if request.opcode() != command::GET_INVOCATION || !request.payload().is_empty() {
+            return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+        }
+        ServiceReply::with_payload(ReplyStatus::Success, &self.bytes)
+    }
+}
+
+/// Read-only byte service backed by one owned, bounded input snapshot.
+pub struct ByteInputService {
+    bytes: Vec<u8>,
+    offset: usize,
+}
+
+impl ByteInputService {
+    /// Own the complete input made available to one application.
+    #[must_use]
+    pub const fn new(bytes: Vec<u8>) -> Self {
+        Self { bytes, offset: 0 }
+    }
+}
+
+impl Service for ByteInputService {
+    fn call(&mut self, request: Request<'_>) -> Result<ServiceReply, DispatchError> {
+        if request.opcode() != stream::READ {
+            return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+        }
+        let Ok(requested) = stream::decode_read_request(request.payload()) else {
+            return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+        };
+        let available = self.bytes.len().saturating_sub(self.offset);
+        let count = requested.min(available).min(MAX_SERVICE_PAYLOAD_BYTES);
+        let end = self
+            .offset
+            .checked_add(count)
+            .ok_or(DispatchError::AccountingOverflow)?;
+        let reply =
+            ServiceReply::with_payload(ReplyStatus::Success, &self.bytes[self.offset..end])?;
+        self.offset = end;
+        Ok(reply)
+    }
+}
+
+/// Shared bounded bytes retained after an output service is registered.
+#[derive(Clone)]
+pub struct SharedOutput {
+    output: Rc<RefCell<BoundedOutput>>,
+}
+
+impl SharedOutput {
+    /// Construct an empty output with one hard aggregate byte ceiling.
+    #[must_use]
+    pub fn new(limit: usize) -> Self {
+        Self {
+            output: Rc::new(RefCell::new(BoundedOutput::new(limit))),
+        }
+    }
+
+    /// Copy all retained bytes to a caller-supplied output.
+    ///
+    /// # Errors
+    ///
+    /// Reports a conflicting service borrow or destination stream failure.
+    pub fn copy_to(&self, destination: &mut dyn Output) -> Result<(), StreamError> {
+        let retained = self.output.try_borrow().map_err(|_| StreamError::Device)?;
+        write_all(destination, retained.as_slice())
+    }
+
+    /// Number of retained bytes.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.output
+            .try_borrow()
+            .map_or(0, |output| output.as_slice().len())
+    }
+
+    /// Whether no bytes were retained.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Write-only byte-stream service retaining output in [`SharedOutput`].
+pub struct ByteOutputService {
+    output: SharedOutput,
+}
+
+impl ByteOutputService {
+    /// Bind a service to shared retained output.
+    #[must_use]
+    pub const fn new(output: SharedOutput) -> Self {
+        Self { output }
+    }
+}
+
+impl Service for ByteOutputService {
+    fn call(&mut self, request: Request<'_>) -> Result<ServiceReply, DispatchError> {
+        if request.opcode() != stream::WRITE
+            || request.payload().is_empty()
+            || request.payload().len() > MAX_SERVICE_PAYLOAD_BYTES
+        {
+            return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+        }
+        let Ok(mut output) = self.output.output.try_borrow_mut() else {
+            return Ok(ServiceReply::empty(ReplyStatus::Failure));
+        };
+        let status = if write_all(&mut *output, request.payload()).is_ok() {
+            ReplyStatus::Success
+        } else {
+            ReplyStatus::Failure
+        };
+        Ok(ServiceReply::empty(status))
+    }
+}
+
 /// Console-service opcode accepting raw bytes as the request payload.
 pub const CONSOLE_WRITE: u16 = 1;
 
@@ -791,15 +947,18 @@ mod tests {
     extern crate std;
 
     use super::{
-        ConsoleService, CopiedMessage, DispatchError, DispatchedOutput, Dispatcher, Handle,
-        HandleOwner, MAX_MESSAGE_BYTES, ReplyStatus, Request, Rights, Service, ServiceReply,
+        ByteInputService, ByteOutputService, CommandInvocationService, ConsoleService,
+        CopiedMessage, DispatchError, DispatchedOutput, Dispatcher, Handle, HandleOwner,
+        MAX_MESSAGE_BYTES, ReplyStatus, Request, Rights, Service, ServiceReply,
+        SharedOutput as RetainedOutput,
     };
     use alloc::boxed::Box;
     use alloc::rc::Rc;
     use alloc::vec;
     use alloc::vec::Vec;
     use core::cell::RefCell;
-    use troe_core::{Output, StreamError, write_all};
+    use troe_abi::{command, stream};
+    use troe_core::{BoundedOutput, Output, StreamError, write_all};
 
     struct EchoService;
 
@@ -811,6 +970,83 @@ mod tests {
                 Ok(ServiceReply::empty(ReplyStatus::InvalidRequest))
             }
         }
+    }
+
+    #[test]
+    fn command_and_standard_stream_services_enforce_exact_protocols() {
+        let mut dispatcher = Dispatcher::new(4, 4).unwrap_or_else(|_| std::process::abort());
+        let (_command_port, command_handle) = dispatcher
+            .register(
+                Box::new(
+                    CommandInvocationService::new("/work", &["echo", "ready"])
+                        .unwrap_or_else(|_| std::process::abort()),
+                ),
+                Rights::CALL,
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        let reply = dispatcher
+            .call(command_handle, command::GET_INVOCATION, &[])
+            .unwrap_or_else(|_| std::process::abort());
+        let invocation =
+            command::Invocation::parse(reply.payload()).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(invocation.cwd(), "/work");
+        assert_eq!(invocation.argument(1), Some("ready"));
+        assert_eq!(
+            dispatcher
+                .call(command_handle, command::GET_INVOCATION, &[0])
+                .unwrap_or_else(|_| std::process::abort())
+                .status(),
+            ReplyStatus::InvalidRequest
+        );
+
+        let (_input_port, input_handle) = dispatcher
+            .register(
+                Box::new(ByteInputService::new(b"abcdef".to_vec())),
+                Rights::CALL,
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        let four = stream::encode_read_request(4).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            dispatcher
+                .call(input_handle, stream::READ, &four)
+                .unwrap_or_else(|_| std::process::abort())
+                .payload(),
+            b"abcd"
+        );
+        assert_eq!(
+            dispatcher
+                .call(input_handle, stream::READ, &four)
+                .unwrap_or_else(|_| std::process::abort())
+                .payload(),
+            b"ef"
+        );
+
+        let retained = RetainedOutput::new(5);
+        let (_output_port, output_handle) = dispatcher
+            .register(
+                Box::new(ByteOutputService::new(retained.clone())),
+                Rights::CALL,
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            dispatcher
+                .call(output_handle, stream::WRITE, b"hello")
+                .unwrap_or_else(|_| std::process::abort())
+                .status(),
+            ReplyStatus::Success
+        );
+        assert_eq!(
+            dispatcher
+                .call(output_handle, stream::WRITE, b"!")
+                .unwrap_or_else(|_| std::process::abort())
+                .status(),
+            ReplyStatus::Failure
+        );
+        let mut copied = BoundedOutput::new(5);
+        retained
+            .copy_to(&mut copied)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(copied.as_slice(), b"hello");
     }
 
     struct FailOnceService {

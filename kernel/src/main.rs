@@ -21,20 +21,26 @@ mod firmware {
     use core::fmt::Write as _;
     use core::panic::PanicInfo;
 
+    use troe_abi::datagram;
     #[cfg(feature = "acceptance-probes")]
     use troe_application::ParseError;
     use troe_application::{
         ABI_MINOR, ApplicationLimits, InitialHandle, LoadPlan, LoaderResource, LoaderTransaction,
         MAX_LOAD_RECORDS, PAGE_BYTES, SegmentPermissions, StartupInfo, Target, parse_kex,
+        stage_artifact,
     };
     use troe_block::{BlockAccess, BlockRegion};
     use troe_block::{BlockDevice, BlockLimits};
     use troe_config::{ActivationPointer, ActivationRecovery, recover_activation};
     use troe_content::{ContentPack, MAX_PACK_BYTES};
-    use troe_core::{Input, MAX_LINE_BYTES, MachineMemorySnapshot, Output, StreamError};
+    use troe_core::{
+        CommandStatus, Input, MAX_LINE_BYTES, MachineMemorySnapshot, Output, PIPE_CAPACITY,
+        StreamError,
+    };
     use troe_dispatch::{
-        ConsoleService, CopiedMessage, DispatchedOutput, Dispatcher, HandleOwner, ReplyStatus,
-        Request, Rights, Service, ServiceReply,
+        ByteInputService, ByteOutputService, CommandInvocationService, ConsoleService,
+        CopiedMessage, DispatchedOutput, Dispatcher, HandleOwner, ReplyStatus, Request, Rights,
+        Service, ServiceReply, SharedOutput,
     };
     use troe_driver::{InputEvent, InputQueueConfig, InputSource};
     use troe_ext4::Ext4Limits;
@@ -54,8 +60,8 @@ mod firmware {
     };
     use troe_persist::{DualSlotStore, RegionSelector, TRANSACTION_BLOCKS};
     use troe_shell::{
-        ArpEntry, CompletionConfig, MachineAction, NetworkControl, NetworkError, NetworkStats,
-        NetworkStatus, PingReply, ReceivedUdp, Shell,
+        ArpEntry, CompletionConfig, ExternalCommand, MachineAction, NetworkControl, NetworkError,
+        NetworkStats, NetworkStatus, PingReply, ReceivedUdp, Shell,
     };
     #[cfg(feature = "acceptance-probes")]
     use troe_statefs::STATE_PATH;
@@ -72,7 +78,7 @@ mod firmware {
         EditorConfig, EditorOutcome, FramebufferDescriptor, FramebufferPixelFormat, InputDecoder,
         KeyEvent, KeyboardConfig, LineEditor, Ps2Set1Decoder, TextConsole, TextConsoleConfig,
     };
-    use troe_vfs::{Namespace, RamFsQuota, ReadOnlyFileSystem};
+    use troe_vfs::{Namespace, NodeKind, RamFsQuota, ReadOnlyFileSystem};
     use uefi::boot;
     use uefi::mem::memory_map::{MemoryMap, MemoryMapOwned};
     use uefi::prelude::*;
@@ -103,6 +109,7 @@ mod firmware {
     const STAGE6_USER_REGIONS: usize = 3;
     const APPLICATION_FIXED_USER_REGIONS: usize = 3;
     const APPLICATION_INTERFACE_ECHO: u32 = 1;
+    const APPLICATION_COMMAND_STEP_LIMIT: u16 = 1024;
     const USER_CODE_BASE: u64 = 0x0000_4000_0000_0000;
     const USER_DATA_BASE: u64 = USER_CODE_BASE + BASE_PAGE_SIZE;
     const USER_STACK_BASE: u64 = USER_CODE_BASE + 0x1_0000;
@@ -291,9 +298,25 @@ mod firmware {
     }
 
     struct ShellTask<'a> {
-        accounting: &'a OwnedAccounting,
+        accounting: &'a mut OwnedAccounting,
+        scheduler: &'a mut Scheduler,
+        task_id: TaskId,
         capabilities: Capabilities,
         stack: PhysicalRange,
+    }
+
+    struct KexCommandRunner<'a> {
+        accounting: &'a mut OwnedAccounting,
+        scheduler: &'a mut Scheduler,
+        shell_id: TaskId,
+        shell_capabilities: Capabilities,
+        runtime: SharedRuntime,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum CommandApplicationOutcome {
+        Exited(u32),
+        Faulted(TaskFault),
     }
 
     #[derive(Clone, Copy)]
@@ -339,6 +362,13 @@ mod firmware {
     }
 
     type SharedRuntime = Rc<RefCell<KernelRuntime>>;
+
+    struct ApplicationDatagramService {
+        network: SharedNetwork,
+        runtime: SharedRuntime,
+        ports: [u16; troe_net::MAX_UDP_PORTS],
+        port_count: usize,
+    }
 
     struct KernelRuntimeCapability {
         runtime: SharedRuntime,
@@ -1272,7 +1302,9 @@ mod firmware {
         }
         let stack = accounting.task_stacks[2].stack;
         let mut shell_task = ShellTask {
-            accounting: &accounting,
+            accounting: &mut accounting,
+            scheduler: &mut scheduler,
+            task_id: shell_id,
             capabilities,
             stack,
         };
@@ -2065,6 +2097,324 @@ mod firmware {
             return Err(());
         }
         Ok(allocation_start)
+    }
+
+    #[allow(clippy::drop_non_drop, clippy::too_many_lines)]
+    fn run_command_application(
+        scheduler: &mut Scheduler,
+        accounting: &mut OwnedAccounting,
+        dispatcher: &mut Dispatcher,
+        services: &[(troe_dispatch::PortId, u32)],
+        source: &[u8],
+    ) -> Result<CommandApplicationOutcome, ()> {
+        if services.is_empty() || services.len() > troe_dispatch::MAX_HANDLES {
+            return Err(());
+        }
+        let mut transaction = LoaderTransaction::new();
+        transaction
+            .acquire(LoaderResource::Staging)
+            .map_err(|_| ())?;
+        let Ok(plan) = parse_kex(source, native_application_target(), ABI_MINOR) else {
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        };
+        let fixed_user_regions = if plan.heap_pages() == 0 {
+            APPLICATION_FIXED_USER_REGIONS - 1
+        } else {
+            APPLICATION_FIXED_USER_REGIONS
+        };
+        let application_user_regions = plan
+            .segments()
+            .count()
+            .checked_add(fixed_user_regions)
+            .ok_or(())?;
+        let private_pages = u16::try_from(plan.charges().private_pages()).map_err(|_| ())?;
+        let stack_pages = u16::try_from(plan.stack_pages()).map_err(|_| ())?;
+
+        let Ok(allocation) = allocate_application(&mut accounting.frames, &plan) else {
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        };
+        if transaction.acquire(LoaderResource::Frames).is_err() {
+            reclaim_application(&mut accounting.frames, allocation)?;
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        }
+        if prepare_application_memory(&allocation, &plan).is_err() {
+            reclaim_application(&mut accounting.frames, allocation)?;
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        }
+        let Ok(mapping_plan) = build_application_plan(
+            &accounting.kernel_plan,
+            accounting.kernel_runtime,
+            &allocation,
+            &plan,
+        ) else {
+            reclaim_application(&mut accounting.frames, allocation)?;
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        };
+        let Ok(address_space) =
+            troe_machine::build_user_address_space(&mapping_plan, allocation.tables)
+        else {
+            reclaim_application(&mut accounting.frames, allocation)?;
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        };
+        if transaction.acquire(LoaderResource::Tables).is_err() {
+            reclaim_application(&mut accounting.frames, allocation)?;
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        }
+        let table_pages = address_space.stats().table_pages;
+        if table_pages == 0
+            || table_pages > APPLICATION_TABLE_PAGES
+            || address_space.user_region_count() != application_user_regions
+        {
+            reclaim_application(&mut accounting.frames, allocation)?;
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        }
+        let table_pages = u16::try_from(table_pages).map_err(|_| ())?;
+        let handle_count = u16::try_from(services.len()).map_err(|_| ())?;
+        let Ok(isolation) = IsolationResource::new(0, table_pages, private_pages, handle_count)
+        else {
+            reclaim_application(&mut accounting.frames, allocation)?;
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        };
+        let Ok(stack_resource) = StackResource::new(0, stack_pages) else {
+            reclaim_application(&mut accounting.frames, allocation)?;
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        };
+        let Ok(task_id) =
+            scheduler.spawn_isolated(Capabilities::SERVICE, stack_resource, isolation)
+        else {
+            reclaim_application(&mut accounting.frames, allocation)?;
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        };
+        if transaction.acquire(LoaderResource::Task).is_err() {
+            rollback_application_task(
+                scheduler,
+                task_id,
+                dispatcher,
+                None,
+                &mut accounting.frames,
+                allocation,
+            )?;
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        }
+
+        let entry = plan.entry_address();
+        let layout = plan.layout();
+        let mut live_owner = None;
+        let setup = (|| -> Result<HandleOwner, ()> {
+            let owner = HandleOwner::isolated(task_id.get()).map_err(|_| ())?;
+            live_owner = Some(owner);
+            let mut startup_handles = Vec::new();
+            startup_handles
+                .try_reserve_exact(services.len())
+                .map_err(|_| ())?;
+            for (port, interface) in services {
+                let handle = dispatcher
+                    .open_owned(*port, Rights::CALL, owner)
+                    .map_err(|_| ())?;
+                startup_handles.push(InitialHandle {
+                    value: handle.abi_value(),
+                    rights: Rights::CALL.bits(),
+                    interface: *interface,
+                    major: 1,
+                    minor: 0,
+                });
+            }
+            transaction
+                .acquire(LoaderResource::Handles)
+                .map_err(|_| ())?;
+            let mut startup = [0_u8; PAGE_BYTES];
+            plan.encode_startup_page(
+                StartupInfo {
+                    task_id: u64::from(task_id.get()),
+                    handles: &startup_handles,
+                },
+                &mut startup,
+            )
+            .map_err(|_| ())?;
+            troe_machine::copy_to_physical(allocation.startup, 0, &startup).map_err(|_| ())?;
+            Ok(owner)
+        })();
+        let Ok(owner) = setup else {
+            rollback_application_task(
+                scheduler,
+                task_id,
+                dispatcher,
+                live_owner,
+                &mut accounting.frames,
+                allocation,
+            )?;
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        };
+        drop(plan);
+        drop(mapping_plan);
+        if transaction.commit().is_err() {
+            rollback_application_task(
+                scheduler,
+                task_id,
+                dispatcher,
+                live_owner,
+                &mut accounting.frames,
+                allocation,
+            )?;
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        }
+
+        let execution = (|| -> Result<CommandApplicationOutcome, ()> {
+            if scheduler
+                .dispatch_next(Capabilities::SERVICE)
+                .map_err(|_| ())?
+                != Some(task_id)
+            {
+                return Err(());
+            }
+            let mut outcome = troe_machine::run_application(
+                address_space,
+                entry,
+                layout.stack_top(),
+                layout.startup_address(),
+                PAGE_BYTES,
+            )
+            .map_err(|_| ())?;
+            let mut steps = 0_u16;
+            let terminal = loop {
+                match outcome {
+                    troe_machine::ApplicationOutcome::Yielded(application) => {
+                        steps = steps.checked_add(1).ok_or(())?;
+                        if steps > APPLICATION_COMMAND_STEP_LIMIT {
+                            scheduler
+                                .fault_current(task_id, TaskFault::ExecutionLeaseExpired)
+                                .map_err(|_| ())?;
+                            break CommandApplicationOutcome::Faulted(
+                                TaskFault::ExecutionLeaseExpired,
+                            );
+                        }
+                        scheduler.yield_current(task_id).map_err(|_| ())?;
+                        if scheduler
+                            .dispatch_next(Capabilities::SERVICE)
+                            .map_err(|_| ())?
+                            != Some(task_id)
+                        {
+                            return Err(());
+                        }
+                        outcome = troe_machine::resume_application(
+                            application,
+                            troe_machine::ApplicationResume::Yield,
+                        )
+                        .map_err(|_| ())?;
+                    }
+                    troe_machine::ApplicationOutcome::HandleCall { application, call } => {
+                        steps = steps.checked_add(1).ok_or(())?;
+                        if steps > APPLICATION_COMMAND_STEP_LIMIT || call.request_bytes() < 2 {
+                            scheduler
+                                .fault_current(task_id, TaskFault::InvalidCall)
+                                .map_err(|_| ())?;
+                            break CommandApplicationOutcome::Faulted(TaskFault::InvalidCall);
+                        }
+                        let mut request = Vec::new();
+                        request
+                            .try_reserve_exact(call.request_bytes())
+                            .map_err(|_| ())?;
+                        request.resize(call.request_bytes(), 0);
+                        application.copy_request(&mut request).map_err(|_| ())?;
+                        let opcode = u16::from_le_bytes([request[0], request[1]]);
+                        let Ok(reply) =
+                            dispatcher.call_owned_abi(owner, call.handle(), opcode, &request[2..])
+                        else {
+                            scheduler
+                                .fault_current(task_id, TaskFault::InvalidCall)
+                                .map_err(|_| ())?;
+                            break CommandApplicationOutcome::Faulted(TaskFault::InvalidCall);
+                        };
+                        if reply.payload().len() > call.reply_capacity() {
+                            scheduler
+                                .fault_current(task_id, TaskFault::InvalidCall)
+                                .map_err(|_| ())?;
+                            break CommandApplicationOutcome::Faulted(TaskFault::InvalidCall);
+                        }
+                        outcome = troe_machine::resume_application(
+                            application,
+                            troe_machine::ApplicationResume::HandleReply {
+                                status: reply.status().abi_value(),
+                                reply: reply.payload(),
+                            },
+                        )
+                        .map_err(|_| ())?;
+                    }
+                    troe_machine::ApplicationOutcome::Exited { status } => {
+                        scheduler.exit_current(task_id, status).map_err(|_| ())?;
+                        break CommandApplicationOutcome::Exited(status);
+                    }
+                    troe_machine::ApplicationOutcome::Faulted(fault) => {
+                        let fault = task_fault(fault);
+                        scheduler.fault_current(task_id, fault).map_err(|_| ())?;
+                        break CommandApplicationOutcome::Faulted(fault);
+                    }
+                }
+            };
+            if dispatcher.close_owner(owner).map_err(|_| ())? != handle_count {
+                return Err(());
+            }
+            live_owner = None;
+            Ok(terminal)
+        })();
+        let Ok(terminal) = execution else {
+            rollback_application_task(
+                scheduler,
+                task_id,
+                dispatcher,
+                live_owner,
+                &mut accounting.frames,
+                allocation,
+            )?;
+            return Err(());
+        };
+        let Ok(reaped) = scheduler.reap(task_id) else {
+            rollback_application_task(
+                scheduler,
+                task_id,
+                dispatcher,
+                live_owner,
+                &mut accounting.frames,
+                allocation,
+            )?;
+            return Err(());
+        };
+        let expected_fault = match terminal {
+            CommandApplicationOutcome::Exited(_) => None,
+            CommandApplicationOutcome::Faulted(fault) => Some(fault),
+        };
+        let valid_reap = reaped.isolation == Some(isolation)
+            && reaped.stack.mapped_pages() == stack_pages
+            && reaped.fault == expected_fault;
+        reclaim_application(&mut accounting.frames, allocation)?;
+        if !valid_reap {
+            return Err(());
+        }
+        Ok(terminal)
+    }
+
+    const fn task_fault(fault: troe_machine::IsolatedFault) -> TaskFault {
+        match fault {
+            troe_machine::IsolatedFault::Translation => TaskFault::Translation,
+            troe_machine::IsolatedFault::Permission => TaskFault::Permission,
+            troe_machine::IsolatedFault::IllegalInstruction => TaskFault::IllegalInstruction,
+            troe_machine::IsolatedFault::InvalidCall => TaskFault::InvalidCall,
+            troe_machine::IsolatedFault::ExecutionLeaseExpired => TaskFault::ExecutionLeaseExpired,
+        }
     }
 
     fn allocate_application(
@@ -3343,6 +3693,152 @@ mod firmware {
         }
     }
 
+    impl ApplicationDatagramService {
+        fn new(network: SharedNetwork, runtime: SharedRuntime) -> Self {
+            Self {
+                network,
+                runtime,
+                ports: [0; troe_net::MAX_UDP_PORTS],
+                port_count: 0,
+            }
+        }
+
+        fn claim_port(&mut self, requested: Option<u16>) -> Result<u16, ReplyStatus> {
+            if let Some(port) = requested {
+                if port == 0 {
+                    return Err(ReplyStatus::InvalidRequest);
+                }
+                if self.ports[..self.port_count].contains(&port) {
+                    return Ok(port);
+                }
+                if self.port_count == self.ports.len() {
+                    return Err(ReplyStatus::Exhausted);
+                }
+                let mut network = self.network.borrow_mut();
+                if network.udp.is_bound(port) {
+                    return Err(ReplyStatus::Conflict);
+                }
+                network
+                    .udp
+                    .bind(port)
+                    .map_err(map_network_error)
+                    .map_err(application_network_status)?;
+                drop(network);
+                self.ports[self.port_count] = port;
+                self.port_count += 1;
+                return Ok(port);
+            }
+
+            if self.port_count == self.ports.len() {
+                return Err(ReplyStatus::Exhausted);
+            }
+            let mut network = self.network.borrow_mut();
+            for _ in 0..troe_net::MAX_UDP_PORTS {
+                let port = network.next_port;
+                network.next_port = if port == u16::MAX { 49_152 } else { port + 1 };
+                if !network.udp.is_bound(port) {
+                    network
+                        .udp
+                        .bind(port)
+                        .map_err(map_network_error)
+                        .map_err(application_network_status)?;
+                    drop(network);
+                    self.ports[self.port_count] = port;
+                    self.port_count += 1;
+                    return Ok(port);
+                }
+            }
+            Err(ReplyStatus::Exhausted)
+        }
+    }
+
+    impl Service for ApplicationDatagramService {
+        fn call(
+            &mut self,
+            request: Request<'_>,
+        ) -> Result<ServiceReply, troe_dispatch::DispatchError> {
+            match request.opcode() {
+                datagram::SEND => {
+                    let Ok(send) = datagram::decode_send_request(request.payload()) else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    let requested = (send.source_port != 0).then_some(send.source_port);
+                    let source_port = match self.claim_port(requested) {
+                        Ok(port) => port,
+                        Err(status) => return Ok(ServiceReply::empty(status)),
+                    };
+                    let mut network = KernelNetwork::new(self.network.clone());
+                    let mut runtime = KernelRuntimeCapability {
+                        runtime: self.runtime.clone(),
+                    };
+                    if let Err(error) = network.send_udp(
+                        Some(source_port),
+                        send.destination,
+                        send.destination_port,
+                        send.payload,
+                        &mut runtime,
+                    ) {
+                        return Ok(ServiceReply::empty(application_network_status(error)));
+                    }
+                    let reply = datagram::encode_send_reply(source_port)
+                        .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?;
+                    ServiceReply::with_payload(ReplyStatus::Success, &reply)
+                }
+                datagram::RECEIVE => {
+                    let Ok(local_port) = datagram::decode_receive_request(request.payload()) else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    let local_port = match self.claim_port(Some(local_port)) {
+                        Ok(port) => port,
+                        Err(status) => return Ok(ServiceReply::empty(status)),
+                    };
+                    let mut network = KernelNetwork::new(self.network.clone());
+                    let mut runtime = KernelRuntimeCapability {
+                        runtime: self.runtime.clone(),
+                    };
+                    let received = match network.listen_udp(local_port, &mut runtime) {
+                        Ok(received) => received,
+                        Err(error) => {
+                            return Ok(ServiceReply::empty(application_network_status(error)));
+                        }
+                    };
+                    let mut encoded = [0_u8; datagram::MAX_RECEIVE_REPLY_BYTES];
+                    let count = datagram::encode_receive_reply(
+                        received.source,
+                        received.source_port,
+                        &received.payload,
+                        &mut encoded,
+                    )
+                    .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?;
+                    ServiceReply::with_payload(ReplyStatus::Success, &encoded[..count])
+                }
+                _ => Ok(ServiceReply::empty(ReplyStatus::InvalidRequest)),
+            }
+        }
+    }
+
+    impl Drop for ApplicationDatagramService {
+        fn drop(&mut self) {
+            let mut network = self.network.borrow_mut();
+            for port in &self.ports[..self.port_count] {
+                let _released = network.udp.unbind(*port);
+            }
+        }
+    }
+
+    const fn application_network_status(error: NetworkError) -> ReplyStatus {
+        match error {
+            NetworkError::NotConfigured => ReplyStatus::NotConfigured,
+            NetworkError::Timeout => ReplyStatus::Timeout,
+            NetworkError::TooLarge => ReplyStatus::TooLarge,
+            NetworkError::Exhausted => ReplyStatus::Exhausted,
+            NetworkError::Cancelled => ReplyStatus::Cancelled,
+            NetworkError::Unavailable | NetworkError::Device | NetworkError::Protocol => {
+                ReplyStatus::Failure
+            }
+        }
+    }
+
     fn same_subnet(left: Ipv4Address, right: Ipv4Address, mask: Ipv4Address) -> bool {
         left.bytes()
             .iter()
@@ -3505,6 +4001,202 @@ mod firmware {
         prompt
     }
 
+    impl ExternalCommand for KexCommandRunner<'_> {
+        #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+        fn execute(
+            &mut self,
+            command: &str,
+            words: &[String],
+            cwd: &str,
+            namespace: &mut Namespace,
+            stdin: &mut dyn Input,
+            stdout: &mut dyn Output,
+            stderr: &mut dyn Output,
+        ) -> Option<CommandStatus> {
+            if !valid_application_name(command) {
+                return None;
+            }
+            let path = alloc::format!("/bin/{}/{}.kex", architecture(), command);
+            let metadata = match namespace.metadata("/", &path) {
+                Ok(metadata) => metadata,
+                Err(troe_vfs::FsError::NotFound) => return None,
+                Err(_) => return Some(command_application_error(stderr, command, "lookup failed")),
+            };
+            if metadata.kind != NodeKind::File {
+                return Some(command_application_error(
+                    stderr,
+                    command,
+                    "artifact is not a file",
+                ));
+            }
+            let Ok(artifact) = stage_artifact(metadata.byte_count, |offset, destination| {
+                namespace
+                    .read_file_at("/", &path, offset, destination)
+                    .map_err(|_| ())
+            }) else {
+                return Some(command_application_error(
+                    stderr,
+                    command,
+                    "artifact staging failed",
+                ));
+            };
+            let Ok(input) = read_command_input(stdin) else {
+                return Some(command_application_error(
+                    stderr,
+                    command,
+                    "input exceeds command limit",
+                ));
+            };
+            let retained_stdout = SharedOutput::new(PIPE_CAPACITY);
+            let retained_stderr = SharedOutput::new(PIPE_CAPACITY);
+            let network = self.runtime.borrow().network.clone();
+            let Ok(mut dispatcher) = Dispatcher::new(5, 10) else {
+                return Some(command_application_error(
+                    stderr,
+                    command,
+                    "service resources exhausted",
+                ));
+            };
+            let services = (|| -> Result<Vec<(troe_dispatch::PortId, u32)>, ()> {
+                let mut services = Vec::new();
+                services.try_reserve_exact(5).map_err(|_| ())?;
+                services.push((
+                    register_command_service(
+                        &mut dispatcher,
+                        CommandInvocationService::new(cwd, words).map_err(|_| ())?,
+                    )?,
+                    troe_abi::interface::COMMAND,
+                ));
+                services.push((
+                    register_command_service(&mut dispatcher, ByteInputService::new(input))?,
+                    troe_abi::interface::STANDARD_INPUT,
+                ));
+                services.push((
+                    register_command_service(
+                        &mut dispatcher,
+                        ByteOutputService::new(retained_stdout.clone()),
+                    )?,
+                    troe_abi::interface::STANDARD_OUTPUT,
+                ));
+                services.push((
+                    register_command_service(
+                        &mut dispatcher,
+                        ByteOutputService::new(retained_stderr.clone()),
+                    )?,
+                    troe_abi::interface::STANDARD_ERROR,
+                ));
+                if let Some(network) = network {
+                    services.push((
+                        register_command_service(
+                            &mut dispatcher,
+                            ApplicationDatagramService::new(network, self.runtime.clone()),
+                        )?,
+                        troe_abi::interface::DATAGRAM,
+                    ));
+                }
+                Ok(services)
+            })();
+            let Ok(services) = services else {
+                return Some(command_application_error(
+                    stderr,
+                    command,
+                    "service setup failed",
+                ));
+            };
+
+            if self.scheduler.yield_current(self.shell_id).is_err() {
+                fatal(b"fatal: shell scheduler yield failed\n");
+            }
+            let outcome = run_command_application(
+                self.scheduler,
+                self.accounting,
+                &mut dispatcher,
+                services.as_slice(),
+                &artifact,
+            );
+            if self
+                .scheduler
+                .dispatch_next(self.shell_capabilities)
+                .ok()
+                .flatten()
+                != Some(self.shell_id)
+            {
+                fatal(b"fatal: shell scheduler restore failed\n");
+            }
+
+            if retained_stdout.copy_to(stdout).is_err() || retained_stderr.copy_to(stderr).is_err()
+            {
+                return Some(CommandStatus::Failure);
+            }
+            Some(match outcome {
+                Ok(CommandApplicationOutcome::Exited(status)) => command_status(status),
+                Ok(CommandApplicationOutcome::Faulted(_)) => {
+                    command_application_error(stderr, command, "application faulted")
+                }
+                Err(()) => command_application_error(stderr, command, "application rejected"),
+            })
+        }
+    }
+
+    fn register_command_service<S: Service + 'static>(
+        dispatcher: &mut Dispatcher,
+        service: S,
+    ) -> Result<troe_dispatch::PortId, ()> {
+        let (port, kernel_handle) = dispatcher
+            .register(Box::new(service), Rights::CALL)
+            .map_err(|_| ())?;
+        dispatcher.close(kernel_handle).map_err(|_| ())?;
+        Ok(port)
+    }
+
+    fn read_command_input(input: &mut dyn Input) -> Result<Vec<u8>, ()> {
+        let mut bytes = Vec::new();
+        let mut chunk = [0_u8; troe_abi::MAX_SERVICE_PAYLOAD_BYTES];
+        loop {
+            let count = input.read(&mut chunk).map_err(|_| ())?;
+            if count > chunk.len() {
+                return Err(());
+            }
+            if count == 0 {
+                return Ok(bytes);
+            }
+            let next = bytes.len().checked_add(count).ok_or(())?;
+            if next > PIPE_CAPACITY {
+                return Err(());
+            }
+            bytes.try_reserve_exact(count).map_err(|_| ())?;
+            bytes.extend_from_slice(&chunk[..count]);
+        }
+    }
+
+    fn command_application_error(
+        stderr: &mut dyn Output,
+        command: &str,
+        message: &str,
+    ) -> CommandStatus {
+        let _ignored = write_all(stderr, alloc::format!("{command}: {message}\n").as_bytes());
+        CommandStatus::Failure
+    }
+
+    const fn command_status(status: u32) -> CommandStatus {
+        match status {
+            troe_abi::exit::SUCCESS => CommandStatus::Success,
+            troe_abi::exit::USAGE => CommandStatus::Usage,
+            troe_abi::exit::NOT_FOUND => CommandStatus::NotFound,
+            troe_abi::exit::DENIED => CommandStatus::Denied,
+            troe_abi::exit::CANCELLED => CommandStatus::Cancelled,
+            _ => CommandStatus::Failure,
+        }
+    }
+
+    fn valid_application_name(name: &str) -> bool {
+        !name.is_empty()
+            && name.as_bytes().iter().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+            })
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn run_shell_task(task: &mut ShellTask<'_>) -> TaskStep {
         let stack_pointer = usize_as_u64(troe_machine::current_stack_pointer());
         if !task.stack.contains(stack_pointer)
@@ -3601,7 +4293,20 @@ mod firmware {
             }
             let mut input = EmptyInput;
             let mut error = NativeConsole;
-            let _status = shell.execute(&line, &mut input, &mut console, &mut error);
+            let mut external = KexCommandRunner {
+                accounting: task.accounting,
+                scheduler: task.scheduler,
+                shell_id: task.task_id,
+                shell_capabilities: task.capabilities,
+                runtime: runtime.clone(),
+            };
+            let _status = shell.execute_with_external(
+                &line,
+                &mut input,
+                &mut console,
+                &mut error,
+                &mut external,
+            );
             if let Some(action) = shell.machine_action() {
                 perform_machine_action(action, &mut console);
             }

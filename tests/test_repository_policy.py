@@ -100,6 +100,26 @@ class RepositoryPolicyTests(unittest.TestCase):
             (REPO_ROOT / "rust-toolchain.toml").read_text(encoding="utf-8")
         )
         self.assertEqual(toolchain["toolchain"]["channel"], "1.97.1")
+        self.assertEqual(
+            toolchain["toolchain"]["targets"],
+            [
+                "x86_64-unknown-uefi",
+                "aarch64-unknown-uefi",
+                "x86_64-unknown-none",
+                "aarch64-unknown-none",
+            ],
+        )
+
+    def test_kex_authoring_skill_is_one_concise_repo_local_file(self) -> None:
+        root = REPO_ROOT / "skills" / "write-kex-apps"
+        files = sorted(path.relative_to(root).as_posix() for path in root.rglob("*"))
+        self.assertEqual(files, ["SKILL.md"])
+        source = (root / "SKILL.md").read_text(encoding="utf-8")
+        self.assertLessEqual(len(source.splitlines()), 120)
+        self.assertTrue(source.startswith("---\nname: write-kex-apps\ndescription: "))
+        self.assertIn("python3 tools/kex.py build", source)
+        self.assertIn("troe_kex_sdk::entry!", source)
+        self.assertIn("Do not infer POSIX behavior", source)
 
     def test_superseded_resource_profiles_cannot_reenter_source_apis(self) -> None:
         forbidden_rust = ("ResourceProfile", "ResourcePolicy", "::tiny()", "::full()")

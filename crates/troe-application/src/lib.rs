@@ -2,7 +2,11 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+extern crate alloc;
+
+use alloc::vec::Vec;
 use core::fmt;
+pub use troe_abi::{ABI_MAJOR, ABI_MINOR};
 
 /// KEX v1 base page size in bytes.
 pub const PAGE_SIZE: u64 = 4096;
@@ -20,11 +24,6 @@ pub const KEX_V1_LOAD_RECORD_BYTES: usize = 40;
 pub const KEX_V1_MAGIC: [u8; 8] = *b"KEX\0FMT\0";
 /// Maximum load records accepted by the standard application policy.
 pub const MAX_LOAD_RECORDS: usize = 16;
-/// Application ABI major implemented by this parser.
-pub const ABI_MAJOR: u16 = 1;
-/// First application ABI minor implemented by this parser.
-pub const ABI_MINOR: u16 = 0;
-
 const CONTAINER_MAJOR: u16 = 1;
 const CONTAINER_MINOR: u16 = 0;
 const STARTUP_PAGES: u64 = 1;
@@ -746,6 +745,59 @@ impl fmt::Display for ParseError {
             Self::InvalidEntryPoint => "KEX entry point is not executable",
         })
     }
+}
+
+/// Failure while copying one externally stored artifact into kernel-owned staging.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StageError {
+    /// Source length is zero, not representable, or above the standard KEX ceiling.
+    InvalidLength,
+    /// Exact staging allocation failed.
+    AllocationFailed,
+    /// The backing source reported an I/O or integrity failure.
+    SourceFailed,
+    /// The backing source ended early or violated the bounded read contract.
+    IncompleteRead,
+}
+
+/// Copy one exact bounded artifact from an offset reader into owned staging.
+///
+/// The parser remains allocation-free; this helper owns only the explicit
+/// source-to-kernel copy required before parsing untrusted executable bytes.
+/// Reads are limited to one KEX page so a provider cannot force a larger
+/// transient request.
+///
+/// # Errors
+///
+/// Rejects invalid lengths, allocation failure, source errors, zero progress,
+/// and any provider result larger than the supplied destination window.
+pub fn stage_artifact(
+    byte_len: u64,
+    mut read_at: impl FnMut(u64, &mut [u8]) -> Result<usize, ()>,
+) -> Result<Vec<u8>, StageError> {
+    let byte_len = usize::try_from(byte_len).map_err(|_| StageError::InvalidLength)?;
+    if byte_len == 0 || byte_len > ApplicationLimits::standard().encoded_bytes() {
+        return Err(StageError::InvalidLength);
+    }
+    let mut staging = Vec::new();
+    staging
+        .try_reserve_exact(byte_len)
+        .map_err(|_| StageError::AllocationFailed)?;
+    staging.resize(byte_len, 0);
+    let mut offset = 0_usize;
+    while offset < byte_len {
+        let end = offset.saturating_add(PAGE_BYTES).min(byte_len);
+        let count = read_at(
+            u64::try_from(offset).map_err(|_| StageError::InvalidLength)?,
+            &mut staging[offset..end],
+        )
+        .map_err(|()| StageError::SourceFailed)?;
+        if count == 0 || count > end - offset {
+            return Err(StageError::IncompleteRead);
+        }
+        offset = offset.checked_add(count).ok_or(StageError::InvalidLength)?;
+    }
+    Ok(staging)
 }
 
 /// Parse and validate a complete KEX v1 artifact without allocating.
@@ -1939,5 +1991,45 @@ mod tests {
         for length in 0..valid.len() {
             assert!(parse_standard(&valid[..length], Target::X86_64).is_err());
         }
+    }
+
+    #[test]
+    fn artifact_staging_accepts_partial_reads_and_preserves_exact_bytes() {
+        let source = valid_artifact(Target::X86_64);
+        let staged = stage_artifact(source.len() as u64, |offset, destination| {
+            let start = usize::try_from(offset).map_err(|_| ())?;
+            let count = destination.len().min(7);
+            destination[..count].copy_from_slice(&source[start..start + count]);
+            Ok(count)
+        })
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(staged, source);
+    }
+
+    #[test]
+    fn artifact_staging_fails_closed_on_length_source_and_progress_errors() {
+        assert_eq!(
+            stage_artifact(0, |_offset, _destination| Ok(0)),
+            Err(StageError::InvalidLength)
+        );
+        assert_eq!(
+            stage_artifact(
+                ApplicationLimits::standard().encoded_bytes() as u64 + 1,
+                |_offset, _destination| Ok(0)
+            ),
+            Err(StageError::InvalidLength)
+        );
+        assert_eq!(
+            stage_artifact(1, |_offset, _destination| Err(())),
+            Err(StageError::SourceFailed)
+        );
+        assert_eq!(
+            stage_artifact(1, |_offset, _destination| Ok(0)),
+            Err(StageError::IncompleteRead)
+        );
+        assert_eq!(
+            stage_artifact(1, |_offset, destination| Ok(destination.len() + 1)),
+            Err(StageError::IncompleteRead)
+        );
     }
 }

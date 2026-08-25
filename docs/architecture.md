@@ -8,10 +8,10 @@ host stdin/stdout ───────────┐                 ┌─ ho
 serial / PS/2 → IRQ → bounded queue → editor ─┘  └─ UART + GOP text console
 ```
 
-Privileged built-ins retain the direct graph. Stage 6 can instead run a bounded
-continuation in a fresh ring-3/EL0 address space and route its copied output
-through generation-owned synchronous message dispatch without exposing kernel
-pointers.
+Recovery built-ins retain the direct graph. Ordinary commands may instead load
+an immutable architecture-specific KEX artifact into a fresh ring-3/EL0 address
+space and route cwd/argv and standard streams through generation-owned
+synchronous message dispatch without exposing kernel pointers.
 
 Repository `scripts` and Cargo commands are bootstrap developer tooling, not a
 package manager or a privileged system-control plane. The planned TROE CLI described
@@ -39,8 +39,11 @@ firmware fails before device publication or volatile I/O.
    same event type outside interrupt context.
 2. The shell crate tokenizes iteratively. Quotes group bytes; no expansion,
    recursion, substitution, environment lookup, or globbing occurs.
-3. The pipeline executor finds a statically linked command by name. Commands
-   receive only stdin/stdout/stderr streams plus access mediated by `Shell`.
+3. The pipeline executor protects shell intrinsics, then tries the exact KEX
+   command path. Only an absent app selects a statically linked recovery
+   implementation. Both forms receive bounded stdin/stdout/stderr streams;
+   KEX may also receive an optional owned IPv4/UDP endpoint, never ambient
+   `Shell` or device authority.
 4. Each non-final command writes to a `BoundedOutput`. The next stage reads the
    frozen result through `SliceInput`; a stage cannot observe mutable internals.
 5. Filesystem commands ask `Namespace` to canonicalize from the logical cwd.
@@ -67,9 +70,10 @@ by ring-3/EL0 page permissions and generation-revoked ownership.
 
 The shell reserves `cd`, `poweroff`, and `reboot` as non-shadowable intrinsics.
 `cd` owns the logical working-directory transition, while both terminal machine
-actions consume only the shell's machine-control grant. Future KEX command
-discovery may replace ordinary command implementations, but it cannot intercept
-these intrinsic names and ABI 1.0 exposes no platform-transition operation.
+actions consume only the shell's machine-control grant. KEX command discovery
+now replaces ordinary command implementations from exact immutable
+architecture-specific paths, but cannot intercept intrinsic names; ABI 1.0
+exposes no platform-transition operation.
 
 ## Allocation
 
@@ -228,6 +232,17 @@ complete non-overlapping ranges, copies a two-byte opcode-prefixed request,
 checks task handle ownership, and copies a successful bounded reply before a
 fresh leased resume. Unknown calls and an attempted `_start` return are
 contained and reclaimed as invalid-call and translation faults.
+
+The Stage 9 command slice layers four required ABI 1.0 services on that mechanism:
+immutable cwd/argv, stdin, stdout, and stderr. The shell logically yields while
+one foreground application runs, then resumes only after owner-wide handle
+revocation, record reaping, page zeroization, and exact frame return. Artifacts
+are read from `/bin/<architecture>/<name>.kex`; only absence permits the static
+recovery fallback. Service replies, per-stream bytes, and total resumed steps
+all have hard ceilings. A fifth optional datagram handle exposes only bounded
+IPv4/UDP send/receive. Its local ports are exclusive to the launch, receive
+waits use cooperative cancellation, and dispatcher teardown unbinds all ports.
+No filesystem, raw-network, route-control, or machine handle is granted.
 
 ## Stage 8 persistent-storage boundary
 

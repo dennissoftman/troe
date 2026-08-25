@@ -478,6 +478,22 @@ impl UdpPortTable {
         self.bindings.iter().any(|binding| binding.port == port)
     }
 
+    /// Release one local port and discard every retained datagram.
+    ///
+    /// Returns whether a live binding was removed. This is the teardown path
+    /// for application-owned endpoint capabilities.
+    pub fn unbind(&mut self, port: u16) -> bool {
+        let Some(index) = self
+            .bindings
+            .iter()
+            .position(|binding| binding.port == port)
+        else {
+            return false;
+        };
+        self.bindings.remove(index);
+        true
+    }
+
     /// Copy one parsed datagram into its destination port's bounded queue.
     ///
     /// # Errors
@@ -1430,6 +1446,9 @@ mod tests {
             );
         }
         assert!(ports.receive(40_000).is_none());
+        assert!(ports.unbind(40_000));
+        assert!(!ports.unbind(40_000));
+        assert!(ports.is_empty());
         Ok(())
     }
 }

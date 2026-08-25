@@ -313,8 +313,8 @@ The tooling model uses separate documents for separate kinds of state:
 
 All four formats MUST be versioned before they are consumed by a released
 system image. A lock file and generation record MUST identify the target
-architecture, project SDK/ABI, selected `micro`, `tiny`, or `full` resource
-profile, resolver version, and every artifact by content identity. Secrets and
+architecture, project SDK/ABI, selected Standard resource policy and explicit
+ceilings, resolver version, and every artifact by content identity. Secrets and
 machine-local credentials MUST be referenced, never embedded in these files.
 
 ---

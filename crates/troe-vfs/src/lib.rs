@@ -432,49 +432,118 @@ impl Namespace {
         Ok(())
     }
 
-    /// Resolve and read a complete file.
+    /// Return metadata for one resolved namespace node.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the path is invalid, missing, or its mounted provider fails.
+    pub fn metadata(&mut self, cwd: &str, path: &str) -> Result<FileMetadata, FsError> {
+        let path = canonicalize(cwd, path)?;
+        if let Some((index, relative)) = self.mount_for_path(&path) {
+            return self.mounts[index].provider.metadata(&relative);
+        }
+        match self.nodes.get(&path) {
+            Some(Node::Directory) => Ok(FileMetadata {
+                kind: NodeKind::Directory,
+                byte_count: 0,
+            }),
+            Some(Node::File { bytes, .. }) => Ok(FileMetadata {
+                kind: NodeKind::File,
+                byte_count: u64::try_from(bytes.len()).map_err(|_| FsError::Overflow)?,
+            }),
+            None => Err(FsError::NotFound),
+        }
+    }
+
+    /// Read a bounded file range without imposing the shell whole-file limit.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the path is invalid, missing, not a file, or the backing
+    /// provider violates its read contract.
+    pub fn read_file_at(
+        &mut self,
+        cwd: &str,
+        path: &str,
+        offset: u64,
+        destination: &mut [u8],
+    ) -> Result<usize, FsError> {
+        let path = canonicalize(cwd, path)?;
+        if let Some((index, relative)) = self.mount_for_path(&path) {
+            let count = self.mounts[index]
+                .provider
+                .read_file(&relative, offset, destination)?;
+            if count > destination.len() {
+                return Err(FsError::Corrupt);
+            }
+            return Ok(count);
+        }
+        match self.nodes.get(&path) {
+            Some(Node::File { bytes, .. }) => {
+                let start = usize::try_from(offset).map_err(|_| FsError::Overflow)?;
+                if start >= bytes.len() || destination.is_empty() {
+                    return Ok(0);
+                }
+                let count = destination.len().min(bytes.len() - start);
+                destination[..count].copy_from_slice(&bytes[start..start + count]);
+                Ok(count)
+            }
+            Some(Node::Directory) => Err(FsError::WrongType),
+            None => Err(FsError::NotFound),
+        }
+    }
+
+    /// Resolve and read a complete file under a caller-selected hard limit.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the path is invalid, missing, not a file, exceeds `max_bytes`,
+    /// cannot be allocated, or its provider fails or makes no progress.
+    pub fn read_file_bounded(
+        &mut self,
+        cwd: &str,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, FsError> {
+        let metadata = self.metadata(cwd, path)?;
+        if metadata.kind != NodeKind::File {
+            return Err(FsError::WrongType);
+        }
+        let byte_count = usize::try_from(metadata.byte_count).map_err(|_| FsError::NoSpace)?;
+        if byte_count > max_bytes {
+            return Err(FsError::NoSpace);
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(byte_count)
+            .map_err(|_| FsError::NoSpace)?;
+        bytes.resize(byte_count, 0);
+        let mut offset = 0_usize;
+        while offset < bytes.len() {
+            let end = offset
+                .checked_add(PROVIDER_READ_CHUNK)
+                .map_or(bytes.len(), |candidate| candidate.min(bytes.len()));
+            let count = self.read_file_at(
+                cwd,
+                path,
+                u64::try_from(offset).map_err(|_| FsError::Overflow)?,
+                &mut bytes[offset..end],
+            )?;
+            if count == 0 || count > end - offset {
+                return Err(FsError::Corrupt);
+            }
+            offset = offset.checked_add(count).ok_or(FsError::Overflow)?;
+        }
+        Ok(bytes)
+    }
+
+    /// Resolve and read one shell-sized complete file.
     ///
     /// # Errors
     ///
     /// Fails if the path is invalid, missing, or not a file.
     pub fn read_file(&mut self, cwd: &str, path: &str) -> Result<Vec<u8>, FsError> {
-        let path = canonicalize(cwd, path)?;
-        if let Some((index, relative)) = self.mount_for_path(&path) {
-            let metadata = self.mounts[index].provider.metadata(&relative)?;
-            if metadata.kind != NodeKind::File {
-                return Err(FsError::WrongType);
-            }
-            let byte_count = usize::try_from(metadata.byte_count).map_err(|_| FsError::NoSpace)?;
-            if byte_count > PIPE_CAPACITY {
-                return Err(FsError::NoSpace);
-            }
-            let mut bytes = Vec::new();
-            bytes
-                .try_reserve_exact(byte_count)
-                .map_err(|_| FsError::NoSpace)?;
-            bytes.resize(byte_count, 0);
-            let mut offset = 0_usize;
-            while offset < bytes.len() {
-                let end = offset
-                    .checked_add(PROVIDER_READ_CHUNK)
-                    .map_or(bytes.len(), |candidate| candidate.min(bytes.len()));
-                let count = self.mounts[index].provider.read_file(
-                    &relative,
-                    u64::try_from(offset).map_err(|_| FsError::Overflow)?,
-                    &mut bytes[offset..end],
-                )?;
-                if count == 0 || count > end - offset {
-                    return Err(FsError::Corrupt);
-                }
-                offset = offset.checked_add(count).ok_or(FsError::Overflow)?;
-            }
-            return Ok(bytes);
-        }
-        match self.nodes.get(&path) {
-            Some(Node::File { bytes, .. }) => Ok(bytes.clone()),
-            Some(Node::Directory) => Err(FsError::WrongType),
-            None => Err(FsError::NotFound),
-        }
+        self.read_file_bounded(cwd, path, PIPE_CAPACITY)
     }
 
     /// Create or replace a RAMFS file. Each call is atomic with respect to quotas.
@@ -1027,6 +1096,30 @@ mod tests {
         assert_eq!(fs.write_file("/", "/tmp/b", b"x"), Ok(()));
         assert_eq!(fs.memory_stats().ramfs_used, 1);
         assert_eq!(fs.memory_stats().ramfs_high_water, 4);
+    }
+
+    #[test]
+    fn metadata_range_reads_and_caller_whole_file_limits_are_distinct() {
+        let mut fs = Namespace::new(RamFsQuota::default());
+        assert_eq!(fs.write_file("/", "/tmp/app.kex", b"0123456789"), Ok(()));
+        assert_eq!(
+            fs.metadata("/", "/tmp/app.kex"),
+            Ok(FileMetadata {
+                kind: NodeKind::File,
+                byte_count: 10,
+            })
+        );
+        let mut range = [0_u8; 4];
+        assert_eq!(fs.read_file_at("/", "/tmp/app.kex", 3, &mut range), Ok(4));
+        assert_eq!(&range, b"3456");
+        assert_eq!(
+            fs.read_file_bounded("/", "/tmp/app.kex", 9),
+            Err(FsError::NoSpace)
+        );
+        assert_eq!(
+            fs.read_file_bounded("/", "/tmp/app.kex", 10),
+            Ok(b"0123456789".to_vec())
+        );
     }
 
     #[test]

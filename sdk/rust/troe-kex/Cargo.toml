@@ -1,0 +1,22 @@
+[package]
+name = "troe-kex-sdk"
+description = "Minimal no_std runtime for TROE KEX command applications"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+troe-abi = { path = "../../../crates/troe-abi" }
+
+[lints.rust]
+unsafe_code = "allow"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"

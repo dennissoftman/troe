@@ -695,6 +695,12 @@ def run_scenario(
     cwd = "/"
 
     assert_storage_report(session, cwd, command_timeout)
+    session.command(
+        "kex-echo application-ready",
+        cwd,
+        command_timeout,
+        contains=("application-ready\n",),
+    )
 
     session.command(
         "net",
@@ -716,7 +722,16 @@ def run_scenario(
     )
     session.command("arp", cwd, command_timeout, contains=("10.0.2.2",))
     session.cancelled_command("sleep 5000", cwd, command_timeout)
+    session.command(
+        "udp send --source-port 40001 10.0.2.2 9 application-datagram",
+        cwd,
+        command_timeout,
+        contains=(
+            "sent 20 bytes from port 40001 to 10.0.2.2:9",
+        ),
+    )
     session.cancelled_command("udp listen 40000", cwd, command_timeout)
+    session.command("net stats", cwd, command_timeout, contains=("udp ports: 0",))
 
     session.edited_command("", b"\t", "", cwd, command_timeout, expected="\ncat\n")
     session.command(
@@ -899,6 +914,12 @@ def run_smoke_scenario(
     cwd = "/"
     assert_storage_report(session, cwd, command_timeout)
     session.command(
+        "kex-echo application-ready",
+        cwd,
+        command_timeout,
+        contains=("application-ready\n",),
+    )
+    session.command(
         "net",
         cwd,
         command_timeout,
@@ -918,7 +939,16 @@ def run_smoke_scenario(
     )
     session.command("arp", cwd, command_timeout, contains=("10.0.2.2",))
     session.cancelled_command("sleep 5000", cwd, command_timeout)
+    session.command(
+        "udp send --source-port 40001 10.0.2.2 9 application-datagram",
+        cwd,
+        command_timeout,
+        contains=(
+            "sent 20 bytes from port 40001 to 10.0.2.2:9",
+        ),
+    )
     session.cancelled_command("udp listen 40000", cwd, command_timeout)
+    session.command("net stats", cwd, command_timeout, contains=("udp ports: 0",))
     session.backspace_command(
         "echo brokeX", "n", cwd, command_timeout, expected="\nbroken\n"
     )

@@ -1,11 +1,11 @@
 # Unsafe inventory
 
-The repository contains exactly 242 project-authored Rust `unsafe` tokens.
+The repository contains exactly 252 project-authored Rust `unsafe` tokens.
 Executable occurrences are confined to five audited modules of
-`crates/troe-machine`; the count also includes one documentation occurrence in
-`troe-memory`. The verification gate fails if this count changes without a
-same-change inventory review. Portable crates and the kernel composition root
-continue to forbid unsafe code.
+`crates/troe-machine` and the freestanding KEX SDK; the count also includes one
+documentation occurrence in `troe-memory`. The verification gate fails if this
+count changes without a same-change inventory review. Portable mechanism-free
+crates and the kernel composition root continue to forbid unsafe code.
 
 | Boundary | Tokens | Invariant |
 |---|---:|---|
@@ -31,6 +31,7 @@ continue to forbid unsafe code.
 | Isolated run state and copied-user access | 21 | One single-CPU active flag grants unique access to a synchronous raw-pointer record; the record distinguishes the internal Stage 6 probe gate from ABI 1.0 execution and retains at most one bounded context/call pair. Entry and message ranges are validated completely before physical translation; suspended task pages remain allocated and identity-mapped only to the supervisor; invalid calls copy no bytes and successful replies are checked before any copy-out. |
 | x86-64 ring-3 mappings and entries | 15 | Every user leaf and traversal level carries U/S while supervisor leaves do not; DPL-3 gates and TSS RSP0 enter the kernel; application entry resets visible GPR/SSE/x87 state, and the syscall gate captures a compile-time-checked 672-byte full context for leased resume; all kernel callee-saved state survives root switches; faults and timer expiry return only through the saved kernel context. |
 | AArch64 EL0 mappings and entries | 13 | AP, PXN, and UXN distinguish EL0 code/data from EL1 mappings; application entry resets visible GPR/SIMD/FP/thread state, and the lower-EL gate captures a compile-time-checked 816-byte full context for leased resume; LDTRB honors user access under PAN; all kernel AAPCS64 state survives TTBR0 replacement. |
+| KEX SDK startup and call gates | 10 | The exported entry receives exactly one kernel-mapped startup page, validates its complete fixed layout before borrowing it, and retains no raw pointer. Architecture-specific inline assembly uses the documented ABI registers for copied handle calls, yield, and non-returning exit; the kernel validates every user range and opaque handle before use. Host builds execute only unsupported stubs. |
 
 The UEFI ExitBootServices call is inside the mechanism module. Its sole call
 site has ended protocol borrows, installed native console/fatal output and the

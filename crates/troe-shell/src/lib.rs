@@ -74,6 +74,42 @@ pub enum CommandClass {
     ReplaceableBuiltin,
 }
 
+/// Optional application resolver used ahead of replaceable recovery built-ins.
+///
+/// Returning `None` means that no application was resolved and lets the shell
+/// use its static recovery implementation or report an unknown command.
+pub trait ExternalCommand {
+    /// Resolve and execute one complete command invocation.
+    #[allow(clippy::too_many_arguments)]
+    fn execute(
+        &mut self,
+        command: &str,
+        words: &[String],
+        cwd: &str,
+        namespace: &mut Namespace,
+        stdin: &mut dyn Input,
+        stdout: &mut dyn Output,
+        stderr: &mut dyn Output,
+    ) -> Option<CommandStatus>;
+}
+
+struct NoExternalCommand;
+
+impl ExternalCommand for NoExternalCommand {
+    fn execute(
+        &mut self,
+        _command: &str,
+        _words: &[String],
+        _cwd: &str,
+        _namespace: &mut Namespace,
+        _stdin: &mut dyn Input,
+        _stdout: &mut dyn Output,
+        _stderr: &mut dyn Output,
+    ) -> Option<CommandStatus> {
+        None
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CommandId {
     Arp,
@@ -725,6 +761,30 @@ impl Shell {
         stdout: &mut dyn Output,
         stderr: &mut dyn Output,
     ) -> CommandStatus {
+        self.execute_inner(line, stdin, stdout, stderr, &mut NoExternalCommand)
+    }
+
+    /// Execute a line while preferring resolved applications for every name
+    /// except the shell-owned intrinsics.
+    pub fn execute_with_external(
+        &mut self,
+        line: &str,
+        stdin: &mut dyn Input,
+        stdout: &mut dyn Output,
+        stderr: &mut dyn Output,
+        external: &mut dyn ExternalCommand,
+    ) -> CommandStatus {
+        self.execute_inner(line, stdin, stdout, stderr, external)
+    }
+
+    fn execute_inner<E: ExternalCommand + ?Sized>(
+        &mut self,
+        line: &str,
+        stdin: &mut dyn Input,
+        stdout: &mut dyn Output,
+        stderr: &mut dyn Output,
+        external: &mut E,
+    ) -> CommandStatus {
         let pipeline = match parse_line(line) {
             Ok(value) => value,
             Err(error) => {
@@ -749,20 +809,20 @@ impl Shell {
             let last = index + 1 == pipeline.stages.len();
             if last {
                 let status = if index == 0 {
-                    self.dispatch(&stage.words, stdin, stdout, stderr)
+                    self.dispatch(&stage.words, stdin, stdout, stderr, external)
                 } else {
                     let mut input = SliceInput::new(&previous);
-                    self.dispatch(&stage.words, &mut input, stdout, stderr)
+                    self.dispatch(&stage.words, &mut input, stdout, stderr, external)
                 };
                 return status;
             }
 
             let mut next = BoundedOutput::new(PIPE_CAPACITY);
             let status = if index == 0 {
-                self.dispatch(&stage.words, stdin, &mut next, stderr)
+                self.dispatch(&stage.words, stdin, &mut next, stderr, external)
             } else {
                 let mut input = SliceInput::new(&previous);
-                self.dispatch(&stage.words, &mut input, &mut next, stderr)
+                self.dispatch(&stage.words, &mut input, &mut next, stderr, external)
             };
             if status != CommandStatus::Success {
                 return status;
@@ -772,21 +832,36 @@ impl Shell {
         CommandStatus::Failure
     }
 
-    fn dispatch(
+    fn dispatch<E: ExternalCommand + ?Sized>(
         &mut self,
         words: &[String],
         stdin: &mut dyn Input,
         stdout: &mut dyn Output,
         stderr: &mut dyn Output,
+        external: &mut E,
     ) -> CommandStatus {
         let Some(command) = words.first().map(String::as_str) else {
             return CommandStatus::Success;
         };
-        let args = &words[1..];
-        let Some(spec) = COMMANDS.iter().find(|spec| spec.name == command) else {
+        let spec = COMMANDS.iter().find(|spec| spec.name == command);
+        if spec.is_none_or(|spec| spec.class == CommandClass::ReplaceableBuiltin)
+            && let Some(status) = external.execute(
+                command,
+                words,
+                &self.cwd,
+                &mut self.namespace,
+                stdin,
+                stdout,
+                stderr,
+            )
+        {
+            return status;
+        }
+        let Some(spec) = spec else {
             let _ignored = write_error(stderr, command, "unknown command");
             return CommandStatus::NotFound;
         };
+        let args = &words[1..];
         if spec.requires_machine_control && !self.machine_control {
             let _ignored = write_error(stderr, command, "machine-control capability denied");
             return CommandStatus::Denied;
@@ -1852,17 +1927,17 @@ const fn parse_error_text(error: ParseError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        ArpEntry, COMMANDS, CommandClass, CompletionConfig, CompletionConfigError, MachineAction,
-        NetworkControl, NetworkError, NetworkStats, NetworkStatus, ParseError, PingReply,
-        ReceivedUdp, Shell, command_class, command_synopsis, parse_line,
+        ArpEntry, COMMANDS, CommandClass, CompletionConfig, CompletionConfigError, ExternalCommand,
+        MachineAction, NetworkControl, NetworkError, NetworkStats, NetworkStatus, ParseError,
+        PingReply, ReceivedUdp, Shell, command_class, command_synopsis, parse_line,
     };
     use alloc::boxed::Box;
     use alloc::format;
-    use alloc::string::ToString;
+    use alloc::string::{String, ToString};
     use alloc::vec::Vec;
     use troe_core::{
         BoundedOutput, MAX_ARGS, MAX_LINE_BYTES, MAX_PIPELINE_STAGES, MachineMemorySnapshot,
-        PIPE_CAPACITY, SliceInput,
+        PIPE_CAPACITY, SliceInput, write_all,
     };
     use troe_driver::InputQueueStats;
     use troe_task::{Cancelled, CooperativeRuntime, MonotonicMillis};
@@ -1983,6 +2058,32 @@ mod tests {
             subnet_mask: Some([255, 255, 255, 0]),
             gateway: Some([10, 0, 2, 2]),
             lease_seconds: Some(86_400),
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeExternal {
+        attempts: Vec<String>,
+    }
+
+    impl ExternalCommand for FakeExternal {
+        fn execute(
+            &mut self,
+            command: &str,
+            _words: &[String],
+            _cwd: &str,
+            _namespace: &mut Namespace,
+            _stdin: &mut dyn troe_core::Input,
+            stdout: &mut dyn troe_core::Output,
+            _stderr: &mut dyn troe_core::Output,
+        ) -> Option<troe_core::CommandStatus> {
+            self.attempts.push(command.to_string());
+            if matches!(command, "echo" | "external") {
+                let _ignored = write_all(stdout, b"external application\n");
+                Some(troe_core::CommandStatus::Success)
+            } else {
+                None
+            }
         }
     }
 
@@ -2126,6 +2227,66 @@ mod tests {
     }
 
     #[test]
+    fn external_apps_replace_builtins_but_never_intrinsics() {
+        let mut shell = shell();
+        let mut external = FakeExternal::default();
+        let mut input = SliceInput::new(b"");
+        let mut output = BoundedOutput::new(256);
+        let mut error = BoundedOutput::new(256);
+
+        assert_eq!(
+            shell.execute_with_external(
+                "echo ignored",
+                &mut input,
+                &mut output,
+                &mut error,
+                &mut external,
+            ),
+            troe_core::CommandStatus::Success
+        );
+        assert_eq!(output.as_slice(), b"external application\n");
+
+        assert_eq!(
+            shell.execute_with_external(
+                "cd /help",
+                &mut input,
+                &mut output,
+                &mut error,
+                &mut external,
+            ),
+            troe_core::CommandStatus::Success
+        );
+        assert_eq!(shell.cwd(), "/help");
+        assert!(!external.attempts.iter().any(|name| name == "cd"));
+
+        let mut fallback = BoundedOutput::new(256);
+        assert_eq!(
+            shell.execute_with_external(
+                "cat readme",
+                &mut input,
+                &mut fallback,
+                &mut error,
+                &mut external,
+            ),
+            troe_core::CommandStatus::Success
+        );
+        assert!(fallback.as_slice().starts_with(b"alpha\n"));
+
+        let mut app_output = BoundedOutput::new(256);
+        assert_eq!(
+            shell.execute_with_external(
+                "external",
+                &mut input,
+                &mut app_output,
+                &mut error,
+                &mut external,
+            ),
+            troe_core::CommandStatus::Success
+        );
+        assert_eq!(app_output.as_slice(), b"external application\n");
+    }
+
+    #[test]
     fn machine_control_commands_are_non_shadowable_intrinsics() {
         assert_eq!(command_class("cd"), Some(CommandClass::Intrinsic));
         assert_eq!(command_class("poweroff"), Some(CommandClass::Intrinsic));
@@ -2256,7 +2417,11 @@ mod tests {
         let status = shell.execute("cat /help/large | cat", &mut input, &mut output, &mut error);
         assert_ne!(status.code(), 0);
         assert!(output.as_slice().is_empty());
-        assert!(error.as_slice().ends_with(b"cat: output failed\n"));
+        assert!(
+            error
+                .as_slice()
+                .ends_with(b"cat: /help/large: filesystem quota exceeded\n")
+        );
     }
 
     #[test]
