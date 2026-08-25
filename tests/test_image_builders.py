@@ -107,6 +107,34 @@ class KefsBuilderTests(unittest.TestCase):
             rejected = subprocess.run(command, check=False, capture_output=True)
             self.assertNotEqual(rejected.returncode, 0)
 
+    def test_architecture_selection_flattens_only_one_bin_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "bin" / "x86_64").mkdir(parents=True)
+            (root / "bin" / "aarch64").mkdir()
+            (root / "etc").mkdir()
+            (root / "bin" / "x86_64" / "tool.kex").write_bytes(b"x86")
+            (root / "bin" / "aarch64" / "tool.kex").write_bytes(b"arm")
+            (root / "etc" / "motd").write_bytes(b"shared")
+
+            x86 = mkefs.decode(mkefs.build(root, "x86_64"))
+            arm = mkefs.decode(mkefs.build(root, "aarch64"))
+            self.assertIn((1, "/bin/tool.kex", b"x86"), x86)
+            self.assertIn((1, "/bin/tool.kex", b"arm"), arm)
+            self.assertIn((1, "/etc/motd", b"shared"), x86)
+            self.assertNotIn((2, "/bin/x86_64", b""), x86)
+            self.assertNotIn((2, "/bin/aarch64", b""), x86)
+
+    def test_architecture_selection_rejects_flat_bin_collisions(self) -> None:
+        entries: list[mkefs.Entry] = [
+            (2, "/bin", b""),
+            (1, "/bin/tool.kex", b"generic"),
+            (2, "/bin/x86_64", b""),
+            (1, "/bin/x86_64/tool.kex", b"target"),
+        ]
+        with self.assertRaisesRegex(ValueError, "collides"):
+            mkefs.select_architecture(entries, "x86_64")
+
     def test_non_normalized_path_is_rejected(self) -> None:
         path = b"/a/../b"
         record = struct.pack("<BHI", 1, len(path), 0) + path

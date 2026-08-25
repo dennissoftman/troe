@@ -237,7 +237,7 @@ The Stage 9 command slice layers four required ABI 1.0 services on that mechanis
 immutable cwd/argv, stdin, stdout, and stderr. The shell logically yields while
 one foreground application runs, then resumes only after owner-wide handle
 revocation, record reaping, page zeroization, and exact frame return. Artifacts
-are read from `/bin/<architecture>/<name>.kex`; only absence permits the static
+are read from target-selected `/bin/<name>.kex`; only absence permits the static
 recovery fallback. Service replies, per-stream bytes, and total resumed steps
 all have hard ceilings. A fifth optional datagram handle exposes only bounded
 IPv4/UDP send/receive. Its local ports are exclusive to the launch, receive

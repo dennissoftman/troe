@@ -10,6 +10,13 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+KEX_APPLICATION_NAMES = tuple(
+    sorted(
+        path.name
+        for path in (REPO_ROOT / "apps").iterdir()
+        if path.is_dir() and (path / "Cargo.toml").is_file()
+    )
+)
 
 
 def cargo_kex(*arguments: object) -> subprocess.CompletedProcess[bytes]:
@@ -26,7 +33,7 @@ class KexToolTests(unittest.TestCase):
     """Keep canonical build, inspection, and installed bytes stable."""
 
     def test_installed_example_artifacts_are_canonical_for_each_target(self) -> None:
-        for command in ("echo", "udp"):
+        for command in KEX_APPLICATION_NAMES:
             for target in ("x86_64", "aarch64"):
                 with self.subTest(command=command, target=target):
                     artifact = REPO_ROOT / "rootfs" / "bin" / target / f"{command}.kex"

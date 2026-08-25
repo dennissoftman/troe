@@ -119,6 +119,13 @@ class ProductionBuildPolicyTests(unittest.TestCase):
         ]
         self.assertEqual(verification.target_clippy_commands(), expected)
 
+    def test_rootfs_image_is_selected_only_by_architecture(self) -> None:
+        for architecture in ("x86_64", "aarch64"):
+            self.assertEqual(
+                build.rootfs_image_path(architecture),
+                build.REPO_ROOT / "assets" / f"root-{architecture}.kefs",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

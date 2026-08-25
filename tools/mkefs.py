@@ -13,6 +13,7 @@ HEADER_SIZE = 16
 MAX_ENTRIES = 0xFFFF
 MAX_PATH = 256
 MOUNTPOINT_SENTINEL = ".mountpoint"
+ARCHITECTURES = ("x86_64", "aarch64")
 Entry = tuple[int, str, bytes]
 
 
@@ -41,6 +42,35 @@ def collect(root: Path) -> list[Entry]:
     return entries
 
 
+def select_architecture(entries: list[Entry], architecture: str) -> list[Entry]:
+    """Project one source architecture into the flat runtime ``/bin`` tree."""
+    if architecture not in ARCHITECTURES:
+        raise ValueError(f"unsupported root architecture: {architecture}")
+    selected_prefix = f"/bin/{architecture}"
+    architecture_prefixes = tuple(f"/bin/{name}" for name in ARCHITECTURES)
+    if (2, selected_prefix, b"") not in entries:
+        raise ValueError(f"source tree has no directory for {architecture}")
+    projected: list[Entry] = []
+    for kind, path, payload in entries:
+        owning_prefix = next(
+            (
+                prefix
+                for prefix in architecture_prefixes
+                if path == prefix or path.startswith(prefix + "/")
+            ),
+            None,
+        )
+        if owning_prefix is None:
+            projected.append((kind, path, payload))
+        elif owning_prefix == selected_prefix and path != selected_prefix:
+            projected.append((kind, "/bin" + path[len(selected_prefix) :], payload))
+    projected.sort(key=lambda entry: entry[1].encode("utf-8"))
+    for previous, current in zip(projected, projected[1:], strict=False):
+        if previous[1] == current[1]:
+            raise ValueError(f"architecture projection collides at {current[1]}")
+    return projected
+
+
 def encode(entries: list[Entry]) -> bytes:
     """Encode an already normalized source tree as canonical KEFS v1 bytes."""
     if len(entries) > MAX_ENTRIES:
@@ -59,9 +89,12 @@ def encode(entries: list[Entry]) -> bytes:
     return MAGIC + struct.pack("<HHI", len(entries), 0, total) + records
 
 
-def build(root: Path) -> bytes:
+def build(root: Path, architecture: str | None = None) -> bytes:
     """Collect and encode one normalized source tree."""
-    return encode(collect(root))
+    entries = collect(root)
+    if architecture is not None:
+        entries = select_architecture(entries, architecture)
+    return encode(entries)
 
 
 def checked_slice(image: bytes, offset: int, length: int, label: str) -> tuple[bytes, int]:
@@ -131,6 +164,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("root", type=Path)
     parser.add_argument("output", type=Path)
     parser.add_argument(
+        "--architecture",
+        choices=ARCHITECTURES,
+        help="flatten this source architecture into the runtime /bin directory",
+    )
+    parser.add_argument(
         "--check", action="store_true", help="fail unless output already matches"
     )
     return parser.parse_args()
@@ -140,6 +178,8 @@ def main() -> int:
     args = parse_args()
     try:
         expected = collect(args.root.resolve())
+        if args.architecture is not None:
+            expected = select_architecture(expected, args.architecture)
         if args.check:
             image = args.output.read_bytes()
         else:
@@ -148,7 +188,10 @@ def main() -> int:
         if not args.check:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_bytes(image)
-        print(f"KEFS v1: {len(image)} bytes -> {args.output}")
+        selection = (
+            f" {args.architecture}" if args.architecture is not None else ""
+        )
+        print(f"KEFS v1{selection}: {len(image)} bytes -> {args.output}")
         return 0
     except (OSError, ValueError) as error:
         print(f"mkefs: {error}", file=sys.stderr)

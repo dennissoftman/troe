@@ -37,6 +37,11 @@ PRODUCTION_FORBIDDEN_MARKERS = (
 )
 
 
+def rootfs_image_path(architecture: str) -> Path:
+    """Return the target-selected KEFS image embedded by one kernel build."""
+    return REPO_ROOT / "assets" / f"root-{architecture}.kefs"
+
+
 def run(*command: str | Path) -> None:
     """Run a build command from the repository root."""
     subprocess.run([str(argument) for argument in command], cwd=REPO_ROOT, check=True)
@@ -111,12 +116,21 @@ def main() -> int:
             if args.fixture_identities
             else ("--identity-file", args.identity_file)
         )
-        run(
-            sys.executable,
-            TOOLS_DIR / "mkefs.py",
-            REPO_ROOT / "rootfs",
-            REPO_ROOT / "assets" / "root.kefs",
+        architectures = tuple(
+            dict.fromkeys(
+                PLATFORM_PROFILES[platform_id].architecture
+                for platform_id in platform_ids
+            )
         )
+        for architecture in architectures:
+            run(
+                sys.executable,
+                TOOLS_DIR / "mkefs.py",
+                REPO_ROOT / "rootfs",
+                rootfs_image_path(architecture),
+                "--architecture",
+                architecture,
+            )
         run(
             sys.executable,
             TOOLS_DIR / "mkstorage.py",
@@ -187,7 +201,7 @@ def main() -> int:
                 "--efi",
                 efi,
                 "--rootfs",
-                REPO_ROOT / "assets" / "root.kefs",
+                rootfs_image_path(profile.architecture),
                 "--image",
                 image,
             )

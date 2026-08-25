@@ -84,7 +84,10 @@ mod firmware {
     use uefi::prelude::*;
     use uefi::proto::console::gop::{GraphicsOutput, PixelFormat as GopPixelFormat};
 
-    const ROOTFS: &[u8] = include_bytes!("../../assets/root.kefs");
+    #[cfg(target_arch = "x86_64")]
+    const ROOTFS: &[u8] = include_bytes!("../../assets/root-x86_64.kefs");
+    #[cfg(target_arch = "aarch64")]
+    const ROOTFS: &[u8] = include_bytes!("../../assets/root-aarch64.kefs");
     const BOOT_MOUNT_MANIFEST: &[u8] = include_bytes!("../../assets/boot.bmnt");
     const PERSISTENCE_SELECTOR: &[u8] = include_bytes!("../../assets/persist.prgn");
     const STATEFS_SELECTOR: &[u8] = include_bytes!("../../assets/state.prgn");
@@ -4016,7 +4019,7 @@ mod firmware {
             if !valid_application_name(command) {
                 return None;
             }
-            let path = alloc::format!("/bin/{}/{}.kex", architecture(), command);
+            let path = alloc::format!("/bin/{command}.kex");
             let metadata = match namespace.metadata("/", &path) {
                 Ok(metadata) => metadata,
                 Err(troe_vfs::FsError::NotFound) => return None,

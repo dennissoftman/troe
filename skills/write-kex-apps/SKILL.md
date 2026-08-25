@@ -87,8 +87,8 @@ cargo kex inspect rootfs/bin/aarch64/<command>.kex
 
 The builder pins the freestanding targets and linker policy, validates the ELF,
 converts through strict KEX v1, and installs architecture-specific artifacts.
-Never copy one architecture's artifact to the other. After artifact changes,
-rebuild `assets/root.kefs` with `python3 tools/mkefs.py rootfs assets/root.kefs`.
+Never copy one architecture's artifact to the other. KEFS assembly projects the
+selected source directory into flat runtime `/bin`; verify both target roots.
 
 Before handing off, run formatting, app/library tests, both KEX byte checks, and
 the narrowest relevant kernel/QEMU gate. For a new command name, acceptance must

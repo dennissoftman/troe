@@ -34,7 +34,7 @@ the 50 ms execution lease and transactionally reclaimed.
   load transactions, explicit initial handles, and zeroized rollback;
 - complete ring-3/EL0 ABI 1.0 entry, exit, resumable yield, and owner-checked
   copied handle calls, with owned x86 local-APIC/AArch64 timer leases;
-- exact `/bin/<architecture>/<command>.kex` shell discovery, external-first
+- exact `/bin/<command>.kex` shell discovery from a target-selected root, external-first
   replaceable commands with static recovery fallback, four bounded command and
   standard-stream services, a repo-local Rust SDK/skill, and canonical
   dual-target build/check/inspect tooling;
@@ -88,10 +88,11 @@ monotonic clock and explicit cancellation checkpoints; Ctrl-C cancels waits and
 ambient service through bounded q35 INTx or GICv2 handlers; an empty receive
 check never spins. DNS, IPv6, TCP, HTTP, TLS,
 fragmentation, and general sockets remain outside this milestone.
-KEX apps may receive one optional owner-scoped IPv4/UDP handle. The `udp` KEX
-replacement proves bounded send, cancellable receive, exclusive port lifetime,
-and teardown back to zero live bindings. TCP now needs its own bounded
-connection-state, timer, and adversarial-test design before implementation.
+KEX apps may receive one optional owner-scoped IPv4/UDP handle. The `echo`,
+`clear`, and `pwd` replacements use only command/stream authority; `udp` also
+proves bounded send, cancellable receive, exclusive port lifetime, and teardown
+back to zero live bindings. Filesystem, timer, diagnostics, and typed network
+capabilities are the next lower-level migration boundary before TCP.
 
 ## Quick start
 

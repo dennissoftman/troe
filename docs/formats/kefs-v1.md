@@ -32,3 +32,8 @@ verification path independently decodes the artifact, validates every record
 and exact end-of-image consumption, and compares the resulting ordered paths,
 kinds, and payloads with the normalized source tree. A byte-for-byte rebuild is
 therefore not the sole round-trip check.
+
+For boot roots, `--architecture` selects one target-qualified source
+`/bin/<architecture>` directory, projects its children into runtime `/bin`, and
+excludes all other architecture directories. The KEFS wire format itself stays
+architecture-neutral.

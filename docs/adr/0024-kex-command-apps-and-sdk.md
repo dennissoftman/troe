@@ -6,7 +6,7 @@ Status: accepted and implemented for the Stage 9 application vertical slice,
 ## Decision
 
 TROE command applications are immutable KEX v1 files installed at
-`/bin/<architecture>/<command>.kex`. A command is a lowercase ASCII name with
+`/bin/<command>.kex`. A command is a lowercase ASCII name with
 digits, `_`, or `-`; applications do not receive arbitrary filesystem paths as
 implicit authority. `cd`, `poweroff`, and `reboot` remain non-shadowable shell
 intrinsics. For every other name the shell tries the KEX resolver first. An
@@ -47,6 +47,11 @@ and can byte-check or inspect installed output. Example source lives
 under `apps/`; canonical generated artifacts are committed under `rootfs/bin`
 until the signed content-store packaging decision replaces that bootstrap
 distribution path.
+
+Repository build outputs remain target-qualified under
+`rootfs/bin/<architecture>/`. KEFS assembly selects exactly one architecture,
+flattens its files into runtime `/bin`, and excludes every other architecture;
+the target-specific kernel still validates the KEX target field before loading.
 
 ## Security and efficiency consequences
 

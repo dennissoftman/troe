@@ -235,10 +235,12 @@ Stage 7 implementation.
 ### Stage 9 command-application integration (complete vertical slice)
 
 The first product-facing integration is implemented. The shell resolves exact
-immutable `/bin/<architecture>/<command>.kex` artifacts, stages them through
-bounded offset reads, and grants versioned command/stdin/stdout/stderr handles.
-`echo` is externally replaceable with a static recovery fallback, while the
-unknown `kex-echo` name proves general discovery on every QEMU composition.
+immutable `/bin/<command>.kex` artifacts from a target-selected root, stages
+them through bounded offset reads, and grants versioned
+command/stdin/stdout/stderr handles.
+`echo`, `clear`, and `pwd` are externally replaceable with static recovery
+fallbacks, while the unknown `kex-echo` name proves general discovery on every
+QEMU composition.
 The repo-local Rust SDK, linker script, canonical dual-target build/inspect
 tool, example source, and concise authoring skill are checked in.
 
@@ -254,9 +256,11 @@ content-store application publication remain on the packaging track.
 The bounded UDP substrate is now exposed through the optional owner-scoped
 application datagram service. `udp.kex` proves send, receive backpressure,
 waiting/cancellation, and teardown to zero live ports on every QEMU composition.
-Next sequence: design TCP as its own bounded connection/timer state machine,
-then implement only after adversarial portable tests fix those limits. DNS,
-TLS, jobs, and general sockets are not implied by the datagram ABI.
+Next sequence: migrate the remaining replaceable utilities through bounded
+filesystem, mutation, timer, diagnostics, and typed network capabilities. TCP
+follows only after those lower-level contracts and their adversarial portable
+tests are fixed. DNS, TLS, jobs, and general sockets are not implied by the
+datagram ABI.
 
 The shell keeps bounded command-name and path completion, including candidate
 listing for an empty or partial command and command-name completion after

@@ -10,7 +10,12 @@ use troe_core::{Input, MAX_LINE_BYTES, MachineMemorySnapshot, Output, StreamErro
 use troe_shell::Shell;
 use troe_vfs::{Namespace, RamFsQuota};
 
-const ROOTFS: &[u8] = include_bytes!("../../assets/root.kefs");
+#[cfg(target_arch = "x86_64")]
+const ROOTFS: &[u8] = include_bytes!("../../assets/root-x86_64.kefs");
+#[cfg(target_arch = "aarch64")]
+const ROOTFS: &[u8] = include_bytes!("../../assets/root-aarch64.kefs");
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+compile_error!("the TROE host model supports only x86_64 and aarch64");
 
 struct HostInput;
 

@@ -21,6 +21,13 @@ else:
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOLS_DIR = REPO_ROOT / "tools"
+KEX_APPLICATIONS = tuple(
+    sorted(
+        path
+        for path in (REPO_ROOT / "apps").iterdir()
+        if path.is_dir() and (path / "Cargo.toml").is_file()
+    )
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -98,12 +105,17 @@ def main() -> int:
             "test_*.py",
         ),
         (sys.executable, REPO_ROOT / "scripts" / "audit.py"),
-        (
-            sys.executable,
-            TOOLS_DIR / "mkefs.py",
-            REPO_ROOT / "rootfs",
-            REPO_ROOT / "assets" / "root.kefs",
-            "--check",
+        *(
+            (
+                sys.executable,
+                TOOLS_DIR / "mkefs.py",
+                REPO_ROOT / "rootfs",
+                REPO_ROOT / "assets" / f"root-{architecture}.kefs",
+                "--architecture",
+                architecture,
+                "--check",
+            )
+            for architecture in ("x86_64", "aarch64")
         ),
         (
             sys.executable,
@@ -112,23 +124,17 @@ def main() -> int:
             "--expected",
             "252",
         ),
-        (
-            "cargo",
-            "kex",
-            "build",
-            REPO_ROOT / "apps" / "echo",
-            "--target",
-            "all",
-            "--check",
-        ),
-        (
-            "cargo",
-            "kex",
-            "build",
-            REPO_ROOT / "apps" / "udp",
-            "--target",
-            "all",
-            "--check",
+        *(
+            (
+                "cargo",
+                "kex",
+                "build",
+                application,
+                "--target",
+                "all",
+                "--check",
+            )
+            for application in KEX_APPLICATIONS
         ),
         (
             "cargo",
