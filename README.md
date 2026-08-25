@@ -1,326 +1,191 @@
 # TROE
 
-TROE (Tiny Rust Operating Environment) is a tiny Rust operating system: a
-bounded command shell, a small VFS, and an owned kernel that is growing toward
-useful cloud virtual-machine deployments. The current slice runs as a normal
-host program and as native x86-64/AArch64 UEFI images.
+### Tiny Rust Operating Environment
 
-Every ordinary shell command is an immutable KEX application running in a fresh
-ring-3/EL0 address space; only `cd`, `poweroff`, and `reboot` remain
-non-shadowable shell intrinsics. The repo-local Rust SDK and dual-target builder produce
-canonical single-file packages containing strict KEX v1 executables;
-the shell grants versioned cwd/argv and standard-stream handles plus only the
-optional capabilities declared by each package. Target-native code enters with
-reset register state, exits, yields through scheduler-
-controlled re-entry, performs owner-checked copied calls, or is terminated by
-the 50 ms execution lease and transactionally reclaimed.
+**A small, strict, capability-oriented operating system for x86-64 and AArch64.**
 
-## What works now
+[![Rust](https://img.shields.io/badge/Rust-1.97.1-dea584?logo=rust&logoColor=white)](rust-toolchain.toml)
+[![Platforms](https://img.shields.io/badge/platforms-x86--64%20%7C%20AArch64-5865f2)](docs/cloud-platform-support.md)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-- stable Rust 1.97.1, edition 2024, `no_std` portable crates;
-- deterministic, versioned, bounds-checked KEFS root image;
-- quota-bound writable `/tmp` and live `/sys` reporting;
-- final UEFI handoff into a checked frame bitmap, a 6 MiB owned TLSF heap, and
-  full live memory accounting;
-- architecture-owned 4 KiB page tables with RX text, RO/NX immutable data,
-  RW/NX runtime memory, typed device mappings, and native fault vectors;
-- bounded cooperative task records, capability-scoped dispatch, deterministic
-  yield/exit/reap accounting, and guarded 64 KiB task stacks;
-- generation-checked service handles, bounded synchronous request/reply
-  messages, and a dispatched native console output path;
-- per-task ring-3/EL0 address spaces, copied user messages, contained task
-  faults, owner-wide handle revocation, zeroization, and physical-frame reuse;
-- allocation-free KEX package, embedded KCAP, and KEX v1 validation with target,
-  ABI, W^X, canonical-layout, entry-point, and standard memory-budget checks;
-- kernel-owned KEX staging, canonical startup pages, validate-before-map native
-  load transactions, explicit initial handles, and zeroized rollback;
-- complete ring-3/EL0 ABI 1.0 entry, exit, resumable yield, and owner-checked
-  copied handle calls, with owned x86 local-APIC/AArch64 timer leases;
-- exact `/bin/<command>.kex` shell discovery from a target-selected root with no
-  privileged ordinary-command fallback, four bounded command and standard-stream
-  services, optional owned datagram, outbound TCP stream, read-only filesystem, and
-  atomic filesystem-mutation services, separate monotonic-timer and immutable
-  typed-diagnostics services, a repo-local Rust SDK/skill, and canonical
-  dual-target build/check/inspect tooling;
-- portable bounded block-region capabilities, strict primary/backup GPT
-  discovery, read-only FAT32 and constrained checksummed ext4 VFS providers,
-  checksummed SCFG v1 service startup policy, and a checksummed BMNT v1 boot
-  mount manifest with deterministic stable-identity resolution;
-- a four-block dual-slot persistence transaction with exact
-  data/flush/commit/flush ordering, host fault injection at every boundary,
-  a checksummed exact-GPT-identity region selector, and native process-reopen
-  recovery on both QEMU transports; plus a bounded SHA-256-addressed immutable
-  content pack loaded from the exactly selected ext4 root and a digest-bound
-  active/predecessor SCFG publication pointer with QEMU-proven health rollback;
-- a bounded single-file persistent state filesystem mounted writable at
-  `/vol/state`, with native flush/reopen recovery on both architectures;
-- bounded Ethernet/ARP/IPv4/UDP/TCP primitives and native fixed-buffer modern
-  virtio-net PCI/MMIO transports, with checksum/fragment/truncation rejection,
-  a 10,000-frame resource-ceiling test, and QEMU-proven host UDP/TCP exchange;
-- canonical bounded identity registry, foreign mapping, mount-policy, and
-  native ACL snapshots, bound as typed immutable roots to active/predecessor
-  generations and revalidated through QEMU rollback/reopen;
-- a bounded modern virtio block core with native AArch64 `virtio-mmio` and
-  x86-64 q35 virtio PCI transports; both have QEMU-proven post-handoff GPT
-  discovery, exact BMNT disk/partition/ext4 identity selection, and a live
-  read-only `/vol/root` mount;
-- owned receive interrupts through q35 LAPIC/I/O APIC and AArch64 GICv2,
-  bounded raw-event delivery, and race-free `hlt`/`wfi` shell idle;
-- project-owned polling 16550 and PL011 early/fatal recovery output, plus an
-  owned GOP framebuffer text console on both architectures;
-- configurable cursor-aware UTF-8 line editing, volatile bounded history,
-  command/VFS completion, ANSI serial-key decoding, and x86-64 PS/2 input;
-- single/double quotes and pipelines of up to eight stages;
-- 64 KiB bounded intermediate byte streams;
-- KEX apps for `arp`, `cat`, `clear`, `dhcp`, `echo`, literal `grep`, `hexdump`,
-  `ls`, `man`, `mem`, `net`, `ping`, `printf`, `pwd`, `rm`, `sleep`, `tcp`, `udp`, and
-  `write`,
-  plus intrinsic `cd`, `poweroff`, and `reboot`;
-- deterministic 1.44 MiB FAT12 images for both primary architectures;
-- host/unit/smoke gates and prompt-synchronized QEMU acceptance on all four
-  named platform profiles across both architectures.
+TROE is an experimental Rust operating system for small, predictable virtual
+machines. It boots as a native UEFI image and provides an interactive shell,
+isolated command-line applications, persistent state, and virtio networking.
 
-### Current networking scope
+Most of TROE is portable `no_std` Rust. Project-authored unsafe code is confined
+to one audited machine boundary; portable crates forbid it.
 
-Normal QEMU images attach one modern virtio-net device and acquire an IPv4
-address, subnet mask, default gateway, and lease through a bounded DHCP
-discover/request exchange. The command environment exposes `net`, `dhcp`, `ping`,
-`arp`, `net stats`, `tcp`, `udp send --source-port`, and `udp listen`. A shared ambient
-service answers ARP and ICMP while the prompt or a cooperative command is idle,
-retains eight ARP neighbors, and owns eight persistent UDP ports with four
-datagrams and 4 KiB per-port receive capacity. Commands use a boot-relative
-monotonic clock and explicit cancellation checkpoints; Ctrl-C cancels waits and
-`sleep` without introducing background jobs. Receive completions wake the
-ambient service through bounded q35 INTx or GICv2 handlers; an empty receive
-check never spins. Outbound TCP is one owner-scoped connection per declared
-`tcp-connect` handle, with one 1,460-byte unacknowledged segment, a 4 KiB
-receive FIFO, exact sequence admission, and bounded retransmission. DNS, IPv6,
-HTTP, TLS, inbound TCP listening, fragmentation, and general sockets remain
-outside this milestone.
-KEX apps may receive optional owner-scoped IPv4/UDP and read-only filesystem
-handles when their embedded KCAP manifests request them. `cat`, `grep`,
-`hexdump`, `ls`,
-and `man` exercise generation-checked files, bounded reads, metadata, and
-lexically paginated directories. `write` and `rm` use a separate bounded,
-atomic complete-file mutation handle. `sleep.kex` uses only a cancellable
-boot-relative timer and `mem.kex` uses only an immutable typed snapshot.
-`net.kex` and `arp.kex` use read-only typed network observation, while
-`dhcp.kex` and `ping.kex` each receive only their one bounded cancellable
-protocol operation. `tcp.kex` receives only one literal-IPv4 outbound byte
-stream; it provides the transport groundwork for later HTTP clients without
-granting DNS, HTTP, TLS, raw-packet, or general-socket authority.
+> **Project status:** TROE runs in QEMU today. It is a research and development
+> project, not yet a general-purpose OS or production cloud image. See the
+> [roadmap](docs/roadmap.md).
 
-## Quick start
+## Why TROE?
 
-Hosted parser/session model (target KEX execution is intentionally unavailable):
+- ⚡ **Efficient by construction.** The current boot image is 1.44 MiB, the
+  kernel owns a fixed 6 MiB heap, and resources are charged only when used.
+- 🛡️ **Isolated by default.** Every ordinary command starts in a fresh
+  ring-3/EL0 address space with only its declared, typed capabilities.
+- ✅ **Strict at every boundary.** Executables, filesystems, configuration,
+  memory mappings, and network input are bounds-checked and validated before use.
+- 🔁 **Predictable under failure.** Work has hard ceilings, application execution
+  has a 50 ms lease, faults are contained, and teardown revokes handles,
+  zeroizes memory, and returns owned frames.
+
+TROE also enforces W^X mappings, guarded task stacks, generation-checked handles,
+fixed-size queues, deterministic image builds, and exact dependency and firmware
+profiles. Small is a policy here, not just a current measurement.
+
+## What runs today
+
+- Native UEFI boots on x86-64 and AArch64.
+- Serial and framebuffer consoles with UTF-8 line editing, history, completion,
+  quoting, and pipelines.
+- A bounded VFS with KEFS, read-only FAT32 and constrained ext4, quota-bound
+  `/tmp`, live `/sys`, and crash-consistent state under `/vol/state`.
+- Ethernet, ARP, DHCP, IPv4, ICMP, UDP, and outbound TCP over virtio-net.
+- KEX applications for `arp`, `cat`, `clear`, `dhcp`, `echo`, `grep`, `hexdump`,
+  `ls`, `man`, `mem`, `net`, `ping`, `printf`, `pwd`, `rm`, `sleep`, `tcp`, `udp`,
+  and `write`.
+
+Only `cd`, `poweroff`, and `reboot` are privileged shell intrinsics. Everything
+else is an immutable KEX application discovered from `/bin`.
+
+## 🎬 Demos
+
+### Shell and filesystem
 
 ```console
-cargo run --manifest-path host/Cargo.toml
-cargo run --manifest-path host/Cargo.toml -- --command "cd /etc"
-cargo run --manifest-path host/Cargo.toml -- --script tests/smoke.sh
+sh:/> cat /etc/motd
+Tiny Rust Operating Environment 0.1.0
+Small by design. Alive on the wire.
+
+sh:/> printf 'first\nsecond\t%s\n' value | grep second
+second  value
+
+sh:/> echo alpha beta | grep beta | write /tmp/result
+sh:/> cat /tmp/result
+alpha beta
 ```
 
-Boot one default interactive VM and run the real KEX apps:
+### Networking
+
+This is an abridged session from the x86-64 QEMU profile:
+
+```console
+sh:/> net
+link: ready
+mac: 52:54:00:12:34:56
+ipv4: 10.0.2.15
+gateway: 10.0.2.2
+
+sh:/> ping 10.0.2.2
+reply from 10.0.2.2: icmp_seq=1 bytes=9
+
+sh:/> udp send --source-port 40001 10.0.2.2 9 hello-from-troe
+sent 15 bytes from port 40001 to 10.0.2.2:9
+```
+
+Networking is currently literal IPv4. DNS, IPv6, HTTP, TLS, and inbound TCP are
+outside the implemented scope.
+
+### KEX applications
+
+KEX packages combine a native executable with a manifest declaring only the
+capabilities that application needs:
+
+```text
+KEX package → validate → fresh user space → grant typed handles
+            → bounded execution → revoke → zeroize → reclaim
+```
+
+Build and inspect the example `echo` application for both targets:
+
+```console
+$ cargo kex build apps/echo --target all --check
+$ cargo kex inspect rootfs/bin/x86_64/echo.kex
+```
+
+Start exploring with [`apps/echo`](apps/echo) and the
+[`troe-kex` Rust SDK](sdk/rust/troe-kex).
+
+## 🚀 Quick start
+
+### Prerequisites
+
+- Rust `1.97.1` via [rustup](https://rustup.rs/); the repository toolchain file
+  selects the required components and targets.
+- Python `3.13` or newer.
+- QEMU `11.1.0` with matching x86-64 or AArch64 UEFI firmware.
+
+From a repository checkout, build and boot the platform matching your host:
 
 ```console
 cargo qemu
 ```
 
-Build and inspect the example KEX command for both native targets:
+The launcher opens TROE on the serial console. Use `poweroff` inside the guest
+to shut it down, or add `--graphical` to open the framebuffer console:
 
 ```console
-cargo kex build apps/echo --target all
-cargo kex build apps/echo --target all --check
-cargo kex inspect rootfs/bin/x86_64/echo.kex
+cargo qemu --graphical
 ```
 
-Each installed `.kex` is one canonical package containing its KCAP manifest and
-KEX v1 executable; app manifests declare only the optional versioned interfaces
-they require.
+Choose a target explicitly when needed:
 
-Build deterministic local/QEMU images with reserved test identities:
+```console
+cargo qemu --platform x86_64-q35-uefi --environment qemu
+cargo qemu --platform aarch64-virt-uefi --environment qemu
+```
+
+Without the exact QEMU setup, the hosted model still exercises the shell parser
+and sessions. It intentionally does not execute KEX applications.
+
+```console
+cargo run --manifest-path host/Cargo.toml
+```
+
+## Build and test
+
+Build deterministic test images for every supported platform:
 
 ```console
 python3 scripts/build.py --platform all --fixture-identities
 ```
 
-For a deployment artifact, provision identities once and supply them explicitly:
-
-```console
-python3 tools/mkidentity.py --output build/deployment-identities.json
-python3 scripts/build.py --platform all \
-  --identity-file build/deployment-identities.json
-```
-
-The build command has no implicit identity mode. Reserved fixture identities
-are reproducible test data and are rejected by production cloud packaging.
-
-Artifacts are written under `build/`, and the script reports their exact
-filenames. The build regenerates KEFS, uses Cargo's locked dependency graph,
-builds release EFI executables, constructs deterministic FAT images and the
-BMNT policy, and enforces the 16 MiB hard ceiling. QEMU acceptance additionally
-creates a reproducible GPT/ext4 storage disk with e2fsprogs plus separate
-four-block writable TXSLOT media for each architecture.
-
-Run all local gates:
+Run the complete local and QEMU gate, or select checks affected by your changes:
 
 ```console
 python3 scripts/test.py
+python3 scripts/test_changed.py --explain
 ```
 
-For a conservative development loop that selects changed packages and reverse
-dependencies, owned Python suites, affected KEX apps, and granular QEMU
-scenarios, run `python3 scripts/test_changed.py --explain`. Unknown or global
-changes widen automatically to the full gate. The selector does not replace the
-full pre-merge run. See [`docs/testing.md`](docs/testing.md) for the scenario
-catalog and coding-agent instructions.
+Use `python3 scripts/test.py --skip-qemu` when the pinned emulator and firmware
+are unavailable. Fixture identities are test data and cannot produce deployment
+artifacts; see the [cloud platform guide](docs/cloud-platform-support.md) for the
+explicit provisioning workflow.
 
-This includes all four pinned QEMU platform suites across x86-64 and AArch64.
-If that exact QEMU/firmware pair is not installed, run the non-emulator gates
-explicitly with `python3 scripts/test.py --skip-qemu`. Run only QEMU acceptance with
-`python3 scripts/test-qemu.py --platform all --environment qemu`; all named
-platforms run concurrently after their images have been built. Omitting
-`--scenario` runs every group and enables owned framebuffer activation plus
-native PS/2 input on x86-64. Repeat `--scenario` for one or more focused groups
-as documented in [`docs/testing.md`](docs/testing.md). For a quick
-terminal-focused iteration, use
-`python3 scripts/test-qemu.py --platform all --environment qemu --smoke`; the
-exhaustive suite remains the standard gate.
+## Project guide
 
-The FAT32 and ext4 providers include optional real-tool interoperability tests.
-On macOS, install their independent image builders/checkers with:
+| Path | Purpose |
+| --- | --- |
+| [`kernel/`](kernel) | UEFI entry point and native kernel composition |
+| [`crates/`](crates) | Portable shell, VFS, storage, networking, task, and driver components |
+| [`apps/`](apps) | Isolated KEX command applications |
+| [`sdk/`](sdk) | Rust application SDK and linker support |
+| [`rootfs/`](rootfs) | Root filesystem and packaged applications |
+| [`host/`](host) | Hosted shell model |
+| [`scripts/`](scripts) | Build, test, and QEMU entry points |
+| [`docs/`](docs) | Architecture, formats, decisions, security notes, and roadmap |
 
-```console
-brew install e2fsprogs dosfstools mtools
-```
+The [documentation guide](docs/README.md) indexes the deeper material:
 
-The canonical ext4 builder accepts exactly e2fsprogs 1.47.4
-(`6-Mar-2025`); another installed version is treated as an on-media format
-change and fails before formatting.
+- [Architecture](docs/architecture.md)
+- [Roadmap](docs/roadmap.md)
+- [Testing guide](docs/testing.md)
+- [Cloud platform support](docs/cloud-platform-support.md)
+- [Security policy](SECURITY.md)
 
-They run automatically when discovered. To make missing tools a test failure,
-add `--require-filesystem-tools`; for example:
+## Contributing and license
 
-```console
-python3 scripts/test.py --skip-qemu --require-filesystem-tools
-```
-
-The tests build temporary images only: dosfstools/mtools create nested FAT32
-content and e2fsprogs creates the exact ADR 0017 ext4 profile. The corresponding
-host checker must accept each image before TROE mounts, lists, and reads it.
-
-The dependency gate requires exactly `cargo-audit 0.22.1` and checks the full
-lockfile against the RustSec database revision committed in
-`tools/rustsec-advisory-db.rev`. Install the tool with:
-
-```console
-cargo install cargo-audit --version 0.22.1 --locked
-```
-
-The exhaustive QEMU gate builds separate `*-acceptance.img` artifacts containing
-terminal permission/exception probes. A build without `--acceptance-probes` is
-rejected if any probe marker is present; deployment status additionally requires
-an explicit non-fixture identity file.
-
-Build the host-native image and open it in QEMU (`x86_64-q35-uefi` on x86-64,
-`aarch64-virt-uefi` on AArch64):
-
-```console
-cargo qemu
-```
-
-Select another exact platform when needed:
-
-```console
-cargo qemu --platform x86_64-q35-uefi --environment qemu
-```
-
-Open the owned framebuffer console while retaining serial stdio as the recovery
-transport:
-
-```console
-cargo qemu --platform x86_64-q35-uefi --environment qemu --graphical
-cargo qemu --platform aarch64-virt-uefi --environment qemu --graphical
-```
-
-The Cargo convenience wrapper supplies the host-native named platform and the
-`qemu` environment when either selector is omitted; the underlying launcher and
-all test APIs remain explicit. The launcher discovers firmware bundled with QEMU
-in conventional installation locations. Architecture, target triple, firmware
-family, machine type, CPU, RAM, and virtio transport derive from the selected
-named platform and are never inferred in the other direction.
-If QEMU does
-not bundle firmware, provide code and variable-store images from rust-osdev
-`ovmf-prebuilt` release `edk2-stable202605-r1` using `--firmware-code` and
-`--firmware-vars`. Whether discovered or supplied explicitly, every code and
-variable-store image must match the committed size and SHA-256 provenance
-record in `tools/qemu-firmware-profile.json`.
-
-The launcher and acceptance harness refuse a QEMU version other than 11.1.0 unless
-`--skip-version-check` is supplied deliberately. Firmware is not silently
-downloaded. UEFI Simple Text Output carries only the bootstrap banner. The image
-then initializes its native 16550 backend on x86-64 or PL011 backend on
-AArch64, copies validated GOP metadata, moves to an explicitly reserved kernel
-stack, captures the final map, and exits boot services through a non-returning
-continuation. After owned mappings and vectors are active, the shell receives
-serial input through the owned interrupt controller and sleeps with `hlt` or
-`wfi` when its bounded queue is empty. Normal shell output is mirrored to the
-owned framebuffer when GOP is available; early and fatal diagnostics remain
-serial-first.
-
-## Repository map
-
-- `crates`: portable byte streams, KEX/ABI/config/GPT/FAT parsing, block regions,
-  memory models, shell, VFS/provider mounts, terminal/editor, accounting, and
-  the isolated native machine mechanism crate;
-- `host`: Stage 0 composition and acceptance runner;
-- `kernel`: UEFI bootstrap and Stage 9 owned-machine composition root;
-- `apps`, `sdk`, `skills`: KEX examples, freestanding SDK, and concise authoring
-  guidance;
-- `rootfs`, `assets`: source tree, installed KEX files, and generated KEFS image;
-- `tools`: dependency-free deterministic image and KEX builders;
-- `scripts`: build, verification, and emulator entry points;
-- `docs`: ADRs, formats, security notes, and staged design.
-
-The core design is [CORE-SPEC.md](CORE-SPEC.md). The future, currently
-unimplemented tooling and package-composition design is
-[TOOLING-PACKAGING-SPEC.md](TOOLING-PACKAGING-SPEC.md). The
-implementation status and immediate sequence are in
-[docs/roadmap.md](docs/roadmap.md), and [docs/README.md](docs/README.md)
-classifies the design records, evaluations, format references, and security
-notes by purpose and status.
-
-## Resource policy
-
-Every supported build uses one bounded `standard` policy for cloud virtual
-machines and the pinned QEMU acceptance environments. There is no
-micro/tiny/full selector or embedded/no-MMU composition. The standard limits
-are safety ceilings, not boot-time reservations: resources are charged as they
-are owned, and usable RAM may refine cache and growth budgets without changing
-the selected policy or system semantics. Terminal/editor, completion, driver,
-identity, and application code expose validated `standard()` policies or
-explicit checked limits so externally controlled sizes remain bounded without
-scattering magic constants through the kernel.
-
-## Hardware direction
-
-QEMU remains a pinned, deterministic acceptance environment, but it is not the
-cloud hardware contract. Stage 7.5 separates CPU architecture, virtual-machine
-platform, and execution environment; q35 and QEMU `virt` resources no longer
-masquerade as architecture facts. Bounded ACPI/FDT discovery and exact combined
-cloud bundles are accepted on the two discoverable QEMU contracts. KVM and
-provider clouds remain unaccepted until independently proven.
-Physical boards, embedded targets, and no-MMU machines are outside the current
-roadmap. See the
-[implementation roadmap](docs/roadmap.md) and
-[ADR 0016](docs/adr/0016-hardware-targets-and-emulator-role.md), plus the
-[cloud support matrix](docs/cloud-platform-support.md).
-
-## Name
-
-The public project name is **TROE**, expanded as **Tiny Rust Operating
-Environment**. Cargo packages, crate directories, Rust identifiers, assembly
-symbols, documentation, and test-only volume labels use the `troe`/`TROE`
-forms. KEX, KEFS, and SCFG remain product-name-independent wire formats.
-
-Licensed under Apache-2.0.
+Contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening
+a change. TROE is licensed under the [Apache License 2.0](LICENSE).
