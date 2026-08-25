@@ -8,12 +8,17 @@ license.workspace = true
 
 [features]
 acceptance-probes = []
+platform-aarch64-virt-uefi = []
+platform-aarch64-uefi-virtio-mmio = []
+platform-x86_64-q35-uefi = []
+platform-x86_64-uefi-virtio-pci = []
 
 [dependencies]
 troe-block = { path = "../troe-block" }
 troe-driver = { path = "../troe-driver" }
 troe-memory = { path = "../troe-memory" }
 troe-net = { path = "../troe-net" }
+troe-platform = { path = "../troe-platform" }
 troe-task = { path = "../troe-task" }
 troe-terminal = { path = "../troe-terminal" }
 troe-virtio = { path = "../troe-virtio" }

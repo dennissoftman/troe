@@ -2,6 +2,10 @@
 
 Status: accepted, 2026-08-22.
 
+Scope note: the decision text preserves the Stage 3 contract at the time it was
+accepted. Dated implementation notes distinguish later current behavior and
+verification from that historical baseline.
+
 ## Decision
 
 Stage 3 keeps the existing low identity layout but replaces firmware page
@@ -53,14 +57,15 @@ share one privileged address space. The dedicated table arena is deliberately
 larger than the pinned 64/128 MiB QEMU profiles require, trading two reserved
 MiB for a simple, bounded builder with no recursive allocation during handoff.
 
-Guard pages remain deferred until Stage 4 introduces task stacks and scheduling.
-Stage 3 nevertheless leaves the UEFI dispatcher stack through a reviewed
-non-returning transition before it exposes expired boot-services memory to the
-frame allocator. The shell therefore runs on an explicit owned and accounted
-RW/NX stack; Stage 4 will replace it with per-task guarded stacks.
+Historical Stage 3 consequence: guard pages remained deferred until task stacks
+and scheduling arrived in Stage 4. Stage 3 nevertheless left the UEFI dispatcher
+stack through a reviewed non-returning transition before exposing expired
+boot-services memory to the frame allocator. The current guarded-stack behavior
+is recorded below; the non-returning handoff and permanent reservation of active
+stacks and page tables remain current invariants.
 
 Implementation note, 2026-08-23: Stage 4 subsequently added three guarded
-32 KiB task-stack payloads. The 128 KiB owned kernel stack remains the scheduler
+64 KiB task-stack payloads. The 128 KiB owned kernel stack remains the scheduler
 and handoff stack; the shell now runs on a guarded task stack. See
 [ADR 0010](0010-cooperative-tasks-and-guarded-stacks.md).
 
@@ -69,3 +74,33 @@ RO aliases and RW/NX aliases are valid, while the union of permissions across
 every alias must still exclude write plus execute. Fresh task roots use this to
 map private pages at user virtual addresses without weakening global W^X. See
 [ADR 0014](0014-unprivileged-task-isolation-and-teardown.md).
+
+Implementation note, 2026-08-24: the Stage 3 arena size and interrupt state
+above are historical. Three 64 KiB guarded task stacks bring the current arena
+to 2,138 pages, and ADRs 0013/0023 subsequently enabled the owned APIC/GIC input
+and virtio-network routes. The loaded PE classifier now accepts between one and
+64 section headers, rejects the raw count before table walking, and exercises
+every valid-image truncation plus deterministic mutations of the complete
+parsed header/table surface. Its independent emitted-region ceiling remains 64.
+
+Current verification note, 2026-08-24: both architecture leaf encoders are pure
+host-testable functions used directly by their target page-table builders. The
+test matrix covers every accepted RO/NX, RW/NX, and RX combination across normal
+or device memory and supervisor or user privilege, checking exact x86-64
+present/W/U/S/NX and PAT-selection bits and exact AArch64 AP/PXN/UXN,
+AttrIndx, and shareability bits. Executable device, W+X, and unreadable profiles
+fail closed, and both descriptor formats retain duplicate-leaf rejection.
+
+The frame allocator now tracks live allocations and permanent runtime
+reservations in separate bitmaps. The normalized boot-arena reservation still
+keeps page tables, the active kernel stack, exception stack, task stacks, and
+guards outside the allocator spans entirely. A deterministic model test varies
+additional runtime reservations and proves that single-frame and contiguous
+allocation never return table, active-stack, boot-reserved, or bitmap-reserved
+pages.
+
+These host proofs do not replace target acceptance. CR3/TTBR activation,
+EFER.NXE and CR0.WP enforcement, the non-returning owned-stack switch, native
+exception entry, and observed write-to-RO, execute-from-NX, and guard-page
+faults remain verified by the exhaustive fresh-machine QEMU matrix on both
+architectures.

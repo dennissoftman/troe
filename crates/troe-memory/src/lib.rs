@@ -862,15 +862,17 @@ struct FrameSpan {
     first_frame: u64,
 }
 
-/// Compact ownership bitmap over the usable spans in a normalized map.
+/// Compact ownership bitmaps over the usable spans in a normalized map.
 ///
 /// Only usable pages consume bitmap bits, so high device ranges do not inflate
-/// metadata. A zero bit denotes a free frame and a one bit an allocated frame.
+/// metadata. Live allocations and permanent reservations use distinct bitmaps;
+/// a frame is free only when both corresponding bits are zero.
 #[derive(Debug, Eq, PartialEq)]
 #[cfg_attr(test, derive(Clone))]
 pub struct FrameAllocator {
     spans: Vec<FrameSpan>,
-    bitmap: Vec<u64>,
+    allocated_bitmap: Vec<u64>,
+    reserved_bitmap: Vec<u64>,
     total_frames: u64,
     free_frames: u64,
 }
@@ -909,15 +911,21 @@ impl FrameAllocator {
             .ok_or(FrameAllocationError::Overflow)?
             / 64;
         let word_count = usize::try_from(word_count).map_err(|_| FrameAllocationError::Overflow)?;
-        let mut bitmap = Vec::new();
-        bitmap
+        let mut allocated_bitmap = Vec::new();
+        allocated_bitmap
             .try_reserve_exact(word_count)
             .map_err(|_| FrameAllocationError::MetadataExhausted)?;
-        bitmap.resize(word_count, 0);
+        allocated_bitmap.resize(word_count, 0);
+        let mut reserved_bitmap = Vec::new();
+        reserved_bitmap
+            .try_reserve_exact(word_count)
+            .map_err(|_| FrameAllocationError::MetadataExhausted)?;
+        reserved_bitmap.resize(word_count, 0);
 
         Ok(Self {
             spans,
-            bitmap,
+            allocated_bitmap,
+            reserved_bitmap,
             total_frames,
             free_frames: total_frames,
         })
@@ -933,7 +941,7 @@ impl FrameAllocator {
             return Err(FrameAllocationError::Exhausted);
         }
         for frame_index in 0..self.total_frames {
-            if !self.is_allocated(frame_index)? {
+            if !self.is_unavailable(frame_index)? {
                 self.set_allocated(frame_index, true)?;
                 self.free_frames -= 1;
                 return self
@@ -995,7 +1003,7 @@ impl FrameAllocator {
                     .ok_or(FrameAllocationError::Overflow)?;
                 let mut free = true;
                 for frame in first..end {
-                    if self.is_allocated(frame)? {
+                    if self.is_unavailable(frame)? {
                         free = false;
                         break;
                     }
@@ -1047,7 +1055,7 @@ impl FrameAllocator {
                 .checked_add(page_count)
                 .ok_or(FrameAllocationError::Overflow)?;
             for frame_index in first..end {
-                if self.is_allocated(frame_index)? {
+                if self.is_unavailable(frame_index)? {
                     continue;
                 }
                 let next_free = self
@@ -1057,7 +1065,7 @@ impl FrameAllocator {
                 let next_reserved = reserved
                     .checked_add(1)
                     .ok_or(FrameAllocationError::Overflow)?;
-                self.set_allocated(frame_index, true)?;
+                self.mark_reserved(frame_index)?;
                 self.free_frames = next_free;
                 reserved = next_reserved;
             }
@@ -1074,6 +1082,9 @@ impl FrameAllocator {
         let frame_index = self
             .index_for_address(address)
             .ok_or(FrameAllocationError::InvalidFrame)?;
+        if self.is_reserved(frame_index)? {
+            return Err(FrameAllocationError::InvalidFrame);
+        }
         if !self.is_allocated(frame_index)? {
             return Err(FrameAllocationError::DoubleFree);
         }
@@ -1105,6 +1116,9 @@ impl FrameAllocator {
             let index = self
                 .index_for_address(address)
                 .ok_or(FrameAllocationError::InvalidFrame)?;
+            if self.is_reserved(index)? {
+                return Err(FrameAllocationError::InvalidFrame);
+            }
             if !self.is_allocated(index)? {
                 return Err(FrameAllocationError::DoubleFree);
             }
@@ -1136,15 +1150,24 @@ impl FrameAllocator {
         self.free_frames
     }
 
-    /// Bitmap storage bytes, excluding the bounded span table.
+    /// Allocation and reservation bitmap storage bytes, excluding the bounded span table.
     #[must_use]
     pub fn bitmap_bytes(&self) -> usize {
-        self.bitmap.len() * core::mem::size_of::<u64>()
+        (self.allocated_bitmap.len() + self.reserved_bitmap.len()) * core::mem::size_of::<u64>()
     }
 
     fn is_allocated(&self, frame_index: u64) -> Result<bool, FrameAllocationError> {
         let (word, mask) = self.bitmap_location(frame_index)?;
-        Ok(self.bitmap[word] & mask != 0)
+        Ok(self.allocated_bitmap[word] & mask != 0)
+    }
+
+    fn is_reserved(&self, frame_index: u64) -> Result<bool, FrameAllocationError> {
+        let (word, mask) = self.bitmap_location(frame_index)?;
+        Ok(self.reserved_bitmap[word] & mask != 0)
+    }
+
+    fn is_unavailable(&self, frame_index: u64) -> Result<bool, FrameAllocationError> {
+        Ok(self.is_allocated(frame_index)? || self.is_reserved(frame_index)?)
     }
 
     fn set_allocated(
@@ -1154,10 +1177,16 @@ impl FrameAllocator {
     ) -> Result<(), FrameAllocationError> {
         let (word, mask) = self.bitmap_location(frame_index)?;
         if allocated {
-            self.bitmap[word] |= mask;
+            self.allocated_bitmap[word] |= mask;
         } else {
-            self.bitmap[word] &= !mask;
+            self.allocated_bitmap[word] &= !mask;
         }
+        Ok(())
+    }
+
+    fn mark_reserved(&mut self, frame_index: u64) -> Result<(), FrameAllocationError> {
+        let (word, mask) = self.bitmap_location(frame_index)?;
+        self.reserved_bitmap[word] |= mask;
         Ok(())
     }
 
@@ -1340,7 +1369,7 @@ mod tests {
         MappingOwner, MappingPermissions, MappingPlan, MappingPlanError, MappingPrivilege,
         MemoryMapError, MemoryRegion, NormalizedMemoryMap, PhysicalRange, RegionKind, VirtualRange,
     };
-    use alloc::vec;
+    use alloc::{vec, vec::Vec};
 
     fn pages(start_page: u64, count: u64) -> PhysicalRange {
         let start = start_page * BASE_PAGE_SIZE;
@@ -1547,7 +1576,7 @@ mod tests {
         let mut allocator = FrameAllocator::from_map(&map)?;
 
         assert_eq!(allocator.total_frames(), 3);
-        assert_eq!(allocator.bitmap_bytes(), 8);
+        assert_eq!(allocator.bitmap_bytes(), 16);
         assert_eq!(allocator.allocate(), Ok(BASE_PAGE_SIZE));
         assert_eq!(allocator.allocate(), Ok(2 * BASE_PAGE_SIZE));
         assert_eq!(allocator.allocate(), Ok(5 * BASE_PAGE_SIZE));
@@ -1594,10 +1623,46 @@ mod tests {
         assert_eq!(allocator.reserve_range(device), Ok(3));
         assert_eq!(allocator.reserve_range(device), Ok(0));
         assert_eq!(allocator.free_frames(), 5);
+        let before = allocator.clone();
+        assert_eq!(
+            allocator.free(device.start()),
+            Err(FrameAllocationError::InvalidFrame)
+        );
+        assert_eq!(allocator, before);
+        let contiguous = allocator.allocate_contiguous(3, 1)?;
+        assert_eq!(contiguous.start(), 6 * BASE_PAGE_SIZE);
+        allocator.free_range(contiguous)?;
 
         while let Ok(frame) = allocator.allocate() {
             assert!(!device.contains(frame));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn reservation_skips_live_allocations_without_changing_their_state()
+    -> Result<(), FrameAllocationError> {
+        let map = NormalizedMemoryMap::build(&[region(1, 4, RegionKind::Usable)], &[])
+            .map_err(|_| FrameAllocationError::Overflow)?;
+        let mut allocator = FrameAllocator::from_map(&map)?;
+        let allocated = allocator.allocate()?;
+        let overlap = pages(1, 2);
+
+        assert_eq!(allocated, BASE_PAGE_SIZE);
+        assert_eq!(allocator.reserve_range(overlap), Ok(1));
+        assert_eq!(allocator.free_frames(), 2);
+        assert_eq!(allocator.free(allocated), Ok(()));
+        assert_eq!(allocator.free_frames(), 3);
+
+        assert_eq!(allocator.reserve_range(overlap), Ok(1));
+        assert_eq!(allocator.reserve_range(overlap), Ok(0));
+        assert_eq!(allocator.free_frames(), 2);
+        let before = allocator.clone();
+        assert_eq!(
+            allocator.free(allocated),
+            Err(FrameAllocationError::InvalidFrame)
+        );
+        assert_eq!(allocator, before);
         Ok(())
     }
 
@@ -1629,11 +1694,127 @@ mod tests {
             Err(FrameAllocationError::DoubleFree)
         );
         assert_eq!(allocator, before);
-        allocator.reserve_range(
-            PhysicalRange::from_pages(middle, 1).map_err(|_| FrameAllocationError::Overflow)?,
-        )?;
-        allocator.free_range(isolated)?;
-        assert_eq!(allocator.free_frames(), 16);
+        assert_eq!(
+            allocator.reserve_range(
+                PhysicalRange::from_pages(middle, 1).map_err(|_| FrameAllocationError::Overflow)?,
+            ),
+            Ok(1)
+        );
+        let before = allocator.clone();
+        assert_eq!(
+            allocator.free_range(isolated),
+            Err(FrameAllocationError::InvalidFrame)
+        );
+        assert_eq!(allocator, before);
+        assert_eq!(allocator.free_frames(), 12);
+        for page in [0, 2, 3] {
+            allocator.free(isolated.start() + page * BASE_PAGE_SIZE)?;
+        }
+        assert_eq!(allocator.free_frames(), 15);
+        Ok(())
+    }
+
+    #[test]
+    fn frame_bitmap_matches_model_across_discontiguous_spans() -> Result<(), FrameAllocationError> {
+        #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+        enum ModelState {
+            Free,
+            Allocated,
+            Reserved,
+        }
+
+        let map = NormalizedMemoryMap::build(
+            &[
+                region(1, 7, RegionKind::Usable),
+                region(8, 3, RegionKind::Reserved),
+                region(16, 9, RegionKind::Usable),
+            ],
+            &[],
+        )
+        .map_err(|_| FrameAllocationError::Overflow)?;
+        let mut allocator = FrameAllocator::from_map(&map)?;
+        let mut addresses = Vec::new();
+        for index in 0..allocator.total_frames() {
+            addresses.push(
+                allocator
+                    .address_for_index(index)
+                    .ok_or(FrameAllocationError::Overflow)?,
+            );
+        }
+        let mut model = vec![ModelState::Free; addresses.len()];
+        let address_count =
+            u64::try_from(addresses.len()).map_err(|_| FrameAllocationError::Overflow)?;
+        let mut random = 0x8d26_4e77_a1b9_c305_u64;
+
+        for _ in 0..512 {
+            random = random
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            match random % 3 {
+                0 => {
+                    let expected = model.iter().position(|state| *state == ModelState::Free);
+                    if let Some(index) = expected {
+                        assert_eq!(allocator.allocate(), Ok(addresses[index]));
+                        model[index] = ModelState::Allocated;
+                    } else {
+                        assert_eq!(allocator.allocate(), Err(FrameAllocationError::Exhausted));
+                    }
+                }
+                1 => {
+                    random = random.rotate_left(17);
+                    let range = pages(random % 28, 1 + (random >> 8) % 6);
+                    let mut expected = 0_u64;
+                    for (address, state) in addresses.iter().copied().zip(&mut model) {
+                        if range.contains(address) && *state == ModelState::Free {
+                            *state = ModelState::Reserved;
+                            expected = expected
+                                .checked_add(1)
+                                .ok_or(FrameAllocationError::Overflow)?;
+                        }
+                    }
+                    assert_eq!(allocator.reserve_range(range), Ok(expected));
+                }
+                _ => {
+                    let index = usize::try_from(random % address_count)
+                        .map_err(|_| FrameAllocationError::Overflow)?;
+                    match model[index] {
+                        ModelState::Free => assert_eq!(
+                            allocator.free(addresses[index]),
+                            Err(FrameAllocationError::DoubleFree)
+                        ),
+                        ModelState::Allocated => {
+                            assert_eq!(allocator.free(addresses[index]), Ok(()));
+                            model[index] = ModelState::Free;
+                        }
+                        ModelState::Reserved => assert_eq!(
+                            allocator.free(addresses[index]),
+                            Err(FrameAllocationError::InvalidFrame)
+                        ),
+                    }
+                }
+            }
+
+            let expected_free = u64::try_from(
+                model
+                    .iter()
+                    .filter(|state| **state == ModelState::Free)
+                    .count(),
+            )
+            .map_err(|_| FrameAllocationError::Overflow)?;
+            assert_eq!(allocator.free_frames(), expected_free);
+            for (index, expected) in model.iter().copied().enumerate() {
+                let frame_index =
+                    u64::try_from(index).map_err(|_| FrameAllocationError::Overflow)?;
+                assert_eq!(
+                    allocator.is_allocated(frame_index)?,
+                    expected == ModelState::Allocated
+                );
+                assert_eq!(
+                    allocator.is_reserved(frame_index)?,
+                    expected == ModelState::Reserved
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1687,6 +1868,71 @@ mod tests {
         }
         assert_eq!(allocator.total_frames(), 6);
         assert_eq!(allocator.free_frames(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn permanent_table_stack_and_runtime_reservations_never_enter_the_frame_pool()
+    -> Result<(), FrameAllocationError> {
+        let boot_arena = pages(16, 24);
+        let page_tables = pages(18, 4);
+        let active_stack = pages(30, 4);
+        let map = NormalizedMemoryMap::build(&[region(1, 96, RegionKind::Usable)], &[boot_arena])
+            .map_err(|_| FrameAllocationError::Overflow)?;
+
+        for seed in 0..32_u64 {
+            let runtime_reserved = pages(48 + seed % 16, 1 + seed % 5);
+            let mut base = FrameAllocator::from_map(&map)?;
+            assert_eq!(base.reserve_range(page_tables), Ok(0));
+            assert_eq!(base.reserve_range(active_stack), Ok(0));
+            assert_eq!(base.reserve_range(boot_arena), Ok(0));
+            assert_eq!(
+                base.reserve_range(runtime_reserved),
+                Ok(runtime_reserved.page_count())
+            );
+            assert_eq!(base.reserve_range(runtime_reserved), Ok(0));
+
+            for permanent in [boot_arena, page_tables, active_stack, runtime_reserved] {
+                let before = base.clone();
+                assert_eq!(
+                    base.free(permanent.start()),
+                    Err(FrameAllocationError::InvalidFrame)
+                );
+                assert_eq!(base, before);
+            }
+
+            let expected: Vec<u64> = (1..97_u64)
+                .map(|page| page * BASE_PAGE_SIZE)
+                .filter(|address| {
+                    !boot_arena.contains(*address) && !runtime_reserved.contains(*address)
+                })
+                .collect();
+            assert_eq!(
+                base.free_frames(),
+                u64::try_from(expected.len()).map_err(|_| FrameAllocationError::Overflow)?
+            );
+            let mut singles = base.clone();
+            for address in expected {
+                assert_eq!(singles.allocate(), Ok(address));
+            }
+            assert_eq!(singles.allocate(), Err(FrameAllocationError::Exhausted));
+
+            for page_count in 1..=8_u64 {
+                for alignment_pages in [1, 2, 4, 8] {
+                    let mut contiguous = base.clone();
+                    while let Ok(range) =
+                        contiguous.allocate_contiguous(page_count, alignment_pages)
+                    {
+                        for permanent in [boot_arena, page_tables, active_stack, runtime_reserved] {
+                            assert!(
+                                range.end() <= permanent.start()
+                                    || range.start() >= permanent.end()
+                            );
+                        }
+                    }
+                }
+            }
+        }
         Ok(())
     }
 

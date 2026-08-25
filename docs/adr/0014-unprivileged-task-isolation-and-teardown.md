@@ -1,6 +1,6 @@
 # ADR 0014: unprivileged task isolation and transactional teardown
 
-Status: accepted, 2026-08-23.
+Status: accepted, 2026-08-23; region-bound clarification, 2026-08-24.
 
 ## Decision
 
@@ -8,15 +8,19 @@ Stage 6 executes isolated tasks at x86-64 ring 3 or AArch64 EL0t. A task owns a
 fresh page-table root, private code/data/stack frames, one guarded user stack,
 and every capability handle minted for its monotonic task identity. Kernel
 image, runtime, and device mappings remain present in each root only at
-supervisor privilege. User mappings are normal RAM, bounded to eight regions,
-and preserve W^X across every physical alias. Device memory is never exposed to
-an isolated task.
+supervisor privilege. Stage 6 constructs exactly three normal-RAM user regions
+(code, data, and stack) under its accepted ceiling of eight, and preserves W^X
+across every physical alias. The shared address-space mechanism retains at most
+19 user regions so ADR 0015's Standard KEX policy can represent sixteen load
+segments plus startup, heap, and stack; that shared storage ceiling does not
+widen the Stage 6 composition. Device memory is never exposed to an isolated
+task.
 
-The current tiny profile allocates one contiguous 2 MiB table arena, one code
-page, one data page, and four stack pages per launch. Guard addresses adjacent
-to the user stack are absent. These are composition limits, not a public
-application ABI. Page-table construction is bounded and fallible before the
-task root is activated. Both the allocation and opaque root are one-shot,
+The Standard Stage 6 composition allocates one contiguous 2 MiB table arena,
+one code page, one data page, and four stack pages per launch. Guard addresses
+adjacent to the user stack are absent. These are composition limits, not a
+public application ABI. Page-table construction is bounded and fallible before
+the task root is activated. Both the allocation and opaque root are one-shot,
 non-cloneable tokens; native execution consumes the root and reclamation
 consumes the allocation. The production frame allocator is likewise
 non-cloneable, preventing accidental duplicate allocation authority; tests may
@@ -71,6 +75,11 @@ Portable tests cover safe/unsafe physical aliases, user ownership/lifetime,
 contiguous allocation and atomic free, copied-message detachment, per-owner
 handle revocation, isolated task fault accounting, cancellation, reaping, and
 resource-slot reuse.
+Compile-time relationships tie the Stage 6 ceiling and exact three-region
+composition to the shared 19-region storage bound, which in turn equals ADR
+0015's sixteen load records plus its three fixed regions. Native construction
+also rejects an address-space summary whose user-region count differs from the
+composition that produced it.
 
 Every production boot on both architectures runs a successful copied-message
 task, then independently exercises translation, write-permission,

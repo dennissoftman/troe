@@ -9,22 +9,23 @@ import subprocess
 import sys
 from pathlib import Path
 
-from qemu_profile import (
-    QEMU_EXECUTABLES,
-    REPO_ROOT,
-    host_architecture,
-    prepare_qemu_command,
-)
+from platform_profile import PLATFORM_IDS, REPO_ROOT
+from qemu_profile import ENVIRONMENT_IDS, prepare_qemu_command
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    default_architecture = host_architecture()
     parser.add_argument(
-        "--arch",
-        choices=tuple(QEMU_EXECUTABLES),
-        default=default_architecture,
-        help=f"architecture to emulate (default: host {default_architecture})",
+        "--platform",
+        choices=PLATFORM_IDS,
+        required=True,
+        help="exact named platform to emulate",
+    )
+    parser.add_argument(
+        "--environment",
+        choices=ENVIRONMENT_IDS,
+        required=True,
+        help="exact execution environment runner",
     )
     parser.add_argument(
         "--firmware-code",
@@ -56,14 +57,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="open the owned framebuffer console while preserving serial stdio",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> int:
     args = parse_args()
     try:
         command = prepare_qemu_command(
-            args.arch,
+            args.platform,
+            args.environment,
             args.firmware_code,
             args.firmware_vars,
             skip_version_check=args.skip_version_check,

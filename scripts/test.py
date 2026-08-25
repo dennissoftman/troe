@@ -9,6 +9,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+if __package__:
+    from .platform_profile import PLATFORM_PROFILES
+    from .qemu_profile import QEMU_ENVIRONMENT
+    from .repository_policy import require_supported_python
+else:
+    from platform_profile import PLATFORM_PROFILES
+    from qemu_profile import QEMU_ENVIRONMENT
+    from repository_policy import require_supported_python
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOLS_DIR = REPO_ROOT / "tools"
@@ -36,7 +45,32 @@ def run(*command: str | Path) -> None:
     )
 
 
+def target_clippy_commands() -> list[tuple[str | Path, ...]]:
+    """Return one exact target gate per named platform."""
+    return [
+        (
+            "cargo",
+            "clippy",
+            "-p",
+            "troe-kernel",
+            "--target",
+            profile.target,
+            "--features",
+            f"{profile.kernel_feature},acceptance-probes",
+            "--",
+            "-D",
+            "warnings",
+        )
+        for profile in PLATFORM_PROFILES.values()
+    ]
+
+
 def main() -> int:
+    try:
+        require_supported_python()
+    except RuntimeError as error:
+        print(f"verification failed: {error}", file=sys.stderr)
+        return 1
     args = parse_args()
     if args.require_filesystem_tools:
         os.environ["TROE_REQUIRE_FS_TOOLS"] = "1"
@@ -51,31 +85,18 @@ def main() -> int:
             "-D",
             "warnings",
         ),
-        (
-            "cargo",
-            "clippy",
-            "-p",
-            "troe-kernel",
-            "--target",
-            "x86_64-unknown-uefi",
-            "--all-features",
-            "--",
-            "-D",
-            "warnings",
-        ),
-        (
-            "cargo",
-            "clippy",
-            "-p",
-            "troe-kernel",
-            "--target",
-            "aarch64-unknown-uefi",
-            "--all-features",
-            "--",
-            "-D",
-            "warnings",
-        ),
+        *target_clippy_commands(),
         ("cargo", "test", "--workspace"),
+        (
+            sys.executable,
+            "-m",
+            "unittest",
+            "discover",
+            "-s",
+            REPO_ROOT / "tests",
+            "-p",
+            "test_*.py",
+        ),
         (sys.executable, REPO_ROOT / "scripts" / "audit.py"),
         (
             sys.executable,
@@ -89,7 +110,7 @@ def main() -> int:
             TOOLS_DIR / "check_unsafe.py",
             REPO_ROOT,
             "--expected",
-            "235",
+            "242",
         ),
         (
             "cargo",
@@ -101,16 +122,35 @@ def main() -> int:
             "--script",
             REPO_ROOT / "tests" / "smoke.sh",
         ),
-        (sys.executable, REPO_ROOT / "scripts" / "build.py"),
         (
             sys.executable,
             REPO_ROOT / "scripts" / "build.py",
+            "--platform",
+            "all",
+            "--fixture-identities",
+        ),
+        (
+            sys.executable,
+            REPO_ROOT / "scripts" / "build.py",
+            "--platform",
+            "all",
+            "--fixture-identities",
             "--acceptance-probes",
         ),
     ]
     if not args.skip_qemu:
         commands.append(
-            (sys.executable, REPO_ROOT / "scripts" / "test-qemu.py", "--skip-build")
+            (
+                sys.executable,
+                REPO_ROOT / "scripts" / "test-qemu.py",
+                "--platform",
+                "all",
+                "--environment",
+                QEMU_ENVIRONMENT,
+                "--skip-build",
+                "--framebuffer-console",
+                "--native-keyboard",
+            )
         )
 
     try:

@@ -18,7 +18,7 @@ pub const KEX_V1_HEADER_BYTES: usize = 64;
 pub const KEX_V1_LOAD_RECORD_BYTES: usize = 40;
 /// Product-name-independent KEX v1 format identifier.
 pub const KEX_V1_MAGIC: [u8; 8] = *b"KEX\0FMT\0";
-/// Maximum load records accepted by any compiled profile.
+/// Maximum load records accepted by the standard application policy.
 pub const MAX_LOAD_RECORDS: usize = 16;
 /// Application ABI major implemented by this parser.
 pub const ABI_MAJOR: u16 = 1;
@@ -76,18 +76,6 @@ impl Target {
     }
 }
 
-/// Build-time resource profile applied to an application load.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u16)]
-pub enum ResourceProfile {
-    /// Non-MMU profile; external native applications are disabled.
-    Micro = 1,
-    /// Constrained MMU profile used by the current native compositions.
-    Tiny = 2,
-    /// Larger MMU profile with higher, still-absolute ceilings.
-    Full = 3,
-}
-
 /// Closed page permission values representable by KEX v1.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -123,7 +111,7 @@ impl SegmentPermissions {
     }
 }
 
-/// Absolute application limits selected by one resource profile.
+/// Absolute application limits enforced by the standard policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ApplicationLimits {
     encoded_bytes: usize,
@@ -139,33 +127,7 @@ pub struct ApplicationLimits {
 }
 
 impl ApplicationLimits {
-    const MICRO: Self = Self {
-        encoded_bytes: 0,
-        load_records: 0,
-        image_span_bytes: 0,
-        image_pages: 0,
-        minimum_stack_pages: 0,
-        maximum_stack_pages: 0,
-        heap_pages: 0,
-        table_pages: 0,
-        resident_pages: 0,
-        initial_handles: 0,
-    };
-
-    const TINY: Self = Self {
-        encoded_bytes: 512 * 1024,
-        load_records: 8,
-        image_span_bytes: 4 * 1024 * 1024,
-        image_pages: 256,
-        minimum_stack_pages: 4,
-        maximum_stack_pages: 16,
-        heap_pages: 64,
-        table_pages: 64,
-        resident_pages: 512,
-        initial_handles: 8,
-    };
-
-    const FULL: Self = Self {
+    const STANDARD: Self = Self {
         encoded_bytes: 16 * 1024 * 1024,
         load_records: 16,
         image_span_bytes: 128 * 1024 * 1024,
@@ -178,14 +140,10 @@ impl ApplicationLimits {
         initial_handles: 32,
     };
 
-    /// Limits fixed by the selected resource profile.
+    /// Limits fixed by the standard application policy.
     #[must_use]
-    pub const fn for_profile(profile: ResourceProfile) -> Self {
-        match profile {
-            ResourceProfile::Micro => Self::MICRO,
-            ResourceProfile::Tiny => Self::TINY,
-            ResourceProfile::Full => Self::FULL,
-        }
+    pub const fn standard() -> Self {
+        Self::STANDARD
     }
 
     /// Maximum encoded artifact bytes staged by the kernel.
@@ -302,7 +260,7 @@ pub struct LoadCharges {
     reserved_resident_pages: u64,
 }
 
-/// Canonical KEX v1 virtual placement outside the profile's image window.
+/// Canonical KEX v1 virtual placement outside the standard image window.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ApplicationLayout {
     startup_address: u64,
@@ -345,7 +303,7 @@ impl ApplicationLayout {
         self.stack_top
     }
 
-    /// Page immediately below the profile's reserved stack slot.
+    /// Page immediately below the standard reserved stack slot.
     #[must_use]
     pub const fn lower_guard_address(self) -> u64 {
         self.lower_guard_address
@@ -387,12 +345,166 @@ pub struct StartupInfo<'handles> {
 pub enum StartupPageError {
     /// The task identity is the reserved zero value.
     InvalidTaskId,
-    /// More initial handles were supplied than the selected profile permits.
+    /// More initial handles were supplied than the standard policy permits.
     TooManyHandles,
     /// A descriptor used the reserved zero opaque-handle value.
     InvalidHandle,
     /// Two descriptors expose the same opaque handle value.
     DuplicateHandle,
+}
+
+/// One provisional resource class acquired by the native loader transaction.
+///
+/// The order is part of the loader contract: bounded staging precedes frames,
+/// inactive tables, the scheduler task record, and the initial handle owner.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum LoaderResource {
+    /// Kernel-owned copy of the encoded KEX artifact.
+    Staging = 0,
+    /// Zeroable private-frame allocation, including the table reservation.
+    Frames = 1,
+    /// Constructed but not yet active application page-table root.
+    Tables = 2,
+    /// Provisional scheduler task and its resource accounting record.
+    Task = 3,
+    /// Initial owner-scoped handle set.
+    Handles = 4,
+}
+
+impl LoaderResource {
+    const ALL: [Self; 5] = [
+        Self::Staging,
+        Self::Frames,
+        Self::Tables,
+        Self::Task,
+        Self::Handles,
+    ];
+
+    const REVERSE: [Self; 5] = [
+        Self::Handles,
+        Self::Task,
+        Self::Tables,
+        Self::Frames,
+        Self::Staging,
+    ];
+
+    const fn bit(self) -> u8 {
+        1 << self as u8
+    }
+}
+
+/// Invalid transition in the provisional native loader transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoaderTransactionError {
+    /// A resource was recorded other than in the fixed acquisition order.
+    OutOfOrder,
+    /// Commit was attempted before every provisional resource was acquired.
+    Incomplete,
+    /// A transition was attempted after the transaction committed.
+    AlreadyCommitted,
+}
+
+/// Allocation-free ownership ledger for the native loader's pre-entry phase.
+///
+/// Native code performs each real acquisition, then records it here. Before
+/// commit, rollback visits every recorded resource in strict reverse order.
+/// Commit is possible only after the complete staging/frame/table/task/handle
+/// sequence, and is the sole transition that marks the root eligible for
+/// activation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LoaderTransaction {
+    owned: u8,
+    next: u8,
+    committed: bool,
+}
+
+impl LoaderTransaction {
+    const ALL_OWNED: u8 = (1 << LoaderResource::ALL.len()) - 1;
+
+    /// Begin an empty transaction whose application root is inactive.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            owned: 0,
+            next: 0,
+            committed: false,
+        }
+    }
+
+    /// Record one successfully acquired provisional resource.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error after commit or when `resource` is not the next member
+    /// of the fixed acquisition sequence.
+    pub fn acquire(&mut self, resource: LoaderResource) -> Result<(), LoaderTransactionError> {
+        if self.committed {
+            return Err(LoaderTransactionError::AlreadyCommitted);
+        }
+        if usize::from(self.next) >= LoaderResource::ALL.len()
+            || LoaderResource::ALL[usize::from(self.next)] != resource
+        {
+            return Err(LoaderTransactionError::OutOfOrder);
+        }
+        self.owned |= resource.bit();
+        self.next += 1;
+        Ok(())
+    }
+
+    /// Release every provisional resource in reverse acquisition order.
+    ///
+    /// The callback performs or observes the concrete cleanup. This method
+    /// clears a bit only after its callback returns, making exhaustive hosted
+    /// failpoint tests use the same state machine as native loading.
+    pub fn rollback(&mut self, mut release: impl FnMut(LoaderResource)) {
+        if self.committed {
+            return;
+        }
+        for resource in LoaderResource::REVERSE {
+            if self.owned & resource.bit() != 0 {
+                release(resource);
+                self.owned &= !resource.bit();
+            }
+        }
+        self.next = 0;
+    }
+
+    /// Transfer all provisional resources to the runnable task atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction already committed or if any
+    /// acquisition phase is missing.
+    pub fn commit(&mut self) -> Result<(), LoaderTransactionError> {
+        if self.committed {
+            return Err(LoaderTransactionError::AlreadyCommitted);
+        }
+        if self.owned != Self::ALL_OWNED {
+            return Err(LoaderTransactionError::Incomplete);
+        }
+        self.owned = 0;
+        self.committed = true;
+        Ok(())
+    }
+
+    /// Number of provisional resource classes still retained by this ledger.
+    #[must_use]
+    pub const fn provisional_resources(self) -> u32 {
+        self.owned.count_ones()
+    }
+
+    /// Whether commit has made the constructed root eligible for activation.
+    #[must_use]
+    pub const fn mapping_active(self) -> bool {
+        self.committed
+    }
+}
+
+impl Default for LoaderTransaction {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl LoadCharges {
@@ -426,7 +538,7 @@ impl LoadCharges {
         self.private_pages
     }
 
-    /// Conservative reservation including the profile's table-page ceiling.
+    /// Conservative reservation including the standard table-page ceiling.
     #[must_use]
     pub const fn reserved_resident_pages(self) -> u64 {
         self.reserved_resident_pages
@@ -437,7 +549,6 @@ impl LoadCharges {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LoadPlan<'artifact> {
     target: Target,
-    profile: ResourceProfile,
     abi_minor: u16,
     entry_offset: u64,
     stack_pages: u64,
@@ -453,12 +564,6 @@ impl<'artifact> LoadPlan<'artifact> {
     #[must_use]
     pub const fn target(&self) -> Target {
         self.target
-    }
-
-    /// Resource profile used for validation.
-    #[must_use]
-    pub const fn profile(&self) -> ResourceProfile {
-        self.profile
     }
 
     /// Minimum ABI minor required by the artifact.
@@ -519,7 +624,7 @@ impl<'artifact> LoadPlan<'artifact> {
         if info.task_id == 0 {
             return Err(StartupPageError::InvalidTaskId);
         }
-        let limits = ApplicationLimits::for_profile(self.profile);
+        let limits = ApplicationLimits::standard();
         if info.handles.len() > usize::from(limits.initial_handles) {
             return Err(StartupPageError::TooManyHandles);
         }
@@ -545,7 +650,7 @@ impl<'artifact> LoadPlan<'artifact> {
         write_u16(destination, 4, ABI_MAJOR);
         write_u16(destination, 6, ABI_MINOR);
         write_u32(destination, 8, 4096);
-        write_u16(destination, 12, self.profile as u16);
+        write_u16(destination, 12, 0);
         write_u16(destination, 14, handle_count);
         write_u64(destination, 16, KEX_V1_IMAGE_BASE);
         write_u64(destination, 24, self.layout.heap_address);
@@ -568,9 +673,7 @@ impl<'artifact> LoadPlan<'artifact> {
 /// Deterministic KEX rejection category.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ParseError {
-    /// The selected profile cannot execute isolated native applications.
-    ApplicationsDisabled,
-    /// Input exceeds the selected staging ceiling.
+    /// Input exceeds the standard staging ceiling.
     ArtifactTooLarge,
     /// Input is shorter than the fixed header.
     TruncatedHeader,
@@ -588,7 +691,7 @@ pub enum ParseError {
     UnsupportedAbi,
     /// Declared artifact size differs from the bounded input.
     LengthMismatch,
-    /// Load-record count is zero or exceeds the selected profile.
+    /// Load-record count is zero or exceeds the standard policy.
     InvalidRecordCount,
     /// Checked format, address, or page arithmetic overflowed.
     ArithmeticOverflow,
@@ -600,15 +703,15 @@ pub enum ParseError {
     OverlappingSegments,
     /// File payload ranges are not exact, ordered, and canonical.
     NoncanonicalPayload,
-    /// The image-relative address span exceeds the selected profile.
+    /// The image-relative address span exceeds the standard policy.
     ImageSpanExceeded,
-    /// Mapped image pages exceed the selected profile.
+    /// Mapped image pages exceed the standard policy.
     ImagePagesExceeded,
-    /// Requested stack pages are outside the selected profile range.
+    /// Requested stack pages are outside the standard range.
     StackBudgetExceeded,
-    /// Requested heap pages exceed the selected profile.
+    /// Requested heap pages exceed the standard policy.
     HeapBudgetExceeded,
-    /// Aggregate private plus table reservation exceeds the profile.
+    /// Aggregate private plus table reservation exceeds the standard policy.
     ResidentBudgetExceeded,
     /// No executable segment exists.
     MissingExecutableSegment,
@@ -619,7 +722,6 @@ pub enum ParseError {
 impl fmt::Display for ParseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::ApplicationsDisabled => "loadable applications are disabled by the profile",
             Self::ArtifactTooLarge => "KEX artifact exceeds the staging budget",
             Self::TruncatedHeader => "KEX header is truncated",
             Self::InvalidMagic => "KEX magic is invalid",
@@ -635,11 +737,11 @@ impl fmt::Display for ParseError {
             Self::InvalidSegmentRange => "KEX segment range is invalid",
             Self::OverlappingSegments => "KEX segments overlap or are out of order",
             Self::NoncanonicalPayload => "KEX segment payload layout is noncanonical",
-            Self::ImageSpanExceeded => "KEX image span exceeds the selected profile",
-            Self::ImagePagesExceeded => "KEX image pages exceed the selected profile",
-            Self::StackBudgetExceeded => "KEX stack request exceeds the selected profile",
-            Self::HeapBudgetExceeded => "KEX heap request exceeds the selected profile",
-            Self::ResidentBudgetExceeded => "KEX resident-page charge exceeds the profile",
+            Self::ImageSpanExceeded => "KEX image span exceeds the standard policy",
+            Self::ImagePagesExceeded => "KEX image pages exceed the standard policy",
+            Self::StackBudgetExceeded => "KEX stack request exceeds the standard policy",
+            Self::HeapBudgetExceeded => "KEX heap request exceeds the standard policy",
+            Self::ResidentBudgetExceeded => "KEX resident-page charge exceeds the standard policy",
             Self::MissingExecutableSegment => "KEX has no executable segment",
             Self::InvalidEntryPoint => "KEX entry point is not executable",
         })
@@ -658,28 +760,22 @@ impl fmt::Display for ParseError {
 pub fn parse_kex(
     artifact: &[u8],
     expected_target: Target,
-    profile: ResourceProfile,
     supported_abi_minor: u16,
 ) -> Result<LoadPlan<'_>, ParseError> {
     parse_with_limits(
         artifact,
         expected_target,
-        profile,
         supported_abi_minor,
-        ApplicationLimits::for_profile(profile),
+        ApplicationLimits::standard(),
     )
 }
 
 fn parse_with_limits(
     artifact: &[u8],
     expected_target: Target,
-    profile: ResourceProfile,
     supported_abi_minor: u16,
     limits: ApplicationLimits,
 ) -> Result<LoadPlan<'_>, ParseError> {
-    if profile == ResourceProfile::Micro {
-        return Err(ParseError::ApplicationsDisabled);
-    }
     if artifact.len() > limits.encoded_bytes {
         return Err(ParseError::ArtifactTooLarge);
     }
@@ -701,7 +797,6 @@ fn parse_with_limits(
 
     Ok(LoadPlan {
         target: header.target,
-        profile,
         abi_minor: header.abi_minor,
         entry_offset: header.entry_offset,
         stack_pages: header.stack_pages,
@@ -1177,19 +1272,18 @@ mod tests {
         )
     }
 
-    fn parse_tiny(bytes: &[u8], target: Target) -> Result<LoadPlan<'_>, ParseError> {
-        parse_kex(bytes, target, ResourceProfile::Tiny, ABI_MINOR)
+    fn parse_standard(bytes: &[u8], target: Target) -> Result<LoadPlan<'_>, ParseError> {
+        parse_kex(bytes, target, ABI_MINOR)
     }
 
     #[test]
     fn valid_plan_is_ordered_bounded_and_exactly_charged() {
         for target in [Target::X86_64, Target::Aarch64] {
             let bytes = valid_artifact(target);
-            let plan = parse_tiny(&bytes, target).unwrap_or_else(|_| unreachable!());
+            let plan = parse_standard(&bytes, target).unwrap_or_else(|_| unreachable!());
             let segments = plan.segments().collect::<Vec<_>>();
 
             assert_eq!(plan.target(), target);
-            assert_eq!(plan.profile(), ResourceProfile::Tiny);
             assert_eq!(plan.abi_minor(), 0);
             assert_eq!(plan.entry_address(), KEX_V1_IMAGE_BASE);
             assert_eq!(segments.len(), 2);
@@ -1201,11 +1295,11 @@ mod tests {
             assert_eq!(plan.charges().staging_bytes(), bytes.len());
             assert_eq!(plan.charges().image_pages(), 2);
             assert_eq!(plan.charges().private_pages(), 7);
-            assert_eq!(plan.charges().reserved_resident_pages(), 71);
+            assert_eq!(plan.charges().reserved_resident_pages(), 519);
             let layout = plan.layout();
             assert_eq!(
                 layout.startup_address(),
-                KEX_V1_IMAGE_BASE + 4 * 1024 * 1024
+                KEX_V1_IMAGE_BASE + 128 * 1024 * 1024
             );
             assert_eq!(layout.heap_bytes(), 0);
             assert_eq!(layout.stack_top() - layout.stack_bottom(), 4 * PAGE_SIZE);
@@ -1217,7 +1311,7 @@ mod tests {
     #[test]
     fn startup_page_is_canonical_and_rejections_are_atomic() {
         let bytes = valid_artifact(Target::X86_64);
-        let plan = parse_tiny(&bytes, Target::X86_64).unwrap_or_else(|_| unreachable!());
+        let plan = parse_standard(&bytes, Target::X86_64).unwrap_or_else(|_| unreachable!());
         let handles = [
             InitialHandle {
                 value: 0x1000_0001,
@@ -1248,7 +1342,7 @@ mod tests {
         assert_eq!(read_u16(&page, 4), Ok(ABI_MAJOR));
         assert_eq!(read_u16(&page, 6), Ok(ABI_MINOR));
         assert_eq!(read_u32(&page, 8), Ok(4096));
-        assert_eq!(read_u16(&page, 12), Ok(ResourceProfile::Tiny as u16));
+        assert_eq!(read_u16(&page, 12), Ok(0));
         assert_eq!(read_u16(&page, 14), Ok(2));
         assert_eq!(read_u64(&page, 16), Ok(KEX_V1_IMAGE_BASE));
         assert_eq!(read_u64(&page, 24), Ok(plan.layout().heap_address()));
@@ -1303,7 +1397,7 @@ mod tests {
         );
         assert_eq!(rejected, original);
 
-        let too_many = [handles[0]; 9];
+        let too_many = [handles[0]; 33];
         assert_eq!(
             plan.encode_startup_page(
                 StartupInfo {
@@ -1318,25 +1412,18 @@ mod tests {
     }
 
     #[test]
-    fn profile_limits_match_adr_0015() {
-        let micro = ApplicationLimits::for_profile(ResourceProfile::Micro);
-        let tiny = ApplicationLimits::for_profile(ResourceProfile::Tiny);
-        let full = ApplicationLimits::for_profile(ResourceProfile::Full);
+    fn standard_limits_match_adr_0015() {
+        let standard = ApplicationLimits::standard();
 
-        assert_eq!(micro.encoded_bytes(), 0);
-        assert_eq!(tiny.encoded_bytes(), 512 * 1024);
-        assert_eq!(tiny.load_records(), 8);
-        assert_eq!(tiny.image_span_bytes(), 4 * 1024 * 1024);
-        assert_eq!(tiny.image_pages(), 256);
-        assert_eq!(tiny.stack_pages(), (4, 16));
-        assert_eq!(tiny.heap_pages(), 64);
-        assert_eq!(tiny.table_pages(), 64);
-        assert_eq!(tiny.resident_pages(), 512);
-        assert_eq!(tiny.initial_handles(), 8);
-        assert_eq!(full.encoded_bytes(), 16 * 1024 * 1024);
-        assert_eq!(full.load_records(), 16);
-        assert_eq!(full.resident_pages(), 16_384);
-        assert_eq!(full.initial_handles(), 32);
+        assert_eq!(standard.encoded_bytes(), 16 * 1024 * 1024);
+        assert_eq!(standard.load_records(), 16);
+        assert_eq!(standard.image_span_bytes(), 128 * 1024 * 1024);
+        assert_eq!(standard.image_pages(), 8192);
+        assert_eq!(standard.stack_pages(), (4, 256));
+        assert_eq!(standard.heap_pages(), 4096);
+        assert_eq!(standard.table_pages(), 512);
+        assert_eq!(standard.resident_pages(), 16_384);
+        assert_eq!(standard.initial_handles(), 32);
     }
 
     #[test]
@@ -1345,15 +1432,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_disabled_profile_and_staging_overflow() {
-        let bytes = valid_artifact(Target::X86_64);
+    fn rejects_staging_overflow() {
+        let oversized = vec![0_u8; ApplicationLimits::STANDARD.encoded_bytes + 1];
         assert_eq!(
-            parse_kex(&bytes, Target::X86_64, ResourceProfile::Micro, ABI_MINOR),
-            Err(ParseError::ApplicationsDisabled)
-        );
-        let oversized = vec![0_u8; ApplicationLimits::TINY.encoded_bytes + 1];
-        assert_eq!(
-            parse_tiny(&oversized, Target::X86_64),
+            parse_standard(&oversized, Target::X86_64),
             Err(ParseError::ArtifactTooLarge)
         );
     }
@@ -1361,7 +1443,7 @@ mod tests {
     #[test]
     fn rejects_truncated_magic_version_target_and_abi() {
         assert_eq!(
-            parse_tiny(&[0_u8; KEX_V1_HEADER_BYTES - 1], Target::X86_64),
+            parse_standard(&[0_u8; KEX_V1_HEADER_BYTES - 1], Target::X86_64),
             Err(ParseError::TruncatedHeader)
         );
         let valid = valid_artifact(Target::X86_64);
@@ -1381,10 +1463,10 @@ mod tests {
         ] {
             let mut bytes = valid.clone();
             bytes[offset] = bytes[offset].wrapping_add(1);
-            assert_eq!(parse_tiny(&bytes, Target::X86_64), Err(error));
+            assert_eq!(parse_standard(&bytes, Target::X86_64), Err(error));
         }
         assert_eq!(
-            parse_tiny(&valid, Target::Aarch64),
+            parse_standard(&valid, Target::Aarch64),
             Err(ParseError::WrongTarget)
         );
     }
@@ -1401,7 +1483,7 @@ mod tests {
             let mut bytes = valid.clone();
             bytes[offset] = bytes[offset].wrapping_add(1);
             assert_eq!(
-                parse_tiny(&bytes, Target::X86_64),
+                parse_standard(&bytes, Target::X86_64),
                 Err(ParseError::InvalidLayout)
             );
         }
@@ -1409,7 +1491,7 @@ mod tests {
             let mut bytes = valid.clone();
             bytes[offset] = 1;
             assert_eq!(
-                parse_tiny(&bytes, Target::X86_64),
+                parse_standard(&bytes, Target::X86_64),
                 Err(ParseError::NonzeroReserved)
             );
         }
@@ -1417,7 +1499,7 @@ mod tests {
         let declared = usize_u64(wrong_length.len()) + 1;
         put_u64(&mut wrong_length, HEADER_ARTIFACT_BYTES, declared);
         assert_eq!(
-            parse_tiny(&wrong_length, Target::X86_64),
+            parse_standard(&wrong_length, Target::X86_64),
             Err(ParseError::LengthMismatch)
         );
     }
@@ -1427,7 +1509,7 @@ mod tests {
         let mut empty = valid_artifact(Target::X86_64);
         put_u16(&mut empty, HEADER_RECORD_COUNT, 0);
         assert_eq!(
-            parse_tiny(&empty, Target::X86_64),
+            parse_standard(&empty, Target::X86_64),
             Err(ParseError::InvalidRecordCount)
         );
 
@@ -1438,11 +1520,11 @@ mod tests {
                 permissions: SegmentPermissions::ReadExecute as u32,
                 payload: &[1],
             };
-            ApplicationLimits::TINY.load_records + 1
+            ApplicationLimits::STANDARD.load_records + 1
         ];
         let too_many = artifact(Target::X86_64, &segments);
         assert_eq!(
-            parse_tiny(&too_many, Target::X86_64),
+            parse_standard(&too_many, Target::X86_64),
             Err(ParseError::InvalidRecordCount)
         );
     }
@@ -1460,7 +1542,7 @@ mod tests {
                 }],
             );
             assert_eq!(
-                parse_tiny(&bytes, Target::X86_64),
+                parse_standard(&bytes, Target::X86_64),
                 Err(ParseError::InvalidPermissions)
             );
         }
@@ -1481,7 +1563,7 @@ mod tests {
                 }],
             );
             assert_eq!(
-                parse_tiny(&bytes, Target::X86_64),
+                parse_standard(&bytes, Target::X86_64),
                 Err(ParseError::InvalidSegmentRange)
             );
         }
@@ -1507,21 +1589,21 @@ mod tests {
             ],
         );
         assert_eq!(
-            parse_tiny(&overlap, Target::X86_64),
+            parse_standard(&overlap, Target::X86_64),
             Err(ParseError::OverlappingSegments)
         );
 
         let sparse = artifact(
             Target::X86_64,
             &[TestSegment {
-                image_offset: ApplicationLimits::TINY.image_span_bytes,
+                image_offset: ApplicationLimits::STANDARD.image_span_bytes,
                 memory_bytes: PAGE_SIZE,
                 permissions: SegmentPermissions::ReadExecute as u32,
                 payload: &[1],
             }],
         );
         assert_eq!(
-            parse_tiny(&sparse, Target::X86_64),
+            parse_standard(&sparse, Target::X86_64),
             Err(ParseError::ImageSpanExceeded)
         );
 
@@ -1529,13 +1611,13 @@ mod tests {
             Target::X86_64,
             &[TestSegment {
                 image_offset: 0,
-                memory_bytes: (ApplicationLimits::TINY.image_pages + 1) * PAGE_SIZE,
+                memory_bytes: (ApplicationLimits::STANDARD.image_pages + 1) * PAGE_SIZE,
                 permissions: SegmentPermissions::ReadExecute as u32,
                 payload: &[1],
             }],
         );
         assert_eq!(
-            parse_tiny(&too_many_pages, Target::X86_64),
+            parse_standard(&too_many_pages, Target::X86_64),
             Err(ParseError::ImagePagesExceeded)
         );
 
@@ -1546,7 +1628,7 @@ mod tests {
             u64::MAX - (PAGE_SIZE - 1),
         );
         assert_eq!(
-            parse_tiny(&overflowing, Target::X86_64),
+            parse_standard(&overflowing, Target::X86_64),
             Err(ParseError::ArithmeticOverflow)
         );
     }
@@ -1561,7 +1643,7 @@ mod tests {
             read_u64(&gap[first_record..], RECORD_FILE_OFFSET).unwrap_or_else(|_| unreachable!());
         put_u64(&mut gap, first_record + RECORD_FILE_OFFSET, offset + 1);
         assert_eq!(
-            parse_tiny(&gap, Target::X86_64),
+            parse_standard(&gap, Target::X86_64),
             Err(ParseError::NoncanonicalPayload)
         );
 
@@ -1570,14 +1652,14 @@ mod tests {
         let length = usize_u64(trailing.len());
         put_u64(&mut trailing, HEADER_ARTIFACT_BYTES, length);
         assert_eq!(
-            parse_tiny(&trailing, Target::X86_64),
+            parse_standard(&trailing, Target::X86_64),
             Err(ParseError::NoncanonicalPayload)
         );
 
         let mut reserved = valid;
         put_u32(&mut reserved, first_record + RECORD_RESERVED, 1);
         assert_eq!(
-            parse_tiny(&reserved, Target::X86_64),
+            parse_standard(&reserved, Target::X86_64),
             Err(ParseError::NonzeroReserved)
         );
     }
@@ -1585,33 +1667,27 @@ mod tests {
     #[test]
     fn rejects_stack_heap_and_aggregate_resident_budgets() {
         let valid = valid_artifact(Target::X86_64);
-        for stack_pages in [0, 3, 17] {
+        for stack_pages in [0, 3, 257] {
             let mut bytes = valid.clone();
             put_u32(&mut bytes, HEADER_STACK_PAGES, stack_pages);
             assert_eq!(
-                parse_tiny(&bytes, Target::X86_64),
+                parse_standard(&bytes, Target::X86_64),
                 Err(ParseError::StackBudgetExceeded)
             );
         }
         let mut heap = valid.clone();
-        put_u32(&mut heap, HEADER_HEAP_PAGES, 65);
+        put_u32(&mut heap, HEADER_HEAP_PAGES, 4097);
         assert_eq!(
-            parse_tiny(&heap, Target::X86_64),
+            parse_standard(&heap, Target::X86_64),
             Err(ParseError::HeapBudgetExceeded)
         );
 
         let limits = ApplicationLimits {
             resident_pages: 70,
-            ..ApplicationLimits::TINY
+            ..ApplicationLimits::STANDARD
         };
         assert_eq!(
-            parse_with_limits(
-                &valid,
-                Target::X86_64,
-                ResourceProfile::Tiny,
-                ABI_MINOR,
-                limits,
-            ),
+            parse_with_limits(&valid, Target::X86_64, ABI_MINOR, limits,),
             Err(ParseError::ResidentBudgetExceeded)
         );
     }
@@ -1628,20 +1704,232 @@ mod tests {
             }],
         );
         assert_eq!(
-            parse_tiny(&missing, Target::X86_64),
+            parse_standard(&missing, Target::X86_64),
             Err(ParseError::MissingExecutableSegment)
         );
 
         let mut bad_entry = valid_artifact(Target::X86_64);
         put_u64(&mut bad_entry, HEADER_ENTRY_OFFSET, PAGE_SIZE);
         assert_eq!(
-            parse_tiny(&bad_entry, Target::X86_64),
+            parse_standard(&bad_entry, Target::X86_64),
             Err(ParseError::InvalidEntryPoint)
         );
         put_u64(&mut bad_entry, HEADER_ENTRY_OFFSET, u64::MAX);
         assert_eq!(
-            parse_tiny(&bad_entry, Target::X86_64),
+            parse_standard(&bad_entry, Target::X86_64),
             Err(ParseError::ArithmeticOverflow)
+        );
+    }
+
+    #[test]
+    fn generated_shared_corpus_covers_both_targets_and_exact_boundaries() {
+        let valid = include!("../../../tests/kex-corpus/valid.inc");
+        for (name, bytes, target) in valid {
+            let parsed = parse_kex(bytes, target, ABI_MINOR);
+            assert!(parsed.is_ok(), "{name}: {:?}", parsed.as_ref().err());
+            let plan = parsed.unwrap_or_else(|_| unreachable!());
+            let limits = ApplicationLimits::standard();
+            let segments = plan.segments().collect::<Vec<_>>();
+            let image_pages = segments
+                .iter()
+                .map(|segment| segment.memory_bytes() / PAGE_SIZE)
+                .sum::<u64>();
+            assert_eq!(plan.charges().staging_bytes(), bytes.len(), "{name}");
+            assert_eq!(plan.charges().image_pages(), image_pages, "{name}");
+            assert_eq!(
+                plan.charges().private_pages(),
+                image_pages + 1 + plan.stack_pages() + plan.heap_pages(),
+                "{name}"
+            );
+            assert_eq!(
+                plan.charges().reserved_resident_pages(),
+                plan.charges().private_pages() + limits.table_pages(),
+                "{name}"
+            );
+            for pair in segments.windows(2) {
+                assert!(
+                    pair[0].virtual_address() + pair[0].memory_bytes() <= pair[1].virtual_address(),
+                    "{name}"
+                );
+            }
+            assert!(segments.iter().all(|segment| {
+                !(segment.permissions().writable() && segment.permissions().executable())
+            }));
+            if name.contains("max-encoded") {
+                assert_eq!(bytes.len(), limits.encoded_bytes(), "{name}");
+            }
+            if name.contains("max-records") {
+                assert_eq!(segments.len(), limits.load_records(), "{name}");
+            }
+            if name.contains("max-span") {
+                let last = segments.last().unwrap_or_else(|| unreachable!());
+                assert_eq!(
+                    last.image_offset() + last.memory_bytes(),
+                    limits.image_span_bytes(),
+                    "{name}"
+                );
+            }
+            if name.contains("max-pages") {
+                assert_eq!(image_pages, limits.image_pages(), "{name}");
+            }
+            if name.contains("max-stack-heap") {
+                assert_eq!(plan.stack_pages(), limits.stack_pages().1, "{name}");
+                assert_eq!(plan.heap_pages(), limits.heap_pages(), "{name}");
+            }
+        }
+
+        let x86_rejections = include!("../../../tests/kex-corpus/rejections-x86_64.inc");
+        for (name, bytes, expected) in x86_rejections {
+            assert_eq!(
+                parse_kex(bytes, Target::X86_64, ABI_MINOR),
+                Err(expected),
+                "{name}"
+            );
+        }
+        let arm_rejections = include!("../../../tests/kex-corpus/rejections-aarch64.inc");
+        for (name, bytes, expected) in arm_rejections {
+            assert_eq!(
+                parse_kex(bytes, Target::Aarch64, ABI_MINOR),
+                Err(expected),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn deterministic_plan_properties_hold_across_varied_disjoint_segments() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        for iteration in 0..256_u64 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1);
+            let count = usize::try_from(state % 16 + 1).unwrap_or_else(|_| unreachable!());
+            let mut segments = Vec::new();
+            let mut image_offset = 0_u64;
+            for index in 0..count {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1);
+                let pages = state % 4 + 1;
+                let permissions = if index == 0 {
+                    SegmentPermissions::ReadExecute
+                } else {
+                    match state % 3 {
+                        0 => SegmentPermissions::ReadOnly,
+                        1 => SegmentPermissions::ReadExecute,
+                        _ => SegmentPermissions::ReadWrite,
+                    }
+                };
+                let payload = match index % 3 {
+                    0 => &[0x90, 0xc3][..],
+                    1 => &[1, 2, 3][..],
+                    _ => &[][..],
+                };
+                segments.push(TestSegment {
+                    image_offset,
+                    memory_bytes: pages * PAGE_SIZE,
+                    permissions: permissions as u32,
+                    payload,
+                });
+                image_offset += (pages + state % 3) * PAGE_SIZE;
+            }
+            let target = if iteration % 2 == 0 {
+                Target::X86_64
+            } else {
+                Target::Aarch64
+            };
+            let mut bytes = artifact(target, &segments);
+            let stack_pages = u32::try_from(4 + state % 253).unwrap_or_else(|_| unreachable!());
+            let heap_pages = u32::try_from(state % 4097).unwrap_or_else(|_| unreachable!());
+            put_u32(&mut bytes, HEADER_STACK_PAGES, stack_pages);
+            put_u32(&mut bytes, HEADER_HEAP_PAGES, heap_pages);
+            let plan = parse_standard(&bytes, target).unwrap_or_else(|_| unreachable!());
+            let parsed = plan.segments().collect::<Vec<_>>();
+            assert_eq!(parsed.len(), count);
+            let mut exact_image_pages = 0_u64;
+            let mut previous_end = 0_u64;
+            for segment in parsed {
+                assert!(segment.image_offset() >= previous_end);
+                assert!(!(segment.permissions().writable() && segment.permissions().executable()));
+                previous_end = segment.image_offset() + segment.memory_bytes();
+                exact_image_pages += segment.memory_bytes() / PAGE_SIZE;
+            }
+            assert_eq!(plan.charges().staging_bytes(), bytes.len());
+            assert_eq!(plan.charges().image_pages(), exact_image_pages);
+            assert_eq!(
+                plan.charges().private_pages(),
+                exact_image_pages + 1 + u64::from(stack_pages) + u64::from(heap_pages)
+            );
+            assert_eq!(
+                plan.charges().reserved_resident_pages(),
+                plan.charges().private_pages() + ApplicationLimits::STANDARD.table_pages
+            );
+        }
+    }
+
+    #[test]
+    fn loader_transaction_failpoints_release_every_provisional_owner() {
+        for failed_index in 0..LoaderResource::ALL.len() {
+            let mut transaction = LoaderTransaction::new();
+            let mut live = [false; LoaderResource::ALL.len()];
+            for (index, resource) in LoaderResource::ALL.iter().copied().enumerate() {
+                if index == failed_index {
+                    break;
+                }
+                live[index] = true;
+                assert_eq!(transaction.acquire(resource), Ok(()));
+            }
+            assert!(!transaction.mapping_active());
+            let mut released = [None; LoaderResource::ALL.len()];
+            let mut release_count = 0;
+            transaction.rollback(|resource| {
+                let index = resource as usize;
+                assert!(live[index]);
+                live[index] = false;
+                released[release_count] = Some(resource);
+                release_count += 1;
+            });
+            assert!(live.iter().all(|owned| !owned));
+            assert_eq!(transaction.provisional_resources(), 0);
+            assert!(!transaction.mapping_active());
+            let expected = LoaderResource::ALL[..failed_index]
+                .iter()
+                .rev()
+                .copied()
+                .collect::<Vec<_>>();
+            let actual = released[..release_count]
+                .iter()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn loader_transaction_requires_complete_ordered_commit() {
+        let mut transaction = LoaderTransaction::new();
+        assert_eq!(
+            transaction.acquire(LoaderResource::Frames),
+            Err(LoaderTransactionError::OutOfOrder)
+        );
+        assert_eq!(
+            transaction.commit(),
+            Err(LoaderTransactionError::Incomplete)
+        );
+        for resource in LoaderResource::ALL {
+            assert_eq!(transaction.acquire(resource), Ok(()));
+        }
+        assert_eq!(transaction.commit(), Ok(()));
+        assert!(transaction.mapping_active());
+        assert_eq!(transaction.provisional_resources(), 0);
+        assert_eq!(
+            transaction.acquire(LoaderResource::Staging),
+            Err(LoaderTransactionError::AlreadyCommitted)
+        );
+        assert_eq!(
+            transaction.commit(),
+            Err(LoaderTransactionError::AlreadyCommitted)
         );
     }
 
@@ -1649,7 +1937,7 @@ mod tests {
     fn every_truncation_fails_without_a_plan() {
         let valid = valid_artifact(Target::X86_64);
         for length in 0..valid.len() {
-            assert!(parse_tiny(&valid[..length], Target::X86_64).is_err());
+            assert!(parse_standard(&valid[..length], Target::X86_64).is_err());
         }
     }
 }

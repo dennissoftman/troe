@@ -8,7 +8,7 @@ pub const MIN_LOGICAL_BLOCK_BYTES: u32 = 512;
 pub const MAX_LOGICAL_BLOCK_BYTES: u32 = 64 * 1024;
 /// Hard ceiling for one device request.
 pub const MAX_TRANSFER_BYTES: usize = 1024 * 1024;
-/// The initial synchronous profile permits exactly one request in flight.
+/// The synchronous block contract permits exactly one request in flight.
 pub const SYNCHRONOUS_QUEUE_DEPTH: u16 = 1;
 
 /// Device geometry and durability properties validated at the capability edge.
@@ -27,7 +27,7 @@ impl BlockGeometry {
     /// # Errors
     ///
     /// Rejects zero capacity, non-power-of-two block sizes outside the hard
-    /// profile, invalid alignment, and byte-capacity overflow.
+    /// supported range, invalid alignment, and byte-capacity overflow.
     pub fn new(
         logical_block_bytes: u32,
         block_count: u64,
@@ -93,7 +93,7 @@ impl BlockGeometry {
     }
 }
 
-/// Per-capability request ceilings selected by a resource profile.
+/// Per-capability request ceilings selected during capability construction.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BlockLimits {
     max_transfer_blocks: u32,
@@ -102,7 +102,7 @@ pub struct BlockLimits {
 }
 
 impl BlockLimits {
-    /// Construct checked request ceilings for the initial synchronous profile.
+    /// Construct checked request ceilings for the synchronous block contract.
     ///
     /// # Errors
     ///
@@ -158,7 +158,7 @@ pub enum BlockAccess {
 /// Stable failures at the block capability boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlockError {
-    /// Device geometry is outside the supported profile.
+    /// Device geometry is outside the supported range.
     InvalidGeometry,
     /// Request ceilings are empty, inconsistent, or unsupported.
     InvalidLimits,
@@ -629,7 +629,7 @@ mod tests {
     }
 
     #[test]
-    fn geometry_and_limits_reject_invalid_profiles() {
+    fn geometry_and_limits_reject_invalid_configurations() {
         assert_eq!(
             BlockGeometry::new(0, 1, 1, false, false),
             Err(BlockError::InvalidGeometry)

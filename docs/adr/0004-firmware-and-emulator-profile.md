@@ -2,6 +2,11 @@
 
 Status: accepted, 2026-08-22.
 
+Implementation note, 2026-08-24: `tools/qemu-firmware-profile.json` records the
+exact code and variable-store sizes and SHA-256 digests for both architecture
+artifacts. Discovery and explicit overrides are accepted only after matching
+that manifest; a filename or QEMU version match alone is insufficient.
+
 Stage 1 targets Rust's `x86_64-unknown-uefi` and `aarch64-unknown-uefi` using
 UEFI Simple Text Input/Output and the firmware allocator. The repeatable test
 profile is QEMU 11.1.0 with rust-osdev ovmf-prebuilt
@@ -23,7 +28,8 @@ goldens at the same time.
 Scope note, 2026-08-24: [ADR 0016](0016-hardware-targets-and-emulator-role.md)
 retains this exact profile as deterministic historical and regression evidence,
 but rejects QEMU devices as the general x86-64 or AArch64 hardware contract.
-New emulator and physical-board profiles are independently named and reviewed.
+New VM platforms and execution environments are independently named and
+reviewed. Physical-board profiles are outside the current roadmap.
 
 Implementation note, 2026-08-23: Stage 6 explicitly selected QEMU's `max` x86
 TCG CPU so acceptance exercises CPUID-reported SMEP/SMAP rather than silently

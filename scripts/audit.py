@@ -8,6 +8,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from repository_policy import load_audit_exceptions, require_supported_python
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATABASE_PATH = REPO_ROOT / "target" / "rustsec-advisory-db"
@@ -70,23 +72,33 @@ def prepare_database(revision: str) -> None:
         raise RuntimeError(f"expected RustSec database {revision}, got {actual}")
 
 
+def audit_command(exceptions: tuple[str, ...]) -> tuple[str | Path, ...]:
+    """Build the closed no-fetch cargo-audit command."""
+    command: list[str | Path] = [
+        "cargo",
+        "audit",
+        "--no-fetch",
+        "--db",
+        DATABASE_PATH,
+        "--file",
+        REPO_ROOT / "Cargo.lock",
+        "--deny",
+        "warnings",
+    ]
+    for advisory in exceptions:
+        command.extend(("--ignore", advisory))
+    return tuple(command)
+
+
 def main() -> int:
     """Prepare exact inputs and fail on every RustSec warning category."""
     try:
+        require_supported_python()
         revision = pinned_revision()
+        exceptions = load_audit_exceptions()
         verify_tool_version()
         prepare_database(revision)
-        run(
-            "cargo",
-            "audit",
-            "--no-fetch",
-            "--db",
-            DATABASE_PATH,
-            "--file",
-            REPO_ROOT / "Cargo.lock",
-            "--deny",
-            "warnings",
-        )
+        run(*audit_command(exceptions))
     except (FileNotFoundError, OSError, RuntimeError) as error:
         print(f"dependency audit failed: {error}", file=sys.stderr)
         return 1
@@ -96,7 +108,10 @@ def main() -> int:
             file=sys.stderr,
         )
         return error.returncode or 1
-    print(f"dependency audit: passed at RustSec {revision}")
+    print(
+        f"dependency audit: passed at RustSec {revision} "
+        f"with {len(exceptions)} reviewed exceptions"
+    )
     return 0
 
 

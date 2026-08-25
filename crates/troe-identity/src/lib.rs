@@ -38,7 +38,7 @@ pub enum IdentityError {
     InvalidHeader,
     /// Integrity checksum failed.
     Checksum,
-    /// A configured profile ceiling was exceeded.
+    /// A configured resource-policy ceiling was exceeded.
     Limit,
     /// One record, string, identifier, or foreign value was malformed.
     InvalidRecord,
@@ -48,11 +48,13 @@ pub enum IdentityError {
     InvalidReference,
     /// Direct group membership contains a cycle.
     MembershipCycle,
+    /// Two individually valid snapshots violate a permanent lifecycle invariant.
+    InvalidTransition,
     /// Allocation failed within an already validated ceiling.
     Exhausted,
 }
 
-/// Resource ceilings for one accepted deployment profile.
+/// Resource ceilings for the standard cloud-VM deployment policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IdentityLimits {
     principals: usize,
@@ -63,21 +65,9 @@ pub struct IdentityLimits {
 }
 
 impl IdentityLimits {
-    /// ADR 0007 `tiny` profile ceilings.
+    /// Standard bounded identity ceilings.
     #[must_use]
-    pub const fn tiny() -> Self {
-        Self {
-            principals: 256,
-            memberships_per_principal: 32,
-            mappings: 1_024,
-            acl_entries: 32,
-            encoded_bytes: 2 * 1024 * 1024,
-        }
-    }
-
-    /// ADR 0007 `full` profile ceilings.
-    #[must_use]
-    pub const fn full() -> Self {
+    pub const fn standard() -> Self {
         Self {
             principals: 65_536,
             memberships_per_principal: 256,
@@ -1027,6 +1017,38 @@ pub fn validate_snapshot(
     })
 }
 
+/// Validate one generation's identity snapshot as a successor to another.
+///
+/// # Errors
+///
+/// Rejects non-increasing registry generations or mapping versions, identity
+/// domain changes, removed principal records, principal-kind changes, and the
+/// resurrection of a permanent tombstone.
+pub fn validate_successor(
+    predecessor: &IdentitySnapshot,
+    successor: &IdentitySnapshot,
+) -> Result<(), IdentityError> {
+    if successor.registry.generation <= predecessor.registry.generation
+        || successor.mapping.version <= predecessor.mapping.version
+        || successor.mapping.domain != predecessor.mapping.domain
+    {
+        return Err(IdentityError::InvalidTransition);
+    }
+    for previous in &predecessor.registry.principals {
+        let current = successor
+            .registry
+            .get(previous.id)
+            .ok_or(IdentityError::InvalidTransition)?;
+        if current.kind != previous.kind
+            || (previous.state == PrincipalState::Tombstoned
+                && current.state != PrincipalState::Tombstoned)
+        {
+            return Err(IdentityError::InvalidTransition);
+        }
+    }
+    Ok(())
+}
+
 fn validate_foreign_value(
     scheme: u32,
     kind: ForeignKind,
@@ -1333,6 +1355,29 @@ mod tests {
         image
     }
 
+    fn snapshot(generation: u64, mapping_version: u64, domain: [u8; 16]) -> IdentitySnapshot {
+        let mut registry = registry(None);
+        registry[36..44].copy_from_slice(&generation.to_le_bytes());
+        checksum(&mut registry, CHECKSUM_OFFSET);
+        let mut mapping = mapping();
+        mapping[32..40].copy_from_slice(&mapping_version.to_le_bytes());
+        mapping[40..56].copy_from_slice(&domain);
+        checksum(&mut mapping, CHECKSUM_OFFSET);
+        let mut mount = mount();
+        mount[64..80].copy_from_slice(&domain);
+        mount[80..88].copy_from_slice(&mapping_version.to_le_bytes());
+        checksum(&mut mount, MOUNT_CHECKSUM_OFFSET);
+        validate_snapshot(
+            &registry,
+            &mapping,
+            &mount,
+            &acl(),
+            generation,
+            IdentityLimits::standard(),
+        )
+        .unwrap_or_else(|_| unreachable!())
+    }
+
     #[test]
     fn canonical_snapshot_cross_validates() -> Result<(), IdentityError> {
         let snapshot = validate_snapshot(
@@ -1341,7 +1386,7 @@ mod tests {
             &mount(),
             &acl(),
             1,
-            IdentityLimits::tiny(),
+            IdentityLimits::standard(),
         )?;
         assert_eq!(snapshot.registry.principals().len(), 2);
         assert_eq!(snapshot.mapping.entries().len(), 2);
@@ -1355,13 +1400,14 @@ mod tests {
         for image in [registry(None), mapping(), mount(), acl()] {
             for length in 0..image.len() {
                 let result = if image.starts_with(&REGISTRY_MAGIC) {
-                    IdentityRegistry::parse(&image[..length], IdentityLimits::tiny()).map(|_| ())
+                    IdentityRegistry::parse(&image[..length], IdentityLimits::standard())
+                        .map(|_| ())
                 } else if image.starts_with(&MAPPING_MAGIC) {
-                    MappingSnapshot::parse(&image[..length], IdentityLimits::tiny()).map(|_| ())
+                    MappingSnapshot::parse(&image[..length], IdentityLimits::standard()).map(|_| ())
                 } else if image.starts_with(&MOUNT_MAGIC) {
                     MountPolicy::parse(&image[..length]).map(|_| ())
                 } else {
-                    NativeAcl::parse(&image[..length], IdentityLimits::tiny()).map(|_| ())
+                    NativeAcl::parse(&image[..length], IdentityLimits::standard()).map(|_| ())
                 };
                 assert!(result.is_err());
             }
@@ -1369,13 +1415,13 @@ mod tests {
                 let mut corrupt = image.clone();
                 corrupt[offset] ^= 1;
                 let result = if image.starts_with(&REGISTRY_MAGIC) {
-                    IdentityRegistry::parse(&corrupt, IdentityLimits::tiny()).map(|_| ())
+                    IdentityRegistry::parse(&corrupt, IdentityLimits::standard()).map(|_| ())
                 } else if image.starts_with(&MAPPING_MAGIC) {
-                    MappingSnapshot::parse(&corrupt, IdentityLimits::tiny()).map(|_| ())
+                    MappingSnapshot::parse(&corrupt, IdentityLimits::standard()).map(|_| ())
                 } else if image.starts_with(&MOUNT_MAGIC) {
                     MountPolicy::parse(&corrupt).map(|_| ())
                 } else {
-                    NativeAcl::parse(&corrupt, IdentityLimits::tiny()).map(|_| ())
+                    NativeAcl::parse(&corrupt, IdentityLimits::standard()).map(|_| ())
                 };
                 assert!(result.is_err());
             }
@@ -1384,17 +1430,19 @@ mod tests {
 
     #[test]
     fn cycles_references_sid_and_acl_order_fail_closed() {
-        assert!(IdentityRegistry::parse(&registry(Some(GROUP)), IdentityLimits::tiny()).is_err());
+        assert!(
+            IdentityRegistry::parse(&registry(Some(GROUP)), IdentityLimits::standard()).is_err()
+        );
         assert_eq!(
-            IdentityRegistry::parse(&cyclic_registry(), IdentityLimits::tiny()),
+            IdentityRegistry::parse(&cyclic_registry(), IdentityLimits::standard()),
             Err(IdentityError::MembershipCycle)
         );
-        let registry = IdentityRegistry::parse(&registry(None), IdentityLimits::tiny())
+        let registry = IdentityRegistry::parse(&registry(None), IdentityLimits::standard())
             .unwrap_or_else(|_| unreachable!());
         let mut wrong_mapping = mapping();
         wrong_mapping[72..88].fill(9);
         checksum(&mut wrong_mapping, CHECKSUM_OFFSET);
-        let mapping = MappingSnapshot::parse(&wrong_mapping, IdentityLimits::tiny())
+        let mapping = MappingSnapshot::parse(&wrong_mapping, IdentityLimits::standard())
             .unwrap_or_else(|_| unreachable!());
         assert_eq!(
             mapping.validate_against(&registry),
@@ -1411,6 +1459,58 @@ mod tests {
         let mut unordered_acl = acl();
         unordered_acl[64] = AclTag::Other as u8;
         checksum(&mut unordered_acl, CHECKSUM_OFFSET);
-        assert!(NativeAcl::parse(&unordered_acl, IdentityLimits::tiny()).is_err());
+        assert!(NativeAcl::parse(&unordered_acl, IdentityLimits::standard()).is_err());
+    }
+
+    #[test]
+    fn successor_requires_monotonic_versions_and_domain_continuity() {
+        let predecessor = snapshot(1, 7, DOMAIN);
+        let successor = snapshot(2, 8, DOMAIN);
+        assert_eq!(validate_successor(&predecessor, &successor), Ok(()));
+
+        let stale_generation = snapshot(1, 8, DOMAIN);
+        assert_eq!(
+            validate_successor(&predecessor, &stale_generation),
+            Err(IdentityError::InvalidTransition)
+        );
+        let stale_mapping = snapshot(2, 7, DOMAIN);
+        assert_eq!(
+            validate_successor(&predecessor, &stale_mapping),
+            Err(IdentityError::InvalidTransition)
+        );
+        let changed_domain = snapshot(2, 8, [4; 16]);
+        assert_eq!(
+            validate_successor(&predecessor, &changed_domain),
+            Err(IdentityError::InvalidTransition)
+        );
+    }
+
+    #[test]
+    fn successor_retains_ids_kinds_and_permanent_tombstones() {
+        let mut predecessor = snapshot(1, 1, DOMAIN);
+        let mut successor = snapshot(2, 2, DOMAIN);
+
+        successor.registry.principals.remove(0);
+        assert_eq!(
+            validate_successor(&predecessor, &successor),
+            Err(IdentityError::InvalidTransition)
+        );
+
+        let mut successor = snapshot(2, 2, DOMAIN);
+        successor.registry.principals[0].kind = PrincipalKind::Service;
+        assert_eq!(
+            validate_successor(&predecessor, &successor),
+            Err(IdentityError::InvalidTransition)
+        );
+
+        predecessor.registry.principals[0].state = PrincipalState::Tombstoned;
+        let successor = snapshot(2, 2, DOMAIN);
+        assert_eq!(
+            validate_successor(&predecessor, &successor),
+            Err(IdentityError::InvalidTransition)
+        );
+        let mut successor = successor;
+        successor.registry.principals[0].state = PrincipalState::Tombstoned;
+        assert_eq!(validate_successor(&predecessor, &successor), Ok(()));
     }
 }

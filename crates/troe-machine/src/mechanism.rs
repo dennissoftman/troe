@@ -14,27 +14,29 @@ use core::cell::UnsafeCell;
 use core::hint::spin_loop;
 use core::ptr;
 use core::ptr::NonNull;
+#[cfg(target_os = "uefi")]
+use core::sync::atomic::AtomicBool;
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 use core::sync::atomic::AtomicU32;
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 use core::sync::atomic::AtomicU64;
-#[cfg(target_os = "uefi")]
-use core::sync::atomic::{AtomicBool, Ordering};
+#[cfg(any(test, target_os = "uefi"))]
+use core::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(any(test, target_os = "uefi"))]
+use troe_driver::InterruptResource;
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 use troe_driver::IoPortResource;
 #[cfg(target_os = "uefi")]
 use troe_driver::{
-    BoundedInputQueue, InputEvent, InputQueueConfig, InputQueueStats, InputSource,
-    InterruptResource, MmioResource, QueueError,
+    BoundedInputQueue, InputEvent, InputQueueConfig, InputQueueStats, InputSource, MmioResource,
+    QueueError,
 };
 #[cfg(any(test, target_os = "uefi"))]
 use troe_memory::PhysicalRange;
 #[cfg(target_os = "uefi")]
 use troe_task::TaskStep;
 #[cfg(target_os = "uefi")]
-use troe_terminal::{
-    Color, FramebufferDescriptor, FramebufferPixelFormat, PixelSurface, SurfaceError,
-};
+use troe_terminal::{Color, FramebufferDescriptor, PixelSurface, SurfaceError};
 #[cfg(target_os = "uefi")]
 use uefi::mem::memory_map::MemoryMapOwned;
 
@@ -122,7 +124,7 @@ pub struct OwnedFramebuffer {
 
 /// Failure to configure owned interrupt-driven input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg(target_os = "uefi")]
+#[cfg(any(test, target_os = "uefi"))]
 pub enum InputInterruptError {
     /// Portable queue metadata could not be allocated before IRQ enablement.
     QueueMetadataExhausted,
@@ -132,6 +134,268 @@ pub enum InputInterruptError {
     InvalidResource,
     /// The interrupt controller did not expose the required input line.
     InterruptLineUnavailable,
+}
+
+/// Validated platform source carried across the machine interrupt boundary.
+#[derive(Debug, Eq, PartialEq)]
+#[cfg(any(test, target_os = "uefi"))]
+pub(crate) struct NetworkInterruptRoute {
+    interrupt: InterruptResource,
+    source: NetworkInterruptSource,
+    priority: u8,
+    trigger: troe_platform::TriggerMode,
+    polarity: troe_platform::Polarity,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+#[cfg(any(test, target_os = "uefi"))]
+enum NetworkInterruptSource {
+    #[cfg_attr(all(target_os = "uefi", target_arch = "aarch64"), allow(dead_code))]
+    PciIntx { pin: u8 },
+    #[cfg_attr(all(target_os = "uefi", target_arch = "x86_64"), allow(dead_code))]
+    VirtioMmio { slot: u32 },
+}
+
+impl NetworkInterruptRoute {
+    /// Validate one q35 PCI `INTx` pin/line against the selected descriptor.
+    #[cfg(any(test, all(target_os = "uefi", target_arch = "x86_64")))]
+    pub(crate) fn q35_pci_intx(line: u8, pin: u8) -> Result<Self, InputInterruptError> {
+        #[cfg(test)]
+        let platform = troe_platform::X86_64_Q35_UEFI
+            .validate()
+            .map_err(|_| InputInterruptError::InvalidResource)?;
+        #[cfg(not(test))]
+        let platform =
+            crate::selected_platform().map_err(|_| InputInterruptError::InvalidResource)?;
+        let troe_platform::VirtioTransportKind::Pci {
+            maximum_interrupt_line,
+            network_vector,
+            network_trigger,
+            network_polarity,
+            ..
+        } = platform.virtio()
+        else {
+            return Err(InputInterruptError::InvalidResource);
+        };
+        if !(1..=4).contains(&pin)
+            || line > maximum_interrupt_line
+            || [
+                troe_platform::InterruptRole::Keyboard,
+                troe_platform::InterruptRole::Serial,
+            ]
+            .into_iter()
+            .filter_map(|role| platform.interrupt(role))
+            .any(|route| route.line() == u32::from(line))
+        {
+            return Err(InputInterruptError::InvalidResource);
+        }
+        let interrupt = InterruptResource::new(u32::from(line), network_vector)
+            .map_err(|_| InputInterruptError::InvalidResource)?;
+        Ok(Self {
+            interrupt,
+            source: NetworkInterruptSource::PciIntx { pin },
+            priority: 0,
+            trigger: network_trigger,
+            polarity: network_polarity,
+        })
+    }
+
+    /// Derive and validate one QEMU `virt` MMIO slot-to-SPI route.
+    #[cfg(any(test, target_os = "uefi"))]
+    pub(crate) fn virtio_mmio(
+        slot: u32,
+        slot_count: u32,
+        first_intid: u32,
+    ) -> Result<Self, InputInterruptError> {
+        #[cfg(test)]
+        let platform = troe_platform::AARCH64_VIRT_UEFI
+            .validate()
+            .map_err(|_| InputInterruptError::InvalidResource)?;
+        #[cfg(not(test))]
+        let platform =
+            crate::selected_platform().map_err(|_| InputInterruptError::InvalidResource)?;
+        let troe_platform::VirtioTransportKind::Mmio {
+            slot_count: described_slots,
+            first_interrupt: described_first,
+            network_priority,
+            network_trigger,
+            network_polarity,
+            ..
+        } = platform.virtio()
+        else {
+            return Err(InputInterruptError::InvalidResource);
+        };
+        if slot_count != u32::from(described_slots)
+            || first_intid != described_first
+            || slot >= slot_count
+        {
+            return Err(InputInterruptError::InvalidResource);
+        }
+        let intid = first_intid
+            .checked_add(slot)
+            .ok_or(InputInterruptError::InvalidResource)?;
+        if !(32..=1019).contains(&intid)
+            || [
+                troe_platform::InterruptRole::Serial,
+                troe_platform::InterruptRole::Timer,
+            ]
+            .into_iter()
+            .filter_map(|role| platform.interrupt(role))
+            .any(|route| route.line() == intid)
+        {
+            return Err(InputInterruptError::InvalidResource);
+        }
+        let vector = platform
+            .interrupt(troe_platform::InterruptRole::Serial)
+            .ok_or(InputInterruptError::InvalidResource)?
+            .vector();
+        let interrupt = InterruptResource::new(intid, vector)
+            .map_err(|_| InputInterruptError::InvalidResource)?;
+        Ok(Self {
+            interrupt,
+            source: NetworkInterruptSource::VirtioMmio { slot },
+            priority: network_priority,
+            trigger: network_trigger,
+            polarity: network_polarity,
+        })
+    }
+
+    const fn interrupt(&self) -> InterruptResource {
+        self.interrupt
+    }
+
+    const fn source(&self) -> &NetworkInterruptSource {
+        &self.source
+    }
+
+    const fn priority(&self) -> u8 {
+        self.priority
+    }
+
+    const fn trigger(&self) -> troe_platform::TriggerMode {
+        self.trigger
+    }
+
+    const fn polarity(&self) -> troe_platform::Polarity {
+        self.polarity
+    }
+}
+
+/// A validated route configured in the controller but still masked.
+#[derive(Debug, Eq, PartialEq)]
+#[cfg(any(test, target_os = "uefi"))]
+pub(crate) struct PreparedNetworkInterrupt {
+    route: NetworkInterruptRoute,
+}
+
+/// Exclusive ownership of one unmasked network interrupt route.
+#[derive(Debug, Eq, PartialEq)]
+#[cfg(any(test, target_os = "uefi"))]
+pub(crate) struct ActiveNetworkInterrupt {
+    route: NetworkInterruptRoute,
+}
+
+/// A controller-masked route awaiting transport-state revocation.
+#[derive(Debug, Eq, PartialEq)]
+#[cfg(any(test, target_os = "uefi"))]
+pub(crate) struct DeactivatedNetworkInterrupt {
+    route: NetworkInterruptRoute,
+}
+
+/// Pure initialization phase used by target reset guards and host fault tests.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(any(test, target_os = "uefi"))]
+pub(crate) enum DmaInitializationPhase {
+    /// Device status has changed, but no queue address is visible yet.
+    DeviceStateChanged,
+    /// At least one queue address has become device-visible.
+    QueuePublished,
+    /// The device accepted `DRIVER_OK` and may consume queues.
+    DriverOk,
+    /// A fully constructed owner now enforces reset-before-release on drop.
+    OwnershipTransferred,
+}
+
+/// Host-testable reset obligation for fallible native device construction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(any(test, target_os = "uefi"))]
+pub(crate) struct DmaInitializationState {
+    phase: DmaInitializationPhase,
+}
+
+#[cfg(any(test, target_os = "uefi"))]
+impl DmaInitializationState {
+    pub(crate) const fn new() -> Self {
+        Self {
+            phase: DmaInitializationPhase::DeviceStateChanged,
+        }
+    }
+
+    pub(crate) const fn mark_queue_published(&mut self) {
+        self.phase = DmaInitializationPhase::QueuePublished;
+    }
+
+    pub(crate) const fn mark_driver_ok(&mut self) {
+        self.phase = DmaInitializationPhase::DriverOk;
+    }
+
+    pub(crate) const fn transfer_ownership(&mut self) {
+        self.phase = DmaInitializationPhase::OwnershipTransferred;
+    }
+
+    pub(crate) const fn cleanup_requires_reset(self) -> bool {
+        !matches!(self.phase, DmaInitializationPhase::OwnershipTransferred)
+    }
+
+    #[cfg(test)]
+    const fn phase(self) -> DmaInitializationPhase {
+        self.phase
+    }
+}
+
+/// Classification of a used-index observation with one descriptor outstanding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(any(test, target_os = "uefi"))]
+pub(crate) enum UsedIndexTransition {
+    /// The device has not completed the outstanding descriptor.
+    Empty,
+    /// Exactly the one outstanding descriptor completed.
+    Completed,
+    /// The device skipped, replayed, or otherwise corrupted the used index.
+    Invalid,
+}
+
+/// Validate the only legal used-index transitions for a one-in-flight queue.
+#[cfg(any(test, target_os = "uefi"))]
+pub(crate) const fn classify_used_index(current: u16, observed: u16) -> UsedIndexTransition {
+    if observed == current {
+        UsedIndexTransition::Empty
+    } else if observed == current.wrapping_add(1) {
+        UsedIndexTransition::Completed
+    } else {
+        UsedIndexTransition::Invalid
+    }
+}
+
+/// Exclusively publish transport ISR state into an empty global slot.
+#[cfg(any(test, target_os = "uefi"))]
+pub(crate) fn claim_network_interrupt_publication(publication: &AtomicUsize, owned: usize) -> bool {
+    owned != 0
+        && publication
+            .compare_exchange(0, owned, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+}
+
+/// Revoke transport ISR state only when it still belongs to this route owner.
+#[cfg(any(test, target_os = "uefi"))]
+pub(crate) fn revoke_network_interrupt_publication(
+    publication: &AtomicUsize,
+    owned: usize,
+) -> bool {
+    owned != 0
+        && publication
+            .compare_exchange(owned, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
 }
 
 /// Failure to arm the architecture-owned application execution timer.
@@ -195,26 +459,11 @@ impl PixelSurface for OwnedFramebuffer {
     }
 
     fn write_pixel(&mut self, x: usize, y: usize, color: Color) -> Result<(), SurfaceError> {
-        if x >= self.descriptor.width() || y >= self.descriptor.height() {
-            return Err(SurfaceError::Bounds);
-        }
-        let pixel = y
-            .checked_mul(self.descriptor.stride())
-            .and_then(|row| row.checked_add(x))
-            .ok_or(SurfaceError::Overflow)?;
-        let offset = pixel.checked_mul(4).ok_or(SurfaceError::Overflow)?;
-        let end = offset.checked_add(4).ok_or(SurfaceError::Overflow)?;
-        if end > self.descriptor.byte_len() {
-            return Err(SurfaceError::Bounds);
-        }
-        let bytes = match self.descriptor.pixel_format() {
-            FramebufferPixelFormat::Rgb => [color.red, color.green, color.blue, 0],
-            FramebufferPixelFormat::Bgr => [color.blue, color.green, color.red, 0],
-        };
-        for (index, byte) in bytes.into_iter().enumerate() {
+        let pixel = self.descriptor.encode_pixel(x, y, color)?;
+        for (index, byte) in pixel.bytes().into_iter().enumerate() {
             let address = self
                 .base
-                .checked_add(offset)
+                .checked_add(pixel.byte_offset())
                 .and_then(|value| value.checked_add(index))
                 .ok_or(SurfaceError::Overflow)?;
             // SAFETY: FramebufferDescriptor construction proved the complete
@@ -659,12 +908,15 @@ pub fn try_read_byte() -> Option<u8> {
 pub fn try_read_keyboard_scancode() -> Option<u8> {
     #[cfg(target_arch = "x86_64")]
     {
-        let Ok(profile) = x86_input_profile() else {
+        let Ok(data_resource) = x86_ports(troe_platform::IoPortRole::KeyboardData) else {
             return None;
         };
-        let data = profile.keyboard_ports.base_port();
-        let status_port = data + 4;
-        // SAFETY: The pinned q35 profile owns the legacy i8042 controller.
+        let Ok(status_resource) = x86_ports(troe_platform::IoPortRole::KeyboardStatus) else {
+            return None;
+        };
+        let data = data_resource.base_port();
+        let status_port = status_resource.base_port();
+        // SAFETY: The validated platform descriptor owns both i8042 ports.
         let status = unsafe { port_read(status_port) };
         if status & 1 == 0 || status & (1 << 5) != 0 {
             None
@@ -688,7 +940,7 @@ pub fn try_read_keyboard_scancode() -> Option<u8> {
 /// Returns a typed failure if a pinned resource cannot form a checked page
 /// range.
 #[cfg(target_os = "uefi")]
-pub fn input_device_ranges() -> Result<[Option<PhysicalRange>; 2], InputInterruptError> {
+pub fn input_device_ranges() -> Result<[Option<PhysicalRange>; 3], InputInterruptError> {
     architecture_input_device_ranges()
 }
 
@@ -711,7 +963,15 @@ pub fn initialize_input_interrupts(config: InputQueueConfig) -> Result<(), Input
         }
         *slot = Some(queue);
     }
-    architecture_initialize_input_interrupts(config)
+    let result = architecture_initialize_input_interrupts(config);
+    if result.is_err() {
+        // SAFETY: Architecture initialization failed with IRQ delivery still
+        // masked, so no producer can retain or access the provisional queue.
+        unsafe {
+            *INPUT_QUEUE.0.get() = None;
+        }
+    }
+    result
 }
 
 /// Block in the architecture idle instruction until one queued input event is
@@ -831,9 +1091,50 @@ pub(crate) fn handle_input_interrupt() {
     }
 }
 
+/// Configure a validated network route while leaving controller delivery masked.
 #[cfg(target_os = "uefi")]
-pub(crate) fn initialize_network_interrupt(line: u32) -> Result<(), InputInterruptError> {
-    architecture_initialize_network_interrupt(line)
+pub(crate) fn prepare_network_interrupt(
+    route: NetworkInterruptRoute,
+) -> Result<PreparedNetworkInterrupt, InputInterruptError> {
+    architecture_prepare_network_interrupt(&route)?;
+    Ok(PreparedNetworkInterrupt { route })
+}
+
+/// Unmask one prepared route after the transport has published ISR state.
+#[cfg(target_os = "uefi")]
+pub(crate) fn activate_network_interrupt(
+    prepared: PreparedNetworkInterrupt,
+) -> ActiveNetworkInterrupt {
+    architecture_activate_network_interrupt(&prepared.route);
+    NETWORK_INTERRUPT_PENDING.store(true, Ordering::Release);
+    ActiveNetworkInterrupt {
+        route: prepared.route,
+    }
+}
+
+/// Roll back a masked prepared route when transport publication cannot commit.
+#[cfg(target_os = "uefi")]
+pub(crate) fn cancel_prepared_network_interrupt(prepared: PreparedNetworkInterrupt) {
+    let PreparedNetworkInterrupt { route } = prepared;
+    architecture_cancel_prepared_network_interrupt(&route);
+}
+
+/// Mask an active route while retaining the CPU IRQ mask for state revocation.
+#[cfg(target_os = "uefi")]
+pub(crate) fn deactivate_network_interrupt(
+    active: ActiveNetworkInterrupt,
+) -> DeactivatedNetworkInterrupt {
+    let ActiveNetworkInterrupt { route } = active;
+    architecture_deactivate_network_interrupt(&route);
+    NETWORK_INTERRUPT_PENDING.store(false, Ordering::Release);
+    DeactivatedNetworkInterrupt { route }
+}
+
+/// Re-enable CPU IRQ delivery after transport ISR state has been unpublished.
+#[cfg(target_os = "uefi")]
+pub(crate) fn finish_network_interrupt_deactivation(deactivated: DeactivatedNetworkInterrupt) {
+    let DeactivatedNetworkInterrupt { route: _route } = deactivated;
+    architecture_enable_input_interrupts();
 }
 
 /// Dispatch an interrupt taken during unprivileged application execution.
@@ -921,56 +1222,45 @@ fn resource_page_range(resource: MmioResource) -> Result<PhysicalRange, InputInt
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
-pub(crate) const X86_KEYBOARD_VECTOR: u8 = 0x31;
-#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
-pub(crate) const X86_SERIAL_VECTOR: u8 = 0x34;
-#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
-pub(crate) const X86_NETWORK_VECTOR: u8 = 0x35;
-#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
-pub(crate) const X86_TIMER_VECTOR: u8 = 0x30;
-#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
-pub(crate) const X86_SPURIOUS_VECTOR: u8 = 0xff;
-
-#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
-struct X86InputProfile {
-    lapic: MmioResource,
-    ioapic: MmioResource,
-    keyboard_ports: IoPortResource,
-    serial_ports: IoPortResource,
-    pit_ports: IoPortResource,
-    system_control_port: IoPortResource,
-    keyboard_interrupt: InterruptResource,
-    serial_interrupt: InterruptResource,
+fn x86_mmio(role: troe_platform::MmioRole) -> Result<MmioResource, InputInterruptError> {
+    let resource = crate::selected_platform()
+        .map_err(|_| InputInterruptError::InvalidResource)?
+        .mmio(role)
+        .ok_or(InputInterruptError::InvalidResource)?;
+    MmioResource::new(resource.base(), resource.byte_len())
+        .map_err(|_| InputInterruptError::InvalidResource)
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
-fn x86_input_profile() -> Result<X86InputProfile, InputInterruptError> {
-    Ok(X86InputProfile {
-        lapic: MmioResource::new(0xfee0_0000, 0x1000)
-            .map_err(|_| InputInterruptError::InvalidResource)?,
-        ioapic: MmioResource::new(0xfec0_0000, 0x1000)
-            .map_err(|_| InputInterruptError::InvalidResource)?,
-        keyboard_ports: IoPortResource::new(0x0060, 5)
-            .map_err(|_| InputInterruptError::InvalidResource)?,
-        serial_ports: IoPortResource::new(0x03f8, 8)
-            .map_err(|_| InputInterruptError::InvalidResource)?,
-        pit_ports: IoPortResource::new(0x0040, 4)
-            .map_err(|_| InputInterruptError::InvalidResource)?,
-        system_control_port: IoPortResource::new(0x0061, 1)
-            .map_err(|_| InputInterruptError::InvalidResource)?,
-        keyboard_interrupt: InterruptResource::new(1, X86_KEYBOARD_VECTOR)
-            .map_err(|_| InputInterruptError::InvalidResource)?,
-        serial_interrupt: InterruptResource::new(4, X86_SERIAL_VECTOR)
-            .map_err(|_| InputInterruptError::InvalidResource)?,
-    })
+fn x86_ports(role: troe_platform::IoPortRole) -> Result<IoPortResource, InputInterruptError> {
+    let resource = crate::selected_platform()
+        .map_err(|_| InputInterruptError::InvalidResource)?
+        .io_ports(role)
+        .ok_or(InputInterruptError::InvalidResource)?;
+    IoPortResource::new(resource.base(), resource.count())
+        .map_err(|_| InputInterruptError::InvalidResource)
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn platform_interrupt(
+    role: troe_platform::InterruptRole,
+) -> Result<InterruptResource, InputInterruptError> {
+    let route = crate::selected_platform()
+        .map_err(|_| InputInterruptError::InvalidResource)?
+        .interrupt(role)
+        .ok_or(InputInterruptError::InvalidResource)?;
+    InterruptResource::new(route.line(), route.vector())
+        .map_err(|_| InputInterruptError::InvalidResource)
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
-fn architecture_input_device_ranges() -> Result<[Option<PhysicalRange>; 2], InputInterruptError> {
-    let profile = x86_input_profile()?;
+fn architecture_input_device_ranges() -> Result<[Option<PhysicalRange>; 3], InputInterruptError> {
+    let lapic = x86_mmio(troe_platform::MmioRole::LocalApic)?;
+    let ioapic = x86_mmio(troe_platform::MmioRole::IoApic)?;
     Ok([
-        Some(resource_page_range(profile.lapic)?),
-        Some(resource_page_range(profile.ioapic)?),
+        Some(resource_page_range(lapic)?),
+        Some(resource_page_range(ioapic)?),
+        None,
     ])
 }
 
@@ -981,40 +1271,68 @@ fn architecture_initialize_input_interrupts(
     const LAPIC_ID: usize = 0x020;
     const LAPIC_SPURIOUS: usize = 0x0f0;
     const LAPIC_SOFTWARE_ENABLE: u32 = 1 << 8;
-    let profile = x86_input_profile()?;
+    let platform = crate::selected_platform().map_err(|_| InputInterruptError::InvalidResource)?;
+    let lapic = x86_mmio(troe_platform::MmioRole::LocalApic)?;
+    let ioapic = x86_mmio(troe_platform::MmioRole::IoApic)?;
+    let keyboard_route = platform
+        .interrupt(troe_platform::InterruptRole::Keyboard)
+        .ok_or(InputInterruptError::InvalidResource)?;
+    let serial_route = platform
+        .interrupt(troe_platform::InterruptRole::Serial)
+        .ok_or(InputInterruptError::InvalidResource)?;
+    let keyboard_interrupt = InterruptResource::new(keyboard_route.line(), keyboard_route.vector())
+        .map_err(|_| InputInterruptError::InvalidResource)?;
+    let serial_interrupt = InterruptResource::new(serial_route.line(), serial_route.vector())
+        .map_err(|_| InputInterruptError::InvalidResource)?;
+    let serial_ports = x86_ports(troe_platform::IoPortRole::Serial)?;
+    let primary_pic = x86_ports(troe_platform::IoPortRole::PicPrimary)?;
+    let secondary_pic = x86_ports(troe_platform::IoPortRole::PicSecondary)?;
+    let (_, spurious_vector) =
+        x86_timer_vectors(platform.timer()).ok_or(InputInterruptError::InvalidResource)?;
 
-    // SAFETY: The pinned q35 profile assigns the legacy PIC mask registers;
-    // masking both controllers prevents firmware-era PIC delivery.
-    unsafe {
-        port_write(0x21, 0xff);
-        port_write(0xa1, 0xff);
-    }
-
-    let ioapic_version = x86_ioapic_read(profile.ioapic, 1);
+    let ioapic_version = x86_ioapic_read(ioapic, 1);
     let maximum_entry = (ioapic_version >> 16) & 0xff;
-    if profile.keyboard_interrupt.line() > maximum_entry
-        || profile.serial_interrupt.line() > maximum_entry
-    {
+    if keyboard_interrupt.line() > maximum_entry || serial_interrupt.line() > maximum_entry {
         return Err(InputInterruptError::InterruptLineUnavailable);
     }
-    for line in 0..=maximum_entry {
-        x86_ioapic_write(profile.ioapic, 0x10 + line * 2, 1 << 16);
-        x86_ioapic_write(profile.ioapic, 0x11 + line * 2, 0);
+    let lapic_base =
+        usize::try_from(lapic.base_address()).map_err(|_| InputInterruptError::InvalidResource)?;
+
+    // SAFETY: The validated descriptor assigns both legacy PIC mask registers;
+    // masking both controllers prevents firmware-era PIC delivery.
+    unsafe {
+        port_write(primary_pic.base_port() + 1, 0xff);
+        port_write(secondary_pic.base_port() + 1, 0xff);
     }
 
-    let lapic_base = usize::try_from(profile.lapic.base_address())
-        .map_err(|_| InputInterruptError::InvalidResource)?;
+    for line in 0..=maximum_entry {
+        x86_ioapic_write(ioapic, 0x10 + line * 2, 1 << 16);
+        x86_ioapic_write(ioapic, 0x11 + line * 2, 0);
+    }
+
     // SAFETY: The LAPIC page is mapped RW/NX as device memory before this call.
     let apic_id = unsafe { mmio_read32(lapic_base + LAPIC_ID) } >> 24;
     // SAFETY: The spurious-vector register belongs to the owned BSP LAPIC.
     unsafe {
         mmio_write32(
             lapic_base + LAPIC_SPURIOUS,
-            LAPIC_SOFTWARE_ENABLE | u32::from(X86_SPURIOUS_VECTOR),
+            LAPIC_SOFTWARE_ENABLE | u32::from(spurious_vector),
         );
     }
-    x86_route_ioapic(profile.ioapic, profile.keyboard_interrupt, apic_id);
-    x86_route_ioapic(profile.ioapic, profile.serial_interrupt, apic_id);
+    x86_route_ioapic(
+        ioapic,
+        keyboard_interrupt,
+        keyboard_route.trigger(),
+        keyboard_route.polarity(),
+        apic_id,
+    );
+    x86_route_ioapic(
+        ioapic,
+        serial_interrupt,
+        serial_route.trigger(),
+        serial_route.polarity(),
+        apic_id,
+    );
 
     // Retain bytes already present before enabling receive notification.
     // SAFETY: Initialization still runs with CPU interrupts masked.
@@ -1023,7 +1341,7 @@ fn architecture_initialize_input_interrupts(
     }
     // SAFETY: COM1's interrupt-enable register is owned by the pinned profile.
     unsafe {
-        let serial_base = profile.serial_ports.base_port();
+        let serial_base = serial_ports.base_port();
         port_write(serial_base + 1, 1);
     }
     architecture_enable_input_interrupts();
@@ -1036,11 +1354,11 @@ fn architecture_handle_input_interrupt(queue: &mut BoundedInputQueue) -> bool {
     if x86_drain_input_devices(queue) {
         queue.record_interrupt();
     }
-    if crate::virtio_pci::acknowledge_network_interrupt_from_isr() {
+    if crate::acknowledge_network_interrupt_from_isr() {
         NETWORK_INTERRUPT_PENDING.store(true, Ordering::Release);
     }
-    if let Ok(profile) = x86_input_profile()
-        && let Ok(lapic_base) = usize::try_from(profile.lapic.base_address())
+    if let Ok(lapic) = x86_mmio(troe_platform::MmioRole::LocalApic)
+        && let Ok(lapic_base) = usize::try_from(lapic.base_address())
     {
         // SAFETY: Every routed input interrupt requires one LAPIC EOI write.
         unsafe { mmio_write32(lapic_base + LAPIC_EOI, 0) };
@@ -1050,6 +1368,7 @@ fn architecture_handle_input_interrupt(queue: &mut BoundedInputQueue) -> bool {
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 fn architecture_monotonic_millis() -> Option<u64> {
+    x86_timer_vectors(crate::selected_platform().ok()?.timer())?;
     let cached = X86_TSC_TICKS_PER_MILLISECOND.load(Ordering::Relaxed);
     let ticks_per_millisecond = if cached == 0 {
         let detected = x86_cpuid_tsc_frequency()
@@ -1065,19 +1384,25 @@ fn architecture_monotonic_millis() -> Option<u64> {
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 fn architecture_initialize_monotonic_clock() -> bool {
-    if let Some(ticks) = x86_cpuid_tsc_frequency()
-        .and_then(|frequency| frequency.checked_div(1_000))
-        .filter(|ticks| *ticks != 0)
-    {
-        X86_TSC_TICKS_PER_MILLISECOND.store(ticks, Ordering::Relaxed);
-        return true;
-    }
-    let start = x86_read_tsc();
-    uefi::boot::stall(core::time::Duration::from_millis(10));
-    let Some(ticks_per_millisecond) = x86_read_tsc()
-        .checked_sub(start)
-        .and_then(|ticks| ticks.checked_div(10))
-    else {
+    let Ok(platform) = crate::selected_platform() else {
+        return false;
+    };
+    let ticks_per_millisecond = match platform.timer() {
+        troe_platform::TimerKind::X86PitTsc { .. } => x86_cpuid_tsc_frequency()
+            .and_then(|frequency| frequency.checked_div(1_000))
+            .filter(|ticks| *ticks != 0)
+            .or_else(x86_calibrate_tsc_with_firmware_stall),
+        troe_platform::TimerKind::X86AcpiPmTsc {
+            pm_timer_port,
+            counter_bits,
+            ..
+        } => x86_ports(troe_platform::IoPortRole::AcpiPmTimer)
+            .ok()
+            .filter(|resource| resource.base_port() == pm_timer_port && resource.port_count() >= 4)
+            .and_then(|resource| x86_calibrate_tsc_with_pm_timer(resource, counter_bits)),
+        troe_platform::TimerKind::Aarch64Generic => None,
+    };
+    let Some(ticks_per_millisecond) = ticks_per_millisecond else {
         return false;
     };
     if ticks_per_millisecond == 0 {
@@ -1085,6 +1410,32 @@ fn architecture_initialize_monotonic_clock() -> bool {
     }
     X86_TSC_TICKS_PER_MILLISECOND.store(ticks_per_millisecond, Ordering::Relaxed);
     true
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn x86_timer_vectors(timer: troe_platform::TimerKind) -> Option<(u8, u8)> {
+    match timer {
+        troe_platform::TimerKind::X86PitTsc {
+            timer_vector,
+            spurious_vector,
+        }
+        | troe_platform::TimerKind::X86AcpiPmTsc {
+            timer_vector,
+            spurious_vector,
+            ..
+        } => Some((timer_vector, spurious_vector)),
+        troe_platform::TimerKind::Aarch64Generic => None,
+    }
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn x86_calibrate_tsc_with_firmware_stall() -> Option<u64> {
+    let start = x86_read_tsc();
+    uefi::boot::stall(core::time::Duration::from_millis(10));
+    x86_read_tsc()
+        .checked_sub(start)?
+        .checked_div(10)
+        .filter(|ticks| *ticks != 0)
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
@@ -1125,39 +1476,163 @@ fn x86_read_tsc() -> u64 {
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+const X86_PM_TIMER_HZ: u64 = 3_579_545;
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+const X86_TIMER_CALIBRATION_TICKS: u32 = 35_795;
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+const X86_TIMER_CALIBRATION_SPINS: usize = 10_000_000;
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn x86_pm_timer_sample(resource: IoPortResource, counter_bits: u8) -> Option<u32> {
+    if resource.port_count() < 4 || !matches!(counter_bits, 24 | 32) {
+        return None;
+    }
+    let value: u32;
+    // SAFETY: The descriptor-owned ACPI PM timer is a read-only naturally
+    // aligned 32-bit I/O register. Counter width is masked after the read.
+    unsafe {
+        core::arch::asm!(
+            "in eax, dx",
+            in("dx") resource.base_port(),
+            out("eax") value,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    Some(value & x86_pm_timer_mask(counter_bits)?)
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+const fn x86_pm_timer_mask(counter_bits: u8) -> Option<u32> {
+    match counter_bits {
+        24 => Some(0x00ff_ffff),
+        32 => Some(u32::MAX),
+        _ => None,
+    }
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn x86_pm_timer_elapsed(start: u32, current: u32, counter_bits: u8) -> Option<u32> {
+    Some(current.wrapping_sub(start) & x86_pm_timer_mask(counter_bits)?)
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn x86_calibrate_tsc_with_pm_timer(resource: IoPortResource, counter_bits: u8) -> Option<u64> {
+    let timer_start = x86_pm_timer_sample(resource, counter_bits)?;
+    let tsc_start = x86_read_tsc();
+    for _ in 0..X86_TIMER_CALIBRATION_SPINS {
+        let current = x86_pm_timer_sample(resource, counter_bits)?;
+        let elapsed = x86_pm_timer_elapsed(timer_start, current, counter_bits)?;
+        if elapsed >= X86_TIMER_CALIBRATION_TICKS {
+            return x86_read_tsc()
+                .checked_sub(tsc_start)?
+                .checked_mul(X86_PM_TIMER_HZ)?
+                .checked_div(u64::from(elapsed))?
+                .checked_div(1_000)
+                .filter(|ticks| *ticks != 0);
+        }
+        spin_loop();
+    }
+    None
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 fn architecture_arm_execution_timer(milliseconds: u32) -> Result<(), ExecutionTimerError> {
     const LAPIC_LVT_TIMER: usize = 0x320;
     const LAPIC_INITIAL_COUNT: usize = 0x380;
-    const LAPIC_CURRENT_COUNT: usize = 0x390;
+    let platform =
+        crate::selected_platform().map_err(|_| ExecutionTimerError::InterruptUnavailable)?;
+    let lapic_resource = x86_mmio(troe_platform::MmioRole::LocalApic)
+        .map_err(|_| ExecutionTimerError::InterruptUnavailable)?;
+    let lapic = usize::try_from(lapic_resource.base_address())
+        .map_err(|_| ExecutionTimerError::InterruptUnavailable)?;
+    let (timer_vector, ticks_per_millisecond) = match platform.timer() {
+        troe_platform::TimerKind::X86PitTsc { timer_vector, .. } => {
+            (timer_vector, x86_calibrate_lapic_with_pit(lapic)?)
+        }
+        troe_platform::TimerKind::X86AcpiPmTsc {
+            timer_vector,
+            pm_timer_port,
+            counter_bits,
+            ..
+        } => {
+            let timer = x86_ports(troe_platform::IoPortRole::AcpiPmTimer)
+                .map_err(|_| ExecutionTimerError::InterruptUnavailable)?;
+            if timer.base_port() != pm_timer_port || timer.port_count() < 4 {
+                return Err(ExecutionTimerError::InterruptUnavailable);
+            }
+            (
+                timer_vector,
+                x86_calibrate_lapic_with_pm_timer(lapic, timer, counter_bits)?,
+            )
+        }
+        troe_platform::TimerKind::Aarch64Generic => {
+            return Err(ExecutionTimerError::InterruptUnavailable);
+        }
+    };
+    let lease_ticks = ticks_per_millisecond
+        .checked_mul(u64::from(milliseconds))
+        .and_then(|ticks| u32::try_from(ticks).ok())
+        .filter(|ticks| *ticks != 0)
+        .ok_or(ExecutionTimerError::InvalidFrequency)?;
+    // SAFETY: The vector is installed, divide state is fixed, and the checked
+    // nonzero initial count selects one-shot mode by leaving mode bits clear.
+    unsafe {
+        mmio_write32(lapic + LAPIC_LVT_TIMER, u32::from(timer_vector));
+        mmio_write32(lapic + LAPIC_INITIAL_COUNT, lease_ticks);
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn x86_prepare_lapic_calibration(lapic: usize) {
+    const LAPIC_LVT_TIMER: usize = 0x320;
+    const LAPIC_INITIAL_COUNT: usize = 0x380;
     const LAPIC_DIVIDE_CONFIG: usize = 0x3e0;
     const LAPIC_MASKED: u32 = 1 << 16;
     const LAPIC_DIVIDE_BY_ONE: u32 = 0b1011;
+    // SAFETY: The validated LAPIC page is mapped as owned device memory. The
+    // timer remains masked while its divide state and maximum count are set.
+    unsafe {
+        mmio_write32(lapic + LAPIC_LVT_TIMER, LAPIC_MASKED);
+        mmio_write32(lapic + LAPIC_DIVIDE_CONFIG, LAPIC_DIVIDE_BY_ONE);
+        mmio_write32(lapic + LAPIC_INITIAL_COUNT, u32::MAX);
+    }
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn x86_lapic_elapsed(lapic: usize) -> u64 {
+    const LAPIC_CURRENT_COUNT: usize = 0x390;
+    // SAFETY: Reading the owned LAPIC current-count register has no side effect.
+    u64::from(u32::MAX - unsafe { mmio_read32(lapic + LAPIC_CURRENT_COUNT) })
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn x86_calibrate_lapic_with_pit(lapic: usize) -> Result<u64, ExecutionTimerError> {
     const PIT_CHANNEL_2_COMMAND: u8 = 0xb0;
     const PIT_TEN_MILLISECONDS: u16 = 11_932;
     const PIT_GATE_2: u8 = 1;
     const PIT_OUT_2: u8 = 1 << 5;
-    const CALIBRATION_SPIN_LIMIT: usize = 10_000_000;
-    let profile = x86_input_profile().map_err(|_| ExecutionTimerError::InterruptUnavailable)?;
-    let lapic = usize::try_from(profile.lapic.base_address())
+    let pit = x86_ports(troe_platform::IoPortRole::Pit)
         .map_err(|_| ExecutionTimerError::InterruptUnavailable)?;
-    let pit_channel = profile.pit_ports.base_port() + 2;
-    let pit_command = profile.pit_ports.base_port() + 3;
-    let system_control = profile.system_control_port.base_port();
-    // SAFETY: The typed PIT and system-control resources are owned by the
-    // pinned q35 profile. Channel 2 is gated low while its one-shot is loaded.
+    let system_control_resource = x86_ports(troe_platform::IoPortRole::SystemControl)
+        .map_err(|_| ExecutionTimerError::InterruptUnavailable)?;
+    let pit_channel = pit.base_port() + 2;
+    let pit_command = pit.base_port() + 3;
+    let system_control = system_control_resource.base_port();
+    // SAFETY: These descriptor-owned resources exist only in pinned q35.
     let original_control = unsafe { port_read(system_control) };
+    // SAFETY: Channel 2 is gated low while its one-shot is loaded.
     unsafe {
         port_write(system_control, original_control & !PIT_GATE_2);
         port_write(pit_command, PIT_CHANNEL_2_COMMAND);
         port_write(pit_channel, PIT_TEN_MILLISECONDS.to_le_bytes()[0]);
         port_write(pit_channel, PIT_TEN_MILLISECONDS.to_le_bytes()[1]);
-        mmio_write32(lapic + LAPIC_LVT_TIMER, LAPIC_MASKED);
-        mmio_write32(lapic + LAPIC_DIVIDE_CONFIG, LAPIC_DIVIDE_BY_ONE);
-        mmio_write32(lapic + LAPIC_INITIAL_COUNT, u32::MAX);
-        port_write(system_control, (original_control & !0b10) | PIT_GATE_2);
     }
+    x86_prepare_lapic_calibration(lapic);
+    // SAFETY: Raising the validated channel-2 gate begins the one-shot.
+    unsafe { port_write(system_control, (original_control & !0b10) | PIT_GATE_2) };
     let mut completed = false;
-    for _ in 0..CALIBRATION_SPIN_LIMIT {
+    for _ in 0..X86_TIMER_CALIBRATION_SPINS {
         // SAFETY: Polling the owned read-only channel-2 output latch.
         if unsafe { port_read(system_control) } & PIT_OUT_2 != 0 {
             completed = true;
@@ -1171,22 +1646,43 @@ fn architecture_arm_execution_timer(milliseconds: u32) -> Result<(), ExecutionTi
         architecture_disarm_execution_timer();
         return Err(ExecutionTimerError::Unsupported);
     }
-    // SAFETY: Reading the owned LAPIC current-count register has no side effect.
-    let current = unsafe { mmio_read32(lapic + LAPIC_CURRENT_COUNT) };
-    let elapsed = u64::from(u32::MAX - current);
-    let lease_ticks = elapsed
-        .checked_mul(u64::from(milliseconds))
-        .and_then(|ticks| ticks.checked_div(10))
-        .and_then(|ticks| u32::try_from(ticks).ok())
+    x86_lapic_elapsed(lapic)
+        .checked_div(10)
         .filter(|ticks| *ticks != 0)
-        .ok_or(ExecutionTimerError::InvalidFrequency)?;
-    // SAFETY: The vector is installed, divide state is fixed, and the checked
-    // nonzero initial count selects one-shot mode by leaving mode bits clear.
-    unsafe {
-        mmio_write32(lapic + LAPIC_LVT_TIMER, u32::from(X86_TIMER_VECTOR));
-        mmio_write32(lapic + LAPIC_INITIAL_COUNT, lease_ticks);
+        .ok_or(ExecutionTimerError::InvalidFrequency)
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn x86_calibrate_lapic_with_pm_timer(
+    lapic: usize,
+    timer: IoPortResource,
+    counter_bits: u8,
+) -> Result<u64, ExecutionTimerError> {
+    x86_prepare_lapic_calibration(lapic);
+    let result = (|| {
+        let start = x86_pm_timer_sample(timer, counter_bits)
+            .ok_or(ExecutionTimerError::InvalidFrequency)?;
+        for _ in 0..X86_TIMER_CALIBRATION_SPINS {
+            let current = x86_pm_timer_sample(timer, counter_bits)
+                .ok_or(ExecutionTimerError::InvalidFrequency)?;
+            let elapsed = x86_pm_timer_elapsed(start, current, counter_bits)
+                .ok_or(ExecutionTimerError::InvalidFrequency)?;
+            if elapsed >= X86_TIMER_CALIBRATION_TICKS {
+                return x86_lapic_elapsed(lapic)
+                    .checked_mul(X86_PM_TIMER_HZ)
+                    .and_then(|ticks| ticks.checked_div(u64::from(elapsed)))
+                    .and_then(|ticks| ticks.checked_div(1_000))
+                    .filter(|ticks| *ticks != 0)
+                    .ok_or(ExecutionTimerError::InvalidFrequency);
+            }
+            spin_loop();
+        }
+        Err(ExecutionTimerError::Unsupported)
+    })();
+    if result.is_err() {
+        architecture_disarm_execution_timer();
     }
-    Ok(())
+    result
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
@@ -1194,8 +1690,8 @@ fn architecture_disarm_execution_timer() {
     const LAPIC_LVT_TIMER: usize = 0x320;
     const LAPIC_INITIAL_COUNT: usize = 0x380;
     const LAPIC_MASKED: u32 = 1 << 16;
-    if let Ok(profile) = x86_input_profile()
-        && let Ok(lapic) = usize::try_from(profile.lapic.base_address())
+    if let Ok(resource) = x86_mmio(troe_platform::MmioRole::LocalApic)
+        && let Ok(lapic) = usize::try_from(resource.base_address())
     {
         // SAFETY: The kernel owns the LAPIC timer registers.
         unsafe {
@@ -1208,8 +1704,8 @@ fn architecture_disarm_execution_timer() {
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 fn architecture_acknowledge_execution_timer_interrupt() {
     const LAPIC_EOI: usize = 0x0b0;
-    if let Ok(profile) = x86_input_profile()
-        && let Ok(lapic) = usize::try_from(profile.lapic.base_address())
+    if let Ok(resource) = x86_mmio(troe_platform::MmioRole::LocalApic)
+        && let Ok(lapic) = usize::try_from(resource.base_address())
     {
         // SAFETY: The active LAPIC timer interrupt requires one EOI write.
         unsafe { mmio_write32(lapic + LAPIC_EOI, 0) };
@@ -1237,44 +1733,127 @@ fn x86_drain_input_devices(queue: &mut BoundedInputQueue) -> bool {
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
-fn x86_route_ioapic(ioapic: MmioResource, interrupt: InterruptResource, apic_id: u32) {
+fn x86_route_ioapic(
+    ioapic: MmioResource,
+    interrupt: InterruptResource,
+    trigger: troe_platform::TriggerMode,
+    polarity: troe_platform::Polarity,
+    apic_id: u32,
+) {
     let register = 0x10 + interrupt.line() * 2;
     x86_ioapic_write(ioapic, register, 1 << 16);
     x86_ioapic_write(ioapic, register + 1, apic_id << 24);
-    x86_ioapic_write(ioapic, register, u32::from(interrupt.vector()));
+    x86_ioapic_write(
+        ioapic,
+        register,
+        u32::from(interrupt.vector()) | x86_ioapic_mode_bits(trigger, polarity),
+    );
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
-fn architecture_initialize_network_interrupt(line: u32) -> Result<(), InputInterruptError> {
+fn architecture_prepare_network_interrupt(
+    route: &NetworkInterruptRoute,
+) -> Result<(), InputInterruptError> {
     const LAPIC_ID: usize = 0x020;
-    const IOAPIC_ACTIVE_LOW: u32 = 1 << 13;
-    const IOAPIC_LEVEL_TRIGGERED: u32 = 1 << 15;
-    let profile = x86_input_profile()?;
+    const IOAPIC_MASKED: u32 = 1 << 16;
+    let NetworkInterruptSource::PciIntx { pin } = route.source() else {
+        return Err(InputInterruptError::InvalidResource);
+    };
+    if !(1..=4).contains(pin) {
+        return Err(InputInterruptError::InvalidResource);
+    }
+    let interrupt = route.interrupt();
+    let lapic = x86_mmio(troe_platform::MmioRole::LocalApic)?;
+    let ioapic = x86_mmio(troe_platform::MmioRole::IoApic)?;
+    let electrical = x86_ioapic_electrical_bits(route)?;
     architecture_mask_input_interrupts();
     let result = (|| {
-        let maximum_entry = (x86_ioapic_read(profile.ioapic, 1) >> 16) & 0xff;
-        if line > maximum_entry {
+        let maximum_entry = (x86_ioapic_read(ioapic, 1) >> 16) & 0xff;
+        if interrupt.line() > maximum_entry {
             return Err(InputInterruptError::InterruptLineUnavailable);
         }
-        let lapic_base = usize::try_from(profile.lapic.base_address())
+        let lapic_base = usize::try_from(lapic.base_address())
             .map_err(|_| InputInterruptError::InvalidResource)?;
         // SAFETY: The mapped LAPIC ID register belongs to the boot CPU.
         let apic_id = unsafe { mmio_read32(lapic_base + LAPIC_ID) } >> 24;
-        let register = 0x10 + line * 2;
-        x86_ioapic_write(profile.ioapic, register, 1 << 16);
-        x86_ioapic_write(profile.ioapic, register + 1, apic_id << 24);
+        let register = 0x10 + interrupt.line() * 2;
+        x86_ioapic_write(ioapic, register, 1 << 16);
+        x86_ioapic_write(ioapic, register + 1, apic_id << 24);
         x86_ioapic_write(
-            profile.ioapic,
+            ioapic,
             register,
-            u32::from(X86_NETWORK_VECTOR) | IOAPIC_ACTIVE_LOW | IOAPIC_LEVEL_TRIGGERED,
+            u32::from(interrupt.vector()) | electrical | IOAPIC_MASKED,
         );
         Ok(())
     })();
-    if result.is_ok() {
-        NETWORK_INTERRUPT_PENDING.store(true, Ordering::Release);
-    }
     architecture_enable_input_interrupts();
     result
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn architecture_activate_network_interrupt(route: &NetworkInterruptRoute) {
+    let Ok(ioapic) = x86_mmio(troe_platform::MmioRole::IoApic) else {
+        park();
+    };
+    let Ok(electrical) = x86_ioapic_electrical_bits(route) else {
+        park();
+    };
+    let interrupt = route.interrupt();
+    architecture_mask_input_interrupts();
+    x86_ioapic_write(
+        ioapic,
+        0x10 + interrupt.line() * 2,
+        u32::from(interrupt.vector()) | electrical,
+    );
+    architecture_enable_input_interrupts();
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn architecture_deactivate_network_interrupt(route: &NetworkInterruptRoute) {
+    const IOAPIC_MASKED: u32 = 1 << 16;
+    let Ok(ioapic) = x86_mmio(troe_platform::MmioRole::IoApic) else {
+        park();
+    };
+    let Ok(electrical) = x86_ioapic_electrical_bits(route) else {
+        park();
+    };
+    let interrupt = route.interrupt();
+    architecture_mask_input_interrupts();
+    x86_ioapic_write(
+        ioapic,
+        0x10 + interrupt.line() * 2,
+        u32::from(interrupt.vector()) | electrical | IOAPIC_MASKED,
+    );
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn architecture_cancel_prepared_network_interrupt(route: &NetworkInterruptRoute) {
+    architecture_deactivate_network_interrupt(route);
+    architecture_enable_input_interrupts();
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn x86_ioapic_electrical_bits(route: &NetworkInterruptRoute) -> Result<u32, InputInterruptError> {
+    if route.priority() != 0 {
+        return Err(InputInterruptError::InvalidResource);
+    }
+    Ok(x86_ioapic_mode_bits(route.trigger(), route.polarity()))
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn x86_ioapic_mode_bits(
+    trigger: troe_platform::TriggerMode,
+    polarity: troe_platform::Polarity,
+) -> u32 {
+    let trigger = match trigger {
+        troe_platform::TriggerMode::Edge => 0,
+        troe_platform::TriggerMode::Level => 1 << 15,
+    };
+    let polarity = match polarity {
+        troe_platform::Polarity::ActiveHigh => 0,
+        troe_platform::Polarity::ActiveLow => 1 << 13,
+    };
+    trigger | polarity
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
@@ -1323,29 +1902,40 @@ fn architecture_wait_for_input_interrupt() {
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
-const SERIAL_PORT: u16 = 0x03f8;
-
-#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 fn architecture_initialize_console() {
-    // SAFETY: The pinned q35 profile exposes the standard COM1 register block.
+    let Ok(platform) = crate::selected_platform() else {
+        return;
+    };
+    if platform.console() != troe_platform::ConsoleKind::Uart16550 {
+        return;
+    }
+    let Ok(serial) = x86_ports(troe_platform::IoPortRole::Serial) else {
+        return;
+    };
+    let base = serial.base_port();
+    // SAFETY: The validated descriptor exposes an eight-register 16550 block.
     unsafe {
-        port_write(SERIAL_PORT + 1, 0x00);
-        port_write(SERIAL_PORT + 3, 0x80);
-        port_write(SERIAL_PORT, 0x01);
-        port_write(SERIAL_PORT + 1, 0x00);
-        port_write(SERIAL_PORT + 3, 0x03);
-        port_write(SERIAL_PORT + 2, 0xc7);
-        port_write(SERIAL_PORT + 4, 0x0b);
+        port_write(base + 1, 0x00);
+        port_write(base + 3, 0x80);
+        port_write(base, 0x01);
+        port_write(base + 1, 0x00);
+        port_write(base + 3, 0x03);
+        port_write(base + 2, 0xc7);
+        port_write(base + 4, 0x0b);
     }
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 fn write_byte(byte: u8) -> bool {
+    let Ok(serial) = x86_ports(troe_platform::IoPortRole::Serial) else {
+        return false;
+    };
+    let base = serial.base_port();
     for _ in 0..UART_SPIN_LIMIT {
-        // SAFETY: The pinned q35 profile assigns COM1 at this legacy I/O range.
-        if unsafe { port_read(SERIAL_PORT + 5) } & 0x20 != 0 {
+        // SAFETY: The validated descriptor owns the 16550 status register.
+        if unsafe { port_read(base + 5) } & 0x20 != 0 {
             // SAFETY: The transmitter is ready and COM1 is exclusively owned.
-            unsafe { port_write(SERIAL_PORT, byte) };
+            unsafe { port_write(base, byte) };
             return true;
         }
         spin_loop();
@@ -1355,12 +1945,14 @@ fn write_byte(byte: u8) -> bool {
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 fn architecture_try_read_byte() -> Option<u8> {
-    // SAFETY: The pinned q35 profile assigns COM1 at this legacy I/O range.
-    if unsafe { port_read(SERIAL_PORT + 5) } & 1 == 0 {
+    let serial = x86_ports(troe_platform::IoPortRole::Serial).ok()?;
+    let base = serial.base_port();
+    // SAFETY: The validated descriptor owns the 16550 status register.
+    if unsafe { port_read(base + 5) } & 1 == 0 {
         None
     } else {
         // SAFETY: The receiver reports one available byte.
-        Some(unsafe { port_read(SERIAL_PORT) })
+        Some(unsafe { port_read(base) })
     }
 }
 
@@ -1373,15 +1965,26 @@ fn architecture_park() {
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 fn architecture_poweroff() {
-    const Q35_PM1_CONTROL_PORT: u16 = 0x0604;
     const ACPI_SLEEP_ENABLE: u16 = 1 << 13;
-    // SAFETY: The pinned q35 profile assigns the ICH9 PM1 control register at
-    // this 16-bit port. S5 uses sleep type zero in the QEMU q35 ACPI profile.
+    let Ok(platform) = crate::selected_platform() else {
+        return;
+    };
+    let troe_platform::PowerKind::Q35 {
+        pm_control_port,
+        sleep_type,
+        ..
+    } = platform.power()
+    else {
+        return;
+    };
+    let value = (u16::from(sleep_type) << 10) | ACPI_SLEEP_ENABLE;
+    // SAFETY: Descriptor validation proves the PM1 port belongs to its owned
+    // range and supplies the selected platform's S5 sleep type.
     unsafe {
         core::arch::asm!(
             "out dx, ax",
-            in("dx") Q35_PM1_CONTROL_PORT,
-            in("ax") ACPI_SLEEP_ENABLE,
+            in("dx") pm_control_port,
+            in("ax") value,
             options(nomem, nostack, preserves_flags)
         );
     }
@@ -1389,11 +1992,23 @@ fn architecture_poweroff() {
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 fn architecture_reboot() {
-    const Q35_RESET_CONTROL_PORT: u16 = 0x0cf9;
     const Q35_RESET_SYSTEM: u8 = 0x06;
-    // SAFETY: The pinned q35 profile assigns the reset-control port; requesting
+    let Ok(platform) = crate::selected_platform() else {
+        return;
+    };
+    let (reset_control_port, reset_value) = match platform.power() {
+        troe_platform::PowerKind::Q35 {
+            reset_control_port, ..
+        } => (reset_control_port, Q35_RESET_SYSTEM),
+        troe_platform::PowerKind::X86Reset {
+            reset_control_port,
+            reset_value,
+        } => (reset_control_port, reset_value),
+        troe_platform::PowerKind::PsciHvc => return,
+    };
+    // SAFETY: The validated descriptor assigns the reset-control port; requesting
     // a full system reset is terminal and the caller parks if it returns.
-    unsafe { port_write(Q35_RESET_CONTROL_PORT, Q35_RESET_SYSTEM) };
+    unsafe { port_write(reset_control_port, reset_value) };
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
@@ -1502,30 +2117,41 @@ unsafe fn mmio_write32(address: usize, value: u32) {
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
-struct Aarch64InputProfile {
-    gic: MmioResource,
-    serial_interrupt: InterruptResource,
+fn aarch64_mmio(role: troe_platform::MmioRole) -> Result<MmioResource, InputInterruptError> {
+    let resource = crate::selected_platform()
+        .map_err(|_| InputInterruptError::InvalidResource)?
+        .mmio(role)
+        .ok_or(InputInterruptError::InvalidResource)?;
+    MmioResource::new(resource.base(), resource.byte_len())
+        .map_err(|_| InputInterruptError::InvalidResource)
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
-fn aarch64_input_profile() -> Result<Aarch64InputProfile, InputInterruptError> {
-    Ok(Aarch64InputProfile {
-        gic: MmioResource::new(0x0800_0000, 0x0002_0000)
-            .map_err(|_| InputInterruptError::InvalidResource)?,
-        serial_interrupt: InterruptResource::new(33, 32)
-            .map_err(|_| InputInterruptError::InvalidResource)?,
-    })
+fn aarch64_gicv2_cpu_target_mask() -> Result<u8, InputInterruptError> {
+    let controller = crate::selected_platform()
+        .map_err(|_| InputInterruptError::InvalidResource)?
+        .interrupt_controller();
+    let troe_platform::InterruptControllerKind::GicV2 { cpu_target_mask } = controller else {
+        return Err(InputInterruptError::InvalidResource);
+    };
+    Ok(cpu_target_mask)
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
-fn architecture_input_device_ranges() -> Result<[Option<PhysicalRange>; 2], InputInterruptError> {
-    let profile = aarch64_input_profile()?;
-    Ok([Some(resource_page_range(profile.gic)?), None])
+fn architecture_input_device_ranges() -> Result<[Option<PhysicalRange>; 3], InputInterruptError> {
+    let distributor = aarch64_mmio(troe_platform::MmioRole::GicV2Distributor)?;
+    let cpu_interface = aarch64_mmio(troe_platform::MmioRole::GicV2CpuInterface)?;
+    let pl011 = aarch64_mmio(troe_platform::MmioRole::Pl011)?;
+    Ok([
+        Some(resource_page_range(distributor)?),
+        Some(resource_page_range(cpu_interface)?),
+        Some(resource_page_range(pl011)?),
+    ])
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 fn architecture_initialize_input_interrupts(
-    config: InputQueueConfig,
+    _config: InputQueueConfig,
 ) -> Result<(), InputInterruptError> {
     const GICD_CTLR: usize = 0x000;
     const GICD_TYPER: usize = 0x004;
@@ -1539,21 +2165,25 @@ fn architecture_initialize_input_interrupts(
     const GICC_CTLR: usize = 0x000;
     const GICC_PMR: usize = 0x004;
     const GICC_BPR: usize = 0x008;
-    const GIC_CPU_OFFSET: usize = 0x1_0000;
 
-    let profile = aarch64_input_profile()?;
-    let distributor = usize::try_from(profile.gic.base_address())
+    let gic_distributor = aarch64_mmio(troe_platform::MmioRole::GicV2Distributor)?;
+    let gic_cpu_interface = aarch64_mmio(troe_platform::MmioRole::GicV2CpuInterface)?;
+    let cpu_target_mask = aarch64_gicv2_cpu_target_mask()?;
+    let serial_route = crate::selected_platform()
+        .map_err(|_| InputInterruptError::InvalidResource)?
+        .interrupt(troe_platform::InterruptRole::Serial)
+        .ok_or(InputInterruptError::InvalidResource)?;
+    let serial_interrupt = InterruptResource::new(serial_route.line(), serial_route.vector())
         .map_err(|_| InputInterruptError::InvalidResource)?;
-    let cpu = distributor + GIC_CPU_OFFSET;
-    let intid = usize::try_from(profile.serial_interrupt.line())
+    let pl011 = aarch64_mmio(troe_platform::MmioRole::Pl011)?;
+    let pl011_base =
+        usize::try_from(pl011.base_address()).map_err(|_| InputInterruptError::InvalidResource)?;
+    let distributor = usize::try_from(gic_distributor.base_address())
         .map_err(|_| InputInterruptError::InvalidResource)?;
-
-    // SAFETY: The complete pinned GICv2 aperture is mapped RW/NX as device
-    // memory, and IRQ delivery remains masked during controller ownership.
-    unsafe {
-        mmio_write32(cpu + GICC_CTLR, 0);
-        mmio_write32(distributor + GICD_CTLR, 0);
-    }
+    let cpu = usize::try_from(gic_cpu_interface.base_address())
+        .map_err(|_| InputInterruptError::InvalidResource)?;
+    let intid = usize::try_from(serial_interrupt.line())
+        .map_err(|_| InputInterruptError::InvalidResource)?;
     // SAFETY: GICD_TYPER is a read-only register inside the owned aperture.
     let typer = unsafe { mmio_read32(distributor + GICD_TYPER) };
     let register_count =
@@ -1563,6 +2193,14 @@ fn architecture_initialize_input_interrupts(
         .ok_or(InputInterruptError::InvalidResource)?;
     if intid >= interrupt_count {
         return Err(InputInterruptError::InterruptLineUnavailable);
+    }
+
+    // SAFETY: All fallible profile validation is complete. The full GICv2
+    // aperture is mapped RW/NX and IRQ delivery remains masked while ownership
+    // is committed, so no failure can expose a partially initialized controller.
+    unsafe {
+        mmio_write32(cpu + GICC_CTLR, 0);
+        mmio_write32(distributor + GICD_CTLR, 0);
     }
     for register in 0..register_count {
         let offset = register * 4;
@@ -1582,12 +2220,17 @@ fn architecture_initialize_input_interrupts(
         gicv2_update_byte(
             distributor + GICD_IPRIORITYR,
             intid,
-            config.interrupt_priority(),
+            serial_route.priority(),
         );
-        gicv2_update_byte(distributor + GICD_ITARGETSR, intid, 0x01);
+        gicv2_update_byte(distributor + GICD_ITARGETSR, intid, cpu_target_mask);
         let config_address = distributor + GICD_ICFGR + (intid / 16) * 4;
         let config_shift = (intid % 16) * 2;
-        let config = mmio_read32(config_address) & !(0b10 << config_shift);
+        let edge = match serial_route.trigger() {
+            troe_platform::TriggerMode::Edge => 0b10,
+            troe_platform::TriggerMode::Level => 0,
+        };
+        let config =
+            (mmio_read32(config_address) & !(0b10 << config_shift)) | (edge << config_shift);
         mmio_write32(config_address, config);
         mmio_write32(distributor + GICD_ISENABLER + word * 4, bit);
         mmio_write32(cpu + GICC_PMR, 0xff);
@@ -1603,7 +2246,8 @@ fn architecture_initialize_input_interrupts(
     // SAFETY: PL011 receive and receive-timeout mask bits are documented and
     // the device is mapped before this call.
     unsafe {
-        mmio_write(
+        pl011_write(
+            pl011_base,
             PL011_INTERRUPT_MASK,
             PL011_RECEIVE_INTERRUPT | PL011_RECEIVE_TIMEOUT_INTERRUPT,
         );
@@ -1617,32 +2261,43 @@ fn architecture_initialize_input_interrupts(
 fn architecture_handle_input_interrupt(queue: &mut BoundedInputQueue) -> bool {
     const GICC_IAR: usize = 0x00c;
     const GICC_EOIR: usize = 0x010;
-    const GIC_CPU_OFFSET: usize = 0x1_0000;
-    let Ok(profile) = aarch64_input_profile() else {
+    let Ok(gic_cpu_interface) = aarch64_mmio(troe_platform::MmioRole::GicV2CpuInterface) else {
         return false;
     };
-    let Ok(distributor) = usize::try_from(profile.gic.base_address()) else {
+    let Ok(serial_interrupt) = platform_interrupt(troe_platform::InterruptRole::Serial) else {
         return false;
     };
-    let cpu = distributor + GIC_CPU_OFFSET;
+    let Ok(timer_interrupt) = platform_interrupt(troe_platform::InterruptRole::Timer) else {
+        return false;
+    };
+    let Ok(pl011) = aarch64_mmio(troe_platform::MmioRole::Pl011) else {
+        return false;
+    };
+    let Ok(pl011_base) = usize::try_from(pl011.base_address()) else {
+        return false;
+    };
+    let Ok(cpu) = usize::try_from(gic_cpu_interface.base_address()) else {
+        return false;
+    };
     // SAFETY: GICC_IAR acknowledges the highest-priority pending interrupt.
     let acknowledge = unsafe { mmio_read32(cpu + GICC_IAR) };
     let intid = acknowledge & 0x03ff;
-    let execution_timer = intid == AARCH64_EXECUTION_TIMER_INTID;
+    let execution_timer = intid == timer_interrupt.line();
     if execution_timer {
         architecture_disarm_execution_timer();
     } else if intid == AARCH64_NETWORK_INTERRUPT_INTID.load(Ordering::Acquire) {
-        if crate::virtio_mmio::acknowledge_network_interrupt_from_isr() {
+        if crate::acknowledge_network_interrupt_from_isr() {
             NETWORK_INTERRUPT_PENDING.store(true, Ordering::Release);
         }
-    } else if intid == profile.serial_interrupt.line() {
+    } else if intid == serial_interrupt.line() {
         queue.record_interrupt();
         // Acknowledge the latched sources before draining. A byte arriving
         // after this write either joins the drain or asserts a fresh source;
         // clearing after the drain would erase that fresh event.
         // SAFETY: These bits clear only the acknowledged PL011 receive sources.
         unsafe {
-            mmio_write(
+            pl011_write(
+                pl011_base,
                 PL011_INTERRUPT_CLEAR,
                 PL011_RECEIVE_INTERRUPT | PL011_RECEIVE_TIMEOUT_INTERRUPT,
             );
@@ -1657,20 +2312,35 @@ fn architecture_handle_input_interrupt(queue: &mut BoundedInputQueue) -> bool {
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
-const AARCH64_EXECUTION_TIMER_INTID: u32 = 30;
-
-#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
-fn architecture_initialize_network_interrupt(intid: u32) -> Result<(), InputInterruptError> {
+fn architecture_prepare_network_interrupt(
+    route: &NetworkInterruptRoute,
+) -> Result<(), InputInterruptError> {
     const GICD_TYPER: usize = 0x004;
     const GICD_IGROUPR: usize = 0x080;
-    const GICD_ISENABLER: usize = 0x100;
+    const GICD_ICENABLER: usize = 0x180;
+    const GICD_ICPENDR: usize = 0x280;
     const GICD_IPRIORITYR: usize = 0x400;
     const GICD_ITARGETSR: usize = 0x800;
     const GICD_ICFGR: usize = 0xc00;
-    let profile = aarch64_input_profile()?;
+    let NetworkInterruptSource::VirtioMmio { slot } = route.source() else {
+        return Err(InputInterruptError::InvalidResource);
+    };
+    let platform = crate::selected_platform().map_err(|_| InputInterruptError::InvalidResource)?;
+    let troe_platform::VirtioTransportKind::Mmio { slot_count, .. } = platform.virtio() else {
+        return Err(InputInterruptError::InvalidResource);
+    };
+    if *slot >= u32::from(slot_count) {
+        return Err(InputInterruptError::InvalidResource);
+    }
+    let intid = route.interrupt().line();
+    if route.polarity() != troe_platform::Polarity::ActiveHigh || route.priority() == 0 {
+        return Err(InputInterruptError::InvalidResource);
+    }
+    let gic = aarch64_mmio(troe_platform::MmioRole::GicV2Distributor)?;
+    let cpu_target_mask = aarch64_gicv2_cpu_target_mask()?;
     architecture_mask_input_interrupts();
     let result = (|| {
-        let distributor = usize::try_from(profile.gic.base_address())
+        let distributor = usize::try_from(gic.base_address())
             .map_err(|_| InputInterruptError::InvalidResource)?;
         // SAFETY: GICD_TYPER is a read-only register in the mapped aperture.
         let count = usize::try_from((unsafe { mmio_read32(distributor + GICD_TYPER) } & 0x1f) + 1)
@@ -1686,29 +2356,122 @@ fn architecture_initialize_network_interrupt(intid: u32) -> Result<(), InputInte
         let bit = 1_u32 << (intid_index % 32);
         // SAFETY: TYPER bounds the selected SPI registers; IRQs are masked.
         unsafe {
+            mmio_write32(distributor + GICD_ICENABLER + word * 4, bit);
+            mmio_write32(distributor + GICD_ICPENDR + word * 4, bit);
             let group = mmio_read32(distributor + GICD_IGROUPR + word * 4);
             mmio_write32(distributor + GICD_IGROUPR + word * 4, group & !bit);
-            gicv2_update_byte(distributor + GICD_IPRIORITYR, intid_index, 0x40);
-            gicv2_update_byte(distributor + GICD_ITARGETSR, intid_index, 0x01);
+            gicv2_update_byte(distributor + GICD_IPRIORITYR, intid_index, route.priority());
+            gicv2_update_byte(distributor + GICD_ITARGETSR, intid_index, cpu_target_mask);
             let address = distributor + GICD_ICFGR + (intid_index / 16) * 4;
             let shift = (intid_index % 16) * 2;
-            let config = mmio_read32(address) & !(0b10 << shift);
+            let edge = match route.trigger() {
+                troe_platform::TriggerMode::Edge => 0b10,
+                troe_platform::TriggerMode::Level => 0,
+            };
+            let config = (mmio_read32(address) & !(0b10 << shift)) | (edge << shift);
             mmio_write32(address, config);
-            mmio_write32(distributor + GICD_ISENABLER + word * 4, bit);
             core::arch::asm!("dsb sy", "isb", options(nomem, nostack));
         }
-        AARCH64_NETWORK_INTERRUPT_INTID.store(intid, Ordering::Release);
         Ok(())
     })();
-    if result.is_ok() {
-        NETWORK_INTERRUPT_PENDING.store(true, Ordering::Release);
-    }
     architecture_enable_input_interrupts();
     result
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn architecture_activate_network_interrupt(route: &NetworkInterruptRoute) {
+    const GICD_ISENABLER: usize = 0x100;
+    let Ok(gic) = aarch64_mmio(troe_platform::MmioRole::GicV2Distributor) else {
+        park();
+    };
+    let Ok(distributor) = usize::try_from(gic.base_address()) else {
+        park();
+    };
+    let intid = route.interrupt().line();
+    let Ok(intid_index) = usize::try_from(intid) else {
+        park();
+    };
+    let word = intid_index / 32;
+    let bit = 1_u32 << (intid_index % 32);
+    architecture_mask_input_interrupts();
+    if AARCH64_NETWORK_INTERRUPT_INTID
+        .compare_exchange(u32::MAX, intid, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        park();
+    }
+    // SAFETY: Preparation validated the SPI against TYPER and configured it
+    // while disabled. The published INTID precedes controller unmasking.
+    unsafe {
+        mmio_write32(distributor + GICD_ISENABLER + word * 4, bit);
+        core::arch::asm!("dsb sy", "isb", options(nomem, nostack));
+    }
+    architecture_enable_input_interrupts();
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn architecture_deactivate_network_interrupt(route: &NetworkInterruptRoute) {
+    const GICD_ICENABLER: usize = 0x180;
+    let Ok(gic) = aarch64_mmio(troe_platform::MmioRole::GicV2Distributor) else {
+        park();
+    };
+    let Ok(distributor) = usize::try_from(gic.base_address()) else {
+        park();
+    };
+    let Ok(intid) = usize::try_from(route.interrupt().line()) else {
+        park();
+    };
+    let word = intid / 32;
+    let bit = 1_u32 << (intid % 32);
+    architecture_mask_input_interrupts();
+    // SAFETY: The active/prepared token names the TYPER-validated SPI.
+    unsafe {
+        mmio_write32(distributor + GICD_ICENABLER + word * 4, bit);
+        core::arch::asm!("dsb sy", "isb", options(nomem, nostack));
+    }
+    if AARCH64_NETWORK_INTERRUPT_INTID
+        .compare_exchange(
+            route.interrupt().line(),
+            u32::MAX,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        )
+        .is_err()
+    {
+        park();
+    }
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn architecture_cancel_prepared_network_interrupt(route: &NetworkInterruptRoute) {
+    const GICD_ICENABLER: usize = 0x180;
+    let Ok(gic) = aarch64_mmio(troe_platform::MmioRole::GicV2Distributor) else {
+        park();
+    };
+    let Ok(distributor) = usize::try_from(gic.base_address()) else {
+        park();
+    };
+    let Ok(intid) = usize::try_from(route.interrupt().line()) else {
+        park();
+    };
+    let word = intid / 32;
+    let bit = 1_u32 << (intid % 32);
+    architecture_mask_input_interrupts();
+    // SAFETY: Preparation validated the SPI against TYPER. Cancellation masks
+    // only this uncommitted route and must not revoke another active route's
+    // published INTID.
+    unsafe {
+        mmio_write32(distributor + GICD_ICENABLER + word * 4, bit);
+        core::arch::asm!("dsb sy", "isb", options(nomem, nostack));
+    }
+    architecture_enable_input_interrupts();
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 fn architecture_monotonic_millis() -> Option<u64> {
+    if crate::selected_platform().ok()?.timer() != troe_platform::TimerKind::Aarch64Generic {
+        return None;
+    }
     let frequency: u64;
     let counter: u64;
     // SAFETY: CNTFRQ_EL0 and CNTPCT_EL0 are read-only at EL1 and the generic
@@ -1734,10 +2497,18 @@ fn architecture_arm_execution_timer(milliseconds: u32) -> Result<(), ExecutionTi
     const GICD_ISENABLER: usize = 0x100;
     const GICD_IPRIORITYR: usize = 0x400;
     const GICD_ICFGR: usize = 0xc00;
-    let profile = aarch64_input_profile().map_err(|_| ExecutionTimerError::InterruptUnavailable)?;
-    let distributor = usize::try_from(profile.gic.base_address())
+    let gic = aarch64_mmio(troe_platform::MmioRole::GicV2Distributor)
         .map_err(|_| ExecutionTimerError::InterruptUnavailable)?;
-    let intid = usize::try_from(AARCH64_EXECUTION_TIMER_INTID)
+    let timer_route = crate::selected_platform()
+        .map_err(|_| ExecutionTimerError::InterruptUnavailable)?
+        .interrupt(troe_platform::InterruptRole::Timer)
+        .ok_or(ExecutionTimerError::InterruptUnavailable)?;
+    if timer_route.polarity() != troe_platform::Polarity::ActiveHigh {
+        return Err(ExecutionTimerError::InterruptUnavailable);
+    }
+    let distributor = usize::try_from(gic.base_address())
+        .map_err(|_| ExecutionTimerError::InterruptUnavailable)?;
+    let intid = usize::try_from(timer_route.line())
         .map_err(|_| ExecutionTimerError::InterruptUnavailable)?;
     let word = intid / 32;
     let bit = 1_u32 << (intid % 32);
@@ -1746,10 +2517,15 @@ fn architecture_arm_execution_timer(milliseconds: u32) -> Result<(), ExecutionTi
     unsafe {
         let group = mmio_read32(distributor + GICD_IGROUPR + word * 4);
         mmio_write32(distributor + GICD_IGROUPR + word * 4, group & !bit);
-        gicv2_update_byte(distributor + GICD_IPRIORITYR, intid, 0x20);
+        gicv2_update_byte(distributor + GICD_IPRIORITYR, intid, timer_route.priority());
         let config_address = distributor + GICD_ICFGR + (intid / 16) * 4;
         let config_shift = (intid % 16) * 2;
-        let config = mmio_read32(config_address) & !(0b10 << config_shift);
+        let edge = match timer_route.trigger() {
+            troe_platform::TriggerMode::Edge => 0b10,
+            troe_platform::TriggerMode::Level => 0,
+        };
+        let config =
+            (mmio_read32(config_address) & !(0b10 << config_shift)) | (edge << config_shift);
         mmio_write32(distributor + GICD_ICFGR + (intid / 16) * 4, config);
         mmio_write32(distributor + GICD_ISENABLER + word * 4, bit);
     }
@@ -1845,8 +2621,6 @@ fn architecture_wait_for_input_interrupt() {
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
-const PL011_BASE: usize = 0x0900_0000;
-#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 const PL011_DATA: usize = 0x000;
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 const PL011_FLAGS: usize = 0x018;
@@ -1869,26 +2643,59 @@ const PL011_RECEIVE_TIMEOUT_INTERRUPT: u32 = 1 << 6;
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 fn architecture_initialize_console() {
-    // SAFETY: These are the documented PL011 registers in the pinned virt
-    // profile. The 24 MHz clock divisors select approximately 115200 baud.
+    const BAUD: u64 = 115_200;
+    let Ok(platform) = crate::selected_platform() else {
+        return;
+    };
+    let troe_platform::ConsoleKind::Pl011 { clock_hz } = platform.console() else {
+        return;
+    };
+    let Ok(resource) = aarch64_mmio(troe_platform::MmioRole::Pl011) else {
+        return;
+    };
+    let Ok(base) = usize::try_from(resource.base_address()) else {
+        return;
+    };
+    let denominator = 16 * BAUD;
+    let mut integer = u64::from(clock_hz) / denominator;
+    let remainder = u64::from(clock_hz) % denominator;
+    let mut fractional = (remainder * 64 + denominator / 2) / denominator;
+    if fractional == 64 {
+        integer += 1;
+        fractional = 0;
+    }
+    let (Ok(integer), Ok(fractional)) = (u32::try_from(integer), u32::try_from(fractional)) else {
+        return;
+    };
+    if integer == 0 || integer > 0xffff {
+        return;
+    }
+    // SAFETY: The descriptor validates the PL011 aperture and input clock; the
+    // computed divisors select approximately 115200 baud without fixed clocks.
     unsafe {
-        mmio_write(PL011_CONTROL, 0);
-        mmio_write(PL011_INTERRUPT_CLEAR, 0x07ff);
-        mmio_write(PL011_INTEGER_BAUD, 13);
-        mmio_write(PL011_FRACTIONAL_BAUD, 1);
-        mmio_write(PL011_LINE_CONTROL, 0x70);
-        mmio_write(PL011_INTERRUPT_MASK, 0);
-        mmio_write(PL011_CONTROL, 0x0301);
+        pl011_write(base, PL011_CONTROL, 0);
+        pl011_write(base, PL011_INTERRUPT_CLEAR, 0x07ff);
+        pl011_write(base, PL011_INTEGER_BAUD, integer);
+        pl011_write(base, PL011_FRACTIONAL_BAUD, fractional);
+        pl011_write(base, PL011_LINE_CONTROL, 0x70);
+        pl011_write(base, PL011_INTERRUPT_MASK, 0);
+        pl011_write(base, PL011_CONTROL, 0x0301);
     }
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 fn write_byte(byte: u8) -> bool {
+    let Ok(resource) = aarch64_mmio(troe_platform::MmioRole::Pl011) else {
+        return false;
+    };
+    let Ok(base) = usize::try_from(resource.base_address()) else {
+        return false;
+    };
     for _ in 0..UART_SPIN_LIMIT {
-        // SAFETY: The pinned virt profile maps PL011 registers at this address.
-        if unsafe { mmio_read(PL011_FLAGS) } & (1 << 5) == 0 {
+        // SAFETY: The validated descriptor owns the PL011 flag register.
+        if unsafe { pl011_read(base, PL011_FLAGS) } & (1 << 5) == 0 {
             // SAFETY: The transmitter FIFO has capacity for one byte.
-            unsafe { mmio_write(PL011_DATA, u32::from(byte)) };
+            unsafe { pl011_write(base, PL011_DATA, u32::from(byte)) };
             return true;
         }
         spin_loop();
@@ -1898,12 +2705,14 @@ fn write_byte(byte: u8) -> bool {
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 fn architecture_try_read_byte() -> Option<u8> {
-    // SAFETY: The pinned virt profile maps PL011 registers at this address.
-    if unsafe { mmio_read(PL011_FLAGS) } & (1 << 4) != 0 {
+    let resource = aarch64_mmio(troe_platform::MmioRole::Pl011).ok()?;
+    let base = usize::try_from(resource.base_address()).ok()?;
+    // SAFETY: The validated descriptor owns the PL011 flag register.
+    if unsafe { pl011_read(base, PL011_FLAGS) } & (1 << 4) != 0 {
         None
     } else {
         // SAFETY: The receiver FIFO reports one available byte.
-        Some(unsafe { mmio_read(PL011_DATA) }.to_le_bytes()[0])
+        Some(unsafe { pl011_read(base, PL011_DATA) }.to_le_bytes()[0])
     }
 }
 
@@ -1917,12 +2726,24 @@ fn architecture_park() {
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 fn architecture_poweroff() {
     const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
+    let Ok(platform) = crate::selected_platform() else {
+        return;
+    };
+    if platform.power() != troe_platform::PowerKind::PsciHvc {
+        return;
+    }
     let _unexpected_return = psci_hvc(PSCI_SYSTEM_OFF);
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 fn architecture_reboot() {
     const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
+    let Ok(platform) = crate::selected_platform() else {
+        return;
+    };
+    if platform.power() != troe_platform::PowerKind::PsciHvc {
+        return;
+    }
     let _unexpected_return = psci_hvc(PSCI_SYSTEM_RESET);
 }
 
@@ -2006,15 +2827,15 @@ fn architecture_run_task_step(stack_top: usize, call: usize, entry: usize) -> us
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
-unsafe fn mmio_read(offset: usize) -> u32 {
+unsafe fn pl011_read(base: usize, offset: usize) -> u32 {
     // SAFETY: The caller supplies a valid aligned PL011 register offset.
-    unsafe { ptr::read_volatile((PL011_BASE + offset) as *const u32) }
+    unsafe { ptr::read_volatile((base + offset) as *const u32) }
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
-unsafe fn mmio_write(offset: usize, value: u32) {
+unsafe fn pl011_write(base: usize, offset: usize, value: u32) {
     // SAFETY: The caller supplies a valid aligned writable PL011 register.
-    unsafe { ptr::write_volatile((PL011_BASE + offset) as *mut u32, value) };
+    unsafe { ptr::write_volatile((base + offset) as *mut u32, value) };
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
@@ -2033,8 +2854,15 @@ unsafe fn mmio_write32(address: usize, value: u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{HeapState, TaskStackError, validate_task_stack};
+    use super::{
+        ActiveNetworkInterrupt, DeactivatedNetworkInterrupt, DmaInitializationPhase,
+        DmaInitializationState, HeapState, InputInterruptError, NetworkInterruptRoute,
+        NetworkInterruptSource, PreparedNetworkInterrupt, TaskStackError, UsedIndexTransition,
+        claim_network_interrupt_publication, classify_used_index,
+        revoke_network_interrupt_publication, validate_task_stack,
+    };
     use core::alloc::Layout;
+    use core::sync::atomic::{AtomicUsize, Ordering};
     use troe_memory::PhysicalRange;
 
     #[repr(align(4096))]
@@ -2094,5 +2922,147 @@ mod tests {
 
         let accepted = PhysicalRange::from_pages(0x20_0000, 8).unwrap_or(too_small);
         assert_eq!(validate_task_stack(accepted), Ok(0x20_8000));
+    }
+
+    #[test]
+    fn network_routes_reject_invalid_and_colliding_resources() {
+        let Ok(route) = NetworkInterruptRoute::q35_pci_intx(11, 1) else {
+            return;
+        };
+        assert!(matches!(
+            route.source(),
+            NetworkInterruptSource::PciIntx { pin: 1 }
+        ));
+        assert_eq!(route.interrupt().line(), 11);
+        assert_eq!(route.priority(), 0);
+        assert_eq!(route.trigger(), troe_platform::TriggerMode::Level);
+        assert_eq!(route.polarity(), troe_platform::Polarity::ActiveLow);
+        let prepared = PreparedNetworkInterrupt { route };
+        let active = ActiveNetworkInterrupt {
+            route: prepared.route,
+        };
+        let deactivated = DeactivatedNetworkInterrupt {
+            route: active.route,
+        };
+        assert!(matches!(
+            deactivated,
+            DeactivatedNetworkInterrupt {
+                route: NetworkInterruptRoute {
+                    source: NetworkInterruptSource::PciIntx { pin: 1 },
+                    ..
+                }
+            }
+        ));
+        for (line, pin) in [(11, 0), (11, 5), (1, 1), (4, 1), (24, 1), (u8::MAX, 1)] {
+            assert_eq!(
+                NetworkInterruptRoute::q35_pci_intx(line, pin),
+                Err(InputInterruptError::InvalidResource)
+            );
+        }
+
+        let first_result = NetworkInterruptRoute::virtio_mmio(0, 32, 48);
+        assert!(matches!(
+            first_result,
+            Ok(NetworkInterruptRoute {
+                source: NetworkInterruptSource::VirtioMmio { slot: 0 },
+                ..
+            })
+        ));
+        let Ok(first) = NetworkInterruptRoute::virtio_mmio(0, 32, 48) else {
+            return;
+        };
+        assert_eq!(first.priority(), 0x20);
+        assert_eq!(first.trigger(), troe_platform::TriggerMode::Edge);
+        assert_eq!(first.polarity(), troe_platform::Polarity::ActiveHigh);
+        assert!(NetworkInterruptRoute::virtio_mmio(31, 32, 48).is_ok());
+        assert_eq!(
+            NetworkInterruptRoute::virtio_mmio(32, 32, 48),
+            Err(InputInterruptError::InvalidResource)
+        );
+        assert_eq!(
+            NetworkInterruptRoute::virtio_mmio(0, 0, 48),
+            Err(InputInterruptError::InvalidResource)
+        );
+        assert_eq!(
+            NetworkInterruptRoute::virtio_mmio(0, 32, u32::MAX),
+            Err(InputInterruptError::InvalidResource)
+        );
+        assert_eq!(
+            NetworkInterruptRoute::virtio_mmio(0, 32, 33),
+            Err(InputInterruptError::InvalidResource)
+        );
+        assert_eq!(
+            NetworkInterruptRoute::virtio_mmio(0, 1, 1019),
+            Err(InputInterruptError::InvalidResource)
+        );
+        assert_eq!(
+            NetworkInterruptRoute::virtio_mmio(0, 1, 1020),
+            Err(InputInterruptError::InvalidResource)
+        );
+        assert_ne!(
+            InputInterruptError::QueueMetadataExhausted,
+            InputInterruptError::AlreadyInitialized
+        );
+        assert_ne!(
+            InputInterruptError::AlreadyInitialized,
+            InputInterruptError::InterruptLineUnavailable
+        );
+    }
+
+    #[test]
+    fn fault_injection_at_every_dma_initialization_phase_requires_reset() {
+        let mut state = DmaInitializationState::new();
+        assert_eq!(state.phase(), DmaInitializationPhase::DeviceStateChanged);
+        let after_device_state_change = state;
+
+        state.mark_queue_published();
+        assert_eq!(state.phase(), DmaInitializationPhase::QueuePublished);
+        let after_queue_publication = state;
+
+        state.mark_driver_ok();
+        assert_eq!(state.phase(), DmaInitializationPhase::DriverOk);
+        let after_driver_ok = state;
+
+        for injected_failure in [
+            after_device_state_change,
+            after_queue_publication,
+            after_driver_ok,
+        ] {
+            assert!(injected_failure.cleanup_requires_reset());
+        }
+
+        state.transfer_ownership();
+        assert_eq!(state.phase(), DmaInitializationPhase::OwnershipTransferred);
+        assert!(!state.cleanup_requires_reset());
+    }
+
+    #[test]
+    fn one_in_flight_used_index_rejects_skips_and_replays() {
+        assert_eq!(classify_used_index(7, 7), UsedIndexTransition::Empty);
+        assert_eq!(classify_used_index(7, 8), UsedIndexTransition::Completed);
+        assert_eq!(classify_used_index(7, 9), UsedIndexTransition::Invalid);
+        assert_eq!(classify_used_index(7, 6), UsedIndexTransition::Invalid);
+        assert_eq!(
+            classify_used_index(u16::MAX, 0),
+            UsedIndexTransition::Completed
+        );
+        assert_eq!(
+            classify_used_index(u16::MAX, 1),
+            UsedIndexTransition::Invalid
+        );
+    }
+
+    #[test]
+    fn network_interrupt_publication_is_exclusive_and_owner_checked() {
+        let publication = AtomicUsize::new(0);
+        assert!(!claim_network_interrupt_publication(&publication, 0));
+        assert!(claim_network_interrupt_publication(&publication, 0x1000));
+        assert!(!claim_network_interrupt_publication(&publication, 0x2000));
+        assert_eq!(publication.load(Ordering::Acquire), 0x1000);
+
+        assert!(!revoke_network_interrupt_publication(&publication, 0x2000));
+        assert_eq!(publication.load(Ordering::Acquire), 0x1000);
+        assert!(revoke_network_interrupt_publication(&publication, 0x1000));
+        assert_eq!(publication.load(Ordering::Acquire), 0);
     }
 }

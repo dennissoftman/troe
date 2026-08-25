@@ -8,8 +8,11 @@ license.workspace = true
 
 [dependencies]
 troe-block = { path = "../troe-block" }
+troe-config = { path = "../troe-config" }
+troe-content = { path = "../troe-content" }
 troe-ext4 = { path = "../troe-ext4" }
 troe-gpt = { path = "../troe-gpt" }
+troe-identity = { path = "../troe-identity" }
 troe-mount = { path = "../troe-mount" }
 troe-vfs = { path = "../troe-vfs" }
 

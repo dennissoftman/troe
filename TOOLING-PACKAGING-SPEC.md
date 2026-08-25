@@ -1015,7 +1015,7 @@ Registry entry
 ├── source identity
 ├── dependencies
 ├── capabilities
-├── resource profile
+├── bounded resource requests
 ├── supported architectures
 ├── SDK compatibility
 ├── signatures
@@ -1130,10 +1130,11 @@ The manifest expresses **intent**.
 The lock file expresses **resolution**.
 
 Resolution is target-specific. A lock entry MUST include the architecture,
-resource profile, SDK/ABI compatibility, source identity, feature selection,
-and artifact digest. If one lock file contains resolutions for multiple
-targets, those graphs must be separate and unambiguous. `--locked` MUST fail
-rather than consult an unrecorded source or silently rewrite the lock file.
+platform compatibility, SDK/ABI compatibility, source identity, feature
+selection, bounded resource requests, and artifact digest. If one lock file
+contains resolutions for multiple targets, those graphs must be separate and
+unambiguous. `--locked` MUST fail rather than consult an unrecorded source or
+silently rewrite the lock file.
 
 ---
 
@@ -1794,7 +1795,7 @@ A package requesting something forbidden should fail during planning, before act
 The tooling can provide convenient predefined system presets without changing the underlying model.
 
 ```bash
-troe system init --preset tiny-vps
+troe system init --preset cloud-minimal
 ```
 
 or:
@@ -1811,12 +1812,11 @@ troe system init --preset cuda
 ```
 
 System presets are simply versioned configuration expanded into ordinary
-`troe-system.toml` intent. They are not additional resource profiles.
-
-The only build-time resource profiles are the `micro`, `tiny`, and `full`
-profiles accepted in ADR 0006. A preset such as `tiny-vps` must select one of
-those profiles explicitly and may then add packages and policy. Tooling MUST
-show the expanded result in `--plan` output.
+`troe-system.toml` intent. They do not select resource profiles: every build
+uses the single standard bounded policy accepted by ADR 0006. A preset such as
+`cloud-minimal` may select packages, services, and explicit runtime budgets
+within those hard ceilings. Tooling MUST show the expanded result in `--plan`
+output.
 
 No special editions of the project should be necessary.
 

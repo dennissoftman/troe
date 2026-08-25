@@ -515,7 +515,7 @@ impl<'a> ContentPack<'a> {
         })
     }
 
-    /// Resolve a bounded active/predecessor generation chain into GC roots.
+    /// Resolve a bounded active/predecessor generation chain into unique GC roots.
     ///
     /// Each retained generation contributes its manifest and SCFG object plus,
     /// when present, a security manifest and its four declared typed objects.
@@ -560,8 +560,8 @@ impl<'a> ContentPack<'a> {
             if config.kind != ObjectKind::SystemConfig {
                 return Err(ContentError::InvalidManifest);
             }
-            roots.push(digest);
-            roots.push(manifest.config());
+            push_unique_root(&mut roots, digest);
+            push_unique_root(&mut roots, manifest.config());
             generation_count += 1;
             if let Some(security_digest) = manifest.security() {
                 let security_object = self
@@ -580,13 +580,13 @@ impl<'a> ContentPack<'a> {
                     (security.mount(), ObjectKind::MountPolicy),
                     (security.acl(), ObjectKind::NativeAcl),
                 ];
-                roots.push(security_digest);
+                push_unique_root(&mut roots, security_digest);
                 for (identity, expected_kind) in typed {
                     let referenced = self.get(identity).ok_or(ContentError::MissingObject)?;
                     if referenced.kind != expected_kind {
                         return Err(ContentError::InvalidManifest);
                     }
-                    roots.push(identity);
+                    push_unique_root(&mut roots, identity);
                 }
             }
             newer_generation = Some(manifest.generation());
@@ -698,6 +698,12 @@ impl<'a> ContentPack<'a> {
         let checksum = crc32_zeroed(&output);
         write_u32(&mut output, CHECKSUM_OFFSET, checksum);
         Ok(output)
+    }
+}
+
+fn push_unique_root(roots: &mut Vec<ContentDigest>, digest: ContentDigest) {
+    if !roots.contains(&digest) {
+        roots.push(digest);
     }
 }
 
@@ -1013,6 +1019,74 @@ mod tests {
             ContentPack::parse(&wrong_kind)?.generation_roots(ContentDigest::of(&generation), 1),
             Err(ContentError::InvalidManifest)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn generation_roots_are_deterministic_and_deduplicate_shared_identity_objects()
+    -> Result<(), ContentError> {
+        let previous_config = b"previous config";
+        let active_config = b"active config";
+        let previous_registry = b"previous registry";
+        let active_registry = b"active registry";
+        let previous_mapping = b"previous mapping";
+        let active_mapping = b"active mapping";
+        let previous_mount = b"previous mount";
+        let active_mount = b"active mount";
+        let shared_acl = b"shared acl";
+        let previous_security = SecurityManifest::new(
+            1,
+            ContentDigest::of(previous_registry),
+            ContentDigest::of(previous_mapping),
+            ContentDigest::of(previous_mount),
+            ContentDigest::of(shared_acl),
+        )?
+        .encode();
+        let active_security = SecurityManifest::new(
+            2,
+            ContentDigest::of(active_registry),
+            ContentDigest::of(active_mapping),
+            ContentDigest::of(active_mount),
+            ContentDigest::of(shared_acl),
+        )?
+        .encode();
+        let previous = GenerationManifest::new(1, ContentDigest::of(previous_config), None)?
+            .with_security(ContentDigest::of(&previous_security))?
+            .encode();
+        let active = GenerationManifest::new(
+            2,
+            ContentDigest::of(active_config),
+            Some(ContentDigest::of(&previous)),
+        )?
+        .with_security(ContentDigest::of(&active_security))?
+        .encode();
+        let image = pack(&[
+            (ObjectKind::SystemConfig, previous_config),
+            (ObjectKind::SystemConfig, active_config),
+            (ObjectKind::IdentityRegistry, previous_registry),
+            (ObjectKind::IdentityRegistry, active_registry),
+            (ObjectKind::IdentityMapping, previous_mapping),
+            (ObjectKind::IdentityMapping, active_mapping),
+            (ObjectKind::MountPolicy, previous_mount),
+            (ObjectKind::MountPolicy, active_mount),
+            (ObjectKind::NativeAcl, shared_acl),
+            (ObjectKind::SecurityManifest, &previous_security),
+            (ObjectKind::SecurityManifest, &active_security),
+            (ObjectKind::GenerationManifest, &previous),
+            (ObjectKind::GenerationManifest, &active),
+        ]);
+        let store = ContentPack::parse(&image)?;
+        let roots = store.generation_roots(ContentDigest::of(&active), 2)?;
+        assert_eq!(roots.len(), 13);
+        assert_eq!(
+            roots,
+            store.generation_roots(ContentDigest::of(&active), 2)?
+        );
+        for (index, root) in roots.iter().enumerate() {
+            assert!(!roots[..index].contains(root));
+        }
+        let retained = store.retain(&roots, roots.len(), image.len())?;
+        assert_eq!(ContentPack::parse(&retained)?.len(), 13);
         Ok(())
     }
 

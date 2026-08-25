@@ -40,11 +40,9 @@ substitutes for another.
 - Deleted identifiers become permanent tombstones. A restore preserves the
   identifier only when restoring the same security actor; otherwise it creates
   a new identifier and requires an explicit metadata remap.
-- The `tiny` profile accepts at most 256 principal records, 32 direct group
-  memberships per principal, and 1,024 external mapping entries. The `full`
-  profile accepts at most 65,536 records, 256 direct memberships, and 262,144
-  mappings. Membership expansion is iterative and cycle checked. `micro`
-  carries no persistent identity registry.
+- The standard policy accepts at most 65,536 principal records, 256 direct
+  group memberships per principal, and 262,144 external mapping entries.
+  Membership expansion is iterative and cycle checked.
 
 ### Identity domains and foreign values
 
@@ -75,7 +73,7 @@ substitutes for another.
 - Only a principal holding identity-administration authority may construct or
   activate a mapping snapshot. A mapped UID, GID, SID, familiar name, or on-disk
   owner field does not grant that authority.
-- If the selected snapshot is absent, corrupt, outside its profile, or
+- If the selected snapshot is absent, corrupt, outside the standard policy, or
   unavailable offline, affected identities remain unmapped. The volume may be
   inspected read-only with raw metadata, but resolution never falls back to the
   current user, `nobody`, UID 0, an administrator SID, or a name match.
@@ -116,8 +114,8 @@ is available losslessly. Providers may not invent an implicit fallback.
   class evaluation; the ACL mask limits named-user and group-class rights; the
   other entry applies only after no owner or group-class match. Malformed,
   duplicate, incomplete, or over-limit ACLs fail the object closed.
-- `tiny` retains at most 32 ACL entries per object and `full` at most 256. ACL
-  lookup and membership work remain inside the selected membership bounds.
+- The standard policy retains at most 256 ACL entries per object. ACL lookup
+  and membership work remain inside the selected membership bounds.
 - An unresolved owner or group never matches a native principal. On a trusted
   `native-mapped` or `explicit-mapping` mount, a valid `other` entry may still
   grant its deliberately broad rights. In either untrusted read-only mode, disk
@@ -165,8 +163,8 @@ is available losslessly. Providers may not invent an implicit fallback.
 
 IREG, IMAP, IMNT, IACL, and ISEC v1 now provide the canonical records below;
 their exact layouts and installer entropy procedure are fixed in
-[identity-v1.md](../formats/identity-v1.md). `troe-identity` applies the `tiny`
-and `full` ceilings, strict parsing, iterative membership-cycle checks, and
+[identity-v1.md](../formats/identity-v1.md). `troe-identity` applies the single
+standard ceiling set, strict parsing, iterative membership-cycle checks, and
 cross-object referential validation. GMAN/CSPK activation binds the complete
 typed snapshot to one generation and includes it in rollback and GC roots.
 
@@ -184,6 +182,13 @@ filesystem experiments are permitted when they retain raw metadata and do not
 treat it as native authority. No persistent writer or stable VFS
 security-metadata ABI may land until its provider-specific write rules are
 accepted.
+
+The cross-generation activation gate additionally requires a strictly newer
+registry generation and mapping version, preserves the mapping domain, retains
+every prior principal ID, rejects a kind change for an existing ID, and makes a
+tombstone permanently non-resurrectable. These checks are separate from the
+single-snapshot parser because both predecessor and candidate must already have
+passed their own checksum, ceiling, and referential validation.
 
 [ADR 0009](0009-persistent-filesystems-and-partitions.md) selects constrained
 ext4 for native persistent volumes, FAT/exFAT for synthetic-owner interchange,

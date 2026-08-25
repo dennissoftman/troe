@@ -7,6 +7,7 @@ import argparse
 import concurrent.futures
 import queue
 import re
+import shutil
 import socket
 import struct
 import subprocess
@@ -17,7 +18,23 @@ import time
 import zlib
 from pathlib import Path
 
-from qemu_profile import QEMU_EXECUTABLES, REPO_ROOT, prepare_qemu_command
+from platform_profile import (
+    AARCH64_UEFI_VIRTIO_MMIO,
+    PLATFORM_IDS,
+    REPO_ROOT,
+    X86_64_Q35_UEFI,
+    X86_64_UEFI_VIRTIO_PCI,
+    resolve_platform,
+    statefs_image_path,
+    txslot_image_path,
+)
+from qemu_profile import (
+    ENVIRONMENT_IDS,
+    build_cloud_bundle,
+    cloud_bundle_path,
+    prepare_qemu_command,
+    resolve_runner,
+)
 
 
 ANSI_ESCAPE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|[=>])")
@@ -30,7 +47,6 @@ TXSLOT_DISK_BYTES = 4_096 * 512
 TXSLOT_PARTITION_OFFSET = 2_048 * 512
 TXSLOT_BYTES = 4 * 512
 TXSLOT_CHECKSUM_OFFSET = 20
-NETWORK_PORTS = {"x86_64": 40123, "aarch64": 40124}
 NETWORK_REQUEST = b"troe-stage8-request"
 NETWORK_REPLY = b"troe-stage8-reply"
 
@@ -42,17 +58,18 @@ class AcceptanceError(RuntimeError):
 class UdpAcceptancePeer:
     """Answer the guest's bounded Stage 8 UDP probe on the slirp host."""
 
-    def __init__(self, architecture: str) -> None:
-        self.architecture = architecture
+    def __init__(self, platform_id: str, environment: str) -> None:
+        self.platform_id = platform_id
+        runner = resolve_runner(platform_id, environment)
         self.received = 0
         self.error: OSError | None = None
         self._stop = threading.Event()
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._socket.settimeout(0.2)
-        self._socket.bind(("127.0.0.1", NETWORK_PORTS[architecture]))
+        self._socket.bind(("127.0.0.1", runner.acceptance_udp_port))
         self._thread = threading.Thread(
             target=self._serve,
-            name=f"udp-acceptance-{architecture}",
+            name=f"udp-acceptance-{platform_id}",
             daemon=True,
         )
 
@@ -85,19 +102,25 @@ class UdpAcceptancePeer:
         self._thread.join(timeout=1.0)
 
 
-def txslot_path(architecture: str) -> Path:
-    """Return the architecture-private writable acceptance medium."""
-    return REPO_ROOT / "build" / f"storage-txslot-{architecture}.img"
+def txslot_path(platform_id: str) -> Path:
+    """Return the platform-private writable acceptance medium."""
+    return txslot_image_path(resolve_platform(platform_id))
 
 
-def statefs_path(architecture: str) -> Path:
-    """Return the architecture-private writable filesystem medium."""
-    return REPO_ROOT / "build" / f"storage-statefs-{architecture}.img"
+def statefs_path(platform_id: str) -> Path:
+    """Return the platform-private writable filesystem medium."""
+    return statefs_image_path(resolve_platform(platform_id))
 
 
-def reset_txslot(architecture: str) -> None:
-    """Start one architecture's process-reopen sequence from empty media."""
-    path = txslot_path(architecture)
+def reset_txslot(platform_id: str, environment: str) -> None:
+    """Start one platform's process-reopen sequence from empty media."""
+    profile = resolve_platform(platform_id)
+    path = txslot_path(platform_id)
+    if resolve_runner(platform_id, environment).disk_layout == "cloud-bundle-v1":
+        bundle = cloud_bundle_path(profile, environment)
+        shutil.copyfile(bundle / "activation.raw", path)
+        shutil.copyfile(bundle / "state.raw", statefs_path(platform_id))
+        return
     subprocess.run(
         [
             sys.executable,
@@ -111,39 +134,39 @@ def reset_txslot(architecture: str) -> None:
             "--state-selector",
             str(REPO_ROOT / "assets" / "state.prgn"),
             "--statefs-output",
-            str(statefs_path(architecture)),
+            str(statefs_path(platform_id)),
         ],
         cwd=REPO_ROOT,
         check=True,
     )
 
 
-def dual_slot_state(architecture: str, path: Path) -> tuple[int, bytes]:
+def dual_slot_state(platform_id: str, path: Path) -> tuple[int, bytes]:
     """Validate TXSLOT v1 and return its newest generation and payload."""
     image = path.read_bytes()
     if len(image) != TXSLOT_DISK_BYTES:
-        raise AcceptanceError(f"{architecture} TXSLOT image has invalid length")
-    image = image[TXSLOT_PARTITION_OFFSET:TXSLOT_PARTITION_OFFSET + TXSLOT_BYTES]
+        raise AcceptanceError(f"{platform_id} TXSLOT image has invalid length")
+    image = image[TXSLOT_PARTITION_OFFSET : TXSLOT_PARTITION_OFFSET + TXSLOT_BYTES]
     generations: list[tuple[int, bytes]] = []
     for slot in range(2):
-        data = image[slot * 1024:slot * 1024 + 512]
-        commit = image[slot * 1024 + 512:slot * 1024 + 1024]
+        data = image[slot * 1024 : slot * 1024 + 512]
+        commit = image[slot * 1024 + 512 : slot * 1024 + 1024]
         if data == bytes(512) and commit == bytes(512):
             continue
         checked_data = bytearray(data)
-        checked_data[TXSLOT_CHECKSUM_OFFSET:TXSLOT_CHECKSUM_OFFSET + 4] = bytes(4)
+        checked_data[TXSLOT_CHECKSUM_OFFSET : TXSLOT_CHECKSUM_OFFSET + 4] = bytes(4)
         data_checksum = struct.unpack_from("<I", data, TXSLOT_CHECKSUM_OFFSET)[0]
         length = struct.unpack_from("<I", data, 16)[0]
         generation = struct.unpack_from("<Q", data, 8)[0]
         checked_commit = bytearray(commit)
-        checked_commit[TXSLOT_CHECKSUM_OFFSET:TXSLOT_CHECKSUM_OFFSET + 4] = bytes(4)
+        checked_commit[TXSLOT_CHECKSUM_OFFSET : TXSLOT_CHECKSUM_OFFSET + 4] = bytes(4)
         valid = (
             data[:8] == b"TXDTv1\0\0"
             and commit[:8] == b"TXCMv1\0\0"
             and generation != 0
             and length <= 512 - 32
             and data[24:32] == bytes(8)
-            and data[32 + length:] == bytes(512 - 32 - length)
+            and data[32 + length :] == bytes(512 - 32 - length)
             and zlib.crc32(checked_data) == data_checksum
             and struct.unpack_from("<Q", commit, 8)[0] == generation
             and struct.unpack_from("<I", commit, 16)[0] == data_checksum
@@ -152,23 +175,25 @@ def dual_slot_state(architecture: str, path: Path) -> tuple[int, bytes]:
             == struct.unpack_from("<I", commit, TXSLOT_CHECKSUM_OFFSET)[0]
         )
         if valid:
-            generations.append((generation, data[32:32 + length]))
+            generations.append((generation, data[32 : 32 + length]))
     generation_numbers = [generation for generation, _ in generations]
     if not generations or len(generation_numbers) != len(set(generation_numbers)):
-        raise AcceptanceError(f"{architecture} TXSLOT has no unique committed generation")
+        raise AcceptanceError(
+            f"{platform_id} TXSLOT has no unique committed generation"
+        )
     return max(generations, key=lambda state: state[0])
 
 
-def txslot_state(architecture: str) -> tuple[int, bytes]:
+def txslot_state(platform_id: str) -> tuple[int, bytes]:
     """Return the activation transaction state."""
-    return dual_slot_state(architecture, txslot_path(architecture))
+    return dual_slot_state(platform_id, txslot_path(platform_id))
 
 
-def statefs_counter(architecture: str) -> tuple[int, int]:
+def statefs_counter(platform_id: str) -> tuple[int, int]:
     """Validate STFS v1 and return transaction generation and file counter."""
-    generation, payload = dual_slot_state(architecture, statefs_path(architecture))
+    generation, payload = dual_slot_state(platform_id, statefs_path(platform_id))
     if len(payload) != 40 or payload[:8] != b"STFSv1\0\0":
-        raise AcceptanceError(f"{architecture} statefs payload is malformed")
+        raise AcceptanceError(f"{platform_id} statefs payload is malformed")
     checked = bytearray(payload)
     checked[20:24] = bytes(4)
     valid = (
@@ -177,14 +202,14 @@ def statefs_counter(architecture: str) -> tuple[int, int]:
         and zlib.crc32(checked) == struct.unpack_from("<I", payload, 20)[0]
     )
     if not valid:
-        raise AcceptanceError(f"{architecture} statefs image failed validation")
+        raise AcceptanceError(f"{platform_id} statefs image failed validation")
     return generation, struct.unpack_from("<Q", payload, 32)[0]
 
 
-def assert_rolled_back_sact(architecture: str, payload: bytes) -> None:
+def assert_rolled_back_sact(platform_id: str, payload: bytes) -> None:
     """Require the durable SACT pointer to select generation one only."""
     if len(payload) != 128 or payload[:8] != b"SACTv1\0\0":
-        raise AcceptanceError(f"{architecture} durable SACT payload is malformed")
+        raise AcceptanceError(f"{platform_id} durable SACT payload is malformed")
     checked = bytearray(payload)
     checked[112:116] = bytes(4)
     valid = (
@@ -196,16 +221,22 @@ def assert_rolled_back_sact(architecture: str, payload: bytes) -> None:
         and zlib.crc32(checked) == struct.unpack_from("<I", payload, 112)[0]
     )
     if not valid:
-        raise AcceptanceError(f"{architecture} did not persist predecessor rollback")
+        raise AcceptanceError(f"{platform_id} did not persist predecessor rollback")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--arch",
-        choices=("all", *QEMU_EXECUTABLES),
-        default="all",
-        help="architecture to test (default: all)",
+        "--platform",
+        choices=("all", *PLATFORM_IDS),
+        required=True,
+        help="named platform to test, or explicit 'all'",
+    )
+    parser.add_argument(
+        "--environment",
+        choices=ENVIRONMENT_IDS,
+        required=True,
+        help="exact execution environment runner",
     )
     parser.add_argument("--firmware-code", type=Path)
     parser.add_argument("--firmware-vars", type=Path)
@@ -242,7 +273,7 @@ def parse_args() -> argparse.Namespace:
         default=COMMAND_TIMEOUT_SECONDS,
         help=f"seconds to wait for each command (default: {COMMAND_TIMEOUT_SECONDS:g})",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def normalize(data: bytes) -> str:
@@ -264,12 +295,18 @@ def parse_owned_memory_accounting(report: str) -> int:
                 f"command output was {report!r}"
             )
     frames = re.search(r"^frames: ([0-9]+)/([0-9]+) free$", report, re.MULTILINE)
-    if frames is None or int(frames.group(2)) == 0 or int(frames.group(1)) > int(frames.group(2)):
+    if (
+        frames is None
+        or int(frames.group(2)) == 0
+        or int(frames.group(1)) > int(frames.group(2))
+    ):
         raise AcceptanceError(f"mem reported invalid frame counters: {report!r}")
-    heap = re.search(
-        r"^heap: ([0-9]+)/([0-9]+) used \([^\n]+\)$", report, re.MULTILINE
-    )
-    if heap is None or int(heap.group(2)) == 0 or int(heap.group(1)) >= int(heap.group(2)):
+    heap = re.search(r"^heap: ([0-9]+)/([0-9]+) used \([^\n]+\)$", report, re.MULTILINE)
+    if (
+        heap is None
+        or int(heap.group(2)) == 0
+        or int(heap.group(1)) >= int(heap.group(2))
+    ):
         raise AcceptanceError(f"mem reported invalid heap counters: {report!r}")
     high_water = re.search(
         r"^heap high-water: ([0-9]+) \([^\n]+\)$", report, re.MULTILINE
@@ -278,7 +315,9 @@ def parse_owned_memory_accounting(report: str) -> int:
         raise AcceptanceError(f"mem reported invalid heap high-water: {report!r}")
     failures = re.search(r"^allocation failures: ([0-9]+)$", report, re.MULTILINE)
     if failures is None or int(failures.group(1)) < 1:
-        raise AcceptanceError(f"bounded allocation failure was not accounted: {report!r}")
+        raise AcceptanceError(
+            f"bounded allocation failure was not accounted: {report!r}"
+        )
     input_queue = re.search(
         r"^input queue: ([0-9]+)/([0-9]+) queued$", report, re.MULTILINE
     )
@@ -297,7 +336,11 @@ def parse_owned_memory_accounting(report: str) -> int:
         raise AcceptanceError(f"ordinary input unexpectedly overflowed: {report!r}")
     idle_waits = re.search(r"^input idle waits: ([0-9]+)$", report, re.MULTILINE)
     wakeups = re.search(r"^input wakeups: ([0-9]+)$", report, re.MULTILINE)
-    if idle_waits is None or wakeups is None or int(wakeups.group(1)) > int(idle_waits.group(1)):
+    if (
+        idle_waits is None
+        or wakeups is None
+        or int(wakeups.group(1)) > int(idle_waits.group(1))
+    ):
         raise AcceptanceError(f"mem reported inconsistent idle accounting: {report!r}")
     return int(heap.group(1))
 
@@ -320,13 +363,20 @@ def assert_owned_boot(session: "SerialSession") -> None:
             raise AcceptanceError(
                 f"{session.architecture} boot missed ownership marker {marker!r}"
             )
+    discovery_marker = {
+        X86_64_UEFI_VIRTIO_PCI: "platform discovery: ACPI validated",
+        AARCH64_UEFI_VIRTIO_MMIO: "platform discovery: FDT validated",
+    }.get(session.platform_id)
+    if discovery_marker is not None and discovery_marker not in transcript:
+        raise AcceptanceError(f"{session.platform_id} boot missed {discovery_marker!r}")
 
 
 class SerialSession:
     """A QEMU child with deadline-bound serial reads and deterministic cleanup."""
 
-    def __init__(self, command: list[str], architecture: str) -> None:
-        self.architecture = architecture
+    def __init__(self, command: list[str], platform_id: str) -> None:
+        self.platform_id = platform_id
+        self.architecture = resolve_platform(platform_id).architecture
         self.process = subprocess.Popen(
             command,
             cwd=REPO_ROOT,
@@ -422,9 +472,7 @@ class SerialSession:
         if "Initializing memory and protection" in tail or "sh:/> " in tail:
             raise AcceptanceError(f"machine rebooted after fatal marker: {tail!r}")
 
-    def terminal_command(
-        self, command: str, marker: bytes, timeout: float
-    ) -> None:
+    def terminal_command(self, command: str, marker: bytes, timeout: float) -> None:
         """Require a platform-control command to emit its marker and exit QEMU."""
         start = self.send(command, timeout)
         self.wait_for(marker, timeout, start)
@@ -439,9 +487,13 @@ class SerialSession:
                 f"{command!r} terminated QEMU with unexpected status {status}"
             )
 
-    def cancelled_command(
-        self, command: str, cwd: str, timeout: float
-    ) -> None:
+    def parked_command(self, command: str, marker: bytes, timeout: float) -> None:
+        """Require a terminal command marker followed by a bounded parked state."""
+        start = self.send(command, timeout)
+        marker_end = self.wait_for(marker, timeout, start)
+        self.assert_terminal(marker_end, min(timeout, 1.0))
+
+    def cancelled_command(self, command: str, cwd: str, timeout: float) -> None:
         """Start a cooperative command and require Ctrl-C to restore the prompt."""
         if self.process.stdin is None:
             raise AcceptanceError("QEMU serial input is unavailable")
@@ -613,11 +665,36 @@ class SerialSession:
         return normalize(bytes(self.output))
 
 
-def run_scenario(session: SerialSession, boot_timeout: float, command_timeout: float) -> None:
+def assert_storage_report(
+    session: SerialSession, cwd: str, command_timeout: float
+) -> None:
+    """Require exact production activation and StateFS region diagnostics."""
+    session.command(
+        "cat /sys/storage",
+        cwd,
+        command_timeout,
+        contains=(
+            "internal activation "
+            "disk=76543210fedcba9889abcdef01234567 "
+            "partition=67452301efcdab8998badcfe10325476 "
+            "type=8e5f0f3f1bde4fcbbf3d5d8a7ec96a21 state=active\n",
+            "internal statefs "
+            "disk=112233445566778899aabbccddeeff00 "
+            "partition=2233445566778899aabbccddeeff0011 "
+            "type=33445566778899aabbccddeeff001122 state=mounted\n",
+        ),
+    )
+
+
+def run_scenario(
+    session: SerialSession, boot_timeout: float, command_timeout: float
+) -> None:
     """Exercise every required built-in plus bounded failure behavior."""
     session.wait_for(b"sh:/> ", boot_timeout)
     assert_owned_boot(session)
     cwd = "/"
+
+    assert_storage_report(session, cwd, command_timeout)
 
     session.command(
         "net",
@@ -641,31 +718,27 @@ def run_scenario(session: SerialSession, boot_timeout: float, command_timeout: f
     session.cancelled_command("sleep 5000", cwd, command_timeout)
     session.cancelled_command("udp listen 40000", cwd, command_timeout)
 
-    session.edited_command(
-        "", b"\t", "", cwd, command_timeout, expected="\ncat\n"
-    )
+    session.edited_command("", b"\t", "", cwd, command_timeout, expected="\ncat\n")
     session.command(
         "man echo",
         cwd,
         command_timeout,
         contains=("NAME\n    echo - write arguments", "SYNOPSIS\n    echo [ARG...]"),
     )
-    session.command(
-        "help", cwd, command_timeout, contains=("help: unknown command",)
-    )
+    session.command("help", cwd, command_timeout, contains=("help: unknown command",))
     session.backspace_command(
         "echo brokeX", "n", cwd, command_timeout, expected="\nbroken\n"
     )
     session.edited_command(
         "echo ac", b"\x1b[D", "b", cwd, command_timeout, expected="\nabc\n"
     )
-    session.command("echo history-ready", cwd, command_timeout, contains=("history-ready\n",))
+    session.command(
+        "echo history-ready", cwd, command_timeout, contains=("history-ready\n",)
+    )
     session.edited_command(
         "", b"\x1b[A", "", cwd, command_timeout, expected="\nhistory-ready\n"
     )
-    session.edited_command(
-        "pw", b"\t", "", cwd, command_timeout, expected="\n/\n"
-    )
+    session.edited_command("pw", b"\t", "", cwd, command_timeout, expected="\n/\n")
     session.command(
         "echo crlf-ready",
         cwd,
@@ -673,7 +746,9 @@ def run_scenario(session: SerialSession, boot_timeout: float, command_timeout: f
         contains=("crlf-ready\n",),
         line_ending=b"\r\n",
     )
-    session.command("ls /", cwd, command_timeout, contains=("etc/", "man/", "sys/", "tmp/"))
+    session.command(
+        "ls /", cwd, command_timeout, contains=("etc/", "man/", "sys/", "tmp/")
+    )
     session.command(
         "cat /etc/motd",
         cwd,
@@ -712,7 +787,10 @@ def run_scenario(session: SerialSession, boot_timeout: float, command_timeout: f
     )
     session.command("rm /tmp/direct", cwd, command_timeout)
     session.command(
-        "cat /tmp/direct", cwd, command_timeout, contains=("cat: /tmp/direct: not found",)
+        "cat /tmp/direct",
+        cwd,
+        command_timeout,
+        contains=("cat: /tmp/direct: not found",),
     )
     session.command(
         "cat /missing", cwd, command_timeout, contains=("cat: /missing: not found",)
@@ -730,9 +808,7 @@ def run_scenario(session: SerialSession, boot_timeout: float, command_timeout: f
         command_timeout,
         contains=("write: /etc/motd: read-only filesystem",),
     )
-    session.command(
-        "clear", cwd, command_timeout, raw_contains=(b"\x1b[2J",)
-    )
+    session.command("clear", cwd, command_timeout, raw_contains=(b"\x1b[2J",))
     session.command("rm /tmp/result", cwd, command_timeout)
 
     for index in range(128):
@@ -784,7 +860,9 @@ def run_scenario(session: SerialSession, boot_timeout: float, command_timeout: f
 
     for _ in range(16):
         session.command(
-            "echo allocation-cycle | grep cycle", cwd, command_timeout,
+            "echo allocation-cycle | grep cycle",
+            cwd,
+            command_timeout,
             contains=("allocation-cycle\n",),
         )
         session.command("write /tmp/cycle stable", cwd, command_timeout)
@@ -809,9 +887,7 @@ def run_scenario(session: SerialSession, boot_timeout: float, command_timeout: f
             f"{baseline_heap} -> {final_heap} bytes"
         )
 
-    session.terminal_command(
-        "poweroff", b"poweroff: requesting soft off", command_timeout
-    )
+    request_poweroff(session, command_timeout)
 
 
 def run_smoke_scenario(
@@ -821,6 +897,7 @@ def run_smoke_scenario(
     session.wait_for(b"sh:/> ", boot_timeout)
     assert_owned_boot(session)
     cwd = "/"
+    assert_storage_report(session, cwd, command_timeout)
     session.command(
         "net",
         cwd,
@@ -848,16 +925,14 @@ def run_smoke_scenario(
     session.edited_command(
         "echo ac", b"\x1b[D", "b", cwd, command_timeout, expected="\nabc\n"
     )
-    session.command("echo history-ready", cwd, command_timeout, contains=("history-ready\n",))
+    session.command(
+        "echo history-ready", cwd, command_timeout, contains=("history-ready\n",)
+    )
     session.edited_command(
         "", b"\x1b[A", "", cwd, command_timeout, expected="\nhistory-ready\n"
     )
-    session.edited_command(
-        "pw", b"\t", "", cwd, command_timeout, expected="\n/\n"
-    )
-    session.command(
-        "clear", cwd, command_timeout, raw_contains=(b"\x1b[2J",)
-    )
+    session.edited_command("pw", b"\t", "", cwd, command_timeout, expected="\n/\n")
+    session.command("clear", cwd, command_timeout, raw_contains=(b"\x1b[2J",))
     session.command(
         "echo qemu-smoke | grep smoke",
         cwd,
@@ -876,9 +951,16 @@ def run_smoke_scenario(
         absent=("firmware", "advisory", "unavailable"),
     )
     parse_owned_memory_accounting(report)
-    session.terminal_command(
-        "poweroff", b"poweroff: requesting soft off", command_timeout
-    )
+    request_poweroff(session, command_timeout)
+
+
+def request_poweroff(session: SerialSession, command_timeout: float) -> None:
+    """Apply the selected platform's proven soft-off or parked policy."""
+    marker = b"poweroff: requesting soft off"
+    if session.platform_id == X86_64_UEFI_VIRTIO_PCI:
+        session.parked_command("poweroff", marker, command_timeout)
+    else:
+        session.terminal_command("poweroff", marker, command_timeout)
 
 
 def run_reboot_scenario(
@@ -895,7 +977,8 @@ def run_reboot_scenario(
 def run_native_keyboard_scenario(args: argparse.Namespace) -> None:
     """Drive the q35 i8042 path independently of serial input."""
     command = prepare_qemu_command(
-        "x86_64",
+        X86_64_Q35_UEFI,
+        args.environment,
         args.firmware_code,
         args.firmware_vars,
         skip_version_check=args.skip_version_check,
@@ -909,7 +992,7 @@ def run_native_keyboard_scenario(args: argparse.Namespace) -> None:
         monitor_path = str(Path(directory) / "qemu.sock")
         monitor_index = command.index("-monitor") + 1
         command[monitor_index] = f"unix:{monitor_path},server=on,wait=off"
-        session = SerialSession(command, "x86_64")
+        session = SerialSession(command, X86_64_Q35_UEFI)
         monitor = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         try:
             deadline = time.monotonic() + args.boot_timeout
@@ -1011,12 +1094,13 @@ def run_fault_scenario(
     session.assert_terminal(marker_end, min(command_timeout, 1.0))
 
 
-def test_architecture(
-    architecture: str,
+def test_platform(
+    platform_id: str,
     args: argparse.Namespace,
 ) -> None:
     command = prepare_qemu_command(
-        architecture,
+        platform_id,
+        args.environment,
         args.firmware_code,
         args.firmware_vars,
         skip_version_check=args.skip_version_check,
@@ -1024,40 +1108,44 @@ def test_architecture(
         acceptance_probes=False,
         framebuffer=args.framebuffer_console,
     )
-    session = SerialSession(command, architecture)
+    session = SerialSession(command, platform_id)
     try:
         scenario = run_smoke_scenario if args.smoke else run_scenario
         scenario(session, args.boot_timeout, args.command_timeout)
-        if args.framebuffer_console and b"Starting console and framebuffer" not in session.output:
+        if (
+            args.framebuffer_console
+            and b"Starting console and framebuffer" not in session.output
+        ):
             raise AcceptanceError(
-                f"{architecture} did not activate the owned framebuffer text console"
+                f"{platform_id} did not activate the owned framebuffer text console"
             )
     except Exception:
-        print(f"--- {architecture} QEMU transcript ---", file=sys.stderr)
+        print(f"--- {platform_id} QEMU transcript ---", file=sys.stderr)
         print(session.transcript(), file=sys.stderr)
         print(f"raw tail: {bytes(session.output[-256:])!r}", file=sys.stderr)
         raise
     finally:
         session.close()
-    reboot_session = SerialSession(command, architecture)
+    reboot_session = SerialSession(command, platform_id)
     try:
         run_reboot_scenario(reboot_session, args.boot_timeout, args.command_timeout)
     except Exception:
-        print(f"--- {architecture} reboot transcript ---", file=sys.stderr)
+        print(f"--- {platform_id} reboot transcript ---", file=sys.stderr)
         print(reboot_session.transcript(), file=sys.stderr)
         raise
     finally:
         reboot_session.close()
 
     if not args.smoke:
-        network_peer = UdpAcceptancePeer(architecture)
+        network_peer = UdpAcceptancePeer(platform_id, args.environment)
         network_peer.start()
         try:
             for expected_generation, fault in enumerate(
                 ("write", "execute", "guard", "exception", "fatal"), start=2
             ):
                 command = prepare_qemu_command(
-                    architecture,
+                    platform_id,
+                    args.environment,
                     args.firmware_code,
                     args.firmware_vars,
                     skip_version_check=args.skip_version_check,
@@ -1065,7 +1153,7 @@ def test_architecture(
                     acceptance_probes=True,
                     framebuffer=args.framebuffer_console,
                 )
-                fault_session = SerialSession(command, architecture)
+                fault_session = SerialSession(command, platform_id)
                 try:
                     run_fault_scenario(
                         fault_session,
@@ -1080,29 +1168,29 @@ def test_architecture(
                         not in fault_session.transcript()
                     ):
                         raise AcceptanceError(
-                            f"{architecture} did not exercise health rollback"
+                            f"{platform_id} did not exercise health rollback"
                         )
                 except Exception:
                     print(
-                        f"--- {architecture} {fault} fault transcript ---",
+                        f"--- {platform_id} {fault} fault transcript ---",
                         file=sys.stderr,
                     )
                     print(fault_session.transcript(), file=sys.stderr)
                     raise
                 finally:
                     fault_session.close()
-                actual_generation, payload = txslot_state(architecture)
+                actual_generation, payload = txslot_state(platform_id)
                 if actual_generation != expected_generation:
                     raise AcceptanceError(
-                        f"{architecture} TXSLOT recovered generation "
+                        f"{platform_id} TXSLOT recovered generation "
                         f"{actual_generation}, expected {expected_generation}"
                     )
-                assert_rolled_back_sact(architecture, payload)
-                state_generation, counter = statefs_counter(architecture)
+                assert_rolled_back_sact(platform_id, payload)
+                state_generation, counter = statefs_counter(platform_id)
                 expected_state = expected_generation - 1
                 if state_generation != expected_state or counter != expected_state:
                     raise AcceptanceError(
-                        f"{architecture} statefs recovered generation "
+                        f"{platform_id} statefs recovered generation "
                         f"{state_generation} and counter {counter}, "
                         f"expected {expected_state}"
                     )
@@ -1110,17 +1198,17 @@ def test_architecture(
             network_peer.close()
         if network_peer.error is not None:
             raise AcceptanceError(
-                f"{architecture} UDP acceptance peer failed: {network_peer.error}"
+                f"{platform_id} UDP acceptance peer failed: {network_peer.error}"
             )
         if network_peer.received != 5:
             raise AcceptanceError(
-                f"{architecture} UDP acceptance peer received "
+                f"{platform_id} UDP acceptance peer received "
                 f"{network_peer.received} probes, expected 5"
             )
-    if args.native_keyboard and architecture == "x86_64":
+    if args.native_keyboard and platform_id == X86_64_Q35_UEFI:
         run_native_keyboard_scenario(args)
     suite = "smoke" if args.smoke else "acceptance"
-    print(f"QEMU {suite} ({architecture}): passed")
+    print(f"QEMU {suite} ({platform_id}): passed")
 
 
 def main() -> int:
@@ -1128,25 +1216,28 @@ def main() -> int:
     if args.boot_timeout <= 0 or args.command_timeout <= 0:
         print("QEMU acceptance failed: timeouts must be positive", file=sys.stderr)
         return 2
-    architectures = QEMU_EXECUTABLES if args.arch == "all" else (args.arch,)
-    if args.arch == "all" and (
+    platform_ids = PLATFORM_IDS if args.platform == "all" else (args.platform,)
+    if args.platform == "all" and (
         args.firmware_code is not None or args.firmware_vars is not None
     ):
         print(
-            "QEMU acceptance failed: explicit firmware paths require one architecture",
+            "QEMU acceptance failed: explicit firmware paths require one platform",
             file=sys.stderr,
         )
         return 2
 
     try:
+        for platform_id in platform_ids:
+            resolve_runner(platform_id, args.environment)
         if not args.skip_build:
-            build_architecture = args.arch
+            build_platform = args.platform
             subprocess.run(
                 [
                     sys.executable,
                     str(REPO_ROOT / "scripts" / "build.py"),
-                    "--arch",
-                    build_architecture,
+                    "--platform",
+                    build_platform,
+                    "--fixture-identities",
                 ],
                 cwd=REPO_ROOT,
                 check=True,
@@ -1156,8 +1247,9 @@ def main() -> int:
                     [
                         sys.executable,
                         str(REPO_ROOT / "scripts" / "build.py"),
-                        "--arch",
-                        build_architecture,
+                        "--platform",
+                        build_platform,
+                        "--fixture-identities",
                         "--acceptance-probes",
                     ],
                     cwd=REPO_ROOT,
@@ -1177,17 +1269,30 @@ def main() -> int:
                 cwd=REPO_ROOT,
                 check=True,
             )
-        for architecture in architectures:
-            reset_txslot(architecture)
-        if len(architectures) == 1:
-            test_architecture(architectures[0], args)
+        if not args.skip_build:
+            for platform_id in platform_ids:
+                profile = resolve_platform(platform_id)
+                runner = resolve_runner(platform_id, args.environment)
+                if runner.disk_layout != "cloud-bundle-v1":
+                    continue
+                build_cloud_bundle(profile, args.environment)
+                if not args.smoke:
+                    build_cloud_bundle(
+                        profile,
+                        args.environment,
+                        acceptance_probes=True,
+                    )
+        for platform_id in platform_ids:
+            reset_txslot(platform_id, args.environment)
+        if len(platform_ids) == 1:
+            test_platform(platform_ids[0], args)
         else:
             with concurrent.futures.ThreadPoolExecutor(
-                max_workers=len(architectures), thread_name_prefix="qemu-acceptance"
+                max_workers=len(platform_ids), thread_name_prefix="qemu-acceptance"
             ) as executor:
                 futures = {
-                    executor.submit(test_architecture, architecture, args): architecture
-                    for architecture in architectures
+                    executor.submit(test_platform, platform_id, args): platform_id
+                    for platform_id in platform_ids
                 }
                 for future in concurrent.futures.as_completed(futures):
                     future.result()

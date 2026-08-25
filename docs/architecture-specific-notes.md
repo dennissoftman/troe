@@ -12,6 +12,15 @@ x86-64 or AArch64 platform contracts.
 
 - Allocate and initialize the complete raw-input queue before enabling a device
   source, controller route, or CPU interrupt class.
+- Validate a network interrupt route before `DRIVER_OK`. Configure it while the
+  transport source and controller route are masked, publish ISR state, and only
+  then unmask delivery. Cancellation must not clear another route's published
+  state, and an active-owner/publication mismatch is terminal while delivery
+  remains masked.
+- Declare DMA allocations before their initialization reset guard so error-path
+  drop order confirms reset before freeing queue memory. Teardown masks the
+  source and controller route, unpublishes ISR state, confirms reset, and only
+  then permits DMA buffers to drop.
 - Map controller and UART apertures RW/NX as device memory before the first
   volatile access. Never alias an aperture through a normal-memory mapping.
 - An ISR may drain at most the selected profile budget. It must acknowledge the
@@ -57,13 +66,15 @@ x86-64 or AArch64 platform contracts.
   features. Its receive queue permits used-buffer notification through the
   validated PCI interrupt pin/line, routed active-low and level-triggered to a
   dedicated IDT vector. The ISR capability read deasserts INTx and only sets a
-  coalesced service-work bit. AArch64 applies the identical queue contract
-  through modern virtio-MMIO with outer-shareable DMA barriers.
+  coalesced service-work bit. PCI source masking remains set until the I/O APIC
+  route and ISR address are committed, and is restored before teardown reset.
+  AArch64 applies the identical queue contract through modern virtio-MMIO with
+  outer-shareable DMA barriers.
 - Terminal machine control is profile-owned: `poweroff` writes the q35 ICH9
   PM1 control register at `0x604` with SLP_EN set for its S5 type, while
   `reboot` requests a full reset through q35 reset control at `0xcf9`. These
-  constants are not a generic x86-64 hardware contract; a physical PC profile
-  must derive equivalent resources from validated ACPI data.
+  constants are not a generic x86-64 VM contract; another platform descriptor
+  must supply equivalent resources directly or through validated ACPI data.
 - Keep the empty-queue transition as `sti; hlt; cli`. x86 delays maskable
   interrupt recognition until after the instruction following `sti`, so `hlt`
   cannot sleep after an input IRQ has already run and filled the queue. Splitting
@@ -129,9 +140,12 @@ x86-64 or AArch64 platform contracts.
   confirms the device before returning; failure to confirm reset parks forever
   because returning could let DMA outlive the borrowed payload.
 - A virtio-net slot derives its QEMU `virt` SPI from the fixed slot-to-INTID
-  profile, validates it against `GICD_TYPER`, and enables it as a level source.
-  The IRQ path acknowledges only the MMIO status and coalesces cooperative
-  service work. Empty receive checks are constant-time and never spin.
+  profile, validates the slot and SPI against `GICD_TYPER`, configures it as a
+  disabled level source, publishes the ISR base and active INTID, and only then
+  enables it. The IRQ path acknowledges only the MMIO status and coalesces
+  cooperative service work. Empty receive checks are constant-time and never
+  spin; a used-index skip or replay instead masks the route and resets the
+  device.
 - The pinned QEMU `virt` command explicitly disables legacy virtio-MMIO. Its
   secondary read-only fixture contains deterministic primary/backup GPT copies
   and a constrained ext4 volume; acceptance reaches that volume only through
@@ -151,22 +165,28 @@ x86-64 or AArch64 platform contracts.
 
 ## Stage 7.5 platform separation
 
-New machine support must separate reusable CPU mechanisms, device drivers, and
-board integration. `cfg(target_arch)` selects instruction-set mechanisms; it
-must not silently select q35, QEMU `virt`, Raspberry Pi, or any other board.
-Each platform profile supplies or validates its own firmware contract, device
-resources, interrupt topology, timer, console, boot media, and power behavior.
+New VM support must separate reusable CPU mechanisms, device drivers, and
+platform integration. `cfg(target_arch)` selects instruction-set mechanisms;
+it must not silently select q35, QEMU `virt`, or another VM. Each platform
+descriptor supplies or validates its firmware contract, device resources,
+interrupt topology, timer, console, boot media, virtio transports, and power
+behavior.
 
-The planned Raspberry Pi 4 profile is the first common AArch64 hardware
-acceptance machine. It does not replace the generic AArch64/UEFI direction and
-does not make Raspberry Pi peripherals architectural requirements. Likewise,
-q35 remains one x86-64 emulator profile rather than a PC compatibility promise.
-Where firmware can describe resources through ACPI, device tree, or UEFI,
-bring-up must validate those descriptions before constructing typed resources;
-fixed constants belong only in an explicitly identified board profile.
+q35 and QEMU `virt` remain exact deterministic acceptance platforms rather than
+general x86-64/AArch64 compatibility promises. Where firmware describes
+resources through ACPI, device tree, PCI, or UEFI, bring-up validates those
+descriptions before constructing typed resources; fixed constants belong only
+in an explicitly identified platform descriptor. Physical and embedded targets
+are outside the current roadmap.
 
-See [ADR 0016](adr/0016-hardware-targets-and-emulator-role.md) for the profile
-boundary and hardware acceptance policy.
+The accepted discoverable x86 QEMU contract uses ACPI-proven APIC, ECAM,
+serial, PM timer, reset, and legacy-input facts. The accepted discoverable
+AArch64 contract uses an edk2-published FDT for GICv2, PSCI-HVC, PL011, timer,
+RAM, and virtio-MMIO. Both consume the exact combined cloud bundle and pass the
+complete persistence, networking, lifecycle, and fault matrix.
+
+See [ADR 0016](adr/0016-hardware-targets-and-emulator-role.md) for the platform
+boundary and cloud acceptance policy.
 
 ## Regression evidence
 

@@ -19,6 +19,16 @@ in [../TOOLING-PACKAGING-SPEC.md](../TOOLING-PACKAGING-SPEC.md) must sit
 above versioned libraries and service interfaces. It does not replace the
 statically linked recovery shell.
 
+`troe-platform` defines immutable named VM descriptions independently of CPU
+architecture and execution environment. Build and launch tooling selects the
+full platform ID explicitly; the machine crate consumes a validated token for
+MMIO/I/O ownership, interrupt topology, console, timer, lifecycle, keyboard,
+and virtio transport facts before owned device access. q35 and QEMU `virt`
+therefore remain two exact platforms rather than architecture defaults.
+Two additional QEMU contracts obtain those facts from bounded ACPI or FDT
+discovery and boot the deterministic three-disk cloud bundle; unsupported
+firmware fails before device publication or volatile I/O.
+
 ## Input-to-output trace
 
 1. A composition root selects validated driver and editor policies. Owned
@@ -117,7 +127,7 @@ identity, authority, lifecycle, and stack resource.
 This makes every scheduling boundary explicit and keeps architecture register
 state out of portable code.
 
-The boot arena contains three reusable 32 KiB task payload slots. Each has an
+The boot arena contains three reusable 64 KiB task payload slots. Each has an
 unmapped 4 KiB page on both sides, while the payload is RW/NX. Boot verification
 interleaves two services, checks deterministic yield/exit counts, reaps their
 records, and reuses a returned slot before launching the shell on the third.
@@ -150,16 +160,17 @@ decoding, line editing, history, and fixed-glyph text rendering outside the
 machine mechanism. `troe-shell` owns completion because it has the authoritative
 command registry and VFS namespace; both command candidates and directory
 listings are returned under caller-selected count and byte budgets. The native
-composition root currently selects the named `tiny` policies. x86-64 decodes
+composition root uses the single Standard resource policy. x86-64 decodes
 US set-1 scan codes from q35 i8042, while both architectures retain serial
 input. AArch64 native keyboard input is deferred to a bounded
 virtio-input transport rather than adding a firmware dependency after handoff.
 
-Stage 5.2 adds the portable `troe-driver` resource and event boundary. The
-selected queue capacity, maximum ISR drain, and programmable controller
-priority come from validated profile configuration. The pinned x86-64 profile
+Stage 5.2 adds the portable `troe-driver` resource and event boundary. Queue
+capacity and maximum ISR drain come from the Standard portable policy;
+controller routes, vectors, trigger/polarity, and priority come from the
+validated VM platform descriptor. The pinned x86-64 platform
 masks the legacy PIC, owns LAPIC/I/O APIC, and routes COM1 and keyboard receive
-interrupts through explicit IDT gates. The pinned AArch64 profile owns GICv2
+interrupts through explicit IDT gates. The pinned AArch64 platform owns GICv2
 and routes PL011 through its IRQ vector. Handlers preserve interrupted CPU
 state, perform bounded non-allocating device work, and enqueue typed raw bytes;
 decoding and editing remain in main context. An empty queue executes a
@@ -188,9 +199,11 @@ Task creation and teardown are transactional. A record retains its root/private
 frame counts and owned handle count. Teardown revokes all handles for the
 monotonic task identity, reaps the exact record, zeroes the complete table/code/
 data/stack allocation, and atomically returns it to the frame bitmap. Every
-production boot exercises all fault classes, checks zero partial delivery and
-zero frame loss, proves the same physical allocation can be reused, then enters
-the shell. See
+acceptance-probe boot exercises all fault classes, checks zero partial delivery
+and zero frame loss, proves the same physical allocation can be reused, then
+enters the shell. Production retains only the valid call/yield/exit loader
+exercise; destructive KEX payloads and malformed corpus cases are feature-gated
+and marker-rejected by the production EFI builder. See
 [ADR 0014](adr/0014-unprivileged-task-isolation-and-teardown.md).
 
 The first native Stage 7 boundary copies KEX bytes into bounded kernel staging
@@ -200,8 +213,8 @@ image virtual ranges with their closed R/RX/RW permissions, places the startup,
 heap, guards, and stack canonically, and keeps the root inactive. The root
 retains supervisor mappings for the kernel image, devices, and only the explicit
 boot-arena runtime ranges needed across an isolated transition; it does not copy
-the general free-RAM identity map. This keeps both backends within the tiny
-profile's 64-page table ceiling. A provisional task receives only the
+the general free-RAM identity map. This keeps both backends within the standard
+512-page table ceiling. A provisional task receives only the
 loader-selected handle; boot acceptance then revokes it,
 reaps the record, zeroes every provisional frame, and verifies exact reuse.
 Malformed native corpus cases fail before frame allocation. Application entry

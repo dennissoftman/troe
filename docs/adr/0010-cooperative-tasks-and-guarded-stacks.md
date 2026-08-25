@@ -1,6 +1,6 @@
 # ADR 0010: cooperative continuations and guarded task stacks
 
-Status: accepted, 2026-08-23.
+Status: accepted, 2026-08-23; stack-size amendment, 2026-08-24.
 
 ## Decision
 
@@ -22,13 +22,19 @@ call stack, and the architecture boundary needs only a synchronous stack-call
 trampoline rather than a portable saved-register layout.
 
 The reserved boot arena contains three task-stack slots. Each slot is one
-unmapped 4 KiB lower guard, a 32 KiB RW/NX payload, and one unmapped 4 KiB upper
+unmapped 4 KiB lower guard, a 64 KiB RW/NX payload, and one unmapped 4 KiB upper
 guard. The owned mapping plan lists payloads individually instead of mapping
 the whole boot arena, so guards are absent from both architecture page tables.
 The kernel validates the adjacency and sizes before scheduling. A feature-only
 acceptance command writes the active shell task's lower guard and must reach a
 stable native write-fault diagnostic without rebooting. Production artifacts
 are scanned for both MMU and task probe markers.
+
+Amendment, 2026-08-24: the networking runtime increased each privileged
+continuation payload from 32 KiB to 64 KiB. The slot count and 4 KiB guards are
+unchanged. Compile-time assertions bind the byte size, sixteen mapped pages,
+guard size, and three-slot arena contribution so later profile work cannot
+silently change only one representation.
 
 Boot runs two service continuations with different yield counts, observes five
 round-robin yields, exits and reaps both, and dispatches a third continuation on

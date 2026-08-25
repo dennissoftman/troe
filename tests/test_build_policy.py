@@ -1,0 +1,124 @@
+"""Host-only checks for production EFI acceptance-payload exclusion."""
+
+from __future__ import annotations
+
+import contextlib
+import io
+import tempfile
+import unittest
+from dataclasses import fields
+from pathlib import Path
+
+from scripts import build, test as verification
+
+
+class ProductionBuildPolicyTests(unittest.TestCase):
+    """Exercise the same marker gate used by the production build."""
+
+    def test_clean_efi_is_accepted_without_qemu(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            image = Path(temporary) / "kernel.efi"
+            image.write_bytes(b"MZ\0canonical production image")
+            build.verify_production_efi(image)
+
+    def test_every_acceptance_marker_is_rejected_without_qemu(self) -> None:
+        for marker in build.PRODUCTION_FORBIDDEN_MARKERS:
+            with self.subTest(marker=marker):
+                with tempfile.TemporaryDirectory() as temporary:
+                    image = Path(temporary) / "kernel.efi"
+                    image.write_bytes(b"MZ\0prefix" + marker + b"suffix")
+                    with self.assertRaisesRegex(
+                        RuntimeError, "acceptance probe marker"
+                    ):
+                        build.verify_production_efi(image)
+
+    def test_platform_is_mandatory_and_architecture_alias_is_gone(self) -> None:
+        parsed = build.parse_args(["--platform", "all", "--fixture-identities"])
+        self.assertEqual(parsed.platform, "all")
+        self.assertTrue(parsed.fixture_identities)
+        self.assertFalse(parsed.acceptance_probes)
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                build.parse_args([])
+            with self.assertRaises(SystemExit):
+                build.parse_args(["--arch", "x86_64"])
+            with self.assertRaises(SystemExit):
+                build.parse_args(["--platform", "unknown"])
+            with self.assertRaises(SystemExit):
+                build.parse_args(["--platform", "all"])
+
+    def test_build_profiles_contain_no_execution_environment_facts(self) -> None:
+        profile_fields = {
+            field.name for field in fields(next(iter(build.PLATFORM_PROFILES.values())))
+        }
+        self.assertEqual(
+            profile_fields,
+            {
+                "numeric_id",
+                "identifier",
+                "architecture",
+                "firmware_discovery",
+                "target",
+                "kernel_feature",
+                "virtio_transport",
+            },
+        )
+        self.assertFalse(hasattr(build, "RUNNER_PROFILES"))
+
+    def test_cargo_argv_uses_exact_platform_feature(self) -> None:
+        for profile in build.PLATFORM_PROFILES.values():
+            with self.subTest(platform=profile.identifier, acceptance=False):
+                self.assertEqual(
+                    build.cargo_build_command(profile, acceptance_probes=False),
+                    (
+                        "cargo",
+                        "build",
+                        "--locked",
+                        "-p",
+                        "troe-kernel",
+                        "--release",
+                        "--target",
+                        profile.target,
+                        "--features",
+                        profile.kernel_feature,
+                    ),
+                )
+            with self.subTest(platform=profile.identifier, acceptance=True):
+                self.assertEqual(
+                    build.cargo_build_command(profile, acceptance_probes=True),
+                    (
+                        "cargo",
+                        "build",
+                        "--locked",
+                        "-p",
+                        "troe-kernel",
+                        "--release",
+                        "--target",
+                        profile.target,
+                        "--features",
+                        f"{profile.kernel_feature},acceptance-probes",
+                    ),
+                )
+
+    def test_verification_target_gates_combine_platform_and_acceptance(self) -> None:
+        expected = [
+            (
+                "cargo",
+                "clippy",
+                "-p",
+                "troe-kernel",
+                "--target",
+                profile.target,
+                "--features",
+                f"{profile.kernel_feature},acceptance-probes",
+                "--",
+                "-D",
+                "warnings",
+            )
+            for profile in build.PLATFORM_PROFILES.values()
+        ]
+        self.assertEqual(verification.target_clippy_commands(), expected)
+
+
+if __name__ == "__main__":
+    unittest.main()

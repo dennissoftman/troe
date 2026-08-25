@@ -2,6 +2,17 @@
 
 Status: accepted for Stage 8, 2026-08-24.
 
+The production native-block path now reads `/system.cspk` only from the exact
+BMNT `root` role, recovers SACT from the exact PRGN-selected TXSLOT, and validates
+the complete active pointer before authorizing the desired system. Validation
+includes both SCFG/GMAN links, the bounded unique GC-root graph, every typed
+identity object in each retained generation, and the predecessor-to-successor
+identity transition. An empty TXSLOT publishes the embedded bootstrap pointer
+only after validation. If the active candidate is invalid, only its named and
+independently validated predecessor may be atomically published; if neither is
+valid, KEFS remains authoritative and the native root is not activated as the
+desired system.
+
 Stage 8 stores executable artifacts, SCFG images, and generation manifests as
 immutable objects addressed by SHA-256. A canonical CSPK v1 pack contains a
 bounded, digest-sorted object table followed by gapless object bytes. The pack
@@ -32,9 +43,11 @@ after the new root is durable and is never required for boot correctness.
 
 The native acceptance profile publishes generation 2 with generation 1 as its
 predecessor, applies the boot-required service's bounded `PreviousGeneration`
-health action, and atomically republishes generation 1. Process-reopen tests
-decode the durable SACT payload after each fault session and require the
-predecessor selection to survive.
+health action, and atomically republishes generation 1. That synthetic health
+decision, its extra transaction, and its diagnostic markers are feature-gated;
+ordinary production boot never invents a service failure or rewrites an already
+valid recovered pointer. Process-reopen tests decode the durable SACT payload
+after each fault session and require the predecessor selection to survive.
 
 This decision does not authorize mutable executable objects, digest-only trust,
 or unbounded dependency traversal. Signatures and registry trust remain Stage 9;

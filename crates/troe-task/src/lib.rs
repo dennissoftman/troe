@@ -418,6 +418,37 @@ impl fmt::Display for TaskError {
     }
 }
 
+/// Failure while performing the scheduler-owned portion of isolated teardown.
+///
+/// A task-transition failure occurs before external authority revocation. A
+/// revocation failure leaves the record terminal and retained, so callers must
+/// not zero or release its physical resources. A reaping failure likewise
+/// leaves the terminal record retained after successful revocation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TeardownError<RevocationError> {
+    /// Scheduler lookup, terminal transition, or reaping failed.
+    Task(TaskError),
+    /// The injected external-authority revoker failed.
+    Revocation(RevocationError),
+}
+
+impl<RevocationError> From<TaskError> for TeardownError<RevocationError> {
+    fn from(error: TaskError) -> Self {
+        Self::Task(error)
+    }
+}
+
+impl<RevocationError: fmt::Display> fmt::Display for TeardownError<RevocationError> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Task(error) => write!(formatter, "isolated teardown task failure: {error}"),
+            Self::Revocation(error) => {
+                write!(formatter, "isolated teardown revocation failure: {error}")
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TaskRecord {
     snapshot: TaskSnapshot,
@@ -707,6 +738,42 @@ impl Scheduler {
         })
     }
 
+    /// Terminalize one isolated record, revoke its external authority, then reap it.
+    ///
+    /// Ready records are cancelled and running records exit with
+    /// `rollback_status`. Already exited or faulted records retain their original
+    /// outcome. Only after the record is terminal is `revoke` invoked with its
+    /// terminal snapshot, and reaping occurs only if revocation succeeds.
+    /// Physical zeroization and frame release are intentionally left to the
+    /// caller after this method returns successfully.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TeardownError::Task`] for an unknown or non-isolated record, an
+    /// invalid lifecycle transition, or a reaping failure. Returns
+    /// [`TeardownError::Revocation`] when the injected revoker fails. Revocation
+    /// failure leaves the task terminal and unreaped; reaping failure leaves it
+    /// terminal and retained after revocation.
+    pub fn terminate_revoke_and_reap<RevocationError>(
+        &mut self,
+        id: TaskId,
+        rollback_status: u32,
+        revoke: impl FnOnce(TaskSnapshot) -> Result<(), RevocationError>,
+    ) -> Result<ReapedTask, TeardownError<RevocationError>> {
+        let snapshot = self.task(id)?;
+        if snapshot.isolation().is_none() {
+            return Err(TeardownError::Task(TaskError::InvalidState));
+        }
+        match snapshot.state() {
+            TaskState::Ready => self.cancel_ready(id, rollback_status)?,
+            TaskState::Running => self.exit_current(id, rollback_status)?,
+            TaskState::Exited | TaskState::Faulted => {}
+        }
+        let terminal = self.task(id)?;
+        revoke(terminal).map_err(TeardownError::Revocation)?;
+        self.reap(id).map_err(TeardownError::Task)
+    }
+
     /// Obtain one immutable task snapshot.
     ///
     /// # Errors
@@ -768,7 +835,7 @@ impl Scheduler {
 mod tests {
     use super::{
         Cancelled, Capabilities, CooperativeRuntime, IsolationResource, MAX_TASKS, MonotonicMillis,
-        Scheduler, StackResource, TaskError, TaskFault, TaskSnapshot, TaskState,
+        Scheduler, StackResource, TaskError, TaskFault, TaskSnapshot, TaskState, TeardownError,
     };
 
     #[derive(Debug)]
@@ -946,6 +1013,101 @@ mod tests {
         assert_eq!(stats.owned_isolation_pages, 0);
         assert_eq!(stats.owned_handles, 0);
         assert_eq!(stats.contained_faults, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn ordered_teardown_terminalizes_before_revocation_and_reaps_afterward()
+    -> Result<(), TeardownError<&'static str>> {
+        for (slot, running) in [(0, false), (1, true)] {
+            let mut scheduler = Scheduler::new(1)?;
+            let isolation = IsolationResource::new(slot, 4, 6, 1)?;
+            let id = scheduler.spawn_isolated(Capabilities::SERVICE, stack(slot)?, isolation)?;
+            if running {
+                assert_eq!(scheduler.dispatch_next(Capabilities::SERVICE), Ok(Some(id)));
+            }
+
+            let mut state_during_revocation = None;
+            let reaped = scheduler.terminate_revoke_and_reap(id, 7, |terminal| {
+                state_during_revocation = Some(terminal.state());
+                Ok::<(), &'static str>(())
+            })?;
+
+            assert_eq!(state_during_revocation, Some(TaskState::Exited));
+            assert_eq!(reaped.id, id);
+            assert_eq!(reaped.exit_status, 7);
+            assert_eq!(reaped.isolation, Some(isolation));
+            assert_eq!(scheduler.task(id), Err(TaskError::UnknownTask));
+            assert_eq!(scheduler.stats().live_records, 0);
+            assert_eq!(scheduler.stats().reaped, 1);
+        }
+
+        let mut scheduler = Scheduler::new(1)?;
+        let isolation = IsolationResource::new(2, 4, 6, 1)?;
+        let id = scheduler.spawn_isolated(Capabilities::SERVICE, stack(2)?, isolation)?;
+        assert_eq!(scheduler.dispatch_next(Capabilities::SERVICE), Ok(Some(id)));
+        scheduler.fault_current(id, TaskFault::Permission)?;
+        let reaped = scheduler.terminate_revoke_and_reap(id, 7, |terminal| {
+            assert_eq!(terminal.state(), TaskState::Faulted);
+            Ok::<(), &'static str>(())
+        })?;
+        assert_eq!(reaped.exit_status, 128);
+        assert_eq!(reaped.fault, Some(TaskFault::Permission));
+        Ok(())
+    }
+
+    #[test]
+    fn teardown_failpoints_retain_terminal_resources() -> Result<(), TaskError> {
+        let mut scheduler = Scheduler::new(2)?;
+        let isolation = IsolationResource::new(0, 4, 6, 1)?;
+        let id = scheduler.spawn_isolated(Capabilities::SERVICE, stack(0)?, isolation)?;
+
+        let failed = scheduler.terminate_revoke_and_reap(id, 9, |terminal| {
+            assert_eq!(terminal.state(), TaskState::Exited);
+            Err("injected revocation failure")
+        });
+        assert_eq!(
+            failed,
+            Err(TeardownError::Revocation("injected revocation failure"))
+        );
+        assert_eq!(
+            scheduler.task(id).map(TaskSnapshot::state),
+            Ok(TaskState::Exited)
+        );
+        assert_eq!(scheduler.stats().live_records, 1);
+        assert_eq!(scheduler.stats().reaped, 0);
+
+        scheduler.reaped = u32::MAX;
+        let mut revoked = false;
+        let failed = scheduler.terminate_revoke_and_reap(id, 10, |terminal| {
+            assert_eq!(terminal.state(), TaskState::Exited);
+            assert_eq!(terminal.exit_status(), Some(9));
+            revoked = true;
+            Ok::<(), &'static str>(())
+        });
+        assert_eq!(
+            failed,
+            Err(TeardownError::Task(TaskError::AccountingOverflow))
+        );
+        assert!(revoked);
+        assert_eq!(
+            scheduler.task(id).map(TaskSnapshot::state),
+            Ok(TaskState::Exited)
+        );
+        assert_eq!(scheduler.stats().live_records, 1);
+
+        let ordinary = scheduler.spawn(Capabilities::NONE, stack(1)?)?;
+        let mut revoker_called = false;
+        let failed = scheduler.terminate_revoke_and_reap(ordinary, 1, |_terminal| {
+            revoker_called = true;
+            Ok::<(), &'static str>(())
+        });
+        assert_eq!(failed, Err(TeardownError::Task(TaskError::InvalidState)));
+        assert!(!revoker_called);
+        assert_eq!(
+            scheduler.task(ordinary).map(TaskSnapshot::state),
+            Ok(TaskState::Ready)
+        );
         Ok(())
     }
 

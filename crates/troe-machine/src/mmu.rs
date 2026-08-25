@@ -8,22 +8,26 @@ use core::ptr;
 #[cfg(target_os = "uefi")]
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use troe_memory::{BASE_PAGE_SIZE, MappingPermissions, PhysicalRange, VirtualRange};
 #[cfg(target_os = "uefi")]
-use troe_memory::{MappingMemoryType, MappingPlan, MappingPrivilege};
+use troe_memory::MappingPlan;
+use troe_memory::{BASE_PAGE_SIZE, MappingPermissions, PhysicalRange, VirtualRange};
+#[cfg(any(test, target_os = "uefi"))]
+use troe_memory::{MappingMemoryType, MappingPrivilege};
 
 const MAX_IMAGE_REGIONS: usize = 64;
 const BASE_PAGE_BYTES: usize = 4096;
 const PE_SIGNATURE: u32 = 0x0000_4550;
 const PE32_PLUS_MAGIC: u16 = 0x020b;
+const MAX_PE_SECTIONS: usize = 64;
 const OPTIONAL_HEADER_MIN_BYTES: usize = 64;
 const OPTIONAL_SECTION_ALIGNMENT_OFFSET: usize = 32;
 const OPTIONAL_SIZE_OF_IMAGE_OFFSET: usize = 56;
 const SECTION_HEADER_BYTES: usize = 40;
 const SECTION_EXECUTE: u32 = 0x2000_0000;
 const SECTION_WRITE: u32 = 0x8000_0000;
-// Tiny KEX permits eight image segments plus startup, heap, and stack regions.
-// Full uses at most sixteen image segments plus the same three fixed regions.
+// Shared Stage 7 storage: Full KEX permits sixteen image segments plus startup,
+// heap, and stack. The Stage 6 composition remains independently capped at
+// eight regions and currently constructs exactly code, data, and stack.
 const MAX_USER_REGIONS: usize = 19;
 #[cfg(target_os = "uefi")]
 const ISOLATED_EXIT_CALL: u64 = 1;
@@ -106,10 +110,19 @@ pub struct UserAddressSpace {
 }
 
 impl UserAddressSpace {
+    /// Maximum user regions retained by the shared Stage 7 address-space context.
+    pub const MAX_REGIONS: usize = MAX_USER_REGIONS;
+
     /// Page-table and mapped-page accounting for teardown validation.
     #[must_use]
     pub const fn stats(&self) -> MmuStats {
         self.stats
+    }
+
+    /// Number of validated user regions retained by this address space.
+    #[must_use]
+    pub const fn user_region_count(&self) -> usize {
+        self.region_count
     }
 }
 
@@ -485,7 +498,10 @@ fn parse_image_layout(image: &[u8], base: u64) -> Result<ImageLayout, MmuError> 
 fn parse_image_header(image: &[u8], pe_offset: usize) -> Result<(usize, usize, u64), MmuError> {
     let section_count = usize::from(read_u16(image, checked_add(pe_offset, 6)?)?);
     let optional_bytes = usize::from(read_u16(image, checked_add(pe_offset, 20)?)?);
-    if optional_bytes < OPTIONAL_HEADER_MIN_BYTES {
+    if section_count == 0
+        || section_count > MAX_PE_SECTIONS
+        || optional_bytes < OPTIONAL_HEADER_MIN_BYTES
+    {
         return Err(MmuError::InvalidImage);
     }
     let optional_start = checked_add(pe_offset, 24)?;
@@ -1441,17 +1457,41 @@ pub fn trigger_native_exception() -> ! {
     architecture_trigger_native_exception()
 }
 
-#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+#[cfg(any(test, target_os = "uefi"))]
+fn validate_leaf_profile(
+    permissions: MappingPermissions,
+    memory_type: MappingMemoryType,
+) -> Result<(), MmuError> {
+    if !permissions.read
+        || (permissions.write && permissions.execute)
+        || (memory_type == MappingMemoryType::Device && permissions.execute)
+    {
+        Err(MmuError::InvalidPlan)
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(any(test, target_os = "uefi"))]
+fn ensure_leaf_unmapped(current: u64, descriptor_mask: u64) -> Result<(), MmuError> {
+    if current & descriptor_mask == 0 {
+        Ok(())
+    } else {
+        Err(MmuError::InvalidPlan)
+    }
+}
+
+#[cfg(any(test, all(target_os = "uefi", target_arch = "x86_64")))]
 const X86_PRESENT: u64 = 1;
-#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+#[cfg(any(test, all(target_os = "uefi", target_arch = "x86_64")))]
 const X86_WRITABLE: u64 = 1 << 1;
-#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+#[cfg(any(test, all(target_os = "uefi", target_arch = "x86_64")))]
 const X86_USER: u64 = 1 << 2;
-#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+#[cfg(any(test, all(target_os = "uefi", target_arch = "x86_64")))]
 const X86_WRITE_THROUGH: u64 = 1 << 3;
-#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+#[cfg(any(test, all(target_os = "uefi", target_arch = "x86_64")))]
 const X86_CACHE_DISABLE: u64 = 1 << 4;
-#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+#[cfg(any(test, all(target_os = "uefi", target_arch = "x86_64")))]
 const X86_NO_EXECUTE: u64 = 1 << 63;
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 const X86_ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
@@ -1575,6 +1615,29 @@ const fn x86_virtual_address_is_canonical(address: u64) -> bool {
     address < (1_u64 << 47) || address >= 0xffff_8000_0000_0000
 }
 
+#[cfg(any(test, all(target_os = "uefi", target_arch = "x86_64")))]
+fn x86_leaf_attributes(
+    permissions: MappingPermissions,
+    memory_type: MappingMemoryType,
+    privilege: MappingPrivilege,
+) -> Result<u64, MmuError> {
+    validate_leaf_profile(permissions, memory_type)?;
+    let mut flags = X86_PRESENT;
+    if permissions.write {
+        flags |= X86_WRITABLE;
+    }
+    if privilege == MappingPrivilege::User {
+        flags |= X86_USER;
+    }
+    if !permissions.execute {
+        flags |= X86_NO_EXECUTE;
+    }
+    if memory_type == MappingMemoryType::Device {
+        flags |= X86_WRITE_THROUGH | X86_CACHE_DISABLE;
+    }
+    Ok(flags)
+}
+
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 #[allow(clippy::too_many_arguments)]
 fn architecture_map_page(
@@ -1621,22 +1684,9 @@ fn architecture_map_page(
     }
     let leaf = table_entry(table, indexes[3])?;
     // SAFETY: The leaf belongs to the exclusively owned page-table tree.
-    if unsafe { ptr::read_volatile(leaf) } & X86_PRESENT != 0 {
-        return Err(MmuError::InvalidPlan);
-    }
-    let mut flags = X86_PRESENT;
-    if permissions.write {
-        flags |= X86_WRITABLE;
-    }
-    if privilege == MappingPrivilege::User {
-        flags |= X86_USER;
-    }
-    if !permissions.execute {
-        flags |= X86_NO_EXECUTE;
-    }
-    if memory_type == MappingMemoryType::Device {
-        flags |= X86_WRITE_THROUGH | X86_CACHE_DISABLE;
-    }
+    let current = unsafe { ptr::read_volatile(leaf) };
+    ensure_leaf_unmapped(current, X86_PRESENT)?;
+    let flags = x86_leaf_attributes(permissions, memory_type, privilege)?;
     // SAFETY: The checked physical address and flags form one terminal PTE.
     unsafe { ptr::write_volatile(leaf, physical_address | flags) };
     Ok(())
@@ -1838,11 +1888,63 @@ struct X86DescriptorTablePointer {
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+struct X86PlatformVectors {
+    keyboard: u8,
+    serial: u8,
+    network: u8,
+    timer: u8,
+    spurious: u8,
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn x86_platform_vectors() -> Result<X86PlatformVectors, MmuError> {
+    let platform = crate::selected_platform().map_err(|_| MmuError::InvalidPlan)?;
+    let keyboard = platform
+        .interrupt(troe_platform::InterruptRole::Keyboard)
+        .ok_or(MmuError::InvalidPlan)?
+        .vector();
+    let serial = platform
+        .interrupt(troe_platform::InterruptRole::Serial)
+        .ok_or(MmuError::InvalidPlan)?
+        .vector();
+    let (timer, spurious) = match platform.timer() {
+        troe_platform::TimerKind::X86PitTsc {
+            timer_vector,
+            spurious_vector,
+        }
+        | troe_platform::TimerKind::X86AcpiPmTsc {
+            timer_vector,
+            spurious_vector,
+            ..
+        } => (timer_vector, spurious_vector),
+        troe_platform::TimerKind::Aarch64Generic => return Err(MmuError::InvalidPlan),
+    };
+    let troe_platform::VirtioTransportKind::Pci {
+        network_vector: network,
+        ..
+    } = platform.virtio()
+    else {
+        return Err(MmuError::InvalidPlan);
+    };
+    if [keyboard, serial, network, timer, spurious].contains(&0x80) {
+        return Err(MmuError::InvalidPlan);
+    }
+    Ok(X86PlatformVectors {
+        keyboard,
+        serial,
+        network,
+        timer,
+        spurious,
+    })
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 fn architecture_install_exception_vectors(exception_stack: PhysicalRange) -> Result<(), MmuError> {
     if exception_stack.byte_count() < BASE_PAGE_SIZE {
         return Err(MmuError::InvalidTableArena);
     }
     let _capabilities = architecture_mmu_capabilities()?;
+    let vectors = x86_platform_vectors()?;
     // SAFETY: This is the unique boot-time initialization of the static TSS,
     // GDT, and IDT while interrupts remain disabled.
     unsafe {
@@ -1871,19 +1973,13 @@ fn architecture_install_exception_vectors(exception_stack: PhysicalRange) -> Res
             (*X86_IDT.0.get()).0[vector] = x86_interrupt_gate(offset, ist);
         }
         let input = x86_input_interrupt_entry as *const () as usize as u64;
-        for vector in [
-            crate::mechanism::X86_KEYBOARD_VECTOR,
-            crate::mechanism::X86_SERIAL_VECTOR,
-            crate::mechanism::X86_NETWORK_VECTOR,
-        ] {
+        for vector in [vectors.keyboard, vectors.serial, vectors.network] {
             (*X86_IDT.0.get()).0[usize::from(vector)] = x86_interrupt_gate(input, 0);
         }
         let timer = x86_execution_timer_entry as *const () as usize as u64;
-        (*X86_IDT.0.get()).0[usize::from(crate::mechanism::X86_TIMER_VECTOR)] =
-            x86_interrupt_gate(timer, 0);
+        (*X86_IDT.0.get()).0[usize::from(vectors.timer)] = x86_interrupt_gate(timer, 0);
         let spurious = x86_spurious_interrupt_entry as *const () as usize as u64;
-        (*X86_IDT.0.get()).0[usize::from(crate::mechanism::X86_SPURIOUS_VECTOR)] =
-            x86_interrupt_gate(spurious, 0);
+        (*X86_IDT.0.get()).0[usize::from(vectors.spurious)] = x86_interrupt_gate(spurious, 0);
         let syscall = x86_isolated_syscall_entry as *const () as usize as u64;
         (*X86_IDT.0.get()).0[0x80] = x86_interrupt_gate_with_dpl(syscall, 0, 3);
     }
@@ -2415,23 +2511,23 @@ extern "C" fn x86_page_fault_fatal(_address: u64, error: u64) -> ! {
     crate::mechanism::park()
 }
 
-#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+#[cfg(any(test, all(target_os = "uefi", target_arch = "aarch64")))]
 const AARCH64_TABLE_OR_PAGE: u64 = 0b11;
-#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+#[cfg(any(test, all(target_os = "uefi", target_arch = "aarch64")))]
 const AARCH64_ACCESS_FLAG: u64 = 1 << 10;
-#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+#[cfg(any(test, all(target_os = "uefi", target_arch = "aarch64")))]
 const AARCH64_INNER_SHAREABLE: u64 = 0b11 << 8;
-#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+#[cfg(any(test, all(target_os = "uefi", target_arch = "aarch64")))]
 const AARCH64_READ_ONLY: u64 = 0b10 << 6;
-#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+#[cfg(any(test, all(target_os = "uefi", target_arch = "aarch64")))]
 const AARCH64_USER_READ_WRITE: u64 = 0b01 << 6;
-#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+#[cfg(any(test, all(target_os = "uefi", target_arch = "aarch64")))]
 const AARCH64_USER_READ_ONLY: u64 = 0b11 << 6;
-#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+#[cfg(any(test, all(target_os = "uefi", target_arch = "aarch64")))]
 const AARCH64_ATTR_DEVICE: u64 = 1 << 2;
-#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+#[cfg(any(test, all(target_os = "uefi", target_arch = "aarch64")))]
 const AARCH64_PXN: u64 = 1 << 53;
-#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+#[cfg(any(test, all(target_os = "uefi", target_arch = "aarch64")))]
 const AARCH64_UXN: u64 = 1 << 54;
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 const AARCH64_ADDRESS_MASK: u64 = 0x0000_ffff_ffff_f000;
@@ -2492,6 +2588,41 @@ fn architecture_validate_table_arena(
     Ok(())
 }
 
+#[cfg(any(test, all(target_os = "uefi", target_arch = "aarch64")))]
+fn aarch64_leaf_attributes(
+    permissions: MappingPermissions,
+    memory_type: MappingMemoryType,
+    privilege: MappingPrivilege,
+) -> Result<u64, MmuError> {
+    validate_leaf_profile(permissions, memory_type)?;
+    let mut flags = AARCH64_TABLE_OR_PAGE | AARCH64_ACCESS_FLAG;
+    if privilege == MappingPrivilege::User {
+        flags |= AARCH64_PXN;
+        flags |= if permissions.write {
+            AARCH64_USER_READ_WRITE
+        } else {
+            AARCH64_USER_READ_ONLY
+        };
+        if !permissions.execute {
+            flags |= AARCH64_UXN;
+        }
+    } else {
+        flags |= AARCH64_UXN;
+        if !permissions.write {
+            flags |= AARCH64_READ_ONLY;
+        }
+        if !permissions.execute {
+            flags |= AARCH64_PXN;
+        }
+    }
+    if memory_type == MappingMemoryType::Device {
+        flags |= AARCH64_ATTR_DEVICE;
+    } else {
+        flags |= AARCH64_INNER_SHAREABLE;
+    }
+    Ok(flags)
+}
+
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 #[allow(clippy::too_many_arguments)]
 fn architecture_map_page(
@@ -2530,34 +2661,9 @@ fn architecture_map_page(
     }
     let leaf = table_entry(table, indexes[3])?;
     // SAFETY: The leaf belongs to the exclusively owned page-table tree.
-    if unsafe { ptr::read_volatile(leaf) } & AARCH64_TABLE_OR_PAGE != 0 {
-        return Err(MmuError::InvalidPlan);
-    }
-    let mut flags = AARCH64_TABLE_OR_PAGE | AARCH64_ACCESS_FLAG;
-    if privilege == MappingPrivilege::User {
-        flags |= AARCH64_PXN;
-        flags |= if permissions.write {
-            AARCH64_USER_READ_WRITE
-        } else {
-            AARCH64_USER_READ_ONLY
-        };
-        if !permissions.execute {
-            flags |= AARCH64_UXN;
-        }
-    } else {
-        flags |= AARCH64_UXN;
-        if !permissions.write {
-            flags |= AARCH64_READ_ONLY;
-        }
-        if !permissions.execute {
-            flags |= AARCH64_PXN;
-        }
-    }
-    if memory_type == MappingMemoryType::Device {
-        flags |= AARCH64_ATTR_DEVICE;
-    } else {
-        flags |= AARCH64_INNER_SHAREABLE;
-    }
+    let current = unsafe { ptr::read_volatile(leaf) };
+    ensure_leaf_unmapped(current, AARCH64_TABLE_OR_PAGE)?;
+    let flags = aarch64_leaf_attributes(permissions, memory_type, privilege)?;
     // SAFETY: The checked physical address and attributes form one page entry.
     unsafe { ptr::write_volatile(leaf, physical_address | flags) };
     Ok(())
@@ -3234,12 +3340,13 @@ mod tests {
     extern crate std;
 
     use super::{
-        MmuError, X86_CODE_SELECTOR, checked_image_slice_bounds, parse_image_layout,
-        x86_interrupt_gate,
+        MAX_PE_SECTIONS, MmuError, SECTION_HEADER_BYTES, X86_CODE_SELECTOR,
+        aarch64_leaf_attributes, checked_image_slice_bounds, ensure_leaf_unmapped,
+        parse_image_layout, x86_interrupt_gate, x86_leaf_attributes,
     };
     use std::vec;
     use std::vec::Vec;
-    use troe_memory::MappingPermissions;
+    use troe_memory::{MappingMemoryType, MappingPermissions, MappingPrivilege};
 
     fn image_with_sections(sections: &[(u32, u32, u32)]) -> Vec<u8> {
         let mut image = vec![0_u8; 0x5000];
@@ -3260,6 +3367,255 @@ mod tests {
             image[header + 36..header + 40].copy_from_slice(&characteristics.to_le_bytes());
         }
         image
+    }
+
+    #[test]
+    #[allow(clippy::similar_names, clippy::too_many_lines)]
+    fn leaf_attributes_cover_the_complete_permission_memory_and_privilege_matrix() {
+        #[derive(Clone, Copy)]
+        struct Case {
+            permissions: MappingPermissions,
+            memory_type: MappingMemoryType,
+            privilege: MappingPrivilege,
+            x86: Option<u64>,
+            aarch64: Option<u64>,
+        }
+
+        const X86_PAT_SELECTION: u64 = (1 << 3) | (1 << 4) | (1 << 7);
+        const AARCH64_ATTR_INDEX: u64 = 0b111 << 2;
+        const AARCH64_SHAREABILITY: u64 = 0b11 << 8;
+        let x86_device = super::X86_WRITE_THROUGH | super::X86_CACHE_DISABLE;
+        let aarch64_base = super::AARCH64_TABLE_OR_PAGE | super::AARCH64_ACCESS_FLAG;
+        let aarch64_kernel_ro = super::AARCH64_READ_ONLY | super::AARCH64_UXN;
+        let aarch64_kernel_rw = super::AARCH64_UXN;
+        let aarch64_user_ro = super::AARCH64_USER_READ_ONLY | super::AARCH64_PXN;
+        let aarch64_user_rw = super::AARCH64_USER_READ_WRITE | super::AARCH64_PXN;
+        let cases = [
+            Case {
+                permissions: MappingPermissions::READ_ONLY,
+                memory_type: MappingMemoryType::Normal,
+                privilege: MappingPrivilege::Kernel,
+                x86: Some(super::X86_PRESENT | super::X86_NO_EXECUTE),
+                aarch64: Some(
+                    aarch64_base
+                        | aarch64_kernel_ro
+                        | super::AARCH64_PXN
+                        | super::AARCH64_INNER_SHAREABLE,
+                ),
+            },
+            Case {
+                permissions: MappingPermissions::READ_WRITE,
+                memory_type: MappingMemoryType::Normal,
+                privilege: MappingPrivilege::Kernel,
+                x86: Some(super::X86_PRESENT | super::X86_WRITABLE | super::X86_NO_EXECUTE),
+                aarch64: Some(
+                    aarch64_base
+                        | aarch64_kernel_rw
+                        | super::AARCH64_PXN
+                        | super::AARCH64_INNER_SHAREABLE,
+                ),
+            },
+            Case {
+                permissions: MappingPermissions::READ_EXECUTE,
+                memory_type: MappingMemoryType::Normal,
+                privilege: MappingPrivilege::Kernel,
+                x86: Some(super::X86_PRESENT),
+                aarch64: Some(aarch64_base | aarch64_kernel_ro | super::AARCH64_INNER_SHAREABLE),
+            },
+            Case {
+                permissions: MappingPermissions::READ_ONLY,
+                memory_type: MappingMemoryType::Normal,
+                privilege: MappingPrivilege::User,
+                x86: Some(super::X86_PRESENT | super::X86_USER | super::X86_NO_EXECUTE),
+                aarch64: Some(
+                    aarch64_base
+                        | aarch64_user_ro
+                        | super::AARCH64_UXN
+                        | super::AARCH64_INNER_SHAREABLE,
+                ),
+            },
+            Case {
+                permissions: MappingPermissions::READ_WRITE,
+                memory_type: MappingMemoryType::Normal,
+                privilege: MappingPrivilege::User,
+                x86: Some(
+                    super::X86_PRESENT
+                        | super::X86_WRITABLE
+                        | super::X86_USER
+                        | super::X86_NO_EXECUTE,
+                ),
+                aarch64: Some(
+                    aarch64_base
+                        | aarch64_user_rw
+                        | super::AARCH64_UXN
+                        | super::AARCH64_INNER_SHAREABLE,
+                ),
+            },
+            Case {
+                permissions: MappingPermissions::READ_EXECUTE,
+                memory_type: MappingMemoryType::Normal,
+                privilege: MappingPrivilege::User,
+                x86: Some(super::X86_PRESENT | super::X86_USER),
+                aarch64: Some(aarch64_base | aarch64_user_ro | super::AARCH64_INNER_SHAREABLE),
+            },
+            Case {
+                permissions: MappingPermissions::READ_ONLY,
+                memory_type: MappingMemoryType::Device,
+                privilege: MappingPrivilege::Kernel,
+                x86: Some(super::X86_PRESENT | super::X86_NO_EXECUTE | x86_device),
+                aarch64: Some(
+                    aarch64_base
+                        | aarch64_kernel_ro
+                        | super::AARCH64_PXN
+                        | super::AARCH64_ATTR_DEVICE,
+                ),
+            },
+            Case {
+                permissions: MappingPermissions::READ_WRITE,
+                memory_type: MappingMemoryType::Device,
+                privilege: MappingPrivilege::Kernel,
+                x86: Some(
+                    super::X86_PRESENT | super::X86_WRITABLE | super::X86_NO_EXECUTE | x86_device,
+                ),
+                aarch64: Some(
+                    aarch64_base
+                        | aarch64_kernel_rw
+                        | super::AARCH64_PXN
+                        | super::AARCH64_ATTR_DEVICE,
+                ),
+            },
+            Case {
+                permissions: MappingPermissions::READ_EXECUTE,
+                memory_type: MappingMemoryType::Device,
+                privilege: MappingPrivilege::Kernel,
+                x86: None,
+                aarch64: None,
+            },
+            Case {
+                permissions: MappingPermissions::READ_ONLY,
+                memory_type: MappingMemoryType::Device,
+                privilege: MappingPrivilege::User,
+                x86: Some(
+                    super::X86_PRESENT | super::X86_USER | super::X86_NO_EXECUTE | x86_device,
+                ),
+                aarch64: Some(
+                    aarch64_base
+                        | aarch64_user_ro
+                        | super::AARCH64_UXN
+                        | super::AARCH64_ATTR_DEVICE,
+                ),
+            },
+            Case {
+                permissions: MappingPermissions::READ_WRITE,
+                memory_type: MappingMemoryType::Device,
+                privilege: MappingPrivilege::User,
+                x86: Some(
+                    super::X86_PRESENT
+                        | super::X86_WRITABLE
+                        | super::X86_USER
+                        | super::X86_NO_EXECUTE
+                        | x86_device,
+                ),
+                aarch64: Some(
+                    aarch64_base
+                        | aarch64_user_rw
+                        | super::AARCH64_UXN
+                        | super::AARCH64_ATTR_DEVICE,
+                ),
+            },
+            Case {
+                permissions: MappingPermissions::READ_EXECUTE,
+                memory_type: MappingMemoryType::Device,
+                privilege: MappingPrivilege::User,
+                x86: None,
+                aarch64: None,
+            },
+        ];
+
+        for case in cases {
+            let x86 = x86_leaf_attributes(case.permissions, case.memory_type, case.privilege);
+            let aarch64 =
+                aarch64_leaf_attributes(case.permissions, case.memory_type, case.privilege);
+            match (case.x86, case.aarch64) {
+                (Some(expected_x86), Some(expected_aarch64)) => {
+                    assert_eq!(x86, Ok(expected_x86));
+                    assert_eq!(aarch64, Ok(expected_aarch64));
+                    assert_eq!(expected_x86 & X86_PAT_SELECTION, x86_device & expected_x86);
+                    assert_eq!(
+                        expected_aarch64 & AARCH64_ATTR_INDEX,
+                        if case.memory_type == MappingMemoryType::Device {
+                            super::AARCH64_ATTR_DEVICE
+                        } else {
+                            0
+                        }
+                    );
+                    assert_eq!(
+                        expected_aarch64 & AARCH64_SHAREABILITY,
+                        if case.memory_type == MappingMemoryType::Normal {
+                            super::AARCH64_INNER_SHAREABLE
+                        } else {
+                            0
+                        }
+                    );
+                }
+                (None, None) => {
+                    assert_eq!(x86, Err(MmuError::InvalidPlan));
+                    assert_eq!(aarch64, Err(MmuError::InvalidPlan));
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[test]
+    fn leaf_attributes_reject_unreadable_and_writable_executable_profiles() {
+        for permission_bits in 0..8_u8 {
+            let permissions = MappingPermissions {
+                read: permission_bits & 1 != 0,
+                write: permission_bits & 2 != 0,
+                execute: permission_bits & 4 != 0,
+            };
+            for memory_type in [MappingMemoryType::Normal, MappingMemoryType::Device] {
+                let invalid = !permissions.read
+                    || (permissions.write && permissions.execute)
+                    || (memory_type == MappingMemoryType::Device && permissions.execute);
+                for privilege in [MappingPrivilege::Kernel, MappingPrivilege::User] {
+                    if invalid {
+                        assert_eq!(
+                            x86_leaf_attributes(permissions, memory_type, privilege),
+                            Err(MmuError::InvalidPlan)
+                        );
+                        assert_eq!(
+                            aarch64_leaf_attributes(permissions, memory_type, privilege),
+                            Err(MmuError::InvalidPlan)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn duplicate_leaf_detection_matches_each_descriptor_format() {
+        assert_eq!(ensure_leaf_unmapped(0, super::X86_PRESENT), Ok(()));
+        assert_eq!(
+            ensure_leaf_unmapped(super::X86_WRITABLE, super::X86_PRESENT),
+            Ok(())
+        );
+        assert_eq!(
+            ensure_leaf_unmapped(super::X86_PRESENT, super::X86_PRESENT),
+            Err(MmuError::InvalidPlan)
+        );
+        for descriptor in 1..=super::AARCH64_TABLE_OR_PAGE {
+            assert_eq!(
+                ensure_leaf_unmapped(descriptor, super::AARCH64_TABLE_OR_PAGE),
+                Err(MmuError::InvalidPlan)
+            );
+        }
+        assert_eq!(
+            ensure_leaf_unmapped(super::AARCH64_ACCESS_FLAG, super::AARCH64_TABLE_OR_PAGE),
+            Ok(())
+        );
     }
 
     #[test]
@@ -3323,6 +3679,51 @@ mod tests {
             parse_image_layout(&image, 0x20_0000),
             Err(MmuError::InvalidImage)
         );
+    }
+
+    #[test]
+    fn pe_section_count_is_explicitly_bounded() {
+        let mut maximum = vec![(0, 0, 0); MAX_PE_SECTIONS];
+        maximum[0] = (0x1000, 0x1000, 0x6000_0000);
+        assert!(parse_image_layout(&image_with_sections(&maximum), 0x20_0000).is_ok());
+
+        let excessive = vec![(0, 0, 0); MAX_PE_SECTIONS + 1];
+        assert_eq!(
+            parse_image_layout(&image_with_sections(&excessive), 0x20_0000),
+            Err(MmuError::InvalidImage)
+        );
+        let empty = image_with_sections(&[]);
+        assert_eq!(
+            parse_image_layout(&empty, 0x20_0000),
+            Err(MmuError::InvalidImage)
+        );
+    }
+
+    #[test]
+    fn every_pe_truncation_and_deterministic_header_fuzz_is_bounded() {
+        let valid =
+            image_with_sections(&[(0x1000, 0x1000, 0x6000_0000), (0x2000, 0x1000, 0x4000_0000)]);
+        for length in 0..valid.len() {
+            assert_eq!(
+                parse_image_layout(&valid[..length], 0x20_0000),
+                Err(MmuError::InvalidImage)
+            );
+        }
+
+        let mut state = 0x4d59_5df4_d0f3_3173_u64;
+        for _ in 0..4_096 {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let mut fuzzed = valid.clone();
+            let header_end = 0x108 + 2 * SECTION_HEADER_BYTES;
+            let header_end_u64 = u64::try_from(header_end).unwrap_or_else(|_| unreachable!());
+            let offset = usize::try_from(state % header_end_u64).unwrap_or_else(|_| unreachable!());
+            let mutation =
+                u8::try_from((state >> 32) & 0xff).unwrap_or_else(|_| unreachable!()) | 1;
+            fuzzed[offset] ^= mutation;
+            let _bounded_result = parse_image_layout(&fuzzed, 0x20_0000);
+        }
     }
 
     #[test]

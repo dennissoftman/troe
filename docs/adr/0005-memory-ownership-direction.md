@@ -2,10 +2,12 @@
 
 Status: accepted and implemented for Stage 2, 2026-08-22.
 
-Implement the physical-frame mechanism as a compact bitmap over normalized
-4 KiB pages, with explicit reservations for discontiguous firmware and device
-regions. Debug and model builds detect invalid and double frees. Use a bounded
-monotonic allocator before the general heap.
+Implement the physical-frame mechanism as paired compact bitmaps over normalized
+4 KiB pages: one records live allocations and one records permanent reservations
+for discontiguous firmware and device regions. Reserved frames cannot be freed,
+and reserving a range never changes the ownership of a live allocation. Debug and
+model builds detect invalid and double frees. Use a bounded monotonic allocator
+before the general heap.
 
 The general-heap evaluation selected pinned `rlsf` 0.2.3: a maintained,
 constant-time, two-level segregated-fit implementation supporting `no_std` and
@@ -25,7 +27,7 @@ Stage 2 introduced the LoaderData boot arena and a checked monotonic model for a
 arena and explicit 128 KiB/16 KiB kernel and emergency stacks. The final map keeps LoaderCode,
 LoaderData (including image, stack, embedded KEFS, arena, and map buffer),
 runtime, ACPI, and device regions reserved. Conventional and expired boot-
-services regions become usable. A compact bitmap tracks only usable pages, so
+services regions become usable. Both compact bitmaps track only usable pages, so
 high MMIO ranges do not inflate metadata. The final-map buffer remains a
 permanent loader reservation after handoff.
 

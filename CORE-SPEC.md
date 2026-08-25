@@ -3,7 +3,7 @@
 **Status:** Draft design specification  
 **Version:** 0.1.0  
 **Primary targets:** QEMU `x86_64`, QEMU `aarch64`  
-**Future targets:** raw x86-64 PCs, raw AArch64 systems  
+**Future targets:** named x86-64 and AArch64 cloud VM platforms
 **Implementation language:** Rust (`no_std`)  
 
 **Implementation status:** Stages 0–8 are implemented. Stage 8 includes bounded
@@ -81,7 +81,8 @@ The words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** descri
 
 - Deterministic builds where the toolchain permits them.
 - Fast boot and immediate terminal availability.
-- Useful operation on microcontroller-class, constrained, and large machines.
+- Efficient operation on bounded cloud virtual machines across supported CPU
+  architectures and hypervisors.
 - Simple on-disk and in-memory formats that can be inspected manually.
 - A shared source tree that produces separate, architecture-native binaries.
 
@@ -218,25 +219,24 @@ A backend owns:
 
 The portable core MUST NOT contain architecture-specific registers, assembly, MMIO addresses, page-table bit encodings, or interrupt numbers.
 
-### 8.3 Target and test profiles
+### 8.3 Platforms and test environments
 
 CPU architecture, machine platform, and execution environment are independent
 axes. An architecture backend owns instruction-set mechanisms; a platform
-profile supplies validated firmware, memory discovery, interrupt, timer,
+descriptor supplies validated firmware, memory discovery, interrupt, timer,
 console, bus, boot-media, and power resources. Selecting `x86_64` or `aarch64`
-MUST NOT silently imply q35, QEMU `virt`, Raspberry Pi, or another board.
+MUST NOT silently imply q35, QEMU `virt`, or another virtual machine.
 
-| Profile | Role | Console | Boot | MMU page size |
+| Platform | Role | Console | Boot | MMU page size |
 |---|---|---|---|---|
 | `x86_64-q35-uefi` | implemented QEMU acceptance | UEFI bootstrap; owned 16550 after handoff | UEFI/OVMF | 4 KiB |
 | `aarch64-virt-uefi` | implemented QEMU acceptance | UEFI bootstrap; owned PL011 after handoff | UEFI/AAVMF | 4 KiB |
-| `aarch64-rpi4-uefi` | planned first AArch64 hardware reference | serial-first; framebuffer when validated | pinned UEFI and SD/USB media | 4 KiB |
-| `x86_64-pc-uefi` | planned first documented PC reference | documented serial/recovery path | UEFI and USB media | 4 KiB |
 
-Exact emulator invocations MUST be pinned in CI scripts. Every physical profile
-MUST instead pin the board/revision, firmware, boot media, required peripherals,
-and recovery procedure used for acceptance. Raspberry Pi 4 is one common
-AArch64 validation board, not an AArch64 compatibility boundary. See
+Exact emulator invocations MUST be pinned in CI scripts. New cloud platforms
+MUST identify the architecture, firmware contract, discovery source,
+transports, interrupt model, required features, and tested hypervisor/machine
+combination. Physical boards and no-MMU/embedded targets are outside the
+current scope. See
 [ADR 0016](docs/adr/0016-hardware-targets-and-emulator-role.md).
 
 ## 9. Core object and authority model
@@ -568,22 +568,19 @@ A home-grown general allocator is discouraged unless its simplicity is materiall
 
 Allocation failure MUST NOT default to an opaque infinite loop. The system MUST either propagate `OutOfMemory`, shed reclaimable memory and retry once under policy control, or enter a diagnostic fatal path when failure occurs in a non-recoverable boot operation.
 
-### 13.5 Memory profiles
+### 13.5 Standard memory policy
 
-The design requires memory policy to be selected at build time and finalized
-from detected usable RAM at boot. The profiles below are defined but are not yet
-selectable in the implementation; current QEMU images use one fixed bounded
-configuration.
+Every supported build uses one bounded standard policy for page-backed cloud
+virtual machines. There is no build-time memory-profile selector and no
+embedded/no-MMU variant. Detected usable RAM may refine runtime budgets, but
+all externally influenced lengths and counts remain below absolute compile-time
+ceilings so corrupt discovery cannot request absurd allocations.
 
-| Profile | Intended machine | Heap approach | RAMFS default cap | Reclaimable cache cap |
-|---|---|---|---:|---:|
-| `micro` | MCU-class, commonly below 2 MiB RAM | fixed arena with compile-time bounds | min(64 KiB, 1/16 RAM) | none |
-| `tiny` | constrained systems, commonly 2–64 MiB RAM | fixed arena or page growth to a firm cap | min(4 MiB, 1/16 RAM) | 0–1% RAM |
-| `full` | larger systems, commonly above 64 MiB RAM | page-backed growth, simple metadata favored | min(64 MiB, 1/8 RAM) | up to 5% RAM |
-
-Values are initial defaults, not ABI. Every limit MUST have an absolute compile-time ceiling so corrupt memory detection cannot produce absurd allocations.
-
-The `micro` profile permits no MMU assumption and prefers fixed-capacity tables, polling devices, direct reads, and no reclaimable cache. The `tiny` profile retains strict bounds while permitting page-backed mechanisms when the machine supplies them. The `full` profile may trade modest memory for simpler code and fewer allocations; it MUST NOT introduce elaborate bit-packing merely to reduce negligible metadata. Profiles change resource limits and compiled capabilities, not command or object semantics.
+Large ceilings are not reservations. The heap, application frames, RAMFS, and
+caches are charged only as memory is acquired; ownership and high-water
+accounting remain exact. Policy SHOULD favor clear metadata and straightforward
+failure handling over elaborate packing that saves negligible memory on the
+supported VM class.
 
 ### 13.6 Adaptive policy
 
@@ -595,7 +592,7 @@ Adaptation MUST remain explainable and deterministic. A policy object receives:
 - heap live bytes and high-water mark;
 - RAMFS charged bytes;
 - reclaimable cache bytes;
-- configured profile and hard ceilings.
+- standard hard ceilings.
 
 It returns explicit budgets for the heap growth reserve, RAMFS, and each cache. Subsystems MUST NOT infer “plenty of memory” independently.
 
@@ -959,7 +956,7 @@ mounted filesystem or shell command, providing hosted SDK `build`/`run`/`inspect
 flows, and defining package-manifest and target-lock formats are explicitly
 deferred integration work. They do not block Stage 7.5 or Stage 8; the
 authoritative order for resuming work is recorded in
-[docs/roadmap.md](docs/roadmap.md#stage-75-platform-separation-and-physical-machine-bring-up-planned).
+[docs/roadmap.md](docs/roadmap.md#stage-75-cloud-platform-separation-phase-a-implemented-phase-b-planned).
 
 - Load target-specific static KEX v1 artifacts selected by ADR 0015; keep ELF as
   a hosted toolchain interchange format rather than a kernel input.
@@ -981,9 +978,10 @@ Dynamic linking is optional and SHOULD follow a working static executable format
 
 **Exit criterion:** an untrusted test application can be loaded, run, exit, and fault without corrupting the kernel, while malformed binaries are rejected deterministically.
 
-### Stage 7.5 — Platform separation and physical-machine bring-up
+### Stage 7.5 — Cloud platform separation
 
-**Status:** planned; accepted by
+**Status:** Phase A platform separation implemented; Phase B cloud discovery
+and named matrix entries planned under
 [ADR 0016](docs/adr/0016-hardware-targets-and-emulator-role.md).
 
 - Separate reusable x86-64/AArch64 CPU mechanisms from platform integration and
@@ -993,17 +991,17 @@ Dynamic linking is optional and SHOULD follow a working static executable format
   contracts.
 - Validate platform resources from an explicit profile, ACPI, device tree, or
   UEFI handoff before constructing typed machine resources.
-- Add USB/SD-suitable GPT/ESP boot media alongside the small emulator image.
-- Use Raspberry Pi 4 as the first AArch64 physical reference, while keeping
-  other AArch64 boards independently addable.
-- Select one documented UEFI/ACPI x86-64 PC as the first physical PC reference.
-- Retain exhaustive host/QEMU fault tests and add serial-driven hardware smoke
-  evidence that records the exact board, revision, firmware, and peripherals.
+- Add named virtio-capable VM descriptors and bounded ACPI, device-tree, and
+  UEFI discovery without ambient probing.
+- Test a declared multi-hypervisor/cloud matrix and record the exact firmware,
+  machine type, transports, and required features for every supported entry.
+- Keep physical boards, USB/SD bring-up, and embedded/no-MMU targets outside
+  the current roadmap.
 
-**Exit criterion:** both pinned QEMU profiles, the selected Raspberry Pi
-reference, and one documented x86-64 UEFI PC reach the recovery shell and pass
-bounded serial smoke tests without introducing board assumptions into portable
-crates or architecture-wide mechanisms.
+**Exit criterion:** both pinned QEMU platforms and every named cloud-matrix
+entry reach the recovery shell and pass bounded boot, storage, networking, and
+lifecycle smoke tests without introducing VM assumptions into portable crates
+or architecture-wide mechanisms.
 
 ### Stage 8 — Networking and persistent operation
 
@@ -1078,7 +1076,8 @@ General abstractions SHOULD normally have at least two real consumers or impleme
 - machine API: x86-64 and AArch64;
 - console: firmware and native UART;
 - VFS node: embedded file, RAMFS file, and generated node;
-- memory policy: micro, tiny, and full profiles.
+- platform descriptors: at least two named VM machines per reusable discovery
+  or transport boundary.
 
 ## 25. Versioning and compatibility
 
@@ -1092,6 +1091,15 @@ Before `1.0`, internal Rust APIs are unstable. The following formats MUST still 
 - dependency lock file;
 - desired-system manifest and generation record;
 - registry metadata and stable machine-readable CLI output, when introduced.
+
+No installed release or live-machine state exists yet, so provisional format
+versions have no backward-compatibility obligation. A format may be replaced or
+renumbered when that materially improves simplicity, efficiency, reliability,
+or security, provided its specification, independent builder/verifier,
+fixtures, corruption tests, and every in-tree consumer change atomically.
+Versioning remains mandatory so test evidence identifies the exact contract;
+it is not a reason to retain accidental fields or migration code for artifacts
+that were never deployed.
 
 Command behavior SHOULD remain backward compatible within a minor release series, but POSIX compatibility MUST NOT be inferred from familiar command names.
 

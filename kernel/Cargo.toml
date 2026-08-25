@@ -8,6 +8,10 @@ license.workspace = true
 
 [features]
 acceptance-probes = ["troe-machine/acceptance-probes"]
+platform-aarch64-virt-uefi = ["troe-machine/platform-aarch64-virt-uefi"]
+platform-aarch64-uefi-virtio-mmio = ["troe-machine/platform-aarch64-uefi-virtio-mmio"]
+platform-x86_64-q35-uefi = ["troe-machine/platform-x86_64-q35-uefi"]
+platform-x86_64-uefi-virtio-pci = ["troe-machine/platform-x86_64-uefi-virtio-pci"]
 
 [dependencies]
 troe-application = { path = "../crates/troe-application" }

@@ -254,7 +254,7 @@ pub enum NetworkError {
     Device,
     /// A received packet or configuration exchange was invalid.
     Protocol,
-    /// The requested packet exceeded the initial profile.
+    /// The requested packet exceeded the bounded network limit.
     TooLarge,
     /// A bounded socket, cache, or queue resource is exhausted.
     Exhausted,
@@ -448,9 +448,9 @@ impl CompletionConfig {
         }
     }
 
-    /// Default completion policy for the `tiny` resource profile.
+    /// Default completion policy for the Standard resource policy.
     #[must_use]
-    pub const fn tiny() -> Self {
+    pub const fn standard() -> Self {
         Self {
             max_candidates: 64,
             max_bytes: 4 * 1024,
@@ -681,7 +681,7 @@ impl Shell {
     /// Complete the token ending at `cursor` without exceeding caller budgets.
     ///
     /// Incomplete quoted tokens are left unchanged in this first completion
-    /// profile. Candidate insertion never performs shell expansion.
+    /// implementation. Candidate insertion never performs shell expansion.
     #[must_use]
     pub fn complete(&mut self, line: &str, cursor: usize, config: CompletionConfig) -> Completion {
         if config.is_disabled()
@@ -1807,7 +1807,7 @@ fn network_failure(stderr: &mut dyn Output, command: &str, error: NetworkError) 
         NetworkError::Timeout => "operation timed out",
         NetworkError::Device => "network device failed",
         NetworkError::Protocol => "invalid network response",
-        NetworkError::TooLarge => "packet exceeds network profile",
+        NetworkError::TooLarge => "packet exceeds network limit",
         NetworkError::Exhausted => "bounded network resources exhausted",
         NetworkError::Cancelled => "cancelled",
     };
@@ -1857,9 +1857,13 @@ mod tests {
         ReceivedUdp, Shell, command_class, command_synopsis, parse_line,
     };
     use alloc::boxed::Box;
+    use alloc::format;
     use alloc::string::ToString;
     use alloc::vec::Vec;
-    use troe_core::{BoundedOutput, MachineMemorySnapshot, SliceInput};
+    use troe_core::{
+        BoundedOutput, MAX_ARGS, MAX_LINE_BYTES, MAX_PIPELINE_STAGES, MachineMemorySnapshot,
+        PIPE_CAPACITY, SliceInput,
+    };
     use troe_driver::InputQueueStats;
     use troe_task::{Cancelled, CooperativeRuntime, MonotonicMillis};
     use troe_vfs::{Namespace, RamFsQuota};
@@ -1990,6 +1994,44 @@ mod tests {
         assert_eq!(parsed.stages[1].words, ["grep", "b"]);
         assert_eq!(parse_line("echo 'bad"), Err(ParseError::UnclosedQuote));
         assert_eq!(parse_line("echo a || cat"), Err(ParseError::EmptyStage));
+    }
+
+    #[test]
+    fn parser_enforces_every_exact_byte_word_and_stage_boundary() {
+        let exact_line = "x".repeat(MAX_LINE_BYTES);
+        assert_eq!(
+            parse_line(&exact_line).map(|pipeline| pipeline.stages.len()),
+            Ok(1)
+        );
+        assert_eq!(
+            parse_line(&format!("{exact_line}x")),
+            Err(ParseError::LineTooLong)
+        );
+
+        let utf8_line = format!("echo a{}", "é".repeat(253));
+        assert_eq!(utf8_line.len(), MAX_LINE_BYTES);
+        assert!(parse_line(&utf8_line).is_ok());
+
+        let exact_words = core::iter::repeat_n("x", MAX_ARGS)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let parsed = parse_line(&exact_words).unwrap_or_default();
+        assert_eq!(parsed.stages[0].words.len(), MAX_ARGS);
+        let too_many_words = format!("{exact_words} x");
+        assert_eq!(
+            parse_line(&too_many_words),
+            Err(ParseError::TooManyArguments)
+        );
+
+        let exact_stages = core::iter::repeat_n("echo", MAX_PIPELINE_STAGES)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert_eq!(
+            parse_line(&exact_stages).map(|pipeline| pipeline.stages.len()),
+            Ok(MAX_PIPELINE_STAGES)
+        );
+        let too_many_stages = format!("{exact_stages} | echo");
+        assert_eq!(parse_line(&too_many_stages), Err(ParseError::TooManyStages));
     }
 
     #[test]
@@ -2151,24 +2193,24 @@ mod tests {
     #[test]
     fn completion_uses_command_pipeline_and_vfs_context() {
         let mut shell = shell();
-        let command = shell.complete("he", 2, CompletionConfig::tiny());
+        let command = shell.complete("he", 2, CompletionConfig::standard());
         assert_eq!(command.candidates.len(), 1);
         assert_eq!(command.common_replacement(), Some("hexdump "));
         assert_eq!(command.candidates[0].display, "hexdump");
 
-        let manual = shell.complete("man ec", 6, CompletionConfig::tiny());
+        let manual = shell.complete("man ec", 6, CompletionConfig::standard());
         assert_eq!(manual.candidates.len(), 1);
         assert_eq!(manual.candidates[0].replacement, "echo ");
 
-        let pipeline = shell.complete("echo x | pw", 11, CompletionConfig::tiny());
+        let pipeline = shell.complete("echo x | pw", 11, CompletionConfig::standard());
         assert_eq!(pipeline.candidates.len(), 1);
         assert_eq!(pipeline.candidates[0].replacement, "pwd ");
 
-        let directory = shell.complete("cd /he", 6, CompletionConfig::tiny());
+        let directory = shell.complete("cd /he", 6, CompletionConfig::standard());
         assert_eq!(directory.candidates.len(), 1);
         assert_eq!(directory.candidates[0].replacement, "/help/");
 
-        let file = shell.complete("cat /help/r", 11, CompletionConfig::tiny());
+        let file = shell.complete("cat /help/r", 11, CompletionConfig::standard());
         assert_eq!(file.candidates.len(), 1);
         assert_eq!(file.candidates[0].replacement, "/help/readme ");
     }
@@ -2215,6 +2257,66 @@ mod tests {
         assert_ne!(status.code(), 0);
         assert!(output.as_slice().is_empty());
         assert!(error.as_slice().ends_with(b"cat: output failed\n"));
+    }
+
+    #[test]
+    fn exact_capacity_pipeline_succeeds_and_one_extra_byte_is_atomic() {
+        let mut namespace = Namespace::new(RamFsQuota::default());
+        assert_eq!(namespace.add_read_only_dir("/help"), Ok(()));
+        let exact = alloc::vec![b'x'; PIPE_CAPACITY];
+        let oversized = alloc::vec![b'y'; PIPE_CAPACITY + 1];
+        assert_eq!(namespace.add_read_only_file("/help/exact", &exact), Ok(()));
+        assert_eq!(
+            namespace.add_read_only_file("/help/oversized", &oversized),
+            Ok(())
+        );
+        let mut shell = Shell::new(namespace, "test", MachineMemorySnapshot::hosted(), true)
+            .unwrap_or_else(|_| std::process::abort());
+
+        let mut input = SliceInput::new(b"");
+        let mut output = BoundedOutput::new(PIPE_CAPACITY);
+        let mut error = BoundedOutput::new(256);
+        assert_eq!(
+            shell.execute("cat /help/exact | cat", &mut input, &mut output, &mut error,),
+            troe_core::CommandStatus::Success
+        );
+        assert_eq!(output.as_slice(), exact);
+        assert!(error.as_slice().is_empty());
+
+        let mut output = BoundedOutput::new(64);
+        let mut error = BoundedOutput::new(256);
+        assert_eq!(
+            shell.execute(
+                "cat /help/oversized | cat",
+                &mut input,
+                &mut output,
+                &mut error,
+            ),
+            troe_core::CommandStatus::Failure
+        );
+        assert!(output.as_slice().is_empty());
+    }
+
+    #[test]
+    fn failed_stage_stops_side_effects_and_stderr_never_enters_the_pipe() {
+        let mut shell = shell();
+        let mut input = SliceInput::new(b"");
+        let mut output = BoundedOutput::new(128);
+        let mut error = BoundedOutput::new(256);
+        let status = shell.execute(
+            "cat /missing | write /tmp/error-copy",
+            &mut input,
+            &mut output,
+            &mut error,
+        );
+
+        assert_eq!(status, troe_core::CommandStatus::NotFound);
+        assert!(output.as_slice().is_empty());
+        assert_eq!(error.as_slice(), b"cat: /missing: not found\n");
+        assert_eq!(
+            shell.namespace.read_file("/", "/tmp/error-copy"),
+            Err(troe_vfs::FsError::NotFound)
+        );
     }
 
     #[test]

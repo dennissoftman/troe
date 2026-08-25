@@ -42,7 +42,7 @@ untrusted and bounded.
 - dispatch: at most 16 ports and 32 handles, generation-checked identities,
   explicit call rights, and 4 KiB request/reply limits;
 - KEX: exact target/version/layout validation before allocation, closed R/RX/RW
-  permissions, fixed profile ceilings, kernel-owned staging, canonical startup
+  permissions, fixed standard ceilings, kernel-owned staging, canonical startup
   pages, explicit initial handles, and transactional zeroized reclamation;
 - application execution: reset ring-3/EL0 state, bounded saved contexts,
   scheduler-selected resume, copied owner-checked request/reply calls, and an

@@ -8,44 +8,109 @@ import subprocess
 import sys
 from pathlib import Path
 
+if __package__:
+    from .platform_profile import (
+        PLATFORM_IDS,
+        PLATFORM_PROFILES,
+        PlatformProfile,
+        boot_image_path,
+    )
+else:
+    from platform_profile import (
+        PLATFORM_IDS,
+        PLATFORM_PROFILES,
+        PlatformProfile,
+        boot_image_path,
+    )
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOLS_DIR = REPO_ROOT / "tools"
 IMAGE_SIZE_LIMIT = 16 * 1024 * 1024
-TARGETS = {
-    "x86_64": "x86_64-unknown-uefi",
-    "aarch64": "aarch64-unknown-uefi",
-}
+PRODUCTION_FORBIDDEN_MARKERS = (
+    b"mmu-probe",
+    b"task-probe",
+    b"probing read-only",
+    b"probing non-executable",
+    b"probing task stack guard",
+    b"KEX-ACCEPTANCE-DESTRUCTIVE-v1\0",
+)
 
 
 def run(*command: str | Path) -> None:
     """Run a build command from the repository root."""
-    subprocess.run(
-        [str(argument) for argument in command], cwd=REPO_ROOT, check=True
+    subprocess.run([str(argument) for argument in command], cwd=REPO_ROOT, check=True)
+
+
+def verify_production_efi(path: Path) -> None:
+    """Reject acceptance-only payloads embedded in a production EFI image."""
+    image = path.read_bytes()
+    for marker in PRODUCTION_FORBIDDEN_MARKERS:
+        if marker in image:
+            label = marker.rstrip(b"\0").decode("ascii", errors="replace")
+            raise RuntimeError(
+                f"production EFI contains acceptance probe marker {label!r}: {path}"
+            )
+
+
+def cargo_build_command(
+    profile: PlatformProfile, *, acceptance_probes: bool
+) -> tuple[str, ...]:
+    """Return the exact kernel build command for one named platform."""
+    features = profile.kernel_feature
+    if acceptance_probes:
+        features += ",acceptance-probes"
+    return (
+        "cargo",
+        "build",
+        "--locked",
+        "-p",
+        "troe-kernel",
+        "--release",
+        "--target",
+        profile.target,
+        "--features",
+        features,
     )
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--arch",
-        choices=("all", *TARGETS),
-        default="all",
-        help="architecture to build (default: all)",
+        "--platform",
+        choices=("all", *PLATFORM_IDS),
+        required=True,
+        help="named platform to build, or explicit 'all'",
     )
     parser.add_argument(
         "--acceptance-probes",
         action="store_true",
         help="build a separate image containing terminal MMU acceptance probes",
     )
-    return parser.parse_args()
+    identity_source = parser.add_mutually_exclusive_group(required=True)
+    identity_source.add_argument(
+        "--fixture-identities",
+        action="store_true",
+        help="use deterministic test identities; never a deployment artifact",
+    )
+    identity_source.add_argument(
+        "--identity-file",
+        type=Path,
+        help="deployment identities created exclusively by tools/mkidentity.py",
+    )
+    return parser.parse_args(argv)
 
 
 def main() -> int:
     args = parse_args()
-    architectures = TARGETS if args.arch == "all" else (args.arch,)
+    platform_ids = PLATFORM_IDS if args.platform == "all" else (args.platform,)
 
     try:
+        identity_arguments: tuple[str | Path, ...] = (
+            ("--fixture-identities",)
+            if args.fixture_identities
+            else ("--identity-file", args.identity_file)
+        )
         run(
             sys.executable,
             TOOLS_DIR / "mkefs.py",
@@ -81,43 +146,34 @@ def main() -> int:
             REPO_ROOT / "assets" / "system.cspk",
             "--activation-output",
             REPO_ROOT / "assets" / "system.sact",
+            *identity_arguments,
+        )
+        run(
+            sys.executable,
+            TOOLS_DIR / "mkstorage.py",
+            "--manifest",
+            REPO_ROOT / "assets" / "boot.bmnt",
+            "--output",
+            REPO_ROOT / "build" / "storage-root.img",
+            "--content",
+            REPO_ROOT / "assets" / "system.cspk",
         )
 
-        for architecture in architectures:
-            target = TARGETS[architecture]
-            cargo_command = [
-                "cargo",
-                "build",
-                "--locked",
-                "-p",
-                "troe-kernel",
-                "--release",
-                "--target",
-                target,
-            ]
-            if args.acceptance_probes:
-                cargo_command.extend(("--features", "acceptance-probes"))
-            run(*cargo_command)
+        for platform_id in platform_ids:
+            profile = PLATFORM_PROFILES[platform_id]
+            run(*cargo_build_command(profile, acceptance_probes=args.acceptance_probes))
 
-            efi = REPO_ROOT / "target" / target / "release" / "kernel.efi"
-            suffix = "-acceptance" if args.acceptance_probes else ""
-            image = REPO_ROOT / "build" / f"boot-{architecture}{suffix}.img"
+            efi = REPO_ROOT / "target" / profile.target / "release" / "kernel.efi"
+            image = boot_image_path(
+                profile, acceptance_probes=args.acceptance_probes
+            )
             if not args.acceptance_probes:
-                efi_bytes = efi.read_bytes()
-                forbidden = (
-                    b"mmu-probe",
-                    b"task-probe",
-                    b"probing read-only",
-                    b"probing non-executable",
-                    b"probing task stack guard",
-                )
-                if any(marker in efi_bytes for marker in forbidden):
-                    raise RuntimeError(f"production EFI contains acceptance probe marker: {efi}")
+                verify_production_efi(efi)
             run(
                 sys.executable,
                 TOOLS_DIR / "mkfat.py",
                 "--arch",
-                architecture,
+                profile.architecture,
                 "--efi",
                 efi,
                 "--output",
@@ -127,7 +183,7 @@ def main() -> int:
                 sys.executable,
                 TOOLS_DIR / "size_report.py",
                 "--arch",
-                architecture,
+                profile.architecture,
                 "--efi",
                 efi,
                 "--rootfs",

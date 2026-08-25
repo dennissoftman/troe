@@ -10,9 +10,9 @@ normal-output transport, not a replacement for the recovery path.
 Terminal policy is supplied through validated configuration values. The kernel
 must not encode editor history counts, retained-history bytes, escape-sequence
 bounds, completion candidate counts, or completion byte budgets as unrelated
-literals. Portable crates provide named resource-profile defaults and public
-constructors so a composition root can select or replace the policy. Runtime
-state must enforce the supplied limits atomically.
+literals. Portable crates provide one named Standard default and public
+constructors so a composition root can select stricter validated limits when
+needed. Runtime state must enforce the supplied limits atomically.
 
 Input transports produce architecture-independent key events. The serial
 decoder consumes complete ANSI CSI/SS3 sequences and discards unknown sequences
@@ -48,3 +48,10 @@ and rendering. QEMU acceptance continues to drive UART so graphical
 availability cannot hide a broken recovery console; additional smoke checks
 require framebuffer activation on both architectures and inject native PS/2
 keys on x86-64.
+
+Implementation amendment, 2026-08-24: the repository's mandatory QEMU gate in
+`scripts/test.py` always passes `--framebuffer-console` and
+`--native-keyboard`. Consequently both architecture runs must report activation
+of the owned framebuffer console, and the x86-64 run must additionally complete
+a shell command delivered exclusively through the i8042 path. The serial-only
+recovery path remains part of the same runs and is still used for assertions.

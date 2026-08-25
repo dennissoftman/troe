@@ -364,7 +364,10 @@ impl MachineMemorySnapshot {
 
 #[cfg(test)]
 mod tests {
-    use super::{BoundedOutput, Input, Output, SliceInput, StreamError, is_backspace, write_all};
+    use super::{
+        BoundedOutput, CommandStatus, Input, Output, SliceInput, StreamError, is_backspace,
+        write_all,
+    };
 
     struct PartialOutput {
         bytes: alloc::vec::Vec<u8>,
@@ -411,5 +414,21 @@ mod tests {
         assert!(is_backspace('\u{8}'));
         assert!(is_backspace('\u{7f}'));
         assert!(!is_backspace('x'));
+    }
+
+    #[test]
+    fn command_status_codes_are_exhaustive_and_stable() {
+        assert_eq!(
+            [
+                CommandStatus::Success,
+                CommandStatus::Failure,
+                CommandStatus::Usage,
+                CommandStatus::NotFound,
+                CommandStatus::Denied,
+                CommandStatus::Cancelled,
+            ]
+            .map(CommandStatus::code),
+            [0, 1, 2, 3, 126, 130]
+        );
     }
 }

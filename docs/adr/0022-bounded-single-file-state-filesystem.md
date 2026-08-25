@@ -2,6 +2,14 @@
 
 Status: accepted and implemented for Stage 8, 2026-08-24.
 
+Normal native initialization now selects the state region by its exact PRGN
+disk, partition, and type identities, reopens STFS through TXSLOT recovery, and
+attaches the recovered provider writable at `/vol/state`. Production mounting
+does not create, increment, remove, or otherwise mutate `/state.bin`. The
+counter mutation and its marker remain an acceptance-only durability probe;
+missing, ambiguous, corrupt, or unsuitable state media leaves the mount absent
+without granting a different block device mutation authority.
+
 The first persistent filesystem mutation surface is STFS v1, not partial ext4
 journal mutation. STFS owns an exact PRGN-selected four-block GPT region and
 exposes only `/state.bin`, bounded by the containing TXSLOT payload ceiling.

@@ -29,8 +29,8 @@ The header is exactly 64 bytes.
 | 24 | 8 | entry offset | image-relative byte inside an RX segment |
 | 32 | 2 | load-record count | bounded, nonzero |
 | 34 | 2 | reserved | zero |
-| 36 | 4 | initial stack pages | within the selected profile range |
-| 40 | 4 | zeroed heap pages | within the selected profile ceiling |
+| 36 | 4 | initial stack pages | within the standard range |
+| 40 | 4 | zeroed heap pages | within the standard ceiling |
 | 44 | 4 | load-record offset | 64 |
 | 48 | 4 | payload offset | `64 + record_count * 40` |
 | 52 | 4 | reserved | zero |
@@ -55,8 +55,8 @@ Each 40-byte record has this layout:
 | 36 | 4 | reserved | zero |
 
 Records are strictly ordered by image offset and their mapped page ranges do
-not overlap. Gaps in virtual space are permitted only within the selected
-profile's image-span ceiling; they remain unmapped. Writable-executable and
+not overlap. Gaps in virtual space are permitted only within the standard
+image-span ceiling; they remain unmapped. Writable-executable and
 execute-only encodings do not exist.
 
 File payloads are tightly concatenated in record order beginning at the header's
@@ -67,32 +67,62 @@ descriptions, and trailing bytes are noncanonical. Each segment's remaining
 
 At least one segment is RX, and the single entry byte must fall within an RX
 segment. The loader verifies all header, table, file, image, fixed-base, page,
-and profile arithmetic before allocating or mapping application memory.
+and standard-policy arithmetic before allocating or mapping application memory.
 
-## Profile ceilings
+## Standard ceilings
 
-| Limit | `micro` | `tiny` | `full` |
-| --- | ---: | ---: | ---: |
-| Encoded bytes | disabled | 512 KiB | 16 MiB |
-| Load records | disabled | 8 | 16 |
-| Image span | disabled | 4 MiB | 128 MiB |
-| Mapped image pages | disabled | 256 | 8,192 |
-| Stack pages | disabled | 4–16 | 4–256 |
-| Heap pages | disabled | 0–64 | 0–4,096 |
-| Page-table pages | disabled | 64 | 512 |
-| Resident pages | disabled | 512 | 16,384 |
+| Limit | Standard |
+| --- | ---: |
+| Encoded bytes | 16 MiB |
+| Load records | 16 |
+| Image span | 128 MiB |
+| Mapped image pages | 8,192 |
+| Stack pages | 4–256 |
+| Heap pages | 0–4,096 |
+| Page-table pages | 512 |
+| Resident pages | 16,384 |
 
 The preliminary portable plan charges exact image, startup, heap, and stack
-pages plus the profile's complete page-table ceiling. Native table construction
+pages plus the standard page-table ceiling. Native table construction
 may refine that reservation downward but may not exceed either the table or
 aggregate resident ceiling.
+
+## Hosted ELF input contract
+
+`tools/elf2kex.py` is the canonical dependency-free hosted converter. Its input
+is a final, statically linked, little-endian System V ELF64 `ET_EXEC` for
+x86-64 or AArch64 at the fixed KEX image base. Program headers begin at byte 64
+and use 56-byte records. `PT_LOAD` records use 4 KiB-aligned file and virtual
+addresses, are ordered and page-disjoint, and request only R, RX, or RW. The
+entry is file-backed RX (and four-byte aligned on AArch64). A consistent
+read-only `PT_PHDR` and a non-executable GNU stack record are the only other
+accepted program types.
+
+The SDK linker resolves link-time relocations. The converter rejects residual
+`REL`, `RELA`, or `RELR` sections rather than carrying relocations into KEX. It
+also rejects interpreters, dynamic metadata, TLS, notes, GNU properties,
+unwind-header/RELRO requirements, unknown program records, W+X, noncanonical
+section metadata, and unexplained nonzero bytes. An optional section table is
+validation input only and is never copied as KEX metadata. After conversion,
+an independent KEX decoder compares every emitted record and payload with the
+validated loads and rechecks canonical layout and exact standard budgets.
+
+Create or verify an artifact with:
+
+```console
+python3 tools/elf2kex.py app.elf app.kex --target x86_64
+python3 tools/elf2kex.py app.elf app.kex --target x86_64 --check
+```
+
+The shared generated corpus lives under `tests/kex-corpus`; its exact file set
+and bytes are checked with `python3 tools/gen_kex_corpus.py --check`.
 
 ## ABI 1.0 virtual layout and startup page
 
 The portable plan fixes the non-image virtual regions so every native backend
 consumes identical checked address arithmetic. The startup page begins at
-`image base + profile image-span ceiling`. The heap slot follows it and reserves
-the profile's maximum heap span in virtual space, although only the requested
+`image base + standard image-span ceiling`. The heap slot follows it and reserves
+the standard maximum heap span in virtual space, although only the requested
 prefix is mapped. One unmapped lower guard follows the heap slot. The fixed
 maximum stack slot follows that guard; the requested stack pages are mapped at
 the top of the slot so they end immediately before an unmapped upper guard.
@@ -107,7 +137,7 @@ The startup page is 4 KiB, little-endian, and zero-padded. Its fixed header is
 | 4 | 2 | ABI major, 1 |
 | 6 | 2 | ABI minor, 0 |
 | 8 | 4 | page bytes, 4,096 |
-| 12 | 2 | resource profile: 1 micro, 2 tiny, 3 full |
+| 12 | 2 | reserved, zero |
 | 14 | 2 | initial handle count |
 | 16 | 8 | image base |
 | 24 | 8 | heap base |
@@ -119,7 +149,7 @@ The startup page is 4 KiB, little-endian, and zero-padded. Its fixed header is
 Each 24-byte initial handle descriptor then contains an opaque handle value
 (`u64`), rights bits (`u32`), interface identifier (`u32`), interface major and
 minor (`u16` each), and four reserved zero bytes. Values must be nonzero and
-unique within the page. Handle count cannot exceed the selected profile. The
+unique within the page. Handle count cannot exceed the standard ceiling. The
 kernel validates the complete descriptor set before clearing and encoding the
 destination, so rejection cannot leave a partial startup record.
 
@@ -127,7 +157,7 @@ destination, so rejection cannot leave a partial startup record.
 
 KEX v1 carries no sections, symbols, interpreter, dynamic metadata, imports,
 exports, relocations, TLS, compression, capabilities, signatures, device
-mappings, or shared-memory contract. A hosted converter must apply link-time
-relocations for the fixed image base and reject any residual runtime requirement
-before emitting KEX. Future package identity and trust metadata wrap KEX rather
-than changing this executable parser implicitly.
+mappings, or shared-memory contract. The hosted SDK must resolve link-time
+relocations for the fixed image base and reject every residual runtime
+requirement before emitting KEX. Future package identity and trust metadata wrap
+KEX rather than changing this executable parser implicitly.

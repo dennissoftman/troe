@@ -19,6 +19,12 @@ libraries remain a good option when the boot container needs more files;
 today's fixed three-directory/one-file layout is smaller to audit and entirely
 validated by extraction.
 
+Implementation note, 2026-08-24: KEFS verification independently decodes the
+artifact and compares the complete normalized source tree. FAT verification
+enumerates the root, `EFI`, and `BOOT` directories, rejects every extra entry,
+requires the architecture-native fallback name, validates the sole allocation
+chain and zeroed unused space, and compares the exact executable payload.
+
 Revisit FAT tooling when the container needs mutation, long filenames, multiple
 payloads, or non-FAT media. Bump KEFS for any incompatible record change.
 

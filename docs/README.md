@@ -35,7 +35,7 @@ historical review evidence.
 - [STFS v1](formats/stfs-v1.md) defines the crash-consistent single-file
   persistent state filesystem committed through TXSLOT.
 - [Identity security v1](formats/identity-v1.md) defines IREG, IMAP, IMNT,
-  IACL, ISEC, profile ceilings, cross-validation, and provisioning rules.
+  IACL, ISEC, standard ceilings, cross-validation, and provisioning rules.
 
 The repository root [README](../README.md), [security policy](../SECURITY.md),
 [contribution guide](../CONTRIBUTING.md), and [third-party inventory](../THIRD_PARTY.md)
@@ -86,15 +86,16 @@ interrupt-driven input and bounded driver-resource increment.
 ADR 0014 governs the completed Stage 6 unprivileged address-space,
 copied-message, contained-fault, and transactional teardown boundary.
 [ADR 0015](adr/0015-kex-application-abi-and-execution-bounds.md) accepts the KEX
-v1 container, application ABI 1.0, profile memory ceilings, and bounded
+v1 container, application ABI 1.0, standard memory ceilings, and bounded
 execution-lease policy for the completed Stage 7. Portable parsing, native
 owned loading, explicit handle grant, all ABI 1.0 calls, resume leases, copied
 dispatch, contained call/fault fates, and zeroized teardown are implemented.
 [ADR 0016](adr/0016-hardware-targets-and-emulator-role.md) separates CPU
-architecture, board/platform, and emulator roles for planned Stage 7.5 physical
-machine support. It retains q35 and `virt` as deterministic QEMU test profiles,
-selects Raspberry Pi 4 as the first AArch64 hardware reference without limiting
-other AArch64 boards, and requires a separately documented x86-64 UEFI PC.
+architecture, VM platform, and execution environment for Stage 7.5
+cloud portability. It retains q35 and `virt` as deterministic QEMU platforms,
+makes virtio the primary device boundary, and requires exact named
+hypervisor/cloud acceptance entries rather than a universal compatibility
+claim.
 
 ## Evaluations
 

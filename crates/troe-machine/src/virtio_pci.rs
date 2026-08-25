@@ -17,13 +17,17 @@ use troe_net::{
     NetworkDevice, RECEIVE_QUEUE_INDEX, TRANSMIT_QUEUE_INDEX, VIRTIO_NET_HEADER_BYTES,
     VirtioNetworkProfile,
 };
+use troe_platform::{IoPortRole, PciConfigurationKind, VirtioTransportKind};
 use troe_virtio::{
     REQUEST_HEADER_BYTES, REQUEST_QUEUE_INDEX, REQUEST_QUEUE_SIZE, RequestKind, RequestPlan,
     SplitQueueLayout, VirtioBlock, VirtioBlockProfile, VirtioBlockTransport,
 };
 
-const PCI_CONFIG_ADDRESS: u16 = 0x0cf8;
-const PCI_CONFIG_DATA: u16 = 0x0cfc;
+use crate::mechanism::{
+    ActiveNetworkInterrupt, DmaInitializationState, NetworkInterruptRoute, UsedIndexTransition,
+    claim_network_interrupt_publication, classify_used_index, revoke_network_interrupt_publication,
+};
+
 const PCI_VENDOR_VIRTIO: u16 = 0x1af4;
 const PCI_DEVICE_MODERN_NETWORK: u16 = 0x1041;
 const PCI_DEVICE_MODERN_BLOCK: u16 = 0x1042;
@@ -76,6 +80,97 @@ const PCI_INTERRUPT_PIN: u8 = 0x3d;
 
 static NETWORK_ISR_ADDRESS: AtomicUsize = AtomicUsize::new(0);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PciConfigurationAccess {
+    Mechanism1 {
+        address_port: u16,
+        data_port: u16,
+    },
+    #[cfg(feature = "platform-x86_64-uefi-virtio-pci")]
+    Ecam(crate::firmware_discovery::X86EcamWindow),
+}
+
+impl PciConfigurationAccess {
+    fn physical_range(self) -> Option<(u64, u64)> {
+        match self {
+            Self::Mechanism1 { .. } => None,
+            #[cfg(feature = "platform-x86_64-uefi-virtio-pci")]
+            Self::Ecam(window) => window.physical_range(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PciPlatformResources {
+    configuration: PciConfigurationAccess,
+    first_bus: u8,
+    last_bus: u8,
+    maximum_interrupt_line: u8,
+}
+
+impl PciPlatformResources {
+    fn selected() -> Result<Self, VirtioPciError> {
+        let platform = crate::selected_platform().map_err(|_| VirtioPciError::InvalidResource)?;
+        let VirtioTransportKind::Pci {
+            configuration: configuration_kind,
+            first_bus,
+            last_bus,
+            maximum_interrupt_line,
+            network_vector,
+            ..
+        } = platform.virtio()
+        else {
+            return Err(VirtioPciError::InvalidResource);
+        };
+        if first_bus > last_bus || network_vector < 32 {
+            return Err(VirtioPciError::InvalidResource);
+        }
+        let configuration = match configuration_kind {
+            PciConfigurationKind::Mechanism1 => {
+                let ports = platform
+                    .io_ports(IoPortRole::PciConfiguration)
+                    .ok_or(VirtioPciError::InvalidResource)?;
+                let data_port = ports
+                    .base()
+                    .checked_add(4)
+                    .ok_or(VirtioPciError::InvalidResource)?;
+                if ports.count() < 8 || !ports.base().is_multiple_of(4) {
+                    return Err(VirtioPciError::InvalidResource);
+                }
+                ports
+                    .base()
+                    .checked_add(ports.count() - 1)
+                    .ok_or(VirtioPciError::InvalidResource)?;
+                PciConfigurationAccess::Mechanism1 {
+                    address_port: ports.base(),
+                    data_port,
+                }
+            }
+            PciConfigurationKind::Ecam => {
+                #[cfg(feature = "platform-x86_64-uefi-virtio-pci")]
+                {
+                    let window = crate::firmware_discovery::x86_ecam_window()
+                        .ok_or(VirtioPciError::InvalidResource)?;
+                    if window.first_bus() != first_bus || window.last_bus() != last_bus {
+                        return Err(VirtioPciError::InvalidResource);
+                    }
+                    PciConfigurationAccess::Ecam(window)
+                }
+                #[cfg(not(feature = "platform-x86_64-uefi-virtio-pci"))]
+                {
+                    return Err(VirtioPciError::InvalidResource);
+                }
+            }
+        };
+        Ok(Self {
+            configuration,
+            first_bus,
+            last_bus,
+            maximum_interrupt_line,
+        })
+    }
+}
+
 /// Bounded q35 virtio PCI initialization failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VirtioPciError {
@@ -114,7 +209,9 @@ pub struct NativeVirtioNetwork {
     receive_used: u16,
     transmit_available: u16,
     transmit_used: u16,
-    interrupt_line: u8,
+    interrupt_route: Option<NetworkInterruptRoute>,
+    active_interrupt: Option<ActiveNetworkInterrupt>,
+    failed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -125,6 +222,7 @@ enum DeviceKind {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PciAddress {
+    platform: PciPlatformResources,
     bus: u8,
     device: u8,
     function: u8,
@@ -153,6 +251,40 @@ struct PciCapabilities {
     device: MmioRegion,
 }
 
+struct PciInitializationGuard {
+    common: MmioRegion,
+    state: DmaInitializationState,
+}
+
+impl PciInitializationGuard {
+    const fn new(common: MmioRegion) -> Self {
+        Self {
+            common,
+            state: DmaInitializationState::new(),
+        }
+    }
+
+    const fn mark_queue_published(&mut self) {
+        self.state.mark_queue_published();
+    }
+
+    const fn mark_driver_ok(&mut self) {
+        self.state.mark_driver_ok();
+    }
+
+    const fn transfer_ownership(&mut self) {
+        self.state.transfer_ownership();
+    }
+}
+
+impl Drop for PciInitializationGuard {
+    fn drop(&mut self) {
+        if self.state.cleanup_requires_reset() {
+            fail_and_reset(self.common);
+        }
+    }
+}
+
 /// Page-aligned BAR portions required by modern virtio PCI capabilities.
 ///
 /// The pinned q35 profile scans bus zero only. Persistent role assignment is
@@ -163,11 +295,30 @@ struct PciCapabilities {
 /// Rejects malformed capability chains, invalid BAR sizing, excessive matching
 /// devices, and ranges that cannot be represented by the page mapper.
 pub fn virtio_pci_device_ranges() -> Result<Vec<PhysicalRange>, VirtioPciError> {
-    let devices = scan_devices()?;
+    let resources = PciPlatformResources::selected()?;
+    let devices = scan_devices(resources)?;
     let mut spans = Vec::new();
+    let configuration_span = usize::from(resources.configuration.physical_range().is_some());
     spans
-        .try_reserve_exact(devices.len().saturating_mul(4))
+        .try_reserve_exact(
+            devices
+                .len()
+                .saturating_mul(4)
+                .saturating_add(configuration_span),
+        )
         .map_err(|_| VirtioPciError::InvalidResource)?;
+    if let Some((start, byte_len)) = resources.configuration.physical_range() {
+        let end = start
+            .checked_add(byte_len)
+            .ok_or(VirtioPciError::InvalidResource)?;
+        if byte_len == 0
+            || !start.is_multiple_of(BASE_PAGE_SIZE)
+            || !byte_len.is_multiple_of(BASE_PAGE_SIZE)
+        {
+            return Err(VirtioPciError::InvalidResource);
+        }
+        spans.push((start, end));
+    }
     for device in devices {
         for region in [device.common, device.notify, device.isr, device.device] {
             let start = u64::try_from(region.address)
@@ -218,7 +369,8 @@ pub fn virtio_pci_device_ranges() -> Result<Vec<PhysicalRange>, VirtioPciError> 
 /// Fails transactionally if any advertised modern block function cannot
 /// establish the selected feature, configuration, and queue profile.
 pub fn discover_virtio_pci_blocks() -> Result<Vec<NativeVirtioBlock>, VirtioPciError> {
-    let locations = scan_devices()?;
+    let resources = PciPlatformResources::selected()?;
+    let locations = scan_devices(resources)?;
     let mut devices = Vec::new();
     devices
         .try_reserve_exact(locations.len())
@@ -239,8 +391,9 @@ pub fn discover_virtio_pci_blocks() -> Result<Vec<NativeVirtioBlock>, VirtioPciE
 /// Rejects multiple NICs and every malformed capability, feature, MAC, queue,
 /// status, DMA, completion, timeout, or reset condition.
 pub fn discover_virtio_pci_network() -> Result<Option<NativeVirtioNetwork>, VirtioPciError> {
+    let resources = PciPlatformResources::selected()?;
     let mut network = None;
-    for capabilities in scan_devices()?
+    for capabilities in scan_devices(resources)?
         .into_iter()
         .filter(|device| device.kind == DeviceKind::Network)
     {
@@ -252,31 +405,34 @@ pub fn discover_virtio_pci_network() -> Result<Option<NativeVirtioNetwork>, Virt
     Ok(network)
 }
 
-fn scan_devices() -> Result<Vec<PciCapabilities>, VirtioPciError> {
+fn scan_devices(resources: PciPlatformResources) -> Result<Vec<PciCapabilities>, VirtioPciError> {
     let mut devices = Vec::new();
     devices
         .try_reserve_exact(MAX_NATIVE_BLOCK_DEVICES)
         .map_err(|_| VirtioPciError::InvalidResource)?;
-    for device in 0_u8..32 {
-        for function in 0_u8..8 {
-            let address = PciAddress {
-                bus: 0,
-                device,
-                function,
-            };
-            let identity = pci_read32(address, 0);
-            if low_u16(identity) != PCI_VENDOR_VIRTIO {
-                continue;
+    for bus in resources.first_bus..=resources.last_bus {
+        for device in 0_u8..32 {
+            for function in 0_u8..8 {
+                let address = PciAddress {
+                    platform: resources,
+                    bus,
+                    device,
+                    function,
+                };
+                let identity = pci_read32(address, 0);
+                if low_u16(identity) != PCI_VENDOR_VIRTIO {
+                    continue;
+                }
+                let kind = match high_u16(identity) {
+                    PCI_DEVICE_MODERN_NETWORK => DeviceKind::Network,
+                    PCI_DEVICE_MODERN_BLOCK => DeviceKind::Block,
+                    _ => continue,
+                };
+                if devices.len() >= MAX_NATIVE_BLOCK_DEVICES {
+                    return Err(VirtioPciError::DeviceLimit);
+                }
+                devices.push(parse_capabilities(address, kind)?);
             }
-            let kind = match high_u16(identity) {
-                PCI_DEVICE_MODERN_NETWORK => DeviceKind::Network,
-                PCI_DEVICE_MODERN_BLOCK => DeviceKind::Block,
-                _ => continue,
-            };
-            if devices.len() >= MAX_NATIVE_BLOCK_DEVICES {
-                return Err(VirtioPciError::DeviceLimit);
-            }
-            devices.push(parse_capabilities(address, kind)?);
         }
     }
     Ok(devices)
@@ -455,46 +611,38 @@ fn probe_bar(address: PciAddress, index: u8) -> Result<BarInfo, VirtioPciError> 
 }
 
 fn initialize_device(capabilities: PciCapabilities) -> Result<NativeVirtioBlock, VirtioPciError> {
+    // Keep the DMA allocation older than the reset guard: Rust drops locals in
+    // reverse declaration order, so every error resets before freeing `queue`.
+    let queue = Box::new(QueueMemory::new()?);
     let command = pci_read16(capabilities.address, 4);
     pci_write16(
         capabilities.address,
         4,
         command | PCI_COMMAND_MEMORY | PCI_COMMAND_BUS_MASTER,
     );
+    let mut reset_guard = PciInitializationGuard::new(capabilities.common);
     reset_device(capabilities.common)?;
     write_status(capabilities.common, STATUS_ACKNOWLEDGE);
     write_status(capabilities.common, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
     let offered_features = read_features(capabilities.common);
     let configuration = read_stable_configuration(capabilities)?;
-    let profile = match VirtioBlockProfile::negotiate(offered_features, &configuration) {
-        Ok(profile) => profile,
-        Err(_error) => {
-            fail_and_reset(capabilities.common);
-            return Err(VirtioPciError::UnsupportedProfile);
-        }
-    };
+    let profile = VirtioBlockProfile::negotiate(offered_features, &configuration)
+        .map_err(|_| VirtioPciError::UnsupportedProfile)?;
     write_features(capabilities.common, profile.negotiated_features());
     let feature_status = STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK;
     write_status(capabilities.common, feature_status);
     if mmio_read_u8(capabilities.common.address + COMMON_DEVICE_STATUS) & STATUS_FEATURES_OK == 0 {
-        fail_and_reset(capabilities.common);
         return Err(VirtioPciError::UnsupportedProfile);
     }
     mmio_write_u16(capabilities.common.address + COMMON_MSIX_CONFIG, NO_VECTOR);
-    let queue = Box::new(QueueMemory::new()?);
-    let notify = match configure_queue(capabilities, &queue) {
-        Ok(notify) => notify,
-        Err(error) => {
-            fail_and_reset(capabilities.common);
-            return Err(error);
-        }
-    };
+    let notify = configure_queue(capabilities, &queue)?;
+    reset_guard.mark_queue_published();
     write_status(capabilities.common, feature_status | STATUS_DRIVER_OK);
     if mmio_read_u8(capabilities.common.address + COMMON_DEVICE_STATUS) & STATUS_DRIVER_OK == 0 {
-        fail_and_reset(capabilities.common);
         return Err(VirtioPciError::DeviceState);
     }
-    Ok(VirtioBlock::new(
+    reset_guard.mark_driver_ok();
+    let device = VirtioBlock::new(
         VirtioPciTransport {
             common: capabilities.common,
             notify,
@@ -504,18 +652,26 @@ fn initialize_device(capabilities: PciCapabilities) -> Result<NativeVirtioBlock,
             used_index: 0,
         },
         profile,
-    ))
+    );
+    reset_guard.transfer_ownership();
+    Ok(device)
 }
 
 fn initialize_network_device(
     capabilities: PciCapabilities,
 ) -> Result<NativeVirtioNetwork, VirtioPciError> {
+    let interrupt_route = pci_interrupt_route(capabilities.address)?;
+    // Keep both DMA allocations older than the reset guard: Rust drops locals
+    // in reverse declaration order, so every error resets before freeing them.
+    let receive = Box::new(NetworkQueueMemory::new()?);
+    let transmit = Box::new(NetworkQueueMemory::new()?);
     let command = pci_read16(capabilities.address, 4);
     pci_write16(
         capabilities.address,
         4,
-        command | PCI_COMMAND_MEMORY | PCI_COMMAND_BUS_MASTER,
+        command | PCI_COMMAND_MEMORY | PCI_COMMAND_BUS_MASTER | PCI_COMMAND_INTERRUPT_DISABLE,
     );
+    let mut reset_guard = PciInitializationGuard::new(capabilities.common);
     reset_device(capabilities.common)?;
     write_status(capabilities.common, STATUS_ACKNOWLEDGE);
     write_status(capabilities.common, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
@@ -528,19 +684,18 @@ fn initialize_network_device(
     let feature_status = STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK;
     write_status(capabilities.common, feature_status);
     if mmio_read_u8(capabilities.common.address + COMMON_DEVICE_STATUS) & STATUS_FEATURES_OK == 0 {
-        fail_and_reset(capabilities.common);
         return Err(VirtioPciError::UnsupportedProfile);
     }
     mmio_write_u16(capabilities.common.address + COMMON_MSIX_CONFIG, NO_VECTOR);
-    let receive = Box::new(NetworkQueueMemory::new()?);
-    let transmit = Box::new(NetworkQueueMemory::new()?);
     let receive_notify = configure_network_queue(capabilities, RECEIVE_QUEUE_INDEX, &receive)?;
+    reset_guard.mark_queue_published();
     let transmit_notify = configure_network_queue(capabilities, TRANSMIT_QUEUE_INDEX, &transmit)?;
+    reset_guard.mark_queue_published();
     write_status(capabilities.common, feature_status | STATUS_DRIVER_OK);
     if mmio_read_u8(capabilities.common.address + COMMON_DEVICE_STATUS) & STATUS_DRIVER_OK == 0 {
-        fail_and_reset(capabilities.common);
         return Err(VirtioPciError::DeviceState);
     }
+    reset_guard.mark_driver_ok();
     let mut network = NativeVirtioNetwork {
         address: capabilities.address,
         common: capabilities.common,
@@ -554,8 +709,11 @@ fn initialize_network_device(
         receive_used: 0,
         transmit_available: 0,
         transmit_used: 0,
-        interrupt_line: pci_interrupt_line(capabilities.address)?,
+        interrupt_route: Some(interrupt_route),
+        active_interrupt: None,
+        failed: false,
     };
+    reset_guard.transfer_ownership();
     network
         .post_receive()
         .map_err(|_| VirtioPciError::InvalidQueue)?;
@@ -852,6 +1010,9 @@ impl NetworkDevice for NativeVirtioNetwork {
     }
 
     fn transmit(&mut self, frame: &[u8]) -> Result<(), NetError> {
+        if self.failed {
+            return Err(NetError::Device);
+        }
         self.transmit.prepare_transmit(frame)?;
         publish_network_descriptor(
             &self.transmit,
@@ -861,48 +1022,64 @@ impl NetworkDevice for NativeVirtioNetwork {
         )?;
         let expected = self.transmit_used.wrapping_add(1);
         for _ in 0..REGISTER_SPIN_LIMIT {
-            if self
+            let observed = self
                 .transmit
-                .read_u16(self.transmit.layout.used_offset() + 2)
-                == expected
-            {
-                dma_observe();
-                let (head, bytes) = self.transmit.used_element(self.transmit_used)?;
-                self.transmit_used = expected;
-                let _acknowledged = mmio_read_u8(self.isr.address);
-                return if head == 0 && bytes == 0 {
-                    Ok(())
-                } else {
-                    Err(NetError::Device)
-                };
+                .read_u16(self.transmit.layout.used_offset() + 2);
+            match classify_used_index(self.transmit_used, observed) {
+                UsedIndexTransition::Empty => spin_loop(),
+                UsedIndexTransition::Completed => {
+                    dma_observe();
+                    let Ok((head, bytes)) = self.transmit.used_element(self.transmit_used) else {
+                        return Err(self.fail_device(NetError::Device));
+                    };
+                    self.transmit_used = expected;
+                    return if head == 0 && bytes == 0 {
+                        Ok(())
+                    } else {
+                        Err(self.fail_device(NetError::Device))
+                    };
+                }
+                UsedIndexTransition::Invalid => {
+                    return Err(self.fail_device(NetError::Device));
+                }
             }
-            spin_loop();
         }
-        if reset_device(self.common).is_err() {
-            terminal_park();
-        }
-        Err(NetError::Timeout)
+        Err(self.fail_device(NetError::Timeout))
     }
 
     fn receive(&mut self) -> Result<Option<Vec<u8>>, NetError> {
+        if self.failed {
+            return Err(NetError::Device);
+        }
         let expected = self.receive_used.wrapping_add(1);
-        if self.receive.read_u16(self.receive.layout.used_offset() + 2) != expected {
-            return Ok(None);
+        let observed = self.receive.read_u16(self.receive.layout.used_offset() + 2);
+        match classify_used_index(self.receive_used, observed) {
+            UsedIndexTransition::Empty => return Ok(None),
+            UsedIndexTransition::Completed => {}
+            UsedIndexTransition::Invalid => return Err(self.fail_device(NetError::Device)),
         }
         dma_observe();
-        let (head, bytes) = self.receive.used_element(self.receive_used)?;
+        let Ok((head, bytes)) = self.receive.used_element(self.receive_used) else {
+            return Err(self.fail_device(NetError::Device));
+        };
         self.receive_used = expected;
-        let bytes = usize::try_from(bytes).map_err(|_| NetError::Device)?;
+        let Ok(bytes) = usize::try_from(bytes) else {
+            return Err(self.fail_device(NetError::Device));
+        };
         if head != 0
             || !(VIRTIO_NET_HEADER_BYTES + ETHERNET_HEADER_BYTES
                 ..=VIRTIO_NET_HEADER_BYTES + MAX_FRAME_BYTES)
                 .contains(&bytes)
             || !self.receive.header_is_zero()
         {
-            return Err(NetError::Device);
+            return Err(self.fail_device(NetError::Device));
         }
-        let frame = self.receive.copy_frame(bytes - VIRTIO_NET_HEADER_BYTES)?;
-        self.post_receive()?;
+        let Ok(frame) = self.receive.copy_frame(bytes - VIRTIO_NET_HEADER_BYTES) else {
+            return Err(self.fail_device(NetError::Device));
+        };
+        if self.post_receive().is_err() {
+            return Err(self.fail_device(NetError::Device));
+        }
         Ok(Some(frame))
     }
 }
@@ -917,11 +1094,26 @@ impl NativeVirtioNetwork {
     ///
     /// Returns a resource error when the advertised PCI line cannot be routed.
     pub fn enable_interrupts(&mut self) -> Result<(), VirtioPciError> {
+        if self.failed || self.active_interrupt.is_some() {
+            return Err(VirtioPciError::DeviceState);
+        }
+        let command = pci_read16(self.address, 4);
+        pci_write16(self.address, 4, command | PCI_COMMAND_INTERRUPT_DISABLE);
+        let route = self
+            .interrupt_route
+            .take()
+            .ok_or(VirtioPciError::DeviceState)?;
+        let prepared = crate::mechanism::prepare_network_interrupt(route)
+            .map_err(|_| VirtioPciError::InvalidResource)?;
+        if !claim_network_interrupt_publication(&NETWORK_ISR_ADDRESS, self.isr.address) {
+            crate::mechanism::cancel_prepared_network_interrupt(prepared);
+            return Err(VirtioPciError::DeviceState);
+        }
+        let active = crate::mechanism::activate_network_interrupt(prepared);
+        self.active_interrupt = Some(active);
         let command = pci_read16(self.address, 4);
         pci_write16(self.address, 4, command & !PCI_COMMAND_INTERRUPT_DISABLE);
-        NETWORK_ISR_ADDRESS.store(self.isr.address, Ordering::Release);
-        crate::mechanism::initialize_network_interrupt(u32::from(self.interrupt_line))
-            .map_err(|_| VirtioPciError::InvalidResource)
+        Ok(())
     }
 
     fn post_receive(&mut self) -> Result<(), NetError> {
@@ -933,6 +1125,27 @@ impl NativeVirtioNetwork {
             self.receive_notify,
         )
     }
+
+    fn fail_device(&mut self, error: NetError) -> NetError {
+        self.failed = true;
+        self.disable_interrupts();
+        if reset_device(self.common).is_err() {
+            terminal_park();
+        }
+        error
+    }
+
+    fn disable_interrupts(&mut self) {
+        let command = pci_read16(self.address, 4);
+        pci_write16(self.address, 4, command | PCI_COMMAND_INTERRUPT_DISABLE);
+        if let Some(active) = self.active_interrupt.take() {
+            let deactivated = crate::mechanism::deactivate_network_interrupt(active);
+            if !revoke_network_interrupt_publication(&NETWORK_ISR_ADDRESS, self.isr.address) {
+                terminal_park();
+            }
+            crate::mechanism::finish_network_interrupt_deactivation(deactivated);
+        }
+    }
 }
 
 pub(crate) fn acknowledge_network_interrupt_from_isr() -> bool {
@@ -940,20 +1153,27 @@ pub(crate) fn acknowledge_network_interrupt_from_isr() -> bool {
     address != 0 && mmio_read_u8(address) & 1 != 0
 }
 
-fn pci_interrupt_line(address: PciAddress) -> Result<u8, VirtioPciError> {
+fn pci_interrupt_route(address: PciAddress) -> Result<NetworkInterruptRoute, VirtioPciError> {
     let line = pci_read8(address, PCI_INTERRUPT_LINE);
     let pin = pci_read8(address, PCI_INTERRUPT_PIN);
-    if line == u8::MAX || pin == 0 {
+    if line > address.platform.maximum_interrupt_line {
         return Err(VirtioPciError::InvalidResource);
     }
-    Ok(line)
+    NetworkInterruptRoute::q35_pci_intx(line, pin).map_err(|_| VirtioPciError::InvalidResource)
 }
 
 impl Drop for NativeVirtioNetwork {
     fn drop(&mut self) {
+        self.disable_interrupts();
         if reset_device(self.common).is_err() {
             terminal_park();
         }
+        let command = pci_read16(self.address, 4);
+        pci_write16(
+            self.address,
+            4,
+            (command | PCI_COMMAND_INTERRUPT_DISABLE) & !PCI_COMMAND_BUS_MASTER,
+        );
     }
 }
 
@@ -1237,79 +1457,150 @@ fn pci_read16(address: PciAddress, offset: u8) -> u16 {
 }
 
 fn pci_write16(address: PciAddress, offset: u8, value: u16) {
-    let selector = 0x8000_0000_u32
-        | (u32::from(address.bus) << 16)
-        | (u32::from(address.device) << 11)
-        | (u32::from(address.function) << 8)
-        | u32::from(offset & !3);
-    let data_port = PCI_CONFIG_DATA + u16::from(offset & 2);
-    // SAFETY: The first output selects one bus-0 configuration dword. The
-    // width-specific second output changes only the requested 16-bit field,
-    // avoiding a read/modify/write of adjacent write-one-to-clear status bits.
+    if !offset.is_multiple_of(2) {
+        return;
+    }
+    let selector = pci_mechanism1_selector(address, offset);
+    // SAFETY: Mechanism #1 ports are descriptor-owned. An ECAM pointer is
+    // within the firmware-validated selected-bus aperture, which is identity
+    // accessible before owned page tables and included in their device map.
+    // The width-specific write avoids adjacent write-one-to-clear status bits.
     unsafe {
-        core::arch::asm!(
-            "out dx, eax",
-            in("dx") PCI_CONFIG_ADDRESS,
-            in("eax") selector,
-            options(nostack, preserves_flags)
-        );
-        core::arch::asm!(
-            "out dx, ax",
-            in("dx") data_port,
-            in("ax") value,
-            options(nostack, preserves_flags)
-        );
+        match address.platform.configuration {
+            PciConfigurationAccess::Mechanism1 {
+                address_port,
+                data_port,
+            } => {
+                core::arch::asm!(
+                    "out dx, eax",
+                    in("dx") address_port,
+                    in("eax") selector,
+                    options(nostack, preserves_flags)
+                );
+                core::arch::asm!(
+                    "out dx, ax",
+                    in("dx") data_port + u16::from(offset & 2),
+                    in("ax") value,
+                    options(nostack, preserves_flags)
+                );
+            }
+            #[cfg(feature = "platform-x86_64-uefi-virtio-pci")]
+            PciConfigurationAccess::Ecam(window) => {
+                let Some(raw) = window.configuration_address(
+                    address.bus,
+                    address.device,
+                    address.function,
+                    offset,
+                ) else {
+                    return;
+                };
+                let Ok(pointer) = usize::try_from(raw) else {
+                    return;
+                };
+                ptr::write_volatile(pointer as *mut u16, value.to_le());
+            }
+        }
     }
 }
 
 fn pci_read32(address: PciAddress, offset: u8) -> u32 {
-    let selector = 0x8000_0000_u32
-        | (u32::from(address.bus) << 16)
-        | (u32::from(address.device) << 11)
-        | (u32::from(address.function) << 8)
-        | u32::from(offset & !3);
-    let value: u32;
-    // SAFETY: CF8/CFC are the bounded PCI mechanism #1 ports owned by the
-    // single-core q35 profile. The selector names bus 0 and one checked field.
+    let aligned_offset = offset & !3;
+    let selector = pci_mechanism1_selector(address, aligned_offset);
+    // SAFETY: Mechanism #1 ports are descriptor-owned. An ECAM pointer is a
+    // naturally aligned dword within the validated and mapped selected-bus
+    // aperture. Reads name only bounded buses, devices, functions, and fields.
     unsafe {
-        core::arch::asm!(
-            "out dx, eax",
-            in("dx") PCI_CONFIG_ADDRESS,
-            in("eax") selector,
-            options(nostack, preserves_flags)
-        );
-        core::arch::asm!(
-            "in eax, dx",
-            in("dx") PCI_CONFIG_DATA,
-            out("eax") value,
-            options(nostack, preserves_flags)
-        );
+        match address.platform.configuration {
+            PciConfigurationAccess::Mechanism1 {
+                address_port,
+                data_port,
+            } => {
+                let value: u32;
+                core::arch::asm!(
+                    "out dx, eax",
+                    in("dx") address_port,
+                    in("eax") selector,
+                    options(nostack, preserves_flags)
+                );
+                core::arch::asm!(
+                    "in eax, dx",
+                    in("dx") data_port,
+                    out("eax") value,
+                    options(nostack, preserves_flags)
+                );
+                value
+            }
+            #[cfg(feature = "platform-x86_64-uefi-virtio-pci")]
+            PciConfigurationAccess::Ecam(window) => {
+                let Some(raw) = window.configuration_address(
+                    address.bus,
+                    address.device,
+                    address.function,
+                    aligned_offset,
+                ) else {
+                    return u32::MAX;
+                };
+                let Ok(pointer) = usize::try_from(raw) else {
+                    return u32::MAX;
+                };
+                u32::from_le(ptr::read_volatile(pointer as *const u32))
+            }
+        }
     }
-    value
 }
 
 fn pci_write32(address: PciAddress, offset: u8, value: u32) {
-    let selector = 0x8000_0000_u32
+    if !offset.is_multiple_of(4) {
+        return;
+    }
+    let selector = pci_mechanism1_selector(address, offset);
+    // SAFETY: Mechanism #1 ports are descriptor-owned. An ECAM pointer is a
+    // naturally aligned dword in the validated and mapped selected-bus
+    // aperture. BAR probing disables decode and restores all changed state.
+    unsafe {
+        match address.platform.configuration {
+            PciConfigurationAccess::Mechanism1 {
+                address_port,
+                data_port,
+            } => {
+                core::arch::asm!(
+                    "out dx, eax",
+                    in("dx") address_port,
+                    in("eax") selector,
+                    options(nostack, preserves_flags)
+                );
+                core::arch::asm!(
+                    "out dx, eax",
+                    in("dx") data_port,
+                    in("eax") value,
+                    options(nostack, preserves_flags)
+                );
+            }
+            #[cfg(feature = "platform-x86_64-uefi-virtio-pci")]
+            PciConfigurationAccess::Ecam(window) => {
+                let Some(raw) = window.configuration_address(
+                    address.bus,
+                    address.device,
+                    address.function,
+                    offset,
+                ) else {
+                    return;
+                };
+                let Ok(pointer) = usize::try_from(raw) else {
+                    return;
+                };
+                ptr::write_volatile(pointer as *mut u32, value.to_le());
+            }
+        }
+    }
+}
+
+fn pci_mechanism1_selector(address: PciAddress, offset: u8) -> u32 {
+    0x8000_0000_u32
         | (u32::from(address.bus) << 16)
         | (u32::from(address.device) << 11)
         | (u32::from(address.function) << 8)
-        | u32::from(offset & !3);
-    // SAFETY: CF8/CFC are the bounded PCI mechanism #1 ports owned by the
-    // single-core q35 profile. BAR probing disables decode and restores state.
-    unsafe {
-        core::arch::asm!(
-            "out dx, eax",
-            in("dx") PCI_CONFIG_ADDRESS,
-            in("eax") selector,
-            options(nostack, preserves_flags)
-        );
-        core::arch::asm!(
-            "out dx, eax",
-            in("dx") PCI_CONFIG_DATA,
-            in("eax") value,
-            options(nostack, preserves_flags)
-        );
-    }
+        | u32::from(offset & !3)
 }
 
 fn low_u16(value: u32) -> u16 {

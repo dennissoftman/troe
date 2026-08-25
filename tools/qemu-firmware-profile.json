@@ -1,0 +1,27 @@
+{
+  "artifacts": {
+    "aarch64": {
+      "code": {
+        "bytes": 67108864,
+        "sha256": "47765fe344818cbc464b1c14ae658fb4b854f5c2ceffa982411731eb4865594d"
+      },
+      "vars": {
+        "bytes": 67108864,
+        "sha256": "b3b855c5a80310168051164986855692d1bdb06e67619856177965cd87c6774f"
+      }
+    },
+    "x86_64": {
+      "code": {
+        "bytes": 3653632,
+        "sha256": "33090cc07675baa5190d9f1e84bf5176b33bcbfa9bacac522961150cdb6dbb2a"
+      },
+      "vars": {
+        "bytes": 540672,
+        "sha256": "5d2ac383371b408398accee7ec27c8c09ea5b74a0de0ceea6513388b15be5d1e"
+      }
+    }
+  },
+  "firmware_release": "edk2-stable202605-r1",
+  "qemu_version": "11.1.0",
+  "schema": 1
+}

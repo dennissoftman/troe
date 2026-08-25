@@ -8,8 +8,10 @@ pipeline to 8 stages, and each intermediate byte stream to 64 KiB. Execute
 stages sequentially and stop on the first non-success status.
 
 Statuses are stable categories (`Success`, `Failure`, `Usage`, `NotFound`,
-`Denied`) with hosted numeric mappings. Expected errors never panic. Stderr is
-not piped in 0.1.
+`Denied`, `Cancelled`) with hosted numeric mappings 0, 1, 2, 3, 126, and 130,
+respectively. `Cancelled` records an explicit cooperative user cancellation and
+does not conflate it with a command or I/O failure. Expected errors never panic.
+Stderr is not piped in 0.1.
 
 Omitting pipelines would force commands toward console coupling. Unbounded
 buffers were rejected. Concurrent ring buffers were rejected until cooperative

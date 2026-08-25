@@ -27,4 +27,8 @@ no product, repository, or vendor name, so a project rename does not change the
 filesystem contract.
 
 `tools/mkefs.py` is the canonical builder. It rejects symlinks and unsupported
-filesystem objects so host-specific link behavior cannot enter an image.
+filesystem objects so host-specific link behavior cannot enter an image. Its
+verification path independently decodes the artifact, validates every record
+and exact end-of-image consumption, and compares the resulting ordered paths,
+kinds, and payloads with the normalized source tree. A byte-for-byte rebuild is
+therefore not the sole round-trip check.

@@ -3,11 +3,10 @@
 Stage 8 identity state is four immutable, checksummed objects selected together
 by one ISEC v1 content-store manifest. All integers are little-endian. Every
 format requires major/minor `1.0`, exact total length, CRC32 coverage with the
-checksum field zero, and zero reserved bytes. The `tiny` profile accepts 256
-principals, 32 direct memberships per principal, 1,024 mappings, 32 ACL entries,
-and 2 MiB per encoded object. The `full` profile accepts 65,536 principals, 256
-direct memberships, 262,144 mappings, 256 ACL entries, and 64 MiB per object.
-The `micro` profile carries none of these objects.
+checksum field zero, and zero reserved bytes. The standard policy accepts
+65,536 principals, 256 direct memberships per principal, 262,144 mappings, 256
+ACL entries, and 64 MiB per encoded object. These are validation ceilings, not
+preallocated capacities.
 
 ## IREG v1 registry
 
@@ -82,6 +81,14 @@ from the host operating system CSPRNG, reject zero and registry collisions, and
 write a complete new immutable snapshot. The post-handoff kernel never mints a
 persistent identity. Deterministic IDs `01…01`, `02…02`, and `03…03` are reserved
 for acceptance fixtures and must not be emitted by deployment tooling.
+
+`tools/mkidentity.py` is the deployment provisioning entry point. It obtains
+all three values from `secrets.token_bytes`, rejects zero, collisions, and the
+three reserved fixture values, writes a new file exclusively with owner-only
+permissions, and refuses to overwrite an existing identity file.
+`tools/mkcontent.py` requires the caller to choose either the explicit
+acceptance-only `--fixture-identities` mode or an `--identity-file`; deployment
+files containing any reserved fixture value fail closed.
 
 ISEC v1 is an exact 192-byte object: magic/version/length at 0–15, generation at
 16, registry/mapping/mount/ACL SHA-256 identities at 24/56/88/120, CRC32 at 152,

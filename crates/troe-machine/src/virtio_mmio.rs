@@ -1,4 +1,4 @@
-//! `AArch64` QEMU `virt` modern virtio-MMIO block transport.
+//! Descriptor-selected modern virtio-MMIO block and network transport.
 
 extern crate alloc;
 
@@ -9,6 +9,8 @@ use core::fmt;
 use core::hint::spin_loop;
 use core::ptr;
 use core::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(target_arch = "x86_64")]
+use core::sync::atomic::{compiler_fence, fence};
 
 use troe_block::BlockError;
 use troe_memory::{BASE_PAGE_SIZE, PhysicalRange};
@@ -17,16 +19,18 @@ use troe_net::{
     NetworkDevice, RECEIVE_QUEUE_INDEX, TRANSMIT_QUEUE_INDEX, VIRTIO_DEVICE_ID_NETWORK,
     VIRTIO_NET_HEADER_BYTES, VirtioNetworkProfile,
 };
+use troe_platform::{MmioRole, VirtioTransportKind};
 use troe_virtio::{
     REQUEST_HEADER_BYTES, REQUEST_QUEUE_INDEX, REQUEST_QUEUE_SIZE, RequestKind, RequestPlan,
     SplitQueueLayout, VIRTIO_DEVICE_ID_BLOCK, VirtioBlock, VirtioBlockProfile,
     VirtioBlockTransport,
 };
 
-const VIRTIO_MMIO_BASE: u64 = 0x0a00_0000;
-const VIRTIO_MMIO_SLOT_BYTES: u64 = 0x200;
-const VIRTIO_MMIO_SLOT_COUNT: usize = 32;
-const VIRTIO_MMIO_APERTURE_BYTES: u64 = VIRTIO_MMIO_SLOT_BYTES * VIRTIO_MMIO_SLOT_COUNT as u64;
+use crate::mechanism::{
+    ActiveNetworkInterrupt, DmaInitializationState, NetworkInterruptRoute, UsedIndexTransition,
+    claim_network_interrupt_publication, classify_used_index, revoke_network_interrupt_publication,
+};
+
 const MAX_NATIVE_BLOCK_DEVICES: usize = 8;
 const REGISTER_SPIN_LIMIT: usize = 1_000_000;
 const CONFIG_READ_ATTEMPTS: usize = 8;
@@ -71,9 +75,102 @@ const STATUS_FAILED: u32 = 128;
 const DESCRIPTOR_NEXT: u16 = 1;
 const DESCRIPTOR_WRITE: u16 = 2;
 const NO_INTERRUPT: u16 = 1;
-const VIRTIO_MMIO_FIRST_INTID: u32 = 48;
-
 static NETWORK_INTERRUPT_BASE: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MmioPlatformResources {
+    aperture_base: u64,
+    aperture_bytes: u64,
+    slot_bytes: u64,
+    slot_count: usize,
+    first_interrupt: u32,
+}
+
+impl MmioPlatformResources {
+    fn selected() -> Result<Self, VirtioMmioError> {
+        let platform = crate::selected_platform().map_err(|_| VirtioMmioError::InvalidResource)?;
+        let aperture = platform
+            .mmio(MmioRole::VirtioMmio)
+            .ok_or(VirtioMmioError::InvalidResource)?;
+        let VirtioTransportKind::Mmio {
+            slot_bytes,
+            slot_count,
+            first_interrupt,
+            ..
+        } = platform.virtio()
+        else {
+            return Err(VirtioMmioError::InvalidResource);
+        };
+        let slot_bytes = u64::from(slot_bytes);
+        let slot_count = usize::from(slot_count);
+        let described_bytes = slot_bytes
+            .checked_mul(u64::try_from(slot_count).map_err(|_| VirtioMmioError::InvalidResource)?)
+            .ok_or(VirtioMmioError::InvalidResource)?;
+        let minimum_slot_bytes =
+            u64::try_from(MMIO_CONFIG + 24).map_err(|_| VirtioMmioError::InvalidResource)?;
+        if described_bytes != aperture.byte_len()
+            || slot_bytes < minimum_slot_bytes
+            || !slot_bytes.is_multiple_of(4)
+            || !aperture.base().is_multiple_of(4)
+        {
+            return Err(VirtioMmioError::InvalidResource);
+        }
+        aperture
+            .base()
+            .checked_add(aperture.byte_len())
+            .ok_or(VirtioMmioError::InvalidResource)?;
+        Ok(Self {
+            aperture_base: aperture.base(),
+            aperture_bytes: aperture.byte_len(),
+            slot_bytes,
+            slot_count,
+            first_interrupt,
+        })
+    }
+
+    fn slot_base(self, index: usize) -> Result<usize, VirtioMmioError> {
+        if index >= self.slot_count {
+            return Err(VirtioMmioError::InvalidResource);
+        }
+        let offset = u64::try_from(index)
+            .ok()
+            .and_then(|slot| slot.checked_mul(self.slot_bytes))
+            .ok_or(VirtioMmioError::InvalidResource)?;
+        let address = self
+            .aperture_base
+            .checked_add(offset)
+            .ok_or(VirtioMmioError::InvalidResource)?;
+        let slot_end = address
+            .checked_add(self.slot_bytes)
+            .ok_or(VirtioMmioError::InvalidResource)?;
+        let aperture_end = self
+            .aperture_base
+            .checked_add(self.aperture_bytes)
+            .ok_or(VirtioMmioError::InvalidResource)?;
+        if slot_end > aperture_end {
+            return Err(VirtioMmioError::InvalidResource);
+        }
+        usize::try_from(slot_end).map_err(|_| VirtioMmioError::InvalidResource)?;
+        usize::try_from(address).map_err(|_| VirtioMmioError::InvalidResource)
+    }
+
+    fn slot_index(self, base: usize) -> Result<u32, VirtioMmioError> {
+        let offset = u64::try_from(base)
+            .ok()
+            .and_then(|base| base.checked_sub(self.aperture_base))
+            .ok_or(VirtioMmioError::InvalidResource)?;
+        if !offset.is_multiple_of(self.slot_bytes) {
+            return Err(VirtioMmioError::InvalidResource);
+        }
+        let index = u32::try_from(offset / self.slot_bytes)
+            .map_err(|_| VirtioMmioError::InvalidResource)?;
+        if usize::try_from(index).map_err(|_| VirtioMmioError::InvalidResource)? >= self.slot_count
+        {
+            return Err(VirtioMmioError::InvalidResource);
+        }
+        Ok(index)
+    }
+}
 
 /// Bounded native virtio-MMIO initialization failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -92,7 +189,7 @@ pub enum VirtioMmioError {
     InvalidQueue,
 }
 
-/// One initialized `AArch64` `virt` block device behind the portable adapter.
+/// One initialized modern virtio-MMIO block device behind the portable adapter.
 pub type NativeVirtioBlock = VirtioBlock<VirtioMmioTransport>;
 
 /// One initialized modern virtio-MMIO network device.
@@ -105,28 +202,66 @@ pub struct NativeVirtioNetwork {
     receive_used: u16,
     transmit_available: u16,
     transmit_used: u16,
+    interrupt_route: Option<NetworkInterruptRoute>,
+    active_interrupt: Option<ActiveNetworkInterrupt>,
+    failed: bool,
 }
 
-/// Page-aligned MMIO apertures owned by the pinned `AArch64` `virt` profile.
+struct MmioInitializationGuard {
+    base: usize,
+    state: DmaInitializationState,
+}
+
+impl MmioInitializationGuard {
+    const fn new(base: usize) -> Self {
+        Self {
+            base,
+            state: DmaInitializationState::new(),
+        }
+    }
+
+    const fn mark_queue_published(&mut self) {
+        self.state.mark_queue_published();
+    }
+
+    const fn mark_driver_ok(&mut self) {
+        self.state.mark_driver_ok();
+    }
+
+    const fn transfer_ownership(&mut self) {
+        self.state.transfer_ownership();
+    }
+}
+
+impl Drop for MmioInitializationGuard {
+    fn drop(&mut self) {
+        if self.state.cleanup_requires_reset() {
+            fail_and_reset(self.base);
+        }
+    }
+}
+
+/// Page-aligned MMIO aperture owned by the selected platform descriptor.
 ///
 /// # Errors
 ///
 /// Returns a typed failure if the fixed aperture is not page-aligned or cannot
 /// form a checked physical range.
 pub fn virtio_mmio_device_ranges() -> Result<[PhysicalRange; 1], VirtioMmioError> {
-    if !VIRTIO_MMIO_BASE.is_multiple_of(BASE_PAGE_SIZE)
-        || !VIRTIO_MMIO_APERTURE_BYTES.is_multiple_of(BASE_PAGE_SIZE)
+    let resources = MmioPlatformResources::selected()?;
+    if !resources.aperture_base.is_multiple_of(BASE_PAGE_SIZE)
+        || !resources.aperture_bytes.is_multiple_of(BASE_PAGE_SIZE)
     {
         return Err(VirtioMmioError::InvalidResource);
     }
-    let pages = VIRTIO_MMIO_APERTURE_BYTES / BASE_PAGE_SIZE;
-    let range = PhysicalRange::from_pages(VIRTIO_MMIO_BASE, pages)
+    let pages = resources.aperture_bytes / BASE_PAGE_SIZE;
+    let range = PhysicalRange::from_pages(resources.aperture_base, pages)
         .map_err(|_| VirtioMmioError::InvalidResource)?;
     Ok([range])
 }
 
-/// Discover and initialize every modern virtio-MMIO block device in the pinned
-/// `AArch64` QEMU `virt` aperture.
+/// Discover and initialize every modern virtio-MMIO block device in the
+/// selected platform aperture.
 ///
 /// Device enumeration order is retained only for discovery diagnostics. It is
 /// never sufficient for assigning a persistent volume role.
@@ -137,19 +272,13 @@ pub fn virtio_mmio_device_ranges() -> Result<[PhysicalRange; 1], VirtioMmioError
 /// exceeded, or if one advertised block device cannot establish the selected
 /// modern feature, configuration, and split-queue profile.
 pub fn discover_virtio_mmio_blocks() -> Result<Vec<NativeVirtioBlock>, VirtioMmioError> {
+    let resources = MmioPlatformResources::selected()?;
     let mut devices = Vec::new();
     devices
         .try_reserve_exact(MAX_NATIVE_BLOCK_DEVICES)
         .map_err(|_| VirtioMmioError::QueueAllocation)?;
-    for index in 0..VIRTIO_MMIO_SLOT_COUNT {
-        let slot = u64::try_from(index).map_err(|_| VirtioMmioError::InvalidResource)?;
-        let address = VIRTIO_MMIO_BASE
-            .checked_add(
-                slot.checked_mul(VIRTIO_MMIO_SLOT_BYTES)
-                    .ok_or(VirtioMmioError::InvalidResource)?,
-            )
-            .ok_or(VirtioMmioError::InvalidResource)?;
-        let base = usize::try_from(address).map_err(|_| VirtioMmioError::InvalidResource)?;
+    for index in 0..resources.slot_count {
+        let base = resources.slot_base(index)?;
         if mmio_read(base, MMIO_MAGIC_VALUE) != VIRTIO_MAGIC
             || mmio_read(base, MMIO_VERSION) != VIRTIO_MMIO_MODERN_VERSION
             || mmio_read(base, MMIO_DEVICE_ID) != VIRTIO_DEVICE_ID_BLOCK
@@ -171,17 +300,10 @@ pub fn discover_virtio_mmio_blocks() -> Result<Vec<NativeVirtioBlock>, VirtioMmi
 /// Rejects multiple NICs and every device that cannot establish the minimal
 /// feature, MAC, two-queue, DMA, status, and reset profile.
 pub fn discover_virtio_mmio_network() -> Result<Option<NativeVirtioNetwork>, VirtioMmioError> {
+    let resources = MmioPlatformResources::selected()?;
     let mut network = None;
-    for index in 0..VIRTIO_MMIO_SLOT_COUNT {
-        let address = VIRTIO_MMIO_BASE
-            .checked_add(
-                u64::try_from(index)
-                    .ok()
-                    .and_then(|slot| slot.checked_mul(VIRTIO_MMIO_SLOT_BYTES))
-                    .ok_or(VirtioMmioError::InvalidResource)?,
-            )
-            .ok_or(VirtioMmioError::InvalidResource)?;
-        let base = usize::try_from(address).map_err(|_| VirtioMmioError::InvalidResource)?;
+    for index in 0..resources.slot_count {
+        let base = resources.slot_base(index)?;
         if mmio_read(base, MMIO_MAGIC_VALUE) != VIRTIO_MAGIC
             || mmio_read(base, MMIO_VERSION) != VIRTIO_MMIO_MODERN_VERSION
             || mmio_read(base, MMIO_DEVICE_ID) != VIRTIO_DEVICE_ID_NETWORK
@@ -191,12 +313,21 @@ pub fn discover_virtio_mmio_network() -> Result<Option<NativeVirtioNetwork>, Vir
         if network.is_some() {
             return Err(VirtioMmioError::DeviceLimit);
         }
-        network = Some(initialize_network_device(base)?);
+        network = Some(initialize_network_device(base, resources)?);
     }
     Ok(network)
 }
 
-fn initialize_network_device(base: usize) -> Result<NativeVirtioNetwork, VirtioMmioError> {
+fn initialize_network_device(
+    base: usize,
+    resources: MmioPlatformResources,
+) -> Result<NativeVirtioNetwork, VirtioMmioError> {
+    let interrupt_route = virtio_mmio_interrupt_route(base, resources)?;
+    // Keep both DMA allocations older than the reset guard: Rust drops locals
+    // in reverse declaration order, so every error resets before freeing them.
+    let receive = Box::new(NetworkQueueMemory::new()?);
+    let transmit = Box::new(NetworkQueueMemory::new()?);
+    let mut reset_guard = MmioInitializationGuard::new(base);
     reset_device(base)?;
     write_status(base, STATUS_ACKNOWLEDGE);
     write_status(base, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
@@ -209,18 +340,17 @@ fn initialize_network_device(base: usize) -> Result<NativeVirtioNetwork, VirtioM
     let feature_status = STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK;
     write_status(base, feature_status);
     if mmio_read(base, MMIO_STATUS) & STATUS_FEATURES_OK == 0 {
-        fail_and_reset(base);
         return Err(VirtioMmioError::UnsupportedProfile);
     }
-    let receive = Box::new(NetworkQueueMemory::new()?);
-    let transmit = Box::new(NetworkQueueMemory::new()?);
     configure_network_queue(base, RECEIVE_QUEUE_INDEX, &receive)?;
+    reset_guard.mark_queue_published();
     configure_network_queue(base, TRANSMIT_QUEUE_INDEX, &transmit)?;
+    reset_guard.mark_queue_published();
     write_status(base, feature_status | STATUS_DRIVER_OK);
     if mmio_read(base, MMIO_STATUS) & STATUS_DRIVER_OK == 0 {
-        fail_and_reset(base);
         return Err(VirtioMmioError::DeviceState);
     }
+    reset_guard.mark_driver_ok();
     let mut network = NativeVirtioNetwork {
         base,
         mac: profile.mac(),
@@ -230,11 +360,26 @@ fn initialize_network_device(base: usize) -> Result<NativeVirtioNetwork, VirtioM
         receive_used: 0,
         transmit_available: 0,
         transmit_used: 0,
+        interrupt_route: Some(interrupt_route),
+        active_interrupt: None,
+        failed: false,
     };
+    reset_guard.transfer_ownership();
     network
         .post_receive()
         .map_err(|_| VirtioMmioError::InvalidQueue)?;
     Ok(network)
+}
+
+fn virtio_mmio_interrupt_route(
+    base: usize,
+    resources: MmioPlatformResources,
+) -> Result<NetworkInterruptRoute, VirtioMmioError> {
+    let slot = resources.slot_index(base)?;
+    let slot_count =
+        u32::try_from(resources.slot_count).map_err(|_| VirtioMmioError::InvalidResource)?;
+    NetworkInterruptRoute::virtio_mmio(slot, slot_count, resources.first_interrupt)
+        .map_err(|_| VirtioMmioError::InvalidResource)
 }
 
 fn configure_network_queue(
@@ -296,44 +441,33 @@ fn read_stable_network_configuration(base: usize) -> Result<[u8; 8], VirtioMmioE
 }
 
 fn initialize_device(base: usize) -> Result<NativeVirtioBlock, VirtioMmioError> {
+    // Keep the DMA allocation older than the reset guard: Rust drops locals in
+    // reverse declaration order, so every error resets before freeing `queue`.
+    let queue = Box::new(QueueMemory::new()?);
+    let mut reset_guard = MmioInitializationGuard::new(base);
     reset_device(base)?;
     write_status(base, STATUS_ACKNOWLEDGE);
     write_status(base, STATUS_ACKNOWLEDGE | STATUS_DRIVER);
 
     let offered_features = read_features(base);
     let configuration = read_stable_configuration(base)?;
-    let profile = match VirtioBlockProfile::negotiate(offered_features, &configuration) {
-        Ok(profile) => profile,
-        Err(_error) => {
-            fail_and_reset(base);
-            return Err(VirtioMmioError::UnsupportedProfile);
-        }
-    };
+    let profile = VirtioBlockProfile::negotiate(offered_features, &configuration)
+        .map_err(|_| VirtioMmioError::UnsupportedProfile)?;
     write_features(base, profile.negotiated_features());
     let feature_status = STATUS_ACKNOWLEDGE | STATUS_DRIVER | STATUS_FEATURES_OK;
     write_status(base, feature_status);
     if mmio_read(base, MMIO_STATUS) & STATUS_FEATURES_OK == 0 {
-        fail_and_reset(base);
         return Err(VirtioMmioError::UnsupportedProfile);
     }
 
-    let queue = match QueueMemory::new() {
-        Ok(queue) => Box::new(queue),
-        Err(error) => {
-            fail_and_reset(base);
-            return Err(error);
-        }
-    };
-    if let Err(error) = configure_queue(base, &queue) {
-        fail_and_reset(base);
-        return Err(error);
-    }
+    configure_queue(base, &queue)?;
+    reset_guard.mark_queue_published();
     write_status(base, feature_status | STATUS_DRIVER_OK);
     if mmio_read(base, MMIO_STATUS) & STATUS_DRIVER_OK == 0 {
-        fail_and_reset(base);
         return Err(VirtioMmioError::DeviceState);
     }
-    Ok(VirtioBlock::new(
+    reset_guard.mark_driver_ok();
+    let device = VirtioBlock::new(
         VirtioMmioTransport {
             base,
             queue,
@@ -341,7 +475,9 @@ fn initialize_device(base: usize) -> Result<NativeVirtioBlock, VirtioMmioError> 
             used_index: 0,
         },
         profile,
-    ))
+    );
+    reset_guard.transfer_ownership();
+    Ok(device)
 }
 
 fn configure_queue(base: usize, queue: &QueueMemory) -> Result<(), VirtioMmioError> {
@@ -566,6 +702,9 @@ impl NetworkDevice for NativeVirtioNetwork {
     }
 
     fn transmit(&mut self, frame: &[u8]) -> Result<(), NetError> {
+        if self.failed {
+            return Err(NetError::Device);
+        }
         self.transmit.prepare_transmit(frame)?;
         publish_network_descriptor(
             &self.transmit,
@@ -575,54 +714,70 @@ impl NetworkDevice for NativeVirtioNetwork {
         )?;
         let expected = self.transmit_used.wrapping_add(1);
         for _ in 0..REGISTER_SPIN_LIMIT {
-            if self
+            let observed = self
                 .transmit
-                .read_u16(self.transmit.layout.used_offset() + 2)
-                == expected
-            {
-                dma_observe();
-                let (head, bytes) = self.transmit.used_element(self.transmit_used)?;
-                self.transmit_used = expected;
-                acknowledge_network_interrupt(self.base);
-                return if head == 0 && bytes == 0 {
-                    Ok(())
-                } else {
-                    Err(NetError::Device)
-                };
+                .read_u16(self.transmit.layout.used_offset() + 2);
+            match classify_used_index(self.transmit_used, observed) {
+                UsedIndexTransition::Empty => spin_loop(),
+                UsedIndexTransition::Completed => {
+                    dma_observe();
+                    let Ok((head, bytes)) = self.transmit.used_element(self.transmit_used) else {
+                        return Err(self.fail_device(NetError::Device));
+                    };
+                    self.transmit_used = expected;
+                    return if head == 0 && bytes == 0 {
+                        Ok(())
+                    } else {
+                        Err(self.fail_device(NetError::Device))
+                    };
+                }
+                UsedIndexTransition::Invalid => {
+                    return Err(self.fail_device(NetError::Device));
+                }
             }
-            spin_loop();
         }
-        if reset_device(self.base).is_err() {
-            terminal_park();
-        }
-        Err(NetError::Timeout)
+        Err(self.fail_device(NetError::Timeout))
     }
 
     fn receive(&mut self) -> Result<Option<Vec<u8>>, NetError> {
+        if self.failed {
+            return Err(NetError::Device);
+        }
         let expected = self.receive_used.wrapping_add(1);
-        if self.receive.read_u16(self.receive.layout.used_offset() + 2) != expected {
-            return Ok(None);
+        let observed = self.receive.read_u16(self.receive.layout.used_offset() + 2);
+        match classify_used_index(self.receive_used, observed) {
+            UsedIndexTransition::Empty => return Ok(None),
+            UsedIndexTransition::Completed => {}
+            UsedIndexTransition::Invalid => return Err(self.fail_device(NetError::Device)),
         }
         dma_observe();
-        let (head, bytes) = self.receive.used_element(self.receive_used)?;
+        let Ok((head, bytes)) = self.receive.used_element(self.receive_used) else {
+            return Err(self.fail_device(NetError::Device));
+        };
         self.receive_used = expected;
-        let bytes = usize::try_from(bytes).map_err(|_| NetError::Device)?;
+        let Ok(bytes) = usize::try_from(bytes) else {
+            return Err(self.fail_device(NetError::Device));
+        };
         if head != 0
             || !(VIRTIO_NET_HEADER_BYTES + ETHERNET_HEADER_BYTES
                 ..=VIRTIO_NET_HEADER_BYTES + MAX_FRAME_BYTES)
                 .contains(&bytes)
             || !self.receive.header_is_zero()
         {
-            return Err(NetError::Device);
+            return Err(self.fail_device(NetError::Device));
         }
-        let frame = self.receive.copy_frame(bytes - VIRTIO_NET_HEADER_BYTES)?;
-        self.post_receive()?;
+        let Ok(frame) = self.receive.copy_frame(bytes - VIRTIO_NET_HEADER_BYTES) else {
+            return Err(self.fail_device(NetError::Device));
+        };
+        if self.post_receive().is_err() {
+            return Err(self.fail_device(NetError::Device));
+        }
         Ok(Some(frame))
     }
 }
 
 impl NativeVirtioNetwork {
-    /// Connect this slot's completion source to the owned `GICv2` distributor.
+    /// Connect this slot's completion source to the owned interrupt controller.
     ///
     /// The IRQ handler only acknowledges the MMIO source and schedules a
     /// bounded cooperative poll; it never parses or allocates packets.
@@ -631,21 +786,21 @@ impl NativeVirtioNetwork {
     ///
     /// Returns a resource error when the slot cannot map to an implemented SPI.
     pub fn enable_interrupts(&mut self) -> Result<(), VirtioMmioError> {
-        let offset = u64::try_from(self.base)
-            .ok()
-            .and_then(|base| base.checked_sub(VIRTIO_MMIO_BASE))
-            .ok_or(VirtioMmioError::InvalidResource)?;
-        if !offset.is_multiple_of(VIRTIO_MMIO_SLOT_BYTES) {
-            return Err(VirtioMmioError::InvalidResource);
+        if self.failed || self.active_interrupt.is_some() {
+            return Err(VirtioMmioError::DeviceState);
         }
-        let slot = u32::try_from(offset / VIRTIO_MMIO_SLOT_BYTES)
+        let route = self
+            .interrupt_route
+            .take()
+            .ok_or(VirtioMmioError::DeviceState)?;
+        let prepared = crate::mechanism::prepare_network_interrupt(route)
             .map_err(|_| VirtioMmioError::InvalidResource)?;
-        let intid = VIRTIO_MMIO_FIRST_INTID
-            .checked_add(slot)
-            .ok_or(VirtioMmioError::InvalidResource)?;
-        NETWORK_INTERRUPT_BASE.store(self.base, Ordering::Release);
-        crate::mechanism::initialize_network_interrupt(intid)
-            .map_err(|_| VirtioMmioError::InvalidResource)
+        if !claim_network_interrupt_publication(&NETWORK_INTERRUPT_BASE, self.base) {
+            crate::mechanism::cancel_prepared_network_interrupt(prepared);
+            return Err(VirtioMmioError::DeviceState);
+        }
+        self.active_interrupt = Some(crate::mechanism::activate_network_interrupt(prepared));
+        Ok(())
     }
 
     fn post_receive(&mut self) -> Result<(), NetError> {
@@ -656,6 +811,25 @@ impl NativeVirtioNetwork {
             RECEIVE_QUEUE_INDEX,
             self.base,
         )
+    }
+
+    fn fail_device(&mut self, error: NetError) -> NetError {
+        self.failed = true;
+        self.disable_interrupts();
+        if reset_device(self.base).is_err() {
+            terminal_park();
+        }
+        error
+    }
+
+    fn disable_interrupts(&mut self) {
+        if let Some(active) = self.active_interrupt.take() {
+            let deactivated = crate::mechanism::deactivate_network_interrupt(active);
+            if !revoke_network_interrupt_publication(&NETWORK_INTERRUPT_BASE, self.base) {
+                terminal_park();
+            }
+            crate::mechanism::finish_network_interrupt_deactivation(deactivated);
+        }
     }
 }
 
@@ -673,6 +847,7 @@ pub(crate) fn acknowledge_network_interrupt_from_isr() -> bool {
 
 impl Drop for NativeVirtioNetwork {
     fn drop(&mut self) {
+        self.disable_interrupts();
         if reset_device(self.base).is_err() {
             terminal_park();
         }
@@ -698,13 +873,6 @@ fn publish_network_descriptor(
     dma_publish();
     mmio_write(base, MMIO_QUEUE_NOTIFY, u32::from(index));
     Ok(())
-}
-
-fn acknowledge_network_interrupt(base: usize) {
-    let status = mmio_read(base, MMIO_INTERRUPT_STATUS) & 0x3;
-    if status != 0 {
-        mmio_write(base, MMIO_INTERRUPT_ACK, status);
-    }
 }
 
 #[repr(C, align(4096))]
@@ -971,23 +1139,35 @@ fn mmio_write(base: usize, offset: usize, value: u32) {
     unsafe { ptr::write_volatile(address as *mut u32, value) };
 }
 
+#[cfg(target_arch = "aarch64")]
 fn dma_publish() {
     // SAFETY: `dmb oshst` orders normal-memory queue and payload writes before
     // the following device notification in the outer-shareable domain.
     unsafe { core::arch::asm!("dmb oshst", options(nostack, preserves_flags)) };
 }
 
+#[cfg(target_arch = "aarch64")]
 fn dma_observe() {
     // SAFETY: `dmb oshld` orders the observed used index before subsequent
     // normal-memory reads of device-written ring, status, and payload bytes.
     unsafe { core::arch::asm!("dmb oshld", options(nostack, preserves_flags)) };
 }
 
+#[cfg(target_arch = "x86_64")]
+fn dma_publish() {
+    compiler_fence(Ordering::Release);
+    fence(Ordering::SeqCst);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn dma_observe() {
+    fence(Ordering::SeqCst);
+    compiler_fence(Ordering::Acquire);
+}
+
 fn terminal_park() -> ! {
-    loop {
-        // SAFETY: A device that cannot confirm reset may still hold DMA
-        // pointers, so returning would violate memory ownership. Parking with
-        // interrupts masked is the only safe terminal outcome.
-        unsafe { core::arch::asm!("msr daifset, #0xf", "wfe", options(nomem, nostack)) };
-    }
+    // The machine mechanism owns the architecture-specific interrupt mask and
+    // terminal idle instruction. A failed reset must never return to a scope
+    // that could release device-visible DMA memory.
+    crate::mechanism::park()
 }

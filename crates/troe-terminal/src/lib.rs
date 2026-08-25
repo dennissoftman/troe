@@ -61,9 +61,9 @@ impl HistoryConfig {
         }
     }
 
-    /// Default policy for the `tiny` resource profile.
+    /// Default bounded resource policy.
     #[must_use]
-    pub const fn tiny() -> Self {
+    pub const fn standard() -> Self {
         Self {
             max_entries: 32,
             max_bytes: 16 * 1024,
@@ -108,9 +108,9 @@ impl InputConfig {
         Ok(Self { max_escape_bytes })
     }
 
-    /// Default policy for the `tiny` resource profile.
+    /// Default bounded resource policy.
     #[must_use]
-    pub const fn tiny() -> Self {
+    pub const fn standard() -> Self {
         Self {
             max_escape_bytes: 16,
         }
@@ -152,13 +152,13 @@ impl EditorConfig {
         })
     }
 
-    /// Default policy for the `tiny` resource profile.
+    /// Default bounded resource policy.
     #[must_use]
-    pub const fn tiny() -> Self {
+    pub const fn standard() -> Self {
         Self {
             max_line_bytes: MAX_LINE_BYTES,
-            history: HistoryConfig::tiny(),
-            input: InputConfig::tiny(),
+            history: HistoryConfig::standard(),
+            input: InputConfig::standard(),
         }
     }
 
@@ -793,9 +793,9 @@ impl KeyboardConfig {
         Self { layout }
     }
 
-    /// Default keyboard policy for the `tiny` resource profile.
+    /// Default bounded keyboard policy.
     #[must_use]
-    pub const fn tiny() -> Self {
+    pub const fn standard() -> Self {
         Self::new(KeyboardLayout::Us)
     }
 
@@ -1069,9 +1069,9 @@ impl TextConsoleConfig {
         })
     }
 
-    /// Default text-console policy for the `tiny` resource profile.
+    /// Default bounded text-console policy.
     #[must_use]
-    pub const fn tiny() -> Self {
+    pub const fn standard() -> Self {
         Self {
             max_cells: 32 * 1024,
             max_escape_bytes: 16,
@@ -1130,6 +1130,27 @@ pub enum FramebufferPixelFormat {
     Rgb,
     /// Blue, green, red, reserved bytes.
     Bgr,
+}
+
+/// Checked byte offset and channel encoding for one framebuffer pixel.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EncodedFramebufferPixel {
+    byte_offset: usize,
+    bytes: [u8; 4],
+}
+
+impl EncodedFramebufferPixel {
+    /// Byte offset from the beginning of the framebuffer mapping.
+    #[must_use]
+    pub const fn byte_offset(self) -> usize {
+        self.byte_offset
+    }
+
+    /// Four bytes in the framebuffer's selected channel order.
+    #[must_use]
+    pub const fn bytes(self) -> [u8; 4] {
+        self.bytes
+    }
 }
 
 /// Invalid physical framebuffer metadata.
@@ -1232,6 +1253,37 @@ impl FramebufferDescriptor {
     #[must_use]
     pub const fn pixel_format(self) -> FramebufferPixelFormat {
         self.pixel_format
+    }
+
+    /// Encode one visible pixel as a checked framebuffer-relative write.
+    ///
+    /// # Errors
+    ///
+    /// Rejects coordinates outside the visible surface, arithmetic overflow,
+    /// or a write extending beyond the validated framebuffer byte range.
+    pub fn encode_pixel(
+        self,
+        x: usize,
+        y: usize,
+        color: Color,
+    ) -> Result<EncodedFramebufferPixel, SurfaceError> {
+        if x >= self.width || y >= self.height {
+            return Err(SurfaceError::Bounds);
+        }
+        let pixel = y
+            .checked_mul(self.stride)
+            .and_then(|row| row.checked_add(x))
+            .ok_or(SurfaceError::Overflow)?;
+        let byte_offset = pixel.checked_mul(4).ok_or(SurfaceError::Overflow)?;
+        let end = byte_offset.checked_add(4).ok_or(SurfaceError::Overflow)?;
+        if end > self.byte_len {
+            return Err(SurfaceError::Bounds);
+        }
+        let bytes = match self.pixel_format {
+            FramebufferPixelFormat::Rgb => [color.red, color.green, color.blue, 0],
+            FramebufferPixelFormat::Bgr => [color.blue, color.green, color.red, 0],
+        };
+        Ok(EncodedFramebufferPixel { byte_offset, bytes })
     }
 }
 
@@ -1789,8 +1841,8 @@ mod tests {
     fn config(max_line_bytes: usize, entries: usize, bytes: usize) -> EditorConfig {
         let history =
             HistoryConfig::new(entries, bytes).unwrap_or_else(|_| HistoryConfig::disabled());
-        EditorConfig::new(max_line_bytes, history, InputConfig::tiny())
-            .unwrap_or_else(|_| EditorConfig::tiny())
+        EditorConfig::new(max_line_bytes, history, InputConfig::standard())
+            .unwrap_or_else(|_| EditorConfig::standard())
     }
 
     #[test]
@@ -1804,14 +1856,14 @@ mod tests {
             Err(ConfigError::EscapeCapacityTooSmall)
         );
         assert_eq!(
-            EditorConfig::new(0, HistoryConfig::disabled(), InputConfig::tiny()),
+            EditorConfig::new(0, HistoryConfig::disabled(), InputConfig::standard()),
             Err(ConfigError::EmptyLineCapacity)
         );
     }
 
     #[test]
     fn decoder_normalizes_keys_utf8_and_crlf() {
-        let mut decoder = InputDecoder::new(InputConfig::tiny());
+        let mut decoder = InputDecoder::new(InputConfig::standard());
         assert_eq!(decoder.push(b'\r'), Some(KeyEvent::Enter));
         assert_eq!(decoder.push(b'\n'), None);
         assert_eq!(decoder.push(0xc3), None);
@@ -1822,7 +1874,7 @@ mod tests {
 
     #[test]
     fn decoder_recognizes_navigation_and_discards_unknown_sequences() {
-        let mut decoder = InputDecoder::new(InputConfig::tiny());
+        let mut decoder = InputDecoder::new(InputConfig::standard());
         assert_eq!(decoder.push(0x1b), None);
         assert_eq!(decoder.push(b'['), None);
         assert_eq!(decoder.push(b'A'), Some(KeyEvent::Up));
@@ -1833,7 +1885,7 @@ mod tests {
         assert_eq!(decoder.push(b'~'), None);
         assert_eq!(decoder.push(b'x'), Some(KeyEvent::Character('x')));
 
-        let input = InputConfig::new(4).unwrap_or_else(|_| InputConfig::tiny());
+        let input = InputConfig::new(4).unwrap_or_else(|_| InputConfig::standard());
         let mut bounded = InputDecoder::new(input);
         for byte in b"\x1b[123456~" {
             assert_eq!(bounded.push(*byte), None);
@@ -1843,7 +1895,7 @@ mod tests {
 
     #[test]
     fn ps2_decoder_maps_modifiers_navigation_and_control_editing() {
-        let mut decoder = Ps2Set1Decoder::new(KeyboardConfig::tiny());
+        let mut decoder = Ps2Set1Decoder::new(KeyboardConfig::standard());
         assert_eq!(decoder.push(0x1e), Some(KeyEvent::Character('a')));
         assert_eq!(decoder.push(0x2a), None);
         assert_eq!(decoder.push(0x1e), Some(KeyEvent::Character('A')));
@@ -1941,7 +1993,7 @@ mod tests {
             Err(ConfigError::EmptyCellCapacity)
         );
         let limited = TextConsoleConfig::new(1, 8, 4, colors.0, colors.1)
-            .unwrap_or_else(|_| TextConsoleConfig::tiny());
+            .unwrap_or_else(|_| TextConsoleConfig::standard());
         assert!(matches!(
             TextConsole::new(MemorySurface::new(24, 16), limited),
             Err(TextConsoleError::CellCapacityExceeded)
@@ -1966,9 +2018,50 @@ mod tests {
     }
 
     #[test]
+    fn framebuffer_pixel_encoding_checks_format_stride_and_extent() {
+        let color = Color::new(0x12, 0x34, 0x56);
+        let rgb = FramebufferDescriptor::new(0x1000, 32, 2, 2, 4, FramebufferPixelFormat::Rgb)
+            .unwrap_or_else(|_| std::process::abort());
+        let first = rgb
+            .encode_pixel(0, 0, color)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(first.byte_offset(), 0);
+        assert_eq!(first.bytes(), [0x12, 0x34, 0x56, 0]);
+
+        let last_visible = rgb
+            .encode_pixel(1, 1, color)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(last_visible.byte_offset(), 20);
+
+        let bgr = FramebufferDescriptor::new(0x1000, 32, 4, 2, 4, FramebufferPixelFormat::Bgr)
+            .unwrap_or_else(|_| std::process::abort());
+        let last_mapped = bgr
+            .encode_pixel(3, 1, color)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(last_mapped.byte_offset(), 28);
+        assert_eq!(last_mapped.bytes(), [0x56, 0x34, 0x12, 0]);
+
+        assert_eq!(rgb.encode_pixel(2, 0, color), Err(SurfaceError::Bounds));
+        assert_eq!(rgb.encode_pixel(0, 2, color), Err(SurfaceError::Bounds));
+
+        let malformed = FramebufferDescriptor {
+            base_address: 0x1000,
+            byte_len: usize::MAX,
+            width: 2,
+            height: 2,
+            stride: usize::MAX,
+            pixel_format: FramebufferPixelFormat::Rgb,
+        };
+        assert_eq!(
+            malformed.encode_pixel(1, 1, color),
+            Err(SurfaceError::Overflow)
+        );
+    }
+
+    #[test]
     fn text_console_renders_controls_and_scrolls_retained_cells() {
         let surface = MemorySurface::new(24, 16);
-        let mut console = TextConsole::new(surface, TextConsoleConfig::tiny())
+        let mut console = TextConsole::new(surface, TextConsoleConfig::standard())
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(console.grid_dimensions(), (4, 2));
         assert_eq!(write_all(&mut console, b"AB\nCD\nE"), Ok(()));
@@ -1981,9 +2074,19 @@ mod tests {
     }
 
     #[test]
+    fn text_console_renders_invalid_utf8_as_replacement_character() {
+        let surface = MemorySurface::new(12, 8);
+        let mut console = TextConsole::new(surface, TextConsoleConfig::standard())
+            .unwrap_or_else(|_| std::process::abort());
+
+        assert_eq!(write_all(&mut console, &[0xff]), Ok(()));
+        assert_eq!(console.cell(0, 0), Some('\u{fffd}'));
+    }
+
+    #[test]
     fn text_console_satisfies_partial_output_contract() {
         let surface = MemorySurface::new(12, 8);
-        let mut console = TextConsole::new(surface, TextConsoleConfig::tiny())
+        let mut console = TextConsole::new(surface, TextConsoleConfig::standard())
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(Output::write(&mut console, b"x"), Ok(1));
     }
@@ -1992,7 +2095,7 @@ mod tests {
     fn text_console_discards_overlong_control_sequences_atomically() {
         let policy =
             TextConsoleConfig::new(4, 4, 8, Color::new(255, 255, 255), Color::new(0, 0, 0))
-                .unwrap_or_else(|_| TextConsoleConfig::tiny());
+                .unwrap_or_else(|_| TextConsoleConfig::standard());
         let mut console = TextConsole::new(MemorySurface::new(12, 8), policy)
             .unwrap_or_else(|_| std::process::abort());
 

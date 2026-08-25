@@ -85,7 +85,7 @@ changing the single-address-space authority model.
 Landed: `troe-task` provides a 16-record hard ceiling, monotonic task IDs,
 round-robin ready/running/exited transitions, typed capability sets, explicit
 yield/exit accounting, and reaping that returns the exact guarded-stack slot.
-The kernel reserves three 32 KiB task payloads, each between two unmapped 4 KiB
+The kernel reserves three 64 KiB task payloads, each between two unmapped 4 KiB
 guards. Architecture-local trampolines run one explicit continuation step on a
 task stack and restore the scheduler stack on yield or exit. Boot acceptance
 executes two interleaved services, checks five deterministic yields, reaps both,
@@ -257,56 +257,51 @@ listing for an empty or partial command and command-name completion after
 completion is a later usability increment; it must use explicit schemas and
 retain deterministic candidate-count and byte ceilings.
 
-## Stage 7.5: platform separation and physical-machine bring-up (planned)
+## Stage 7.5: cloud platform separation (Phases A and B verified)
 
 QEMU remains the fast, deterministic acceptance backend; it must not define the
-meaning of either supported CPU architecture. This stage separates three axes
-that the current machine crate partly conflates:
+meaning of either supported CPU architecture or the complete cloud VM contract.
+This stage separates three axes that the current machine crate partly
+conflates:
 
 - architecture: x86-64 or AArch64 CPU, MMU, exception, and context mechanisms;
 - platform: interrupt controller, timers, firmware tables, buses, UARTs, boot
   media, and shutdown/reboot mechanisms; and
-- execution environment: emulator, virtual machine, or physical board.
+- execution environment: emulator or named cloud/hypervisor VM.
 
-The first planned AArch64 physical reference is Raspberry Pi 4 with a pinned
-board revision, firmware, boot contract, and serial wiring. It is deliberately
-one common acceptance board, not the definition or limit of AArch64 support.
-Other AArch64 UEFI, ACPI, or device-tree machines must be addable as independent
-profiles. The x86-64 side will select and document one ordinary UEFI/ACPI PC as
-its first physical reference rather than claiming that q35 describes all PCs.
+Physical boards, embedded/no-MMU targets, and a hardware lab are not part of
+the current product plan. The next portability target is a documented matrix of
+virtio-capable cloud VM platforms, with bounded ACPI, device-tree, or UEFI
+discovery where fixed QEMU resources are insufficient.
 
-Proceed in this order:
+Phases A and B complete items 1–6 for the two named discoverable QEMU
+contracts:
 
-1. introduce an explicit target-profile descriptor and split CPU mechanisms
-   from q35, `virt`, Raspberry Pi, and PC-platform resources;
+1. introduce an explicit validated platform descriptor and split CPU mechanisms
+   from q35, QEMU `virt`, and other VM-platform resources;
 2. move MMIO bases, interrupt IDs/routes, timers, UART choice, framebuffer
    metadata, and power control out of architecture-wide assumptions and obtain
    them from a validated profile, ACPI, device tree, or UEFI handoff;
 3. retain `x86_64-q35-uefi` and `aarch64-virt-uefi` as pinned QEMU test profiles
    and keep their complete deterministic acceptance matrix green;
-4. add deterministic GPT/EFI-system-partition boot media suitable for USB and
-   SD cards; keep the small FAT image as a fast emulator artifact, not a
-   physical-machine requirement;
-5. bring up `aarch64-rpi4-uefi` through serial-first boot, owned memory/MMU,
-   exceptions, timer, interrupts, framebuffer when available, shell input, and
-   controlled poweroff/reboot behavior;
-6. bring up one explicitly identified `x86_64-pc-uefi` reference with the same
-   kernel invariants and a documented recovery console; and
-7. add a bounded hardware smoke harness with versioned serial transcripts and
-   board/firmware metadata. Hardware jobs may run in a lab or manually when CI
-   cannot own a board, but release evidence must identify exactly what ran.
+4. add bounded ACPI, device-tree, and UEFI discovery needed by named cloud VM
+   platforms, rejecting missing, ambiguous, overlapping, or unsupported
+   resources before volatile I/O or interrupt enable;
+5. define a multi-hypervisor/cloud acceptance matrix with exact firmware,
+   machine type, virtio transports, required features, and image contract; and
+6. run bounded boot, storage, networking, and lifecycle smoke tests for every
+   supported matrix entry while retaining exhaustive host/QEMU fault gates.
 
-Drivers remain capability-producing components selected by a platform profile;
-board support must not leak fixed addresses or ambient device discovery into
-portable crates. A Raspberry Pi-specific driver is acceptable where the
-hardware is genuinely board-specific, while reusable UART, interrupt, block,
-network, USB, and PCI drivers should remain independently selectable.
+Drivers remain capability-producing components selected by a platform
+descriptor; VM support must not leak fixed addresses or ambient device
+discovery into portable crates. Reusable UART, interrupt, block, network, PCI,
+and virtio drivers remain independently selectable.
 
-Exit: the production kernel reaches the recovery shell and passes bounded
-serial smoke tests on both pinned QEMU profiles, the selected Raspberry Pi
-reference, and one documented x86-64 UEFI PC. Host and QEMU fault-injection
-remain the exhaustive safety gates; hardware runs add evidence for real
-firmware, memory maps, interrupts, timers, devices, and boot media. See
+Exit: the production kernel reaches the recovery shell and passes bounded boot,
+storage, networking, lifecycle, persistence, and fault tests on both accepted
+discoverable QEMU matrix entries. Pinned split-media QEMU profiles remain
+regression environments; KVM and real provider rows remain unaccepted until
+their exact contracts pass independently. See
 [ADR 0016](adr/0016-hardware-targets-and-emulator-role.md).
 
 ## Stage 8: networking and persistent operation (verified)

@@ -1,0 +1,41 @@
+{
+  "platforms": [
+    {
+      "architecture": "x86_64",
+      "firmware_discovery": "fixed",
+      "id": 1,
+      "kernel_feature": "platform-x86_64-q35-uefi",
+      "name": "x86_64-q35-uefi",
+      "target": "x86_64-unknown-uefi",
+      "virtio_transport": "pci"
+    },
+    {
+      "architecture": "aarch64",
+      "firmware_discovery": "fixed",
+      "id": 2,
+      "kernel_feature": "platform-aarch64-virt-uefi",
+      "name": "aarch64-virt-uefi",
+      "target": "aarch64-unknown-uefi",
+      "virtio_transport": "mmio"
+    },
+    {
+      "architecture": "x86_64",
+      "firmware_discovery": "acpi",
+      "id": 3,
+      "kernel_feature": "platform-x86_64-uefi-virtio-pci",
+      "name": "x86_64-uefi-virtio-pci",
+      "target": "x86_64-unknown-uefi",
+      "virtio_transport": "pci"
+    },
+    {
+      "architecture": "aarch64",
+      "firmware_discovery": "fdt",
+      "id": 4,
+      "kernel_feature": "platform-aarch64-uefi-virtio-mmio",
+      "name": "aarch64-uefi-virtio-mmio",
+      "target": "aarch64-unknown-uefi",
+      "virtio_transport": "mmio"
+    }
+  ],
+  "schema": 1
+}

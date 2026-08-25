@@ -33,8 +33,10 @@ ambient authority. The pinned q35 and `virt` composition profiles initially
 supply MMIO/port ranges, interrupt lines, vectors, and controller topology.
 Future ACPI MADT or device-tree discovery may produce the same descriptors
 without changing device-driver behavior. Resource addresses are platform facts;
-queue sizes, drain budgets, priorities, and other policy limits remain selected
-profile configuration rather than unrelated kernel literals.
+queue sizes, drain budgets, priorities, and other policy limits remain part of
+the bounded Standard composition rather than unrelated kernel literals.
+Portable constructors may accept stricter validated limits without creating
+another build profile.
 
 The x86-64 profile owns the local APIC and I/O APIC, masks the legacy PIC, and
 routes q35 keyboard and COM1 receive interrupts to explicit IDT gates. The

@@ -1,0 +1,294 @@
+{
+  "entries": [
+    {
+      "acceptance_evidence": [],
+      "architecture": "x86_64",
+      "artifact_status": "host-verified",
+      "block_device": "virtio-blk-pci-modern",
+      "boot_contract": "uefi-removable-fallback-gpt-esp",
+      "environment": "qemu",
+      "firmware": "pinned-edk2-uefi",
+      "gaps": [
+        "combined system.raw layout is host-verified but the current QEMU runtime gate still attaches boot and root as separate media"
+      ],
+      "id": "qemu-q35-x86_64",
+      "image_format": "raw-gpt",
+      "interrupt_model": "lapic-ioapic",
+      "machine_contract": "qemu-q35",
+      "missing_drivers": [],
+      "network_device": "virtio-net-pci-modern",
+      "platform": "x86_64-q35-uefi",
+      "provider": "qemu",
+      "required_cpu_features": [
+        "x86-64-long-mode",
+        "nx",
+        "physical-address-width-32-to-52",
+        "four-level-paging-handoff"
+      ],
+      "required_disks": [
+        "system",
+        "activation",
+        "state"
+      ],
+      "runtime_status": "compatible-unverified",
+      "virtio_transport": "pci"
+    },
+    {
+      "acceptance_evidence": [],
+      "architecture": "aarch64",
+      "artifact_status": "host-verified",
+      "block_device": "virtio-blk-mmio-modern",
+      "boot_contract": "uefi-removable-fallback-gpt-esp",
+      "environment": "qemu",
+      "firmware": "pinned-edk2-uefi",
+      "gaps": [
+        "combined system.raw layout is host-verified but the current QEMU runtime gate still attaches boot and root as separate media"
+      ],
+      "id": "qemu-virt-aarch64",
+      "image_format": "raw-gpt",
+      "interrupt_model": "gicv2",
+      "machine_contract": "qemu-virt-gicv2",
+      "missing_drivers": [],
+      "network_device": "virtio-net-mmio-modern",
+      "platform": "aarch64-virt-uefi",
+      "provider": "qemu",
+      "required_cpu_features": [
+        "aarch64-el1",
+        "four-kib-translation-granule",
+        "physical-address-width-32-to-48"
+      ],
+      "required_disks": [
+        "system",
+        "activation",
+        "state"
+      ],
+      "runtime_status": "compatible-unverified",
+      "virtio_transport": "mmio"
+    },
+    {
+      "acceptance_evidence": [
+        "python3 scripts/test-qemu.py --platform x86_64-uefi-virtio-pci --environment qemu --skip-build"
+      ],
+      "architecture": "x86_64",
+      "artifact_status": "host-verified",
+      "block_device": "virtio-blk-pci-modern",
+      "boot_contract": "uefi-removable-fallback-gpt-esp",
+      "environment": "qemu",
+      "firmware": "pinned-edk2-uefi-acpi-with-injected-spcr",
+      "gaps": [],
+      "id": "qemu-discoverable-virtio-pci-x86_64",
+      "image_format": "raw-gpt",
+      "interrupt_model": "acpi-discovered-lapic-ioapic",
+      "machine_contract": "qemu-q35-acpi-ecam-pm-timer-reset-only-virtio-pci",
+      "missing_drivers": [],
+      "network_device": "virtio-net-pci-modern",
+      "platform": "x86_64-uefi-virtio-pci",
+      "provider": "qemu",
+      "required_cpu_features": [
+        "x86-64-long-mode",
+        "nx",
+        "physical-address-width-32-to-52",
+        "four-level-paging-handoff"
+      ],
+      "required_disks": [
+        "system",
+        "activation",
+        "state"
+      ],
+      "runtime_status": "accepted",
+      "virtio_transport": "pci"
+    },
+    {
+      "acceptance_evidence": [
+        "python3 scripts/test-qemu.py --platform aarch64-uefi-virtio-mmio --environment qemu --skip-build"
+      ],
+      "architecture": "aarch64",
+      "artifact_status": "host-verified",
+      "block_device": "virtio-blk-mmio-modern",
+      "boot_contract": "uefi-removable-fallback-gpt-esp",
+      "environment": "qemu",
+      "firmware": "pinned-edk2-uefi-fdt-with-acpi-disabled",
+      "gaps": [],
+      "id": "qemu-discoverable-virtio-mmio-aarch64",
+      "image_format": "raw-gpt",
+      "interrupt_model": "device-tree-discovered-gicv2",
+      "machine_contract": "qemu-virt-gicv2-fdt-psci-hvc-virtio-mmio",
+      "missing_drivers": [],
+      "network_device": "virtio-net-mmio-modern",
+      "platform": "aarch64-uefi-virtio-mmio",
+      "provider": "qemu",
+      "required_cpu_features": [
+        "aarch64-el1",
+        "four-kib-translation-granule",
+        "physical-address-width-32-to-48"
+      ],
+      "required_disks": [
+        "system",
+        "activation",
+        "state"
+      ],
+      "runtime_status": "accepted",
+      "virtio_transport": "mmio"
+    },
+    {
+      "acceptance_evidence": [],
+      "architecture": "x86_64",
+      "artifact_status": "host-verified",
+      "block_device": "virtio-blk-pci-modern",
+      "boot_contract": "uefi-removable-fallback-gpt-esp",
+      "environment": "qemu-kvm",
+      "firmware": "edk2-uefi",
+      "gaps": [
+        "no pinned KVM runtime acceptance result",
+        "combined system.raw layout has no runtime boot result"
+      ],
+      "id": "qemu-kvm-q35-x86_64",
+      "image_format": "raw-gpt",
+      "interrupt_model": "lapic-ioapic",
+      "machine_contract": "qemu-q35-with-kvm-acceleration",
+      "missing_drivers": [],
+      "network_device": "virtio-net-pci-modern",
+      "platform": "x86_64-q35-uefi",
+      "provider": "qemu-kvm",
+      "required_cpu_features": [
+        "x86-64-long-mode",
+        "nx",
+        "physical-address-width-32-to-52",
+        "four-level-paging-handoff"
+      ],
+      "required_disks": [
+        "system",
+        "activation",
+        "state"
+      ],
+      "runtime_status": "compatible-unverified",
+      "virtio_transport": "pci"
+    },
+    {
+      "acceptance_evidence": [],
+      "architecture": "aarch64",
+      "artifact_status": "host-verified",
+      "block_device": "virtio-blk-mmio-modern",
+      "boot_contract": "uefi-removable-fallback-gpt-esp",
+      "environment": "qemu-kvm",
+      "firmware": "edk2-uefi",
+      "gaps": [
+        "no pinned AArch64 KVM runtime acceptance result",
+        "combined system.raw layout has no runtime boot result"
+      ],
+      "id": "qemu-kvm-virt-aarch64",
+      "image_format": "raw-gpt",
+      "interrupt_model": "gicv2",
+      "machine_contract": "qemu-virt-gicv2-with-kvm-acceleration",
+      "missing_drivers": [],
+      "network_device": "virtio-net-mmio-modern",
+      "platform": "aarch64-virt-uefi",
+      "provider": "qemu-kvm",
+      "required_cpu_features": [
+        "aarch64-el1",
+        "four-kib-translation-granule",
+        "physical-address-width-32-to-48"
+      ],
+      "required_disks": [
+        "system",
+        "activation",
+        "state"
+      ],
+      "runtime_status": "compatible-unverified",
+      "virtio_transport": "mmio"
+    },
+    {
+      "acceptance_evidence": [],
+      "architecture": "x86_64",
+      "artifact_status": "unavailable",
+      "block_device": "nvme",
+      "boot_contract": "provider-uefi-import",
+      "environment": "aws-ec2-nitro",
+      "firmware": "provider-uefi",
+      "gaps": [
+        "no validated Nitro platform discovery",
+        "no provider image-import acceptance"
+      ],
+      "id": "aws-nitro-x86_64",
+      "image_format": "unavailable",
+      "interrupt_model": "provider-acpi-msi",
+      "machine_contract": "aws-nitro",
+      "missing_drivers": [
+        "nvme",
+        "ena"
+      ],
+      "network_device": "ena",
+      "platform": null,
+      "provider": "aws",
+      "required_cpu_features": [
+        "provider-contract-unverified"
+      ],
+      "required_disks": [],
+      "runtime_status": "incompatible",
+      "virtio_transport": null
+    },
+    {
+      "acceptance_evidence": [],
+      "architecture": "aarch64",
+      "artifact_status": "unavailable",
+      "block_device": "nvme",
+      "boot_contract": "provider-uefi-import",
+      "environment": "aws-ec2-nitro",
+      "firmware": "provider-uefi",
+      "gaps": [
+        "no validated Nitro AArch64 platform discovery",
+        "no provider image-import acceptance"
+      ],
+      "id": "aws-nitro-aarch64",
+      "image_format": "unavailable",
+      "interrupt_model": "provider-acpi-msi",
+      "machine_contract": "aws-nitro",
+      "missing_drivers": [
+        "nvme",
+        "ena"
+      ],
+      "network_device": "ena",
+      "platform": null,
+      "provider": "aws",
+      "required_cpu_features": [
+        "provider-contract-unverified"
+      ],
+      "required_disks": [],
+      "runtime_status": "incompatible",
+      "virtio_transport": null
+    },
+    {
+      "acceptance_evidence": [],
+      "architecture": "x86_64",
+      "artifact_status": "unavailable",
+      "block_device": "hyper-v-storage",
+      "boot_contract": "generation-2-uefi-vhd-import",
+      "environment": "azure-generation-2",
+      "firmware": "hyper-v-uefi",
+      "gaps": [
+        "no validated Hyper-V platform discovery",
+        "raw GPT bundle is not an accepted provider import artifact",
+        "no provider runtime acceptance"
+      ],
+      "id": "azure-generation-2-x86_64",
+      "image_format": "unavailable",
+      "interrupt_model": "hyper-v-synic",
+      "machine_contract": "hyper-v-generation-2",
+      "missing_drivers": [
+        "hyper-v-vmbus",
+        "hyper-v-storage",
+        "hyper-v-network"
+      ],
+      "network_device": "hyper-v-network",
+      "platform": null,
+      "provider": "azure",
+      "required_cpu_features": [
+        "provider-contract-unverified"
+      ],
+      "required_disks": [],
+      "runtime_status": "incompatible",
+      "virtio_transport": null
+    }
+  ],
+  "schema": 1
+}

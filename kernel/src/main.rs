@@ -21,20 +21,16 @@ mod firmware {
     use core::fmt::Write as _;
     use core::panic::PanicInfo;
 
-    use troe_application::{
-        ABI_MINOR, ApplicationLimits, InitialHandle, LoadPlan, PAGE_BYTES, ParseError,
-        ResourceProfile, SegmentPermissions, StartupInfo, Target, parse_kex,
-    };
     #[cfg(feature = "acceptance-probes")]
+    use troe_application::ParseError;
+    use troe_application::{
+        ABI_MINOR, ApplicationLimits, InitialHandle, LoadPlan, LoaderResource, LoaderTransaction,
+        MAX_LOAD_RECORDS, PAGE_BYTES, SegmentPermissions, StartupInfo, Target, parse_kex,
+    };
     use troe_block::{BlockAccess, BlockRegion};
     use troe_block::{BlockDevice, BlockLimits};
-    #[cfg(feature = "acceptance-probes")]
-    use troe_config::{ActivationPointer, ConfigReference, FailureAction, parse_config};
-    #[cfg(feature = "acceptance-probes")]
-    use troe_content::{
-        ContentDigest, ContentPack, GenerationManifest, MAX_PACK_BYTES, ObjectKind,
-        SecurityManifest,
-    };
+    use troe_config::{ActivationPointer, ActivationRecovery, recover_activation};
+    use troe_content::{ContentPack, MAX_PACK_BYTES};
     use troe_core::{Input, MAX_LINE_BYTES, MachineMemorySnapshot, Output, StreamError};
     use troe_dispatch::{
         ConsoleService, CopiedMessage, DispatchedOutput, Dispatcher, HandleOwner, ReplyStatus,
@@ -42,11 +38,8 @@ mod firmware {
     };
     use troe_driver::{InputEvent, InputQueueConfig, InputSource};
     use troe_ext4::Ext4Limits;
-    use troe_gpt::GptLimits;
-    #[cfg(feature = "acceptance-probes")]
-    use troe_gpt::{GptGuid, discover};
-    #[cfg(feature = "acceptance-probes")]
-    use troe_identity::{IdentityLimits, MountIdentityMode, validate_snapshot};
+    use troe_gpt::{GptGuid, GptLimits, discover};
+    use troe_identity::IdentityLimits;
     use troe_memory::{
         BASE_PAGE_SIZE, BootAllocator, FrameAllocator, MAX_FIRMWARE_REGIONS, Mapping,
         MappingLifetime, MappingMemoryType, MappingOwner, MappingPermissions, MappingPlan,
@@ -59,20 +52,21 @@ mod firmware {
         build_arp_request, build_dhcp_discover, build_dhcp_request, build_icmp_echo, build_udp,
         parse_arp, parse_dhcp, parse_icmp_echo, parse_udp,
     };
-    #[cfg(feature = "acceptance-probes")]
     use troe_persist::{DualSlotStore, RegionSelector, TRANSACTION_BLOCKS};
     use troe_shell::{
         ArpEntry, CompletionConfig, MachineAction, NetworkControl, NetworkError, NetworkStats,
         NetworkStatus, PingReply, ReceivedUdp, Shell,
     };
     #[cfg(feature = "acceptance-probes")]
-    use troe_statefs::{STATE_PATH, StateFs};
-    #[cfg(feature = "acceptance-probes")]
-    use troe_storage::read_selected_file;
-    use troe_storage::{ActivationLimits, prepare_read_only};
+    use troe_statefs::STATE_PATH;
+    use troe_statefs::StateFs;
+    use troe_storage::{
+        ActivationLimits, MAX_STORAGE_REPORT_BYTES, STORAGE_REPORT_EXTENSION_BYTES,
+        prepare_read_only, read_selected_file, validate_root_activation,
+    };
     use troe_task::{
         Cancelled, Capabilities, CooperativeRuntime, IsolationResource, MonotonicMillis, Scheduler,
-        StackResource, TaskFault, TaskId, TaskState, TaskStep,
+        StackResource, TaskFault, TaskId, TaskStep,
     };
     use troe_terminal::{
         EditorConfig, EditorOutcome, FramebufferDescriptor, FramebufferPixelFormat, InputDecoder,
@@ -86,11 +80,8 @@ mod firmware {
 
     const ROOTFS: &[u8] = include_bytes!("../../assets/root.kefs");
     const BOOT_MOUNT_MANIFEST: &[u8] = include_bytes!("../../assets/boot.bmnt");
-    #[cfg(feature = "acceptance-probes")]
     const PERSISTENCE_SELECTOR: &[u8] = include_bytes!("../../assets/persist.prgn");
-    #[cfg(feature = "acceptance-probes")]
     const STATEFS_SELECTOR: &[u8] = include_bytes!("../../assets/state.prgn");
-    #[cfg(feature = "acceptance-probes")]
     const INITIAL_ACTIVATION: &[u8] = include_bytes!("../../assets/system.sact");
     const OWNED_HEAP_BYTES: u64 = 6 * 1024 * 1024;
     const PAGE_TABLE_BYTES: u64 = 2 * 1024 * 1024;
@@ -107,7 +98,10 @@ mod firmware {
     const ISOLATED_PRIVATE_PAGES: u64 =
         ISOLATED_CODE_PAGES + ISOLATED_DATA_PAGES + ISOLATED_STACK_PAGES;
     const ISOLATED_RESOURCE_PAGES: u64 = ISOLATED_TABLE_PAGES + ISOLATED_PRIVATE_PAGES;
-    const APPLICATION_TABLE_PAGES: u64 = 64;
+    const APPLICATION_TABLE_PAGES: u64 = 512;
+    const STAGE6_USER_REGION_LIMIT: usize = 8;
+    const STAGE6_USER_REGIONS: usize = 3;
+    const APPLICATION_FIXED_USER_REGIONS: usize = 3;
     const APPLICATION_INTERFACE_ECHO: u32 = 1;
     const USER_CODE_BASE: u64 = 0x0000_4000_0000_0000;
     const USER_DATA_BASE: u64 = USER_CODE_BASE + BASE_PAGE_SIZE;
@@ -124,6 +118,15 @@ mod firmware {
     const BOOT_MEMORY_LABEL: &str = "Initializing memory and protection";
     const BOOT_DEVICES_LABEL: &str = "Starting devices and input";
     const BOOT_RUNTIME_LABEL: &str = "Starting task and application runtime";
+    const _: () = assert!(TASK_STACK_BYTES == TASK_STACK_PAGES as u64 * BASE_PAGE_SIZE);
+    const _: () = assert!(TASK_GUARD_BYTES == BASE_PAGE_SIZE);
+    const _: () = assert!(TASK_STACK_COUNT == 3);
+    const _: () = assert!(STAGE6_USER_REGIONS <= STAGE6_USER_REGION_LIMIT);
+    const _: () = assert!(STAGE6_USER_REGION_LIMIT <= troe_machine::UserAddressSpace::MAX_REGIONS);
+    const _: () = assert!(
+        MAX_LOAD_RECORDS + APPLICATION_FIXED_USER_REGIONS
+            == troe_machine::UserAddressSpace::MAX_REGIONS
+    );
 
     struct FirmwareConsole;
 
@@ -173,7 +176,7 @@ mod firmware {
             let Ok(surface) = troe_machine::OwnedFramebuffer::new(framebuffer) else {
                 return Self::Serial(NativeConsole);
             };
-            let Ok(framebuffer) = TextConsole::new(surface, TextConsoleConfig::tiny()) else {
+            let Ok(framebuffer) = TextConsole::new(surface, TextConsoleConfig::standard()) else {
                 return Self::Serial(NativeConsole);
             };
             Self::Mirrored {
@@ -234,13 +237,36 @@ mod firmware {
         kernel_plan: MappingPlan,
         native_blocks: RefCell<Vec<troe_machine::NativeVirtioBlock>>,
         native_statefs: RefCell<Option<Box<dyn ReadOnlyFileSystem>>>,
+        native_generation: NativeGenerationState,
         boot_mount_manifest: BootMountManifest,
     }
 
-    type NativeBlockInitialization = (
-        Vec<troe_machine::NativeVirtioBlock>,
-        Option<Box<dyn ReadOnlyFileSystem>>,
-    );
+    struct NativeBlockInitialization {
+        blocks: Vec<troe_machine::NativeVirtioBlock>,
+        statefs: Option<Box<dyn ReadOnlyFileSystem>>,
+        generation: NativeGenerationState,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum NativeGenerationState {
+        Active,
+        Predecessor,
+        Recovery,
+    }
+
+    impl NativeGenerationState {
+        const fn desired_system_available(self) -> bool {
+            !matches!(self, Self::Recovery)
+        }
+
+        const fn name(self) -> &'static str {
+            match self {
+                Self::Active => "active",
+                Self::Predecessor => "predecessor",
+                Self::Recovery => "recovery",
+            }
+        }
+    }
 
     #[derive(Clone, Copy)]
     struct TaskStackLayout {
@@ -367,8 +393,11 @@ mod firmware {
     #[derive(Clone, Copy, Eq, PartialEq)]
     enum ApplicationProbe {
         Calls,
+        #[cfg(feature = "acceptance-probes")]
         Spin,
+        #[cfg(feature = "acceptance-probes")]
         InvalidCall,
+        #[cfg(feature = "acceptance-probes")]
         UnexpectedReturn,
     }
 
@@ -376,8 +405,11 @@ mod firmware {
         const fn expected_fault(self) -> Option<TaskFault> {
             match self {
                 Self::Calls => None,
+                #[cfg(feature = "acceptance-probes")]
                 Self::Spin => Some(TaskFault::ExecutionLeaseExpired),
+                #[cfg(feature = "acceptance-probes")]
                 Self::InvalidCall => Some(TaskFault::InvalidCall),
+                #[cfg(feature = "acceptance-probes")]
                 Self::UnexpectedReturn => Some(TaskFault::Translation),
             }
         }
@@ -436,8 +468,20 @@ mod firmware {
         if uefi::helpers::init().is_err() {
             return Status::DEVICE_ERROR;
         }
+        if troe_machine::validate_selected_platform().is_err() {
+            let mut firmware_console = FirmwareConsole;
+            if let Some(failure) = troe_machine::platform_discovery_failure() {
+                let _ignored = write_all(&mut firmware_console, b"platform discovery failed: ");
+                let _ignored = write_all(&mut firmware_console, failure.label().as_bytes());
+                let _ignored = write_all(&mut firmware_console, b"\n");
+            }
+            return Status::ABORTED;
+        }
+        let Ok(platform_source) = troe_machine::selected_platform_source() else {
+            return Status::ABORTED;
+        };
         let mut firmware_console = FirmwareConsole;
-        if let Ok(prepared) = prepare_handoff(&mut firmware_console) {
+        if let Ok(prepared) = prepare_handoff(&mut firmware_console, platform_source) {
             let stack = prepared.boot_memory.stack;
             let prepared = Box::leak(Box::new(prepared));
             match troe_machine::enter_owned_stack(stack, prepared, post_handoff) {
@@ -450,8 +494,20 @@ mod firmware {
         }
     }
 
-    fn prepare_handoff(console: &mut FirmwareConsole) -> Result<PreparedHandoff, ()> {
+    fn prepare_handoff(
+        console: &mut FirmwareConsole,
+        platform_source: troe_machine::PlatformSource,
+    ) -> Result<PreparedHandoff, ()> {
         write_all(console, b"\x1b[2J\x1b[H")?;
+        match platform_source {
+            troe_machine::PlatformSource::Acpi => {
+                write_all(console, b"platform discovery: ACPI validated\n")?;
+            }
+            troe_machine::PlatformSource::Fdt => {
+                write_all(console, b"platform discovery: FDT validated\n")?;
+            }
+            troe_machine::PlatformSource::Fixed => {}
+        }
 
         let image_layout = troe_machine::loaded_image_layout().map_err(|_| ())?;
         let framebuffer = capture_framebuffer();
@@ -522,8 +578,8 @@ mod firmware {
             return Err(());
         }
         let boot_mount_manifest = prepared.boot_mount_manifest.as_ref().ok_or(())?;
-        troe_machine::initialize_input_interrupts(InputQueueConfig::tiny()).map_err(|_| ())?;
-        let (native_blocks, native_statefs) = initialize_native_blocks(boot_mount_manifest)?;
+        troe_machine::initialize_input_interrupts(InputQueueConfig::standard()).map_err(|_| ())?;
+        let native = initialize_native_blocks(boot_mount_manifest)?;
         let boot_mount_manifest = prepared.boot_mount_manifest.take().ok_or(())?;
         if !write_machine_boot_status(BOOT_DEVICES_LABEL, true) {
             return Err(());
@@ -538,8 +594,9 @@ mod firmware {
             framebuffer,
             kernel_runtime: prepared.boot_memory.arena,
             kernel_plan: mapping_plan,
-            native_blocks: RefCell::new(native_blocks),
-            native_statefs: RefCell::new(native_statefs),
+            native_blocks: RefCell::new(native.blocks),
+            native_statefs: RefCell::new(native.statefs),
+            native_generation: native.generation,
             boot_mount_manifest,
         })
     }
@@ -547,37 +604,27 @@ mod firmware {
     fn initialize_native_blocks(
         boot_mount_manifest: &BootMountManifest,
     ) -> Result<NativeBlockInitialization, ()> {
-        #[cfg(not(feature = "acceptance-probes"))]
-        let _ = boot_mount_manifest;
-        #[cfg(target_arch = "aarch64")]
-        let mut devices = troe_machine::discover_virtio_mmio_blocks().map_err(|_| ())?;
-        #[cfg(target_arch = "x86_64")]
-        let mut devices = troe_machine::discover_virtio_pci_blocks().map_err(|_| ())?;
-        for device in &mut devices {
-            let block_bytes =
-                usize::try_from(device.geometry().logical_block_bytes()).map_err(|_| ())?;
-            let mut first_block = Vec::new();
-            first_block.try_reserve_exact(block_bytes).map_err(|_| ())?;
-            first_block.resize(block_bytes, 0);
-            device.read_blocks(0, 1, &mut first_block).map_err(|_| ())?;
-        }
+        let mut devices = troe_machine::discover_virtio_blocks().map_err(|_| ())?;
         #[cfg(feature = "acceptance-probes")]
-        let statefs = Some(probe_native_persistence(&mut devices, boot_mount_manifest)?);
+        let generation = recover_native_generation(&mut devices, boot_mount_manifest)?;
+        #[cfg(not(feature = "acceptance-probes"))]
+        let generation = recover_native_generation(&mut devices, boot_mount_manifest);
+        #[cfg(feature = "acceptance-probes")]
+        let statefs = recover_native_statefs(&mut devices)?;
+        #[cfg(not(feature = "acceptance-probes"))]
+        let statefs = recover_native_statefs(&mut devices);
         #[cfg(feature = "acceptance-probes")]
         probe_native_network()?;
-        #[cfg(not(feature = "acceptance-probes"))]
-        let statefs = None;
-        Ok((devices, statefs))
+        Ok(NativeBlockInitialization {
+            blocks: devices,
+            statefs,
+            generation,
+        })
     }
 
     #[cfg(feature = "acceptance-probes")]
     fn probe_native_network() -> Result<(), ()> {
-        #[cfg(target_arch = "aarch64")]
-        let mut network = troe_machine::discover_virtio_mmio_network()
-            .map_err(|_| ())?
-            .ok_or(())?;
-        #[cfg(target_arch = "x86_64")]
-        let mut network = troe_machine::discover_virtio_pci_network()
+        let mut network = troe_machine::discover_virtio_network()
             .map_err(|_| ())?
             .ok_or(())?;
         network.enable_interrupts().map_err(|_| ())?;
@@ -596,10 +643,14 @@ mod firmware {
         if !troe_machine::write(b"native network: ARP reply verified\n") {
             return Err(());
         }
-        #[cfg(target_arch = "x86_64")]
+        #[cfg(feature = "platform-x86_64-q35-uefi")]
         let host_port = 40_123;
-        #[cfg(target_arch = "aarch64")]
+        #[cfg(feature = "platform-aarch64-virt-uefi")]
         let host_port = 40_124;
+        #[cfg(feature = "platform-x86_64-uefi-virtio-pci")]
+        let host_port = 40_125;
+        #[cfg(feature = "platform-aarch64-uefi-virtio-mmio")]
+        let host_port = 40_126;
         let request = build_udp(
             network.mac_address(),
             gateway_mac,
@@ -690,10 +741,26 @@ mod firmware {
     }
 
     #[cfg(feature = "acceptance-probes")]
-    fn probe_native_persistence(
+    fn recover_native_generation(
         devices: &mut Vec<troe_machine::NativeVirtioBlock>,
         boot_mount_manifest: &BootMountManifest,
-    ) -> Result<Box<dyn ReadOnlyFileSystem>, ()> {
+    ) -> Result<NativeGenerationState, ()> {
+        recover_native_generation_inner(devices, boot_mount_manifest)
+    }
+
+    #[cfg(not(feature = "acceptance-probes"))]
+    fn recover_native_generation(
+        devices: &mut Vec<troe_machine::NativeVirtioBlock>,
+        boot_mount_manifest: &BootMountManifest,
+    ) -> NativeGenerationState {
+        recover_native_generation_inner(devices, boot_mount_manifest)
+            .unwrap_or(NativeGenerationState::Recovery)
+    }
+
+    fn recover_native_generation_inner(
+        devices: &mut Vec<troe_machine::NativeVirtioBlock>,
+        boot_mount_manifest: &BootMountManifest,
+    ) -> Result<NativeGenerationState, ()> {
         let activation_limits = native_activation_limits()?;
         let content_bytes = read_selected_file(
             boot_mount_manifest,
@@ -709,43 +776,101 @@ mod firmware {
         let selector = RegionSelector::parse(PERSISTENCE_SELECTOR).map_err(|_| ())?;
         let region = take_transaction_region(devices, selector)?;
         let mut store = DualSlotStore::open(region).map_err(|_| ())?;
-        let recovered = store
-            .payload()
-            .map(ActivationPointer::parse)
-            .transpose()
-            .map_err(|_| ())?;
-        let mut pointer = recovered.unwrap_or(bootstrap);
-        let rollback_required = validate_generation_pointer(&content, pointer)?;
-        store.commit(&pointer.encode()).map_err(|_| ())?;
-        if recovered.is_none() {
-            if !troe_machine::write(b"native generation: candidate published\n") {
-                return Err(());
+        let recovered = match store.payload() {
+            Some(payload) => Some(ActivationPointer::parse(payload).map_err(|_| ())?),
+            None => None,
+        };
+        let candidate = recovered.unwrap_or(bootstrap);
+        let (pointer, validated, state) = match recover_activation(candidate, |pointer| {
+            validate_root_activation(&content, pointer, IdentityLimits::standard())
+        }) {
+            ActivationRecovery::Active { pointer, validated } => {
+                (pointer, validated, NativeGenerationState::Active)
             }
-            if rollback_required {
+            ActivationRecovery::Previous { pointer, validated } => {
+                (pointer, validated, NativeGenerationState::Predecessor)
+            }
+            ActivationRecovery::Unavailable => return Ok(NativeGenerationState::Recovery),
+        };
+        let newly_published = recovered.is_none() || state == NativeGenerationState::Predecessor;
+        if newly_published {
+            store.commit(&pointer.encode()).map_err(|_| ())?;
+        }
+
+        #[cfg(feature = "acceptance-probes")]
+        let state = {
+            let mut selected_state = state;
+            if selected_state == NativeGenerationState::Active && validated.health_rollback() {
                 let previous = pointer.previous().ok_or(())?;
-                pointer = ActivationPointer::new(previous, None).map_err(|_| ())?;
-                if validate_generation_pointer(&content, pointer)? {
+                let previous_pointer = ActivationPointer::new(previous, None).map_err(|_| ())?;
+                let previous_validation = validate_root_activation(
+                    &content,
+                    previous_pointer,
+                    IdentityLimits::standard(),
+                )
+                .map_err(|_| ())?;
+                if previous_validation.health_rollback()
+                    || !troe_machine::write(b"native generation: candidate published\n")
+                {
                     return Err(());
                 }
-                store.commit(&pointer.encode()).map_err(|_| ())?;
+                store.commit(&previous_pointer.encode()).map_err(|_| ())?;
+                selected_state = NativeGenerationState::Predecessor;
                 if !troe_machine::write(b"native generation: health rollback committed\n") {
                     return Err(());
                 }
+            } else if !newly_published {
+                // Exercise a complete durable transaction on every acceptance
+                // boot without changing the production activation policy.
+                store.commit(&pointer.encode()).map_err(|_| ())?;
             }
-        }
-        if !troe_machine::write(b"native identity: generation snapshot verified\n") {
-            return Err(());
-        }
-        if !troe_machine::write(b"native content: selected ext4 CSPK verified\n") {
-            return Err(());
-        }
-        if !troe_machine::write(b"native persistence: committed and flushed\n") {
-            return Err(());
-        }
+            if !troe_machine::write(b"native identity: generation snapshot verified\n") {
+                return Err(());
+            }
+            if !troe_machine::write(b"native content: selected ext4 CSPK verified\n") {
+                return Err(());
+            }
+            if !troe_machine::write(b"native persistence: committed and flushed\n") {
+                return Err(());
+            }
+            selected_state
+        };
+        #[cfg(not(feature = "acceptance-probes"))]
+        let _ = validated.health_rollback();
+        Ok(state)
+    }
 
+    fn mount_native_statefs(
+        devices: &mut Vec<troe_machine::NativeVirtioBlock>,
+    ) -> Result<StateFs<troe_machine::NativeVirtioBlock>, ()> {
         let state_selector = RegionSelector::parse(STATEFS_SELECTOR).map_err(|_| ())?;
         let state_region = take_transaction_region(devices, state_selector)?;
-        let mut statefs = StateFs::mount(state_region).map_err(|_| ())?;
+        StateFs::mount(state_region).map_err(|_| ())
+    }
+
+    #[cfg(feature = "acceptance-probes")]
+    fn recover_native_statefs(
+        devices: &mut Vec<troe_machine::NativeVirtioBlock>,
+    ) -> Result<Option<Box<dyn ReadOnlyFileSystem>>, ()> {
+        let statefs = mount_native_statefs(devices)?;
+        let mut statefs = statefs;
+        probe_native_statefs_mutation(&mut statefs)?;
+        Ok(Some(Box::new(statefs)))
+    }
+
+    #[cfg(not(feature = "acceptance-probes"))]
+    fn recover_native_statefs(
+        devices: &mut Vec<troe_machine::NativeVirtioBlock>,
+    ) -> Option<Box<dyn ReadOnlyFileSystem>> {
+        mount_native_statefs(devices)
+            .ok()
+            .map(|statefs| Box::new(statefs) as Box<dyn ReadOnlyFileSystem>)
+    }
+
+    #[cfg(feature = "acceptance-probes")]
+    fn probe_native_statefs_mutation(
+        statefs: &mut StateFs<troe_machine::NativeVirtioBlock>,
+    ) -> Result<(), ()> {
         let mut prior = [0_u8; 8];
         let next = match statefs.read_file(STATE_PATH, 0, &mut prior) {
             Ok(8) => u64::from_le_bytes(prior).checked_add(1).ok_or(())?,
@@ -767,10 +892,9 @@ mod firmware {
         if !troe_machine::write(b"native statefs: mutation committed and flushed\n") {
             return Err(());
         }
-        Ok(Box::new(statefs))
+        Ok(())
     }
 
-    #[cfg(feature = "acceptance-probes")]
     fn take_transaction_region(
         devices: &mut Vec<troe_machine::NativeVirtioBlock>,
         selector: RegionSelector,
@@ -814,126 +938,14 @@ mod firmware {
         let (index, first_lba) = selected.ok_or(())?;
         let device = devices.remove(index);
         let limits = BlockLimits::new(1, 512, 1).map_err(|_| ())?;
-        let region = BlockRegion::new(
+        BlockRegion::new(
             device,
             first_lba,
             TRANSACTION_BLOCKS,
             BlockAccess::ReadWrite,
             limits,
         )
-        .map_err(|_| ())?;
-        Ok(region)
-    }
-
-    #[cfg(feature = "acceptance-probes")]
-    fn validate_generation_pointer(
-        content: &ContentPack<'_>,
-        pointer: ActivationPointer,
-    ) -> Result<bool, ()> {
-        let (active_manifest_digest, active_manifest, active_bytes) =
-            resolve_generation(content, pointer.active())?;
-        let active_config = parse_config(active_bytes).map_err(|_| ())?;
-        let rollback_required = active_config
-            .services()
-            .iter()
-            .any(|service| service.failure_action() == FailureAction::PreviousGeneration);
-        match pointer.previous() {
-            Some(previous) => {
-                let (previous_manifest_digest, _, _) = resolve_generation(content, previous)?;
-                if active_manifest.previous() != Some(previous_manifest_digest)
-                    || active_config.previous_generation() != Some(previous.generation())
-                    || !active_config.recovery().fallback_previous()
-                    || !rollback_required
-                {
-                    return Err(());
-                }
-            }
-            None => {
-                if active_manifest.previous().is_some()
-                    || active_config.previous_generation().is_some()
-                    || active_config.recovery().fallback_previous()
-                    || rollback_required
-                {
-                    return Err(());
-                }
-            }
-        }
-        let roots = content
-            .generation_roots(active_manifest_digest, 2)
-            .map_err(|_| ())?;
-        if roots.len() < 7 || roots.len() > 14 {
-            return Err(());
-        }
-        Ok(rollback_required)
-    }
-
-    #[cfg(feature = "acceptance-probes")]
-    fn resolve_generation<'a>(
-        content: &'a ContentPack<'a>,
-        reference: ConfigReference,
-    ) -> Result<(ContentDigest, GenerationManifest, &'a [u8]), ()> {
-        let config = content.get(reference.digest()).ok_or(())?;
-        if config.kind != ObjectKind::SystemConfig || !reference.matches(config.bytes) {
-            return Err(());
-        }
-        let mut found = None;
-        for object in content.objects() {
-            if object.kind != ObjectKind::GenerationManifest {
-                continue;
-            }
-            let manifest = GenerationManifest::parse(object.bytes).map_err(|_| ())?;
-            if manifest.generation() == reference.generation()
-                && manifest.config() == reference.digest()
-                && found.replace((object.digest, manifest)).is_some()
-            {
-                return Err(());
-            }
-        }
-        let (manifest_digest, manifest) = found.ok_or(())?;
-        validate_generation_security(content, manifest)?;
-        Ok((manifest_digest, manifest, config.bytes))
-    }
-
-    #[cfg(feature = "acceptance-probes")]
-    fn validate_generation_security(
-        content: &ContentPack<'_>,
-        generation: GenerationManifest,
-    ) -> Result<(), ()> {
-        let security = content.get(generation.security().ok_or(())?).ok_or(())?;
-        if security.kind != ObjectKind::SecurityManifest {
-            return Err(());
-        }
-        let security = SecurityManifest::parse(security.bytes).map_err(|_| ())?;
-        if security.generation() != generation.generation() {
-            return Err(());
-        }
-        let registry = content.get(security.registry()).ok_or(())?;
-        let mapping = content.get(security.mapping()).ok_or(())?;
-        let mount = content.get(security.mount()).ok_or(())?;
-        let acl = content.get(security.acl()).ok_or(())?;
-        if registry.kind != ObjectKind::IdentityRegistry
-            || mapping.kind != ObjectKind::IdentityMapping
-            || mount.kind != ObjectKind::MountPolicy
-            || acl.kind != ObjectKind::NativeAcl
-        {
-            return Err(());
-        }
-        let snapshot = validate_snapshot(
-            registry.bytes,
-            mapping.bytes,
-            mount.bytes,
-            acl.bytes,
-            generation.generation(),
-            IdentityLimits::tiny(),
-        )
-        .map_err(|_| ())?;
-        if snapshot.mount.role() != "root"
-            || snapshot.mount.mode() != MountIdentityMode::ExplicitMapping
-            || !snapshot.mount.raw_metadata_lossless()
-        {
-            return Err(());
-        }
-        Ok(())
+        .map_err(|_| ())
     }
 
     fn native_activation_limits() -> Result<ActivationLimits, ()> {
@@ -1066,15 +1078,6 @@ mod firmware {
                 MappingOwner::KernelImage,
             )?;
         }
-        if let Some(device) = console_device_range() {
-            insert_identity(
-                &mut plan,
-                device,
-                MappingPermissions::READ_WRITE,
-                MappingMemoryType::Device,
-                MappingOwner::MachineDevice,
-            )?;
-        }
         for device in troe_machine::input_device_ranges()
             .map_err(|_| ())?
             .into_iter()
@@ -1088,18 +1091,7 @@ mod firmware {
                 MappingOwner::MachineDevice,
             )?;
         }
-        #[cfg(target_arch = "aarch64")]
-        for device in troe_machine::virtio_mmio_device_ranges().map_err(|_| ())? {
-            insert_identity(
-                &mut plan,
-                device,
-                MappingPermissions::READ_WRITE,
-                MappingMemoryType::Device,
-                MappingOwner::MachineDevice,
-            )?;
-        }
-        #[cfg(target_arch = "x86_64")]
-        for device in troe_machine::virtio_pci_device_ranges().map_err(|_| ())? {
+        for device in troe_machine::virtio_device_ranges().map_err(|_| ())? {
             insert_identity(
                 &mut plan,
                 device,
@@ -1217,17 +1209,6 @@ mod firmware {
         memory_type.0 == boot::MemoryType::CONVENTIONAL.0
             || memory_type.0 == boot::MemoryType::BOOT_SERVICES_CODE.0
             || memory_type.0 == boot::MemoryType::BOOT_SERVICES_DATA.0
-    }
-
-    fn console_device_range() -> Option<PhysicalRange> {
-        #[cfg(target_arch = "x86_64")]
-        {
-            None
-        }
-        #[cfg(target_arch = "aarch64")]
-        {
-            PhysicalRange::from_pages(0x0900_0000, 1).ok()
-        }
     }
 
     fn normalize_final_map(
@@ -1523,6 +1504,7 @@ mod firmware {
         };
         if address_space.stats().table_pages == 0
             || address_space.stats().table_pages > ISOLATED_TABLE_PAGES
+            || address_space.user_region_count() != STAGE6_USER_REGIONS
         {
             reclaim_isolated(&mut accounting.frames, allocation)?;
             return Err(());
@@ -1651,7 +1633,7 @@ mod firmware {
         scheduler: &mut Scheduler,
         accounting: &mut OwnedAccounting,
     ) -> Result<(), ()> {
-        let artifact = native_kex_artifact(ApplicationProbe::Calls)?;
+        let artifact = native_kex_artifact(ApplicationProbe::Calls);
         let baseline_frames = accounting.frames.free_frames();
         let baseline_tasks = scheduler.stats();
         let mut dispatcher = Dispatcher::new(1, 2).map_err(|_| ())?;
@@ -1664,85 +1646,89 @@ mod firmware {
             accounting,
             &mut dispatcher,
             port,
-            &artifact,
+            artifact,
             ApplicationProbe::Calls,
         )?;
-        let spinning = native_kex_artifact(ApplicationProbe::Spin)?;
-        let reused = load_and_reclaim_application(
-            scheduler,
-            accounting,
-            &mut dispatcher,
-            port,
-            &spinning,
-            ApplicationProbe::Spin,
-        )?;
-        let invalid_call = native_kex_artifact(ApplicationProbe::InvalidCall)?;
-        let invalid_reused = load_and_reclaim_application(
-            scheduler,
-            accounting,
-            &mut dispatcher,
-            port,
-            &invalid_call,
-            ApplicationProbe::InvalidCall,
-        )?;
-        let unexpected_return = native_kex_artifact(ApplicationProbe::UnexpectedReturn)?;
-        let return_reused = load_and_reclaim_application(
-            scheduler,
-            accounting,
-            &mut dispatcher,
-            port,
-            &unexpected_return,
-            ApplicationProbe::UnexpectedReturn,
-        )?;
+        #[cfg(not(feature = "acceptance-probes"))]
+        let _ = first;
+
+        #[cfg(feature = "acceptance-probes")]
+        let (reused, invalid_reused, return_reused) = {
+            let spinning = native_kex_artifact(ApplicationProbe::Spin);
+            let reused = load_and_reclaim_application(
+                scheduler,
+                accounting,
+                &mut dispatcher,
+                port,
+                spinning,
+                ApplicationProbe::Spin,
+            )?;
+            let invalid_call = native_kex_artifact(ApplicationProbe::InvalidCall);
+            let invalid_reused = load_and_reclaim_application(
+                scheduler,
+                accounting,
+                &mut dispatcher,
+                port,
+                invalid_call,
+                ApplicationProbe::InvalidCall,
+            )?;
+            let unexpected_return = native_kex_artifact(ApplicationProbe::UnexpectedReturn);
+            let return_reused = load_and_reclaim_application(
+                scheduler,
+                accounting,
+                &mut dispatcher,
+                port,
+                unexpected_return,
+                ApplicationProbe::UnexpectedReturn,
+            )?;
+            (reused, invalid_reused, return_reused)
+        };
+
         if accounting.frames.free_frames() != baseline_frames
-            || reused != first
-            || invalid_reused != first
-            || return_reused != first
             || scheduler.stats().owned_address_spaces != baseline_tasks.owned_address_spaces
             || scheduler.stats().owned_isolation_pages != baseline_tasks.owned_isolation_pages
             || scheduler.stats().owned_handles != baseline_tasks.owned_handles
             || scheduler.stats().yields != baseline_tasks.yields.checked_add(1).ok_or(())?
-            || scheduler.stats().contained_faults
-                != baseline_tasks.contained_faults.checked_add(3).ok_or(())?
             || dispatcher.stats().live_handles != 1
         {
             return Err(());
         }
 
-        let mut invalid = artifact.clone();
-        invalid[0] ^= 0xff;
-        require_staged_rejection(&invalid, ParseError::InvalidMagic)?;
-        invalid.clone_from(&artifact);
-        invalid[22] = 1;
-        require_staged_rejection(&invalid, ParseError::NonzeroReserved)?;
-        invalid.clone_from(&artifact);
-        invalid[12] = if native_application_target() == Target::X86_64 {
-            Target::Aarch64 as u8
-        } else {
-            Target::X86_64 as u8
-        };
-        invalid[13] = 0;
-        require_staged_rejection(&invalid, ParseError::WrongTarget)?;
-        invalid.clone_from(&artifact);
-        invalid[64 + 32] = 0;
-        require_staged_rejection(&invalid, ParseError::InvalidPermissions)?;
-        require_staged_rejection(&artifact[..63], ParseError::TruncatedHeader)?;
-        if accounting.frames.free_frames() != baseline_frames {
+        #[cfg(not(feature = "acceptance-probes"))]
+        if scheduler.stats().contained_faults != baseline_tasks.contained_faults {
             return Err(());
+        }
+
+        #[cfg(feature = "acceptance-probes")]
+        {
+            if reused != first
+                || invalid_reused != first
+                || return_reused != first
+                || scheduler.stats().contained_faults
+                    != baseline_tasks.contained_faults.checked_add(3).ok_or(())?
+            {
+                return Err(());
+            }
+            #[cfg(target_arch = "x86_64")]
+            let rejections = include!("../../tests/kex-corpus/rejections-x86_64.inc");
+            #[cfg(target_arch = "aarch64")]
+            let rejections = include!("../../tests/kex-corpus/rejections-aarch64.inc");
+            for (_name, source, expected) in rejections {
+                require_staged_rejection(source, expected)?;
+            }
+            if accounting.frames.free_frames() != baseline_frames {
+                return Err(());
+            }
         }
         Ok(())
     }
 
+    #[cfg(feature = "acceptance-probes")]
     fn require_staged_rejection(source: &[u8], expected: ParseError) -> Result<(), ()> {
         let mut staging = Vec::new();
         staging.try_reserve_exact(source.len()).map_err(|_| ())?;
         staging.extend_from_slice(source);
-        match parse_kex(
-            &staging,
-            native_application_target(),
-            ResourceProfile::Tiny,
-            ABI_MINOR,
-        ) {
+        match parse_kex(&staging, native_application_target(), ABI_MINOR) {
             Err(error) if error == expected => Ok(()),
             _ => Err(()),
         }
@@ -1757,26 +1743,46 @@ mod firmware {
         source: &[u8],
         probe: ApplicationProbe,
     ) -> Result<u64, ()> {
-        let limits = ApplicationLimits::for_profile(ResourceProfile::Tiny);
+        let limits = ApplicationLimits::standard();
         if source.len() > limits.encoded_bytes() {
             return Err(());
         }
+        let mut transaction = LoaderTransaction::new();
         let mut staging = Vec::new();
         staging.try_reserve_exact(source.len()).map_err(|_| ())?;
         staging.extend_from_slice(source);
-        let plan = parse_kex(
-            &staging,
-            native_application_target(),
-            ResourceProfile::Tiny,
-            ABI_MINOR,
-        )
-        .map_err(|_| ())?;
+        transaction
+            .acquire(LoaderResource::Staging)
+            .map_err(|_| ())?;
+        let Ok(plan) = parse_kex(&staging, native_application_target(), ABI_MINOR) else {
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        };
+        let fixed_user_regions = if plan.heap_pages() == 0 {
+            APPLICATION_FIXED_USER_REGIONS - 1
+        } else {
+            APPLICATION_FIXED_USER_REGIONS
+        };
+        let application_user_regions = plan
+            .segments()
+            .count()
+            .checked_add(fixed_user_regions)
+            .ok_or(())?;
         let private_pages = u16::try_from(plan.charges().private_pages()).map_err(|_| ())?;
         let stack_pages = u16::try_from(plan.stack_pages()).map_err(|_| ())?;
 
-        let allocation = allocate_application(&mut accounting.frames, &plan)?;
+        let Ok(allocation) = allocate_application(&mut accounting.frames, &plan) else {
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        };
+        if transaction.acquire(LoaderResource::Frames).is_err() {
+            reclaim_application(&mut accounting.frames, allocation)?;
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        }
         if prepare_application_memory(&allocation, &plan).is_err() {
             reclaim_application(&mut accounting.frames, allocation)?;
+            clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         }
         let Ok(mapping_plan) = build_application_plan(
@@ -1786,37 +1792,64 @@ mod firmware {
             &plan,
         ) else {
             reclaim_application(&mut accounting.frames, allocation)?;
+            clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
         let Ok(address_space) =
             troe_machine::build_user_address_space(&mapping_plan, allocation.tables)
         else {
             reclaim_application(&mut accounting.frames, allocation)?;
+            clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
-        let table_pages = address_space.stats().table_pages;
-        if table_pages == 0 || table_pages > APPLICATION_TABLE_PAGES {
+        if transaction.acquire(LoaderResource::Tables).is_err() {
             reclaim_application(&mut accounting.frames, allocation)?;
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        }
+        let table_pages = address_space.stats().table_pages;
+        if table_pages == 0
+            || table_pages > APPLICATION_TABLE_PAGES
+            || address_space.user_region_count() != application_user_regions
+        {
+            reclaim_application(&mut accounting.frames, allocation)?;
+            clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         }
         let Ok(table_pages) = u16::try_from(table_pages) else {
             reclaim_application(&mut accounting.frames, allocation)?;
+            clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
         let Ok(isolation) = IsolationResource::new(0, table_pages, private_pages, 1) else {
             reclaim_application(&mut accounting.frames, allocation)?;
+            clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
         let Ok(stack_resource) = StackResource::new(0, stack_pages) else {
             reclaim_application(&mut accounting.frames, allocation)?;
+            clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
         let Ok(task_id) =
             scheduler.spawn_isolated(Capabilities::SERVICE, stack_resource, isolation)
         else {
             reclaim_application(&mut accounting.frames, allocation)?;
+            clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
+        if transaction.acquire(LoaderResource::Task).is_err() {
+            rollback_application_task(
+                scheduler,
+                task_id,
+                dispatcher,
+                None,
+                &mut accounting.frames,
+                allocation,
+            )?;
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        }
         let entry = plan.entry_address();
         let layout = plan.layout();
         let allocation_start = allocation.complete.start();
@@ -1827,6 +1860,9 @@ mod firmware {
                 .open_owned(port, Rights::CALL, owner)
                 .map_err(|_| ())?;
             live_owner = Some(owner);
+            transaction
+                .acquire(LoaderResource::Handles)
+                .map_err(|_| ())?;
             let initial_handles = [InitialHandle {
                 value: handle.abi_value(),
                 rights: Rights::CALL.bits(),
@@ -1855,11 +1891,24 @@ mod firmware {
                 &mut accounting.frames,
                 allocation,
             )?;
+            clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
         drop(plan);
         drop(staging);
         drop(mapping_plan);
+        if transaction.commit().is_err() {
+            rollback_application_task(
+                scheduler,
+                task_id,
+                dispatcher,
+                live_owner,
+                &mut accounting.frames,
+                allocation,
+            )?;
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        }
         let committed = (|| -> Result<(), ()> {
             if scheduler
                 .dispatch_next(Capabilities::SERVICE)
@@ -1936,6 +1985,7 @@ mod firmware {
                         scheduler.exit_current(task_id, 0).map_err(|_| ())?;
                         break;
                     }
+                    #[cfg(feature = "acceptance-probes")]
                     (
                         ApplicationProbe::Spin,
                         troe_machine::ApplicationOutcome::Faulted(
@@ -1947,6 +1997,7 @@ mod firmware {
                             .map_err(|_| ())?;
                         break;
                     }
+                    #[cfg(feature = "acceptance-probes")]
                     (
                         ApplicationProbe::InvalidCall,
                         troe_machine::ApplicationOutcome::Faulted(
@@ -1958,6 +2009,7 @@ mod firmware {
                             .map_err(|_| ())?;
                         break;
                     }
+                    #[cfg(feature = "acceptance-probes")]
                     (
                         ApplicationProbe::UnexpectedReturn,
                         troe_machine::ApplicationOutcome::Faulted(
@@ -2169,16 +2221,35 @@ mod firmware {
         frames: &mut FrameAllocator,
         allocation: ApplicationAllocation,
     ) -> Result<(), ()> {
-        if let Some(owner) = owner {
-            dispatcher.close_owner(owner).map_err(|_| ())?;
-        }
-        match scheduler.task(task_id).map_err(|_| ())?.state() {
-            TaskState::Ready => scheduler.cancel_ready(task_id, 1).map_err(|_| ())?,
-            TaskState::Running => scheduler.exit_current(task_id, 1).map_err(|_| ())?,
-            TaskState::Exited | TaskState::Faulted => {}
-        }
-        scheduler.reap(task_id).map_err(|_| ())?;
+        terminate_revoke_and_reap_task(scheduler, task_id, dispatcher, owner)?;
         reclaim_application(frames, allocation)
+    }
+
+    fn clear_provisional_loader_ownership(transaction: &mut LoaderTransaction) {
+        transaction.rollback(|_resource| {});
+    }
+
+    /// Complete the scheduler/capability portion of ADR 0014 teardown.
+    ///
+    /// Physical allocations remain owned by the caller until this returns, so
+    /// no zeroization or frame release can precede terminalization, revocation,
+    /// and reaping. Any failure deliberately leaks the retained allocation into
+    /// the terminal boot path instead of making it reusable prematurely.
+    fn terminate_revoke_and_reap_task(
+        scheduler: &mut Scheduler,
+        task_id: TaskId,
+        dispatcher: &mut Dispatcher,
+        owner: Option<HandleOwner>,
+    ) -> Result<(), ()> {
+        scheduler
+            .terminate_revoke_and_reap(task_id, 1, |_terminal| {
+                if let Some(owner) = owner {
+                    dispatcher.close_owner(owner).map_err(|_| ())?;
+                }
+                Ok::<(), ()>(())
+            })
+            .map(|_reaped| ())
+            .map_err(|_| ())
     }
 
     #[allow(clippy::needless_pass_by_value)]
@@ -2201,113 +2272,52 @@ mod firmware {
         }
     }
 
-    fn native_kex_artifact(probe: ApplicationProbe) -> Result<Vec<u8>, ()> {
-        #[cfg(target_arch = "x86_64")]
-        let payload: &[u8] = match probe {
-            ApplicationProbe::Calls => &[
-                0x83, 0x3f, 0x58, 0x75, 0x76, 0x48, 0x81, 0xfe, 0x00, 0x10, 0x00, 0x00, 0x75, 0x6d,
-                0x4c, 0x8b, 0x67, 0x40, 0xbb, 0x78, 0x56, 0x34, 0x12, 0xb8, 0x01, 0x00, 0x00, 0x00,
-                0xcd, 0x80, 0x85, 0xc0, 0x75, 0x59, 0x85, 0xd2, 0x75, 0x55, 0x48, 0x81, 0xfb, 0x78,
-                0x56, 0x34, 0x12, 0x75, 0x4c, 0x48, 0x83, 0xec, 0x20, 0x66, 0xc7, 0x04, 0x24, 0x01,
-                0x00, 0xc7, 0x44, 0x24, 0x02, 0x70, 0x69, 0x6e, 0x67, 0x4c, 0x89, 0xe7, 0x48, 0x89,
-                0xe6, 0xba, 0x06, 0x00, 0x00, 0x00, 0x4c, 0x8d, 0x54, 0x24, 0x10, 0x41, 0xb8, 0x04,
-                0x00, 0x00, 0x00, 0xb8, 0x02, 0x00, 0x00, 0x00, 0xcd, 0x80, 0x85, 0xc0, 0x75, 0x19,
-                0x83, 0xfa, 0x04, 0x75, 0x14, 0x81, 0x7c, 0x24, 0x10, 0x70, 0x69, 0x6e, 0x67, 0x75,
-                0x0a, 0x48, 0x83, 0xc4, 0x20, 0x31, 0xff, 0x31, 0xc0, 0xcd, 0x80, 0xbf, 0x01, 0x00,
-                0x00, 0x00, 0x31, 0xc0, 0xcd, 0x80, 0x0f, 0x0b,
-            ],
-            ApplicationProbe::Spin => &[0xeb, 0xfe],
-            ApplicationProbe::InvalidCall => {
-                &[0xb8, 0x03, 0x00, 0x00, 0x00, 0xcd, 0x80, 0x0f, 0x0b]
+    fn native_kex_artifact(probe: ApplicationProbe) -> &'static [u8] {
+        match probe {
+            ApplicationProbe::Calls => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    include_bytes!("../../tests/kex-corpus/native-calls-x86_64.kex")
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    include_bytes!("../../tests/kex-corpus/native-calls-aarch64.kex")
+                }
             }
-            ApplicationProbe::UnexpectedReturn => &[0xc3],
-        };
-        #[cfg(target_arch = "aarch64")]
-        let payload: &[u8] = match probe {
-            ApplicationProbe::Calls => &[
-                0x09, 0x00, 0x40, 0xb9, 0x3f, 0x61, 0x01, 0x71, 0x41, 0x04, 0x00, 0x54, 0x3f, 0x04,
-                0x40, 0xf1, 0x01, 0x04, 0x00, 0x54, 0x13, 0x20, 0x40, 0xf9, 0x74, 0x24, 0x80, 0xd2,
-                0x28, 0x00, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4, 0x60, 0x03, 0x00, 0xb5, 0x41, 0x03,
-                0x00, 0xb5, 0x9f, 0x8e, 0x04, 0xf1, 0x01, 0x03, 0x00, 0x54, 0xff, 0x83, 0x00, 0xd1,
-                0x29, 0x00, 0x80, 0x52, 0xe9, 0x03, 0x00, 0x79, 0x09, 0x2e, 0x8d, 0x52, 0xc9, 0xed,
-                0xac, 0x72, 0xe9, 0x23, 0x00, 0xb8, 0xe0, 0x03, 0x13, 0xaa, 0xe1, 0x03, 0x00, 0x91,
-                0xc2, 0x00, 0x80, 0xd2, 0xe3, 0x43, 0x00, 0x91, 0x84, 0x00, 0x80, 0xd2, 0x48, 0x00,
-                0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4, 0x40, 0x01, 0x00, 0xb5, 0x3f, 0x10, 0x00, 0xf1,
-                0x01, 0x01, 0x00, 0x54, 0xea, 0x13, 0x40, 0xb9, 0x5f, 0x01, 0x09, 0x6b, 0xa1, 0x00,
-                0x00, 0x54, 0xff, 0x83, 0x00, 0x91, 0x00, 0x00, 0x80, 0xd2, 0x08, 0x00, 0x80, 0xd2,
-                0x01, 0x00, 0x00, 0xd4, 0x20, 0x00, 0x80, 0xd2, 0x08, 0x00, 0x80, 0xd2, 0x01, 0x00,
-                0x00, 0xd4, 0x00, 0x00, 0x20, 0xd4,
-            ],
-            ApplicationProbe::Spin => &[0x00, 0x00, 0x00, 0x14],
-            ApplicationProbe::InvalidCall => &[
-                0x68, 0x00, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4, 0x00, 0x00, 0x20, 0xd4,
-            ],
-            ApplicationProbe::UnexpectedReturn => &[0xc0, 0x03, 0x5f, 0xd6],
-        };
-        let payload_offset = 64_usize.checked_add(40).ok_or(())?;
-        let artifact_bytes = payload_offset.checked_add(payload.len()).ok_or(())?;
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(artifact_bytes).map_err(|_| ())?;
-        bytes.resize(artifact_bytes, 0);
-        bytes[..8].copy_from_slice(b"KEX\0FMT\0");
-        put_kex_u16(&mut bytes, 8, 1)?;
-        put_kex_u16(&mut bytes, 10, 0)?;
-        put_kex_u16(&mut bytes, 12, native_application_target() as u16)?;
-        put_kex_u16(&mut bytes, 14, 64)?;
-        put_kex_u16(&mut bytes, 16, 40)?;
-        put_kex_u16(&mut bytes, 18, 1)?;
-        put_kex_u16(&mut bytes, 20, 0)?;
-        put_kex_u16(&mut bytes, 32, 1)?;
-        put_kex_u32(&mut bytes, 36, 4)?;
-        put_kex_u32(&mut bytes, 44, 64)?;
-        put_kex_u32(
-            &mut bytes,
-            48,
-            u32::try_from(payload_offset).map_err(|_| ())?,
-        )?;
-        put_kex_u64(
-            &mut bytes,
-            56,
-            u64::try_from(artifact_bytes).map_err(|_| ())?,
-        )?;
-        put_kex_u64(
-            &mut bytes,
-            64 + 8,
-            u64::try_from(payload_offset).map_err(|_| ())?,
-        )?;
-        put_kex_u64(
-            &mut bytes,
-            64 + 16,
-            u64::try_from(payload.len()).map_err(|_| ())?,
-        )?;
-        put_kex_u64(&mut bytes, 64 + 24, BASE_PAGE_SIZE)?;
-        put_kex_u32(&mut bytes, 64 + 32, SegmentPermissions::ReadExecute as u32)?;
-        bytes[payload_offset..].copy_from_slice(payload);
-        Ok(bytes)
-    }
-
-    fn put_kex_u16(bytes: &mut [u8], offset: usize, value: u16) -> Result<(), ()> {
-        bytes
-            .get_mut(offset..offset.checked_add(2).ok_or(())?)
-            .ok_or(())?
-            .copy_from_slice(&value.to_le_bytes());
-        Ok(())
-    }
-
-    fn put_kex_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), ()> {
-        bytes
-            .get_mut(offset..offset.checked_add(4).ok_or(())?)
-            .ok_or(())?
-            .copy_from_slice(&value.to_le_bytes());
-        Ok(())
-    }
-
-    fn put_kex_u64(bytes: &mut [u8], offset: usize, value: u64) -> Result<(), ()> {
-        bytes
-            .get_mut(offset..offset.checked_add(8).ok_or(())?)
-            .ok_or(())?
-            .copy_from_slice(&value.to_le_bytes());
-        Ok(())
+            #[cfg(feature = "acceptance-probes")]
+            ApplicationProbe::Spin => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    include_bytes!("../../tests/kex-corpus/native-spin-x86_64.kex")
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    include_bytes!("../../tests/kex-corpus/native-spin-aarch64.kex")
+                }
+            }
+            #[cfg(feature = "acceptance-probes")]
+            ApplicationProbe::InvalidCall => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    include_bytes!("../../tests/kex-corpus/native-invalid-call-x86_64.kex")
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    include_bytes!("../../tests/kex-corpus/native-invalid-call-aarch64.kex")
+                }
+            }
+            #[cfg(feature = "acceptance-probes")]
+            ApplicationProbe::UnexpectedReturn => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    include_bytes!("../../tests/kex-corpus/native-unexpected-return-x86_64.kex")
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    include_bytes!("../../tests/kex-corpus/native-unexpected-return-aarch64.kex")
+                }
+            }
+        }
     }
 
     fn rollback_isolated_task(
@@ -2318,15 +2328,7 @@ mod firmware {
         frames: &mut FrameAllocator,
         allocation: IsolatedAllocation,
     ) -> Result<(), ()> {
-        if let Some(owner) = owner {
-            dispatcher.close_owner(owner).map_err(|_| ())?;
-        }
-        match scheduler.task(task_id).map_err(|_| ())?.state() {
-            TaskState::Ready => scheduler.cancel_ready(task_id, 1).map_err(|_| ())?,
-            TaskState::Running => scheduler.exit_current(task_id, 1).map_err(|_| ())?,
-            TaskState::Exited | TaskState::Faulted => {}
-        }
-        scheduler.reap(task_id).map_err(|_| ())?;
+        terminate_revoke_and_reap_task(scheduler, task_id, dispatcher, owner)?;
         reclaim_isolated(frames, allocation)
     }
 
@@ -2436,7 +2438,7 @@ mod firmware {
         if !protected_code {
             return Err(());
         }
-        for (virtual_start, physical, permissions) in [
+        let user_mappings: [(u64, PhysicalRange, MappingPermissions); STAGE6_USER_REGIONS] = [
             (
                 USER_CODE_BASE,
                 allocation.code,
@@ -2452,7 +2454,8 @@ mod firmware {
                 allocation.stack,
                 MappingPermissions::READ_WRITE,
             ),
-        ] {
+        ];
+        for (virtual_start, physical, permissions) in user_mappings {
             let virtual_range =
                 VirtualRange::from_pages(virtual_start, physical.page_count()).map_err(|_| ())?;
             let mapping = Mapping::user(
@@ -2765,6 +2768,49 @@ mod firmware {
         write_all(console, summary.as_bytes()).is_ok()
     }
 
+    fn append_internal_storage_report(
+        report: &mut String,
+        generation: NativeGenerationState,
+        statefs_mounted: bool,
+    ) -> Result<(), ()> {
+        let activation = RegionSelector::parse(PERSISTENCE_SELECTOR).map_err(|_| ())?;
+        let statefs = RegionSelector::parse(STATEFS_SELECTOR).map_err(|_| ())?;
+        report.push_str("internal activation disk=");
+        write_storage_identity(report, activation.disk_guid())?;
+        report.push_str(" partition=");
+        write_storage_identity(report, activation.partition_guid())?;
+        report.push_str(" type=");
+        write_storage_identity(report, activation.partition_type_guid())?;
+        writeln!(report, " state={}", generation.name()).map_err(|_| ())?;
+        report.push_str("internal statefs disk=");
+        write_storage_identity(report, statefs.disk_guid())?;
+        report.push_str(" partition=");
+        write_storage_identity(report, statefs.partition_guid())?;
+        report.push_str(" type=");
+        write_storage_identity(report, statefs.partition_type_guid())?;
+        writeln!(
+            report,
+            " state={}",
+            if statefs_mounted {
+                "mounted"
+            } else {
+                "missing"
+            }
+        )
+        .map_err(|_| ())?;
+        if report.len() > MAX_STORAGE_REPORT_BYTES {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    fn write_storage_identity(report: &mut String, identity: [u8; 16]) -> Result<(), ()> {
+        for byte in identity {
+            write!(report, "{byte:02x}").map_err(|_| ())?;
+        }
+        Ok(())
+    }
+
     fn activate_native_storage(
         accounting: &OwnedAccounting,
         namespace: &mut Namespace,
@@ -2776,18 +2822,44 @@ mod firmware {
         let activation = prepare_read_only(&accounting.boot_mount_manifest, devices, limits)
             .unwrap_or_else(|_| fatal(b"fatal: native storage activation failed\n"));
         let desired_system_available = activation.desired_system_available();
-        let mount_count = activation.mounts().len();
+        let root_mounted = activation
+            .mounts()
+            .iter()
+            .any(|mount| mount.path() == "/vol/root");
+        let mut storage_report = String::new();
+        let report_capacity = activation
+            .report()
+            .len()
+            .checked_add(STORAGE_REPORT_EXTENSION_BYTES)
+            .unwrap_or_else(|| fatal(b"fatal: native storage diagnostic overflow\n"));
+        if storage_report.try_reserve_exact(report_capacity).is_err() {
+            fatal(b"fatal: cannot retain native storage diagnostic\n");
+        }
+        storage_report.push_str(activation.report());
         for mount in activation.into_mounts() {
             mount
                 .attach(namespace)
                 .unwrap_or_else(|_| fatal(b"fatal: cannot attach native filesystem provider\n"));
         }
+        let statefs_mounted = accounting.native_statefs.borrow().is_some();
         if let Some(statefs) = accounting.native_statefs.borrow_mut().take() {
             namespace
                 .mount_writable("/vol/state", statefs)
                 .unwrap_or_else(|_| fatal(b"fatal: cannot attach native state filesystem\n"));
         }
-        if desired_system_available && mount_count != 0 {
+        append_internal_storage_report(
+            &mut storage_report,
+            accounting.native_generation,
+            statefs_mounted,
+        )
+        .unwrap_or_else(|()| fatal(b"fatal: cannot extend native storage diagnostic\n"));
+        namespace
+            .set_system_file("/sys/storage", storage_report.as_bytes())
+            .unwrap_or_else(|_| fatal(b"fatal: cannot publish native storage diagnostic\n"));
+        if desired_system_available
+            && root_mounted
+            && accounting.native_generation.desired_system_available()
+        {
             if write_boot_status(console, "Mounting /vol/root read-only", true).is_err() {
                 fatal(b"fatal: native storage diagnostic failed\n");
             }
@@ -3370,12 +3442,7 @@ mod firmware {
     }
 
     fn discover_network_service() -> Option<SharedNetwork> {
-        #[cfg(target_arch = "aarch64")]
-        let mut device = troe_machine::discover_virtio_mmio_network()
-            .ok()
-            .flatten()?;
-        #[cfg(target_arch = "x86_64")]
-        let mut device = troe_machine::discover_virtio_pci_network().ok().flatten()?;
+        let mut device = troe_machine::discover_virtio_network().ok().flatten()?;
         device.enable_interrupts().ok()?;
         let service = KernelNetworkService::new(device).ok()?;
         Some(Rc::new(RefCell::new(service)))
@@ -3477,13 +3544,13 @@ mod firmware {
             fatal(b"fatal: cannot compose namespace\n");
         };
         let runtime = finish_shell_startup(&mut shell, &mut console, &motd, native_root);
-        let editor_config = EditorConfig::tiny();
+        let editor_config = EditorConfig::standard();
         if editor_config.max_line_bytes() > MAX_LINE_BYTES {
             fatal(b"fatal: editor line policy exceeds shell parser policy\n");
         }
-        let completion_config = CompletionConfig::tiny();
+        let completion_config = CompletionConfig::standard();
         let mut decoder = InputDecoder::new(editor_config.input());
-        let mut keyboard = Ps2Set1Decoder::new(KeyboardConfig::tiny());
+        let mut keyboard = Ps2Set1Decoder::new(KeyboardConfig::standard());
         let mut editor = LineEditor::new(editor_config);
 
         loop {
@@ -3665,7 +3732,7 @@ mod firmware {
         if completion.truncated {
             write_all(
                 console,
-                b"... completion list truncated by profile limits\n",
+                b"... completion list truncated by standard limits\n",
             )?;
         }
         redraw_editor(editor, prompt, console)

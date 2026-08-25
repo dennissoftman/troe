@@ -1,11 +1,27 @@
 # ADR 0018: volume namespace and deterministic root discovery
 
-Status: accepted, 2026-08-24; BMNT v1 parsing and portable stable-identity
-resolution are implemented. The AArch64 QEMU profile now validates its embedded
-BMNT fixture before handoff and activates an exactly matched GPT/ext4 provider.
+Status: accepted and implemented for Stage 8, 2026-08-24. BMNT v1 parsing,
+portable stable-identity resolution, and the production post-handoff activation
+path are implemented. Both native profiles use the owned BMNT record to locate
+the exact root provider and `/system.cspk`; enumeration order never grants a
+role. A mounted root becomes the desired system only after generation and
+identity recovery also succeeds. Missing, ambiguous, corrupt, or unauthorized
+media remains inspectable only through the static KEFS recovery environment.
 Loading an installed manifest from the EFI system partition belongs to Stage 9
 deployment tooling; the Stage 8 QEMU fixture validates the identical owned BMNT
 record and post-handoff selection rules.
+
+The current native scope publishes a bounded deterministic `/sys/storage`
+snapshot containing every scanned device, GPT region, stable identity, probe
+state, and configured role result. The kernel retains those bytes before
+consuming provider plans but publishes them only after every returned provider
+and the optional StateFS mount have attached successfully, so a `matched`
+report cannot describe a failed namespace attachment.
+The activation TXSLOT and StateFS devices are consumed into exclusive region
+capabilities before the BMNT provider pass; two bounded `internal` records
+therefore retain their exact PRGN disk, partition, and type identities plus the
+selected generation and StateFS mount outcomes. The combined file remains
+inside the 32 KiB report ceiling.
 
 ## Context
 

@@ -791,8 +791,8 @@ mod tests {
     extern crate std;
 
     use super::{
-        ConsoleService, CopiedMessage, DispatchError, DispatchedOutput, Dispatcher, HandleOwner,
-        MAX_MESSAGE_BYTES, ReplyStatus, Request, Rights, Service, ServiceReply,
+        ConsoleService, CopiedMessage, DispatchError, DispatchedOutput, Dispatcher, Handle,
+        HandleOwner, MAX_MESSAGE_BYTES, ReplyStatus, Request, Rights, Service, ServiceReply,
     };
     use alloc::boxed::Box;
     use alloc::rc::Rc;
@@ -810,6 +810,33 @@ mod tests {
             } else {
                 Ok(ServiceReply::empty(ReplyStatus::InvalidRequest))
             }
+        }
+    }
+
+    struct FailOnceService {
+        request_ids: Rc<RefCell<Vec<u64>>>,
+    }
+
+    impl Service for FailOnceService {
+        fn call(&mut self, request: Request<'_>) -> Result<ServiceReply, DispatchError> {
+            let mut request_ids = self.request_ids.borrow_mut();
+            request_ids.push(request.id());
+            if request_ids.len() == 1 {
+                Err(DispatchError::MetadataExhausted)
+            } else {
+                Ok(ServiceReply::empty(ReplyStatus::Success))
+            }
+        }
+    }
+
+    struct RecordingService {
+        request_ids: Rc<RefCell<Vec<u64>>>,
+    }
+
+    impl Service for RecordingService {
+        fn call(&mut self, request: Request<'_>) -> Result<ServiceReply, DispatchError> {
+            self.request_ids.borrow_mut().push(request.id());
+            Ok(ServiceReply::empty(ReplyStatus::Success))
         }
     }
 
@@ -841,6 +868,29 @@ mod tests {
     }
 
     #[test]
+    fn delivered_request_id_remains_consumed_after_service_error() -> Result<(), DispatchError> {
+        let request_ids = Rc::new(RefCell::new(Vec::new()));
+        let mut dispatcher = Dispatcher::new(1, 1)?;
+        let (_port, handle) = dispatcher.register(
+            Box::new(FailOnceService {
+                request_ids: Rc::clone(&request_ids),
+            }),
+            Rights::CALL,
+        )?;
+
+        assert_eq!(
+            dispatcher.call(handle, 1, b"first"),
+            Err(DispatchError::MetadataExhausted)
+        );
+        let reply = dispatcher.call(handle, 1, b"second")?;
+        assert_eq!(reply.request_id(), 2);
+        assert_eq!(&*request_ids.borrow(), &[1, 2]);
+        assert_eq!(dispatcher.stats().calls, 2);
+        assert_eq!(dispatcher.stats().replies, 1);
+        Ok(())
+    }
+
+    #[test]
     fn application_handle_tokens_are_nonzero_and_generation_checked() -> Result<(), DispatchError> {
         let mut dispatcher = Dispatcher::new(1, 2)?;
         let (port, kernel) = dispatcher.register(Box::new(EchoService), Rights::CALL)?;
@@ -862,6 +912,109 @@ mod tests {
         let replacement = dispatcher.open_owned(port, Rights::CALL, owner)?;
         assert_ne!(replacement.abi_value(), first.abi_value());
         dispatcher.close(kernel)?;
+        Ok(())
+    }
+
+    #[test]
+    fn maximum_handle_generation_retires_slot_without_reuse() -> Result<(), DispatchError> {
+        let mut dispatcher = Dispatcher::new(1, 1)?;
+        let (port, _initial) = dispatcher.register(Box::new(EchoService), Rights::CALL)?;
+        dispatcher.handles[0].generation = u32::MAX;
+        let terminal = Handle {
+            slot: 0,
+            generation: u32::MAX,
+        };
+
+        dispatcher.close(terminal)?;
+
+        assert_eq!(dispatcher.handles[0].generation, u32::MAX);
+        assert!(dispatcher.handles[0].retired);
+        assert_eq!(dispatcher.stats().live_handles, 0);
+        assert_eq!(
+            dispatcher.call(terminal, 7, b"stale"),
+            Err(DispatchError::InvalidHandle)
+        );
+        assert_eq!(
+            dispatcher.open(port, Rights::CALL),
+            Err(DispatchError::HandleCapacityExhausted)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn saturated_request_identity_fails_before_delivery() -> Result<(), DispatchError> {
+        let request_ids = Rc::new(RefCell::new(Vec::new()));
+        let mut dispatcher = Dispatcher::new(1, 1)?;
+        let (_port, handle) = dispatcher.register(
+            Box::new(RecordingService {
+                request_ids: Rc::clone(&request_ids),
+            }),
+            Rights::CALL,
+        )?;
+        dispatcher.next_request_id = u64::MAX;
+
+        assert_eq!(
+            dispatcher.call(handle, 1, b"request-overflow"),
+            Err(DispatchError::AccountingOverflow)
+        );
+        assert!(request_ids.borrow().is_empty());
+        assert_eq!(dispatcher.next_request_id, u64::MAX);
+        assert_eq!(dispatcher.stats().calls, 0);
+        assert_eq!(dispatcher.stats().replies, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn saturated_call_counter_fails_before_delivery() -> Result<(), DispatchError> {
+        let request_ids = Rc::new(RefCell::new(Vec::new()));
+        let mut dispatcher = Dispatcher::new(1, 1)?;
+        let (_port, handle) = dispatcher.register(
+            Box::new(RecordingService {
+                request_ids: Rc::clone(&request_ids),
+            }),
+            Rights::CALL,
+        )?;
+        dispatcher.calls = u64::MAX;
+
+        assert_eq!(
+            dispatcher.call(handle, 1, b"call-overflow"),
+            Err(DispatchError::AccountingOverflow)
+        );
+        assert!(request_ids.borrow().is_empty());
+        assert_eq!(dispatcher.next_request_id, 1);
+        assert_eq!(dispatcher.stats().calls, u64::MAX);
+        assert_eq!(dispatcher.stats().replies, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn reply_counter_failure_consumes_successfully_delivered_identity() -> Result<(), DispatchError>
+    {
+        let request_ids = Rc::new(RefCell::new(Vec::new()));
+        let mut dispatcher = Dispatcher::new(1, 1)?;
+        let (_port, handle) = dispatcher.register(
+            Box::new(RecordingService {
+                request_ids: Rc::clone(&request_ids),
+            }),
+            Rights::CALL,
+        )?;
+        dispatcher.replies = u64::MAX;
+
+        assert_eq!(
+            dispatcher.call(handle, 1, b"reply-overflow"),
+            Err(DispatchError::AccountingOverflow)
+        );
+        assert_eq!(&*request_ids.borrow(), &[1]);
+        assert_eq!(dispatcher.next_request_id, 2);
+        assert_eq!(dispatcher.stats().calls, 1);
+        assert_eq!(dispatcher.stats().replies, u64::MAX);
+
+        dispatcher.replies = 0;
+        let reply = dispatcher.call(handle, 1, b"after-overflow")?;
+        assert_eq!(reply.request_id(), 2);
+        assert_eq!(&*request_ids.borrow(), &[1, 2]);
+        assert_eq!(dispatcher.stats().calls, 2);
+        assert_eq!(dispatcher.stats().replies, 1);
         Ok(())
     }
 

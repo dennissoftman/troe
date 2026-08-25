@@ -1,18 +1,32 @@
 # ADR 0015: KEX v1 application format, ABI, and execution bounds
 
-Status: accepted, 2026-08-23.
+Status: accepted and implemented, 2026-08-25.
 
 Implementation note, 2026-08-23: the portable parser, canonical virtual layout,
 startup-page encoder, and native owned-staging/validate/map/reclaim transaction
 are implemented. The native root maps only the supervisor image, devices, and
 explicit boot-arena runtime ranges needed across an isolated transition, keeping
-both backends inside the tiny profile's table ceiling. A subsequent increment
+both backends inside the standard policy's 512-page table ceiling. A subsequent increment
 added reset ring-3/EL0 entry, ABI call 0 exit, and enforced 50 ms one-shot leases
 using the x86 local APIC calibrated by typed PIT resources and the AArch64
 generic physical timer through GICv2 PPI 30. The final Stage 7 increment added
 bounded full-context suspension, scheduler-selected yield resume, owner-checked
 copied handle calls, reply copy-out, and native invalid-call/unexpected-return
 acceptance on both primary architectures.
+
+Closure note, 2026-08-25: `tools/elf2kex.py` now provides the dependency-free
+hosted ELF64-to-KEX conversion boundary and independently decodes every artifact
+it emits. `tools/gen_kex_corpus.py` deterministically generates the shared
+x86-64/AArch64 acceptance, rejection, native-exercise, and exact-budget corpus
+consumed by both hosted tests and the portable Rust parser. The kernel's
+production Stage 7 exercise embeds only the generated valid call/yield/exit
+artifact. Malformed, spinning, invalid-call, and unexpected-return artifacts
+are compiled only with `acceptance-probes`; every destructive artifact carries
+a stable marker that the production EFI build gate rejects without needing
+QEMU. The production-used provisional loader ledger and hosted failpoint tests
+cover staging, frames, inactive tables, task records, and handles, including
+reverse rollback and the rule that no root becomes active before complete
+commit.
 
 ## Decision
 
@@ -22,15 +36,40 @@ application ABI major 1. KEX is the executable inside a future immutable package
 artifact; it is not itself a package, trust envelope, manifest, lock file, or
 signature format.
 
-The hosted SDK links an ordinary freestanding static ELF for the KEX v1 image
-base `0x0000_4000_0000_0000` and then converts it into canonical KEX. ELF
-remains a toolchain interchange format and is never parsed by the kernel. The
-converter must apply all link-time relocations and fail if the result still
-needs an interpreter, dynamic loader, runtime relocation, thread-local-storage
-model, writable executable mapping, or another facility absent from KEX v1.
+The hosted SDK links a freestanding static ELF for the KEX v1 image base
+`0x0000_4000_0000_0000` and then converts it into canonical KEX. ELF remains a
+toolchain interchange format and is never parsed by the kernel. The SDK linker
+must apply all link-time relocations; the converter rejects every residual
+relocation record and any result that still needs an interpreter, dynamic
+loader, runtime relocation, thread-local-storage model, writable executable
+mapping, or another facility absent from KEX v1.
 
 This keeps the native parser smaller than a policy-rich ELF loader without
 requiring a custom compiler or linker.
+
+### Hosted ELF conversion contract
+
+The converter accepts only a bounded, final ELF64 little-endian System V
+`ET_EXEC` for `EM_X86_64` or `EM_AARCH64`. It requires the canonical 64-byte
+ELF header, 56-byte program records beginning immediately after it, no extended
+header counts, at most 64 program headers and 16 load segments, zero target
+flags, and 4 KiB-aligned `PT_LOAD` file and virtual addresses at or above the
+fixed image base. Load records must already be ordered and disjoint after page
+rounding, use exactly R, RX, or RW permissions, and contain a file-backed
+executable entry; AArch64 entries are additionally four-byte aligned. A
+canonical read-only `PT_PHDR` and non-executable GNU stack record are allowed.
+
+Interpreter, dynamic, TLS, note, GNU property, unwind-header, RELRO, and unknown
+program records are rejected. A section table may be absent. If present, it is
+bounded to 4,096 canonical 64-byte records and is checked against its owning
+load segment; residual `REL`, `RELA`, or `RELR`, dynamic metadata, TLS, W+X,
+invalid links/names/alignments, and allocated sections outside their load
+mapping are rejected. Nonzero bytes outside the ELF header, tables, segments,
+or described sections are also rejected. The converter emits tightly packed
+KEX records in validated load order, independently parses the result, and
+compares its target, entry, requested stack/heap, records, payloads, and exact
+length with the validated ELF before writing it. The input ceiling is 64 MiB;
+the standard KEX policy then applies its smaller encoded and resident limits.
 
 ### KEX v1 container
 
@@ -64,7 +103,7 @@ The loader accepts an artifact only when all of the following hold:
   equals the bounded input length;
 - the header, table, payload ranges, and every addition, multiplication,
   rounding operation, and host-width conversion are representable;
-- there is between one and the profile maximum number of load records;
+- there is between one and the standard maximum number of load records;
 - image offsets and memory sizes describe nonempty 4 KiB page ranges, file bytes
   do not exceed memory bytes, and the remaining bytes can be deterministically
   zero-filled;
@@ -72,7 +111,7 @@ The loader accepts an artifact only when all of the following hold:
   page-rounded image ranges overlap, and every file range follows the record
   table and lies wholly inside the artifact;
 - the image span, mapped pages, stack, heap, page tables, staging bytes, and
-  total resident ownership all fit the selected profile;
+  total resident ownership all fit the standard policy;
 - permissions are exactly one of the three v1 values, at least one segment is
   executable, no page or physical alias is writable and executable, and the
   entry lies wholly inside an executable segment;
@@ -114,7 +153,7 @@ interrupt delivery is enabled so the execution lease can be enforced. The
 startup page uses fixed-width little-endian fields and contains:
 
 - its byte size and ABI major/minor;
-- the 4 KiB page size and selected resource-profile identity;
+- the 4 KiB page size and a required zero reserved field;
 - image base, heap base and length, and stack bounds;
 - the application's monotonic task identity; and
 - a bounded inline list of initial handle descriptors, each carrying an opaque
@@ -171,26 +210,26 @@ space but no frames. The total resident ceiling includes image, startup, heap,
 stack, and application page-table frames. Kernel staging is separately bounded
 and is released before entry.
 
-| Limit | `micro` | `tiny` | `full` |
-| --- | ---: | ---: | ---: |
-| Loadable isolated applications | disabled | enabled | enabled |
-| Encoded KEX bytes | 0 | 512 KiB | 16 MiB |
-| Load records | 0 | 8 | 16 |
-| Image virtual span | 0 | 4 MiB | 128 MiB |
-| Mapped image pages | 0 | 256 | 8,192 |
-| Initial stack pages | 0 | 4–16 | 4–256 |
-| Zeroed heap pages | 0 | 0–64 | 0–4,096 |
-| Application page-table pages | 0 | 64 | 512 |
-| Total resident pages | 0 | 512 (2 MiB) | 16,384 (64 MiB) |
-| Initial handles | 0 | 8 | 32 |
+| Limit | Standard |
+| --- | ---: |
+| Loadable isolated applications | enabled |
+| Encoded KEX bytes | 16 MiB |
+| Load records | 16 |
+| Image virtual span | 128 MiB |
+| Mapped image pages | 8,192 |
+| Initial stack pages | 4–256 |
+| Zeroed heap pages | 0–4,096 |
+| Application page-table pages | 512 |
+| Total resident pages | 16,384 (64 MiB) |
+| Initial handles | 32 |
 
-`micro` has no Stage 6 MMU isolation boundary and therefore cannot load
-untrusted native KEX code. Its recovery built-ins remain statically linked.
-For `tiny` and `full`, every launch reserves its exact requested and derived
-resident pages plus task, address-space, and handle slots before commit. There
-is no overcommit, demand paging, stack growth, `brk`, `mmap`, shared page, or
-runtime executable-memory operation in ABI 1.0. An SDK allocator may manage
-only the fixed zeroed heap described by the startup page.
+There is one application resource policy. These values are safety maxima, not
+boot-time reservations or a machine-size selector. Every launch charges its
+exact staging, image, startup, heap, and stack ownership, plus bounded table,
+task, address-space, and handle capacity before commit. There is no overcommit,
+demand paging, stack growth, `brk`, `mmap`, shared page, or runtime
+executable-memory operation in ABI 1.0. An SDK allocator may manage only the
+fixed zeroed heap described by the startup page.
 
 The loader first copies at most the encoded-byte ceiling into kernel-owned
 staging memory, parses and validates the complete artifact into a bounded load
@@ -215,8 +254,8 @@ The application cannot catch, mask, extend, or handle this event.
 A successful call or yield merely makes the task eligible for another lease;
 the scheduler regains control and may cancel it or run another ready task first.
 Consequently, code that periodically reaches a gate cannot trap the kernel in a
-single synchronous launch loop. An application may live for many leases, but
-each selected profile or caller may set a smaller lease or an additional total
+single synchronous launch loop. An application may live for many leases, but a
+caller may set a smaller lease or an additional total
 lifetime/call-count policy. The ABI exposes no promise of a minimum quantum or
 forward progress.
 
@@ -242,6 +281,16 @@ bounded, W^X, and charge exactly the frames later retained by the task record.
 Allocation-failure injection at every staging, frame, table, task, and handle
 step must prove no mapping becomes active and no resource remains owned after a
 rejection.
+
+The committed generated corpus is authoritative only together with its
+generator: `python3 tools/gen_kex_corpus.py --check` must reproduce the exact
+file set and bytes. The `tests.test_elf2kex` and `tests.test_build_policy`
+stdlib suites exercise deterministic conversion, the closed ELF
+rejection surface, corpus regeneration, and the production marker policy.
+`cargo test -p troe-application` runs every generated KEX through the portable
+parser, checks exact boundary charges, covers every truncation of a valid
+artifact, and exercises deterministic segment properties and all five loader
+transaction failpoints.
 
 Native acceptance on x86-64 and AArch64 must run a valid SDK-built KEX that
 receives only declared handles, yields, performs a copied request/reply, and

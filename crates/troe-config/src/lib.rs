@@ -182,6 +182,53 @@ impl ActivationPointer {
     }
 }
 
+/// Result of validating an active SACT candidate and its one bounded fallback.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ActivationRecovery<T> {
+    /// The complete published pointer validated without fallback.
+    Active {
+        /// Pointer whose active generation was selected.
+        pointer: ActivationPointer,
+        /// Caller-defined validation result retained without a second parse.
+        validated: T,
+    },
+    /// The published active candidate failed and its named predecessor validated alone.
+    Previous {
+        /// Canonical predecessor-only pointer eligible for atomic republication.
+        pointer: ActivationPointer,
+        /// Caller-defined validation result retained without a second parse.
+        validated: T,
+    },
+    /// Neither the active pointer nor its optional predecessor validated.
+    Unavailable,
+}
+
+/// Validate one published activation pointer, then its named predecessor only.
+///
+/// The validator receives the complete active pointer first. If that fails and
+/// the pointer names a predecessor, the second and final attempt is a canonical
+/// predecessor-only pointer. Validation errors are deliberately reduced to the
+/// fail-closed availability outcome; callers may publish only the pointer
+/// returned in a successful variant.
+pub fn recover_activation<T, E>(
+    pointer: ActivationPointer,
+    mut validate: impl FnMut(ActivationPointer) -> Result<T, E>,
+) -> ActivationRecovery<T> {
+    if let Ok(validated) = validate(pointer) {
+        return ActivationRecovery::Active { pointer, validated };
+    }
+    let Some(previous) = pointer.previous() else {
+        return ActivationRecovery::Unavailable;
+    };
+    let Ok(pointer) = ActivationPointer::new(previous, None) else {
+        return ActivationRecovery::Unavailable;
+    };
+    match validate(pointer) {
+        Ok(validated) => ActivationRecovery::Previous { pointer, validated },
+        Err(_) => ActivationRecovery::Unavailable,
+    }
+}
+
 /// Stable SACT parse or construction failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ActivationError {
@@ -737,9 +784,9 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::{
-        ACTIVATION_V1_BYTES, ActivationError, ActivationPointer, CONFIG_V1_MAGIC, ConfigError,
-        ConfigReference, ContentDigest, FailureAction, HEADER_BYTES, RECORD_BYTES, StartupMode,
-        crc32, parse_config,
+        ACTIVATION_V1_BYTES, ActivationError, ActivationPointer, ActivationRecovery,
+        CONFIG_V1_MAGIC, ConfigError, ConfigReference, ContentDigest, FailureAction, HEADER_BYTES,
+        RECORD_BYTES, StartupMode, crc32, parse_config, recover_activation,
     };
 
     fn valid_config() -> Vec<u8> {
@@ -919,6 +966,97 @@ mod tests {
             ActivationPointer::parse(&encoded),
             Err(ActivationError::Checksum)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn activation_recovery_prefers_a_valid_complete_pointer() -> Result<(), ConfigError> {
+        let active = ConfigReference::from_bytes(&valid_config())?;
+        let previous = ConfigReference {
+            generation: 6,
+            byte_count: 64,
+            checksum: 0x1234_5678,
+            digest: ContentDigest::of(b"previous"),
+        };
+        let pointer = ActivationPointer::new(active, Some(previous))
+            .map_err(|_| ConfigError::InvalidRecoveryPolicy)?;
+        let mut attempts = Vec::new();
+        let recovered = recover_activation(pointer, |candidate| {
+            attempts.push(candidate);
+            Ok::<_, ()>(candidate.active())
+        });
+        assert_eq!(attempts, [pointer]);
+        assert_eq!(
+            recovered,
+            ActivationRecovery::Active {
+                pointer,
+                validated: active,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn activation_recovery_uses_only_the_named_predecessor() -> Result<(), ConfigError> {
+        let active = ConfigReference::from_bytes(&valid_config())?;
+        let previous = ConfigReference {
+            generation: 6,
+            byte_count: 64,
+            checksum: 0x1234_5678,
+            digest: ContentDigest::of(b"previous"),
+        };
+        let pointer = ActivationPointer::new(active, Some(previous))
+            .map_err(|_| ConfigError::InvalidRecoveryPolicy)?;
+        let previous_pointer = ActivationPointer::new(previous, None)
+            .map_err(|_| ConfigError::InvalidRecoveryPolicy)?;
+        let mut attempts = Vec::new();
+        let recovered = recover_activation(pointer, |candidate| {
+            attempts.push(candidate);
+            if candidate == previous_pointer {
+                Ok(candidate.active())
+            } else {
+                Err(())
+            }
+        });
+        assert_eq!(attempts, [pointer, previous_pointer]);
+        assert_eq!(
+            recovered,
+            ActivationRecovery::Previous {
+                pointer: previous_pointer,
+                validated: previous,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn activation_recovery_fails_closed_after_two_bounded_attempts() -> Result<(), ConfigError> {
+        let active = ConfigReference::from_bytes(&valid_config())?;
+        let previous = ConfigReference {
+            generation: 6,
+            byte_count: 64,
+            checksum: 0x1234_5678,
+            digest: ContentDigest::of(b"previous"),
+        };
+        let pointer = ActivationPointer::new(active, Some(previous))
+            .map_err(|_| ConfigError::InvalidRecoveryPolicy)?;
+        let mut attempts = Vec::new();
+        let recovered = recover_activation(pointer, |candidate| {
+            attempts.push(candidate);
+            Err::<(), _>(())
+        });
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(recovered, ActivationRecovery::Unavailable);
+
+        let pointer =
+            ActivationPointer::new(active, None).map_err(|_| ConfigError::InvalidRecoveryPolicy)?;
+        let mut attempts = 0;
+        let recovered = recover_activation(pointer, |_candidate| {
+            attempts += 1;
+            Err::<(), _>(())
+        });
+        assert_eq!(attempts, 1);
+        assert_eq!(recovered, ActivationRecovery::Unavailable);
         Ok(())
     }
 }

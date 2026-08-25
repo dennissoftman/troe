@@ -1,7 +1,7 @@
 # ADR 0023: bounded virtio network and minimal protocol profile
 
 Status: accepted and implemented for Stage 8; amended by the networking
-usability increment, 2026-08-24.
+usability and transport-safety increments, 2026-08-24.
 
 The first supported NIC is modern virtio-net on the existing AArch64 MMIO and
 x86-64 PCI buses. The initial device profile negotiates no checksum, segment,
@@ -60,3 +60,23 @@ and `arp` expose that state without adding background jobs or shell loops.
 Command waits use a boot-relative monotonic clock and observe Ctrl-C only at
 explicit checkpoints. TCP, TLS, DNS, background jobs, and general sockets
 remain explicitly deferred.
+
+The transport-safety increment makes the interrupt route a validated,
+move-only capability rather than passing a raw line or INTID between the
+transport and machine mechanism. q35 validates the advertised PCI pin and line,
+including collisions with owned input routes, and `virt` validates the MMIO
+slot-derived SPI before `DRIVER_OK`. Interrupt activation keeps the PCI source
+and controller route masked while configuring the route and publishing ISR
+state, then unmasks them in that order. A failed publication leaves the new
+route masked without revoking an already active route. Teardown revokes ISR and
+INTID state only for the move-only owner; an ownership mismatch parks with
+delivery masked instead of releasing DMA behind stale ISR state.
+
+Every fallible initialization path after the first device-state change owns a
+reset guard. DMA allocations outlive that guard, so unwinding confirms reset
+before their storage is released even when queue-address publication or
+`DRIVER_OK` fails. Permanent queue errors first mask and unpublish interrupt
+state and then reset. Normal teardown follows the same order before queue
+buffers drop. With one descriptor in flight, a used index may stay unchanged or
+advance by exactly one (including wrapping); skips and replays are device errors
+that trigger this fail-closed path rather than appearing as an empty queue.

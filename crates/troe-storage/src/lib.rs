@@ -6,23 +6,37 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod generation;
+
+pub use generation::{
+    GenerationValidationError, ValidatedRootActivation, validate_root_activation,
+};
+
 use alloc::boxed::Box;
 use alloc::rc::Rc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use core::fmt::{self, Write};
 
 use troe_block::{BlockAccess, BlockDevice, BlockError, BlockGeometry, BlockLimits, BlockRegion};
 use troe_ext4::{Ext4, Ext4Limits};
-use troe_gpt::{GptLimits, discover};
+use troe_gpt::{GptError, GptGuid, GptLimits, discover};
 use troe_mount::{
-    AccessMode, BootMountManifest, FilesystemProfile, MAX_DISCOVERED_VOLUMES, MatchState,
-    MountEntry, SelectorKind, VolumeSelector,
+    AccessMode, AvailabilityPolicy, BootMountManifest, FilesystemProfile, MAX_DISCOVERED_VOLUMES,
+    MatchState, MountEntry, MountResolution, SelectorKind, VolumeSelector,
 };
 use troe_vfs::{FsError, Namespace, NodeKind, ReadOnlyFileSystem};
 
 /// Hard ceiling for one early-activation file read.
 pub const MAX_SELECTED_FILE_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum discovered GPT regions retained for deterministic diagnostics.
+pub const MAX_REPORTED_REGIONS: usize = 64;
+/// Hard ceiling for the generated `/sys/storage` topology snapshot.
+pub const MAX_STORAGE_REPORT_BYTES: usize = 32 * 1024;
+/// Space reserved for kernel-owned transaction and `StateFS` region diagnostics.
+pub const STORAGE_REPORT_EXTENSION_BYTES: usize = 1024;
+const MAX_DISCOVERY_REPORT_BYTES: usize = MAX_STORAGE_REPORT_BYTES - STORAGE_REPORT_EXTENSION_BYTES;
 
 /// Complete parser, request, and filesystem ceilings for one activation pass.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -104,6 +118,7 @@ pub struct ReadOnlyActivation {
     scanned_devices: u8,
     valid_gpt_disks: u8,
     candidates: u8,
+    report: String,
 }
 
 impl ReadOnlyActivation {
@@ -137,10 +152,20 @@ impl ReadOnlyActivation {
         self.valid_gpt_disks
     }
 
-    /// Number of candidates that matched every on-media identity.
+    /// Number of clean supported volumes retained, including foreign media.
     #[must_use]
     pub const fn candidate_count(&self) -> u8 {
         self.candidates
+    }
+
+    /// Deterministic bounded topology, identity, and role-state snapshot.
+    ///
+    /// The kernel publishes these exact bytes at `/sys/storage` after every
+    /// returned provider has attached successfully. Consequently a `matched`
+    /// role is observable only in a namespace where that provider is mounted.
+    #[must_use]
+    pub fn report(&self) -> &str {
+        &self.report
     }
 }
 
@@ -149,6 +174,8 @@ impl ReadOnlyActivation {
 pub enum ActivationError {
     /// Device or validated-candidate input exceeded the hard discovery ceiling.
     DiscoveryLimit,
+    /// One device simultaneously claimed whole-device and partitioned filesystems.
+    ConflictingLayout,
     /// Bounded metadata allocation failed before any mount was returned.
     MetadataExhausted,
     /// Manifest resolution rejected the bounded candidate set.
@@ -175,6 +202,44 @@ pub enum SelectedFileError {
 struct Candidate {
     selector: VolumeSelector,
     provider: Option<Box<dyn ReadOnlyFileSystem>>,
+    device_index: u8,
+    first_block: u64,
+    block_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProbeState {
+    Valid,
+    InvalidGeometry,
+    Corrupt,
+    Unsupported,
+    Io,
+    Exhausted,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GptProbe {
+    Valid { disk_guid: GptGuid, partitions: u16 },
+    Invalid(GptError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DeviceObservation {
+    index: u8,
+    geometry: BlockGeometry,
+    whole_ext4: ProbeState,
+    gpt: GptProbe,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RegionObservation {
+    device_index: u8,
+    first_block: u64,
+    block_count: u64,
+    type_guid: GptGuid,
+    partition_guid: GptGuid,
+    ext4: ProbeState,
+    filesystem_uuid: Option<[u8; 16]>,
 }
 
 struct SharedDevice<D: BlockDevice> {
@@ -261,12 +326,28 @@ pub fn prepare_read_only<D: BlockDevice + 'static>(
         u8::try_from(devices.len()).map_err(|_| ActivationError::DiscoveryLimit)?;
     let mut candidates = Vec::new();
     candidates
-        .try_reserve_exact(manifest.entries().len())
+        .try_reserve_exact(MAX_DISCOVERED_VOLUMES.min(manifest.entries().len().max(devices.len())))
+        .map_err(|_| ActivationError::MetadataExhausted)?;
+    let mut device_observations = Vec::new();
+    device_observations
+        .try_reserve_exact(devices.len())
+        .map_err(|_| ActivationError::MetadataExhausted)?;
+    let mut region_observations = Vec::new();
+    region_observations
+        .try_reserve_exact(MAX_REPORTED_REGIONS.min(devices.len().saturating_mul(2)))
         .map_err(|_| ActivationError::MetadataExhausted)?;
     let mut valid_gpt_disks = 0_u8;
 
-    for device in devices {
-        if discover_device(manifest, device, limits, &mut candidates)? {
+    for (index, device) in devices.into_iter().enumerate() {
+        let device_index = u8::try_from(index).map_err(|_| ActivationError::DiscoveryLimit)?;
+        if discover_device(
+            device_index,
+            device,
+            limits,
+            &mut candidates,
+            &mut device_observations,
+            &mut region_observations,
+        )? {
             valid_gpt_disks = valid_gpt_disks
                 .checked_add(1)
                 .ok_or(ActivationError::DiscoveryLimit)?;
@@ -282,6 +363,14 @@ pub fn prepare_read_only<D: BlockDevice + 'static>(
         .map_err(|_| ActivationError::Resolution)?;
     let candidate_count =
         u8::try_from(candidates.len()).map_err(|_| ActivationError::DiscoveryLimit)?;
+    let report = render_storage_report(
+        manifest,
+        &resolution,
+        &device_observations,
+        &region_observations,
+        &candidates,
+        valid_gpt_disks,
+    )?;
     let mut mounts = Vec::new();
     mounts
         .try_reserve_exact(manifest.entries().len())
@@ -309,6 +398,7 @@ pub fn prepare_read_only<D: BlockDevice + 'static>(
         scanned_devices,
         valid_gpt_disks,
         candidates: candidate_count,
+        report,
     })
 }
 
@@ -459,103 +549,134 @@ fn read_provider_file<D: BlockDevice>(
 }
 
 fn discover_device<D: BlockDevice + 'static>(
-    manifest: &BootMountManifest,
+    device_index: u8,
     device: D,
     limits: ActivationLimits,
     candidates: &mut Vec<Candidate>,
+    device_observations: &mut Vec<DeviceObservation>,
+    region_observations: &mut Vec<RegionObservation>,
 ) -> Result<bool, ActivationError> {
     let shared = SharedDevice::new(device);
-    discover_whole_ext4(manifest, &shared, limits, candidates)?;
-    let Ok(mut whole) =
+    let geometry = shared.geometry();
+    let whole_ext4 = discover_whole_ext4(device_index, &shared, limits, candidates)?;
+    let gpt_result =
         BlockRegion::whole_device(shared.clone(), BlockAccess::ReadOnly, limits.block())
-    else {
-        return Ok(false);
-    };
-    let Ok(gpt) = discover(&mut whole, limits.gpt()) else {
-        return Ok(false);
-    };
-    for entry in manifest.entries() {
-        let selector = entry.selector();
-        if entry.access() != AccessMode::ReadOnly
-            || entry.filesystem() != FilesystemProfile::Ext4V1
-            || selector.kind() != SelectorKind::GptPartition
-            || selector
-                .disk_guid()
-                .map(troe_mount::StableIdentifier::bytes)
-                != Some(gpt.disk_guid().disk_bytes())
-        {
-            continue;
+            .map_err(GptError::Block)
+            .and_then(|mut whole| discover(&mut whole, limits.gpt()));
+
+    let (gpt_probe, valid_gpt) = match gpt_result {
+        Ok(gpt) => {
+            if whole_ext4 == ProbeState::Valid {
+                return Err(ActivationError::ConflictingLayout);
+            }
+            let partition_count = u16::try_from(gpt.partitions().len())
+                .map_err(|_| ActivationError::DiscoveryLimit)?;
+            for partition in gpt.partitions() {
+                if region_observations.len() >= MAX_REPORTED_REGIONS {
+                    return Err(ActivationError::DiscoveryLimit);
+                }
+                region_observations
+                    .try_reserve(1)
+                    .map_err(|_| ActivationError::MetadataExhausted)?;
+                let region_result = BlockRegion::new(
+                    shared.clone(),
+                    partition.first_lba(),
+                    partition.block_count(),
+                    BlockAccess::ReadOnly,
+                    limits.block(),
+                );
+                let (ext4_state, filesystem_uuid) = match region_result {
+                    Ok(region) => match Ext4::mount(region, limits.ext4()) {
+                        Ok(ext4) => {
+                            let filesystem_uuid = ext4.uuid().bytes();
+                            let selector = VolumeSelector::gpt_ext4(
+                                gpt.disk_guid().disk_bytes(),
+                                partition.unique_guid().disk_bytes(),
+                                filesystem_uuid,
+                            )
+                            .map_err(|_| ActivationError::Resolution)?;
+                            push_candidate(
+                                candidates,
+                                selector,
+                                Box::new(ext4),
+                                device_index,
+                                partition.first_lba(),
+                                partition.block_count(),
+                            )?;
+                            (ProbeState::Valid, Some(filesystem_uuid))
+                        }
+                        Err(error) => (probe_state(error), None),
+                    },
+                    Err(_) => (ProbeState::InvalidGeometry, None),
+                };
+                region_observations.push(RegionObservation {
+                    device_index,
+                    first_block: partition.first_lba(),
+                    block_count: partition.block_count(),
+                    type_guid: partition.type_guid(),
+                    partition_guid: partition.unique_guid(),
+                    ext4: ext4_state,
+                    filesystem_uuid,
+                });
+            }
+            (
+                GptProbe::Valid {
+                    disk_guid: gpt.disk_guid(),
+                    partitions: partition_count,
+                },
+                true,
+            )
         }
-        let Some(partition_guid) = selector.partition_guid() else {
-            continue;
-        };
-        let Some(partition) = gpt
-            .partition_by_unique_guid(troe_gpt::GptGuid::from_disk_bytes(partition_guid.bytes()))
-        else {
-            continue;
-        };
-        let Ok(region) = BlockRegion::new(
-            shared.clone(),
-            partition.first_lba(),
-            partition.block_count(),
-            BlockAccess::ReadOnly,
-            limits.block(),
-        ) else {
-            continue;
-        };
-        let Ok(ext4) = Ext4::mount(region, limits.ext4()) else {
-            continue;
-        };
-        let Ok(discovered) = VolumeSelector::gpt_ext4(
-            gpt.disk_guid().disk_bytes(),
-            partition.unique_guid().disk_bytes(),
-            ext4.uuid().bytes(),
-        ) else {
-            continue;
-        };
-        if discovered == selector {
-            push_candidate(candidates, discovered, Box::new(ext4))?;
-        }
-    }
-    Ok(true)
+        Err(GptError::MetadataExhausted) => return Err(ActivationError::MetadataExhausted),
+        Err(error) => (GptProbe::Invalid(error), false),
+    };
+    device_observations
+        .try_reserve(1)
+        .map_err(|_| ActivationError::MetadataExhausted)?;
+    device_observations.push(DeviceObservation {
+        index: device_index,
+        geometry,
+        whole_ext4,
+        gpt: gpt_probe,
+    });
+    Ok(valid_gpt)
 }
 
 fn discover_whole_ext4<D: BlockDevice + 'static>(
-    manifest: &BootMountManifest,
+    device_index: u8,
     device: &SharedDevice<D>,
     limits: ActivationLimits,
     candidates: &mut Vec<Candidate>,
-) -> Result<(), ActivationError> {
-    for entry in manifest.entries() {
-        let selector = entry.selector();
-        if entry.access() != AccessMode::ReadOnly
-            || entry.filesystem() != FilesystemProfile::Ext4V1
-            || selector.kind() != SelectorKind::WholeDevice
-        {
-            continue;
-        }
-        let Ok(region) =
-            BlockRegion::whole_device(device.clone(), BlockAccess::ReadOnly, limits.block())
-        else {
-            continue;
-        };
-        let Ok(ext4) = Ext4::mount(region, limits.ext4()) else {
-            continue;
-        };
-        let Ok(discovered) = VolumeSelector::whole_ext4(ext4.uuid().bytes()) else {
-            continue;
-        };
-        if discovered == selector {
-            push_candidate(candidates, discovered, Box::new(ext4))?;
-        }
-    }
-    Ok(())
+) -> Result<ProbeState, ActivationError> {
+    let Ok(region) =
+        BlockRegion::whole_device(device.clone(), BlockAccess::ReadOnly, limits.block())
+    else {
+        return Ok(ProbeState::InvalidGeometry);
+    };
+    let ext4 = match Ext4::mount(region, limits.ext4()) {
+        Ok(ext4) => ext4,
+        Err(error) => return Ok(probe_state(error)),
+    };
+    let selector =
+        VolumeSelector::whole_ext4(ext4.uuid().bytes()).map_err(|_| ActivationError::Resolution)?;
+    push_candidate(
+        candidates,
+        selector,
+        Box::new(ext4),
+        device_index,
+        0,
+        device.geometry.block_count(),
+    )?;
+    Ok(ProbeState::Valid)
 }
 
 fn push_candidate(
     candidates: &mut Vec<Candidate>,
     selector: VolumeSelector,
     provider: Box<dyn ReadOnlyFileSystem>,
+    device_index: u8,
+    first_block: u64,
+    block_count: u64,
 ) -> Result<(), ActivationError> {
     if candidates.len() >= MAX_DISCOVERED_VOLUMES {
         return Err(ActivationError::DiscoveryLimit);
@@ -566,16 +687,288 @@ fn push_candidate(
     candidates.push(Candidate {
         selector,
         provider: Some(provider),
+        device_index,
+        first_block,
+        block_count,
     });
     Ok(())
+}
+
+const fn probe_state(error: FsError) -> ProbeState {
+    match error {
+        FsError::Unsupported => ProbeState::Unsupported,
+        FsError::Io => ProbeState::Io,
+        FsError::NoSpace => ProbeState::Exhausted,
+        FsError::Invalid
+        | FsError::NotFound
+        | FsError::WrongType
+        | FsError::ReadOnly
+        | FsError::Overflow
+        | FsError::Exists
+        | FsError::Corrupt => ProbeState::Corrupt,
+    }
+}
+
+struct StorageReport {
+    bytes: String,
+}
+
+impl StorageReport {
+    fn new() -> Result<Self, ActivationError> {
+        let mut bytes = String::new();
+        bytes
+            .try_reserve_exact(MAX_DISCOVERY_REPORT_BYTES)
+            .map_err(|_| ActivationError::MetadataExhausted)?;
+        Ok(Self { bytes })
+    }
+
+    fn finish(self) -> String {
+        self.bytes
+    }
+}
+
+impl Write for StorageReport {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        if self
+            .bytes
+            .len()
+            .checked_add(value.len())
+            .is_none_or(|length| length > MAX_DISCOVERY_REPORT_BYTES)
+        {
+            return Err(fmt::Error);
+        }
+        self.bytes.push_str(value);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy)]
+struct HexIdentity([u8; 16]);
+
+impl fmt::Display for HexIdentity {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(formatter, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+fn render_storage_report(
+    manifest: &BootMountManifest,
+    resolution: &MountResolution,
+    devices: &[DeviceObservation],
+    regions: &[RegionObservation],
+    candidates: &[Candidate],
+    valid_gpt_disks: u8,
+) -> Result<String, ActivationError> {
+    let mut report = StorageReport::new()?;
+    writeln!(report, "storage-v1")
+        .and_then(|()| writeln!(report, "devices {}", devices.len()))
+        .and_then(|()| writeln!(report, "gpt-disks {valid_gpt_disks}"))
+        .and_then(|()| writeln!(report, "regions {}", regions.len()))
+        .and_then(|()| writeln!(report, "volumes {}", candidates.len()))
+        .and_then(|()| {
+            writeln!(
+                report,
+                "required-roles {}",
+                if resolution.desired_system_available() {
+                    "available"
+                } else {
+                    "recovery"
+                }
+            )
+        })
+        .map_err(|_| ActivationError::DiscoveryLimit)?;
+
+    for device in devices {
+        write!(
+            report,
+            "device {} block-bytes={} blocks={} alignment={} flush={} fua={} whole-ext4={} gpt=",
+            device.index,
+            device.geometry.logical_block_bytes(),
+            device.geometry.block_count(),
+            device.geometry.required_alignment_blocks(),
+            yes_no(device.geometry.supports_flush()),
+            yes_no(device.geometry.supports_force_unit_access()),
+            probe_name(device.whole_ext4),
+        )
+        .map_err(|_| ActivationError::DiscoveryLimit)?;
+        match device.gpt {
+            GptProbe::Valid {
+                disk_guid,
+                partitions,
+            } => writeln!(
+                report,
+                "valid disk={} partitions={partitions}",
+                HexIdentity(disk_guid.disk_bytes())
+            ),
+            GptProbe::Invalid(error) => writeln!(report, "{}", gpt_error_name(error)),
+        }
+        .map_err(|_| ActivationError::DiscoveryLimit)?;
+    }
+
+    for region in regions {
+        write!(
+            report,
+            "region device={} first={} blocks={} type={} partition={} ext4={}",
+            region.device_index,
+            region.first_block,
+            region.block_count,
+            HexIdentity(region.type_guid.disk_bytes()),
+            HexIdentity(region.partition_guid.disk_bytes()),
+            probe_name(region.ext4),
+        )
+        .map_err(|_| ActivationError::DiscoveryLimit)?;
+        if let Some(filesystem_uuid) = region.filesystem_uuid {
+            write!(report, " uuid={}", HexIdentity(filesystem_uuid))
+                .map_err(|_| ActivationError::DiscoveryLimit)?;
+        }
+        writeln!(report).map_err(|_| ActivationError::DiscoveryLimit)?;
+    }
+
+    for (index, candidate) in candidates.iter().enumerate() {
+        write!(
+            report,
+            "volume {index} device={} first={} blocks={} kind={} filesystem={} uuid={}",
+            candidate.device_index,
+            candidate.first_block,
+            candidate.block_count,
+            selector_kind_name(candidate.selector.kind()),
+            filesystem_name(candidate.selector.filesystem()),
+            HexIdentity(candidate.selector.filesystem_identity().bytes()),
+        )
+        .map_err(|_| ActivationError::DiscoveryLimit)?;
+        if let Some(disk) = candidate.selector.disk_guid() {
+            write!(report, " disk={}", HexIdentity(disk.bytes()))
+                .map_err(|_| ActivationError::DiscoveryLimit)?;
+        }
+        if let Some(partition) = candidate.selector.partition_guid() {
+            write!(report, " partition={}", HexIdentity(partition.bytes()))
+                .map_err(|_| ActivationError::DiscoveryLimit)?;
+        }
+        writeln!(report).map_err(|_| ActivationError::DiscoveryLimit)?;
+    }
+
+    write_role_report(&mut report, manifest, resolution)?;
+    Ok(report.finish())
+}
+
+fn write_role_report(
+    report: &mut StorageReport,
+    manifest: &BootMountManifest,
+    resolution: &MountResolution,
+) -> Result<(), ActivationError> {
+    for (entry, resolved) in manifest.entries().iter().zip(resolution.entries()) {
+        write!(
+            report,
+            "role {} path=/vol/{} filesystem={} access={} availability={} state=",
+            entry.name(),
+            entry.name(),
+            filesystem_name(entry.filesystem()),
+            access_name(entry.access()),
+            availability_name(entry.availability()),
+        )
+        .map_err(|_| ActivationError::DiscoveryLimit)?;
+        match resolved.state() {
+            MatchState::Missing => writeln!(report, "missing"),
+            MatchState::Ambiguous => writeln!(report, "ambiguous"),
+            MatchState::Matched { candidate_index } => {
+                writeln!(report, "matched volume={candidate_index}")
+            }
+        }
+        .map_err(|_| ActivationError::DiscoveryLimit)?;
+    }
+    Ok(())
+}
+
+const fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
+}
+
+const fn probe_name(state: ProbeState) -> &'static str {
+    match state {
+        ProbeState::Valid => "valid",
+        ProbeState::InvalidGeometry => "invalid-geometry",
+        ProbeState::Corrupt => "corrupt",
+        ProbeState::Unsupported => "unsupported",
+        ProbeState::Io => "io-error",
+        ProbeState::Exhausted => "profile-exhausted",
+    }
+}
+
+const fn selector_kind_name(kind: SelectorKind) -> &'static str {
+    match kind {
+        SelectorKind::WholeDevice => "whole-device",
+        SelectorKind::GptPartition => "gpt-partition",
+    }
+}
+
+const fn filesystem_name(filesystem: FilesystemProfile) -> &'static str {
+    match filesystem {
+        FilesystemProfile::Fat32 => "fat32",
+        FilesystemProfile::Ext4V1 => "ext4-v1",
+    }
+}
+
+const fn access_name(access: AccessMode) -> &'static str {
+    match access {
+        AccessMode::ReadOnly => "read-only",
+        AccessMode::ReadWrite => "read-write",
+    }
+}
+
+const fn availability_name(availability: AvailabilityPolicy) -> &'static str {
+    match availability {
+        AvailabilityPolicy::Optional => "optional",
+        AvailabilityPolicy::Required => "required",
+    }
+}
+
+const fn gpt_error_name(error: GptError) -> &'static str {
+    match error {
+        GptError::InvalidLimits => "invalid-limits",
+        GptError::UnsupportedGeometry => "unsupported-geometry",
+        GptError::InvalidProtectiveMbr => "invalid-protective-mbr",
+        GptError::InvalidHeader => "invalid-header",
+        GptError::HeaderChecksum => "header-checksum",
+        GptError::InvalidEntryLayout => "invalid-entry-layout",
+        GptError::EntryChecksum => "entry-checksum",
+        GptError::InconsistentCopies => "inconsistent-copies",
+        GptError::InvalidPartition => "invalid-partition",
+        GptError::OverlappingPartitions => "overlapping-partitions",
+        GptError::DuplicateIdentifier => "duplicate-identifier",
+        GptError::MetadataExhausted => "metadata-exhausted",
+        GptError::Block(error) => block_error_name(error),
+    }
+}
+
+const fn block_error_name(error: BlockError) -> &'static str {
+    match error {
+        BlockError::InvalidGeometry => "block-invalid-geometry",
+        BlockError::InvalidLimits => "block-invalid-limits",
+        BlockError::InvalidRegion => "block-invalid-region",
+        BlockError::EmptyTransfer => "block-empty-transfer",
+        BlockError::Misaligned => "block-misaligned",
+        BlockError::OutOfBounds => "block-out-of-bounds",
+        BlockError::TransferTooLarge => "block-transfer-too-large",
+        BlockError::BufferLength => "block-buffer-length",
+        BlockError::ReadOnly => "block-read-only",
+        BlockError::Unsupported => "block-unsupported",
+        BlockError::Device => "block-io-error",
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use alloc::vec;
     use alloc::vec::Vec;
+    use core::fmt::Write;
 
-    use super::{ActivationLimits, SharedDevice, prepare_read_only};
+    use super::{
+        ActivationLimits, Candidate, MAX_DISCOVERY_REPORT_BYTES, SharedDevice, StorageReport,
+        prepare_read_only, render_storage_report,
+    };
     use troe_block::{BlockDevice, BlockError, BlockGeometry, BlockLimits};
     use troe_ext4::Ext4Limits;
     use troe_gpt::GptLimits;
@@ -646,6 +1039,16 @@ mod tests {
         assert!(!empty.desired_system_available());
         assert!(empty.mounts().is_empty());
         assert_eq!(empty.scanned_devices(), 0);
+        assert_eq!(
+            empty.report(),
+            "storage-v1\n\
+             devices 0\n\
+             gpt-disks 0\n\
+             regions 0\n\
+             volumes 0\n\
+             required-roles recovery\n\
+             role root path=/vol/root filesystem=ext4-v1 access=read-only availability=required state=missing\n"
+        );
 
         let foreign = prepare_read_only(&manifest, vec![MemoryDevice::zeroed(64)], limits())
             .unwrap_or_else(|_| std::process::abort());
@@ -654,6 +1057,60 @@ mod tests {
         assert_eq!(foreign.scanned_devices(), 1);
         assert_eq!(foreign.valid_gpt_disks(), 0);
         assert_eq!(foreign.candidate_count(), 0);
+        assert!(
+            foreign.report().contains(
+                "device 0 block-bytes=512 blocks=64 alignment=1 flush=no fua=no \
+                 whole-ext4=unsupported gpt=invalid-protective-mbr\n"
+            ),
+            "{}",
+            foreign.report()
+        );
+        assert!(foreign.report().ends_with(
+            "role root path=/vol/root filesystem=ext4-v1 access=read-only \
+             availability=required state=missing\n"
+        ));
+    }
+
+    #[test]
+    fn topology_report_distinguishes_unique_and_ambiguous_stable_identities() {
+        let manifest = parse_manifest(MANIFEST).unwrap_or_else(|_| std::process::abort());
+        let selector = manifest.entries()[0].selector();
+        let candidate = |device_index| Candidate {
+            selector,
+            provider: None,
+            device_index,
+            first_block: 0,
+            block_count: 128,
+        };
+        let unique = vec![candidate(7)];
+        let unique_resolution = manifest
+            .resolve(&[selector])
+            .unwrap_or_else(|_| std::process::abort());
+        let unique_report =
+            render_storage_report(&manifest, &unique_resolution, &[], &[], &unique, 0)
+                .unwrap_or_else(|_| std::process::abort());
+        assert!(unique_report.contains("required-roles available\n"));
+        assert!(unique_report.contains("volume 0 device=7 first=0 blocks=128"));
+        assert!(unique_report.ends_with("state=matched volume=0\n"));
+
+        let ambiguous = vec![candidate(1), candidate(9)];
+        let ambiguous_resolution = manifest
+            .resolve(&[selector, selector])
+            .unwrap_or_else(|_| std::process::abort());
+        let ambiguous_report =
+            render_storage_report(&manifest, &ambiguous_resolution, &[], &[], &ambiguous, 0)
+                .unwrap_or_else(|_| std::process::abort());
+        assert!(ambiguous_report.contains("required-roles recovery\n"));
+        assert!(ambiguous_report.ends_with("state=ambiguous\n"));
+    }
+
+    #[test]
+    fn topology_report_ceiling_is_exact_and_atomic_per_write() {
+        let mut report = StorageReport::new().unwrap_or_else(|_| std::process::abort());
+        let exact = "x".repeat(MAX_DISCOVERY_REPORT_BYTES);
+        assert_eq!(report.write_str(&exact), Ok(()));
+        assert_eq!(report.write_str("x"), Err(core::fmt::Error));
+        assert_eq!(report.finish().len(), MAX_DISCOVERY_REPORT_BYTES);
     }
 
     #[test]

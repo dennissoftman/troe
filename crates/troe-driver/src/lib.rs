@@ -43,7 +43,6 @@ impl fmt::Display for ConfigError {
 pub struct InputQueueConfig {
     capacity: usize,
     max_drain_per_interrupt: usize,
-    interrupt_priority: u8,
 }
 
 impl InputQueueConfig {
@@ -52,11 +51,7 @@ impl InputQueueConfig {
     /// # Errors
     ///
     /// Rejects zero values and capacities above the published hard ceilings.
-    pub const fn new(
-        capacity: usize,
-        max_drain_per_interrupt: usize,
-        interrupt_priority: u8,
-    ) -> Result<Self, ConfigError> {
+    pub const fn new(capacity: usize, max_drain_per_interrupt: usize) -> Result<Self, ConfigError> {
         if capacity == 0 || max_drain_per_interrupt == 0 {
             return Err(ConfigError::Empty);
         }
@@ -66,17 +61,15 @@ impl InputQueueConfig {
         Ok(Self {
             capacity,
             max_drain_per_interrupt,
-            interrupt_priority,
         })
     }
 
-    /// Default input policy for the `tiny` resource profile.
+    /// Default input policy for the Standard resource policy.
     #[must_use]
-    pub const fn tiny() -> Self {
+    pub const fn standard() -> Self {
         Self {
             capacity: 256,
             max_drain_per_interrupt: 32,
-            interrupt_priority: 0xa0,
         }
     }
 
@@ -90,12 +83,6 @@ impl InputQueueConfig {
     #[must_use]
     pub const fn max_drain_per_interrupt(self) -> usize {
         self.max_drain_per_interrupt
-    }
-
-    /// Architecture interrupt-controller priority selected by the profile.
-    #[must_use]
-    pub const fn interrupt_priority(self) -> u8 {
-        self.interrupt_priority
     }
 }
 
@@ -395,17 +382,16 @@ mod tests {
 
     #[test]
     fn queue_policy_is_configurable_and_checked() {
-        assert_eq!(InputQueueConfig::new(0, 1, 0xa0), Err(ConfigError::Empty));
-        assert_eq!(InputQueueConfig::new(1, 0, 0xa0), Err(ConfigError::Empty));
-        let tiny = InputQueueConfig::tiny();
-        assert!(tiny.capacity() > 0);
-        assert!(tiny.max_drain_per_interrupt() > 0);
-        assert_eq!(tiny.interrupt_priority(), 0xa0);
+        assert_eq!(InputQueueConfig::new(0, 1), Err(ConfigError::Empty));
+        assert_eq!(InputQueueConfig::new(1, 0), Err(ConfigError::Empty));
+        let standard = InputQueueConfig::standard();
+        assert!(standard.capacity() > 0);
+        assert!(standard.max_drain_per_interrupt() > 0);
     }
 
     #[test]
     fn queue_is_fifo_and_drops_newest_at_capacity() {
-        let config = InputQueueConfig::new(2, 1, 0x80).unwrap_or_else(|_| InputQueueConfig::tiny());
+        let config = InputQueueConfig::new(2, 1).unwrap_or_else(|_| InputQueueConfig::standard());
         let mut queue =
             BoundedInputQueue::try_new(config).unwrap_or_else(|_| std::process::abort());
         let first = InputEvent::new(InputSource::Serial, b'a');

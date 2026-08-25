@@ -1,7 +1,11 @@
 # ADR 0009: persistent filesystems and lean partition discovery
 
-Status: accepted direction, 2026-08-23; exact driver profiles remain TBD before
-implementation.
+Status: accepted direction, 2026-08-23; implementation scope clarified
+2026-08-25. Stage 8 implements bounded block regions and GPT discovery, strict
+read-only FAT32 and ext4-v1 providers, read-only BMNT-selected ext4 root
+activation, and separate PRGN/TXSLOT-backed activation and `StateFS` mutation.
+Read/write FAT, mutable ext4, exFAT, NTFS, dynamic provider loading, and repair
+remain explicitly future work.
 
 ## Context
 
@@ -48,18 +52,24 @@ kernel composition root into a collection of inseparable format parsers.
   Read-only support and lossless inspection of SIDs and security descriptors
   precede write support.
 
-The ext4 volume stores persistent content, generation records, explicitly
-named mutable volumes, and secrets according to their separate policies. It
-does not replace KEFS as the independent recovery path, and filesystem
-snapshots are not required for system-generation rollback.
+The implemented ext4-v1 volume stores immutable persistent content and is
+mounted read-only. Generation activation and the initial named mutable state
+use separately selected TXSLOT/StateFS regions instead of pretending that a
+read-only ext4 provider already supplies journaled mutation, secrets, or
+filesystem rollback. Ext4 does not replace KEFS as the independent recovery
+path, and filesystem snapshots are not required for system-generation
+rollback.
 
 ### Filesystem modules
 
 The kernel owns the VFS object model, mount namespace, capability checks, and a
 small block-I/O contract. FAT12/16/32, exFAT, ext4, NTFS, and future disk
 formats are separate filesystem providers with explicit dependencies and
-feature gates. They must not be implemented inside the machine backend or
-kernel composition root.
+composition selection. They must not be implemented inside the machine backend
+or kernel composition root. Cargo feature gates become mandatory once one
+production composition can choose among multiple interchangeable providers;
+the current image links its sole ext4-v1 native-root provider explicitly as a
+crate dependency rather than presenting an unused feature switch as selection.
 
 Before dynamic loading exists, a filesystem provider may be a statically
 selected crate linked into a particular image. This is a composition mechanism,
