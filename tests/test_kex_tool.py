@@ -64,6 +64,10 @@ class KexToolTests(unittest.TestCase):
                         expected = [(6, 1, 0)]
                     elif command in {"rm", "write"}:
                         expected = [(7, 1, 0)]
+                    elif command == "sleep":
+                        expected = [(8, 1, 0)]
+                    elif command == "mem":
+                        expected = [(9, 1, 0)]
                     else:
                         expected = []
                     self.assertEqual(records, expected)

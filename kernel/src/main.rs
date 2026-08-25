@@ -21,7 +21,10 @@ mod firmware {
     use core::fmt::Write as _;
     use core::panic::PanicInfo;
 
-    use troe_abi::{command, datagram, filesystem, filesystem_mutation, requirements, stream};
+    use troe_abi::{
+        command, datagram, diagnostics, filesystem, filesystem_mutation, requirements, stream,
+        timer,
+    };
     #[cfg(feature = "acceptance-probes")]
     use troe_application::ParseError;
     use troe_application::{
@@ -34,15 +37,15 @@ mod firmware {
     use troe_config::{ActivationPointer, ActivationRecovery, recover_activation};
     use troe_content::{ContentPack, MAX_PACK_BYTES};
     use troe_core::{
-        CommandStatus, Input, MAX_LINE_BYTES, MachineMemorySnapshot, Output, PIPE_CAPACITY,
-        StreamError,
+        CommandStatus, Input, MAX_LINE_BYTES, MachineMemoryOwner, MachineMemorySnapshot,
+        MemoryStats, Output, PIPE_CAPACITY, StreamError,
     };
     use troe_dispatch::{
         ByteInputService, ByteOutputService, CommandInvocationService, ConsoleService,
         CopiedMessage, DispatchedOutput, Dispatcher, HandleOwner, ReplyStatus, Request, Rights,
         Service, ServiceReply, SharedOutput,
     };
-    use troe_driver::{InputEvent, InputQueueConfig, InputSource};
+    use troe_driver::{InputEvent, InputQueueConfig, InputQueueStats, InputSource};
     use troe_ext4::Ext4Limits;
     use troe_gpt::{GptGuid, GptLimits, discover};
     use troe_identity::IdentityLimits;
@@ -61,7 +64,7 @@ mod firmware {
     use troe_persist::{DualSlotStore, RegionSelector, TRANSACTION_BLOCKS};
     use troe_shell::{
         ArpEntry, CompletionConfig, ExternalCommand, MachineAction, NetworkControl, NetworkError,
-        NetworkStats, NetworkStatus, PingReply, ReceivedUdp, Shell,
+        NetworkStats, NetworkStatus, PingReply, ReceivedUdp, Shell, format_memory_report,
     };
     #[cfg(feature = "acceptance-probes")]
     use troe_statefs::STATE_PATH;
@@ -394,6 +397,14 @@ mod firmware {
         cwd: String,
         next_token: Option<u32>,
         pending: Option<PendingFileReplacement>,
+    }
+
+    struct ApplicationTimerService {
+        runtime: SharedRuntime,
+    }
+
+    struct ApplicationDiagnosticsService {
+        snapshot: [u8; diagnostics::SNAPSHOT_BYTES],
     }
 
     struct PendingFileReplacement {
@@ -4080,6 +4091,48 @@ mod firmware {
         }
     }
 
+    impl Service for ApplicationTimerService {
+        fn call(
+            &mut self,
+            request: Request<'_>,
+        ) -> Result<ServiceReply, troe_dispatch::DispatchError> {
+            match request.opcode() {
+                timer::NOW if request.payload().is_empty() => {
+                    let milliseconds = self.runtime.borrow().now().as_millis();
+                    ServiceReply::with_payload(
+                        ReplyStatus::Success,
+                        &timer::encode_milliseconds(milliseconds),
+                    )
+                }
+                timer::SLEEP_UNTIL => {
+                    let Ok(deadline) = timer::decode_milliseconds(request.payload()) else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    let mut runtime = KernelRuntimeCapability {
+                        runtime: self.runtime.clone(),
+                    };
+                    match runtime.sleep_until(MonotonicMillis::from_millis(deadline)) {
+                        Ok(()) => Ok(ServiceReply::empty(ReplyStatus::Success)),
+                        Err(Cancelled) => Ok(ServiceReply::empty(ReplyStatus::Cancelled)),
+                    }
+                }
+                _ => Ok(ServiceReply::empty(ReplyStatus::InvalidRequest)),
+            }
+        }
+    }
+
+    impl Service for ApplicationDiagnosticsService {
+        fn call(
+            &mut self,
+            request: Request<'_>,
+        ) -> Result<ServiceReply, troe_dispatch::DispatchError> {
+            if request.opcode() != diagnostics::GET_SNAPSHOT || !request.payload().is_empty() {
+                return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+            }
+            ServiceReply::with_payload(ReplyStatus::Success, &self.snapshot)
+        }
+    }
+
     const fn application_filesystem_status(error: FsError) -> ReplyStatus {
         match error {
             FsError::Invalid => ReplyStatus::InvalidPath,
@@ -4464,6 +4517,8 @@ mod firmware {
             let mut datagram_required = false;
             let mut filesystem_required = false;
             let mut filesystem_mutation_required = false;
+            let mut timer_required = false;
+            let mut diagnostics_required = false;
             for requirement in capability_manifest.iter() {
                 if requirement.interface == troe_abi::interface::DATAGRAM
                     && requirement.major == datagram::MAJOR
@@ -4480,6 +4535,16 @@ mod firmware {
                     && requirement.minor == filesystem_mutation::MINOR
                 {
                     filesystem_mutation_required = true;
+                } else if requirement.interface == troe_abi::interface::TIMER
+                    && requirement.major == timer::MAJOR
+                    && requirement.minor == timer::MINOR
+                {
+                    timer_required = true;
+                } else if requirement.interface == troe_abi::interface::DIAGNOSTICS
+                    && requirement.major == diagnostics::MAJOR
+                    && requirement.minor == diagnostics::MINOR
+                {
+                    diagnostics_required = true;
                 } else {
                     return Some(command_application_error(
                         stderr,
@@ -4487,6 +4552,43 @@ mod firmware {
                         "unsupported capability requirement",
                     ));
                 }
+            }
+            let machine_memory = machine_snapshot(self.accounting);
+            let machine_input = troe_machine::input_interrupt_stats();
+            let namespace_memory = namespace.memory_stats();
+            let diagnostics_snapshot = if diagnostics_required {
+                match application_diagnostics_snapshot(
+                    machine_memory,
+                    machine_input,
+                    namespace_memory,
+                ) {
+                    Ok(snapshot) => Some(snapshot),
+                    Err(()) => {
+                        return Some(command_application_error(
+                            stderr,
+                            command,
+                            "diagnostics snapshot failed",
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
+            let memory_report = format_memory_report(
+                architecture(),
+                machine_memory,
+                machine_input,
+                namespace_memory,
+            );
+            if namespace
+                .set_system_file("/sys/memory", memory_report.as_bytes())
+                .is_err()
+            {
+                return Some(command_application_error(
+                    stderr,
+                    command,
+                    "memory report refresh failed",
+                ));
             }
             let Ok(input) = read_command_input(stdin) else {
                 return Some(command_application_error(
@@ -4512,7 +4614,9 @@ mod firmware {
             let service_count = 4
                 + usize::from(datagram_required)
                 + usize::from(filesystem_required)
-                + usize::from(filesystem_mutation_required);
+                + usize::from(filesystem_mutation_required)
+                + usize::from(timer_required)
+                + usize::from(diagnostics_required);
             let Some(handle_capacity) = service_count.checked_mul(2) else {
                 return Some(command_application_error(
                     stderr,
@@ -4601,6 +4705,32 @@ mod firmware {
                         interface: troe_abi::interface::FILESYSTEM_MUTATE,
                         major: filesystem_mutation::MAJOR,
                         minor: filesystem_mutation::MINOR,
+                    });
+                }
+                if timer_required {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationTimerService {
+                                runtime: self.runtime.clone(),
+                            },
+                        )?,
+                        interface: troe_abi::interface::TIMER,
+                        major: timer::MAJOR,
+                        minor: timer::MINOR,
+                    });
+                }
+                if diagnostics_required {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationDiagnosticsService {
+                                snapshot: diagnostics_snapshot.ok_or(())?,
+                            },
+                        )?,
+                        interface: troe_abi::interface::DIAGNOSTICS,
+                        major: diagnostics::MAJOR,
+                        minor: diagnostics::MINOR,
                     });
                 }
                 Ok(services)
@@ -4964,6 +5094,61 @@ mod firmware {
             usize_as_u64(heap.high_water_bytes),
             usize_as_u64(heap.failed_allocations),
         )
+    }
+
+    fn application_diagnostics_snapshot(
+        machine: MachineMemorySnapshot,
+        input: Option<InputQueueStats>,
+        memory: MemoryStats,
+    ) -> Result<[u8; diagnostics::SNAPSHOT_BYTES], ()> {
+        let machine_memory = if machine.owner() == MachineMemoryOwner::Kernel {
+            Some(diagnostics::MachineMemory {
+                usable_bytes: machine.usable_bytes().ok_or(())?,
+                reserved_bytes: machine.reserved_bytes().ok_or(())?,
+                total_frames: machine.total_frames().ok_or(())?,
+                free_frames: machine.free_frames().ok_or(())?,
+                heap_total_bytes: machine.heap_total_bytes().ok_or(())?,
+                heap_used_bytes: machine.heap_used_bytes().ok_or(())?,
+                heap_high_water_bytes: machine.heap_high_water_bytes().ok_or(())?,
+                failed_allocations: machine.failed_allocations().ok_or(())?,
+            })
+        } else {
+            None
+        };
+        let input = input
+            .map(|input| {
+                Ok(diagnostics::InputQueue {
+                    queued: u64::try_from(input.queued).map_err(|_| ())?,
+                    capacity: u64::try_from(input.capacity).map_err(|_| ())?,
+                    interrupts: input.interrupts,
+                    delivered: input.delivered,
+                    dropped: input.dropped,
+                    idle_waits: input.idle_waits,
+                    wakeups: input.wakeups,
+                })
+            })
+            .transpose()?;
+        diagnostics::encode_snapshot(diagnostics::Snapshot {
+            architecture: if cfg!(target_arch = "x86_64") {
+                diagnostics::Architecture::X86_64
+            } else {
+                diagnostics::Architecture::Aarch64
+            },
+            memory_owner: match machine.owner() {
+                MachineMemoryOwner::Host => diagnostics::MemoryOwner::Host,
+                MachineMemoryOwner::Firmware => diagnostics::MemoryOwner::Firmware,
+                MachineMemoryOwner::Kernel => diagnostics::MemoryOwner::Kernel,
+            },
+            pressure: diagnostics::Pressure::Normal,
+            machine_memory,
+            input,
+            ramfs_used_bytes: memory.ramfs_used,
+            ramfs_limit_bytes: memory.ramfs_limit,
+            ramfs_high_water_bytes: memory.ramfs_high_water,
+            caches_used_bytes: 0,
+            caches_limit_bytes: 0,
+        })
+        .map_err(|_| ())
     }
 
     const fn usize_as_u64(value: usize) -> u64 {

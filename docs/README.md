@@ -91,6 +91,9 @@ lexically paginated directory contract.
 [ADR 0027](adr/0027-kex-atomic-filesystem-mutation.md) fixes the separate KEX
 atomic create/replace/remove handle, sequential 64 KiB staging, terminal commit,
 and teardown-abort contract.
+[ADR 0028](adr/0028-kex-timer-and-diagnostics-services.md) fixes separate KEX
+boot-relative monotonic timer and immutable typed diagnostics authorities and
+the `sleep`/`mem` migration.
 ADR 0012 governs the completed Stage 5.1 terminal and
 framebuffer increment; AArch64 native keyboard input remains a later
 virtio-input transport decision. ADR 0013 governs the completed Stage 5.2

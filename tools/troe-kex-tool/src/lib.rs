@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 pub use elf::convert_elf;
-use troe_abi::{datagram, filesystem, filesystem_mutation, interface, requirements};
+use troe_abi::{
+    datagram, diagnostics, filesystem, filesystem_mutation, interface, requirements, timer,
+};
 use troe_application::{
     ABI_MINOR, ApplicationLimits, KEX_V1_HEADER_BYTES, KEX_V1_IMAGE_BASE, Target, parse_kex,
 };
@@ -398,6 +400,16 @@ fn capability_requirement(name: &str) -> ToolResult<requirements::Requirement> {
             interface: interface::FILESYSTEM_MUTATE,
             major: filesystem_mutation::MAJOR,
             minor: filesystem_mutation::MINOR,
+        }),
+        "timer" => Ok(requirements::Requirement {
+            interface: interface::TIMER,
+            major: timer::MAJOR,
+            minor: timer::MINOR,
+        }),
+        "diagnostics" => Ok(requirements::Requirement {
+            interface: interface::DIAGNOSTICS,
+            major: diagnostics::MAJOR,
+            minor: diagnostics::MINOR,
         }),
         _ => Err(ToolError::new(format!(
             "unknown TROE KEX capability '{name}'"

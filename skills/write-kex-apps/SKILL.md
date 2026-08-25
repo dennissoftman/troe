@@ -15,8 +15,8 @@ only as needed. Do not infer POSIX behavior.
 - Implement `fn main(&mut CommandContext) -> u32`; return a constant from
   `troe_kex_sdk::exit`.
 - Get `cwd`/`argv` with `CommandContext::invocation`; use only granted
-  `stdin`, `stdout`, `stderr`, optional `datagram`/`filesystem`/mutation, and
-  cooperative `yield_now`.
+  `stdin`, `stdout`, `stderr`, optional datagram/filesystem/mutation/timer/
+  diagnostics clients, and cooperative `yield_now`.
 - Declare every optional authority in `[package.metadata.troe-kex]`
   `capabilities`; use `[]` or omit the table when none is needed.
 - No undeclared filesystem, environment, clock, raw sockets/device access,
@@ -41,6 +41,10 @@ names, and 3,072 aggregate name bytes. Request `filesystem-read` only when used.
 Mutation permits one 64 KiB complete-file staging transaction: append
 sequentially, then commit or abort; teardown aborts unfinished work. Remove is
 atomic. Request `filesystem-mutate` only for create/replace/remove operations.
+Timer values are boot-relative monotonic milliseconds only. Request `timer`,
+form deadlines with saturation, and treat `sleep_until` as cancellable.
+Diagnostics is one immutable typed launch snapshot. Request `diagnostics` only
+for bounded reporting; it grants no mutable memory, input, or device access.
 
 ## Minimal crate
 

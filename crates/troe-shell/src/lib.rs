@@ -13,8 +13,8 @@ use alloc::vec::Vec;
 use core::fmt::Write as _;
 use troe_core::{
     BoundedOutput, CommandStatus, Input, MAX_ARGS, MAX_LINE_BYTES, MAX_PIPELINE_STAGES,
-    MachineMemoryOwner, MachineMemorySnapshot, Output, PIPE_CAPACITY, SliceInput, StreamError,
-    write_all,
+    MachineMemoryOwner, MachineMemorySnapshot, MemoryStats, Output, PIPE_CAPACITY, SliceInput,
+    StreamError, write_all,
 };
 use troe_driver::InputQueueStats;
 use troe_task::CooperativeRuntime;
@@ -1447,51 +1447,11 @@ impl Shell {
     }
 
     fn memory_report(&self) -> String {
-        let stats = self.namespace.memory_stats();
-        let (owner, map) = match self.machine_memory.owner() {
-            MachineMemoryOwner::Host => ("host process", "unavailable"),
-            MachineMemoryOwner::Firmware => ("firmware", "firmware snapshot (advisory)"),
-            MachineMemoryOwner::Kernel => ("kernel", "final map (owned)"),
-        };
-        let usable = optional_byte_count(self.machine_memory.usable_bytes());
-        let reserved = optional_byte_count(self.machine_memory.reserved_bytes());
-        let frames = optional_ratio(
-            self.machine_memory.free_frames(),
-            self.machine_memory.total_frames(),
-            "free",
-        );
-        let heap = optional_byte_ratio(
-            self.machine_memory.heap_used_bytes(),
-            self.machine_memory.heap_total_bytes(),
-            "used",
-        );
-        let heap_high_water = optional_byte_count(self.machine_memory.heap_high_water_bytes());
-        let failed_allocations = optional_bytes(self.machine_memory.failed_allocations());
-        let ramfs_used = byte_count(stats.ramfs_used);
-        let ramfs_limit = byte_count(stats.ramfs_limit);
-        let ramfs_high_water = byte_count(stats.ramfs_high_water);
-        let (input_queue, input_interrupts, input_delivered, input_dropped, idle_waits, wakeups) =
-            match self.machine_input {
-                Some(input) => (
-                    format!("{}/{} queued", input.queued, input.capacity),
-                    input.interrupts.to_string(),
-                    input.delivered.to_string(),
-                    input.dropped.to_string(),
-                    input.idle_waits.to_string(),
-                    input.wakeups.to_string(),
-                ),
-                None => (
-                    "unavailable".to_string(),
-                    "unavailable".to_string(),
-                    "unavailable".to_string(),
-                    "unavailable".to_string(),
-                    "unavailable".to_string(),
-                    "unavailable".to_string(),
-                ),
-            };
-        format!(
-            "arch: {}\nmemory owner: {owner}\nmemory map: {map}\ntotal usable: {usable}\nreserved: {reserved}\nframes: {frames}\nheap: {heap}\nheap high-water: {heap_high_water}\nallocation failures: {failed_allocations}\ninput queue: {input_queue}\ninput interrupts: {input_interrupts}\ninput delivered: {input_delivered}\ninput dropped: {input_dropped}\ninput idle waits: {idle_waits}\ninput wakeups: {wakeups}\nramfs used: {}\nramfs limit: {}\nramfs high-water: {}\ncaches used: 0\ncaches limit: 0\npressure: normal (RAMFS policy only)\n",
-            self.architecture, ramfs_used, ramfs_limit, ramfs_high_water,
+        format_memory_report(
+            &self.architecture,
+            self.machine_memory,
+            self.machine_input,
+            self.namespace.memory_stats(),
         )
     }
 
@@ -1500,6 +1460,61 @@ impl Shell {
         self.namespace
             .set_system_file("/sys/memory", report.as_bytes())
     }
+}
+
+/// Format the canonical bounded memory/driver report used by `mem` and
+/// `/sys/memory`.
+#[must_use]
+pub fn format_memory_report(
+    architecture: &str,
+    machine_memory: MachineMemorySnapshot,
+    machine_input: Option<InputQueueStats>,
+    stats: MemoryStats,
+) -> String {
+    let (owner, map) = match machine_memory.owner() {
+        MachineMemoryOwner::Host => ("host process", "unavailable"),
+        MachineMemoryOwner::Firmware => ("firmware", "firmware snapshot (advisory)"),
+        MachineMemoryOwner::Kernel => ("kernel", "final map (owned)"),
+    };
+    let usable = optional_byte_count(machine_memory.usable_bytes());
+    let reserved = optional_byte_count(machine_memory.reserved_bytes());
+    let frames = optional_ratio(
+        machine_memory.free_frames(),
+        machine_memory.total_frames(),
+        "free",
+    );
+    let heap = optional_byte_ratio(
+        machine_memory.heap_used_bytes(),
+        machine_memory.heap_total_bytes(),
+        "used",
+    );
+    let heap_high_water = optional_byte_count(machine_memory.heap_high_water_bytes());
+    let failed_allocations = optional_bytes(machine_memory.failed_allocations());
+    let ramfs_used = byte_count(stats.ramfs_used);
+    let ramfs_limit = byte_count(stats.ramfs_limit);
+    let ramfs_high_water = byte_count(stats.ramfs_high_water);
+    let (input_queue, input_interrupts, input_delivered, input_dropped, idle_waits, wakeups) =
+        match machine_input {
+            Some(input) => (
+                format!("{}/{} queued", input.queued, input.capacity),
+                input.interrupts.to_string(),
+                input.delivered.to_string(),
+                input.dropped.to_string(),
+                input.idle_waits.to_string(),
+                input.wakeups.to_string(),
+            ),
+            None => (
+                "unavailable".to_string(),
+                "unavailable".to_string(),
+                "unavailable".to_string(),
+                "unavailable".to_string(),
+                "unavailable".to_string(),
+                "unavailable".to_string(),
+            ),
+        };
+    format!(
+        "arch: {architecture}\nmemory owner: {owner}\nmemory map: {map}\ntotal usable: {usable}\nreserved: {reserved}\nframes: {frames}\nheap: {heap}\nheap high-water: {heap_high_water}\nallocation failures: {failed_allocations}\ninput queue: {input_queue}\ninput interrupts: {input_interrupts}\ninput delivered: {input_delivered}\ninput dropped: {input_dropped}\ninput idle waits: {idle_waits}\ninput wakeups: {wakeups}\nramfs used: {ramfs_used}\nramfs limit: {ramfs_limit}\nramfs high-water: {ramfs_high_water}\ncaches used: 0\ncaches limit: 0\npressure: normal (RAMFS policy only)\n",
+    )
 }
 
 #[derive(Clone, Copy, Debug)]

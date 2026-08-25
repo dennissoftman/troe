@@ -38,8 +38,9 @@ the 50 ms execution lease and transactionally reclaimed.
 - exact `/bin/<command>.kex` shell discovery from a target-selected root, external-first
   replaceable commands with static recovery fallback, four bounded command and
   standard-stream services, optional owned datagram, read-only filesystem, and
-  atomic filesystem-mutation services, a repo-local Rust SDK/skill, and
-  canonical dual-target build/check/inspect tooling;
+  atomic filesystem-mutation services, separate monotonic-timer and immutable
+  typed-diagnostics services, a repo-local Rust SDK/skill, and canonical
+  dual-target build/check/inspect tooling;
 - portable bounded block-region capabilities, strict primary/backup GPT
   discovery, read-only FAT32 and constrained checksummed ext4 VFS providers,
   checksummed SCFG v1 service startup policy, and a checksummed BMNT v1 boot
@@ -71,7 +72,7 @@ the 50 ms execution lease and transactionally reclaimed.
 - single/double quotes and pipelines of up to eight stages;
 - 64 KiB bounded intermediate byte streams;
 - `cat`, `echo`, literal `grep`, `ls`, `pwd`, `cd`, `man`, `mem`, `clear`,
-  `poweroff`, `reboot`, `write`, `rm`, and `hexdump`;
+  `poweroff`, `reboot`, `write`, `rm`, `hexdump`, and `sleep`;
 - deterministic 1.44 MiB FAT12 images for both primary architectures;
 - host/unit/smoke gates and prompt-synchronized QEMU acceptance on both
   architectures.
@@ -94,8 +95,10 @@ KEX apps may receive optional owner-scoped IPv4/UDP and read-only filesystem
 handles when their KCAP manifests request them. `cat`, `grep`, `hexdump`, `ls`,
 and `man` exercise generation-checked files, bounded reads, metadata, and
 lexically paginated directories. `write` and `rm` use a separate bounded,
-atomic complete-file mutation handle. Timer, diagnostics, and typed network
-capabilities are the next lower-level migration boundaries before TCP.
+atomic complete-file mutation handle. `sleep.kex` uses only a cancellable
+boot-relative timer and `mem.kex` uses only an immutable typed snapshot. Typed
+route/DHCP/ARP/ICMP/stat services are the next lower-level migration boundary
+before TCP.
 
 ## Quick start
 

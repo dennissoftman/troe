@@ -4,7 +4,8 @@
 use core::{fmt, slice};
 
 pub use troe_abi::{
-    ABI_MAJOR, ABI_MINOR, command, datagram, exit, filesystem, filesystem_mutation,
+    ABI_MAJOR, ABI_MINOR, command, datagram, diagnostics, exit, filesystem, filesystem_mutation,
+    timer,
 };
 use troe_abi::{MAX_MESSAGE_BYTES, MAX_SERVICE_PAYLOAD_BYTES, interface, reply, stream};
 
@@ -124,6 +125,8 @@ pub struct CommandContext {
     datagram: Option<Handle>,
     filesystem_read: Option<Handle>,
     filesystem_mutate: Option<Handle>,
+    timer: Option<Handle>,
+    diagnostics: Option<Handle>,
 }
 
 impl CommandContext {
@@ -147,6 +150,12 @@ impl CommandContext {
                 interface::FILESYSTEM_MUTATE,
                 filesystem_mutation::MAJOR,
                 filesystem_mutation::MINOR,
+            )?,
+            timer: startup.optional_handle(interface::TIMER, timer::MAJOR, timer::MINOR)?,
+            diagnostics: startup.optional_handle(
+                interface::DIAGNOSTICS,
+                diagnostics::MAJOR,
+                diagnostics::MINOR,
             )?,
         })
     }
@@ -218,6 +227,30 @@ impl CommandContext {
     pub const fn filesystem_mutation(&self) -> Result<FilesystemMutation, Error> {
         match self.filesystem_mutate {
             Some(handle) => Ok(FilesystemMutation { handle }),
+            None => Err(Error::MissingAuthority),
+        }
+    }
+
+    /// Borrow the optional boot-relative monotonic timer capability.
+    ///
+    /// # Errors
+    ///
+    /// Reports that the package did not request or receive timer authority.
+    pub const fn timer(&self) -> Result<Timer, Error> {
+        match self.timer {
+            Some(handle) => Ok(Timer { handle }),
+            None => Err(Error::MissingAuthority),
+        }
+    }
+
+    /// Borrow the optional immutable diagnostics capability.
+    ///
+    /// # Errors
+    ///
+    /// Reports that the package did not request or receive diagnostics.
+    pub const fn diagnostics(&self) -> Result<Diagnostics, Error> {
+        match self.diagnostics {
+            Some(handle) => Ok(Diagnostics { handle }),
             None => Err(Error::MissingAuthority),
         }
     }
@@ -305,6 +338,18 @@ pub struct ReadOnlyFilesystem {
 /// Atomic create/replace and remove client scoped to one application lifetime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FilesystemMutation {
+    handle: Handle,
+}
+
+/// Boot-relative monotonic timer client scoped to one application lifetime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Timer {
+    handle: Handle,
+}
+
+/// Immutable diagnostics client scoped to one application lifetime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Diagnostics {
     handle: Handle,
 }
 
@@ -544,6 +589,48 @@ impl FileReplacement {
         } else {
             Err(Error::InvalidCall)
         }
+    }
+}
+
+impl Timer {
+    /// Read the current boot-relative monotonic millisecond count.
+    ///
+    /// # Errors
+    ///
+    /// Reports service, decoding, or call-gate failure.
+    pub fn now(&mut self) -> Result<u64, Error> {
+        let mut reply = [0_u8; timer::MILLISECONDS_BYTES];
+        let count = call(self.handle, timer::NOW, &[], &mut reply)?;
+        timer::decode_milliseconds(&reply[..count]).map_err(|_| Error::InvalidCall)
+    }
+
+    /// Cooperatively wait until one boot-relative monotonic deadline.
+    ///
+    /// # Errors
+    ///
+    /// Reports cancellation, service, decoding, or call-gate failure.
+    pub fn sleep_until(&mut self, deadline_milliseconds: u64) -> Result<(), Error> {
+        let request = timer::encode_milliseconds(deadline_milliseconds);
+        let mut reply = [];
+        let count = call(self.handle, timer::SLEEP_UNTIL, &request, &mut reply)?;
+        if count == 0 {
+            Ok(())
+        } else {
+            Err(Error::InvalidCall)
+        }
+    }
+}
+
+impl Diagnostics {
+    /// Read the immutable typed snapshot captured for this launch.
+    ///
+    /// # Errors
+    ///
+    /// Reports service, decoding, or call-gate failure.
+    pub fn snapshot(&mut self) -> Result<diagnostics::Snapshot, Error> {
+        let mut reply = [0_u8; diagnostics::SNAPSHOT_BYTES];
+        let count = call(self.handle, diagnostics::GET_SNAPSHOT, &[], &mut reply)?;
+        diagnostics::decode_snapshot(&reply[..count]).map_err(|_| Error::InvalidCall)
     }
 }
 
@@ -1013,6 +1100,8 @@ mod tests {
             interface::STANDARD_OUTPUT,
             interface::STANDARD_ERROR,
             interface::DATAGRAM,
+            interface::TIMER,
+            interface::DIAGNOSTICS,
         ]);
         let startup = Startup::parse(&page);
         assert!(startup.is_ok());
@@ -1021,6 +1110,8 @@ mod tests {
             assert!(command.is_ok());
             if let Ok(command) = command {
                 assert!(command.datagram().is_ok());
+                assert!(command.timer().is_ok());
+                assert!(command.diagnostics().is_ok());
             }
         }
     }
