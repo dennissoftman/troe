@@ -19,3 +19,13 @@ DESCRIPTION
     Lua uses a bounded 8 MiB TLSF heap and periodically yields to the KEX
     scheduler. Exhausting the heap raises a normal protected Lua memory error;
     it cannot grow memory or access ambient host resources.
+
+EXAMPLES
+    Working example programs are shipped as architecture-independent data:
+
+        lua /share/lua/examples/strings.lua
+        lua /share/lua/examples/math.lua
+        lua /share/lua/examples/tables-coroutines.lua
+
+    Read them with cat, copy one to /tmp, and adapt it there. The immutable
+    originals remain available in the recovery root.

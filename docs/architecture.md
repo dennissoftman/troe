@@ -51,6 +51,11 @@ firmware fails before device publication or volatile I/O.
    frozen result through `SliceInput`; a stage cannot observe mutable internals.
 5. Filesystem commands ask `Namespace` to canonicalize from the logical cwd.
    Immutable KEFS nodes and writable `/tmp` nodes share one object model.
+   The recovery root keeps executables in `/bin`, system configuration in
+   `/etc`, architecture-independent package data in producer-owned
+   `/share/<name>` directories, and persistent or mounted data under `/vol`.
+   Native shared libraries will use `/lib` when dynamic linking is added;
+   executable code does not belong in `/share`.
 6. The final output capability writes host bytes or the native UART.
    When validated GOP metadata is available, normal native shell output is also
    rendered into an owned fixed-glyph framebuffer console. UEFI text output is

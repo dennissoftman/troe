@@ -983,6 +983,37 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
         contains=("lua-file:hello sum=1250025000 sqrt=9 pow=1024",),
     )
     session.command(
+        "lua /share/lua/examples/strings.lua",
+        cwd,
+        command_timeout,
+        contains=(
+            "hello, TROE!",
+            "match=8..11 upper=HELLO, TROE!",
+            "packed=4 bytes values=-123,456",
+            "utf8=1 codepoint, 2 bytes, U+03BB",
+        ),
+    )
+    session.command(
+        "lua /share/lua/examples/math.lua",
+        cwd,
+        command_timeout,
+        contains=(
+            " 90 degrees: sin= 1.000000 cos= 0.000000",
+            "mean=5.00 standard-deviation=2.00",
+            "2^10=1024 log2(1024)=10 gcd(84,30)=6",
+        ),
+    )
+    session.command(
+        "lua /share/lua/examples/tables-coroutines.lua",
+        cwd,
+        command_timeout,
+        contains=(
+            "task 1: network (priority 3)",
+            "vector sum: (7, 10)",
+            "square(4)=16",
+        ),
+    )
+    session.command(
         "lua -e 'error(\"expected-error\")'",
         cwd,
         command_timeout,

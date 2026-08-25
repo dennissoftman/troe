@@ -1,0 +1,9 @@
+TROE shared data
+================
+
+/share contains immutable, architecture-independent data shipped with TROE.
+Each producer owns a directory named /share/<producer> so examples, templates,
+schemas, themes, and similar assets remain easy to find and cannot collide.
+
+Executables belong in /bin, system configuration in /etc, persistent or
+mounted data in /vol, and future native shared libraries in /lib.
