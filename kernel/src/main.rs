@@ -21,7 +21,7 @@ mod firmware {
     use core::fmt::Write as _;
     use core::panic::PanicInfo;
 
-    use troe_abi::{command, datagram, filesystem, requirements, stream};
+    use troe_abi::{command, datagram, filesystem, filesystem_mutation, requirements, stream};
     #[cfg(feature = "acceptance-probes")]
     use troe_application::ParseError;
     use troe_application::{
@@ -113,6 +113,7 @@ mod firmware {
     const APPLICATION_FIXED_USER_REGIONS: usize = 3;
     const APPLICATION_INTERFACE_ECHO: u32 = 1;
     const APPLICATION_COMMAND_STEP_LIMIT: u16 = 1024;
+    const _: () = assert!(filesystem_mutation::MAX_FILE_BYTES == PIPE_CAPACITY);
     const USER_CODE_BASE: u64 = 0x0000_4000_0000_0000;
     const USER_DATA_BASE: u64 = USER_CODE_BASE + BASE_PAGE_SIZE;
     const USER_STACK_BASE: u64 = USER_CODE_BASE + 0x1_0000;
@@ -360,6 +361,7 @@ mod firmware {
     }
 
     type SharedNetwork = Rc<RefCell<KernelNetworkService>>;
+    type SharedNamespace<'namespace> = Rc<RefCell<&'namespace mut Namespace>>;
 
     struct KernelNetwork {
         service: SharedNetwork,
@@ -382,9 +384,22 @@ mod firmware {
     }
 
     struct ApplicationFilesystemService<'namespace> {
-        namespace: &'namespace mut Namespace,
+        namespace: SharedNamespace<'namespace>,
         cwd: String,
         files: [ApplicationFileSlot; filesystem::MAX_OPEN_FILES],
+    }
+
+    struct ApplicationFilesystemMutationService<'namespace> {
+        namespace: SharedNamespace<'namespace>,
+        cwd: String,
+        next_token: Option<u32>,
+        pending: Option<PendingFileReplacement>,
+    }
+
+    struct PendingFileReplacement {
+        token: u32,
+        path: String,
+        bytes: Vec<u8>,
     }
 
     struct ApplicationFileSlot {
@@ -3718,7 +3733,7 @@ mod firmware {
     }
 
     impl<'namespace> ApplicationFilesystemService<'namespace> {
-        fn new(namespace: &'namespace mut Namespace, cwd: &str) -> Result<Self, ()> {
+        fn new(namespace: SharedNamespace<'namespace>, cwd: &str) -> Result<Self, ()> {
             let mut owned_cwd = String::new();
             owned_cwd.try_reserve_exact(cwd.len()).map_err(|_| ())?;
             owned_cwd.push_str(cwd);
@@ -3737,6 +3752,7 @@ mod firmware {
         fn open(&mut self, path: &str) -> Result<filesystem::OpenFile, ReplyStatus> {
             let metadata = self
                 .namespace
+                .borrow_mut()
                 .metadata(&self.cwd, path)
                 .map_err(application_filesystem_status)?;
             if metadata.kind != NodeKind::File {
@@ -3835,15 +3851,14 @@ mod firmware {
                     else {
                         return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
                     };
-                    let (files, namespace) = (&self.files, &mut self.namespace);
-                    let path = match Self::slot(files, token)
+                    let path = match Self::slot(&self.files, token)
                         .and_then(|slot| slot.path.as_deref().ok_or(ReplyStatus::InvalidRequest))
                     {
                         Ok(path) => path,
                         Err(status) => return Ok(ServiceReply::empty(status)),
                     };
                     let mut bytes = [0_u8; troe_abi::MAX_SERVICE_PAYLOAD_BYTES];
-                    let count = match namespace.read_file_at(
+                    let count = match self.namespace.borrow_mut().read_file_at(
                         &self.cwd,
                         path,
                         offset,
@@ -3870,7 +3885,7 @@ mod firmware {
                     let Ok(decoded) = filesystem::decode_list_request(request.payload()) else {
                         return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
                     };
-                    let listing = match self.namespace.list_bounded(
+                    let listing = match self.namespace.borrow_mut().list_bounded(
                         &self.cwd,
                         decoded.path,
                         decoded.cursor,
@@ -3905,7 +3920,7 @@ mod firmware {
                     let Ok(path) = filesystem::decode_path_request(request.payload()) else {
                         return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
                     };
-                    let metadata = match self.namespace.metadata(&self.cwd, path) {
+                    let metadata = match self.namespace.borrow_mut().metadata(&self.cwd, path) {
                         Ok(metadata) => metadata,
                         Err(error) => {
                             return Ok(ServiceReply::empty(application_filesystem_status(error)));
@@ -3922,6 +3937,143 @@ mod firmware {
                         ReplyStatus::Success,
                         &filesystem::encode_metadata_reply(metadata),
                     )
+                }
+                _ => Ok(ServiceReply::empty(ReplyStatus::InvalidRequest)),
+            }
+        }
+    }
+
+    impl<'namespace> ApplicationFilesystemMutationService<'namespace> {
+        fn new(namespace: SharedNamespace<'namespace>, cwd: &str) -> Result<Self, ()> {
+            let mut owned_cwd = String::new();
+            owned_cwd.try_reserve_exact(cwd.len()).map_err(|_| ())?;
+            owned_cwd.push_str(cwd);
+            Ok(Self {
+                namespace,
+                cwd: owned_cwd,
+                next_token: Some(1),
+                pending: None,
+            })
+        }
+
+        fn begin_replace(&mut self, path: &str) -> Result<u32, ReplyStatus> {
+            if self.pending.is_some() {
+                return Err(ReplyStatus::Conflict);
+            }
+            let token = self.next_token.ok_or(ReplyStatus::Exhausted)?;
+            let mut owned_path = String::new();
+            owned_path
+                .try_reserve_exact(path.len())
+                .map_err(|_| ReplyStatus::Exhausted)?;
+            owned_path.push_str(path);
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(filesystem_mutation::MAX_FILE_BYTES)
+                .map_err(|_| ReplyStatus::Exhausted)?;
+            self.next_token = token.checked_add(1);
+            self.pending = Some(PendingFileReplacement {
+                token,
+                path: owned_path,
+                bytes,
+            });
+            Ok(token)
+        }
+
+        fn append(
+            &mut self,
+            append: filesystem_mutation::AppendRequest<'_>,
+        ) -> Result<(), ReplyStatus> {
+            let pending = self.pending.as_mut().ok_or(ReplyStatus::InvalidRequest)?;
+            let offset = usize::try_from(append.offset).map_err(|_| ReplyStatus::Overflow)?;
+            if pending.token != append.token || pending.bytes.len() != offset {
+                return Err(ReplyStatus::InvalidRequest);
+            }
+            let next = offset
+                .checked_add(append.bytes.len())
+                .ok_or(ReplyStatus::Overflow)?;
+            if next > filesystem_mutation::MAX_FILE_BYTES {
+                return Err(ReplyStatus::TooLarge);
+            }
+            pending.bytes.extend_from_slice(append.bytes);
+            Ok(())
+        }
+
+        fn finish(&mut self, token: u32, commit: bool) -> Result<(), ReplyStatus> {
+            let Some(pending) = self.pending.take() else {
+                return Err(ReplyStatus::InvalidRequest);
+            };
+            if pending.token != token {
+                self.pending = Some(pending);
+                return Err(ReplyStatus::InvalidRequest);
+            }
+            if !commit {
+                return Ok(());
+            }
+            self.namespace
+                .borrow_mut()
+                .write_file(&self.cwd, &pending.path, &pending.bytes)
+                .map_err(application_filesystem_status)
+        }
+
+        fn remove(&mut self, path: &str) -> Result<(), ReplyStatus> {
+            if self.pending.is_some() {
+                return Err(ReplyStatus::Conflict);
+            }
+            self.namespace
+                .borrow_mut()
+                .remove_file(&self.cwd, path)
+                .map_err(application_filesystem_status)
+        }
+    }
+
+    impl Service for ApplicationFilesystemMutationService<'_> {
+        fn call(
+            &mut self,
+            request: Request<'_>,
+        ) -> Result<ServiceReply, troe_dispatch::DispatchError> {
+            match request.opcode() {
+                filesystem_mutation::BEGIN_REPLACE => {
+                    let Ok(path) = filesystem_mutation::decode_path_request(request.payload())
+                    else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    let token = match self.begin_replace(path) {
+                        Ok(token) => token,
+                        Err(status) => return Ok(ServiceReply::empty(status)),
+                    };
+                    let reply = filesystem_mutation::encode_token(token)
+                        .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?;
+                    ServiceReply::with_payload(ReplyStatus::Success, &reply)
+                }
+                filesystem_mutation::APPEND => {
+                    let Ok(append) = filesystem_mutation::decode_append_request(request.payload())
+                    else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    match self.append(append) {
+                        Ok(()) => Ok(ServiceReply::empty(ReplyStatus::Success)),
+                        Err(status) => Ok(ServiceReply::empty(status)),
+                    }
+                }
+                filesystem_mutation::COMMIT_REPLACE | filesystem_mutation::ABORT_REPLACE => {
+                    let Ok(token) = filesystem_mutation::decode_token(request.payload()) else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    let commit = request.opcode() == filesystem_mutation::COMMIT_REPLACE;
+                    match self.finish(token, commit) {
+                        Ok(()) => Ok(ServiceReply::empty(ReplyStatus::Success)),
+                        Err(status) => Ok(ServiceReply::empty(status)),
+                    }
+                }
+                filesystem_mutation::REMOVE => {
+                    let Ok(path) = filesystem_mutation::decode_path_request(request.payload())
+                    else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    match self.remove(path) {
+                        Ok(()) => Ok(ServiceReply::empty(ReplyStatus::Success)),
+                        Err(status) => Ok(ServiceReply::empty(status)),
+                    }
                 }
                 _ => Ok(ServiceReply::empty(ReplyStatus::InvalidRequest)),
             }
@@ -4311,6 +4463,7 @@ mod firmware {
             };
             let mut datagram_required = false;
             let mut filesystem_required = false;
+            let mut filesystem_mutation_required = false;
             for requirement in capability_manifest.iter() {
                 if requirement.interface == troe_abi::interface::DATAGRAM
                     && requirement.major == datagram::MAJOR
@@ -4322,6 +4475,11 @@ mod firmware {
                     && requirement.minor == filesystem::MINOR
                 {
                     filesystem_required = true;
+                } else if requirement.interface == troe_abi::interface::FILESYSTEM_MUTATE
+                    && requirement.major == filesystem_mutation::MAJOR
+                    && requirement.minor == filesystem_mutation::MINOR
+                {
+                    filesystem_mutation_required = true;
                 } else {
                     return Some(command_application_error(
                         stderr,
@@ -4351,8 +4509,10 @@ mod firmware {
             } else {
                 None
             };
-            let service_count =
-                4 + usize::from(datagram_required) + usize::from(filesystem_required);
+            let service_count = 4
+                + usize::from(datagram_required)
+                + usize::from(filesystem_required)
+                + usize::from(filesystem_mutation_required);
             let Some(handle_capacity) = service_count.checked_mul(2) else {
                 return Some(command_application_error(
                     stderr,
@@ -4366,6 +4526,11 @@ mod firmware {
                     command,
                     "service resources exhausted",
                 ));
+            };
+            let filesystem_namespace = if filesystem_required || filesystem_mutation_required {
+                Some(Rc::new(RefCell::new(namespace)))
+            } else {
+                None
             };
             let services = (|| -> Result<Vec<CommandStartupService>, ()> {
                 let mut services = Vec::new();
@@ -4415,6 +4580,7 @@ mod firmware {
                     });
                 }
                 if filesystem_required {
+                    let namespace = filesystem_namespace.as_ref().ok_or(())?.clone();
                     services.push(CommandStartupService {
                         port: register_command_service(
                             &mut dispatcher,
@@ -4423,6 +4589,18 @@ mod firmware {
                         interface: troe_abi::interface::FILESYSTEM_READ,
                         major: filesystem::MAJOR,
                         minor: filesystem::MINOR,
+                    });
+                }
+                if filesystem_mutation_required {
+                    let namespace = filesystem_namespace.as_ref().ok_or(())?.clone();
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationFilesystemMutationService::new(namespace, cwd)?,
+                        )?,
+                        interface: troe_abi::interface::FILESYSTEM_MUTATE,
+                        major: filesystem_mutation::MAJOR,
+                        minor: filesystem_mutation::MINOR,
                     });
                 }
                 Ok(services)

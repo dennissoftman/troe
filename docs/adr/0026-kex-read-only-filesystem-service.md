@@ -42,8 +42,8 @@ lexical ordering makes repeated pages deterministic without exposing provider
 enumeration order. Apps must still bound whole-file and line processing and
 close successful opens on every exit path.
 
-This interface deliberately cannot implement `write` or `rm`; mutation needs a
-separate capability with provider-specific atomicity and durability semantics.
-Timer, diagnostics, and typed network services also remain separate. Those
-boundaries and their command migrations precede TCP and larger runtimes such as
-Lua or Python.
+This interface deliberately cannot implement `write` or `rm`; ADR 0027 adds a
+separate capability while retaining provider-specific atomicity and durability
+semantics. Timer, diagnostics, and typed network services also remain separate.
+Those boundaries and their command migrations precede TCP and larger runtimes
+such as Lua or Python.

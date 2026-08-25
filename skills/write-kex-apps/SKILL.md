@@ -15,11 +15,11 @@ only as needed. Do not infer POSIX behavior.
 - Implement `fn main(&mut CommandContext) -> u32`; return a constant from
   `troe_kex_sdk::exit`.
 - Get `cwd`/`argv` with `CommandContext::invocation`; use only granted
-  `stdin`, `stdout`, `stderr`, optional `datagram`/`filesystem`, and
+  `stdin`, `stdout`, `stderr`, optional `datagram`/`filesystem`/mutation, and
   cooperative `yield_now`.
 - Declare every optional authority in `[package.metadata.troe-kex]`
   `capabilities`; use `[]` or omit the table when none is needed.
-- No filesystem mutation, environment, clock, raw sockets/device access,
+- No undeclared filesystem, environment, clock, raw sockets/device access,
   threads, process spawning, dynamic linking, TLS, signals, or allocator is
   granted.
 - Never hand-code call gates, startup parsing, handle values, ELF layout, or
@@ -38,6 +38,9 @@ Read-only filesystem paths are at most 256 bytes; opens are generation-checked
 and limited to eight. Reads may be partial. Close every open file. Directory
 pages are lexical and opaque-cursor based, with at most 64 entries, 64-byte
 names, and 3,072 aggregate name bytes. Request `filesystem-read` only when used.
+Mutation permits one 64 KiB complete-file staging transaction: append
+sequentially, then commit or abort; teardown aborts unfinished work. Remove is
+atomic. Request `filesystem-mutate` only for create/replace/remove operations.
 
 ## Minimal crate
 

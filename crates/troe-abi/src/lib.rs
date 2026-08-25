@@ -30,6 +30,8 @@ pub mod interface {
     pub const DATAGRAM: u32 = 5;
     /// Read-only view of one application namespace.
     pub const FILESYSTEM_READ: u32 = 6;
+    /// Atomic create/replace and remove authority for one application namespace.
+    pub const FILESYSTEM_MUTATE: u32 = 7;
 }
 
 /// Canonical package-side declaration of optional startup authorities.
@@ -1183,6 +1185,155 @@ pub mod filesystem {
     }
 }
 
+/// Bounded transactional filesystem-mutation protocol.
+pub mod filesystem_mutation {
+    use super::{MAX_SERVICE_PAYLOAD_BYTES, filesystem};
+
+    /// Interface major version.
+    pub const MAJOR: u16 = 1;
+    /// Interface minor version.
+    pub const MINOR: u16 = 0;
+    /// Begin one complete-file atomic replacement.
+    pub const BEGIN_REPLACE: u16 = 1;
+    /// Append one sequential chunk to the pending replacement.
+    pub const APPEND: u16 = 2;
+    /// Atomically publish the complete pending replacement.
+    pub const COMMIT_REPLACE: u16 = 3;
+    /// Discard the complete pending replacement.
+    pub const ABORT_REPLACE: u16 = 4;
+    /// Atomically remove one regular file.
+    pub const REMOVE: u16 = 5;
+    /// Maximum staged bytes in one replacement.
+    pub const MAX_FILE_BYTES: usize = 64 * 1024;
+    /// Fixed bytes preceding an append payload.
+    pub const APPEND_HEADER_BYTES: usize = 8;
+    /// Maximum bytes carried by one append call.
+    pub const MAX_APPEND_BYTES: usize = MAX_SERVICE_PAYLOAD_BYTES - APPEND_HEADER_BYTES;
+    /// Exact replacement-token reply/request bytes.
+    pub const TOKEN_BYTES: usize = 4;
+
+    /// Invalid mutation request or reply encoding.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct EncodingError;
+
+    /// Borrowed validated append request.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct AppendRequest<'a> {
+        /// Opaque active replacement token.
+        pub token: u32,
+        /// Required sequential byte offset.
+        pub offset: u32,
+        /// Nonempty bytes appended at `offset`.
+        pub bytes: &'a [u8],
+    }
+
+    /// Encode a begin-replace or remove path request.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty, excessive, invalid, or short destinations atomically.
+    pub fn encode_path_request(path: &str, output: &mut [u8]) -> Result<usize, EncodingError> {
+        filesystem::encode_path_request(path, output).map_err(|_| EncodingError)
+    }
+
+    /// Decode a begin-replace or remove path request.
+    ///
+    /// # Errors
+    ///
+    /// Rejects noncanonical filesystem paths.
+    pub fn decode_path_request(bytes: &[u8]) -> Result<&str, EncodingError> {
+        filesystem::decode_path_request(bytes).map_err(|_| EncodingError)
+    }
+
+    /// Encode one opaque nonzero replacement token.
+    ///
+    /// # Errors
+    ///
+    /// Rejects token zero.
+    pub fn encode_token(token: u32) -> Result<[u8; TOKEN_BYTES], EncodingError> {
+        if token == 0 {
+            return Err(EncodingError);
+        }
+        Ok(token.to_le_bytes())
+    }
+
+    /// Decode one exact opaque replacement token.
+    ///
+    /// # Errors
+    ///
+    /// Rejects the wrong length or token zero.
+    pub fn decode_token(bytes: &[u8]) -> Result<u32, EncodingError> {
+        if bytes.len() != TOKEN_BYTES {
+            return Err(EncodingError);
+        }
+        let token = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        if token == 0 {
+            return Err(EncodingError);
+        }
+        Ok(token)
+    }
+
+    /// Encode one nonempty sequential append request.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero tokens, empty/excessive chunks, offsets beyond the file
+    /// ceiling, overflow, or insufficient output without modifying it.
+    pub fn encode_append_request(
+        token: u32,
+        offset: usize,
+        bytes: &[u8],
+        output: &mut [u8],
+    ) -> Result<usize, EncodingError> {
+        let count = APPEND_HEADER_BYTES
+            .checked_add(bytes.len())
+            .ok_or(EncodingError)?;
+        let end = offset.checked_add(bytes.len()).ok_or(EncodingError)?;
+        if token == 0
+            || bytes.is_empty()
+            || bytes.len() > MAX_APPEND_BYTES
+            || end > MAX_FILE_BYTES
+            || output.len() < count
+        {
+            return Err(EncodingError);
+        }
+        let offset = u32::try_from(offset).map_err(|_| EncodingError)?;
+        let mut encoded = [0_u8; MAX_SERVICE_PAYLOAD_BYTES];
+        encoded[..4].copy_from_slice(&token.to_le_bytes());
+        encoded[4..8].copy_from_slice(&offset.to_le_bytes());
+        encoded[APPEND_HEADER_BYTES..count].copy_from_slice(bytes);
+        output[..count].copy_from_slice(&encoded[..count]);
+        Ok(count)
+    }
+
+    /// Decode one exact sequential append request.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero tokens, empty/excessive bytes, or offsets whose complete
+    /// chunk exceeds the file ceiling.
+    pub fn decode_append_request(bytes: &[u8]) -> Result<AppendRequest<'_>, EncodingError> {
+        if bytes.len() <= APPEND_HEADER_BYTES || bytes.len() > MAX_SERVICE_PAYLOAD_BYTES {
+            return Err(EncodingError);
+        }
+        let token = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let offset = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let payload = &bytes[APPEND_HEADER_BYTES..];
+        let end = usize::try_from(offset)
+            .map_err(|_| EncodingError)?
+            .checked_add(payload.len())
+            .ok_or(EncodingError)?;
+        if token == 0 || payload.len() > MAX_APPEND_BYTES || end > MAX_FILE_BYTES {
+            return Err(EncodingError);
+        }
+        Ok(AppendRequest {
+            token,
+            offset,
+            bytes: payload,
+        })
+    }
+}
+
 /// Owned IPv4/UDP datagram protocol.
 pub mod datagram {
     /// Interface major version.
@@ -1392,7 +1543,8 @@ pub mod datagram {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_MESSAGE_BYTES, command, datagram, filesystem, interface, requirements, stream,
+        MAX_MESSAGE_BYTES, command, datagram, filesystem, filesystem_mutation, interface,
+        requirements, stream,
     };
 
     #[test]
@@ -1404,6 +1556,7 @@ mod tests {
             interface::STANDARD_ERROR,
             interface::DATAGRAM,
             interface::FILESYSTEM_READ,
+            interface::FILESYSTEM_MUTATE,
         ];
         assert!(interfaces.iter().all(|value| *value != 0));
         assert!(
@@ -1533,6 +1686,45 @@ mod tests {
         let unsorted = [entries[1], entries[0]];
         assert!(filesystem::encode_list_reply(None, &unsorted, &mut unchanged).is_err());
         assert_eq!(unchanged, [0xa5; filesystem::MAX_LIST_REPLY_BYTES]);
+    }
+
+    #[test]
+    fn filesystem_mutation_is_sequential_bounded_and_exact() {
+        let token = filesystem_mutation::encode_token(7).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(filesystem_mutation::decode_token(&token), Ok(7));
+        assert!(filesystem_mutation::decode_token(&[7, 0, 0, 0, 0]).is_err());
+        assert!(filesystem_mutation::encode_token(0).is_err());
+
+        let mut bytes = [0_u8; super::MAX_SERVICE_PAYLOAD_BYTES];
+        let count = filesystem_mutation::encode_append_request(
+            7,
+            filesystem_mutation::MAX_FILE_BYTES - 3,
+            b"end",
+            &mut bytes,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        let append = filesystem_mutation::decode_append_request(&bytes[..count])
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(append.token, 7);
+        assert_eq!(
+            append.offset,
+            u32::try_from(filesystem_mutation::MAX_FILE_BYTES - 3)
+                .unwrap_or_else(|_| std::process::abort())
+        );
+        assert_eq!(append.bytes, b"end");
+        assert!(
+            filesystem_mutation::encode_append_request(
+                7,
+                filesystem_mutation::MAX_FILE_BYTES - 2,
+                b"end",
+                &mut bytes,
+            )
+            .is_err()
+        );
+
+        let mut unchanged = [0xa5_u8; 8];
+        assert!(filesystem_mutation::encode_append_request(0, 0, b"x", &mut unchanged).is_err());
+        assert_eq!(unchanged, [0xa5; 8]);
     }
 
     #[test]

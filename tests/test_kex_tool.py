@@ -62,6 +62,8 @@ class KexToolTests(unittest.TestCase):
                         expected = [(5, 1, 0)]
                     elif command in {"cat", "grep", "hexdump", "ls", "man"}:
                         expected = [(6, 1, 0)]
+                    elif command in {"rm", "write"}:
+                        expected = [(7, 1, 0)]
                     else:
                         expected = []
                     self.assertEqual(records, expected)

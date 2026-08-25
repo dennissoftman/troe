@@ -260,10 +260,11 @@ waiting/cancellation, and teardown to zero live ports on every QEMU composition.
 The optional read-only filesystem service now supplies generation-checked open
 tokens, bounded offset reads and metadata, and lexical pagination. `cat`,
 `grep`, `hexdump`, `ls`, and `man` exercise it on every QEMU composition.
-Next sequence: migrate the remaining replaceable utilities through separate
-mutation, timer, diagnostics, and typed network capabilities. TCP follows only
-after those lower-level contracts and their adversarial portable tests are
-fixed. DNS, TLS, jobs, and general sockets are not implied by these ABIs.
+Atomic complete-file mutation is now implemented and exercised by `write.kex`
+and `rm.kex`. Next sequence: migrate the remaining replaceable utilities through
+separate timer, diagnostics, and typed network capabilities. TCP follows only
+after those lower-level contracts and their adversarial portable tests are fixed.
+DNS, TLS, jobs, and general sockets are not implied by these ABIs.
 
 The shell keeps bounded command-name and path completion, including candidate
 listing for an empty or partial command and command-name completion after

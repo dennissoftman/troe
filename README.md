@@ -37,9 +37,9 @@ the 50 ms execution lease and transactionally reclaimed.
   copied handle calls, with owned x86 local-APIC/AArch64 timer leases;
 - exact `/bin/<command>.kex` shell discovery from a target-selected root, external-first
   replaceable commands with static recovery fallback, four bounded command and
-  standard-stream services, optional owned datagram and read-only filesystem
-  services, a repo-local Rust SDK/skill, and canonical dual-target
-  build/check/inspect tooling;
+  standard-stream services, optional owned datagram, read-only filesystem, and
+  atomic filesystem-mutation services, a repo-local Rust SDK/skill, and
+  canonical dual-target build/check/inspect tooling;
 - portable bounded block-region capabilities, strict primary/backup GPT
   discovery, read-only FAT32 and constrained checksummed ext4 VFS providers,
   checksummed SCFG v1 service startup policy, and a checksummed BMNT v1 boot
@@ -93,8 +93,9 @@ fragmentation, and general sockets remain outside this milestone.
 KEX apps may receive optional owner-scoped IPv4/UDP and read-only filesystem
 handles when their KCAP manifests request them. `cat`, `grep`, `hexdump`, `ls`,
 and `man` exercise generation-checked files, bounded reads, metadata, and
-lexically paginated directories. Mutation, timer, diagnostics, and typed
-network capabilities are the next lower-level migration boundaries before TCP.
+lexically paginated directories. `write` and `rm` use a separate bounded,
+atomic complete-file mutation handle. Timer, diagnostics, and typed network
+capabilities are the next lower-level migration boundaries before TCP.
 
 ## Quick start
 

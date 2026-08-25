@@ -10,7 +10,7 @@ test or gate; this inventory did not itself rerun the broad test matrix.
 
 | Classification | Count | ADRs |
 | --- | ---: | --- |
-| Implemented | 24 | 0001–0005, 0007–0008, 0010–0026 |
+| Implemented | 25 | 0001–0005, 0007–0008, 0010–0027 |
 | Superseded + implemented | 1 | 0006 |
 | Direction / deferred by explicit scope | 1 | 0009 |
 
@@ -48,13 +48,14 @@ features.
 | [0023](0023-bounded-virtio-network-profile.md) | Implemented | Bounded Ethernet/ARP/IPv4/ICMP/UDP/DHCP parsing and retained-state tests in [`crates/troe-net/src/lib.rs`](../../crates/troe-net/src/lib.rs); queue and device frontends in [`crates/troe-virtio/src/lib.rs`](../../crates/troe-virtio/src/lib.rs), [`virtio_mmio.rs`](../../crates/troe-machine/src/virtio_mmio.rs), and [`virtio_pci.rs`](../../crates/troe-machine/src/virtio_pci.rs); typed route lifecycle, publication ownership, DMA-reset failpoints, and used-index checks in [`crates/troe-machine/src/mechanism.rs`](../../crates/troe-machine/src/mechanism.rs); shell/QEMU exchange gates in [`crates/troe-shell/src/lib.rs`](../../crates/troe-shell/src/lib.rs) and [`scripts/test-qemu.py`](../../scripts/test-qemu.py) | None for the accepted profile. TCP, TLS, DNS, IPv6, background jobs, general sockets, and non-virtio NICs are explicit later capabilities. |
 | [0024](0024-kex-command-apps-and-sdk.md) | Implemented | Allocation-free protocols and KCAP v1 requirements in [`crates/troe-abi`](../../crates/troe-abi/src/lib.rs), stream services in [`crates/troe-dispatch`](../../crates/troe-dispatch/src/lib.rs), SDK and linker policy under [`sdk`](../../sdk/rust/troe-kex/src/lib.rs), canonical Rust builder in [`tools/troe-kex-tool`](../../tools/troe-kex-tool), target-selected flat `/bin` assembly in [`tools/mkefs.py`](../../tools/mkefs.py), and least-authority external-first launch in [`kernel/src/main.rs`](../../kernel/src/main.rs); `echo`, `clear`, and `pwd` run as KEX apps in every QEMU composition | ADR 0026 adds read-only filesystem authority; mutation, timer, diagnostics, and typed network capabilities remain before TCP. Packaging signatures and general jobs remain separately sequenced work. |
 | [0025](0025-kex-owned-datagram-service.md) | Implemented | Canonical datagram ABI and SDK client in [`crates/troe-abi`](../../crates/troe-abi/src/lib.rs) and [`sdk`](../../sdk/rust/troe-kex/src/lib.rs); exclusive binding, cooperative wait, status mapping, and drop-time unbind in [`kernel/src/main.rs`](../../kernel/src/main.rs); `udp.kex` send/cancel/zero-port teardown assertions in [`scripts/test-qemu.py`](../../scripts/test-qemu.py) | TCP remains a separate bounded state-machine and timer design; DNS, TLS, IPv6, background jobs, and generic sockets remain out of scope. |
-| [0026](0026-kex-read-only-filesystem-service.md) | Implemented | Canonical filesystem ABI and SDK client in [`crates/troe-abi`](../../crates/troe-abi/src/lib.rs) and [`sdk`](../../sdk/rust/troe-kex/src/lib.rs); bounded lexical VFS pagination in [`crates/troe-vfs`](../../crates/troe-vfs/src/lib.rs); generation-checked launch service in [`kernel/src/main.rs`](../../kernel/src/main.rs); `cat`, `grep`, `hexdump`, `ls`, and `man` KEX apps execute in every QEMU composition | Filesystem mutation requires a separate durability-aware interface; timer, diagnostics, and typed network migrations remain before TCP. |
+| [0026](0026-kex-read-only-filesystem-service.md) | Implemented | Canonical filesystem ABI and SDK client in [`crates/troe-abi`](../../crates/troe-abi/src/lib.rs) and [`sdk`](../../sdk/rust/troe-kex/src/lib.rs); bounded lexical VFS pagination in [`crates/troe-vfs`](../../crates/troe-vfs/src/lib.rs); generation-checked launch service in [`kernel/src/main.rs`](../../kernel/src/main.rs); `cat`, `grep`, `hexdump`, `ls`, and `man` KEX apps execute in every QEMU composition | ADR 0027 separately supplies mutation; timer, diagnostics, and typed network migrations remain before TCP. |
+| [0027](0027-kex-atomic-filesystem-mutation.md) | Implemented | Canonical sequential transaction ABI and streaming SDK client in [`crates/troe-abi`](../../crates/troe-abi/src/lib.rs) and [`sdk`](../../sdk/rust/troe-kex/src/lib.rs); fixed-ceiling staging, atomic namespace commit/remove, and teardown abort in [`kernel/src/main.rs`](../../kernel/src/main.rs); `write.kex` and `rm.kex` exercise quotas, immutable denial, recovery, and leak accounting in [`scripts/test-qemu.py`](../../scripts/test-qemu.py) | Rename, directory mutation, partial writes, broader durability transactions, timer, diagnostics, and typed network application services remain separate. |
 
 ## Closure conclusion
 
 All accepted current-scope ADR contracts are implemented, including ADR 0016
 Phase B, shell-launched KEX commands, and the owned application datagram and
-read-only filesystem services. Filesystem mutation, timer, diagnostics, and
+read-only filesystem and atomic mutation services. Timer, diagnostics, and
 typed network application boundaries remain deliberately separate decisions
 before TCP; TCP additionally requires its own bounded state-machine, timer,
 ownership, and adversarial-test contract.

@@ -3,7 +3,9 @@
 
 use core::{fmt, slice};
 
-pub use troe_abi::{ABI_MAJOR, ABI_MINOR, command, datagram, exit, filesystem};
+pub use troe_abi::{
+    ABI_MAJOR, ABI_MINOR, command, datagram, exit, filesystem, filesystem_mutation,
+};
 use troe_abi::{MAX_MESSAGE_BYTES, MAX_SERVICE_PAYLOAD_BYTES, interface, reply, stream};
 
 const STARTUP_PAGE_BYTES: usize = 4096;
@@ -121,6 +123,7 @@ pub struct CommandContext {
     stderr: Handle,
     datagram: Option<Handle>,
     filesystem_read: Option<Handle>,
+    filesystem_mutate: Option<Handle>,
 }
 
 impl CommandContext {
@@ -139,6 +142,11 @@ impl CommandContext {
                 interface::FILESYSTEM_READ,
                 filesystem::MAJOR,
                 filesystem::MINOR,
+            )?,
+            filesystem_mutate: startup.optional_handle(
+                interface::FILESYSTEM_MUTATE,
+                filesystem_mutation::MAJOR,
+                filesystem_mutation::MINOR,
             )?,
         })
     }
@@ -198,6 +206,18 @@ impl CommandContext {
     pub const fn filesystem(&self) -> Result<ReadOnlyFilesystem, Error> {
         match self.filesystem_read {
             Some(handle) => Ok(ReadOnlyFilesystem { handle }),
+            None => Err(Error::MissingAuthority),
+        }
+    }
+
+    /// Borrow the optional atomic filesystem-mutation capability.
+    ///
+    /// # Errors
+    ///
+    /// Reports that the package did not request or receive mutation authority.
+    pub const fn filesystem_mutation(&self) -> Result<FilesystemMutation, Error> {
+        match self.filesystem_mutate {
+            Some(handle) => Ok(FilesystemMutation { handle }),
             None => Err(Error::MissingAuthority),
         }
     }
@@ -280,6 +300,19 @@ pub struct Datagram {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReadOnlyFilesystem {
     handle: Handle,
+}
+
+/// Atomic create/replace and remove client scoped to one application lifetime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FilesystemMutation {
+    handle: Handle,
+}
+
+/// One pending complete-file replacement.
+pub struct FileReplacement {
+    handle: Handle,
+    token: u32,
+    offset: usize,
 }
 
 impl ReadOnlyFilesystem {
@@ -385,6 +418,132 @@ impl ReadOnlyFilesystem {
         .map_err(|_| Error::InvalidCall)?;
         let count = call(self.handle, filesystem::LIST, &request[..count], buffer)?;
         filesystem::DirectoryPage::parse(&buffer[..count]).map_err(|_| Error::InvalidCall)
+    }
+}
+
+impl FilesystemMutation {
+    /// Begin staging one complete regular-file replacement.
+    ///
+    /// Only one replacement may be pending on this capability. Application
+    /// teardown implicitly discards an uncommitted replacement.
+    ///
+    /// # Errors
+    ///
+    /// Reports invalid paths, conflicting pending work, exhaustion, or a
+    /// service/call-gate failure.
+    pub fn begin_replace(&mut self, path: &str) -> Result<FileReplacement, Error> {
+        let mut request = [0_u8; filesystem::MAX_PATH_BYTES];
+        let count = filesystem_mutation::encode_path_request(path, &mut request)
+            .map_err(|_| Error::InvalidCall)?;
+        let mut reply = [0_u8; filesystem_mutation::TOKEN_BYTES];
+        let count = call(
+            self.handle,
+            filesystem_mutation::BEGIN_REPLACE,
+            &request[..count],
+            &mut reply,
+        )?;
+        let token =
+            filesystem_mutation::decode_token(&reply[..count]).map_err(|_| Error::InvalidCall)?;
+        Ok(FileReplacement {
+            handle: self.handle,
+            token,
+            offset: 0,
+        })
+    }
+
+    /// Atomically remove one regular file.
+    ///
+    /// # Errors
+    ///
+    /// Reports invalid/missing paths, immutable targets, a conflicting pending
+    /// replacement, filesystem failures, or call-gate failure.
+    pub fn remove(&mut self, path: &str) -> Result<(), Error> {
+        let mut request = [0_u8; filesystem::MAX_PATH_BYTES];
+        let count = filesystem_mutation::encode_path_request(path, &mut request)
+            .map_err(|_| Error::InvalidCall)?;
+        let mut reply = [];
+        let count = call(
+            self.handle,
+            filesystem_mutation::REMOVE,
+            &request[..count],
+            &mut reply,
+        )?;
+        if count == 0 {
+            Ok(())
+        } else {
+            Err(Error::InvalidCall)
+        }
+    }
+}
+
+impl FileReplacement {
+    /// Append all bytes sequentially using bounded copied calls.
+    ///
+    /// # Errors
+    ///
+    /// Reports the first size, staging, service, or call-gate failure.
+    pub fn write_all(&mut self, mut bytes: &[u8]) -> Result<(), Error> {
+        while !bytes.is_empty() {
+            let chunk_bytes = bytes.len().min(filesystem_mutation::MAX_APPEND_BYTES);
+            let mut request = [0_u8; MAX_SERVICE_PAYLOAD_BYTES];
+            let count = filesystem_mutation::encode_append_request(
+                self.token,
+                self.offset,
+                &bytes[..chunk_bytes],
+                &mut request,
+            )
+            .map_err(|_| Error::TooLarge)?;
+            let mut reply = [];
+            let reply_bytes = call(
+                self.handle,
+                filesystem_mutation::APPEND,
+                &request[..count],
+                &mut reply,
+            )?;
+            if reply_bytes != 0 {
+                return Err(Error::InvalidCall);
+            }
+            self.offset = self
+                .offset
+                .checked_add(chunk_bytes)
+                .ok_or(Error::Overflow)?;
+            bytes = &bytes[chunk_bytes..];
+        }
+        Ok(())
+    }
+
+    /// Atomically publish the complete staged bytes and consume this token.
+    ///
+    /// The service discards the staging transaction whether commit succeeds or
+    /// returns a filesystem failure.
+    ///
+    /// # Errors
+    ///
+    /// Reports immutable targets, quotas, filesystem failures, or call-gate
+    /// failure.
+    pub fn commit(self) -> Result<(), Error> {
+        self.finish(filesystem_mutation::COMMIT_REPLACE)
+    }
+
+    /// Discard the staged bytes and consume this token.
+    ///
+    /// # Errors
+    ///
+    /// Reports a stale token or call-gate failure.
+    pub fn abort(self) -> Result<(), Error> {
+        self.finish(filesystem_mutation::ABORT_REPLACE)
+    }
+
+    fn finish(self, opcode: u16) -> Result<(), Error> {
+        let request =
+            filesystem_mutation::encode_token(self.token).map_err(|_| Error::InvalidCall)?;
+        let mut reply = [];
+        let count = call(self.handle, opcode, &request, &mut reply)?;
+        if count == 0 {
+            Ok(())
+        } else {
+            Err(Error::InvalidCall)
+        }
     }
 }
 

@@ -50,7 +50,7 @@ pub const fn filesystem_message(error: Error) -> &'static [u8] {
         Error::NotFound => b"not found",
         Error::WrongType => b"wrong node type",
         Error::ReadOnly => b"read-only filesystem",
-        Error::NoSpace => b"filesystem quota exceeded",
+        Error::NoSpace | Error::TooLarge => b"filesystem quota exceeded",
         Error::Overflow => b"filesystem size overflow",
         Error::Exists => b"already exists",
         Error::Corrupt => b"filesystem metadata is corrupt",
