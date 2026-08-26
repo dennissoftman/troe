@@ -38,12 +38,11 @@ mod firmware {
     use troe_content::{ContentPack, MAX_PACK_BYTES};
     use troe_core::{
         CommandStatus, Input, MAX_LINE_BYTES, MachineMemoryOwner, MachineMemorySnapshot,
-        MemoryStats, Output, PIPE_CAPACITY, StreamError,
+        MemoryStats, Output, StreamError,
     };
     use troe_dispatch::{
-        ByteInputService, ByteOutputService, CommandInvocationService, ConsoleService,
-        CopiedMessage, DispatchedOutput, Dispatcher, HandleOwner, ReplyStatus, Request, Rights,
-        Service, ServiceReply, SharedOutput,
+        CommandInvocationService, ConsoleService, CopiedMessage, DispatchedOutput, Dispatcher,
+        HandleOwner, ReplyStatus, Request, Rights, Service, ServiceReply,
     };
     use troe_driver::{InputEvent, InputQueueConfig, InputQueueStats, InputSource};
     use troe_ext4::Ext4Limits;
@@ -68,7 +67,8 @@ mod firmware {
     };
     use troe_persist::{DualSlotStore, RegionSelector, TRANSACTION_BLOCKS};
     use troe_shell::{
-        CompletionConfig, ExternalCommand, MachineAction, Shell, format_memory_report,
+        CompletionConfig, ExternalCommand, MachineAction, SharedNamespace, Shell,
+        format_memory_report,
     };
     #[cfg(feature = "acceptance-probes")]
     use troe_statefs::STATE_PATH;
@@ -85,7 +85,9 @@ mod firmware {
         EditorConfig, EditorOutcome, FramebufferDescriptor, FramebufferPixelFormat, InputDecoder,
         KeyEvent, KeyboardConfig, LineEditor, Ps2Set1Decoder, TextConsole, TextConsoleConfig,
     };
-    use troe_vfs::{FsError, Namespace, NodeKind, RamFsQuota, ReadOnlyFileSystem};
+    use troe_vfs::{
+        FILE_IO_BUFFER_BYTES, FsError, Namespace, NodeKind, RamFsQuota, ReadOnlyFileSystem,
+    };
     use uefi::boot;
     use uefi::mem::memory_map::{MemoryMap, MemoryMapOwned};
     use uefi::prelude::*;
@@ -119,7 +121,6 @@ mod firmware {
     const APPLICATION_FIXED_USER_REGIONS: usize = 3;
     const APPLICATION_INTERFACE_ECHO: u32 = 1;
     const APPLICATION_COMMAND_STEP_LIMIT: u16 = 1024;
-    const _: () = assert!(filesystem_mutation::MAX_FILE_BYTES == 1024 * 1024);
     const USER_CODE_BASE: u64 = 0x0000_4000_0000_0000;
     const USER_DATA_BASE: u64 = USER_CODE_BASE + BASE_PAGE_SIZE;
     const USER_STACK_BASE: u64 = USER_CODE_BASE + 0x1_0000;
@@ -407,7 +408,6 @@ mod firmware {
 
     type SharedNetwork = Rc<RefCell<KernelNetworkService>>;
     type SharedTcpConnection = Rc<RefCell<KernelTcpConnection>>;
-    type SharedNamespace<'namespace> = Rc<RefCell<&'namespace mut Namespace>>;
     type SharedRuntimeMounts = Rc<RefCell<RuntimeMountRegistry>>;
 
     struct RuntimeMountRecord {
@@ -594,21 +594,29 @@ mod firmware {
         port_count: usize,
     }
 
-    struct ApplicationFilesystemService<'namespace> {
-        namespace: SharedNamespace<'namespace>,
+    struct ApplicationFilesystemService {
+        namespace: SharedNamespace,
         cwd: String,
         files: [ApplicationFileSlot; filesystem::MAX_OPEN_FILES],
     }
 
-    struct ApplicationFilesystemMutationService<'namespace> {
-        namespace: SharedNamespace<'namespace>,
+    struct ApplicationInputService<'stream> {
+        input: Rc<RefCell<&'stream mut dyn Input>>,
+    }
+
+    struct ApplicationOutputService<'stream> {
+        output: Rc<RefCell<&'stream mut dyn Output>>,
+    }
+
+    struct ApplicationFilesystemMutationService {
+        namespace: SharedNamespace,
         cwd: String,
         next_token: Option<u32>,
         pending: Option<PendingFileReplacement>,
     }
 
-    struct ApplicationVolumeControlService<'namespace> {
-        namespace: SharedNamespace<'namespace>,
+    struct ApplicationVolumeControlService {
+        namespace: SharedNamespace,
         mounts: SharedRuntimeMounts,
     }
 
@@ -644,7 +652,9 @@ mod firmware {
     struct PendingFileReplacement {
         token: u32,
         path: String,
+        offset: u64,
         bytes: Vec<u8>,
+        chunk_bytes: usize,
     }
 
     struct ApplicationFileSlot {
@@ -1294,8 +1304,10 @@ mod firmware {
     fn native_activation_limits() -> Result<ActivationLimits, ()> {
         let block = BlockLimits::new(8, 4096, 1).map_err(|_| ())?;
         let gpt = GptLimits::new(128, 16 * 1024, 16).map_err(|_| ())?;
-        let ext4 = Ext4Limits::new(8, 64, 256, 4096, 1024 * 1024, 4096, 64).map_err(|_| ())?;
-        let fat32 = Fat32Limits::new(4096, 4096, 1024 * 1024, 4096, 64).map_err(|_| ())?;
+        let ext4 = Ext4Limits::new(8, 64, 256, 4096, u64::from(u32::MAX) * 4096, 4096, 64)
+            .map_err(|_| ())?;
+        let fat32 =
+            Fat32Limits::new(u32::MAX, 4096, u64::from(u32::MAX), 4096, 64).map_err(|_| ())?;
         Ok(ActivationLimits::new(block, gpt, ext4, fat32))
     }
 
@@ -4278,8 +4290,69 @@ mod firmware {
         }
     }
 
-    impl<'namespace> ApplicationFilesystemService<'namespace> {
-        fn new(namespace: SharedNamespace<'namespace>, cwd: &str) -> Result<Self, ()> {
+    impl Service for ApplicationInputService<'_> {
+        fn call(
+            &mut self,
+            request: Request<'_>,
+        ) -> Result<ServiceReply, troe_dispatch::DispatchError> {
+            if request.opcode() != stream::READ {
+                return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+            }
+            let Ok(requested) = stream::decode_read_request(request.payload()) else {
+                return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+            };
+            let mut bytes = [0_u8; troe_abi::MAX_SERVICE_PAYLOAD_BYTES];
+            let Ok(mut input) = self.input.try_borrow_mut() else {
+                return Ok(ServiceReply::empty(ReplyStatus::Conflict));
+            };
+            match input.read(&mut bytes[..requested]) {
+                Ok(count) if count <= requested => {
+                    ServiceReply::with_payload(ReplyStatus::Success, &bytes[..count])
+                }
+                Ok(_) => Ok(ServiceReply::empty(ReplyStatus::Corrupt)),
+                Err(_) => Ok(ServiceReply::empty(ReplyStatus::Failure)),
+            }
+        }
+    }
+
+    impl Service for ApplicationOutputService<'_> {
+        fn call(
+            &mut self,
+            request: Request<'_>,
+        ) -> Result<ServiceReply, troe_dispatch::DispatchError> {
+            let Ok(mut output) = self.output.try_borrow_mut() else {
+                return Ok(ServiceReply::empty(ReplyStatus::Conflict));
+            };
+            match request.opcode() {
+                stream::WRITE
+                    if !request.payload().is_empty()
+                        && request.payload().len() <= troe_abi::MAX_SERVICE_PAYLOAD_BYTES =>
+                {
+                    let status = if troe_core::write_all(&mut **output, request.payload()).is_ok() {
+                        ReplyStatus::Success
+                    } else {
+                        ReplyStatus::Failure
+                    };
+                    Ok(ServiceReply::empty(status))
+                }
+                stream::SET_CHUNK_SIZE => {
+                    let Ok(bytes) = stream::decode_chunk_size(request.payload()) else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    let status = if output.set_chunk_size(bytes).is_ok() {
+                        ReplyStatus::Success
+                    } else {
+                        ReplyStatus::Unsupported
+                    };
+                    Ok(ServiceReply::empty(status))
+                }
+                _ => Ok(ServiceReply::empty(ReplyStatus::InvalidRequest)),
+            }
+        }
+    }
+
+    impl ApplicationFilesystemService {
+        fn new(namespace: SharedNamespace, cwd: &str) -> Result<Self, ()> {
             let mut owned_cwd = String::new();
             owned_cwd.try_reserve_exact(cwd.len()).map_err(|_| ())?;
             owned_cwd.push_str(cwd);
@@ -4371,7 +4444,7 @@ mod firmware {
         }
     }
 
-    impl Service for ApplicationFilesystemService<'_> {
+    impl Service for ApplicationFilesystemService {
         #[allow(clippy::too_many_lines)]
         fn call(
             &mut self,
@@ -4506,8 +4579,8 @@ mod firmware {
         }
     }
 
-    impl<'namespace> ApplicationFilesystemMutationService<'namespace> {
-        fn new(namespace: SharedNamespace<'namespace>, cwd: &str) -> Result<Self, ()> {
+    impl ApplicationFilesystemMutationService {
+        fn new(namespace: SharedNamespace, cwd: &str) -> Result<Self, ()> {
             let mut owned_cwd = String::new();
             owned_cwd.try_reserve_exact(cwd.len()).map_err(|_| ())?;
             owned_cwd.push_str(cwd);
@@ -4529,15 +4602,17 @@ mod firmware {
                 .try_reserve_exact(path.len())
                 .map_err(|_| ReplyStatus::Exhausted)?;
             owned_path.push_str(path);
-            let mut bytes = Vec::new();
-            bytes
-                .try_reserve_exact(filesystem_mutation::MAX_FILE_BYTES)
-                .map_err(|_| ReplyStatus::Exhausted)?;
+            self.namespace
+                .borrow_mut()
+                .truncate_file(&self.cwd, path)
+                .map_err(application_filesystem_status)?;
             self.next_token = token.checked_add(1);
             self.pending = Some(PendingFileReplacement {
                 token,
                 path: owned_path,
-                bytes,
+                offset: 0,
+                bytes: Vec::new(),
+                chunk_bytes: FILE_IO_BUFFER_BYTES,
             });
             Ok(token)
         }
@@ -4547,17 +4622,34 @@ mod firmware {
             append: filesystem_mutation::AppendRequest<'_>,
         ) -> Result<(), ReplyStatus> {
             let pending = self.pending.as_mut().ok_or(ReplyStatus::InvalidRequest)?;
-            let offset = usize::try_from(append.offset).map_err(|_| ReplyStatus::Overflow)?;
-            if pending.token != append.token || pending.bytes.len() != offset {
+            if pending.token != append.token || pending.offset != append.offset {
                 return Err(ReplyStatus::InvalidRequest);
             }
-            let next = offset
-                .checked_add(append.bytes.len())
-                .ok_or(ReplyStatus::Overflow)?;
-            if next > filesystem_mutation::MAX_FILE_BYTES {
-                return Err(ReplyStatus::TooLarge);
-            }
+            pending
+                .bytes
+                .try_reserve_exact(append.bytes.len())
+                .map_err(|_| ReplyStatus::Exhausted)?;
             pending.bytes.extend_from_slice(append.bytes);
+            pending.offset = pending
+                .offset
+                .checked_add(u64::try_from(append.bytes.len()).map_err(|_| ReplyStatus::Overflow)?)
+                .ok_or(ReplyStatus::Overflow)?;
+            if pending.bytes.len() >= pending.chunk_bytes {
+                self.namespace
+                    .borrow_mut()
+                    .append_file(&self.cwd, &pending.path, &pending.bytes)
+                    .map_err(application_filesystem_status)?;
+                pending.bytes.clear();
+            }
+            Ok(())
+        }
+
+        fn set_chunk_size(&mut self, token: u32, bytes: usize) -> Result<(), ReplyStatus> {
+            let pending = self.pending.as_mut().ok_or(ReplyStatus::InvalidRequest)?;
+            if pending.token != token || pending.offset != 0 || !pending.bytes.is_empty() {
+                return Err(ReplyStatus::InvalidRequest);
+            }
+            pending.chunk_bytes = bytes;
             Ok(())
         }
 
@@ -4572,9 +4664,14 @@ mod firmware {
             if !commit {
                 return Ok(());
             }
-            self.namespace
-                .borrow_mut()
-                .write_file(&self.cwd, &pending.path, &pending.bytes)
+            let mut namespace = self.namespace.borrow_mut();
+            if !pending.bytes.is_empty() {
+                namespace
+                    .append_file(&self.cwd, &pending.path, &pending.bytes)
+                    .map_err(application_filesystem_status)?;
+            }
+            namespace
+                .sync_file(&self.cwd, &pending.path)
                 .map_err(application_filesystem_status)
         }
 
@@ -4619,7 +4716,7 @@ mod firmware {
         }
     }
 
-    impl Service for ApplicationFilesystemMutationService<'_> {
+    impl Service for ApplicationFilesystemMutationService {
         fn call(
             &mut self,
             request: Request<'_>,
@@ -4644,6 +4741,17 @@ mod firmware {
                         return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
                     };
                     match self.append(append) {
+                        Ok(()) => Ok(ServiceReply::empty(ReplyStatus::Success)),
+                        Err(status) => Ok(ServiceReply::empty(status)),
+                    }
+                }
+                filesystem_mutation::SET_CHUNK_SIZE => {
+                    let Ok((token, bytes)) =
+                        filesystem_mutation::decode_chunk_size_request(request.payload())
+                    else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    match self.set_chunk_size(token, bytes) {
                         Ok(()) => Ok(ServiceReply::empty(ReplyStatus::Success)),
                         Err(status) => Ok(ServiceReply::empty(status)),
                     }
@@ -4698,7 +4806,7 @@ mod firmware {
         }
     }
 
-    impl Service for ApplicationVolumeControlService<'_> {
+    impl Service for ApplicationVolumeControlService {
         fn call(
             &mut self,
             request: Request<'_>,
@@ -5611,7 +5719,7 @@ mod firmware {
             command: &str,
             words: &[String],
             cwd: &str,
-            namespace: &mut Namespace,
+            namespace: &SharedNamespace,
             stdin: &mut dyn Input,
             stdout: &mut dyn Output,
             stderr: &mut dyn Output,
@@ -5620,7 +5728,7 @@ mod firmware {
                 return None;
             }
             let path = alloc::format!("/bin/{command}.kex");
-            let metadata = match namespace.metadata("/", &path) {
+            let metadata = match namespace.borrow_mut().metadata("/", &path) {
                 Ok(metadata) => metadata,
                 Err(troe_vfs::FsError::NotFound) => return None,
                 Err(_) => return Some(command_application_error(stderr, command, "lookup failed")),
@@ -5634,6 +5742,7 @@ mod firmware {
             }
             let Ok(artifact) = stage_artifact(metadata.byte_count, |offset, destination| {
                 namespace
+                    .borrow_mut()
                     .read_file_at("/", &path, offset, destination)
                     .map_err(|_| ())
             }) else {
@@ -5722,7 +5831,7 @@ mod firmware {
             }
             let machine_memory = machine_snapshot(self.accounting);
             let machine_input = troe_machine::input_interrupt_stats();
-            let namespace_memory = namespace.memory_stats();
+            let namespace_memory = namespace.borrow().memory_stats();
             let diagnostics_snapshot = if diagnostics_required {
                 match application_diagnostics_snapshot(
                     machine_memory,
@@ -5748,6 +5857,7 @@ mod firmware {
                 namespace_memory,
             );
             if namespace
+                .borrow_mut()
                 .set_system_file("/sys/memory", memory_report.as_bytes())
                 .is_err()
             {
@@ -5757,15 +5867,6 @@ mod firmware {
                     "memory report refresh failed",
                 ));
             }
-            let Ok(input) = read_command_input(stdin) else {
-                return Some(command_application_error(
-                    stderr,
-                    command,
-                    "input exceeds command limit",
-                ));
-            };
-            let retained_stdout = SharedOutput::new(PIPE_CAPACITY);
-            let retained_stderr = SharedOutput::new(PIPE_CAPACITY);
             let application_network = self.runtime.borrow().network.clone();
             let application_transport_network = if datagram_required || tcp_connect_required {
                 let Some(network) = application_network.clone() else {
@@ -5806,10 +5907,13 @@ mod firmware {
             };
             let filesystem_namespace =
                 if filesystem_required || filesystem_mutation_required || volume_control_required {
-                    Some(Rc::new(RefCell::new(namespace)))
+                    Some(Rc::clone(namespace))
                 } else {
                     None
                 };
+            let shared_stdin = Rc::new(RefCell::new(&mut *stdin));
+            let shared_stdout = Rc::new(RefCell::new(&mut *stdout));
+            let shared_stderr = Rc::new(RefCell::new(&mut *stderr));
             let services = (|| -> Result<Vec<CommandStartupService>, ()> {
                 let mut services = Vec::new();
                 services.try_reserve_exact(service_count).map_err(|_| ())?;
@@ -5823,7 +5927,12 @@ mod firmware {
                     minor: command::MINOR,
                 });
                 services.push(CommandStartupService {
-                    port: register_command_service(&mut dispatcher, ByteInputService::new(input))?,
+                    port: register_command_service(
+                        &mut dispatcher,
+                        ApplicationInputService {
+                            input: Rc::clone(&shared_stdin),
+                        },
+                    )?,
                     interface: troe_abi::interface::STANDARD_INPUT,
                     major: stream::MAJOR,
                     minor: stream::MINOR,
@@ -5831,7 +5940,9 @@ mod firmware {
                 services.push(CommandStartupService {
                     port: register_command_service(
                         &mut dispatcher,
-                        ByteOutputService::new(retained_stdout.clone()),
+                        ApplicationOutputService {
+                            output: Rc::clone(&shared_stdout),
+                        },
                     )?,
                     interface: troe_abi::interface::STANDARD_OUTPUT,
                     major: stream::MAJOR,
@@ -5840,7 +5951,9 @@ mod firmware {
                 services.push(CommandStartupService {
                     port: register_command_service(
                         &mut dispatcher,
-                        ByteOutputService::new(retained_stderr.clone()),
+                        ApplicationOutputService {
+                            output: Rc::clone(&shared_stderr),
+                        },
                     )?,
                     interface: troe_abi::interface::STANDARD_ERROR,
                     major: stream::MAJOR,
@@ -5979,11 +6092,21 @@ mod firmware {
                 Ok(services)
             })();
             let Ok(services) = services else {
-                return Some(command_application_error(
-                    stderr,
-                    command,
-                    "service setup failed",
-                ));
+                drop(dispatcher);
+                let status =
+                    shared_stderr
+                        .try_borrow_mut()
+                        .map_or(CommandStatus::Failure, |mut output| {
+                            command_application_error(
+                                &mut **output,
+                                command,
+                                "service setup failed",
+                            )
+                        });
+                drop(shared_stdin);
+                drop(shared_stdout);
+                drop(shared_stderr);
+                return Some(status);
             };
 
             if self.scheduler.yield_current(self.shell_id).is_err() {
@@ -6006,16 +6129,11 @@ mod firmware {
                 fatal(b"fatal: shell scheduler restore failed\n");
             }
 
-            if retained_stdout.copy_to(stdout).is_err() || retained_stderr.copy_to(stderr).is_err()
-            {
-                return Some(CommandStatus::Failure);
-            }
-            Some(match outcome {
+            drop(dispatcher);
+            let status = match outcome {
                 Ok(CommandApplicationOutcome::Exited(status)) => command_status(status),
-                Ok(CommandApplicationOutcome::Faulted(fault)) => command_application_error(
-                    stderr,
-                    command,
-                    match fault {
+                Ok(CommandApplicationOutcome::Faulted(fault)) => {
+                    let message = match fault {
                         TaskFault::Translation => "application faulted: translation",
                         TaskFault::Permission => "application faulted: permission",
                         TaskFault::IllegalInstruction => "application faulted: illegal instruction",
@@ -6023,10 +6141,29 @@ mod firmware {
                         TaskFault::ExecutionLeaseExpired => {
                             "application faulted: execution lease expired"
                         }
-                    },
-                ),
-                Err(()) => command_application_error(stderr, command, "application rejected"),
-            })
+                    };
+                    shared_stderr
+                        .try_borrow_mut()
+                        .map_or(CommandStatus::Failure, |mut output| {
+                            command_application_error(&mut **output, command, message)
+                        })
+                }
+                Err(()) => {
+                    shared_stderr
+                        .try_borrow_mut()
+                        .map_or(CommandStatus::Failure, |mut output| {
+                            command_application_error(
+                                &mut **output,
+                                command,
+                                "application rejected",
+                            )
+                        })
+                }
+            };
+            drop(shared_stdin);
+            drop(shared_stdout);
+            drop(shared_stderr);
+            Some(status)
         }
     }
 
@@ -6039,26 +6176,6 @@ mod firmware {
             .map_err(|_| ())?;
         dispatcher.close(kernel_handle).map_err(|_| ())?;
         Ok(port)
-    }
-
-    fn read_command_input(input: &mut dyn Input) -> Result<Vec<u8>, ()> {
-        let mut bytes = Vec::new();
-        let mut chunk = [0_u8; troe_abi::MAX_SERVICE_PAYLOAD_BYTES];
-        loop {
-            let count = input.read(&mut chunk).map_err(|_| ())?;
-            if count > chunk.len() {
-                return Err(());
-            }
-            if count == 0 {
-                return Ok(bytes);
-            }
-            let next = bytes.len().checked_add(count).ok_or(())?;
-            if next > PIPE_CAPACITY {
-                return Err(());
-            }
-            bytes.try_reserve_exact(count).map_err(|_| ())?;
-            bytes.extend_from_slice(&chunk[..count]);
-        }
     }
 
     fn command_application_error(

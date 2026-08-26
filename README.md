@@ -39,14 +39,15 @@ profiles. Small is a policy here, not just a current measurement.
 
 - Native UEFI boots on x86-64 and AArch64.
 - Serial and framebuffer consoles with UTF-8 line editing, history, completion,
-  quoting, and pipelines.
+  literal single/double quoting, pipelines, and streamed `<`, `>`, and `>>`
+  redirection.
 - A bounded VFS with KEFS, a default read-write persistent ext4 volume at
   `/vol/root`, read/write FAT32, bounded ext4 symbolic/hard links, quota-bound
   `/tmp`, live `/sys`, and crash-consistent state under `/vol/state`.
 - Ethernet, ARP, DHCP, IPv4, ICMP, UDP, and outbound TCP over virtio-net.
 - KEX applications for `arp`, `awk`, `cat`, `clear`, `dhcp`, `echo`, `grep`,
   `hexdump`, `ln`, `ls`, `lua`, `man`, `mem`, `mount`, `net`, `ping`, `printf`,
-  `pwd`, `rm`, `sed`, `sleep`, `tar`, `tcp`, `udp`, `wc`, and `write`.
+  `pwd`, `rm`, `sed`, `sleep`, `tar`, `tcp`, `udp`, and `wc`.
 
 Only `cd`, `poweroff`, and `reboot` are privileged shell intrinsics. Everything
 else is an immutable KEX application discovered from `/bin`.
@@ -63,11 +64,11 @@ Small by design. Alive on the wire.
 sh:/> printf 'first\nsecond\t%s\n' value | grep second
 second  value
 
-sh:/> echo alpha beta | grep beta | write /tmp/result
+sh:/> echo alpha beta | grep beta > /tmp/result
 sh:/> cat /tmp/result
 alpha beta
 
-sh:/> write /vol/root/note persistent
+sh:/> printf persistent > /vol/root/note
 sh:/> ln -s note /vol/root/latest
 sh:/> cat /vol/root/latest
 persistent
@@ -99,7 +100,7 @@ Every `cargo qemu` invocation also creates or preserves the sparse, exact 1 GiB
 this interchange disk is not rebuilt, so files survive normal QEMU launches:
 
 ```console
-sh:/> write /vol/shared/from-troe.txt hello-from-troe
+sh:/> printf hello-from-troe > /vol/shared/from-troe.txt
 sh:/> cat /vol/shared/from-troe.txt
 hello-from-troe
 ```

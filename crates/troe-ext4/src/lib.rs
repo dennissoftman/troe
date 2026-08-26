@@ -31,6 +31,17 @@ const EXT4_BITMAP_BITS: u32 = 32_768;
 const EXT4_ROOT_INO: u32 = 2;
 const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
 const EXT4_EXT_MAGIC: u16 = 0xf30a;
+const EXT4_INLINE_EXTENTS: usize = 4;
+const EXT4_EXTENT_HEADER_BYTES: usize = 12;
+const EXT4_EXTENT_RECORD_BYTES: usize = 12;
+const EXT4_EXTENT_TAIL_BYTES: usize = 4;
+const EXT4_LEAF_EXTENTS: usize =
+    (EXT4_BLOCK_BYTES - EXT4_EXTENT_HEADER_BYTES - EXT4_EXTENT_TAIL_BYTES)
+        / EXT4_EXTENT_RECORD_BYTES;
+const EXT4_EXTENT_TAIL_OFFSET: usize =
+    EXT4_EXTENT_HEADER_BYTES + EXT4_LEAF_EXTENTS * EXT4_EXTENT_RECORD_BYTES;
+const EXT4_ROOT_INDEXES: usize = 4;
+const EXT4_MAX_DEPTH_ONE_EXTENTS: usize = EXT4_LEAF_EXTENTS * EXT4_ROOT_INDEXES;
 const EXT4_FT_REG_FILE: u8 = 1;
 const EXT4_FT_DIR: u8 = 2;
 const EXT4_FT_SYMLINK: u8 = 7;
@@ -223,12 +234,19 @@ struct Layout {
     uuid: Ext4Uuid,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Extent {
     logical: u32,
     physical: u32,
     blocks: u16,
     unwritten: bool,
+}
+
+#[derive(Clone, Debug)]
+struct ParsedExtentRoot {
+    extents: Vec<Extent>,
+    tree_blocks: Vec<u32>,
+    tree_logicals: Vec<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -238,6 +256,8 @@ struct Inode {
     kind: NodeKind,
     size: u64,
     extents: Vec<Extent>,
+    extent_tree_blocks: Vec<u32>,
+    extent_tree_logicals: Vec<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -786,6 +806,65 @@ impl<D: BlockDevice> Ext4<D> {
         Ok(())
     }
 
+    fn release_extents(&mut self, extents: &[Extent]) -> Result<(), FsError> {
+        let mut released = false;
+        for extent in extents {
+            for offset in 0..u32::from(extent.blocks) {
+                self.set_block_allocated(
+                    extent
+                        .physical
+                        .checked_add(offset)
+                        .ok_or(FsError::Overflow)?,
+                    false,
+                )?;
+                released = true;
+            }
+        }
+        if released {
+            self.durability_barrier()?;
+        }
+        Ok(())
+    }
+
+    fn append_physical_blocks(
+        extents: &mut Vec<Extent>,
+        mut logical: u32,
+        blocks: &[u32],
+    ) -> Result<(), FsError> {
+        for physical in blocks.iter().copied() {
+            if let Some(last) = extents.last_mut() {
+                let logical_end = last
+                    .logical
+                    .checked_add(u32::from(last.blocks))
+                    .ok_or(FsError::Overflow)?;
+                let physical_end = last
+                    .physical
+                    .checked_add(u32::from(last.blocks))
+                    .ok_or(FsError::Overflow)?;
+                if logical_end == logical
+                    && physical_end == physical
+                    && last.blocks < 0x8000
+                    && !last.unwritten
+                {
+                    last.blocks += 1;
+                    logical = logical.checked_add(1).ok_or(FsError::Overflow)?;
+                    continue;
+                }
+            }
+            if extents.len() >= EXT4_MAX_DEPTH_ONE_EXTENTS {
+                return Err(FsError::NoSpace);
+            }
+            extents.push(Extent {
+                logical,
+                physical,
+                blocks: 1,
+                unwritten: false,
+            });
+            logical = logical.checked_add(1).ok_or(FsError::Overflow)?;
+        }
+        Ok(())
+    }
+
     fn inode_record_location(&mut self, number: u32) -> Result<(u32, usize), FsError> {
         if number == 0 || number > self.layout.inodes {
             return Err(FsError::Corrupt);
@@ -868,13 +947,15 @@ impl<D: BlockDevice> Ext4<D> {
     }
 
     fn extent_sector_count(raw: &[u8], volume_blocks: u32) -> Result<u64, FsError> {
-        parse_extents(raw.get(40..100).ok_or(FsError::Corrupt)?, volume_blocks)?
-            .iter()
-            .try_fold(0_u64, |total, extent| {
-                total
-                    .checked_add(u64::from(extent.blocks) * (EXT4_BLOCK_BYTES_U64 / 512))
-                    .ok_or(FsError::Overflow)
-            })
+        let parsed = parse_extents(raw.get(40..100).ok_or(FsError::Corrupt)?, volume_blocks)?;
+        if !parsed.tree_blocks.is_empty() {
+            return Err(FsError::Unsupported);
+        }
+        parsed.extents.iter().try_fold(0_u64, |total, extent| {
+            total
+                .checked_add(u64::from(extent.blocks) * (EXT4_BLOCK_BYTES_U64 / 512))
+                .ok_or(FsError::Overflow)
+        })
     }
 
     fn encode_inode_content(
@@ -951,6 +1032,138 @@ impl<D: BlockDevice> Ext4<D> {
         put_u16(raw, 42, extent_count)
     }
 
+    fn encode_inode_extent_records(
+        raw: &mut [u8],
+        size: u64,
+        extents: &[Extent],
+        tree_blocks: &[u32],
+        metadata_sectors: u64,
+    ) -> Result<(), FsError> {
+        let required_tree_blocks = if extents.len() <= EXT4_INLINE_EXTENTS {
+            0
+        } else {
+            extents.len().div_ceil(EXT4_LEAF_EXTENTS)
+        };
+        if extents.len() > EXT4_MAX_DEPTH_ONE_EXTENTS
+            || extents.iter().any(|extent| extent.unwritten)
+            || tree_blocks.len() != required_tree_blocks
+        {
+            return Err(FsError::NoSpace);
+        }
+        let size_bytes = size.to_le_bytes();
+        put_u32(
+            raw,
+            4,
+            u32::from_le_bytes(size_bytes[..4].try_into().map_err(|_| FsError::Overflow)?),
+        )?;
+        put_u32(
+            raw,
+            108,
+            u32::from_le_bytes(size_bytes[4..].try_into().map_err(|_| FsError::Overflow)?),
+        )?;
+        let data_blocks = extents.iter().try_fold(0_u64, |total, extent| {
+            total
+                .checked_add(u64::from(extent.blocks))
+                .ok_or(FsError::Overflow)
+        })?;
+        let sectors = data_blocks
+            .checked_add(u64::try_from(tree_blocks.len()).map_err(|_| FsError::Overflow)?)
+            .ok_or(FsError::Overflow)?
+            .checked_mul(EXT4_BLOCK_BYTES_U64 / 512)
+            .and_then(|data| data.checked_add(metadata_sectors))
+            .ok_or(FsError::Overflow)?;
+        put_u32(
+            raw,
+            28,
+            u32::try_from(sectors & u64::from(u32::MAX)).map_err(|_| FsError::Overflow)?,
+        )?;
+        put_u16(
+            raw,
+            116,
+            u16::try_from(sectors >> 32).map_err(|_| FsError::Overflow)?,
+        )?;
+        put_u32(raw, 32, read_u32(raw, 32)? | EXT4_EXTENTS_FL)?;
+        raw[40..100].fill(0);
+        put_u16(raw, 40, EXT4_EXT_MAGIC)?;
+        put_u16(raw, 44, 4)?;
+        if tree_blocks.is_empty() {
+            put_u16(
+                raw,
+                42,
+                u16::try_from(extents.len()).map_err(|_| FsError::Overflow)?,
+            )?;
+            for (index, extent) in extents.iter().enumerate() {
+                let offset = 52_usize
+                    .checked_add(index.checked_mul(12).ok_or(FsError::Overflow)?)
+                    .ok_or(FsError::Overflow)?;
+                put_u32(raw, offset, extent.logical)?;
+                put_u16(raw, offset + 4, extent.blocks)?;
+                put_u16(raw, offset + 6, 0)?;
+                put_u32(raw, offset + 8, extent.physical)?;
+            }
+        } else {
+            put_u16(
+                raw,
+                42,
+                u16::try_from(tree_blocks.len()).map_err(|_| FsError::Overflow)?,
+            )?;
+            put_u16(raw, 46, 1)?;
+            for (index, block) in tree_blocks.iter().copied().enumerate() {
+                let first_extent = extents
+                    .get(index * EXT4_LEAF_EXTENTS)
+                    .ok_or(FsError::Corrupt)?;
+                let offset = 52_usize
+                    .checked_add(index.checked_mul(12).ok_or(FsError::Overflow)?)
+                    .ok_or(FsError::Overflow)?;
+                put_u32(raw, offset, first_extent.logical)?;
+                put_u32(raw, offset + 4, block)?;
+                put_u16(raw, offset + 8, 0)?;
+                put_u16(raw, offset + 10, 0)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn encode_extent_leaf(
+        raw: &mut [u8],
+        extents: &[Extent],
+        checksum_seed: u32,
+        inode_number: u32,
+        inode_generation: u32,
+    ) -> Result<(), FsError> {
+        if raw.len() != EXT4_BLOCK_BYTES || extents.is_empty() || extents.len() > EXT4_LEAF_EXTENTS
+        {
+            return Err(FsError::Invalid);
+        }
+        raw.fill(0);
+        put_u16(raw, 0, EXT4_EXT_MAGIC)?;
+        put_u16(
+            raw,
+            2,
+            u16::try_from(extents.len()).map_err(|_| FsError::Overflow)?,
+        )?;
+        put_u16(
+            raw,
+            4,
+            u16::try_from(EXT4_LEAF_EXTENTS).map_err(|_| FsError::Overflow)?,
+        )?;
+        for (index, extent) in extents.iter().enumerate() {
+            let offset = 12_usize
+                .checked_add(index.checked_mul(12).ok_or(FsError::Overflow)?)
+                .ok_or(FsError::Overflow)?;
+            put_u32(raw, offset, extent.logical)?;
+            put_u16(raw, offset + 4, extent.blocks)?;
+            put_u16(raw, offset + 6, 0)?;
+            put_u32(raw, offset + 8, extent.physical)?;
+        }
+        let inode_seed = crc32c(
+            crc32c(checksum_seed, &inode_number.to_le_bytes()),
+            &inode_generation.to_le_bytes(),
+        );
+        let checksum = crc32c(inode_seed, &raw[..EXT4_EXTENT_TAIL_OFFSET]);
+        put_u32(raw, EXT4_EXTENT_TAIL_OFFSET, checksum)
+    }
+
     fn refresh_inode_checksum(&self, raw: &mut [u8], number: u32) -> Result<(), FsError> {
         raw[124..126].fill(0);
         raw[130..132].fill(0);
@@ -1007,6 +1220,142 @@ impl<D: BlockDevice> Ext4<D> {
         Self::encode_inode_content(raw, size, blocks, metadata_sectors)?;
         self.refresh_inode_checksum(raw, number)?;
         self.write_fs_block(table_block, &table)
+    }
+
+    fn write_inode_extent_records(
+        &mut self,
+        number: u32,
+        kind: NodeKind,
+        size: u64,
+        extents: &[Extent],
+        existing: &Inode,
+    ) -> Result<(), FsError> {
+        if existing.number != number || existing.kind != kind {
+            return Err(FsError::Corrupt);
+        }
+        let tree_count = if extents.len() <= EXT4_INLINE_EXTENTS {
+            0
+        } else {
+            extents.len().div_ceil(EXT4_LEAF_EXTENTS)
+        };
+        if tree_count > EXT4_ROOT_INDEXES {
+            return Err(FsError::NoSpace);
+        }
+        let reuse_tree = tree_count != 0 && tree_count == existing.extent_tree_blocks.len();
+        let tree_blocks = if reuse_tree {
+            existing.extent_tree_blocks.clone()
+        } else {
+            let tree_zeroes = alloc::vec![0_u8; tree_count * EXT4_BLOCK_BYTES];
+            self.allocate_file_blocks(&tree_zeroes)?
+        };
+        for (index, block) in tree_blocks.iter().copied().enumerate() {
+            let start = index * EXT4_LEAF_EXTENTS;
+            let end = (start + EXT4_LEAF_EXTENTS).min(extents.len());
+            let mut leaf = [0_u8; EXT4_BLOCK_BYTES];
+            Self::encode_extent_leaf(
+                &mut leaf,
+                &extents[start..end],
+                self.layout.checksum_seed,
+                number,
+                existing.generation,
+            )?;
+            if let Err(error) = self.write_fs_block(block, &leaf) {
+                if !reuse_tree {
+                    let _ignored = self.release_blocks(&tree_blocks);
+                }
+                return Err(error);
+            }
+        }
+        let (table_block, offset) = self.inode_record_location(number)?;
+        let mut table = self.read_fs_block(table_block)?;
+        let raw = table
+            .get_mut(offset..offset + EXT4_INODE_BYTES)
+            .ok_or(FsError::Corrupt)?;
+        let data_blocks = existing.extents.iter().try_fold(0_u64, |total, extent| {
+            total
+                .checked_add(u64::from(extent.blocks))
+                .ok_or(FsError::Overflow)
+        })?;
+        let allocated_sectors = data_blocks
+            .checked_add(
+                u64::try_from(existing.extent_tree_blocks.len()).map_err(|_| FsError::Overflow)?,
+            )
+            .and_then(|blocks| blocks.checked_mul(EXT4_BLOCK_BYTES_U64 / 512))
+            .ok_or(FsError::Overflow)?;
+        let metadata_sectors = Self::inode_sector_count(raw)?
+            .checked_sub(allocated_sectors)
+            .ok_or(FsError::Corrupt)?;
+        Self::encode_inode_extent_records(raw, size, extents, &tree_blocks, metadata_sectors)?;
+        self.refresh_inode_checksum(raw, number)?;
+        if let Err(error) = self
+            .write_fs_block(table_block, &table)
+            .and_then(|()| self.durability_barrier())
+        {
+            if !reuse_tree {
+                let _ignored = self.release_blocks(&tree_blocks);
+            }
+            return Err(error);
+        }
+        if reuse_tree {
+            Ok(())
+        } else {
+            self.release_blocks(&existing.extent_tree_blocks)
+        }
+    }
+
+    fn append_regular_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), FsError> {
+        self.ensure_writable()?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let inode = self.resolve(path)?;
+        if inode.kind != NodeKind::File {
+            return Err(FsError::WrongType);
+        }
+        let added = u64::try_from(bytes.len()).map_err(|_| FsError::Overflow)?;
+        let next_size = inode.size.checked_add(added).ok_or(FsError::Overflow)?;
+        if next_size > self.limits.max_file_bytes() {
+            return Err(FsError::NoSpace);
+        }
+        self.begin_mutation()?;
+        let partial =
+            usize::try_from(inode.size % EXT4_BLOCK_BYTES_U64).map_err(|_| FsError::Overflow)?;
+        let mut consumed = 0_usize;
+        if partial != 0 {
+            let logical =
+                u32::try_from(inode.size / EXT4_BLOCK_BYTES_U64).map_err(|_| FsError::NoSpace)?;
+            let logical = logical.checked_sub(1).ok_or(FsError::Corrupt)?;
+            let (physical, unwritten) = map_block(&inode, logical)?.ok_or(FsError::Corrupt)?;
+            if unwritten {
+                return Err(FsError::Corrupt);
+            }
+            let mut block = self.read_fs_block(physical)?;
+            consumed = bytes.len().min(EXT4_BLOCK_BYTES - partial);
+            block[partial..partial + consumed].copy_from_slice(&bytes[..consumed]);
+            self.write_fs_block(physical, &block)?;
+        }
+        let new_blocks = self.allocate_file_blocks(&bytes[consumed..])?;
+        let mut extents = inode.extents.clone();
+        let logical = u32::try_from(
+            inode
+                .size
+                .checked_add(EXT4_BLOCK_BYTES_U64 - 1)
+                .ok_or(FsError::Overflow)?
+                / EXT4_BLOCK_BYTES_U64,
+        )
+        .map_err(|_| FsError::NoSpace)?;
+        if let Err(error) = Self::append_physical_blocks(&mut extents, logical, &new_blocks) {
+            let _ignored = self.release_blocks(&new_blocks);
+            return Err(error);
+        }
+        if let Err(error) = self
+            .write_inode_extent_records(inode.number, NodeKind::File, next_size, &extents, &inode)
+            .and_then(|()| self.durability_barrier())
+        {
+            let _ignored = self.release_blocks(&new_blocks);
+            return Err(error);
+        }
+        self.finish_mutation()
     }
 
     fn raw_inode_record(&mut self, number: u32) -> Result<[u8; EXT4_INODE_BYTES], FsError> {
@@ -1171,7 +1520,50 @@ impl<D: BlockDevice> Ext4<D> {
         let raw = block
             .get(offset..offset + EXT4_INODE_BYTES)
             .ok_or(FsError::Corrupt)?;
-        parse_inode(raw, number, self.layout, self.limits)
+        let mut inode = parse_inode(raw, number, self.layout, self.limits)?;
+        if !inode.extent_tree_blocks.is_empty() {
+            let mut extents = Vec::new();
+            for (index, block) in inode.extent_tree_blocks.iter().copied().enumerate() {
+                let leaf = self.read_fs_block(block)?;
+                let parsed = parse_extent_leaf(
+                    &leaf,
+                    self.layout.blocks,
+                    self.layout.checksum_seed,
+                    inode.number,
+                    inode.generation,
+                )?;
+                if parsed.first().map(|extent| extent.logical)
+                    != inode.extent_tree_logicals.get(index).copied()
+                {
+                    return Err(FsError::Corrupt);
+                }
+                extents
+                    .try_reserve_exact(parsed.len())
+                    .map_err(|_| FsError::NoSpace)?;
+                extents.extend_from_slice(&parsed);
+            }
+            let file_blocks = inode
+                .size
+                .checked_add(EXT4_BLOCK_BYTES_U64 - 1)
+                .ok_or(FsError::Overflow)?
+                / EXT4_BLOCK_BYTES_U64;
+            let mut previous_end = 0_u32;
+            for extent in &extents {
+                let end = extent
+                    .logical
+                    .checked_add(u32::from(extent.blocks))
+                    .ok_or(FsError::Overflow)?;
+                if extent.logical < previous_end
+                    || u64::from(end) > file_blocks
+                    || (inode.kind != NodeKind::File && extent.unwritten)
+                {
+                    return Err(FsError::Corrupt);
+                }
+                previous_end = end;
+            }
+            inode.extents = extents;
+        }
+        Ok(inode)
     }
 
     fn read_inode_payload(
@@ -1671,6 +2063,30 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Ext4<D> {
         })
     }
 
+    fn truncate_file(&mut self, path: &str) -> Result<(), FsError> {
+        match self.resolve(path) {
+            Ok(inode) => {
+                if inode.kind != NodeKind::File {
+                    return Err(FsError::WrongType);
+                }
+                self.begin_mutation()?;
+                self.write_inode_extent_records(inode.number, NodeKind::File, 0, &[], &inode)?;
+                self.release_extents(&inode.extents)?;
+                self.finish_mutation()
+            }
+            Err(FsError::NotFound) => self.write_file(path, &[]),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn append_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), FsError> {
+        self.append_regular_file(path, bytes)
+    }
+
+    fn sync_file(&mut self, _path: &str) -> Result<(), FsError> {
+        self.durability_barrier()
+    }
+
     fn write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), FsError> {
         self.ensure_writable()?;
         if u64::try_from(bytes.len()).map_err(|_| FsError::NoSpace)? > self.limits.max_file_bytes()
@@ -1689,7 +2105,8 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Ext4<D> {
             if inode.kind != NodeKind::File {
                 return Err(FsError::WrongType);
             }
-            let old_blocks = Self::physical_inode_blocks(&inode)?;
+            let old_extents = inode.extents.clone();
+            let old_tree_blocks = inode.extent_tree_blocks.clone();
             self.begin_mutation()?;
             let new_blocks = self.allocate_file_blocks(bytes)?;
             if let Err(error) = self
@@ -1705,7 +2122,8 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Ext4<D> {
                 let _ignored = self.release_blocks(&new_blocks);
                 return Err(error);
             }
-            self.release_blocks(&old_blocks)?;
+            self.release_extents(&old_extents)?;
+            self.release_blocks(&old_tree_blocks)?;
             return self.finish_mutation();
         }
 
@@ -1860,9 +2278,6 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Ext4<D> {
             // bounded refcount/checksum mutation, which is outside ext4-v1.
             return Err(FsError::Unsupported);
         }
-        let blocks = (links == 1)
-            .then(|| Self::physical_inode_blocks(&inode))
-            .transpose()?;
         self.begin_mutation()?;
         let removed = self.remove_directory_entry(&parent, &name)?;
         if removed.inode != inode.number {
@@ -1873,7 +2288,8 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Ext4<D> {
             self.durability_barrier()?;
             return self.finish_mutation();
         }
-        self.release_blocks(blocks.as_deref().ok_or(FsError::Corrupt)?)?;
+        self.release_extents(&inode.extents)?;
+        self.release_blocks(&inode.extent_tree_blocks)?;
         self.clear_inode_record(inode.number)?;
         self.set_inode_allocated(inode.number, false)?;
         self.durability_barrier()?;
@@ -2105,11 +2521,15 @@ fn parse_inode(
     let inline_symlink = kind == NodeKind::Symlink
         && size <= u64::try_from(EXT4_FAST_SYMLINK_BYTES).map_err(|_| FsError::Overflow)?
         && inode_sectors == symlink_metadata_sectors;
-    let extents = if inline_symlink {
+    let parsed_extents = if inline_symlink {
         if flags & EXT4_EXTENTS_FL != 0 {
             return Err(FsError::Corrupt);
         }
-        Vec::new()
+        ParsedExtentRoot {
+            extents: Vec::new(),
+            tree_blocks: Vec::new(),
+            tree_logicals: Vec::new(),
+        }
     } else {
         if flags & EXT4_EXTENTS_FL == 0 {
             return Err(FsError::Corrupt);
@@ -2120,7 +2540,7 @@ fn parse_inode(
         .checked_add(EXT4_BLOCK_BYTES_U64 - 1)
         .ok_or(FsError::Overflow)?
         / EXT4_BLOCK_BYTES_U64;
-    for extent in &extents {
+    for extent in &parsed_extents.extents {
         let end = u64::from(extent.logical) + u64::from(extent.blocks);
         if end > file_blocks || (kind != NodeKind::File && extent.unwritten) {
             return Err(FsError::Corrupt);
@@ -2131,22 +2551,59 @@ fn parse_inode(
         generation,
         kind,
         size,
-        extents,
+        extents: parsed_extents.extents,
+        extent_tree_blocks: parsed_extents.tree_blocks,
+        extent_tree_logicals: parsed_extents.tree_logicals,
     })
 }
 
-fn parse_extents(raw: &[u8], volume_blocks: u32) -> Result<Vec<Extent>, FsError> {
+fn parse_extents(raw: &[u8], volume_blocks: u32) -> Result<ParsedExtentRoot, FsError> {
     if raw.len() != 60
         || read_u16(raw, 0)? != EXT4_EXT_MAGIC
         || read_u16(raw, 4)? != 4
-        || read_u16(raw, 6)? != 0
         || read_u32(raw, 8)? != 0
     {
         return Err(FsError::Unsupported);
     }
     let count = read_u16(raw, 2)?;
+    let depth = read_u16(raw, 6)?;
     if count > 4 {
         return Err(FsError::Corrupt);
+    }
+    if depth == 1 {
+        let mut tree_blocks = Vec::new();
+        tree_blocks
+            .try_reserve_exact(usize::from(count))
+            .map_err(|_| FsError::NoSpace)?;
+        let mut tree_logicals = Vec::new();
+        tree_logicals
+            .try_reserve_exact(usize::from(count))
+            .map_err(|_| FsError::NoSpace)?;
+        let mut previous_logical = None;
+        for index in 0..count {
+            let offset = 12 + usize::from(index) * 12;
+            let logical = read_u32(raw, offset)?;
+            let physical = read_u32(raw, offset + 4)?;
+            let physical_high = read_u16(raw, offset + 8)?;
+            if physical == 0
+                || physical >= volume_blocks
+                || physical_high != 0
+                || previous_logical.is_some_and(|previous| logical <= previous)
+            {
+                return Err(FsError::Corrupt);
+            }
+            previous_logical = Some(logical);
+            tree_logicals.push(logical);
+            tree_blocks.push(physical);
+        }
+        return Ok(ParsedExtentRoot {
+            extents: Vec::new(),
+            tree_blocks,
+            tree_logicals,
+        });
+    }
+    if depth != 0 {
+        return Err(FsError::Unsupported);
     }
     let mut extents = Vec::new();
     extents
@@ -2155,6 +2612,81 @@ fn parse_extents(raw: &[u8], volume_blocks: u32) -> Result<Vec<Extent>, FsError>
     let mut previous_end = 0_u32;
     for index in 0..count {
         let offset = 12 + usize::from(index) * 12;
+        let logical = read_u32(raw, offset)?;
+        let encoded_blocks = read_u16(raw, offset + 4)?;
+        let physical_high = read_u16(raw, offset + 6)?;
+        let physical = read_u32(raw, offset + 8)?;
+        let unwritten = encoded_blocks > 0x8000;
+        let blocks = if unwritten {
+            encoded_blocks - 0x8000
+        } else {
+            encoded_blocks
+        };
+        let logical_end = logical
+            .checked_add(u32::from(blocks))
+            .ok_or(FsError::Overflow)?;
+        let physical_end = physical
+            .checked_add(u32::from(blocks))
+            .ok_or(FsError::Overflow)?;
+        if blocks == 0
+            || physical_high != 0
+            || physical == 0
+            || physical_end > volume_blocks
+            || (index != 0 && logical < previous_end)
+        {
+            return Err(FsError::Corrupt);
+        }
+        extents.push(Extent {
+            logical,
+            physical,
+            blocks,
+            unwritten,
+        });
+        previous_end = logical_end;
+    }
+    Ok(ParsedExtentRoot {
+        extents,
+        tree_blocks: Vec::new(),
+        tree_logicals: Vec::new(),
+    })
+}
+
+fn parse_extent_leaf(
+    raw: &[u8],
+    volume_blocks: u32,
+    checksum_seed: u32,
+    inode_number: u32,
+    inode_generation: u32,
+) -> Result<Vec<Extent>, FsError> {
+    if raw.len() != EXT4_BLOCK_BYTES
+        || read_u16(raw, 0)? != EXT4_EXT_MAGIC
+        || read_u16(raw, 4)? != u16::try_from(EXT4_LEAF_EXTENTS).map_err(|_| FsError::Overflow)?
+        || read_u16(raw, 6)? != 0
+        || read_u32(raw, 8)? != 0
+    {
+        return Err(FsError::Unsupported);
+    }
+    let count = usize::from(read_u16(raw, 2)?);
+    if count == 0 || count > EXT4_LEAF_EXTENTS {
+        return Err(FsError::Corrupt);
+    }
+    let stored_checksum = read_u32(raw, EXT4_EXTENT_TAIL_OFFSET)?;
+    let inode_seed = crc32c(
+        crc32c(checksum_seed, &inode_number.to_le_bytes()),
+        &inode_generation.to_le_bytes(),
+    );
+    if stored_checksum != crc32c(inode_seed, &raw[..EXT4_EXTENT_TAIL_OFFSET]) {
+        return Err(FsError::Corrupt);
+    }
+    let mut extents = Vec::new();
+    extents
+        .try_reserve_exact(count)
+        .map_err(|_| FsError::NoSpace)?;
+    let mut previous_end = 0_u32;
+    for index in 0..count {
+        let offset = 12_usize
+            .checked_add(index.checked_mul(12).ok_or(FsError::Overflow)?)
+            .ok_or(FsError::Overflow)?;
         let logical = read_u32(raw, offset)?;
         let encoded_blocks = read_u16(raw, offset + 4)?;
         let physical_high = read_u16(raw, offset + 6)?;
@@ -2446,6 +2978,7 @@ mod tests {
     use alloc::format;
     use alloc::string::{String, ToString};
     use alloc::vec;
+    use alloc::vec::Vec;
     use std::fs::{self, File, OpenOptions};
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::path::{Path, PathBuf};
@@ -2455,9 +2988,10 @@ mod tests {
 
     use super::{
         BlockDevice, BlockRegion, CRC32C_POLYNOMIAL, EXT4_BLOCK_BYTES, EXT4_BLOCK_BYTES_U32,
-        EXT4_EXTENTS_FL, EXT4_FAST_SYMLINK_BYTES, EXT4_FEATURE_COMPAT, EXT4_FEATURE_INCOMPAT,
-        EXT4_FEATURE_RO_COMPAT, EXT4_INODE_BYTES, EXT4_ROOT_INO, EXT4_VALID_FS, Ext4, Ext4Limits,
-        FsError, NodeKind, ReadOnlyFileSystem, crc32c, read_u16, read_u32,
+        EXT4_EXTENT_TAIL_OFFSET, EXT4_EXTENTS_FL, EXT4_FAST_SYMLINK_BYTES, EXT4_FEATURE_COMPAT,
+        EXT4_FEATURE_INCOMPAT, EXT4_FEATURE_RO_COMPAT, EXT4_INODE_BYTES, EXT4_ROOT_INO,
+        EXT4_VALID_FS, Ext4, Ext4Limits, Extent, FsError, NodeKind, ReadOnlyFileSystem, crc32c,
+        parse_extent_leaf, parse_extents, read_u16, read_u32,
     };
 
     const DEVICE_BLOCK_BYTES_U32: u32 = 512;
@@ -2664,6 +3198,45 @@ mod tests {
         Ext4Limits::new(1, 16, 8, 32, 64 * 1024, 4096, 64)
     }
 
+    #[test]
+    fn depth_one_extent_metadata_describes_two_gib_without_payload_staging() -> Result<(), FsError>
+    {
+        let mut extents = Vec::new();
+        for index in 0..16_u32 {
+            extents.push(Extent {
+                logical: index * 0x8000,
+                physical: 10 + index * 0x8000,
+                blocks: 0x8000,
+                unwritten: false,
+            });
+        }
+        let mut raw = [0_u8; EXT4_INODE_BYTES];
+        Ext4::<SparseDevice>::encode_inode_extent_records(
+            &mut raw,
+            2 * 1024 * 1024 * 1024,
+            &extents,
+            &[600_000],
+            0,
+        )?;
+        let root = parse_extents(&raw[40..100], 700_000)?;
+        assert_eq!(root.tree_blocks, [600_000]);
+        assert_eq!(root.tree_logicals, [0]);
+
+        let mut leaf = [0_u8; EXT4_BLOCK_BYTES];
+        let seed = crc32c(u32::MAX, &UUID);
+        Ext4::<SparseDevice>::encode_extent_leaf(&mut leaf, &extents, seed, 3, FILE_GENERATION)?;
+        assert_eq!(
+            parse_extent_leaf(&leaf, 700_000, seed, 3, FILE_GENERATION)?,
+            extents
+        );
+        leaf[EXT4_EXTENT_TAIL_OFFSET] ^= 1;
+        assert_eq!(
+            parse_extent_leaf(&leaf, 700_000, seed, 3, FILE_GENERATION),
+            Err(FsError::Corrupt)
+        );
+        Ok(())
+    }
+
     fn mount(device: SparseDevice) -> Result<Ext4<SparseDevice>, FsError> {
         let block_limits = BlockLimits::new(8, EXT4_BLOCK_BYTES, 1).map_err(|_| FsError::Io)?;
         let region = BlockRegion::whole_device(device, BlockAccess::ReadOnly, block_limits)
@@ -2689,13 +3262,19 @@ mod tests {
     }
 
     fn mount_file_writable(path: &Path) -> Result<Ext4<FileDevice>, String> {
+        mount_file_writable_with_limits(path, limits().map_err(|error| error.to_string())?)
+    }
+
+    fn mount_file_writable_with_limits(
+        path: &Path,
+        limits: Ext4Limits,
+    ) -> Result<Ext4<FileDevice>, String> {
         let device = FileDevice::open_writable(path)?;
         let block_limits = BlockLimits::new(8, EXT4_BLOCK_BYTES, 1)
             .map_err(|error| format!("invalid block limits: {error:?}"))?;
         let region = BlockRegion::whole_device(device, BlockAccess::ReadWrite, block_limits)
             .map_err(|error| format!("cannot grant writable image region: {error:?}"))?;
-        Ext4::mount(region, limits().map_err(|error| error.to_string())?)
-            .map_err(|error| error.to_string())
+        Ext4::mount(region, limits).map_err(|error| error.to_string())
     }
 
     fn e2fs_tool(name: &str) -> Option<PathBuf> {
@@ -3487,5 +4066,79 @@ mod tests {
 
         drop(ext4);
         verify_writer_interoperability(&image, &e2fsck)
+    }
+
+    #[test]
+    #[ignore = "writes and verifies a 128 MiB real ext4 file"]
+    fn streams_128_mib_to_real_ext4_with_bounded_chunks() -> Result<(), String> {
+        const IMAGE_BYTES: u64 = 256 * 1024 * 1024;
+        const FILE_BYTES: u64 = 128 * 1024 * 1024;
+        const CHUNK_BYTES: usize = 1024 * 1024;
+        let Some(mke2fs) = e2fs_tool("mke2fs") else {
+            return unavailable_tool("mke2fs");
+        };
+        let Some(e2fsck) = e2fs_tool("e2fsck") else {
+            return unavailable_tool("e2fsck");
+        };
+        let temporary = TestDirectory::create("ext4-large-stream")?;
+        let image = temporary.path().join("filesystem.ext4");
+        File::create(&image)
+            .and_then(|file| file.set_len(IMAGE_BYTES))
+            .map_err(|error| error.to_string())?;
+        let format = Command::new(mke2fs)
+            .args([
+                "-q",
+                "-F",
+                "-t",
+                "ext4",
+                "-b",
+                "4096",
+                "-I",
+                "256",
+                "-O",
+                "none,has_journal,ext_attr,extent,filetype,sparse_super,large_file,extra_isize,metadata_csum",
+                "-E",
+                "lazy_itable_init=0,lazy_journal_init=0",
+            ])
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&format, "mke2fs for large stream")?;
+
+        let stress_limits = Ext4Limits::new(8, 32, 16, 128, IMAGE_BYTES, CHUNK_BYTES, 64)
+            .map_err(|error| error.to_string())?;
+        let mut ext4 = mount_file_writable_with_limits(&image, stress_limits)?;
+        ext4.truncate_file("/large.bin")
+            .map_err(|error| error.to_string())?;
+        let chunk = vec![0x5a; CHUNK_BYTES];
+        for _ in 0..FILE_BYTES / CHUNK_BYTES as u64 {
+            ext4.append_file("/large.bin", &chunk)
+                .map_err(|error| error.to_string())?;
+        }
+        ext4.sync_file("/large.bin")
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            ext4.metadata("/large.bin")
+                .map_err(|error| error.to_string())?
+                .byte_count,
+            FILE_BYTES
+        );
+        for offset in [0, FILE_BYTES / 2, FILE_BYTES - 4096] {
+            let mut sample = [0_u8; 4096];
+            assert_eq!(
+                ext4.read_file("/large.bin", offset, &mut sample)
+                    .map_err(|error| error.to_string())?,
+                sample.len()
+            );
+            assert!(sample.iter().all(|byte| *byte == 0x5a));
+        }
+        drop(ext4);
+
+        let check = Command::new(e2fsck)
+            .args(["-fn"])
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&check, "e2fsck after 128 MiB streamed write")
     }
 }

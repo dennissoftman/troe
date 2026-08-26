@@ -8,7 +8,8 @@ host stdin/stdout ───────────┐                 ┌─ ho
 serial / PS/2 → IRQ → bounded queue → editor ─┘  └─ UART + GOP text console
 ```
 
-The shell owns parsing, pipelines, completion, cwd, and three intrinsics.
+The shell owns parsing, pipelines, streamed file redirection, completion, cwd,
+and three intrinsics.
 Ordinary commands always load an immutable architecture-specific KEX artifact
 into a fresh ring-3/EL0 address space and route cwd/argv, standard streams, and
 declared optional services through generation-owned synchronous message dispatch
@@ -38,17 +39,23 @@ firmware fails before device publication or volatile I/O.
    enforces its UTF-8 byte bound, cursor-aware editing, volatile history limits,
    and decoded key events; ANSI serial input and x86 set-1 PS/2 input feed the
    same event type outside interrupt context.
-2. The shell crate tokenizes iteratively. Quotes group bytes; no expansion,
-   recursion, substitution, environment lookup, or globbing occurs.
+2. The shell crate tokenizes iteratively. Single and double quotes group literal
+   bytes; no expansion, recursion, substitution, environment lookup, or
+   globbing occurs. Unquoted `<`, `>`, and `>>` select bounded-memory file
+   streams.
 3. The pipeline executor protects shell intrinsics, then resolves the exact KEX
    command path. Absence reports an unavailable application and never selects
    privileged utility behavior. KEX receives bounded stdin/stdout/stderr streams
-   plus only declared optional datagram, read-only VFS, complete-file mutation,
+   plus only declared optional datagram, read-only VFS, streamed file mutation,
    monotonic timer, diagnostics, network-observation, DHCP, ICMP, or outbound
    TCP-connect handles;
    never ambient `Shell`, provider, block, device, or machine authority.
-4. Each non-final command writes to a `BoundedOutput`. The next stage reads the
-   frozen result through `SliceInput`; a stage cannot observe mutable internals.
+4. Each non-final command writes to a dynamically growing, 1 MiB-bounded
+   `BoundedOutput`. The next stage reads the frozen result through `SliceInput`;
+   a stage cannot observe mutable internals. Final output redirection instead
+   range-reads or incrementally writes the namespace with a 16 KiB default
+   buffer. Applications may request power-of-two chunks from 4 KiB to 1 MiB;
+   file length is governed by the provider format, media, and configured quota.
 5. Filesystem commands ask `Namespace` to canonicalize from the logical cwd.
    Immutable KEFS nodes and writable `/tmp` nodes share one object model.
    The recovery root keeps executables in `/bin`, system configuration in
@@ -256,15 +263,15 @@ no fixed lifetime heap-size policy is applied.
 The Stage 9 command slice installs one canonical package per command. Its KCAP
 manifest is validated from the same staged file before optional services are
 constructed, and its embedded KEX v1 executable is validated before mapping.
-It layers four required ABI 1.0 services on that mechanism: immutable cwd/argv,
-stdin, stdout, and stderr. The shell logically yields while
+It layers command-invocation 1.0 and standard-stream 1.1 services on that
+mechanism: immutable cwd/argv, stdin, stdout, and stderr. The shell logically yields while
 one foreground application runs, then resumes only after owner-wide handle
 revocation, record reaping, page zeroization, and exact frame return. Artifacts
 are read from target-selected `/bin/<name>.kex`; absence is a terminal not-found
-result. Service replies, per-stream bytes, and total resumed steps all have hard
-ceilings. Optional interfaces expose only bounded IPv4/UDP
-send/receive, read-only VFS operations, one atomic complete-file mutation
-transaction, a boot-relative monotonic timer, one immutable typed diagnostics
+result. Service payloads and total resumed steps have hard ceilings; standard
+streams themselves forward without an aggregate byte cap. Optional interfaces
+expose only bounded IPv4/UDP send/receive, read-only VFS operations, one
+sequential streamed file mutation, a boot-relative monotonic timer, one immutable typed diagnostics
    snapshot, read-only typed network observation, one DHCP exchange, one ICMP
    echo exchange, or one literal-IPv4 outbound TCP stream. Network observation,
    configuration, echo, datagrams, and TCP are independent authorities; none
@@ -272,8 +279,9 @@ transaction, a boot-relative monotonic timer, one immutable typed diagnostics
 ports are exclusive to the launch; read-only
 open tokens are generation-checked and limited to eight; directory traversal is
 lexically paginated and final-component link targets are bounded. Mutation
-staging is sequential, capped at 1 MiB, and discarded on teardown unless
-atomically committed; empty-directory creation is a separate bounded operation.
+working state is sequential, 16 KiB by default, and selectable through 1 MiB;
+teardown does not roll back already written bytes. Empty-directory creation is
+a separate bounded operation.
 Timer waits are foreground
 and cancellable; diagnostics retains fixed copied bytes rather than accounting
    borrows. TCP retains at most one unacknowledged 1,460-byte segment and one
@@ -337,12 +345,12 @@ traffic; no packet-declared allocation or unbounded device wait enters either
 side of the boundary.
 
 KEFS is the intentionally built-in recovery exception. The current FAT12 image
-is read by firmware. General FAT12/16/32, exFAT, the default persistent ext4
-profile, and later NTFS support are separate providers; the first exact ext4
-read/write subset is fixed by ADR 0017. Before dynamic loading
-they may be statically selected crates, and later writable providers should run
-as capability-scoped services. An image does not carry providers it did not
-select.
+is read by firmware. FAT32 and the default persistent ext4 profile are the
+implemented runtime providers; general FAT12/16, exFAT, and later NTFS remain
+separate future providers. The first exact ext4 read/write subset is fixed by
+ADR 0017. Before dynamic loading, providers may be statically selected crates,
+and later writable providers should run as capability-scoped services. An image
+does not carry providers it did not select.
 
 An external filesystem provider may be packaged under its own declared license,
 but the module label alone is not a license boundary. Differently licensed

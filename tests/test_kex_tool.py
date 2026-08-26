@@ -115,7 +115,7 @@ class KexToolTests(unittest.TestCase):
                     if command == "udp":
                         expected = [(5, 1, 0)]
                     elif command == "tar":
-                        expected = [(6, 1, 2), (7, 1, 3)]
+                        expected = [(6, 1, 2), (7, 2, 0)]
                     elif command in {
                         "awk",
                         "cat",
@@ -128,8 +128,8 @@ class KexToolTests(unittest.TestCase):
                         "wc",
                     }:
                         expected = [(6, 1, 2)]
-                    elif command in {"ln", "rm", "write"}:
-                        expected = [(7, 1, 3)]
+                    elif command in {"ln", "rm"}:
+                        expected = [(7, 2, 0)]
                     elif command == "sleep":
                         expected = [(8, 1, 0)]
                     elif command == "mem":

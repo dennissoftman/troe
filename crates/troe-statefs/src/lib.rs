@@ -24,6 +24,7 @@ const PRESENT: u16 = 1;
 pub struct StateFs<D: BlockDevice> {
     store: DualSlotStore<D>,
     bytes: Option<Vec<u8>>,
+    pending: Option<Vec<u8>>,
 }
 
 impl<D: BlockDevice> core::fmt::Debug for StateFs<D> {
@@ -46,7 +47,11 @@ impl<D: BlockDevice> StateFs<D> {
     pub fn mount(region: BlockRegion<D>) -> Result<Self, FsError> {
         let store = DualSlotStore::open(region).map_err(map_persist)?;
         let bytes = store.payload().map(parse_image).transpose()?.flatten();
-        Ok(Self { store, bytes })
+        Ok(Self {
+            store,
+            bytes,
+            pending: None,
+        })
     }
 
     /// Newest committed filesystem transaction generation.
@@ -158,7 +163,53 @@ impl<D: BlockDevice> ReadOnlyFileSystem for StateFs<D> {
                 FsError::ReadOnly
             });
         }
+        self.pending = None;
         self.commit(Some(bytes))
+    }
+
+    fn truncate_file(&mut self, path: &str) -> Result<(), FsError> {
+        if path != STATE_PATH {
+            return Err(if path == "/" {
+                FsError::WrongType
+            } else {
+                FsError::ReadOnly
+            });
+        }
+        self.pending = Some(Vec::new());
+        Ok(())
+    }
+
+    fn append_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), FsError> {
+        if path != STATE_PATH {
+            return Err(FsError::ReadOnly);
+        }
+        let maximum = self.max_file_bytes();
+        if self.pending.is_none() {
+            self.pending = Some(self.bytes.clone().unwrap_or_default());
+        }
+        let pending = self.pending.as_mut().ok_or(FsError::Invalid)?;
+        let next = pending
+            .len()
+            .checked_add(bytes.len())
+            .ok_or(FsError::Overflow)?;
+        if next > maximum {
+            return Err(FsError::NoSpace);
+        }
+        pending
+            .try_reserve_exact(bytes.len())
+            .map_err(|_| FsError::NoSpace)?;
+        pending.extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn sync_file(&mut self, path: &str) -> Result<(), FsError> {
+        if path != STATE_PATH {
+            return Err(FsError::ReadOnly);
+        }
+        let Some(pending) = self.pending.take() else {
+            return Ok(());
+        };
+        self.commit(Some(&pending))
     }
 
     fn remove_file(&mut self, path: &str) -> Result<(), FsError> {
@@ -169,6 +220,7 @@ impl<D: BlockDevice> ReadOnlyFileSystem for StateFs<D> {
                 FsError::ReadOnly
             });
         }
+        self.pending = None;
         if self.bytes.is_none() {
             return Err(FsError::NotFound);
         }
@@ -342,7 +394,7 @@ mod tests {
     }
 
     #[test]
-    fn vfs_mutation_reopens_and_removes_atomically() -> Result<(), FsError> {
+    fn vfs_mutation_reopens_and_removes_durably() -> Result<(), FsError> {
         let device = MemoryDevice::new();
         let statefs = StateFs::mount(region(device.clone()).map_err(|_| FsError::Io)?)?;
         let mut namespace = Namespace::new(RamFsQuota::default());

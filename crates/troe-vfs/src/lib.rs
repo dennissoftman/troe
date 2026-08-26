@@ -9,7 +9,7 @@ use alloc::collections::BTreeMap;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::{fmt, str};
-use troe_core::{MemoryStats, PIPE_CAPACITY};
+use troe_core::MemoryStats;
 
 /// Maximum encoded path length.
 pub const MAX_PATH_BYTES: usize = 256;
@@ -21,6 +21,12 @@ pub const MAX_PATH_DEPTH: usize = 16;
 pub const KEFS_V1_MAGIC: [u8; 8] = *b"KEFSv1\0\0";
 const KEFS_HEADER_LEN: usize = 16;
 const PROVIDER_READ_CHUNK: usize = 4 * 1024;
+/// Default working-set target used when complete-file compatibility helpers stream.
+///
+/// This is four ext4 blocks. It is a transfer size, never a file-size ceiling.
+pub const FILE_IO_BUFFER_BYTES: usize = 16 * 1024;
+/// Largest app-selected file-stream aggregation size.
+pub const MAX_FILE_IO_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_PROVIDER_DIRECTORY_ENTRIES: usize = 1024;
 const MAX_PROVIDER_DIRECTORY_BYTES: usize = 64 * 1024;
 
@@ -144,7 +150,7 @@ pub trait ReadOnlyFileSystem: fmt::Debug {
         max_name_bytes: usize,
     ) -> Result<ProviderListing, FsError>;
 
-    /// Atomically create or replace one complete regular file.
+    /// Truncate an existing regular file or create an empty one.
     ///
     /// Read-only providers retain this default. A writable provider must not
     /// report success until its declared durability transaction completes.
@@ -153,8 +159,46 @@ pub trait ReadOnlyFileSystem: fmt::Debug {
     ///
     /// The default rejects every request as read-only. Writable providers
     /// report their bounded path, space, corruption, or transport failures.
-    fn write_file(&mut self, _path: &str, _bytes: &[u8]) -> Result<(), FsError> {
+    fn truncate_file(&mut self, _path: &str) -> Result<(), FsError> {
         Err(FsError::ReadOnly)
+    }
+
+    /// Append one nonempty chunk to a regular file.
+    ///
+    /// Providers must retain only bounded working state independent of the
+    /// resulting file size. The file may be partially extended if later I/O
+    /// fails, matching ordinary streamed file-write semantics.
+    ///
+    /// # Errors
+    ///
+    /// The default rejects every request as read-only. Writable providers
+    /// report format, media-capacity, corruption, or transport failures.
+    fn append_file(&mut self, _path: &str, _bytes: &[u8]) -> Result<(), FsError> {
+        Err(FsError::ReadOnly)
+    }
+
+    /// Complete and durably order a streamed file write.
+    ///
+    /// # Errors
+    ///
+    /// The default rejects every request as read-only.
+    fn sync_file(&mut self, _path: &str) -> Result<(), FsError> {
+        Err(FsError::ReadOnly)
+    }
+
+    /// Compatibility helper that replaces one complete regular file by
+    /// feeding it to the provider in bounded chunks.
+    ///
+    /// # Errors
+    ///
+    /// Reports the first truncate, append, or durability failure. A failure
+    /// after truncation can leave a prefix, as for a conventional write loop.
+    fn write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), FsError> {
+        self.truncate_file(path)?;
+        for chunk in bytes.chunks(FILE_IO_BUFFER_BYTES) {
+            self.append_file(path, chunk)?;
+        }
+        self.sync_file(path)
     }
 
     /// Create one empty directory without replacing an existing entry.
@@ -242,7 +286,7 @@ impl Default for RamFsQuota {
         Self {
             max_bytes: 1024 * 1024,
             max_nodes: 128,
-            max_file_bytes: 64 * 1024,
+            max_file_bytes: 1024 * 1024,
         }
     }
 }
@@ -513,7 +557,7 @@ impl Namespace {
         }
     }
 
-    /// Read a bounded file range without imposing the shell whole-file limit.
+    /// Read a bounded file range without retaining the complete file.
     ///
     /// # Errors
     ///
@@ -595,28 +639,31 @@ impl Namespace {
         Ok(bytes)
     }
 
-    /// Resolve and read one shell-sized complete file.
+    /// Resolve and read one complete file for compatibility callers.
+    ///
+    /// Stream-oriented callers should use [`Self::read_file_at`] so memory use
+    /// does not scale with file size.
     ///
     /// # Errors
     ///
     /// Fails if the path is invalid, missing, or not a file.
     pub fn read_file(&mut self, cwd: &str, path: &str) -> Result<Vec<u8>, FsError> {
-        self.read_file_bounded(cwd, path, PIPE_CAPACITY)
+        self.read_file_bounded(cwd, path, usize::MAX)
     }
 
-    /// Create or replace a RAMFS file. Each call is atomic with respect to quotas.
+    /// Truncate an existing writable file or create an empty one.
     ///
     /// # Errors
     ///
     /// Fails for invalid paths, immutable targets, missing parents, or quota exhaustion.
-    pub fn write_file(&mut self, cwd: &str, path: &str, bytes: &[u8]) -> Result<(), FsError> {
+    pub fn truncate_file(&mut self, cwd: &str, path: &str) -> Result<(), FsError> {
         let path = canonicalize(cwd, path)?;
         let changes_commands = is_command_path(&path);
         if let Some((index, relative)) = self.mount_for_path(&path) {
             if !self.mounts[index].writable {
                 return Err(FsError::ReadOnly);
             }
-            self.mounts[index].provider.write_file(&relative, bytes)?;
+            self.mounts[index].provider.truncate_file(&relative)?;
             if changes_commands {
                 self.bump_command_revision();
             }
@@ -624,9 +671,6 @@ impl Namespace {
         }
         if !is_under_tmp(&path) {
             return Err(FsError::ReadOnly);
-        }
-        if bytes.len() > self.quota.max_file_bytes {
-            return Err(FsError::NoSpace);
         }
         let parent = parent_path(&path).ok_or(FsError::Invalid)?;
         if !matches!(self.nodes.get(parent), Some(Node::Directory)) {
@@ -650,29 +694,129 @@ impl Namespace {
             .ramfs_bytes
             .checked_sub(old_len)
             .ok_or(FsError::Overflow)?;
-        let new_total = without_old
-            .checked_add(bytes.len())
-            .ok_or(FsError::Overflow)?;
-        if new_total > self.quota.max_bytes {
-            return Err(FsError::NoSpace);
-        }
-
         self.nodes.insert(
             path,
             Node::File {
-                bytes: bytes.to_vec(),
+                bytes: Vec::new(),
                 writable: true,
             },
         );
-        self.ramfs_bytes = new_total;
+        self.ramfs_bytes = without_old;
         if is_new {
             self.ramfs_nodes += 1;
         }
-        self.ramfs_high_water = self.ramfs_high_water.max(new_total);
         if changes_commands {
             self.bump_command_revision();
         }
         Ok(())
+    }
+
+    /// Append one chunk without retaining a second complete-file copy.
+    ///
+    /// RAMFS payload memory is the file's backing storage itself. Mounted
+    /// providers receive the chunk directly.
+    ///
+    /// # Errors
+    ///
+    /// Fails for invalid or immutable paths, wrong node types, quota/media
+    /// exhaustion, or provider I/O errors.
+    pub fn append_file(&mut self, cwd: &str, path: &str, bytes: &[u8]) -> Result<(), FsError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let path = canonicalize(cwd, path)?;
+        let changes_commands = is_command_path(&path);
+        if let Some((index, relative)) = self.mount_for_path(&path) {
+            if !self.mounts[index].writable {
+                return Err(FsError::ReadOnly);
+            }
+            self.mounts[index].provider.append_file(&relative, bytes)?;
+            if changes_commands {
+                self.bump_command_revision();
+            }
+            return Ok(());
+        }
+        if !is_under_tmp(&path) {
+            return Err(FsError::ReadOnly);
+        }
+        let current_len = match self.nodes.get(&path) {
+            Some(Node::File {
+                bytes,
+                writable: true,
+            }) => bytes.len(),
+            Some(Node::File { .. }) => return Err(FsError::ReadOnly),
+            Some(Node::Directory) => return Err(FsError::WrongType),
+            None => return Err(FsError::NotFound),
+        };
+        let next_len = current_len
+            .checked_add(bytes.len())
+            .ok_or(FsError::Overflow)?;
+        if next_len > self.quota.max_file_bytes {
+            return Err(FsError::NoSpace);
+        }
+        let next_total = self
+            .ramfs_bytes
+            .checked_add(bytes.len())
+            .ok_or(FsError::Overflow)?;
+        if next_total > self.quota.max_bytes {
+            return Err(FsError::NoSpace);
+        }
+        let Some(Node::File {
+            bytes: destination,
+            writable: true,
+        }) = self.nodes.get_mut(&path)
+        else {
+            return Err(FsError::Corrupt);
+        };
+        destination
+            .try_reserve_exact(bytes.len())
+            .map_err(|_| FsError::NoSpace)?;
+        destination.extend_from_slice(bytes);
+        self.ramfs_bytes = next_total;
+        self.ramfs_high_water = self.ramfs_high_water.max(next_total);
+        if changes_commands {
+            self.bump_command_revision();
+        }
+        Ok(())
+    }
+
+    /// Complete a streamed write and request provider durability.
+    ///
+    /// RAMFS needs no additional operation.
+    ///
+    /// # Errors
+    ///
+    /// Reports invalid paths, immutable mounts, or durability failures.
+    pub fn sync_file(&mut self, cwd: &str, path: &str) -> Result<(), FsError> {
+        let path = canonicalize(cwd, path)?;
+        if let Some((index, relative)) = self.mount_for_path(&path) {
+            if !self.mounts[index].writable {
+                return Err(FsError::ReadOnly);
+            }
+            return self.mounts[index].provider.sync_file(&relative);
+        }
+        match self.nodes.get(&path) {
+            Some(Node::File { writable: true, .. }) => Ok(()),
+            Some(Node::File { .. }) => Err(FsError::ReadOnly),
+            Some(Node::Directory) => Err(FsError::WrongType),
+            None => Err(FsError::NotFound),
+        }
+    }
+
+    /// Replace one complete file through the streaming provider interface.
+    ///
+    /// This compatibility helper never creates a second aggregate buffer; it
+    /// writes the caller-owned slice in [`FILE_IO_BUFFER_BYTES`] chunks.
+    ///
+    /// # Errors
+    ///
+    /// Reports the first truncate, append, or durability failure.
+    pub fn write_file(&mut self, cwd: &str, path: &str, bytes: &[u8]) -> Result<(), FsError> {
+        self.truncate_file(cwd, path)?;
+        for chunk in bytes.chunks(FILE_IO_BUFFER_BYTES) {
+            self.append_file(cwd, path, chunk)?;
+        }
+        self.sync_file(cwd, path)
     }
 
     /// Delete a writable file and release its complete quota charge.
@@ -1328,10 +1472,99 @@ mod tests {
         DirEntry, FileMetadata, FsError, KEFS_V1_MAGIC, Namespace, NodeKind, ProviderListing,
         RamFsQuota, ReadOnlyFileSystem, canonicalize,
     };
-    use alloc::{boxed::Box, vec, vec::Vec};
+    use alloc::{boxed::Box, rc::Rc, vec, vec::Vec};
+    use core::cell::RefCell;
 
     #[derive(Debug)]
     struct TestProvider;
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    struct CountingState {
+        bytes: u64,
+        largest_chunk: usize,
+        syncs: u32,
+    }
+
+    #[derive(Debug)]
+    struct CountingProvider {
+        state: Rc<RefCell<CountingState>>,
+    }
+
+    impl ReadOnlyFileSystem for CountingProvider {
+        fn metadata(&mut self, path: &str) -> Result<FileMetadata, FsError> {
+            match path {
+                "/" => Ok(FileMetadata {
+                    kind: NodeKind::Directory,
+                    byte_count: 0,
+                }),
+                "/large" => Ok(FileMetadata {
+                    kind: NodeKind::File,
+                    byte_count: self.state.borrow().bytes,
+                }),
+                _ => Err(FsError::NotFound),
+            }
+        }
+
+        fn read_file(
+            &mut self,
+            path: &str,
+            offset: u64,
+            destination: &mut [u8],
+        ) -> Result<usize, FsError> {
+            if path != "/large" {
+                return Err(FsError::NotFound);
+            }
+            let available = self.state.borrow().bytes.saturating_sub(offset);
+            let count = destination
+                .len()
+                .min(usize::try_from(available).unwrap_or(usize::MAX));
+            destination[..count].fill(0xa5);
+            Ok(count)
+        }
+
+        fn list(
+            &mut self,
+            _path: &str,
+            _cursor: u64,
+            _max_entries: usize,
+            _max_name_bytes: usize,
+        ) -> Result<ProviderListing, FsError> {
+            Ok(ProviderListing {
+                entries: Vec::new(),
+                next_cursor: None,
+            })
+        }
+
+        fn truncate_file(&mut self, path: &str) -> Result<(), FsError> {
+            if path != "/large" {
+                return Err(FsError::Invalid);
+            }
+            self.state.borrow_mut().bytes = 0;
+            Ok(())
+        }
+
+        fn append_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), FsError> {
+            if path != "/large" || bytes.is_empty() {
+                return Err(FsError::Invalid);
+            }
+            let mut state = self.state.borrow_mut();
+            state.bytes = state
+                .bytes
+                .checked_add(u64::try_from(bytes.len()).map_err(|_| FsError::Overflow)?)
+                .ok_or(FsError::Overflow)?;
+            state.largest_chunk = state.largest_chunk.max(bytes.len());
+            Ok(())
+        }
+
+        fn sync_file(&mut self, path: &str) -> Result<(), FsError> {
+            if path != "/large" {
+                return Err(FsError::Invalid);
+            }
+            let mut state = self.state.borrow_mut();
+            state.syncs = state.syncs.saturating_add(1);
+            Ok(())
+        }
+    }
 
     impl ReadOnlyFileSystem for TestProvider {
         fn metadata(&mut self, path: &str) -> Result<FileMetadata, FsError> {
@@ -1449,6 +1682,32 @@ mod tests {
         assert_eq!(fs.write_file("/", "/tmp/b", b"x"), Ok(()));
         assert_eq!(fs.memory_stats().ramfs_used, 1);
         assert_eq!(fs.memory_stats().ramfs_high_water, 4);
+    }
+
+    #[test]
+    fn streamed_provider_scales_to_two_gib_with_one_mib_working_chunks() {
+        const TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+        const CHUNK_BYTES: usize = 1024 * 1024;
+        let state = Rc::new(RefCell::new(CountingState::default()));
+        let provider = CountingProvider {
+            state: Rc::clone(&state),
+        };
+        let mut fs = Namespace::new(RamFsQuota::default());
+        assert_eq!(fs.mount_writable("/media", Box::new(provider)), Ok(()));
+        assert_eq!(fs.truncate_file("/", "/media/large"), Ok(()));
+        let chunk = vec![0x5a; CHUNK_BYTES];
+        for _ in 0..TOTAL_BYTES / CHUNK_BYTES as u64 {
+            assert_eq!(fs.append_file("/", "/media/large", &chunk), Ok(()));
+        }
+        assert_eq!(fs.sync_file("/", "/media/large"), Ok(()));
+        assert_eq!(
+            *state.borrow(),
+            CountingState {
+                bytes: TOTAL_BYTES,
+                largest_chunk: CHUNK_BYTES,
+                syncs: 1,
+            }
+        );
     }
 
     #[test]

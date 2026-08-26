@@ -595,11 +595,17 @@ pub mod stream {
     /// Interface major version.
     pub const MAJOR: u16 = 1;
     /// Interface minor version.
-    pub const MINOR: u16 = 0;
+    pub const MINOR: u16 = 1;
     /// Read up to the requested byte count from a byte-input handle.
     pub const READ: u16 = 1;
     /// Write the complete payload to a byte-output handle.
     pub const WRITE: u16 = 1;
+    /// Select a bounded power-of-two downstream aggregation size.
+    pub const SET_CHUNK_SIZE: u16 = 2;
+    /// Smallest configurable aggregation size.
+    pub const MIN_CHUNK_SIZE: usize = 4 * 1024;
+    /// Largest configurable aggregation size.
+    pub const MAX_CHUNK_SIZE: usize = 1024 * 1024;
 
     /// Invalid byte-stream request encoding.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -629,6 +635,39 @@ pub mod stream {
         }
         let value = usize::from(u16::from_le_bytes([bytes[0], bytes[1]]));
         if value == 0 || value > MAX_SERVICE_PAYLOAD_BYTES {
+            return Err(RequestError);
+        }
+        Ok(value)
+    }
+
+    /// Encode one configurable output aggregation size.
+    ///
+    /// # Errors
+    ///
+    /// Rejects non-power-of-two values outside the enforced stream range.
+    pub fn encode_chunk_size(bytes: usize) -> Result<[u8; 4], RequestError> {
+        if !(MIN_CHUNK_SIZE..=MAX_CHUNK_SIZE).contains(&bytes) || !bytes.is_power_of_two() {
+            return Err(RequestError);
+        }
+        Ok(u32::try_from(bytes)
+            .map_err(|_| RequestError)?
+            .to_le_bytes())
+    }
+
+    /// Decode one exact configurable output aggregation size.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed, non-power-of-two, or out-of-policy values.
+    pub fn decode_chunk_size(bytes: &[u8]) -> Result<usize, RequestError> {
+        if bytes.len() != 4 {
+            return Err(RequestError);
+        }
+        let value = usize::try_from(u32::from_le_bytes(
+            bytes.try_into().map_err(|_| RequestError)?,
+        ))
+        .map_err(|_| RequestError)?;
+        if !(MIN_CHUNK_SIZE..=MAX_CHUNK_SIZE).contains(&value) || !value.is_power_of_two() {
             return Err(RequestError);
         }
         Ok(value)
@@ -1248,23 +1287,23 @@ pub mod filesystem {
     }
 }
 
-/// Bounded transactional filesystem-mutation protocol.
+/// Streaming filesystem-mutation protocol.
 pub mod filesystem_mutation {
     use core::str;
 
     use super::{MAX_SERVICE_PAYLOAD_BYTES, filesystem};
 
     /// Interface major version.
-    pub const MAJOR: u16 = 1;
+    pub const MAJOR: u16 = 2;
     /// Interface minor version.
-    pub const MINOR: u16 = 3;
-    /// Begin one complete-file atomic replacement.
+    pub const MINOR: u16 = 0;
+    /// Truncate or create one file and begin a sequential streamed replacement.
     pub const BEGIN_REPLACE: u16 = 1;
     /// Append one sequential chunk to the pending replacement.
     pub const APPEND: u16 = 2;
-    /// Atomically publish the complete pending replacement.
+    /// Flush and durably order the pending streamed replacement.
     pub const COMMIT_REPLACE: u16 = 3;
-    /// Discard the complete pending replacement.
+    /// End the replacement without flushing its final buffered chunk.
     pub const ABORT_REPLACE: u16 = 4;
     /// Atomically remove one regular file or symbolic link.
     pub const REMOVE: u16 = 5;
@@ -1274,14 +1313,16 @@ pub mod filesystem_mutation {
     pub const CREATE_HARD_LINK: u16 = 7;
     /// Create one empty directory without replacing an existing entry.
     pub const CREATE_DIRECTORY: u16 = 8;
-    /// Maximum staged bytes in one replacement.
-    pub const MAX_FILE_BYTES: usize = 1024 * 1024;
+    /// Select the aggregation size for one pending streamed replacement.
+    pub const SET_CHUNK_SIZE: u16 = 9;
     /// Fixed bytes preceding an append payload.
-    pub const APPEND_HEADER_BYTES: usize = 8;
+    pub const APPEND_HEADER_BYTES: usize = 12;
     /// Maximum bytes carried by one append call.
     pub const MAX_APPEND_BYTES: usize = MAX_SERVICE_PAYLOAD_BYTES - APPEND_HEADER_BYTES;
     /// Exact replacement-token reply/request bytes.
     pub const TOKEN_BYTES: usize = 4;
+    /// Exact replacement-token plus chunk-size request bytes.
+    pub const CHUNK_SIZE_REQUEST_BYTES: usize = 8;
     /// Fixed bytes preceding the two strings in a link request.
     pub const LINK_REQUEST_HEADER_BYTES: usize = 4;
     /// Largest canonical two-string link request.
@@ -1298,7 +1339,7 @@ pub mod filesystem_mutation {
         /// Opaque active replacement token.
         pub token: u32,
         /// Required sequential byte offset.
-        pub offset: u32,
+        pub offset: u64,
         /// Nonempty bytes appended at `offset`.
         pub bytes: &'a [u8],
     }
@@ -1422,34 +1463,64 @@ pub mod filesystem_mutation {
         Ok(token)
     }
 
+    /// Encode a token-scoped streamed-write aggregation size.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero tokens and sizes outside the standard stream policy.
+    pub fn encode_chunk_size_request(
+        token: u32,
+        bytes: usize,
+    ) -> Result<[u8; CHUNK_SIZE_REQUEST_BYTES], EncodingError> {
+        if token == 0 {
+            return Err(EncodingError);
+        }
+        let size = super::stream::encode_chunk_size(bytes).map_err(|_| EncodingError)?;
+        let mut output = [0_u8; CHUNK_SIZE_REQUEST_BYTES];
+        output[..4].copy_from_slice(&token.to_le_bytes());
+        output[4..].copy_from_slice(&size);
+        Ok(output)
+    }
+
+    /// Decode a token-scoped streamed-write aggregation size.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed tokens or out-of-policy sizes.
+    pub fn decode_chunk_size_request(bytes: &[u8]) -> Result<(u32, usize), EncodingError> {
+        if bytes.len() != CHUNK_SIZE_REQUEST_BYTES {
+            return Err(EncodingError);
+        }
+        let token = u32::from_le_bytes(bytes[..4].try_into().map_err(|_| EncodingError)?);
+        if token == 0 {
+            return Err(EncodingError);
+        }
+        let size = super::stream::decode_chunk_size(&bytes[4..]).map_err(|_| EncodingError)?;
+        Ok((token, size))
+    }
+
     /// Encode one nonempty sequential append request.
     ///
     /// # Errors
     ///
-    /// Rejects zero tokens, empty/excessive chunks, offsets beyond the file
-    /// ceiling, overflow, or insufficient output without modifying it.
+    /// Rejects zero tokens, empty/excessive chunks, or insufficient output
+    /// without modifying it.
     pub fn encode_append_request(
         token: u32,
-        offset: usize,
+        offset: u64,
         bytes: &[u8],
         output: &mut [u8],
     ) -> Result<usize, EncodingError> {
         let count = APPEND_HEADER_BYTES
             .checked_add(bytes.len())
             .ok_or(EncodingError)?;
-        let end = offset.checked_add(bytes.len()).ok_or(EncodingError)?;
-        if token == 0
-            || bytes.is_empty()
-            || bytes.len() > MAX_APPEND_BYTES
-            || end > MAX_FILE_BYTES
-            || output.len() < count
+        if token == 0 || bytes.is_empty() || bytes.len() > MAX_APPEND_BYTES || output.len() < count
         {
             return Err(EncodingError);
         }
-        let offset = u32::try_from(offset).map_err(|_| EncodingError)?;
         let mut encoded = [0_u8; MAX_SERVICE_PAYLOAD_BYTES];
         encoded[..4].copy_from_slice(&token.to_le_bytes());
-        encoded[4..8].copy_from_slice(&offset.to_le_bytes());
+        encoded[4..12].copy_from_slice(&offset.to_le_bytes());
         encoded[APPEND_HEADER_BYTES..count].copy_from_slice(bytes);
         output[..count].copy_from_slice(&encoded[..count]);
         Ok(count)
@@ -1459,20 +1530,15 @@ pub mod filesystem_mutation {
     ///
     /// # Errors
     ///
-    /// Rejects zero tokens, empty/excessive bytes, or offsets whose complete
-    /// chunk exceeds the file ceiling.
+    /// Rejects zero tokens or empty/excessive byte payloads.
     pub fn decode_append_request(bytes: &[u8]) -> Result<AppendRequest<'_>, EncodingError> {
         if bytes.len() <= APPEND_HEADER_BYTES || bytes.len() > MAX_SERVICE_PAYLOAD_BYTES {
             return Err(EncodingError);
         }
         let token = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        let offset = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        let offset = u64::from_le_bytes(bytes[4..12].try_into().map_err(|_| EncodingError)?);
         let payload = &bytes[APPEND_HEADER_BYTES..];
-        let end = usize::try_from(offset)
-            .map_err(|_| EncodingError)?
-            .checked_add(payload.len())
-            .ok_or(EncodingError)?;
-        if token == 0 || payload.len() > MAX_APPEND_BYTES || end > MAX_FILE_BYTES {
+        if token == 0 || payload.len() > MAX_APPEND_BYTES {
             return Err(EncodingError);
         }
         Ok(AppendRequest {
@@ -3046,7 +3112,7 @@ mod tests {
     }
 
     #[test]
-    fn stream_read_request_has_exact_bounds() {
+    fn stream_requests_have_exact_bounds_and_chunk_policy() {
         assert!(stream::encode_read_request(0).is_err());
         let maximum = stream::encode_read_request(super::MAX_SERVICE_PAYLOAD_BYTES)
             .unwrap_or_else(|_| std::process::abort());
@@ -3056,6 +3122,14 @@ mod tests {
         );
         assert!(stream::encode_read_request(super::MAX_SERVICE_PAYLOAD_BYTES + 1).is_err());
         assert!(stream::decode_read_request(&[1]).is_err());
+        for bytes in [stream::MIN_CHUNK_SIZE, stream::MAX_CHUNK_SIZE] {
+            let encoded =
+                stream::encode_chunk_size(bytes).unwrap_or_else(|_| std::process::abort());
+            assert_eq!(stream::decode_chunk_size(&encoded), Ok(bytes));
+        }
+        assert!(stream::encode_chunk_size(stream::MIN_CHUNK_SIZE / 2).is_err());
+        assert!(stream::encode_chunk_size(3 * stream::MIN_CHUNK_SIZE / 2).is_err());
+        assert!(stream::encode_chunk_size(2 * stream::MAX_CHUNK_SIZE).is_err());
     }
 
     #[test]
@@ -3117,38 +3191,26 @@ mod tests {
     }
 
     #[test]
-    fn filesystem_mutation_is_sequential_bounded_and_exact() {
-        assert_eq!(filesystem_mutation::MAX_FILE_BYTES, 1024 * 1024);
+    fn filesystem_mutation_is_sequential_streamed_and_exact() {
         let token = filesystem_mutation::encode_token(7).unwrap_or_else(|_| std::process::abort());
         assert_eq!(filesystem_mutation::decode_token(&token), Ok(7));
         assert!(filesystem_mutation::decode_token(&[7, 0, 0, 0, 0]).is_err());
         assert!(filesystem_mutation::encode_token(0).is_err());
 
         let mut bytes = [0_u8; super::MAX_SERVICE_PAYLOAD_BYTES];
-        let count = filesystem_mutation::encode_append_request(
-            7,
-            filesystem_mutation::MAX_FILE_BYTES - 3,
-            b"end",
-            &mut bytes,
-        )
-        .unwrap_or_else(|_| std::process::abort());
+        let large_offset = u64::from(u32::MAX) + 9;
+        let count = filesystem_mutation::encode_append_request(7, large_offset, b"end", &mut bytes)
+            .unwrap_or_else(|_| std::process::abort());
         let append = filesystem_mutation::decode_append_request(&bytes[..count])
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(append.token, 7);
-        assert_eq!(
-            append.offset,
-            u32::try_from(filesystem_mutation::MAX_FILE_BYTES - 3)
-                .unwrap_or_else(|_| std::process::abort())
-        );
+        assert_eq!(append.offset, large_offset);
         assert_eq!(append.bytes, b"end");
-        assert!(
-            filesystem_mutation::encode_append_request(
-                7,
-                filesystem_mutation::MAX_FILE_BYTES - 2,
-                b"end",
-                &mut bytes,
-            )
-            .is_err()
+        let configured = filesystem_mutation::encode_chunk_size_request(7, 1024 * 1024)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            filesystem_mutation::decode_chunk_size_request(&configured),
+            Ok((7, 1024 * 1024))
         );
 
         let mut unchanged = [0xa5_u8; 8];

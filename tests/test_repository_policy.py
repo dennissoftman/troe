@@ -155,7 +155,6 @@ class RepositoryPolicyTests(unittest.TestCase):
             "tcp",
             "udp",
             "wc",
-            "write",
         }
         apps = {
             path.name
@@ -166,7 +165,7 @@ class RepositoryPolicyTests(unittest.TestCase):
         for architecture in ("x86_64", "aarch64"):
             root = REPO_ROOT / "rootfs" / "bin" / architecture
             installed = {path.stem for path in root.glob("*.kex")}
-            self.assertEqual(installed, ordinary | {"kex-echo"})
+            self.assertEqual(installed, ordinary)
             self.assertEqual(list(root.glob("*.kcap")), [])
 
         shell = (REPO_ROOT / "crates/troe-shell/src/lib.rs").read_text(encoding="utf-8")

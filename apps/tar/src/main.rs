@@ -10,7 +10,8 @@ use troe_app_tar::{
 };
 use troe_kex_sdk::{
     CommandContext, Error, FILESYSTEM_IO_BUFFER_BYTES, FILESYSTEM_LIST_BUFFER_BYTES,
-    FileReplacement, INVOCATION_BUFFER_BYTES, ReadOnlyFilesystem, entry, exit, filesystem,
+    FileReplacement, INVOCATION_BUFFER_BYTES, MAX_FILE_STREAM_CHUNK_BYTES, ReadOnlyFilesystem,
+    entry, exit, filesystem,
 };
 
 const MAX_DEPTH: usize = 16;
@@ -390,6 +391,7 @@ fn extract_entry(
         EntryKind::File => {
             reject_existing_symlink(filesystem, path, &mut scratch.link)?;
             let mut replacement = mutation.begin_replace(path)?;
+            replacement.set_chunk_size(MAX_FILE_STREAM_CHUNK_BYTES)?;
             let mut remaining = header.size;
             while remaining != 0 {
                 let count = scratch
@@ -425,7 +427,8 @@ fn create<'operand>(
         PathBuffer::absolute(invocation.cwd(), archive).map_err(|_| Error::InvalidPath)?;
     let mut link_buffer = [0_u8; filesystem::MAX_LINK_BYTES];
     reject_existing_symlink(&mut filesystem, archive_path.as_str(), &mut link_buffer)?;
-    let replacement = mutation.begin_replace(archive_path.as_str())?;
+    let mut replacement = mutation.begin_replace(archive_path.as_str())?;
+    replacement.set_chunk_size(MAX_FILE_STREAM_CHUNK_BYTES)?;
     let mut writer = ArchiveWriter { replacement };
     let mut scratch = Scratch::new();
     for operand in operands {

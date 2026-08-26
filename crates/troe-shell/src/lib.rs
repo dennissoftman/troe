@@ -7,15 +7,20 @@ extern crate alloc;
 extern crate std;
 
 use alloc::format;
+use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::cell::RefCell;
 use troe_core::{
     BoundedOutput, CommandStatus, Input, MAX_ARGS, MAX_LINE_BYTES, MAX_PIPELINE_STAGES,
     MachineMemoryOwner, MachineMemorySnapshot, MemoryStats, Output, PIPE_CAPACITY, SliceInput,
     StreamError, write_all,
 };
 use troe_driver::InputQueueStats;
-use troe_vfs::{FsError, Namespace, NodeKind};
+use troe_vfs::{FILE_IO_BUFFER_BYTES, FsError, MAX_FILE_IO_BUFFER_BYTES, Namespace, NodeKind};
+
+/// Shared namespace ownership used by stream endpoints and KEX services.
+pub type SharedNamespace = Rc<RefCell<Namespace>>;
 
 /// Shell parse failures caused by untrusted command input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -30,6 +35,29 @@ pub enum ParseError {
     UnclosedQuote,
     /// A pipeline begins, ends, or contains two adjacent separators.
     EmptyStage,
+    /// A redirection operator has no following path.
+    MissingRedirectionTarget,
+    /// One stage specifies the same redirection direction more than once.
+    DuplicateRedirection,
+    /// Input or output redirection is attached to an unsupported pipeline stage.
+    InvalidRedirectionPosition,
+}
+
+/// Standard-output file redirection selected by one shell stage.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OutputRedirection {
+    /// Truncate the destination before executing, then stream command output.
+    Replace(String),
+    /// Open or create the destination, then stream output at its end.
+    Append(String),
+}
+
+impl OutputRedirection {
+    fn path(&self) -> &str {
+        match self {
+            Self::Replace(path) | Self::Append(path) => path,
+        }
+    }
 }
 
 /// One parsed command invocation.
@@ -37,6 +65,10 @@ pub enum ParseError {
 pub struct Stage {
     /// Command name followed by its arguments.
     pub words: Vec<String>,
+    /// Optional file used as this stage's standard input.
+    pub input: Option<String>,
+    /// Optional streamed file destination used as this stage's standard output.
+    pub output: Option<OutputRedirection>,
 }
 
 /// A bounded sequence of commands connected by byte streams.
@@ -51,6 +83,13 @@ enum Quote {
     None,
     Single,
     Double,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingRedirection {
+    Input,
+    Replace,
+    Append,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -81,7 +120,7 @@ pub trait ExternalCommand {
         command: &str,
         words: &[String],
         cwd: &str,
-        namespace: &mut Namespace,
+        namespace: &SharedNamespace,
         stdin: &mut dyn Input,
         stdout: &mut dyn Output,
         stderr: &mut dyn Output,
@@ -96,12 +135,152 @@ impl ExternalCommand for NoExternalCommand {
         _command: &str,
         _words: &[String],
         _cwd: &str,
-        _namespace: &mut Namespace,
+        _namespace: &SharedNamespace,
         _stdin: &mut dyn Input,
         _stdout: &mut dyn Output,
         _stderr: &mut dyn Output,
     ) -> Option<CommandStatus> {
         None
+    }
+}
+
+const MIN_FILE_CHUNK_BYTES: usize = 4 * 1024;
+
+struct NamespaceFileInput {
+    namespace: SharedNamespace,
+    cwd: String,
+    path: String,
+    offset: u64,
+}
+
+impl NamespaceFileInput {
+    fn new(namespace: &SharedNamespace, cwd: &str, path: &str) -> Result<Self, FsError> {
+        let metadata = namespace.borrow_mut().metadata(cwd, path)?;
+        if metadata.kind != NodeKind::File {
+            return Err(FsError::WrongType);
+        }
+        Ok(Self {
+            namespace: Rc::clone(namespace),
+            cwd: cwd.to_string(),
+            path: path.to_string(),
+            offset: 0,
+        })
+    }
+}
+
+impl Input for NamespaceFileInput {
+    fn read(&mut self, destination: &mut [u8]) -> Result<usize, StreamError> {
+        let count = self
+            .namespace
+            .borrow_mut()
+            .read_file_at(&self.cwd, &self.path, self.offset, destination)
+            .map_err(|_| StreamError::Device)?;
+        self.offset = self
+            .offset
+            .checked_add(u64::try_from(count).map_err(|_| StreamError::Device)?)
+            .ok_or(StreamError::Device)?;
+        Ok(count)
+    }
+}
+
+struct NamespaceFileOutput {
+    namespace: SharedNamespace,
+    cwd: String,
+    path: String,
+    buffer: Vec<u8>,
+    chunk_bytes: usize,
+    failure: Option<FsError>,
+}
+
+impl NamespaceFileOutput {
+    fn new(
+        namespace: &SharedNamespace,
+        cwd: &str,
+        redirection: &OutputRedirection,
+    ) -> Result<Self, FsError> {
+        let path = redirection.path();
+        let mut namespace_ref = namespace.borrow_mut();
+        match redirection {
+            OutputRedirection::Replace(_) => namespace_ref.truncate_file(cwd, path)?,
+            OutputRedirection::Append(_) => match namespace_ref.metadata(cwd, path) {
+                Ok(metadata) if metadata.kind == NodeKind::File => {
+                    namespace_ref.sync_file(cwd, path)?;
+                }
+                Ok(_) => return Err(FsError::WrongType),
+                Err(FsError::NotFound) => namespace_ref.truncate_file(cwd, path)?,
+                Err(error) => return Err(error),
+            },
+        }
+        drop(namespace_ref);
+        Ok(Self {
+            namespace: Rc::clone(namespace),
+            cwd: cwd.to_string(),
+            path: path.to_string(),
+            buffer: Vec::new(),
+            chunk_bytes: FILE_IO_BUFFER_BYTES,
+            failure: None,
+        })
+    }
+
+    fn flush(&mut self) -> Result<(), FsError> {
+        if let Some(error) = self.failure {
+            return Err(error);
+        }
+        if self.buffer.is_empty() {
+            return Ok(());
+        }
+        if let Err(error) =
+            self.namespace
+                .borrow_mut()
+                .append_file(&self.cwd, &self.path, &self.buffer)
+        {
+            self.failure = Some(error);
+            return Err(error);
+        }
+        self.buffer.clear();
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(), FsError> {
+        self.flush()?;
+        self.namespace.borrow_mut().sync_file(&self.cwd, &self.path)
+    }
+}
+
+impl Output for NamespaceFileOutput {
+    fn set_chunk_size(&mut self, bytes: usize) -> Result<(), StreamError> {
+        if !(MIN_FILE_CHUNK_BYTES..=MAX_FILE_IO_BUFFER_BYTES).contains(&bytes)
+            || !bytes.is_power_of_two()
+        {
+            return Err(StreamError::Unsupported);
+        }
+        self.flush().map_err(|_| StreamError::Device)?;
+        self.chunk_bytes = bytes;
+        Ok(())
+    }
+
+    fn write(&mut self, mut bytes: &[u8]) -> Result<usize, StreamError> {
+        if self.failure.is_some() {
+            return Err(StreamError::Device);
+        }
+        let accepted = bytes.len();
+        while !bytes.is_empty() {
+            let available = self.chunk_bytes.saturating_sub(self.buffer.len());
+            if available == 0 {
+                self.flush().map_err(|_| StreamError::Device)?;
+                continue;
+            }
+            let count = available.min(bytes.len());
+            self.buffer
+                .try_reserve_exact(count)
+                .map_err(|_| StreamError::NoSpace)?;
+            self.buffer.extend_from_slice(&bytes[..count]);
+            bytes = &bytes[count..];
+            if self.buffer.len() == self.chunk_bytes {
+                self.flush().map_err(|_| StreamError::Device)?;
+            }
+        }
+        Ok(accepted)
     }
 }
 
@@ -374,11 +553,12 @@ impl Completion {
     }
 }
 
-/// Parse quoting and `|` separators without expansion or recursion.
+/// Parse quoting, pipelines, and bounded file redirection without expansion.
 ///
 /// # Errors
 ///
 /// Fails on configured line/word/stage bounds, malformed quotes, or empty stages.
+#[allow(clippy::too_many_lines)]
 pub fn parse_line(line: &str) -> Result<Pipeline, ParseError> {
     if line.len() > MAX_LINE_BYTES {
         return Err(ParseError::LineTooLong);
@@ -388,8 +568,12 @@ pub fn parse_line(line: &str) -> Result<Pipeline, ParseError> {
     let mut word = String::new();
     let mut word_started = false;
     let mut quote = Quote::None;
+    let mut input = None;
+    let mut output = None;
+    let mut pending = None;
 
-    for character in line.chars() {
+    let mut characters = line.chars().peekable();
+    while let Some(character) = characters.next() {
         match quote {
             Quote::Single => {
                 if character == '\'' {
@@ -415,18 +599,61 @@ pub fn parse_line(line: &str) -> Result<Pipeline, ParseError> {
                     word_started = true;
                 }
                 '|' => {
-                    push_word(&mut words, &mut word, &mut word_started)?;
+                    push_token(
+                        &mut words,
+                        &mut input,
+                        &mut output,
+                        &mut pending,
+                        &mut word,
+                        &mut word_started,
+                    )?;
+                    if pending.is_some() {
+                        return Err(ParseError::MissingRedirectionTarget);
+                    }
                     if words.is_empty() {
                         return Err(ParseError::EmptyStage);
                     }
-                    stages.push(Stage { words });
+                    stages.push(Stage {
+                        words,
+                        input,
+                        output,
+                    });
                     if stages.len() >= MAX_PIPELINE_STAGES {
                         return Err(ParseError::TooManyStages);
                     }
                     words = Vec::new();
+                    input = None;
+                    output = None;
+                }
+                '<' | '>' => {
+                    push_token(
+                        &mut words,
+                        &mut input,
+                        &mut output,
+                        &mut pending,
+                        &mut word,
+                        &mut word_started,
+                    )?;
+                    if pending.is_some() {
+                        return Err(ParseError::MissingRedirectionTarget);
+                    }
+                    pending = Some(if character == '<' {
+                        PendingRedirection::Input
+                    } else if characters.next_if_eq(&'>').is_some() {
+                        PendingRedirection::Append
+                    } else {
+                        PendingRedirection::Replace
+                    });
                 }
                 value if value.is_whitespace() => {
-                    push_word(&mut words, &mut word, &mut word_started)?;
+                    push_token(
+                        &mut words,
+                        &mut input,
+                        &mut output,
+                        &mut pending,
+                        &mut word,
+                        &mut word_started,
+                    )?;
                 }
                 value => {
                     word.push(value);
@@ -438,27 +665,70 @@ pub fn parse_line(line: &str) -> Result<Pipeline, ParseError> {
     if quote != Quote::None {
         return Err(ParseError::UnclosedQuote);
     }
-    push_word(&mut words, &mut word, &mut word_started)?;
+    push_token(
+        &mut words,
+        &mut input,
+        &mut output,
+        &mut pending,
+        &mut word,
+        &mut word_started,
+    )?;
+    if pending.is_some() {
+        return Err(ParseError::MissingRedirectionTarget);
+    }
     if words.is_empty() {
-        if stages.is_empty() {
+        if stages.is_empty() && input.is_none() && output.is_none() {
             return Ok(Pipeline::default());
         }
         return Err(ParseError::EmptyStage);
     }
-    stages.push(Stage { words });
+    stages.push(Stage {
+        words,
+        input,
+        output,
+    });
+    let last = stages.len().saturating_sub(1);
+    if stages.iter().enumerate().any(|(index, stage)| {
+        (stage.input.is_some() && index != 0) || (stage.output.is_some() && index != last)
+    }) {
+        return Err(ParseError::InvalidRedirectionPosition);
+    }
     Ok(Pipeline { stages })
 }
 
-fn push_word(
+fn push_token(
     words: &mut Vec<String>,
+    input: &mut Option<String>,
+    output: &mut Option<OutputRedirection>,
+    pending: &mut Option<PendingRedirection>,
     word: &mut String,
     started: &mut bool,
 ) -> Result<(), ParseError> {
     if *started {
-        if words.len() >= MAX_ARGS {
-            return Err(ParseError::TooManyArguments);
+        let token = core::mem::take(word);
+        match pending.take() {
+            Some(PendingRedirection::Input) => {
+                if input.replace(token).is_some() {
+                    return Err(ParseError::DuplicateRedirection);
+                }
+            }
+            Some(PendingRedirection::Replace) => {
+                if output.replace(OutputRedirection::Replace(token)).is_some() {
+                    return Err(ParseError::DuplicateRedirection);
+                }
+            }
+            Some(PendingRedirection::Append) => {
+                if output.replace(OutputRedirection::Append(token)).is_some() {
+                    return Err(ParseError::DuplicateRedirection);
+                }
+            }
+            None => {
+                if words.len() >= MAX_ARGS {
+                    return Err(ParseError::TooManyArguments);
+                }
+                words.push(token);
+            }
         }
-        words.push(core::mem::take(word));
         *started = false;
     }
     Ok(())
@@ -476,7 +746,7 @@ pub enum MachineAction {
 /// Stateful shell composition root. Authority is explicit in its fields.
 #[derive(Debug)]
 pub struct Shell {
-    namespace: Namespace,
+    namespace: SharedNamespace,
     command_catalog: CommandCatalog,
     cwd: String,
     machine_control: bool,
@@ -502,7 +772,7 @@ impl Shell {
         namespace.set_system_file("/sys/memory", memory_report.as_bytes())?;
         let command_catalog = CommandCatalog::new()?;
         Ok(Self {
-            namespace,
+            namespace: Rc::new(RefCell::new(namespace)),
             command_catalog,
             cwd: "/".to_string(),
             machine_control,
@@ -538,8 +808,12 @@ impl Shell {
         let Some(context) = completion_context(line, cursor) else {
             return Completion::default();
         };
+        if context.redirect_target {
+            return self.complete_paths(context, false, config);
+        }
         if context.word_index == 0 {
-            self.command_catalog.refresh(&mut self.namespace);
+            self.command_catalog
+                .refresh(&mut self.namespace.borrow_mut());
             return complete_commands(
                 context,
                 &self.command_catalog.names,
@@ -548,7 +822,8 @@ impl Shell {
             );
         }
         if context.command == Some("man") && context.word_index == 1 {
-            self.command_catalog.refresh(&mut self.namespace);
+            self.command_catalog
+                .refresh(&mut self.namespace.borrow_mut());
             return complete_commands(
                 context,
                 &self.command_catalog.names,
@@ -610,29 +885,95 @@ impl Shell {
         let mut previous = Vec::new();
         for (index, stage) in pipeline.stages.iter().enumerate() {
             let last = index + 1 == pipeline.stages.len();
+            let redirected_input = match stage.input.as_deref() {
+                Some(path) => match NamespaceFileInput::new(&self.namespace, &self.cwd, path) {
+                    Ok(input) => Some(input),
+                    Err(error) => return fs_failure(stderr, "sh", path, error),
+                },
+                None => None,
+            };
+            let mut redirected_input = redirected_input;
             if last {
-                let status = if index == 0 {
-                    self.dispatch(&stage.words, stdin, stdout, stderr, external)
-                } else {
-                    let mut input = SliceInput::new(&previous);
-                    self.dispatch(&stage.words, &mut input, stdout, stderr, external)
-                };
-                return status;
+                if let Some(redirection) = stage.output.as_ref() {
+                    let mut redirected_output =
+                        match NamespaceFileOutput::new(&self.namespace, &self.cwd, redirection) {
+                            Ok(output) => output,
+                            Err(error) => {
+                                return fs_failure(stderr, "sh", redirection.path(), error);
+                            }
+                        };
+                    let status = self.dispatch_stage(
+                        &stage.words,
+                        index == 0,
+                        redirected_input
+                            .as_mut()
+                            .map(|input| input as &mut dyn Input),
+                        &previous,
+                        stdin,
+                        &mut redirected_output,
+                        stderr,
+                        external,
+                    );
+                    return match redirected_output.finish() {
+                        Ok(()) => status,
+                        Err(error) => fs_failure(stderr, "sh", redirection.path(), error),
+                    };
+                }
+                return self.dispatch_stage(
+                    &stage.words,
+                    index == 0,
+                    redirected_input
+                        .as_mut()
+                        .map(|input| input as &mut dyn Input),
+                    &previous,
+                    stdin,
+                    stdout,
+                    stderr,
+                    external,
+                );
             }
 
             let mut next = BoundedOutput::new(PIPE_CAPACITY);
-            let status = if index == 0 {
-                self.dispatch(&stage.words, stdin, &mut next, stderr, external)
-            } else {
-                let mut input = SliceInput::new(&previous);
-                self.dispatch(&stage.words, &mut input, &mut next, stderr, external)
-            };
+            let status = self.dispatch_stage(
+                &stage.words,
+                index == 0,
+                redirected_input
+                    .as_mut()
+                    .map(|input| input as &mut dyn Input),
+                &previous,
+                stdin,
+                &mut next,
+                stderr,
+                external,
+            );
             if status != CommandStatus::Success {
                 return status;
             }
             previous = next.into_vec();
         }
         CommandStatus::Failure
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_stage<E: ExternalCommand + ?Sized>(
+        &mut self,
+        words: &[String],
+        first: bool,
+        redirected_input: Option<&mut dyn Input>,
+        previous: &[u8],
+        stdin: &mut dyn Input,
+        stdout: &mut dyn Output,
+        stderr: &mut dyn Output,
+        external: &mut E,
+    ) -> CommandStatus {
+        if let Some(input) = redirected_input {
+            self.dispatch(words, input, stdout, stderr, external)
+        } else if first {
+            self.dispatch(words, stdin, stdout, stderr, external)
+        } else {
+            let mut input = SliceInput::new(previous);
+            self.dispatch(words, &mut input, stdout, stderr, external)
+        }
     }
 
     fn dispatch<E: ExternalCommand + ?Sized>(
@@ -652,7 +993,7 @@ impl Shell {
                 command,
                 words,
                 &self.cwd,
-                &mut self.namespace,
+                &self.namespace,
                 stdin,
                 stdout,
                 stderr,
@@ -687,7 +1028,7 @@ impl Shell {
         config: CompletionConfig,
     ) -> Completion {
         let (directory, displayed_parent, name_prefix) = split_completion_path(context.prefix);
-        let Ok(listing) = self.namespace.list_matching_bounded(
+        let Ok(listing) = self.namespace.borrow_mut().list_matching_bounded(
             &self.cwd,
             directory,
             name_prefix,
@@ -743,7 +1084,7 @@ impl Shell {
         if args.len() != 1 {
             return usage(stderr, "cd", "cd PATH");
         }
-        match self.namespace.resolve_dir(&self.cwd, &args[0]) {
+        match self.namespace.borrow_mut().resolve_dir(&self.cwd, &args[0]) {
             Ok(path) => {
                 self.cwd = path;
                 CommandStatus::Success
@@ -836,13 +1177,17 @@ struct CompletionContext<'a> {
     word_index: usize,
     command: Option<&'a str>,
     arguments: [Option<&'a str>; 4],
+    redirect_target: bool,
 }
 
+#[allow(clippy::too_many_lines)]
 fn completion_context(line: &str, cursor: usize) -> Option<CompletionContext<'_>> {
     let mut quote = Quote::None;
     let mut word_started = false;
     let mut word_start = 0_usize;
     let mut word_quoted = false;
+    let mut word_redirect_target = false;
+    let mut pending_redirection = false;
     let mut word_index = 0_usize;
     let mut command = None;
     let mut arguments = [None; 4];
@@ -864,6 +1209,7 @@ fn completion_context(line: &str, cursor: usize) -> Option<CompletionContext<'_>
                     if !word_started {
                         word_started = true;
                         word_start = index;
+                        word_redirect_target = pending_redirection;
                     }
                     word_quoted = true;
                     quote = if character == '\'' {
@@ -873,28 +1219,74 @@ fn completion_context(line: &str, cursor: usize) -> Option<CompletionContext<'_>
                     };
                 }
                 '|' => {
+                    if word_started {
+                        retain_completion_word(
+                            line,
+                            index,
+                            word_start,
+                            word_index,
+                            word_quoted,
+                            word_redirect_target,
+                            &mut command,
+                            &mut arguments,
+                        );
+                    }
                     word_started = false;
                     word_quoted = false;
+                    word_redirect_target = false;
+                    pending_redirection = false;
                     word_index = 0;
                     command = None;
                     arguments = [None; 4];
                 }
+                '<' | '>' => {
+                    if word_started {
+                        retain_completion_word(
+                            line,
+                            index,
+                            word_start,
+                            word_index,
+                            word_quoted,
+                            word_redirect_target,
+                            &mut command,
+                            &mut arguments,
+                        );
+                        if !word_redirect_target {
+                            word_index = word_index.saturating_add(1);
+                        }
+                    }
+                    word_started = false;
+                    word_quoted = false;
+                    word_redirect_target = false;
+                    pending_redirection = true;
+                }
                 value if value.is_whitespace() => {
                     if word_started {
-                        if word_index == 0 && !word_quoted {
-                            command = Some(&line[word_start..index]);
-                        } else if word_index > 0 && word_index <= arguments.len() && !word_quoted {
-                            arguments[word_index - 1] = Some(&line[word_start..index]);
+                        retain_completion_word(
+                            line,
+                            index,
+                            word_start,
+                            word_index,
+                            word_quoted,
+                            word_redirect_target,
+                            &mut command,
+                            &mut arguments,
+                        );
+                        if word_redirect_target {
+                            pending_redirection = false;
+                        } else {
+                            word_index = word_index.saturating_add(1);
                         }
-                        word_index = word_index.saturating_add(1);
                         word_started = false;
                         word_quoted = false;
+                        word_redirect_target = false;
                     }
                 }
                 _ => {
                     if !word_started {
                         word_started = true;
                         word_start = index;
+                        word_redirect_target = pending_redirection;
                     }
                 }
             },
@@ -911,7 +1303,29 @@ fn completion_context(line: &str, cursor: usize) -> Option<CompletionContext<'_>
         word_index,
         command,
         arguments,
+        redirect_target: pending_redirection || word_redirect_target,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn retain_completion_word<'line>(
+    line: &'line str,
+    end: usize,
+    start: usize,
+    word_index: usize,
+    quoted: bool,
+    redirect_target: bool,
+    command: &mut Option<&'line str>,
+    arguments: &mut [Option<&'line str>; 4],
+) {
+    if quoted || redirect_target {
+        return;
+    }
+    if word_index == 0 {
+        *command = Some(&line[start..end]);
+    } else if word_index <= arguments.len() {
+        arguments[word_index - 1] = Some(&line[start..end]);
+    }
 }
 
 fn complete_commands(
@@ -1047,7 +1461,7 @@ fn argument_completion(context: CompletionContext<'_>) -> ArgumentCompletion {
         }
         "awk" if context.word_index > awk_program_position(context.arguments) => paths,
         "cat" | "ln" | "wc" if context.word_index >= 1 => paths,
-        "hexdump" | "ls" | "lua" | "rm" | "write" if context.word_index == 1 => paths,
+        "hexdump" | "ls" | "lua" | "rm" if context.word_index == 1 => paths,
         _ => ArgumentCompletion::None,
     }
 }
@@ -1080,9 +1494,9 @@ fn split_completion_path(prefix: &str) -> (&str, &str, &str) {
 }
 
 fn is_bare_word_component(name: &str) -> bool {
-    !name
-        .chars()
-        .any(|character| character.is_whitespace() || matches!(character, '\'' | '"' | '|'))
+    !name.chars().any(|character| {
+        character.is_whitespace() || matches!(character, '\'' | '"' | '|' | '<' | '>')
+    })
 }
 
 fn common_prefix_bytes(first: &str, candidate: &str, limit: usize) -> usize {
@@ -1183,6 +1597,9 @@ const fn parse_error_text(error: ParseError) -> &'static str {
         ParseError::TooManyStages => "too many pipeline stages",
         ParseError::UnclosedQuote => "unclosed quote",
         ParseError::EmptyStage => "empty pipeline stage",
+        ParseError::MissingRedirectionTarget => "missing redirection target",
+        ParseError::DuplicateRedirection => "duplicate redirection",
+        ParseError::InvalidRedirectionPosition => "invalid redirection position",
     }
 }
 
@@ -1190,18 +1607,112 @@ const fn parse_error_text(error: ParseError) -> &'static str {
 mod tests {
     use super::{
         CommandClass, CompletionConfig, CompletionConfigError, ExternalCommand, INTRINSICS,
-        MachineAction, ParseError, Shell, command_class, command_synopsis, format_memory_report,
-        parse_line,
+        MachineAction, OutputRedirection, ParseError, SharedNamespace, Shell, command_class,
+        command_synopsis, format_memory_report, parse_line,
     };
+    use alloc::boxed::Box;
     use alloc::format;
+    use alloc::rc::Rc;
     use alloc::string::{String, ToString};
     use alloc::vec::Vec;
+    use core::cell::RefCell;
     use troe_core::{
         BoundedOutput, CommandStatus, Input, MAX_ARGS, MAX_LINE_BYTES, MAX_PIPELINE_STAGES,
         MachineMemorySnapshot, Output, PIPE_CAPACITY, SliceInput, write_all,
     };
     use troe_driver::InputQueueStats;
-    use troe_vfs::{FsError, Namespace, RamFsQuota};
+    use troe_vfs::{
+        FILE_IO_BUFFER_BYTES, FileMetadata, FsError, MAX_FILE_IO_BUFFER_BYTES, Namespace, NodeKind,
+        ProviderListing, RamFsQuota, ReadOnlyFileSystem,
+    };
+
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    struct StreamState {
+        bytes: u64,
+        largest_chunk: usize,
+        syncs: u32,
+    }
+
+    #[derive(Debug)]
+    struct StreamProvider {
+        state: Rc<RefCell<StreamState>>,
+    }
+
+    impl ReadOnlyFileSystem for StreamProvider {
+        fn metadata(&mut self, path: &str) -> Result<FileMetadata, FsError> {
+            match path {
+                "/" => Ok(FileMetadata {
+                    kind: NodeKind::Directory,
+                    byte_count: 0,
+                }),
+                "/large" => Ok(FileMetadata {
+                    kind: NodeKind::File,
+                    byte_count: self.state.borrow().bytes,
+                }),
+                _ => Err(FsError::NotFound),
+            }
+        }
+
+        fn read_file(
+            &mut self,
+            path: &str,
+            offset: u64,
+            destination: &mut [u8],
+        ) -> Result<usize, FsError> {
+            if path != "/large" {
+                return Err(FsError::NotFound);
+            }
+            let count = destination.len().min(
+                usize::try_from(self.state.borrow().bytes.saturating_sub(offset))
+                    .unwrap_or(usize::MAX),
+            );
+            destination[..count].fill(0x5a);
+            Ok(count)
+        }
+
+        fn list(
+            &mut self,
+            _path: &str,
+            _cursor: u64,
+            _max_entries: usize,
+            _max_name_bytes: usize,
+        ) -> Result<ProviderListing, FsError> {
+            Ok(ProviderListing {
+                entries: Vec::new(),
+                next_cursor: None,
+            })
+        }
+
+        fn truncate_file(&mut self, path: &str) -> Result<(), FsError> {
+            if path != "/large" {
+                return Err(FsError::Invalid);
+            }
+            *self.state.borrow_mut() = StreamState::default();
+            Ok(())
+        }
+
+        fn append_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), FsError> {
+            if path != "/large" || bytes.is_empty() {
+                return Err(FsError::Invalid);
+            }
+            let mut state = self.state.borrow_mut();
+            state.bytes = state
+                .bytes
+                .checked_add(u64::try_from(bytes.len()).map_err(|_| FsError::Overflow)?)
+                .ok_or(FsError::Overflow)?;
+            state.largest_chunk = state.largest_chunk.max(bytes.len());
+            Ok(())
+        }
+
+        fn sync_file(&mut self, path: &str) -> Result<(), FsError> {
+            if path != "/large" {
+                return Err(FsError::Invalid);
+            }
+            let mut state = self.state.borrow_mut();
+            state.syncs = state.syncs.saturating_add(1);
+            Ok(())
+        }
+    }
 
     fn shell() -> Shell {
         let mut namespace = Namespace::new(RamFsQuota::default());
@@ -1247,7 +1758,7 @@ mod tests {
             command: &str,
             words: &[String],
             cwd: &str,
-            namespace: &mut Namespace,
+            namespace: &SharedNamespace,
             stdin: &mut dyn Input,
             stdout: &mut dyn Output,
             stderr: &mut dyn Output,
@@ -1261,20 +1772,42 @@ mod tests {
                         Self::failure(stderr, command, "stream I/O failed", CommandStatus::Failure)
                     }
                 }
-                "cat" if words.len() == 2 => match namespace.read_file(cwd, &words[1]) {
-                    Ok(bytes) if write_all(stdout, &bytes).is_ok() => Some(CommandStatus::Success),
-                    Ok(_) => {
-                        Self::failure(stderr, command, "stream I/O failed", CommandStatus::Failure)
+                "cat" if words.len() == 2 => {
+                    let mut offset = 0_u64;
+                    let mut chunk = [0_u8; 4096];
+                    loop {
+                        let result = namespace
+                            .borrow_mut()
+                            .read_file_at(cwd, &words[1], offset, &mut chunk);
+                        match result {
+                            Ok(0) => return Some(CommandStatus::Success),
+                            Ok(count) if write_all(stdout, &chunk[..count]).is_ok() => {
+                                offset = offset.saturating_add(count as u64);
+                            }
+                            Ok(_) => {
+                                return Self::failure(
+                                    stderr,
+                                    command,
+                                    "stream I/O failed",
+                                    CommandStatus::Failure,
+                                );
+                            }
+                            Err(error) => {
+                                let status = if error == FsError::NotFound {
+                                    CommandStatus::NotFound
+                                } else {
+                                    CommandStatus::Failure
+                                };
+                                return Self::failure(
+                                    stderr,
+                                    command,
+                                    &format!("{}: {error}", words[1]),
+                                    status,
+                                );
+                            }
+                        }
                     }
-                    Err(error) => {
-                        let status = if error == FsError::NotFound {
-                            CommandStatus::NotFound
-                        } else {
-                            CommandStatus::Failure
-                        };
-                        Self::failure(stderr, command, &format!("{}: {error}", words[1]), status)
-                    }
-                },
+                }
                 "copy" if words.len() == 1 => {
                     let mut buffer = [0_u8; 512];
                     loop {
@@ -1292,40 +1825,29 @@ mod tests {
                         }
                     }
                 }
-                "write" if words.len() == 2 => {
-                    let mut bytes = Vec::new();
-                    let mut buffer = [0_u8; 512];
-                    loop {
-                        let Ok(count) = stdin.read(&mut buffer) else {
+                "stream-default" | "stream-archive" => {
+                    if command == "stream-archive"
+                        && stdout.set_chunk_size(MAX_FILE_IO_BUFFER_BYTES).is_err()
+                    {
+                        return Self::failure(
+                            stderr,
+                            command,
+                            "chunk policy failed",
+                            CommandStatus::Failure,
+                        );
+                    }
+                    let block = [0x5a; 4096];
+                    for _ in 0..512 {
+                        if write_all(stdout, &block).is_err() {
                             return Self::failure(
                                 stderr,
                                 command,
                                 "stream I/O failed",
                                 CommandStatus::Failure,
                             );
-                        };
-                        if count == 0 {
-                            break;
                         }
-                        if bytes.len().saturating_add(count) > PIPE_CAPACITY {
-                            return Self::failure(
-                                stderr,
-                                command,
-                                "input exceeds pipeline capacity",
-                                CommandStatus::Failure,
-                            );
-                        }
-                        bytes.extend_from_slice(&buffer[..count]);
                     }
-                    match namespace.write_file(cwd, &words[1], &bytes) {
-                        Ok(()) => Some(CommandStatus::Success),
-                        Err(error) => Self::failure(
-                            stderr,
-                            command,
-                            &format!("{}: {error}", words[1]),
-                            CommandStatus::Failure,
-                        ),
-                    }
+                    Some(CommandStatus::Success)
                 }
                 "fail" => {
                     Self::failure(stderr, command, "requested failure", CommandStatus::Failure)
@@ -1343,6 +1865,44 @@ mod tests {
         assert_eq!(parsed.stages[1].words, ["grep", "b"]);
         assert_eq!(parse_line("echo 'bad"), Err(ParseError::UnclosedQuote));
         assert_eq!(parse_line("echo a || cat"), Err(ParseError::EmptyStage));
+    }
+
+    #[test]
+    fn redirection_parses_outside_quotes_and_never_enters_argv() {
+        let parsed = parse_line("copy<'input file' | copy >>\"output file\"")
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(parsed.stages.len(), 2);
+        assert_eq!(parsed.stages[0].words, ["copy"]);
+        assert_eq!(parsed.stages[0].input.as_deref(), Some("input file"));
+        assert_eq!(parsed.stages[0].output, None);
+        assert_eq!(parsed.stages[1].words, ["copy"]);
+        assert_eq!(parsed.stages[1].input, None);
+        assert_eq!(
+            parsed.stages[1].output,
+            Some(OutputRedirection::Append("output file".to_string()))
+        );
+
+        let quoted = parse_line("echo 'a > b' \"c < d\"").unwrap_or_default();
+        assert_eq!(quoted.stages[0].words, ["echo", "a > b", "c < d"]);
+        assert_eq!(quoted.stages[0].input, None);
+        assert_eq!(quoted.stages[0].output, None);
+
+        assert_eq!(
+            parse_line("echo >"),
+            Err(ParseError::MissingRedirectionTarget)
+        );
+        assert_eq!(
+            parse_line("echo > first > second"),
+            Err(ParseError::DuplicateRedirection)
+        );
+        assert_eq!(
+            parse_line("echo > file | copy"),
+            Err(ParseError::InvalidRedirectionPosition)
+        );
+        assert_eq!(
+            parse_line("echo | copy < file"),
+            Err(ParseError::InvalidRedirectionPosition)
+        );
     }
 
     #[test]
@@ -1400,6 +1960,127 @@ mod tests {
         );
         assert_eq!(status, CommandStatus::Success);
         assert_eq!(output.as_slice(), b"alpha\nbeta alpha\n");
+        assert!(error.as_slice().is_empty());
+    }
+
+    #[test]
+    fn redirection_replaces_appends_reads_and_leaves_normal_failure_result() {
+        let mut shell = shell();
+        assert_eq!(
+            shell
+                .namespace
+                .borrow_mut()
+                .write_file("/", "/tmp/result", b"old\n"),
+            Ok(())
+        );
+        let mut external = FakeExternal::default();
+        let mut input = SliceInput::new(b"");
+        let mut output = BoundedOutput::new(64);
+        let mut error = BoundedOutput::new(512);
+
+        assert_eq!(
+            shell.execute_with_external(
+                "copy < /help/readme > /tmp/result",
+                &mut input,
+                &mut output,
+                &mut error,
+                &mut external,
+            ),
+            CommandStatus::Success
+        );
+        assert!(output.as_slice().is_empty());
+        assert_eq!(
+            shell.namespace.borrow_mut().read_file("/", "/tmp/result"),
+            Ok(b"alpha\nbeta alpha\n".to_vec())
+        );
+
+        assert_eq!(
+            shell.execute_with_external(
+                "echo >> /tmp/result",
+                &mut input,
+                &mut output,
+                &mut error,
+                &mut external,
+            ),
+            CommandStatus::Success
+        );
+        assert_eq!(
+            shell.namespace.borrow_mut().read_file("/", "/tmp/result"),
+            Ok(b"alpha\nbeta alpha\nexternal application\n".to_vec())
+        );
+
+        assert_eq!(
+            shell.execute_with_external(
+                "fail > /tmp/result",
+                &mut input,
+                &mut output,
+                &mut error,
+                &mut external,
+            ),
+            CommandStatus::Failure
+        );
+        assert_eq!(
+            shell.namespace.borrow_mut().read_file("/", "/tmp/result"),
+            Ok(Vec::new())
+        );
+    }
+
+    #[test]
+    fn redirection_streams_past_old_limit_and_honors_archive_chunk_hint() {
+        const TOTAL_BYTES: u64 = 2 * 1024 * 1024;
+        let mut shell = shell();
+        let state = Rc::new(RefCell::new(StreamState::default()));
+        assert_eq!(
+            shell.namespace.borrow_mut().mount_writable(
+                "/media",
+                Box::new(StreamProvider {
+                    state: Rc::clone(&state),
+                }),
+            ),
+            Ok(())
+        );
+        let mut external = FakeExternal::default();
+        let mut input = SliceInput::new(b"");
+        let mut output = BoundedOutput::new(64);
+        let mut error = BoundedOutput::new(512);
+
+        assert_eq!(
+            shell.execute_with_external(
+                "stream-default > /media/large",
+                &mut input,
+                &mut output,
+                &mut error,
+                &mut external,
+            ),
+            CommandStatus::Success
+        );
+        assert_eq!(
+            *state.borrow(),
+            StreamState {
+                bytes: TOTAL_BYTES,
+                largest_chunk: FILE_IO_BUFFER_BYTES,
+                syncs: 1,
+            }
+        );
+
+        assert_eq!(
+            shell.execute_with_external(
+                "stream-archive > /media/large",
+                &mut input,
+                &mut output,
+                &mut error,
+                &mut external,
+            ),
+            CommandStatus::Success
+        );
+        assert_eq!(
+            *state.borrow(),
+            StreamState {
+                bytes: TOTAL_BYTES,
+                largest_chunk: MAX_FILE_IO_BUFFER_BYTES,
+                syncs: 1,
+            }
+        );
         assert!(error.as_slice().is_empty());
     }
 
@@ -1538,6 +2219,11 @@ mod tests {
         let file = shell.complete("cat /help/r", 11, CompletionConfig::standard());
         assert_eq!(file.candidates[0].replacement, "/help/readme ");
 
+        for line in ["echo > /help/r", "echo >>/help/r", "copy </help/r"] {
+            let completion = shell.complete(line, line.len(), CompletionConfig::standard());
+            assert_eq!(completion.candidates[0].replacement, "/help/readme ");
+        }
+
         let net_mode = "net st";
         let completion = shell.complete(net_mode, net_mode.len(), CompletionConfig::standard());
         assert_eq!(completion.candidates[0].replacement, "stats ");
@@ -1584,7 +2270,7 @@ mod tests {
         assert_eq!(first.common_replacement(), Some("hexdump "));
         assert_eq!(
             shell.command_catalog.revision,
-            Some(shell.namespace.command_revision())
+            Some(shell.namespace.borrow().command_revision())
         );
 
         shell.command_catalog.names.push("cached-only".to_string());
@@ -1594,6 +2280,7 @@ mod tests {
         assert_eq!(
             shell
                 .namespace
+                .borrow_mut()
                 .add_read_only_file("/bin/beta.kex", b"package"),
             Ok(())
         );
@@ -1649,6 +2336,7 @@ mod tests {
 
     #[test]
     fn exact_capacity_pipeline_succeeds_and_one_extra_byte_is_atomic() {
+        assert_eq!(PIPE_CAPACITY, 1024 * 1024);
         let mut namespace = Namespace::new(RamFsQuota::default());
         let exact = alloc::vec![b'x'; PIPE_CAPACITY];
         let oversized = alloc::vec![b'y'; PIPE_CAPACITY + 1];
@@ -1699,7 +2387,7 @@ mod tests {
         let mut output = BoundedOutput::new(128);
         let mut error = BoundedOutput::new(256);
         let status = shell.execute_with_external(
-            "fail | write /tmp/error-copy",
+            "fail | copy > /tmp/error-copy",
             &mut input,
             &mut output,
             &mut error,
@@ -1710,7 +2398,10 @@ mod tests {
         assert!(output.as_slice().is_empty());
         assert_eq!(error.as_slice(), b"fail: requested failure\n");
         assert_eq!(
-            shell.namespace.read_file("/", "/tmp/error-copy"),
+            shell
+                .namespace
+                .borrow_mut()
+                .read_file("/", "/tmp/error-copy"),
             Err(FsError::NotFound)
         );
         assert_eq!(external.attempts, ["fail"]);

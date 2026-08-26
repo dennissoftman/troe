@@ -1,6 +1,7 @@
 # ADR 0017: constrained ext4 profile v1
 
-Status: accepted and implemented, 2026-08-24.
+Status: accepted and implemented, 2026-08-24; amended with streamed writes and
+checksummed depth-one extent leaves, 2026-08-26.
 
 ## Context
 
@@ -20,7 +21,7 @@ immutable content; it does not require every ext4 layout optimization.
 
 The `troe-ext4` v1 profile is a strict, clean ext4 subset. Read-only mounts
 retain the original parser contract, while a read-write block capability may
-perform bounded complete-file mutation:
+perform bounded-memory streamed mutation:
 
 - one block device, a 4 KiB filesystem block, 256-byte inodes, 32-byte group
   descriptors, and at most 32 block groups;
@@ -35,25 +36,26 @@ perform bounded complete-file mutation:
 - regular files, directories, and symbolic links with UTF-8 names and file-type
   directory entries; special files, xattr interpretation, and ACL interpretation
   are outside the VFS surface;
-- inline inode extent roots only (tree depth zero), at most four ordered
-  extents, holes in regular files read as zero, and no holes or unwritten
-  extents in directories; and
+- inline inode extent roots at depth zero or a checksummed depth-one root with
+  at most four leaf blocks and 1,360 ordered extents; holes in regular files
+  read as zero, and directories use neither holes nor unwritten extents; and
 - explicit per-mount ceilings for groups, traversed inodes, directory entries,
   directory blocks, file bytes, read bytes, and name bytes.
 
 Unknown or merely unneeded feature bits fail the mount. The provider does not
 replay the journal and therefore refuses dirty media and `needs_recovery`.
 Directory indexing, 64-bit block numbers, flex groups, bigalloc, inline data,
-encryption, case folding, external journals, and extent-tree blocks are not in
-v1. The volume UUID is exposed so mount policy can select a filesystem by
-stable identity.
+encryption, case folding, external journals, and extent trees deeper than one
+level are not in v1. The volume UUID is exposed so mount policy can select a
+filesystem by stable identity.
 
 Writable mounts require flush or force-unit-access durability and implement
-complete-file create, copy-on-write replacement, non-directory unlink,
-empty-directory creation, symbolic-link creation, and regular-file hard-link creation.
-Allocation bitmaps, group and superblock counters, inode extents, directory
-records, and every affected checksum are updated within the same bounded
-profile.
+regular-file create/truncate/sequential append, non-directory unlink,
+empty-directory creation, symbolic-link creation, and regular-file hard-link
+creation. Data blocks and extent records grow incrementally from bounded caller
+chunks. Allocation bitmaps, group and superblock counters, inode extents and
+extent-leaf checksums, directory records, and every other affected checksum are
+updated within the same bounded profile.
 
 Symbolic-link targets are UTF-8 and at most 256 bytes. Both inline fast
 symlinks and depth-zero extent-backed symlinks are accepted. Traversal follows
@@ -63,22 +65,23 @@ over-budget expansion fail closed. Hard links are limited to regular files,
 cannot cross providers, update only the inode link count/checksum plus the new
 directory record, and preserve the shared inode's remaining metadata.
 
-Replacing a file starts from its exact existing 256-byte inode. Only file size,
-the data-derived part of its allocated-sector count, inline extent root, and
-inode checksum may change. Any sector count belonging to preserved metadata
-blocks remains accounted. Mode bits (including `0777`), raw UID/GID,
+Truncating or extending a file starts from its exact existing 256-byte inode.
+Only file size, the data-derived part of its allocated-sector count, extent
+root/leaf records, and inode checksum may change. Any sector count belonging to
+preserved metadata blocks remains accounted. Mode bits (including `0777`), raw UID/GID,
 timestamps, flags, generation, inline metadata, ACL/xattr references, and all
 other inode bytes are preserved. A newly created regular file has raw UID 1000,
 raw GID 1000, and mode `0600`; these are storage defaults, not an authorization
 decision. A newly created symbolic link uses the same UID/GID defaults and the
 conventional raw mode `0777`.
 
-Before the first metadata mutation the provider clears `EXT4_VALID_FS` and
-flushes it. It restores clean state only after new content and all metadata are
-durable. Replacement publishes through one inode-table-block write and reclaims
-the old extents afterward. Because v1 still does not replay the journal, an
-interrupted mutation requires external `e2fsck`; dirty media fail closed rather
-than being accepted as a completed transaction.
+Before each metadata mutation the provider clears `EXT4_VALID_FS` and flushes
+it. It restores clean state only after the new chunk and its metadata are
+durable. A failed multi-chunk operation can therefore leave a valid written
+prefix after the last completed chunk; it does not promise rollback. Because
+v1 still does not replay the journal, interruption inside a mutation requires
+external `e2fsck`; dirty media fail closed rather than being accepted as a
+completed transaction.
 
 A host image for this exact profile can be created by selecting only these
 features rather than relying on defaults, for example with `mke2fs -t ext4 -b
@@ -101,8 +104,8 @@ block-bitmap, inode-bitmap, inode, and directory-tail checksums; free counters
 and bitmap padding; and equality between allocated blocks and the complete set
 of superblock, descriptor, bitmap, inode-table, and inline-extent blocks. It
 also requires zeroed unallocated inode records, rejects unsupported inode kinds,
-xattrs, ACL blocks, extent trees, directory holes, and unreachable live inodes,
-and compares the complete canonical directory tree and file payloads. This
+xattrs, ACL blocks, pre-populated extent trees, directory holes, and unreachable
+live inodes, and compares the complete canonical directory tree and file payloads. This
 verification is deliberately independent of both e2fsck's verdict and the
 kernel provider.
 
@@ -117,6 +120,8 @@ The subset is intentionally narrower than general ext4. Expanding it requires
 new corruption tests and an update to this versioned profile. Journal replay,
 ACL authorization, xattr exposure and external-xattr final unlink, hard links
 to directories or symlinks, indexed-directory mutation, directory removal/rename,
-and deep extent trees remain later increments. Writer interoperability is
-checked by remounting and running read-only `e2fsck` after file/directory create,
-replacement, and removal.
+and extent trees deeper than one remain later increments. Writer
+interoperability is checked by remounting and running read-only `e2fsck` after
+file/directory create, replacement, and removal. An explicit stress test also
+streams and samples a 128 MiB real image; a separate metadata test describes a
+2 GiB file without staging its payload.

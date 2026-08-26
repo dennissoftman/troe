@@ -152,6 +152,23 @@ pub struct Fat32<D: BlockDevice> {
     region: BlockRegion<D>,
     limits: Fat32Limits,
     layout: Layout,
+    append_cursor: Option<FatAppendCursor>,
+    read_cursor: Option<FatReadCursor>,
+}
+
+#[derive(Clone, Debug)]
+struct FatAppendCursor {
+    path: String,
+    byte_count: u64,
+    tail: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+struct FatReadCursor {
+    path: String,
+    byte_count: u64,
+    cluster_index: usize,
+    cluster: u32,
 }
 
 impl<D: BlockDevice> fmt::Debug for Fat32<D> {
@@ -204,6 +221,8 @@ impl<D: BlockDevice> Fat32<D> {
             region,
             limits,
             layout,
+            append_cursor: None,
+            read_cursor: None,
         };
         let media = mounted.read_fat_entry(0)?;
         let reserved = mounted.read_fat_entry(1)?;
@@ -265,11 +284,7 @@ impl<D: BlockDevice> Fat32<D> {
             return Err(FsError::Corrupt);
         }
         let mut chain = Vec::new();
-        chain
-            .try_reserve_exact(
-                usize::try_from(self.limits.max_chain_clusters()).map_err(|_| FsError::Overflow)?,
-            )
-            .map_err(|_| FsError::NoSpace)?;
+        chain.try_reserve_exact(64).map_err(|_| FsError::NoSpace)?;
         let mut current = first;
         loop {
             if chain.len()
@@ -293,6 +308,36 @@ impl<D: BlockDevice> Fat32<D> {
             }
             current = next;
         }
+    }
+
+    fn chain_tail_for_bytes(&mut self, first: u32, byte_count: u64) -> Result<u32, FsError> {
+        let cluster_bytes =
+            u64::try_from(self.layout.cluster_bytes()?).map_err(|_| FsError::Overflow)?;
+        let required = byte_count
+            .checked_add(cluster_bytes - 1)
+            .ok_or(FsError::Overflow)?
+            / cluster_bytes;
+        if required == 0 || required > u64::from(self.limits.max_chain_clusters()) {
+            return Err(FsError::Corrupt);
+        }
+        let mut current = first;
+        for index in 0..required {
+            let next = self.read_fat_entry(current)?;
+            if index + 1 == required {
+                return (next >= FAT32_EOC_MIN)
+                    .then_some(current)
+                    .ok_or(FsError::Corrupt);
+            }
+            if next < 2
+                || next == FAT32_BAD_CLUSTER
+                || next > self.layout.last_cluster()?
+                || (0x0fff_fff0..FAT32_EOC_MIN).contains(&next)
+            {
+                return Err(FsError::Corrupt);
+            }
+            current = next;
+        }
+        Err(FsError::Corrupt)
     }
 
     fn read_fat_entry(&mut self, cluster: u32) -> Result<u32, FsError> {
@@ -468,6 +513,98 @@ impl<D: BlockDevice> Fat32<D> {
         Ok(())
     }
 
+    fn append_regular_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), FsError> {
+        self.read_cursor = None;
+        self.ensure_writable()?;
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let normalized = canonicalize("/", path)?;
+        if normalized != path {
+            return Err(FsError::Invalid);
+        }
+        let (parent, name) = self.resolve_parent(path)?;
+        let entries = self.read_directory(parent.first_cluster)?;
+        let mut matching = entries
+            .iter()
+            .filter(|entry| names_equal(&entry.name, &name));
+        let existing = matching.next().cloned().ok_or(FsError::NotFound)?;
+        if matching.next().is_some() {
+            return Err(FsError::Corrupt);
+        }
+        if existing.kind != NodeKind::File {
+            return Err(FsError::WrongType);
+        }
+        let added = u64::try_from(bytes.len()).map_err(|_| FsError::Overflow)?;
+        let next_size = existing
+            .byte_count
+            .checked_add(added)
+            .ok_or(FsError::Overflow)?;
+        if next_size > self.limits.max_file_bytes() || next_size > u64::from(u32::MAX) {
+            return Err(FsError::NoSpace);
+        }
+        let mut tail = self
+            .append_cursor
+            .as_ref()
+            .filter(|cursor| cursor.path == path && cursor.byte_count == existing.byte_count)
+            .and_then(|cursor| cursor.tail);
+        if existing.byte_count != 0 && tail.is_none() {
+            tail = Some(self.chain_tail_for_bytes(existing.first_cluster, existing.byte_count)?);
+        }
+
+        self.begin_mutation()?;
+        let cluster_bytes = self.layout.cluster_bytes()?;
+        let partial = usize::try_from(
+            existing.byte_count % u64::try_from(cluster_bytes).map_err(|_| FsError::Overflow)?,
+        )
+        .map_err(|_| FsError::Overflow)?;
+        let mut consumed = 0_usize;
+        if partial != 0 {
+            let tail_cluster = tail.ok_or(FsError::Corrupt)?;
+            let mut cluster = self.read_cluster(tail_cluster)?;
+            consumed = bytes.len().min(cluster_bytes - partial);
+            cluster[partial..partial + consumed].copy_from_slice(&bytes[..consumed]);
+            self.write_cluster(tail_cluster, &cluster)?;
+        }
+
+        let new_chain = self.allocate_file_chain(&bytes[consumed..])?;
+        let previous_tail = tail;
+        if let Some(first_new) = new_chain.first().copied() {
+            if let Some(previous) = previous_tail
+                && let Err(error) = self.write_fat_entry(previous, first_new)
+            {
+                let _ignored = self.release_clusters(&new_chain);
+                return Err(error);
+            }
+            tail = new_chain.last().copied();
+        }
+        let first_cluster = if existing.first_cluster == 0 {
+            new_chain.first().copied().ok_or(FsError::Corrupt)?
+        } else {
+            existing.first_cluster
+        };
+        if let Err(error) = self.replace_directory_entry(
+            &existing,
+            first_cluster,
+            usize::try_from(next_size).map_err(|_| FsError::NoSpace)?,
+        ) {
+            if let Some(previous) = previous_tail
+                && !new_chain.is_empty()
+            {
+                let _ignored = self.write_fat_entry(previous, 0x0fff_ffff);
+            }
+            let _ignored = self.release_clusters(&new_chain);
+            return Err(error);
+        }
+        self.finish_mutation()?;
+        self.append_cursor = Some(FatAppendCursor {
+            path: normalized,
+            byte_count: next_size,
+            tail,
+        });
+        Ok(())
+    }
+
     fn force_unit_access(&self) -> bool {
         let info = self.region.info();
         !info.supports_flush() && info.supports_force_unit_access()
@@ -635,6 +772,40 @@ impl<D: BlockDevice> Fat32<D> {
         }
         self.invalidate_fsinfo()?;
         self.durability_barrier()
+    }
+
+    fn release_chain_for_bytes(&mut self, first: u32, byte_count: u64) -> Result<(), FsError> {
+        let cluster_bytes =
+            u64::try_from(self.layout.cluster_bytes()?).map_err(|_| FsError::Overflow)?;
+        let required = byte_count
+            .checked_add(cluster_bytes - 1)
+            .ok_or(FsError::Overflow)?
+            / cluster_bytes;
+        if required == 0 || required > u64::from(self.limits.max_chain_clusters()) {
+            return Err(FsError::Corrupt);
+        }
+        let mut current = first;
+        for index in 0..required {
+            let next = self.read_fat_entry(current)?;
+            let final_cluster = index + 1 == required;
+            if final_cluster != (next >= FAT32_EOC_MIN) {
+                return Err(FsError::Corrupt);
+            }
+            self.write_fat_entry(current, 0)?;
+            if final_cluster {
+                self.invalidate_fsinfo()?;
+                return self.durability_barrier();
+            }
+            if next < 2
+                || next == FAT32_BAD_CLUSTER
+                || next > self.layout.last_cluster()?
+                || (0x0fff_fff0..FAT32_EOC_MIN).contains(&next)
+            {
+                return Err(FsError::Corrupt);
+            }
+            current = next;
+        }
+        Err(FsError::Corrupt)
     }
 
     fn allocate_file_chain(&mut self, bytes: &[u8]) -> Result<Vec<u32>, FsError> {
@@ -857,29 +1028,59 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Fat32<D> {
         if entry.byte_count == 0 {
             return Ok(0);
         }
-        let chain = self.cluster_chain(entry.first_cluster)?;
         let cluster_bytes = self.layout.cluster_bytes()?;
-        let required_clusters = usize::try_from(entry.byte_count)
-            .ok()
-            .and_then(|bytes| bytes.checked_add(cluster_bytes - 1))
-            .map(|bytes| bytes / cluster_bytes)
-            .ok_or(FsError::Overflow)?;
-        if chain.len() != required_clusters {
-            return Err(FsError::Corrupt);
-        }
         let mut file_offset = usize::try_from(offset).map_err(|_| FsError::Overflow)?;
+        let cluster_index = file_offset / cluster_bytes;
+        let (mut current_index, mut cluster) = self
+            .read_cursor
+            .as_ref()
+            .filter(|cursor| {
+                cursor.path == path
+                    && cursor.byte_count == entry.byte_count
+                    && cursor.cluster_index <= cluster_index
+            })
+            .map_or((0, entry.first_cluster), |cursor| {
+                (cursor.cluster_index, cursor.cluster)
+            });
+        while current_index < cluster_index {
+            let next = self.read_fat_entry(cluster)?;
+            if !(2..FAT32_EOC_MIN).contains(&next) || next > self.layout.last_cluster()? {
+                return Err(FsError::Corrupt);
+            }
+            cluster = next;
+            current_index += 1;
+        }
         let mut copied = 0_usize;
         while copied < wanted {
-            let cluster_index = file_offset / cluster_bytes;
             let in_cluster = file_offset % cluster_bytes;
-            let cluster = *chain.get(cluster_index).ok_or(FsError::Corrupt)?;
             let bytes = self.read_cluster(cluster)?;
             let count = (wanted - copied).min(cluster_bytes - in_cluster);
             destination[copied..copied + count]
                 .copy_from_slice(&bytes[in_cluster..in_cluster + count]);
             copied += count;
             file_offset = file_offset.checked_add(count).ok_or(FsError::Overflow)?;
+            if copied < wanted {
+                let next = self.read_fat_entry(cluster)?;
+                if !(2..FAT32_EOC_MIN).contains(&next) || next > self.layout.last_cluster()? {
+                    return Err(FsError::Corrupt);
+                }
+                cluster = next;
+                current_index += 1;
+            } else if offset
+                .checked_add(u64::try_from(copied).map_err(|_| FsError::Overflow)?)
+                .ok_or(FsError::Overflow)?
+                == entry.byte_count
+                && self.read_fat_entry(cluster)? < FAT32_EOC_MIN
+            {
+                return Err(FsError::Corrupt);
+            }
         }
+        self.read_cursor = Some(FatReadCursor {
+            path: path.to_string(),
+            byte_count: entry.byte_count,
+            cluster_index: current_index,
+            cluster,
+        });
         Ok(copied)
     }
 
@@ -927,7 +1128,28 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Fat32<D> {
         })
     }
 
+    fn truncate_file(&mut self, path: &str) -> Result<(), FsError> {
+        self.write_file(path, &[])?;
+        let normalized = canonicalize("/", path)?;
+        self.append_cursor = Some(FatAppendCursor {
+            path: normalized,
+            byte_count: 0,
+            tail: None,
+        });
+        Ok(())
+    }
+
+    fn append_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), FsError> {
+        self.append_regular_file(path, bytes)
+    }
+
+    fn sync_file(&mut self, _path: &str) -> Result<(), FsError> {
+        self.durability_barrier()
+    }
+
     fn write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), FsError> {
+        self.append_cursor = None;
+        self.read_cursor = None;
         self.ensure_writable()?;
         if u64::try_from(bytes.len()).map_err(|_| FsError::NoSpace)? > self.limits.max_file_bytes()
             || u32::try_from(bytes.len()).is_err()
@@ -947,11 +1169,6 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Fat32<D> {
             if existing.kind != NodeKind::File {
                 return Err(FsError::WrongType);
             }
-            let old_chain = if existing.byte_count == 0 {
-                Vec::new()
-            } else {
-                self.cluster_chain(existing.first_cluster)?
-            };
             self.begin_mutation()?;
             let new_chain = self.allocate_file_chain(bytes)?;
             let first_cluster = new_chain.first().copied().unwrap_or(0);
@@ -960,7 +1177,9 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Fat32<D> {
                 let _ignored = self.release_clusters(&new_chain);
                 return Err(error);
             }
-            self.release_clusters(&old_chain)?;
+            if existing.byte_count != 0 {
+                self.release_chain_for_bytes(existing.first_cluster, existing.byte_count)?;
+            }
             return self.finish_mutation();
         }
 
@@ -985,6 +1204,8 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Fat32<D> {
     }
 
     fn create_directory(&mut self, path: &str) -> Result<(), FsError> {
+        self.append_cursor = None;
+        self.read_cursor = None;
         self.ensure_writable()?;
         let (parent, name) = self.resolve_parent(path)?;
         let entries = self.read_directory(parent.first_cluster)?;
@@ -1058,6 +1279,8 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Fat32<D> {
     }
 
     fn remove_file(&mut self, path: &str) -> Result<(), FsError> {
+        self.append_cursor = None;
+        self.read_cursor = None;
         self.ensure_writable()?;
         let (parent, name) = self.resolve_parent(path)?;
         let entries = self.read_directory(parent.first_cluster)?;
@@ -1071,14 +1294,11 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Fat32<D> {
         if entry.kind != NodeKind::File {
             return Err(FsError::WrongType);
         }
-        let old_chain = if entry.byte_count == 0 {
-            Vec::new()
-        } else {
-            self.cluster_chain(entry.first_cluster)?
-        };
         self.begin_mutation()?;
         self.delete_directory_entry(&entry)?;
-        self.release_clusters(&old_chain)?;
+        if entry.byte_count != 0 {
+            self.release_chain_for_bytes(entry.first_cluster, entry.byte_count)?;
+        }
         self.finish_mutation()
     }
 
@@ -1779,13 +1999,19 @@ mod tests {
     }
 
     fn mount_file_writable(path: &Path) -> Result<Fat32<FileDevice>, String> {
+        mount_file_writable_with_limits(path, limits().map_err(|error| error.to_string())?)
+    }
+
+    fn mount_file_writable_with_limits(
+        path: &Path,
+        limits: Fat32Limits,
+    ) -> Result<Fat32<FileDevice>, String> {
         let device = FileDevice::open_writable(path)?;
         let block_limits = BlockLimits::new(1, BLOCK_BYTES, 1)
             .map_err(|error| format!("invalid block limits: {error:?}"))?;
         let region = BlockRegion::whole_device(device, BlockAccess::ReadWrite, block_limits)
             .map_err(|error| format!("cannot grant writable image region: {error:?}"))?;
-        Fat32::mount(region, limits().map_err(|error| error.to_string())?)
-            .map_err(|error| error.to_string())
+        Fat32::mount(region, limits).map_err(|error| error.to_string())
     }
 
     fn fat_tool(name: &str) -> Option<PathBuf> {
@@ -2199,5 +2425,66 @@ mod tests {
 
         drop(fat);
         verify_writer_interoperability(&image, &fsck_fat)
+    }
+
+    #[test]
+    #[ignore = "writes and verifies a 128 MiB real FAT32 file"]
+    fn streams_128_mib_to_real_fat32_with_bounded_chunks() -> Result<(), String> {
+        const IMAGE_BYTES: u64 = 256 * 1024 * 1024;
+        const FILE_BYTES: u64 = 128 * 1024 * 1024;
+        const CHUNK_BYTES: usize = 1024 * 1024;
+        let Some(mkfs_fat) = fat_tool("mkfs.fat") else {
+            return unavailable_tool("mkfs.fat");
+        };
+        let Some(fsck_fat) = fat_tool("fsck.fat") else {
+            return unavailable_tool("fsck.fat");
+        };
+        let temporary = TestDirectory::create("fat32-large-stream")?;
+        let image = temporary.path().join("filesystem.fat32");
+        File::create(&image)
+            .and_then(|file| file.set_len(IMAGE_BYTES))
+            .map_err(|error| error.to_string())?;
+        let format = Command::new(mkfs_fat)
+            .args(["-F", "32", "-n", "TROESTRESS"])
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&format, "mkfs.fat for large stream")?;
+
+        let stress_limits = Fat32Limits::new(u32::MAX, 128, FILE_BYTES, CHUNK_BYTES, 64)
+            .map_err(|error| error.to_string())?;
+        let mut fat = mount_file_writable_with_limits(&image, stress_limits)?;
+        fat.truncate_file("/large.bin")
+            .map_err(|error| error.to_string())?;
+        let chunk = vec![0xa5; CHUNK_BYTES];
+        for _ in 0..FILE_BYTES / CHUNK_BYTES as u64 {
+            fat.append_file("/large.bin", &chunk)
+                .map_err(|error| error.to_string())?;
+        }
+        fat.sync_file("/large.bin")
+            .map_err(|error| error.to_string())?;
+        assert_eq!(
+            fat.metadata("/large.bin")
+                .map_err(|error| error.to_string())?
+                .byte_count,
+            FILE_BYTES
+        );
+        for offset in [0, FILE_BYTES / 2, FILE_BYTES - 4096] {
+            let mut sample = [0_u8; 4096];
+            assert_eq!(
+                fat.read_file("/large.bin", offset, &mut sample)
+                    .map_err(|error| error.to_string())?,
+                sample.len()
+            );
+            assert!(sample.iter().all(|byte| *byte == 0xa5));
+        }
+        drop(fat);
+
+        let check = Command::new(fsck_fat)
+            .args(["-vn"])
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&check, "fsck.fat after 128 MiB streamed write")
     }
 }

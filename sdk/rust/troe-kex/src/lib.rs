@@ -35,6 +35,10 @@ pub const DATAGRAM_BUFFER_BYTES: usize = datagram::MAX_RECEIVE_REPLY_BYTES;
 pub const FILESYSTEM_LIST_BUFFER_BYTES: usize = filesystem::MAX_LIST_REPLY_BYTES;
 /// Maximum useful payload buffer for one filesystem range read or append call.
 pub const FILESYSTEM_IO_BUFFER_BYTES: usize = MAX_SERVICE_PAYLOAD_BYTES;
+/// Smallest accepted file-stream aggregation hint.
+pub const MIN_FILE_STREAM_CHUNK_BYTES: usize = stream::MIN_CHUNK_SIZE;
+/// Largest accepted file-stream aggregation hint.
+pub const MAX_FILE_STREAM_CHUNK_BYTES: usize = stream::MAX_CHUNK_SIZE;
 
 /// One opaque application handle selected from the immutable startup page.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -187,10 +191,26 @@ pub struct CommandContext {
 impl CommandContext {
     fn from_startup(startup: &Startup<'_>) -> Result<Self, StartupError> {
         Ok(Self {
-            invocation: startup.required_handle(interface::COMMAND)?,
-            stdin: startup.required_handle(interface::STANDARD_INPUT)?,
-            stdout: startup.required_handle(interface::STANDARD_OUTPUT)?,
-            stderr: startup.required_handle(interface::STANDARD_ERROR)?,
+            invocation: startup.required_handle(
+                interface::COMMAND,
+                command::MAJOR,
+                command::MINOR,
+            )?,
+            stdin: startup.required_handle(
+                interface::STANDARD_INPUT,
+                stream::MAJOR,
+                stream::MINOR,
+            )?,
+            stdout: startup.required_handle(
+                interface::STANDARD_OUTPUT,
+                stream::MAJOR,
+                stream::MINOR,
+            )?,
+            stderr: startup.required_handle(
+                interface::STANDARD_ERROR,
+                stream::MAJOR,
+                stream::MINOR,
+            )?,
             datagram: startup.optional_handle(
                 interface::DATAGRAM,
                 datagram::MAJOR,
@@ -310,7 +330,7 @@ impl CommandContext {
         }
     }
 
-    /// Borrow the optional atomic filesystem-mutation capability.
+    /// Borrow the optional streamed filesystem-mutation capability.
     ///
     /// # Errors
     ///
@@ -499,6 +519,25 @@ pub struct StandardOutput {
 }
 
 impl StandardOutput {
+    /// Select a bounded downstream aggregation size.
+    ///
+    /// File-backed redirection accepts power-of-two values from 4 KiB through
+    /// 1 MiB. Other sinks may report `Unsupported`.
+    ///
+    /// # Errors
+    ///
+    /// Reports an invalid size, unsupported sink, service, or call-gate failure.
+    pub fn set_chunk_size(&mut self, bytes: usize) -> Result<(), Error> {
+        let request = stream::encode_chunk_size(bytes).map_err(|_| Error::InvalidCall)?;
+        let mut reply = [];
+        let count = call(self.handle, stream::SET_CHUNK_SIZE, &request, &mut reply)?;
+        if count == 0 {
+            Ok(())
+        } else {
+            Err(Error::InvalidCall)
+        }
+    }
+
     /// Write the complete byte slice using bounded copied calls.
     ///
     /// # Errors
@@ -535,7 +574,7 @@ pub struct ReadOnlyFilesystem {
     handle: Handle,
 }
 
-/// Atomic file-mutation and link client scoped to one application lifetime.
+/// Streamed file-mutation and link client scoped to one application lifetime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FilesystemMutation {
     handle: Handle,
@@ -590,11 +629,11 @@ pub struct TcpConnection {
     local_port: u16,
 }
 
-/// One pending complete-file replacement.
+/// One pending sequential file replacement.
 pub struct FileReplacement {
     handle: Handle,
     token: u32,
-    offset: usize,
+    offset: u64,
 }
 
 impl ReadOnlyFilesystem {
@@ -729,10 +768,11 @@ impl ReadOnlyFilesystem {
 }
 
 impl FilesystemMutation {
-    /// Begin staging one complete regular-file replacement.
+    /// Truncate or create one regular file and begin streaming its replacement.
     ///
-    /// Only one replacement may be pending on this capability. Application
-    /// teardown implicitly discards an uncommitted replacement.
+    /// Only one replacement may be pending on this capability. Bytes can reach
+    /// storage before `commit`; failure or teardown can therefore leave a
+    /// truncated file or a written prefix, like an ordinary write loop.
     ///
     /// # Errors
     ///
@@ -847,11 +887,39 @@ impl FilesystemMutation {
 }
 
 impl FileReplacement {
+    /// Select the kernel aggregation size for this streamed replacement.
+    ///
+    /// Values are power-of-two sizes from 4 KiB through 1 MiB. Configure the
+    /// writer before sending payload bytes.
+    ///
+    /// # Errors
+    ///
+    /// Reports invalid policy, stale tokens, service, or call-gate failures.
+    pub fn set_chunk_size(&mut self, bytes: usize) -> Result<(), Error> {
+        if self.offset != 0 {
+            return Err(Error::InvalidCall);
+        }
+        let request = filesystem_mutation::encode_chunk_size_request(self.token, bytes)
+            .map_err(|_| Error::InvalidCall)?;
+        let mut reply = [];
+        let count = call(
+            self.handle,
+            filesystem_mutation::SET_CHUNK_SIZE,
+            &request,
+            &mut reply,
+        )?;
+        if count == 0 {
+            Ok(())
+        } else {
+            Err(Error::InvalidCall)
+        }
+    }
+
     /// Append all bytes sequentially using bounded copied calls.
     ///
     /// # Errors
     ///
-    /// Reports the first size, staging, service, or call-gate failure.
+    /// Reports the first size, buffering, service, or call-gate failure.
     pub fn write_all(&mut self, mut bytes: &[u8]) -> Result<(), Error> {
         while !bytes.is_empty() {
             let chunk_bytes = bytes.len().min(filesystem_mutation::MAX_APPEND_BYTES);
@@ -875,17 +943,14 @@ impl FileReplacement {
             }
             self.offset = self
                 .offset
-                .checked_add(chunk_bytes)
+                .checked_add(u64::try_from(chunk_bytes).map_err(|_| Error::Overflow)?)
                 .ok_or(Error::Overflow)?;
             bytes = &bytes[chunk_bytes..];
         }
         Ok(())
     }
 
-    /// Atomically publish the complete staged bytes and consume this token.
-    ///
-    /// The service discards the staging transaction whether commit succeeds or
-    /// returns a filesystem failure.
+    /// Flush and durably order the streamed bytes, then consume this token.
     ///
     /// # Errors
     ///
@@ -895,7 +960,9 @@ impl FileReplacement {
         self.finish(filesystem_mutation::COMMIT_REPLACE)
     }
 
-    /// Discard the staged bytes and consume this token.
+    /// Consume this token without flushing its final buffered chunk.
+    ///
+    /// Previously flushed bytes and the initial truncation remain visible.
     ///
     /// # Errors
     ///
@@ -1300,8 +1367,8 @@ impl<'a> Startup<'a> {
         Ok(Some(HeapRegion { address, byte_len }))
     }
 
-    fn required_handle(&self, wanted: u32) -> Result<Handle, StartupError> {
-        self.optional_handle(wanted, 1, 0)?
+    fn required_handle(&self, wanted: u32, major: u16, minor: u16) -> Result<Handle, StartupError> {
+        self.optional_handle(wanted, major, minor)?
             .ok_or(StartupError::MissingAuthority)
     }
 
@@ -1663,7 +1730,7 @@ mod tests {
     use super::{
         ABI_MAJOR, ABI_MINOR, CommandContext, HeapRegion, KEX_HEAP_ADDRESS, KEX_STACK_TOP,
         STARTUP_HANDLE_BYTES, STARTUP_HEADER_BYTES, STARTUP_PAGE_BYTES, Startup, StartupError,
-        interface,
+        interface, stream,
     };
 
     fn startup_page(interfaces: &[u32]) -> [u8; STARTUP_PAGE_BYTES] {
@@ -1691,6 +1758,15 @@ mod tests {
             page[offset + 8..offset + 12].copy_from_slice(&1_u32.to_le_bytes());
             page[offset + 12..offset + 16].copy_from_slice(&interface.to_le_bytes());
             page[offset + 16..offset + 18].copy_from_slice(&1_u16.to_le_bytes());
+            let minor = if matches!(
+                interface,
+                interface::STANDARD_INPUT | interface::STANDARD_OUTPUT | interface::STANDARD_ERROR
+            ) {
+                stream::MINOR
+            } else {
+                0
+            };
+            page[offset + 18..offset + 20].copy_from_slice(&minor.to_le_bytes());
         }
         page
     }
@@ -1771,6 +1847,23 @@ mod tests {
 
     #[test]
     fn startup_rejects_truncation_padding_and_duplicate_interfaces() {
+        let mut old_stream = startup_page(&[
+            interface::COMMAND,
+            interface::STANDARD_INPUT,
+            interface::STANDARD_OUTPUT,
+            interface::STANDARD_ERROR,
+        ]);
+        let output_descriptor = STARTUP_HEADER_BYTES + 2 * STARTUP_HANDLE_BYTES;
+        old_stream[output_descriptor + 18..output_descriptor + 20].fill(0);
+        let startup = Startup::parse(&old_stream);
+        assert!(startup.is_ok());
+        if let Ok(startup) = startup {
+            assert!(matches!(
+                CommandContext::from_startup(&startup),
+                Err(StartupError::MissingAuthority)
+            ));
+        }
+
         let mut page = startup_page(&[
             interface::COMMAND,
             interface::COMMAND,

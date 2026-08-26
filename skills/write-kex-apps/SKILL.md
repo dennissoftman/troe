@@ -12,25 +12,21 @@ only as needed. Do not infer POSIX behavior.
 ## App contract
 
 - Use Rust `#![no_std]`, `#![no_main]`, and `troe_kex_sdk::entry!`.
-- Implement `fn main(&mut CommandContext) -> u32`; return a constant from
-  `troe_kex_sdk::exit`.
-- Get `cwd`/`argv` with `CommandContext::invocation`; use only granted
-  `stdin`, `stdout`, `stderr`, optional datagram/filesystem/mutation/timer/
-  diagnostics/TCP clients, and cooperative `yield_now`.
-- Declare every optional authority in `[package.metadata.troe-kex]`
-  `capabilities`; use `[]` or omit the table when none is needed.
-- No undeclared filesystem, environment, clock, raw sockets/device access,
-  threads, process spawning, dynamic linking, TLS, signals, or allocator is
-  granted.
-- Never hand-code call gates, startup parsing, handle values, ELF layout, or
-  KEX bytes. Do not add `unsafe` unless a reviewed SDK change strictly needs it.
-- Treat every argument/input byte and every service result as untrusted. Check
-  errors, avoid panics, and fail closed with `exit::FAILURE` or `exit::USAGE`.
+- Implement `fn main(&mut CommandContext) -> u32`; return a `troe_kex_sdk::exit` constant.
+- Get `cwd`/`argv` with `CommandContext::invocation`; use only granted standard streams, optional clients, and `yield_now`.
+- Declare every optional authority in `[package.metadata.troe-kex]` `capabilities`; use `[]` or omit the table when none is needed.
+- No undeclared filesystem, environment, clock, sockets/devices, threads, spawning, dynamic linking, TLS, signals, or allocator is granted.
+- Never hand-code call gates, startup parsing, handles, ELF layout, or KEX bytes; add `unsafe` only for a strictly required reviewed SDK change.
+- Treat arguments, input, and service results as untrusted; check errors, avoid panics, and fail closed with `exit::FAILURE` or `exit::USAGE`.
 
 Hard ABI ceilings: 32 arguments including argv[0], 256-byte cwd, 512 aggregate
-argument bytes, 4,094-byte service payload, 4 KiB message, and 64 KiB total per
-standard stream. Stream reads may be partial; zero bytes is EOF. `write_all`
-either accepts the complete slice in bounded calls or returns an error.
+argument bytes, 4,094-byte service payload, and a 4 KiB message. Standard
+streams do not have an aggregate byte ceiling: the kernel forwards
+message-sized calls directly to the supplied stream. Reads may be partial; zero
+bytes is EOF. `write_all` accepts the supplied slice in bounded calls or returns
+an error. A file-backed stdout uses 16 KiB aggregation by default and accepts
+power-of-two chunk hints from 4 KiB through 1 MiB. Use the default for ordinary
+text; request 1 MiB for measured bulk/archive paths.
 Datagrams are IPv4/UDP only, at most 1,472 payload bytes. Explicit ports are
 nonzero and exclusively owned until app teardown; `receive` is cancellable and
 reports Ctrl-C as `Error::Cancelled`. Treat `command.datagram()` as optional.
@@ -39,10 +35,14 @@ and limited to eight. Reads may be partial. Close every open file. Directory
 pages are lexical and opaque-cursor based, with at most 64 entries, 64-byte
 names, and 3,072 aggregate name bytes. Request `filesystem-read` only when used.
 Symbolic-link targets can be read without following the final component.
-Mutation permits one 1 MiB complete-file staging transaction: append
-sequentially, then commit or abort; teardown aborts unfinished work. Remove and
-empty-directory creation are separate bounded operations. Request
-`filesystem-mutate` only for create/replace/remove/link operations.
+Mutation permits one sequential streamed replacement with 64-bit offsets and
+bounded 16 KiB default aggregation. `begin_replace` truncates or creates the
+destination immediately; `commit` flushes and orders it, while `abort`, faults,
+or teardown can leave an empty file or previously flushed prefix. There is no
+ABI file-size cap. Call `FileReplacement::set_chunk_size` before writing when a
+bulk workload needs a power-of-two 4 KiB–1 MiB chunk. Remove and empty-directory
+creation are separate bounded operations. Request `filesystem-mutate` only for
+create/replace/remove/link operations.
 Timer values are boot-relative monotonic milliseconds only. Request `timer`,
 form deadlines with saturation, and treat `sleep_until` as cancellable.
 Diagnostics is one immutable typed launch snapshot. Request `diagnostics` only

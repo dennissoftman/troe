@@ -1,0 +1,18 @@
+NAME
+    sh - execute bounded pipelines and streamed file redirection
+
+SYNOPSIS
+    COMMAND [ARG...] [< FILE] [> FILE | >> FILE]
+    COMMAND... | COMMAND...
+
+DESCRIPTION
+    Single and double quotes group literal text; neither performs expansion.
+    An unquoted | connects bounded byte streams. Unquoted < supplies the first
+    stage from FILE. Unquoted > truncates or creates FILE before execution and
+    streams final stdout, while >> creates or streams at the existing end.
+
+    File streams use a 16 KiB default working buffer and are not capped by the
+    shell. A failing command may leave an empty file or written prefix. The
+    1 MiB limit applies only between sequential pipeline stages. Redirection
+    paths do not enter command argv. Environment and variable expansion,
+    stderr redirection, heredocs, jobs, and descriptor numbers are not supported.

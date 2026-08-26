@@ -52,7 +52,7 @@ kernel composition root into a collection of inseparable format parsers.
   Read-only support and lossless inspection of SIDs and security descriptors
   precede write support.
 
-The implemented ext4-v1 provider supports metadata-preserving complete-file
+The implemented ext4-v1 provider supports metadata-preserving streamed file
 mutation plus bounded symbolic/hard links when the manifest and block
 capability are writable. Generation
 activation and the initial named mutable state still use separately selected

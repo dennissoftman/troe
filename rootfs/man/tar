@@ -8,9 +8,10 @@ SYNOPSIS
 
 DESCRIPTION
     Creates and reads POSIX ustar archives without compression. Creation and
-    extraction stream file payloads in bounded chunks; one archive is limited
-    to the 1 MiB transactional-file profile. Regular files, directories, and
-    safe relative symbolic links are supported.
+    extraction stream file payloads with 1 MiB filesystem aggregation and no
+    application-level archive-size cap. Filesystem capacity and ustar numeric
+    fields remain inherent limits. Regular files, directories, and safe
+    relative symbolic links are supported.
 
     Extraction rejects absolute paths, parent traversal, unsafe link targets,
     unsupported record types, corrupt checksums, and writes through symbolic

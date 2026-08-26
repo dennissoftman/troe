@@ -17,7 +17,7 @@ exists but is malformed, exceeds policy, or faults fails closed and never
 falls back.
 
 The first command ABI is synchronous and capability-only. Startup supplies
-exactly four ABI 1.0 call handles:
+one command-invocation 1.0 handle and three standard-stream 1.1 handles:
 
 - command invocation: returns one bounded, versioned `cwd` and `argv` record;
 - standard input: bounded reads from the current pipeline stream;
@@ -25,9 +25,11 @@ exactly four ABI 1.0 call handles:
 
 All request and reply sizes remain within the existing 4 KiB dispatcher
 message ceiling. Invocation encoding accepts at most 32 arguments, a 256-byte
-working directory, and 512 aggregate argument bytes. The kernel stages input
-and output under the existing 64 KiB pipeline ceiling. Unknown opcodes,
-versions, handles, trailing bytes, and over-capacity output are deterministic
+working directory, and 512 aggregate argument bytes. The kernel forwards each
+standard-input read and standard-output/error write directly to the supplied
+stream; it does not stage a complete application stream. File-backed output
+may select a power-of-two 4 KiB through 1 MiB aggregation size. Unknown
+opcodes, versions, handles, trailing bytes, and sink failures are deterministic
 errors. EOF is a successful zero-byte input reply.
 
 Application artifacts are sized with VFS metadata and copied through bounded
@@ -73,9 +75,10 @@ wrong targets, residual bytes, and artifacts outside Standard KEX ceilings.
 Resolution performs no directory search and never executes from writable
 state. Only `NotFound` selects a recovery built-in, preventing a corrupt or
 hostile installed application from silently changing the executed code path.
-Pipeline bytes are copied at the service boundary in this synchronous version;
-that is bounded and simple, but a future concurrent pipeline design will need
-an explicit ring/wakeup contract rather than silently widening this ABI.
+Stream bytes are copied in message-sized calls at the synchronous service
+boundary, but complete input or output is not retained by the KEX runner. A
+future concurrent pipeline design will need an explicit ring/wakeup contract
+rather than silently widening this ABI.
 
 ## Sequencing consequence
 

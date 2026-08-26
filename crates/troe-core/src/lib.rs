@@ -13,8 +13,12 @@ pub const MAX_LINE_BYTES: usize = 512;
 pub const MAX_ARGS: usize = 32;
 /// Maximum number of stages in one pipeline.
 pub const MAX_PIPELINE_STAGES: usize = 8;
-/// Maximum bytes passed between two pipeline stages.
-pub const PIPE_CAPACITY: usize = 64 * 1024;
+/// Maximum aggregate bytes retained between sequential pipeline stages.
+///
+/// The current shell executes stages sequentially, so an intermediate stage
+/// must be retained until its consumer runs. This limit does not apply to
+/// terminal streams or file redirection and is not a transfer-chunk size.
+pub const PIPE_CAPACITY: usize = 1024 * 1024;
 
 /// Whether a terminal character requests deletion of the preceding character.
 ///
@@ -61,6 +65,20 @@ pub trait Input {
 
 /// Byte-oriented output capability.
 pub trait Output {
+    /// Request a preferred downstream aggregation size.
+    ///
+    /// Implementations that buffer file writes may accept this hint; direct
+    /// devices and retained diagnostic streams normally reject it. The value
+    /// never changes the maximum stream or file length.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Unsupported` when the sink is not configurable or the hint is
+    /// outside its enforced policy.
+    fn set_chunk_size(&mut self, _bytes: usize) -> Result<(), StreamError> {
+        Err(StreamError::Unsupported)
+    }
+
     /// Write some bytes, returning the number accepted.
     ///
     /// # Errors
@@ -169,6 +187,9 @@ impl Output for BoundedOutput {
         if new_len > self.limit {
             return Err(StreamError::NoSpace);
         }
+        self.bytes
+            .try_reserve_exact(bytes.len())
+            .map_err(|_| StreamError::NoSpace)?;
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
     }

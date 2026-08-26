@@ -810,7 +810,7 @@ def run_boot_group(session: SerialSession, command_timeout: float) -> None:
     cwd = "/"
     assert_storage_report(session, cwd, command_timeout)
     session.command(
-        "kex-echo application-ready",
+        "echo application-ready",
         cwd,
         command_timeout,
         contains=("application-ready\n",),
@@ -876,6 +876,12 @@ def run_shell_terminal_group(session: SerialSession, command_timeout: float) -> 
         command_timeout,
         contains=("NAME\n    echo - write arguments", "SYNOPSIS\n    echo [ARG...]"),
     )
+    session.command(
+        "man sh",
+        cwd,
+        command_timeout,
+        contains=("streamed file redirection", "16 KiB default working buffer"),
+    )
     session.command("help", cwd, command_timeout, contains=("help: unknown command",))
     session.backspace_command(
         "echo brokeX", "n", cwd, command_timeout, expected="\nbroken\n"
@@ -912,9 +918,7 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
         ),
     )
     session.command("mount root", cwd, command_timeout)
-    session.command(
-        f"write {SHARED_FILE} {SHARED_CONTENT}", cwd, command_timeout
-    )
+    session.command(f"printf %s {SHARED_CONTENT} > {SHARED_FILE}", cwd, command_timeout)
     session.command(
         f"cat {SHARED_FILE}",
         cwd,
@@ -939,7 +943,7 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
         command_timeout,
         contains=("native ext4 mount\n",),
     )
-    session.command(f"write {MUTABLE_ROOT_FILE} initial", cwd, command_timeout)
+    session.command(f"printf initial > {MUTABLE_ROOT_FILE}", cwd, command_timeout)
     session.command(
         f"ln {MUTABLE_ROOT_FILE} /vol/root/troe-mutable-hard",
         cwd,
@@ -957,7 +961,7 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
         contains=("troe-mutable-hard", "troe-mutable-soft@"),
     )
     session.command(
-        f"write /vol/root/troe-mutable-soft {MUTABLE_ROOT_CONTENT}",
+        f"printf %s {MUTABLE_ROOT_CONTENT} > /vol/root/troe-mutable-soft",
         cwd,
         command_timeout,
     )
@@ -1014,9 +1018,7 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
     )
     session.command("cd /", cwd, command_timeout, next_cwd="/")
     cwd = "/"
-    session.command(
-        "echo alpha beta | grep beta | write /tmp/result", cwd, command_timeout
-    )
+    session.command("echo alpha beta | grep beta > /tmp/result", cwd, command_timeout)
     session.command("cat /tmp/result", cwd, command_timeout, contains=("alpha beta\n",))
     session.command("pwd", cwd, command_timeout, contains=("/\n",))
     session.command("cd /man", cwd, command_timeout, next_cwd="/man")
@@ -1030,10 +1032,27 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
     )
     session.command("cd /", cwd, command_timeout, next_cwd="/")
     cwd = "/"
-    session.command("write /tmp/direct AB", cwd, command_timeout)
+    session.command("printf AB > /tmp/direct", cwd, command_timeout)
+    session.command("printf CD >> /tmp/direct", cwd, command_timeout)
     session.command(
-        "hexdump /tmp/direct", cwd, command_timeout, contains=("00000000  41 42 ",)
+        "hexdump /tmp/direct",
+        cwd,
+        command_timeout,
+        contains=("00000000  41 42 43 44 ",),
     )
+    session.command("wc -c < /tmp/direct", cwd, command_timeout, contains=("4\n",))
+    session.command(
+        "lua -e 'print(string.rep(\"x\",70000))' > /tmp/large-stream",
+        cwd,
+        command_timeout,
+    )
+    session.command(
+        "wc -c < /tmp/large-stream", cwd, command_timeout, contains=("70001\n",)
+    )
+    session.command("rm /tmp/large-stream", cwd, command_timeout)
+    session.command("printf Q > '/tmp/quoted file'", cwd, command_timeout)
+    session.command("cat '/tmp/quoted file'", cwd, command_timeout, contains=("Q",))
+    session.command("rm '/tmp/quoted file'", cwd, command_timeout)
     session.command("rm /tmp/direct", cwd, command_timeout)
     session.command(
         "cat /tmp/direct",
@@ -1052,10 +1071,10 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
     )
     session.command("pwd extra", cwd, command_timeout, contains=("pwd: pwd",))
     session.command(
-        "write /etc/motd nope",
+        "printf nope > /etc/motd",
         cwd,
         command_timeout,
-        contains=("write: /etc/motd: read-only filesystem",),
+        contains=("sh: /etc/motd: read-only filesystem",),
     )
     session.command("rm /tmp/result", cwd, command_timeout)
 
@@ -1154,15 +1173,15 @@ def run_quota_memory_group(session: SerialSession, command_timeout: float) -> No
     """Exercise the RAMFS quota and bounded transient-allocation accounting."""
     cwd = "/"
     for index in range(128):
-        session.command(f"write /tmp/q{index:03} x", cwd, command_timeout)
+        session.command(f"printf x > /tmp/q{index:03}", cwd, command_timeout)
     session.command(
-        "write /tmp/q128 x",
+        "printf x > /tmp/q128",
         cwd,
         command_timeout,
-        contains=("write: /tmp/q128: filesystem quota exceeded",),
+        contains=("sh: /tmp/q128: filesystem quota exceeded",),
     )
     session.command("rm /tmp/q000", cwd, command_timeout)
-    session.command("write /tmp/recovered ok", cwd, command_timeout)
+    session.command("printf ok > /tmp/recovered", cwd, command_timeout)
     session.command("cat /tmp/recovered", cwd, command_timeout, contains=("ok",))
     # Return the recovered directory slot before the transient create/remove
     # cycle below; otherwise the test itself keeps the 128-entry quota full.
@@ -1178,7 +1197,7 @@ def run_quota_memory_group(session: SerialSession, command_timeout: float) -> No
             command_timeout,
             contains=("allocation-cycle\n",),
         )
-        session.command("write /tmp/cycle stable", cwd, command_timeout)
+        session.command("printf stable > /tmp/cycle", cwd, command_timeout)
         session.command("rm /tmp/cycle", cwd, command_timeout)
 
     # The first report refreshes the retained /sys/memory payload (whose text
@@ -1207,7 +1226,7 @@ def run_quota_memory_group(session: SerialSession, command_timeout: float) -> No
             command_timeout,
             contains=("allocation-cycle\n",),
         )
-        session.command("write /tmp/cycle stable", cwd, command_timeout)
+        session.command("printf stable > /tmp/cycle", cwd, command_timeout)
         session.command("rm /tmp/cycle", cwd, command_timeout)
     session.command("mem", cwd, command_timeout)
     final_report = session.command(
@@ -1266,7 +1285,7 @@ def run_smoke_scenario(
     cwd = "/"
     assert_storage_report(session, cwd, command_timeout)
     session.command(
-        "kex-echo application-ready",
+        "echo application-ready",
         cwd,
         command_timeout,
         contains=("application-ready\n",),

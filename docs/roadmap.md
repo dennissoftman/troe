@@ -6,7 +6,8 @@
 - Both EFI targets compile on stable Rust and fit well below component budgets.
 - Root data is generated deterministically and validated again when mounted.
 - RAMFS mutation and deletion accounting have provider tests; parser failures,
-  pipelines, intrinsic behavior, and command status have host tests.
+  pipelines, streamed redirection, intrinsic behavior, and command status have
+  host tests.
 - Build, test, image, size, and QEMU entry points are repository scripts.
 - Prompt-synchronized QEMU acceptance drives every named production platform
   image through all KEX apps, failure cases, RAMFS quota exhaustion and
@@ -240,9 +241,9 @@ The first product-facing integration is implemented. The shell resolves exact
 immutable `/bin/<command>.kex` artifacts from a target-selected root, stages
 them through bounded offset reads, and grants versioned
 command/stdin/stdout/stderr handles.
-`echo`, `clear`, and `pwd` established external execution, while the unknown
-`kex-echo` name proves general discovery on every QEMU composition. The complete
-ordinary command set now uses the same KEX-only path.
+`echo`, `clear`, and `pwd` established external execution and prove normal
+catalog discovery on every QEMU composition. The complete ordinary command set
+now uses the same KEX-only path.
 The repo-local Rust SDK, linker script, canonical dual-target build/inspect
 tool, single-file packages with embedded least-authority KCAP manifests,
 example source, and concise authoring skill are checked in.
@@ -263,9 +264,11 @@ The optional read-only filesystem service now supplies generation-checked open
 tokens, bounded offset reads and metadata, and lexical pagination with
 symbolic-link kinds plus final-component `readlink`. `awk`, `cat`, `grep`,
 `hexdump`, `ls`, `man`, `sed`, `tar`, and `wc` exercise it on every QEMU
-composition. Atomic complete-file mutation now stages up to 1 MiB and includes
-bounded empty-directory and link creation. It is exercised by `write.kex`,
-`rm.kex`, `ln.kex`, and streaming uncompressed `tar.kex`. Separate monotonic timer and
+composition. Streamed mutation uses 64-bit offsets and 16 KiB default working
+buffers with power-of-two selection through 1 MiB; file length is left to
+format, media, and quota. It also includes bounded empty-directory and link
+creation. Shell `>`/`>>`, `rm.kex`, `ln.kex`, and uncompressed `tar.kex`
+exercise it. Separate monotonic timer and
 immutable typed diagnostics services now back `sleep.kex` and `mem.kex`.
 Independent typed observation, DHCP, and ICMP
 echo services now back `net.kex`, `arp.kex`, `dhcp.kex`, and `ping.kex` without
@@ -416,14 +419,14 @@ The first portable storage/configuration boundary is landed:
   and validated UTF-16 names;
 - ADR 0007 now accepts native-principal, foreign-identity, mapping,
   mount-policy, ACL, and fail-closed recovery rules before persistent writes;
-- `troe-vfs` exposes bounded provider reads plus complete-file replace/remove
-  hooks and namespace mount routing; `troe-fat` implements strict FAT32 with
+- `troe-vfs` exposes bounded provider reads plus truncate/append/sync and remove
+  hooks with namespace mount routing; `troe-fat` implements strict FAT32 with
   mirrored FAT, BPB/backup/FSInfo, cycle, short-name, LFN validation, and
-  copy-on-write create/replace/remove; and
+  incremental cluster-chain create/append/remove; and
 - ADR 0017 fixes the first ext4 feature bitmap; `troe-ext4` implements its
-  clean, 4 KiB-block, inline-extent profile with UUID selection,
+  clean, 4 KiB-block, depth-one extent profile with UUID selection,
   CRC32C-protected superblock/group/inode/directory traversal, sparse-file
-  reads, metadata-preserving complete-file mutation, bounded symbolic/hard
+  reads, metadata-preserving streamed mutation, bounded symbolic/hard
   links, and hard group/inode/directory/file/read/name ceilings. Real-tool
   interoperability fixtures are accepted by e2fsprogs/dosfstools checkers
   before the ext4/FAT32 providers mount, list, and read them; and
@@ -546,10 +549,11 @@ registry trust, and deployment belong to Stage 9. See
 The Stage 8 storage direction is already bounded by
 [ADR 0009](adr/0009-persistent-filesystems-and-partitions.md): keep KEFS as the
 built-in recovery root and FAT12 as the current firmware container; introduce
-whole-device regions and read-only GPT discovery; provide read/write
-FAT12/16/32, exFAT, constrained ext4, and later NTFS as separately selected
-filesystem modules. Ext4 is the default native persistent data provider;
-FAT/exFAT serve removable-media interchange. Partition creation remains
+whole-device regions and read-only GPT discovery; and keep disk formats as
+separately selected filesystem modules. Read/write FAT32 and constrained ext4
+are implemented. General FAT12/16 and exFAT remain future removable-media
+interchange providers, while NTFS remains a later optional foreign provider.
+Ext4 is the default native persistent data provider. Partition creation remains
 host-side, and writable filesystem providers should move behind isolated
 service boundaries when the task/application model can support that transition.
 Separately licensed modules remain outside the default Apache-2.0 image and

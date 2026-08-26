@@ -42,7 +42,6 @@ FILESYSTEM_APPS = frozenset(
         "sed",
         "tar",
         "wc",
-        "write",
     )
 )
 TERMINAL_APPS = frozenset(("clear", "echo", "man", "pwd"))
@@ -422,8 +421,6 @@ def build_plan(
             continue
         if path_text.startswith("rootfs/bin/"):
             application = path.stem
-            if application == "kex-echo":
-                application = "echo"
             plan.applications.add(application)
             plan.note(f"kex:{application}", path)
             _add_python(plan, path, "test_kex_tool.py", "test_image_builders.py")
@@ -542,20 +539,6 @@ def commands_for_plan(
                 "kex",
                 "build",
                 str(REPO_ROOT / "apps" / application),
-                "--target",
-                "all",
-                "--check",
-            )
-        )
-    if plan.all_applications:
-        commands.append(
-            (
-                "cargo",
-                "kex",
-                "build",
-                str(REPO_ROOT / "apps" / "echo"),
-                "--name",
-                "kex-echo",
                 "--target",
                 "all",
                 "--check",

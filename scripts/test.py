@@ -156,17 +156,6 @@ def main() -> int:
         ),
         (
             "cargo",
-            "kex",
-            "build",
-            REPO_ROOT / "apps" / "echo",
-            "--name",
-            "kex-echo",
-            "--target",
-            "all",
-            "--check",
-        ),
-        (
-            "cargo",
             "run",
             "--quiet",
             "-p",
