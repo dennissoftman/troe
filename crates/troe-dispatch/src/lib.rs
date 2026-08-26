@@ -270,6 +270,54 @@ pub struct ServiceReply {
     payload: Vec<u8>,
 }
 
+/// Bounded service completion written directly into caller-owned storage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ServiceReplyInfo {
+    status: ReplyStatus,
+    payload_bytes: usize,
+    payload_copies: u64,
+    payload_allocations: u64,
+}
+
+impl ServiceReplyInfo {
+    /// Describe an empty completion without a copy or allocation.
+    #[must_use]
+    pub const fn empty(status: ReplyStatus) -> Self {
+        Self {
+            status,
+            payload_bytes: 0,
+            payload_copies: 0,
+            payload_allocations: 0,
+        }
+    }
+
+    /// Describe a non-empty completion copied once into caller-owned storage.
+    ///
+    /// The service must have initialized exactly `payload_bytes` bytes of the
+    /// destination supplied to [`Service::call_into`].
+    #[must_use]
+    pub const fn copied(status: ReplyStatus, payload_bytes: usize) -> Self {
+        Self {
+            status,
+            payload_bytes,
+            payload_copies: if payload_bytes == 0 { 0 } else { 1 },
+            payload_allocations: 0,
+        }
+    }
+
+    /// Stable service-level result.
+    #[must_use]
+    pub const fn status(self) -> ReplyStatus {
+        self.status
+    }
+
+    /// Initialized prefix length in the supplied destination.
+    #[must_use]
+    pub const fn payload_bytes(self) -> usize {
+        self.payload_bytes
+    }
+}
+
 impl ServiceReply {
     /// Construct an empty service reply.
     #[must_use]
@@ -278,6 +326,18 @@ impl ServiceReply {
             status,
             payload: Vec::new(),
         }
+    }
+
+    /// Stable service-level result.
+    #[must_use]
+    pub const fn status(&self) -> ReplyStatus {
+        self.status
+    }
+
+    /// Owned bounded reply bytes.
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
     }
 
     /// Copy bounded reply bytes into an owned response.
@@ -309,6 +369,34 @@ pub struct Reply {
     payload: Vec<u8>,
 }
 
+/// Complete bounded reply retained in caller-owned storage.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReplyInfo {
+    request_id: u64,
+    status: ReplyStatus,
+    payload_bytes: usize,
+}
+
+impl ReplyInfo {
+    /// Identity of the request that produced this reply.
+    #[must_use]
+    pub const fn request_id(self) -> u64 {
+        self.request_id
+    }
+
+    /// Stable service-level result.
+    #[must_use]
+    pub const fn status(self) -> ReplyStatus {
+        self.status
+    }
+
+    /// Initialized prefix length in the caller-owned destination.
+    #[must_use]
+    pub const fn payload_bytes(self) -> usize {
+        self.payload_bytes
+    }
+}
+
 impl Reply {
     /// Identity of the request that produced this reply.
     #[must_use]
@@ -338,6 +426,38 @@ pub trait Service {
     /// Returns a dispatcher error when reply construction cannot satisfy its
     /// resource bounds. Service-domain failures belong in [`ReplyStatus`].
     fn call(&mut self, request: Request<'_>) -> Result<ServiceReply, DispatchError>;
+
+    /// Handle one request using bounded caller-owned reply storage.
+    ///
+    /// The default preserves compatibility with owned service replies. A
+    /// service with a naturally caller-directed encoder can override this to
+    /// remove the intermediate allocation and copy.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same mechanism failures as [`Self::call`] and rejects a
+    /// reply that does not fit `destination`.
+    fn call_into(
+        &mut self,
+        request: Request<'_>,
+        destination: &mut [u8],
+    ) -> Result<ServiceReplyInfo, DispatchError> {
+        let reply = self.call(request)?;
+        if reply.payload.len() > destination.len() {
+            return Err(DispatchError::MessageTooLarge);
+        }
+        let payload_bytes = reply.payload.len();
+        destination[..payload_bytes].copy_from_slice(&reply.payload);
+        let nonempty = u64::from(payload_bytes != 0);
+        Ok(ServiceReplyInfo {
+            status: reply.status,
+            payload_bytes,
+            payload_copies: nonempty
+                .checked_mul(2)
+                .ok_or(DispatchError::AccountingOverflow)?,
+            payload_allocations: nonempty,
+        })
+    }
 }
 
 /// Dispatcher mechanism and resource failures.
@@ -452,6 +572,7 @@ pub struct Dispatcher<'service> {
     request_bytes: u64,
     reply_bytes: u64,
     reply_payload_copies: u64,
+    reply_payload_allocations: u64,
 }
 
 impl<'service> Dispatcher<'service> {
@@ -487,6 +608,7 @@ impl<'service> Dispatcher<'service> {
             request_bytes: 0,
             reply_bytes: 0,
             reply_payload_copies: 0,
+            reply_payload_allocations: 0,
         })
     }
 
@@ -714,14 +836,45 @@ impl<'service> Dispatcher<'service> {
             .reply_payload_copies
             .checked_add(u64::from(!service_reply.payload.is_empty()))
             .ok_or(DispatchError::AccountingOverflow)?;
+        let reply_payload_allocations = self
+            .reply_payload_allocations
+            .checked_add(u64::from(!service_reply.payload.is_empty()))
+            .ok_or(DispatchError::AccountingOverflow)?;
         self.replies = replies;
         self.reply_bytes = reply_bytes;
         self.reply_payload_copies = reply_payload_copies;
+        self.reply_payload_allocations = reply_payload_allocations;
         Ok(Reply {
             request_id,
             status: service_reply.status,
             payload: service_reply.payload,
         })
+    }
+
+    /// Deliver one ABI call and write its bounded reply into caller-owned
+    /// storage only when the handle remains owned by the supplied task.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed, stale, foreign, or insufficient-rights handles,
+    /// insufficient destination storage, service failures, and counter
+    /// overflow before returning a partial completion.
+    pub fn call_owned_abi_into(
+        &mut self,
+        owner: HandleOwner,
+        value: u64,
+        opcode: u16,
+        payload: &[u8],
+        destination: &mut [u8],
+    ) -> Result<ReplyInfo, DispatchError> {
+        if !matches!(owner, HandleOwner::IsolatedTask(id) if id != 0) {
+            return Err(DispatchError::InvalidOwner);
+        }
+        let handle = Handle::from_abi_value(value)?;
+        if self.handle_binding(handle)?.owner != owner {
+            return Err(DispatchError::InvalidHandle);
+        }
+        self.call_into(handle, opcode, payload, destination)
     }
 
     /// Deliver one ABI call only when the opaque handle remains owned by the
@@ -771,8 +924,87 @@ impl<'service> Dispatcher<'service> {
             request_payload_allocations: 0,
             reply_bytes: self.reply_bytes,
             reply_payload_copies: self.reply_payload_copies,
-            reply_payload_allocations: self.reply_payload_copies,
+            reply_payload_allocations: self.reply_payload_allocations,
         }
+    }
+
+    fn call_into(
+        &mut self,
+        handle: Handle,
+        opcode: u16,
+        payload: &[u8],
+        destination: &mut [u8],
+    ) -> Result<ReplyInfo, DispatchError> {
+        if payload.len() > MAX_MESSAGE_BYTES || destination.len() > MAX_MESSAGE_BYTES {
+            return Err(DispatchError::MessageTooLarge);
+        }
+        let binding = self.handle_binding(handle)?;
+        if !binding.rights.contains(Rights::CALL) {
+            return Err(DispatchError::PermissionDenied);
+        }
+        self.validate_port(binding.port)?;
+        let request_id = self.next_request_id;
+        let next_request_id = request_id
+            .checked_add(1)
+            .ok_or(DispatchError::AccountingOverflow)?;
+        let calls = self
+            .calls
+            .checked_add(1)
+            .ok_or(DispatchError::AccountingOverflow)?;
+        let request_bytes = self
+            .request_bytes
+            .checked_add(
+                u64::try_from(payload.len()).map_err(|_| DispatchError::AccountingOverflow)?,
+            )
+            .ok_or(DispatchError::AccountingOverflow)?;
+        let request = Request {
+            id: request_id,
+            opcode,
+            payload,
+        };
+        self.next_request_id = next_request_id;
+        self.calls = calls;
+        self.request_bytes = request_bytes;
+        let port_index = usize::from(binding.port.slot);
+        let service = self
+            .ports
+            .get_mut(port_index)
+            .and_then(|slot| slot.service.as_mut())
+            .ok_or(DispatchError::InvalidPort)?;
+        let service_reply = service.call_into(request, destination)?;
+        if service_reply.payload_bytes > destination.len()
+            || service_reply.payload_bytes > MAX_MESSAGE_BYTES
+        {
+            return Err(DispatchError::MessageTooLarge);
+        }
+        let replies = self
+            .replies
+            .checked_add(1)
+            .ok_or(DispatchError::AccountingOverflow)?;
+        let reply_bytes = self
+            .reply_bytes
+            .checked_add(
+                u64::try_from(service_reply.payload_bytes)
+                    .map_err(|_| DispatchError::AccountingOverflow)?,
+            )
+            .ok_or(DispatchError::AccountingOverflow)?;
+        let reply_payload_copies = self
+            .reply_payload_copies
+            .checked_add(service_reply.payload_copies)
+            .ok_or(DispatchError::AccountingOverflow)?;
+        let reply_payload_allocations = self
+            .reply_payload_allocations
+            .checked_add(service_reply.payload_allocations)
+            .ok_or(DispatchError::AccountingOverflow)?;
+        self.replies = replies;
+        self.reply_bytes = reply_bytes;
+        self.reply_payload_copies = reply_payload_copies;
+        self.reply_payload_allocations = reply_payload_allocations;
+        Ok(ReplyInfo {
+            request_id,
+            status: service_reply.status,
+            payload_bytes: service_reply.payload_bytes,
+        })
     }
 
     fn allocate_port(
@@ -1049,7 +1281,7 @@ mod tests {
     use super::{
         ByteInputService, ByteOutputService, CommandInvocationService, ConsoleService,
         CopiedMessage, DispatchError, DispatchedOutput, Dispatcher, Handle, HandleOwner,
-        MAX_MESSAGE_BYTES, ReplyStatus, Request, Rights, Service, ServiceReply,
+        MAX_MESSAGE_BYTES, ReplyStatus, Request, Rights, Service, ServiceReply, ServiceReplyInfo,
         SharedOutput as RetainedOutput,
     };
     use alloc::boxed::Box;
@@ -1069,6 +1301,29 @@ mod tests {
             } else {
                 Ok(ServiceReply::empty(ReplyStatus::InvalidRequest))
             }
+        }
+    }
+
+    struct DirectEchoService;
+
+    impl Service for DirectEchoService {
+        fn call(&mut self, request: Request<'_>) -> Result<ServiceReply, DispatchError> {
+            ServiceReply::with_payload(ReplyStatus::Success, request.payload())
+        }
+
+        fn call_into(
+            &mut self,
+            request: Request<'_>,
+            destination: &mut [u8],
+        ) -> Result<ServiceReplyInfo, DispatchError> {
+            if request.payload().len() > destination.len() {
+                return Err(DispatchError::MessageTooLarge);
+            }
+            destination[..request.payload().len()].copy_from_slice(request.payload());
+            Ok(ServiceReplyInfo::copied(
+                ReplyStatus::Success,
+                request.payload().len(),
+            ))
         }
     }
 
@@ -1224,6 +1479,25 @@ mod tests {
         assert_eq!(stats.request_bytes, 0);
         assert_eq!(stats.reply_bytes, 0);
         assert_eq!(stats.reply_payload_copies, 0);
+        assert_eq!(stats.reply_payload_allocations, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn caller_owned_reply_path_has_no_payload_allocation() -> Result<(), DispatchError> {
+        let mut dispatcher = Dispatcher::new(1, 1)?;
+        let (_port, handle) = dispatcher.register(Box::new(DirectEchoService), Rights::CALL)?;
+        let mut destination = [0_u8; 16];
+
+        let reply = dispatcher.call_into(handle, 7, b"direct", &mut destination)?;
+
+        assert_eq!(reply.status(), ReplyStatus::Success);
+        assert_eq!(reply.payload_bytes(), 6);
+        assert_eq!(&destination[..reply.payload_bytes()], b"direct");
+        let stats = dispatcher.stats();
+        assert_eq!(stats.calls, 1);
+        assert_eq!(stats.replies, 1);
+        assert_eq!(stats.reply_payload_copies, 1);
         assert_eq!(stats.reply_payload_allocations, 0);
         Ok(())
     }

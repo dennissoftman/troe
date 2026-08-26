@@ -506,6 +506,71 @@ def assert_owned_boot(session: "SerialSession") -> None:
         raise AcceptanceError(f"{session.platform_id} boot missed {discovery_marker!r}")
 
 
+def assert_ipc_baseline(session: "SerialSession") -> None:
+    """Require both IPC paths and their deterministic structural counters."""
+    rows: dict[tuple[str, int], dict[str, int]] = {}
+    for line in session.transcript().splitlines():
+        if not line.startswith("ipc-baseline "):
+            continue
+        fields: dict[str, str] = {}
+        for field in line.split()[1:]:
+            key, separator, value = field.partition("=")
+            if not separator or not key or not value:
+                raise AcceptanceError(f"malformed IPC baseline row: {line!r}")
+            fields[key] = value
+        try:
+            path = fields.pop("path")
+            payload = int(fields.pop("payload"))
+            counters = {key: int(value) for key, value in fields.items()}
+        except (KeyError, ValueError) as error:
+            raise AcceptanceError(f"malformed IPC baseline row: {line!r}") from error
+        key = (path, payload)
+        if key in rows:
+            raise AcceptanceError(f"duplicate IPC baseline row: {line!r}")
+        rows[key] = counters
+
+    payloads = (0, 64, 256, 4096)
+    expected = {
+        (path, payload)
+        for path in ("in-process", "isolated-diagnostics")
+        for payload in payloads
+    }
+    if set(rows) != expected:
+        raise AcceptanceError(
+            f"{session.architecture} IPC baseline matrix mismatch: {sorted(rows)!r}"
+        )
+    for payload in payloads:
+        local = rows[("in-process", payload)]
+        if (
+            local.get("warmup") != 64
+            or local.get("samples") != 256
+            or local.get("calls") != 256
+            or local.get("address_space_switches") != 0
+            or local.get("tlb_invalidations") != 0
+            or local.get("timer_programs") != 0
+        ):
+            raise AcceptanceError(f"invalid in-process IPC counters: {local!r}")
+
+        isolated = rows[("isolated-diagnostics", payload)]
+        fragments = 512 if payload == 4096 else 256
+        boundaries = 768 if payload == 4096 else 256
+        if (
+            isolated.get("warmup") != 64
+            or isolated.get("samples") != 256
+            or isolated.get("calls") != 256
+            or isolated.get("request_allocations") != 0
+            or isolated.get("reply_allocations") != 0
+            or isolated.get("steady_allocations") != 0
+            or isolated.get("wire_fragments") != fragments
+            or isolated.get("address_space_switches") != boundaries * 2
+            or isolated.get("tlb_invalidations") != boundaries * 2
+            or isolated.get("timer_programs") != boundaries
+            or isolated.get("retained_requests") != 1
+            or isolated.get("contexts") != 1
+        ):
+            raise AcceptanceError(f"invalid isolated IPC counters: {isolated!r}")
+
+
 class SerialSession:
     """A QEMU child with deadline-bound serial reads and deterministic cleanup."""
 
@@ -1552,6 +1617,7 @@ def run_fault_scenario(
     """Prove that one forbidden access reaches the native fatal vector."""
     session.wait_for(b"sh:/> ", boot_timeout)
     assert_owned_boot(session)
+    assert_ipc_baseline(session)
     if "native persistence: committed and flushed" not in session.transcript():
         raise AcceptanceError(
             f"{session.architecture} did not complete the native TXSLOT transaction"

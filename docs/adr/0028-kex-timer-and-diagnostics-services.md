@@ -44,6 +44,16 @@ revokes it and completes the blocked client with terminal cancellation.
 One-shot launch is the current composition policy; persistent service processes
 and automatic restart remain separate decisions.
 
+The follow-up IPC matrix preserves that fault-domain design while removing
+steady transport allocation. Server calls copy into fixed kernel request and
+reply buffers, and the endpoint encodes directly into caller-owned reply
+storage. Native acceptance snapshots successful heap-allocation calls around
+every measured receive-to-reply interval and requires a zero delta. The
+composition retains at most one request and one server context. The 4 KiB
+logical benchmark row uses two generation-checked fragments because the v1
+server envelope shares the 4 KiB gate with its fixed header; the result reports
+the extra copies, root switches, TLB invalidations, and timer programs.
+
 ## Security and sequencing consequences
 
 Sleeping remains a foreground synchronous call and is bounded by both

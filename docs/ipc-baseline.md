@@ -1,8 +1,9 @@
 # IPC baseline and measurement contract
 
-This is the pre-scheduler-change baseline for the synchronous in-process
-dispatcher. It deliberately measures the mechanism that exists today rather
-than projecting the cost of deferred calls or an isolated user server.
+This records both the pre-scheduler synchronous in-process dispatcher and the
+first protected diagnostics-server path. It measures mechanisms that exist in
+the tree; QEMU validates counters and bounds, while publishable latency claims
+still require named real hardware.
 
 ## Reproducing the host matrix
 
@@ -55,5 +56,64 @@ not match the current in-process contract.
 QEMU validates the counter plumbing and event-count regression. Its latency is
 not a hardware performance claim. Publishable latency comparisons require the
 unchanged acceptance image and matrix on named real x86-64 and AArch64 machines.
-The isolated diagnostics path introduced later must emit the identical schema,
-so its extra copies and protection transitions can be compared directly.
+
+## Isolated diagnostics matrix
+
+The acceptance kernel runs the same 0, 64, 256, and 4096-byte logical payload
+matrix through a least-authority EL0/ring-3 diagnostics transport server. Each
+row uses 64 warmup requests and 256 measured requests. The interval begins when
+the server endpoint starts delivering the first fragment and ends when it
+accepts that request's final generation-checked reply. It therefore includes
+the copied handoff, protected execution, reply gate, address-space switches,
+TLB work, and lease programming, but excludes process construction, teardown,
+and serial formatting.
+
+The v1 server envelope carries a token, interface, opcode, bounds, and reserved
+bytes inside the 4 KiB call limit. A 4096-byte logical payload consequently
+uses two bounded fragments; smaller rows use one. The matrix reports this
+rather than silently reducing the 4 KiB payload. Reply tokens change for every
+fragment, and a logical sample completes only after every fragment is echoed
+and validated.
+
+The kernel now uses a fixed 4 KiB request buffer and a caller-owned fixed reply
+buffer for server-endpoint calls. `Service::call_into` lets the endpoint encode
+directly into that reply buffer. No payload alias crosses the protection
+boundary: the server still receives a copy and the kernel still validates and
+copies its reply. General services retain the owned-reply API.
+
+The owned heap records successful allocation and deallocation calls. Every
+measured receive-to-reply interval snapshots that counter and boot fails unless
+the delta is exactly zero. This is stronger than checking live bytes or a
+high-water mark, either of which can miss transient allocation. Construction
+and final client-reply ownership remain bounded setup/teardown work outside the
+steady interval.
+
+The first server composition has hard ceilings of one retained request and one
+suspended server context. The ordinary command step limit remains 1024; only
+the acceptance benchmark uses a 1536-step ceiling so 320 two-fragment warmup
+and measured exchanges fit in one server lifetime.
+
+## Deterministic native structural result
+
+Both QEMU architecture gates require these totals for each 256-request row:
+
+| Logical payload | Wire fragments | Request copies | Reply copies | Reply allocations | Address-space switches | TLB invalidations | Timer programs |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0 | 256 | 0 | 0 | 0 | 512 | 512 | 256 |
+| 64 | 256 | 512 | 512 | 0 | 512 | 512 | 256 |
+| 256 | 256 | 512 | 512 | 0 | 512 | 512 | 256 |
+| 4096 | 512 | 1024 | 1024 | 0 | 1536 | 1536 | 768 |
+
+The zero-byte row counts payload copies, not fixed envelope writes. x86-64
+currently reloads CR3 in each direction; AArch64 changes TTBR0 and executes a
+full `TLBI VMALLE1`. Thus the measured full-invalidation cost is explicit.
+ASID/PCID retention is a justified future optimization, but it is not assumed
+or simulated here. Likewise, one lease is deliberately programmed for every
+user-execution segment; removing that safety boundary was not an acceptable
+latency optimization.
+
+The optimization made in this slice is therefore narrow and measured: two
+transient kernel allocations were removed from the server transport path, and
+the endpoint now performs a direct copy into caller-owned bounded storage.
+Reply ownership, token generation checks, server-fault fate, and teardown are
+unchanged.

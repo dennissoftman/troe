@@ -413,7 +413,7 @@ slice has an independent exit criterion:
    address-space identifiers, or TLB work--without weakening reply ownership or
    fault fate.
 
-Implementation status, 2026-08-26: slices 1–5 are complete. The trap-entry
+Implementation status, 2026-08-26: slices 1–6 are complete. The trap-entry
 matrix and native probes are documented in `native-trap-entry-contract.md`; the
 host/native counter baseline is documented in `ipc-baseline.md`; and
 `troe-task` contains the preallocated wait/pending tables plus the portable
@@ -425,9 +425,16 @@ idle accounting, and exact frame return. Diagnostics now crosses a copied
 receive/reply boundary into a least-authority isolated KEX server with a
 generation-checked request token. Native acceptance faults that server after
 receive, proves exact frame/handle reclamation and one terminal client reply,
-then launches the normal server again. Automatic restart and a persistent
-server process remain later composition policy. Slice 6, the identical
-in-kernel/isolated measurement matrix and measured optimization pass, is next.
+then launches the normal server again. The isolated path now emits the same
+0/64/256/4096-byte matrix as the in-process dispatcher. The 4 KiB row exposes
+its required two-fragment v1 envelope, every row asserts zero allocator calls
+inside the protected receive-to-reply interval, and deterministic counters
+cover copies, root switches, full TLB invalidations, and lease programming on
+both architectures. Fixed kernel call buffers and caller-owned endpoint reply
+storage remove the measured transient allocations without weakening copied
+ownership or fault fate. Automatic restart, persistent server residency, and
+ASID/PCID retention remain later composition policies rather than hidden parts
+of this sequence.
 
 Only after these exits should a device-owning filesystem or network service
 move out of the kernel. Shared-memory grants, priority donation, SMP, and

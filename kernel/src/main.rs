@@ -45,7 +45,7 @@ mod firmware {
     };
     use troe_dispatch::{
         CommandInvocationService, ConsoleService, CopiedMessage, DispatchedOutput, Dispatcher,
-        HandleOwner, ReplyStatus, Request, Rights, Service, ServiceReply,
+        HandleOwner, ReplyStatus, Request, Rights, Service, ServiceReply, ServiceReplyInfo,
     };
     use troe_driver::{InputEvent, InputQueueConfig, InputQueueStats, InputSource};
     use troe_ext4::Ext4Limits;
@@ -136,6 +136,11 @@ mod firmware {
     const IPC_BASELINE_WARMUP_CALLS: usize = 64;
     #[cfg(feature = "acceptance-probes")]
     const IPC_BASELINE_SAMPLES: usize = 256;
+    const IPC_ISOLATED_STEP_LIMIT: u16 = 1536;
+    #[cfg(feature = "acceptance-probes")]
+    const DIAGNOSTICS_SERVER_MAX_RETAINED_REQUESTS: usize = 1;
+    #[cfg(feature = "acceptance-probes")]
+    const DIAGNOSTICS_SERVER_MAX_CONTEXTS: usize = 1;
     const USER_CODE_BASE: u64 = 0x0000_4000_0000_0000;
     const USER_DATA_BASE: u64 = USER_CODE_BASE + BASE_PAGE_SIZE;
     const USER_STACK_BASE: u64 = USER_CODE_BASE + 0x1_0000;
@@ -723,6 +728,8 @@ mod firmware {
         status: ReplyStatus,
         reply: Vec<u8>,
         reply_bytes: usize,
+        steady_allocation_calls: Option<usize>,
+        steady_allocation_free: bool,
     }
 
     struct DiagnosticsServerEndpoint {
@@ -735,6 +742,38 @@ mod firmware {
         exchange: Rc<RefCell<DiagnosticsServerExchange>>,
         artifact: &'static [u8],
         fault_probe: bool,
+        outcome: Option<Result<CommandApplicationOutcome, ()>>,
+    }
+
+    #[cfg(feature = "acceptance-probes")]
+    struct DiagnosticsBenchmarkExchange {
+        payload: [u8; troe_abi::MAX_MESSAGE_BYTES],
+        payload_bytes: usize,
+        logical_index: usize,
+        fragment_index: usize,
+        received: bool,
+        expected_token: u64,
+        started_ticks: u64,
+        started_execution: troe_machine::ApplicationExecutionStats,
+        started_allocations: usize,
+        samples: [u64; IPC_BASELINE_SAMPLES],
+        measured: usize,
+        address_space_switches: u64,
+        tlb_invalidations: u64,
+        timer_programs: u64,
+        steady_allocation_calls: u64,
+    }
+
+    #[cfg(feature = "acceptance-probes")]
+    struct DiagnosticsBenchmarkEndpoint {
+        exchange: Rc<RefCell<DiagnosticsBenchmarkExchange>>,
+    }
+
+    #[cfg(feature = "acceptance-probes")]
+    struct DiagnosticsBenchmarkRunner<'a> {
+        accounting: &'a mut OwnedAccounting,
+        scheduler: &'a mut Scheduler,
+        exchange: Rc<RefCell<DiagnosticsBenchmarkExchange>>,
         outcome: Option<Result<CommandApplicationOutcome, ()>>,
     }
 
@@ -1733,7 +1772,7 @@ mod firmware {
         run_application_load_verification(&mut scheduler, &mut accounting)
             .unwrap_or_else(|()| fatal(b"fatal: Stage 7 load-boundary verification failed\n"));
         #[cfg(feature = "acceptance-probes")]
-        run_ipc_baseline_verification()
+        run_ipc_baseline_verification(&mut scheduler, &mut accounting)
             .unwrap_or_else(|()| fatal(b"fatal: IPC baseline verification failed\n"));
         if !write_machine_boot_status(BOOT_RUNTIME_LABEL, true) {
             fatal(b"fatal: application loader diagnostic failed\n");
@@ -1877,7 +1916,10 @@ mod firmware {
     }
 
     #[cfg(feature = "acceptance-probes")]
-    fn run_ipc_baseline_verification() -> Result<(), ()> {
+    fn run_ipc_baseline_verification(
+        scheduler: &mut Scheduler,
+        accounting: &mut OwnedAccounting,
+    ) -> Result<(), ()> {
         let frequency = troe_machine::benchmark_counter_frequency_hz().ok_or(())?;
         let payload = [0x5a_u8; troe_dispatch::MAX_MESSAGE_BYTES];
         for payload_bytes in [0_usize, 64, 256, 4 * 1024] {
@@ -1955,6 +1997,120 @@ mod firmware {
                 ipc_percentile(&samples, 95),
                 ipc_percentile(&samples, 99),
                 samples[IPC_BASELINE_SAMPLES - 1],
+            )
+            .map_err(|_| ())?;
+            if !troe_machine::write(line.as_bytes()) {
+                return Err(());
+            }
+        }
+        run_isolated_ipc_baseline_verification(scheduler, accounting, frequency)
+    }
+
+    #[cfg(feature = "acceptance-probes")]
+    #[allow(clippy::too_many_lines)]
+    fn run_isolated_ipc_baseline_verification(
+        scheduler: &mut Scheduler,
+        accounting: &mut OwnedAccounting,
+        frequency: u64,
+    ) -> Result<(), ()> {
+        for payload_bytes in [0_usize, 64, 256, 4 * 1024] {
+            let baseline_frames = accounting.frames.free_frames();
+            let exchange = Rc::new(RefCell::new(DiagnosticsBenchmarkExchange {
+                payload: [0x5a; troe_abi::MAX_MESSAGE_BYTES],
+                payload_bytes,
+                logical_index: 0,
+                fragment_index: 0,
+                received: false,
+                expected_token: 0,
+                started_ticks: 0,
+                started_execution: troe_machine::ApplicationExecutionStats::default(),
+                started_allocations: 0,
+                samples: [0; IPC_BASELINE_SAMPLES],
+                measured: 0,
+                address_space_switches: 0,
+                tlb_invalidations: 0,
+                timer_programs: 0,
+                steady_allocation_calls: 0,
+            }));
+            let stack = accounting.task_stacks[1].stack;
+            let mut runner = DiagnosticsBenchmarkRunner {
+                accounting,
+                scheduler,
+                exchange: Rc::clone(&exchange),
+                outcome: None,
+            };
+            let step =
+                troe_machine::run_task_step(stack, &mut runner, run_diagnostics_benchmark_task)
+                    .map_err(|_| ())?;
+            let outcome = runner.outcome.take().ok_or(())?;
+            if step != TaskStep::ExitSuccess
+                || !matches!(
+                    outcome,
+                    Ok(CommandApplicationOutcome::Exited(troe_abi::exit::SUCCESS))
+                )
+            {
+                return Err(());
+            }
+            drop(runner);
+            if accounting.frames.free_frames() != baseline_frames {
+                return Err(());
+            }
+            let mut exchange = exchange.borrow_mut();
+            let fragments = DiagnosticsBenchmarkEndpoint::fragments(payload_bytes);
+            let measured_fragments = IPC_BASELINE_SAMPLES.checked_mul(fragments).ok_or(())?;
+            let measured_boundaries = IPC_BASELINE_SAMPLES
+                .checked_mul(
+                    fragments
+                        .checked_mul(2)
+                        .ok_or(())?
+                        .checked_sub(1)
+                        .ok_or(())?,
+                )
+                .ok_or(())?;
+            let expected_switches = u64::try_from(measured_boundaries)
+                .map_err(|_| ())?
+                .checked_mul(2)
+                .ok_or(())?;
+            let expected_bytes = u64::try_from(IPC_BASELINE_SAMPLES)
+                .map_err(|_| ())?
+                .checked_mul(u64::try_from(payload_bytes).map_err(|_| ())?)
+                .ok_or(())?;
+            let expected_payload_copies = if payload_bytes == 0 {
+                0
+            } else {
+                u64::try_from(measured_fragments)
+                    .map_err(|_| ())?
+                    .checked_mul(2)
+                    .ok_or(())?
+            };
+            if exchange.logical_index != IPC_BASELINE_WARMUP_CALLS + IPC_BASELINE_SAMPLES
+                || exchange.fragment_index != 0
+                || exchange.received
+                || exchange.measured != IPC_BASELINE_SAMPLES
+                || exchange.steady_allocation_calls != 0
+                || exchange.address_space_switches != expected_switches
+                || exchange.tlb_invalidations != expected_switches
+                || exchange.timer_programs != u64::try_from(measured_boundaries).map_err(|_| ())?
+            {
+                return Err(());
+            }
+            exchange.samples.sort_unstable();
+            let completed_calls = u64::try_from(IPC_BASELINE_SAMPLES).map_err(|_| ())?;
+            let mut line = String::new();
+            writeln!(
+                line,
+                "ipc-baseline path=isolated-diagnostics payload={payload_bytes} warmup={} samples={} counter_hz={frequency} p50_ticks={} p95_ticks={} p99_ticks={} max_ticks={} calls={completed_calls} request_bytes={expected_bytes} request_copies={expected_payload_copies} request_allocations=0 reply_bytes={expected_bytes} reply_copies={expected_payload_copies} reply_allocations=0 address_space_switches={} tlb_invalidations={} timer_programs={} wire_fragments={measured_fragments} retained_requests={} contexts={} steady_allocations=0",
+                IPC_BASELINE_WARMUP_CALLS,
+                IPC_BASELINE_SAMPLES,
+                ipc_percentile(&exchange.samples, 50),
+                ipc_percentile(&exchange.samples, 95),
+                ipc_percentile(&exchange.samples, 99),
+                exchange.samples[IPC_BASELINE_SAMPLES - 1],
+                exchange.address_space_switches,
+                exchange.tlb_invalidations,
+                exchange.timer_programs,
+                DIAGNOSTICS_SERVER_MAX_RETAINED_REQUESTS,
+                DIAGNOSTICS_SERVER_MAX_CONTEXTS,
             )
             .map_err(|_| ())?;
             if !troe_machine::write(line.as_bytes()) {
@@ -2356,7 +2512,14 @@ mod firmware {
         }];
         let source = native_kex_artifact(ApplicationProbe::HeapGrowthLimit);
         match run_command_application(
-            scheduler, accounting, dispatcher, &services, None, source, 0,
+            scheduler,
+            accounting,
+            dispatcher,
+            &services,
+            None,
+            source,
+            0,
+            APPLICATION_COMMAND_STEP_LIMIT,
         )? {
             CommandApplicationOutcome::Faulted(TaskFault::ExecutionLeaseExpired) => Ok(()),
             CommandApplicationOutcome::Exited(_) | CommandApplicationOutcome::Faulted(_) => Err(()),
@@ -3006,6 +3169,54 @@ mod firmware {
         Ok(payload)
     }
 
+    #[cfg(feature = "acceptance-probes")]
+    #[inline(never)]
+    fn run_diagnostics_benchmark_task(runner: &mut DiagnosticsBenchmarkRunner<'_>) -> TaskStep {
+        let outcome = (|| -> Result<CommandApplicationOutcome, ()> {
+            let package =
+                parse_kex_package(native_diagnostics_benchmark_artifact()).map_err(|_| ())?;
+            let mut requirements = package.requirements().iter();
+            let requirement = requirements.next().ok_or(())?;
+            if requirements.next().is_some()
+                || requirement.interface != troe_abi::interface::SERVER_ENDPOINT
+                || requirement.major != server::MAJOR
+                || requirement.minor != server::MINOR
+            {
+                return Err(());
+            }
+            let mut dispatcher = Dispatcher::new(1, 2).map_err(|_| ())?;
+            let port = register_command_service(
+                &mut dispatcher,
+                DiagnosticsBenchmarkEndpoint {
+                    exchange: Rc::clone(&runner.exchange),
+                },
+            )?;
+            let services = [CommandStartupService {
+                port,
+                interface: troe_abi::interface::SERVER_ENDPOINT,
+                major: server::MAJOR,
+                minor: server::MINOR,
+            }];
+            run_command_application(
+                runner.scheduler,
+                runner.accounting,
+                &mut dispatcher,
+                &services,
+                None,
+                package.executable(),
+                1,
+                IPC_ISOLATED_STEP_LIMIT,
+            )
+        })();
+        let success = outcome.is_ok();
+        runner.outcome = Some(outcome);
+        if success {
+            TaskStep::ExitSuccess
+        } else {
+            TaskStep::ExitFailure
+        }
+    }
+
     #[inline(never)]
     fn run_diagnostics_server_task(runner: &mut DiagnosticsServerRunner<'_>) -> TaskStep {
         let outcome = (|| -> Result<CommandApplicationOutcome, ()> {
@@ -3040,6 +3251,7 @@ mod firmware {
                 None,
                 package.executable(),
                 1,
+                APPLICATION_COMMAND_STEP_LIMIT,
             )
         })();
         let success = outcome.is_ok();
@@ -3075,6 +3287,8 @@ mod firmware {
             status: ReplyStatus::Failure,
             reply: reply_storage,
             reply_bytes: 0,
+            steady_allocation_calls: None,
+            steady_allocation_free: false,
         }));
         let stack = accounting.task_stacks[1].stack;
         let mut runner = DiagnosticsServerRunner {
@@ -3106,7 +3320,7 @@ mod firmware {
         #[cfg(not(feature = "acceptance-probes"))]
         let _ = fault_probe;
         let mut exchange = exchange.borrow_mut();
-        if exchange.completed {
+        if exchange.completed && exchange.steady_allocation_free {
             let reply_bytes = exchange.reply_bytes;
             let status = exchange.status;
             let mut reply = Vec::new();
@@ -3431,7 +3645,11 @@ mod firmware {
         }
     }
 
-    #[allow(clippy::drop_non_drop, clippy::too_many_lines)]
+    #[allow(
+        clippy::drop_non_drop,
+        clippy::too_many_arguments,
+        clippy::too_many_lines
+    )]
     fn run_command_application(
         scheduler: &mut Scheduler,
         accounting: &mut OwnedAccounting,
@@ -3440,6 +3658,7 @@ mod firmware {
         deferred_services: Option<&CommandDeferredServices>,
         source: &[u8],
         resource_slot: u8,
+        step_limit: u16,
     ) -> Result<CommandApplicationOutcome, ()> {
         if services.is_empty() || services.len() > troe_dispatch::MAX_HANDLES {
             return Err(());
@@ -3659,6 +3878,8 @@ mod firmware {
             )
             .map_err(|_| ())?;
             let mut steps = 0_u16;
+            let mut request = [0_u8; troe_abi::MAX_MESSAGE_BYTES];
+            let mut direct_reply = [0_u8; troe_abi::MAX_MESSAGE_BYTES];
             let terminal = loop {
                 let resumable = matches!(
                     &outcome,
@@ -3677,7 +3898,15 @@ mod firmware {
                 }
                 if resumable {
                     steps = steps.checked_add(1).ok_or(())?;
-                    if steps > APPLICATION_COMMAND_STEP_LIMIT {
+                    let product_step_limit = APPLICATION_COMMAND_STEP_LIMIT;
+                    let effective_step_limit = if cfg!(feature = "acceptance-probes")
+                        && step_limit == IPC_ISOLATED_STEP_LIMIT
+                    {
+                        step_limit
+                    } else {
+                        product_step_limit
+                    };
+                    if steps > effective_step_limit {
                         scheduler
                             .fault_current(task_id, TaskFault::ExecutionLeaseExpired)
                             .map_err(|_| ())?;
@@ -3707,12 +3936,8 @@ mod firmware {
                                 .map_err(|_| ())?;
                             break CommandApplicationOutcome::Faulted(TaskFault::InvalidCall);
                         }
-                        let mut request = Vec::new();
-                        request
-                            .try_reserve_exact(call.request_bytes())
-                            .map_err(|_| ())?;
-                        request.resize(call.request_bytes(), 0);
-                        application.copy_request(&mut request).map_err(|_| ())?;
+                        let request = &mut request[..call.request_bytes()];
+                        application.copy_request(request).map_err(|_| ())?;
                         let opcode = u16::from_le_bytes([request[0], request[1]]);
                         let preparation = if let (Some(interface), Some(deferred_services)) = (
                             command_handle_interface(&command_handles, call.handle()),
@@ -3735,6 +3960,33 @@ mod firmware {
                         };
                         match preparation {
                             DeferredCallPreparation::NotDeferred => {
+                                if command_handle_interface(&command_handles, call.handle())
+                                    == Some(troe_abi::interface::SERVER_ENDPOINT)
+                                {
+                                    let Ok(reply) = dispatcher.call_owned_abi_into(
+                                        owner,
+                                        call.handle(),
+                                        opcode,
+                                        &request[2..],
+                                        &mut direct_reply[..call.reply_capacity()],
+                                    ) else {
+                                        scheduler
+                                            .fault_current(task_id, TaskFault::InvalidCall)
+                                            .map_err(|_| ())?;
+                                        break CommandApplicationOutcome::Faulted(
+                                            TaskFault::InvalidCall,
+                                        );
+                                    };
+                                    outcome = troe_machine::resume_application(
+                                        application,
+                                        troe_machine::ApplicationResume::HandleReply {
+                                            status: reply.status().abi_value(),
+                                            reply: &direct_reply[..reply.payload_bytes()],
+                                        },
+                                    )
+                                    .map_err(|_| ())?;
+                                    continue;
+                                }
                                 let Ok(reply) = dispatcher.call_owned_abi(
                                     owner,
                                     call.handle(),
@@ -4379,6 +4631,18 @@ mod firmware {
                 include_bytes!("../../tests/kex-corpus/aarch64/diagnostics-server.kex"),
                 false,
             )
+        }
+    }
+
+    #[cfg(feature = "acceptance-probes")]
+    fn native_diagnostics_benchmark_artifact() -> &'static [u8] {
+        #[cfg(target_arch = "x86_64")]
+        {
+            include_bytes!("../../tests/kex-corpus/x86_64/diagnostics-benchmark-server.kex")
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            include_bytes!("../../tests/kex-corpus/aarch64/diagnostics-benchmark-server.kex")
         }
     }
 
@@ -6101,7 +6365,10 @@ mod firmware {
                         ReplyStatus::Success,
                         &encoded[..encoded_bytes],
                     )?;
-                    self.exchange.borrow_mut().received = true;
+                    let mut exchange = self.exchange.borrow_mut();
+                    exchange.received = true;
+                    exchange.steady_allocation_calls =
+                        Some(troe_machine::heap_stats().allocation_calls);
                     Ok(reply)
                 }
                 server::REPLY => {
@@ -6128,10 +6395,248 @@ mod firmware {
                     exchange.reply_bytes = reply_bytes;
                     exchange.status = status;
                     exchange.completed = true;
+                    exchange.steady_allocation_free = exchange.steady_allocation_calls
+                        == Some(troe_machine::heap_stats().allocation_calls);
                     Ok(ServiceReply::empty(ReplyStatus::Success))
                 }
                 _ => Ok(ServiceReply::empty(ReplyStatus::InvalidRequest)),
             }
+        }
+
+        fn call_into(
+            &mut self,
+            request: Request<'_>,
+            destination: &mut [u8],
+        ) -> Result<ServiceReplyInfo, troe_dispatch::DispatchError> {
+            if request.opcode() != server::RECEIVE || !request.payload().is_empty() {
+                let reply = self.call(request)?;
+                if reply.payload().len() > destination.len() {
+                    return Err(troe_dispatch::DispatchError::MessageTooLarge);
+                }
+                destination[..reply.payload().len()].copy_from_slice(reply.payload());
+                return Ok(if reply.payload().is_empty() {
+                    ServiceReplyInfo::empty(reply.status())
+                } else {
+                    ServiceReplyInfo::copied(reply.status(), reply.payload().len())
+                });
+            }
+            let encoded_bytes = {
+                let exchange = self.exchange.borrow();
+                if exchange.received || exchange.completed {
+                    return Ok(ServiceReplyInfo::empty(ReplyStatus::Conflict));
+                }
+                match server::encode_received_request(
+                    exchange.operation.abi_value(),
+                    troe_abi::interface::DIAGNOSTICS,
+                    diagnostics::GET_SNAPSHOT,
+                    exchange.reply_capacity,
+                    exchange.snapshot.as_ref(),
+                    destination,
+                ) {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return Ok(ServiceReplyInfo::empty(ReplyStatus::InvalidRequest));
+                    }
+                }
+            };
+            let mut exchange = self.exchange.borrow_mut();
+            exchange.received = true;
+            exchange.steady_allocation_calls = Some(troe_machine::heap_stats().allocation_calls);
+            Ok(ServiceReplyInfo::copied(
+                ReplyStatus::Success,
+                encoded_bytes,
+            ))
+        }
+    }
+
+    #[cfg(feature = "acceptance-probes")]
+    impl DiagnosticsBenchmarkEndpoint {
+        const FRAGMENT_BYTES: usize =
+            if server::MAX_RECEIVE_REQUEST_BYTES < server::MAX_REPLY_PAYLOAD_BYTES {
+                server::MAX_RECEIVE_REQUEST_BYTES
+            } else {
+                server::MAX_REPLY_PAYLOAD_BYTES
+            };
+
+        fn fragments(payload_bytes: usize) -> usize {
+            if payload_bytes > Self::FRAGMENT_BYTES {
+                2
+            } else {
+                1
+            }
+        }
+
+        fn fragment_range(payload_bytes: usize, fragment_index: usize) -> Option<(usize, usize)> {
+            let first = payload_bytes.min(Self::FRAGMENT_BYTES);
+            match fragment_index {
+                0 => Some((0, first)),
+                1 if first < payload_bytes => Some((first, payload_bytes)),
+                _ => None,
+            }
+        }
+
+        #[allow(clippy::too_many_lines)]
+        fn direct_call(
+            &mut self,
+            request: Request<'_>,
+            destination: &mut [u8],
+        ) -> Result<ServiceReplyInfo, troe_dispatch::DispatchError> {
+            match request.opcode() {
+                server::RECEIVE if request.payload().is_empty() => {
+                    let mut exchange = self.exchange.borrow_mut();
+                    let total = IPC_BASELINE_WARMUP_CALLS + IPC_BASELINE_SAMPLES;
+                    if exchange.logical_index == total {
+                        return Ok(ServiceReplyInfo::empty(ReplyStatus::Conflict));
+                    }
+                    if exchange.received {
+                        return Ok(ServiceReplyInfo::empty(ReplyStatus::Conflict));
+                    }
+                    let fragments = Self::fragments(exchange.payload_bytes);
+                    let (start, end) =
+                        Self::fragment_range(exchange.payload_bytes, exchange.fragment_index)
+                            .ok_or(troe_dispatch::DispatchError::AccountingOverflow)?;
+                    if exchange.fragment_index == 0 {
+                        exchange.started_ticks = troe_machine::benchmark_counter_ticks();
+                        exchange.started_execution = troe_machine::application_execution_stats();
+                        exchange.started_allocations = troe_machine::heap_stats().allocation_calls;
+                    }
+                    let transport_index = exchange
+                        .logical_index
+                        .checked_mul(2)
+                        .and_then(|value| value.checked_add(exchange.fragment_index))
+                        .and_then(|value| value.checked_add(1))
+                        .ok_or(troe_dispatch::DispatchError::AccountingOverflow)?;
+                    let generation = u32::try_from(transport_index)
+                        .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?;
+                    let token = u64::from(generation) << 16;
+                    let final_fragment = exchange.fragment_index + 1 == fragments;
+                    let opcode = if final_fragment { 1 } else { 2 };
+                    let encoded = server::encode_received_request(
+                        token,
+                        troe_abi::interface::DIAGNOSTICS,
+                        opcode,
+                        end - start,
+                        &exchange.payload[start..end],
+                        destination,
+                    )
+                    .map_err(|_| troe_dispatch::DispatchError::MessageTooLarge)?;
+                    exchange.received = true;
+                    exchange.expected_token = token;
+                    Ok(ServiceReplyInfo::copied(ReplyStatus::Success, encoded))
+                }
+                server::REPLY => {
+                    let completion = server::decode_reply_request(request.payload())
+                        .map_err(|_| troe_dispatch::DispatchError::InvalidHandle)?;
+                    let mut exchange = self.exchange.borrow_mut();
+                    if !exchange.received
+                        || completion.token() != exchange.expected_token
+                        || completion.status() != troe_abi::reply::SUCCESS
+                    {
+                        return Ok(ServiceReplyInfo::empty(ReplyStatus::Conflict));
+                    }
+                    PendingOperationId::from_abi_value(completion.token())
+                        .map_err(|_| troe_dispatch::DispatchError::InvalidHandle)?;
+                    let fragments = Self::fragments(exchange.payload_bytes);
+                    let (start, end) =
+                        Self::fragment_range(exchange.payload_bytes, exchange.fragment_index)
+                            .ok_or(troe_dispatch::DispatchError::AccountingOverflow)?;
+                    if completion.payload() != &exchange.payload[start..end] {
+                        return Ok(ServiceReplyInfo::empty(ReplyStatus::InvalidRequest));
+                    }
+                    exchange.received = false;
+                    if exchange.fragment_index + 1 == fragments {
+                        if exchange.logical_index >= IPC_BASELINE_WARMUP_CALLS {
+                            let finished_ticks = troe_machine::benchmark_counter_ticks();
+                            let finished_execution = troe_machine::application_execution_stats();
+                            let finished_allocations = troe_machine::heap_stats().allocation_calls;
+                            let sample_index = exchange
+                                .logical_index
+                                .checked_sub(IPC_BASELINE_WARMUP_CALLS)
+                                .ok_or(troe_dispatch::DispatchError::AccountingOverflow)?;
+                            exchange.samples[sample_index] = finished_ticks
+                                .checked_sub(exchange.started_ticks)
+                                .ok_or(troe_dispatch::DispatchError::AccountingOverflow)?;
+                            exchange.measured = exchange
+                                .measured
+                                .checked_add(1)
+                                .ok_or(troe_dispatch::DispatchError::AccountingOverflow)?;
+                            exchange.address_space_switches = exchange
+                                .address_space_switches
+                                .checked_add(
+                                    finished_execution
+                                        .address_space_switches
+                                        .checked_sub(
+                                            exchange.started_execution.address_space_switches,
+                                        )
+                                        .ok_or(troe_dispatch::DispatchError::AccountingOverflow)?,
+                                )
+                                .ok_or(troe_dispatch::DispatchError::AccountingOverflow)?;
+                            exchange.tlb_invalidations = exchange
+                                .tlb_invalidations
+                                .checked_add(
+                                    finished_execution
+                                        .tlb_invalidations
+                                        .checked_sub(exchange.started_execution.tlb_invalidations)
+                                        .ok_or(troe_dispatch::DispatchError::AccountingOverflow)?,
+                                )
+                                .ok_or(troe_dispatch::DispatchError::AccountingOverflow)?;
+                            exchange.timer_programs = exchange
+                                .timer_programs
+                                .checked_add(
+                                    finished_execution
+                                        .timer_programs
+                                        .checked_sub(exchange.started_execution.timer_programs)
+                                        .ok_or(troe_dispatch::DispatchError::AccountingOverflow)?,
+                                )
+                                .ok_or(troe_dispatch::DispatchError::AccountingOverflow)?;
+                            exchange.steady_allocation_calls = exchange
+                                .steady_allocation_calls
+                                .checked_add(
+                                    u64::try_from(
+                                        finished_allocations
+                                            .checked_sub(exchange.started_allocations)
+                                            .ok_or(
+                                                troe_dispatch::DispatchError::AccountingOverflow,
+                                            )?,
+                                    )
+                                    .map_err(|_| {
+                                        troe_dispatch::DispatchError::AccountingOverflow
+                                    })?,
+                                )
+                                .ok_or(troe_dispatch::DispatchError::AccountingOverflow)?;
+                        }
+                        exchange.logical_index = exchange
+                            .logical_index
+                            .checked_add(1)
+                            .ok_or(troe_dispatch::DispatchError::AccountingOverflow)?;
+                        exchange.fragment_index = 0;
+                    } else {
+                        exchange.fragment_index += 1;
+                    }
+                    Ok(ServiceReplyInfo::empty(ReplyStatus::Success))
+                }
+                _ => Ok(ServiceReplyInfo::empty(ReplyStatus::InvalidRequest)),
+            }
+        }
+    }
+
+    #[cfg(feature = "acceptance-probes")]
+    impl Service for DiagnosticsBenchmarkEndpoint {
+        fn call(
+            &mut self,
+            request: Request<'_>,
+        ) -> Result<ServiceReply, troe_dispatch::DispatchError> {
+            let mut destination = [0_u8; troe_abi::MAX_MESSAGE_BYTES];
+            let reply = self.direct_call(request, &mut destination)?;
+            ServiceReply::with_payload(reply.status(), &destination[..reply.payload_bytes()])
+        }
+
+        fn call_into(
+            &mut self,
+            request: Request<'_>,
+            destination: &mut [u8],
+        ) -> Result<ServiceReplyInfo, troe_dispatch::DispatchError> {
+            self.direct_call(request, destination)
         }
     }
 
@@ -7399,6 +7904,7 @@ mod firmware {
                 deferred_services.as_ref(),
                 package.executable(),
                 0,
+                APPLICATION_COMMAND_STEP_LIMIT,
             );
             if self
                 .scheduler

@@ -1119,6 +1119,8 @@ pub fn run_application(
         return Err(MmuError::ExecutionTimerUnavailable);
     }
     let raw = architecture_run_application(root, entry, user_stack, startup_address, startup_bytes);
+    #[cfg(feature = "acceptance-probes")]
+    crate::mechanism::record_application_execution_boundary();
     crate::mechanism::quiesce_application_execution();
     // SAFETY: Native completion restored the kernel root and unique call frame.
     let state = unsafe { (*ISOLATED_RUN.0.get()).take() };
@@ -1220,6 +1222,8 @@ pub fn resume_application(
         return Err(MmuError::ExecutionTimerUnavailable);
     }
     let raw = architecture_resume_application(root, &context);
+    #[cfg(feature = "acceptance-probes")]
+    crate::mechanism::record_application_execution_boundary();
     crate::mechanism::quiesce_application_execution();
     // SAFETY: Native completion restored the kernel root and unique call frame.
     let state = unsafe { (*ISOLATED_RUN.0.get()).take() };

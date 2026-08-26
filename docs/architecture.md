@@ -192,6 +192,13 @@ first narrow exception: its immutable snapshot crosses a canonical copied
 receive/reply transport to an isolated KEX server, while the remaining
 registered services stay in-process.
 
+Server-endpoint calls use fixed kernel request/reply buffers and let the
+endpoint encode directly into caller-owned reply storage. The protected
+receive-to-reply interval therefore performs no dynamic allocation while still
+copying across the protection boundary. The first composition retains at most
+one request and one suspended server context. It launches one server process
+per client request; persistent residency and restart remain later policy.
+
 Stage 5.1 adds `troe-terminal`, which keeps transport-independent input
 decoding, line editing, history, and fixed-glyph text rendering outside the
 machine mechanism. `troe-shell` owns completion because it has the VFS namespace

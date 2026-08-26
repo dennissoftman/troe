@@ -31,6 +31,11 @@ KEX_APPLICATIONS = tuple(
 KEX_SERVICES = (
     (REPO_ROOT / "services" / "diagnostics", "diagnostics-server", 8),
     (
+        REPO_ROOT / "services" / "diagnostics-benchmark",
+        "diagnostics-benchmark-server",
+        8,
+    ),
+    (
         REPO_ROOT / "services" / "diagnostics-fault",
         "diagnostics-fault-server",
         8,

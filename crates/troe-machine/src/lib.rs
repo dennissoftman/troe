@@ -428,6 +428,11 @@ pub fn selected_platform_source() -> Result<PlatformSource, troe_platform::Platf
     return Ok(PlatformSource::Fdt);
 }
 
+#[cfg(all(target_os = "uefi", feature = "acceptance-probes"))]
+pub use mechanism::{
+    ApplicationExecutionStats, application_execution_stats, benchmark_counter_frequency_hz,
+    benchmark_counter_ticks,
+};
 #[cfg(target_os = "uefi")]
 pub use mechanism::{
     FramebufferError, HeapStats, InputInterruptError, OwnedFramebuffer, PhysicalMemoryError,
@@ -440,8 +445,6 @@ pub use mechanism::{
     wait_for_input_event, wait_for_runtime_event, wait_for_runtime_event_timeout, write,
     zero_physical_range,
 };
-#[cfg(all(target_os = "uefi", feature = "acceptance-probes"))]
-pub use mechanism::{benchmark_counter_frequency_hz, benchmark_counter_ticks};
 
 #[cfg(target_os = "uefi")]
 pub use mmu::{

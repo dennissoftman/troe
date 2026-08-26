@@ -18,7 +18,13 @@ use core::ptr::NonNull;
 use core::sync::atomic::AtomicBool;
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 use core::sync::atomic::AtomicU32;
-#[cfg(any(test, all(target_os = "uefi", target_arch = "x86_64")))]
+#[cfg(any(
+    test,
+    all(
+        target_os = "uefi",
+        any(target_arch = "x86_64", feature = "acceptance-probes")
+    )
+))]
 use core::sync::atomic::AtomicU64;
 #[cfg(any(test, target_os = "uefi"))]
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -104,6 +110,23 @@ pub struct HeapStats {
     pub high_water_bytes: usize,
     /// Allocation requests rejected by the owned heap.
     pub failed_allocations: usize,
+    /// Successful allocation calls served by the owned heap.
+    pub allocation_calls: usize,
+    /// Matching deallocation calls returned to the owned heap.
+    pub deallocation_calls: usize,
+}
+
+/// Structural native application-boundary counters used by acceptance IPC
+/// measurements.
+#[cfg(feature = "acceptance-probes")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ApplicationExecutionStats {
+    /// Kernel-to-user plus user-to-kernel address-space activations.
+    pub address_space_switches: u64,
+    /// Full TLB invalidations implied by those root switches today.
+    pub tlb_invalidations: u64,
+    /// Successfully programmed one-shot application execution leases.
+    pub timer_programs: u64,
 }
 
 /// Failure to establish checked post-handoff framebuffer access.
@@ -435,6 +458,15 @@ static NETWORK_INTERRUPT_PENDING: AtomicBool = AtomicBool::new(false);
 #[cfg(target_os = "uefi")]
 static RUNTIME_TIMER_FIRED: AtomicBool = AtomicBool::new(false);
 
+#[cfg(all(target_os = "uefi", feature = "acceptance-probes"))]
+static APPLICATION_ADDRESS_SPACE_SWITCHES: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(all(target_os = "uefi", feature = "acceptance-probes"))]
+static APPLICATION_TLB_INVALIDATIONS: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(all(target_os = "uefi", feature = "acceptance-probes"))]
+static APPLICATION_TIMER_PROGRAMS: AtomicU64 = AtomicU64::new(0);
+
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 static AARCH64_NETWORK_INTERRUPT_INTID: AtomicU32 = AtomicU32::new(u32::MAX);
 
@@ -491,6 +523,8 @@ struct HeapState {
     used_bytes: usize,
     high_water_bytes: usize,
     failed_allocations: usize,
+    allocation_calls: usize,
+    deallocation_calls: usize,
     initialized: bool,
 }
 
@@ -503,6 +537,8 @@ impl HeapState {
             used_bytes: 0,
             high_water_bytes: 0,
             failed_allocations: 0,
+            allocation_calls: 0,
+            deallocation_calls: 0,
             initialized: false,
         }
     }
@@ -534,6 +570,7 @@ impl HeapState {
         if let Some(allocation) = self.tlsf.allocate(layout) {
             self.used_bytes = self.used_bytes.saturating_add(layout.size());
             self.high_water_bytes = self.high_water_bytes.max(self.used_bytes);
+            self.allocation_calls = self.allocation_calls.saturating_add(1);
             return allocation.as_ptr();
         }
         self.failed_allocations = self.failed_allocations.saturating_add(1);
@@ -548,6 +585,7 @@ impl HeapState {
         // layout, satisfying TLSF's deallocation contract.
         unsafe { self.tlsf.deallocate(allocation, layout.align()) };
         self.used_bytes = self.used_bytes.saturating_sub(layout.size());
+        self.deallocation_calls = self.deallocation_calls.saturating_add(1);
     }
 
     #[cfg(target_os = "uefi")]
@@ -561,6 +599,8 @@ impl HeapState {
             used_bytes: self.used_bytes,
             high_water_bytes: self.high_water_bytes,
             failed_allocations: self.failed_allocations,
+            allocation_calls: self.allocation_calls,
+            deallocation_calls: self.deallocation_calls,
         }
     }
 }
@@ -1252,11 +1292,33 @@ pub(crate) fn prepare_application_execution(milliseconds: u32) -> Result<(), Exe
     }
     architecture_mask_input_interrupts();
     match architecture_arm_execution_timer(milliseconds) {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            #[cfg(feature = "acceptance-probes")]
+            APPLICATION_TIMER_PROGRAMS.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
         Err(error) => {
             architecture_disarm_execution_timer();
             Err(error)
         }
+    }
+}
+
+/// Record one complete native application entry/return boundary.
+#[cfg(all(target_os = "uefi", feature = "acceptance-probes"))]
+pub(crate) fn record_application_execution_boundary() {
+    APPLICATION_ADDRESS_SPACE_SWITCHES.fetch_add(2, Ordering::Relaxed);
+    APPLICATION_TLB_INVALIDATIONS.fetch_add(2, Ordering::Relaxed);
+}
+
+/// Snapshot structural native application-boundary counters.
+#[cfg(all(target_os = "uefi", feature = "acceptance-probes"))]
+#[must_use]
+pub fn application_execution_stats() -> ApplicationExecutionStats {
+    ApplicationExecutionStats {
+        address_space_switches: APPLICATION_ADDRESS_SPACE_SWITCHES.load(Ordering::Relaxed),
+        tlb_invalidations: APPLICATION_TLB_INVALIDATIONS.load(Ordering::Relaxed),
+        timer_programs: APPLICATION_TIMER_PROGRAMS.load(Ordering::Relaxed),
     }
 }
 
@@ -3120,7 +3182,10 @@ mod tests {
         assert!(!reused.is_null());
         // SAFETY: `reused` is a unique live allocation from this heap.
         unsafe { heap.deallocate(reused, large) };
-        assert_eq!(heap.stats().used_bytes, 0);
+        let stats = heap.stats();
+        assert_eq!(stats.used_bytes, 0);
+        assert_eq!(stats.allocation_calls, 2);
+        assert_eq!(stats.deallocation_calls, 2);
     }
 
     #[test]
@@ -3136,6 +3201,8 @@ mod tests {
         assert!(heap.allocate(oversized).is_null());
         assert_eq!(heap.stats().used_bytes, 0);
         assert_eq!(heap.stats().failed_allocations, 1);
+        assert_eq!(heap.stats().allocation_calls, 0);
+        assert_eq!(heap.stats().deallocation_calls, 0);
     }
 
     #[test]

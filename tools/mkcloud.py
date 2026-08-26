@@ -105,6 +105,7 @@ BUNDLE_MANIFEST = "bundle.json"
 PRODUCTION_FORBIDDEN_MARKERS = (
     b"mmu-probe",
     b"task-probe",
+    b"service-probe",
     b"probing read-only",
     b"probing non-executable",
     b"probing task stack guard",
