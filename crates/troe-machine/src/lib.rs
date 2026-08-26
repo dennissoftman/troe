@@ -439,6 +439,8 @@ pub use mechanism::{
     take_network_interrupt, try_input_event, try_read_byte, try_read_keyboard_scancode,
     wait_for_input_event, wait_for_runtime_event, write, zero_physical_range,
 };
+#[cfg(all(target_os = "uefi", feature = "acceptance-probes"))]
+pub use mechanism::{benchmark_counter_frequency_hz, benchmark_counter_ticks};
 
 #[cfg(target_os = "uefi")]
 pub use mmu::{

@@ -16,6 +16,8 @@ historical review evidence.
   refactors must not erase.
 - [Native trap-entry contract](native-trap-entry-contract.md) enumerates every
   Rust-calling native gate, its saved state, origin proof, and fault fate.
+- [IPC baseline](ipc-baseline.md) defines and records the pre-scheduler
+  synchronous latency matrix and structural event counters.
 - [KEFS v1](formats/kefs-v1.md) defines the implemented embedded-filesystem
   format.
 - [KEX v1](formats/kex-v1.md) defines the implemented portable executable

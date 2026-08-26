@@ -387,6 +387,23 @@ pub struct DispatchStats {
     pub calls: u64,
     /// Replies successfully returned to clients.
     pub replies: u64,
+    /// Bytes borrowed directly from callers for delivered requests.
+    pub request_bytes: u64,
+    /// Request payload copies performed by this in-process dispatcher.
+    ///
+    /// This remains zero because [`Request`] borrows the caller's payload.
+    pub request_payload_copies: u64,
+    /// Request payload allocations performed by this in-process dispatcher.
+    ///
+    /// This remains zero because [`Request`] borrows the caller's payload.
+    pub request_payload_allocations: u64,
+    /// Owned reply payload bytes successfully returned to clients.
+    pub reply_bytes: u64,
+    /// Non-empty reply payload copies completed by [`ServiceReply::with_payload`].
+    pub reply_payload_copies: u64,
+    /// Non-empty reply buffer allocations completed by
+    /// [`ServiceReply::with_payload`].
+    pub reply_payload_allocations: u64,
 }
 
 /// Bounded synchronous in-process service router.
@@ -404,6 +421,9 @@ pub struct Dispatcher<'service> {
     next_request_id: u64,
     calls: u64,
     replies: u64,
+    request_bytes: u64,
+    reply_bytes: u64,
+    reply_payload_copies: u64,
 }
 
 impl<'service> Dispatcher<'service> {
@@ -436,6 +456,9 @@ impl<'service> Dispatcher<'service> {
             next_request_id: 1,
             calls: 0,
             replies: 0,
+            request_bytes: 0,
+            reply_bytes: 0,
+            reply_payload_copies: 0,
         })
     }
 
@@ -624,6 +647,12 @@ impl<'service> Dispatcher<'service> {
             .calls
             .checked_add(1)
             .ok_or(DispatchError::AccountingOverflow)?;
+        let request_bytes = self
+            .request_bytes
+            .checked_add(
+                u64::try_from(payload.len()).map_err(|_| DispatchError::AccountingOverflow)?,
+            )
+            .ok_or(DispatchError::AccountingOverflow)?;
         let request = Request {
             id: request_id,
             opcode,
@@ -631,6 +660,7 @@ impl<'service> Dispatcher<'service> {
         };
         self.next_request_id = next_request_id;
         self.calls = calls;
+        self.request_bytes = request_bytes;
         let port_index = usize::from(binding.port.slot);
         let service = self
             .ports
@@ -645,7 +675,20 @@ impl<'service> Dispatcher<'service> {
             .replies
             .checked_add(1)
             .ok_or(DispatchError::AccountingOverflow)?;
+        let reply_bytes = self
+            .reply_bytes
+            .checked_add(
+                u64::try_from(service_reply.payload.len())
+                    .map_err(|_| DispatchError::AccountingOverflow)?,
+            )
+            .ok_or(DispatchError::AccountingOverflow)?;
+        let reply_payload_copies = self
+            .reply_payload_copies
+            .checked_add(u64::from(!service_reply.payload.is_empty()))
+            .ok_or(DispatchError::AccountingOverflow)?;
         self.replies = replies;
+        self.reply_bytes = reply_bytes;
+        self.reply_payload_copies = reply_payload_copies;
         Ok(Reply {
             request_id,
             status: service_reply.status,
@@ -695,6 +738,12 @@ impl<'service> Dispatcher<'service> {
             live_handles: u16::try_from(live_handles).unwrap_or(u16::MAX),
             calls: self.calls,
             replies: self.replies,
+            request_bytes: self.request_bytes,
+            request_payload_copies: 0,
+            request_payload_allocations: 0,
+            reply_bytes: self.reply_bytes,
+            reply_payload_copies: self.reply_payload_copies,
+            reply_payload_allocations: self.reply_payload_copies,
         }
     }
 
@@ -1121,8 +1170,33 @@ mod tests {
         assert_eq!(first.payload(), b"alpha");
         assert_eq!(second.request_id(), 2);
         assert_eq!(second.payload(), b"beta");
-        assert_eq!(dispatcher.stats().calls, 2);
-        assert_eq!(dispatcher.stats().replies, 2);
+        let stats = dispatcher.stats();
+        assert_eq!(stats.calls, 2);
+        assert_eq!(stats.replies, 2);
+        assert_eq!(stats.request_bytes, 9);
+        assert_eq!(stats.request_payload_copies, 0);
+        assert_eq!(stats.request_payload_allocations, 0);
+        assert_eq!(stats.reply_bytes, 9);
+        assert_eq!(stats.reply_payload_copies, 2);
+        assert_eq!(stats.reply_payload_allocations, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn empty_payloads_do_not_claim_a_copy_or_allocation() -> Result<(), DispatchError> {
+        let mut dispatcher = Dispatcher::new(1, 1)?;
+        let (_port, handle) = dispatcher.register(Box::new(EchoService), Rights::CALL)?;
+
+        let reply = dispatcher.call(handle, 7, &[])?;
+
+        assert!(reply.payload().is_empty());
+        let stats = dispatcher.stats();
+        assert_eq!(stats.calls, 1);
+        assert_eq!(stats.replies, 1);
+        assert_eq!(stats.request_bytes, 0);
+        assert_eq!(stats.reply_bytes, 0);
+        assert_eq!(stats.reply_payload_copies, 0);
+        assert_eq!(stats.reply_payload_allocations, 0);
         Ok(())
     }
 

@@ -1064,6 +1064,23 @@ pub fn monotonic_millis() -> Option<u64> {
     architecture_monotonic_millis()
 }
 
+/// Read the architecture's highest-resolution monotonic benchmark counter.
+///
+/// The value is exposed only in acceptance images. QEMU results are suitable
+/// for regression comparison but not real-hardware latency claims.
+#[must_use]
+#[cfg(all(target_os = "uefi", feature = "acceptance-probes"))]
+pub fn benchmark_counter_ticks() -> u64 {
+    architecture_benchmark_counter_ticks()
+}
+
+/// Return the benchmark counter frequency established for this boot.
+#[must_use]
+#[cfg(all(target_os = "uefi", feature = "acceptance-probes"))]
+pub fn benchmark_counter_frequency_hz() -> Option<u64> {
+    architecture_benchmark_counter_frequency_hz()
+}
+
 /// Establish the architecture monotonic-counter frequency before firmware
 /// boot services are released.
 ///
@@ -1506,6 +1523,27 @@ fn x86_read_tsc() -> u64 {
         );
     }
     ticks
+}
+
+#[cfg(all(
+    target_os = "uefi",
+    target_arch = "x86_64",
+    feature = "acceptance-probes"
+))]
+fn architecture_benchmark_counter_ticks() -> u64 {
+    x86_read_tsc()
+}
+
+#[cfg(all(
+    target_os = "uefi",
+    target_arch = "x86_64",
+    feature = "acceptance-probes"
+))]
+fn architecture_benchmark_counter_frequency_hz() -> Option<u64> {
+    X86_TSC_TICKS_PER_MILLISECOND
+        .load(Ordering::Relaxed)
+        .checked_mul(1_000)
+        .filter(|frequency| *frequency != 0)
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
@@ -2529,6 +2567,40 @@ fn architecture_monotonic_millis() -> Option<u64> {
         return None;
     }
     counter.checked_mul(1_000)?.checked_div(frequency)
+}
+
+#[cfg(all(
+    target_os = "uefi",
+    target_arch = "aarch64",
+    feature = "acceptance-probes"
+))]
+fn architecture_benchmark_counter_ticks() -> u64 {
+    let counter: u64;
+    // SAFETY: CNTPCT_EL0 is read-only at EL1; ISB orders the timestamp after
+    // preceding benchmark work on the pinned single-vCPU acceptance profile.
+    unsafe {
+        core::arch::asm!(
+            "isb",
+            "mrs {}, cntpct_el0",
+            out(reg) counter,
+            options(nomem, nostack)
+        );
+    }
+    counter
+}
+
+#[cfg(all(
+    target_os = "uefi",
+    target_arch = "aarch64",
+    feature = "acceptance-probes"
+))]
+fn architecture_benchmark_counter_frequency_hz() -> Option<u64> {
+    let frequency: u64;
+    // SAFETY: CNTFRQ_EL0 is a read-only generic-timer register at EL1.
+    unsafe {
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frequency, options(nomem, nostack));
+    }
+    (frequency != 0).then_some(frequency)
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]

@@ -123,6 +123,10 @@ mod firmware {
     const APPLICATION_COMMAND_STEP_LIMIT: u16 = 1024;
     const APPLICATION_COMMAND_RUNTIME_MILLISECONDS: u64 = 10_000;
     const APPLICATION_SYNCHRONOUS_WAIT_MILLISECONDS: u64 = 4_000;
+    #[cfg(feature = "acceptance-probes")]
+    const IPC_BASELINE_WARMUP_CALLS: usize = 64;
+    #[cfg(feature = "acceptance-probes")]
+    const IPC_BASELINE_SAMPLES: usize = 256;
     const USER_CODE_BASE: u64 = 0x0000_4000_0000_0000;
     const USER_DATA_BASE: u64 = USER_CODE_BASE + BASE_PAGE_SIZE;
     const USER_STACK_BASE: u64 = USER_CODE_BASE + 0x1_0000;
@@ -1616,6 +1620,9 @@ mod firmware {
             .unwrap_or_else(|()| fatal(b"fatal: Stage 6 isolation verification failed\n"));
         run_application_load_verification(&mut scheduler, &mut accounting)
             .unwrap_or_else(|()| fatal(b"fatal: Stage 7 load-boundary verification failed\n"));
+        #[cfg(feature = "acceptance-probes")]
+        run_ipc_baseline_verification()
+            .unwrap_or_else(|()| fatal(b"fatal: IPC baseline verification failed\n"));
         if !write_machine_boot_status(BOOT_RUNTIME_LABEL, true) {
             fatal(b"fatal: application loader diagnostic failed\n");
         }
@@ -1749,6 +1756,100 @@ mod firmware {
             return Err(());
         }
         Ok(())
+    }
+
+    #[cfg(feature = "acceptance-probes")]
+    fn run_ipc_baseline_verification() -> Result<(), ()> {
+        let frequency = troe_machine::benchmark_counter_frequency_hz().ok_or(())?;
+        let payload = [0x5a_u8; troe_dispatch::MAX_MESSAGE_BYTES];
+        for payload_bytes in [0_usize, 64, 256, 4 * 1024] {
+            let mut dispatcher = Dispatcher::new(1, 1).map_err(|_| ())?;
+            let (_port, handle) = dispatcher
+                .register(Box::new(EchoService), Rights::CALL)
+                .map_err(|_| ())?;
+            let request = &payload[..payload_bytes];
+            for _ in 0..IPC_BASELINE_WARMUP_CALLS {
+                let reply = dispatcher.call(handle, 1, request).map_err(|_| ())?;
+                if reply.status() != ReplyStatus::Success || reply.payload() != request {
+                    return Err(());
+                }
+                core::hint::black_box(reply);
+            }
+            let baseline = dispatcher.stats();
+            let mut samples = [0_u64; IPC_BASELINE_SAMPLES];
+            for sample in &mut samples {
+                let started = troe_machine::benchmark_counter_ticks();
+                let reply = dispatcher
+                    .call(handle, 1, core::hint::black_box(request))
+                    .map_err(|_| ())?;
+                let finished = troe_machine::benchmark_counter_ticks();
+                if reply.status() != ReplyStatus::Success || reply.payload() != request {
+                    return Err(());
+                }
+                core::hint::black_box(reply);
+                *sample = finished.checked_sub(started).ok_or(())?;
+            }
+            samples.sort_unstable();
+            let stats = dispatcher.stats();
+            let completed_calls = stats.replies.checked_sub(baseline.replies).ok_or(())?;
+            let request_bytes = stats
+                .request_bytes
+                .checked_sub(baseline.request_bytes)
+                .ok_or(())?;
+            let reply_bytes = stats
+                .reply_bytes
+                .checked_sub(baseline.reply_bytes)
+                .ok_or(())?;
+            let reply_copies = stats
+                .reply_payload_copies
+                .checked_sub(baseline.reply_payload_copies)
+                .ok_or(())?;
+            let expected_calls = u64::try_from(IPC_BASELINE_SAMPLES).map_err(|_| ())?;
+            let expected_bytes = expected_calls
+                .checked_mul(u64::try_from(payload_bytes).map_err(|_| ())?)
+                .ok_or(())?;
+            let expected_copies = if payload_bytes == 0 {
+                0
+            } else {
+                expected_calls
+            };
+            if stats.calls.checked_sub(baseline.calls) != Some(expected_calls)
+                || completed_calls != expected_calls
+                || request_bytes != expected_bytes
+                || reply_bytes != expected_bytes
+                || reply_copies != expected_copies
+                || stats
+                    .reply_payload_allocations
+                    .checked_sub(baseline.reply_payload_allocations)
+                    != Some(expected_copies)
+                || stats.request_payload_copies != 0
+                || stats.request_payload_allocations != 0
+            {
+                return Err(());
+            }
+            let mut line = String::new();
+            writeln!(
+                line,
+                "ipc-baseline path=in-process payload={payload_bytes} warmup={} samples={} counter_hz={frequency} p50_ticks={} p95_ticks={} p99_ticks={} max_ticks={} calls={completed_calls} request_bytes={request_bytes} request_copies=0 request_allocations=0 reply_bytes={reply_bytes} reply_copies={reply_copies} reply_allocations={reply_copies} address_space_switches=0 tlb_invalidations=0 timer_programs=0",
+                IPC_BASELINE_WARMUP_CALLS,
+                IPC_BASELINE_SAMPLES,
+                ipc_percentile(&samples, 50),
+                ipc_percentile(&samples, 95),
+                ipc_percentile(&samples, 99),
+                samples[IPC_BASELINE_SAMPLES - 1],
+            )
+            .map_err(|_| ())?;
+            if !troe_machine::write(line.as_bytes()) {
+                return Err(());
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "acceptance-probes")]
+    fn ipc_percentile(sorted: &[u64; IPC_BASELINE_SAMPLES], percentile: usize) -> u64 {
+        let rank = sorted.len().saturating_mul(percentile).saturating_add(99) / 100;
+        sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
     }
 
     fn run_isolation_verification(
