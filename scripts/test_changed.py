@@ -30,7 +30,20 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 ALL_QEMU_SCENARIOS = DEFAULT_SCENARIOS
 NETWORK_APPS = frozenset(("arp", "dhcp", "net", "ping", "tcp", "udp"))
 FILESYSTEM_APPS = frozenset(
-    ("cat", "grep", "hexdump", "ln", "ls", "printf", "rm", "write")
+    (
+        "awk",
+        "cat",
+        "grep",
+        "hexdump",
+        "ln",
+        "ls",
+        "printf",
+        "rm",
+        "sed",
+        "tar",
+        "wc",
+        "write",
+    )
 )
 TERMINAL_APPS = frozenset(("clear", "echo", "man", "pwd"))
 LOW_LEVEL_PACKAGES = frozenset(

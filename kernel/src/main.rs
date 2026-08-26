@@ -119,7 +119,7 @@ mod firmware {
     const APPLICATION_FIXED_USER_REGIONS: usize = 3;
     const APPLICATION_INTERFACE_ECHO: u32 = 1;
     const APPLICATION_COMMAND_STEP_LIMIT: u16 = 1024;
-    const _: () = assert!(filesystem_mutation::MAX_FILE_BYTES == PIPE_CAPACITY);
+    const _: () = assert!(filesystem_mutation::MAX_FILE_BYTES == 1024 * 1024);
     const USER_CODE_BASE: u64 = 0x0000_4000_0000_0000;
     const USER_DATA_BASE: u64 = USER_CODE_BASE + BASE_PAGE_SIZE;
     const USER_STACK_BASE: u64 = USER_CODE_BASE + 0x1_0000;
@@ -4486,6 +4486,21 @@ mod firmware {
                         &filesystem::encode_metadata_reply(metadata),
                     )
                 }
+                filesystem::READ_LINK => {
+                    let Ok(path) = filesystem::decode_path_request(request.payload()) else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    let target = match self.namespace.borrow_mut().read_link(&self.cwd, path) {
+                        Ok(target) => target,
+                        Err(error) => {
+                            return Ok(ServiceReply::empty(application_filesystem_status(error)));
+                        }
+                    };
+                    let mut encoded = [0_u8; filesystem::MAX_LINK_BYTES];
+                    let count = filesystem::encode_link_reply(&target, &mut encoded)
+                        .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?;
+                    ServiceReply::with_payload(ReplyStatus::Success, &encoded[..count])
+                }
                 _ => Ok(ServiceReply::empty(ReplyStatus::InvalidRequest)),
             }
         }
@@ -4592,6 +4607,16 @@ mod firmware {
                 .create_hard_link(&self.cwd, existing, new_path)
                 .map_err(application_filesystem_status)
         }
+
+        fn create_directory(&mut self, path: &str) -> Result<(), ReplyStatus> {
+            if self.pending.is_some() {
+                return Err(ReplyStatus::Conflict);
+            }
+            self.namespace
+                .borrow_mut()
+                .create_directory(&self.cwd, path)
+                .map_err(application_filesystem_status)
+        }
     }
 
     impl Service for ApplicationFilesystemMutationService<'_> {
@@ -4654,6 +4679,16 @@ mod firmware {
                         self.create_hard_link(link.target, link.link_path)
                     };
                     match result {
+                        Ok(()) => Ok(ServiceReply::empty(ReplyStatus::Success)),
+                        Err(status) => Ok(ServiceReply::empty(status)),
+                    }
+                }
+                filesystem_mutation::CREATE_DIRECTORY => {
+                    let Ok(path) = filesystem_mutation::decode_path_request(request.payload())
+                    else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    match self.create_directory(path) {
                         Ok(()) => Ok(ServiceReply::empty(ReplyStatus::Success)),
                         Err(status) => Ok(ServiceReply::empty(status)),
                     }

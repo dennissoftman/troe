@@ -588,6 +588,27 @@ impl<D: BlockDevice> Ext4<D> {
         self.adjust_superblock_counter(16, allocate)
     }
 
+    fn set_directory_allocated(
+        &mut self,
+        inode_number: u32,
+        allocate: bool,
+    ) -> Result<(), FsError> {
+        if inode_number < self.layout.first_inode || inode_number > self.layout.inodes {
+            return Err(FsError::Corrupt);
+        }
+        let group = (inode_number - 1) / self.layout.inodes_per_group;
+        let mut descriptor = self.group_descriptor(group)?;
+        let current = read_u16(&descriptor, 16)?;
+        let updated = if allocate {
+            current.checked_add(1)
+        } else {
+            current.checked_sub(1)
+        }
+        .ok_or(FsError::Corrupt)?;
+        put_u16(&mut descriptor, 16, updated)?;
+        self.write_group_descriptor(group, descriptor)
+    }
+
     fn retain_free_run(runs: &mut Vec<(u32, u32)>, start: u32, blocks: u32) {
         if blocks == 0 {
             return;
@@ -827,7 +848,7 @@ impl<D: BlockDevice> Ext4<D> {
             24,
             u16::try_from(gid & u32::from(u16::MAX)).map_err(|_| FsError::Overflow)?,
         )?;
-        put_u16(raw, 26, 1)?;
+        put_u16(raw, 26, if kind == NodeKind::Directory { 2 } else { 1 })?;
         put_u16(
             raw,
             120,
@@ -1448,7 +1469,7 @@ impl<D: BlockDevice> Ext4<D> {
         let file_type = match kind {
             NodeKind::File => EXT4_FT_REG_FILE,
             NodeKind::Symlink => EXT4_FT_SYMLINK,
-            NodeKind::Directory => return Err(FsError::Unsupported),
+            NodeKind::Directory => EXT4_FT_DIR,
         };
         let required = directory_record_bytes(name.len())?;
         let block_count =
@@ -1712,6 +1733,100 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Ext4<D> {
             let _ignored = self.clear_inode_record(inode_number);
             let _ignored = self.set_inode_allocated(inode_number, false);
             let _ignored = self.release_blocks(&new_blocks);
+            return Err(error);
+        }
+        self.finish_mutation()
+    }
+
+    fn create_directory(&mut self, path: &str) -> Result<(), FsError> {
+        self.ensure_writable()?;
+        let (parent, name) = self.resolve_parent(path)?;
+        let entries = self.read_directory(&parent)?;
+        let mut matching = entries.iter().filter(|entry| entry.name == name);
+        if matching.next().is_some() {
+            if matching.next().is_some() {
+                return Err(FsError::Corrupt);
+            }
+            return Err(FsError::Exists);
+        }
+
+        let inode_number = self.find_free_inode()?;
+        self.begin_mutation()?;
+        self.set_inode_allocated(inode_number, true)?;
+        if let Err(error) = self.set_directory_allocated(inode_number, true) {
+            let _ignored = self.set_inode_allocated(inode_number, false);
+            return Err(error);
+        }
+        let zeroes = alloc::vec![0_u8; EXT4_BLOCK_BYTES];
+        let blocks = match self.allocate_file_blocks(&zeroes) {
+            Ok(blocks) if blocks.len() == 1 => blocks,
+            Ok(blocks) => {
+                let _ignored = self.release_blocks(&blocks);
+                let _ignored = self.set_directory_allocated(inode_number, false);
+                let _ignored = self.set_inode_allocated(inode_number, false);
+                return Err(FsError::Corrupt);
+            }
+            Err(error) => {
+                let _ignored = self.set_directory_allocated(inode_number, false);
+                let _ignored = self.set_inode_allocated(inode_number, false);
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.write_inode_extents(
+            inode_number,
+            NodeKind::Directory,
+            EXT4_BLOCK_BYTES_U64,
+            &blocks,
+            true,
+        ) {
+            let _ignored = self.clear_inode_record(inode_number);
+            let _ignored = self.set_directory_allocated(inode_number, false);
+            let _ignored = self.set_inode_allocated(inode_number, false);
+            let _ignored = self.release_blocks(&blocks);
+            return Err(error);
+        }
+        let directory = match self.read_inode(inode_number) {
+            Ok(inode) => inode,
+            Err(error) => {
+                let _ignored = self.clear_inode_record(inode_number);
+                let _ignored = self.set_directory_allocated(inode_number, false);
+                let _ignored = self.set_inode_allocated(inode_number, false);
+                let _ignored = self.release_blocks(&blocks);
+                return Err(error);
+            }
+        };
+        let mut block = alloc::vec![0_u8; EXT4_BLOCK_BYTES];
+        let tail = EXT4_BLOCK_BYTES - EXT4_DIR_TAIL_BYTES;
+        let initialize = write_directory_record(&mut block, 0, 12, inode_number, b".", EXT4_FT_DIR)
+            .and_then(|()| {
+                write_directory_record(&mut block, 12, tail - 12, parent.number, b"..", EXT4_FT_DIR)
+            })
+            .and_then(|()| initialize_directory_tail(&mut block))
+            .and_then(|()| {
+                refresh_directory_checksum(self.layout.checksum_seed, &directory, &mut block)
+            })
+            .and_then(|()| self.write_fs_block(blocks[0], &block))
+            .and_then(|()| self.durability_barrier());
+        if let Err(error) = initialize {
+            let _ignored = self.clear_inode_record(inode_number);
+            let _ignored = self.set_directory_allocated(inode_number, false);
+            let _ignored = self.set_inode_allocated(inode_number, false);
+            let _ignored = self.release_blocks(&blocks);
+            return Err(error);
+        }
+
+        let parent_raw = self.raw_inode_record(parent.number)?;
+        let parent_links = read_u16(&parent_raw, 26)?;
+        let next_parent_links = parent_links.checked_add(1).ok_or(FsError::NoSpace)?;
+        self.update_inode_links(parent.number, parent_links, next_parent_links)?;
+        if let Err(error) =
+            self.add_directory_entry(&parent, &name, inode_number, NodeKind::Directory)
+        {
+            let _ignored = self.update_inode_links(parent.number, next_parent_links, parent_links);
+            let _ignored = self.clear_inode_record(inode_number);
+            let _ignored = self.set_directory_allocated(inode_number, false);
+            let _ignored = self.set_inode_allocated(inode_number, false);
+            let _ignored = self.release_blocks(&blocks);
             return Err(error);
         }
         self.finish_mutation()
@@ -3115,6 +3230,11 @@ mod tests {
         assert_eq!(ext4.metadata("/created.txt"), Err(FsError::NotFound));
         ext4.write_file("/empty", b"")?;
         assert_eq!(ext4.metadata("/empty")?.byte_count, 0);
+        ext4.create_directory("/archive")?;
+        assert_eq!(ext4.metadata("/archive")?.kind, NodeKind::Directory);
+        ext4.write_file("/archive/member", b"nested")?;
+        assert_eq!(ext4.metadata("/archive/member")?.byte_count, 6);
+        assert_eq!(ext4.create_directory("/archive"), Err(FsError::Exists));
         Ok(())
     }
 
@@ -3240,6 +3360,12 @@ mod tests {
             .write_file("/created.txt", b"created by troe\n")
             .map_err(|error| error.to_string())?;
         writable
+            .create_directory("/archive")
+            .map_err(|error| error.to_string())?;
+        writable
+            .write_file("/archive/member.txt", b"member\n")
+            .map_err(|error| error.to_string())?;
+        writable
             .remove_file("/nested/message.txt")
             .map_err(|error| error.to_string())?;
         drop(writable);
@@ -3263,6 +3389,20 @@ mod tests {
                 .read_link("/config-link")
                 .map_err(|error| error.to_string())?,
             "/config.txt"
+        );
+        assert_eq!(
+            remounted
+                .metadata("/archive")
+                .map_err(|error| error.to_string())?
+                .kind,
+            NodeKind::Directory
+        );
+        assert_eq!(
+            remounted
+                .metadata("/archive/member.txt")
+                .map_err(|error| error.to_string())?
+                .byte_count,
+            7
         );
         assert!(matches!(
             remounted.metadata("/nested/message.txt"),

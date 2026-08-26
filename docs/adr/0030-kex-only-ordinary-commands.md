@@ -7,11 +7,13 @@ of ADR 0024 and related command-service ADRs.
 ## Decision
 
 The shell implements exactly three non-shadowable intrinsics: `cd`, `poweroff`,
-and `reboot`. Every other command name is resolved as `/bin/<name>.kex` and has
-no statically linked shell implementation. A registered name with no artifact
-returns not-found as `application unavailable`; an unregistered name returns
-not-found as `unknown command`. A present malformed, incompatible, denied,
-faulting, or over-budget application continues to fail closed.
+and `reboot`. Every other valid command name is resolved exactly as
+`/bin/<name>.kex` and has no statically linked shell implementation. Missing
+artifacts return not-found as unknown commands. A present malformed,
+incompatible, denied, faulting, or over-budget application continues to fail
+closed. Completion discovers `.kex` names lazily from `/bin`, caches the bounded
+catalog until its namespace revision changes, and never uses completion metadata
+to authorize execution.
 
 The shell retains only bounded parsing, sequential pipeline transport, logical
 working-directory state, command metadata/completion, and authorized terminal
@@ -22,10 +24,11 @@ services, executes the isolated task, and revokes all owner state before the
 shell resumes.
 
 The immutable target-selected KEFS root is the recovery command distribution:
-both supported images contain behavior-equivalent KEX apps for `arp`, `cat`,
-`clear`, `dhcp`, `echo`, `grep`, `hexdump`, `ls`, `lua`, `man`, `mem`, `net`, `ping`,
-`printf`, `pwd`, `rm`, `sleep`, `tcp`, `udp`, and `write`. Losing one artifact does not
-silently substitute privileged code with different authority or semantics.
+both supported images contain behavior-equivalent KEX apps for `arp`, `awk`,
+`cat`, `clear`, `dhcp`, `echo`, `grep`, `hexdump`, `ln`, `ls`, `lua`, `man`,
+`mem`, `mount`, `net`, `ping`, `printf`, `pwd`, `rm`, `sed`, `sleep`, `tar`,
+`tcp`, `udp`, `wc`, and `write`. Losing one artifact does not silently substitute
+privileged code with different authority or semantics.
 `cd` cannot be external because it mutates the shell session; poweroff and
 reboot remain intrinsic because ABI 1.0 intentionally exposes no
 machine-control service.

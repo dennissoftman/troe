@@ -38,17 +38,19 @@ Read-only filesystem paths are at most 256 bytes; opens are generation-checked
 and limited to eight. Reads may be partial. Close every open file. Directory
 pages are lexical and opaque-cursor based, with at most 64 entries, 64-byte
 names, and 3,072 aggregate name bytes. Request `filesystem-read` only when used.
-Mutation permits one 64 KiB complete-file staging transaction: append
-sequentially, then commit or abort; teardown aborts unfinished work. Remove is
-atomic. Request `filesystem-mutate` only for create/replace/remove operations.
+Symbolic-link targets can be read without following the final component.
+Mutation permits one 1 MiB complete-file staging transaction: append
+sequentially, then commit or abort; teardown aborts unfinished work. Remove and
+empty-directory creation are separate bounded operations. Request
+`filesystem-mutate` only for create/replace/remove/link operations.
 Timer values are boot-relative monotonic milliseconds only. Request `timer`,
 form deadlines with saturation, and treat `sleep_until` as cancellable.
 Diagnostics is one immutable typed launch snapshot. Request `diagnostics` only
 for bounded reporting; it grants no mutable memory, input, or device access.
 Use `network-observe` only for status/stats/neighbors, `network-configure` only
 for cancellable DHCP, and `icmp-echo` only for one cancellable ping exchange.
-Use `tcp-connect` only for one literal-IPv4 bounded stream per launch.
-None grants raw Ethernet, routes, DNS, TLS, another network capability, or devices.
+Use `tcp-connect` only for one literal-IPv4 bounded stream per launch. None grants
+raw Ethernet, routes, DNS, TLS, another network capability, or devices.
 
 ## Minimal crate
 
@@ -110,11 +112,9 @@ installs one architecture-specific `.kex` package.
 Never copy one architecture's artifact to the other. KEFS assembly projects the
 selected source directory into flat runtime `/bin`; verify both target roots.
 
-After updating artifacts, run `python3 scripts/test_changed.py --dry-run --explain`,
-then run it without `--dry-run`; never remove a selected gate. Add
+After updating artifacts, run `python3 scripts/test_changed.py --dry-run --explain`, then
+run it without `--dry-run`; never remove a selected gate. Add
 new-command behavior to the proper `scripts/test-qemu.py` group and selector
-test. Before merge, require `full-test` or run `python3 scripts/test.py`; see
-`docs/testing.md`.
-If a required capability is absent, stop and propose a versioned interface in
-`troe-abi` plus a bounded kernel service. Do not smuggle authority through raw
-pointers, magic opcodes, writable executable paths, or ad-hoc syscalls.
+test. Before merge, require `full-test` or run `python3 scripts/test.py`; see `docs/testing.md`.
+If a required capability is absent, propose a versioned, bounded `troe-abi`
+kernel service; never smuggle authority through ad-hoc syscalls or magic opcodes.

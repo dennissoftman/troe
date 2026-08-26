@@ -8,12 +8,6 @@ use core::str;
 
 use troe_kex_sdk::{CommandContext, Error, INVOCATION_BUFFER_BYTES, entry, exit};
 
-const COMMANDS: &[&str] = &[
-    "arp", "cat", "cd", "clear", "dhcp", "echo", "grep", "hexdump", "ln", "ls", "man", "mem",
-    "mount", "net", "ping", "poweroff", "printf", "pwd", "reboot", "rm", "sleep", "tcp", "udp",
-    "write",
-];
-
 fn main(command: &mut CommandContext) -> u32 {
     let mut invocation_bytes = [0_u8; INVOCATION_BUFFER_BYTES];
     let Ok(invocation) = command.invocation(&mut invocation_bytes) else {
@@ -25,7 +19,7 @@ fn main(command: &mut CommandContext) -> u32 {
     let Some(name) = invocation.argument(1) else {
         return exit::FAILURE;
     };
-    if !COMMANDS.contains(&name) {
+    if !valid_command_name(name) {
         common::report(&mut command.stderr(), "man", b"no manual entry for command");
         return exit::NOT_FOUND;
     }
@@ -51,7 +45,7 @@ fn main(command: &mut CommandContext) -> u32 {
             return common::filesystem_failure(&mut command.stderr(), "man", path, Error::NoSpace);
         }
         Err(Error::NotFound) => {
-            common::report(&mut command.stderr(), "man", b"manual page is unavailable");
+            common::report(&mut command.stderr(), "man", b"no manual entry for command");
             return exit::NOT_FOUND;
         }
         Err(error) => {
@@ -91,6 +85,13 @@ fn main(command: &mut CommandContext) -> u32 {
         return common::filesystem_failure(&mut command.stderr(), "man", path, Error::Corrupt);
     }
     exit::SUCCESS
+}
+
+fn valid_command_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.as_bytes().iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
 }
 
 entry!(main);

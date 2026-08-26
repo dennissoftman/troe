@@ -1,0 +1,30 @@
+[package]
+name = "troe-app-tar"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "tar"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+troe-kex-sdk = { path = "../../sdk/rust/troe-kex" }
+
+[package.metadata.troe-kex]
+capabilities = ["filesystem-read", "filesystem-mutate"]
+stack-pages = 12
+
+[profile.release]
+codegen-units = 1
+lto = false
+opt-level = "z"
+panic = "abort"
+strip = "none"
+
+[workspace]

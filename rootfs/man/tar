@@ -1,0 +1,17 @@
+NAME
+    tar - create, list, and extract bounded uncompressed ustar archives
+
+SYNOPSIS
+    tar -cf ARCHIVE PATH...
+    tar -tf ARCHIVE
+    tar -xf ARCHIVE
+
+DESCRIPTION
+    Creates and reads POSIX ustar archives without compression. Creation and
+    extraction stream file payloads in bounded chunks; one archive is limited
+    to the 1 MiB transactional-file profile. Regular files, directories, and
+    safe relative symbolic links are supported.
+
+    Extraction rejects absolute paths, parent traversal, unsafe link targets,
+    unsupported record types, corrupt checksums, and writes through symbolic
+    link path components. ARCHIVE must be a filesystem path; - is not supported.

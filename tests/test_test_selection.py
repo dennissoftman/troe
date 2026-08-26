@@ -85,6 +85,14 @@ class ChangedTestSelectionTests(unittest.TestCase):
             (PurePosixPath("apps/man/src/main.rs"),), PACKAGES
         )
         self.assertEqual(printf_plan.qemu_scenarios, {"filesystem"})
+        wc_plan = test_changed.build_plan(
+            (PurePosixPath("apps/wc/src/lib.rs"),), PACKAGES
+        )
+        tar_plan = test_changed.build_plan(
+            (PurePosixPath("apps/tar/src/lib.rs"),), PACKAGES
+        )
+        self.assertEqual(wc_plan.qemu_scenarios, {"filesystem"})
+        self.assertEqual(tar_plan.qemu_scenarios, {"filesystem"})
         self.assertEqual(man_plan.qemu_scenarios, {"shell-terminal"})
         lua_plan = test_changed.build_plan(
             (PurePosixPath("apps/lua/src/main.rs"),), PACKAGES

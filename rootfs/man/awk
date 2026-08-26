@@ -1,0 +1,14 @@
+NAME
+    awk - select records and print bounded fields
+
+SYNOPSIS
+    awk [-F SEP] PROGRAM [FILE...]
+
+DESCRIPTION
+    Splits records on ASCII whitespace, or on the one-byte SEP supplied by -F.
+    Actions use { print ITEM, ... }, where an item is $0 through $32, NR, NF,
+    or a quoted literal. A missing action prints the complete record.
+
+    Supported selectors are /LITERAL/ and $N == "LITERAL". Patterns are
+    literal bytes. Variables, arithmetic, regular expressions, BEGIN/END,
+    assignments, functions, and general awk expressions are not implemented.

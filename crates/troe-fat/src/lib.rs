@@ -984,6 +984,79 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Fat32<D> {
         self.finish_mutation()
     }
 
+    fn create_directory(&mut self, path: &str) -> Result<(), FsError> {
+        self.ensure_writable()?;
+        let (parent, name) = self.resolve_parent(path)?;
+        let entries = self.read_directory(parent.first_cluster)?;
+        let mut matching = entries
+            .iter()
+            .filter(|entry| names_equal(&entry.name, &name));
+        if matching.next().is_some() {
+            if matching.next().is_some() {
+                return Err(FsError::Corrupt);
+            }
+            return Err(FsError::Exists);
+        }
+
+        self.begin_mutation()?;
+        let cluster_bytes = self.layout.cluster_bytes()?;
+        let zeroes = alloc::vec![0_u8; cluster_bytes];
+        let clusters = self.allocate_file_chain(&zeroes)?;
+        let Some(cluster) = clusters.first().copied().filter(|_| clusters.len() == 1) else {
+            let _ignored = self.release_clusters(&clusters);
+            return Err(FsError::Corrupt);
+        };
+        let mut directory = zeroes;
+        let initialize_entry = |raw: &mut [u8], name: &[u8; 11], target: u32| {
+            raw.fill(0);
+            raw[..11].copy_from_slice(name);
+            raw[11] = 0x10;
+            let encoded = target.to_le_bytes();
+            raw[20..22].copy_from_slice(&encoded[2..4]);
+            raw[26..28].copy_from_slice(&encoded[..2]);
+        };
+        initialize_entry(
+            &mut directory[..DIRECTORY_ENTRY_BYTES],
+            b".          ",
+            cluster,
+        );
+        initialize_entry(
+            &mut directory[DIRECTORY_ENTRY_BYTES..2 * DIRECTORY_ENTRY_BYTES],
+            b"..         ",
+            if parent.name == "/" {
+                0
+            } else {
+                parent.first_cluster
+            },
+        );
+        if let Err(error) = self.write_cluster(cluster, &directory) {
+            let _ignored = self.release_clusters(&clusters);
+            return Err(error);
+        }
+
+        let mut records = directory_records(&name, &entries, cluster, 0)?;
+        let Some(short) = records.last_mut() else {
+            let _ignored = self.release_clusters(&clusters);
+            return Err(FsError::Corrupt);
+        };
+        short[11] = 0x10;
+        let slots = match self.reserve_directory_slots(parent.first_cluster, records.len()) {
+            Ok(slots) => slots,
+            Err(error) => {
+                let _ignored = self.release_clusters(&clusters);
+                return Err(error);
+            }
+        };
+        if let Err(error) = self
+            .write_directory_records(&slots, &records)
+            .and_then(|()| self.durability_barrier())
+        {
+            let _ignored = self.release_clusters(&clusters);
+            return Err(error);
+        }
+        self.finish_mutation()
+    }
+
     fn remove_file(&mut self, path: &str) -> Result<(), FsError> {
         self.ensure_writable()?;
         let (parent, name) = self.resolve_parent(path)?;
@@ -1880,6 +1953,12 @@ mod tests {
             .write_file("/Created Here.txt", b"created by troe\n")
             .map_err(|error| error.to_string())?;
         writable
+            .create_directory("/Archive Output")
+            .map_err(|error| error.to_string())?;
+        writable
+            .write_file("/Archive Output/member.txt", b"member\n")
+            .map_err(|error| error.to_string())?;
+        writable
             .remove_file("/nested/Message.txt")
             .map_err(|error| error.to_string())?;
         drop(writable);
@@ -1899,6 +1978,20 @@ mod tests {
             remounted.metadata("/nested/Message.txt"),
             Err(FsError::NotFound)
         ));
+        assert_eq!(
+            remounted
+                .metadata("/Archive Output")
+                .map_err(|error| error.to_string())?
+                .kind,
+            NodeKind::Directory
+        );
+        assert_eq!(
+            remounted
+                .metadata("/Archive Output/member.txt")
+                .map_err(|error| error.to_string())?
+                .byte_count,
+            7
+        );
         Ok(())
     }
 
@@ -1981,6 +2074,14 @@ mod tests {
         assert_eq!(fat.metadata("/empty")?.byte_count, 0);
         fat.remove_file("/empty")?;
         assert_eq!(fat.metadata("/empty"), Err(FsError::NotFound));
+        fat.create_directory("/Archive Output")?;
+        assert_eq!(fat.metadata("/Archive Output")?.kind, NodeKind::Directory);
+        fat.write_file("/Archive Output/member.txt", b"nested")?;
+        assert_eq!(fat.metadata("/Archive Output/member.txt")?.byte_count, 6);
+        assert_eq!(
+            fat.create_directory("/Archive Output"),
+            Err(FsError::Exists)
+        );
         Ok(())
     }
 

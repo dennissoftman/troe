@@ -1,0 +1,12 @@
+NAME
+    wc - count lines, words, and bytes
+
+SYNOPSIS
+    wc [-lwc] [FILE...]
+
+DESCRIPTION
+    Counts newline bytes, ASCII-whitespace-delimited words, and bytes. With no
+    file, reads standard input. A FILE of - also selects standard input.
+
+    The default output is lines, words, then bytes. Options select individual
+    columns and may be combined. Multiple operands produce a total row.

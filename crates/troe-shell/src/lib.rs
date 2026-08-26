@@ -54,11 +54,10 @@ enum Quote {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct CommandSpec {
-    intrinsic: Option<IntrinsicId>,
+struct IntrinsicSpec {
+    id: IntrinsicId,
     name: &'static str,
     synopsis: &'static str,
-    class: CommandClass,
 }
 
 /// Stable execution placement for a shell command name.
@@ -72,9 +71,8 @@ pub enum CommandClass {
 
 /// Application resolver used for every non-intrinsic command.
 ///
-/// Returning `None` means that no application was resolved. Registered
-/// application names then report an unavailable artifact; unknown names report
-/// an unknown command. Neither case falls back to shell-owned utility behavior.
+/// Returning `None` means that no application was resolved. No shell-owned
+/// utility fallback is attempted.
 pub trait ExternalCommand {
     /// Resolve and execute one complete command invocation.
     #[allow(clippy::too_many_arguments)]
@@ -114,163 +112,155 @@ enum IntrinsicId {
     Reboot,
 }
 
-const COMMANDS: &[CommandSpec] = &[
-    CommandSpec {
-        intrinsic: None,
-        name: "arp",
-        synopsis: "arp",
-        class: CommandClass::Application,
-    },
-    CommandSpec {
-        intrinsic: None,
-        name: "cat",
-        synopsis: "cat [FILE...]",
-        class: CommandClass::Application,
-    },
-    CommandSpec {
-        intrinsic: Some(IntrinsicId::Cd),
+const INTRINSICS: &[IntrinsicSpec] = &[
+    IntrinsicSpec {
+        id: IntrinsicId::Cd,
         name: "cd",
         synopsis: "cd PATH",
-        class: CommandClass::Intrinsic,
     },
-    CommandSpec {
-        intrinsic: None,
-        name: "clear",
-        synopsis: "clear",
-        class: CommandClass::Application,
-    },
-    CommandSpec {
-        intrinsic: None,
-        name: "dhcp",
-        synopsis: "dhcp",
-        class: CommandClass::Application,
-    },
-    CommandSpec {
-        intrinsic: None,
-        name: "echo",
-        synopsis: "echo [ARG...]",
-        class: CommandClass::Application,
-    },
-    CommandSpec {
-        intrinsic: None,
-        name: "grep",
-        synopsis: "grep PATTERN [FILE...]",
-        class: CommandClass::Application,
-    },
-    CommandSpec {
-        intrinsic: None,
-        name: "hexdump",
-        synopsis: "hexdump [FILE]",
-        class: CommandClass::Application,
-    },
-    CommandSpec {
-        intrinsic: None,
-        name: "ls",
-        synopsis: "ls [PATH]",
-        class: CommandClass::Application,
-    },
-    CommandSpec {
-        intrinsic: None,
-        name: "lua",
-        synopsis: "lua [-e CODE | FILE | -] [ARG...]",
-        class: CommandClass::Application,
-    },
-    CommandSpec {
-        intrinsic: None,
-        name: "man",
-        synopsis: "man COMMAND",
-        class: CommandClass::Application,
-    },
-    CommandSpec {
-        intrinsic: None,
-        name: "mem",
-        synopsis: "mem",
-        class: CommandClass::Application,
-    },
-    CommandSpec {
-        intrinsic: None,
-        name: "net",
-        synopsis: "net | net stats",
-        class: CommandClass::Application,
-    },
-    CommandSpec {
-        intrinsic: None,
-        name: "ping",
-        synopsis: "ping ADDRESS",
-        class: CommandClass::Application,
-    },
-    CommandSpec {
-        intrinsic: Some(IntrinsicId::PowerOff),
+    IntrinsicSpec {
+        id: IntrinsicId::PowerOff,
         name: "poweroff",
         synopsis: "poweroff",
-        class: CommandClass::Intrinsic,
     },
-    CommandSpec {
-        intrinsic: None,
-        name: "printf",
-        synopsis: "printf FORMAT [ARG...]",
-        class: CommandClass::Application,
-    },
-    CommandSpec {
-        intrinsic: None,
-        name: "pwd",
-        synopsis: "pwd",
-        class: CommandClass::Application,
-    },
-    CommandSpec {
-        intrinsic: Some(IntrinsicId::Reboot),
+    IntrinsicSpec {
+        id: IntrinsicId::Reboot,
         name: "reboot",
         synopsis: "reboot",
-        class: CommandClass::Intrinsic,
-    },
-    CommandSpec {
-        intrinsic: None,
-        name: "rm",
-        synopsis: "rm FILE",
-        class: CommandClass::Application,
-    },
-    CommandSpec {
-        intrinsic: None,
-        name: "sleep",
-        synopsis: "sleep MILLISECONDS",
-        class: CommandClass::Application,
-    },
-    CommandSpec {
-        intrinsic: None,
-        name: "tcp",
-        synopsis: "tcp ADDRESS PORT [TEXT...]",
-        class: CommandClass::Application,
-    },
-    CommandSpec {
-        intrinsic: None,
-        name: "udp",
-        synopsis: "udp send [--source-port PORT] ADDRESS PORT [TEXT...] | udp listen PORT",
-        class: CommandClass::Application,
-    },
-    CommandSpec {
-        intrinsic: None,
-        name: "write",
-        synopsis: "write FILE [TEXT...]",
-        class: CommandClass::Application,
     },
 ];
 
-/// Return the reserved execution placement for a registered command name.
-///
-/// External command discovery must consult this classification before trying
-/// to resolve a KEX application. Intrinsic names always retain shell dispatch.
-#[must_use]
-pub fn command_class(name: &str) -> Option<CommandClass> {
-    COMMANDS
-        .iter()
-        .find(|command| command.name == name)
-        .map(|command| command.class)
+const COMMAND_CATALOG_MAX_ENTRIES: usize = 1024;
+const COMMAND_CATALOG_MAX_BYTES: usize = 64 * 1024;
+const COMMAND_CATALOG_PAGE_ENTRIES: usize = 64;
+const COMMAND_CATALOG_PAGE_BYTES: usize = 4096;
+
+#[derive(Debug)]
+struct CommandCatalog {
+    revision: Option<u64>,
+    names: Vec<String>,
+    truncated: bool,
 }
 
-/// Return the concise synopsis associated with a registered command name.
+impl CommandCatalog {
+    fn new() -> Result<Self, FsError> {
+        let mut names = Vec::new();
+        names
+            .try_reserve_exact(INTRINSICS.len())
+            .map_err(|_| FsError::NoSpace)?;
+        for intrinsic in INTRINSICS {
+            names.push(intrinsic.name.to_string());
+        }
+        Ok(Self {
+            revision: None,
+            names,
+            truncated: false,
+        })
+    }
+
+    fn refresh(&mut self, namespace: &mut Namespace) {
+        let revision = namespace.command_revision();
+        if self.revision == Some(revision) {
+            return;
+        }
+        if let Ok((names, truncated)) = load_command_catalog(namespace) {
+            self.names = names;
+            self.truncated = truncated;
+            self.revision = Some(revision);
+        }
+    }
+}
+
+fn load_command_catalog(namespace: &mut Namespace) -> Result<(Vec<String>, bool), FsError> {
+    let mut names = Vec::new();
+    names
+        .try_reserve_exact(INTRINSICS.len())
+        .map_err(|_| FsError::NoSpace)?;
+    let mut retained_bytes = 0_usize;
+    for intrinsic in INTRINSICS {
+        retained_bytes = retained_bytes
+            .checked_add(intrinsic.name.len())
+            .ok_or(FsError::Overflow)?;
+        names.push(intrinsic.name.to_string());
+    }
+
+    let mut cursor = 0_u64;
+    let mut scanned = 0_usize;
+    let mut truncated = false;
+    'pages: loop {
+        let page = match namespace.list_bounded(
+            "/",
+            "/bin",
+            cursor,
+            COMMAND_CATALOG_PAGE_ENTRIES,
+            COMMAND_CATALOG_PAGE_BYTES,
+        ) {
+            Ok(page) => page,
+            Err(FsError::NotFound) => break,
+            Err(error) => return Err(error),
+        };
+        let page_len = page.entries.len();
+        for entry in page.entries {
+            scanned = scanned.checked_add(1).ok_or(FsError::Overflow)?;
+            if scanned > COMMAND_CATALOG_MAX_ENTRIES {
+                truncated = true;
+                break 'pages;
+            }
+            if entry.kind != NodeKind::File {
+                continue;
+            }
+            let Some(name) = entry
+                .name
+                .strip_suffix(".kex")
+                .filter(|name| valid_command_name(name))
+            else {
+                continue;
+            };
+            let next_bytes = retained_bytes
+                .checked_add(name.len())
+                .ok_or(FsError::Overflow)?;
+            if next_bytes > COMMAND_CATALOG_MAX_BYTES {
+                truncated = true;
+                break 'pages;
+            }
+            names.try_reserve(1).map_err(|_| FsError::NoSpace)?;
+            names.push(name.to_string());
+            retained_bytes = next_bytes;
+        }
+        match page.next_cursor {
+            Some(next) if next != cursor && page_len != 0 => cursor = next,
+            Some(_) => return Err(FsError::Corrupt),
+            None => break,
+        }
+    }
+    names.sort_unstable();
+    names.dedup();
+    Ok((names, truncated))
+}
+
+fn valid_command_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.as_bytes().iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        })
+}
+
+/// Return whether a name is reserved for shell-intrinsic execution.
+///
+/// Application names are discovered dynamically from `/bin` and therefore do
+/// not appear in this static classification.
+#[must_use]
+pub fn command_class(name: &str) -> Option<CommandClass> {
+    INTRINSICS
+        .iter()
+        .find(|command| command.name == name)
+        .map(|_| CommandClass::Intrinsic)
+}
+
+/// Return the concise synopsis associated with a shell intrinsic.
 #[must_use]
 pub fn command_synopsis(name: &str) -> Option<&'static str> {
-    COMMANDS
+    INTRINSICS
         .iter()
         .find(|command| command.name == name)
         .map(|command| command.synopsis)
@@ -487,6 +477,7 @@ pub enum MachineAction {
 #[derive(Debug)]
 pub struct Shell {
     namespace: Namespace,
+    command_catalog: CommandCatalog,
     cwd: String,
     machine_control: bool,
     machine_action: Option<MachineAction>,
@@ -509,8 +500,10 @@ impl Shell {
         let memory_report =
             format_memory_report(architecture, machine_memory, None, namespace.memory_stats());
         namespace.set_system_file("/sys/memory", memory_report.as_bytes())?;
+        let command_catalog = CommandCatalog::new()?;
         Ok(Self {
             namespace,
+            command_catalog,
             cwd: "/".to_string(),
             machine_control,
             machine_action: None,
@@ -546,16 +539,30 @@ impl Shell {
             return Completion::default();
         };
         if context.word_index == 0 {
-            return complete_commands(context, config);
+            self.command_catalog.refresh(&mut self.namespace);
+            return complete_commands(
+                context,
+                &self.command_catalog.names,
+                self.command_catalog.truncated,
+                config,
+            );
         }
         if context.command == Some("man") && context.word_index == 1 {
-            return complete_commands(context, config);
+            self.command_catalog.refresh(&mut self.namespace);
+            return complete_commands(
+                context,
+                &self.command_catalog.names,
+                self.command_catalog.truncated,
+                config,
+            );
         }
-        let Some(directories_only) = path_completion_mode(context.command, context.word_index)
-        else {
-            return Completion::default();
-        };
-        self.complete_paths(context, directories_only, config)
+        match argument_completion(context) {
+            ArgumentCompletion::None => Completion::default(),
+            ArgumentCompletion::Values(values) => complete_values(context, values, config),
+            ArgumentCompletion::Paths { directories_only } => {
+                self.complete_paths(context, directories_only, config)
+            }
+        }
     }
 
     /// Execute a complete line, including any bounded pipeline.
@@ -639,8 +646,8 @@ impl Shell {
         let Some(command) = words.first().map(String::as_str) else {
             return CommandStatus::Success;
         };
-        let spec = COMMANDS.iter().find(|spec| spec.name == command);
-        if spec.is_none_or(|spec| spec.class == CommandClass::Application)
+        let intrinsic = INTRINSICS.iter().find(|spec| spec.name == command);
+        if intrinsic.is_none()
             && let Some(status) = external.execute(
                 command,
                 words,
@@ -653,14 +660,11 @@ impl Shell {
         {
             return status;
         }
-        let Some(spec) = spec else {
+        let Some(spec) = intrinsic else {
             let _ignored = write_error(stderr, command, "unknown command");
             return CommandStatus::NotFound;
         };
-        let Some(intrinsic) = spec.intrinsic else {
-            let _ignored = write_error(stderr, command, "application unavailable");
-            return CommandStatus::NotFound;
-        };
+        let intrinsic = spec.id;
         let args = &words[1..];
         if matches!(intrinsic, IntrinsicId::PowerOff | IntrinsicId::Reboot) && !self.machine_control
         {
@@ -831,6 +835,7 @@ struct CompletionContext<'a> {
     prefix: &'a str,
     word_index: usize,
     command: Option<&'a str>,
+    arguments: [Option<&'a str>; 4],
 }
 
 fn completion_context(line: &str, cursor: usize) -> Option<CompletionContext<'_>> {
@@ -840,6 +845,7 @@ fn completion_context(line: &str, cursor: usize) -> Option<CompletionContext<'_>
     let mut word_quoted = false;
     let mut word_index = 0_usize;
     let mut command = None;
+    let mut arguments = [None; 4];
 
     for (index, character) in line[..cursor].char_indices() {
         match quote {
@@ -871,11 +877,14 @@ fn completion_context(line: &str, cursor: usize) -> Option<CompletionContext<'_>
                     word_quoted = false;
                     word_index = 0;
                     command = None;
+                    arguments = [None; 4];
                 }
                 value if value.is_whitespace() => {
                     if word_started {
                         if word_index == 0 && !word_quoted {
                             command = Some(&line[word_start..index]);
+                        } else if word_index > 0 && word_index <= arguments.len() && !word_quoted {
+                            arguments[word_index - 1] = Some(&line[word_start..index]);
                         }
                         word_index = word_index.saturating_add(1);
                         word_started = false;
@@ -901,22 +910,25 @@ fn completion_context(line: &str, cursor: usize) -> Option<CompletionContext<'_>
         prefix: &line[start..cursor],
         word_index,
         command,
+        arguments,
     })
 }
 
-fn complete_commands(context: CompletionContext<'_>, config: CompletionConfig) -> Completion {
+fn complete_commands(
+    context: CompletionContext<'_>,
+    names: &[String],
+    catalog_truncated: bool,
+    config: CompletionConfig,
+) -> Completion {
     let mut completion = Completion {
         replacement_start: context.start,
         replacement_end: context.end,
         candidates: Vec::new(),
-        truncated: false,
+        truncated: catalog_truncated,
     };
     let mut retained_bytes = 0_usize;
-    for spec in COMMANDS
-        .iter()
-        .filter(|spec| spec.name.starts_with(context.prefix))
-    {
-        let replacement = format!("{} ", spec.name);
+    for name in names.iter().filter(|name| name.starts_with(context.prefix)) {
+        let replacement = format!("{name} ");
         let Some(next_bytes) = retained_bytes.checked_add(replacement.len()) else {
             completion.truncated = true;
             break;
@@ -927,7 +939,7 @@ fn complete_commands(context: CompletionContext<'_>, config: CompletionConfig) -
             break;
         }
         completion.candidates.push(CompletionCandidate {
-            display: spec.name.to_string(),
+            display: name.clone(),
             replacement,
         });
         retained_bytes = next_bytes;
@@ -935,13 +947,127 @@ fn complete_commands(context: CompletionContext<'_>, config: CompletionConfig) -
     completion
 }
 
-fn path_completion_mode(command: Option<&str>, word_index: usize) -> Option<bool> {
-    match (command, word_index) {
-        (Some("cd"), 1) => Some(true),
-        (Some("cat"), 1..) | (Some("grep"), 2..) | (Some("hexdump" | "ls" | "rm" | "write"), 1) => {
-            Some(false)
+fn complete_values(
+    context: CompletionContext<'_>,
+    values: &[&str],
+    config: CompletionConfig,
+) -> Completion {
+    let mut completion = Completion {
+        replacement_start: context.start,
+        replacement_end: context.end,
+        candidates: Vec::new(),
+        truncated: false,
+    };
+    let mut retained_bytes = 0_usize;
+    for value in values
+        .iter()
+        .copied()
+        .filter(|value| value.starts_with(context.prefix))
+    {
+        let replacement = format!("{value} ");
+        let Some(next_bytes) = retained_bytes.checked_add(replacement.len()) else {
+            completion.truncated = true;
+            break;
+        };
+        if completion.candidates.len() >= config.max_candidates() || next_bytes > config.max_bytes()
+        {
+            completion.truncated = true;
+            break;
         }
-        _ => None,
+        completion.candidates.push(CompletionCandidate {
+            display: value.to_string(),
+            replacement,
+        });
+        retained_bytes = next_bytes;
+    }
+    completion
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArgumentCompletion {
+    None,
+    Values(&'static [&'static str]),
+    Paths { directories_only: bool },
+}
+
+// These optional schemas enrich arguments for commands the shell understands;
+// they do not define which applications exist. The lazy `/bin` catalog is the
+// sole source for application-name discovery.
+const AWK_OPTIONS: &[&str] = &["-F"];
+const LN_OPTIONS: &[&str] = &["-s"];
+const LUA_OPTIONS: &[&str] = &["-", "-e"];
+const NET_MODES: &[&str] = &["stats"];
+const SED_OPTIONS: &[&str] = &["-e", "-n"];
+const TAR_MODES: &[&str] = &["-cf", "-tf", "-xf", "cf", "tf", "xf"];
+const UDP_MODES: &[&str] = &["listen", "send"];
+const UDP_SEND_OPTIONS: &[&str] = &["--source-port"];
+const WC_OPTIONS: &[&str] = &["-c", "-l", "-lc", "-lw", "-lwc", "-w", "-wc"];
+
+fn argument_completion(context: CompletionContext<'_>) -> ArgumentCompletion {
+    let Some(command) = context.command else {
+        return ArgumentCompletion::None;
+    };
+    let paths = ArgumentCompletion::Paths {
+        directories_only: false,
+    };
+    match command {
+        "cd" if context.word_index == 1 => ArgumentCompletion::Paths {
+            directories_only: true,
+        },
+        "grep" if context.word_index >= 2 => paths,
+        "ln" if context.word_index == 1 && context.prefix.starts_with('-') => {
+            ArgumentCompletion::Values(LN_OPTIONS)
+        }
+        "lua" if context.word_index == 1 && context.prefix.starts_with('-') => {
+            ArgumentCompletion::Values(LUA_OPTIONS)
+        }
+        "net" if context.word_index == 1 => ArgumentCompletion::Values(NET_MODES),
+        "udp" if context.word_index == 1 => ArgumentCompletion::Values(UDP_MODES),
+        "udp"
+            if context.word_index == 2
+                && context.arguments[0] == Some("send")
+                && context.prefix.starts_with('-') =>
+        {
+            ArgumentCompletion::Values(UDP_SEND_OPTIONS)
+        }
+        "wc" if context.word_index >= 1 && context.prefix.starts_with('-') => {
+            ArgumentCompletion::Values(WC_OPTIONS)
+        }
+        "sed" if context.word_index <= 2 && context.prefix.starts_with('-') => {
+            ArgumentCompletion::Values(SED_OPTIONS)
+        }
+        "sed" if context.word_index > sed_script_position(context.arguments) => paths,
+        "tar" if context.word_index == 1 => ArgumentCompletion::Values(TAR_MODES),
+        "tar" if context.word_index == 2 => paths,
+        "tar" if context.word_index >= 3 && matches!(context.arguments[0], Some("-cf" | "cf")) => {
+            paths
+        }
+        "awk" if context.word_index == 1 && context.prefix.starts_with('-') => {
+            ArgumentCompletion::Values(AWK_OPTIONS)
+        }
+        "awk" if context.word_index > awk_program_position(context.arguments) => paths,
+        "cat" | "ln" | "wc" if context.word_index >= 1 => paths,
+        "hexdump" | "ls" | "lua" | "rm" | "write" if context.word_index == 1 => paths,
+        _ => ArgumentCompletion::None,
+    }
+}
+
+fn sed_script_position(arguments: [Option<&str>; 4]) -> usize {
+    let mut position = 1;
+    if arguments[0] == Some("-n") {
+        position += 1;
+    }
+    if arguments.get(position - 1).copied().flatten() == Some("-e") {
+        position += 1;
+    }
+    position
+}
+
+fn awk_program_position(arguments: [Option<&str>; 4]) -> usize {
+    match arguments[0] {
+        Some("-F") => 3,
+        Some(option) if option.starts_with("-F") && option.len() > 2 => 2,
+        _ => 1,
     }
 }
 
@@ -1063,7 +1189,7 @@ const fn parse_error_text(error: ParseError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMMANDS, CommandClass, CompletionConfig, CompletionConfigError, ExternalCommand,
+        CommandClass, CompletionConfig, CompletionConfigError, ExternalCommand, INTRINSICS,
         MachineAction, ParseError, Shell, command_class, command_synopsis, format_memory_report,
         parse_line,
     };
@@ -1080,6 +1206,13 @@ mod tests {
     fn shell() -> Shell {
         let mut namespace = Namespace::new(RamFsQuota::default());
         assert_eq!(namespace.add_read_only_dir("/help"), Ok(()));
+        assert_eq!(namespace.add_read_only_dir("/bin"), Ok(()));
+        for command in ["cat", "echo", "hexdump", "man", "pwd"] {
+            assert_eq!(
+                namespace.add_read_only_file(&format!("/bin/{command}.kex"), b"package"),
+                Ok(())
+            );
+        }
         assert_eq!(
             namespace.add_read_only_file("/help/readme", b"alpha\nbeta alpha\n"),
             Ok(())
@@ -1271,7 +1404,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_commands_require_applications_and_unknown_names_stay_distinct() {
+    fn unresolved_non_intrinsic_commands_never_fall_back_to_shell_utilities() {
         let mut shell = shell();
         let mut input = SliceInput::new(b"");
         let mut output = BoundedOutput::new(64);
@@ -1281,14 +1414,14 @@ mod tests {
             shell.execute("cat /help/readme", &mut input, &mut output, &mut error),
             CommandStatus::NotFound
         );
-        assert_eq!(error.as_slice(), b"cat: application unavailable\n");
+        assert_eq!(error.as_slice(), b"cat: unknown command\n");
 
         let mut error = BoundedOutput::new(128);
         assert_eq!(
             shell.execute("tcp 192.0.2.1 80", &mut input, &mut output, &mut error),
             CommandStatus::NotFound
         );
-        assert_eq!(error.as_slice(), b"tcp: application unavailable\n");
+        assert_eq!(error.as_slice(), b"tcp: unknown command\n");
 
         let mut error = BoundedOutput::new(128);
         assert_eq!(
@@ -1350,26 +1483,17 @@ mod tests {
         assert_eq!(command_class("cd"), Some(CommandClass::Intrinsic));
         assert_eq!(command_class("poweroff"), Some(CommandClass::Intrinsic));
         assert_eq!(command_class("reboot"), Some(CommandClass::Intrinsic));
-        assert_eq!(command_class("cat"), Some(CommandClass::Application));
-        assert_eq!(command_class("man"), Some(CommandClass::Application));
-        assert_eq!(command_class("lua"), Some(CommandClass::Application));
-        assert_eq!(command_class("printf"), Some(CommandClass::Application));
-        assert_eq!(command_class("tcp"), Some(CommandClass::Application));
+        assert_eq!(command_class("cat"), None);
         assert_eq!(command_class("help"), None);
-        assert_eq!(command_synopsis("man"), Some("man COMMAND"));
-        assert_eq!(
-            command_synopsis("lua"),
-            Some("lua [-e CODE | FILE | -] [ARG...]")
+        assert_eq!(command_synopsis("cd"), Some("cd PATH"));
+        assert_eq!(command_synopsis("wc"), None);
+        assert!(
+            INTRINSICS
+                .windows(2)
+                .all(|pair| pair[0].name < pair[1].name)
         );
-        assert_eq!(command_synopsis("printf"), Some("printf FORMAT [ARG...]"));
-        assert_eq!(command_synopsis("tcp"), Some("tcp ADDRESS PORT [TEXT...]"));
-        assert!(COMMANDS.windows(2).all(|pair| pair[0].name < pair[1].name));
 
-        let intrinsic_names: Vec<&str> = COMMANDS
-            .iter()
-            .filter(|command| command.class == CommandClass::Intrinsic)
-            .map(|command| command.name)
-            .collect();
+        let intrinsic_names: Vec<&str> = INTRINSICS.iter().map(|command| command.name).collect();
         assert_eq!(intrinsic_names, ["cd", "poweroff", "reboot"]);
     }
 
@@ -1413,6 +1537,92 @@ mod tests {
 
         let file = shell.complete("cat /help/r", 11, CompletionConfig::standard());
         assert_eq!(file.candidates[0].replacement, "/help/readme ");
+
+        let net_mode = "net st";
+        let completion = shell.complete(net_mode, net_mode.len(), CompletionConfig::standard());
+        assert_eq!(completion.candidates[0].replacement, "stats ");
+
+        let udp_mode = "udp li";
+        let completion = shell.complete(udp_mode, udp_mode.len(), CompletionConfig::standard());
+        assert_eq!(completion.candidates[0].replacement, "listen ");
+
+        let wc_option = "wc -lw";
+        let completion = shell.complete(wc_option, wc_option.len(), CompletionConfig::standard());
+        assert!(
+            completion
+                .candidates
+                .iter()
+                .any(|candidate| candidate.replacement == "-lwc ")
+        );
+
+        let tar_mode = "tar -x";
+        let completion = shell.complete(tar_mode, tar_mode.len(), CompletionConfig::standard());
+        assert!(
+            completion
+                .candidates
+                .iter()
+                .any(|candidate| candidate.replacement == "-xf ")
+        );
+
+        for line in [
+            "ln /help/r",
+            "sed 's/a/b/' /help/r",
+            "awk -F : '{ print $1 }' /help/r",
+            "tar -cf /tmp/archive.tar /help/r",
+        ] {
+            let completion = shell.complete(line, line.len(), CompletionConfig::standard());
+            assert_eq!(completion.candidates[0].replacement, "/help/readme ");
+        }
+    }
+
+    #[test]
+    fn lazy_catalog_is_cached_and_revision_invalidated() {
+        let mut shell = shell();
+        assert_eq!(shell.command_catalog.revision, None);
+
+        let first = shell.complete("he", 2, CompletionConfig::standard());
+        assert_eq!(first.common_replacement(), Some("hexdump "));
+        assert_eq!(
+            shell.command_catalog.revision,
+            Some(shell.namespace.command_revision())
+        );
+
+        shell.command_catalog.names.push("cached-only".to_string());
+        let cached = shell.complete("cached", 6, CompletionConfig::standard());
+        assert_eq!(cached.common_replacement(), Some("cached-only "));
+
+        assert_eq!(
+            shell
+                .namespace
+                .add_read_only_file("/bin/beta.kex", b"package"),
+            Ok(())
+        );
+        let refreshed = shell.complete("be", 2, CompletionConfig::standard());
+        assert_eq!(refreshed.common_replacement(), Some("beta "));
+        assert!(
+            shell
+                .complete("cached", 6, CompletionConfig::standard())
+                .candidates
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn large_catalog_retains_one_thousand_discovered_applications() {
+        let mut namespace = Namespace::new(RamFsQuota::default());
+        assert_eq!(namespace.add_read_only_dir("/bin"), Ok(()));
+        for index in 0..1000 {
+            assert_eq!(
+                namespace.add_read_only_file(&format!("/bin/app{index:04}.kex"), b"package",),
+                Ok(())
+            );
+        }
+        let mut shell = Shell::new(namespace, "test", MachineMemorySnapshot::hosted(), true)
+            .unwrap_or_else(|_| std::process::abort());
+        let completion = shell.complete("app0999", 7, CompletionConfig::standard());
+        assert_eq!(completion.common_replacement(), Some("app0999 "));
+        assert!(!shell.command_catalog.truncated);
+        assert_eq!(shell.command_catalog.names.len(), 1000 + INTRINSICS.len());
     }
 
     #[test]

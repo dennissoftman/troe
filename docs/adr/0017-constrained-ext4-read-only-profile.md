@@ -33,8 +33,8 @@ perform bounded complete-file mutation:
 - CRC32C validation of the superblock, every consumed group descriptor, inode,
   and directory block;
 - regular files, directories, and symbolic links with UTF-8 names and file-type
-  directory entries; special files, xattr interpretation, ACL interpretation,
-  and directory creation are outside the VFS surface;
+  directory entries; special files, xattr interpretation, and ACL interpretation
+  are outside the VFS surface;
 - inline inode extent roots only (tree depth zero), at most four ordered
   extents, holes in regular files read as zero, and no holes or unwritten
   extents in directories; and
@@ -50,7 +50,7 @@ stable identity.
 
 Writable mounts require flush or force-unit-access durability and implement
 complete-file create, copy-on-write replacement, non-directory unlink,
-symbolic-link creation, and regular-file hard-link creation.
+empty-directory creation, symbolic-link creation, and regular-file hard-link creation.
 Allocation bitmaps, group and superblock counters, inode extents, directory
 records, and every affected checksum are updated within the same bounded
 profile.
@@ -116,7 +116,7 @@ fail closed under deterministic memory and traversal ceilings.
 The subset is intentionally narrower than general ext4. Expanding it requires
 new corruption tests and an update to this versioned profile. Journal replay,
 ACL authorization, xattr exposure and external-xattr final unlink, hard links
-to directories or symlinks, indexed directories, directory creation/rename,
+to directories or symlinks, indexed-directory mutation, directory removal/rename,
 and deep extent trees remain later increments. Writer interoperability is
-checked by remounting and running read-only `e2fsck` after create, replacement,
-and removal.
+checked by remounting and running read-only `e2fsck` after file/directory create,
+replacement, and removal.

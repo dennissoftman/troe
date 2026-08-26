@@ -157,6 +157,18 @@ pub trait ReadOnlyFileSystem: fmt::Debug {
         Err(FsError::ReadOnly)
     }
 
+    /// Create one empty directory without replacing an existing entry.
+    ///
+    /// Read-only providers retain this default.
+    ///
+    /// # Errors
+    ///
+    /// The default rejects every request as read-only. Writable providers
+    /// report invalid parents, collisions, space, corruption, or transport failures.
+    fn create_directory(&mut self, _path: &str) -> Result<(), FsError> {
+        Err(FsError::ReadOnly)
+    }
+
     /// Atomically remove one regular file or symbolic-link directory entry.
     ///
     /// Read-only providers retain this default.
@@ -266,6 +278,7 @@ struct ProviderMount {
 pub struct Namespace {
     nodes: BTreeMap<String, Node>,
     mounts: Vec<ProviderMount>,
+    command_revision: u64,
     quota: RamFsQuota,
     ramfs_bytes: usize,
     ramfs_nodes: usize,
@@ -283,6 +296,7 @@ impl Namespace {
         Self {
             nodes,
             mounts: Vec::new(),
+            command_revision: 0,
             quota,
             ramfs_bytes: 0,
             ramfs_nodes: 0,
@@ -357,7 +371,11 @@ impl Namespace {
         if !matches!(self.nodes.get(parent), Some(Node::Directory)) {
             return Err(FsError::NotFound);
         }
+        let changes_commands = is_command_path(&path);
         self.nodes.insert(path, node);
+        if changes_commands {
+            self.bump_command_revision();
+        }
         Ok(())
     }
 
@@ -368,6 +386,7 @@ impl Namespace {
     /// Fails atomically if metadata, bounds, ordering, paths, or parents are invalid.
     pub fn mount_embedded(&mut self, image: &[u8]) -> Result<(), FsError> {
         let parsed = parse_embedded(image)?;
+        let changes_commands = parsed.iter().any(|entry| is_command_path(&entry.path));
         let mut staged = self.nodes.clone();
         for entry in parsed {
             if self.mount_for_path(&entry.path).is_some() {
@@ -384,6 +403,9 @@ impl Namespace {
             insert_node(&mut staged, entry.path, node)?;
         }
         self.nodes = staged;
+        if changes_commands {
+            self.bump_command_revision();
+        }
         Ok(())
     }
 
@@ -449,6 +471,7 @@ impl Namespace {
         if !target_exists {
             self.nodes.insert(path.clone(), Node::Directory);
         }
+        let changes_commands = is_command_path(&path);
         self.mounts.push(ProviderMount {
             path,
             provider,
@@ -461,6 +484,9 @@ impl Namespace {
                 .cmp(&left.path.len())
                 .then_with(|| left.path.cmp(&right.path))
         });
+        if changes_commands {
+            self.bump_command_revision();
+        }
         Ok(())
     }
 
@@ -585,11 +611,16 @@ impl Namespace {
     /// Fails for invalid paths, immutable targets, missing parents, or quota exhaustion.
     pub fn write_file(&mut self, cwd: &str, path: &str, bytes: &[u8]) -> Result<(), FsError> {
         let path = canonicalize(cwd, path)?;
+        let changes_commands = is_command_path(&path);
         if let Some((index, relative)) = self.mount_for_path(&path) {
             if !self.mounts[index].writable {
                 return Err(FsError::ReadOnly);
             }
-            return self.mounts[index].provider.write_file(&relative, bytes);
+            self.mounts[index].provider.write_file(&relative, bytes)?;
+            if changes_commands {
+                self.bump_command_revision();
+            }
+            return Ok(());
         }
         if !is_under_tmp(&path) {
             return Err(FsError::ReadOnly);
@@ -638,6 +669,9 @@ impl Namespace {
             self.ramfs_nodes += 1;
         }
         self.ramfs_high_water = self.ramfs_high_water.max(new_total);
+        if changes_commands {
+            self.bump_command_revision();
+        }
         Ok(())
     }
 
@@ -648,11 +682,16 @@ impl Namespace {
     /// Fails if the path is invalid, missing, immutable, or not a file.
     pub fn remove_file(&mut self, cwd: &str, path: &str) -> Result<(), FsError> {
         let path = canonicalize(cwd, path)?;
+        let changes_commands = is_command_path(&path);
         if let Some((index, relative)) = self.mount_for_path(&path) {
             if !self.mounts[index].writable {
                 return Err(FsError::ReadOnly);
             }
-            return self.mounts[index].provider.remove_file(&relative);
+            self.mounts[index].provider.remove_file(&relative)?;
+            if changes_commands {
+                self.bump_command_revision();
+            }
+            return Ok(());
         }
         match self.nodes.get(&path) {
             Some(Node::File {
@@ -670,6 +709,49 @@ impl Namespace {
             None => return Err(FsError::NotFound),
         }
         self.nodes.remove(&path);
+        if changes_commands {
+            self.bump_command_revision();
+        }
+        Ok(())
+    }
+
+    /// Create one empty writable directory.
+    ///
+    /// # Errors
+    ///
+    /// Fails for invalid paths, immutable mounts, missing parents, collisions,
+    /// unsupported providers, or RAMFS quota exhaustion.
+    pub fn create_directory(&mut self, cwd: &str, path: &str) -> Result<(), FsError> {
+        let path = canonicalize(cwd, path)?;
+        let changes_commands = is_command_path(&path);
+        if let Some((index, relative)) = self.mount_for_path(&path) {
+            if !self.mounts[index].writable {
+                return Err(FsError::ReadOnly);
+            }
+            self.mounts[index].provider.create_directory(&relative)?;
+            if changes_commands {
+                self.bump_command_revision();
+            }
+            return Ok(());
+        }
+        if !is_under_tmp(&path) {
+            return Err(FsError::ReadOnly);
+        }
+        if self.nodes.contains_key(&path) {
+            return Err(FsError::Exists);
+        }
+        if self.ramfs_nodes >= self.quota.max_nodes {
+            return Err(FsError::NoSpace);
+        }
+        let parent = parent_path(&path).ok_or(FsError::Invalid)?;
+        if !matches!(self.nodes.get(parent), Some(Node::Directory)) {
+            return Err(FsError::NotFound);
+        }
+        self.nodes.insert(path, Node::Directory);
+        self.ramfs_nodes = self.ramfs_nodes.checked_add(1).ok_or(FsError::Overflow)?;
+        if changes_commands {
+            self.bump_command_revision();
+        }
         Ok(())
     }
 
@@ -697,6 +779,7 @@ impl Namespace {
         link_path: &str,
     ) -> Result<(), FsError> {
         let link_path = canonicalize(cwd, link_path)?;
+        let changes_commands = is_command_path(&link_path);
         let (index, relative) = self
             .mount_for_path(&link_path)
             .ok_or(FsError::Unsupported)?;
@@ -705,7 +788,11 @@ impl Namespace {
         }
         self.mounts[index]
             .provider
-            .create_symlink(target, &relative)
+            .create_symlink(target, &relative)?;
+        if changes_commands {
+            self.bump_command_revision();
+        }
+        Ok(())
     }
 
     /// Add a hard-link name within one writable mounted provider.
@@ -722,6 +809,7 @@ impl Namespace {
     ) -> Result<(), FsError> {
         let existing = canonicalize(cwd, existing)?;
         let new_path = canonicalize(cwd, new_path)?;
+        let changes_commands = is_command_path(&new_path);
         let (existing_index, existing_relative) =
             self.mount_for_path(&existing).ok_or(FsError::Unsupported)?;
         let (new_index, new_relative) =
@@ -734,7 +822,11 @@ impl Namespace {
         }
         self.mounts[existing_index]
             .provider
-            .create_hard_link(&existing_relative, &new_relative)
+            .create_hard_link(&existing_relative, &new_relative)?;
+        if changes_commands {
+            self.bump_command_revision();
+        }
+        Ok(())
     }
 
     /// List immediate children in lexical order.
@@ -1006,6 +1098,20 @@ impl Namespace {
         }
     }
 
+    /// Revision of namespace changes that can alter `/bin` command discovery.
+    ///
+    /// Consumers may cache a validated command catalog until this value
+    /// changes. Unrelated file and generated-system-node mutations leave it
+    /// unchanged.
+    #[must_use]
+    pub const fn command_revision(&self) -> u64 {
+        self.command_revision
+    }
+
+    fn bump_command_revision(&mut self) {
+        self.command_revision = self.command_revision.wrapping_add(1);
+    }
+
     fn mount_for_path(&self, path: &str) -> Option<(usize, String)> {
         self.mounts.iter().enumerate().find_map(|(index, mount)| {
             if path == mount.path {
@@ -1017,6 +1123,10 @@ impl Namespace {
             }
         })
     }
+}
+
+fn is_command_path(path: &str) -> bool {
+    path == "/bin" || path.starts_with("/bin/")
 }
 
 fn validate_listing(
@@ -1309,6 +1419,14 @@ mod tests {
                 Err(FsError::Invalid)
             }
         }
+
+        fn create_directory(&mut self, path: &str) -> Result<(), FsError> {
+            if path == "/directory" {
+                Ok(())
+            } else {
+                Err(FsError::Invalid)
+            }
+        }
     }
 
     #[test]
@@ -1331,6 +1449,44 @@ mod tests {
         assert_eq!(fs.write_file("/", "/tmp/b", b"x"), Ok(()));
         assert_eq!(fs.memory_stats().ramfs_used, 1);
         assert_eq!(fs.memory_stats().ramfs_high_water, 4);
+    }
+
+    #[test]
+    fn ramfs_directory_creation_is_bounded_and_requires_existing_parents() {
+        let mut fs = Namespace::new(RamFsQuota {
+            max_bytes: 4,
+            max_nodes: 2,
+            max_file_bytes: 4,
+        });
+        assert_eq!(fs.create_directory("/", "/tmp/one"), Ok(()));
+        assert_eq!(fs.create_directory("/", "/tmp/one/two"), Ok(()));
+        assert_eq!(
+            fs.create_directory("/", "/tmp/one/three"),
+            Err(FsError::NoSpace)
+        );
+        assert_eq!(
+            fs.create_directory("/", "/tmp/one/two"),
+            Err(FsError::Exists)
+        );
+    }
+
+    #[test]
+    fn command_revision_changes_only_for_successful_bin_updates() {
+        let mut fs = Namespace::new(RamFsQuota::default());
+        assert_eq!(fs.command_revision(), 0);
+        assert_eq!(fs.write_file("/", "/tmp/data", b"x"), Ok(()));
+        assert_eq!(fs.set_system_file("/sys/status", b"ready"), Ok(()));
+        assert_eq!(fs.command_revision(), 0);
+
+        assert_eq!(fs.add_read_only_dir("/bin"), Ok(()));
+        assert_eq!(fs.command_revision(), 1);
+        assert_eq!(fs.add_read_only_file("/bin/echo.kex", b"kex"), Ok(()));
+        assert_eq!(fs.command_revision(), 2);
+        assert_eq!(
+            fs.add_read_only_file("/bin/echo.kex", b"duplicate"),
+            Err(FsError::Exists)
+        );
+        assert_eq!(fs.command_revision(), 2);
     }
 
     #[test]

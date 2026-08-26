@@ -131,6 +131,7 @@ class RepositoryPolicyTests(unittest.TestCase):
     def test_every_ordinary_command_is_kex_only_on_both_targets(self) -> None:
         ordinary = {
             "arp",
+            "awk",
             "cat",
             "clear",
             "dhcp",
@@ -148,9 +149,12 @@ class RepositoryPolicyTests(unittest.TestCase):
             "printf",
             "pwd",
             "rm",
+            "sed",
             "sleep",
+            "tar",
             "tcp",
             "udp",
+            "wc",
             "write",
         }
         apps = {

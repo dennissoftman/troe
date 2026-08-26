@@ -644,7 +644,7 @@ pub mod filesystem {
     /// Interface major version.
     pub const MAJOR: u16 = 1;
     /// Interface minor version.
-    pub const MINOR: u16 = 1;
+    pub const MINOR: u16 = 2;
     /// Resolve and open one regular file.
     pub const OPEN: u16 = 1;
     /// Read one bounded range through an open-file token.
@@ -655,6 +655,8 @@ pub mod filesystem {
     pub const LIST: u16 = 4;
     /// Return metadata without opening an object.
     pub const METADATA: u16 = 5;
+    /// Read one symbolic-link target without following the final component.
+    pub const READ_LINK: u16 = 6;
     /// Maximum path bytes accepted by this interface.
     pub const MAX_PATH_BYTES: usize = 256;
     /// Maximum simultaneously open files per application service.
@@ -682,6 +684,8 @@ pub mod filesystem {
         LIST_REPLY_HEADER_BYTES + MAX_LIST_ENTRIES * LIST_ENTRY_HEADER_BYTES + MAX_LIST_NAME_BYTES;
     /// Fixed metadata reply bytes.
     pub const METADATA_REPLY_BYTES: usize = 16;
+    /// Maximum encoded bytes in one symbolic-link target.
+    pub const MAX_LINK_BYTES: usize = MAX_PATH_BYTES;
 
     /// Invalid filesystem request or reply encoding.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1146,6 +1150,31 @@ pub mod filesystem {
         Ok(Metadata { kind, byte_count })
     }
 
+    /// Encode one exact UTF-8 symbolic-link target.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty, excessive, NUL-containing targets or short output.
+    pub fn encode_link_reply(target: &str, output: &mut [u8]) -> Result<usize, EncodingError> {
+        validate_link(target)?;
+        if output.len() < target.len() {
+            return Err(EncodingError);
+        }
+        output[..target.len()].copy_from_slice(target.as_bytes());
+        Ok(target.len())
+    }
+
+    /// Decode one exact UTF-8 symbolic-link target.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty, excessive, invalid UTF-8, or NUL-containing targets.
+    pub fn decode_link_reply(bytes: &[u8]) -> Result<&str, EncodingError> {
+        let target = str::from_utf8(bytes).map_err(|_| EncodingError)?;
+        validate_link(target)?;
+        Ok(target)
+    }
+
     fn validate_path(path: &str) -> Result<(), EncodingError> {
         if path.is_empty() || path.len() > MAX_PATH_BYTES || path.as_bytes().contains(&0) {
             return Err(EncodingError);
@@ -1159,6 +1188,13 @@ pub mod filesystem {
             || name.contains('/')
             || matches!(name, "." | "..")
         {
+            return Err(EncodingError);
+        }
+        Ok(())
+    }
+
+    fn validate_link(target: &str) -> Result<(), EncodingError> {
+        if target.is_empty() || target.len() > MAX_LINK_BYTES || target.as_bytes().contains(&0) {
             return Err(EncodingError);
         }
         Ok(())
@@ -1221,7 +1257,7 @@ pub mod filesystem_mutation {
     /// Interface major version.
     pub const MAJOR: u16 = 1;
     /// Interface minor version.
-    pub const MINOR: u16 = 2;
+    pub const MINOR: u16 = 3;
     /// Begin one complete-file atomic replacement.
     pub const BEGIN_REPLACE: u16 = 1;
     /// Append one sequential chunk to the pending replacement.
@@ -1236,8 +1272,10 @@ pub mod filesystem_mutation {
     pub const CREATE_SYMLINK: u16 = 6;
     /// Create one same-provider hard link to an existing regular file.
     pub const CREATE_HARD_LINK: u16 = 7;
+    /// Create one empty directory without replacing an existing entry.
+    pub const CREATE_DIRECTORY: u16 = 8;
     /// Maximum staged bytes in one replacement.
-    pub const MAX_FILE_BYTES: usize = 64 * 1024;
+    pub const MAX_FILE_BYTES: usize = 1024 * 1024;
     /// Fixed bytes preceding an append payload.
     pub const APPEND_HEADER_BYTES: usize = 8;
     /// Maximum bytes carried by one append call.
@@ -3066,10 +3104,21 @@ mod tests {
         let unsorted = [entries[1], entries[0]];
         assert!(filesystem::encode_list_reply(None, &unsorted, &mut unchanged).is_err());
         assert_eq!(unchanged, [0xa5; filesystem::MAX_LIST_REPLY_BYTES]);
+
+        let mut link = [0_u8; filesystem::MAX_LINK_BYTES];
+        let count = filesystem::encode_link_reply("../target", &mut link)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            filesystem::decode_link_reply(&link[..count]),
+            Ok("../target")
+        );
+        assert!(filesystem::decode_link_reply(b"").is_err());
+        assert!(filesystem::decode_link_reply(b"bad\0target").is_err());
     }
 
     #[test]
     fn filesystem_mutation_is_sequential_bounded_and_exact() {
+        assert_eq!(filesystem_mutation::MAX_FILE_BYTES, 1024 * 1024);
         let token = filesystem_mutation::encode_token(7).unwrap_or_else(|_| std::process::abort());
         assert_eq!(filesystem_mutation::decode_token(&token), Ok(7));
         assert!(filesystem_mutation::decode_token(&[7, 0, 0, 0, 0]).is_err());

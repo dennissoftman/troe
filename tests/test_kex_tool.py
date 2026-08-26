@@ -61,7 +61,13 @@ class KexToolTests(unittest.TestCase):
                     self.assertEqual(report["abi"], "1.1")
                     self.assertEqual(report["target"], target)
                     expected_stack_pages = (
-                        64 if command == "lua" else 20 if command == "grep" else 4
+                        64
+                        if command == "lua"
+                        else 12
+                        if command == "tar"
+                        else 20
+                        if command in {"awk", "grep", "sed"}
+                        else 4
                     )
                     self.assertEqual(report["stack_pages"], expected_stack_pages)
                     self.assertEqual(
@@ -108,10 +114,22 @@ class KexToolTests(unittest.TestCase):
                     ]
                     if command == "udp":
                         expected = [(5, 1, 0)]
-                    elif command in {"cat", "grep", "hexdump", "ls", "lua", "man"}:
-                        expected = [(6, 1, 1)]
+                    elif command == "tar":
+                        expected = [(6, 1, 2), (7, 1, 3)]
+                    elif command in {
+                        "awk",
+                        "cat",
+                        "grep",
+                        "hexdump",
+                        "ls",
+                        "lua",
+                        "man",
+                        "sed",
+                        "wc",
+                    }:
+                        expected = [(6, 1, 2)]
                     elif command in {"ln", "rm", "write"}:
-                        expected = [(7, 1, 2)]
+                        expected = [(7, 1, 3)]
                     elif command == "sleep":
                         expected = [(8, 1, 0)]
                     elif command == "mem":

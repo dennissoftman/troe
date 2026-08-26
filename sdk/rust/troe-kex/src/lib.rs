@@ -33,6 +33,8 @@ pub const INVOCATION_BUFFER_BYTES: usize = command::MAX_INVOCATION_BYTES;
 pub const DATAGRAM_BUFFER_BYTES: usize = datagram::MAX_RECEIVE_REPLY_BYTES;
 /// Maximum stack buffer needed to receive one directory page.
 pub const FILESYSTEM_LIST_BUFFER_BYTES: usize = filesystem::MAX_LIST_REPLY_BYTES;
+/// Maximum useful payload buffer for one filesystem range read or append call.
+pub const FILESYSTEM_IO_BUFFER_BYTES: usize = MAX_SERVICE_PAYLOAD_BYTES;
 
 /// One opaque application handle selected from the immutable startup page.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -699,6 +701,31 @@ impl ReadOnlyFilesystem {
         let count = call(self.handle, filesystem::LIST, &request[..count], buffer)?;
         filesystem::DirectoryPage::parse(&buffer[..count]).map_err(|_| Error::InvalidCall)
     }
+
+    /// Read the exact UTF-8 target of one symbolic link without following it.
+    ///
+    /// The returned string borrows `buffer`.
+    ///
+    /// # Errors
+    ///
+    /// Reports invalid paths, wrong object kinds, unsupported providers,
+    /// filesystem failures, or a malformed service reply.
+    pub fn read_link<'buffer>(
+        &mut self,
+        path: &str,
+        buffer: &'buffer mut [u8; filesystem::MAX_LINK_BYTES],
+    ) -> Result<&'buffer str, Error> {
+        let mut request = [0_u8; filesystem::MAX_PATH_BYTES];
+        let count =
+            filesystem::encode_path_request(path, &mut request).map_err(|_| Error::InvalidCall)?;
+        let count = call(
+            self.handle,
+            filesystem::READ_LINK,
+            &request[..count],
+            buffer,
+        )?;
+        filesystem::decode_link_reply(&buffer[..count]).map_err(|_| Error::InvalidCall)
+    }
 }
 
 impl FilesystemMutation {
@@ -745,6 +772,30 @@ impl FilesystemMutation {
         let count = call(
             self.handle,
             filesystem_mutation::REMOVE,
+            &request[..count],
+            &mut reply,
+        )?;
+        if count == 0 {
+            Ok(())
+        } else {
+            Err(Error::InvalidCall)
+        }
+    }
+
+    /// Create one empty directory without replacing an existing entry.
+    ///
+    /// # Errors
+    ///
+    /// Reports invalid or missing parents, collisions, immutable or
+    /// unsupported providers, persistence failures, or call-gate failure.
+    pub fn create_directory(&mut self, path: &str) -> Result<(), Error> {
+        let mut request = [0_u8; filesystem::MAX_PATH_BYTES];
+        let count = filesystem_mutation::encode_path_request(path, &mut request)
+            .map_err(|_| Error::InvalidCall)?;
+        let mut reply = [];
+        let count = call(
+            self.handle,
+            filesystem_mutation::CREATE_DIRECTORY,
             &request[..count],
             &mut reply,
         )?;

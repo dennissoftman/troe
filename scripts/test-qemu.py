@@ -977,6 +977,44 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
         contains=("second\tvalue\n",),
     )
     session.command(
+        r"printf 'one two\nthree\n' | wc",
+        cwd,
+        command_timeout,
+        contains=("2 3 14\n",),
+    )
+    session.command(
+        r"printf 'alpha beta\nbeta gamma\n' | sed 's/beta/B/g'",
+        cwd,
+        command_timeout,
+        contains=("alpha B\nB gamma\n",),
+    )
+    session.command(
+        r"""printf 'svc ready\njob waiting\n' | awk '$2 == "ready" { print NR, $1 }'""",
+        cwd,
+        command_timeout,
+        contains=("1 svc\n",),
+    )
+    session.command("cd /vol/root", cwd, command_timeout, next_cwd="/vol/root")
+    cwd = "/vol/root"
+    session.command("tar -cf troe-test.tar nested", cwd, command_timeout)
+    session.command(
+        "tar -tf troe-test.tar",
+        cwd,
+        command_timeout,
+        contains=("nested\n", "nested/state.txt\n"),
+    )
+    session.command("cd /vol/shared", cwd, command_timeout, next_cwd="/vol/shared")
+    cwd = "/vol/shared"
+    session.command("tar -xf /vol/root/troe-test.tar", cwd, command_timeout)
+    session.command(
+        "cat nested/state.txt",
+        cwd,
+        command_timeout,
+        contains=("read-only activation complete\n",),
+    )
+    session.command("cd /", cwd, command_timeout, next_cwd="/")
+    cwd = "/"
+    session.command(
         "echo alpha beta | grep beta | write /tmp/result", cwd, command_timeout
     )
     session.command("cat /tmp/result", cwd, command_timeout, contains=("alpha beta\n",))

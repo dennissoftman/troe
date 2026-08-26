@@ -169,8 +169,8 @@ are not contained.
 
 Stage 5.1 adds `troe-terminal`, which keeps transport-independent input
 decoding, line editing, history, and fixed-glyph text rendering outside the
-machine mechanism. `troe-shell` owns completion because it has the authoritative
-command registry and VFS namespace; both command candidates and directory
+machine mechanism. `troe-shell` owns completion because it has the VFS namespace
+and its revision-aware `/bin` catalog; both command candidates and directory
 listings are returned under caller-selected count and byte budgets. The native
 composition root uses the single Standard resource policy. x86-64 decodes
 US set-1 scan codes from q35 i8042, while both architectures retain serial
@@ -271,8 +271,10 @@ transaction, a boot-relative monotonic timer, one immutable typed diagnostics
    exposes raw frames, routes, DNS, TLS, or devices. Datagram
 ports are exclusive to the launch; read-only
 open tokens are generation-checked and limited to eight; directory traversal is
-lexically paginated. Mutation staging is sequential, capped at 64 KiB, and
-discarded on teardown unless atomically committed. Timer waits are foreground
+lexically paginated and final-component link targets are bounded. Mutation
+staging is sequential, capped at 1 MiB, and discarded on teardown unless
+atomically committed; empty-directory creation is a separate bounded operation.
+Timer waits are foreground
 and cancellable; diagnostics retains fixed copied bytes rather than accounting
    borrows. TCP retains at most one unacknowledged 1,460-byte segment and one
    4 KiB receive FIFO per connection, retransmits four times on fixed timers,

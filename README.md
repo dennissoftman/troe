@@ -44,9 +44,9 @@ profiles. Small is a policy here, not just a current measurement.
   `/vol/root`, read/write FAT32, bounded ext4 symbolic/hard links, quota-bound
   `/tmp`, live `/sys`, and crash-consistent state under `/vol/state`.
 - Ethernet, ARP, DHCP, IPv4, ICMP, UDP, and outbound TCP over virtio-net.
-- KEX applications for `arp`, `cat`, `clear`, `dhcp`, `echo`, `grep`, `hexdump`,
-  `ln`, `ls`, `lua`, `man`, `mem`, `mount`, `net`, `ping`, `printf`, `pwd`, `rm`,
-  `sleep`, `tcp`, `udp`, and `write`.
+- KEX applications for `arp`, `awk`, `cat`, `clear`, `dhcp`, `echo`, `grep`,
+  `hexdump`, `ln`, `ls`, `lua`, `man`, `mem`, `mount`, `net`, `ping`, `printf`,
+  `pwd`, `rm`, `sed`, `sleep`, `tar`, `tcp`, `udp`, `wc`, and `write`.
 
 Only `cd`, `poweroff`, and `reboot` are privileged shell intrinsics. Everything
 else is an immutable KEX application discovered from `/bin`.

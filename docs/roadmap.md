@@ -133,7 +133,7 @@ dispatch-ready boot marker. See
 The portable `troe-terminal` crate now provides configurable input decoding,
 cursor-aware line editing, bounded volatile history, set-1 keyboard decoding,
 and fixed-glyph framebuffer rendering. `troe-shell` provides bounded
-command/VFS completion from one authoritative command registry. The kernel
+command/VFS completion from a lazy revision-aware `/bin` catalog. The kernel
 copies and validates UEFI GOP metadata before handoff and mirrors normal output
 to an owned RW/NX device mapping while retaining UART for early, fatal,
 headless, and acceptance paths.
@@ -261,10 +261,11 @@ application datagram service. `udp.kex` proves send, receive backpressure,
 waiting/cancellation, and teardown to zero live ports on every QEMU composition.
 The optional read-only filesystem service now supplies generation-checked open
 tokens, bounded offset reads and metadata, and lexical pagination with
-symbolic-link kinds. `cat`,
-`grep`, `hexdump`, `ls`, and `man` exercise it on every QEMU composition.
-Atomic complete-file mutation and bounded link creation are now implemented and
-exercised by `write.kex`, `rm.kex`, and `ln.kex`. Separate monotonic timer and
+symbolic-link kinds plus final-component `readlink`. `awk`, `cat`, `grep`,
+`hexdump`, `ls`, `man`, `sed`, `tar`, and `wc` exercise it on every QEMU
+composition. Atomic complete-file mutation now stages up to 1 MiB and includes
+bounded empty-directory and link creation. It is exercised by `write.kex`,
+`rm.kex`, `ln.kex`, and streaming uncompressed `tar.kex`. Separate monotonic timer and
 immutable typed diagnostics services now back `sleep.kex` and `mem.kex`.
 Independent typed observation, DHCP, and ICMP
 echo services now back `net.kex`, `arp.kex`, `dhcp.kex`, and `ping.kex` without
@@ -275,11 +276,14 @@ echo services now back `net.kex`, `arp.kex`, `dhcp.kex`, and `ping.kex` without
    connect, transfer, close, and repeated owner cleanup. DNS, HTTP, TLS, inbound
    listening, jobs, and general sockets are not implied by these ABIs.
 
-The shell keeps bounded command-name and path completion, including candidate
-listing for an empty or partial command and command-name completion after
-`man`. Rich Bash/Zsh-style option, argument, provider, and application-aware
-completion is a later usability increment; it must use explicit schemas and
-retain deterministic candidate-count and byte ceilings.
+The shell keeps bounded command-name and path completion. Application names are
+discovered lazily from `/bin`, cached until the namespace command revision
+changes, and combined with the three static privileged intrinsics. The catalog
+handles 1,000 applications without rescanning on each completion. Optional
+command schemas add bounded file-position, mode, and option completion for the
+implemented tools without controlling application discovery. Persisting the
+catalog awaits an authoritative package-generation digest so stale writable
+media cannot advertise commands from a different system image.
 
 ### Post-Stage 9: dynamic linking and reusable runtimes (planned)
 

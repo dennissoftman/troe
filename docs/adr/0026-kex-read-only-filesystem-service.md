@@ -7,9 +7,10 @@ Status: accepted and implemented for the Stage 9 read-only command migration,
 
 A KEX package may request the optional `filesystem-read` capability. If the
 launching shell owns a live VFS namespace, the kernel grants interface 6,
-version 1.1, rooted at that namespace and resolving relative paths from the
+version 1.2, rooted at that namespace and resolving relative paths from the
 command's immutable startup cwd. The interface exposes only `open`, offset
-`read`, `close`, `metadata`, and paginated `list`; it grants no mutation,
+`read`, `close`, `metadata`, paginated `list`, and final-component `readlink`;
+it grants no mutation,
 mount, provider, block, device, or raw kernel authority.
 
 Requests and replies use the allocation-free codecs in `troe-abi` and remain
@@ -19,7 +20,8 @@ bounded by the caller's reply capacity. Directory pages are lexical, carry an
 opaque continuation cursor, and contain at most 64 entries, 64 bytes per name,
 and 3,072 aggregate name bytes. Listings distinguish regular files,
 directories, and provider-owned symbolic links; metadata and open follow a
-link to its bounded provider-root target. Metadata identifies only resolved
+link to its bounded provider-root target. `readlink` returns at most 256 UTF-8
+target bytes without following the final component. Metadata identifies only resolved
 object kind and byte count. Exact decoding rejects unknown versions/opcodes,
 trailing bytes,
 invalid paths or cursors, wrong object kinds, stale tokens, and overflow.
@@ -32,7 +34,7 @@ shell resumes. The manifest remains least-authority: packages without
 unsupported, or unavailable requirement rejects launch.
 
 The repo-local SDK exposes typed read-only operations and errors. `cat`,
-`grep`, `hexdump`, `ls`, and `man` are the first migrated consumers and their
+`grep`, `hexdump`, `ls`, `man`, and later `tar` are migrated consumers and their
 KEX artifacts execute on both targets. ADR 0030 later removed the temporary
 absent-artifact fallbacks.
 
