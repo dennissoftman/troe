@@ -171,7 +171,7 @@ process, dynamic-module, OS, or raw filesystem access.
 
 KEX images are statically linked today. A bounded, single-package dynamic
 linking design for reusable libc and language runtimes is an explicit
-[post-Stage 9 roadmap milestone](docs/roadmap.md#post-stage-9-dynamic-linking-and-reusable-runtimes-planned).
+[planned roadmap milestone](docs/roadmap.md#dynamic-linking-and-reusable-runtimes--planned).
 
 ## 🚀 Quick start
 

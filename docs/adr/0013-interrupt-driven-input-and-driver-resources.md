@@ -52,4 +52,4 @@ are bounded and observable. Existing exception, W^X, terminal, and polling
 fatal-path tests remain mandatory.
 
 The machine-specific ordering constraints and regression checklist are kept in
-[the architecture-specific implementation notes](../architecture-specific-notes.md).
+[the native machine invariants](../architecture.md#native-machine-invariants).

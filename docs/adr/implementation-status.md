@@ -8,9 +8,10 @@ test or gate. The broad hosted gate and all four QEMU platform suites include
 the ADR 0031 TCP stream and repeated-teardown checks.
 
 Planning note, 2026-08-26: ADR 0032's portable wait/pending-call foundation,
-native timer/UDP deferred replies, and first isolated diagnostics server are
-implemented while general mailboxes and multiple live KEX tasks remain staged.
-ADR 0033 accepts the future configuration-namespace direction, and ADR 0034
+native timer/UDP deferred replies, isolated diagnostics server, fault cleanup,
+and zero-allocation measured transport interval are implemented. General
+mailboxes, persistent servers, and multiple live KEX tasks remain staged. ADR
+0033 accepts the future configuration-namespace direction, and ADR 0034
 consolidates the typed native-handle rule followed by existing services. Their
 scoped-directory and package-activation work is explicitly deferred, so none of
 these planning decisions changes the implemented closure set.

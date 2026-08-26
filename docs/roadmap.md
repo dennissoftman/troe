@@ -1,648 +1,135 @@
 # Implementation roadmap
 
-## Landed in the initial slice
-
-- Stage 0 host runner and Stage 1 UEFI applications share portable code.
-- Both EFI targets compile on stable Rust and fit well below component budgets.
-- Root data is generated deterministically and validated again when mounted.
-- RAMFS mutation and deletion accounting have provider tests; parser failures,
-  pipelines, streamed redirection, intrinsic behavior, and command status have
-  host tests.
-- Build, test, image, size, and QEMU entry points are repository scripts.
-- Prompt-synchronized QEMU acceptance drives every named production platform
-  image through all KEX apps, failure cases, RAMFS quota exhaustion and
-  recovery, memory
-  reporting, and authorized poweroff/reboot with bounded timeouts.
-
-## Stage 2: owned machine (complete)
-
-### 1. Owned memory and console substrate — complete
-
-Normalize the UEFI memory map, reserve the image/stack/KEFS/map, introduce a
-bounded monotonic boot allocator, implement a project-owned frame bitmap, and add
-polling 16550/PL011 backends. Keep firmware services active until native fatal
-diagnostics and allocator accounting are verified.
-
-Landed: the portable normalization, monotonic boot allocator, and compact frame
-bitmap are host tested. Both images reserve an explicit LoaderData arena and
-run polling 16550/PL011 backends before firmware services are released.
-
-Exit: allocator model tests cover discontiguous ranges, exhaustion, double
-free, invalid free, and checked overflow; native UART output matches firmware
-output in QEMU.
-
-### 2. Exit boot services as one reviewed transition — complete
-
-Select and audit the general heap, copy the final memory map into owned memory,
-drop every firmware protocol reference, switch console and fatal paths, exit
-boot services, and publish full memory counters through `mem`.
-
-Exit: repeated pipeline/RAMFS workloads run without firmware services or leaks,
-and allocation failure reaches a bounded diagnostic path.
-
-Landed: `rlsf` TLSF was selected and measured, the final map is retained and
-normalized, every console/fatal path is native, boot services are exited, and
-`mem` exposes owned frame and heap counters. Multi-platform QEMU acceptance
-proves no net
-heap growth across repeated transient workloads and exercises the bounded
-allocation-failure probe.
-
-MMU-owned page tables and W^X follow this transition; they should not be mixed
-into the first memory-ownership patch.
-
-## Stage 3: MMU-owned mappings and W^X (verified)
-
-Build architecture-specific page tables from pure, host-tested range plans;
-classify normal and device memory; protect immutable and executable regions;
-and add deliberate permission-fault acceptance cases on both architectures.
-
-Exit: mapping invariants hold in model tests and representative write and
-execute violations reach stable native fault diagnostics in QEMU.
-
-Landed: a bounded architecture-neutral mapping plan rejects virtual overlap,
-unsafe physical aliases, overflow, W+X, executable devices, and unequal ranges
-in host tests. The kernel builds a minimal identity plan for owned runtime RAM,
-PE-classified image sections, and the PL011 device page; x86-64 and AArch64
-translate it into fresh 4 KiB page
-tables from a reserved 2 MiB arena. Kernel text is RX, immutable image data is
-RO/NX, runtime memory is RW/NX, and device memory is RW/NX with device
-attributes. A one-way owned-stack handoff precedes firmware-memory reclamation.
-Native fixed-selector x86-64 GDT/TSS/IDT and masked AArch64 VBAR state provide
-terminal coverage for unexpected exceptions. Destructive write, execute, and
-native-exception probes exist only in separate acceptance images; production
-images are scanned to exclude their command strings. Host tests, both target
-Clippy gates, production/acceptance builds, and the pinned dependency audit pass.
-The exhaustive normal-boot, write-fault, execute-fault, native-exception,
-fatal-state, poweroff, and reboot matrix passes on both targets with QEMU 11.1.0.
-
-## Stage 4: cooperative tasks (complete)
-
-Introduce bounded task records, explicit owned stacks with guard pages,
-cooperative yield, task lifecycle accounting, and capability-scoped dispatch
-without adding preemption or per-task address spaces.
-
-Exit: multiple tasks yield and terminate deterministically, stack guards reach
-native fault diagnostics, and task-owned resources are reclaimed without
-changing the single-address-space authority model.
-
-Landed: `troe-task` provides a 16-record hard ceiling, monotonic task IDs,
-round-robin ready/running/exited transitions, typed capability sets, explicit
-yield/exit accounting, and reaping that returns the exact guarded-stack slot.
-The kernel reserves one 64 KiB service payload plus 128 KiB server and shell
-payloads, each between two unmapped 4 KiB guards. Architecture-local
-trampolines run one explicit continuation step on a task stack and restore the
-scheduler stack on yield or exit. Boot acceptance
-executes two interleaved services, checks five deterministic yields, reaps both,
-reuses a returned slot, then dispatches the console/filesystem/machine-control
-shell task only with its declared capabilities. Feature-only acceptance images
-write a task guard and reach the same terminal native fault state on both
-architectures; production images exclude that dispatch string.
-
-The continuation model deliberately stores durable state in an explicitly
-owned continuation object, accounts for it through the bounded task record, and
-discards native frames at each yield. It does not add preemption, saved
-arbitrary call stacks, per-task address spaces, or a hardware isolation claim.
-See [ADR 0010](adr/0010-cooperative-tasks-and-guarded-stacks.md).
-
-## Stage 5: in-process message dispatch (complete)
-
-Introduce handles, ports, bounded messages, request/reply semantics, and a
-service adapter that can replace a selected direct call without changing its
-conceptual API.
-
-Exit: a filesystem or console service can switch between direct and dispatched
-implementations in tests.
-
-Landed: `troe-dispatch` provides generation-checked opaque port and handle
-identities, per-handle call rights, hard ceilings of 16 ports, 32 handles, and
-4 KiB per request or reply, monotonic request IDs, owned bounded replies, typed
-service statuses, explicit close/invalidation, and live call/reply accounting.
-Requests borrow immutable bytes only for one synchronous call; no queued state,
-blocking, cancellation race, shared-memory contract, or wire ABI is implied.
-
-`ConsoleService` and `DispatchedOutput` preserve the existing byte-oriented
-`Output` interface. Host tests send the same payload through direct and
-dispatched console implementations and compare exact bytes, including a payload
-that requires multiple bounded calls. The native shell registers one console
-port and emits prompts and normal stdout through its one explicitly granted call
-handle. Native fatal output and input delivery stay at the machine boundary so a
-dispatcher failure cannot recurse through itself. Both QEMU targets require the
-dispatch-ready boot marker. See
-[ADR 0011](adr/0011-bounded-in-process-message-dispatch.md).
-
-## Stage 5.1: native text console and shell usability — complete
-
-The portable `troe-terminal` crate now provides configurable input decoding,
-cursor-aware line editing, bounded volatile history, set-1 keyboard decoding,
-and fixed-glyph framebuffer rendering. `troe-shell` provides bounded
-command/VFS completion from a lazy revision-aware `/bin` catalog. The kernel
-copies and validates UEFI GOP metadata before handoff and mirrors normal output
-to an owned RW/NX device mapping while retaining UART for early, fatal,
-headless, and acceptance paths.
-
-Exit: both architectures can display and edit a shell line through the owned
-text-console abstraction; every retained-entry and byte budget comes from a
-validated selected profile; unknown serial escape sequences cannot corrupt the
-line; and the existing deterministic UART acceptance matrix remains available.
-The x86-64 q35 profile also accepts a native PS/2 keyboard. AArch64 native
-keyboard input is a later virtio-input increment; serial input and owned ramfb
-output are covered now.
-See [ADR 0012](adr/0012-native-text-console-and-editor-policy.md).
-
-## Stage 5.2: interrupt-driven input and driver resources — complete
-
-The portable `troe-driver` crate now provides checked MMIO, I/O-port, and
-interrupt resources plus a preallocated raw-input FIFO. Its capacity,
-per-interrupt drain budget, overflow accounting, and programmable priority are
-selected by validated configuration. The machine layer owns q35 LAPIC/I/O APIC
-and AArch64 `virt` GICv2, routes PS/2, 16550, and PL011 receive interrupts, and
-replaces the shell's busy poll loop with race-free `hlt`/`wfi` idle. Bootstrap
-and fatal recovery retain direct polling, and the cooperative scheduler remains
-non-preemptive.
-
-Exit: both QEMU architectures receive serial shell input only through owned
-interrupt delivery after initialization; x86 native keyboard input uses IRQ1;
-all ISR loops and retained events obey selected profile bounds; overflow and
-interrupt counters are observable; idle wakeups cannot be lost; and fault,
-terminal, and recovery-console acceptance remains green. QEMU acceptance checks
-positive delivery/idle counters and zero drops under ordinary input. See
-[ADR 0013](adr/0013-interrupt-driven-input-and-driver-resources.md).
-
-## Stage 6: optional isolation (complete)
-
-Landed: fresh per-task roots execute at x86-64 ring 3 and AArch64 EL0t with
-kernel mappings supervisor-only, explicit RX/RW user mappings, unmapped stack
-guards, and global W^X across safe aliases. The internal exit gate validates a
-complete user range before copying at most 4 KiB into kernel-owned memory.
-Handles carry monotonic task ownership and are generation-revoked before exact
-record reaping, page zeroization, and atomic frame-range return.
-
-Exit: a deliberately faulting isolated task cannot corrupt the kernel or an
-unrelated service; its memory, handles, and task resources are reclaimed, and
-authority transfer remains explicit. Stage 6 does not imply loadable
-applications, a stable userspace ABI, or preemption; those require separate
-decisions and later milestones. Every boot on both architectures contains
-translation, write, execute, illegal-instruction, disabled alternate-entry,
-invalid-opcode, invalid-pointer, oversize-message, and invalid-status faults;
-AArch64 also rejects a nonzero `SVC` encoding. The matrix proves no partial
-copy or net frame loss, reuses the returned physical range, then enters the
-ordinary shell. See
-[ADR 0014](adr/0014-unprivileged-task-isolation-and-teardown.md).
-
-## Stage 7: loadable applications (complete)
-
-Stage 6 supplies the privilege, copied-message, fault-fate, and transactional
-teardown boundary required by a loader.
-[ADR 0015](adr/0015-kex-application-abi-and-execution-bounds.md) selects the
-small static KEX v1 container, application ABI 1.0, per-profile staging and
-resident-memory ceilings, and a 50 ms maximum uninterrupted user lease
-terminated by an owned timer. Those choices are intentionally independent of
-the internal Stage 6 probe format.
-
-The first two implementation slices established the loader.
-`troe-application` provides the
-allocation-free KEX v1 parser, fixed profile limits, bounded load plans, exact
-and conservative page charges, canonical virtual placement, and ABI 1.0 startup
-page encoding. The native composition copies each artifact into bounded
-kernel-owned staging before parsing, allocates exact private pages plus the
-profile's table reservation, initializes fresh frames, builds an inactive root
-from the portable plan, grants one explicit owner-scoped handle, and then proves
-revocation, zeroization, exact reclamation, and malformed-input rejection on
-both targets. No external artifact byte is executed in this slice.
-
-The third slice makes the boundary runnable. Both architectures reset documented
-application-visible integer, floating-point/SIMD, and control state; pass the
-immutable startup pair; enable interrupt delivery; implement ABI call 0 exit;
-and arm a 50 ms one-shot before external KEX instructions execute. x86 uses an
-owned local-APIC timer calibrated once from typed PIT channel-2 resources;
-AArch64 uses the generic physical timer through owned GICv2 PPI 30. IRQ
-delivery remains masked until the native entry gate has published its complete
-kernel return context. Native boot runs a
-target-specific exit application and terminates a spinning application by lease
-expiry, then proves stale-handle rejection, exact frame return, and allocation
-reuse on both targets.
-
-The fourth slice completes ABI 1.0. Architecture gates capture bounded full user
-contexts at `yield` and `handle_call`; the scheduler explicitly reselects a
-yielded task; every resume receives a fresh lease, and every yield, handle call,
-or heap-growth request is charged against the 1,024-step/10-second command
-ceiling. Handle calls validate complete
-non-overlapping request/reply ranges, copy the opcode-prefixed request, prove the
-opaque handle still belongs to the task, synchronously dispatch it, and copy out
-only a successful bounded reply. Native acceptance checks register preservation,
-reply bytes, unknown-call fate, attempted-return fate, exact teardown, and frame
-reuse on both targets.
-
-Exit: a valid target-specific static application can start, call a documented
-minimal ABI, exit or fault without harming the kernel or another service, and
-leave no memory or handle ownership behind. Malformed artifacts fail before
-execution with no partial mappings. Dynamic linking, POSIX compatibility,
-preemption, persistence, and a public package registry are not part of the
-Stage 7 implementation.
-
-### Stage 9 command-application integration (complete vertical slice)
-
-The first product-facing integration is implemented. The shell resolves exact
-immutable `/bin/<command>.kex` artifacts from a target-selected root, stages
-them through bounded offset reads, and grants versioned
-command/stdin/stdout/stderr handles.
-`echo`, `clear`, and `pwd` established external execution and prove normal
-catalog discovery on every QEMU composition. The complete ordinary command set
-now uses the same KEX-only path.
-The repo-local Rust SDK, linker script, canonical dual-target build/inspect
-tool, single-file packages with embedded least-authority KCAP manifests,
-example source, and concise authoring skill are checked in.
-
-KEX command discovery excludes the permanently intrinsic `cd`, `poweroff`, and
-`reboot` names. `cd` remains a shell-session state transition; the platform
-transitions remain machine-control-capability operations unavailable to
-application ABI 1.0.
-
-Absent artifacts report an unavailable application; present corrupt or faulting
-artifacts fail closed. Public package manifests, target locks, signatures, and
-content-store application publication remain on the packaging track.
-
-The bounded UDP substrate is now exposed through the optional owner-scoped
-application datagram service. `udp.kex` proves send, receive backpressure,
-waiting/cancellation, and teardown to zero live ports on every QEMU composition.
-The optional read-only filesystem service now supplies generation-checked open
-tokens, bounded offset reads and metadata, and lexical pagination with
-symbolic-link kinds plus final-component `readlink`. `awk`, `cat`, `grep`,
-`hexdump`, `ls`, `man`, `sed`, `tar`, and `wc` exercise it on every QEMU
-composition. Streamed mutation uses 64-bit offsets and 16 KiB default working
-buffers with power-of-two selection through 1 MiB; file length is left to
-format, media, and quota. It also includes bounded empty-directory and link
-creation. Shell `>`/`>>`, `rm.kex`, `ln.kex`, and uncompressed `tar.kex`
-exercise it. Separate monotonic timer and
-immutable typed diagnostics services now back `sleep.kex` and `mem.kex`.
-Independent typed observation, DHCP, and ICMP
-echo services now back `net.kex`, `arp.kex`, `dhcp.kex`, and `ping.kex` without
-   granting raw frames, routes, devices, or one another's authority. The remaining
-   ordinary-command recovery implementations are removed. Interface 13 now
-   supplies one owner-scoped outbound TCP stream under fixed state, receive,
-   retransmission, timer, and teardown bounds; `tcp.kex` proves literal-IPv4
-   connect, transfer, close, and repeated owner cleanup. DNS, HTTP, TLS, inbound
-   listening, jobs, and general sockets are not implied by these ABIs.
-
-[ADR 0034](adr/0034-typed-capability-handles-and-unix-compatibility.md)
-generalizes that boundary for future native objects. TROE shares bounded
-ownership, generation, cancellation, wait, and teardown mechanics across
-opaque handles, but retains typed file, directory, byte-stream, datagram,
-listener, timer, and control interfaces. Package-managed filesystem grants must
-become scoped directory roots; any BSD/POSIX descriptor API is an optional
-userspace compatibility layer rather than a kernel contract.
-
-The shell keeps bounded command-name and path completion. Application names are
-discovered lazily from `/bin`, cached until the namespace command revision
-changes, and combined with the three static privileged intrinsics. The catalog
-handles 1,000 applications without rescanning on each completion. Optional
-command schemas add bounded file-position, mode, and option completion for the
-implemented tools without controlling application discovery. Persisting the
-catalog awaits an authoritative package-generation digest so stale writable
-media cannot advertise commands from a different system image.
-
-### Post-Stage 9: dynamic linking and reusable runtimes (planned)
-
-KEX applications are currently self-contained static images. That is a useful
-first trust boundary, but it duplicates large runtimes in every artifact and is
-not a satisfactory distribution model for a reusable libc, language runtimes,
-or a future Python port. A reviewed dynamic-linking design is therefore an
-explicit platform milestone rather than an untracked possibility.
-
-The milestone must preserve the properties of the current single-file KEX UX:
-
-- an application can ship as one self-contained package containing its native
-  image, manifest, and pinned shared objects, while an immutable
-  content-addressed store may deduplicate identical objects across packages;
-- dependency identity, architecture, ABI and symbol versions are explicit, and
-  resolution has hard depth, object-count, symbol-count, relocation-count, and
-  byte ceilings with deterministic cycle and missing-dependency failures;
-- relocation and mapping retain W^X, make read-only-after-relocation state
-  immutable, never grant capabilities to a library independently of its owning
-  application, and account/reclaim every private and shared page exactly;
-- x86-64 and AArch64 use documented relocation subsets and identical package
-  semantics, with negative corpus tests and native teardown/reuse gates; and
-- the SDK can build, inspect, bundle, and reproduce a package without relying on
-  ambient host libraries or paths.
-
-The design decision still needs to choose a bounded KEX container revision and
-whether relocation is performed by a small user-space runtime loader, by the
-host packaging tool, or by a narrowly scoped kernel mechanism. Importing a
-general ELF dynamic linker into the kernel is not implied. Until that decision
-lands, libc and Lua components remain statically linked into each `.kex`.
-
-### Post-Stage 9: bounded waits and asynchronous mailboxes (in progress)
-
-[ADR 0032](adr/0032-bounded-wait-channels-and-asynchronous-mailboxes.md)
-records the accepted staged direction derived from a review of BeOS/Haiku
-message ports, loopers, and media scheduling. Its portable wait, blocked-task,
-and pending-call models are implemented. Timer sleep and UDP receive now use
-one bounded native deferred-reply slot and hardware-backed idle waits; general
-mailboxes are not yet current behavior.
-
-The review narrows the useful first step. Existing timer and network services
-already wait cooperatively, but they do so inside one synchronous service call
-while the sole application remains logically running. A real blocked state
-therefore requires a captured user context, copied request, deferred reply,
-generation-checked wait registration, cancellation fate, and owner-teardown
-rule outside arbitrary suspended kernel frames. The existing synchronous
-service `PortId` remains a service endpoint; a queued repository is named a
-mailbox rather than changing that established meaning.
-
-The proposed implementation sequence is:
-
-1. measure checkpoint spinning, idle/wakeup behavior, wait duration,
-   cancellation, and retained request bytes in the existing timer, UDP, and TCP
-   services;
-2. host-test portable wait keys, blocked lifecycle transitions, wake reasons,
-   pending calls, stale-generation rejection, and teardown without changing
-   native execution;
-3. retain suspended KEX contexts and pending ABI calls in a bounded
-   composition-owned table, then convert the timer wait and UDP receive as the
-   first two real consumers;
-4. prove single-CPU timeout, cancellation, close/revoke wakeup, exact
-   zeroization/frame return, and non-spinning idle behavior on both native
-   targets; and
-5. implement preallocated FIFO mailboxes only after two named non-test
-   consumers require queued complete messages.
-
-This proposal does not add preemption, SMP, shared memory, scheduling classes,
-background jobs, or concurrent shell pipelines. Concurrent pipelines require a
-separate decision because launching every stage together changes ADR 0002's
-first-failure and side-effect ordering even when byte order and EOF remain
-identical. Media-style buffer pools and BFS-style live catalog queries remain
-separate workload-triggered directions, not implied scope.
-
-### Next microkernel execution order (proposed)
-
-The next work should preserve the current copied-message and capability model
-while turning its synchronous composition into measurable fault domains. Each
-slice has an independent exit criterion:
-
-1. Complete the native trap-entry contract. Enumerate every Rust-calling
-   syscall, exception, timer, and external-IRQ gate on both architectures and
-   prove the required stack, saved-register set, interrupt mask, x86 DF/AC
-   normalization, AArch64 exception origin, and active-context publication
-   ordering. Native probes must exercise each distinct return/fault path; this
-   is a behavioral gate, not an unsafe-token count.
-2. Record the existing IPC baseline before changing scheduling. Measure empty,
-   64-byte, 256-byte, and 4 KiB calls after warmup, reporting architecture
-   counter ticks and p50/p95/p99/max latency together with copies, allocations, address-space
-   switches, TLB invalidations, timer programs, and completed calls. QEMU keeps
-   the event-count regression deterministic; latency claims require real
-   x86-64 and AArch64 hardware counters.
-3. Implement ADR 0032's portable blocked lifecycle, generation-checked wait
-   registrations, pending-operation identities, wake reasons, cancellation,
-   deadline, close/revoke, and teardown models. Exhaustive host tests must land
-   before any native scheduler change.
-4. Retain suspended KEX contexts and deferred replies in one bounded
-   composition-owned table. Convert timer sleep and UDP receive first, prove
-   lost-wakeup exclusion and non-spinning idle on both architectures, and keep
-   the current four-second synchronous ceiling as a compatibility maximum.
-5. Add the minimum copied client/server IPC primitives needed for one real user
-   server: receive, reply, generation-checked request tokens, and terminal peer
-   fate. Move the immutable diagnostics snapshot service first because it has
-   no device, DMA, filesystem, or mutation authority. A server fault must leave
-   the kernel alive, complete or cancel every pending client call exactly once,
-   revoke the server's handles, and reclaim its frames; automatic restart is a
-   later composition policy.
-6. Rerun the identical IPC matrix across in-kernel and isolated diagnostics
-   service paths. The first isolated path must have zero steady-state dynamic
-   allocation and explicit hard ceilings for retained requests and contexts.
-   Optimize only measured costs--copy count, direct handoff, timer programming,
-   address-space identifiers, or TLB work--without weakening reply ownership or
-   fault fate.
-
-Implementation status, 2026-08-26: slices 1–6 are complete. The trap-entry
-matrix and native probes are documented in `native-trap-entry-contract.md`; the
-host/native counter baseline is documented in `ipc-baseline.md`; and
-`troe-task` contains the preallocated wait/pending tables plus the portable
-blocked lifecycle and exhaustive transition tests. Kernel composition retains
-one preallocated suspended KEX context for timer/UDP commands, enters a distinct
-native deadline-idle mode, and resumes only after an exact scheduler wake. The
-four-platform native gate covers success, timeout, cancellation, non-spinning
-idle accounting, and exact frame return. Diagnostics now crosses a copied
-receive/reply boundary into a least-authority isolated KEX server with a
-generation-checked request token. Native acceptance faults that server after
-receive, proves exact frame/handle reclamation and one terminal client reply,
-then launches the normal server again. The isolated path now emits the same
-0/64/256/4096-byte matrix as the in-process dispatcher. The 4 KiB row exposes
-its required two-fragment v1 envelope, every row asserts zero allocator calls
-inside the protected receive-to-reply interval, and deterministic counters
-cover copies, root switches, full TLB invalidations, and lease programming on
-both architectures. Fixed kernel call buffers and caller-owned endpoint reply
-storage remove the measured transient allocations without weakening copied
-ownership or fault fate. Automatic restart, persistent server residency, and
-ASID/PCID retention remain later composition policies rather than hidden parts
-of this sequence.
-
-Only after these exits should a device-owning filesystem or network service
-move out of the kernel. Shared-memory grants, priority donation, SMP, and
-general mailboxes each require separate measurements and ownership decisions.
-
-## Stage 7.5: cloud platform separation (Phases A and B verified)
-
-QEMU remains the fast, deterministic acceptance backend; it must not define the
-meaning of either supported CPU architecture or the complete cloud VM contract.
-This stage separates three axes that the current machine crate partly
-conflates:
-
-- architecture: x86-64 or AArch64 CPU, MMU, exception, and context mechanisms;
-- platform: interrupt controller, timers, firmware tables, buses, UARTs, boot
-  media, and shutdown/reboot mechanisms; and
-- execution environment: emulator or named cloud/hypervisor VM.
-
-Physical boards, embedded/no-MMU targets, and a hardware lab are not part of
-the current product plan. The next portability target is a documented matrix of
-virtio-capable cloud VM platforms, with bounded ACPI, device-tree, or UEFI
-discovery where fixed QEMU resources are insufficient.
-
-Phases A and B complete items 1–6 for the two named discoverable QEMU
-contracts:
-
-1. introduce an explicit validated platform descriptor and split CPU mechanisms
-   from q35, QEMU `virt`, and other VM-platform resources;
-2. move MMIO bases, interrupt IDs/routes, timers, UART choice, framebuffer
-   metadata, and power control out of architecture-wide assumptions and obtain
-   them from a validated profile, ACPI, device tree, or UEFI handoff;
-3. retain `x86_64-q35-uefi` and `aarch64-virt-uefi` as pinned QEMU test profiles
-   and keep their complete deterministic acceptance matrix green;
-4. add bounded ACPI, device-tree, and UEFI discovery needed by named cloud VM
-   platforms, rejecting missing, ambiguous, overlapping, or unsupported
-   resources before volatile I/O or interrupt enable;
-5. define a multi-hypervisor/cloud acceptance matrix with exact firmware,
-   machine type, virtio transports, required features, and image contract; and
-6. run bounded boot, storage, networking, and lifecycle smoke tests for every
-   supported matrix entry while retaining exhaustive host/QEMU fault gates.
-
-Drivers remain capability-producing components selected by a platform
-descriptor; VM support must not leak fixed addresses or ambient device
-discovery into portable crates. Reusable UART, interrupt, block, network, PCI,
-and virtio drivers remain independently selectable.
-
-Exit: the production kernel reaches the recovery shell and passes bounded boot,
-storage, networking, lifecycle, persistence, and fault tests on both accepted
-discoverable QEMU matrix entries. Pinned split-media QEMU profiles remain
-regression environments; KVM and real provider rows remain unaccepted until
-their exact contracts pass independently. See
-[ADR 0016](adr/0016-hardware-targets-and-emulator-role.md).
-
-## Stage 8: networking and persistent operation (verified)
-
-The first portable storage/configuration boundary is landed:
-
-- `troe-block` provides owned or borrowed synchronous device capabilities,
-  checked subregions, exact request buffers, read/write authority, transfer and
-  alignment ceilings, explicit flush/FUA properties, and a one-request queue
-  bound enforced by exclusive borrowing;
-- `troe-gpt` performs bounded read-only GPT discovery with a canonical
-  protective MBR, independently checksummed primary and backup headers/arrays,
-  copy consistency, duplicate-ID and overlap rejection, strict entry bounds,
-  and validated UTF-16 names;
-- ADR 0007 now accepts native-principal, foreign-identity, mapping,
-  mount-policy, ACL, and fail-closed recovery rules before persistent writes;
-- `troe-vfs` exposes bounded provider reads plus truncate/append/sync and remove
-  hooks with namespace mount routing; `troe-fat` implements strict FAT32 with
-  mirrored FAT, BPB/backup/FSInfo, cycle, short-name, LFN validation, and
-  incremental cluster-chain create/append/remove; and
-- ADR 0017 fixes the first ext4 feature bitmap; `troe-ext4` implements its
-  clean, 4 KiB-block, depth-one extent profile with UUID selection,
-  CRC32C-protected superblock/group/inode/directory traversal, sparse-file
-  reads, metadata-preserving streamed mutation, bounded symbolic/hard
-  links, and hard group/inode/directory/file/read/name ceilings. Real-tool
-  interoperability fixtures are accepted by e2fsprogs/dosfstools checkers
-  before the ext4/FAT32 providers mount, list, and read them; and
-- `troe-config` implements checksummed SCFG v1 desired-system/service startup
-  policy with canonical dependencies, bounded health/restart behavior, explicit
-  predecessor fallback, and a mandatory immutable recovery environment; and
-- `troe-mount` implements the checksummed external BMNT v1.1 boot-side mount
-  manifest, bounded canonical role names, explicit whole-device/GPT selectors,
-  access, availability, and auto/manual activation policy, duplicate-selector
-  rejection, and deterministic exact stable-identity resolution for diskless,
-  matched, missing, and ambiguous media. `mount.kex` lists the policy and can
-  activate an already validated manual volume at runtime; and
-- `troe-virtio` implements the bounded modern single-request block profile, and
-  the AArch64 `virt` machine profile now discovers `virtio-mmio` block devices,
-  establishes an eight-entry split queue with explicit DMA ordering and
-  reset-before-return timeout safety, and completes a native post-handoff read
-  in QEMU acceptance; and
-- `troe-storage` shares native devices across exclusive synchronous region
-  capabilities, validates exact BMNT-selected GPT/ext4/FAT32 identities, and
-  grants only the read-only or read-write authority requested by BMNT. Both
-  QEMU fixtures mount the matched volume read-write at `/vol/root`; acceptance
-  creates, replaces, links, unlinks, flushes, reopens, and rereads content
-  through the live shell; and
-- the q35 front end discovers modern virtio PCI capabilities, validates and
-  maps their sized BAR regions, and drives the shared synchronous queue without
-  exposing PCI details above `troe-machine`; and
-- `troe-persist` implements the first writable durability primitive: a
-  four-block dual-slot record with data/flush/commit/flush ordering, exact
-  generation/checksum recovery, and host fault injection at every boundary;
-  PRGN v1 selects a strict four-block GPT partition by exact disk, unique
-  partition, and partition-type GUIDs; dedicated per-architecture QEMU media
-  exercise real native virtio writes and flushes across five process
-  termination/reopen cycles; SACT v1 now binds the TXSLOT payload to an exact
-  canonical SCFG generation, length, checksum, and SHA-256 content address and
-  revalidates that immutable configuration after every reopen; and
-- `troe-content` implements the bounded CSPK v1 immutable object pack with
-  canonical SHA-256 addressing, strict whole-pack and per-object verification,
-  binary lookup, deduplication, and budgeted mark-and-copy retention. Both
-  native acceptance paths borrow the BMNT-selected ext4 provider to read
-  `/system.cspk`, resolve its digest-bound SCFG, and only then publish or
-  recover its SACT pointer. The kernel embeds only the 128-byte bootstrap SACT
-  record, not the CSPK or SCFG bytes; and
-- GMAN v1 supplies checksummed immutable generation roots. Bounded traversal
-  rejects cycles, non-descending predecessors, missing objects, and kind
-  confusion before producing mark-and-copy roots. Native acceptance publishes
-  generation 2, applies its configured health failure, durably rolls back to
-  generation 1, and verifies the exact recovered SACT payload after every
-  subsequent process termination.
-- STFS v1 supplies the first writable filesystem provider: one bounded
-  `/state.bin` on its own exact PRGN-selected GPT region, with whole-filesystem
-  TXSLOT publication and explicit flushes. It mounts at `/vol/state`; both QEMU
-  profiles mutate it across five process terminations while the harness
-  independently checks transaction generation, STFS checksum, and file bytes.
-- `troe-net` supplies safe bounded Ethernet/ARP/IPv4/ICMP/UDP/TCP and DHCP
-  construction and parsing, checksum and fragment rejection, plus a
-  count-and-byte-bounded receive FIFO. Truncation and 10,000-frame flood tests
-  are host verified. Native fixed-buffer modern virtio-net queues run through
-  q35 PCI and AArch64 MMIO. Normal QEMU compositions now acquire an IPv4 lease,
-  run one ambient eight-frame checkpoint service that answers ARP and ICMP at
-  the idle prompt. Eight ARP records and eight persistent UDP ports are fixed
-  ceilings; every port drops newest beyond four datagrams or 4 KiB. Replaceable
-  `arp`, `net stats`, `udp send --source-port`, cancellable `udp listen`, and
-  one-connection outbound `tcp` surfaces sit on typed independent services. TCP
-  has four live slots, a 4 KiB per-connection receive FIFO, one unacknowledged
-  segment, exact sequence admission, and four fixed retransmissions. A monotonic
-  millisecond clock, cooperative
-  `sleep`, and Ctrl-C checkpoints prepare later applications and jobs without
-  adding them. The independent acceptance peer exchange remains the transport
-  regression gate; a separate TCP peer proves stream transfer and repeated
-  teardown.
-- `troe-identity` implements canonical checksummed IREG registry, IMAP foreign
-  mapping, IMNT mount-policy, and IACL native ACL formats under the accepted
-  Standard ceilings. It rejects every truncated/corrupted fixture,
-  duplicate compatibility and foreign keys, invalid SID/POSIX encodings,
-  missing or kind-incompatible principals, and iterative membership cycles.
-  ISEC v1 binds the four typed CSPK objects to GMAN; activation validates the
-  complete active and predecessor snapshots, and generation GC retains them as
-  transitive roots.
-
-These mechanisms are host verified; both VM block and network transports,
-policy-selected read-only/read-write mount activation, the bounded TXSLOT
-transaction, digest-bound ext4
-CSPK/SACT/ISEC recovery, selected state-filesystem mutation, and host UDP
-exchange are QEMU verified. Five independent fault-isolation processes per
-named platform revalidate the rolled-back generation-1 security snapshot and
-persist incremented state after deliberate terminal faults.
-
-ADR 0018 fixes the bootstrap semantics for the next storage increments. KEFS
-provides the immutable `/`, `/vol/root` is the selected persistent ext4 role,
-`/vol/boot` is the normally read-only EFI system partition, and additional
-configured media mounts below `/vol/<name>`. Host or installer tooling creates
-the filesystems and a bounded boot-side mount manifest. Native discovery must
-match its stable disk, partition, and filesystem identities exactly; no disk,
-several disks, duplicate identities, and missing/corrupt root media all retain
-the KEFS recovery shell without guessing from enumeration order or labels.
-
-Exit audit: the system boots both primary targets, configures one supported
-modern virtio NIC, exchanges UDP data with an independent host peer, persists
-activation and selected filesystem state across process termination/reopen, and
-holds declared memory ceilings under exhaustive truncation/checksum cases and a
-10,000-frame flood. Stage 8 is complete. Stage 9 deployment, update trust,
-diagnostics, migration, and broader filesystem/provider work must preserve the
-independently testable transport, region, provider, VFS, configuration, content,
-identity, and command boundaries established here.
-
-## Deferred tooling and packaging track
-
-The tooling/package architecture is documented now so early formats and
-interfaces do not foreclose it, but it is not part of the next three
-increments. Until loadable applications and persistence exist, Cargo,
-repository scripts, KEFS, and FAT images remain explicit bootstrap mechanisms,
-not public package or generation formats.
-
-ADR 0033 similarly separates future package-managed configuration from the
-bootstrap image: `/config` is writable desired intent, while `/sys/config` is
-the read-only configuration of the active immutable generation. The current
-KEFS `/etc` tree remains implementation reality until a deliberate recovery
-namespace migration; it is not a future package ABI.
-
-Hosted manifest, lock, and artifact validation may be prototyped before native
-application loading. Native execution begins with core Stage 7; a persistent
-store, system generations, and rollback begin with Stage 8; supported updates,
-registry trust, and deployment belong to Stage 9. See
-[../TOOLING-PACKAGING-SPEC.md](../TOOLING-PACKAGING-SPEC.md#511-alignment-with-the-core-roadmap).
-
-The Stage 8 storage direction is already bounded by
-[ADR 0009](adr/0009-persistent-filesystems-and-partitions.md): keep KEFS as the
-built-in recovery root and FAT12 as the current firmware container; introduce
-whole-device regions and read-only GPT discovery; and keep disk formats as
-separately selected filesystem modules. Read/write FAT32 and constrained ext4
-are implemented. General FAT12/16 and exFAT remain future removable-media
-interchange providers, while NTFS remains a later optional foreign provider.
-Ext4 is the default native persistent data provider. Partition creation remains
-host-side, and writable filesystem providers should move behind isolated
-service boundaries when the task/application model can support that transition.
-Separately licensed modules remain outside the default Apache-2.0 image and
-require explicit packaging and distribution review.
+This page tracks landed stages and the work that is still intentionally open.
+It is not a second architecture specification: current mechanics belong in
+[the architecture guide](architecture.md), serialized contracts belong in
+[formats](formats), and design rationale belongs in [ADRs](adr).
+
+Status words are used narrowly:
+
+- **complete** means the stage's stated exit is implemented and covered by its
+  named host or QEMU gate;
+- **in progress** means useful slices have landed but the stage exit is still
+  open; and
+- **planned** means groundwork is retained here, but the repository does not
+  claim the capability.
+
+## Landed foundation
+
+| Stage | Status | Durable outcome |
+| --- | --- | --- |
+| 0–1: portable model and UEFI | complete | One bounded shell/VFS model runs on the host and in x86-64 and AArch64 UEFI images. Deterministic KEFS generation, parser/filesystem tests, and serial acceptance are established. |
+| 2–3: owned machine and MMU | complete | The kernel exits boot services, owns allocation and native diagnostics, installs owned page tables, enforces W^X, and contains deliberate permission faults on both architectures. See [ADR 0005](adr/0005-memory-ownership-direction.md) and [ADR 0008](adr/0008-owned-page-tables-and-wx.md). |
+| 4–5: cooperative tasks and dispatch | complete | Bounded task records, guarded stacks, typed capabilities, synchronous copied request/reply, and exact teardown are implemented. See [ADR 0010](adr/0010-cooperative-tasks-and-guarded-stacks.md) and [ADR 0011](adr/0011-bounded-in-process-message-dispatch.md). |
+| 5.1–5.2: terminal and interrupt input | complete | The owned text console, bounded editor/history/completion, interrupt resources, input queues, native idle, x86 keyboard, and both serial paths are accepted. See [ADR 0012](adr/0012-native-text-console-and-editor-policy.md) and [ADR 0013](adr/0013-interrupt-driven-input-and-driver-resources.md). |
+| 6: task isolation | complete | Fresh ring-3/EL0 address spaces, copied-message validation, contained user faults, owner-scoped handle revocation, zeroization, and exact frame reclamation pass on both architectures. See [ADR 0014](adr/0014-unprivileged-task-isolation-and-teardown.md). |
+| 7: loadable applications | complete | Static KEX v1 applications run through ABI 1.1 with bounded leases, explicit handles, scheduler-controlled resume, fail-closed loading, and transactional teardown. See [ADR 0015](adr/0015-kex-application-abi-and-execution-bounds.md) and the [KEX format](formats/kex-v1.md). |
+| 7.5: platform separation | Phases A and B complete | CPU mechanisms are separated from named VM platforms. Pinned q35/`virt` profiles and two discoverable QEMU ACPI/FDT contracts pass the complete acceptance matrix. No real provider-cloud environment is accepted. See [ADR 0016](adr/0016-hardware-targets-and-emulator-role.md) and [cloud platform support](cloud-platform-support.md). |
+| 8: networking and persistence | complete | Bounded virtio block/network transports, stable volume selection, FAT32/ext4 providers, immutable generations, crash-consistent activation/rollback, StateFS mutation, identity metadata, UDP, DHCP, ICMP, and bounded outbound TCP are host- and QEMU-verified. The exact disk contracts remain in [formats](formats). |
+
+The detailed closure classification for all accepted decisions is maintained in
+the [ADR implementation ledger](adr/implementation-status.md). Completed stages
+remain listed here so their ordering and architectural dependencies are not
+lost, but their old patch-by-patch narratives are intentionally omitted.
+
+## Stage 9: production usability — in progress
+
+The first product-facing vertical slice is complete:
+
+- every ordinary shell command is an immutable KEX application; only `cd`,
+  `poweroff`, and `reboot` remain privileged intrinsics;
+- the repo-local Rust SDK, linker contract, `cargo kex` build/inspect workflow,
+  single-file KEX/KCAP packages, examples, and authoring skill are present;
+- typed filesystem, mutation, timer, diagnostics, datagram, observation, DHCP,
+  ICMP, and outbound-TCP services preserve least authority; and
+- command discovery and completion use the immutable `/bin` catalog, while
+  corrupt, absent, or faulting artifacts fail closed.
+
+This is not yet a production release. Stage 9 remains open until one named
+deployment can be installed, operated, updated, diagnosed, and recovered using
+supported procedures. The remaining exit work is:
+
+1. define registry trust roots, artifact signatures, revocation, provenance,
+   target locks, and stable machine-readable tooling schemas;
+2. ship supported install, update, rollback, garbage-collection,
+   crash-diagnostic, reproducible-release, and bounded data-migration flows;
+3. implement ADR 0033's writable desired configuration at `/config` and
+   generation-bound active projection at `/sys/config`, then deliberately
+   migrate the recovery-only KEFS `/etc` layout;
+4. document deployment-class threat models, hardening profiles, operational
+   limits, and a minimal recovery image; and
+5. decide whether an optional userspace BSD/POSIX facade materially improves
+   portability without replacing the typed native interfaces fixed by
+   [ADR 0034](adr/0034-typed-capability-handles-and-unix-compatibility.md).
+
+## Runtime and service evolution
+
+[ADR 0032](adr/0032-bounded-wait-channels-and-asynchronous-mailboxes.md) remains
+a staged decision, but its first six execution slices are complete. Portable
+wait/pending-call models, native deferred timer and UDP waits, bounded suspended
+contexts, an isolated diagnostics server, server-fault cleanup, and the
+in-process/isolated IPC counter matrix are implemented. The exact trap rules
+and measurement contract are preserved in [testing](testing.md).
+
+Still open:
+
+- add preallocated FIFO mailboxes only after two named non-test consumers need
+  queued complete messages;
+- support multiple independently scheduled live KEX applications and define
+  persistent-server and restart policy before moving a device-owning service
+  out of the kernel; and
+- consider ASID/PCID retention, priority donation, shared-memory grants,
+  preemption, SMP, background jobs, or concurrent pipelines only through
+  separate measurements and ownership decisions.
+
+The existing synchronous service `PortId` remains a service endpoint. A future
+queued object is a mailbox, not a silent semantic expansion of that endpoint.
+
+## Dynamic linking and reusable runtimes — planned
+
+KEX applications are self-contained static images. Dynamic linking is a named
+milestone because importing an ambient ELF loader would weaken the current
+single-file and bounded-validation properties.
+
+Any accepted design must:
+
+- permit one self-contained package with pinned shared objects while allowing
+  immutable content-addressed deduplication;
+- make architecture, ABI, dependency, and symbol versions explicit and bound
+  depth, object, symbol, relocation, and byte counts;
+- preserve W^X and read-only-after-relocation state, grant libraries no
+  authority independent of their application, and reclaim every page exactly;
+- define reviewed x86-64 and AArch64 relocation subsets with negative corpora
+  and native teardown/reuse gates; and
+- let the SDK reproduce and inspect a package without ambient host libraries
+  or paths.
+
+A future decision must choose the KEX container revision and whether relocation
+belongs in a small userspace runtime, hosted packaging, or a narrowly scoped
+kernel mechanism. Until then, libc and Lua components remain statically linked.
+
+## Platform expansion — planned per environment
+
+TROE support is an exact `(platform, environment)` claim. The accepted runtime
+matrix currently contains only the four named QEMU contracts documented in
+[cloud platform support](cloud-platform-support.md). QEMU with KVM and provider
+clouds remain unaccepted until their exact firmware, storage/network drivers,
+image-import contract, and real-instance lifecycle evidence exist. Physical
+boards, USB/SD bring-up, and no-MMU targets are outside the current product
+roadmap.
+
+## Tooling and packaging — planned beyond the bootstrap SDK
+
+[The tooling and packaging specification](../TOOLING-PACKAGING-SPEC.md) is
+forward-looking design, not a list of commands that work today. Cargo,
+repository scripts, the KEX SDK, KCAP manifests, and deterministic image tools
+are the current bootstrap surface. A public package registry, trusted
+generation publication, native `troe` package CLI, and package-managed
+configuration remain Stage 9 work and must reuse the implemented content,
+identity, rollback, and typed-authority boundaries rather than invent parallel
+ones.
+
+General FAT12/16 and exFAT, NTFS, journal replay, repair, dynamic filesystem
+providers, and broader authorization policy remain separately scoped storage
+decisions. Read/write FAT32, the constrained ext4 profile, and StateFS are the
+implemented providers; their presence does not imply the broader formats.

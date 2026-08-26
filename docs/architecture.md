@@ -92,7 +92,7 @@ The shell reserves `cd`, `poweroff`, and `reboot` as its only non-shadowable int
 `cd` owns the logical working-directory transition, while both terminal machine
 actions consume only the shell's machine-control grant. KEX command discovery
 resolves every ordinary command from exact immutable architecture-specific
-paths, but cannot intercept intrinsic names; ABI 1.0
+paths, but cannot intercept intrinsic names; ABI 1.1
 exposes no platform-transition operation.
 
 Native KEX interfaces follow ADR 0034: opaque handles share generation,
@@ -387,3 +387,91 @@ Initial partition support is discovery rather than management: accept a whole
 device or validate a bounded GPT layout created by host/installer tooling. No
 filesystem provider can address blocks outside its granted region. See
 [ADR 0009](adr/0009-persistent-filesystems-and-partitions.md).
+
+## Native machine invariants
+
+These implementation details are recorded here because a portable refactor can
+erase them while leaving high-level interfaces apparently unchanged. Any change
+to interrupt entry, idle waiting, controller setup, isolated execution, or a
+named machine profile must review ADRs 0013, 0014, and 0016, the native contract
+tests, and all four exhaustive QEMU platform suites together. q35 and QEMU
+`virt` are exact profiles, not generic x86-64 or AArch64 contracts.
+
+### Shared ordering
+
+- Allocate the complete raw-input queue before enabling a source, controller
+  route, or CPU interrupt class. An ISR drains at most the selected budget,
+  acknowledges delivery even when the drop-newest queue is full, and leaves
+  decoding to main context.
+- Configure a network route while its transport and controller source are
+  masked. Publish ISR state before unmasking. Teardown reverses that order and
+  confirms device reset before DMA storage can drop.
+- Map controller, UART, and transport apertures RW/NX as device memory before
+  volatile access. Never retain a normal-memory alias to device pages.
+- Main-context queue access keeps the owned IRQ class masked. The proof is
+  single-CPU and must be replaced before SMP. Polling is limited to bootstrap
+  and terminal fatal output; the normal shell uses interrupt delivery.
+- Application entry publishes the complete kernel return context before user
+  IRQ delivery. Completion masks IRQs, disables the lease, restores the kernel
+  root, invalidates stale translations, unpublishes the active record, and only
+  then re-enables delivery.
+- Validate the entry, stack, and complete message range against retained user
+  mappings before copying any byte. User privilege never receives a device
+  mapping or writable/executable alias.
+
+### x86-64 q35 profile
+
+- Both legacy PICs stay masked. LAPIC/I/O APIC bounds come from the reported
+  controller topology; q35 IRQ1 and IRQ4 route to explicit non-exception IDT
+  vectors targeting the BSP.
+- Rust-calling entries preserve the required GPR and FXSAVE state, execute
+  `cld`, and clear application-controlled AC before Rust. Device service
+  precedes LAPIC EOI; the spurious vector returns without EOI.
+- Empty-queue idle remains the single ordered `sti; hlt; cli` transition.
+  Splitting it recreates a lost-wakeup window.
+- User mappings require U/S on every traversal entry and terminal PTE. TSS RSP0
+  and user descriptors precede ring-3 entry; SMEP and SMAP are enabled, while
+  inherited LA57, CET, supervisor protection keys, `SYSCALL`, `SYSENTER`, and
+  FSGSBASE state are rejected or disabled before userspace.
+- The bounded q35 scanner covers bus zero, validates/de-loops modern virtio PCI
+  capabilities, probes BAR sizes with decode disabled, restores configuration,
+  and maps only the referenced page-rounded spans. Block and network queues use
+  fixed modern-v1 contracts and reset-before-DMA-drop teardown.
+- `poweroff` and `reboot` use q35 profile resources. Their I/O ports are not
+  architecture defaults and another platform must supply validated equivalents.
+
+### AArch64 QEMU `virt` profile
+
+- The pinned profile uses GICv2. Distributor loops are bounded by
+  `GICD_TYPER`; PL011 INTID 33 and each virtio SPI are validated before enable.
+  GICv3 or a different firmware security state requires a distinct review.
+- The IRQ vector preserves x0–x30, q0–q31, FPCR/FPSR, and the saved exception
+  origin before Rust. Synchronous, FIQ, and SError paths that are not the lower
+  application gate remain fatal.
+- Idle keeps PSTATE.I set for `dsb sy; wfi`, briefly unmasks after wake so the
+  pending GIC interrupt dispatches, then masks again before checking queues.
+  Unmasking before `wfi` recreates a lost-wakeup race.
+- EL0 mappings use distinct AP/PXN/UXN policy. Copied messages use unprivileged
+  loads while PAN is active; return restores TTBR0_EL1 and completes the global
+  invalidation before Rust resumes.
+- The profile maps only its documented virtio-MMIO aperture, accepts modern
+  devices, uses page-aligned live queue memory and outer-shareable DMA barriers,
+  and parks on an unconfirmed reset rather than allowing DMA to outlive storage.
+- PSCI 1.0 HVC supplies terminal poweroff and reboot. An unexpected PSCI return
+  falls back to the terminal CPU park path.
+
+### Platform separation and regression evidence
+
+`cfg(target_arch)` selects instruction-set mechanisms, never a VM. Each named
+platform descriptor supplies or validates firmware, memory, interrupt, timer,
+console, storage/network transport, and lifecycle facts before typed resources
+are constructed. The discoverable x86 QEMU contract uses bounded ACPI; the
+discoverable AArch64 contract uses the edk2-published FDT. Both consume the
+combined raw bundle and pass persistence, networking, lifecycle, and fault
+acceptance. See [ADR 0016](adr/0016-hardware-targets-and-emulator-role.md) and
+[cloud platform support](cloud-platform-support.md).
+
+Short smoke runs are insufficient for these invariants. The exhaustive paced
+serial workload has caught an AArch64 unmask-before-`wfi` race that short boots
+did not reproduce. Fault, W^X, guard, fatal-console, non-reboot, input-drop, and
+idle/wakeup assertions remain enabled because their entry paths share state.

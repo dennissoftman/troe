@@ -3,7 +3,7 @@
 **Status:** Draft design specification  
 **Version:** 0.1.0  
 **Primary targets:** QEMU `x86_64`, QEMU `aarch64`  
-**Future targets:** named x86-64 and AArch64 cloud VM platforms
+**Future targets:** named x86-64 and AArch64 provider-cloud VM platforms
 **Implementation language:** Rust (`no_std`)  
 
 **Implementation status:** Stages 0–8 are implemented. Stage 8 includes bounded
@@ -11,8 +11,11 @@ native block/network transports, deterministic persistent-volume selection,
 immutable generation content, crash-consistent activation/rollback and selected
 state mutation, plus generation-bound identity/mapping metadata. Stage 7 includes
 the portable KEX parser/load-plan policy, native
-validate/map/reclaim transactions, all three ABI 1.0 calls, contained fault
-fates, and enforced 50 ms execution leases. See
+validate/map/reclaim transactions, the complete ABI 1.1 boundary, contained
+fault fates, and enforced 50 ms execution leases. A product-facing Stage 9
+slice supplies KEX-only ordinary commands, typed application services, and the
+repo-local SDK; supported deployment, update trust, and package management are
+still open. See
 [docs/roadmap.md](docs/roadmap.md).
 
 The product name is TROE (Tiny Rust Operating Environment), and `troe` is the
@@ -144,7 +147,7 @@ There is:
 Ordinary commands are target-native immutable KEX files, not privileged shell
 functions. The shell registry retains only names/synopses and the three
 intrinsics; the kernel resolver validates, maps, services, and tears down each
-application through ABI 1.0.
+application through ABI 1.1.
 
 ## 7. Boot strategy
 
@@ -338,7 +341,7 @@ names MUST NOT be shadowed or replaced by a KEX application. `cd` mutates
 shell-owned session state and therefore executes in the invoking shell. The two
 terminal actions remain behind the shell's explicit machine-control capability;
 ordinary KEX applications cannot acquire that authority or invoke an intrinsic
-through application ABI 1.0. No ordinary command has a privileged fallback.
+through application ABI 1.1. No ordinary command has a privileged fallback.
 
 ### 11.3 Required commands
 
@@ -461,7 +464,7 @@ Quota exhaustion MUST return `NoSpace` without destabilizing unrelated subsystem
 - Symlinks are initially absent, eliminating link traversal cycles.
 - Directory order exposed by `ls` MUST be deterministic.
 
-### 12.6 Identity and foreign filesystem metadata (TBD)
+### 12.6 Identity and foreign filesystem metadata
 
 Persistent and external filesystem support MUST NOT assume that a raw numeric
 UID/GID, a Windows SID, or a familiar account name is proof of a local system
@@ -479,12 +482,13 @@ distinguishable and inspectable; they MUST NOT silently collapse to a local
 user, group, administrator, or all-powerful fallback identity. Translation
 that is approximate or lossy must be reported explicitly.
 
-The exact principal representation, group model, mapping-domain format,
-authorization descriptor, copy/archive behavior, and fail-closed rules require
-a focused ADR before a persistent writable filesystem, foreign-filesystem
-write support, or stable VFS metadata ABI is accepted. The proposed direction
-and unresolved questions are recorded in
-[ADR 0007](docs/adr/0007-identity-and-foreign-filesystem-mapping.md).
+[ADR 0007](docs/adr/0007-identity-and-foreign-filesystem-mapping.md) accepts the
+native-principal, foreign-identity, mapping, mount-policy, ACL, and fail-closed
+direction. [Identity security v1](docs/formats/identity-v1.md) fixes the current
+IREG/IMAP/IMNT/IACL/ISEC serialization and generation binding. A broader
+multi-principal authorization engine, stable security-metadata VFS surface, and
+additional foreign writers require their own decisions; implemented metadata
+formats do not silently grant those capabilities.
 
 ### 12.7 Persistent filesystem modules and partitions
 
@@ -968,32 +972,27 @@ explicit, and all owned resources are revoked, zeroed, and reclaimed.
 
 **Status:** implemented from the design accepted by
 [ADR 0015](docs/adr/0015-kex-application-abi-and-execution-bounds.md). The
-portable KEX plan, native transaction, complete ABI 1.0 gate, scheduler-owned
+portable KEX plan, native transaction, complete ABI 1.1 gate, scheduler-owned
 resume, copied handle dispatch, contained call/fault fates, and execution lease
-are active on both primary architectures.
-
-The kernel/security exit criterion is complete. Loading KEX files from a
-mounted filesystem or shell command, providing hosted SDK `build`/`run`/`inspect`
-flows, and defining package-manifest and target-lock formats are explicitly
-deferred integration work. They do not block Stage 7.5 or Stage 8; the
-authoritative order for resuming work is recorded in
-[docs/roadmap.md](docs/roadmap.md#stage-75-cloud-platform-separation-phase-a-implemented-phase-b-planned).
+are active on both primary architectures. The shell loads immutable
+architecture-specific `/bin/<command>.kex` packages, validates their embedded
+KCAP manifests, and grants only declared typed services. The repo-local Rust
+SDK and `cargo kex` build/inspect workflow are implemented. Registry trust,
+target locks, and signed publication remain Stage 9 work.
 
 - Load target-specific static KEX v1 artifacts selected by ADR 0015; keep ELF as
   a hosted toolchain interchange format rather than a kernel input.
 - Validate every header, segment, permission, alignment, relocation, entry point, and address range before mapping.
 - Give each application an explicit set of handles/capabilities and a bounded memory budget.
-- Implement the small versioned application ABI 1.0 independently of POSIX.
+- Implement the small versioned application ABI 1.1 independently of POSIX.
 - Provide application startup, exit status, fault reporting, and resource reclamation.
 - Support architecture-native binaries; cross-architecture instruction emulation is not required.
 - Keep the immutable target-selected KEX root available for recovery.
-- Before released tooling consumes them, define a versioned
-  application/package manifest and target-specific lock format and validate
-  immutable artifacts on the host using the native boundary's rules.
-- Introduce the first native SDK and hosted `troe build`, `troe run`,
-  `troe inspect`, and `troe explain` flows without granting the tooling client
-  ambient system authority; this is deferred integration rather than part of
-  the completed kernel exit criterion.
+- Bind executable and least-authority manifest into one validated KEX package;
+  keep target locks, signatures, and publication metadata outside reserved
+  format bytes until their Stage 9 contracts are accepted.
+- Maintain the repo-local native SDK and hosted build/inspect tools without
+  granting the tooling client ambient system authority.
 
 Dynamic linking is optional and SHOULD follow a working static executable format rather than ship with the first loader.
 
@@ -1001,9 +1000,10 @@ Dynamic linking is optional and SHOULD follow a working static executable format
 
 ### Stage 7.5 — Cloud platform separation
 
-**Status:** Phase A platform separation implemented; Phase B cloud discovery
-and named matrix entries planned under
-[ADR 0016](docs/adr/0016-hardware-targets-and-emulator-role.md).
+**Status:** Phases A and B are implemented for two exact discoverable QEMU
+contracts under
+[ADR 0016](docs/adr/0016-hardware-targets-and-emulator-role.md). KVM and real
+provider-cloud rows remain unaccepted until their own contracts pass.
 
 - Separate reusable x86-64/AArch64 CPU mechanisms from platform integration and
   execution-environment selection.
@@ -1062,10 +1062,14 @@ Configured health failure rolls generation 2 back durably to generation 1.
 
 ### Stage 9 — Production usability
 
-**Status:** not implemented.
+**Status:** in progress. The KEX-only ordinary-command set, typed application
+services, repo-local SDK, and deterministic deployment-bundle tooling form a
+complete vertical slice. Supported installation, updates, registry trust,
+configuration activation, diagnostics, and recovery procedures remain open;
+see [the implementation roadmap](docs/roadmap.md#stage-9-production-usability--in-progress).
 
-- Establish a supported native application SDK and versioned ABI policy.
-- Add selected utilities and services driven by real use cases.
+- Stabilize the native application SDK and versioned ABI policy for a release.
+- Expand utilities and services only from bounded, measured use cases.
 - Decide whether ADR 0034's optional userspace BSD/POSIX facade materially
   improves portability without turning its universal descriptor vocabulary
   into the native kernel ABI.
@@ -1081,7 +1085,10 @@ Configured health failure rolls generation 2 back durably to generation 1.
 
 **Exit criterion:** a named end-to-end deployment can be installed, operated, updated, diagnosed, and recovered using documented procedures.
 
-Preemption, SMP, external filesystems, networking, executable loading, and POSIX subsets each require focused proposals and security review. They are part of the intended post-MVP design space, but no specific implementation is implied merely by completing an earlier stage.
+Preemption, SMP, additional filesystem profiles, dynamic linking, broader
+network protocols, and POSIX subsets each require focused proposals and
+security review. No specific expansion is implied merely by completing an
+earlier stage.
 
 ## 24. API evolution rule
 
