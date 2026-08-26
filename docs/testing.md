@@ -114,8 +114,9 @@ After changing code or tests:
    and add selector regression tests with that rule.
 4. Use an individual `--scenario` while diagnosing or iterating inside one
    known subsystem. Return to the selector after the change is complete.
-5. Before declaring a branch merge-ready, require the successful `full-test`
-   workflow or run `python3 scripts/test.py` in the pinned local environment.
+5. Before declaring a branch merge-ready, run `python3 scripts/test.py` in the
+   pinned local environment and retain the result in the maintainer's local
+   release notes or terminal log.
 
 Never infer that an unchanged file makes its tests irrelevant. Tests may be
 selected through reverse dependencies, generated inputs, package formats, or
@@ -304,10 +305,11 @@ kernel allocations were removed and the endpoint copies directly into
 caller-owned bounded storage. Reply ownership, token generation checks,
 server-fault fate, and teardown are unchanged.
 
-## Merge gate
+## Maintainer release gate
 
-`.github/workflows/full-test.yml` runs the exhaustive command on a self-hosted
-macOS runner labelled `troe-qemu-11-1`. That runner must provide Rust 1.97.1,
-QEMU 11.1.0, the committed `edk2-stable202605-r1` firmware bytes,
-`cargo-audit` 0.22.1, e2fsprogs 1.47.4, dosfstools, and mtools. Repository branch
-protection should require the `exhaustive pinned gate` check.
+The repository intentionally has no GitHub Actions workflow. The maintainer
+runs `python3 scripts/test.py --require-filesystem-tools` locally before a merge
+or release. The pinned environment must provide Rust 1.97.1, QEMU 11.1.0, the
+committed `edk2-stable202605-r1` firmware bytes, `cargo-audit` 0.22.1,
+e2fsprogs 1.47.4, dosfstools, and mtools. The focused selector is a development
+aid and does not replace this maintainer-owned exhaustive gate.
