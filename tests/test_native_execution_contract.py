@@ -11,6 +11,9 @@ MMU_SOURCE = (REPO_ROOT / "crates/troe-machine/src/mmu.rs").read_text(
     encoding="utf-8"
 )
 KERNEL_SOURCE = (REPO_ROOT / "kernel/src/main.rs").read_text(encoding="utf-8")
+CONTRACT_SOURCE = (REPO_ROOT / "docs/native-trap-entry-contract.md").read_text(
+    encoding="utf-8"
+)
 
 
 def source_between(source: str, start: str, end: str) -> str:
@@ -48,6 +51,137 @@ class NativeExecutionContractTests(unittest.TestCase):
             '"popfq"',
             '"call {handler}"',
         )
+
+    def test_every_rust_calling_x86_gate_normalizes_df_and_ac(self) -> None:
+        gates = (
+            (
+                'extern "C" fn x86_isolated_syscall_entry()',
+                'extern "C" fn x86_isolated_syscall_handler(',
+            ),
+            (
+                'extern "C" fn x86_execution_timer_entry()',
+                'extern "C" fn x86_execution_timer_handler(',
+            ),
+            (
+                'extern "C" fn x86_input_interrupt_entry()',
+                'extern "C" fn x86_input_interrupt_handler()',
+            ),
+            (
+                'extern "C" fn x86_exception_no_error_entry()',
+                'extern "C" fn x86_exception_error_entry()',
+            ),
+            (
+                'extern "C" fn x86_exception_error_entry()',
+                'extern "C" fn x86_exception_dispatch(',
+            ),
+            (
+                'extern "C" fn x86_page_fault_entry()',
+                'extern "C" fn x86_page_fault_dispatch(',
+            ),
+        )
+        for start, end in gates:
+            with self.subTest(gate=start):
+                entry = source_between(MMU_SOURCE, start, end)
+                require_order(
+                    self,
+                    entry,
+                    '"cld"',
+                    '"pushfq"',
+                    '"btr qword ptr [rsp], 18"',
+                    '"popfq"',
+                    '"call {',
+                )
+
+    def test_resumable_native_irq_frames_save_complete_visible_state(self) -> None:
+        x86 = source_between(
+            MMU_SOURCE,
+            'extern "C" fn x86_input_interrupt_entry()',
+            'extern "C" fn x86_input_interrupt_handler()',
+        )
+        require_order(
+            self,
+            x86,
+            '"push rax"',
+            '"push r15"',
+            '"fxsave64 [rsp]"',
+            '"call {handler}"',
+            '"fxrstor64 [rsp]"',
+            '"pop r15"',
+            '"pop rax"',
+            '"iretq"',
+        )
+
+        aarch64 = source_between(
+            MMU_SOURCE,
+            '"troe_aarch64_irq_entry:"',
+            "isolated_complete = sym aarch64_isolated_complete",
+        )
+        require_order(
+            self,
+            aarch64,
+            '"msr daifset, #2"',
+            '"stp q0, q1, [sp, #272]"',
+            '"stp q30, q31, [sp, #752]"',
+            '"stp x0, x1, [sp, #0]"',
+            '"str x30, [sp, #240]"',
+            '"bl troe_aarch64_input_interrupt"',
+            '"ldp q0, q1, [sp, #272]"',
+            '"ldp q30, q31, [sp, #752]"',
+            '"ldp x0, x1, [sp, #0]"',
+            '"ldr x30, [sp, #240]"',
+            '"eret"',
+        )
+
+    def test_aarch64_suspended_context_preserves_thread_pointer(self) -> None:
+        context = source_between(
+            MMU_SOURCE,
+            "struct ArchitectureApplicationContext {",
+            "pub struct ApplicationSession",
+        )
+        self.assertIn("thread_pointer: u64", context)
+        self.assertIn("thread_pointer) == 808", context)
+
+        lower_sync = source_between(
+            MMU_SOURCE,
+            '"troe_aarch64_lower_sync_entry:"',
+            '"troe_aarch64_isolated_complete_entry:"',
+        )
+        require_order(
+            self,
+            lower_sync,
+            '"mrs x9, tpidr_el0"',
+            '"str x9, [sp, #808]"',
+            '"bl troe_aarch64_isolated_syscall"',
+        )
+        resume = source_between(
+            MMU_SOURCE,
+            "unsafe extern \"C\" fn aarch64_resume_application(",
+            "extern \"C\" fn aarch64_isolated_complete()",
+        )
+        require_order(
+            self,
+            resume,
+            '"ldr x9, [x11, #808]"',
+            '"msr tpidr_el0, x9"',
+            '"eret"',
+        )
+        self.assertIn("native-thread-pointer-aarch64.kex", KERNEL_SOURCE)
+
+    def test_documented_matrix_enumerates_every_native_gate(self) -> None:
+        for gate in (
+            "x86_isolated_syscall_entry",
+            "x86_execution_timer_entry",
+            "x86_input_interrupt_entry",
+            "x86_exception_no_error_entry",
+            "x86_exception_error_entry",
+            "x86_page_fault_entry",
+            "x86_spurious_interrupt_entry",
+            "troe_aarch64_exception_entry",
+            "troe_aarch64_lower_sync_entry",
+            "troe_aarch64_irq_entry",
+        ):
+            with self.subTest(gate=gate):
+                self.assertIn(f"`{gate}`", CONTRACT_SOURCE)
 
     def test_aarch64_irq_passes_exception_origin_to_timer_handler(self) -> None:
         vectors = source_between(

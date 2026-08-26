@@ -49,6 +49,7 @@ native-spin-aarch64.kex	aarch64	ok
 native-heap-growth-limit-aarch64.kex	aarch64	ok
 native-invalid-call-aarch64.kex	aarch64	ok
 native-unexpected-return-aarch64.kex	aarch64	ok
+native-thread-pointer-aarch64.kex	aarch64	ok
 valid-standard-max-records-aarch64.kex	aarch64	ok
 valid-standard-max-span-aarch64.kex	aarch64	ok
 valid-standard-max-pages-aarch64.kex	aarch64	ok

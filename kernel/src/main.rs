@@ -733,6 +733,8 @@ mod firmware {
         Spin,
         #[cfg(feature = "acceptance-probes")]
         HeapGrowthLimit,
+        #[cfg(all(feature = "acceptance-probes", target_arch = "aarch64"))]
+        ThreadPointer,
         #[cfg(feature = "acceptance-probes")]
         InvalidCall,
         #[cfg(feature = "acceptance-probes")]
@@ -747,6 +749,8 @@ mod firmware {
                 Self::Spin => Some(TaskFault::ExecutionLeaseExpired),
                 #[cfg(feature = "acceptance-probes")]
                 Self::HeapGrowthLimit => Some(TaskFault::ExecutionLeaseExpired),
+                #[cfg(all(feature = "acceptance-probes", target_arch = "aarch64"))]
+                Self::ThreadPointer => None,
                 #[cfg(feature = "acceptance-probes")]
                 Self::InvalidCall => Some(TaskFault::InvalidCall),
                 #[cfg(feature = "acceptance-probes")]
@@ -2045,31 +2049,21 @@ mod firmware {
                 unexpected_return,
                 ApplicationProbe::UnexpectedReturn,
             )?;
-            let heap_growth_limit = native_kex_artifact(ApplicationProbe::HeapGrowthLimit);
-            let command_services = [CommandStartupService {
-                port,
-                interface: APPLICATION_INTERFACE_ECHO,
-                major: 1,
-                minor: 0,
-            }];
-            if run_command_application(
-                scheduler,
-                accounting,
-                &mut dispatcher,
-                &command_services,
-                heap_growth_limit,
-            )? != CommandApplicationOutcome::Faulted(TaskFault::ExecutionLeaseExpired)
-            {
-                return Err(());
-            }
+            #[cfg(target_arch = "aarch64")]
+            verify_application_thread_pointer(scheduler, accounting, &mut dispatcher, port, first)?;
+            verify_application_heap_growth_limit(scheduler, accounting, &mut dispatcher, port)?;
             (reused, invalid_reused, return_reused)
         };
 
+        #[cfg(not(all(feature = "acceptance-probes", target_arch = "aarch64")))]
+        let expected_yields = baseline_tasks.yields.checked_add(1).ok_or(())?;
+        #[cfg(all(feature = "acceptance-probes", target_arch = "aarch64"))]
+        let expected_yields = baseline_tasks.yields.checked_add(2).ok_or(())?;
         if accounting.frames.free_frames() != baseline_frames
             || scheduler.stats().owned_address_spaces != baseline_tasks.owned_address_spaces
             || scheduler.stats().owned_isolation_pages != baseline_tasks.owned_isolation_pages
             || scheduler.stats().owned_handles != baseline_tasks.owned_handles
-            || scheduler.stats().yields != baseline_tasks.yields.checked_add(1).ok_or(())?
+            || scheduler.stats().yields != expected_yields
             || dispatcher.stats().live_handles != 1
         {
             return Err(());
@@ -2102,6 +2096,50 @@ mod firmware {
             }
         }
         Ok(())
+    }
+
+    #[cfg(all(feature = "acceptance-probes", target_arch = "aarch64"))]
+    fn verify_application_thread_pointer(
+        scheduler: &mut Scheduler,
+        accounting: &mut OwnedAccounting,
+        dispatcher: &mut Dispatcher<'_>,
+        port: troe_dispatch::PortId,
+        expected_allocation: u64,
+    ) -> Result<(), ()> {
+        let source = native_kex_artifact(ApplicationProbe::ThreadPointer);
+        let allocation = load_and_reclaim_application(
+            scheduler,
+            accounting,
+            dispatcher,
+            port,
+            source,
+            ApplicationProbe::ThreadPointer,
+        )?;
+        if allocation == expected_allocation {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+
+    #[cfg(feature = "acceptance-probes")]
+    fn verify_application_heap_growth_limit(
+        scheduler: &mut Scheduler,
+        accounting: &mut OwnedAccounting,
+        dispatcher: &mut Dispatcher<'_>,
+        port: troe_dispatch::PortId,
+    ) -> Result<(), ()> {
+        let services = [CommandStartupService {
+            port,
+            interface: APPLICATION_INTERFACE_ECHO,
+            major: 1,
+            minor: 0,
+        }];
+        let source = native_kex_artifact(ApplicationProbe::HeapGrowthLimit);
+        match run_command_application(scheduler, accounting, dispatcher, &services, source)? {
+            CommandApplicationOutcome::Faulted(TaskFault::ExecutionLeaseExpired) => Ok(()),
+            CommandApplicationOutcome::Exited(_) | CommandApplicationOutcome::Faulted(_) => Err(()),
+        }
     }
 
     #[cfg(feature = "acceptance-probes")]
@@ -2360,6 +2398,34 @@ mod firmware {
                         ApplicationProbe::Calls,
                         troe_machine::ApplicationOutcome::Exited { status: 0 },
                     ) if observed_yield && observed_call => {
+                        scheduler.exit_current(task_id, 0).map_err(|_| ())?;
+                        break;
+                    }
+                    #[cfg(all(feature = "acceptance-probes", target_arch = "aarch64"))]
+                    (
+                        ApplicationProbe::ThreadPointer,
+                        troe_machine::ApplicationOutcome::Yielded(application),
+                    ) if !observed_yield => {
+                        scheduler.yield_current(task_id).map_err(|_| ())?;
+                        if scheduler
+                            .dispatch_next(Capabilities::SERVICE)
+                            .map_err(|_| ())?
+                            != Some(task_id)
+                        {
+                            return Err(());
+                        }
+                        observed_yield = true;
+                        outcome = troe_machine::resume_application(
+                            application,
+                            troe_machine::ApplicationResume::Yield,
+                        )
+                        .map_err(|_| ())?;
+                    }
+                    #[cfg(all(feature = "acceptance-probes", target_arch = "aarch64"))]
+                    (
+                        ApplicationProbe::ThreadPointer,
+                        troe_machine::ApplicationOutcome::Exited { status: 0 },
+                    ) if observed_yield => {
                         scheduler.exit_current(task_id, 0).map_err(|_| ())?;
                         break;
                     }
@@ -3286,6 +3352,10 @@ mod firmware {
                 {
                     include_bytes!("../../tests/kex-corpus/native-heap-growth-limit-aarch64.kex")
                 }
+            }
+            #[cfg(all(feature = "acceptance-probes", target_arch = "aarch64"))]
+            ApplicationProbe::ThreadPointer => {
+                include_bytes!("../../tests/kex-corpus/native-thread-pointer-aarch64.kex")
             }
             #[cfg(feature = "acceptance-probes")]
             ApplicationProbe::InvalidCall => {

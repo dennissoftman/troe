@@ -17,6 +17,13 @@ else:
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT = REPO_ROOT / "tests" / "kex-corpus"
 ACCEPTANCE_MARKER = b"KEX-ACCEPTANCE-DESTRUCTIVE-v1\0"
+
+
+def _aarch64_words(*words: int) -> bytes:
+    """Encode a small reviewed AArch64 acceptance program."""
+    return b"".join(struct.pack("<I", word) for word in words)
+
+
 NATIVE_CODE = {
     "x86_64": {
         "calls": bytes.fromhex(
@@ -44,6 +51,23 @@ NATIVE_CODE = {
         "spin": bytes.fromhex("00000014"),
         "heap-growth-limit": bytes.fromhex(
             "680080d200008092e1031faae2031faae3031faae4031faa010000d4f9ffff17"
+        ),
+        "thread-pointer": _aarch64_words(
+            0xD28A_CF09,  # mov x9, #0x5678
+            0xD51B_D049,  # msr tpidr_el0, x9
+            0xD280_0028,  # mov x8, #1 (yield)
+            0xD400_0001,  # svc #0
+            0xD53B_D04A,  # mrs x10, tpidr_el0
+            0xD28A_CF09,  # mov x9, #0x5678
+            0xEB09_015F,  # cmp x10, x9
+            0x5400_0081,  # b.ne failure
+            0xD280_0000,  # mov x0, #0
+            0xD280_0008,  # mov x8, #0 (exit)
+            0xD400_0001,  # svc #0
+            0xD280_0020,  # failure: mov x0, #1
+            0xD280_0008,  # mov x8, #0 (exit)
+            0xD400_0001,  # svc #0
+            0xD420_0000,  # brk #0
         ),
         "invalid-call": bytes.fromhex("680080d2010000d4000020d4"),
         "unexpected-return": bytes.fromhex("c0035fd6"),
@@ -318,6 +342,19 @@ def generate_corpus() -> dict[str, bytes]:
             valid_rows.append(
                 f'    ("{name}", include_bytes!("{name}") as &[u8], '
                 f"Target::{'X86_64' if target == 'x86_64' else 'Aarch64'}),"
+            )
+
+        if target == "aarch64":
+            probe = "thread-pointer"
+            artifact = _canonical(
+                target, NATIVE_CODE[target][probe] + ACCEPTANCE_MARKER
+            )
+            name = f"native-{probe}-{target}.kex"
+            files[name] = artifact
+            manifest.append(f"{name}\t{target}\tok")
+            valid_rows.append(
+                f'    ("{name}", include_bytes!("{name}") as &[u8], '
+                "Target::Aarch64),"
             )
 
         boundary_artifacts = {

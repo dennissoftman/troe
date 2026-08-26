@@ -158,7 +158,7 @@ an interrupt observing partial entry state. Every x86 interrupt gate that calls
 Rust also clears the application-controlled direction and alignment-check flags
 before entering compiled code. The
 portable v1 CPU-state contract is x87 plus SSE/XMM on x86-64 and baseline
-FP/Advanced SIMD on AArch64. These complete states survive calls and yields;
+FP/Advanced SIMD plus TPIDR_EL0 on AArch64. These complete states survive calls and yields;
 AVX/AVX-512/AMX and SVE/SME are not enabled because v1 has no feature
 negotiation or extended-state layout. The
 startup page uses fixed-width little-endian fields and contains:

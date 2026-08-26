@@ -244,6 +244,7 @@ struct ArchitectureApplicationContext {
     instruction: u64,
     status: u64,
     stack: u64,
+    thread_pointer: u64,
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
@@ -253,6 +254,7 @@ const _: () = {
     assert!(core::mem::offset_of!(ArchitectureApplicationContext, fpcr) == 768);
     assert!(core::mem::offset_of!(ArchitectureApplicationContext, instruction) == 784);
     assert!(core::mem::offset_of!(ArchitectureApplicationContext, stack) == 800);
+    assert!(core::mem::offset_of!(ArchitectureApplicationContext, thread_pointer) == 808);
 };
 
 /// Opaque saved application context, address-space root, and pending ABI call.
@@ -3262,6 +3264,8 @@ unsafe extern "C" fn aarch64_resume_application(
         "isb",
         "ldr x9, [x11, #800]",
         "msr sp_el0, x9",
+        "ldr x9, [x11, #808]",
+        "msr tpidr_el0, x9",
         "ldr x9, [x11, #784]",
         "msr elr_el1, x9",
         "ldr x9, [x11, #792]",
@@ -3441,6 +3445,8 @@ core::arch::global_asm!(
     "str x10, [sp, #792]",
     "mrs x9, sp_el0",
     "str x9, [sp, #800]",
+    "mrs x9, tpidr_el0",
+    "str x9, [sp, #808]",
     "mrs x9, esr_el1",
     "lsr x10, x9, #26",
     "cmp x10, #0x15",

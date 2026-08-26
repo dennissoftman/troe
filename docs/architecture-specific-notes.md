@@ -130,7 +130,8 @@ x86-64 or AArch64 platform contracts.
   inaccessible and UXN, user code is EL0 RO/X and PXN, and user data/stack are
   EL0 RW/NX and PXN. The lower-EL synchronous vector is separate from current-EL
   fatal handling. SVC entry captures a compile-time-checked 816-byte
-  x0-x30/q0-q31/control/return frame for yield and handle-call resume.
+  x0-x30/q0-q31/control/return frame, including application TPIDR_EL0, for
+  yield and handle-call resume.
 - The copied-message path uses `LDTRB` so its source access keeps unprivileged
   semantics even when PAN is active. The entry/return boundary preserves
   x19-x30, q8-q15, FPCR, FPSR, DAIF, SP_EL0, and TPIDR_EL0, restores TTBR0_EL1,

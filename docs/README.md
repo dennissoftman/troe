@@ -14,6 +14,8 @@ historical review evidence.
 - [Architecture-specific notes](architecture-specific-notes.md) preserve the
   x86-64 and AArch64 interrupt, idle, and controller invariants that portable
   refactors must not erase.
+- [Native trap-entry contract](native-trap-entry-contract.md) enumerates every
+  Rust-calling native gate, its saved state, origin proof, and fault fate.
 - [KEFS v1](formats/kefs-v1.md) defines the implemented embedded-filesystem
   format.
 - [KEX v1](formats/kex-v1.md) defines the implemented portable executable

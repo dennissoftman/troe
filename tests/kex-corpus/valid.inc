@@ -14,6 +14,7 @@
     ("native-heap-growth-limit-aarch64.kex", include_bytes!("native-heap-growth-limit-aarch64.kex") as &[u8], Target::Aarch64),
     ("native-invalid-call-aarch64.kex", include_bytes!("native-invalid-call-aarch64.kex") as &[u8], Target::Aarch64),
     ("native-unexpected-return-aarch64.kex", include_bytes!("native-unexpected-return-aarch64.kex") as &[u8], Target::Aarch64),
+    ("native-thread-pointer-aarch64.kex", include_bytes!("native-thread-pointer-aarch64.kex") as &[u8], Target::Aarch64),
     ("valid-standard-max-records-aarch64.kex", include_bytes!("valid-standard-max-records-aarch64.kex") as &[u8], Target::Aarch64),
     ("valid-standard-max-span-aarch64.kex", include_bytes!("valid-standard-max-span-aarch64.kex") as &[u8], Target::Aarch64),
     ("valid-standard-max-pages-aarch64.kex", include_bytes!("valid-standard-max-pages-aarch64.kex") as &[u8], Target::Aarch64),
