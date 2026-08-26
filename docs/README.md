@@ -112,12 +112,12 @@ implementation, retaining only `cd`, `poweroff`, and `reboot` as intrinsics.
 [ADR 0031](adr/0031-bounded-kex-tcp-connect-service.md) fixes the outbound-only
 literal-IPv4 TCP KEX authority, byte-stream operations, state/timer/resource
 bounds, and owner teardown without adding DNS, TLS, listen, or general sockets.
-[ADR 0032](adr/0032-bounded-wait-channels-and-asynchronous-mailboxes.md) is a
-documentation-only proposal for scheduler-visible wait channels, deferred KEX
-replies, and later capability mailboxes. It deliberately leaves current
-synchronous dispatch, sequential pipelines, single-CPU execution, and accepted
-ADR closure unchanged until its semantics and first production consumers are
-accepted.
+[ADR 0032](adr/0032-bounded-wait-channels-and-asynchronous-mailboxes.md) fixes a
+staged scheduler-visible wait and deferred-reply direction. The portable
+blocked lifecycle, generation-checked wait registrations, copied pending calls,
+and teardown models are implemented; native KEX deferral and later capability
+mailboxes remain explicit subsequent slices. Current services are still
+synchronous until those native consumers land.
 ADR 0012 governs the completed Stage 5.1 terminal and
 framebuffer increment; AArch64 native keyboard input remains a later
 virtio-input transport decision. ADR 0013 governs the completed Stage 5.2

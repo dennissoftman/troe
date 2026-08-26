@@ -7,6 +7,15 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::fmt;
 
+mod wait;
+
+pub use wait::{
+    MAX_PENDING_CALLS, MAX_PENDING_REQUEST_BYTES, MAX_WAIT_REGISTRATIONS, PendingCallError,
+    PendingCallSnapshot, PendingCallState, PendingCallStats, PendingCallTable, PendingOperationId,
+    WaitCompletion, WaitError, WaitKey, WaitObservation, WaitRegistration, WaitResource, WaitSpec,
+    WaitStats, WaitTable, WakeBatch, WakeInterest, WakeReason,
+};
+
 /// Milliseconds elapsed on the machine's monotonic clock.
 ///
 /// Values have no wall-clock meaning and may be compared only within one boot.
@@ -239,6 +248,8 @@ pub enum TaskState {
     Ready,
     /// Currently executing on the single CPU.
     Running,
+    /// Suspended at an owned ABI boundary on one generation-checked wait.
+    Blocked(WaitKey),
     /// Finished and retaining resources until explicitly reaped.
     Exited,
     /// Faulted at unprivileged execution level and awaiting explicit reaping.
@@ -282,6 +293,15 @@ impl TaskSnapshot {
     #[must_use]
     pub const fn state(self) -> TaskState {
         self.state
+    }
+
+    /// Published wait identity while the task is blocked.
+    #[must_use]
+    pub const fn wait_key(self) -> Option<WaitKey> {
+        match self.state {
+            TaskState::Blocked(wait) => Some(wait),
+            TaskState::Ready | TaskState::Running | TaskState::Exited | TaskState::Faulted => None,
+        }
     }
 
     /// Authority granted at spawn time.
@@ -354,6 +374,12 @@ pub struct TaskStats {
     pub reaped: u32,
     /// Explicit cooperative yields observed.
     pub yields: u32,
+    /// Running tasks transitioned to a scheduler-visible blocked state.
+    pub blocks: u32,
+    /// Blocked tasks returned to readiness through a matching wait key.
+    pub wakes: u32,
+    /// Tasks currently retained in a blocked state.
+    pub blocked_tasks: u16,
     /// Mapped stack pages retained by live records.
     pub owned_stack_pages: u32,
     /// Isolated address spaces retained by live records.
@@ -457,8 +483,8 @@ struct TaskRecord {
 /// Bounded single-CPU round-robin cooperative scheduler policy.
 ///
 /// The scheduler owns records and resource accounting, but not native context
-/// switching. At most one record can be `Running`; only an explicit yield or
-/// exit returns it to scheduler control.
+/// switching. At most one record can be `Running`; only an explicit yield,
+/// block, exit, or contained fault returns it to scheduler control.
 #[derive(Debug)]
 pub struct Scheduler {
     records: Vec<TaskRecord>,
@@ -469,6 +495,8 @@ pub struct Scheduler {
     spawned: u32,
     reaped: u32,
     total_yields: u32,
+    total_blocks: u32,
+    total_wakes: u32,
     contained_faults: u32,
 }
 
@@ -495,6 +523,8 @@ impl Scheduler {
             spawned: 0,
             reaped: 0,
             total_yields: 0,
+            total_blocks: 0,
+            total_wakes: 0,
             contained_faults: 0,
         })
     }
@@ -637,6 +667,53 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Suspend the running isolated task on one published wait registration.
+    ///
+    /// The native context and pending call are owned by composition tables,
+    /// never by a suspended Rust frame in this scheduler.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a non-current, non-running, or non-isolated task and checked
+    /// transition-counter overflow.
+    pub fn block_current(&mut self, id: TaskId, wait: WaitKey) -> Result<(), TaskError> {
+        if self.current != Some(id) {
+            return Err(TaskError::InvalidState);
+        }
+        let total_blocks = self
+            .total_blocks
+            .checked_add(1)
+            .ok_or(TaskError::AccountingOverflow)?;
+        let record = self.record_mut(id)?;
+        if record.snapshot.state != TaskState::Running || record.snapshot.isolation.is_none() {
+            return Err(TaskError::InvalidState);
+        }
+        record.snapshot.state = TaskState::Blocked(wait);
+        self.current = None;
+        self.total_blocks = total_blocks;
+        Ok(())
+    }
+
+    /// Return one blocked task to readiness through its exact wait identity.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unknown, stale, duplicated, or mismatched wakes and checked
+    /// transition-counter overflow.
+    pub fn wake_blocked(&mut self, id: TaskId, wait: WaitKey) -> Result<(), TaskError> {
+        let total_wakes = self
+            .total_wakes
+            .checked_add(1)
+            .ok_or(TaskError::AccountingOverflow)?;
+        let record = self.record_mut(id)?;
+        if record.snapshot.state != TaskState::Blocked(wait) {
+            return Err(TaskError::InvalidState);
+        }
+        record.snapshot.state = TaskState::Ready;
+        self.total_wakes = total_wakes;
+        Ok(())
+    }
+
     /// Replace the resource accounting of the running isolated task.
     ///
     /// This is used after an atomic address-space growth commit. The address-
@@ -706,6 +783,24 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Terminalize a blocked isolated task after its wait and pending call have
+    /// been cancelled by composition-owned tables.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a non-blocked or non-isolated task.
+    pub fn cancel_blocked(&mut self, id: TaskId, status: u32) -> Result<(), TaskError> {
+        let record = self.record_mut(id)?;
+        if !matches!(record.snapshot.state, TaskState::Blocked(_))
+            || record.snapshot.isolation.is_none()
+        {
+            return Err(TaskError::InvalidState);
+        }
+        record.snapshot.state = TaskState::Exited;
+        record.snapshot.exit_status = Some(status);
+        Ok(())
+    }
+
     /// Terminate the running unprivileged task after a contained native fault.
     ///
     /// # Errors
@@ -728,6 +823,30 @@ impl Scheduler {
         record.snapshot.exit_status = Some(128);
         record.snapshot.fault = Some(fault);
         self.current = None;
+        self.contained_faults = contained_faults;
+        Ok(())
+    }
+
+    /// Terminalize a blocked isolated task after a contained asynchronous fault.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a non-blocked or non-isolated task and checked fault-accounting
+    /// overflow. State is unchanged on every error.
+    pub fn fault_blocked(&mut self, id: TaskId, fault: TaskFault) -> Result<(), TaskError> {
+        let contained_faults = self
+            .contained_faults
+            .checked_add(1)
+            .ok_or(TaskError::AccountingOverflow)?;
+        let record = self.record_mut(id)?;
+        if !matches!(record.snapshot.state, TaskState::Blocked(_))
+            || record.snapshot.isolation.is_none()
+        {
+            return Err(TaskError::InvalidState);
+        }
+        record.snapshot.state = TaskState::Faulted;
+        record.snapshot.exit_status = Some(128);
+        record.snapshot.fault = Some(fault);
         self.contained_faults = contained_faults;
         Ok(())
     }
@@ -771,10 +890,10 @@ impl Scheduler {
 
     /// Terminalize one isolated record, revoke its external authority, then reap it.
     ///
-    /// Ready records are cancelled and running records exit with
-    /// `rollback_status`. Already exited or faulted records retain their original
-    /// outcome. Only after the record is terminal is `revoke` invoked with its
-    /// terminal snapshot, and reaping occurs only if revocation succeeds.
+    /// Ready and blocked records are cancelled and running records exit with
+    /// `rollback_status`. Already exited or faulted records retain their
+    /// original outcome. Only after the record is terminal is `revoke` invoked
+    /// with its terminal snapshot, and reaping occurs only if revocation succeeds.
     /// Physical zeroization and frame release are intentionally left to the
     /// caller after this method returns successfully.
     ///
@@ -798,6 +917,7 @@ impl Scheduler {
         match snapshot.state() {
             TaskState::Ready => self.cancel_ready(id, rollback_status)?,
             TaskState::Running => self.exit_current(id, rollback_status)?,
+            TaskState::Blocked(_) => self.cancel_blocked(id, rollback_status)?,
             TaskState::Exited | TaskState::Faulted => {}
         }
         let terminal = self.task(id)?;
@@ -829,6 +949,11 @@ impl Scheduler {
             .iter()
             .filter(|record| record.snapshot.isolation.is_some())
             .count();
+        let blocked_tasks = self
+            .records
+            .iter()
+            .filter(|record| matches!(record.snapshot.state, TaskState::Blocked(_)))
+            .count();
         let (owned_isolation_pages, owned_handles) =
             self.records
                 .iter()
@@ -846,6 +971,9 @@ impl Scheduler {
             live_records: u16::try_from(self.records.len()).unwrap_or(u16::MAX),
             reaped: self.reaped,
             yields: self.total_yields,
+            blocks: self.total_blocks,
+            wakes: self.total_wakes,
+            blocked_tasks: u16::try_from(blocked_tasks).unwrap_or(u16::MAX),
             owned_stack_pages,
             owned_address_spaces: u16::try_from(owned_address_spaces).unwrap_or(u16::MAX),
             owned_isolation_pages,
@@ -866,7 +994,9 @@ impl Scheduler {
 mod tests {
     use super::{
         Cancelled, Capabilities, CooperativeRuntime, IsolationResource, MAX_TASKS, MonotonicMillis,
-        Scheduler, StackResource, TaskError, TaskFault, TaskSnapshot, TaskState, TeardownError,
+        PendingCallSnapshot, PendingCallState, PendingCallTable, Scheduler, StackResource,
+        TaskError, TaskFault, TaskSnapshot, TaskState, TeardownError, WaitObservation,
+        WaitRegistration, WaitSpec, WaitTable, WakeInterest, WakeReason,
     };
 
     #[derive(Debug)]
@@ -945,6 +1075,150 @@ mod tests {
             Ok(Some(0x1_0007))
         );
         assert_eq!(scheduler.stats().yields, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn blocked_lifecycle_runs_other_ready_work_and_rejects_stale_wakes() -> Result<(), TaskError> {
+        let mut scheduler = Scheduler::new(2)?;
+        let isolation = IsolationResource::new(0, 4, 6, 1)?;
+        let blocked = scheduler.spawn_isolated(Capabilities::SERVICE, stack(0)?, isolation)?;
+        let ready = scheduler.spawn(Capabilities::SERVICE, stack(1)?)?;
+        let mut pending = PendingCallTable::new(1, 16).map_err(|_| TaskError::InvalidState)?;
+        let operation = pending
+            .begin(blocked, 1, 7, 3, b"sleep", 8)
+            .map_err(|_| TaskError::InvalidState)?;
+        let spec = WaitSpec::new(
+            blocked,
+            operation,
+            None,
+            WakeInterest::DEADLINE,
+            Some(MonotonicMillis::from_millis(10)),
+        )
+        .map_err(|_| TaskError::InvalidState)?;
+        let mut waits = WaitTable::new(1).map_err(|_| TaskError::InvalidState)?;
+        let wait = match waits
+            .register(
+                spec,
+                WaitObservation::Pending,
+                MonotonicMillis::from_millis(0),
+            )
+            .map_err(|_| TaskError::InvalidState)?
+        {
+            WaitRegistration::Blocked(wait) => wait,
+            WaitRegistration::Ready(_) => return Err(TaskError::InvalidState),
+        };
+        pending
+            .bind_wait(operation, wait)
+            .map_err(|_| TaskError::InvalidState)?;
+
+        assert_eq!(
+            scheduler.dispatch_next(Capabilities::SERVICE),
+            Ok(Some(blocked))
+        );
+        scheduler.block_current(blocked, wait)?;
+        assert_eq!(scheduler.task(blocked)?.wait_key(), Some(wait));
+        assert_eq!(scheduler.stats().blocked_tasks, 1);
+        assert_eq!(scheduler.stats().blocks, 1);
+        assert_eq!(
+            scheduler.dispatch_next(Capabilities::SERVICE),
+            Ok(Some(ready))
+        );
+        scheduler.exit_current(ready, 0)?;
+
+        let batch = waits
+            .expire(MonotonicMillis::from_millis(10))
+            .map_err(|_| TaskError::InvalidState)?;
+        let completion = batch.iter().next().ok_or(TaskError::InvalidState)?;
+        pending
+            .resolve(completion)
+            .map_err(|_| TaskError::InvalidState)?;
+        scheduler.wake_blocked(completion.owner(), completion.key())?;
+        assert_eq!(
+            scheduler.wake_blocked(completion.owner(), completion.key()),
+            Err(TaskError::InvalidState)
+        );
+        assert_eq!(
+            pending.call(operation).map(PendingCallSnapshot::state),
+            Ok(PendingCallState::Ready(WakeReason::Deadline))
+        );
+        assert_eq!(scheduler.stats().blocked_tasks, 0);
+        assert_eq!(scheduler.stats().wakes, 1);
+        assert_eq!(
+            scheduler.dispatch_next(Capabilities::SERVICE),
+            Ok(Some(blocked))
+        );
+        scheduler.exit_current(blocked, 0)?;
+        Ok(())
+    }
+
+    #[test]
+    fn blocked_teardown_cancels_wait_and_pending_call_before_reap()
+    -> Result<(), TeardownError<&'static str>> {
+        let mut scheduler = Scheduler::new(1)?;
+        let isolation = IsolationResource::new(0, 4, 6, 1)?;
+        let id = scheduler.spawn_isolated(Capabilities::SERVICE, stack(0)?, isolation)?;
+        let mut pending = PendingCallTable::new(1, 16)
+            .map_err(|_| TeardownError::Task(TaskError::InvalidState))?;
+        let operation = pending
+            .begin(id, 1, 7, 3, b"receive", 8)
+            .map_err(|_| TeardownError::Task(TaskError::InvalidState))?;
+        let spec = WaitSpec::new(
+            id,
+            operation,
+            None,
+            WakeInterest::DEADLINE,
+            Some(MonotonicMillis::from_millis(10)),
+        )
+        .map_err(|_| TeardownError::Task(TaskError::InvalidState))?;
+        let mut waits =
+            WaitTable::new(1).map_err(|_| TeardownError::Task(TaskError::InvalidState))?;
+        let wait = match waits
+            .register(
+                spec,
+                WaitObservation::Pending,
+                MonotonicMillis::from_millis(0),
+            )
+            .map_err(|_| TeardownError::Task(TaskError::InvalidState))?
+        {
+            WaitRegistration::Blocked(wait) => wait,
+            WaitRegistration::Ready(_) => {
+                return Err(TeardownError::Task(TaskError::InvalidState));
+            }
+        };
+        pending
+            .bind_wait(operation, wait)
+            .map_err(|_| TeardownError::Task(TaskError::InvalidState))?;
+        assert_eq!(scheduler.dispatch_next(Capabilities::SERVICE), Ok(Some(id)));
+        scheduler.block_current(id, wait)?;
+
+        let reaped = scheduler.terminate_revoke_and_reap(id, 9, |terminal| {
+            assert_eq!(terminal.state(), TaskState::Exited);
+            let batch = waits
+                .cancel_owner(id, WakeReason::Revoked)
+                .map_err(|_| "wait cancellation failed")?;
+            for completion in batch.iter() {
+                pending
+                    .resolve(completion)
+                    .map_err(|_| "pending resolution failed")?;
+            }
+            if pending
+                .teardown_owner(id, WakeReason::Revoked)
+                .map_err(|_| "pending teardown failed")?
+                != 1
+            {
+                return Err("pending teardown count mismatch");
+            }
+            Ok(())
+        })?;
+
+        assert_eq!(reaped.id, id);
+        assert_eq!(reaped.exit_status, 9);
+        assert_eq!(waits.stats().live, 0);
+        assert_eq!(pending.stats().live, 0);
+        assert_eq!(pending.stats().retained_bytes, 0);
+        assert_eq!(pending.stats().zeroized_bytes, 7);
+        assert_eq!(scheduler.stats().live_records, 0);
         Ok(())
     }
 

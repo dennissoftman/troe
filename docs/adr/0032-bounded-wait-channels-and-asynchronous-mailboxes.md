@@ -1,8 +1,9 @@
 # ADR 0032: Bounded wait channels and asynchronous capability mailboxes
 
-Status: proposed, documentation-only design, 2026-08-26. This ADR does not
-describe current behavior and does not authorize implementation until its open
-semantics and first production consumers are accepted.
+Status: accepted staged direction, 2026-08-26. The portable blocked lifecycle,
+wait-registration, and pending-call models are implemented; native suspended
+contexts, deferred replies, idle integration, and mailboxes remain later
+explicit slices and are not current behavior.
 
 ## Existing-contract review
 
@@ -13,7 +14,8 @@ contracts are deliberately narrower:
 - ADR 0011's `PortId` names one synchronous service endpoint; it is not a FIFO
   queue. A call exclusively borrows the dispatcher until one reply completes.
 - ADRs 0010 and 0014 retain ready, running, exited, and faulted task states.
-  Exactly one task is running, and no scheduler-visible blocked state exists.
+  The portable scheduler now also models `Blocked(wait key)`, but no native KEX
+  enters that state until the composition-owned suspended-context slice lands.
 - ADR 0015 can suspend a KEX application only at an ABI call, yield, fault, or
   lease expiry. Its 50 ms timer terminates an uninterrupted application; it is
   not resumable general preemption.
@@ -41,10 +43,20 @@ confused. Producer and consumer authority should be represented by distinct
 typed handles or interfaces rather than adding broad ambient send/receive
 rights to every existing service handle.
 
-## Proposed direction
+## Accepted direction
 
 Introduce two separable portable mechanisms. The wait mechanism may be useful
 before mailboxes have enough real consumers to justify implementation.
+
+Implementation note, 2026-08-26: `troe-task` now provides preallocated tables
+for at most 16 generation-checked waits and 16 copied pending calls. Its atomic
+observe-or-publish operation handles already-ready, expired, closed, cancelled,
+and revoked conditions without publishing a stale wait. Pending requests have a
+4 KiB per-call ceiling, a construction-time system byte ceiling, strictly
+monotonic request identities, exact state transitions, owner teardown, and
+zeroization before slot reuse. Portable scheduler tests cover blocking, running
+other ready work, exact-key wakeup, stale/double-wake rejection, and ordered
+terminal teardown. These types retain no native context or pointer.
 
 ### Wait channels and deferred replies
 
@@ -154,6 +166,14 @@ status wins when several stages fail, and how all stream handles close on every
 exit or fault. Until then pipelines remain sequential.
 
 ## Verification required before acceptance
+
+The portable portion of this gate is implemented in `crates/troe-task`: tests
+cover observe-before-publish readiness, every terminal wake reason, deadline
+and close/cancellation first-consumer races, stale wait and resource
+generations, exact slot and retained-byte ceilings, pending identity reuse,
+counter failpoints, copied-request detachment, zeroization, and owner teardown.
+The following native evidence remains required before the deferred-reply slice
+is accepted as current behavior.
 
 Portable model tests must cover every legal lifecycle transition and reject
 double block, double wake, stale generations, wake-before-publication races,

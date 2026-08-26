@@ -330,12 +330,13 @@ host packaging tool, or by a narrowly scoped kernel mechanism. Importing a
 general ELF dynamic linker into the kernel is not implied. Until that decision
 lands, libc and Lua components remain statically linked into each `.kex`.
 
-### Post-Stage 9: bounded waits and asynchronous mailboxes (proposed)
+### Post-Stage 9: bounded waits and asynchronous mailboxes (in progress)
 
 [ADR 0032](adr/0032-bounded-wait-channels-and-asynchronous-mailboxes.md)
-records a documentation-only proposal derived from a review of BeOS/Haiku
-message ports, loopers, and media scheduling. It is not current behavior and is
-not yet an accepted implementation milestone.
+records the accepted staged direction derived from a review of BeOS/Haiku
+message ports, loopers, and media scheduling. Its portable wait, blocked-task,
+and pending-call models are implemented; native deferred replies and mailboxes
+are not yet current behavior.
 
 The review narrows the useful first step. Existing timer and network services
 already wait cooperatively, but they do so inside one synchronous service call
@@ -383,8 +384,8 @@ slice has an independent exit criterion:
    ordering. Native probes must exercise each distinct return/fault path; this
    is a behavioral gate, not an unsafe-token count.
 2. Record the existing IPC baseline before changing scheduling. Measure empty,
-   64-byte, 256-byte, and 4 KiB calls after warmup, reporting cycles and
-   p50/p95/p99/max latency together with copies, allocations, address-space
+   64-byte, 256-byte, and 4 KiB calls after warmup, reporting architecture
+   counter ticks and p50/p95/p99/max latency together with copies, allocations, address-space
    switches, TLB invalidations, timer programs, and completed calls. QEMU keeps
    the event-count regression deterministic; latency claims require real
    x86-64 and AArch64 hardware counters.
@@ -409,6 +410,13 @@ slice has an independent exit criterion:
    Optimize only measured costs--copy count, direct handoff, timer programming,
    address-space identifiers, or TLB work--without weakening reply ownership or
    fault fate.
+
+Implementation status, 2026-08-26: slices 1–3 are complete. The trap-entry
+matrix and native probes are documented in `native-trap-entry-contract.md`; the
+host/native counter baseline is documented in `ipc-baseline.md`; and
+`troe-task` contains the preallocated wait/pending tables plus the portable
+blocked lifecycle and exhaustive transition tests. Slice 4 is next. No native
+service uses deferred completion yet.
 
 Only after these exits should a device-owning filesystem or network service
 move out of the kernel. Shared-memory grants, priority donation, SMP, and
