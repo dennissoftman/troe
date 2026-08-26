@@ -117,7 +117,9 @@ system generation
 atomic activation
 ```
 
-A package installation should therefore never become an uncontrolled sequence of scripts modifying `/etc`, creating users, starting daemons and leaving files behind.
+A package installation should therefore never become an uncontrolled sequence
+of scripts modifying a live configuration tree, creating users, starting
+daemons and leaving files behind.
 
 ---
 
@@ -315,6 +317,15 @@ architecture, project SDK/ABI, selected Standard resource policy and explicit
 ceilings, resolver version, and every artifact by content identity. Secrets and
 machine-local credentials MUST be referenced, never embedded in these files.
 
+On a package-managed machine, [`/config`](docs/adr/0033-desired-and-active-configuration-namespaces.md)
+is the writable source of desired system and application configuration.
+`/sys/config` is the read-only, non-secret configuration resolved for the active
+generation. Editing `/config` does not mutate the running system; validation and
+activation construct a new immutable generation, while rollback restores the
+matching prior `/sys/config`. Mutable application state remains in explicitly
+declared volumes, and secret values remain behind references and scoped
+authority rather than either configuration tree.
+
 ---
 
 ## 6. Package Model
@@ -475,6 +486,8 @@ The model separates:
 - immutable package objects;
 - an immutable generation containing resolved objects, service definitions,
   capability grants, and non-secret configuration;
+- writable desired configuration under `/config`, which may be an invalid draft
+  and is never consumed live by running services;
 - explicitly named persistent volumes and secret references whose lifetimes
   are independent of a generation; and
 - one small, crash-consistent active-generation pointer.
@@ -484,6 +497,12 @@ silently rewind, delete, or reinterpret persistent data. A package that needs a
 data migration must declare compatible schema ranges, forward and rollback
 behavior, required free space, and whether rollback becomes unsafe. The plan
 must stop for explicit approval when safe rollback cannot be preserved.
+
+The effective active configuration is projected read-only under `/sys/config`.
+It changes atomically with the active generation. Rollback does not overwrite
+the operator's `/config` drafts; tooling must make the difference between
+desired and active configuration explicit and allow deliberate repair or
+reversion.
 
 Activation SHOULD use a two-phase flow: construct and verify the candidate,
 then switch the active pointer and run bounded health checks. On boot or health

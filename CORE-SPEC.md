@@ -391,6 +391,13 @@ These signatures are illustrative, not frozen ABI. The implementation SHOULD avo
 └── dev/         capability-backed device nodes, if enabled
 ```
 
+This is the current embedded recovery namespace. Its `/etc` directory contains
+bootstrap files and is not a package installation or future configuration ABI.
+For the package-managed system, ADR 0033 reserves `/config` for writable desired
+configuration and `/sys/config` for the read-only configuration resolved from
+the active immutable generation. Editing `/config` does not mutate the active
+generation.
+
 `/sys` and `/dev` are project-defined namespaces, not Linux-compatible ABIs.
 
 Useful generated nodes include:
@@ -1051,6 +1058,9 @@ Configured health failure rolls generation 2 back durably to generation 1.
   reproducible-release procedures, including explicit data-migration limits.
 - Establish registry trust roots, signature and revocation policy, provenance
   requirements, and stable machine-readable tooling schemas.
+- Implement ADR 0033's bounded writable desired-configuration surface at
+  `/config` and generation-bound read-only active projection at `/sys/config`;
+  migrate the KEFS bootstrap `/etc` layout without treating it as a package ABI.
 - Define threat models and hardening profiles for supported deployment classes.
 - Maintain a minimal recovery image even when the full production image grows beyond the floppy-size target.
 

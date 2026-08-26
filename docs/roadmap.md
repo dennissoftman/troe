@@ -540,6 +540,12 @@ increments. Until loadable applications and persistence exist, Cargo,
 repository scripts, KEFS, and FAT images remain explicit bootstrap mechanisms,
 not public package or generation formats.
 
+ADR 0033 similarly separates future package-managed configuration from the
+bootstrap image: `/config` is writable desired intent, while `/sys/config` is
+the read-only configuration of the active immutable generation. The current
+KEFS `/etc` tree remains implementation reality until a deliberate recovery
+namespace migration; it is not a future package ABI.
+
 Hosted manifest, lock, and artifact validation may be prototyped before native
 application loading. Native execution begins with core Stage 7; a persistent
 store, system generations, and rollback begin with Stage 8; supported updates,

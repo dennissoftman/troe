@@ -58,11 +58,16 @@ firmware fails before device publication or volatile I/O.
    file length is governed by the provider format, media, and configured quota.
 5. Filesystem commands ask `Namespace` to canonicalize from the logical cwd.
    Immutable KEFS nodes and writable `/tmp` nodes share one object model.
-   The recovery root keeps executables in `/bin`, system configuration in
-   `/etc`, architecture-independent package data in producer-owned
+   The current recovery root keeps executables in `/bin`, bootstrap
+   configuration in `/etc`, architecture-independent package data in
+   producer-owned
    `/share/<name>` directories, and persistent or mounted data under `/vol`.
    Native shared libraries will use `/lib` when dynamic linking is added;
    executable code does not belong in `/share`.
+   `/etc` is not the future package-managed configuration ABI: ADR 0033 reserves
+   writable desired configuration under `/config` and projects the active
+   generation's resolved, non-secret configuration read-only under
+   `/sys/config`. Recovery KEFS migration remains explicit future work.
 6. The final output capability writes host bytes or the native UART.
    When validated GOP metadata is available, normal native shell output is also
    rendered into an owned fixed-glyph framebuffer console. UEFI text output is
