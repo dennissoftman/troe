@@ -1578,6 +1578,22 @@ def run_fault_scenario(
         command_timeout,
         contains=("00000000  ",),
     )
+    if fault == "write":
+        session.command(
+            "service-probe fault",
+            "/",
+            command_timeout,
+            contains=(
+                "mem: diagnostics unavailable",
+                "isolated diagnostics server fault contained",
+            ),
+        )
+        session.command(
+            "mem",
+            "/",
+            command_timeout,
+            contains=("memory owner: kernel", "memory map: final map (owned)"),
+        )
     start = len(session.output)
     command = "task-probe guard" if fault == "guard" else f"mmu-probe {fault}"
     session.send(command, command_timeout)

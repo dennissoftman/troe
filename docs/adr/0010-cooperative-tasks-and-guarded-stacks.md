@@ -1,6 +1,6 @@
 # ADR 0010: cooperative continuations and guarded task stacks
 
-Status: accepted, 2026-08-23; stack-size amendment, 2026-08-24.
+Status: accepted, 2026-08-23; stack-size amendments, 2026-08-24 and 2026-08-26.
 
 ## Decision
 
@@ -21,10 +21,12 @@ frames. References and locks cannot accidentally remain hidden on a suspended
 call stack, and the architecture boundary needs only a synchronous stack-call
 trampoline rather than a portable saved-register layout.
 
-The reserved boot arena contains three task-stack slots. Each slot is one
-unmapped 4 KiB lower guard, a 64 KiB RW/NX payload, and one unmapped 4 KiB upper
-guard. The owned mapping plan lists payloads individually instead of mapping
-the whole boot arena, so guards are absent from both architecture page tables.
+The reserved boot arena contains three task-stack slots. Each slot has one
+unmapped 4 KiB lower guard, one RW/NX payload, and one unmapped 4 KiB upper
+guard. Slot 0 retains a 64 KiB cooperative-service payload; slots 1 and 2
+provide 128 KiB payloads for the isolated-server composition and shell,
+respectively. The owned mapping plan lists payloads individually instead of
+mapping the whole boot arena, so guards are absent from both architecture page tables.
 The kernel validates the adjacency and sizes before scheduling. A feature-only
 acceptance command writes the active shell task's lower guard and must reach a
 stable native write-fault diagnostic without rebooting. Production artifacts
@@ -35,6 +37,13 @@ continuation payload from 32 KiB to 64 KiB. The slot count and 4 KiB guards are
 unchanged. Compile-time assertions bind the byte size, sixteen mapped pages,
 guard size, and three-slot arena contribution so later profile work cannot
 silently change only one representation.
+
+Amendment, 2026-08-26: the shell's nested KEX loader/deferred-reply path and the
+first isolated user-server composition receive explicit 128 KiB payloads. A
+native AArch64 guard fault proved that the former 64 KiB shell payload was
+insufficient; separate byte/page constants and boot-time checks now bind all
+three heterogeneous slots. This changes permanent reserved memory by 128 KiB,
+not the KEX user-stack limits or the unmapped guard policy.
 
 Boot runs two service continuations with different yield counts, observes five
 round-robin yields, exits and reaps both, and dispatches a third continuation on

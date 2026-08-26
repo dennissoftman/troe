@@ -5,11 +5,10 @@ use core::{fmt, slice};
 
 pub use troe_abi::{
     ABI_MAJOR, ABI_MINOR, command, datagram, diagnostics, exit, filesystem, filesystem_mutation,
-    icmp_echo, network_configuration, network_observation, tcp_connect, timer, volume_control,
+    icmp_echo, interface, network_configuration, network_observation, reply, server, tcp_connect,
+    timer, volume_control,
 };
-use troe_abi::{
-    MAX_MESSAGE_BYTES, MAX_SERVICE_PAYLOAD_BYTES, heap_growth, interface, reply, stream,
-};
+use troe_abi::{MAX_MESSAGE_BYTES, MAX_SERVICE_PAYLOAD_BYTES, heap_growth, stream};
 
 const STARTUP_PAGE_BYTES: usize = 4096;
 const STARTUP_HEADER_BYTES: usize = 64;
@@ -39,6 +38,8 @@ pub const FILESYSTEM_IO_BUFFER_BYTES: usize = MAX_SERVICE_PAYLOAD_BYTES;
 pub const MIN_FILE_STREAM_CHUNK_BYTES: usize = stream::MIN_CHUNK_SIZE;
 /// Largest accepted file-stream aggregation hint.
 pub const MAX_FILE_STREAM_CHUNK_BYTES: usize = stream::MAX_CHUNK_SIZE;
+/// Maximum stack buffer needed to receive one isolated-server request.
+pub const SERVER_REQUEST_BUFFER_BYTES: usize = MAX_MESSAGE_BYTES;
 
 /// One opaque application handle selected from the immutable startup page.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -433,6 +434,70 @@ impl CommandContext {
     /// Reports an invalid kernel completion or a non-freestanding host build.
     pub fn yield_now(&mut self) -> Result<(), Error> {
         yield_now()
+    }
+}
+
+/// Validated startup authority for one isolated user service.
+pub struct ServerContext {
+    endpoint: Handle,
+    heap: Option<HeapRegion>,
+}
+
+impl ServerContext {
+    fn from_startup(startup: &Startup<'_>) -> Result<Self, StartupError> {
+        Ok(Self {
+            endpoint: startup.required_handle(
+                interface::SERVER_ENDPOINT,
+                server::MAJOR,
+                server::MINOR,
+            )?,
+            heap: startup.heap_region()?,
+        })
+    }
+
+    /// Consume the server's validated heap token, if one was configured.
+    pub fn take_heap(&mut self) -> Option<HeapRegion> {
+        self.heap.take()
+    }
+
+    /// Receive the copied request assigned to this server invocation.
+    ///
+    /// The returned request and payload borrow `buffer`. The opaque token must
+    /// be supplied unchanged to [`Self::reply`].
+    ///
+    /// # Errors
+    ///
+    /// Reports call-gate, service-fate, or canonical decoding failure.
+    pub fn receive<'buffer>(
+        &self,
+        buffer: &'buffer mut [u8; SERVER_REQUEST_BUFFER_BYTES],
+    ) -> Result<server::ReceivedRequest<'buffer>, Error> {
+        let count = call(self.endpoint, server::RECEIVE, &[], buffer)?;
+        server::decode_received_request(&buffer[..count]).map_err(|_| Error::InvalidCall)
+    }
+
+    /// Complete one received request exactly once with copied reply bytes.
+    ///
+    /// # Errors
+    ///
+    /// Reports an invalid token/status/payload, duplicate completion, peer
+    /// fate, or call-gate failure.
+    pub fn reply(&self, token: u64, status: u32, payload: &[u8]) -> Result<(), Error> {
+        let mut request = [0_u8; MAX_SERVICE_PAYLOAD_BYTES];
+        let count = server::encode_reply_request(token, status, payload, &mut request)
+            .map_err(|_| Error::InvalidCall)?;
+        let mut response = [0_u8; 0];
+        let count = call(
+            self.endpoint,
+            server::REPLY,
+            &request[..count],
+            &mut response,
+        )?;
+        if count == 0 {
+            Ok(())
+        } else {
+            Err(Error::InvalidCall)
+        }
     }
 }
 
@@ -1495,6 +1560,33 @@ pub unsafe fn __run(
     terminate(main(&mut command));
 }
 
+/// Run one isolated service entry function from the raw kernel startup pair.
+///
+/// # Safety
+///
+/// `startup_address` must identify the immutable mapped startup page supplied
+/// by the KEX loader for the complete duration of this non-returning call.
+#[doc(hidden)]
+pub unsafe fn __run_server(
+    startup_address: *const u8,
+    startup_bytes: usize,
+    main: fn(&mut ServerContext) -> u32,
+) -> ! {
+    if startup_address.is_null() || startup_bytes != STARTUP_PAGE_BYTES {
+        terminate(exit::FAILURE);
+    }
+    // SAFETY: The raw KEX entry contract supplies one immutable mapped startup
+    // page. Startup parsing validates every byte before exposing authority.
+    let bytes = unsafe { slice::from_raw_parts(startup_address, startup_bytes) };
+    let Ok(startup) = Startup::parse(bytes) else {
+        terminate(exit::FAILURE);
+    };
+    let Ok(mut server) = ServerContext::from_startup(&startup) else {
+        terminate(exit::DENIED);
+    };
+    terminate(main(&mut server));
+}
+
 /// Define `_start` and a fail-closed panic handler for one KEX command app.
 #[macro_export]
 macro_rules! entry {
@@ -1504,6 +1596,24 @@ macro_rules! entry {
         pub extern "C" fn _start(startup_address: *const u8, startup_bytes: usize) -> ! {
             // SAFETY: Only the kernel KEX loader enters this exported symbol.
             unsafe { $crate::__run(startup_address, startup_bytes, $main) }
+        }
+
+        #[panic_handler]
+        fn panic(_information: &core::panic::PanicInfo<'_>) -> ! {
+            $crate::terminate($crate::exit::FAILURE)
+        }
+    };
+}
+
+/// Define `_start` and a fail-closed panic handler for one isolated KEX server.
+#[macro_export]
+macro_rules! server_entry {
+    ($main:path) => {
+        #[allow(clippy::not_unsafe_ptr_arg_deref)]
+        #[unsafe(no_mangle)]
+        pub extern "C" fn _start(startup_address: *const u8, startup_bytes: usize) -> ! {
+            // SAFETY: Only the kernel KEX loader enters this exported symbol.
+            unsafe { $crate::__run_server(startup_address, startup_bytes, $main) }
         }
 
         #[panic_handler]
@@ -1729,8 +1839,8 @@ mod tests {
 
     use super::{
         ABI_MAJOR, ABI_MINOR, CommandContext, HeapRegion, KEX_HEAP_ADDRESS, KEX_STACK_TOP,
-        STARTUP_HANDLE_BYTES, STARTUP_HEADER_BYTES, STARTUP_PAGE_BYTES, Startup, StartupError,
-        interface, stream,
+        STARTUP_HANDLE_BYTES, STARTUP_HEADER_BYTES, STARTUP_PAGE_BYTES, ServerContext, Startup,
+        StartupError, interface, stream,
     };
 
     fn startup_page(interfaces: &[u32]) -> [u8; STARTUP_PAGE_BYTES] {
@@ -1813,6 +1923,26 @@ mod tests {
                 assert!(command.take_heap().is_none());
             }
         }
+    }
+
+    #[test]
+    fn server_startup_requires_only_the_typed_endpoint() {
+        let page = startup_page(&[interface::SERVER_ENDPOINT]);
+        let startup = Startup::parse(&page).unwrap_or_else(|_| std::process::abort());
+        let mut server =
+            ServerContext::from_startup(&startup).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            server.take_heap().as_ref().map(HeapRegion::byte_len),
+            Some(8 * STARTUP_PAGE_BYTES)
+        );
+        assert!(server.take_heap().is_none());
+
+        let missing = startup_page(&[interface::DIAGNOSTICS]);
+        let startup = Startup::parse(&missing).unwrap_or_else(|_| std::process::abort());
+        assert!(matches!(
+            ServerContext::from_startup(&startup),
+            Err(StartupError::MissingAuthority)
+        ));
     }
 
     #[test]

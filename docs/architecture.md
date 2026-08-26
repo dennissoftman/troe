@@ -160,8 +160,9 @@ identity, authority, lifecycle, and stack resource.
 This makes every scheduling boundary explicit and keeps architecture register
 state out of portable code.
 
-The boot arena contains three reusable 64 KiB task payload slots. Each has an
-unmapped 4 KiB page on both sides, while the payload is RW/NX. Boot verification
+The boot arena contains one reusable 64 KiB cooperative task payload plus
+128 KiB isolated-server and shell payloads. Each has an unmapped 4 KiB page on
+both sides, while the payload is RW/NX. Boot verification
 interleaves two services, checks deterministic yield/exit counts, reaps their
 records, and reuses a returned slot before launching the shell on the third.
 The shell record alone carries console, filesystem, and machine-control
@@ -183,10 +184,13 @@ The first switched edge is native console output. `ConsoleService` converts a
 bounded write request into the existing `Output` operation, while
 `DispatchedOutput` presents the same byte-stream trait to the shell. Requests
 larger than one message are split through ordinary partial-write semantics.
-Fatal diagnostics and input delivery remain direct machine mechanisms. This is
-still in-process dispatch, not IPC: service code shares the caller's privileged
-address space, borrowed request bytes are not a wire format, and service faults
-are not contained.
+Fatal diagnostics and input delivery remain direct machine mechanisms. This
+original path is still in-process dispatch, not IPC: service code shares the
+caller's privileged address space, borrowed request bytes are not a wire format,
+and service faults are not contained. The later diagnostics migration is the
+first narrow exception: its immutable snapshot crosses a canonical copied
+receive/reply transport to an isolated KEX server, while the remaining
+registered services stay in-process.
 
 Stage 5.1 adds `troe-terminal`, which keeps transport-independent input
 decoding, line editing, history, and fixed-glyph text rendering outside the

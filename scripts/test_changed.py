@@ -389,6 +389,10 @@ def build_plan(
         if _classify_app(plan, path):
             continue
 
+        if path_text.startswith("services/"):
+            plan.require_full(path, "isolated user-service artifact changed")
+            continue
+
         if path_text.startswith("tests/test_") and path.suffix == ".py":
             _add_python(plan, path, path.name)
             continue

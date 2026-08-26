@@ -40,6 +40,33 @@ pub struct PendingOperationId {
 }
 
 impl PendingOperationId {
+    /// Stable opaque token suitable for round-tripping through copied IPC.
+    #[must_use]
+    pub const fn abi_value(self) -> u64 {
+        (self.generation as u64) << 16 | self.slot as u64
+    }
+
+    /// Decode one opaque copied-IPC token.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero generations and noncanonical high bits. Table lookup still
+    /// performs the authoritative current-generation check.
+    pub const fn from_abi_value(value: u64) -> Result<Self, PendingCallError> {
+        if value >> 48 != 0 {
+            return Err(PendingCallError::StaleOperation);
+        }
+        let bytes = value.to_le_bytes();
+        let generation = u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
+        if generation == 0 {
+            return Err(PendingCallError::StaleOperation);
+        }
+        Ok(Self {
+            slot: u16::from_le_bytes([bytes[0], bytes[1]]),
+            generation,
+        })
+    }
+
     /// Pool-local slot used only by diagnostics and tests.
     #[must_use]
     pub const fn slot(self) -> u16 {
@@ -1283,6 +1310,35 @@ mod tests {
             Ok(operation) => operation,
             Err(_) => std::process::abort(),
         }
+    }
+
+    #[test]
+    fn pending_operation_tokens_are_canonical_and_generation_checked() {
+        let owner = task(0);
+        let mut calls = PendingCallTable::new(1, 8).unwrap_or_else(|_| std::process::abort());
+        let first = pending(&mut calls, owner, 1, b"one");
+        assert_eq!(
+            PendingOperationId::from_abi_value(first.abi_value()),
+            Ok(first)
+        );
+        assert_eq!(
+            PendingOperationId::from_abi_value(0),
+            Err(PendingCallError::StaleOperation)
+        );
+        assert_eq!(
+            PendingOperationId::from_abi_value(1_u64 << 48),
+            Err(PendingCallError::StaleOperation)
+        );
+        calls
+            .mark_ready(first, WakeReason::ResourceReady)
+            .unwrap_or_else(|_| std::process::abort());
+        calls
+            .finish(first)
+            .unwrap_or_else(|_| std::process::abort());
+        let second = pending(&mut calls, owner, 2, b"two");
+        assert_ne!(first.abi_value(), second.abi_value());
+        assert_eq!(calls.call(first), Err(PendingCallError::StaleOperation));
+        assert!(calls.call(second).is_ok());
     }
 
     fn timer_spec(owner: TaskId, operation: PendingOperationId, deadline: u64) -> WaitSpec {

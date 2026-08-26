@@ -61,8 +61,8 @@ other ready work, exact-key wakeup, stale/double-wake rejection, and ordered
 terminal teardown. These portable types retain no native context or pointer.
 The kernel composition layer constructs at most one pending slot, wait slot,
 and suspended-context slot only for a command that holds timer or datagram
-authority. The large continuation storage is preallocated off the 64 KiB task
-stack; the deferred transition itself performs no metadata allocation.
+authority. The large continuation storage is preallocated off the guarded
+native stacks; the deferred transition itself performs no metadata allocation.
 
 ### Wait channels and deferred replies
 

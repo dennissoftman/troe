@@ -117,8 +117,10 @@ staged scheduler-visible wait and deferred-reply direction. The portable
 blocked lifecycle, generation-checked wait registrations, copied pending calls,
 and teardown models are implemented. Native timer sleep and UDP receive now use
 one bounded composition-owned suspended context, deferred reply, and hardware
-idle deadline; capability mailboxes and multiple live KEX applications remain
-explicit later slices.
+idle deadline. The immutable diagnostics snapshot now crosses the first copied
+client/server receive/reply boundary into a fault-contained KEX server;
+capability mailboxes and multiple independently scheduled live KEX applications
+remain explicit later slices.
 ADR 0012 governs the completed Stage 5.1 terminal and
 framebuffer increment; AArch64 native keyboard input remains a later
 virtio-input transport decision. ADR 0013 governs the completed Stage 5.2

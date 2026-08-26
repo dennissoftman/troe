@@ -3093,6 +3093,9 @@ fn architecture_activate(root: u64, capabilities: ArchitectureMmuCapabilities) {
 static AARCH64_KERNEL_CONTEXT: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+static AARCH64_EXCEPTION_STACK_TOP: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 fn architecture_run_isolated(root: u64, entry: u64, stack_top: u64) -> u64 {
     // SAFETY: `run_isolated` validated all mappings and exclusively installed
     // the active state. The naked boundary preserves AAPCS64 callee-saved GPR,
@@ -3146,7 +3149,8 @@ unsafe extern "C" fn aarch64_enter_isolated(_root: u64, _entry: u64, _stack_top:
         "str x9, [sp, #248]",
         "mrs x9, tpidr_el0",
         "str x9, [sp, #256]",
-        "adr x9, {context}",
+        "adrp x9, {context}",
+        "add x9, x9, :lo12:{context}",
         "mov x10, sp",
         "str x10, [x9]",
         "msr ttbr0_el1, x0",
@@ -3195,7 +3199,8 @@ unsafe extern "C" fn aarch64_enter_application(
         "str x9, [sp, #248]",
         "mrs x9, tpidr_el0",
         "str x9, [sp, #256]",
-        "adr x9, {context}",
+        "adrp x9, {context}",
+        "add x9, x9, :lo12:{context}",
         "mov x10, sp",
         "str x10, [x9]",
         "msr ttbr0_el1, x0",
@@ -3307,7 +3312,8 @@ unsafe extern "C" fn aarch64_resume_application(
         "str x9, [sp, #248]",
         "mrs x9, tpidr_el0",
         "str x9, [sp, #256]",
-        "adr x9, {kernel_context}",
+        "adrp x9, {kernel_context}",
+        "add x9, x9, :lo12:{kernel_context}",
         "mov x10, sp",
         "str x10, [x9]",
         "msr ttbr0_el1, x0",
@@ -3370,14 +3376,16 @@ unsafe extern "C" fn aarch64_resume_application(
 extern "C" fn aarch64_isolated_complete() -> ! {
     core::arch::naked_asm!(
         "mov x11, x0",
-        "adr x9, {kernel_root}",
+        "adrp x9, {kernel_root}",
+        "add x9, x9, :lo12:{kernel_root}",
         "ldr x10, [x9]",
         "msr ttbr0_el1, x10",
         "dsb sy",
         "tlbi vmalle1",
         "dsb sy",
         "isb",
-        "adr x9, {context}",
+        "adrp x9, {context}",
+        "add x9, x9, :lo12:{context}",
         "ldr x9, [x9]",
         "mov sp, x9",
         "ldr x12, [sp, #240]",
@@ -3605,7 +3613,7 @@ unsafe extern "C" {
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
-fn architecture_install_exception_vectors(_exception_stack: PhysicalRange) -> Result<(), MmuError> {
+fn architecture_install_exception_vectors(exception_stack: PhysicalRange) -> Result<(), MmuError> {
     let mut current_el: u64;
     // SAFETY: Reading CurrentEL is side-effect free.
     unsafe {
@@ -3614,6 +3622,11 @@ fn architecture_install_exception_vectors(_exception_stack: PhysicalRange) -> Re
     if current_el >> 2 != 1 {
         return Err(MmuError::UnsupportedCpu);
     }
+    let exception_stack_top = exception_stack.end();
+    if exception_stack_top == 0 || !exception_stack_top.is_multiple_of(16) {
+        return Err(MmuError::InvalidPlan);
+    }
+    AARCH64_EXCEPTION_STACK_TOP.store(exception_stack_top, Ordering::Release);
     // SAFETY: The global assembly symbol is 2 KiB aligned and contains all 16
     // fixed-size architectural vector entries for the lifetime of the image.
     let vectors = ptr::addr_of!(troe_aarch64_vectors) as u64;
@@ -3713,8 +3726,35 @@ extern "C" fn troe_aarch64_isolated_fault(esr: u64, _address: u64) -> u64 {
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+#[unsafe(naked)]
 #[unsafe(no_mangle)]
-extern "C" fn troe_aarch64_exception_fatal(esr: u64, far: u64) -> ! {
+extern "C" fn troe_aarch64_exception_fatal(_esr: u64, _far: u64) -> ! {
+    core::arch::naked_asm!(
+        "adrp x9, {stack_top}",
+        "add x9, x9, :lo12:{stack_top}",
+        "ldr x9, [x9]",
+        "cbz x9, 1f",
+        "mov sp, x9",
+        "b {report}",
+        "1:",
+        "b 1b",
+        stack_top = sym AARCH64_EXCEPTION_STACK_TOP,
+        report = sym troe_aarch64_exception_fatal_report,
+    );
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+extern "C" fn troe_aarch64_exception_fatal_report(esr: u64, far: u64) -> ! {
+    let exception_return: u64;
+    let stack_pointer: u64;
+    // SAFETY: ELR_EL1 is read-only here, and reading the current stack pointer
+    // has no side effects. The values make terminal kernel faults actionable.
+    unsafe {
+        core::arch::asm!("mrs {}, elr_el1", out(reg) exception_return, options(nomem, nostack));
+        core::arch::asm!("mov {}, sp", out(reg) stack_pointer, options(nomem, nostack));
+    }
+    let handler_address =
+        u64::try_from((troe_aarch64_exception_fatal_report as *const ()).addr()).unwrap_or(0);
     let exception_class = (esr >> 26) & 0x3f;
     let message = if exception_class == 0x21 {
         b"fault: execute permission violation\n".as_slice()
@@ -3724,8 +3764,14 @@ extern "C" fn troe_aarch64_exception_fatal(esr: u64, far: u64) -> ! {
         b"fault: native exception\n".as_slice()
     };
     let _written = crate::mechanism::write(message);
-    let mut detail = *b"esr=0000000000000000 far=0000000000000000\n";
-    for (offset, value) in [(4, esr), (25, far)] {
+    let mut detail = *b"esr=0000000000000000 far=0000000000000000 elr=0000000000000000 sp=0000000000000000 handler=0000000000000000\n";
+    for (offset, value) in [
+        (4, esr),
+        (25, far),
+        (46, exception_return),
+        (66, stack_pointer),
+        (91, handler_address),
+    ] {
         for digit in 0..16 {
             let shift = (15 - digit) * 4;
             let nibble = ((value >> shift) & 0xf) as u8;

@@ -20,10 +20,13 @@ mod firmware {
     use core::cell::{Cell, RefCell};
     use core::fmt::Write as _;
     use core::panic::PanicInfo;
+    #[cfg(feature = "acceptance-probes")]
+    use core::sync::atomic::{AtomicBool, Ordering};
 
     use troe_abi::{
         command, datagram, diagnostics, filesystem, filesystem_mutation, heap_growth, icmp_echo,
-        network_configuration, network_observation, stream, tcp_connect, timer, volume_control,
+        network_configuration, network_observation, server, stream, tcp_connect, timer,
+        volume_control,
     };
     #[cfg(feature = "acceptance-probes")]
     use troe_application::ParseError;
@@ -107,8 +110,12 @@ mod firmware {
     const OWNED_STACK_BYTES: u64 = 128 * 1024;
     const EXCEPTION_STACK_BYTES: u64 = 16 * 1024;
     const TASK_STACK_BYTES: u64 = 64 * 1024;
+    const SERVER_TASK_STACK_BYTES: u64 = 128 * 1024;
+    const SHELL_TASK_STACK_BYTES: u64 = 128 * 1024;
     const TASK_GUARD_BYTES: u64 = BASE_PAGE_SIZE;
     const TASK_STACK_PAGES: u16 = 16;
+    const SERVER_TASK_STACK_PAGES: u16 = 32;
+    const SHELL_TASK_STACK_PAGES: u16 = 32;
     const TASK_STACK_COUNT: usize = 3;
     const ISOLATED_TABLE_PAGES: u64 = PAGE_TABLE_BYTES / BASE_PAGE_SIZE;
     const ISOLATED_CODE_PAGES: u64 = 1;
@@ -138,13 +145,19 @@ mod firmware {
         + PAGE_TABLE_BYTES
         + OWNED_STACK_BYTES
         + EXCEPTION_STACK_BYTES
-        + (TASK_STACK_BYTES + 2 * TASK_GUARD_BYTES) * TASK_STACK_COUNT as u64)
+        + TASK_STACK_BYTES
+        + SERVER_TASK_STACK_BYTES
+        + SHELL_TASK_STACK_BYTES
+        + 2 * TASK_GUARD_BYTES * TASK_STACK_COUNT as u64)
         / BASE_PAGE_SIZE) as usize;
     const BOOT_STATUS_WIDTH: usize = 54;
     const BOOT_MEMORY_LABEL: &str = "Initializing memory and protection";
     const BOOT_DEVICES_LABEL: &str = "Starting devices and input";
     const BOOT_RUNTIME_LABEL: &str = "Starting task and application runtime";
     const _: () = assert!(TASK_STACK_BYTES == TASK_STACK_PAGES as u64 * BASE_PAGE_SIZE);
+    const _: () =
+        assert!(SERVER_TASK_STACK_BYTES == SERVER_TASK_STACK_PAGES as u64 * BASE_PAGE_SIZE);
+    const _: () = assert!(SHELL_TASK_STACK_BYTES == SHELL_TASK_STACK_PAGES as u64 * BASE_PAGE_SIZE);
     const _: () = assert!(TASK_GUARD_BYTES == BASE_PAGE_SIZE);
     const _: () = assert!(TASK_STACK_COUNT == 3);
     const _: () = assert!(STAGE6_USER_REGIONS <= STAGE6_USER_REGION_LIMIT);
@@ -356,6 +369,7 @@ mod firmware {
     struct CommandDeferredServices {
         runtime: SharedRuntime,
         datagram: Option<SharedApplicationDatagram>,
+        diagnostics: Option<Rc<[u8; diagnostics::SNAPSHOT_BYTES]>>,
     }
 
     enum DeferredCallKind {
@@ -366,6 +380,9 @@ mod firmware {
             state: SharedApplicationDatagram,
             local_port: u16,
             deadline: MonotonicMillis,
+            resource: WaitResource,
+        },
+        Diagnostics {
             resource: WaitResource,
         },
     }
@@ -473,6 +490,9 @@ mod firmware {
     type SharedTcpConnection = Rc<RefCell<KernelTcpConnection>>;
     type SharedRuntimeMounts = Rc<RefCell<RuntimeMountRegistry>>;
     type SharedApplicationDatagram = Rc<RefCell<ApplicationDatagramState>>;
+    type SharedDiagnosticsSnapshot = Rc<[u8; diagnostics::SNAPSHOT_BYTES]>;
+    type DiagnosticsServerCompletion = (ReplyStatus, Vec<u8>);
+    type DiagnosticsServerFate = (WakeReason, Option<DiagnosticsServerCompletion>);
 
     struct RuntimeMountRecord {
         name: String,
@@ -692,9 +712,36 @@ mod firmware {
         runtime: SharedRuntime,
     }
 
-    struct ApplicationDiagnosticsService {
-        snapshot: [u8; diagnostics::SNAPSHOT_BYTES],
+    struct ApplicationDiagnosticsProxyService;
+
+    struct DiagnosticsServerExchange {
+        operation: PendingOperationId,
+        snapshot: SharedDiagnosticsSnapshot,
+        reply_capacity: usize,
+        received: bool,
+        completed: bool,
+        status: ReplyStatus,
+        reply: Vec<u8>,
+        reply_bytes: usize,
     }
+
+    struct DiagnosticsServerEndpoint {
+        exchange: Rc<RefCell<DiagnosticsServerExchange>>,
+    }
+
+    struct DiagnosticsServerRunner<'a> {
+        accounting: &'a mut OwnedAccounting,
+        scheduler: &'a mut Scheduler,
+        exchange: Rc<RefCell<DiagnosticsServerExchange>>,
+        artifact: &'static [u8],
+        fault_probe: bool,
+        outcome: Option<Result<CommandApplicationOutcome, ()>>,
+    }
+
+    #[cfg(feature = "acceptance-probes")]
+    static DIAGNOSTICS_FAULT_PROBE_REQUESTED: AtomicBool = AtomicBool::new(false);
+    #[cfg(feature = "acceptance-probes")]
+    static DIAGNOSTICS_FAULT_PROBE_CONTAINED: AtomicBool = AtomicBool::new(false);
 
     struct ApplicationNetworkObservationService {
         network: Option<SharedNetwork>,
@@ -1411,9 +1458,9 @@ mod firmware {
             .allocate(EXCEPTION_STACK_BYTES, BASE_PAGE_SIZE)
             .map_err(|_| ())?;
         let task_stacks = [
-            allocate_task_stack(&mut allocator)?,
-            allocate_task_stack(&mut allocator)?,
-            allocate_task_stack(&mut allocator)?,
+            allocate_task_stack(&mut allocator, TASK_STACK_BYTES)?,
+            allocate_task_stack(&mut allocator, SERVER_TASK_STACK_BYTES)?,
+            allocate_task_stack(&mut allocator, SHELL_TASK_STACK_BYTES)?,
         ];
         allocator.seal();
         let heap_start = usize::try_from(heap.start()).map_err(|_| ())?;
@@ -1439,12 +1486,15 @@ mod firmware {
         })
     }
 
-    fn allocate_task_stack(allocator: &mut BootAllocator) -> Result<TaskStackLayout, ()> {
+    fn allocate_task_stack(
+        allocator: &mut BootAllocator,
+        stack_bytes: u64,
+    ) -> Result<TaskStackLayout, ()> {
         let lower_guard = allocator
             .allocate(TASK_GUARD_BYTES, BASE_PAGE_SIZE)
             .map_err(|_| ())?;
         let stack = allocator
-            .allocate(TASK_STACK_BYTES, BASE_PAGE_SIZE)
+            .allocate(stack_bytes, BASE_PAGE_SIZE)
             .map_err(|_| ())?;
         let upper_guard = allocator
             .allocate(TASK_GUARD_BYTES, BASE_PAGE_SIZE)
@@ -1692,7 +1742,7 @@ mod firmware {
         let capabilities = Capabilities::CONSOLE
             .union(Capabilities::FILESYSTEM)
             .union(Capabilities::MACHINE_CONTROL);
-        let stack_resource = StackResource::new(2, TASK_STACK_PAGES)
+        let stack_resource = StackResource::new(2, SHELL_TASK_STACK_PAGES)
             .unwrap_or_else(|_| fatal(b"fatal: invalid shell task stack\n"));
         let shell_id = scheduler
             .spawn(capabilities, stack_resource)
@@ -1701,7 +1751,7 @@ mod firmware {
             .dispatch_next(capabilities)
             .unwrap_or_else(|_| fatal(b"fatal: shell task dispatch failed\n"));
         if dispatched != Some(shell_id)
-            || scheduler.stats().owned_stack_pages != u32::from(TASK_STACK_PAGES)
+            || scheduler.stats().owned_stack_pages != u32::from(SHELL_TASK_STACK_PAGES)
         {
             fatal(b"fatal: shell task accounting failed\n");
         }
@@ -1724,11 +1774,17 @@ mod firmware {
         scheduler: &mut Scheduler,
         accounting: &OwnedAccounting,
     ) -> Result<(), ()> {
-        for layout in accounting.task_stacks {
+        for (slot, layout) in accounting.task_stacks.iter().copied().enumerate() {
+            let expected_pages = match slot {
+                0 => u64::from(TASK_STACK_PAGES),
+                1 => u64::from(SERVER_TASK_STACK_PAGES),
+                2 => u64::from(SHELL_TASK_STACK_PAGES),
+                _ => return Err(()),
+            };
             if layout.lower_guard.end() != layout.stack.start()
                 || layout.stack.end() != layout.upper_guard.start()
                 || layout.lower_guard.page_count() != 1
-                || layout.stack.page_count() != u64::from(TASK_STACK_PAGES)
+                || layout.stack.page_count() != expected_pages
                 || layout.upper_guard.page_count() != 1
             {
                 return Err(());
@@ -1736,7 +1792,7 @@ mod firmware {
         }
 
         let first_resource = StackResource::new(0, TASK_STACK_PAGES).map_err(|_| ())?;
-        let second_resource = StackResource::new(1, TASK_STACK_PAGES).map_err(|_| ())?;
+        let second_resource = StackResource::new(1, SERVER_TASK_STACK_PAGES).map_err(|_| ())?;
         let first = scheduler
             .spawn(Capabilities::SERVICE, first_resource)
             .map_err(|_| ())?;
@@ -2299,7 +2355,9 @@ mod firmware {
             minor: 0,
         }];
         let source = native_kex_artifact(ApplicationProbe::HeapGrowthLimit);
-        match run_command_application(scheduler, accounting, dispatcher, &services, None, source)? {
+        match run_command_application(
+            scheduler, accounting, dispatcher, &services, None, source, 0,
+        )? {
             CommandApplicationOutcome::Faulted(TaskFault::ExecutionLeaseExpired) => Ok(()),
             CommandApplicationOutcome::Exited(_) | CommandApplicationOutcome::Faulted(_) => Err(()),
         }
@@ -2819,6 +2877,46 @@ mod firmware {
                 kind: DeferredCallKind::Timer { deadline },
             });
         }
+        if interface == troe_abi::interface::DIAGNOSTICS {
+            if opcode != diagnostics::GET_SNAPSHOT || !payload.is_empty() {
+                return Ok(DeferredCallPreparation::Immediate {
+                    status: ReplyStatus::InvalidRequest,
+                    payload: Vec::new(),
+                });
+            }
+            if services.diagnostics.is_none() {
+                return Ok(DeferredCallPreparation::Immediate {
+                    status: ReplyStatus::NotFound,
+                    payload: Vec::new(),
+                });
+            }
+            let operation = pending
+                .begin(
+                    task_id,
+                    *next_request_id,
+                    handle,
+                    opcode,
+                    payload,
+                    reply_capacity,
+                )
+                .map_err(|_| ())?;
+            *next_request_id = (*next_request_id).checked_add(1).ok_or(())?;
+            let resource =
+                WaitResource::new(operation.abi_value(), task_id.get()).map_err(|_| ())?;
+            let spec = WaitSpec::new(
+                task_id,
+                operation,
+                Some(resource),
+                WakeInterest::RESOURCE_READY,
+                None,
+            )
+            .map_err(|_| ())?;
+            return Ok(DeferredCallPreparation::Blocked {
+                operation,
+                spec,
+                kind: DeferredCallKind::Diagnostics { resource },
+            });
+        }
         if interface != troe_abi::interface::DATAGRAM || opcode != datagram::RECEIVE {
             return Ok(DeferredCallPreparation::NotDeferred);
         }
@@ -2908,6 +3006,124 @@ mod firmware {
         Ok(payload)
     }
 
+    #[inline(never)]
+    fn run_diagnostics_server_task(runner: &mut DiagnosticsServerRunner<'_>) -> TaskStep {
+        let outcome = (|| -> Result<CommandApplicationOutcome, ()> {
+            let package = parse_kex_package(runner.artifact).map_err(|_| ())?;
+            let mut requirements = package.requirements().iter();
+            let requirement = requirements.next().ok_or(())?;
+            if requirements.next().is_some()
+                || requirement.interface != troe_abi::interface::SERVER_ENDPOINT
+                || requirement.major != server::MAJOR
+                || requirement.minor != server::MINOR
+            {
+                return Err(());
+            }
+            let mut dispatcher = Dispatcher::new(1, 2).map_err(|_| ())?;
+            let port = register_command_service(
+                &mut dispatcher,
+                DiagnosticsServerEndpoint {
+                    exchange: Rc::clone(&runner.exchange),
+                },
+            )?;
+            let services = [CommandStartupService {
+                port,
+                interface: troe_abi::interface::SERVER_ENDPOINT,
+                major: server::MAJOR,
+                minor: server::MINOR,
+            }];
+            run_command_application(
+                runner.scheduler,
+                runner.accounting,
+                &mut dispatcher,
+                &services,
+                None,
+                package.executable(),
+                1,
+            )
+        })();
+        let success = outcome.is_ok();
+        runner.outcome = Some(outcome);
+        if success {
+            TaskStep::ExitSuccess
+        } else {
+            TaskStep::ExitFailure
+        }
+    }
+
+    #[inline(never)]
+    fn run_diagnostics_server(
+        scheduler: &mut Scheduler,
+        accounting: &mut OwnedAccounting,
+        operation: PendingOperationId,
+        snapshot: SharedDiagnosticsSnapshot,
+        reply_capacity: usize,
+    ) -> Result<DiagnosticsServerFate, ()> {
+        let baseline_frames = accounting.frames.free_frames();
+        let (artifact, fault_probe) = native_diagnostics_server_artifact();
+        let mut reply_storage = Vec::new();
+        reply_storage
+            .try_reserve_exact(troe_abi::MAX_MESSAGE_BYTES)
+            .map_err(|_| ())?;
+        reply_storage.resize(troe_abi::MAX_MESSAGE_BYTES, 0);
+        let exchange = Rc::new(RefCell::new(DiagnosticsServerExchange {
+            operation,
+            snapshot,
+            reply_capacity,
+            received: false,
+            completed: false,
+            status: ReplyStatus::Failure,
+            reply: reply_storage,
+            reply_bytes: 0,
+        }));
+        let stack = accounting.task_stacks[1].stack;
+        let mut runner = DiagnosticsServerRunner {
+            accounting,
+            scheduler,
+            exchange: Rc::clone(&exchange),
+            artifact,
+            fault_probe,
+            outcome: None,
+        };
+        let step = troe_machine::run_task_step(stack, &mut runner, run_diagnostics_server_task)
+            .map_err(|_| ())?;
+        let outcome = runner.outcome.take().ok_or(())?;
+        if (step == TaskStep::ExitSuccess) != outcome.is_ok() {
+            return Err(());
+        }
+        let fault_probe = runner.fault_probe;
+        drop(runner);
+        if accounting.frames.free_frames() != baseline_frames {
+            return Err(());
+        }
+        #[cfg(feature = "acceptance-probes")]
+        if fault_probe {
+            if !matches!(outcome, Ok(CommandApplicationOutcome::Faulted(_))) {
+                return Err(());
+            }
+            DIAGNOSTICS_FAULT_PROBE_CONTAINED.store(true, Ordering::Release);
+        }
+        #[cfg(not(feature = "acceptance-probes"))]
+        let _ = fault_probe;
+        let mut exchange = exchange.borrow_mut();
+        if exchange.completed {
+            let reply_bytes = exchange.reply_bytes;
+            let status = exchange.status;
+            let mut reply = Vec::new();
+            reply.try_reserve_exact(reply_bytes).map_err(|_| ())?;
+            reply.extend_from_slice(&exchange.reply[..reply_bytes]);
+            exchange.reply[..reply_bytes].fill(0);
+            return Ok((WakeReason::ResourceReady, Some((status, reply))));
+        }
+        match outcome {
+            Ok(CommandApplicationOutcome::Exited(troe_abi::exit::SUCCESS)) => {
+                Ok((WakeReason::Closed, None))
+            }
+            Ok(CommandApplicationOutcome::Exited(_) | CommandApplicationOutcome::Faulted(_))
+            | Err(()) => Ok((WakeReason::Revoked, None)),
+        }
+    }
+
     fn deferred_reply(
         kind: DeferredCallKind,
         reason: WakeReason,
@@ -2928,7 +3144,11 @@ mod firmware {
                 Ok((ReplyStatus::Cancelled, Vec::new()))
             }
             (_, WakeReason::Closed) => Ok((ReplyStatus::Conflict, Vec::new())),
-            (DeferredCallKind::Timer { .. }, WakeReason::ResourceReady) => Err(()),
+            (
+                DeferredCallKind::Timer { .. } | DeferredCallKind::Diagnostics { .. },
+                WakeReason::ResourceReady,
+            )
+            | (DeferredCallKind::Diagnostics { .. }, WakeReason::Deadline) => Err(()),
         }
     }
 
@@ -3003,10 +3223,12 @@ mod firmware {
                         }
                     }
                 }
+                DeferredCallKind::Diagnostics { .. } => return Err(()),
             }
             let deadline = match &suspended_call.kind {
                 DeferredCallKind::Timer { deadline }
                 | DeferredCallKind::Datagram { deadline, .. } => *deadline,
+                DeferredCallKind::Diagnostics { .. } => return Err(()),
             };
             let remaining = deadline.as_millis().saturating_sub(now.as_millis());
             if remaining == 0 {
@@ -3046,8 +3268,84 @@ mod firmware {
 
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
+    fn complete_diagnostics_deferred_call(
+        scheduler: &mut Scheduler,
+        accounting: &mut OwnedAccounting,
+        task_id: TaskId,
+        operation: PendingOperationId,
+        snapshot: SharedDiagnosticsSnapshot,
+        resource: WaitResource,
+        pending: &mut PendingCallTable,
+        waits: &mut WaitTable,
+        suspended: &mut SuspendedApplicationCalls,
+    ) -> Result<
+        (
+            troe_machine::ApplicationSession,
+            troe_machine::ApplicationCall,
+            ReplyStatus,
+            Vec<u8>,
+        ),
+        (),
+    > {
+        let reply_capacity = pending.call(operation).map_err(|_| ())?.reply_capacity();
+        let (reason, server_reply) =
+            run_diagnostics_server(scheduler, accounting, operation, snapshot, reply_capacity)?;
+        let completion = match reason {
+            WakeReason::ResourceReady | WakeReason::Closed => {
+                let batch = waits.wake_resource(resource, reason).map_err(|_| ())?;
+                let completion = batch.iter().next().ok_or(())?;
+                if batch.iter().nth(1).is_some() {
+                    return Err(());
+                }
+                completion
+            }
+            WakeReason::Revoked => waits
+                .cancel_operation(operation, reason)
+                .map_err(|_| ())?
+                .ok_or(())?,
+            WakeReason::Deadline | WakeReason::Cancelled => return Err(()),
+        };
+        pending.resolve(completion).map_err(|_| ())?;
+        scheduler
+            .wake_blocked(completion.owner(), completion.key())
+            .map_err(|_| ())?;
+        if scheduler
+            .dispatch_next(Capabilities::SERVICE)
+            .map_err(|_| ())?
+            != Some(task_id)
+        {
+            return Err(());
+        }
+        let suspended_call = suspended.take(operation)?;
+        if !matches!(
+            suspended_call.kind,
+            DeferredCallKind::Diagnostics { resource: owned, .. } if owned == resource
+        ) {
+            return Err(());
+        }
+        let (status, payload) = match reason {
+            WakeReason::ResourceReady => server_reply.ok_or(())?,
+            WakeReason::Closed => (ReplyStatus::Conflict, Vec::new()),
+            WakeReason::Revoked => (ReplyStatus::Cancelled, Vec::new()),
+            WakeReason::Deadline | WakeReason::Cancelled => return Err(()),
+        };
+        if payload.len() > suspended_call.call.reply_capacity() {
+            return Err(());
+        }
+        pending.finish(operation).map_err(|_| ())?;
+        Ok((
+            suspended_call.application,
+            suspended_call.call,
+            status,
+            payload,
+        ))
+    }
+
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
     fn resume_deferred_application_call(
         scheduler: &mut Scheduler,
+        accounting: &mut OwnedAccounting,
         task_id: TaskId,
         operation: PendingOperationId,
         spec: WaitSpec,
@@ -3055,6 +3353,7 @@ mod firmware {
         application: troe_machine::ApplicationSession,
         call: troe_machine::ApplicationCall,
         runtime: &SharedRuntime,
+        diagnostics_snapshot: Option<&SharedDiagnosticsSnapshot>,
         state: &mut CommandDeferredState,
     ) -> Result<troe_machine::ApplicationOutcome, ()> {
         let registration = state
@@ -3082,6 +3381,12 @@ mod firmware {
                 .map_err(|_| ())
             }
             WaitRegistration::Blocked(wait) => {
+                let diagnostics = match &kind {
+                    DeferredCallKind::Diagnostics { resource } => {
+                        Some((Rc::clone(diagnostics_snapshot.ok_or(())?), *resource))
+                    }
+                    DeferredCallKind::Timer { .. } | DeferredCallKind::Datagram { .. } => None,
+                };
                 state.pending.bind_wait(operation, wait).map_err(|_| ())?;
                 state.suspended.insert(SuspendedApplicationCall {
                     operation,
@@ -3090,15 +3395,30 @@ mod firmware {
                     kind,
                 })?;
                 scheduler.block_current(task_id, wait).map_err(|_| ())?;
-                let (application, _call, status, payload) = wait_for_deferred_call(
-                    scheduler,
-                    task_id,
-                    operation,
-                    runtime,
-                    &mut state.pending,
-                    &mut state.waits,
-                    &mut state.suspended,
-                )?;
+                let (application, _call, status, payload) =
+                    if let Some((snapshot, resource)) = diagnostics {
+                        complete_diagnostics_deferred_call(
+                            scheduler,
+                            accounting,
+                            task_id,
+                            operation,
+                            snapshot,
+                            resource,
+                            &mut state.pending,
+                            &mut state.waits,
+                            &mut state.suspended,
+                        )?
+                    } else {
+                        wait_for_deferred_call(
+                            scheduler,
+                            task_id,
+                            operation,
+                            runtime,
+                            &mut state.pending,
+                            &mut state.waits,
+                            &mut state.suspended,
+                        )?
+                    };
                 troe_machine::resume_application(
                     application,
                     troe_machine::ApplicationResume::HandleReply {
@@ -3119,6 +3439,7 @@ mod firmware {
         services: &[CommandStartupService],
         deferred_services: Option<&CommandDeferredServices>,
         source: &[u8],
+        resource_slot: u8,
     ) -> Result<CommandApplicationOutcome, ()> {
         if services.is_empty() || services.len() > troe_dispatch::MAX_HANDLES {
             return Err(());
@@ -3198,14 +3519,17 @@ mod firmware {
         }
         let handle_count = u16::try_from(services.len()).map_err(|_| ())?;
         let retained_table_pages = allocation.tables.page_count();
-        let Ok(mut isolation) =
-            IsolationResource::new(0, retained_table_pages, private_pages, handle_count)
-        else {
+        let Ok(mut isolation) = IsolationResource::new(
+            resource_slot,
+            retained_table_pages,
+            private_pages,
+            handle_count,
+        ) else {
             reclaim_command_application(&mut accounting.frames, allocation);
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
-        let Ok(stack_resource) = StackResource::new(0, stack_pages) else {
+        let Ok(stack_resource) = StackResource::new(resource_slot, stack_pages) else {
             reclaim_command_application(&mut accounting.frames, allocation);
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
@@ -3468,6 +3792,7 @@ mod firmware {
                                 let state = deferred_state.as_mut().ok_or(())?;
                                 outcome = resume_deferred_application_call(
                                     scheduler,
+                                    accounting,
                                     task_id,
                                     operation,
                                     spec,
@@ -3475,6 +3800,7 @@ mod firmware {
                                     application,
                                     call,
                                     &deferred_services.runtime,
+                                    deferred_services.diagnostics.as_ref(),
                                     state,
                                 )?;
                             }
@@ -4019,6 +4345,40 @@ mod firmware {
         #[cfg(target_arch = "aarch64")]
         {
             Target::Aarch64
+        }
+    }
+
+    fn native_diagnostics_server_artifact() -> (&'static [u8], bool) {
+        #[cfg(feature = "acceptance-probes")]
+        if DIAGNOSTICS_FAULT_PROBE_REQUESTED.swap(false, Ordering::AcqRel) {
+            #[cfg(target_arch = "x86_64")]
+            {
+                return (
+                    include_bytes!("../../tests/kex-corpus/x86_64/diagnostics-fault-server.kex"),
+                    true,
+                );
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                return (
+                    include_bytes!("../../tests/kex-corpus/aarch64/diagnostics-fault-server.kex"),
+                    true,
+                );
+            }
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            (
+                include_bytes!("../../tests/kex-corpus/x86_64/diagnostics-server.kex"),
+                false,
+            )
+        }
+        #[cfg(target_arch = "aarch64")]
+        {
+            (
+                include_bytes!("../../tests/kex-corpus/aarch64/diagnostics-server.kex"),
+                false,
+            )
         }
     }
 
@@ -5695,15 +6055,83 @@ mod firmware {
         }
     }
 
-    impl Service for ApplicationDiagnosticsService {
+    impl Service for ApplicationDiagnosticsProxyService {
+        fn call(
+            &mut self,
+            _request: Request<'_>,
+        ) -> Result<ServiceReply, troe_dispatch::DispatchError> {
+            // Diagnostics calls are intercepted before synchronous dispatch
+            // and completed by the isolated diagnostics server.
+            Ok(ServiceReply::empty(ReplyStatus::Failure))
+        }
+    }
+
+    impl Service for DiagnosticsServerEndpoint {
         fn call(
             &mut self,
             request: Request<'_>,
         ) -> Result<ServiceReply, troe_dispatch::DispatchError> {
-            if request.opcode() != diagnostics::GET_SNAPSHOT || !request.payload().is_empty() {
-                return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+            match request.opcode() {
+                server::RECEIVE if request.payload().is_empty() => {
+                    let mut encoded = Vec::new();
+                    encoded
+                        .try_reserve_exact(troe_abi::MAX_MESSAGE_BYTES)
+                        .map_err(|_| troe_dispatch::DispatchError::MetadataExhausted)?;
+                    encoded.resize(troe_abi::MAX_MESSAGE_BYTES, 0);
+                    let encoded_bytes = {
+                        let exchange = self.exchange.borrow();
+                        if exchange.received || exchange.completed {
+                            return Ok(ServiceReply::empty(ReplyStatus::Conflict));
+                        }
+                        match server::encode_received_request(
+                            exchange.operation.abi_value(),
+                            troe_abi::interface::DIAGNOSTICS,
+                            diagnostics::GET_SNAPSHOT,
+                            exchange.reply_capacity,
+                            exchange.snapshot.as_ref(),
+                            &mut encoded,
+                        ) {
+                            Ok(bytes) => bytes,
+                            Err(_) => {
+                                return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                            }
+                        }
+                    };
+                    let reply = ServiceReply::with_payload(
+                        ReplyStatus::Success,
+                        &encoded[..encoded_bytes],
+                    )?;
+                    self.exchange.borrow_mut().received = true;
+                    Ok(reply)
+                }
+                server::REPLY => {
+                    let Ok(completion) = server::decode_reply_request(request.payload()) else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    let Ok(operation) = PendingOperationId::from_abi_value(completion.token())
+                    else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    let Some(status) = ReplyStatus::from_abi_value(completion.status()) else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    let mut exchange = self.exchange.borrow_mut();
+                    if !exchange.received
+                        || exchange.completed
+                        || exchange.operation != operation
+                        || completion.payload().len() > exchange.reply_capacity
+                    {
+                        return Ok(ServiceReply::empty(ReplyStatus::Conflict));
+                    }
+                    let reply_bytes = completion.payload().len();
+                    exchange.reply[..reply_bytes].copy_from_slice(completion.payload());
+                    exchange.reply_bytes = reply_bytes;
+                    exchange.status = status;
+                    exchange.completed = true;
+                    Ok(ServiceReply::empty(ReplyStatus::Success))
+                }
+                _ => Ok(ServiceReply::empty(ReplyStatus::InvalidRequest)),
             }
-            ServiceReply::with_payload(ReplyStatus::Success, &self.snapshot)
         }
     }
 
@@ -6859,9 +7287,7 @@ mod firmware {
                     services.push(CommandStartupService {
                         port: register_command_service(
                             &mut dispatcher,
-                            ApplicationDiagnosticsService {
-                                snapshot: diagnostics_snapshot.ok_or(())?,
-                            },
+                            ApplicationDiagnosticsProxyService,
                         )?,
                         interface: troe_abi::interface::DIAGNOSTICS,
                         major: diagnostics::MAJOR,
@@ -6959,10 +7385,11 @@ mod firmware {
             if self.scheduler.yield_current(self.shell_id).is_err() {
                 fatal(b"fatal: shell scheduler yield failed\n");
             }
-            let deferred_services =
-                (timer_required || datagram_required).then(|| CommandDeferredServices {
+            let deferred_services = (timer_required || datagram_required || diagnostics_required)
+                .then(|| CommandDeferredServices {
                     runtime: self.runtime.clone(),
                     datagram: application_datagram_state,
+                    diagnostics: diagnostics_snapshot,
                 });
             let outcome = run_command_application(
                 self.scheduler,
@@ -6971,6 +7398,7 @@ mod firmware {
                 services.as_slice(),
                 deferred_services.as_ref(),
                 package.executable(),
+                0,
             );
             if self
                 .scheduler
@@ -7125,6 +7553,15 @@ mod firmware {
                 fatal(b"fatal: native console input failed\n");
             };
             #[cfg(feature = "acceptance-probes")]
+            let diagnostics_fault_probe = line == "service-probe fault";
+            #[cfg(feature = "acceptance-probes")]
+            if diagnostics_fault_probe {
+                DIAGNOSTICS_FAULT_PROBE_CONTAINED.store(false, Ordering::Release);
+                if DIAGNOSTICS_FAULT_PROBE_REQUESTED.swap(true, Ordering::AcqRel) {
+                    fatal(b"fatal: diagnostics fault probe already pending\n");
+                }
+            }
+            #[cfg(feature = "acceptance-probes")]
             if line == "mmu-probe write" {
                 let _result = write_all(&mut console, b"probing read-only mapping\n");
                 troe_machine::trigger_write_fault(ROOTFS.as_ptr() as usize);
@@ -7160,13 +7597,37 @@ mod firmware {
                 shell_capabilities: task.capabilities,
                 runtime: runtime.clone(),
             };
+            #[cfg(feature = "acceptance-probes")]
+            let execution_line = if diagnostics_fault_probe {
+                "mem"
+            } else {
+                &line
+            };
+            #[cfg(not(feature = "acceptance-probes"))]
+            let execution_line = &line;
             let _status = shell.execute_with_external(
-                &line,
+                execution_line,
                 &mut input,
                 &mut console,
                 &mut error,
                 &mut external,
             );
+            #[cfg(feature = "acceptance-probes")]
+            if diagnostics_fault_probe {
+                if DIAGNOSTICS_FAULT_PROBE_REQUESTED.load(Ordering::Acquire)
+                    || !DIAGNOSTICS_FAULT_PROBE_CONTAINED.swap(false, Ordering::AcqRel)
+                {
+                    fatal(b"fatal: diagnostics server fault was not contained\n");
+                }
+                if write_all(
+                    &mut console,
+                    b"isolated diagnostics server fault contained\n",
+                )
+                .is_err()
+                {
+                    fatal(b"fatal: diagnostics fault probe report failed\n");
+                }
+            }
             if let Some(action) = shell.machine_action() {
                 perform_machine_action(action, &mut console);
             }
@@ -7316,7 +7777,7 @@ mod firmware {
         machine: MachineMemorySnapshot,
         input: Option<InputQueueStats>,
         memory: MemoryStats,
-    ) -> Result<[u8; diagnostics::SNAPSHOT_BYTES], ()> {
+    ) -> Result<SharedDiagnosticsSnapshot, ()> {
         let machine_memory = if machine.owner() == MachineMemoryOwner::Kernel {
             Some(diagnostics::MachineMemory {
                 usable_bytes: machine.usable_bytes().ok_or(())?,
@@ -7344,7 +7805,7 @@ mod firmware {
                 })
             })
             .transpose()?;
-        diagnostics::encode_snapshot(diagnostics::Snapshot {
+        let snapshot = diagnostics::encode_snapshot(diagnostics::Snapshot {
             architecture: if cfg!(target_arch = "x86_64") {
                 diagnostics::Architecture::X86_64
             } else {
@@ -7364,7 +7825,8 @@ mod firmware {
             caches_used_bytes: 0,
             caches_limit_bytes: 0,
         })
-        .map_err(|_| ())
+        .map_err(|_| ())?;
+        Ok(Rc::new(snapshot))
     }
 
     const fn usize_as_u64(value: usize) -> u64 {

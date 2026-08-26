@@ -34,6 +34,7 @@ IMAGE_SIZE_LIMIT = 16 * 1024 * 1024
 PRODUCTION_FORBIDDEN_MARKERS = (
     b"mmu-probe",
     b"task-probe",
+    b"service-probe",
     b"probing read-only",
     b"probing non-executable",
     b"probing task stack guard",

@@ -205,6 +205,34 @@ impl ReplyStatus {
     pub const fn abi_value(self) -> u32 {
         self as u32
     }
+
+    /// Decode one stable application-ABI reply value.
+    #[must_use]
+    pub const fn from_abi_value(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(Self::Success),
+            1 => Some(Self::InvalidRequest),
+            2 => Some(Self::NotFound),
+            3 => Some(Self::Failure),
+            4 => Some(Self::Exhausted),
+            5 => Some(Self::NotConfigured),
+            6 => Some(Self::Cancelled),
+            7 => Some(Self::Timeout),
+            8 => Some(Self::Conflict),
+            9 => Some(Self::TooLarge),
+            10 => Some(Self::InvalidPath),
+            11 => Some(Self::WrongType),
+            12 => Some(Self::ReadOnly),
+            13 => Some(Self::NoSpace),
+            14 => Some(Self::Exists),
+            15 => Some(Self::Corrupt),
+            16 => Some(Self::Io),
+            17 => Some(Self::Unsupported),
+            18 => Some(Self::Overflow),
+            19 => Some(Self::NetworkProtocol),
+            _ => None,
+        }
+    }
 }
 
 /// Borrowed request delivered synchronously to one service.

@@ -1,7 +1,7 @@
 # ADR 0028: KEX monotonic timer and diagnostics services
 
 Status: accepted and implemented for the Stage 9 timer and diagnostics command
-migration, 2026-08-25.
+migration, 2026-08-25; isolated diagnostics-server amendment, 2026-08-26.
 
 ## Decision
 
@@ -33,6 +33,17 @@ borrow of live accounting or a mutable kernel object.
 launch, so `mem` and read-only filesystem consumers retain one canonical report
 without granting diagnostics apps filesystem authority.
 
+Amendment, 2026-08-26: the snapshot implementation moved out of the privileged
+dispatcher into the first isolated KEX user server. The client call is retained
+as one bounded pending operation; a separate `server-endpoint` handle delivers
+one canonical copied request containing a generation-checked token and accepts
+one canonical copied reply. The server receives no filesystem, device, DMA,
+network, mutation, input, memory-management, or machine-control authority. A
+server exit closes the peer, while a server fault or composition rejection
+revokes it and completes the blocked client with terminal cancellation.
+One-shot launch is the current composition policy; persistent service processes
+and automatic restart remain separate decisions.
+
 ## Security and sequencing consequences
 
 Sleeping remains a foreground synchronous call and is bounded by both
@@ -42,7 +53,10 @@ the blocked-task and deferred-reply design proposed by ADR 0032.
 Diagnostics cannot poll, enumerate principals, read arbitrary memory, consume
 input events, or change accounting. Both interfaces use copied request/reply
 messages, exact version checks, and normal owner-wide handle revocation at
-application teardown.
+application teardown. Native acceptance faults the diagnostics server after it
+receives a request, verifies exact frame return and a single cancelled client
+completion, retains the shell, and then proves that a normal server launch
+still succeeds.
 
 These contracts are suitable primitives for later bounded interpreters and TCP
 state machines, but do not define either. ADR 0029 separately supplies the

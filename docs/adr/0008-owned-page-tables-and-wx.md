@@ -64,9 +64,10 @@ boot-services memory to the frame allocator. The current guarded-stack behavior
 is recorded below; the non-returning handoff and permanent reservation of active
 stacks and page tables remain current invariants.
 
-Implementation note, 2026-08-23: Stage 4 subsequently added three guarded
-64 KiB task-stack payloads. The 128 KiB owned kernel stack remains the scheduler
-and handoff stack; the shell now runs on a guarded task stack. See
+Implementation note, amended 2026-08-26: Stage 4 subsequently added three
+guarded task-stack payloads: one 64 KiB cooperative slot and 128 KiB server and
+shell slots. The 128 KiB owned kernel stack remains the scheduler and handoff
+stack; the shell runs on a guarded task stack. See
 [ADR 0010](0010-cooperative-tasks-and-guarded-stacks.md).
 
 Implementation note, 2026-08-23: Stage 6 permits a narrowly safer alias class:
@@ -75,9 +76,10 @@ every alias must still exclude write plus execute. Fresh task roots use this to
 map private pages at user virtual addresses without weakening global W^X. See
 [ADR 0014](0014-unprivileged-task-isolation-and-teardown.md).
 
-Implementation note, 2026-08-24: the Stage 3 arena size and interrupt state
-above are historical. Three 64 KiB guarded task stacks bring the current arena
-to 2,138 pages, and ADRs 0013/0023 subsequently enabled the owned APIC/GIC input
+Implementation note, amended 2026-08-26: the Stage 3 arena size and interrupt
+state above are historical. The heterogeneous 64/128/128 KiB guarded task
+stacks bring the current arena to 2,170 pages, and ADRs 0013/0023 subsequently
+enabled the owned APIC/GIC input
 and virtio-network routes. The loaded PE classifier now accepts between one and
 64 section headers, rejects the raw count before table walking, and exercises
 every valid-image truncation plus deterministic mutations of the complete

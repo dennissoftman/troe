@@ -442,6 +442,11 @@ fn capability_requirement(name: &str) -> ToolResult<requirements::Requirement> {
             major: volume_control::MAJOR,
             minor: volume_control::MINOR,
         }),
+        "server-endpoint" => Ok(requirements::Requirement {
+            interface: interface::SERVER_ENDPOINT,
+            major: troe_abi::server::MAJOR,
+            minor: troe_abi::server::MINOR,
+        }),
         _ => Err(ToolError::new(format!(
             "unknown TROE KEX capability '{name}'"
         ))),

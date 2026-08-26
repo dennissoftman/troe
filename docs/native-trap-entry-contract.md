@@ -19,6 +19,10 @@ single-CPU x86-64 and AArch64 backends, not a generic ABI for other machines.
   and the published run kind permits that fate. Kernel-origin faults are fatal.
 - Completion restores the kernel address space and CPU state before Rust regains
   control. The active run is then unpublished before IRQ delivery is re-enabled.
+- Native assembly addresses retained data symbols without depending on image
+  size. AArch64 uses `ADRP` plus the low-12-bit relocation for kernel roots,
+  saved contexts, and emergency-stack state; `ADR` cannot safely name data once
+  an image crosses its ±1 MiB reach.
 
 ## x86-64 gates
 
@@ -40,7 +44,7 @@ restored only when that user continuation is deliberately resumed.
 
 | Vector path | User fate | Required entry work |
 | --- | --- | --- |
-| `troe_aarch64_exception_entry` | fatal | mask DAIF, pass ESR/FAR, never return |
+| `troe_aarch64_exception_entry` | fatal | mask DAIF, switch to the dedicated 16 KiB mapped emergency stack, pass ESR/FAR, never return |
 | `troe_aarch64_lower_sync_entry` | suspend or terminate | mask DAIF, save X0-X30, Q0-Q31, FPCR/FPSR, ELR/SPSR, SP_EL0, and TPIDR_EL0; distinguish `SVC #0` from faults |
 | `troe_aarch64_irq_entry` | resume, complete a kernel deadline, or terminate a user lease | mask IRQ, save/restore X0-X30, Q0-Q31, FPCR/FPSR, pass saved SPSR origin; only an active EL0 application timer may complete the published context, while a kernel deadline records its wake and returns through the saved IRQ frame |
 | current/lower FIQ or SError vector | fatal | route to the common fatal exception entry |
@@ -57,6 +61,8 @@ write-permission, execute-permission, illegal-instruction, unexpected-entry,
 page-return, execution-timer, external input/network IRQ, heap-growth-limit,
 and AArch64 thread-pointer preservation paths. Terminal fault sessions exercise
 kernel-origin write, execute, synchronous-exception, and task-stack-guard paths.
+The acceptance image exceeds 1 MiB and therefore also exercises the
+page-relative data-symbol relocations used by AArch64 entry and completion.
 The source contract test pins assembly ordering that cannot be probabilistically
 inferred from one emulator timing interleaving. Both target lints and all four
 exhaustive QEMU profiles remain mandatory after a gate change.

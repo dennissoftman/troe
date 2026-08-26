@@ -88,9 +88,10 @@ changing the single-address-space authority model.
 Landed: `troe-task` provides a 16-record hard ceiling, monotonic task IDs,
 round-robin ready/running/exited transitions, typed capability sets, explicit
 yield/exit accounting, and reaping that returns the exact guarded-stack slot.
-The kernel reserves three 64 KiB task payloads, each between two unmapped 4 KiB
-guards. Architecture-local trampolines run one explicit continuation step on a
-task stack and restore the scheduler stack on yield or exit. Boot acceptance
+The kernel reserves one 64 KiB service payload plus 128 KiB server and shell
+payloads, each between two unmapped 4 KiB guards. Architecture-local
+trampolines run one explicit continuation step on a task stack and restore the
+scheduler stack on yield or exit. Boot acceptance
 executes two interleaved services, checks five deterministic yields, reaps both,
 reuses a returned slot, then dispatches the console/filesystem/machine-control
 shell task only with its declared capabilities. Feature-only acceptance images
@@ -412,7 +413,7 @@ slice has an independent exit criterion:
    address-space identifiers, or TLB work--without weakening reply ownership or
    fault fate.
 
-Implementation status, 2026-08-26: slices 1–4 are complete. The trap-entry
+Implementation status, 2026-08-26: slices 1–5 are complete. The trap-entry
 matrix and native probes are documented in `native-trap-entry-contract.md`; the
 host/native counter baseline is documented in `ipc-baseline.md`; and
 `troe-task` contains the preallocated wait/pending tables plus the portable
@@ -420,8 +421,13 @@ blocked lifecycle and exhaustive transition tests. Kernel composition retains
 one preallocated suspended KEX context for timer/UDP commands, enters a distinct
 native deadline-idle mode, and resumes only after an exact scheduler wake. The
 four-platform native gate covers success, timeout, cancellation, non-spinning
-idle accounting, and exact frame return. Slice 5, the immutable diagnostics
-user server, is next.
+idle accounting, and exact frame return. Diagnostics now crosses a copied
+receive/reply boundary into a least-authority isolated KEX server with a
+generation-checked request token. Native acceptance faults that server after
+receive, proves exact frame/handle reclamation and one terminal client reply,
+then launches the normal server again. Automatic restart and a persistent
+server process remain later composition policy. Slice 6, the identical
+in-kernel/isolated measurement matrix and measured optimization pass, is next.
 
 Only after these exits should a device-owning filesystem or network service
 move out of the kernel. Shared-memory grants, priority donation, SMP, and

@@ -28,6 +28,14 @@ KEX_APPLICATIONS = tuple(
         if path.is_dir() and (path / "Cargo.toml").is_file()
     )
 )
+KEX_SERVICES = (
+    (REPO_ROOT / "services" / "diagnostics", "diagnostics-server", 8),
+    (
+        REPO_ROOT / "services" / "diagnostics-fault",
+        "diagnostics-fault-server",
+        8,
+    ),
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -153,6 +161,24 @@ def main() -> int:
                 "--check",
             )
             for application in KEX_APPLICATIONS
+        ),
+        *(
+            (
+                "cargo",
+                "kex",
+                "build",
+                service,
+                "--name",
+                name,
+                "--target",
+                "all",
+                "--output",
+                REPO_ROOT / "tests" / "kex-corpus",
+                "--stack-pages",
+                str(stack_pages),
+                "--check",
+            )
+            for service, name, stack_pages in KEX_SERVICES
         ),
         (
             "cargo",
