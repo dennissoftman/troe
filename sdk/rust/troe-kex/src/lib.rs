@@ -515,7 +515,7 @@ pub struct ReadOnlyFilesystem {
     handle: Handle,
 }
 
-/// Atomic create/replace and remove client scoped to one application lifetime.
+/// Atomic file-mutation and link client scoped to one application lifetime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FilesystemMutation {
     handle: Handle,
@@ -707,7 +707,7 @@ impl FilesystemMutation {
         })
     }
 
-    /// Atomically remove one regular file.
+    /// Atomically remove one regular file or symbolic link.
     ///
     /// # Errors
     ///
@@ -724,6 +724,45 @@ impl FilesystemMutation {
             &request[..count],
             &mut reply,
         )?;
+        if count == 0 {
+            Ok(())
+        } else {
+            Err(Error::InvalidCall)
+        }
+    }
+
+    /// Create one symbolic link.
+    ///
+    /// The target is stored as supplied. Absolute targets are interpreted by
+    /// the mounted provider, and relative targets are relative to the link's
+    /// parent directory.
+    ///
+    /// # Errors
+    ///
+    /// Reports invalid or existing paths, immutable or unsupported providers,
+    /// a conflicting pending replacement, filesystem failures, or call-gate
+    /// failure.
+    pub fn create_symlink(&mut self, target: &str, link_path: &str) -> Result<(), Error> {
+        self.create_link(filesystem_mutation::CREATE_SYMLINK, target, link_path)
+    }
+
+    /// Create one same-provider hard link to an existing regular file.
+    ///
+    /// # Errors
+    ///
+    /// Reports invalid, missing, cross-provider, wrong-type, or existing paths,
+    /// immutable or unsupported providers, a conflicting pending replacement,
+    /// filesystem failures, or call-gate failure.
+    pub fn create_hard_link(&mut self, existing: &str, new_path: &str) -> Result<(), Error> {
+        self.create_link(filesystem_mutation::CREATE_HARD_LINK, existing, new_path)
+    }
+
+    fn create_link(&mut self, opcode: u16, target: &str, link_path: &str) -> Result<(), Error> {
+        let mut request = [0_u8; filesystem_mutation::MAX_LINK_REQUEST_BYTES];
+        let count = filesystem_mutation::encode_link_request(target, link_path, &mut request)
+            .map_err(|_| Error::InvalidCall)?;
+        let mut reply = [];
+        let count = call(self.handle, opcode, &request[..count], &mut reply)?;
         if count == 0 {
             Ok(())
         } else {

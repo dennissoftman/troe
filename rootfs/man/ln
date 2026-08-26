@@ -1,0 +1,12 @@
+NAME
+    ln - create a symbolic or hard link
+
+SYNOPSIS
+    ln TARGET LINK_NAME
+    ln -s TARGET LINK_NAME
+
+DESCRIPTION
+    Without -s, creates a same-filesystem hard link to an existing regular
+    file. With -s, stores TARGET as a symbolic link. Relative symbolic targets
+    are resolved from LINK_NAME's parent directory. FAT32 and providers without
+    link support reject both forms.

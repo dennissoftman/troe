@@ -2,10 +2,10 @@
 
 Status: accepted direction, 2026-08-23; implementation scope clarified
 2026-08-25. Stage 8 implements bounded block regions and GPT discovery, strict
-read-only FAT32 and ext4-v1 providers, read-only BMNT-selected ext4 root
-activation, and separate PRGN/TXSLOT-backed activation and `StateFS` mutation.
-Read/write FAT, mutable ext4, exFAT, NTFS, dynamic provider loading, and repair
-remain explicitly future work.
+read/write FAT32 and constrained ext4-v1 providers, BMNT-authorized read-only or
+read-write activation, and separate PRGN/TXSLOT-backed activation and `StateFS`
+mutation. FAT12/16, exFAT, NTFS, dynamic provider loading, journal replay, and
+repair remain explicitly future work.
 
 ## Context
 
@@ -52,13 +52,14 @@ kernel composition root into a collection of inseparable format parsers.
   Read-only support and lossless inspection of SIDs and security descriptors
   precede write support.
 
-The implemented ext4-v1 volume stores immutable persistent content and is
-mounted read-only. Generation activation and the initial named mutable state
-use separately selected TXSLOT/StateFS regions instead of pretending that a
-read-only ext4 provider already supplies journaled mutation, secrets, or
-filesystem rollback. Ext4 does not replace KEFS as the independent recovery
-path, and filesystem snapshots are not required for system-generation
-rollback.
+The implemented ext4-v1 provider supports metadata-preserving complete-file
+mutation plus bounded symbolic/hard links when the manifest and block
+capability are writable. Generation
+activation and the initial named mutable state still use separately selected
+TXSLOT/StateFS regions; the constrained writer does not claim journal replay,
+secrets policy, or filesystem rollback. Ext4 does not replace KEFS as the
+independent recovery path, and filesystem snapshots are not required for
+system-generation rollback.
 
 ### Filesystem modules
 

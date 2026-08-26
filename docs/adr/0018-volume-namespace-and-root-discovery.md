@@ -23,6 +23,14 @@ therefore retain their exact PRGN disk, partition, and type identities plus the
 selected generation and StateFS mount outcomes. The combined file remains
 inside the 32 KiB report ceiling.
 
+The repository now carries a strict human-editable volume table whose names
+derive `/vol/<name>` targets and whose exact GPT/filesystem identities, access,
+availability, and automatic-activation policy compile into canonical BMNT v1.
+The QEMU launcher can attach additional raw data disks for these entries. This
+does not change the remaining installed-media work: deployed kernels still
+need to load the compiled BMNT from their EFI system partition rather than the
+current build-time embedded artifact.
+
 ## Context
 
 KEFS already supplies an immutable recovery filesystem, while ADR 0009 selects
@@ -160,7 +168,7 @@ mounted merely because a recognized filesystem is present.
 - KEFS remains an independent recovery foundation while `/vol/root` provides a
   clear persistent-system role.
 - The installer owns destructive provisioning, and the kernel owns bounded,
-  read-only discovery and policy enforcement.
+  read-only discovery plus manifest-selected read/write policy enforcement.
 - A tiny bootstrap format is added, but it avoids coupling root discovery to
   the larger desired-system configuration format.
 

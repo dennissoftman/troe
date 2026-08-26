@@ -33,6 +33,7 @@ troe-task = { path = "../crates/troe-task" }
 troe-terminal = { path = "../crates/troe-terminal" }
 troe-vfs = { path = "../crates/troe-vfs" }
 troe-ext4 = { path = "../crates/troe-ext4" }
+troe-fat = { path = "../crates/troe-fat" }
 troe-gpt = { path = "../crates/troe-gpt" }
 troe-identity = { path = "../crates/troe-identity" }
 

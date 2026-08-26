@@ -5,6 +5,11 @@ without relying on device enumeration order or mutable filesystem labels. All
 integers are little-endian. The product-name-independent magic is `BMNTv1`,
 followed by two zero bytes.
 
+Humans configure this format through the strict
+[`volume-table-v1`](volume-table-v1.md) TOML source. The build tooling compiles
+that source into BMNT; the kernel consumes only the bounded binary form defined
+here.
+
 The complete image is at most 4 KiB and contains at most 16 entries. Its
 64-byte header contains the format version, exact header and 96-byte record
 sizes, exact total bytes, a CRC-32 covering the complete image with its own

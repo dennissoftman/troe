@@ -1,4 +1,4 @@
-//! Strict bounded read-only FAT32 provider.
+//! Strict bounded FAT32 provider with copy-on-write file mutation.
 #![no_std]
 #![forbid(unsafe_code)]
 
@@ -11,7 +11,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::char::decode_utf16;
 use core::fmt;
-use troe_block::{BlockDevice, BlockError, BlockRegion};
+use troe_block::{BlockAccess, BlockDevice, BlockError, BlockRegion};
 use troe_vfs::{
     DirEntry, FileMetadata, FsError, MAX_NAME_BYTES, NodeKind, ProviderListing, ReadOnlyFileSystem,
     canonicalize,
@@ -21,6 +21,8 @@ const FAT32_MIN_CLUSTERS: u32 = 65_525;
 const FAT32_MAX_CLUSTER: u32 = 0x0fff_ffef;
 const FAT32_BAD_CLUSTER: u32 = 0x0fff_fff7;
 const FAT32_EOC_MIN: u32 = 0x0fff_fff8;
+const FAT32_CLEAN_SHUTDOWN: u32 = 0x0800_0000;
+const FAT32_NO_HARD_ERROR: u32 = 0x0400_0000;
 const DIRECTORY_ENTRY_BYTES: usize = 32;
 const LFN_UNITS_PER_ENTRY: usize = 13;
 const MAX_LFN_ENTRIES: usize = 20;
@@ -37,7 +39,7 @@ pub struct Fat32Limits {
 }
 
 impl Fat32Limits {
-    /// Construct a checked read-only provider profile.
+    /// Construct a checked provider profile.
     ///
     /// # Errors
     ///
@@ -110,6 +112,10 @@ struct Layout {
     data_start: u64,
     cluster_count: u32,
     root_cluster: u32,
+    reserved_sectors: u16,
+    fsinfo_sector: u16,
+    backup_sector: u16,
+    volume_id: u32,
 }
 
 impl Layout {
@@ -131,6 +137,14 @@ struct FatEntry {
     kind: NodeKind,
     first_cluster: u32,
     byte_count: u64,
+    short_name: [u8; 11],
+    directory_slots: Vec<DirectorySlot>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DirectorySlot {
+    cluster: u32,
+    offset: usize,
 }
 
 /// Mounted strict FAT32 provider owning exactly one block-region capability.
@@ -181,6 +195,10 @@ impl<D: BlockDevice> Fat32<D> {
             data_start: bpb.data_start,
             cluster_count: bpb.cluster_count,
             root_cluster: bpb.root_cluster,
+            reserved_sectors: bpb.reserved_sectors,
+            fsinfo_sector: bpb.fsinfo_sector,
+            backup_sector: bpb.backup_sector,
+            volume_id: bpb.volume_id,
         };
         let mut mounted = Self {
             region,
@@ -189,12 +207,22 @@ impl<D: BlockDevice> Fat32<D> {
         };
         let media = mounted.read_fat_entry(0)?;
         let reserved = mounted.read_fat_entry(1)?;
-        if media & 0xff != u32::from(bpb.media) || media < FAT32_EOC_MIN || reserved < FAT32_EOC_MIN
+        if media & 0xff != u32::from(bpb.media)
+            || media < FAT32_EOC_MIN
+            || reserved < FAT32_EOC_MIN
+            || reserved & (FAT32_CLEAN_SHUTDOWN | FAT32_NO_HARD_ERROR)
+                != FAT32_CLEAN_SHUTDOWN | FAT32_NO_HARD_ERROR
         {
             return Err(FsError::Corrupt);
         }
         let _root = mounted.read_directory(layout.root_cluster)?;
         Ok(mounted)
+    }
+
+    /// FAT32 volume identifier copied from the extended BPB.
+    #[must_use]
+    pub const fn volume_id(&self) -> u32 {
+        self.layout.volume_id
     }
 
     fn resolve(&mut self, path: &str) -> Result<FatEntry, FsError> {
@@ -207,6 +235,8 @@ impl<D: BlockDevice> Fat32<D> {
             kind: NodeKind::Directory,
             first_cluster: self.layout.root_cluster,
             byte_count: 0,
+            short_name: [0; 11],
+            directory_slots: Vec::new(),
         };
         if normalized == "/" {
             return Ok(current);
@@ -341,20 +371,30 @@ impl<D: BlockDevice> Fat32<D> {
             )
             .map_err(|_| FsError::NoSpace)?;
         let mut lfn = LfnState::default();
+        let mut lfn_slots = Vec::new();
         for cluster in chain {
             let bytes = self.read_cluster(cluster)?;
-            for raw in bytes.chunks_exact(DIRECTORY_ENTRY_BYTES) {
+            for (slot_index, raw) in bytes.chunks_exact(DIRECTORY_ENTRY_BYTES).enumerate() {
+                let slot = DirectorySlot {
+                    cluster,
+                    offset: slot_index
+                        .checked_mul(DIRECTORY_ENTRY_BYTES)
+                        .ok_or(FsError::Overflow)?,
+                };
                 let first = raw[0];
                 if first == 0 {
                     return Ok(entries);
                 }
                 if first == 0xe5 {
                     lfn.reset();
+                    lfn_slots.clear();
                     continue;
                 }
                 let attributes = raw[11];
                 if attributes == 0x0f {
                     lfn.push(raw)?;
+                    lfn_slots.try_reserve(1).map_err(|_| FsError::NoSpace)?;
+                    lfn_slots.push(slot);
                     continue;
                 }
                 if attributes & 0xc0 != 0 {
@@ -362,6 +402,7 @@ impl<D: BlockDevice> Fat32<D> {
                 }
                 if attributes & 0x08 != 0 {
                     lfn.reset();
+                    lfn_slots.clear();
                     continue;
                 }
                 if entries.len()
@@ -377,6 +418,11 @@ impl<D: BlockDevice> Fat32<D> {
                     short_name(raw, self.limits.max_name_bytes())?
                 };
                 lfn.reset();
+                let mut directory_slots = core::mem::take(&mut lfn_slots);
+                directory_slots
+                    .try_reserve(1)
+                    .map_err(|_| FsError::NoSpace)?;
+                directory_slots.push(slot);
                 if name == "." || name == ".." {
                     continue;
                 }
@@ -403,10 +449,379 @@ impl<D: BlockDevice> Fat32<D> {
                     kind,
                     first_cluster,
                     byte_count,
+                    short_name: raw[..11].try_into().map_err(|_| FsError::Corrupt)?,
+                    directory_slots,
                 });
             }
         }
         Err(FsError::Corrupt)
+    }
+
+    fn ensure_writable(&self) -> Result<(), FsError> {
+        let info = self.region.info();
+        if info.access() != BlockAccess::ReadWrite {
+            return Err(FsError::ReadOnly);
+        }
+        if !info.supports_flush() && !info.supports_force_unit_access() {
+            return Err(FsError::Unsupported);
+        }
+        Ok(())
+    }
+
+    fn force_unit_access(&self) -> bool {
+        let info = self.region.info();
+        !info.supports_flush() && info.supports_force_unit_access()
+    }
+
+    fn write_sector(&mut self, lba: u64, bytes: &[u8]) -> Result<(), FsError> {
+        if bytes.len() != self.layout.block_bytes {
+            return Err(FsError::Invalid);
+        }
+        self.region
+            .write_blocks(lba, 1, bytes, self.force_unit_access())
+            .map_err(map_block)
+    }
+
+    fn durability_barrier(&mut self) -> Result<(), FsError> {
+        self.ensure_writable()?;
+        if self.region.info().supports_flush() {
+            self.region.flush().map_err(map_block)?;
+        }
+        Ok(())
+    }
+
+    fn begin_mutation(&mut self) -> Result<(), FsError> {
+        let reserved = self.read_fat_entry(1)?;
+        self.write_fat_entry(1, reserved & !FAT32_CLEAN_SHUTDOWN)?;
+        self.durability_barrier()
+    }
+
+    fn finish_mutation(&mut self) -> Result<(), FsError> {
+        let reserved = self.read_fat_entry(1)?;
+        self.write_fat_entry(1, reserved | FAT32_CLEAN_SHUTDOWN | FAT32_NO_HARD_ERROR)?;
+        self.durability_barrier()
+    }
+
+    fn write_cluster(&mut self, cluster: u32, bytes: &[u8]) -> Result<(), FsError> {
+        if bytes.len() != self.layout.cluster_bytes()? {
+            return Err(FsError::Invalid);
+        }
+        let first_lba = self.cluster_lba(cluster)?;
+        for sector in 0..self.layout.sectors_per_cluster {
+            let start = usize::try_from(sector)
+                .ok()
+                .and_then(|value| value.checked_mul(self.layout.block_bytes))
+                .ok_or(FsError::Overflow)?;
+            let end = start
+                .checked_add(self.layout.block_bytes)
+                .ok_or(FsError::Overflow)?;
+            self.write_sector(first_lba + u64::from(sector), &bytes[start..end])?;
+        }
+        Ok(())
+    }
+
+    fn write_fat_entry(&mut self, cluster: u32, value: u32) -> Result<(), FsError> {
+        if cluster > self.layout.last_cluster()? || value > 0x0fff_ffff {
+            return Err(FsError::Invalid);
+        }
+        let offset = u64::from(cluster).checked_mul(4).ok_or(FsError::Overflow)?;
+        let block_bytes = u64::try_from(self.layout.block_bytes).map_err(|_| FsError::Overflow)?;
+        let sector_offset = offset / block_bytes;
+        if sector_offset >= u64::from(self.layout.fat_sectors) {
+            return Err(FsError::Corrupt);
+        }
+        let byte_offset = usize::try_from(offset % block_bytes).map_err(|_| FsError::Overflow)?;
+        let first_lba = self
+            .layout
+            .fat_start
+            .checked_add(sector_offset)
+            .ok_or(FsError::Overflow)?;
+        let second_lba = self
+            .layout
+            .second_fat_start
+            .checked_add(sector_offset)
+            .ok_or(FsError::Overflow)?;
+        let mut first = read_sector(&mut self.region, first_lba, self.layout.block_bytes)?;
+        let second = read_sector(&mut self.region, second_lba, self.layout.block_bytes)?;
+        if first != second {
+            return Err(FsError::Corrupt);
+        }
+        let preserved = read_u32(&first, byte_offset)? & 0xf000_0000;
+        first[byte_offset..byte_offset + 4].copy_from_slice(&(preserved | value).to_le_bytes());
+        self.write_sector(first_lba, &first)?;
+        self.write_sector(second_lba, &first)
+    }
+
+    fn find_free_clusters(&mut self, count: usize) -> Result<Vec<u32>, FsError> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        if count
+            > usize::try_from(self.limits.max_chain_clusters()).map_err(|_| FsError::Overflow)?
+        {
+            return Err(FsError::NoSpace);
+        }
+        let entries_per_sector = self.layout.block_bytes / 4;
+        let mut output = Vec::new();
+        output
+            .try_reserve_exact(count)
+            .map_err(|_| FsError::NoSpace)?;
+        for sector in 0..self.layout.fat_sectors {
+            let first = read_sector(
+                &mut self.region,
+                self.layout.fat_start + u64::from(sector),
+                self.layout.block_bytes,
+            )?;
+            let second = read_sector(
+                &mut self.region,
+                self.layout.second_fat_start + u64::from(sector),
+                self.layout.block_bytes,
+            )?;
+            if first != second {
+                return Err(FsError::Corrupt);
+            }
+            for index in 0..entries_per_sector {
+                let cluster = usize::try_from(sector)
+                    .ok()
+                    .and_then(|value| value.checked_mul(entries_per_sector))
+                    .and_then(|value| value.checked_add(index))
+                    .and_then(|value| u32::try_from(value).ok())
+                    .ok_or(FsError::Overflow)?;
+                if cluster < 2 || cluster > self.layout.last_cluster()? {
+                    continue;
+                }
+                if read_u32(&first, index * 4)?.trailing_zeros() >= 28 {
+                    output.push(cluster);
+                    if output.len() == count {
+                        return Ok(output);
+                    }
+                }
+            }
+        }
+        Err(FsError::NoSpace)
+    }
+
+    fn program_chain(&mut self, clusters: &[u32]) -> Result<(), FsError> {
+        for (index, cluster) in clusters.iter().copied().enumerate() {
+            let next = clusters.get(index + 1).copied().unwrap_or(0x0fff_ffff);
+            self.write_fat_entry(cluster, next)?;
+        }
+        Ok(())
+    }
+
+    fn invalidate_fsinfo(&mut self) -> Result<(), FsError> {
+        let primary_lba = u64::from(self.layout.fsinfo_sector);
+        let mut bytes = read_sector(&mut self.region, primary_lba, self.layout.block_bytes)?;
+        validate_fsinfo(&bytes, self.layout.cluster_count)?;
+        bytes[488..496].fill(0xff);
+        self.write_sector(primary_lba, &bytes)?;
+        let backup = self
+            .layout
+            .backup_sector
+            .checked_add(self.layout.fsinfo_sector)
+            .filter(|sector| *sector < self.layout.reserved_sectors);
+        if let Some(backup_sector) = backup {
+            self.write_sector(u64::from(backup_sector), &bytes)?;
+        }
+        Ok(())
+    }
+
+    fn release_clusters(&mut self, clusters: &[u32]) -> Result<(), FsError> {
+        if clusters.is_empty() {
+            return Ok(());
+        }
+        for cluster in clusters {
+            self.write_fat_entry(*cluster, 0)?;
+        }
+        self.invalidate_fsinfo()?;
+        self.durability_barrier()
+    }
+
+    fn allocate_file_chain(&mut self, bytes: &[u8]) -> Result<Vec<u32>, FsError> {
+        if bytes.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cluster_bytes = self.layout.cluster_bytes()?;
+        let count = bytes
+            .len()
+            .checked_add(cluster_bytes - 1)
+            .map(|value| value / cluster_bytes)
+            .ok_or(FsError::Overflow)?;
+        let clusters = self.find_free_clusters(count)?;
+        let mut block = Vec::new();
+        block
+            .try_reserve_exact(cluster_bytes)
+            .map_err(|_| FsError::NoSpace)?;
+        block.resize(cluster_bytes, 0);
+        for (index, cluster) in clusters.iter().copied().enumerate() {
+            block.fill(0);
+            let start = index.checked_mul(cluster_bytes).ok_or(FsError::Overflow)?;
+            let end = start
+                .checked_add(cluster_bytes)
+                .map_or(bytes.len(), |candidate| candidate.min(bytes.len()));
+            block[..end - start].copy_from_slice(&bytes[start..end]);
+            self.write_cluster(cluster, &block)?;
+        }
+        if let Err(error) = self.program_chain(&clusters) {
+            for cluster in &clusters {
+                let _ignored = self.write_fat_entry(*cluster, 0);
+            }
+            return Err(error);
+        }
+        self.invalidate_fsinfo()?;
+        self.durability_barrier()?;
+        Ok(clusters)
+    }
+
+    fn resolve_parent(&mut self, path: &str) -> Result<(FatEntry, String), FsError> {
+        let normalized = canonicalize("/", path)?;
+        if normalized != path || path == "/" || !path.starts_with('/') {
+            return Err(FsError::Invalid);
+        }
+        let (parent, name) = path.rsplit_once('/').ok_or(FsError::Invalid)?;
+        if name.is_empty() || name.len() > self.limits.max_name_bytes() {
+            return Err(FsError::Invalid);
+        }
+        let parent_path = if parent.is_empty() { "/" } else { parent };
+        let parent = self.resolve(parent_path)?;
+        if parent.kind != NodeKind::Directory {
+            return Err(FsError::WrongType);
+        }
+        Ok((parent, name.to_string()))
+    }
+
+    fn reserve_directory_slots(
+        &mut self,
+        directory_cluster: u32,
+        required: usize,
+    ) -> Result<Vec<DirectorySlot>, FsError> {
+        let cluster_bytes = self.layout.cluster_bytes()?;
+        if required == 0 || required > cluster_bytes / DIRECTORY_ENTRY_BYTES {
+            return Err(FsError::NoSpace);
+        }
+        let chain = self.cluster_chain(directory_cluster)?;
+        let mut past_end = false;
+        for cluster in &chain {
+            let bytes = self.read_cluster(*cluster)?;
+            let mut run = Vec::new();
+            run.try_reserve_exact(required)
+                .map_err(|_| FsError::NoSpace)?;
+            for (index, raw) in bytes.chunks_exact(DIRECTORY_ENTRY_BYTES).enumerate() {
+                if raw[0] == 0 {
+                    past_end = true;
+                }
+                if past_end || raw[0] == 0xe5 {
+                    run.push(DirectorySlot {
+                        cluster: *cluster,
+                        offset: index
+                            .checked_mul(DIRECTORY_ENTRY_BYTES)
+                            .ok_or(FsError::Overflow)?,
+                    });
+                    if run.len() == required {
+                        return Ok(run);
+                    }
+                } else {
+                    run.clear();
+                }
+            }
+        }
+        if chain.len()
+            >= usize::try_from(self.limits.max_chain_clusters()).map_err(|_| FsError::Overflow)?
+        {
+            return Err(FsError::NoSpace);
+        }
+        let cluster = *self
+            .find_free_clusters(1)?
+            .first()
+            .ok_or(FsError::NoSpace)?;
+        let zeroes = alloc::vec![0_u8; cluster_bytes];
+        self.write_cluster(cluster, &zeroes)?;
+        self.write_fat_entry(cluster, 0x0fff_ffff)?;
+        let tail = *chain.last().ok_or(FsError::Corrupt)?;
+        if let Err(error) = self.write_fat_entry(tail, cluster) {
+            let _ignored = self.write_fat_entry(cluster, 0);
+            return Err(error);
+        }
+        self.invalidate_fsinfo()?;
+        self.durability_barrier()?;
+        let mut slots = Vec::new();
+        slots
+            .try_reserve_exact(required)
+            .map_err(|_| FsError::NoSpace)?;
+        for index in 0..required {
+            slots.push(DirectorySlot {
+                cluster,
+                offset: index
+                    .checked_mul(DIRECTORY_ENTRY_BYTES)
+                    .ok_or(FsError::Overflow)?,
+            });
+        }
+        Ok(slots)
+    }
+
+    fn write_directory_records(
+        &mut self,
+        slots: &[DirectorySlot],
+        records: &[[u8; DIRECTORY_ENTRY_BYTES]],
+    ) -> Result<(), FsError> {
+        if slots.len() != records.len() || slots.is_empty() {
+            return Err(FsError::Invalid);
+        }
+        let cluster = slots[0].cluster;
+        if slots.iter().any(|slot| slot.cluster != cluster) {
+            return Err(FsError::Unsupported);
+        }
+        let mut bytes = self.read_cluster(cluster)?;
+        for (slot, record) in slots.iter().zip(records) {
+            let destination = bytes
+                .get_mut(slot.offset..slot.offset + DIRECTORY_ENTRY_BYTES)
+                .ok_or(FsError::Corrupt)?;
+            destination.copy_from_slice(record);
+        }
+        self.write_cluster(cluster, &bytes)
+    }
+
+    fn replace_directory_entry(
+        &mut self,
+        entry: &FatEntry,
+        first_cluster: u32,
+        byte_count: usize,
+    ) -> Result<(), FsError> {
+        let slot = *entry.directory_slots.last().ok_or(FsError::Corrupt)?;
+        let mut bytes = self.read_cluster(slot.cluster)?;
+        let raw = bytes
+            .get_mut(slot.offset..slot.offset + DIRECTORY_ENTRY_BYTES)
+            .ok_or(FsError::Corrupt)?;
+        let cluster_bytes = first_cluster.to_le_bytes();
+        raw[20..22].copy_from_slice(&cluster_bytes[2..4]);
+        raw[26..28].copy_from_slice(&cluster_bytes[..2]);
+        raw[28..32].copy_from_slice(
+            &u32::try_from(byte_count)
+                .map_err(|_| FsError::NoSpace)?
+                .to_le_bytes(),
+        );
+        self.write_cluster(slot.cluster, &bytes)?;
+        self.durability_barrier()
+    }
+
+    fn delete_directory_entry(&mut self, entry: &FatEntry) -> Result<(), FsError> {
+        if entry.directory_slots.is_empty() {
+            return Err(FsError::Corrupt);
+        }
+        let mut index = 0;
+        while index < entry.directory_slots.len() {
+            let cluster = entry.directory_slots[index].cluster;
+            let mut bytes = self.read_cluster(cluster)?;
+            while index < entry.directory_slots.len()
+                && entry.directory_slots[index].cluster == cluster
+            {
+                let offset = entry.directory_slots[index].offset;
+                *bytes.get_mut(offset).ok_or(FsError::Corrupt)? = 0xe5;
+                index += 1;
+            }
+            self.write_cluster(cluster, &bytes)?;
+        }
+        self.durability_barrier()
     }
 }
 
@@ -511,6 +926,265 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Fat32<D> {
             next_cursor: (index < source.len()).then(|| u64::try_from(index).unwrap_or(u64::MAX)),
         })
     }
+
+    fn write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), FsError> {
+        self.ensure_writable()?;
+        if u64::try_from(bytes.len()).map_err(|_| FsError::NoSpace)? > self.limits.max_file_bytes()
+            || u32::try_from(bytes.len()).is_err()
+        {
+            return Err(FsError::NoSpace);
+        }
+        let (parent, name) = self.resolve_parent(path)?;
+        let entries = self.read_directory(parent.first_cluster)?;
+        let mut matching = entries
+            .iter()
+            .filter(|entry| names_equal(&entry.name, &name));
+        let existing = matching.next().cloned();
+        if matching.next().is_some() {
+            return Err(FsError::Corrupt);
+        }
+        if let Some(existing) = existing {
+            if existing.kind != NodeKind::File {
+                return Err(FsError::WrongType);
+            }
+            let old_chain = if existing.byte_count == 0 {
+                Vec::new()
+            } else {
+                self.cluster_chain(existing.first_cluster)?
+            };
+            self.begin_mutation()?;
+            let new_chain = self.allocate_file_chain(bytes)?;
+            let first_cluster = new_chain.first().copied().unwrap_or(0);
+            if let Err(error) = self.replace_directory_entry(&existing, first_cluster, bytes.len())
+            {
+                let _ignored = self.release_clusters(&new_chain);
+                return Err(error);
+            }
+            self.release_clusters(&old_chain)?;
+            return self.finish_mutation();
+        }
+
+        let provisional = directory_records(&name, &entries, 0, 0)?;
+        self.begin_mutation()?;
+        let slots = self.reserve_directory_slots(parent.first_cluster, provisional.len())?;
+        let new_chain = self.allocate_file_chain(bytes)?;
+        let records = directory_records(
+            &name,
+            &entries,
+            new_chain.first().copied().unwrap_or(0),
+            u32::try_from(bytes.len()).map_err(|_| FsError::NoSpace)?,
+        )?;
+        if let Err(error) = self
+            .write_directory_records(&slots, &records)
+            .and_then(|()| self.durability_barrier())
+        {
+            let _ignored = self.release_clusters(&new_chain);
+            return Err(error);
+        }
+        self.finish_mutation()
+    }
+
+    fn remove_file(&mut self, path: &str) -> Result<(), FsError> {
+        self.ensure_writable()?;
+        let (parent, name) = self.resolve_parent(path)?;
+        let entries = self.read_directory(parent.first_cluster)?;
+        let mut matching = entries
+            .into_iter()
+            .filter(|entry| names_equal(&entry.name, &name));
+        let entry = matching.next().ok_or(FsError::NotFound)?;
+        if matching.next().is_some() {
+            return Err(FsError::Corrupt);
+        }
+        if entry.kind != NodeKind::File {
+            return Err(FsError::WrongType);
+        }
+        let old_chain = if entry.byte_count == 0 {
+            Vec::new()
+        } else {
+            self.cluster_chain(entry.first_cluster)?
+        };
+        self.begin_mutation()?;
+        self.delete_directory_entry(&entry)?;
+        self.release_clusters(&old_chain)?;
+        self.finish_mutation()
+    }
+
+    fn create_symlink(&mut self, _target: &str, _link_path: &str) -> Result<(), FsError> {
+        self.ensure_writable()?;
+        Err(FsError::Unsupported)
+    }
+
+    fn create_hard_link(&mut self, _existing: &str, _new_path: &str) -> Result<(), FsError> {
+        self.ensure_writable()?;
+        Err(FsError::Unsupported)
+    }
+}
+
+fn directory_records(
+    name: &str,
+    entries: &[FatEntry],
+    first_cluster: u32,
+    byte_count: u32,
+) -> Result<Vec<[u8; DIRECTORY_ENTRY_BYTES]>, FsError> {
+    validate_writable_name(name)?;
+    let exact = encode_exact_short_name(name);
+    let exact_available = exact
+        .as_ref()
+        .is_some_and(|(raw, _)| entries.iter().all(|entry| entry.short_name != *raw));
+    let (short, case_flags, long_name) = if exact_available {
+        let (raw, flags) = exact.ok_or(FsError::Invalid)?;
+        (raw, flags, false)
+    } else {
+        (unique_short_alias(name, entries)?, 0, true)
+    };
+    let mut records = Vec::new();
+    if long_name {
+        let units: Vec<u16> = name.encode_utf16().collect();
+        if units.is_empty() || units.len() > 255 {
+            return Err(FsError::Invalid);
+        }
+        let count = units.len().div_ceil(LFN_UNITS_PER_ENTRY);
+        if count == 0 || count > MAX_LFN_ENTRIES {
+            return Err(FsError::NoSpace);
+        }
+        records
+            .try_reserve_exact(count + 1)
+            .map_err(|_| FsError::NoSpace)?;
+        let checksum = short_name_checksum(&short);
+        for ordinal in (1..=count).rev() {
+            let mut raw = [0xff_u8; DIRECTORY_ENTRY_BYTES];
+            raw[0] = u8::try_from(ordinal).map_err(|_| FsError::Overflow)?;
+            if ordinal == count {
+                raw[0] |= 0x40;
+            }
+            raw[11] = 0x0f;
+            raw[12] = 0;
+            raw[13] = checksum;
+            raw[26..28].fill(0);
+            let offsets = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
+            let start = (ordinal - 1)
+                .checked_mul(LFN_UNITS_PER_ENTRY)
+                .ok_or(FsError::Overflow)?;
+            for (index, offset) in offsets.iter().copied().enumerate() {
+                let unit_index = start.checked_add(index).ok_or(FsError::Overflow)?;
+                let unit = units
+                    .get(unit_index)
+                    .copied()
+                    .unwrap_or(if unit_index == units.len() { 0 } else { 0xffff });
+                raw[offset..offset + 2].copy_from_slice(&unit.to_le_bytes());
+            }
+            records.push(raw);
+        }
+    } else {
+        records.try_reserve_exact(1).map_err(|_| FsError::NoSpace)?;
+    }
+    let mut raw = [0_u8; DIRECTORY_ENTRY_BYTES];
+    raw[..11].copy_from_slice(&short);
+    raw[11] = 0x20;
+    raw[12] = case_flags;
+    let cluster = first_cluster.to_le_bytes();
+    raw[20..22].copy_from_slice(&cluster[2..4]);
+    raw[26..28].copy_from_slice(&cluster[..2]);
+    raw[28..32].copy_from_slice(&byte_count.to_le_bytes());
+    records.push(raw);
+    Ok(records)
+}
+
+fn validate_writable_name(name: &str) -> Result<(), FsError> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.ends_with([' ', '.'])
+        || name
+            .chars()
+            .any(|character| character <= '\u{1f}' || "\"*/:<>?\\|".contains(character))
+    {
+        return Err(FsError::Invalid);
+    }
+    Ok(())
+}
+
+fn encode_exact_short_name(name: &str) -> Option<([u8; 11], u8)> {
+    let (base, extension) = match name.rsplit_once('.') {
+        Some((base, extension)) if !base.is_empty() && !extension.is_empty() => (base, extension),
+        Some(_) => return None,
+        None => (name, ""),
+    };
+    if base.len() > 8
+        || extension.len() > 3
+        || !base.bytes().all(short_name_byte)
+        || !extension.bytes().all(short_name_byte)
+    {
+        return None;
+    }
+    let base_lower = component_case(base)?;
+    let extension_lower = component_case(extension)?;
+    let mut raw = [b' '; 11];
+    for (destination, source) in raw[..8].iter_mut().zip(base.bytes()) {
+        *destination = source.to_ascii_uppercase();
+    }
+    for (destination, source) in raw[8..].iter_mut().zip(extension.bytes()) {
+        *destination = source.to_ascii_uppercase();
+    }
+    if raw[0] == 0xe5 {
+        raw[0] = 0x05;
+    }
+    Some((
+        raw,
+        u8::from(base_lower) << 3 | u8::from(extension_lower) << 4,
+    ))
+}
+
+fn short_name_byte(byte: u8) -> bool {
+    byte.is_ascii() && byte > 0x20 && byte != 0x7f && !b"\"*+,./:;<=>?[\\]|".contains(&byte)
+}
+
+fn component_case(component: &str) -> Option<bool> {
+    let has_lower = component.bytes().any(|byte| byte.is_ascii_lowercase());
+    let has_upper = component.bytes().any(|byte| byte.is_ascii_uppercase());
+    (!has_lower || !has_upper).then_some(has_lower)
+}
+
+fn unique_short_alias(name: &str, entries: &[FatEntry]) -> Result<[u8; 11], FsError> {
+    let (base_source, extension_source) = name
+        .rsplit_once('.')
+        .filter(|(base, extension)| !base.is_empty() && !extension.is_empty())
+        .unwrap_or((name, ""));
+    let mut base = String::new();
+    for character in base_source.chars() {
+        if character.is_ascii_alphanumeric() || "$%'-_@~`!(){}^#&".contains(character) {
+            base.push(character.to_ascii_uppercase());
+        }
+    }
+    if base.is_empty() {
+        base.push_str("FILE");
+    }
+    let mut extension = String::new();
+    for character in extension_source.chars() {
+        if extension.len() >= 3 {
+            break;
+        }
+        if character.is_ascii_alphanumeric() || "$%'-_@~`!(){}^#&".contains(character) {
+            extension.push(character.to_ascii_uppercase());
+        }
+    }
+    for sequence in 1_u16..=9999 {
+        let suffix = format!("~{sequence}");
+        let prefix_bytes = 8_usize.checked_sub(suffix.len()).ok_or(FsError::Overflow)?;
+        let mut raw = [b' '; 11];
+        for (destination, source) in raw[..prefix_bytes].iter_mut().zip(base.bytes()) {
+            *destination = source;
+        }
+        let suffix_start = prefix_bytes.min(base.len());
+        raw[suffix_start..suffix_start + suffix.len()].copy_from_slice(suffix.as_bytes());
+        for (destination, source) in raw[8..].iter_mut().zip(extension.bytes()) {
+            *destination = source;
+        }
+        if entries.iter().all(|entry| entry.short_name != raw) {
+            return Ok(raw);
+        }
+    }
+    Err(FsError::NoSpace)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -524,6 +1198,7 @@ struct Bpb {
     data_start: u64,
     cluster_count: u32,
     media: u8,
+    volume_id: u32,
 }
 
 fn parse_bpb(boot: &[u8], region_blocks: u64, block_bytes: usize) -> Result<Bpb, FsError> {
@@ -596,6 +1271,7 @@ fn parse_bpb(boot: &[u8], region_blocks: u64, block_bytes: usize) -> Result<Bpb,
         data_start,
         cluster_count,
         media: boot[21],
+        volume_id: read_u32(boot, 67)?,
     })
 }
 
@@ -783,8 +1459,12 @@ fn validate_limits(limits: Fat32Limits) -> Result<(), FsError> {
     .map(|_| ())
 }
 
-const fn map_block(_error: BlockError) -> FsError {
-    FsError::Io
+const fn map_block(error: BlockError) -> FsError {
+    match error {
+        BlockError::ReadOnly => FsError::ReadOnly,
+        BlockError::Unsupported => FsError::Unsupported,
+        _ => FsError::Io,
+    }
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, FsError> {
@@ -809,8 +1489,8 @@ mod tests {
     use alloc::format;
     use alloc::string::{String, ToString};
     use alloc::vec;
-    use std::fs::{self, File};
-    use std::io::{Read, Seek, SeekFrom};
+    use std::fs::{self, File, OpenOptions};
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -853,6 +1533,22 @@ mod tests {
                     .map_err(|error| format!("invalid image geometry: {error:?}"))?;
             Ok(Self { file, geometry })
         }
+
+        fn open_writable(path: &Path) -> Result<Self, String> {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .map_err(|error| error.to_string())?;
+            let bytes = file.metadata().map_err(|error| error.to_string())?.len();
+            if bytes == 0 || !bytes.is_multiple_of(BLOCK_BYTES as u64) {
+                return Err("FAT32 test image has invalid length".into());
+            }
+            let geometry =
+                BlockGeometry::new(BLOCK_BYTES_U32, bytes / BLOCK_BYTES as u64, 1, true, false)
+                    .map_err(|error| format!("invalid image geometry: {error:?}"))?;
+            Ok(Self { file, geometry })
+        }
     }
 
     impl BlockDevice for FileDevice {
@@ -880,6 +1576,33 @@ mod tests {
                 .seek(SeekFrom::Start(offset))
                 .and_then(|_| self.file.read_exact(destination))
                 .map_err(|_| BlockError::Device)
+        }
+
+        fn write_blocks(
+            &mut self,
+            start_block: u64,
+            block_count: u32,
+            source: &[u8],
+            force_unit_access: bool,
+        ) -> Result<(), BlockError> {
+            let offset = start_block
+                .checked_mul(BLOCK_BYTES as u64)
+                .ok_or(BlockError::Device)?;
+            let expected = usize::try_from(block_count)
+                .ok()
+                .and_then(|count| count.checked_mul(BLOCK_BYTES))
+                .ok_or(BlockError::Device)?;
+            if source.len() != expected || force_unit_access {
+                return Err(BlockError::Device);
+            }
+            self.file
+                .seek(SeekFrom::Start(offset))
+                .and_then(|_| self.file.write_all(source))
+                .map_err(|_| BlockError::Device)
+        }
+
+        fn flush(&mut self) -> Result<(), BlockError> {
+            self.file.sync_all().map_err(|_| BlockError::Device)
         }
     }
 
@@ -928,6 +1651,30 @@ mod tests {
             }
             Ok(())
         }
+
+        fn write_blocks(
+            &mut self,
+            start_block: u64,
+            block_count: u32,
+            source: &[u8],
+            force_unit_access: bool,
+        ) -> Result<(), BlockError> {
+            if block_count != 1
+                || source.len() != BLOCK_BYTES
+                || start_block >= BLOCK_COUNT
+                || force_unit_access
+            {
+                return Err(BlockError::Device);
+            }
+            let mut block = [0_u8; BLOCK_BYTES];
+            block.copy_from_slice(source);
+            self.blocks.insert(start_block, block);
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<(), BlockError> {
+            Ok(())
+        }
     }
 
     fn limits() -> Result<Fat32Limits, FsError> {
@@ -941,12 +1688,29 @@ mod tests {
         Fat32::mount(region, limits()?)
     }
 
+    fn mount_writable(device: SparseDevice) -> Result<Fat32<SparseDevice>, FsError> {
+        let block_limits = BlockLimits::new(1, BLOCK_BYTES, 1).map_err(|_| FsError::Io)?;
+        let region = BlockRegion::whole_device(device, BlockAccess::ReadWrite, block_limits)
+            .map_err(|_| FsError::Io)?;
+        Fat32::mount(region, limits()?)
+    }
+
     fn mount_file(path: &Path) -> Result<Fat32<FileDevice>, String> {
         let device = FileDevice::open(path)?;
         let block_limits = BlockLimits::new(1, BLOCK_BYTES, 1)
             .map_err(|error| format!("invalid block limits: {error:?}"))?;
         let region = BlockRegion::whole_device(device, BlockAccess::ReadOnly, block_limits)
             .map_err(|error| format!("cannot grant image region: {error:?}"))?;
+        Fat32::mount(region, limits().map_err(|error| error.to_string())?)
+            .map_err(|error| error.to_string())
+    }
+
+    fn mount_file_writable(path: &Path) -> Result<Fat32<FileDevice>, String> {
+        let device = FileDevice::open_writable(path)?;
+        let block_limits = BlockLimits::new(1, BLOCK_BYTES, 1)
+            .map_err(|error| format!("invalid block limits: {error:?}"))?;
+        let region = BlockRegion::whole_device(device, BlockAccess::ReadWrite, block_limits)
+            .map_err(|error| format!("cannot grant writable image region: {error:?}"))?;
         Fat32::mount(region, limits().map_err(|error| error.to_string())?)
             .map_err(|error| error.to_string())
     }
@@ -1070,7 +1834,7 @@ mod tests {
         blocks.insert(DATA + 3, long);
 
         Ok(SparseDevice {
-            geometry: BlockGeometry::new(512, BLOCK_COUNT, 1, false, false)?,
+            geometry: BlockGeometry::new(512, BLOCK_COUNT, 1, true, false)?,
             blocks,
         })
     }
@@ -1105,6 +1869,37 @@ mod tests {
 
     fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
         bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+    }
+
+    fn verify_writer_interoperability(image: &Path, fsck_fat: &Path) -> Result<(), String> {
+        let mut writable = mount_file_writable(image)?;
+        writable
+            .write_file("/Long Name.txt", b"modified by troe\n")
+            .map_err(|error| error.to_string())?;
+        writable
+            .write_file("/Created Here.txt", b"created by troe\n")
+            .map_err(|error| error.to_string())?;
+        writable
+            .remove_file("/nested/Message.txt")
+            .map_err(|error| error.to_string())?;
+        drop(writable);
+        let post_write_check = Command::new(fsck_fat)
+            .args(["-vn"])
+            .arg(image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&post_write_check, "fsck.fat after TROE writes")?;
+        let mut remounted = mount_file(image)?;
+        let mut modified = [0_u8; 17];
+        let count = remounted
+            .read_file("/Long Name.txt", 0, &mut modified)
+            .map_err(|error| error.to_string())?;
+        assert_eq!(&modified[..count], b"modified by troe\n");
+        assert!(matches!(
+            remounted.metadata("/nested/Message.txt"),
+            Err(FsError::NotFound)
+        ));
+        Ok(())
     }
 
     #[test]
@@ -1163,6 +1958,65 @@ mod tests {
     }
 
     #[test]
+    fn creates_replaces_and_removes_short_long_and_nested_files() -> Result<(), FsError> {
+        let mut fat = mount_writable(valid_device().map_err(|_| FsError::Io)?)?;
+
+        let replacement = vec![b'r'; 700];
+        fat.write_file("/hello.txt", &replacement)?;
+        assert_eq!(fat.metadata("/HELLO.TXT")?.byte_count, 700);
+        let mut replaced = vec![0_u8; 700];
+        assert_eq!(fat.read_file("/hello.txt", 0, &mut replaced[..700])?, 700);
+        assert_eq!(replaced, replacement);
+
+        fat.write_file("/new.txt", b"short")?;
+        fat.write_file("/A fresh file.txt", b"long name")?;
+        fat.write_file("/SUBDIR/nested.bin", b"nested")?;
+        assert_eq!(fat.metadata("/new.txt")?.byte_count, 5);
+        assert_eq!(fat.metadata("/A fresh file.txt")?.byte_count, 9);
+        assert_eq!(fat.metadata("/subdir/nested.bin")?.byte_count, 6);
+
+        fat.remove_file("/Long Name.txt")?;
+        assert_eq!(fat.metadata("/Long Name.txt"), Err(FsError::NotFound));
+        fat.write_file("/empty", b"")?;
+        assert_eq!(fat.metadata("/empty")?.byte_count, 0);
+        fat.remove_file("/empty")?;
+        assert_eq!(fat.metadata("/empty"), Err(FsError::NotFound));
+        Ok(())
+    }
+
+    #[test]
+    fn read_only_capability_rejects_mutation() -> Result<(), FsError> {
+        let mut fat = mount(valid_device().map_err(|_| FsError::Io)?)?;
+        assert_eq!(fat.write_file("/new.txt", b"data"), Err(FsError::ReadOnly));
+        assert_eq!(fat.remove_file("/HELLO.TXT"), Err(FsError::ReadOnly));
+        Ok(())
+    }
+
+    #[test]
+    fn fat32_explicitly_rejects_symbolic_and_hard_links() -> Result<(), FsError> {
+        let mut fat = mount_writable(valid_device().map_err(|_| FsError::Io)?)?;
+        assert_eq!(
+            fat.create_symlink("/HELLO.TXT", "/link"),
+            Err(FsError::Unsupported)
+        );
+        assert_eq!(
+            fat.create_hard_link("/HELLO.TXT", "/hard"),
+            Err(FsError::Unsupported)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mutation_dirty_marker_brackets_durable_changes() -> Result<(), FsError> {
+        let mut fat = mount_writable(valid_device().map_err(|_| FsError::Io)?)?;
+        fat.begin_mutation()?;
+        assert_eq!(fat.read_fat_entry(1)? & super::FAT32_CLEAN_SHUTDOWN, 0);
+        fat.finish_mutation()?;
+        assert_ne!(fat.read_fat_entry(1)? & super::FAT32_CLEAN_SHUTDOWN, 0);
+        Ok(())
+    }
+
+    #[test]
     fn mounts_image_created_by_dosfstools_and_populated_by_mtools() -> Result<(), String> {
         let Some(mkfs_fat) = fat_tool("mkfs.fat") else {
             return unavailable_tool("mkfs.fat");
@@ -1214,7 +2068,7 @@ mod tests {
             .output()
             .map_err(|error| error.to_string())?;
         command_succeeded(&copy_nested, "mcopy nested file")?;
-        let check = Command::new(fsck_fat)
+        let check = Command::new(&fsck_fat)
             .args(["-vn"])
             .arg(&image)
             .output()
@@ -1241,6 +2095,8 @@ mod tests {
             .read_file("/nested/Message.txt", 0, &mut nested)
             .map_err(|error| error.to_string())?;
         assert_eq!(&nested[..count], b"nested FAT32 file\n");
-        Ok(())
+
+        drop(fat);
+        verify_writer_interoperability(&image, &fsck_fat)
     }
 }

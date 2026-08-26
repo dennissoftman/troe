@@ -642,7 +642,7 @@ pub mod filesystem {
     /// Interface major version.
     pub const MAJOR: u16 = 1;
     /// Interface minor version.
-    pub const MINOR: u16 = 0;
+    pub const MINOR: u16 = 1;
     /// Resolve and open one regular file.
     pub const OPEN: u16 = 1;
     /// Read one bounded range through an open-file token.
@@ -693,6 +693,8 @@ pub mod filesystem {
         File = 1,
         /// Directory containing named children.
         Directory = 2,
+        /// Symbolic link owned and resolved by a filesystem provider.
+        Symlink = 3,
     }
 
     impl NodeKind {
@@ -700,6 +702,7 @@ pub mod filesystem {
             match value {
                 1 => Ok(Self::File),
                 2 => Ok(Self::Directory),
+                3 => Ok(Self::Symlink),
                 _ => Err(EncodingError),
             }
         }
@@ -1209,12 +1212,14 @@ pub mod filesystem {
 
 /// Bounded transactional filesystem-mutation protocol.
 pub mod filesystem_mutation {
+    use core::str;
+
     use super::{MAX_SERVICE_PAYLOAD_BYTES, filesystem};
 
     /// Interface major version.
     pub const MAJOR: u16 = 1;
     /// Interface minor version.
-    pub const MINOR: u16 = 0;
+    pub const MINOR: u16 = 2;
     /// Begin one complete-file atomic replacement.
     pub const BEGIN_REPLACE: u16 = 1;
     /// Append one sequential chunk to the pending replacement.
@@ -1223,8 +1228,12 @@ pub mod filesystem_mutation {
     pub const COMMIT_REPLACE: u16 = 3;
     /// Discard the complete pending replacement.
     pub const ABORT_REPLACE: u16 = 4;
-    /// Atomically remove one regular file.
+    /// Atomically remove one regular file or symbolic link.
     pub const REMOVE: u16 = 5;
+    /// Create one symbolic link with a provider-owned target.
+    pub const CREATE_SYMLINK: u16 = 6;
+    /// Create one same-provider hard link to an existing regular file.
+    pub const CREATE_HARD_LINK: u16 = 7;
     /// Maximum staged bytes in one replacement.
     pub const MAX_FILE_BYTES: usize = 64 * 1024;
     /// Fixed bytes preceding an append payload.
@@ -1233,6 +1242,11 @@ pub mod filesystem_mutation {
     pub const MAX_APPEND_BYTES: usize = MAX_SERVICE_PAYLOAD_BYTES - APPEND_HEADER_BYTES;
     /// Exact replacement-token reply/request bytes.
     pub const TOKEN_BYTES: usize = 4;
+    /// Fixed bytes preceding the two strings in a link request.
+    pub const LINK_REQUEST_HEADER_BYTES: usize = 4;
+    /// Largest canonical two-string link request.
+    pub const MAX_LINK_REQUEST_BYTES: usize =
+        LINK_REQUEST_HEADER_BYTES + 2 * filesystem::MAX_PATH_BYTES;
 
     /// Invalid mutation request or reply encoding.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1247,6 +1261,15 @@ pub mod filesystem_mutation {
         pub offset: u32,
         /// Nonempty bytes appended at `offset`.
         pub bytes: &'a [u8],
+    }
+
+    /// Borrowed validated symbolic- or hard-link request.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct LinkRequest<'a> {
+        /// Symbolic target or existing regular-file path.
+        pub target: &'a str,
+        /// New directory-entry path.
+        pub link_path: &'a str,
     }
 
     /// Encode a begin-replace or remove path request.
@@ -1265,6 +1288,70 @@ pub mod filesystem_mutation {
     /// Rejects noncanonical filesystem paths.
     pub fn decode_path_request(bytes: &[u8]) -> Result<&str, EncodingError> {
         filesystem::decode_path_request(bytes).map_err(|_| EncodingError)
+    }
+
+    /// Encode one symbolic- or hard-link request.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty, excessive, NUL-containing strings or insufficient
+    /// output without modifying it.
+    pub fn encode_link_request(
+        target: &str,
+        link_path: &str,
+        output: &mut [u8],
+    ) -> Result<usize, EncodingError> {
+        validate_link_string(target)?;
+        validate_link_string(link_path)?;
+        let count = LINK_REQUEST_HEADER_BYTES
+            .checked_add(target.len())
+            .and_then(|count| count.checked_add(link_path.len()))
+            .ok_or(EncodingError)?;
+        if output.len() < count {
+            return Err(EncodingError);
+        }
+        let target_bytes = u16::try_from(target.len()).map_err(|_| EncodingError)?;
+        let link_bytes = u16::try_from(link_path.len()).map_err(|_| EncodingError)?;
+        let mut encoded = [0_u8; MAX_LINK_REQUEST_BYTES];
+        encoded[..2].copy_from_slice(&target_bytes.to_le_bytes());
+        encoded[2..4].copy_from_slice(&link_bytes.to_le_bytes());
+        let target_end = LINK_REQUEST_HEADER_BYTES + target.len();
+        encoded[LINK_REQUEST_HEADER_BYTES..target_end].copy_from_slice(target.as_bytes());
+        encoded[target_end..count].copy_from_slice(link_path.as_bytes());
+        output[..count].copy_from_slice(&encoded[..count]);
+        Ok(count)
+    }
+
+    /// Decode one exact symbolic- or hard-link request.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed lengths, non-UTF-8, empty, excessive, NUL-containing,
+    /// or trailing bytes.
+    pub fn decode_link_request(bytes: &[u8]) -> Result<LinkRequest<'_>, EncodingError> {
+        if bytes.len() < LINK_REQUEST_HEADER_BYTES || bytes.len() > MAX_LINK_REQUEST_BYTES {
+            return Err(EncodingError);
+        }
+        let target_bytes = usize::from(u16::from_le_bytes([bytes[0], bytes[1]]));
+        let link_bytes = usize::from(u16::from_le_bytes([bytes[2], bytes[3]]));
+        let target_end = LINK_REQUEST_HEADER_BYTES
+            .checked_add(target_bytes)
+            .ok_or(EncodingError)?;
+        let end = target_end.checked_add(link_bytes).ok_or(EncodingError)?;
+        if end != bytes.len() {
+            return Err(EncodingError);
+        }
+        let target = str::from_utf8(
+            bytes
+                .get(LINK_REQUEST_HEADER_BYTES..target_end)
+                .ok_or(EncodingError)?,
+        )
+        .map_err(|_| EncodingError)?;
+        let link_path = str::from_utf8(bytes.get(target_end..end).ok_or(EncodingError)?)
+            .map_err(|_| EncodingError)?;
+        validate_link_string(target)?;
+        validate_link_string(link_path)?;
+        Ok(LinkRequest { target, link_path })
     }
 
     /// Encode one opaque nonzero replacement token.
@@ -1353,6 +1440,16 @@ pub mod filesystem_mutation {
             offset,
             bytes: payload,
         })
+    }
+
+    fn validate_link_string(value: &str) -> Result<(), EncodingError> {
+        if value.is_empty()
+            || value.len() > filesystem::MAX_PATH_BYTES
+            || value.as_bytes().contains(&0)
+        {
+            return Err(EncodingError);
+        }
+        Ok(())
     }
 }
 
@@ -2618,6 +2715,10 @@ mod tests {
                 kind: filesystem::NodeKind::File,
                 name: "motd",
             },
+            filesystem::DirectoryEntry {
+                kind: filesystem::NodeKind::Symlink,
+                name: "motd-link",
+            },
         ];
         let mut bytes = [0_u8; filesystem::MAX_LIST_REPLY_BYTES];
         let count = filesystem::encode_list_reply(Some(2), &entries, &mut bytes)
@@ -2676,6 +2777,27 @@ mod tests {
         let mut unchanged = [0xa5_u8; 8];
         assert!(filesystem_mutation::encode_append_request(0, 0, b"x", &mut unchanged).is_err());
         assert_eq!(unchanged, [0xa5; 8]);
+
+        let mut link_bytes = [0_u8; filesystem_mutation::MAX_LINK_REQUEST_BYTES];
+        let count = filesystem_mutation::encode_link_request(
+            "../target",
+            "/vol/root/link",
+            &mut link_bytes,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            filesystem_mutation::decode_link_request(&link_bytes[..count]),
+            Ok(filesystem_mutation::LinkRequest {
+                target: "../target",
+                link_path: "/vol/root/link",
+            })
+        );
+        assert!(filesystem_mutation::decode_link_request(&link_bytes[..count - 1]).is_err());
+        let mut unchanged = [0xa5_u8; 7];
+        assert!(
+            filesystem_mutation::encode_link_request("target", "link", &mut unchanged).is_err()
+        );
+        assert_eq!(unchanged, [0xa5; 7]);
     }
 
     #[test]

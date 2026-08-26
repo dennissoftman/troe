@@ -6,5 +6,6 @@ SYNOPSIS
 
 DESCRIPTION
     Writes TEXT arguments joined by spaces, or standard input when TEXT is
-    omitted. The replacement is atomic within the bounded RAMFS. Persistent
-    disk mutation is not implied.
+    omitted. Publishes one complete replacement through the selected writable
+    RAMFS, FAT32, ext4, or state provider. Existing ext4 inode metadata is
+    preserved except for fields required to describe the new content.

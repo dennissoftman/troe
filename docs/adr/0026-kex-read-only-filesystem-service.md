@@ -7,7 +7,7 @@ Status: accepted and implemented for the Stage 9 read-only command migration,
 
 A KEX package may request the optional `filesystem-read` capability. If the
 launching shell owns a live VFS namespace, the kernel grants interface 6,
-version 1.0, rooted at that namespace and resolving relative paths from the
+version 1.1, rooted at that namespace and resolving relative paths from the
 command's immutable startup cwd. The interface exposes only `open`, offset
 `read`, `close`, `metadata`, and paginated `list`; it grants no mutation,
 mount, provider, block, device, or raw kernel authority.
@@ -17,8 +17,11 @@ inside the 4 KiB dispatcher message ceiling. Paths are at most 256 bytes.
 Each launch owns at most eight generation-checked open-file tokens. Reads are
 bounded by the caller's reply capacity. Directory pages are lexical, carry an
 opaque continuation cursor, and contain at most 64 entries, 64 bytes per name,
-and 3,072 aggregate name bytes. Metadata identifies only object kind and byte
-count. Exact decoding rejects unknown versions/opcodes, trailing bytes,
+and 3,072 aggregate name bytes. Listings distinguish regular files,
+directories, and provider-owned symbolic links; metadata and open follow a
+link to its bounded provider-root target. Metadata identifies only resolved
+object kind and byte count. Exact decoding rejects unknown versions/opcodes,
+trailing bytes,
 invalid paths or cursors, wrong object kinds, stale tokens, and overflow.
 
 The service borrows the shell's live namespace only for the isolated launch.

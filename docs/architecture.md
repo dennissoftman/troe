@@ -283,12 +283,14 @@ granted.
 
 ## Stage 8 persistent-storage boundary
 
-The portable block-region, GPT, VFS-provider, read-only FAT32, constrained
-read-only ext4, native virtio transport, dual-slot durability, and selected
-STFS mutation pieces preserve this dependency direction. Broader filesystem
-mutation is a later provider expansion. A transport provides bounded block-region
-capabilities; partition discovery turns a whole device into non-overlapping
-regions; independently selected filesystem providers expose VFS objects.
+The portable block-region, GPT, VFS-provider, read/write FAT32, constrained
+metadata-preserving ext4 with bounded symbolic/hard links, native virtio
+transport, dual-slot durability, and
+selected STFS mutation pieces preserve this dependency direction. Broader
+directory, rename, journal-replay, and repair mutation is a later provider
+expansion. A transport provides bounded block-region capabilities; partition
+discovery turns a whole device into non-overlapping regions; independently
+selected filesystem providers expose VFS objects.
 Format-specific structures do not enter the machine backend, block transport,
 partition layer, or kernel composition root.
 
@@ -315,7 +317,8 @@ traversal and mark-and-copy retention carry all five security objects together.
 STFS is the separate narrow mutation provider. It consumes its own exact
 PRGN-selected writable region, commits the entire single-file filesystem
 through TXSLOT, and attaches at `/vol/state`. The VFS mount records writable
-authority explicitly; ext4 and FAT retain read-only default mutation methods.
+authority explicitly; ext4 and FAT mutate only through manifest-selected
+writable block-region capabilities.
 
 The first network boundary is likewise split between safe protocol policy and
 machine transport. `troe-net` owns strict bounded Ethernet/ARP/IPv4/UDP parsing,
@@ -332,7 +335,7 @@ side of the boundary.
 KEFS is the intentionally built-in recovery exception. The current FAT12 image
 is read by firmware. General FAT12/16/32, exFAT, the default persistent ext4
 profile, and later NTFS support are separate providers; the first exact ext4
-read-only subset is fixed by ADR 0017. Before dynamic loading
+read/write subset is fixed by ADR 0017. Before dynamic loading
 they may be statically selected crates, and later writable providers should run
 as capability-scoped services. An image does not carry providers it did not
 select.

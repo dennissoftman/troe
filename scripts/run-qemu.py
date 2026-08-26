@@ -57,6 +57,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="open the owned framebuffer console while preserving serial stdio",
     )
+    parser.add_argument(
+        "--volume-table",
+        type=Path,
+        help="build with this strict TOML custom-volume policy",
+    )
+    parser.add_argument(
+        "--data-disk",
+        action="append",
+        type=Path,
+        default=[],
+        help="attach one additional writable raw disk image (repeatable, maximum four)",
+    )
     return parser.parse_args(argv)
 
 
@@ -71,6 +83,8 @@ def main() -> int:
             skip_version_check=args.skip_version_check,
             build=not args.skip_build,
             graphical=args.graphical,
+            volume_table=args.volume_table,
+            data_disks=tuple(args.data_disk),
         )
         if args.dry_run:
             print(shlex.join(command))

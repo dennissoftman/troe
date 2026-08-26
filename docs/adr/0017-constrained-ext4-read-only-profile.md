@@ -1,4 +1,4 @@
-# ADR 0017: constrained ext4 read-only profile v1
+# ADR 0017: constrained ext4 profile v1
 
 Status: accepted and implemented, 2026-08-24.
 
@@ -7,8 +7,9 @@ Status: accepted and implemented, 2026-08-24.
 ADR 0009 selects a constrained ext4 provider for native persistent data but
 intentionally leaves its exact first feature profile open. Accepting host
 `mkfs.ext4` defaults would make the kernel's parser surface change whenever
-host tooling changes. Full journal replay and mutation also require durability
-and crash-recovery work that the first storage increment does not yet provide.
+host tooling changes. Full journal replay and general mutation also require
+durability and crash-recovery work that the first storage increment does not
+yet provide.
 
 The first provider must nevertheless read useful, host-created data volumes
 through the same bounded block-region and VFS interfaces as FAT32. A small
@@ -17,7 +18,9 @@ immutable content; it does not require every ext4 layout optimization.
 
 ## Decision
 
-The `troe-ext4` v1 profile is a strict, clean, read-only ext4 subset:
+The `troe-ext4` v1 profile is a strict, clean ext4 subset. Read-only mounts
+retain the original parser contract, while a read-write block capability may
+perform bounded complete-file mutation:
 
 - one block device, a 4 KiB filesystem block, 256-byte inodes, 32-byte group
   descriptors, and at most 32 block groups;
@@ -29,9 +32,9 @@ The `troe-ext4` v1 profile is a strict, clean, read-only ext4 subset:
   `extra_isize`, and `metadata_csum`;
 - CRC32C validation of the superblock, every consumed group descriptor, inode,
   and directory block;
-- regular files and directories with UTF-8 names and file-type directory
-  entries; symlinks, special files, xattr interpretation, ACL interpretation,
-  and mutation are outside the VFS surface for this increment;
+- regular files, directories, and symbolic links with UTF-8 names and file-type
+  directory entries; special files, xattr interpretation, ACL interpretation,
+  and directory creation are outside the VFS surface;
 - inline inode extent roots only (tree depth zero), at most four ordered
   extents, holes in regular files read as zero, and no holes or unwritten
   extents in directories; and
@@ -44,6 +47,38 @@ Directory indexing, 64-bit block numbers, flex groups, bigalloc, inline data,
 encryption, case folding, external journals, and extent-tree blocks are not in
 v1. The volume UUID is exposed so mount policy can select a filesystem by
 stable identity.
+
+Writable mounts require flush or force-unit-access durability and implement
+complete-file create, copy-on-write replacement, non-directory unlink,
+symbolic-link creation, and regular-file hard-link creation.
+Allocation bitmaps, group and superblock counters, inode extents, directory
+records, and every affected checksum are updated within the same bounded
+profile.
+
+Symbolic-link targets are UTF-8 and at most 256 bytes. Both inline fast
+symlinks and depth-zero extent-backed symlinks are accepted. Traversal follows
+at most eight links, charges every restarted inode lookup to the operation
+ceiling, and resolves absolute targets within the provider root; cycles and
+over-budget expansion fail closed. Hard links are limited to regular files,
+cannot cross providers, update only the inode link count/checksum plus the new
+directory record, and preserve the shared inode's remaining metadata.
+
+Replacing a file starts from its exact existing 256-byte inode. Only file size,
+the data-derived part of its allocated-sector count, inline extent root, and
+inode checksum may change. Any sector count belonging to preserved metadata
+blocks remains accounted. Mode bits (including `0777`), raw UID/GID,
+timestamps, flags, generation, inline metadata, ACL/xattr references, and all
+other inode bytes are preserved. A newly created regular file has raw UID 1000,
+raw GID 1000, and mode `0600`; these are storage defaults, not an authorization
+decision. A newly created symbolic link uses the same UID/GID defaults and the
+conventional raw mode `0777`.
+
+Before the first metadata mutation the provider clears `EXT4_VALID_FS` and
+flushes it. It restores clean state only after new content and all metadata are
+durable. Replacement publishes through one inode-table-block write and reclaims
+the old extents afterward. Because v1 still does not replay the journal, an
+interrupted mutation requires external `e2fsck`; dirty media fail closed rather
+than being accepted as a completed transaction.
 
 A host image for this exact profile can be created by selecting only these
 features rather than relying on defaults, for example with `mke2fs -t ext4 -b
@@ -79,7 +114,9 @@ kernel composition root. Corrupt metadata and unsupported format evolution
 fail closed under deterministic memory and traversal ceilings.
 
 The subset is intentionally narrower than general ext4. Expanding it requires
-new corruption tests and an update to this versioned profile. Writable mount,
-journal replay, ACL authorization, xattr exposure, indexed directories, and
-deep extent trees remain later Stage 8 increments; read-only v1 does not claim
-crash recovery or persistent activation.
+new corruption tests and an update to this versioned profile. Journal replay,
+ACL authorization, xattr exposure and external-xattr final unlink, hard links
+to directories or symlinks, indexed directories, directory creation/rename,
+and deep extent trees remain later increments. Writer interoperability is
+checked by remounting and running read-only `e2fsck` after create, replacement,
+and removal.

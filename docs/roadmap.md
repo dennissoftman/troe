@@ -260,11 +260,13 @@ The bounded UDP substrate is now exposed through the optional owner-scoped
 application datagram service. `udp.kex` proves send, receive backpressure,
 waiting/cancellation, and teardown to zero live ports on every QEMU composition.
 The optional read-only filesystem service now supplies generation-checked open
-tokens, bounded offset reads and metadata, and lexical pagination. `cat`,
+tokens, bounded offset reads and metadata, and lexical pagination with
+symbolic-link kinds. `cat`,
 `grep`, `hexdump`, `ls`, and `man` exercise it on every QEMU composition.
-Atomic complete-file mutation is now implemented and exercised by `write.kex`
-and `rm.kex`. Separate monotonic timer and immutable typed diagnostics services
-now back `sleep.kex` and `mem.kex`. Independent typed observation, DHCP, and ICMP
+Atomic complete-file mutation and bounded link creation are now implemented and
+exercised by `write.kex`, `rm.kex`, and `ln.kex`. Separate monotonic timer and
+immutable typed diagnostics services now back `sleep.kex` and `mem.kex`.
+Independent typed observation, DHCP, and ICMP
 echo services now back `net.kex`, `arp.kex`, `dhcp.kex`, and `ping.kex` without
    granting raw frames, routes, devices, or one another's authority. The remaining
    ordinary-command recovery implementations are removed. Interface 13 now
@@ -410,13 +412,15 @@ The first portable storage/configuration boundary is landed:
   and validated UTF-16 names;
 - ADR 0007 now accepts native-principal, foreign-identity, mapping,
   mount-policy, ACL, and fail-closed recovery rules before persistent writes;
-- `troe-vfs` exposes a bounded read-only provider contract and namespace mount
-  routing; `troe-fat` implements the first strict read-only FAT32 provider with
-  mirrored FAT, BPB/backup/FSInfo, cycle, short-name, and LFN validation; and
+- `troe-vfs` exposes bounded provider reads plus complete-file replace/remove
+  hooks and namespace mount routing; `troe-fat` implements strict FAT32 with
+  mirrored FAT, BPB/backup/FSInfo, cycle, short-name, LFN validation, and
+  copy-on-write create/replace/remove; and
 - ADR 0017 fixes the first ext4 feature bitmap; `troe-ext4` implements its
-  clean read-only, 4 KiB-block, inline-extent profile with UUID selection,
+  clean, 4 KiB-block, inline-extent profile with UUID selection,
   CRC32C-protected superblock/group/inode/directory traversal, sparse-file
-  reads, and hard group/inode/directory/file/read/name ceilings. Real-tool
+  reads, metadata-preserving complete-file mutation, bounded symbolic/hard
+  links, and hard group/inode/directory/file/read/name ceilings. Real-tool
   interoperability fixtures are accepted by e2fsprogs/dosfstools checkers
   before the ext4/FAT32 providers mount, list, and read them; and
 - `troe-config` implements checksummed SCFG v1 desired-system/service startup
@@ -433,9 +437,11 @@ The first portable storage/configuration boundary is landed:
   reset-before-return timeout safety, and completes a native post-handoff read
   in QEMU acceptance; and
 - `troe-storage` shares native devices across exclusive synchronous region
-  capabilities, validates exact BMNT-selected GPT/ext4 identities, and prepares
-  only read-only providers. Both QEMU fixtures mount the matched volume at
-  `/vol/root` and read it through the live shell; and
+  capabilities, validates exact BMNT-selected GPT/ext4/FAT32 identities, and
+  grants only the read-only or read-write authority requested by BMNT. Both
+  QEMU fixtures mount the matched volume read-write at `/vol/root`; acceptance
+  creates, replaces, links, unlinks, flushes, reopens, and rereads content
+  through the live shell; and
 - the q35 front end discovers modern virtio PCI capabilities, validates and
   maps their sized BAR regions, and drives the shared synchronous queue without
   exposing PCI details above `troe-machine`; and
@@ -493,7 +499,8 @@ The first portable storage/configuration boundary is landed:
   transitive roots.
 
 These mechanisms are host verified; both VM block and network transports,
-read-only mount activation, the bounded TXSLOT transaction, digest-bound ext4
+policy-selected read-only/read-write mount activation, the bounded TXSLOT
+transaction, digest-bound ext4
 CSPK/SACT/ISEC recovery, selected state-filesystem mutation, and host UDP
 exchange are QEMU verified. Five independent fault-isolation processes per
 named platform revalidate the rolled-back generation-1 security snapshot and

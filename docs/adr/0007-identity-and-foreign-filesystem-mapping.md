@@ -170,18 +170,22 @@ typed snapshot to one generation and includes it in rollback and GC roots.
 
 The format/version/integrity ceilings, host-CSPRNG provisioning rule,
 crash-consistent generation recovery, and parser inspection APIs are now
-implemented and tested. Before a future multi-principal filesystem writer
-consumes them, its format ADR must additionally fix and test the provider's
-exact raw UID/GID, mode, POSIX ACL, xattr, and fidelity behavior. In particular,
-a writable ext4 expansion must not infer those rules from the current read-only
-subset.
+implemented and tested. The constrained ext4 writer is deliberately not a
+multi-principal authorization engine: replacement preserves every raw inode
+metadata byte except the size, block mapping, data-allocation portion of the
+sector count, and checksum fields required by new content. Metadata-block
+accounting is preserved. Creation uses the explicit raw UID/GID 1000 and mode
+`0600` defaults fixed by ADR 0017. Raw mode, ACL, and identity values remain
+informational until a mapped authorization surface is accepted.
+Regular-file hard-link creation changes only the shared inode's link count and
+checksum; content replacement through any hard or symbolic link retains the
+same raw-metadata preservation rule.
 
 The owner-less KEFS image and single-session RAMFS remain unchanged because
 they are bootstrap formats with no multi-user security claim. Read-only
 filesystem experiments are permitted when they retain raw metadata and do not
-treat it as native authority. No persistent writer or stable VFS
-security-metadata ABI may land until its provider-specific write rules are
-accepted.
+treat it as native authority. No additional persistent writer or stable VFS
+security-metadata ABI may land without provider-specific write rules.
 
 The cross-generation activation gate additionally requires a strictly newer
 registry generation and mapping version, preserves the mapping domain, retains

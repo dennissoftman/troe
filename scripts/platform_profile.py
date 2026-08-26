@@ -132,6 +132,11 @@ def boot_image_path(
     return REPO_ROOT / "build" / f"boot-{profile.identifier}{suffix}.img"
 
 
+def root_storage_image_path(profile: PlatformProfile) -> Path:
+    """Return the platform-qualified mutable persistent-root path."""
+    return REPO_ROOT / "build" / f"storage-root-{profile.identifier}.img"
+
+
 def txslot_image_path(profile: PlatformProfile) -> Path:
     """Return the platform-qualified mutable activation-medium path."""
     return REPO_ROOT / "build" / f"storage-txslot-{profile.identifier}.img"

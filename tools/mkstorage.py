@@ -5,11 +5,14 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import struct
 import subprocess
 import sys
 import tempfile
+import tomllib
+import uuid
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -95,34 +98,286 @@ STATEFS_TYPE_GUID = bytes.fromhex("33445566778899aabbccddeeff001122")
 BMNT_HEADER_BYTES = 64
 BMNT_RECORD_BYTES = 96
 BMNT_CHECKSUM_OFFSET = 20
+BMNT_MAX_BYTES = 4 * 1024
+BMNT_MAX_ENTRIES = 16
+BMNT_MAX_NAME_BYTES = 32
 PRGN_BYTES = 80
 PRGN_CHECKSUM_OFFSET = 20
 
 
-def build_manifest() -> bytes:
-    """Encode one required read-only `/vol/root` ext4 selector."""
-    name = b"root"
-    total_bytes = BMNT_HEADER_BYTES + BMNT_RECORD_BYTES + len(name)
+@dataclass(frozen=True)
+class MountSpec:
+    """One canonical source entry for a BMNT `/vol/<name>` mount."""
+
+    name: str
+    selector: str
+    filesystem: str
+    access: str
+    availability: str
+    disk_guid: bytes
+    partition_guid: bytes
+    filesystem_identity: bytes
+
+
+def default_mount_specs() -> tuple[MountSpec, ...]:
+    """Return the deterministic QEMU root policy used without a source table."""
+    return (
+        MountSpec(
+            name="root",
+            selector="gpt",
+            filesystem="ext4-v1",
+            access="read-write",
+            availability="required",
+            disk_guid=DISK_GUID,
+            partition_guid=PARTITION_GUID,
+            filesystem_identity=FILESYSTEM_UUID,
+        ),
+    )
+
+
+def _canonical_uuid(value: object, label: str, *, gpt: bool) -> bytes:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a canonical UUID string")
+    try:
+        parsed = uuid.UUID(value)
+    except (AttributeError, ValueError) as error:
+        raise ValueError(f"{label} must be a canonical UUID string") from error
+    if str(parsed) != value.lower() or parsed.int == 0:
+        raise ValueError(f"{label} must be a canonical nonzero UUID string")
+    return parsed.bytes_le if gpt else parsed.bytes
+
+
+def _required_string(entry: dict[str, object], key: str, index: int) -> str:
+    value = entry.get(key)
+    if not isinstance(value, str):
+        raise ValueError(f"volume {index} field {key!r} must be a string")
+    return value
+
+
+def _validated_mount_specs(entries: object) -> tuple[MountSpec, ...]:
+    if not isinstance(entries, (list, tuple)) or not entries:
+        raise ValueError("volume table must contain at least one [[volumes]] entry")
+    if len(entries) > BMNT_MAX_ENTRIES:
+        raise ValueError(f"volume table exceeds the {BMNT_MAX_ENTRIES}-entry limit")
+
+    retained: list[MountSpec] = []
+    for index, raw in enumerate(entries):
+        if isinstance(raw, MountSpec):
+            spec = raw
+        elif isinstance(raw, dict):
+            name = _required_string(raw, "name", index)
+            selector = _required_string(raw, "selector", index)
+            filesystem = _required_string(raw, "filesystem", index)
+            access = _required_string(raw, "access", index)
+            availability = _required_string(raw, "availability", index)
+            activation = _required_string(raw, "activation", index)
+            if activation != "auto":
+                raise ValueError(
+                    f"volume {name!r} activation must be 'auto'; manual mounts are not implemented"
+                )
+            common = {
+                "name",
+                "selector",
+                "filesystem",
+                "access",
+                "availability",
+                "activation",
+            }
+            if selector == "gpt" and filesystem == "ext4-v1":
+                expected = common | {"disk_guid", "partition_guid", "filesystem_uuid"}
+                disk_guid = _canonical_uuid(raw.get("disk_guid"), "disk_guid", gpt=True)
+                partition_guid = _canonical_uuid(
+                    raw.get("partition_guid"), "partition_guid", gpt=True
+                )
+                filesystem_identity = _canonical_uuid(
+                    raw.get("filesystem_uuid"), "filesystem_uuid", gpt=False
+                )
+            elif selector == "whole-device" and filesystem == "ext4-v1":
+                expected = common | {"filesystem_uuid"}
+                disk_guid = bytes(16)
+                partition_guid = bytes(16)
+                filesystem_identity = _canonical_uuid(
+                    raw.get("filesystem_uuid"), "filesystem_uuid", gpt=False
+                )
+            elif selector == "gpt" and filesystem == "fat32":
+                expected = common | {"disk_guid", "partition_guid", "volume_id"}
+                disk_guid = _canonical_uuid(raw.get("disk_guid"), "disk_guid", gpt=True)
+                partition_guid = _canonical_uuid(
+                    raw.get("partition_guid"), "partition_guid", gpt=True
+                )
+                volume_id = raw.get("volume_id")
+                if (
+                    not isinstance(volume_id, str)
+                    or re.fullmatch(r"[0-9a-fA-F]{8}", volume_id) is None
+                ):
+                    raise ValueError(
+                        f"volume {name!r} FAT32 volume_id must contain exactly eight hex digits"
+                    )
+                numeric_volume_id = int(volume_id, 16)
+                if numeric_volume_id == 0:
+                    raise ValueError(f"volume {name!r} FAT32 volume_id must be nonzero")
+                filesystem_identity = numeric_volume_id.to_bytes(4, "little") + bytes(
+                    12
+                )
+            else:
+                raise ValueError(
+                    f"volume {name!r} has unsupported selector/filesystem combination"
+                )
+            if set(raw) != expected:
+                missing = sorted(expected - set(raw))
+                extra = sorted(set(raw) - expected)
+                raise ValueError(
+                    f"volume {name!r} fields do not match its profile; missing={missing} extra={extra}"
+                )
+            spec = MountSpec(
+                name=name,
+                selector=selector,
+                filesystem=filesystem,
+                access=access,
+                availability=availability,
+                disk_guid=disk_guid,
+                partition_guid=partition_guid,
+                filesystem_identity=filesystem_identity,
+            )
+        else:
+            raise ValueError(f"volume {index} must be a TOML table")
+
+        name_bytes = spec.name.encode("utf-8")
+        if (
+            not 1 <= len(name_bytes) <= BMNT_MAX_NAME_BYTES
+            or re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", spec.name) is None
+        ):
+            raise ValueError(
+                f"volume name {spec.name!r} must use 1-{BMNT_MAX_NAME_BYTES} lowercase ASCII name bytes"
+            )
+        if spec.filesystem not in {"ext4-v1", "fat32"}:
+            raise ValueError(f"volume {spec.name!r} has an unsupported filesystem")
+        if spec.access not in {"read-only", "read-write"}:
+            raise ValueError(f"volume {spec.name!r} has an invalid access policy")
+        if spec.availability not in {"optional", "required"}:
+            raise ValueError(f"volume {spec.name!r} has an invalid availability policy")
+        if spec.selector not in {"gpt", "whole-device"}:
+            raise ValueError(f"volume {spec.name!r} has an invalid selector")
+        if spec.selector == "whole-device" and spec.filesystem != "ext4-v1":
+            raise ValueError("whole-device selectors currently support only ext4-v1")
+        if spec.name == "root" and spec.filesystem != "ext4-v1":
+            raise ValueError("the reserved root volume must use ext4-v1")
+        if spec.name == "boot" and spec.filesystem != "fat32":
+            raise ValueError("the reserved boot volume must use fat32")
+        if any(
+            len(identifier) != 16
+            for identifier in (
+                spec.disk_guid,
+                spec.partition_guid,
+                spec.filesystem_identity,
+            )
+        ):
+            raise ValueError(f"volume {spec.name!r} has an invalid stable identifier")
+        if not any(spec.filesystem_identity):
+            raise ValueError(f"volume {spec.name!r} has a zero filesystem identity")
+        if spec.selector == "gpt" and (
+            not any(spec.disk_guid) or not any(spec.partition_guid)
+        ):
+            raise ValueError(f"volume {spec.name!r} has a zero GPT identity")
+        if spec.selector == "whole-device" and (
+            any(spec.disk_guid) or any(spec.partition_guid)
+        ):
+            raise ValueError(
+                f"volume {spec.name!r} has GPT fields on a whole-device selector"
+            )
+        if spec.filesystem == "fat32" and any(spec.filesystem_identity[4:]):
+            raise ValueError(f"volume {spec.name!r} has a noncanonical FAT32 identity")
+        retained.append(spec)
+
+    retained.sort(key=lambda entry: entry.name)
+    for previous, current in zip(retained, retained[1:], strict=False):
+        if previous.name == current.name:
+            raise ValueError(f"duplicate volume name {current.name!r}")
+    selectors: set[tuple[object, ...]] = set()
+    for spec in retained:
+        selector_key = (
+            spec.selector,
+            spec.filesystem,
+            spec.disk_guid,
+            spec.partition_guid,
+            spec.filesystem_identity,
+        )
+        if selector_key in selectors:
+            raise ValueError(f"volume {spec.name!r} duplicates another stable selector")
+        selectors.add(selector_key)
+    string_bytes = sum(len(spec.name.encode("utf-8")) for spec in retained)
+    encoded_bytes = BMNT_HEADER_BYTES + len(retained) * BMNT_RECORD_BYTES + string_bytes
+    if encoded_bytes > BMNT_MAX_BYTES:
+        raise ValueError(
+            f"compiled volume table exceeds the {BMNT_MAX_BYTES}-byte limit"
+        )
+    return tuple(retained)
+
+
+def load_volume_table(path: Path) -> tuple[MountSpec, ...]:
+    """Parse and strictly validate one human-editable volume table."""
+    try:
+        with path.open("rb") as source:
+            document = tomllib.load(source)
+    except tomllib.TOMLDecodeError as error:
+        raise ValueError(f"invalid volume table TOML: {error}") from error
+    if (
+        set(document) != {"version", "volumes"}
+        or type(document.get("version")) is not int
+        or document.get("version") != 1
+    ):
+        raise ValueError(
+            "volume table must contain only version=1 and [[volumes]] entries"
+        )
+    return _validated_mount_specs(document["volumes"])
+
+
+def require_fixture_root(entries: tuple[MountSpec, ...]) -> None:
+    """Require a table used with `--output` to select the generated root disk."""
+    root = [entry for entry in entries if entry.name == "root"]
+    if root != list(default_mount_specs()):
+        raise ValueError(
+            "a generated QEMU root fixture requires the canonical root entry; "
+            "custom entries may be added alongside it"
+        )
+
+
+def build_manifest(entries: object | None = None) -> bytes:
+    """Compile canonical mount specifications into one checksummed BMNT v1 image."""
+    specs = _validated_mount_specs(
+        default_mount_specs() if entries is None else entries
+    )
+    names = [spec.name.encode("utf-8") for spec in specs]
+    total_bytes = (
+        BMNT_HEADER_BYTES
+        + len(specs) * BMNT_RECORD_BYTES
+        + sum(len(name) for name in names)
+    )
     image = bytearray(total_bytes)
     image[:8] = b"BMNTv1\0\0"
     struct.pack_into(
         "<HHHHI", image, 8, 1, 0, BMNT_HEADER_BYTES, BMNT_RECORD_BYTES, total_bytes
     )
-    struct.pack_into("<H", image, 24, 1)
-    struct.pack_into("<I", image, 28, len(name))
+    struct.pack_into("<H", image, 24, len(specs))
+    struct.pack_into("<I", image, 28, sum(len(name) for name in names))
 
-    record = memoryview(image)[
-        BMNT_HEADER_BYTES : BMNT_HEADER_BYTES + BMNT_RECORD_BYTES
-    ]
-    record[0] = 2  # GPT partition
-    record[1] = 2  # ext4 v1
-    record[2] = 1  # read-only
-    record[3] = 2  # required
-    struct.pack_into("<IH", record, 4, 0, len(name))
-    record[16:32] = DISK_GUID
-    record[32:48] = PARTITION_GUID
-    record[48:64] = FILESYSTEM_UUID
-    image[-len(name) :] = name
+    string_offset = 0
+    string_start = BMNT_HEADER_BYTES + len(specs) * BMNT_RECORD_BYTES
+    for index, (spec, name) in enumerate(zip(specs, names, strict=True)):
+        start = BMNT_HEADER_BYTES + index * BMNT_RECORD_BYTES
+        record = memoryview(image)[start : start + BMNT_RECORD_BYTES]
+        record[0] = {"whole-device": 1, "gpt": 2}[spec.selector]
+        record[1] = {"fat32": 1, "ext4-v1": 2}[spec.filesystem]
+        record[2] = {"read-only": 1, "read-write": 2}[spec.access]
+        record[3] = {"optional": 1, "required": 2}[spec.availability]
+        struct.pack_into("<IH", record, 4, string_offset, len(name))
+        record[16:32] = spec.disk_guid
+        record[32:48] = spec.partition_guid
+        record[48:64] = spec.filesystem_identity
+        image[
+            string_start + string_offset : string_start + string_offset + len(name)
+        ] = name
+        string_offset += len(name)
 
     checksum_image = bytearray(image)
     checksum_image[BMNT_CHECKSUM_OFFSET : BMNT_CHECKSUM_OFFSET + 4] = b"\0" * 4
@@ -1035,25 +1290,96 @@ def create_ext4(content: bytes | None = None) -> bytes:
         return image
 
 
-def verify_manifest(manifest: bytes) -> None:
-    """Check exact BMNT size, checksum, and stable identities."""
-    if len(manifest) != BMNT_HEADER_BYTES + BMNT_RECORD_BYTES + 4:
-        raise ValueError("unexpected BMNT size")
+def decode_manifest(manifest: bytes) -> tuple[MountSpec, ...]:
+    """Independently decode and validate one canonical BMNT v1 image."""
+    if not BMNT_HEADER_BYTES <= len(manifest) <= BMNT_MAX_BYTES:
+        raise ValueError("BMNT size is outside the format bounds")
+    if (
+        manifest[:8] != b"BMNTv1\0\0"
+        or struct.unpack_from("<HHHHI", manifest, 8)
+        != (1, 0, BMNT_HEADER_BYTES, BMNT_RECORD_BYTES, len(manifest))
+        or struct.unpack_from("<H", manifest, 26)[0] != 0
+        or any(manifest[32:BMNT_HEADER_BYTES])
+    ):
+        raise ValueError("invalid BMNT header")
     stored = struct.unpack_from("<I", manifest, BMNT_CHECKSUM_OFFSET)[0]
     checked = bytearray(manifest)
     checked[BMNT_CHECKSUM_OFFSET : BMNT_CHECKSUM_OFFSET + 4] = b"\0" * 4
     if zlib.crc32(checked) != stored:
         raise ValueError("BMNT checksum mismatch")
-    record = manifest[BMNT_HEADER_BYTES : BMNT_HEADER_BYTES + BMNT_RECORD_BYTES]
-    if record[16:32] != DISK_GUID or record[32:48] != PARTITION_GUID:
-        raise ValueError("BMNT GPT identity mismatch")
-    if record[48:64] != FILESYSTEM_UUID or manifest[-4:] != b"root":
-        raise ValueError("BMNT filesystem identity mismatch")
+
+    count = struct.unpack_from("<H", manifest, 24)[0]
+    string_bytes = struct.unpack_from("<I", manifest, 28)[0]
+    if not 1 <= count <= BMNT_MAX_ENTRIES:
+        raise ValueError("BMNT entry count is outside the format bounds")
+    string_start = BMNT_HEADER_BYTES + count * BMNT_RECORD_BYTES
+    if string_start + string_bytes != len(manifest):
+        raise ValueError("BMNT record and string lengths are inconsistent")
+    strings = manifest[string_start:]
+    selector_names = {1: "whole-device", 2: "gpt"}
+    filesystem_names = {1: "fat32", 2: "ext4-v1"}
+    access_names = {1: "read-only", 2: "read-write"}
+    availability_names = {1: "optional", 2: "required"}
+    decoded: list[MountSpec] = []
+    expected_name_offset = 0
+    for index in range(count):
+        start = BMNT_HEADER_BYTES + index * BMNT_RECORD_BYTES
+        record = manifest[start : start + BMNT_RECORD_BYTES]
+        if len(record) != BMNT_RECORD_BYTES or any(record[10:16]) or any(record[64:]):
+            raise ValueError(f"BMNT record {index} uses reserved bytes")
+        try:
+            selector = selector_names[record[0]]
+            filesystem = filesystem_names[record[1]]
+            access = access_names[record[2]]
+            availability = availability_names[record[3]]
+        except KeyError as error:
+            raise ValueError(f"BMNT record {index} contains an unknown enum") from error
+        name_offset, name_bytes = struct.unpack_from("<IH", record, 4)
+        if (
+            name_offset != expected_name_offset
+            or not 1 <= name_bytes <= BMNT_MAX_NAME_BYTES
+        ):
+            raise ValueError(f"BMNT record {index} has a noncanonical name range")
+        name_end = name_offset + name_bytes
+        try:
+            name = strings[name_offset:name_end].decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ValueError(f"BMNT record {index} name is not UTF-8") from error
+        if name_end > len(strings):
+            raise ValueError(f"BMNT record {index} name is truncated")
+        expected_name_offset = name_end
+        spec = MountSpec(
+            name=name,
+            selector=selector,
+            filesystem=filesystem,
+            access=access,
+            availability=availability,
+            disk_guid=bytes(record[16:32]),
+            partition_guid=bytes(record[32:48]),
+            filesystem_identity=bytes(record[48:64]),
+        )
+        decoded.append(spec)
+    if expected_name_offset != len(strings):
+        raise ValueError("BMNT string table contains trailing bytes")
+    specs = _validated_mount_specs(decoded)
+    if tuple(decoded) != specs or build_manifest(specs) != manifest:
+        raise ValueError("BMNT image is not canonically ordered or encoded")
+    return specs
+
+
+def verify_manifest(manifest: bytes) -> None:
+    """Check one complete BMNT image without trusting its source table."""
+    decode_manifest(manifest)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument(
+        "--volume-table",
+        type=Path,
+        help="compile this strict TOML volume table instead of the built-in fixture policy",
+    )
     parser.add_argument(
         "--output", type=Path, help="also create the GPT/ext4 disk image"
     )
@@ -1066,7 +1392,14 @@ def main() -> int:
     parser.add_argument("--statefs-output", type=Path)
     args = parser.parse_args()
     try:
-        manifest = build_manifest()
+        entries = (
+            load_volume_table(args.volume_table)
+            if args.volume_table is not None
+            else default_mount_specs()
+        )
+        if args.output is not None:
+            require_fixture_root(entries)
+        manifest = build_manifest(entries)
         verify_manifest(manifest)
         args.manifest.parent.mkdir(parents=True, exist_ok=True)
         args.manifest.write_bytes(manifest)

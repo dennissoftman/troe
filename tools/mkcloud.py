@@ -1187,15 +1187,19 @@ def _verify_boot_root_binding(efi: bytes, disk: GptDisk, root: GptPartition) -> 
         raise ValueError("EFI-embedded BMNT payload is truncated")
     manifest = efi[offset:end]
     mkstorage.verify_manifest(manifest)
-    record = manifest[
-        mkstorage.BMNT_HEADER_BYTES : mkstorage.BMNT_HEADER_BYTES
-        + mkstorage.BMNT_RECORD_BYTES
+    roots = [
+        entry for entry in mkstorage.decode_manifest(manifest) if entry.name == "root"
     ]
+    if len(roots) != 1:
+        raise ValueError("EFI-embedded BMNT does not contain exactly one root role")
+    root_entry = roots[0]
     filesystem_uuid = root.payload[1024 + 104 : 1024 + 120]
     if (
-        record[16:32] != disk.disk_guid
-        or record[32:48] != root.unique_guid
-        or record[48:64] != filesystem_uuid
+        root_entry.selector != "gpt"
+        or root_entry.filesystem != "ext4-v1"
+        or root_entry.disk_guid != disk.disk_guid
+        or root_entry.partition_guid != root.unique_guid
+        or root_entry.filesystem_identity != filesystem_uuid
     ):
         raise ValueError("EFI-embedded BMNT does not select the packaged root")
 
@@ -1397,7 +1401,7 @@ def _bundle_manifest(
                 BUNDLE_FILENAMES[role],
                 images[role],
                 disks[role],
-                writable=role != "system",
+                writable=True,
             )
             for role in ("system", "activation", "state")
         ],

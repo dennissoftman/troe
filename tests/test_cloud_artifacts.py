@@ -359,7 +359,7 @@ class CloudBundleTests(unittest.TestCase):
         self.assertFalse(any(activation.partitions[0].payload))
         self.assertFalse(any(state.partitions[0].payload))
         self.assertTrue(first_manifest["disks"][1]["writable"])
-        self.assertFalse(first_manifest["disks"][0]["writable"])
+        self.assertTrue(first_manifest["disks"][0]["writable"])
 
     def test_every_qemu_platform_matrix_entry_assembles_on_the_host(self) -> None:
         qemu_entries = [

@@ -31,6 +31,8 @@ pub enum NodeKind {
     Directory,
     /// Regular byte file.
     File,
+    /// Symbolic link resolved by its owning provider.
+    Symlink,
 }
 
 /// Filesystem failures.
@@ -155,7 +157,7 @@ pub trait ReadOnlyFileSystem: fmt::Debug {
         Err(FsError::ReadOnly)
     }
 
-    /// Atomically remove one regular file.
+    /// Atomically remove one regular file or symbolic-link directory entry.
     ///
     /// Read-only providers retain this default.
     ///
@@ -164,6 +166,35 @@ pub trait ReadOnlyFileSystem: fmt::Debug {
     /// The default rejects every request as read-only. Writable providers
     /// report their bounded path, corruption, or transport failures.
     fn remove_file(&mut self, _path: &str) -> Result<(), FsError> {
+        Err(FsError::ReadOnly)
+    }
+
+    /// Read the exact UTF-8 target stored in one symbolic link without following it.
+    ///
+    /// # Errors
+    ///
+    /// Providers without symbolic-link support return [`FsError::Unsupported`].
+    fn read_link(&mut self, _path: &str) -> Result<String, FsError> {
+        Err(FsError::Unsupported)
+    }
+
+    /// Create one symbolic link without replacing an existing directory entry.
+    ///
+    /// # Errors
+    ///
+    /// Read-only providers retain this default. Writable providers report
+    /// unsupported formats, invalid targets, collisions, or persistence failures.
+    fn create_symlink(&mut self, _target: &str, _link_path: &str) -> Result<(), FsError> {
+        Err(FsError::ReadOnly)
+    }
+
+    /// Add a hard-link name for an existing regular file.
+    ///
+    /// # Errors
+    ///
+    /// Read-only providers retain this default. Providers must reject directories
+    /// and cross-filesystem requests.
+    fn create_hard_link(&mut self, _existing: &str, _new_path: &str) -> Result<(), FsError> {
         Err(FsError::ReadOnly)
     }
 }
@@ -348,6 +379,7 @@ impl Namespace {
                     bytes: entry.data,
                     writable: false,
                 },
+                NodeKind::Symlink => return Err(FsError::Unsupported),
             };
             insert_node(&mut staged, entry.path, node)?;
         }
@@ -641,6 +673,70 @@ impl Namespace {
         Ok(())
     }
 
+    /// Return a mounted provider's symbolic-link target without following it.
+    ///
+    /// # Errors
+    ///
+    /// Fails for invalid, non-provider, missing, or non-symbolic-link paths.
+    pub fn read_link(&mut self, cwd: &str, path: &str) -> Result<String, FsError> {
+        let path = canonicalize(cwd, path)?;
+        let (index, relative) = self.mount_for_path(&path).ok_or(FsError::Unsupported)?;
+        self.mounts[index].provider.read_link(&relative)
+    }
+
+    /// Create a symbolic link on one writable mounted provider.
+    ///
+    /// # Errors
+    ///
+    /// Fails for invalid paths, immutable mounts, unsupported providers, or
+    /// provider persistence failures.
+    pub fn create_symlink(
+        &mut self,
+        cwd: &str,
+        target: &str,
+        link_path: &str,
+    ) -> Result<(), FsError> {
+        let link_path = canonicalize(cwd, link_path)?;
+        let (index, relative) = self
+            .mount_for_path(&link_path)
+            .ok_or(FsError::Unsupported)?;
+        if !self.mounts[index].writable {
+            return Err(FsError::ReadOnly);
+        }
+        self.mounts[index]
+            .provider
+            .create_symlink(target, &relative)
+    }
+
+    /// Add a hard-link name within one writable mounted provider.
+    ///
+    /// # Errors
+    ///
+    /// Fails for cross-provider links, invalid paths, immutable mounts,
+    /// unsupported providers, or provider persistence failures.
+    pub fn create_hard_link(
+        &mut self,
+        cwd: &str,
+        existing: &str,
+        new_path: &str,
+    ) -> Result<(), FsError> {
+        let existing = canonicalize(cwd, existing)?;
+        let new_path = canonicalize(cwd, new_path)?;
+        let (existing_index, existing_relative) =
+            self.mount_for_path(&existing).ok_or(FsError::Unsupported)?;
+        let (new_index, new_relative) =
+            self.mount_for_path(&new_path).ok_or(FsError::Unsupported)?;
+        if existing_index != new_index {
+            return Err(FsError::Unsupported);
+        }
+        if !self.mounts[existing_index].writable {
+            return Err(FsError::ReadOnly);
+        }
+        self.mounts[existing_index]
+            .provider
+            .create_hard_link(&existing_relative, &new_relative)
+    }
+
     /// List immediate children in lexical order.
     ///
     /// # Errors
@@ -889,7 +985,7 @@ impl Namespace {
         if let Some((index, relative)) = self.mount_for_path(&path) {
             return match self.mounts[index].provider.metadata(&relative)?.kind {
                 NodeKind::Directory => Ok(path),
-                NodeKind::File => Err(FsError::WrongType),
+                NodeKind::File | NodeKind::Symlink => Err(FsError::WrongType),
             };
         }
         match self.nodes.get(&path) {
@@ -1191,6 +1287,28 @@ mod tests {
                 next_cursor: None,
             })
         }
+
+        fn read_link(&mut self, path: &str) -> Result<alloc::string::String, FsError> {
+            (path == "/link")
+                .then(|| "/data".into())
+                .ok_or(FsError::WrongType)
+        }
+
+        fn create_symlink(&mut self, target: &str, link_path: &str) -> Result<(), FsError> {
+            if target == "/data" && link_path == "/link" {
+                Ok(())
+            } else {
+                Err(FsError::Invalid)
+            }
+        }
+
+        fn create_hard_link(&mut self, existing: &str, new_path: &str) -> Result<(), FsError> {
+            if existing == "/data" && new_path == "/hard" {
+                Ok(())
+            } else {
+                Err(FsError::Invalid)
+            }
+        }
     }
 
     #[test]
@@ -1236,6 +1354,22 @@ mod tests {
         assert_eq!(
             fs.read_file_bounded("/", "/tmp/app.kex", 10),
             Ok(b"0123456789".to_vec())
+        );
+    }
+
+    #[test]
+    fn mounted_link_operations_require_one_writable_provider() {
+        let mut fs = Namespace::new(RamFsQuota::default());
+        assert_eq!(fs.mount_writable("/media", Box::new(TestProvider)), Ok(()));
+        assert_eq!(fs.create_symlink("/", "/data", "/media/link"), Ok(()));
+        assert_eq!(fs.read_link("/", "/media/link"), Ok("/data".into()));
+        assert_eq!(
+            fs.create_hard_link("/", "/media/data", "/media/hard"),
+            Ok(())
+        );
+        assert_eq!(
+            fs.create_hard_link("/", "/media/data", "/tmp/hard"),
+            Err(FsError::Unsupported)
         );
     }
 

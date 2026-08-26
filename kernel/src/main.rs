@@ -47,6 +47,7 @@ mod firmware {
     };
     use troe_driver::{InputEvent, InputQueueConfig, InputQueueStats, InputSource};
     use troe_ext4::Ext4Limits;
+    use troe_fat::Fat32Limits;
     use troe_gpt::{GptGuid, GptLimits, discover};
     use troe_identity::IdentityLimits;
     use troe_memory::{
@@ -70,8 +71,8 @@ mod firmware {
     use troe_statefs::STATE_PATH;
     use troe_statefs::StateFs;
     use troe_storage::{
-        ActivationLimits, MAX_STORAGE_REPORT_BYTES, STORAGE_REPORT_EXTENSION_BYTES,
-        prepare_read_only, read_selected_file, validate_root_activation,
+        ActivationLimits, MAX_STORAGE_REPORT_BYTES, STORAGE_REPORT_EXTENSION_BYTES, prepare_mounts,
+        read_selected_file, validate_root_activation,
     };
     use troe_task::{
         Cancelled, Capabilities, CooperativeRuntime, IsolationResource, MonotonicMillis, Scheduler,
@@ -1111,7 +1112,8 @@ mod firmware {
         let block = BlockLimits::new(8, 4096, 1).map_err(|_| ())?;
         let gpt = GptLimits::new(128, 16 * 1024, 16).map_err(|_| ())?;
         let ext4 = Ext4Limits::new(8, 64, 256, 4096, 1024 * 1024, 4096, 64).map_err(|_| ())?;
-        Ok(ActivationLimits::new(block, gpt, ext4))
+        let fat32 = Fat32Limits::new(4096, 4096, 1024 * 1024, 4096, 64).map_err(|_| ())?;
+        Ok(ActivationLimits::new(block, gpt, ext4, fat32))
     }
 
     fn reserve_and_install_heap() -> Result<BootMemory, ()> {
@@ -3456,10 +3458,35 @@ mod firmware {
         }
     }
 
+    #[derive(Clone, Copy)]
+    enum NativeRootMode {
+        Recovery,
+        ReadOnly,
+        ReadWrite,
+    }
+
+    impl NativeRootMode {
+        const fn summary(self) -> &'static str {
+            match self {
+                Self::Recovery => "recovery root (read-only)",
+                Self::ReadOnly => "/vol/root (read-only)",
+                Self::ReadWrite => "/vol/root (read-write)",
+            }
+        }
+
+        const fn boot_label(self) -> &'static str {
+            match self {
+                Self::Recovery => "Mounting recovery root read-only",
+                Self::ReadOnly => "Mounting /vol/root read-only",
+                Self::ReadWrite => "Mounting /vol/root read-write",
+            }
+        }
+    }
+
     fn write_shell_banner(
         console: &mut dyn Output,
         motd: &[u8],
-        native_root: bool,
+        root_mode: NativeRootMode,
         network: Option<NetworkStatus>,
     ) -> bool {
         if write_all(console, b"\n").is_err()
@@ -3470,13 +3497,13 @@ mod firmware {
             return false;
         }
 
-        let root = if native_root {
-            "/vol/root (read-only)"
-        } else {
-            "recovery root (read-only)"
-        };
         let mut summary = String::new();
-        let _formatted = write!(&mut summary, "{} | {root} | ", architecture());
+        let _formatted = write!(
+            &mut summary,
+            "{} | {} | ",
+            architecture(),
+            root_mode.summary()
+        );
         if let Some(address) = network.and_then(|status| status.address) {
             let _formatted = write_ipv4(&mut summary, address);
             if let Some(mask) = network.and_then(|status| status.subnet_mask) {
@@ -3538,17 +3565,25 @@ mod firmware {
         accounting: &OwnedAccounting,
         namespace: &mut Namespace,
         console: &mut dyn Output,
-    ) -> bool {
+    ) -> NativeRootMode {
         let limits = native_activation_limits()
             .unwrap_or_else(|()| fatal(b"fatal: invalid native storage limits\n"));
         let devices = core::mem::take(&mut *accounting.native_blocks.borrow_mut());
-        let activation = prepare_read_only(&accounting.boot_mount_manifest, devices, limits)
+        let activation = prepare_mounts(&accounting.boot_mount_manifest, devices, limits)
             .unwrap_or_else(|_| fatal(b"fatal: native storage activation failed\n"));
         let desired_system_available = activation.desired_system_available();
-        let root_mounted = activation
+        let root_mode = activation
             .mounts()
             .iter()
-            .any(|mount| mount.path() == "/vol/root");
+            .find(|mount| mount.path() == "/vol/root")
+            .map_or(NativeRootMode::Recovery, |mount| {
+                if mount.is_writable() {
+                    NativeRootMode::ReadWrite
+                } else {
+                    NativeRootMode::ReadOnly
+                }
+            });
+        let root_mounted = !matches!(root_mode, NativeRootMode::Recovery);
         let mut storage_report = String::new();
         let report_capacity = activation
             .report()
@@ -3583,28 +3618,29 @@ mod firmware {
             && root_mounted
             && accounting.native_generation.desired_system_available()
         {
-            if write_boot_status(console, "Mounting /vol/root read-only", true).is_err() {
+            if write_boot_status(console, root_mode.boot_label(), true).is_err() {
                 fatal(b"fatal: native storage diagnostic failed\n");
             }
-            true
+            root_mode
         } else {
-            if write_boot_status(console, "Mounting recovery root read-only", true).is_err() {
+            let recovery = NativeRootMode::Recovery;
+            if write_boot_status(console, recovery.boot_label(), true).is_err() {
                 fatal(b"fatal: native storage diagnostic failed\n");
             }
-            false
+            recovery
         }
     }
 
     fn compose_namespace(
         accounting: &OwnedAccounting,
         console: &mut dyn Output,
-    ) -> (Namespace, bool) {
+    ) -> (Namespace, NativeRootMode) {
         let mut namespace = Namespace::new(RamFsQuota::default());
         if namespace.mount_embedded(ROOTFS).is_err() {
             fatal(b"fatal: cannot mount embedded root\n");
         }
-        let native_root = activate_native_storage(accounting, &mut namespace, console);
-        (namespace, native_root)
+        let root_mode = activate_native_storage(accounting, &mut namespace, console);
+        (namespace, root_mode)
     }
 
     impl KernelNetworkService {
@@ -4229,6 +4265,7 @@ mod firmware {
                             kind: match entry.kind {
                                 NodeKind::File => filesystem::NodeKind::File,
                                 NodeKind::Directory => filesystem::NodeKind::Directory,
+                                NodeKind::Symlink => filesystem::NodeKind::Symlink,
                             },
                             name: &entry.name,
                         });
@@ -4253,6 +4290,7 @@ mod firmware {
                         kind: match metadata.kind {
                             NodeKind::File => filesystem::NodeKind::File,
                             NodeKind::Directory => filesystem::NodeKind::Directory,
+                            NodeKind::Symlink => filesystem::NodeKind::Symlink,
                         },
                         byte_count: metadata.byte_count,
                     };
@@ -4347,6 +4385,26 @@ mod firmware {
                 .remove_file(&self.cwd, path)
                 .map_err(application_filesystem_status)
         }
+
+        fn create_symlink(&mut self, target: &str, link_path: &str) -> Result<(), ReplyStatus> {
+            if self.pending.is_some() {
+                return Err(ReplyStatus::Conflict);
+            }
+            self.namespace
+                .borrow_mut()
+                .create_symlink(&self.cwd, target, link_path)
+                .map_err(application_filesystem_status)
+        }
+
+        fn create_hard_link(&mut self, existing: &str, new_path: &str) -> Result<(), ReplyStatus> {
+            if self.pending.is_some() {
+                return Err(ReplyStatus::Conflict);
+            }
+            self.namespace
+                .borrow_mut()
+                .create_hard_link(&self.cwd, existing, new_path)
+                .map_err(application_filesystem_status)
+        }
     }
 
     impl Service for ApplicationFilesystemMutationService<'_> {
@@ -4394,6 +4452,21 @@ mod firmware {
                         return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
                     };
                     match self.remove(path) {
+                        Ok(()) => Ok(ServiceReply::empty(ReplyStatus::Success)),
+                        Err(status) => Ok(ServiceReply::empty(status)),
+                    }
+                }
+                filesystem_mutation::CREATE_SYMLINK | filesystem_mutation::CREATE_HARD_LINK => {
+                    let Ok(link) = filesystem_mutation::decode_link_request(request.payload())
+                    else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    let result = if request.opcode() == filesystem_mutation::CREATE_SYMLINK {
+                        self.create_symlink(link.target, link.link_path)
+                    } else {
+                        self.create_hard_link(link.target, link.link_path)
+                    };
+                    match result {
                         Ok(()) => Ok(ServiceReply::empty(ReplyStatus::Success)),
                         Err(status) => Ok(ServiceReply::empty(status)),
                     }
@@ -5259,10 +5332,10 @@ mod firmware {
     fn finish_shell_startup(
         console: &mut dyn Output,
         motd: &[u8],
-        native_root: bool,
+        root_mode: NativeRootMode,
     ) -> SharedRuntime {
         let (network_status, runtime) = install_command_runtime(console);
-        if !write_shell_banner(console, motd, native_root, network_status) {
+        if !write_shell_banner(console, motd, root_mode, network_status) {
             fatal(b"fatal: native console write failed\n");
         }
         runtime
@@ -5764,7 +5837,7 @@ mod firmware {
         if write_boot_status(&mut console, console_label, true).is_err() {
             fatal(b"fatal: framebuffer console write failed\n");
         }
-        let (mut namespace, native_root) = compose_namespace(task.accounting, &mut console);
+        let (mut namespace, root_mode) = compose_namespace(task.accounting, &mut console);
         let motd = namespace
             .read_file("/", "/etc/motd")
             .unwrap_or_else(|_| fatal(b"fatal: cannot read /etc/motd\n"));
@@ -5775,7 +5848,7 @@ mod firmware {
         else {
             fatal(b"fatal: cannot compose namespace\n");
         };
-        let runtime = finish_shell_startup(&mut console, &motd, native_root);
+        let runtime = finish_shell_startup(&mut console, &motd, root_mode);
         let editor_config = EditorConfig::standard();
         if editor_config.max_line_bytes() > MAX_LINE_BYTES {
             fatal(b"fatal: editor line policy exceeds shell parser policy\n");

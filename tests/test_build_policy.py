@@ -38,6 +38,17 @@ class ProductionBuildPolicyTests(unittest.TestCase):
         self.assertTrue(parsed.fixture_identities)
         self.assertFalse(parsed.acceptance_probes)
         self.assertFalse(parsed.all_variants)
+        self.assertEqual(parsed.volume_table, build.DEFAULT_VOLUME_TABLE)
+        custom = build.parse_args(
+            [
+                "--platform",
+                "all",
+                "--fixture-identities",
+                "--volume-table",
+                "custom.toml",
+            ]
+        )
+        self.assertEqual(custom.volume_table, Path("custom.toml"))
         all_variants = build.parse_args(
             ["--platform", "all", "--fixture-identities", "--all-variants"]
         )

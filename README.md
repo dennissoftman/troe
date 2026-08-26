@@ -40,12 +40,13 @@ profiles. Small is a policy here, not just a current measurement.
 - Native UEFI boots on x86-64 and AArch64.
 - Serial and framebuffer consoles with UTF-8 line editing, history, completion,
   quoting, and pipelines.
-- A bounded VFS with KEFS, read-only FAT32 and constrained ext4, quota-bound
+- A bounded VFS with KEFS, a default read-write persistent ext4 volume at
+  `/vol/root`, read/write FAT32, bounded ext4 symbolic/hard links, quota-bound
   `/tmp`, live `/sys`, and crash-consistent state under `/vol/state`.
 - Ethernet, ARP, DHCP, IPv4, ICMP, UDP, and outbound TCP over virtio-net.
 - KEX applications for `arp`, `cat`, `clear`, `dhcp`, `echo`, `grep`, `hexdump`,
-  `ls`, `lua`, `man`, `mem`, `net`, `ping`, `printf`, `pwd`, `rm`, `sleep`, `tcp`,
-  `udp`, and `write`.
+  `ln`, `ls`, `lua`, `man`, `mem`, `net`, `ping`, `printf`, `pwd`, `rm`, `sleep`,
+  `tcp`, `udp`, and `write`.
 
 Only `cd`, `poweroff`, and `reboot` are privileged shell intrinsics. Everything
 else is an immutable KEX application discovered from `/bin`.
@@ -66,9 +67,27 @@ sh:/> echo alpha beta | grep beta | write /tmp/result
 sh:/> cat /tmp/result
 alpha beta
 
+sh:/> write /vol/root/note persistent
+sh:/> ln -s note /vol/root/latest
+sh:/> cat /vol/root/latest
+persistent
+
 sh:/> lua -e 'print(string.format("Lua %.1f", math.sqrt(81)))'
 Lua 9.0
 ```
+
+Additional ext4-v1 or FAT32 partitions can be declared in the strict
+human-editable [`config/volumes.toml`](config/volumes.toml). Names map to
+`/vol/<name>` and exact stable identities are compiled into the bounded boot
+manifest. Attach custom QEMU media with:
+
+```console
+cargo qemu --volume-table path/to/volumes.toml --data-disk path/to/disk.raw
+```
+
+Configured matches mount automatically; `cat /sys/storage` reports every
+device, candidate, configured role, and failure state. See the
+[volume-table format](docs/formats/volume-table-v1.md) for the complete schema.
 
 ### Networking
 

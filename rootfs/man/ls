@@ -6,4 +6,5 @@ SYNOPSIS
 
 DESCRIPTION
     Lists immediate children in deterministic lexical order. Directories have
-    a trailing slash. PATH defaults to the current directory.
+    a trailing slash and symbolic links have a trailing @. PATH defaults to the
+    current directory.

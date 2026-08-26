@@ -137,6 +137,7 @@ class RepositoryPolicyTests(unittest.TestCase):
             "echo",
             "grep",
             "hexdump",
+            "ln",
             "ls",
             "lua",
             "man",

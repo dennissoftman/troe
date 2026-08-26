@@ -1,4 +1,4 @@
-//! Deterministic native-volume discovery and read-only mount activation.
+//! Deterministic native-volume discovery and manifest-authorized mount activation.
 #![no_std]
 #![forbid(unsafe_code)]
 
@@ -21,7 +21,8 @@ use core::fmt::{self, Write};
 
 use troe_block::{BlockAccess, BlockDevice, BlockError, BlockGeometry, BlockLimits, BlockRegion};
 use troe_ext4::{Ext4, Ext4Limits};
-use troe_gpt::{GptError, GptGuid, GptLimits, discover};
+use troe_fat::{Fat32, Fat32Limits};
+use troe_gpt::{GptError, GptGuid, GptLimits, GptPartition, discover};
 use troe_mount::{
     AccessMode, AvailabilityPolicy, BootMountManifest, FilesystemProfile, MAX_DISCOVERED_VOLUMES,
     MatchState, MountEntry, MountResolution, SelectorKind, VolumeSelector,
@@ -44,13 +45,24 @@ pub struct ActivationLimits {
     block: BlockLimits,
     gpt: GptLimits,
     ext4: Ext4Limits,
+    fat32: Fat32Limits,
 }
 
 impl ActivationLimits {
     /// Compose already-validated limits for each storage layer.
     #[must_use]
-    pub const fn new(block: BlockLimits, gpt: GptLimits, ext4: Ext4Limits) -> Self {
-        Self { block, gpt, ext4 }
+    pub const fn new(
+        block: BlockLimits,
+        gpt: GptLimits,
+        ext4: Ext4Limits,
+        fat32: Fat32Limits,
+    ) -> Self {
+        Self {
+            block,
+            gpt,
+            ext4,
+            fat32,
+        }
     }
 
     /// Limits applied to every whole-device and partition capability.
@@ -70,28 +82,41 @@ impl ActivationLimits {
     pub const fn ext4(self) -> Ext4Limits {
         self.ext4
     }
+
+    /// Limits applied to every FAT32 provider candidate.
+    #[must_use]
+    pub const fn fat32(self) -> Fat32Limits {
+        self.fat32
+    }
 }
 
 /// One fully validated provider ready to attach below `/vol`.
-pub struct PreparedReadOnlyMount {
+pub struct PreparedMount {
     path: String,
     provider: Box<dyn ReadOnlyFileSystem>,
+    writable: bool,
 }
 
-impl core::fmt::Debug for PreparedReadOnlyMount {
+impl core::fmt::Debug for PreparedMount {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter
-            .debug_struct("PreparedReadOnlyMount")
+            .debug_struct("PreparedMount")
             .field("path", &self.path)
             .finish_non_exhaustive()
     }
 }
 
-impl PreparedReadOnlyMount {
+impl PreparedMount {
     /// Absolute namespace path derived from the canonical manifest name.
     #[must_use]
     pub fn path(&self) -> &str {
         &self.path
+    }
+
+    /// Whether the validated manifest granted mutation authority.
+    #[must_use]
+    pub const fn is_writable(&self) -> bool {
+        self.writable
     }
 
     /// Consume this plan and return its validated provider.
@@ -106,14 +131,18 @@ impl PreparedReadOnlyMount {
     ///
     /// Forwards namespace path, collision, and provider-root failures.
     pub fn attach(self, namespace: &mut Namespace) -> Result<(), FsError> {
-        namespace.mount_read_only(&self.path, self.provider)
+        if self.writable {
+            namespace.mount_writable(&self.path, self.provider)
+        } else {
+            namespace.mount_read_only(&self.path, self.provider)
+        }
     }
 }
 
 /// Deterministic result of one bounded discovery and manifest-resolution pass.
 #[derive(Debug)]
-pub struct ReadOnlyActivation {
-    mounts: Vec<PreparedReadOnlyMount>,
+pub struct StorageActivation {
+    mounts: Vec<PreparedMount>,
     desired_system_available: bool,
     scanned_devices: u8,
     valid_gpt_disks: u8,
@@ -121,16 +150,16 @@ pub struct ReadOnlyActivation {
     report: String,
 }
 
-impl ReadOnlyActivation {
+impl StorageActivation {
     /// Validated providers in canonical manifest order.
     #[must_use]
-    pub fn mounts(&self) -> &[PreparedReadOnlyMount] {
+    pub fn mounts(&self) -> &[PreparedMount] {
         &self.mounts
     }
 
     /// Consume the result and return its provider plans.
     #[must_use]
-    pub fn into_mounts(self) -> Vec<PreparedReadOnlyMount> {
+    pub fn into_mounts(self) -> Vec<PreparedMount> {
         self.mounts
     }
 
@@ -240,6 +269,8 @@ struct RegionObservation {
     partition_guid: GptGuid,
     ext4: ProbeState,
     filesystem_uuid: Option<[u8; 16]>,
+    fat32: ProbeState,
+    fat32_volume_id: Option<u32>,
 }
 
 struct SharedDevice<D: BlockDevice> {
@@ -304,7 +335,7 @@ impl<D: BlockDevice> BlockDevice for SharedDevice<D> {
     }
 }
 
-/// Discover exact BMNT-selected ext4 providers without granting mutation authority.
+/// Discover exact BMNT-selected ext4 providers with manifest-bounded authority.
 ///
 /// Foreign, missing, corrupt, and unsupported media are availability outcomes,
 /// not parser-policy errors. No returned provider exists until GPT copies,
@@ -314,11 +345,11 @@ impl<D: BlockDevice> BlockDevice for SharedDevice<D> {
 ///
 /// Rejects inputs above hard discovery limits, bounded allocation failure, or
 /// an internal manifest-resolution limit failure before returning mount plans.
-pub fn prepare_read_only<D: BlockDevice + 'static>(
+pub fn prepare_mounts<D: BlockDevice + 'static>(
     manifest: &BootMountManifest,
     devices: Vec<D>,
     limits: ActivationLimits,
-) -> Result<ReadOnlyActivation, ActivationError> {
+) -> Result<StorageActivation, ActivationError> {
     if devices.len() > MAX_DISCOVERED_VOLUMES {
         return Err(ActivationError::DiscoveryLimit);
     }
@@ -341,6 +372,7 @@ pub fn prepare_read_only<D: BlockDevice + 'static>(
     for (index, device) in devices.into_iter().enumerate() {
         let device_index = u8::try_from(index).map_err(|_| ActivationError::DiscoveryLimit)?;
         if discover_device(
+            manifest,
             device_index,
             device,
             limits,
@@ -390,9 +422,13 @@ pub fn prepare_read_only<D: BlockDevice + 'static>(
         path.try_reserve_exact(entry.name().len())
             .map_err(|_| ActivationError::MetadataExhausted)?;
         path.push_str(entry.name());
-        mounts.push(PreparedReadOnlyMount { path, provider });
+        mounts.push(PreparedMount {
+            path,
+            provider,
+            writable: entry.access() == AccessMode::ReadWrite,
+        });
     }
-    Ok(ReadOnlyActivation {
+    Ok(StorageActivation {
         mounts,
         desired_system_available: resolution.desired_system_available(),
         scanned_devices,
@@ -400,6 +436,30 @@ pub fn prepare_read_only<D: BlockDevice + 'static>(
         candidates: candidate_count,
         report,
     })
+}
+
+/// Prepare only manifests whose entries are all read-only.
+///
+/// Use [`prepare_mounts`] when the validated manifest deliberately requests a
+/// writable provider. This compatibility entry point refuses mutation policy.
+///
+/// # Errors
+///
+/// Rejects a manifest containing any read-write role and otherwise forwards
+/// [`prepare_mounts`] failures.
+pub fn prepare_read_only<D: BlockDevice + 'static>(
+    manifest: &BootMountManifest,
+    devices: Vec<D>,
+    limits: ActivationLimits,
+) -> Result<StorageActivation, ActivationError> {
+    if manifest
+        .entries()
+        .iter()
+        .any(|entry| entry.access() == AccessMode::ReadWrite)
+    {
+        return Err(ActivationError::Resolution);
+    }
+    prepare_mounts(manifest, devices, limits)
 }
 
 /// Read one complete bounded file from an exactly BMNT-selected ext4 role.
@@ -433,10 +493,7 @@ pub fn read_selected_file<D: BlockDevice>(
         .iter()
         .filter(|entry| entry.name() == role);
     let entry = entries.next().ok_or(SelectedFileError::InvalidRequest)?;
-    if entries.next().is_some()
-        || entry.access() != AccessMode::ReadOnly
-        || entry.filesystem() != FilesystemProfile::Ext4V1
-    {
+    if entries.next().is_some() || entry.filesystem() != FilesystemProfile::Ext4V1 {
         return Err(SelectedFileError::InvalidRequest);
     }
 
@@ -549,6 +606,7 @@ fn read_provider_file<D: BlockDevice>(
 }
 
 fn discover_device<D: BlockDevice + 'static>(
+    manifest: &BootMountManifest,
     device_index: u8,
     device: D,
     limits: ActivationLimits,
@@ -558,7 +616,7 @@ fn discover_device<D: BlockDevice + 'static>(
 ) -> Result<bool, ActivationError> {
     let shared = SharedDevice::new(device);
     let geometry = shared.geometry();
-    let whole_ext4 = discover_whole_ext4(device_index, &shared, limits, candidates)?;
+    let whole_ext4 = discover_whole_ext4(manifest, device_index, &shared, limits, candidates)?;
     let gpt_result =
         BlockRegion::whole_device(shared.clone(), BlockAccess::ReadOnly, limits.block())
             .map_err(GptError::Block)
@@ -578,37 +636,29 @@ fn discover_device<D: BlockDevice + 'static>(
                 region_observations
                     .try_reserve(1)
                     .map_err(|_| ActivationError::MetadataExhausted)?;
-                let region_result = BlockRegion::new(
-                    shared.clone(),
-                    partition.first_lba(),
-                    partition.block_count(),
-                    BlockAccess::ReadOnly,
-                    limits.block(),
-                );
-                let (ext4_state, filesystem_uuid) = match region_result {
-                    Ok(region) => match Ext4::mount(region, limits.ext4()) {
-                        Ok(ext4) => {
-                            let filesystem_uuid = ext4.uuid().bytes();
-                            let selector = VolumeSelector::gpt_ext4(
-                                gpt.disk_guid().disk_bytes(),
-                                partition.unique_guid().disk_bytes(),
-                                filesystem_uuid,
-                            )
-                            .map_err(|_| ActivationError::Resolution)?;
-                            push_candidate(
-                                candidates,
-                                selector,
-                                Box::new(ext4),
-                                device_index,
-                                partition.first_lba(),
-                                partition.block_count(),
-                            )?;
-                            (ProbeState::Valid, Some(filesystem_uuid))
-                        }
-                        Err(error) => (probe_state(error), None),
-                    },
-                    Err(_) => (ProbeState::InvalidGeometry, None),
-                };
+                let (ext4_state, filesystem_uuid) = probe_partition_ext4(
+                    manifest,
+                    &shared,
+                    geometry,
+                    limits,
+                    gpt.disk_guid(),
+                    partition,
+                    device_index,
+                    candidates,
+                )?;
+                let (fat32_state, fat32_volume_id) = probe_partition_fat32(
+                    manifest,
+                    &shared,
+                    geometry,
+                    limits,
+                    gpt.disk_guid(),
+                    partition,
+                    device_index,
+                    candidates,
+                )?;
+                if ext4_state == ProbeState::Valid && fat32_state == ProbeState::Valid {
+                    return Err(ActivationError::ConflictingLayout);
+                }
                 region_observations.push(RegionObservation {
                     device_index,
                     first_block: partition.first_lba(),
@@ -617,6 +667,8 @@ fn discover_device<D: BlockDevice + 'static>(
                     partition_guid: partition.unique_guid(),
                     ext4: ext4_state,
                     filesystem_uuid,
+                    fat32: fat32_state,
+                    fat32_volume_id,
                 });
             }
             (
@@ -643,6 +695,7 @@ fn discover_device<D: BlockDevice + 'static>(
 }
 
 fn discover_whole_ext4<D: BlockDevice + 'static>(
+    manifest: &BootMountManifest,
     device_index: u8,
     device: &SharedDevice<D>,
     limits: ActivationLimits,
@@ -653,12 +706,17 @@ fn discover_whole_ext4<D: BlockDevice + 'static>(
     else {
         return Ok(ProbeState::InvalidGeometry);
     };
-    let ext4 = match Ext4::mount(region, limits.ext4()) {
+    let ext4_probe = match Ext4::mount(region, limits.ext4()) {
         Ok(ext4) => ext4,
         Err(error) => return Ok(probe_state(error)),
     };
-    let selector =
-        VolumeSelector::whole_ext4(ext4.uuid().bytes()).map_err(|_| ActivationError::Resolution)?;
+    let selector = VolumeSelector::whole_ext4(ext4_probe.uuid().bytes())
+        .map_err(|_| ActivationError::Resolution)?;
+    let access = selected_block_access(manifest, selector, device.geometry)?;
+    let provider_region = BlockRegion::whole_device(device.clone(), access, limits.block())
+        .map_err(|_| ActivationError::Resolution)?;
+    let ext4 =
+        Ext4::mount(provider_region, limits.ext4()).map_err(|_| ActivationError::Resolution)?;
     push_candidate(
         candidates,
         selector,
@@ -668,6 +726,132 @@ fn discover_whole_ext4<D: BlockDevice + 'static>(
         device.geometry.block_count(),
     )?;
     Ok(ProbeState::Valid)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn probe_partition_ext4<D: BlockDevice + 'static>(
+    manifest: &BootMountManifest,
+    device: &SharedDevice<D>,
+    geometry: BlockGeometry,
+    limits: ActivationLimits,
+    disk_guid: GptGuid,
+    partition: &GptPartition,
+    device_index: u8,
+    candidates: &mut Vec<Candidate>,
+) -> Result<(ProbeState, Option<[u8; 16]>), ActivationError> {
+    let Ok(region) = BlockRegion::new(
+        device.clone(),
+        partition.first_lba(),
+        partition.block_count(),
+        BlockAccess::ReadOnly,
+        limits.block(),
+    ) else {
+        return Ok((ProbeState::InvalidGeometry, None));
+    };
+    let probe = match Ext4::mount(region, limits.ext4()) {
+        Ok(probe) => probe,
+        Err(error) => return Ok((probe_state(error), None)),
+    };
+    let filesystem_uuid = probe.uuid().bytes();
+    let selector = VolumeSelector::gpt_ext4(
+        disk_guid.disk_bytes(),
+        partition.unique_guid().disk_bytes(),
+        filesystem_uuid,
+    )
+    .map_err(|_| ActivationError::Resolution)?;
+    let access = selected_block_access(manifest, selector, geometry)?;
+    let provider_region = BlockRegion::new(
+        device.clone(),
+        partition.first_lba(),
+        partition.block_count(),
+        access,
+        limits.block(),
+    )
+    .map_err(|_| ActivationError::Resolution)?;
+    let provider =
+        Ext4::mount(provider_region, limits.ext4()).map_err(|_| ActivationError::Resolution)?;
+    push_candidate(
+        candidates,
+        selector,
+        Box::new(provider),
+        device_index,
+        partition.first_lba(),
+        partition.block_count(),
+    )?;
+    Ok((ProbeState::Valid, Some(filesystem_uuid)))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn probe_partition_fat32<D: BlockDevice + 'static>(
+    manifest: &BootMountManifest,
+    device: &SharedDevice<D>,
+    geometry: BlockGeometry,
+    limits: ActivationLimits,
+    disk_guid: GptGuid,
+    partition: &GptPartition,
+    device_index: u8,
+    candidates: &mut Vec<Candidate>,
+) -> Result<(ProbeState, Option<u32>), ActivationError> {
+    let Ok(region) = BlockRegion::new(
+        device.clone(),
+        partition.first_lba(),
+        partition.block_count(),
+        BlockAccess::ReadOnly,
+        limits.block(),
+    ) else {
+        return Ok((ProbeState::InvalidGeometry, None));
+    };
+    let probe = match Fat32::mount(region, limits.fat32()) {
+        Ok(probe) => probe,
+        Err(error) => return Ok((probe_state(error), None)),
+    };
+    let volume_id = probe.volume_id();
+    let Ok(selector) = VolumeSelector::gpt_fat32(
+        disk_guid.disk_bytes(),
+        partition.unique_guid().disk_bytes(),
+        volume_id,
+    ) else {
+        return Ok((ProbeState::Corrupt, None));
+    };
+    let access = selected_block_access(manifest, selector, geometry)?;
+    let provider_region = BlockRegion::new(
+        device.clone(),
+        partition.first_lba(),
+        partition.block_count(),
+        access,
+        limits.block(),
+    )
+    .map_err(|_| ActivationError::Resolution)?;
+    let provider =
+        Fat32::mount(provider_region, limits.fat32()).map_err(|_| ActivationError::Resolution)?;
+    push_candidate(
+        candidates,
+        selector,
+        Box::new(provider),
+        device_index,
+        partition.first_lba(),
+        partition.block_count(),
+    )?;
+    Ok((ProbeState::Valid, Some(volume_id)))
+}
+
+fn selected_block_access(
+    manifest: &BootMountManifest,
+    selector: VolumeSelector,
+    geometry: BlockGeometry,
+) -> Result<BlockAccess, ActivationError> {
+    let writable = manifest
+        .entries()
+        .iter()
+        .any(|entry| entry.selector() == selector && entry.access() == AccessMode::ReadWrite);
+    if writable {
+        if !geometry.supports_flush() && !geometry.supports_force_unit_access() {
+            return Err(ActivationError::Resolution);
+        }
+        Ok(BlockAccess::ReadWrite)
+    } else {
+        Ok(BlockAccess::ReadOnly)
+    }
 }
 
 fn push_candidate(
@@ -824,6 +1008,12 @@ fn render_storage_report(
             write!(report, " uuid={}", HexIdentity(filesystem_uuid))
                 .map_err(|_| ActivationError::DiscoveryLimit)?;
         }
+        write!(report, " fat32={}", probe_name(region.fat32))
+            .map_err(|_| ActivationError::DiscoveryLimit)?;
+        if let Some(volume_id) = region.fat32_volume_id {
+            write!(report, " volume-id={volume_id:08x}")
+                .map_err(|_| ActivationError::DiscoveryLimit)?;
+        }
         writeln!(report).map_err(|_| ActivationError::DiscoveryLimit)?;
     }
 
@@ -966,11 +1156,12 @@ mod tests {
     use core::fmt::Write;
 
     use super::{
-        ActivationLimits, Candidate, MAX_DISCOVERY_REPORT_BYTES, SharedDevice, StorageReport,
-        prepare_read_only, render_storage_report,
+        ActivationError, ActivationLimits, Candidate, MAX_DISCOVERY_REPORT_BYTES, SharedDevice,
+        StorageReport, prepare_mounts, prepare_read_only, render_storage_report,
     };
     use troe_block::{BlockDevice, BlockError, BlockGeometry, BlockLimits};
     use troe_ext4::Ext4Limits;
+    use troe_fat::Fat32Limits;
     use troe_gpt::GptLimits;
     use troe_mount::parse_manifest;
 
@@ -1028,13 +1219,19 @@ mod tests {
             GptLimits::new(128, 16 * 1024, 8).unwrap_or_else(|_| std::process::abort()),
             Ext4Limits::new(8, 32, 64, 1024, 1024 * 1024, 4096, 64)
                 .unwrap_or_else(|_| std::process::abort()),
+            Fat32Limits::new(4096, 1024, 1024 * 1024, 4096, 64)
+                .unwrap_or_else(|_| std::process::abort()),
         )
     }
 
     #[test]
     fn missing_and_foreign_media_preserve_recovery_without_partial_mounts() {
         let manifest = parse_manifest(MANIFEST).unwrap_or_else(|_| std::process::abort());
-        let empty = prepare_read_only::<MemoryDevice>(&manifest, Vec::new(), limits())
+        assert!(matches!(
+            prepare_read_only::<MemoryDevice>(&manifest, Vec::new(), limits()),
+            Err(ActivationError::Resolution)
+        ));
+        let empty = prepare_mounts::<MemoryDevice>(&manifest, Vec::new(), limits())
             .unwrap_or_else(|_| std::process::abort());
         assert!(!empty.desired_system_available());
         assert!(empty.mounts().is_empty());
@@ -1047,10 +1244,10 @@ mod tests {
              regions 0\n\
              volumes 0\n\
              required-roles recovery\n\
-             role root path=/vol/root filesystem=ext4-v1 access=read-only availability=required state=missing\n"
+             role root path=/vol/root filesystem=ext4-v1 access=read-write availability=required state=missing\n"
         );
 
-        let foreign = prepare_read_only(&manifest, vec![MemoryDevice::zeroed(64)], limits())
+        let foreign = prepare_mounts(&manifest, vec![MemoryDevice::zeroed(64)], limits())
             .unwrap_or_else(|_| std::process::abort());
         assert!(!foreign.desired_system_available());
         assert!(foreign.mounts().is_empty());
@@ -1066,7 +1263,7 @@ mod tests {
             foreign.report()
         );
         assert!(foreign.report().ends_with(
-            "role root path=/vol/root filesystem=ext4-v1 access=read-only \
+            "role root path=/vol/root filesystem=ext4-v1 access=read-write \
              availability=required state=missing\n"
         ));
     }

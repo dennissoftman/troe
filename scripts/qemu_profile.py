@@ -23,6 +23,7 @@ if __package__:
         PlatformProfile,
         boot_image_path,
         resolve_platform,
+        root_storage_image_path,
         statefs_image_path,
         txslot_image_path,
     )
@@ -35,6 +36,7 @@ else:
         PlatformProfile,
         boot_image_path,
         resolve_platform,
+        root_storage_image_path,
         statefs_image_path,
         txslot_image_path,
     )
@@ -43,6 +45,10 @@ else:
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_QEMU_VERSION = "11.1.0"
 FIRMWARE_PROFILE_PATH = REPO_ROOT / "tools" / "qemu-firmware-profile.json"
+DEFAULT_VOLUME_TABLE = REPO_ROOT / "config" / "volumes.toml"
+# Split-disk QEMU profiles already expose boot, root, activation, and state
+# devices; four additions exactly preserve the native eight-device ceiling.
+MAX_EXTRA_DATA_DISKS = 4
 
 
 @dataclass(frozen=True)
@@ -474,6 +480,7 @@ def _qemu_arguments(
     *,
     graphical: bool,
     framebuffer: bool,
+    data_disks: tuple[Path, ...] = (),
 ) -> list[str]:
     """Return exact QEMU arguments from one already-resolved runner record."""
     command = [
@@ -505,7 +512,7 @@ def _qemu_arguments(
         command.extend(
             (
                 "-drive",
-                f"if=none,format=raw,readonly=on,id=troe-system,file={image}",
+                f"if=none,format=raw,cache=writeback,id=troe-system,file={image}",
                 "-device",
                 f"{runner.virtio_block_device},drive=troe-system,bootindex=1",
             )
@@ -516,7 +523,7 @@ def _qemu_arguments(
                 "-drive",
                 f"if=virtio,format=raw,file={image}",
                 "-drive",
-                f"if=none,format=raw,readonly=on,id=troe-root,file={storage}",
+                f"if=none,format=raw,cache=writeback,id=troe-root,file={storage}",
                 "-device",
                 f"{runner.virtio_block_device},drive=troe-root",
             )
@@ -531,6 +538,20 @@ def _qemu_arguments(
             f"if=none,format=raw,cache=writeback,id=troe-statefs,file={statefs}",
             "-device",
             f"{runner.virtio_block_device},drive=troe-statefs",
+        )
+    )
+    for index, data_disk in enumerate(data_disks):
+        drive_id = f"troe-data-{index}"
+        command.extend(
+            (
+                "-drive",
+                f"if=none,format=raw,cache=writeback,id={drive_id},file={data_disk}",
+                "-device",
+                f"{runner.virtio_block_device},drive={drive_id}",
+            )
+        )
+    command.extend(
+        (
             "-netdev",
             "user,id=troe-net",
             "-device",
@@ -594,6 +615,8 @@ def prepare_qemu_command(
     acceptance_probes: bool = False,
     graphical: bool = False,
     framebuffer: bool = False,
+    volume_table: Path | None = None,
+    data_disks: tuple[Path, ...] = (),
 ) -> list[str]:
     """Build an image, copy a disposable variable store, and return QEMU arguments."""
     profile = resolve_platform(platform_id)
@@ -614,7 +637,32 @@ def prepare_qemu_command(
 
     firmware = resolve_firmware(firmware_code, executable, runner, "code")
     vars_source = resolve_firmware(firmware_vars, executable, runner, "vars")
+    if len(data_disks) > MAX_EXTRA_DATA_DISKS:
+        raise RuntimeError(
+            f"at most {MAX_EXTRA_DATA_DISKS} additional data disks may be attached"
+        )
+    resolved_data_disks: list[Path] = []
+    for supplied in data_disks:
+        selected = supplied.expanduser().resolve(strict=True)
+        if not selected.is_file():
+            raise FileNotFoundError(
+                f"custom data disk is not a regular file: {selected}"
+            )
+        if selected in resolved_data_disks:
+            raise RuntimeError(
+                f"custom data disk is attached more than once: {selected}"
+            )
+        resolved_data_disks.append(selected)
+    if not build and volume_table is not None:
+        raise RuntimeError("--volume-table requires a build; remove --skip-build")
     if build:
+        selected_volume_table = (
+            DEFAULT_VOLUME_TABLE if volume_table is None else volume_table.expanduser()
+        ).resolve(strict=True)
+        if not selected_volume_table.is_file():
+            raise FileNotFoundError(
+                f"volume table is not a regular file: {selected_volume_table}"
+            )
         subprocess.run(
             [
                 sys.executable,
@@ -622,6 +670,8 @@ def prepare_qemu_command(
                 "--platform",
                 profile.identifier,
                 "--fixture-identities",
+                "--volume-table",
+                str(selected_volume_table),
                 *(("--acceptance-probes",) if acceptance_probes else ()),
             ],
             cwd=REPO_ROOT,
@@ -634,6 +684,8 @@ def prepare_qemu_command(
                 str(REPO_ROOT / "tools" / "mkstorage.py"),
                 "--manifest",
                 str(REPO_ROOT / "assets" / "boot.bmnt"),
+                "--volume-table",
+                str(selected_volume_table),
                 "--output",
                 str(REPO_ROOT / "build" / "storage-root.img"),
                 "--content",
@@ -683,7 +735,7 @@ def prepare_qemu_command(
             shutil.copyfile(bundle / "state.raw", statefs_image_path(profile))
     if not image.is_file():
         raise FileNotFoundError(f"boot image not found: {image}")
-    storage = REPO_ROOT / "build" / "storage-root.img"
+    storage = root_storage_image_path(profile)
     if runner.disk_layout == "split" and not storage.is_file():
         raise FileNotFoundError(f"storage fixture not found: {storage}")
     txslot = txslot_image_path(profile)
@@ -692,6 +744,17 @@ def prepare_qemu_command(
     statefs = statefs_image_path(profile)
     if not statefs.is_file() or statefs.stat().st_size != 4_096 * 512:
         raise FileNotFoundError(f"statefs fixture not found or invalid: {statefs}")
+    reserved_disks = {
+        image.resolve(),
+        storage.resolve(),
+        txslot.resolve(),
+        statefs.resolve(),
+    }
+    for data_disk in resolved_data_disks:
+        if data_disk in reserved_disks:
+            raise RuntimeError(
+                f"custom data disk duplicates a TROE system disk: {data_disk}"
+            )
     variables = variable_store_path(profile)
     shutil.copyfile(vars_source, variables)
     command = _qemu_arguments(
@@ -703,6 +766,7 @@ def prepare_qemu_command(
         storage,
         txslot,
         statefs,
+        data_disks=tuple(resolved_data_disks),
         graphical=graphical,
         framebuffer=framebuffer,
     )

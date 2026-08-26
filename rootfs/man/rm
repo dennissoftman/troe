@@ -5,5 +5,6 @@ SYNOPSIS
     rm FILE
 
 DESCRIPTION
-    Removes one file from writable RAMFS content and returns its quota charge.
-    Immutable and mounted read-only content cannot be removed.
+    Removes one regular file or symbolic link from a writable provider.
+    Removing one ext4 hard-link name preserves the inode and its other names.
+    Directories, immutable content, and mounted read-only content are rejected.

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -14,6 +15,7 @@ if __package__:
         PLATFORM_PROFILES,
         PlatformProfile,
         boot_image_path,
+        root_storage_image_path,
     )
 else:
     from platform_profile import (
@@ -21,11 +23,13 @@ else:
         PLATFORM_PROFILES,
         PlatformProfile,
         boot_image_path,
+        root_storage_image_path,
     )
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOLS_DIR = REPO_ROOT / "tools"
+DEFAULT_VOLUME_TABLE = REPO_ROOT / "config" / "volumes.toml"
 IMAGE_SIZE_LIMIT = 16 * 1024 * 1024
 PRODUCTION_FORBIDDEN_MARKERS = (
     b"mmu-probe",
@@ -109,6 +113,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         help="deployment identities created exclusively by tools/mkidentity.py",
     )
+    parser.add_argument(
+        "--volume-table",
+        type=Path,
+        default=DEFAULT_VOLUME_TABLE,
+        help="strict TOML source compiled into the boot mount manifest",
+    )
     return parser.parse_args(argv)
 
 
@@ -147,6 +157,8 @@ def main() -> int:
             TOOLS_DIR / "mkstorage.py",
             "--manifest",
             REPO_ROOT / "assets" / "boot.bmnt",
+            "--volume-table",
+            args.volume_table,
             "--persistence-selector",
             REPO_ROOT / "assets" / "persist.prgn",
             "--state-selector",
@@ -173,16 +185,24 @@ def main() -> int:
             REPO_ROOT / "assets" / "system.sact",
             *identity_arguments,
         )
+        root_source = REPO_ROOT / "build" / "storage-root.img"
         run(
             sys.executable,
             TOOLS_DIR / "mkstorage.py",
             "--manifest",
             REPO_ROOT / "assets" / "boot.bmnt",
+            "--volume-table",
+            args.volume_table,
             "--output",
-            REPO_ROOT / "build" / "storage-root.img",
+            root_source,
             "--content",
             REPO_ROOT / "assets" / "system.cspk",
         )
+        for platform_id in platform_ids:
+            shutil.copyfile(
+                root_source,
+                root_storage_image_path(PLATFORM_PROFILES[platform_id]),
+            )
 
         for acceptance_probes in requested_variants(args):
             for platform_id in platform_ids:

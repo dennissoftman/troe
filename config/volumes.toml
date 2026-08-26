@@ -1,0 +1,15 @@
+version = 1
+
+# TROE derives the mount path from the name: this entry becomes /vol/root.
+# GPT identifiers use their normal textual UUID form; the compiler performs the
+# GPT mixed-endian conversion. ext4 UUIDs use their normal `blkid` form.
+[[volumes]]
+name = "root"
+selector = "gpt"
+filesystem = "ext4-v1"
+disk_guid = "76543210-ba98-fedc-0123-456789abcdef"
+partition_guid = "87654321-cba9-ffed-1032-547698badcfe"
+filesystem_uuid = "00112233-4455-6677-8899-aabbccddeeff"
+access = "read-write"
+availability = "required"
+activation = "auto"

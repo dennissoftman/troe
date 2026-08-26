@@ -41,6 +41,8 @@ fn main(command: &mut CommandContext) -> u32 {
             if output.write_all(entry.name.as_bytes()).is_err()
                 || (entry.kind == filesystem::NodeKind::Directory
                     && output.write_all(b"/").is_err())
+                || (entry.kind == filesystem::NodeKind::Symlink
+                    && output.write_all(b"@").is_err())
                 || output.write_all(b"\n").is_err()
             {
                 return common::stream_failure(&mut command.stderr(), "ls");

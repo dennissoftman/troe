@@ -62,10 +62,10 @@ Every bundle has one explicit kind:
 | `acceptance` | requires all reserved fixture identities | requires an acceptance marker | requires `--allow-test-artifacts` |
 
 Activation and state images use the existing PRGN-selected disk, partition,
-and type GUIDs. Their four-block payloads are zero in a release bundle. Clone
-each seed for one machine and attach it writable; do not share one mutable copy
-between machines. Attach `system.raw` read-only when the environment supports
-that policy.
+and type GUIDs. Their four-block payloads are zero in a release bundle. The
+system image contains the default writable ext4 root role. Clone all three
+images for each machine and attach them writable; never share one mutable copy
+between machines.
 
 ## Build and verify
 

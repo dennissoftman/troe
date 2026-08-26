@@ -30,6 +30,7 @@ from platform_profile import (  # noqa: E402
     boot_image_path,
     platform_manifest,
     resolve_platform,
+    root_storage_image_path,
     statefs_image_path,
     txslot_image_path,
 )
@@ -381,6 +382,10 @@ class FirmwareProfileTests(unittest.TestCase):
                     REPO_ROOT / "build" / f"boot-{profile.identifier}-acceptance.img",
                 )
                 self.assertEqual(
+                    root_storage_image_path(profile),
+                    REPO_ROOT / "build" / f"storage-root-{profile.identifier}.img",
+                )
+                self.assertEqual(
                     txslot_image_path(profile),
                     REPO_ROOT / "build" / f"storage-txslot-{profile.identifier}.img",
                 )
@@ -449,7 +454,7 @@ class FirmwareProfileTests(unittest.TestCase):
             "-drive",
             "if=virtio,format=raw,file=/boot.img",
             "-drive",
-            "if=none,format=raw,readonly=on,id=troe-root,file=/root.img",
+            "if=none,format=raw,cache=writeback,id=troe-root,file=/root.img",
         ]
         x86 = _qemu_arguments(
             RUNNER_PROFILES[(X86_64_Q35_UEFI, QEMU_ENVIRONMENT)],
@@ -550,16 +555,33 @@ class FirmwareProfileTests(unittest.TestCase):
         )
         self.assertNotIn("if=virtio,format=raw,file=/boot.img", cloud_x86)
         self.assertNotIn(
-            "if=none,format=raw,readonly=on,id=troe-root,file=/root.img",
+            "if=none,format=raw,cache=writeback,id=troe-root,file=/root.img",
             cloud_x86,
         )
         self.assertIn(
-            "if=none,format=raw,readonly=on,id=troe-system,file=/boot.img",
+            "if=none,format=raw,cache=writeback,id=troe-system,file=/boot.img",
             cloud_x86,
         )
         self.assertIn(
             "virtio-blk-pci,disable-legacy=on,drive=troe-system,bootindex=1",
             cloud_x86,
+        )
+
+        custom = _qemu_arguments(
+            RUNNER_PROFILES[(X86_64_Q35_UEFI, QEMU_ENVIRONMENT)],
+            "/qemu-x86_64",
+            **paths,
+            graphical=False,
+            framebuffer=False,
+            data_disks=(Path("/archive.raw"), Path("/media.raw")),
+        )
+        self.assertIn(
+            "if=none,format=raw,cache=writeback,id=troe-data-0,file=/archive.raw",
+            custom,
+        )
+        self.assertIn(
+            "virtio-blk-pci,disable-legacy=on,drive=troe-data-1",
+            custom,
         )
 
     def test_launcher_and_acceptance_clis_require_platform_and_environment(
@@ -576,6 +598,24 @@ class FirmwareProfileTests(unittest.TestCase):
         )
         self.assertEqual(run_args.platform, X86_64_Q35_UEFI)
         self.assertEqual(run_args.environment, QEMU_ENVIRONMENT)
+        custom_run_args = RUN_QEMU.parse_args(
+            [
+                "--platform",
+                X86_64_Q35_UEFI,
+                "--environment",
+                QEMU_ENVIRONMENT,
+                "--volume-table",
+                "custom.toml",
+                "--data-disk",
+                "archive.raw",
+                "--data-disk",
+                "media.raw",
+            ]
+        )
+        self.assertEqual(custom_run_args.volume_table, Path("custom.toml"))
+        self.assertEqual(
+            custom_run_args.data_disk, [Path("archive.raw"), Path("media.raw")]
+        )
         test_args = TEST_QEMU.parse_args(
             ["--platform", "all", "--environment", QEMU_ENVIRONMENT]
         )

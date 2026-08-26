@@ -25,6 +25,7 @@ from platform_profile import (
     X86_64_Q35_UEFI,
     X86_64_UEFI_VIRTIO_PCI,
     resolve_platform,
+    root_storage_image_path,
     statefs_image_path,
     txslot_image_path,
 )
@@ -52,6 +53,8 @@ NETWORK_REQUEST = b"troe-stage8-request"
 NETWORK_REPLY = b"troe-stage8-reply"
 TCP_REQUEST = b"troe-tcp-request"
 TCP_REPLY = b"troe-tcp-reply\n"
+MUTABLE_ROOT_FILE = "/vol/root/troe-mutable.txt"
+MUTABLE_ROOT_CONTENT = "persistent-ext4-content"
 
 
 class AcceptanceError(RuntimeError):
@@ -182,6 +185,10 @@ def reset_txslot(platform_id: str, environment: str) -> None:
         shutil.copyfile(bundle / "activation.raw", path)
         shutil.copyfile(bundle / "state.raw", statefs_path(platform_id))
         return
+    shutil.copyfile(
+        REPO_ROOT / "build" / "storage-root.img",
+        root_storage_image_path(profile),
+    )
     subprocess.run(
         [
             sys.executable,
@@ -446,7 +453,7 @@ def assert_owned_boot(session: "SerialSession") -> None:
         "Starting devices and input",
         "Starting task and application runtime",
         "Starting console",
-        "Mounting /vol/root read-only",
+        "Mounting /vol/root read-write",
         "Configuring network: 10.0.2.15/24",
         "Tiny Rust Operating Environment 0.1.0",
         "Small by design. Alive on the wire.",
@@ -894,6 +901,36 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
         command_timeout,
         contains=("native ext4 mount\n",),
     )
+    session.command(f"write {MUTABLE_ROOT_FILE} initial", cwd, command_timeout)
+    session.command(
+        f"ln {MUTABLE_ROOT_FILE} /vol/root/troe-mutable-hard",
+        cwd,
+        command_timeout,
+    )
+    session.command(
+        "ln -s troe-mutable.txt /vol/root/troe-mutable-soft",
+        cwd,
+        command_timeout,
+    )
+    session.command(
+        "ls /vol/root",
+        cwd,
+        command_timeout,
+        contains=("troe-mutable-hard", "troe-mutable-soft@"),
+    )
+    session.command(
+        f"write /vol/root/troe-mutable-soft {MUTABLE_ROOT_CONTENT}",
+        cwd,
+        command_timeout,
+    )
+    session.command(
+        "cat /vol/root/troe-mutable-hard",
+        cwd,
+        command_timeout,
+        contains=(MUTABLE_ROOT_CONTENT,),
+    )
+    session.command("rm /vol/root/troe-mutable-hard", cwd, command_timeout)
+    session.command("rm /vol/root/troe-mutable-soft", cwd, command_timeout)
     session.command("echo alpha beta", cwd, command_timeout, contains=("alpha beta\n",))
     session.command(
         r"printf 'first\nsecond\t%s\n' value | grep second",
@@ -1249,11 +1286,23 @@ def request_poweroff(session: SerialSession, command_timeout: float) -> None:
 
 
 def run_reboot_scenario(
-    session: SerialSession, boot_timeout: float, command_timeout: float
+    session: SerialSession,
+    boot_timeout: float,
+    command_timeout: float,
+    *,
+    verify_mutable_root: bool = False,
 ) -> None:
     """Require the native reset request to terminate QEMU under -no-reboot."""
     session.wait_for(b"sh:/> ", boot_timeout)
     assert_owned_boot(session)
+    if verify_mutable_root:
+        session.command(
+            f"cat {MUTABLE_ROOT_FILE}",
+            "/",
+            command_timeout,
+            contains=(MUTABLE_ROOT_CONTENT,),
+        )
+        session.command(f"rm {MUTABLE_ROOT_FILE}", "/", command_timeout)
     session.terminal_command(
         "reboot", b"reboot: requesting cold reset", command_timeout
     )
@@ -1441,10 +1490,15 @@ def test_platform(
             f"{platform_id} TCP acceptance peer received "
             f"{tcp_peer.received} streams, expected {expected_tcp_streams}"
         )
-    if args.smoke or "persistence" in scenario_groups:
+    if args.smoke or scenario_groups.intersection(("filesystem", "persistence")):
         reboot_session = SerialSession(command, platform_id)
         try:
-            run_reboot_scenario(reboot_session, args.boot_timeout, args.command_timeout)
+            run_reboot_scenario(
+                reboot_session,
+                args.boot_timeout,
+                args.command_timeout,
+                verify_mutable_root=not args.smoke and "filesystem" in scenario_groups,
+            )
         except Exception:
             print(f"--- {platform_id} reboot transcript ---", file=sys.stderr)
             print(reboot_session.transcript(), file=sys.stderr)

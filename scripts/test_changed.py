@@ -29,7 +29,9 @@ else:
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ALL_QEMU_SCENARIOS = DEFAULT_SCENARIOS
 NETWORK_APPS = frozenset(("arp", "dhcp", "net", "ping", "tcp", "udp"))
-FILESYSTEM_APPS = frozenset(("cat", "grep", "hexdump", "ls", "printf", "rm", "write"))
+FILESYSTEM_APPS = frozenset(
+    ("cat", "grep", "hexdump", "ln", "ls", "printf", "rm", "write")
+)
 TERMINAL_APPS = frozenset(("clear", "echo", "man", "pwd"))
 LOW_LEVEL_PACKAGES = frozenset(
     (
@@ -78,6 +80,7 @@ PACKAGE_SCENARIOS = {
     "troe-kex-tool": set(ALL_QEMU_SCENARIOS),
 }
 PYTHON_IMPACTS = {
+    "config/volumes.toml": ("test_mkstorage.py", "test_cloud_artifacts.py"),
     "scripts/audit.py": ("test_audit_policy.py",),
     "scripts/build.py": ("test_build_policy.py", "test_cloud_artifacts.py"),
     "scripts/platform_profile.py": ("test_build_policy.py", "test_qemu_profile.py"),
@@ -105,6 +108,7 @@ PYTHON_IMPACTS = {
     "tools/size_report.py": ("test_build_policy.py",),
 }
 RUNTIME_TOOL_SCENARIOS = {
+    "config/volumes.toml": ("boot", "filesystem"),
     "scripts/build.py": ("boot",),
     "tools/mkcloud.py": ("boot", "filesystem", "persistence"),
     "tools/mkconfig.py": ("boot", "persistence"),

@@ -4,9 +4,107 @@ from __future__ import annotations
 
 import shutil
 import struct
+import tempfile
+import textwrap
 import unittest
+from pathlib import Path
 
 from tools import mkstorage
+
+
+class MountManifestTests(unittest.TestCase):
+    """Keep the shipped persistent root role explicitly writable."""
+
+    def test_root_role_is_required_read_write_ext4(self) -> None:
+        manifest = mkstorage.build_manifest()
+        mkstorage.verify_manifest(manifest)
+        record = manifest[
+            mkstorage.BMNT_HEADER_BYTES : mkstorage.BMNT_HEADER_BYTES
+            + mkstorage.BMNT_RECORD_BYTES
+        ]
+        self.assertEqual(record[:4], bytes((2, 2, 2, 2)))
+
+    def test_repository_volume_table_reproduces_the_default_policy(self) -> None:
+        table = Path(__file__).resolve().parents[1] / "config" / "volumes.toml"
+        self.assertEqual(
+            mkstorage.build_manifest(mkstorage.load_volume_table(table)),
+            mkstorage.build_manifest(),
+        )
+
+    def compile_table(self, source: str) -> tuple[mkstorage.MountSpec, ...]:
+        with tempfile.TemporaryDirectory(prefix="troe-volumes-") as directory:
+            path = Path(directory) / "volumes.toml"
+            path.write_text(textwrap.dedent(source), encoding="utf-8")
+            return mkstorage.load_volume_table(path)
+
+    def test_custom_ext4_and_fat32_entries_compile_canonically(self) -> None:
+        entries = self.compile_table(
+            """
+            version = 1
+
+            [[volumes]]
+            name = "media"
+            selector = "gpt"
+            filesystem = "fat32"
+            disk_guid = "11111111-2222-3333-4444-555555555555"
+            partition_guid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            volume_id = "a1b2c3d4"
+            access = "read-write"
+            availability = "optional"
+            activation = "auto"
+
+            [[volumes]]
+            name = "archive"
+            selector = "whole-device"
+            filesystem = "ext4-v1"
+            filesystem_uuid = "99999999-8888-7777-6666-555555555555"
+            access = "read-only"
+            availability = "optional"
+            activation = "auto"
+            """
+        )
+        manifest = mkstorage.build_manifest(entries)
+        self.assertEqual(
+            [entry.name for entry in mkstorage.decode_manifest(manifest)],
+            ["archive", "media"],
+        )
+        media = mkstorage.decode_manifest(manifest)[1]
+        self.assertEqual(media.filesystem_identity[:4], bytes.fromhex("d4c3b2a1"))
+        self.assertEqual(media.filesystem_identity[4:], bytes(12))
+
+    def test_custom_table_rejects_manual_and_ambiguous_mounts(self) -> None:
+        with self.assertRaisesRegex(ValueError, "manual mounts are not implemented"):
+            self.compile_table(
+                """
+                version = 1
+                [[volumes]]
+                name = "archive"
+                selector = "whole-device"
+                filesystem = "ext4-v1"
+                filesystem_uuid = "99999999-8888-7777-6666-555555555555"
+                access = "read-only"
+                availability = "optional"
+                activation = "manual"
+                """
+            )
+
+        duplicate = mkstorage.default_mount_specs()[0]
+        with self.assertRaisesRegex(ValueError, "duplicates another stable selector"):
+            mkstorage.build_manifest(
+                (
+                    duplicate,
+                    mkstorage.MountSpec(
+                        name="second",
+                        selector=duplicate.selector,
+                        filesystem=duplicate.filesystem,
+                        access=duplicate.access,
+                        availability="optional",
+                        disk_guid=duplicate.disk_guid,
+                        partition_guid=duplicate.partition_guid,
+                        filesystem_identity=duplicate.filesystem_identity,
+                    ),
+                )
+            )
 
 
 class E2fsprogsPinTests(unittest.TestCase):

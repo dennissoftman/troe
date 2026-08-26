@@ -26,6 +26,8 @@ historical review evidence.
   and bounded service-startup parser for the first Stage 8 slice.
 - [BMNT v1](formats/bmnt-v1.md) defines the implemented boot-side mount manifest
   and deterministic stable-identity volume resolution policy.
+- [Volume table v1](formats/volume-table-v1.md) defines the strict human-editable
+  source compiled into BMNT for custom ext4-v1 and FAT32 mounts.
 - [TXSLOT v1](formats/txslot-v1.md) defines the implemented four-block
   dual-slot durability transaction and predecessor recovery rules.
 - [PRGN v1](formats/prgn-v1.md) defines the exact GPT identity selector that
@@ -60,10 +62,11 @@ not deprecated merely because their stage has completed; later implementation
 notes identify decisions that were revisited. ADR 0007 now fixes the Stage 8
 native-principal, foreign-identity, mapping, mount-policy, and fail-closed ACL
 direction; its serialized formats and generation binding are implemented. ADR
-0009 is the accepted storage direction; its block, GPT, VFS-provider, read-only
+0009 is the accepted storage direction; its block, GPT, VFS-provider, read/write
 FAT32/constrained ext4, and selected STFS mutation slices are implemented.
-[ADR 0017](adr/0017-constrained-ext4-read-only-profile.md) fixes
-the exact clean read-only ext4 v1 feature bitmap and parser bounds.
+[ADR 0017](adr/0017-constrained-ext4-read-only-profile.md) fixes the exact
+clean ext4 v1 feature bitmap, parser bounds, and metadata-preserving mutation
+rules.
 [ADR 0018](adr/0018-volume-namespace-and-root-discovery.md) reserves the
 `/vol/root` and `/vol/boot` roles, keeps KEFS as the diskless recovery root, and
 requires deterministic root selection through the now-implemented BMNT v1
@@ -93,8 +96,8 @@ bounded receive queues, and teardown contract required before TCP.
 read-only VFS handle, generation-checked opens, bounded offset reads, and
 lexically paginated directory contract.
 [ADR 0027](adr/0027-kex-atomic-filesystem-mutation.md) fixes the separate KEX
-atomic create/replace/remove handle, sequential 64 KiB staging, terminal commit,
-and teardown-abort contract.
+atomic create/replace/remove/link handle, sequential 64 KiB staging, terminal
+commit, and teardown-abort contract.
 [ADR 0028](adr/0028-kex-timer-and-diagnostics-services.md) fixes separate KEX
 boot-relative monotonic timer and immutable typed diagnostics authorities and
 the `sleep`/`mem` migration.

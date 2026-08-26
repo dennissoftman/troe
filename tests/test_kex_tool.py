@@ -109,9 +109,9 @@ class KexToolTests(unittest.TestCase):
                     if command == "udp":
                         expected = [(5, 1, 0)]
                     elif command in {"cat", "grep", "hexdump", "ls", "lua", "man"}:
-                        expected = [(6, 1, 0)]
-                    elif command in {"rm", "write"}:
-                        expected = [(7, 1, 0)]
+                        expected = [(6, 1, 1)]
+                    elif command in {"ln", "rm", "write"}:
+                        expected = [(7, 1, 2)]
                     elif command == "sleep":
                         expected = [(8, 1, 0)]
                     elif command == "mem":

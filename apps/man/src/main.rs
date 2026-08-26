@@ -9,8 +9,8 @@ use core::str;
 use troe_kex_sdk::{CommandContext, Error, INVOCATION_BUFFER_BYTES, entry, exit};
 
 const COMMANDS: &[&str] = &[
-    "arp", "cat", "cd", "clear", "dhcp", "echo", "grep", "hexdump", "ls", "man", "mem", "net",
-    "ping", "poweroff", "printf", "pwd", "reboot", "rm", "sleep", "tcp", "udp", "write",
+    "arp", "cat", "cd", "clear", "dhcp", "echo", "grep", "hexdump", "ln", "ls", "man", "mem",
+    "net", "ping", "poweroff", "printf", "pwd", "reboot", "rm", "sleep", "tcp", "udp", "write",
 ];
 
 fn main(command: &mut CommandContext) -> u32 {
