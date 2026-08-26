@@ -78,8 +78,10 @@ mod firmware {
         prepare_mounts, read_selected_file, validate_root_activation,
     };
     use troe_task::{
-        Cancelled, Capabilities, CooperativeRuntime, IsolationResource, MonotonicMillis, Scheduler,
-        StackResource, TaskFault, TaskId, TaskStep,
+        Cancelled, Capabilities, CooperativeRuntime, IsolationResource, MonotonicMillis,
+        PendingCallState, PendingCallTable, PendingOperationId, Scheduler, StackResource,
+        TaskFault, TaskId, TaskStep, WaitObservation, WaitRegistration, WaitResource, WaitSpec,
+        WaitTable, WakeInterest, WakeReason,
     };
     use troe_terminal::{
         EditorConfig, EditorOutcome, FramebufferDescriptor, FramebufferPixelFormat, InputDecoder,
@@ -346,6 +348,61 @@ mod firmware {
     }
 
     #[derive(Clone, Copy)]
+    struct CommandApplicationHandle {
+        value: u64,
+        interface: u32,
+    }
+
+    struct CommandDeferredServices {
+        runtime: SharedRuntime,
+        datagram: Option<SharedApplicationDatagram>,
+    }
+
+    enum DeferredCallKind {
+        Timer {
+            deadline: MonotonicMillis,
+        },
+        Datagram {
+            state: SharedApplicationDatagram,
+            local_port: u16,
+            deadline: MonotonicMillis,
+            resource: WaitResource,
+        },
+    }
+
+    struct SuspendedApplicationCall {
+        operation: PendingOperationId,
+        application: troe_machine::ApplicationSession,
+        call: troe_machine::ApplicationCall,
+        kind: DeferredCallKind,
+    }
+
+    struct SuspendedApplicationCalls {
+        slots: Vec<SuspendedApplicationCall>,
+        high_water: u8,
+    }
+
+    struct CommandDeferredState {
+        pending: PendingCallTable,
+        waits: WaitTable,
+        suspended: SuspendedApplicationCalls,
+        next_request_id: u64,
+    }
+
+    enum DeferredCallPreparation {
+        NotDeferred,
+        Immediate {
+            status: ReplyStatus,
+            payload: Vec<u8>,
+        },
+        Blocked {
+            operation: PendingOperationId,
+            spec: WaitSpec,
+            kind: DeferredCallKind,
+        },
+    }
+
+    #[derive(Clone, Copy)]
     struct Ipv4Configuration {
         address: Ipv4Address,
         subnet_mask: Ipv4Address,
@@ -415,6 +472,7 @@ mod firmware {
     type SharedNetwork = Rc<RefCell<KernelNetworkService>>;
     type SharedTcpConnection = Rc<RefCell<KernelTcpConnection>>;
     type SharedRuntimeMounts = Rc<RefCell<RuntimeMountRegistry>>;
+    type SharedApplicationDatagram = Rc<RefCell<ApplicationDatagramState>>;
 
     struct RuntimeMountRecord {
         name: String,
@@ -594,8 +652,12 @@ mod firmware {
     type SharedRuntime = Rc<RefCell<KernelRuntime>>;
 
     struct ApplicationDatagramService {
-        network: SharedNetwork,
+        state: SharedApplicationDatagram,
         runtime: SharedRuntime,
+    }
+
+    struct ApplicationDatagramState {
+        network: SharedNetwork,
         ports: [u16; troe_net::MAX_UDP_PORTS],
         port_count: usize,
     }
@@ -2237,7 +2299,7 @@ mod firmware {
             minor: 0,
         }];
         let source = native_kex_artifact(ApplicationProbe::HeapGrowthLimit);
-        match run_command_application(scheduler, accounting, dispatcher, &services, source)? {
+        match run_command_application(scheduler, accounting, dispatcher, &services, None, source)? {
             CommandApplicationOutcome::Faulted(TaskFault::ExecutionLeaseExpired) => Ok(()),
             CommandApplicationOutcome::Exited(_) | CommandApplicationOutcome::Faulted(_) => Err(()),
         }
@@ -2612,12 +2674,450 @@ mod firmware {
         Ok(allocation_start)
     }
 
+    impl SuspendedApplicationCalls {
+        fn new() -> Result<Self, ()> {
+            let mut slots = Vec::new();
+            slots.try_reserve_exact(1).map_err(|_| ())?;
+            Ok(Self {
+                slots,
+                high_water: 0,
+            })
+        }
+
+        fn insert(&mut self, call: SuspendedApplicationCall) -> Result<(), ()> {
+            if !self.slots.is_empty() {
+                return Err(());
+            }
+            self.slots.push(call);
+            self.high_water = 1;
+            Ok(())
+        }
+
+        fn get(&self, operation: PendingOperationId) -> Result<&SuspendedApplicationCall, ()> {
+            self.slots
+                .first()
+                .filter(|call| call.operation == operation)
+                .ok_or(())
+        }
+
+        fn take(&mut self, operation: PendingOperationId) -> Result<SuspendedApplicationCall, ()> {
+            if self
+                .slots
+                .first()
+                .is_none_or(|call| call.operation != operation)
+            {
+                return Err(());
+            }
+            Ok(self.slots.remove(0))
+        }
+
+        fn clear(&mut self) {
+            self.slots.clear();
+        }
+    }
+
+    impl CommandDeferredState {
+        #[inline(never)]
+        fn new() -> Result<Self, ()> {
+            Ok(Self {
+                pending: PendingCallTable::new(1, troe_task::MAX_PENDING_REQUEST_BYTES)
+                    .map_err(|_| ())?,
+                waits: WaitTable::new(1).map_err(|_| ())?,
+                suspended: SuspendedApplicationCalls::new()?,
+                next_request_id: 1,
+            })
+        }
+
+        fn is_empty(&self) -> bool {
+            self.pending.stats().live == 0
+                && self.pending.stats().retained_bytes == 0
+                && self.waits.stats().live == 0
+                && self.suspended.slots.is_empty()
+        }
+
+        fn respected_bounds(&self) -> bool {
+            self.pending.stats().high_water <= 1
+                && self.waits.stats().high_water <= 1
+                && self.suspended.high_water <= 1
+        }
+
+        fn revoke_owner(&mut self, owner: TaskId) -> Result<(), ()> {
+            self.waits
+                .cancel_owner(owner, WakeReason::Revoked)
+                .map_err(|_| ())?;
+            self.pending
+                .teardown_owner(owner, WakeReason::Revoked)
+                .map_err(|_| ())?;
+            self.suspended.clear();
+            Ok(())
+        }
+    }
+
+    fn command_handle_interface(handles: &[CommandApplicationHandle], value: u64) -> Option<u32> {
+        handles
+            .iter()
+            .find(|handle| handle.value == value)
+            .map(|handle| handle.interface)
+    }
+
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn prepare_deferred_call(
+        task_id: TaskId,
+        interface: u32,
+        handle: u64,
+        opcode: u16,
+        payload: &[u8],
+        reply_capacity: usize,
+        services: &CommandDeferredServices,
+        pending: &mut PendingCallTable,
+        next_request_id: &mut u64,
+    ) -> Result<DeferredCallPreparation, ()> {
+        if interface == troe_abi::interface::TIMER && opcode == timer::SLEEP_UNTIL {
+            let Ok(deadline) = timer::decode_milliseconds(payload) else {
+                return Ok(DeferredCallPreparation::Immediate {
+                    status: ReplyStatus::InvalidRequest,
+                    payload: Vec::new(),
+                });
+            };
+            let deadline = MonotonicMillis::from_millis(deadline);
+            let now = services.runtime.borrow().now();
+            if deadline > now.saturating_add(APPLICATION_SYNCHRONOUS_WAIT_MILLISECONDS) {
+                return Ok(DeferredCallPreparation::Immediate {
+                    status: ReplyStatus::Timeout,
+                    payload: Vec::new(),
+                });
+            }
+            if deadline <= now {
+                return Ok(DeferredCallPreparation::Immediate {
+                    status: ReplyStatus::Success,
+                    payload: Vec::new(),
+                });
+            }
+            let operation = pending
+                .begin(
+                    task_id,
+                    *next_request_id,
+                    handle,
+                    opcode,
+                    payload,
+                    reply_capacity,
+                )
+                .map_err(|_| ())?;
+            *next_request_id = (*next_request_id).checked_add(1).ok_or(())?;
+            let spec = WaitSpec::new(
+                task_id,
+                operation,
+                None,
+                WakeInterest::DEADLINE,
+                Some(deadline),
+            )
+            .map_err(|_| ())?;
+            return Ok(DeferredCallPreparation::Blocked {
+                operation,
+                spec,
+                kind: DeferredCallKind::Timer { deadline },
+            });
+        }
+        if interface != troe_abi::interface::DATAGRAM || opcode != datagram::RECEIVE {
+            return Ok(DeferredCallPreparation::NotDeferred);
+        }
+        let Ok(local_port) = datagram::decode_receive_request(payload) else {
+            return Ok(DeferredCallPreparation::Immediate {
+                status: ReplyStatus::InvalidRequest,
+                payload: Vec::new(),
+            });
+        };
+        let Some(state) = &services.datagram else {
+            return Ok(DeferredCallPreparation::Immediate {
+                status: ReplyStatus::NotFound,
+                payload: Vec::new(),
+            });
+        };
+        let local_port = match state.borrow_mut().claim_port(Some(local_port)) {
+            Ok(port) => port,
+            Err(status) => {
+                return Ok(DeferredCallPreparation::Immediate {
+                    status,
+                    payload: Vec::new(),
+                });
+            }
+        };
+        match state.borrow_mut().receive_now(local_port) {
+            Ok(Some(received)) => {
+                let payload = encode_received_datagram(&received)?;
+                return Ok(DeferredCallPreparation::Immediate {
+                    status: ReplyStatus::Success,
+                    payload,
+                });
+            }
+            Err(status) => {
+                return Ok(DeferredCallPreparation::Immediate {
+                    status,
+                    payload: Vec::new(),
+                });
+            }
+            Ok(None) => {}
+        }
+        let now = services.runtime.borrow().now();
+        let deadline = now.saturating_add(APPLICATION_SYNCHRONOUS_WAIT_MILLISECONDS);
+        let operation = pending
+            .begin(
+                task_id,
+                *next_request_id,
+                handle,
+                opcode,
+                payload,
+                reply_capacity,
+            )
+            .map_err(|_| ())?;
+        *next_request_id = (*next_request_id).checked_add(1).ok_or(())?;
+        let resource = WaitResource::new(u64::from(local_port), task_id.get()).map_err(|_| ())?;
+        let spec = WaitSpec::new(
+            task_id,
+            operation,
+            Some(resource),
+            WakeInterest::RESOURCE_READY.union(WakeInterest::DEADLINE),
+            Some(deadline),
+        )
+        .map_err(|_| ())?;
+        Ok(DeferredCallPreparation::Blocked {
+            operation,
+            spec,
+            kind: DeferredCallKind::Datagram {
+                state: state.clone(),
+                local_port,
+                deadline,
+                resource,
+            },
+        })
+    }
+
+    fn encode_received_datagram(received: &ReceivedUdp) -> Result<Vec<u8>, ()> {
+        let mut encoded = [0_u8; datagram::MAX_RECEIVE_REPLY_BYTES];
+        let count = datagram::encode_receive_reply(
+            received.source,
+            received.source_port,
+            &received.payload,
+            &mut encoded,
+        )
+        .map_err(|_| ())?;
+        let mut payload = Vec::new();
+        payload.try_reserve_exact(count).map_err(|_| ())?;
+        payload.extend_from_slice(&encoded[..count]);
+        Ok(payload)
+    }
+
+    fn deferred_reply(
+        kind: DeferredCallKind,
+        reason: WakeReason,
+        received: Option<ReceivedUdp>,
+    ) -> Result<(ReplyStatus, Vec<u8>), ()> {
+        match (kind, reason) {
+            (DeferredCallKind::Timer { .. }, WakeReason::Deadline) => {
+                Ok((ReplyStatus::Success, Vec::new()))
+            }
+            (DeferredCallKind::Datagram { .. }, WakeReason::ResourceReady) => Ok((
+                ReplyStatus::Success,
+                encode_received_datagram(&received.ok_or(())?)?,
+            )),
+            (DeferredCallKind::Datagram { .. }, WakeReason::Deadline) => {
+                Ok((ReplyStatus::Timeout, Vec::new()))
+            }
+            (_, WakeReason::Cancelled | WakeReason::Revoked) => {
+                Ok((ReplyStatus::Cancelled, Vec::new()))
+            }
+            (_, WakeReason::Closed) => Ok((ReplyStatus::Conflict, Vec::new())),
+            (DeferredCallKind::Timer { .. }, WakeReason::ResourceReady) => Err(()),
+        }
+    }
+
+    fn wait_for_deferred_call(
+        scheduler: &mut Scheduler,
+        task_id: TaskId,
+        operation: PendingOperationId,
+        runtime: &SharedRuntime,
+        pending: &mut PendingCallTable,
+        waits: &mut WaitTable,
+        suspended: &mut SuspendedApplicationCalls,
+    ) -> Result<
+        (
+            troe_machine::ApplicationSession,
+            troe_machine::ApplicationCall,
+            ReplyStatus,
+            Vec<u8>,
+        ),
+        (),
+    > {
+        let mut received = None;
+        let completion = loop {
+            let state = pending.call(operation).map_err(|_| ())?.state();
+            let PendingCallState::Waiting(wait) = state else {
+                return Err(());
+            };
+            let cancelled = runtime.borrow_mut().checkpoint().is_err();
+            if cancelled {
+                if let Some(completion) = waits
+                    .cancel_operation(operation, WakeReason::Cancelled)
+                    .map_err(|_| ())?
+                {
+                    break completion;
+                }
+                return Err(());
+            }
+            let now = runtime.borrow().now();
+            let suspended_call = suspended.get(operation)?;
+            match &suspended_call.kind {
+                DeferredCallKind::Timer { deadline } => {
+                    if now >= *deadline {
+                        let batch = waits.expire(now).map_err(|_| ())?;
+                        if let Some(completion) = batch.iter().next() {
+                            break completion;
+                        }
+                    }
+                }
+                DeferredCallKind::Datagram {
+                    state,
+                    local_port,
+                    deadline,
+                    resource,
+                } => {
+                    if let Some(datagram) = state
+                        .borrow_mut()
+                        .receive_now(*local_port)
+                        .map_err(|_| ())?
+                    {
+                        received = Some(datagram);
+                        let batch = waits
+                            .wake_resource(*resource, WakeReason::ResourceReady)
+                            .map_err(|_| ())?;
+                        if let Some(completion) = batch.iter().next() {
+                            break completion;
+                        }
+                        return Err(());
+                    }
+                    if now >= *deadline {
+                        let batch = waits.expire(now).map_err(|_| ())?;
+                        if let Some(completion) = batch.iter().next() {
+                            break completion;
+                        }
+                    }
+                }
+            }
+            let deadline = match &suspended_call.kind {
+                DeferredCallKind::Timer { deadline }
+                | DeferredCallKind::Datagram { deadline, .. } => *deadline,
+            };
+            let remaining = deadline.as_millis().saturating_sub(now.as_millis());
+            if remaining == 0 {
+                continue;
+            }
+            let interval = u32::try_from(remaining.min(u64::from(u32::MAX))).map_err(|_| ())?;
+            let _deadline_fired =
+                troe_machine::wait_for_runtime_event_timeout(interval).map_err(|_| ())?;
+            if pending.call(operation).map_err(|_| ())?.state() != PendingCallState::Waiting(wait) {
+                return Err(());
+            }
+        };
+        pending.resolve(completion).map_err(|_| ())?;
+        scheduler
+            .wake_blocked(completion.owner(), completion.key())
+            .map_err(|_| ())?;
+        if scheduler
+            .dispatch_next(Capabilities::SERVICE)
+            .map_err(|_| ())?
+            != Some(task_id)
+        {
+            return Err(());
+        }
+        let suspended_call = suspended.take(operation)?;
+        let (status, payload) = deferred_reply(suspended_call.kind, completion.reason(), received)?;
+        if payload.len() > suspended_call.call.reply_capacity() {
+            return Err(());
+        }
+        pending.finish(operation).map_err(|_| ())?;
+        Ok((
+            suspended_call.application,
+            suspended_call.call,
+            status,
+            payload,
+        ))
+    }
+
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn resume_deferred_application_call(
+        scheduler: &mut Scheduler,
+        task_id: TaskId,
+        operation: PendingOperationId,
+        spec: WaitSpec,
+        kind: DeferredCallKind,
+        application: troe_machine::ApplicationSession,
+        call: troe_machine::ApplicationCall,
+        runtime: &SharedRuntime,
+        state: &mut CommandDeferredState,
+    ) -> Result<troe_machine::ApplicationOutcome, ()> {
+        let registration = state
+            .waits
+            .register(spec, WaitObservation::Pending, runtime.borrow().now())
+            .map_err(|_| ())?;
+        match registration {
+            WaitRegistration::Ready(reason) => {
+                state
+                    .pending
+                    .mark_ready(operation, reason)
+                    .map_err(|_| ())?;
+                let (status, payload) = deferred_reply(kind, reason, None)?;
+                if payload.len() > call.reply_capacity() {
+                    return Err(());
+                }
+                state.pending.finish(operation).map_err(|_| ())?;
+                troe_machine::resume_application(
+                    application,
+                    troe_machine::ApplicationResume::HandleReply {
+                        status: status.abi_value(),
+                        reply: &payload,
+                    },
+                )
+                .map_err(|_| ())
+            }
+            WaitRegistration::Blocked(wait) => {
+                state.pending.bind_wait(operation, wait).map_err(|_| ())?;
+                state.suspended.insert(SuspendedApplicationCall {
+                    operation,
+                    application,
+                    call,
+                    kind,
+                })?;
+                scheduler.block_current(task_id, wait).map_err(|_| ())?;
+                let (application, _call, status, payload) = wait_for_deferred_call(
+                    scheduler,
+                    task_id,
+                    operation,
+                    runtime,
+                    &mut state.pending,
+                    &mut state.waits,
+                    &mut state.suspended,
+                )?;
+                troe_machine::resume_application(
+                    application,
+                    troe_machine::ApplicationResume::HandleReply {
+                        status: status.abi_value(),
+                        reply: &payload,
+                    },
+                )
+                .map_err(|_| ())
+            }
+        }
+    }
+
     #[allow(clippy::drop_non_drop, clippy::too_many_lines)]
     fn run_command_application(
         scheduler: &mut Scheduler,
         accounting: &mut OwnedAccounting,
         dispatcher: &mut Dispatcher<'_>,
         services: &[CommandStartupService],
+        deferred_services: Option<&CommandDeferredServices>,
         source: &[u8],
     ) -> Result<CommandApplicationOutcome, ()> {
         if services.is_empty() || services.len() > troe_dispatch::MAX_HANDLES {
@@ -2733,17 +3233,25 @@ mod firmware {
         let entry = plan.entry_address();
         let layout = plan.layout();
         let mut live_owner = None;
-        let setup = (|| -> Result<HandleOwner, ()> {
+        let setup = (|| -> Result<(HandleOwner, Vec<CommandApplicationHandle>), ()> {
             let owner = HandleOwner::isolated(task_id.get()).map_err(|_| ())?;
             live_owner = Some(owner);
             let mut startup_handles = Vec::new();
             startup_handles
                 .try_reserve_exact(services.len())
                 .map_err(|_| ())?;
+            let mut command_handles = Vec::new();
+            command_handles
+                .try_reserve_exact(services.len())
+                .map_err(|_| ())?;
             for service in services {
                 let handle = dispatcher
                     .open_owned(service.port, Rights::CALL, owner)
                     .map_err(|_| ())?;
+                command_handles.push(CommandApplicationHandle {
+                    value: handle.abi_value(),
+                    interface: service.interface,
+                });
                 startup_handles.push(InitialHandle {
                     value: handle.abi_value(),
                     rights: Rights::CALL.bits(),
@@ -2765,9 +3273,9 @@ mod firmware {
             )
             .map_err(|_| ())?;
             troe_machine::copy_to_physical(allocation.startup, 0, &startup).map_err(|_| ())?;
-            Ok(owner)
+            Ok((owner, command_handles))
         })();
-        let Ok(owner) = setup else {
+        let Ok((owner, command_handles)) = setup else {
             rollback_command_application_task(
                 scheduler,
                 task_id,
@@ -2793,6 +3301,21 @@ mod firmware {
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         }
+
+        let deferred_state = deferred_services
+            .map(|_| CommandDeferredState::new())
+            .transpose();
+        let Ok(mut deferred_state) = deferred_state else {
+            rollback_command_application_task(
+                scheduler,
+                task_id,
+                dispatcher,
+                live_owner,
+                &mut accounting.frames,
+                allocation,
+            );
+            return Err(());
+        };
 
         let execution = (|| -> Result<CommandApplicationOutcome, ()> {
             if scheduler
@@ -2867,28 +3390,95 @@ mod firmware {
                         request.resize(call.request_bytes(), 0);
                         application.copy_request(&mut request).map_err(|_| ())?;
                         let opcode = u16::from_le_bytes([request[0], request[1]]);
-                        let Ok(reply) =
-                            dispatcher.call_owned_abi(owner, call.handle(), opcode, &request[2..])
-                        else {
-                            scheduler
-                                .fault_current(task_id, TaskFault::InvalidCall)
-                                .map_err(|_| ())?;
-                            break CommandApplicationOutcome::Faulted(TaskFault::InvalidCall);
+                        let preparation = if let (Some(interface), Some(deferred_services)) = (
+                            command_handle_interface(&command_handles, call.handle()),
+                            deferred_services,
+                        ) {
+                            let state = deferred_state.as_mut().ok_or(())?;
+                            prepare_deferred_call(
+                                task_id,
+                                interface,
+                                call.handle(),
+                                opcode,
+                                &request[2..],
+                                call.reply_capacity(),
+                                deferred_services,
+                                &mut state.pending,
+                                &mut state.next_request_id,
+                            )?
+                        } else {
+                            DeferredCallPreparation::NotDeferred
                         };
-                        if reply.payload().len() > call.reply_capacity() {
-                            scheduler
-                                .fault_current(task_id, TaskFault::InvalidCall)
+                        match preparation {
+                            DeferredCallPreparation::NotDeferred => {
+                                let Ok(reply) = dispatcher.call_owned_abi(
+                                    owner,
+                                    call.handle(),
+                                    opcode,
+                                    &request[2..],
+                                ) else {
+                                    scheduler
+                                        .fault_current(task_id, TaskFault::InvalidCall)
+                                        .map_err(|_| ())?;
+                                    break CommandApplicationOutcome::Faulted(
+                                        TaskFault::InvalidCall,
+                                    );
+                                };
+                                if reply.payload().len() > call.reply_capacity() {
+                                    scheduler
+                                        .fault_current(task_id, TaskFault::InvalidCall)
+                                        .map_err(|_| ())?;
+                                    break CommandApplicationOutcome::Faulted(
+                                        TaskFault::InvalidCall,
+                                    );
+                                }
+                                outcome = troe_machine::resume_application(
+                                    application,
+                                    troe_machine::ApplicationResume::HandleReply {
+                                        status: reply.status().abi_value(),
+                                        reply: reply.payload(),
+                                    },
+                                )
                                 .map_err(|_| ())?;
-                            break CommandApplicationOutcome::Faulted(TaskFault::InvalidCall);
+                            }
+                            DeferredCallPreparation::Immediate { status, payload } => {
+                                if payload.len() > call.reply_capacity() {
+                                    scheduler
+                                        .fault_current(task_id, TaskFault::InvalidCall)
+                                        .map_err(|_| ())?;
+                                    break CommandApplicationOutcome::Faulted(
+                                        TaskFault::InvalidCall,
+                                    );
+                                }
+                                outcome = troe_machine::resume_application(
+                                    application,
+                                    troe_machine::ApplicationResume::HandleReply {
+                                        status: status.abi_value(),
+                                        reply: &payload,
+                                    },
+                                )
+                                .map_err(|_| ())?;
+                            }
+                            DeferredCallPreparation::Blocked {
+                                operation,
+                                spec,
+                                kind,
+                            } => {
+                                let deferred_services = deferred_services.ok_or(())?;
+                                let state = deferred_state.as_mut().ok_or(())?;
+                                outcome = resume_deferred_application_call(
+                                    scheduler,
+                                    task_id,
+                                    operation,
+                                    spec,
+                                    kind,
+                                    application,
+                                    call,
+                                    &deferred_services.runtime,
+                                    state,
+                                )?;
+                            }
                         }
-                        outcome = troe_machine::resume_application(
-                            application,
-                            troe_machine::ApplicationResume::HandleReply {
-                                status: reply.status().abi_value(),
-                                reply: reply.payload(),
-                            },
-                        )
-                        .map_err(|_| ())?;
                     }
                     troe_machine::ApplicationOutcome::HeapGrow {
                         mut application,
@@ -2966,10 +3556,22 @@ mod firmware {
             if dispatcher.close_owner(owner).map_err(|_| ())? != handle_count {
                 return Err(());
             }
+            if deferred_state
+                .as_ref()
+                .is_some_and(|state| !state.is_empty() || !state.respected_bounds())
+            {
+                return Err(());
+            }
             live_owner = None;
             Ok(terminal)
         })();
         let Ok(terminal) = execution else {
+            if deferred_state
+                .as_mut()
+                .is_some_and(|state| state.revoke_owner(task_id).is_err())
+            {
+                fatal(b"fatal: deferred application cleanup failed\n");
+            }
             rollback_command_application_task(
                 scheduler,
                 task_id,
@@ -4506,37 +5108,6 @@ mod firmware {
             self.service.borrow_mut().transmit(&datagram)?;
             Ok(source_port)
         }
-
-        fn listen_udp(
-            &mut self,
-            local_port: u16,
-            runtime: &mut dyn CooperativeRuntime,
-        ) -> Result<ReceivedUdp, NetworkError> {
-            if self.service.borrow().configuration.is_none() {
-                return Err(NetworkError::NotConfigured);
-            }
-            self.service
-                .borrow_mut()
-                .udp
-                .bind(local_port)
-                .map_err(map_network_error)?;
-            let deadline = runtime
-                .now()
-                .saturating_add(APPLICATION_SYNCHRONOUS_WAIT_MILLISECONDS);
-            loop {
-                if let Some(datagram) = self.service.borrow_mut().udp.receive(local_port) {
-                    return Ok(ReceivedUdp {
-                        source: datagram.source_ip.bytes(),
-                        source_port: datagram.source_port,
-                        payload: datagram.payload,
-                    });
-                }
-                if runtime.now() >= deadline {
-                    return Err(NetworkError::Timeout);
-                }
-                runtime.checkpoint().map_err(|_| NetworkError::Cancelled)?;
-            }
-        }
     }
 
     impl Service for ApplicationInputService<'_> {
@@ -5111,12 +5682,12 @@ mod firmware {
                     if deadline > now.saturating_add(APPLICATION_SYNCHRONOUS_WAIT_MILLISECONDS) {
                         return Ok(ServiceReply::empty(ReplyStatus::Timeout));
                     }
-                    let mut runtime = KernelRuntimeCapability {
-                        runtime: self.runtime.clone(),
-                    };
-                    match runtime.sleep_until(deadline) {
-                        Ok(()) => Ok(ServiceReply::empty(ReplyStatus::Success)),
-                        Err(Cancelled) => Ok(ServiceReply::empty(ReplyStatus::Cancelled)),
+                    if deadline <= now {
+                        Ok(ServiceReply::empty(ReplyStatus::Success))
+                    } else {
+                        // Future sleeps are intercepted at the composition
+                        // boundary and retained as deferred calls.
+                        Ok(ServiceReply::empty(ReplyStatus::Failure))
                     }
                 }
                 _ => Ok(ServiceReply::empty(ReplyStatus::InvalidRequest)),
@@ -5302,10 +5873,15 @@ mod firmware {
     }
 
     impl ApplicationDatagramService {
-        fn new(network: SharedNetwork, runtime: SharedRuntime) -> Self {
+        fn new(state: SharedApplicationDatagram, runtime: SharedRuntime) -> Self {
+            Self { state, runtime }
+        }
+    }
+
+    impl ApplicationDatagramState {
+        fn new(network: SharedNetwork) -> Self {
             Self {
                 network,
-                runtime,
                 ports: [0; troe_net::MAX_UDP_PORTS],
                 port_count: 0,
             }
@@ -5358,6 +5934,18 @@ mod firmware {
             }
             Err(ReplyStatus::Exhausted)
         }
+
+        fn receive_now(&mut self, local_port: u16) -> Result<Option<ReceivedUdp>, ReplyStatus> {
+            if self.network.borrow().configuration.is_none() {
+                return Err(ReplyStatus::NotConfigured);
+            }
+            let datagram = self.network.borrow_mut().udp.receive(local_port);
+            Ok(datagram.map(|datagram| ReceivedUdp {
+                source: datagram.source_ip.bytes(),
+                source_port: datagram.source_port,
+                payload: datagram.payload,
+            }))
+        }
     }
 
     impl Service for ApplicationDatagramService {
@@ -5371,11 +5959,11 @@ mod firmware {
                         return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
                     };
                     let requested = (send.source_port != 0).then_some(send.source_port);
-                    let source_port = match self.claim_port(requested) {
+                    let source_port = match self.state.borrow_mut().claim_port(requested) {
                         Ok(port) => port,
                         Err(status) => return Ok(ServiceReply::empty(status)),
                     };
-                    let mut network = KernelNetwork::new(self.network.clone());
+                    let mut network = KernelNetwork::new(self.state.borrow().network.clone());
                     let mut runtime = KernelRuntimeCapability {
                         runtime: self.runtime.clone(),
                     };
@@ -5396,19 +5984,14 @@ mod firmware {
                     let Ok(local_port) = datagram::decode_receive_request(request.payload()) else {
                         return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
                     };
-                    let local_port = match self.claim_port(Some(local_port)) {
+                    let local_port = match self.state.borrow_mut().claim_port(Some(local_port)) {
                         Ok(port) => port,
                         Err(status) => return Ok(ServiceReply::empty(status)),
                     };
-                    let mut network = KernelNetwork::new(self.network.clone());
-                    let mut runtime = KernelRuntimeCapability {
-                        runtime: self.runtime.clone(),
-                    };
-                    let received = match network.listen_udp(local_port, &mut runtime) {
-                        Ok(received) => received,
-                        Err(error) => {
-                            return Ok(ServiceReply::empty(application_network_status(error)));
-                        }
+                    let received = match self.state.borrow_mut().receive_now(local_port) {
+                        Ok(Some(received)) => received,
+                        Ok(None) => return Ok(ServiceReply::empty(ReplyStatus::Timeout)),
+                        Err(status) => return Ok(ServiceReply::empty(status)),
                     };
                     let mut encoded = [0_u8; datagram::MAX_RECEIVE_REPLY_BYTES];
                     let count = datagram::encode_receive_reply(
@@ -5425,7 +6008,7 @@ mod firmware {
         }
     }
 
-    impl Drop for ApplicationDatagramService {
+    impl Drop for ApplicationDatagramState {
         fn drop(&mut self) {
             let mut network = self.network.borrow_mut();
             for port in &self.ports[..self.port_count] {
@@ -6168,6 +6751,16 @@ mod firmware {
             let shared_stdin = Rc::new(RefCell::new(&mut *stdin));
             let shared_stdout = Rc::new(RefCell::new(&mut *stdout));
             let shared_stderr = Rc::new(RefCell::new(&mut *stderr));
+            let application_datagram_state = if datagram_required {
+                let network = application_transport_network
+                    .clone()
+                    .unwrap_or_else(|| fatal(b"fatal: datagram capability disappeared\n"));
+                Some(Rc::new(RefCell::new(ApplicationDatagramState::new(
+                    network,
+                ))))
+            } else {
+                None
+            };
             let services = (|| -> Result<Vec<CommandStartupService>, ()> {
                 let mut services = Vec::new();
                 services.try_reserve_exact(service_count).map_err(|_| ())?;
@@ -6214,11 +6807,11 @@ mod firmware {
                     minor: stream::MINOR,
                 });
                 if datagram_required {
-                    let network = application_transport_network.as_ref().ok_or(())?.clone();
+                    let state = application_datagram_state.as_ref().ok_or(())?.clone();
                     services.push(CommandStartupService {
                         port: register_command_service(
                             &mut dispatcher,
-                            ApplicationDatagramService::new(network, self.runtime.clone()),
+                            ApplicationDatagramService::new(state, self.runtime.clone()),
                         )?,
                         interface: troe_abi::interface::DATAGRAM,
                         major: datagram::MAJOR,
@@ -6366,11 +6959,17 @@ mod firmware {
             if self.scheduler.yield_current(self.shell_id).is_err() {
                 fatal(b"fatal: shell scheduler yield failed\n");
             }
+            let deferred_services =
+                (timer_required || datagram_required).then(|| CommandDeferredServices {
+                    runtime: self.runtime.clone(),
+                    datagram: application_datagram_state,
+                });
             let outcome = run_command_application(
                 self.scheduler,
                 self.accounting,
                 &mut dispatcher,
                 services.as_slice(),
+                deferred_services.as_ref(),
                 package.executable(),
             );
             if self

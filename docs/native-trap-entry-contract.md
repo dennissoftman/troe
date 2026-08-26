@@ -25,7 +25,7 @@ single-CPU x86-64 and AArch64 backends, not a generic ABI for other machines.
 | Gate | User fate | Required entry work |
 | --- | --- | --- |
 | `x86_isolated_syscall_entry` | suspend or terminate | hardware RSP0 stack, save all GPRs and FXSAVE state, clear DF/AC, validate active run |
-| `x86_execution_timer_entry` | terminate lease | clear DF/AC, pass saved CS origin, disarm and acknowledge timer, restore published kernel context |
+| `x86_execution_timer_entry` | terminate user lease or resume kernel deadline wait | inspect saved CS before selecting the path; user origin clears DF/AC, disarms and acknowledges the lease, then restores the published kernel context; kernel origin saves/restores every GPR and FXSAVE class, clears DF/AC, records the runtime deadline, and returns with `iretq` |
 | `x86_input_interrupt_entry` | resume | save all GPRs and FXSAVE state, clear DF/AC, service bounded input, restore state, `iretq` |
 | `x86_exception_no_error_entry` | contain or fatal | clear DF/AC, pass saved CS origin, restore kernel context only for a contained user fault |
 | `x86_exception_error_entry` | contain or fatal | clear DF/AC, account for hardware error code, pass saved CS origin |
@@ -42,7 +42,7 @@ restored only when that user continuation is deliberately resumed.
 | --- | --- | --- |
 | `troe_aarch64_exception_entry` | fatal | mask DAIF, pass ESR/FAR, never return |
 | `troe_aarch64_lower_sync_entry` | suspend or terminate | mask DAIF, save X0-X30, Q0-Q31, FPCR/FPSR, ELR/SPSR, SP_EL0, and TPIDR_EL0; distinguish `SVC #0` from faults |
-| `troe_aarch64_irq_entry` | resume or terminate lease | mask IRQ, save/restore X0-X30, Q0-Q31, FPCR/FPSR, pass saved SPSR origin; only an active EL0 application timer may complete the published context |
+| `troe_aarch64_irq_entry` | resume, complete a kernel deadline, or terminate a user lease | mask IRQ, save/restore X0-X30, Q0-Q31, FPCR/FPSR, pass saved SPSR origin; only an active EL0 application timer may complete the published context, while a kernel deadline records its wake and returns through the saved IRQ frame |
 | current/lower FIQ or SError vector | fatal | route to the common fatal exception entry |
 
 Application entry resets `TPIDR_EL0`; a suspended application context preserves

@@ -132,6 +132,30 @@ class NativeExecutionContractTests(unittest.TestCase):
             '"eret"',
         )
 
+    def test_x86_timer_has_distinct_user_lease_and_kernel_deadline_returns(self) -> None:
+        entry = source_between(
+            MMU_SOURCE,
+            'extern "C" fn x86_execution_timer_entry()',
+            'extern "C" fn x86_runtime_timer_handler()',
+        )
+        require_order(
+            self,
+            entry,
+            '"test byte ptr [rsp + 8], 3"',
+            '"jz 2f"',
+            '"call {handler}"',
+            '"jmp {complete}"',
+            '"2:"',
+            '"push rax"',
+            '"push r15"',
+            '"fxsave64 [rsp]"',
+            '"call {runtime_handler}"',
+            '"fxrstor64 [rsp]"',
+            '"pop r15"',
+            '"pop rax"',
+            '"iretq"',
+        )
+
     def test_aarch64_suspended_context_preserves_thread_pointer(self) -> None:
         context = source_between(
             MMU_SOURCE,
@@ -239,6 +263,55 @@ class NativeExecutionContractTests(unittest.TestCase):
             "steps.checked_add(1)",
             "APPLICATION_COMMAND_STEP_LIMIT",
         )
+
+    def test_deferred_calls_block_idle_wake_and_resume_in_owned_order(self) -> None:
+        waiter = source_between(
+            KERNEL_SOURCE,
+            "fn wait_for_deferred_call(",
+            "fn run_command_application(",
+        )
+        require_order(
+            self,
+            waiter,
+            "checkpoint()",
+            "wait_for_runtime_event_timeout(interval)",
+            "pending.resolve(completion)",
+            "wake_blocked(completion.owner(), completion.key())",
+            "dispatch_next(Capabilities::SERVICE)",
+            "suspended.take(operation)",
+            "pending.finish(operation)",
+        )
+
+        deferred_resume = source_between(
+            KERNEL_SOURCE,
+            "fn resume_deferred_application_call(",
+            "fn run_command_application(",
+        )
+        require_order(
+            self,
+            deferred_resume,
+            "state.pending.bind_wait(operation, wait)",
+            "state.suspended.insert(",
+            "scheduler.block_current(task_id, wait)",
+            "wait_for_deferred_call(",
+            "troe_machine::resume_application(",
+        )
+
+        deferred_state = source_between(
+            KERNEL_SOURCE,
+            "impl CommandDeferredState {",
+            "fn command_handle_interface(",
+        )
+        self.assertIn("cancel_owner(owner, WakeReason::Revoked)", deferred_state)
+        self.assertIn("teardown_owner(owner, WakeReason::Revoked)", deferred_state)
+
+        runner = source_between(
+            KERNEL_SOURCE,
+            "fn run_command_application(",
+            "const fn task_fault(",
+        )
+        self.assertIn("resume_deferred_application_call(", runner)
+        self.assertIn("state.revoke_owner(task_id)", runner)
 
     def test_command_cleanup_failures_are_terminal(self) -> None:
         runner = source_between(

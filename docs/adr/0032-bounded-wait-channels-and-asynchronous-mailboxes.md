@@ -1,9 +1,11 @@
 # ADR 0032: Bounded wait channels and asynchronous capability mailboxes
 
 Status: accepted staged direction, 2026-08-26. The portable blocked lifecycle,
-wait-registration, and pending-call models are implemented; native suspended
-contexts, deferred replies, idle integration, and mailboxes remain later
-explicit slices and are not current behavior.
+wait-registration, and pending-call models are implemented. One native
+composition-owned suspended context now backs deferred timer sleep and UDP
+receive, including deadline/input/network wakeups and kernel idle integration.
+General mailboxes and multiple simultaneously live KEX applications remain
+later explicit slices.
 
 ## Existing-contract review
 
@@ -13,17 +15,17 @@ contracts are deliberately narrower:
 
 - ADR 0011's `PortId` names one synchronous service endpoint; it is not a FIFO
   queue. A call exclusively borrows the dispatcher until one reply completes.
-- ADRs 0010 and 0014 retain ready, running, exited, and faulted task states.
-  The portable scheduler now also models `Blocked(wait key)`, but no native KEX
-  enters that state until the composition-owned suspended-context slice lands.
+- ADRs 0010 and 0014 retain ready, running, blocked, exited, and faulted task
+  states. A timer-sleeping or UDP-receiving native KEX now enters
+  `Blocked(wait key)` with its complete continuation outside the scheduler.
 - ADR 0015 can suspend a KEX application only at an ABI call, yield, fault, or
   lease expiry. Its 50 ms timer terminates an uninterrupted application; it is
   not resumable general preemption.
-- ADRs 0025, 0028, and 0031 implement four-second, cancellable foreground waits
-  inside a synchronous service call. Their cooperative checkpoints make bounded
-  ambient input and network progress, but the application record remains
-  logically running, the kernel retains the service call stack, and the CPU
-  does not enter a scheduler-visible blocked state.
+- ADRs 0025 and 0031 still implement some four-second, cancellable foreground
+  network waits inside a synchronous service call. Timer sleep and UDP receive
+  no longer do: composition copies the request, owns the suspended user
+  context, blocks the task, and enters the native idle boundary. TCP remains a
+  later deferred consumer.
 - ADR 0002 keeps shell pipelines sequential and stops at the first unsuccessful
   stage. Starting all stages concurrently would change when downstream side
   effects can occur, even if byte order, EOF, and final status were preserved.
@@ -56,7 +58,11 @@ and revoked conditions without publishing a stale wait. Pending requests have a
 monotonic request identities, exact state transitions, owner teardown, and
 zeroization before slot reuse. Portable scheduler tests cover blocking, running
 other ready work, exact-key wakeup, stale/double-wake rejection, and ordered
-terminal teardown. These types retain no native context or pointer.
+terminal teardown. These portable types retain no native context or pointer.
+The kernel composition layer constructs at most one pending slot, wait slot,
+and suspended-context slot only for a command that holds timer or datagram
+authority. The large continuation storage is preallocated off the 64 KiB task
+stack; the deferred transition itself performs no metadata allocation.
 
 ### Wait channels and deferred replies
 
@@ -98,13 +104,14 @@ resource wakes its waiters with a terminal typed result. Owner teardown marks
 the task terminal and, as part of handle revocation, cancels every matching
 pending call and wait registration before user memory is zeroed or returned.
 
-The first implementation remains single-CPU and non-preemptive. When no task is
-ready, the composition root may enter the existing architecture idle boundary
-only after the wait table, device work bits, input queue, and timer deadline
-have been checked with the architecture's lost-wakeup exclusion intact. The
-application execution-lease timer and a future kernel wait-deadline timer are
-separate modes with explicit ownership; one must not silently reuse armed state
-from the other.
+The first implementation remains single-CPU and non-preemptive. While the sole
+foreground KEX is blocked, the composition root may enter the architecture idle
+boundary only after the wait table, device work bits, input queue, and timer
+deadline have been checked with the architecture's lost-wakeup exclusion. The
+application execution-lease timer and kernel wait-deadline timer are separate
+modes with explicit return paths. On x86-64 the timer gate distinguishes saved
+CPL and fully preserves a kernel IRQ frame; on AArch64 the saved SPSR and active
+run identity distinguish a user lease from a kernel deadline.
 
 ### Capability mailboxes
 
@@ -148,10 +155,11 @@ without a measured use:
    result. Convert two existing real consumers--the monotonic timer wait and UDP
    receive--before treating the abstraction as justified. TCP may follow only
    after its retransmission and four-second operation deadlines retain their
-   current semantics.
+   current semantics. **Implemented for the one-foreground-KEX profile.**
 4. Prove native single-CPU blocking, cancellation, timeout, close/revoke wakeup,
    exact handle revocation, zeroization, frame return, and absence of idle
-   spinning on both architectures.
+   spinning on both architectures. **Implemented for timer/UDP through portable
+   race/teardown tests, native ordering contracts, and all four QEMU profiles.**
 5. Implement the portable mailbox only when two named non-test consumers need
    queued complete messages. A synthetic boot probe alone is verification, not
    product justification.
@@ -167,13 +175,16 @@ exit or fault. Until then pipelines remain sequential.
 
 ## Verification required before acceptance
 
-The portable portion of this gate is implemented in `crates/troe-task`: tests
+The portable and first native portions of this gate are implemented. Tests
 cover observe-before-publish readiness, every terminal wake reason, deadline
 and close/cancellation first-consumer races, stale wait and resource
 generations, exact slot and retained-byte ceilings, pending identity reuse,
 counter failpoints, copied-request detachment, zeroization, and owner teardown.
-The following native evidence remains required before the deferred-reply slice
-is accepted as current behavior.
+Native acceptance exercises successful timer deadline, timer cancellation,
+over-limit rejection, UDP cancellation, UDP timeout, idle/wakeup counter growth,
+exact free-frame return, and subsequent deep filesystem activity on both
+architectures and all four platform profiles. Source contracts pin the
+block/idle/wake/resume ordering and dual timer-entry paths.
 
 Portable model tests must cover every legal lifecycle transition and reject
 double block, double wake, stale generations, wake-before-publication races,
@@ -182,7 +193,7 @@ request-ID reuse, partial admission, queue wraparound, and every exact capacity
 boundary. Allocation failure must leave no published mailbox, pending call, or
 wait registration.
 
-Native acceptance on x86-64 and AArch64 must prove:
+Later generalization beyond one foreground KEX must additionally prove:
 
 - a blocked application retains its exact address-space, frame, stack, handle,
   and context ownership and resumes only through scheduler selection;

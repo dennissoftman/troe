@@ -432,6 +432,9 @@ static INPUT_QUEUE: InputQueueCell = InputQueueCell(UnsafeCell::new(None));
 #[cfg(target_os = "uefi")]
 static NETWORK_INTERRUPT_PENDING: AtomicBool = AtomicBool::new(false);
 
+#[cfg(target_os = "uefi")]
+static RUNTIME_TIMER_FIRED: AtomicBool = AtomicBool::new(false);
+
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 static AARCH64_NETWORK_INTERRUPT_INTID: AtomicU32 = AtomicU32::new(u32::MAX);
 
@@ -1036,6 +1039,60 @@ pub fn wait_for_runtime_event() {
     }
 }
 
+/// Sleep until bounded input/network work arrives or one runtime deadline fires.
+///
+/// This is distinct from an application execution lease: callers use it only
+/// while no unprivileged context is active. The one-shot timer interrupt
+/// returns to the kernel idle loop instead of completing an application fault.
+/// The return value is `true` when the deadline timer fired and `false` when an
+/// input or network event became pending first.
+///
+/// # Errors
+///
+/// Rejects a zero interval or unavailable architecture timer.
+#[cfg(target_os = "uefi")]
+pub fn wait_for_runtime_event_timeout(milliseconds: u32) -> Result<bool, ExecutionTimerError> {
+    if milliseconds == 0 {
+        return Err(ExecutionTimerError::InvalidFrequency);
+    }
+    architecture_mask_input_interrupts();
+    // SAFETY: IRQ delivery is masked on the single boot CPU.
+    let input_pending = unsafe { input_queue_mut() }.is_some_and(|queue| queue.stats().queued != 0);
+    if input_pending || NETWORK_INTERRUPT_PENDING.load(Ordering::Acquire) {
+        architecture_enable_input_interrupts();
+        return Ok(false);
+    }
+    RUNTIME_TIMER_FIRED.store(false, Ordering::Release);
+    if let Err(error) = architecture_arm_execution_timer(milliseconds) {
+        architecture_disarm_execution_timer();
+        architecture_enable_input_interrupts();
+        return Err(error);
+    }
+    // Close the event-publication window after timer programming while IRQ
+    // delivery remains masked.
+    // SAFETY: Main context still has exclusive queue access.
+    let input_pending = unsafe { input_queue_mut() }.is_some_and(|queue| queue.stats().queued != 0);
+    if input_pending || NETWORK_INTERRUPT_PENDING.load(Ordering::Acquire) {
+        architecture_disarm_execution_timer();
+        architecture_enable_input_interrupts();
+        return Ok(false);
+    }
+    // SAFETY: Main context has exclusive access while accounting the wait.
+    if let Some(queue) = unsafe { input_queue_mut() } {
+        queue.record_idle_wait();
+    }
+    architecture_wait_for_input_interrupt();
+    // The architecture helper returns with IRQ delivery masked.
+    architecture_disarm_execution_timer();
+    // SAFETY: Main context again has exclusive queue access.
+    if let Some(queue) = unsafe { input_queue_mut() } {
+        queue.record_wakeup();
+    }
+    let timer_fired = RUNTIME_TIMER_FIRED.swap(false, Ordering::AcqRel);
+    architecture_enable_input_interrupts();
+    Ok(timer_fired)
+}
+
 /// Consume the coalesced indication that a network completion needs polling.
 #[must_use]
 #[cfg(target_os = "uefi")]
@@ -1114,6 +1171,14 @@ pub(crate) fn handle_input_interrupt() {
     }
 }
 
+/// Complete one x86 kernel-runtime deadline interrupt.
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+pub(crate) fn handle_runtime_timer_interrupt() {
+    architecture_disarm_execution_timer();
+    architecture_acknowledge_execution_timer_interrupt();
+    RUNTIME_TIMER_FIRED.store(true, Ordering::Release);
+}
+
 /// Configure a validated network route while leaving controller delivery masked.
 #[cfg(target_os = "uefi")]
 pub(crate) fn prepare_network_interrupt(
@@ -1168,7 +1233,11 @@ pub(crate) fn finish_network_interrupt_deactivation(deactivated: DeactivatedNetw
 pub(crate) fn handle_application_interrupt() -> bool {
     // SAFETY: The native interrupt entry masks nested IRQ delivery and the
     // single boot CPU is the only producer or consumer at this boundary.
-    unsafe { input_queue_mut() }.is_some_and(architecture_handle_input_interrupt)
+    let timer = unsafe { input_queue_mut() }.is_some_and(architecture_handle_input_interrupt);
+    if timer {
+        RUNTIME_TIMER_FIRED.store(true, Ordering::Release);
+    }
+    timer
 }
 
 /// Mask IRQ delivery and arm a one-shot execution lease.
@@ -2563,10 +2632,19 @@ fn architecture_monotonic_millis() -> Option<u64> {
         core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frequency, options(nomem, nostack));
         core::arch::asm!("mrs {}, cntpct_el0", out(reg) counter, options(nomem, nostack));
     }
+    counter_millis(counter, frequency)
+}
+
+#[cfg(any(test, all(target_os = "uefi", target_arch = "aarch64")))]
+fn counter_millis(counter: u64, frequency: u64) -> Option<u64> {
     if frequency < 1_000 {
         return None;
     }
-    counter.checked_mul(1_000)?.checked_div(frequency)
+    let whole_seconds = counter.checked_div(frequency)?;
+    let remainder = counter.checked_rem(frequency)?;
+    whole_seconds
+        .checked_mul(1_000)?
+        .checked_add(remainder.checked_mul(1_000)?.checked_div(frequency)?)
 }
 
 #[cfg(all(
@@ -2978,7 +3056,7 @@ mod tests {
         ActiveNetworkInterrupt, DeactivatedNetworkInterrupt, DmaInitializationPhase,
         DmaInitializationState, HeapState, InputInterruptError, NetworkInterruptRoute,
         NetworkInterruptSource, PreparedNetworkInterrupt, TaskStackError, UsedIndexTransition,
-        cached_nonzero, claim_network_interrupt_publication, classify_used_index,
+        cached_nonzero, claim_network_interrupt_publication, classify_used_index, counter_millis,
         revoke_network_interrupt_publication, validate_task_stack,
     };
     use core::alloc::Layout;
@@ -3005,6 +3083,17 @@ mod tests {
         assert_eq!(second, Ok(7));
         assert_eq!(calls.get(), 1);
         assert_eq!(cache.load(Ordering::Acquire), 7);
+    }
+
+    #[test]
+    fn counter_millisecond_scaling_preserves_long_uptime() {
+        assert_eq!(counter_millis(u64::MAX, 1_000), Some(u64::MAX));
+        assert_eq!(
+            counter_millis(u64::MAX, 1_000_000_000),
+            Some(18_446_744_073_709)
+        );
+        assert_eq!(counter_millis(999, 1_000), Some(999));
+        assert_eq!(counter_millis(1, 999), None);
     }
 
     #[test]

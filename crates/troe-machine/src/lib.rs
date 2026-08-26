@@ -437,7 +437,8 @@ pub use mechanism::{
     input_interrupt_stats, mark_firmware_exited, monotonic_millis, park, poweroff,
     probe_allocation_failure, read_byte, reboot, run_task_step, take_interrupt_ownership,
     take_network_interrupt, try_input_event, try_read_byte, try_read_keyboard_scancode,
-    wait_for_input_event, wait_for_runtime_event, write, zero_physical_range,
+    wait_for_input_event, wait_for_runtime_event, wait_for_runtime_event_timeout, write,
+    zero_physical_range,
 };
 #[cfg(all(target_os = "uefi", feature = "acceptance-probes"))]
 pub use mechanism::{benchmark_counter_frequency_hz, benchmark_counter_ticks};

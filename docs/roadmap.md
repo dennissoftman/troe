@@ -335,8 +335,9 @@ lands, libc and Lua components remain statically linked into each `.kex`.
 [ADR 0032](adr/0032-bounded-wait-channels-and-asynchronous-mailboxes.md)
 records the accepted staged direction derived from a review of BeOS/Haiku
 message ports, loopers, and media scheduling. Its portable wait, blocked-task,
-and pending-call models are implemented; native deferred replies and mailboxes
-are not yet current behavior.
+and pending-call models are implemented. Timer sleep and UDP receive now use
+one bounded native deferred-reply slot and hardware-backed idle waits; general
+mailboxes are not yet current behavior.
 
 The review narrows the useful first step. Existing timer and network services
 already wait cooperatively, but they do so inside one synchronous service call
@@ -411,12 +412,16 @@ slice has an independent exit criterion:
    address-space identifiers, or TLB work--without weakening reply ownership or
    fault fate.
 
-Implementation status, 2026-08-26: slices 1–3 are complete. The trap-entry
+Implementation status, 2026-08-26: slices 1–4 are complete. The trap-entry
 matrix and native probes are documented in `native-trap-entry-contract.md`; the
 host/native counter baseline is documented in `ipc-baseline.md`; and
 `troe-task` contains the preallocated wait/pending tables plus the portable
-blocked lifecycle and exhaustive transition tests. Slice 4 is next. No native
-service uses deferred completion yet.
+blocked lifecycle and exhaustive transition tests. Kernel composition retains
+one preallocated suspended KEX context for timer/UDP commands, enters a distinct
+native deadline-idle mode, and resumes only after an exact scheduler wake. The
+four-platform native gate covers success, timeout, cancellation, non-spinning
+idle accounting, and exact frame return. Slice 5, the immutable diagnostics
+user server, is next.
 
 Only after these exits should a device-owning filesystem or network service
 move out of the kernel. Shared-memory grants, priority donation, SMP, and

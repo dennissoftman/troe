@@ -115,9 +115,10 @@ bounds, and owner teardown without adding DNS, TLS, listen, or general sockets.
 [ADR 0032](adr/0032-bounded-wait-channels-and-asynchronous-mailboxes.md) fixes a
 staged scheduler-visible wait and deferred-reply direction. The portable
 blocked lifecycle, generation-checked wait registrations, copied pending calls,
-and teardown models are implemented; native KEX deferral and later capability
-mailboxes remain explicit subsequent slices. Current services are still
-synchronous until those native consumers land.
+and teardown models are implemented. Native timer sleep and UDP receive now use
+one bounded composition-owned suspended context, deferred reply, and hardware
+idle deadline; capability mailboxes and multiple live KEX applications remain
+explicit later slices.
 ADR 0012 governs the completed Stage 5.1 terminal and
 framebuffer increment; AArch64 native keyboard input remains a later
 virtio-input transport decision. ADR 0013 governs the completed Stage 5.2

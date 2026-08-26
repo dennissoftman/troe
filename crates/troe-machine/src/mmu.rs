@@ -2617,6 +2617,8 @@ extern "C" fn x86_isolated_syscall_handler(frame: *const ArchitectureApplication
 #[unsafe(naked)]
 extern "C" fn x86_execution_timer_entry() -> ! {
     core::arch::naked_asm!(
+        "test byte ptr [rsp + 8], 3",
+        "jz 2f",
         "cld",
         "pushfq",
         "btr qword ptr [rsp], 18",
@@ -2626,9 +2628,60 @@ extern "C" fn x86_execution_timer_entry() -> ! {
         "sub rsp, 32",
         "call {handler}",
         "jmp {complete}",
+        "2:",
+        "push rax",
+        "push rcx",
+        "push rdx",
+        "push rbx",
+        "push rbp",
+        "push rsi",
+        "push rdi",
+        "push r8",
+        "push r9",
+        "push r10",
+        "push r11",
+        "push r12",
+        "push r13",
+        "push r14",
+        "push r15",
+        "mov rbx, rsp",
+        "sub rsp, 560",
+        "and rsp, -16",
+        "fxsave64 [rsp]",
+        "cld",
+        "pushfq",
+        "btr qword ptr [rsp], 18",
+        "popfq",
+        "sub rsp, 32",
+        "call {runtime_handler}",
+        "add rsp, 32",
+        "fxrstor64 [rsp]",
+        "mov rsp, rbx",
+        "pop r15",
+        "pop r14",
+        "pop r13",
+        "pop r12",
+        "pop r11",
+        "pop r10",
+        "pop r9",
+        "pop r8",
+        "pop rdi",
+        "pop rsi",
+        "pop rbp",
+        "pop rbx",
+        "pop rdx",
+        "pop rcx",
+        "pop rax",
+        "iretq",
         handler = sym x86_execution_timer_handler,
+        runtime_handler = sym x86_runtime_timer_handler,
         complete = sym x86_isolated_complete,
     );
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+extern "C" fn x86_runtime_timer_handler() {
+    crate::mechanism::handle_runtime_timer_interrupt();
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
@@ -3661,7 +3714,7 @@ extern "C" fn troe_aarch64_isolated_fault(esr: u64, _address: u64) -> u64 {
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 #[unsafe(no_mangle)]
-extern "C" fn troe_aarch64_exception_fatal(esr: u64, _far: u64) -> ! {
+extern "C" fn troe_aarch64_exception_fatal(esr: u64, far: u64) -> ! {
     let exception_class = (esr >> 26) & 0x3f;
     let message = if exception_class == 0x21 {
         b"fault: execute permission violation\n".as_slice()
@@ -3671,6 +3724,19 @@ extern "C" fn troe_aarch64_exception_fatal(esr: u64, _far: u64) -> ! {
         b"fault: native exception\n".as_slice()
     };
     let _written = crate::mechanism::write(message);
+    let mut detail = *b"esr=0000000000000000 far=0000000000000000\n";
+    for (offset, value) in [(4, esr), (25, far)] {
+        for digit in 0..16 {
+            let shift = (15 - digit) * 4;
+            let nibble = ((value >> shift) & 0xf) as u8;
+            detail[offset + digit] = if nibble < 10 {
+                b'0' + nibble
+            } else {
+                b'a' + nibble - 10
+            };
+        }
+    }
+    let _written = crate::mechanism::write(&detail);
     crate::mechanism::park()
 }
 

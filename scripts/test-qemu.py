@@ -464,6 +464,22 @@ def parse_owned_memory_accounting(report: str) -> int:
     return int(heap.group(1))
 
 
+def parse_runtime_counter(report: str, label: str) -> int:
+    """Read one exact integer counter from the immutable diagnostics report."""
+    match = re.search(rf"^{re.escape(label)}: ([0-9]+)$", report, re.MULTILINE)
+    if match is None:
+        raise AcceptanceError(f"mem did not report {label!r}: {report!r}")
+    return int(match.group(1))
+
+
+def parse_free_frames(report: str) -> int:
+    """Read the current owned free-frame count from a diagnostics report."""
+    match = re.search(r"^frames: ([0-9]+)/([0-9]+) free$", report, re.MULTILINE)
+    if match is None:
+        raise AcceptanceError(f"mem did not report owned frames: {report!r}")
+    return int(match.group(1))
+
+
 def assert_owned_boot(session: "SerialSession") -> None:
     """Require the concise statuses emitted across the ownership handoff."""
     transcript = session.transcript()
@@ -847,6 +863,10 @@ def run_network_group(
         contains=("rx frames:", "arp entries:", "checkpoints:"),
     )
     session.command("arp", cwd, command_timeout, contains=("10.0.2.2",))
+    before_waits = session.command("mem", cwd, command_timeout)
+    idle_before = parse_runtime_counter(before_waits, "input idle waits")
+    frames_before = parse_free_frames(before_waits)
+    session.command("sleep 100", cwd, command_timeout)
     session.cancelled_command("sleep 3000", cwd, command_timeout)
     session.command(
         "sleep 5000",
@@ -869,6 +889,18 @@ def run_network_group(
         contains=("udp: operation timed out",),
     )
     session.command("net stats", cwd, command_timeout, contains=("udp ports: 0",))
+    after_waits = session.command("mem", cwd, command_timeout)
+    idle_after = parse_runtime_counter(after_waits, "input idle waits")
+    frames_after = parse_free_frames(after_waits)
+    if idle_after <= idle_before:
+        raise AcceptanceError(
+            "deferred timer/UDP workload did not enter the native idle-wakeup path"
+        )
+    if frames_after != frames_before:
+        raise AcceptanceError(
+            "deferred timer/UDP workload leaked application frames: "
+            f"{frames_before} -> {frames_after} free"
+        )
     session.cancelled_command(f"tcp 10.0.2.2 {tcp_port}", cwd, command_timeout)
     for _ in range(5):
         session.command(
