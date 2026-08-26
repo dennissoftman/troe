@@ -152,7 +152,11 @@ the raw `_start(startup_address, startup_bytes) -> !` boundary. On x86-64,
 pointer is 16-byte aligned, all other application-visible general registers are
 zero, floating-point/SIMD registers and control state are reset to documented
 defaults, the x86 direction and alignment-check flags are clear, and application
-interrupt delivery is enabled so the execution lease can be enforced. The
+interrupt delivery is enabled only after the architecture gate has published a
+complete kernel return context, so the execution lease can be enforced without
+an interrupt observing partial entry state. Every x86 interrupt gate that calls
+Rust also clears the application-controlled direction and alignment-check flags
+before entering compiled code. The
 portable v1 CPU-state contract is x87 plus SSE/XMM on x86-64 and baseline
 FP/Advanced SIMD on AArch64. These complete states survive calls and yields;
 AVX/AVX-512/AMX and SVE/SME are not enabled because v1 has no feature
@@ -276,19 +280,23 @@ atomic reclamation transaction.
 
 Stage 7 remains cooperative between ABI boundaries, but untrusted code does not
 receive an unlimited uninterrupted CPU lease. Each entry or resumption arms an
-architecture-owned one-shot timer for at most 50 ms. A call or voluntary yield
-disarms the timer before kernel work begins. If the timer expires while the CPU
-is in application privilege, the kernel switches to its own root and stack,
-marks the task `execution-lease-expired`, and tears it down without resuming it.
-The application cannot catch, mask, extend, or handle this event.
+architecture-owned one-shot timer for at most 50 ms. A call, voluntary yield,
+or heap-growth request disarms the timer before kernel work begins. If the timer
+expires while the CPU is in application privilege, the kernel switches to its
+own root and stack, marks the task `execution-lease-expired`, and tears it down
+without resuming it. AArch64 verifies the saved exception origin before treating
+the timer as an application expiry. The application cannot catch, mask, extend,
+or handle this event. x86 calibrates its local-APIC timer once and reuses the
+nonzero result; a resumption does not repeat the PIT/PM-timer calibration wait.
 
-A successful call or yield merely makes the task eligible for another lease;
-the scheduler regains control and may cancel it or run another ready task first.
-Consequently, code that periodically reaches a gate cannot trap the kernel in a
-single synchronous launch loop. An application may live for many leases, but a
-caller may set a smaller lease or an additional total
-lifetime/call-count policy. The ABI exposes no promise of a minimum quantum or
-forward progress.
+A successful call, yield, or heap-growth result merely makes the task eligible
+for another lease; the scheduler regains control and may cancel it or run
+another ready task first. Every such resumable outcome is charged against the
+same command budget. The current foreground command is terminated after more
+than 1,024 resumptions or ten seconds of elapsed runtime. Consequently, code
+that periodically reaches a gate cannot keep the synchronous launch loop alive
+indefinitely. The ABI exposes no promise of a minimum quantum or forward
+progress.
 
 The timer is a containment deadline, not resumable general preemption. Expiry
 discards the user context. A timer or other exception taken while already in

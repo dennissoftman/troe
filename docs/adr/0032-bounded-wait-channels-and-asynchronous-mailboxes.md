@@ -17,10 +17,11 @@ contracts are deliberately narrower:
 - ADR 0015 can suspend a KEX application only at an ABI call, yield, fault, or
   lease expiry. Its 50 ms timer terminates an uninterrupted application; it is
   not resumable general preemption.
-- ADRs 0025, 0028, and 0031 implement cancellable foreground waits inside a
-  synchronous service call. Their cooperative checkpoints make bounded ambient
-  input and network progress, but the application record remains logically
-  running and the kernel retains the service call stack.
+- ADRs 0025, 0028, and 0031 implement four-second, cancellable foreground waits
+  inside a synchronous service call. Their cooperative checkpoints make bounded
+  ambient input and network progress, but the application record remains
+  logically running, the kernel retains the service call stack, and the CPU
+  does not enter a scheduler-visible blocked state.
 - ADR 0002 keeps shell pipelines sequential and stops at the first unsuccessful
   stage. Starting all stages concurrently would change when downstream side
   effects can occur, even if byte order, EOF, and final status were preserved.

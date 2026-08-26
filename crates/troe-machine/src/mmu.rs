@@ -51,6 +51,8 @@ const OUTCOME_APPLICATION_YIELD: u64 = 1 << 62;
 const OUTCOME_APPLICATION_HANDLE_CALL: u64 = 1 << 61;
 #[cfg(target_os = "uefi")]
 const OUTCOME_APPLICATION_HEAP_GROW: u64 = 1 << 60;
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+const AARCH64_SPSR_MODE_MASK: u64 = 0b1111;
 
 /// Native fault category contained at the user/kernel boundary.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1107,17 +1109,19 @@ pub fn run_application(
             pending_application: None,
         });
     }
-    if crate::mechanism::arm_execution_timer(APPLICATION_LEASE_MILLISECONDS).is_err() {
+    if crate::mechanism::prepare_application_execution(APPLICATION_LEASE_MILLISECONDS).is_err() {
         // SAFETY: No user entry occurred and this call still owns the state.
         unsafe { *ISOLATED_RUN.0.get() = None };
         ISOLATED_ACTIVE.store(false, Ordering::Release);
+        crate::mechanism::finish_application_execution();
         return Err(MmuError::ExecutionTimerUnavailable);
     }
     let raw = architecture_run_application(root, entry, user_stack, startup_address, startup_bytes);
-    crate::mechanism::disarm_execution_timer();
+    crate::mechanism::quiesce_application_execution();
     // SAFETY: Native completion restored the kernel root and unique call frame.
     let state = unsafe { (*ISOLATED_RUN.0.get()).take() };
     ISOLATED_ACTIVE.store(false, Ordering::Release);
+    crate::mechanism::finish_application_execution();
     let state = state.ok_or(MmuError::InvalidUserContext)?;
     decode_application_outcome(
         raw,
@@ -1206,17 +1210,19 @@ pub fn resume_application(
             pending_application: None,
         });
     }
-    if crate::mechanism::arm_execution_timer(APPLICATION_LEASE_MILLISECONDS).is_err() {
+    if crate::mechanism::prepare_application_execution(APPLICATION_LEASE_MILLISECONDS).is_err() {
         // SAFETY: No user re-entry occurred and this call still owns the state.
         unsafe { *ISOLATED_RUN.0.get() = None };
         ISOLATED_ACTIVE.store(false, Ordering::Release);
+        crate::mechanism::finish_application_execution();
         return Err(MmuError::ExecutionTimerUnavailable);
     }
     let raw = architecture_resume_application(root, &context);
-    crate::mechanism::disarm_execution_timer();
+    crate::mechanism::quiesce_application_execution();
     // SAFETY: Native completion restored the kernel root and unique call frame.
     let state = unsafe { (*ISOLATED_RUN.0.get()).take() };
     ISOLATED_ACTIVE.store(false, Ordering::Release);
+    crate::mechanism::finish_application_execution();
     let state = state.ok_or(MmuError::InvalidUserContext)?;
     decode_application_outcome(
         raw,
@@ -2660,6 +2666,10 @@ extern "C" fn x86_input_interrupt_entry() {
         "sub rsp, 560",
         "and rsp, -16",
         "fxsave64 [rsp]",
+        "cld",
+        "pushfq",
+        "btr qword ptr [rsp], 18",
+        "popfq",
         "sub rsp, 32",
         "call {handler}",
         "add rsp, 32",
@@ -3486,6 +3496,7 @@ core::arch::global_asm!(
     "mrs x10, fpsr",
     "str x9, [sp, #248]",
     "str x10, [sp, #256]",
+    "mrs x0, spsr_el1",
     "bl troe_aarch64_input_interrupt",
     "cbnz x0, troe_aarch64_isolated_complete_entry",
     "ldr x9, [sp, #248]",
@@ -3568,11 +3579,15 @@ fn architecture_trigger_native_exception() -> ! {
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 #[unsafe(no_mangle)]
-extern "C" fn troe_aarch64_input_interrupt() -> u64 {
+extern "C" fn troe_aarch64_input_interrupt(saved_program_status: u64) -> u64 {
     if crate::mechanism::handle_application_interrupt() {
-        if ISOLATED_ACTIVE.load(Ordering::Acquire)
-            && active_run_kind() == Some(RunKind::Application)
-        {
+        let active_application = ISOLATED_ACTIVE.load(Ordering::Acquire)
+            && active_run_kind() == Some(RunKind::Application);
+        if !active_application {
+            // A disarmed level timer can still have one acknowledged edge in
+            // flight. With no published run there is no context to complete.
+            0
+        } else if saved_program_status & AARCH64_SPSR_MODE_MASK == 0 {
             encoded_fault(IsolatedFault::ExecutionLeaseExpired)
         } else {
             troe_aarch64_exception_fatal(0, 0)

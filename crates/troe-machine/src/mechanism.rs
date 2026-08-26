@@ -18,7 +18,7 @@ use core::ptr::NonNull;
 use core::sync::atomic::AtomicBool;
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 use core::sync::atomic::AtomicU32;
-#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+#[cfg(any(test, all(target_os = "uefi", target_arch = "x86_64")))]
 use core::sync::atomic::AtomicU64;
 #[cfg(any(test, target_os = "uefi"))]
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -435,8 +435,14 @@ static NETWORK_INTERRUPT_PENDING: AtomicBool = AtomicBool::new(false);
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 static AARCH64_NETWORK_INTERRUPT_INTID: AtomicU32 = AtomicU32::new(u32::MAX);
 
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+static AARCH64_EXECUTION_TIMER_CONFIGURED: AtomicBool = AtomicBool::new(false);
+
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 static X86_TSC_TICKS_PER_MILLISECOND: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+static X86_LAPIC_TICKS_PER_MILLISECOND: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_os = "uefi")]
 impl OwnedFramebuffer {
@@ -1148,16 +1154,43 @@ pub(crate) fn handle_application_interrupt() -> bool {
     unsafe { input_queue_mut() }.is_some_and(architecture_handle_input_interrupt)
 }
 
-/// Arm a one-shot execution lease for unprivileged application code.
+/// Mask IRQ delivery and arm a one-shot execution lease.
+///
+/// IRQs remain masked on success. The architecture entry boundary publishes
+/// its complete kernel return context before enabling delivery in userspace,
+/// so the lease cannot observe an active run with a stale kernel context.
 #[cfg(target_os = "uefi")]
-pub(crate) fn arm_execution_timer(milliseconds: u32) -> Result<(), ExecutionTimerError> {
+pub(crate) fn prepare_application_execution(milliseconds: u32) -> Result<(), ExecutionTimerError> {
     if milliseconds == 0 {
         return Err(ExecutionTimerError::InvalidFrequency);
     }
-    architecture_arm_execution_timer(milliseconds)
+    architecture_mask_input_interrupts();
+    match architecture_arm_execution_timer(milliseconds) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            architecture_disarm_execution_timer();
+            Err(error)
+        }
+    }
 }
 
-/// Disable the one-shot execution timer before doing kernel work.
+/// Disable the one-shot execution timer while retaining the CPU IRQ mask.
+///
+/// Native completion restores the masked kernel state captured by the entry
+/// boundary. The active run must be unpublished before IRQ delivery is
+/// re-enabled with [`finish_application_execution`].
+#[cfg(target_os = "uefi")]
+pub(crate) fn quiesce_application_execution() {
+    architecture_disarm_execution_timer();
+}
+
+/// Re-enable IRQ delivery after the active application state is unpublished.
+#[cfg(target_os = "uefi")]
+pub(crate) fn finish_application_execution() {
+    architecture_enable_input_interrupts();
+}
+
+/// Disable the one-shot execution timer from an already-masked native gate.
 #[cfg(target_os = "uefi")]
 pub(crate) fn disarm_execution_timer() {
     architecture_disarm_execution_timer();
@@ -1482,6 +1515,22 @@ const X86_TIMER_CALIBRATION_TICKS: u32 = 35_795;
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 const X86_TIMER_CALIBRATION_SPINS: usize = 10_000_000;
 
+#[cfg(any(test, all(target_os = "uefi", target_arch = "x86_64")))]
+fn cached_nonzero<E>(
+    cache: &AtomicU64,
+    produce: impl FnOnce() -> Result<u64, E>,
+) -> Result<u64, E> {
+    let cached = cache.load(Ordering::Acquire);
+    if cached != 0 {
+        return Ok(cached);
+    }
+    let value = produce()?;
+    if value != 0 {
+        cache.store(value, Ordering::Release);
+    }
+    Ok(value)
+}
+
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 fn x86_pm_timer_sample(resource: IoPortResource, counter_bits: u8) -> Option<u32> {
     if resource.port_count() < 4 || !matches!(counter_bits, 24 | 32) {
@@ -1545,12 +1594,13 @@ fn architecture_arm_execution_timer(milliseconds: u32) -> Result<(), ExecutionTi
         .map_err(|_| ExecutionTimerError::InterruptUnavailable)?;
     let lapic = usize::try_from(lapic_resource.base_address())
         .map_err(|_| ExecutionTimerError::InterruptUnavailable)?;
-    let (timer_vector, ticks_per_millisecond) = match platform.timer() {
-        troe_platform::TimerKind::X86PitTsc { timer_vector, .. } => {
-            (timer_vector, x86_calibrate_lapic_with_pit(lapic)?)
-        }
+    let timer = platform.timer();
+    let timer_vector = x86_timer_vectors(timer)
+        .map(|(timer_vector, _spurious_vector)| timer_vector)
+        .ok_or(ExecutionTimerError::InterruptUnavailable)?;
+    let ticks_per_millisecond = cached_nonzero(&X86_LAPIC_TICKS_PER_MILLISECOND, || match timer {
+        troe_platform::TimerKind::X86PitTsc { .. } => x86_calibrate_lapic_with_pit(lapic),
         troe_platform::TimerKind::X86AcpiPmTsc {
-            timer_vector,
             pm_timer_port,
             counter_bits,
             ..
@@ -1560,15 +1610,10 @@ fn architecture_arm_execution_timer(milliseconds: u32) -> Result<(), ExecutionTi
             if timer.base_port() != pm_timer_port || timer.port_count() < 4 {
                 return Err(ExecutionTimerError::InterruptUnavailable);
             }
-            (
-                timer_vector,
-                x86_calibrate_lapic_with_pm_timer(lapic, timer, counter_bits)?,
-            )
+            x86_calibrate_lapic_with_pm_timer(lapic, timer, counter_bits)
         }
-        troe_platform::TimerKind::Aarch64Generic => {
-            return Err(ExecutionTimerError::InterruptUnavailable);
-        }
-    };
+        troe_platform::TimerKind::Aarch64Generic => Err(ExecutionTimerError::InterruptUnavailable),
+    })?;
     let lease_ticks = ticks_per_millisecond
         .checked_mul(u64::from(milliseconds))
         .and_then(|ticks| u32::try_from(ticks).ok())
@@ -2512,22 +2557,25 @@ fn architecture_arm_execution_timer(milliseconds: u32) -> Result<(), ExecutionTi
         .map_err(|_| ExecutionTimerError::InterruptUnavailable)?;
     let word = intid / 32;
     let bit = 1_u32 << (intid % 32);
-    // SAFETY: PPI 30 is the architected non-secure physical timer interrupt;
-    // the kernel owns the GIC distributor and configures it level-sensitive.
-    unsafe {
-        let group = mmio_read32(distributor + GICD_IGROUPR + word * 4);
-        mmio_write32(distributor + GICD_IGROUPR + word * 4, group & !bit);
-        gicv2_update_byte(distributor + GICD_IPRIORITYR, intid, timer_route.priority());
-        let config_address = distributor + GICD_ICFGR + (intid / 16) * 4;
-        let config_shift = (intid % 16) * 2;
-        let edge = match timer_route.trigger() {
-            troe_platform::TriggerMode::Edge => 0b10,
-            troe_platform::TriggerMode::Level => 0,
-        };
-        let config =
-            (mmio_read32(config_address) & !(0b10 << config_shift)) | (edge << config_shift);
-        mmio_write32(distributor + GICD_ICFGR + (intid / 16) * 4, config);
-        mmio_write32(distributor + GICD_ISENABLER + word * 4, bit);
+    if !AARCH64_EXECUTION_TIMER_CONFIGURED.load(Ordering::Acquire) {
+        // SAFETY: PPI 30 is the architected non-secure physical timer interrupt;
+        // the caller masked IRQ delivery before this one-time configuration.
+        unsafe {
+            let group = mmio_read32(distributor + GICD_IGROUPR + word * 4);
+            mmio_write32(distributor + GICD_IGROUPR + word * 4, group & !bit);
+            gicv2_update_byte(distributor + GICD_IPRIORITYR, intid, timer_route.priority());
+            let config_address = distributor + GICD_ICFGR + (intid / 16) * 4;
+            let config_shift = (intid % 16) * 2;
+            let edge = match timer_route.trigger() {
+                troe_platform::TriggerMode::Edge => 0b10,
+                troe_platform::TriggerMode::Level => 0,
+            };
+            let config =
+                (mmio_read32(config_address) & !(0b10 << config_shift)) | (edge << config_shift);
+            mmio_write32(distributor + GICD_ICFGR + (intid / 16) * 4, config);
+            mmio_write32(distributor + GICD_ISENABLER + word * 4, bit);
+        }
+        AARCH64_EXECUTION_TIMER_CONFIGURED.store(true, Ordering::Release);
     }
     let frequency: u64;
     let counter: u64;
@@ -2858,15 +2906,34 @@ mod tests {
         ActiveNetworkInterrupt, DeactivatedNetworkInterrupt, DmaInitializationPhase,
         DmaInitializationState, HeapState, InputInterruptError, NetworkInterruptRoute,
         NetworkInterruptSource, PreparedNetworkInterrupt, TaskStackError, UsedIndexTransition,
-        claim_network_interrupt_publication, classify_used_index,
+        cached_nonzero, claim_network_interrupt_publication, classify_used_index,
         revoke_network_interrupt_publication, validate_task_stack,
     };
     use core::alloc::Layout;
-    use core::sync::atomic::{AtomicUsize, Ordering};
+    use core::cell::Cell;
+    use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use troe_memory::PhysicalRange;
 
     #[repr(align(4096))]
     struct TestArena([u8; 4096]);
+
+    #[test]
+    fn timer_calibration_is_cached_after_one_nonzero_result() {
+        let cache = AtomicU64::new(0);
+        let calls = Cell::new(0_u8);
+        let first = cached_nonzero(&cache, || {
+            calls.set(calls.get() + 1);
+            Ok::<u64, ()>(7)
+        });
+        let second = cached_nonzero(&cache, || {
+            calls.set(calls.get() + 1);
+            Ok::<u64, ()>(11)
+        });
+        assert_eq!(first, Ok(7));
+        assert_eq!(second, Ok(7));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(cache.load(Ordering::Acquire), 7);
+    }
 
     #[test]
     fn owned_heap_aligns_coalesces_and_reuses() {

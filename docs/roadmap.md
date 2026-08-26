@@ -213,15 +213,19 @@ The third slice makes the boundary runnable. Both architectures reset documented
 application-visible integer, floating-point/SIMD, and control state; pass the
 immutable startup pair; enable interrupt delivery; implement ABI call 0 exit;
 and arm a 50 ms one-shot before external KEX instructions execute. x86 uses an
-owned local-APIC timer calibrated from typed PIT channel-2 resources; AArch64
-uses the generic physical timer through owned GICv2 PPI 30. Native boot runs a
+owned local-APIC timer calibrated once from typed PIT channel-2 resources;
+AArch64 uses the generic physical timer through owned GICv2 PPI 30. IRQ
+delivery remains masked until the native entry gate has published its complete
+kernel return context. Native boot runs a
 target-specific exit application and terminates a spinning application by lease
 expiry, then proves stale-handle rejection, exact frame return, and allocation
 reuse on both targets.
 
 The fourth slice completes ABI 1.0. Architecture gates capture bounded full user
 contexts at `yield` and `handle_call`; the scheduler explicitly reselects a
-yielded task; every resume receives a fresh lease. Handle calls validate complete
+yielded task; every resume receives a fresh lease, and every yield, handle call,
+or heap-growth request is charged against the 1,024-step/10-second command
+ceiling. Handle calls validate complete
 non-overlapping request/reply ranges, copy the opcode-prefixed request, prove the
 opaque handle still belongs to the task, synchronously dispatch it, and copy out
 only a successful bounded reply. Native acceptance checks register preservation,
@@ -365,6 +369,50 @@ separate decision because launching every stage together changes ADR 0002's
 first-failure and side-effect ordering even when byte order and EOF remain
 identical. Media-style buffer pools and BFS-style live catalog queries remain
 separate workload-triggered directions, not implied scope.
+
+### Next microkernel execution order (proposed)
+
+The next work should preserve the current copied-message and capability model
+while turning its synchronous composition into measurable fault domains. Each
+slice has an independent exit criterion:
+
+1. Complete the native trap-entry contract. Enumerate every Rust-calling
+   syscall, exception, timer, and external-IRQ gate on both architectures and
+   prove the required stack, saved-register set, interrupt mask, x86 DF/AC
+   normalization, AArch64 exception origin, and active-context publication
+   ordering. Native probes must exercise each distinct return/fault path; this
+   is a behavioral gate, not an unsafe-token count.
+2. Record the existing IPC baseline before changing scheduling. Measure empty,
+   64-byte, 256-byte, and 4 KiB calls after warmup, reporting cycles and
+   p50/p95/p99/max latency together with copies, allocations, address-space
+   switches, TLB invalidations, timer programs, and completed calls. QEMU keeps
+   the event-count regression deterministic; latency claims require real
+   x86-64 and AArch64 hardware counters.
+3. Implement ADR 0032's portable blocked lifecycle, generation-checked wait
+   registrations, pending-operation identities, wake reasons, cancellation,
+   deadline, close/revoke, and teardown models. Exhaustive host tests must land
+   before any native scheduler change.
+4. Retain suspended KEX contexts and deferred replies in one bounded
+   composition-owned table. Convert timer sleep and UDP receive first, prove
+   lost-wakeup exclusion and non-spinning idle on both architectures, and keep
+   the current four-second synchronous ceiling as a compatibility maximum.
+5. Add the minimum copied client/server IPC primitives needed for one real user
+   server: receive, reply, generation-checked request tokens, and terminal peer
+   fate. Move the immutable diagnostics snapshot service first because it has
+   no device, DMA, filesystem, or mutation authority. A server fault must leave
+   the kernel alive, complete or cancel every pending client call exactly once,
+   revoke the server's handles, and reclaim its frames; automatic restart is a
+   later composition policy.
+6. Rerun the identical IPC matrix across in-kernel and isolated diagnostics
+   service paths. The first isolated path must have zero steady-state dynamic
+   allocation and explicit hard ceilings for retained requests and contexts.
+   Optimize only measured costs--copy count, direct handoff, timer programming,
+   address-space identifiers, or TLB work--without weakening reply ownership or
+   fault fate.
+
+Only after these exits should a device-owning filesystem or network service
+move out of the kernel. Shared-memory grants, priority donation, SMP, and
+general mailboxes each require separate measurements and ownership decisions.
 
 ## Stage 7.5: cloud platform separation (Phases A and B verified)
 

@@ -12,11 +12,12 @@ no secure-boot integration or multi-user boundary in this milestone; package
 signing, DNS, TLS, inbound TCP listening, jobs, and general sockets remain
 future decisions.
 
-The portable crates forbid unsafe Rust. Project-authored unsafe operations are
-confined to `troe-machine`, counted by the verification gate, and documented in
-the unsafe inventory. Transitive unsafe code is limited to the pinned UEFI and
-TLSF boundaries. Console input and both filesystem image formats are treated as
-untrusted and bounded.
+The portable crates and kernel forbid unsafe Rust. Project-authored unsafe
+operations are confined to `troe-machine` and are verified through native
+boundary contract tests, both target builds, and exhaustive QEMU acceptance
+rather than a raw token-count gate. Transitive unsafe code is limited to the
+pinned UEFI and TLSF boundaries. Console input and both filesystem image
+formats are treated as untrusted and bounded.
 
 ## Invariants enforced now
 
@@ -46,8 +47,10 @@ untrusted and bounded.
   permissions, fixed standard ceilings, kernel-owned staging, canonical startup
   pages, explicit initial handles, and transactional zeroized reclamation;
 - application execution: reset ring-3/EL0 state, bounded saved contexts,
-  scheduler-selected resume, copied owner-checked request/reply calls, and an
-  architecture-owned 50 ms one-shot that terminates non-returning code;
+  scheduler-selected resume, copied owner-checked request/reply calls, a 50 ms
+  maximum uninterrupted user lease, a 1,024-gate/10-second command ceiling,
+  and four-second hard bounds on the currently synchronous timer and datagram
+  waits;
 - outbound TCP: one connection per declared handle, four system-wide, one
   1,460-byte unacknowledged segment and 4 KiB receive FIFO per connection,
   exact-tuple/sequence admission, four retransmissions, four-second cancellable

@@ -4,8 +4,8 @@ This page records machine details that are easy to erase accidentally during a
 portable refactor. These are current implementation invariants, not generic
 driver policy. Any change to interrupt entry, idle waiting, controller setup,
 or a current machine profile must review this page, ADR 0013, ADR 0014, ADR
-0016, the unsafe inventory, and all four exhaustive QEMU platform suites
-together. The q35
+0016, the native boundary contract tests, and all four exhaustive QEMU platform
+suites together. The q35
 and `virt` sections describe implemented test profiles; they are not generic
 x86-64 or AArch64 platform contracts.
 
@@ -34,6 +34,9 @@ x86-64 or AArch64 platform contracts.
 - Isolated execution remains single-CPU and synchronous. Interrupts are masked,
   exactly one native active-state record may exist, and the kernel root must be
   restored with stale translations invalidated before Rust regains control.
+- Native application entry must publish the complete kernel return context
+  before enabling IRQ delivery. Completion disables the lease while IRQs are
+  masked, unpublishes the active record, and only then re-enables delivery.
 - Validate user entry, stack, and complete message ranges against retained user
   mapping metadata. Invalid calls must not copy a prefix. Never expose device
   mappings or a writable/executable physical alias at user privilege.
@@ -49,8 +52,9 @@ x86-64 or AArch64 platform contracts.
 - Install the input and spurious IDT gates before setting LAPIC software enable
   or unmasking CPU interrupts. External interrupt gates have no hardware error
   code, so their entry layout must stay distinct from exception entries.
-- The common input entry preserves all general registers plus x87/SSE state
-  before calling Rust. If Rust gains AVX usage, the save policy must be reviewed;
+- The common input entry preserves all general registers plus x87/SSE state,
+  clears the user-controlled direction and alignment-check flags, and only then
+  calls Rust. If Rust gains AVX usage, the save policy must be reviewed;
   `fxsave64` does not preserve extended AVX state.
 - Drain the device before writing LAPIC EOI. A normal routed interrupt needs one
   EOI; the LAPIC spurious vector must return without one.

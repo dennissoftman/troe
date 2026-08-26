@@ -847,7 +847,13 @@ def run_network_group(
         contains=("rx frames:", "arp entries:", "checkpoints:"),
     )
     session.command("arp", cwd, command_timeout, contains=("10.0.2.2",))
-    session.cancelled_command("sleep 5000", cwd, command_timeout)
+    session.cancelled_command("sleep 3000", cwd, command_timeout)
+    session.command(
+        "sleep 5000",
+        cwd,
+        command_timeout,
+        contains=("sleep: operation timed out",),
+    )
     session.command(
         "udp send --source-port 40001 10.0.2.2 9 application-datagram",
         cwd,
@@ -855,6 +861,13 @@ def run_network_group(
         contains=("sent 20 bytes from port 40001 to 10.0.2.2:9",),
     )
     session.cancelled_command("udp listen 40000", cwd, command_timeout)
+    session.command("net stats", cwd, command_timeout, contains=("udp ports: 0",))
+    session.command(
+        "udp listen 40002",
+        cwd,
+        command_timeout,
+        contains=("udp: operation timed out",),
+    )
     session.command("net stats", cwd, command_timeout, contains=("udp ports: 0",))
     session.cancelled_command(f"tcp 10.0.2.2 {tcp_port}", cwd, command_timeout)
     for _ in range(5):
@@ -1315,7 +1328,13 @@ def run_smoke_scenario(
         contains=("rx frames:", "arp entries:", "checkpoints:"),
     )
     session.command("arp", cwd, command_timeout, contains=("10.0.2.2",))
-    session.cancelled_command("sleep 5000", cwd, command_timeout)
+    session.cancelled_command("sleep 3000", cwd, command_timeout)
+    session.command(
+        "sleep 5000",
+        cwd,
+        command_timeout,
+        contains=("sleep: operation timed out",),
+    )
     session.command(
         "udp send --source-port 40001 10.0.2.2 9 application-datagram",
         cwd,
@@ -1323,6 +1342,13 @@ def run_smoke_scenario(
         contains=("sent 20 bytes from port 40001 to 10.0.2.2:9",),
     )
     session.cancelled_command("udp listen 40000", cwd, command_timeout)
+    session.command("net stats", cwd, command_timeout, contains=("udp ports: 0",))
+    session.command(
+        "udp listen 40002",
+        cwd,
+        command_timeout,
+        contains=("udp: operation timed out",),
+    )
     session.command("net stats", cwd, command_timeout, contains=("udp ports: 0",))
     session.command(
         f"tcp 10.0.2.2 {tcp_port} troe-tcp-request",

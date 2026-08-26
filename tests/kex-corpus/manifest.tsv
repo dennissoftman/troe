@@ -1,6 +1,7 @@
 # file	target	result
 native-calls-x86_64.kex	x86_64	ok
 native-spin-x86_64.kex	x86_64	ok
+native-heap-growth-limit-x86_64.kex	x86_64	ok
 native-invalid-call-x86_64.kex	x86_64	ok
 native-unexpected-return-x86_64.kex	x86_64	ok
 valid-standard-max-records-x86_64.kex	x86_64	ok
@@ -45,6 +46,7 @@ reject-missing-executable-x86_64.kex	x86_64	MissingExecutableSegment
 reject-entry-at-segment-end-x86_64.kex	x86_64	InvalidEntryPoint
 native-calls-aarch64.kex	aarch64	ok
 native-spin-aarch64.kex	aarch64	ok
+native-heap-growth-limit-aarch64.kex	aarch64	ok
 native-invalid-call-aarch64.kex	aarch64	ok
 native-unexpected-return-aarch64.kex	aarch64	ok
 valid-standard-max-records-aarch64.kex	aarch64	ok

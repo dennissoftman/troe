@@ -37,6 +37,10 @@ fn main(command: &mut CommandContext) -> u32 {
             common::report(&mut command.stderr(), "sleep", b"cancelled");
             exit::CANCELLED
         }
+        Err(Error::Timeout) => {
+            common::report(&mut command.stderr(), "sleep", b"operation timed out");
+            exit::FAILURE
+        }
         Err(_) => {
             common::report(&mut command.stderr(), "sleep", b"runtime unavailable");
             exit::FAILURE

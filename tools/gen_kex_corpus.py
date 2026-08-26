@@ -27,6 +27,9 @@ NATIVE_CODE = {
             "800f0b"
         ),
         "spin": bytes.fromhex("ebfe"),
+        "heap-growth-limit": bytes.fromhex(
+            "b80300000048c7c7ffffffff31f631d24531d24531c0cd80ebe6"
+        ),
         "invalid-call": bytes.fromhex("b803000000cd800f0b"),
         "unexpected-return": bytes.fromhex("c3"),
     },
@@ -39,6 +42,9 @@ NATIVE_CODE = {
             "ff830091000080d2080080d2010000d4200080d2080080d2010000d4000020d4"
         ),
         "spin": bytes.fromhex("00000014"),
+        "heap-growth-limit": bytes.fromhex(
+            "680080d200008092e1031faae2031faae3031faae4031faa010000d4f9ffff17"
+        ),
         "invalid-call": bytes.fromhex("680080d2010000d4000020d4"),
         "unexpected-return": bytes.fromhex("c0035fd6"),
     },
@@ -297,7 +303,12 @@ def generate_corpus() -> dict[str, bytes]:
             f'    ("{calls_name}", include_bytes!("{calls_name}") as &[u8], '
             f"Target::{'X86_64' if target == 'x86_64' else 'Aarch64'}),"
         )
-        for probe in ("spin", "invalid-call", "unexpected-return"):
+        for probe in (
+            "spin",
+            "heap-growth-limit",
+            "invalid-call",
+            "unexpected-return",
+        ):
             artifact = _canonical(
                 target, NATIVE_CODE[target][probe] + ACCEPTANCE_MARKER
             )

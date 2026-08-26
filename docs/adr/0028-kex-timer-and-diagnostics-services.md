@@ -14,9 +14,11 @@ The timer service exposes only the current boot-relative monotonic millisecond
 count and a cancellable `sleep-until` operation with an exact eight-byte
 deadline. It has no wall-clock meaning, calendar state, periodic registration,
 callback, background task, or interrupt control. The kernel reuses its
-nondecreasing monotonic runtime and cooperative cancellation checkpoints.
-`sleep.kex` obtains `now`, forms a saturating deadline, and preserves the
-existing usage and Ctrl-C exit behavior.
+nondecreasing monotonic runtime and cooperative cancellation checkpoints. A
+synchronous sleep may wait at most four seconds; a later deadline returns the
+stable timeout status without entering the wait. `sleep.kex` obtains `now`,
+forms a saturating deadline, and reports success, cancellation, or timeout
+distinctly.
 
 The diagnostics service exposes one immutable typed snapshot captured before
 application service setup. Its fixed 168-byte canonical record identifies the
@@ -33,8 +35,10 @@ without granting diagnostics apps filesystem authority.
 
 ## Security and sequencing consequences
 
-Sleeping remains a foreground synchronous call and is bounded by cancellation;
-this decision introduces no jobs, timer handles, wakeup queues, or preemption.
+Sleeping remains a foreground synchronous call and is bounded by both
+cancellation and the four-second deadline; this decision introduces no jobs,
+timer handles, wakeup queues, or preemption. Longer non-spinning waits require
+the blocked-task and deferred-reply design proposed by ADR 0032.
 Diagnostics cannot poll, enumerate principals, read arbitrary memory, consume
 input events, or change accounting. Both interfaces use copied request/reply
 messages, exact version checks, and normal owner-wide handle revocation at

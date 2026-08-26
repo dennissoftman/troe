@@ -121,6 +121,8 @@ mod firmware {
     const APPLICATION_FIXED_USER_REGIONS: usize = 3;
     const APPLICATION_INTERFACE_ECHO: u32 = 1;
     const APPLICATION_COMMAND_STEP_LIMIT: u16 = 1024;
+    const APPLICATION_COMMAND_RUNTIME_MILLISECONDS: u64 = 10_000;
+    const APPLICATION_SYNCHRONOUS_WAIT_MILLISECONDS: u64 = 4_000;
     const USER_CODE_BASE: u64 = 0x0000_4000_0000_0000;
     const USER_DATA_BASE: u64 = USER_CODE_BASE + BASE_PAGE_SIZE;
     const USER_STACK_BASE: u64 = USER_CODE_BASE + 0x1_0000;
@@ -730,6 +732,8 @@ mod firmware {
         #[cfg(feature = "acceptance-probes")]
         Spin,
         #[cfg(feature = "acceptance-probes")]
+        HeapGrowthLimit,
+        #[cfg(feature = "acceptance-probes")]
         InvalidCall,
         #[cfg(feature = "acceptance-probes")]
         UnexpectedReturn,
@@ -741,6 +745,8 @@ mod firmware {
                 Self::Calls => None,
                 #[cfg(feature = "acceptance-probes")]
                 Self::Spin => Some(TaskFault::ExecutionLeaseExpired),
+                #[cfg(feature = "acceptance-probes")]
+                Self::HeapGrowthLimit => Some(TaskFault::ExecutionLeaseExpired),
                 #[cfg(feature = "acceptance-probes")]
                 Self::InvalidCall => Some(TaskFault::InvalidCall),
                 #[cfg(feature = "acceptance-probes")]
@@ -2039,6 +2045,23 @@ mod firmware {
                 unexpected_return,
                 ApplicationProbe::UnexpectedReturn,
             )?;
+            let heap_growth_limit = native_kex_artifact(ApplicationProbe::HeapGrowthLimit);
+            let command_services = [CommandStartupService {
+                port,
+                interface: APPLICATION_INTERFACE_ECHO,
+                major: 1,
+                minor: 0,
+            }];
+            if run_command_application(
+                scheduler,
+                accounting,
+                &mut dispatcher,
+                &command_services,
+                heap_growth_limit,
+            )? != CommandApplicationOutcome::Faulted(TaskFault::ExecutionLeaseExpired)
+            {
+                return Err(());
+            }
             (reused, invalid_reused, return_reused)
         };
 
@@ -2063,7 +2086,7 @@ mod firmware {
                 || invalid_reused != first
                 || return_reused != first
                 || scheduler.stats().contained_faults
-                    != baseline_tasks.contained_faults.checked_add(3).ok_or(())?
+                    != baseline_tasks.contained_faults.checked_add(4).ok_or(())?
             {
                 return Err(());
             }
@@ -2466,12 +2489,12 @@ mod firmware {
             return Err(());
         };
         if transaction.acquire(LoaderResource::Frames).is_err() {
-            reclaim_application(&mut accounting.frames, allocation)?;
+            reclaim_command_application(&mut accounting.frames, allocation);
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         }
         if prepare_application_memory(&allocation, &plan).is_err() {
-            reclaim_application(&mut accounting.frames, allocation)?;
+            reclaim_command_application(&mut accounting.frames, allocation);
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         }
@@ -2481,19 +2504,19 @@ mod firmware {
             &allocation,
             &plan,
         ) else {
-            reclaim_application(&mut accounting.frames, allocation)?;
+            reclaim_command_application(&mut accounting.frames, allocation);
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
         let Ok(address_space) =
             troe_machine::build_user_address_space(&mapping_plan, allocation.tables)
         else {
-            reclaim_application(&mut accounting.frames, allocation)?;
+            reclaim_command_application(&mut accounting.frames, allocation);
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
         if transaction.acquire(LoaderResource::Tables).is_err() {
-            reclaim_application(&mut accounting.frames, allocation)?;
+            reclaim_command_application(&mut accounting.frames, allocation);
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         }
@@ -2502,7 +2525,7 @@ mod firmware {
             || table_pages > APPLICATION_TABLE_PAGES
             || address_space.user_region_count() != application_user_regions
         {
-            reclaim_application(&mut accounting.frames, allocation)?;
+            reclaim_command_application(&mut accounting.frames, allocation);
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         }
@@ -2511,31 +2534,31 @@ mod firmware {
         let Ok(mut isolation) =
             IsolationResource::new(0, retained_table_pages, private_pages, handle_count)
         else {
-            reclaim_application(&mut accounting.frames, allocation)?;
+            reclaim_command_application(&mut accounting.frames, allocation);
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
         let Ok(stack_resource) = StackResource::new(0, stack_pages) else {
-            reclaim_application(&mut accounting.frames, allocation)?;
+            reclaim_command_application(&mut accounting.frames, allocation);
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
         let Ok(task_id) =
             scheduler.spawn_isolated(Capabilities::SERVICE, stack_resource, isolation)
         else {
-            reclaim_application(&mut accounting.frames, allocation)?;
+            reclaim_command_application(&mut accounting.frames, allocation);
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
         if transaction.acquire(LoaderResource::Task).is_err() {
-            rollback_application_task(
+            rollback_command_application_task(
                 scheduler,
                 task_id,
                 dispatcher,
                 None,
                 &mut accounting.frames,
                 allocation,
-            )?;
+            );
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         }
@@ -2578,28 +2601,28 @@ mod firmware {
             Ok(owner)
         })();
         let Ok(owner) = setup else {
-            rollback_application_task(
+            rollback_command_application_task(
                 scheduler,
                 task_id,
                 dispatcher,
                 live_owner,
                 &mut accounting.frames,
                 allocation,
-            )?;
+            );
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
         drop(plan);
         drop(mapping_plan);
         if transaction.commit().is_err() {
-            rollback_application_task(
+            rollback_command_application_task(
                 scheduler,
                 task_id,
                 dispatcher,
                 live_owner,
                 &mut accounting.frames,
                 allocation,
-            )?;
+            );
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         }
@@ -2612,6 +2635,7 @@ mod firmware {
             {
                 return Err(());
             }
+            let command_started = troe_machine::monotonic_millis().ok_or(())?;
             let mut outcome = troe_machine::run_application(
                 address_space,
                 entry,
@@ -2622,17 +2646,32 @@ mod firmware {
             .map_err(|_| ())?;
             let mut steps = 0_u16;
             let terminal = loop {
+                let resumable = matches!(
+                    &outcome,
+                    troe_machine::ApplicationOutcome::Yielded(_)
+                        | troe_machine::ApplicationOutcome::HandleCall { .. }
+                        | troe_machine::ApplicationOutcome::HeapGrow { .. }
+                );
+                let elapsed = troe_machine::monotonic_millis()
+                    .ok_or(())?
+                    .saturating_sub(command_started);
+                if elapsed > APPLICATION_COMMAND_RUNTIME_MILLISECONDS {
+                    scheduler
+                        .fault_current(task_id, TaskFault::ExecutionLeaseExpired)
+                        .map_err(|_| ())?;
+                    break CommandApplicationOutcome::Faulted(TaskFault::ExecutionLeaseExpired);
+                }
+                if resumable {
+                    steps = steps.checked_add(1).ok_or(())?;
+                    if steps > APPLICATION_COMMAND_STEP_LIMIT {
+                        scheduler
+                            .fault_current(task_id, TaskFault::ExecutionLeaseExpired)
+                            .map_err(|_| ())?;
+                        break CommandApplicationOutcome::Faulted(TaskFault::ExecutionLeaseExpired);
+                    }
+                }
                 match outcome {
                     troe_machine::ApplicationOutcome::Yielded(application) => {
-                        steps = steps.checked_add(1).ok_or(())?;
-                        if steps > APPLICATION_COMMAND_STEP_LIMIT {
-                            scheduler
-                                .fault_current(task_id, TaskFault::ExecutionLeaseExpired)
-                                .map_err(|_| ())?;
-                            break CommandApplicationOutcome::Faulted(
-                                TaskFault::ExecutionLeaseExpired,
-                            );
-                        }
                         scheduler.yield_current(task_id).map_err(|_| ())?;
                         if scheduler
                             .dispatch_next(Capabilities::SERVICE)
@@ -2648,8 +2687,7 @@ mod firmware {
                         .map_err(|_| ())?;
                     }
                     troe_machine::ApplicationOutcome::HandleCall { application, call } => {
-                        steps = steps.checked_add(1).ok_or(())?;
-                        if steps > APPLICATION_COMMAND_STEP_LIMIT || call.request_bytes() < 2 {
+                        if call.request_bytes() < 2 {
                             scheduler
                                 .fault_current(task_id, TaskFault::InvalidCall)
                                 .map_err(|_| ())?;
@@ -2765,25 +2803,25 @@ mod firmware {
             Ok(terminal)
         })();
         let Ok(terminal) = execution else {
-            rollback_application_task(
+            rollback_command_application_task(
                 scheduler,
                 task_id,
                 dispatcher,
                 live_owner,
                 &mut accounting.frames,
                 allocation,
-            )?;
+            );
             return Err(());
         };
         let Ok(reaped) = scheduler.reap(task_id) else {
-            rollback_application_task(
+            rollback_command_application_task(
                 scheduler,
                 task_id,
                 dispatcher,
                 live_owner,
                 &mut accounting.frames,
                 allocation,
-            )?;
+            );
             return Err(());
         };
         let expected_fault = match terminal {
@@ -2793,9 +2831,9 @@ mod firmware {
         let valid_reap = reaped.isolation == Some(isolation)
             && reaped.stack.mapped_pages() == stack_pages
             && reaped.fault == expected_fault;
-        reclaim_application(&mut accounting.frames, allocation)?;
+        reclaim_command_application(&mut accounting.frames, allocation);
         if !valid_reap {
-            return Err(());
+            fatal(b"fatal: application reap invariant failed\n");
         }
         Ok(terminal)
     }
@@ -2917,15 +2955,17 @@ mod firmware {
         retained_tables: usize,
     ) -> Result<(), ()> {
         while allocation.growth_ranges.len() > retained {
-            let range = allocation.growth_ranges.pop().ok_or(())?;
+            let range = *allocation.growth_ranges.last().ok_or(())?;
             troe_machine::zero_physical_range(range).map_err(|_| ())?;
             frames.free_range(range).map_err(|_| ())?;
+            allocation.growth_ranges.pop();
         }
         while allocation.growth_table_frames.len() > retained_tables {
-            let frame = allocation.growth_table_frames.pop().ok_or(())?;
+            let frame = *allocation.growth_table_frames.last().ok_or(())?;
             let range = PhysicalRange::from_pages(frame, 1).map_err(|_| ())?;
             troe_machine::zero_physical_range(range).map_err(|_| ())?;
             frames.free(frame).map_err(|_| ())?;
+            allocation.growth_table_frames.pop();
         }
         Ok(())
     }
@@ -3136,6 +3176,27 @@ mod firmware {
         reclaim_application(frames, allocation)
     }
 
+    fn rollback_command_application_task(
+        scheduler: &mut Scheduler,
+        task_id: TaskId,
+        dispatcher: &mut Dispatcher<'_>,
+        owner: Option<HandleOwner>,
+        frames: &mut FrameAllocator,
+        allocation: ApplicationAllocation,
+    ) {
+        if rollback_application_task(scheduler, task_id, dispatcher, owner, frames, allocation)
+            .is_err()
+        {
+            fatal(b"fatal: application rollback invariant failed\n");
+        }
+    }
+
+    fn reclaim_command_application(frames: &mut FrameAllocator, allocation: ApplicationAllocation) {
+        if reclaim_application(frames, allocation).is_err() {
+            fatal(b"fatal: application reclaim invariant failed\n");
+        }
+    }
+
     fn clear_provisional_loader_ownership(transaction: &mut LoaderTransaction) {
         transaction.rollback(|_resource| {});
     }
@@ -3213,6 +3274,17 @@ mod firmware {
                 #[cfg(target_arch = "aarch64")]
                 {
                     include_bytes!("../../tests/kex-corpus/native-spin-aarch64.kex")
+                }
+            }
+            #[cfg(feature = "acceptance-probes")]
+            ApplicationProbe::HeapGrowthLimit => {
+                #[cfg(target_arch = "x86_64")]
+                {
+                    include_bytes!("../../tests/kex-corpus/native-heap-growth-limit-x86_64.kex")
+                }
+                #[cfg(target_arch = "aarch64")]
+                {
+                    include_bytes!("../../tests/kex-corpus/native-heap-growth-limit-aarch64.kex")
                 }
             }
             #[cfg(feature = "acceptance-probes")]
@@ -4277,6 +4349,9 @@ mod firmware {
                 .udp
                 .bind(local_port)
                 .map_err(map_network_error)?;
+            let deadline = runtime
+                .now()
+                .saturating_add(APPLICATION_SYNCHRONOUS_WAIT_MILLISECONDS);
             loop {
                 if let Some(datagram) = self.service.borrow_mut().udp.receive(local_port) {
                     return Ok(ReceivedUdp {
@@ -4284,6 +4359,9 @@ mod firmware {
                         source_port: datagram.source_port,
                         payload: datagram.payload,
                     });
+                }
+                if runtime.now() >= deadline {
+                    return Err(NetworkError::Timeout);
                 }
                 runtime.checkpoint().map_err(|_| NetworkError::Cancelled)?;
             }
@@ -4857,10 +4935,15 @@ mod firmware {
                     let Ok(deadline) = timer::decode_milliseconds(request.payload()) else {
                         return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
                     };
+                    let deadline = MonotonicMillis::from_millis(deadline);
+                    let now = self.runtime.borrow().now();
+                    if deadline > now.saturating_add(APPLICATION_SYNCHRONOUS_WAIT_MILLISECONDS) {
+                        return Ok(ServiceReply::empty(ReplyStatus::Timeout));
+                    }
                     let mut runtime = KernelRuntimeCapability {
                         runtime: self.runtime.clone(),
                     };
-                    match runtime.sleep_until(MonotonicMillis::from_millis(deadline)) {
+                    match runtime.sleep_until(deadline) {
                         Ok(()) => Ok(ServiceReply::empty(ReplyStatus::Success)),
                         Err(Cancelled) => Ok(ServiceReply::empty(ReplyStatus::Cancelled)),
                     }

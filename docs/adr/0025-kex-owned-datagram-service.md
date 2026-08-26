@@ -15,17 +15,20 @@ Every request and reply is allocation-free at the ABI boundary and canonical.
 `send` carries an optional source port, destination IPv4 address and nonzero
 port, and at most 1,472 payload bytes; its exact reply is the selected nonzero
 source port. `receive` carries one nonzero local port and returns the source
-address, source port, and bounded payload. General service statuses distinguish
-invalid input, exhaustion, absent configuration, cancellation, timeout,
-ownership conflict, and oversize input.
+address, source port, and bounded payload. A receive has a four-second hard
+deadline and returns the stable timeout status if neither a datagram nor
+cancellation arrives. General service statuses distinguish invalid input,
+exhaustion, absent configuration, cancellation, timeout, ownership conflict,
+and oversize input.
 
 The per-launch service exclusively claims each requested or selected local port
 before use. A second owner cannot reuse an existing binding. Claims are bounded
 by the platform's eight-port ceiling and reuse the existing four-datagram/4 KiB
 per-port drop-newest queues. `receive` waits through the existing cooperative
-runtime checkpoint so network interrupts make progress and Ctrl-C returns the
-stable cancelled status. Dropping the launch dispatcher unbinds every claimed
-port and discards retained datagrams before the shell resumes.
+runtime checkpoint so network interrupts make progress, Ctrl-C returns the
+stable cancelled status, and the hard deadline is observed. Dropping the launch
+dispatcher unbinds every claimed port and discards retained datagrams before
+the shell resumes.
 
 The repo-local SDK exposes `CommandContext::datagram`, fixed receive storage,
 and typed `send`/`receive` methods. `apps/udp` is the first replacement app.
