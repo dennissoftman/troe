@@ -272,6 +272,13 @@ Interfaces that may later cross an IPC boundary MUST be message-shaped:
 - no exposure of private implementation layout;
 - documented cancellation and partial-operation semantics.
 
+ADR 0034 unifies ownership, generation, accounting, close, cancellation, wait,
+and teardown mechanics across handles without erasing object type. Only genuine
+byte streams share stream operations. Files, directories, datagrams, listeners,
+timers, and system-control interfaces retain distinct bounded protocols. The
+native ABI MUST NOT acquire an open-ended descriptor, `ioctl`, `fcntl`, socket
+option, or generic socket escape hatch.
+
 The initial implementation MAY use direct function calls. The semantics MUST NOT depend on shared internal pointers that prevent later dispatch or IPC.
 
 ## 10. Terminal and streams
@@ -379,6 +386,12 @@ pub trait Directory {
 ```
 
 These signatures are illustrative, not frozen ABI. The implementation SHOULD avoid heap-allocated iterators on hot or boot paths.
+
+For package-managed applications, filesystem authority SHOULD be rooted at
+explicit directory handles selected from manifest grants. Operations resolve
+relative to those roots; an absolute path is a name, not authority by itself.
+The current command filesystem service's access to the launching shell
+namespace is an implemented bootstrap slice, not the general package contract.
 
 ### 12.2 Initial namespace
 
@@ -1053,7 +1066,9 @@ Configured health failure rolls generation 2 back durably to generation 1.
 
 - Establish a supported native application SDK and versioned ABI policy.
 - Add selected utilities and services driven by real use cases.
-- Decide whether a documented POSIX subset materially improves portability without dominating the design.
+- Decide whether ADR 0034's optional userspace BSD/POSIX facade materially
+  improves portability without turning its universal descriptor vocabulary
+  into the native kernel ABI.
 - Add supported update, rollback, garbage-collection, crash-diagnostic, and
   reproducible-release procedures, including explicit data-migration limits.
 - Establish registry trust roots, signature and revocation policy, provenance

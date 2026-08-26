@@ -8,9 +8,10 @@ test or gate. The broad hosted gate and all four QEMU platform suites include
 the ADR 0031 TCP stream and repeated-teardown checks.
 
 Planning note, 2026-08-26: ADR 0032 remains a documentation-only proposal. ADR
-0033 accepts the future configuration-namespace direction but explicitly
-defers implementation until native package activation, so neither changes the
-implemented closure set.
+0033 accepts the future configuration-namespace direction, and ADR 0034
+consolidates the typed native-handle rule followed by existing services. Their
+scoped-directory and package-activation work is explicitly deferred, so none of
+these planning decisions changes the implemented closure set.
 
 ## Summary
 
@@ -18,7 +19,7 @@ implemented closure set.
 | --- | ---: | --- |
 | Implemented | 29 | 0001–0005, 0007–0008, 0010–0031 |
 | Superseded + implemented | 1 | 0006 |
-| Direction / deferred by explicit scope | 2 | 0009, 0033 |
+| Direction / deferred by explicit scope | 3 | 0009, 0033–0034 |
 | Proposed / documentation only | 1 | 0032 |
 
 The accepted ADR closure set has no remaining implementation gap. Physical
@@ -63,6 +64,7 @@ features.
 | [0031](0031-bounded-kex-tcp-connect-service.md) | Implemented | Strict TCP frame codec and bounded connection machine in [`crates/troe-net/src/lib.rs`](../../crates/troe-net/src/lib.rs) and [`crates/troe-net/src/tcp.rs`](../../crates/troe-net/src/tcp.rs); adversarial transitions in [`crates/troe-net/tests/tcp_state_machine.rs`](../../crates/troe-net/tests/tcp_state_machine.rs); exact interface 13 protocol and SDK typestate in [`crates/troe-abi`](../../crates/troe-abi/src/lib.rs) and [`sdk`](../../sdk/rust/troe-kex/src/lib.rs); owner-scoped kernel adapter in [`kernel/src/main.rs`](../../kernel/src/main.rs); repeated `tcp.kex` host-peer exchanges in [`scripts/test-qemu.py`](../../scripts/test-qemu.py) | HTTP clients such as `wget`/`curl` may build on this byte stream later. DNS, TLS, inbound listen/accept, IPv6, background jobs, and general sockets remain separate decisions. |
 | [0032](0032-bounded-wait-channels-and-asynchronous-mailboxes.md) | Proposed / documentation only | Existing synchronous waits in ADRs 0025, 0028, and 0031 and the captured KEX call context in [`kernel/src/main.rs`](../../kernel/src/main.rs) establish the review baseline only. | Acceptance requires settled pending-operation, close/drain, deadline-timer, and first-consumer semantics. No code implements scheduler-visible blocking, deferred replies, or capability mailboxes. |
 | [0033](0033-desired-and-active-configuration-namespaces.md) | Direction / deferred by explicit scope | Existing immutable SCFG/GMAN generation configuration and the current KEFS `/etc` recovery files establish the model and migration baseline only. | Native `/config` storage and authorization, `/sys/config` generation projection, desired-versus-active tooling, and recovery namespace migration are explicitly deferred until native package activation. |
+| [0034](0034-typed-capability-handles-and-unix-compatibility.md) | Direction / deferred by explicit scope | Existing generation-checked dispatch handles, typed SDK interfaces, and the separate filesystem, mutation, datagram, timer, diagnostics, network-control, and TCP services already conform to the native typed-handle rule. | Scoped package directory roots, heterogeneous waits, listeners, and any optional userspace BSD/POSIX facade remain later work with separate acceptance gates. |
 
 ## Closure conclusion
 
@@ -77,3 +79,6 @@ it does not add DNS, HTTP, TLS, inbound listening, or general sockets.
 ADR 0032 is excluded from this closure conclusion because it remains a
 documentation-only proposal. ADR 0033 settles a later namespace direction but
 explicitly defers its implementation, so it creates no current closure gap.
+ADR 0034 records the rule already followed by current typed services while
+deferring scoped roots and compatibility work; it likewise creates no current
+closure gap.

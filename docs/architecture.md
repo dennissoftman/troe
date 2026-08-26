@@ -95,6 +95,15 @@ resolves every ordinary command from exact immutable architecture-specific
 paths, but cannot intercept intrinsic names; ABI 1.0
 exposes no platform-transition operation.
 
+Native KEX interfaces follow ADR 0034: opaque handles share generation,
+ownership, accounting, cancellation, waiting, and teardown machinery, while
+files, directories, byte streams, datagrams, listeners, timers, and control
+services keep typed protocols. There is no universal native file-descriptor or
+generic socket namespace, and no `ioctl`-style escape hatch. A future
+BSD/POSIX-compatible API belongs in an optional userspace runtime over these
+capabilities. Package-managed filesystem grants will resolve to scoped
+directory roots rather than ambient access to `/`.
+
 ## Allocation
 
 Portable components use `alloc` but every untrusted growth path has a local

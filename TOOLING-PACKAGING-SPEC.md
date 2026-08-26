@@ -162,6 +162,13 @@ service = "example-api"
 
 Security information is therefore not maintained separately from package metadata.
 
+Capability declarations bind typed interfaces rather than admission to a
+universal descriptor namespace. Filesystem entries such as `app` and `data`
+resolve to scoped directory roots; network connect, listen, datagram,
+observation, and configuration remain independent grants. ADR 0034 defines the
+native handle rule and confines any future BSD/POSIX descriptor facade to an
+optional userspace compatibility runtime.
+
 ---
 
 ## 3. The Command-Line Interface

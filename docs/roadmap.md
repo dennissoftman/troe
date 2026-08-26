@@ -279,6 +279,14 @@ echo services now back `net.kex`, `arp.kex`, `dhcp.kex`, and `ping.kex` without
    connect, transfer, close, and repeated owner cleanup. DNS, HTTP, TLS, inbound
    listening, jobs, and general sockets are not implied by these ABIs.
 
+[ADR 0034](adr/0034-typed-capability-handles-and-unix-compatibility.md)
+generalizes that boundary for future native objects. TROE shares bounded
+ownership, generation, cancellation, wait, and teardown mechanics across
+opaque handles, but retains typed file, directory, byte-stream, datagram,
+listener, timer, and control interfaces. Package-managed filesystem grants must
+become scoped directory roots; any BSD/POSIX descriptor API is an optional
+userspace compatibility layer rather than a kernel contract.
+
 The shell keeps bounded command-name and path completion. Application names are
 discovered lazily from `/bin`, cached until the namespace command revision
 changes, and combined with the three static privileged intrinsics. The catalog
