@@ -23,7 +23,7 @@ mod firmware {
 
     use troe_abi::{
         command, datagram, diagnostics, filesystem, filesystem_mutation, heap_growth, icmp_echo,
-        network_configuration, network_observation, stream, tcp_connect, timer,
+        network_configuration, network_observation, stream, tcp_connect, timer, volume_control,
     };
     #[cfg(feature = "acceptance-probes")]
     use troe_application::ParseError;
@@ -55,7 +55,10 @@ mod firmware {
         Mapping, MappingLifetime, MappingMemoryType, MappingOwner, MappingPermissions, MappingPlan,
         MemoryMapStats, MemoryRegion, NormalizedMemoryMap, PhysicalRange, RegionKind, VirtualRange,
     };
-    use troe_mount::{BootMountManifest, parse_manifest};
+    use troe_mount::{
+        AccessMode, ActivationMode, BootMountManifest, FilesystemProfile, MAX_MANIFEST_BYTES,
+        parse_manifest,
+    };
     use troe_net::{
         ArpCache, DhcpMessageType, DhcpPacket, Ipv4Address, MAX_UDP_PAYLOAD_BYTES, MacAddress,
         NetError, NetworkDevice, NetworkServiceStats, TcpConnection, TcpEndpoint, TcpError,
@@ -71,8 +74,8 @@ mod firmware {
     use troe_statefs::STATE_PATH;
     use troe_statefs::StateFs;
     use troe_storage::{
-        ActivationLimits, MAX_STORAGE_REPORT_BYTES, STORAGE_REPORT_EXTENSION_BYTES, prepare_mounts,
-        read_selected_file, validate_root_activation,
+        ActivationLimits, MAX_STORAGE_REPORT_BYTES, PreparedMount, STORAGE_REPORT_EXTENSION_BYTES,
+        prepare_mounts, read_selected_file, validate_root_activation,
     };
     use troe_task::{
         Cancelled, Capabilities, CooperativeRuntime, IsolationResource, MonotonicMillis, Scheduler,
@@ -92,7 +95,6 @@ mod firmware {
     const ROOTFS: &[u8] = include_bytes!("../../assets/root-x86_64.kefs");
     #[cfg(target_arch = "aarch64")]
     const ROOTFS: &[u8] = include_bytes!("../../assets/root-aarch64.kefs");
-    const BOOT_MOUNT_MANIFEST: &[u8] = include_bytes!("../../assets/boot.bmnt");
     const PERSISTENCE_SELECTOR: &[u8] = include_bytes!("../../assets/persist.prgn");
     const STATEFS_SELECTOR: &[u8] = include_bytes!("../../assets/state.prgn");
     const INITIAL_ACTIVATION: &[u8] = include_bytes!("../../assets/system.sact");
@@ -254,6 +256,7 @@ mod firmware {
         native_statefs: RefCell<Option<Box<dyn ReadOnlyFileSystem>>>,
         native_generation: NativeGenerationState,
         boot_mount_manifest: BootMountManifest,
+        runtime_mounts: SharedRuntimeMounts,
     }
 
     struct NativeBlockInitialization {
@@ -405,6 +408,164 @@ mod firmware {
     type SharedNetwork = Rc<RefCell<KernelNetworkService>>;
     type SharedTcpConnection = Rc<RefCell<KernelTcpConnection>>;
     type SharedNamespace<'namespace> = Rc<RefCell<&'namespace mut Namespace>>;
+    type SharedRuntimeMounts = Rc<RefCell<RuntimeMountRegistry>>;
+
+    struct RuntimeMountRecord {
+        name: String,
+        filesystem: volume_control::Filesystem,
+        access: volume_control::Access,
+        activation: volume_control::Activation,
+        state: volume_control::State,
+        prepared: Option<PreparedMount>,
+    }
+
+    struct RuntimeMountRegistry {
+        entries: Vec<RuntimeMountRecord>,
+    }
+
+    impl RuntimeMountRegistry {
+        const fn empty() -> Self {
+            Self {
+                entries: Vec::new(),
+            }
+        }
+
+        fn configure(
+            &mut self,
+            manifest: &BootMountManifest,
+            mut prepared: Vec<PreparedMount>,
+            namespace: &mut Namespace,
+        ) -> Result<(), ()> {
+            if !self.entries.is_empty() {
+                return Err(());
+            }
+            self.entries
+                .try_reserve_exact(manifest.entries().len())
+                .map_err(|_| ())?;
+            for entry in manifest.entries() {
+                let path = alloc::format!("/vol/{}", entry.name());
+                let plan = prepared
+                    .iter()
+                    .position(|plan| plan.path() == path)
+                    .map(|index| prepared.remove(index));
+                if plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.activation() != entry.activation())
+                {
+                    return Err(());
+                }
+                let (state, prepared) = match (entry.activation(), plan) {
+                    (ActivationMode::Auto, Some(plan)) => {
+                        plan.attach(namespace).map_err(|_| ())?;
+                        (volume_control::State::Mounted, None)
+                    }
+                    (ActivationMode::Manual, Some(plan)) => {
+                        (volume_control::State::Ready, Some(plan))
+                    }
+                    (_, None) => (volume_control::State::Unavailable, None),
+                };
+                let mut name = String::new();
+                name.try_reserve_exact(entry.name().len()).map_err(|_| ())?;
+                name.push_str(entry.name());
+                self.entries.push(RuntimeMountRecord {
+                    name,
+                    filesystem: match entry.filesystem() {
+                        FilesystemProfile::Fat32 => volume_control::Filesystem::Fat32,
+                        FilesystemProfile::Ext4V1 => volume_control::Filesystem::Ext4V1,
+                    },
+                    access: match entry.access() {
+                        AccessMode::ReadOnly => volume_control::Access::ReadOnly,
+                        AccessMode::ReadWrite => volume_control::Access::ReadWrite,
+                    },
+                    activation: match entry.activation() {
+                        ActivationMode::Auto => volume_control::Activation::Auto,
+                        ActivationMode::Manual => volume_control::Activation::Manual,
+                    },
+                    state,
+                    prepared,
+                });
+            }
+            if prepared.is_empty() { Ok(()) } else { Err(()) }
+        }
+
+        fn encode_list(&self, output: &mut [u8]) -> Result<usize, ()> {
+            let mut entries = Vec::new();
+            entries
+                .try_reserve_exact(self.entries.len())
+                .map_err(|_| ())?;
+            for entry in &self.entries {
+                entries.push(volume_control::VolumeInfo {
+                    name: &entry.name,
+                    filesystem: entry.filesystem,
+                    access: entry.access,
+                    activation: entry.activation,
+                    state: entry.state,
+                });
+            }
+            volume_control::encode_list(&entries, output).map_err(|_| ())
+        }
+
+        fn activate(&mut self, name: &str, namespace: &mut Namespace) -> Result<(), ReplyStatus> {
+            let entry = self
+                .entries
+                .iter_mut()
+                .find(|entry| entry.name == name)
+                .ok_or(ReplyStatus::NotFound)?;
+            match entry.state {
+                volume_control::State::Mounted => Ok(()),
+                volume_control::State::Unavailable => Err(ReplyStatus::NotFound),
+                volume_control::State::Failed => Err(ReplyStatus::Failure),
+                volume_control::State::Ready => {
+                    if entry.activation != volume_control::Activation::Manual {
+                        return Err(ReplyStatus::InvalidRequest);
+                    }
+                    let plan = entry.prepared.take().ok_or(ReplyStatus::Corrupt)?;
+                    if let Ok(()) = plan.attach(namespace) {
+                        entry.state = volume_control::State::Mounted;
+                        let _updated = mark_storage_role_mounted(namespace, name);
+                        Ok(())
+                    } else {
+                        entry.state = volume_control::State::Failed;
+                        Err(ReplyStatus::Failure)
+                    }
+                }
+            }
+        }
+    }
+
+    fn mark_storage_role_mounted(namespace: &mut Namespace, name: &str) -> Result<(), ()> {
+        let current = namespace.read_file("/", "/sys/storage").map_err(|_| ())?;
+        let current = core::str::from_utf8(&current).map_err(|_| ())?;
+        let prefix = alloc::format!("role {name} ");
+        let marker = " state=ready volume=";
+        let replacement = " state=mounted volume=";
+        let mut updated = String::new();
+        updated
+            .try_reserve_exact(
+                current
+                    .len()
+                    .saturating_add(replacement.len() - marker.len()),
+            )
+            .map_err(|_| ())?;
+        let mut changed = false;
+        for line in current.split_inclusive('\n') {
+            if line.starts_with(&prefix) {
+                let offset = line.find(marker).ok_or(())?;
+                updated.push_str(&line[..offset]);
+                updated.push_str(replacement);
+                updated.push_str(&line[offset + marker.len()..]);
+                changed = true;
+            } else {
+                updated.push_str(line);
+            }
+        }
+        if !changed {
+            return Err(());
+        }
+        namespace
+            .set_system_file("/sys/storage", updated.as_bytes())
+            .map_err(|_| ())
+    }
 
     struct KernelTcpConnection {
         id: u64,
@@ -444,6 +605,11 @@ mod firmware {
         cwd: String,
         next_token: Option<u32>,
         pending: Option<PendingFileReplacement>,
+    }
+
+    struct ApplicationVolumeControlService<'namespace> {
+        namespace: SharedNamespace<'namespace>,
+        mounts: SharedRuntimeMounts,
     }
 
     struct ApplicationTimerService {
@@ -670,7 +836,7 @@ mod firmware {
         let image_layout = troe_machine::loaded_image_layout().map_err(|_| ())?;
         let framebuffer = capture_framebuffer();
         let boot_memory = reserve_and_install_heap()?;
-        let boot_mount_manifest = parse_manifest(BOOT_MOUNT_MANIFEST).map_err(|_| ())?;
+        let boot_mount_manifest = load_boot_mount_manifest()?;
         troe_machine::initialize_console();
         if !troe_machine::initialize_monotonic_clock() {
             return Err(());
@@ -681,6 +847,22 @@ mod firmware {
             framebuffer,
             boot_mount_manifest: Some(boot_mount_manifest),
         })
+    }
+
+    fn load_boot_mount_manifest() -> Result<BootMountManifest, ()> {
+        let protocol = boot::get_image_file_system(boot::image_handle()).map_err(|_| ())?;
+        let mut filesystem = uefi::fs::FileSystem::new(protocol);
+        let path = cstr16!("\\EFI\\BOOT\\VOLUMES.BMT");
+        let file_bytes = usize::try_from(filesystem.metadata(path).map_err(|_| ())?.file_size())
+            .map_err(|_| ())?;
+        if file_bytes > MAX_MANIFEST_BYTES {
+            return Err(());
+        }
+        let bytes = filesystem.read(path).map_err(|_| ())?;
+        if bytes.len() != file_bytes {
+            return Err(());
+        }
+        parse_manifest(&bytes).map_err(|_| ())
     }
 
     fn post_handoff(prepared: &mut PreparedHandoff) -> ! {
@@ -758,6 +940,7 @@ mod firmware {
             native_statefs: RefCell::new(native.statefs),
             native_generation: native.generation,
             boot_mount_manifest,
+            runtime_mounts: Rc::new(RefCell::new(RuntimeMountRegistry::empty())),
         })
     }
 
@@ -3594,11 +3777,15 @@ mod firmware {
             fatal(b"fatal: cannot retain native storage diagnostic\n");
         }
         storage_report.push_str(activation.report());
-        for mount in activation.into_mounts() {
-            mount
-                .attach(namespace)
-                .unwrap_or_else(|_| fatal(b"fatal: cannot attach native filesystem provider\n"));
-        }
+        accounting
+            .runtime_mounts
+            .borrow_mut()
+            .configure(
+                &accounting.boot_mount_manifest,
+                activation.into_mounts(),
+                namespace,
+            )
+            .unwrap_or_else(|()| fatal(b"fatal: cannot configure native mount registry\n"));
         let statefs_mounted = accounting.native_statefs.borrow().is_some();
         if let Some(statefs) = accounting.native_statefs.borrow_mut().take() {
             namespace
@@ -4467,6 +4654,40 @@ mod firmware {
                         self.create_hard_link(link.target, link.link_path)
                     };
                     match result {
+                        Ok(()) => Ok(ServiceReply::empty(ReplyStatus::Success)),
+                        Err(status) => Ok(ServiceReply::empty(status)),
+                    }
+                }
+                _ => Ok(ServiceReply::empty(ReplyStatus::InvalidRequest)),
+            }
+        }
+    }
+
+    impl Service for ApplicationVolumeControlService<'_> {
+        fn call(
+            &mut self,
+            request: Request<'_>,
+        ) -> Result<ServiceReply, troe_dispatch::DispatchError> {
+            match request.opcode() {
+                volume_control::LIST if request.payload().is_empty() => {
+                    let mut reply = [0_u8; volume_control::MAX_LIST_REPLY_BYTES];
+                    let count = self
+                        .mounts
+                        .borrow()
+                        .encode_list(&mut reply)
+                        .map_err(|()| troe_dispatch::DispatchError::AccountingOverflow)?;
+                    ServiceReply::with_payload(ReplyStatus::Success, &reply[..count])
+                }
+                volume_control::ACTIVATE => {
+                    let Ok(name) = volume_control::decode_activate_request(request.payload())
+                    else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    let status = self
+                        .mounts
+                        .borrow_mut()
+                        .activate(name, &mut self.namespace.borrow_mut());
+                    match status {
                         Ok(()) => Ok(ServiceReply::empty(ReplyStatus::Success)),
                         Err(status) => Ok(ServiceReply::empty(status)),
                     }
@@ -5404,6 +5625,7 @@ mod firmware {
             let mut network_configuration_required = false;
             let mut icmp_echo_required = false;
             let mut tcp_connect_required = false;
+            let mut volume_control_required = false;
             for requirement in capability_manifest.iter() {
                 if requirement.interface == troe_abi::interface::DATAGRAM
                     && requirement.major == datagram::MAJOR
@@ -5450,6 +5672,11 @@ mod firmware {
                     && requirement.minor == tcp_connect::MINOR
                 {
                     tcp_connect_required = true;
+                } else if requirement.interface == troe_abi::interface::VOLUME_CONTROL
+                    && requirement.major == volume_control::MAJOR
+                    && requirement.minor == volume_control::MINOR
+                {
+                    volume_control_required = true;
                 } else {
                     return Some(command_application_error(
                         stderr,
@@ -5526,7 +5753,8 @@ mod firmware {
                 + usize::from(network_observation_required)
                 + usize::from(network_configuration_required)
                 + usize::from(icmp_echo_required)
-                + usize::from(tcp_connect_required);
+                + usize::from(tcp_connect_required)
+                + usize::from(volume_control_required);
             let Some(handle_capacity) = service_count.checked_mul(2) else {
                 return Some(command_application_error(
                     stderr,
@@ -5541,11 +5769,12 @@ mod firmware {
                     "service resources exhausted",
                 ));
             };
-            let filesystem_namespace = if filesystem_required || filesystem_mutation_required {
-                Some(Rc::new(RefCell::new(namespace)))
-            } else {
-                None
-            };
+            let filesystem_namespace =
+                if filesystem_required || filesystem_mutation_required || volume_control_required {
+                    Some(Rc::new(RefCell::new(namespace)))
+                } else {
+                    None
+                };
             let services = (|| -> Result<Vec<CommandStartupService>, ()> {
                 let mut services = Vec::new();
                 services.try_reserve_exact(service_count).map_err(|_| ())?;
@@ -5695,6 +5924,21 @@ mod firmware {
                         interface: troe_abi::interface::TCP_CONNECT,
                         major: tcp_connect::MAJOR,
                         minor: tcp_connect::MINOR,
+                    });
+                }
+                if volume_control_required {
+                    let namespace = filesystem_namespace.as_ref().ok_or(())?.clone();
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationVolumeControlService {
+                                namespace,
+                                mounts: self.accounting.runtime_mounts.clone(),
+                            },
+                        )?,
+                        interface: troe_abi::interface::VOLUME_CONTROL,
+                        major: volume_control::MAJOR,
+                        minor: volume_control::MINOR,
                     });
                 }
                 Ok(services)

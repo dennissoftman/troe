@@ -124,6 +124,8 @@ class KexToolTests(unittest.TestCase):
                         expected = [(12, 1, 0)]
                     elif command == "tcp":
                         expected = [(13, 1, 0)]
+                    elif command == "mount":
+                        expected = [(14, 1, 0)]
                     else:
                         expected = []
                     self.assertEqual(records, expected)

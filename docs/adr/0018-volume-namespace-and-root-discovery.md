@@ -25,11 +25,12 @@ inside the 32 KiB report ceiling.
 
 The repository now carries a strict human-editable volume table whose names
 derive `/vol/<name>` targets and whose exact GPT/filesystem identities, access,
-availability, and automatic-activation policy compile into canonical BMNT v1.
-The QEMU launcher can attach additional raw data disks for these entries. This
-does not change the remaining installed-media work: deployed kernels still
-need to load the compiled BMNT from their EFI system partition rather than the
-current build-time embedded artifact.
+availability, and automatic/manual activation policy compile into canonical
+BMNT v1.1. The QEMU launcher can attach additional raw data disks for these
+entries. Both split and combined boot media install BMNT as
+`EFI/BOOT/VOLUMES.BMT`; the kernel loads and validates it before handoff.
+`mount.kex` can list the bounded policy and activate only already prepared
+manual entries.
 
 ## Context
 
@@ -99,11 +100,10 @@ firmware handoff and copies the bounded result into owned memory. This keeps
 selection independent of the persistent volume and leaves no live firmware
 protocol dependency after handoff.
 
-The first QEMU acceptance fixture compiles that generated manifest into the EFI
-artifact and validates the owned parsed result before handoff. This exercises
-the complete post-handoff discovery policy without adding a live firmware
-dependency. Installed-media support must replace that fixture source with the
-loaded-image EFI system partition path; it must not change BMNT matching rules.
+Every boot-image builder places the generated manifest beside the fallback EFI
+executable. The UEFI bootstrap opens the loaded-image filesystem, reads that
+bounded file, validates BMNT, and retains only owned parsed state across
+handoff. No live firmware dependency remains afterward.
 
 The manifest is separate from SCFG. It answers only enough bootstrap questions
 to locate volumes; SCFG can then be loaded and activated from a selected,

@@ -1,0 +1,21 @@
+version = 1
+
+[[volumes]]
+name = "root"
+selector = "gpt"
+filesystem = "ext4-v1"
+disk_guid = "76543210-ba98-fedc-0123-456789abcdef"
+partition_guid = "87654321-cba9-ffed-1032-547698badcfe"
+filesystem_uuid = "00112233-4455-6677-8899-aabbccddeeff"
+access = "read-write"
+availability = "required"
+activation = "auto"
+
+[[volumes]]
+name = "archive"
+selector = "whole-device"
+filesystem = "ext4-v1"
+filesystem_uuid = "00112233-4455-6677-8899-aabbccddeeff"
+access = "read-only"
+availability = "optional"
+activation = "manual"

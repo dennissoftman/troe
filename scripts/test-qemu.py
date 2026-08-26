@@ -884,6 +884,13 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
     """Exercise mounted reads, pipelines, paths, and bounded file mutation."""
     cwd = "/"
     session.command(
+        "mount",
+        cwd,
+        command_timeout,
+        contains=("root /vol/root ext4-v1 rw auto mounted\n",),
+    )
+    session.command("mount root", cwd, command_timeout)
+    session.command(
         "ls /", cwd, command_timeout, contains=("etc/", "man/", "sys/", "tmp/")
     )
     session.command(
@@ -994,21 +1001,21 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
         contains=("Lua 5.5.1", "Lua.org, PUC-Rio"),
     )
     session.command(
-        "lua -e 'print(\"lua-inline\", math.floor(math.sin(0)), "
-        "string.format(\"%04d\", 7))'",
+        'lua -e \'print("lua-inline", math.floor(math.sin(0)), '
+        'string.format("%04d", 7))\'',
         cwd,
         command_timeout,
         contains=("lua-inline\t0\t0007\n",),
     )
     session.command(
-        "lua -e 'local ok,e=pcall(function() error(\"jump-ok\") end); "
-        "print(\"lua-jump\", ok, type(e), e, e:match(\"jump%-ok\") ~= nil)'",
+        'lua -e \'local ok,e=pcall(function() error("jump-ok") end); '
+        'print("lua-jump", ok, type(e), e, e:match("jump%-ok") ~= nil)\'',
         cwd,
         command_timeout,
         contains=("lua-jump\tfalse\tstring\t", "jump-ok\ttrue\n"),
     )
     session.command(
-        r'''printf 'print("lua-stdin", 6*7)\n' | lua -''',
+        r"""printf 'print("lua-stdin", 6*7)\n' | lua -""",
         cwd,
         command_timeout,
         contains=("lua-stdin\t42\n",),
@@ -1052,8 +1059,8 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
     )
     session.command(
         "lua -e 'local t={}; local n=0; for i=1,6144 do "
-        "local s=string.rep(\"x\",1024); t[i]=s; n=n+#s end; "
-        "print(\"lua-grow\",#t,n)'",
+        'local s=string.rep("x",1024); t[i]=s; n=n+#s end; '
+        'print("lua-grow",#t,n)\'',
         cwd,
         command_timeout,
         contains=("lua-grow\t6144\t6291456\n",),
@@ -1066,8 +1073,8 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
     )
     session.command(
         "lua -e 'local ok=pcall(function() "
-        "string.rep(\"x\",16*1024*1024*1024) end); collectgarbage(); "
-        "print(\"lua-oom\",ok)'",
+        'string.rep("x",16*1024*1024*1024) end); collectgarbage(); '
+        'print("lua-oom",ok)\'',
         cwd,
         command_timeout,
         contains=("lua-oom\tfalse\n",),

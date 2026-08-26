@@ -142,6 +142,7 @@ class RepositoryPolicyTests(unittest.TestCase):
             "lua",
             "man",
             "mem",
+            "mount",
             "net",
             "ping",
             "printf",

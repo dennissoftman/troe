@@ -30,9 +30,10 @@ capabilities = ["datagram"]
 
 The implemented closed names are `datagram`, `filesystem-read`,
 `filesystem-mutate`, `timer`, `diagnostics`, `network-observe`,
-`network-configure`, `icmp-echo`, and `tcp-connect`. Each selects one exact
-interface; no name implies another. In particular, `tcp-connect` accepts only a
-literal IPv4 endpoint and does not grant DNS, TLS, listening, or raw packets.
+`network-configure`, `icmp-echo`, `tcp-connect`, and `volume-control`. Each
+selects one exact interface; no name implies another. In particular,
+`tcp-connect` accepts only a literal IPv4 endpoint and does not grant DNS, TLS,
+listening, or raw packets.
 
 The builder embeds the encoded manifest before the executable in
 `<command>.kex`; no `.kcap` sidecar is installed. A malformed, unknown,

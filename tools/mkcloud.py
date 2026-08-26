@@ -870,9 +870,9 @@ def _fat32_boot_sector() -> bytes:
     return bytes(sector)
 
 
-def _fat32_fsinfo(file_clusters: int) -> bytes:
-    allocated = 3 + file_clusters
-    next_free = FAT32_FIRST_FILE_CLUSTER + file_clusters
+def _fat32_fsinfo(file_clusters: int, manifest_clusters: int = 0) -> bytes:
+    allocated = 3 + file_clusters + manifest_clusters
+    next_free = FAT32_FIRST_FILE_CLUSTER + file_clusters + manifest_clusters
     if next_free > FAT32_MAX_CLUSTER:
         next_free = 0xFFFF_FFFF
     sector = bytearray(SECTOR_BYTES)
@@ -884,11 +884,18 @@ def _fat32_fsinfo(file_clusters: int) -> bytes:
     return bytes(sector)
 
 
-def build_fat32_esp(efi: bytes, architecture: str) -> bytes:
+def build_fat32_esp(
+    efi: bytes, architecture: str, mount_manifest: bytes | None = None
+) -> bytes:
     """Build the deterministic fixed-media FAT32 EFI System Partition."""
+    if mount_manifest is not None and not mount_manifest:
+        raise ValueError("boot mount manifest must not be empty")
     boot_name = _fat32_boot_name(architecture)
     file_clusters = _fat32_file_clusters(len(efi))
-    last_file_cluster = FAT32_FIRST_FILE_CLUSTER + file_clusters - 1
+    manifest_clusters = (
+        _fat32_file_clusters(len(mount_manifest)) if mount_manifest is not None else 0
+    )
+    last_file_cluster = FAT32_FIRST_FILE_CLUSTER + file_clusters + manifest_clusters - 1
     if (
         not FAT32_MIN_CLUSTERS <= FAT32_CLUSTER_COUNT < FAT32_MAX_CLUSTERS
         or last_file_cluster > FAT32_MAX_CLUSTER
@@ -897,7 +904,7 @@ def build_fat32_esp(efi: bytes, architecture: str) -> bytes:
 
     image = bytearray(SYSTEM_ESP_SECTORS * SECTOR_BYTES)
     boot = _fat32_boot_sector()
-    fsinfo = _fat32_fsinfo(file_clusters)
+    fsinfo = _fat32_fsinfo(file_clusters, manifest_clusters)
     image[:SECTOR_BYTES] = boot
     fsinfo_offset = FAT32_FSINFO_SECTOR * SECTOR_BYTES
     image[fsinfo_offset : fsinfo_offset + SECTOR_BYTES] = fsinfo
@@ -911,7 +918,12 @@ def build_fat32_esp(efi: bytes, architecture: str) -> bytes:
     _set_fat32(fat, 1, FAT32_END_OF_CHAIN)
     for cluster in (FAT32_ROOT_CLUSTER, FAT32_EFI_CLUSTER, FAT32_BOOT_CLUSTER):
         _set_fat32(fat, cluster, FAT32_END_OF_CHAIN)
-    for cluster in range(FAT32_FIRST_FILE_CLUSTER, last_file_cluster + 1):
+    efi_last_cluster = FAT32_FIRST_FILE_CLUSTER + file_clusters - 1
+    for cluster in range(FAT32_FIRST_FILE_CLUSTER, efi_last_cluster + 1):
+        following = FAT32_END_OF_CHAIN if cluster == efi_last_cluster else cluster + 1
+        _set_fat32(fat, cluster, following)
+    first_manifest_cluster = efi_last_cluster + 1
+    for cluster in range(first_manifest_cluster, last_file_cluster + 1):
         following = FAT32_END_OF_CHAIN if cluster == last_file_cluster else cluster + 1
         _set_fat32(fat, cluster, following)
     first_fat = FAT32_RESERVED_SECTORS * SECTOR_BYTES
@@ -944,17 +956,29 @@ def build_fat32_esp(efi: bytes, architecture: str) -> bytes:
     image[boot_directory + 64 : boot_directory + 96] = _fat32_directory_entry(
         boot_name, 0x20, FAT32_FIRST_FILE_CLUSTER, len(efi)
     )
+    if mount_manifest is not None:
+        image[boot_directory + 96 : boot_directory + 128] = _fat32_directory_entry(
+            mkfat.MOUNT_MANIFEST_NAME,
+            0x20,
+            first_manifest_cluster,
+            len(mount_manifest),
+        )
     file_offset = _fat32_cluster_offset(FAT32_FIRST_FILE_CLUSTER)
     image[file_offset : file_offset + len(efi)] = efi
+    if mount_manifest is not None:
+        manifest_offset = _fat32_cluster_offset(first_manifest_cluster)
+        image[manifest_offset : manifest_offset + len(mount_manifest)] = mount_manifest
 
     encoded = bytes(image)
-    if _extract_fat32_efi(encoded, architecture) != efi:
-        raise ValueError("independent FAT32 verification did not reproduce the EFI")
+    if _extract_fat32_files(encoded, architecture) != (efi, mount_manifest):
+        raise ValueError("independent FAT32 verification did not reproduce boot files")
     return encoded
 
 
-def _extract_fat32_efi(payload: bytes, architecture: str) -> bytes:
-    """Independently parse the complete constrained FAT32 ESP."""
+def _extract_fat32_files(
+    payload: bytes, architecture: str
+) -> tuple[bytes, bytes | None]:
+    """Independently parse the complete constrained FAT32 ESP boot files."""
     if len(payload) != SYSTEM_ESP_SECTORS * SECTOR_BYTES:
         raise ValueError("ESP partition has the wrong exact length")
     if not FAT32_MIN_CLUSTERS <= FAT32_CLUSTER_COUNT < FAT32_MAX_CLUSTERS:
@@ -1050,7 +1074,14 @@ def _extract_fat32_efi(payload: bytes, architecture: str) -> bytes:
     boot_directory = payload[boot_offset : boot_offset + SECTOR_BYTES]
     size = struct.unpack_from("<I", boot_directory, 64 + 28)[0]
     file_clusters = _fat32_file_clusters(size)
-    last_file_cluster = FAT32_FIRST_FILE_CLUSTER + file_clusters - 1
+    manifest_present = boot_directory[96:107] == mkfat.MOUNT_MANIFEST_NAME
+    manifest_size = (
+        struct.unpack_from("<I", boot_directory, 96 + 28)[0] if manifest_present else 0
+    )
+    manifest_clusters = _fat32_file_clusters(manifest_size) if manifest_present else 0
+    efi_last_cluster = FAT32_FIRST_FILE_CLUSTER + file_clusters - 1
+    first_manifest_cluster = efi_last_cluster + 1
+    last_file_cluster = efi_last_cluster + manifest_clusters
     if last_file_cluster > FAT32_MAX_CLUSTER:
         raise ValueError("ESP FAT32 executable exceeds the data region")
     expected_boot = bytearray(SECTOR_BYTES)
@@ -1063,6 +1094,15 @@ def _extract_fat32_efi(payload: bytes, architecture: str) -> bytes:
     expected_boot[64:96] = _fat32_directory_entry(
         boot_name, 0x20, FAT32_FIRST_FILE_CLUSTER, size
     )
+    if manifest_present:
+        if manifest_size == 0:
+            raise ValueError("ESP boot mount manifest is empty")
+        expected_boot[96:128] = _fat32_directory_entry(
+            mkfat.MOUNT_MANIFEST_NAME,
+            0x20,
+            first_manifest_cluster,
+            manifest_size,
+        )
     if boot_directory != expected_boot:
         raise ValueError("ESP FAT32 BOOT directory is not canonical")
 
@@ -1077,7 +1117,11 @@ def _extract_fat32_efi(payload: bytes, architecture: str) -> bytes:
             expected = 0x0FFF_FF00 | FAT32_MEDIA
         elif cluster in (1, FAT32_ROOT_CLUSTER, FAT32_EFI_CLUSTER, FAT32_BOOT_CLUSTER):
             expected = FAT32_END_OF_CHAIN
-        elif FAT32_FIRST_FILE_CLUSTER <= cluster <= last_file_cluster:
+        elif FAT32_FIRST_FILE_CLUSTER <= cluster <= efi_last_cluster:
+            expected = (
+                FAT32_END_OF_CHAIN if cluster == efi_last_cluster else cluster + 1
+            )
+        elif first_manifest_cluster <= cluster <= last_file_cluster:
             expected = (
                 FAT32_END_OF_CHAIN if cluster == last_file_cluster else cluster + 1
             )
@@ -1086,8 +1130,8 @@ def _extract_fat32_efi(payload: bytes, architecture: str) -> bytes:
         if struct.unpack_from("<I", fat, cluster * 4)[0] != expected:
             raise ValueError("ESP FAT32 allocation table is not canonical")
 
-    allocated = 3 + file_clusters
-    expected_next = FAT32_FIRST_FILE_CLUSTER + file_clusters
+    allocated = 3 + file_clusters + manifest_clusters
+    expected_next = FAT32_FIRST_FILE_CLUSTER + file_clusters + manifest_clusters
     if expected_next > FAT32_MAX_CLUSTER:
         expected_next = 0xFFFF_FFFF
     if (
@@ -1101,11 +1145,31 @@ def _extract_fat32_efi(payload: bytes, architecture: str) -> bytes:
     allocation = payload[file_offset : file_offset + allocation_bytes]
     if any(allocation[size:]):
         raise ValueError("ESP FAT32 executable allocation padding is not zero")
+    mount_manifest = None
+    if manifest_present:
+        manifest_offset = _fat32_cluster_offset(first_manifest_cluster)
+        manifest_allocation_bytes = manifest_clusters * SECTOR_BYTES
+        manifest_allocation = payload[
+            manifest_offset : manifest_offset + manifest_allocation_bytes
+        ]
+        if any(manifest_allocation[manifest_size:]):
+            raise ValueError("ESP FAT32 mount-manifest padding is not zero")
+        mount_manifest = manifest_allocation[:manifest_size]
     if expected_next <= FAT32_MAX_CLUSTER:
         unused = _fat32_cluster_offset(expected_next)
         if any(payload[unused:]):
             raise ValueError("ESP FAT32 unused data clusters are not zero")
-    return allocation[:size]
+    return allocation[:size], mount_manifest
+
+
+def _extract_fat32_efi(payload: bytes, architecture: str) -> bytes:
+    """Independently parse the constrained ESP and return its EFI executable."""
+    return _extract_fat32_files(payload, architecture)[0]
+
+
+def _extract_fat32_mount_manifest(payload: bytes, architecture: str) -> bytes | None:
+    """Independently parse the constrained ESP and return its optional BMNT."""
+    return _extract_fat32_files(payload, architecture)[1]
 
 
 def _verify_pe_coff_machine(efi: bytes, architecture: str) -> None:
@@ -1171,27 +1235,16 @@ def verify_esp_payload(
     return efi
 
 
-def _verify_boot_root_binding(efi: bytes, disk: GptDisk, root: GptPartition) -> None:
-    """Require the EFI-embedded BMNT selector to name the packaged root."""
-    magic = b"BMNTv1\0\0"
-    if efi.count(magic) != 1:
-        raise ValueError("EFI executable does not contain exactly one BMNT manifest")
-    offset = efi.index(magic)
-    if offset + 20 > len(efi):
-        raise ValueError("EFI-embedded BMNT header is truncated")
-    total_bytes = struct.unpack_from("<I", efi, offset + 16)[0]
-    if not mkstorage.BMNT_HEADER_BYTES <= total_bytes <= 4_096:
-        raise ValueError("EFI-embedded BMNT length is outside the bound")
-    end = offset + total_bytes
-    if end > len(efi):
-        raise ValueError("EFI-embedded BMNT payload is truncated")
-    manifest = efi[offset:end]
+def _verify_boot_root_binding(
+    manifest: bytes, disk: GptDisk, root: GptPartition
+) -> None:
+    """Require the boot-file BMNT selector to name the packaged root."""
     mkstorage.verify_manifest(manifest)
     roots = [
         entry for entry in mkstorage.decode_manifest(manifest) if entry.name == "root"
     ]
     if len(roots) != 1:
-        raise ValueError("EFI-embedded BMNT does not contain exactly one root role")
+        raise ValueError("boot BMNT does not contain exactly one root role")
     root_entry = roots[0]
     filesystem_uuid = root.payload[1024 + 104 : 1024 + 120]
     if (
@@ -1201,7 +1254,7 @@ def _verify_boot_root_binding(efi: bytes, disk: GptDisk, root: GptPartition) -> 
         or root_entry.partition_guid != root.unique_guid
         or root_entry.filesystem_identity != filesystem_uuid
     ):
-        raise ValueError("EFI-embedded BMNT does not select the packaged root")
+        raise ValueError("boot BMNT does not select the packaged root")
 
 
 def _extract_root_content(payload: bytes) -> bytes:
@@ -1346,7 +1399,7 @@ def verify_system_disk(
         or root.sectors != SYSTEM_ROOT_SECTORS
     ):
         raise ValueError("system disk partition contract is invalid")
-    efi = verify_esp_payload(
+    verify_esp_payload(
         esp.payload,
         architecture,
         expected_platform,
@@ -1354,7 +1407,10 @@ def verify_system_disk(
     )
     content = verify_root_payload(root.payload)
     _verify_content_identity_policy(content, bundle_kind)
-    _verify_boot_root_binding(efi, disk, root)
+    manifest = _extract_fat32_mount_manifest(esp.payload, architecture)
+    if manifest is None:
+        raise ValueError("system ESP does not contain VOLUMES.BMT")
+    _verify_boot_root_binding(manifest, disk, root)
     return disk
 
 
@@ -1433,8 +1489,10 @@ def assemble_bundle(
     if environment["architecture"] != platform["architecture"]:
         raise ValueError("environment/platform architecture is inconsistent")
     architecture = str(platform["architecture"])
-    efi = mkfat.extract(boot_fat, _fat32_boot_name(architecture))
-    esp_payload = build_fat32_esp(efi, architecture)
+    efi, mount_manifest = mkfat.extract_files(boot_fat, _fat32_boot_name(architecture))
+    if mount_manifest is None:
+        raise ValueError("boot FAT image does not contain VOLUMES.BMT")
+    esp_payload = build_fat32_esp(efi, architecture, mount_manifest)
     verify_esp_payload(
         esp_payload,
         architecture,
@@ -1443,7 +1501,7 @@ def assemble_bundle(
     )
     source_disk, source_root, content = _expect_source_root(root_source)
     _verify_content_identity_policy(content, bundle_kind)
-    _verify_boot_root_binding(efi, source_disk, source_root)
+    _verify_boot_root_binding(mount_manifest, source_disk, source_root)
     system = build_system_disk(
         esp_payload,
         source_disk.disk_guid,

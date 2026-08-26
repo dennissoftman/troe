@@ -2,7 +2,8 @@
 
 The volume table is TROE's human-editable source for the bounded BMNT v1 boot
 mount manifest. `tools/mkstorage.py` compiles it into a checksummed canonical
-binary before the kernel is built. The kernel never parses TOML.
+binary installed as `EFI/BOOT/VOLUMES.BMT`. The kernel never parses TOML and
+does not embed the resulting policy in its executable.
 
 The top level contains exactly `version = 1` and one or more `[[volumes]]`
 tables. Each name deterministically maps to `/vol/<name>`; arbitrary target
@@ -31,9 +32,9 @@ Supported profiles are:
 
 `access` is `read-only` or `read-write`. `availability` is `required` or
 `optional`; a missing required entry keeps TROE in recovery mode, while a
-missing optional entry is only reported. The first implementation accepts only
-`activation = "auto"`. The field is explicit so a later preauthorized
-`mount NAME` command can add `manual` without inventing a second policy format.
+missing optional entry is only reported. `activation` is `auto` or `manual`.
+Automatic entries attach during boot. Matching manual entries remain prepared
+until `mount NAME` activates them. `root` must always use `auto`.
 
 Names contain lowercase ASCII letters, digits, and internal hyphens, are at
 most 32 bytes, and become paths below `/vol`. `root` is reserved for ext4-v1
@@ -59,9 +60,11 @@ cargo qemu --volume-table path/to/volumes.toml \
   --data-disk path/to/archive.raw
 ```
 
-The table is compiled during the build, so `--volume-table` cannot be combined
-with `--skip-build`. To restart the already-built image without recreating its
-mutable root disk, reuse the same attached media with:
+The launcher rebuilds the boot image when `--volume-table` is supplied, so that
+option cannot be combined with `--skip-build`. This recompiles BMNT and replaces
+the boot file; it does not compile the policy into the kernel. To restart the
+already-built image without recreating its mutable root disk, reuse the same
+attached media with:
 
 ```console
 cargo qemu --skip-build --data-disk path/to/archive.raw
@@ -69,8 +72,9 @@ cargo qemu --skip-build --data-disk path/to/archive.raw
 
 Every attached filesystem is still required to match its complete configured
 identity and strict provider profile. Discovery order, labels, and device names
-never grant a mount role. Active and missing entries are reported by
-`cat /sys/storage`.
+never grant a mount role. Run `mount` to list active, ready, and unavailable
+entries; run `mount NAME` for an authorized manual entry. The detailed device
+topology remains available through `cat /sys/storage`.
 
 The repository default is [`config/volumes.toml`](../../config/volumes.toml).
 The generated QEMU root image requires that canonical root entry; custom

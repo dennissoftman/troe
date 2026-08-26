@@ -220,6 +220,8 @@ def main() -> int:
                     profile.architecture,
                     "--efi",
                     efi,
+                    "--manifest",
+                    REPO_ROOT / "assets" / "boot.bmnt",
                     "--output",
                     image,
                 )

@@ -34,7 +34,7 @@ One bundle contains exactly four files:
 | --- | ---: | ---: | --- |
 | protective MBR and primary GPT | 0–33 | 17 KiB | canonical UEFI GPT metadata |
 | alignment gap | 34–2047 | 1007 KiB | zero |
-| `esp` | 2048–71679 | 34 MiB | deterministic fixed-media FAT32 ESP with one architecture-native fallback EFI executable |
+| `esp` | 2048–71679 | 34 MiB | deterministic fixed-media FAT32 ESP with one architecture-native fallback EFI executable and `VOLUMES.BMT` |
 | `root` | 71680–104447 | 16 MiB | exact constrained-ext4 payload from the verified root source disk |
 | trailing gap | 104448–106462 | 1007.5 KiB | zero |
 | backup GPT | 106463–106495 | 16.5 KiB | entry-array copy and backup header |
@@ -42,7 +42,7 @@ One bundle contains exactly four files:
 The combined disk preserves the root source disk GUID, root partition GUID,
 filesystem UUID, and bytes. This is required because BMNT selects all three
 root identities rather than an enumeration index. Packaging and verification
-extract the EFI-embedded BMNT and require it to select those exact three root
+extract `EFI/BOOT/VOLUMES.BMT` and require it to select those exact three root
 identities. The selected platform identifier must also occur exactly once in
 the executable, preventing accidental cross-platform artifact labeling. The ESP
 has the standard EFI System Partition type and the architecture-native UEFI
@@ -127,7 +127,7 @@ The verifier fails closed and owns its parsing bounds. It checks:
   complete canonical directory/allocation tree, and zero unallocated space;
 - bounded PE/COFF header location and section table, PE32+ EFI-application
   subsystem, architecture-native Machine value, selected platform marker, and
-  embedded BMNT binding to the packaged root;
+  external `VOLUMES.BMT` binding to the packaged root;
 - the explicit production/development/acceptance identity and probe policy;
 - the existing independent constrained-ext4 semantic verifier for the root,
   including extraction and exact-tree verification of `/system.cspk`;

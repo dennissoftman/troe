@@ -278,8 +278,10 @@ and cancellable; diagnostics retains fixed copied bytes rather than accounting
    4 KiB receive FIFO per connection, retransmits four times on fixed timers,
    and admits only the exact tuple and next sequence. Dispatcher teardown
    unbinds ports, removes connections, and invalidates every token. No
-mount, raw-network, route-control, provider, block, device, or machine handle is
-granted.
+raw-network, route-control, provider, block, device, or machine handle is
+granted. The separate volume-control interface can list the boot policy and
+activate only a BMNT-authorized provider already prepared by stable-identity
+discovery; it cannot name raw devices or arbitrary target paths.
 
 ## Stage 8 persistent-storage boundary
 

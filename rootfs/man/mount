@@ -1,0 +1,15 @@
+NAME
+    mount - list or activate configured volumes
+
+SYNOPSIS
+    mount
+    mount VOLUME
+
+DESCRIPTION
+    With no arguments, lists every entry from the boot volume policy, its
+    /vol path, filesystem, access mode, activation mode, and current state.
+
+    With VOLUME, activates a validated entry configured with
+    activation = "manual". The command cannot select arbitrary devices,
+    filesystems, or paths; all stable identities and authority come from the
+    boot policy. Already-mounted volumes succeed without changing state.

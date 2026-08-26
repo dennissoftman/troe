@@ -14,7 +14,7 @@ use std::process::Command;
 pub use elf::convert_elf;
 use troe_abi::{
     datagram, diagnostics, filesystem, filesystem_mutation, icmp_echo, interface,
-    network_configuration, network_observation, requirements, tcp_connect, timer,
+    network_configuration, network_observation, requirements, tcp_connect, timer, volume_control,
 };
 use troe_application::{
     ABI_MAJOR, ABI_MINOR, KEX_PACKAGE_V1_MAGIC, KEX_V1_HEADER_BYTES, KEX_V1_IMAGE_BASE,
@@ -436,6 +436,11 @@ fn capability_requirement(name: &str) -> ToolResult<requirements::Requirement> {
             interface: interface::TCP_CONNECT,
             major: tcp_connect::MAJOR,
             minor: tcp_connect::MINOR,
+        }),
+        "volume-control" => Ok(requirements::Requirement {
+            interface: interface::VOLUME_CONTROL,
+            major: volume_control::MAJOR,
+            minor: volume_control::MINOR,
         }),
         _ => Err(ToolError::new(format!(
             "unknown TROE KEX capability '{name}'"

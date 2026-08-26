@@ -24,8 +24,8 @@ use troe_ext4::{Ext4, Ext4Limits};
 use troe_fat::{Fat32, Fat32Limits};
 use troe_gpt::{GptError, GptGuid, GptLimits, GptPartition, discover};
 use troe_mount::{
-    AccessMode, AvailabilityPolicy, BootMountManifest, FilesystemProfile, MAX_DISCOVERED_VOLUMES,
-    MatchState, MountEntry, MountResolution, SelectorKind, VolumeSelector,
+    AccessMode, ActivationMode, AvailabilityPolicy, BootMountManifest, FilesystemProfile,
+    MAX_DISCOVERED_VOLUMES, MatchState, MountEntry, MountResolution, SelectorKind, VolumeSelector,
 };
 use troe_vfs::{FsError, Namespace, NodeKind, ReadOnlyFileSystem};
 
@@ -95,6 +95,7 @@ pub struct PreparedMount {
     path: String,
     provider: Box<dyn ReadOnlyFileSystem>,
     writable: bool,
+    activation: ActivationMode,
 }
 
 impl core::fmt::Debug for PreparedMount {
@@ -117,6 +118,12 @@ impl PreparedMount {
     #[must_use]
     pub const fn is_writable(&self) -> bool {
         self.writable
+    }
+
+    /// Whether this provider should attach at boot or await runtime activation.
+    #[must_use]
+    pub const fn activation(&self) -> ActivationMode {
+        self.activation
     }
 
     /// Consume this plan and return its validated provider.
@@ -426,6 +433,7 @@ pub fn prepare_mounts<D: BlockDevice + 'static>(
             path,
             provider,
             writable: entry.access() == AccessMode::ReadWrite,
+            activation: entry.activation(),
         });
     }
     Ok(StorageActivation {
@@ -1052,19 +1060,27 @@ fn write_role_report(
     for (entry, resolved) in manifest.entries().iter().zip(resolution.entries()) {
         write!(
             report,
-            "role {} path=/vol/{} filesystem={} access={} availability={} state=",
+            "role {} path=/vol/{} filesystem={} access={} availability={} activation={} state=",
             entry.name(),
             entry.name(),
             filesystem_name(entry.filesystem()),
             access_name(entry.access()),
             availability_name(entry.availability()),
+            activation_name(entry.activation()),
         )
         .map_err(|_| ActivationError::DiscoveryLimit)?;
         match resolved.state() {
             MatchState::Missing => writeln!(report, "missing"),
             MatchState::Ambiguous => writeln!(report, "ambiguous"),
             MatchState::Matched { candidate_index } => {
-                writeln!(report, "matched volume={candidate_index}")
+                writeln!(
+                    report,
+                    "{} volume={candidate_index}",
+                    match entry.activation() {
+                        ActivationMode::Auto => "mounted",
+                        ActivationMode::Manual => "ready",
+                    }
+                )
             }
         }
         .map_err(|_| ActivationError::DiscoveryLimit)?;
@@ -1112,6 +1128,13 @@ const fn availability_name(availability: AvailabilityPolicy) -> &'static str {
     match availability {
         AvailabilityPolicy::Optional => "optional",
         AvailabilityPolicy::Required => "required",
+    }
+}
+
+const fn activation_name(activation: ActivationMode) -> &'static str {
+    match activation {
+        ActivationMode::Auto => "auto",
+        ActivationMode::Manual => "manual",
     }
 }
 
@@ -1244,7 +1267,7 @@ mod tests {
              regions 0\n\
              volumes 0\n\
              required-roles recovery\n\
-             role root path=/vol/root filesystem=ext4-v1 access=read-write availability=required state=missing\n"
+             role root path=/vol/root filesystem=ext4-v1 access=read-write availability=required activation=auto state=missing\n"
         );
 
         let foreign = prepare_mounts(&manifest, vec![MemoryDevice::zeroed(64)], limits())
@@ -1264,7 +1287,7 @@ mod tests {
         );
         assert!(foreign.report().ends_with(
             "role root path=/vol/root filesystem=ext4-v1 access=read-write \
-             availability=required state=missing\n"
+             availability=required activation=auto state=missing\n"
         ));
     }
 
@@ -1288,7 +1311,7 @@ mod tests {
                 .unwrap_or_else(|_| std::process::abort());
         assert!(unique_report.contains("required-roles available\n"));
         assert!(unique_report.contains("volume 0 device=7 first=0 blocks=128"));
-        assert!(unique_report.ends_with("state=matched volume=0\n"));
+        assert!(unique_report.ends_with("state=mounted volume=0\n"));
 
         let ambiguous = vec![candidate(1), candidate(9)];
         let ambiguous_resolution = manifest

@@ -426,11 +426,12 @@ The first portable storage/configuration boundary is landed:
 - `troe-config` implements checksummed SCFG v1 desired-system/service startup
   policy with canonical dependencies, bounded health/restart behavior, explicit
   predecessor fallback, and a mandatory immutable recovery environment; and
-- `troe-mount` implements the checksummed BMNT v1 boot-side mount manifest,
-  bounded canonical role names, explicit whole-device/GPT selectors, access and
-  availability policy, duplicate-selector rejection, and deterministic exact
-  stable-identity resolution for diskless, matched, missing, and ambiguous
-  media; and
+- `troe-mount` implements the checksummed external BMNT v1.1 boot-side mount
+  manifest, bounded canonical role names, explicit whole-device/GPT selectors,
+  access, availability, and auto/manual activation policy, duplicate-selector
+  rejection, and deterministic exact stable-identity resolution for diskless,
+  matched, missing, and ambiguous media. `mount.kex` lists the policy and can
+  activate an already validated manual volume at runtime; and
 - `troe-virtio` implements the bounded modern single-request block profile, and
   the AArch64 `virt` machine profile now discovers `virtio-mmio` block devices,
   establishes an eight-entry split queue with explicit DMA ordering and

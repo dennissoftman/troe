@@ -65,6 +65,16 @@ pub enum AvailabilityPolicy {
     Required = 2,
 }
 
+/// Whether a validated volume attaches during boot or awaits explicit activation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ActivationMode {
+    /// Attach the volume during namespace composition.
+    Auto = 1,
+    /// Retain the prepared provider until an authorized runtime request.
+    Manual = 2,
+}
+
 /// One nonzero stable 128-bit identifier in exact on-media byte order.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct StableIdentifier([u8; 16]);
@@ -218,6 +228,7 @@ pub struct MountEntry {
     filesystem: FilesystemProfile,
     access: AccessMode,
     availability: AvailabilityPolicy,
+    activation: ActivationMode,
     selector: VolumeSelector,
 }
 
@@ -244,6 +255,12 @@ impl MountEntry {
     #[must_use]
     pub const fn availability(&self) -> AvailabilityPolicy {
         self.availability
+    }
+
+    /// Boot-time or explicitly requested activation policy.
+    #[must_use]
+    pub const fn activation(&self) -> ActivationMode {
+        self.activation
     }
 
     /// Exact stable selector.
@@ -347,7 +364,7 @@ pub fn parse_manifest(bytes: &[u8]) -> Result<BootMountManifest, ManifestError> 
         || bytes.len() > MAX_MANIFEST_BYTES
         || bytes.get(..8) != Some(&BOOT_MOUNT_V1_MAGIC)
         || read_u16(bytes, 8)? != 1
-        || read_u16(bytes, 10)? != 0
+        || read_u16(bytes, 10)? != 1
         || usize::from(read_u16(bytes, 12)?) != HEADER_BYTES
         || usize::from(read_u16(bytes, 14)?) != RECORD_BYTES
         || usize::try_from(read_u32(bytes, 16)?).map_err(|_| ManifestError::InvalidHeader)?
@@ -424,12 +441,16 @@ fn parse_entry(
     expected_string_offset: usize,
 ) -> Result<MountEntry, ManifestError> {
     if record.len() != RECORD_BYTES
-        || read_u16(record, 10)? != 0
-        || read_u32(record, 12)? != 0
+        || record[11..16].iter().any(|byte| *byte != 0)
         || record[64..].iter().any(|byte| *byte != 0)
     {
         return Err(ManifestError::InvalidEntry);
     }
+    let activation = match record[10] {
+        1 => ActivationMode::Auto,
+        2 => ActivationMode::Manual,
+        _ => return Err(ManifestError::InvalidEntry),
+    };
     let kind = match record[0] {
         1 => SelectorKind::WholeDevice,
         2 => SelectorKind::GptPartition,
@@ -470,7 +491,8 @@ fn parse_entry(
     {
         return Err(ManifestError::InvalidString);
     }
-    if (name == "root" && filesystem != FilesystemProfile::Ext4V1)
+    if (name == "root"
+        && (filesystem != FilesystemProfile::Ext4V1 || activation != ActivationMode::Auto))
         || (name == "boot" && filesystem != FilesystemProfile::Fat32)
     {
         return Err(ManifestError::InvalidEntry);
@@ -489,6 +511,7 @@ fn parse_entry(
         filesystem,
         access,
         availability,
+        activation,
         selector,
     })
 }
@@ -643,10 +666,10 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::{
-        AccessMode, AvailabilityPolicy, BOOT_MOUNT_V1_MAGIC, FilesystemProfile, HEADER_BYTES,
-        IdentityError, MAX_DISCOVERED_VOLUMES, MAX_MOUNT_ENTRIES, ManifestError, MatchState,
-        RECORD_BYTES, ResolutionError, SelectorKind, VolumeSelector, crc32_with_zeroed_checksum,
-        parse_manifest,
+        AccessMode, ActivationMode, AvailabilityPolicy, BOOT_MOUNT_V1_MAGIC, FilesystemProfile,
+        HEADER_BYTES, IdentityError, MAX_DISCOVERED_VOLUMES, MAX_MOUNT_ENTRIES, ManifestError,
+        MatchState, RECORD_BYTES, ResolutionError, SelectorKind, VolumeSelector,
+        crc32_with_zeroed_checksum, parse_manifest,
     };
 
     #[derive(Clone)]
@@ -654,6 +677,7 @@ mod tests {
         name: &'a str,
         access: AccessMode,
         availability: AvailabilityPolicy,
+        activation: ActivationMode,
         selector: VolumeSelector,
     }
 
@@ -683,6 +707,7 @@ mod tests {
             name,
             access: AccessMode::ReadOnly,
             availability,
+            activation: ActivationMode::Auto,
             selector,
         }
     }
@@ -693,7 +718,7 @@ mod tests {
         let mut bytes = vec![0_u8; total];
         bytes[..8].copy_from_slice(&BOOT_MOUNT_V1_MAGIC);
         put_u16(&mut bytes, 8, 1);
-        put_u16(&mut bytes, 10, 0);
+        put_u16(&mut bytes, 10, 1);
         put_u16(&mut bytes, 12, to_u16(HEADER_BYTES));
         put_u16(&mut bytes, 14, to_u16(RECORD_BYTES));
         put_u32(&mut bytes, 16, to_u32(total));
@@ -707,6 +732,7 @@ mod tests {
             bytes[start + 1] = entry.selector.filesystem as u8;
             bytes[start + 2] = entry.access as u8;
             bytes[start + 3] = entry.availability as u8;
+            bytes[start + 10] = entry.activation as u8;
             put_u32(&mut bytes, start + 4, to_u32(string_offset));
             put_u16(&mut bytes, start + 8, to_u16(entry.name.len()));
             if let Some(disk) = entry.selector.disk_guid {
@@ -771,6 +797,7 @@ mod tests {
         assert_eq!(boot.filesystem(), FilesystemProfile::Fat32);
         assert_eq!(boot.access(), AccessMode::ReadOnly);
         assert_eq!(boot.availability(), AvailabilityPolicy::Optional);
+        assert_eq!(boot.activation(), ActivationMode::Auto);
         assert_eq!(boot.selector().kind(), SelectorKind::GptPartition);
         assert_eq!(
             boot.selector()
@@ -805,6 +832,22 @@ mod tests {
             .unwrap_or_else(|_| std::process::abort());
         assert!(resolution.entries().is_empty());
         assert!(resolution.desired_system_available());
+    }
+
+    #[test]
+    fn minor_one_manual_is_canonical_and_old_minor_is_rejected() {
+        let mut entries = valid_entries();
+        entries[1].activation = ActivationMode::Manual;
+        let manifest = parse_manifest(&encode(&entries)).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(manifest.entries()[1].activation(), ActivationMode::Manual);
+
+        let mut legacy = encode(&valid_entries());
+        put_u16(&mut legacy, 10, 0);
+        for index in 0..valid_entries().len() {
+            legacy[HEADER_BYTES + index * RECORD_BYTES + 10] = 0;
+        }
+        refresh_checksum(&mut legacy);
+        assert_eq!(parse_manifest(&legacy), Err(ManifestError::InvalidHeader));
     }
 
     #[test]

@@ -138,7 +138,11 @@ class KefsBuilderTests(unittest.TestCase):
     def test_non_normalized_path_is_rejected(self) -> None:
         path = b"/a/../b"
         record = struct.pack("<BHI", 1, len(path), 0) + path
-        image = mkefs.MAGIC + struct.pack("<HHI", 1, 0, mkefs.HEADER_SIZE + len(record)) + record
+        image = (
+            mkefs.MAGIC
+            + struct.pack("<HHI", 1, 0, mkefs.HEADER_SIZE + len(record))
+            + record
+        )
         with self.assertRaises(ValueError):
             mkefs.decode(image)
 
@@ -147,6 +151,7 @@ class FatBuilderTests(unittest.TestCase):
     """Exercise the exact fixed FAT12 UEFI container contract."""
 
     PAYLOAD = bytes(range(251)) * 5
+    MANIFEST = b"BMNTv1\0\0" + bytes(range(32))
 
     def test_both_architectures_build_deterministically_and_verify(self) -> None:
         for architecture, boot_name in mkfat.BOOT_NAMES.items():
@@ -157,6 +162,13 @@ class FatBuilderTests(unittest.TestCase):
                 self.assertEqual(len(first), mkfat.IMAGE_SIZE)
                 self.assertEqual(mkfat.extract(first, boot_name), self.PAYLOAD)
                 mkfat.verify(first, boot_name, self.PAYLOAD)
+
+    def test_optional_mount_manifest_round_trips_as_a_separate_boot_file(self) -> None:
+        boot_name = mkfat.BOOT_NAMES["x86_64"]
+        image = mkfat.build(self.PAYLOAD, boot_name, self.MANIFEST)
+        self.assertEqual(mkfat.extract(image, boot_name), self.PAYLOAD)
+        self.assertEqual(mkfat.extract_mount_manifest(image, boot_name), self.MANIFEST)
+        mkfat.verify(image, boot_name, self.PAYLOAD, self.MANIFEST)
 
     def test_extra_entry_in_each_directory_is_rejected(self) -> None:
         boot_name = mkfat.BOOT_NAMES["x86_64"]
@@ -170,7 +182,7 @@ class FatBuilderTests(unittest.TestCase):
         for offset in offsets:
             with self.subTest(offset=offset):
                 corrupt = bytearray(image)
-                corrupt[offset:offset + 32] = extra
+                corrupt[offset : offset + 32] = extra
                 with self.assertRaises(ValueError):
                     mkfat.extract(bytes(corrupt), boot_name)
 
@@ -188,10 +200,12 @@ class FatBuilderTests(unittest.TestCase):
             mkfat.extract(bytes(geometry), boot_name)
 
         extra_fat = bytearray(image)
-        fat = bytearray(extra_fat[mkfat.SECTOR:mkfat.SECTOR + mkfat.FAT_SECTORS * mkfat.SECTOR])
+        fat = bytearray(
+            extra_fat[mkfat.SECTOR : mkfat.SECTOR + mkfat.FAT_SECTORS * mkfat.SECTOR]
+        )
         mkfat.set_fat12(fat, 100, mkfat.END_OF_CHAIN)
-        extra_fat[mkfat.SECTOR:mkfat.SECTOR + len(fat)] = fat
-        extra_fat[mkfat.SECTOR + len(fat):mkfat.SECTOR + 2 * len(fat)] = fat
+        extra_fat[mkfat.SECTOR : mkfat.SECTOR + len(fat)] = fat
+        extra_fat[mkfat.SECTOR + len(fat) : mkfat.SECTOR + 2 * len(fat)] = fat
         with self.assertRaises(ValueError):
             mkfat.extract(bytes(extra_fat), boot_name)
 

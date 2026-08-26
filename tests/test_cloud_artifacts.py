@@ -277,7 +277,11 @@ class CloudBundleTests(unittest.TestCase):
             + b"x86_64-q35-uefi\0"
             + mkstorage.build_manifest(),
         )
-        cls.boot = mkfat.build(cls.efi, mkfat.BOOT_NAMES["x86_64"])
+        cls.boot = mkfat.build(
+            cls.efi,
+            mkfat.BOOT_NAMES["x86_64"],
+            mkstorage.build_manifest(),
+        )
         root = bytearray(mkcloud.SYSTEM_ROOT_SECTORS * mkcloud.SECTOR_BYTES)
         root[:32] = b"synthetic-root-start".ljust(32, b"!")
         root[-32:] = b"root-payload-end".ljust(32, b"!")
@@ -378,7 +382,11 @@ class CloudBundleTests(unittest.TestCase):
                 + b"\0"
                 + mkstorage.build_manifest(),
             )
-            boot = mkfat.build(efi, mkfat.BOOT_NAMES[architecture])
+            boot = mkfat.build(
+                efi,
+                mkfat.BOOT_NAMES[architecture],
+                mkstorage.build_manifest(),
+            )
             with (
                 self.subTest(platform=platform["name"]),
                 mock.patch.object(
@@ -627,6 +635,7 @@ class CloudBundleTests(unittest.TestCase):
         acceptance_boot = mkfat.build(
             acceptance_efi,
             mkfat.BOOT_NAMES["x86_64"],
+            mkstorage.build_manifest(),
         )
         with mock.patch.object(
             mkcloud,
@@ -720,7 +729,9 @@ class CloudBundleTests(unittest.TestCase):
             "x86_64", b"aarch64-virt-uefi\0" + mkstorage.build_manifest()
         )
         wrong_platform_boot = mkfat.build(
-            wrong_platform_efi, mkfat.BOOT_NAMES["x86_64"]
+            wrong_platform_efi,
+            mkfat.BOOT_NAMES["x86_64"],
+            mkstorage.build_manifest(),
         )
         with (
             mock.patch.object(

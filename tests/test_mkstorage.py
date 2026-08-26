@@ -7,6 +7,7 @@ import struct
 import tempfile
 import textwrap
 import unittest
+import zlib
 from pathlib import Path
 
 from tools import mkstorage
@@ -30,6 +31,13 @@ class MountManifestTests(unittest.TestCase):
             mkstorage.build_manifest(mkstorage.load_volume_table(table)),
             mkstorage.build_manifest(),
         )
+
+    def test_manual_acceptance_fixture_keeps_the_canonical_root(self) -> None:
+        table = Path(__file__).resolve().parent / "fixtures" / "volumes-manual.toml"
+        entries = mkstorage.load_volume_table(table)
+        mkstorage.require_fixture_root(entries)
+        self.assertEqual([entry.name for entry in entries], ["archive", "root"])
+        self.assertEqual(entries[0].activation, "manual")
 
     def compile_table(self, source: str) -> tuple[mkstorage.MountSpec, ...]:
         with tempfile.TemporaryDirectory(prefix="troe-volumes-") as directory:
@@ -72,18 +80,52 @@ class MountManifestTests(unittest.TestCase):
         self.assertEqual(media.filesystem_identity[:4], bytes.fromhex("d4c3b2a1"))
         self.assertEqual(media.filesystem_identity[4:], bytes(12))
 
-    def test_custom_table_rejects_manual_and_ambiguous_mounts(self) -> None:
-        with self.assertRaisesRegex(ValueError, "manual mounts are not implemented"):
+    def test_custom_table_accepts_manual_and_rejects_ambiguous_mounts(self) -> None:
+        manual = self.compile_table(
+            """
+            version = 1
+            [[volumes]]
+            name = "archive"
+            selector = "whole-device"
+            filesystem = "ext4-v1"
+            filesystem_uuid = "99999999-8888-7777-6666-555555555555"
+            access = "read-only"
+            availability = "optional"
+            activation = "manual"
+            """
+        )
+        self.assertEqual(manual[0].activation, "manual")
+        self.assertEqual(
+            mkstorage.decode_manifest(mkstorage.build_manifest(manual)), manual
+        )
+
+        old_minor = bytearray(mkstorage.build_manifest(manual))
+        struct.pack_into("<H", old_minor, 10, 0)
+        old_minor[
+            mkstorage.BMNT_CHECKSUM_OFFSET : mkstorage.BMNT_CHECKSUM_OFFSET + 4
+        ] = bytes(4)
+        struct.pack_into(
+            "<I",
+            old_minor,
+            mkstorage.BMNT_CHECKSUM_OFFSET,
+            zlib.crc32(old_minor),
+        )
+        with self.assertRaisesRegex(ValueError, "invalid BMNT header"):
+            mkstorage.decode_manifest(bytes(old_minor))
+
+        with self.assertRaisesRegex(
+            ValueError, "root volume must activate automatically"
+        ):
             self.compile_table(
                 """
                 version = 1
                 [[volumes]]
-                name = "archive"
+                name = "root"
                 selector = "whole-device"
                 filesystem = "ext4-v1"
                 filesystem_uuid = "99999999-8888-7777-6666-555555555555"
-                access = "read-only"
-                availability = "optional"
+                access = "read-write"
+                availability = "required"
                 activation = "manual"
                 """
             )

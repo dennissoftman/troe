@@ -45,8 +45,8 @@ profiles. Small is a policy here, not just a current measurement.
   `/tmp`, live `/sys`, and crash-consistent state under `/vol/state`.
 - Ethernet, ARP, DHCP, IPv4, ICMP, UDP, and outbound TCP over virtio-net.
 - KEX applications for `arp`, `cat`, `clear`, `dhcp`, `echo`, `grep`, `hexdump`,
-  `ln`, `ls`, `lua`, `man`, `mem`, `net`, `ping`, `printf`, `pwd`, `rm`, `sleep`,
-  `tcp`, `udp`, and `write`.
+  `ln`, `ls`, `lua`, `man`, `mem`, `mount`, `net`, `ping`, `printf`, `pwd`, `rm`,
+  `sleep`, `tcp`, `udp`, and `write`.
 
 Only `cd`, `poweroff`, and `reboot` are privileged shell intrinsics. Everything
 else is an immutable KEX application discovered from `/bin`.
@@ -78,15 +78,19 @@ Lua 9.0
 
 Additional ext4-v1 or FAT32 partitions can be declared in the strict
 human-editable [`config/volumes.toml`](config/volumes.toml). Names map to
-`/vol/<name>` and exact stable identities are compiled into the bounded boot
-manifest. Attach custom QEMU media with:
+`/vol/<name>` and exact stable identities are compiled into the bounded
+`EFI/BOOT/VOLUMES.BMT` boot file. The kernel reads that file through UEFI before
+handoff, so changing the volume policy does not relink the kernel. Attach custom
+QEMU media with:
 
 ```console
 cargo qemu --volume-table path/to/volumes.toml --data-disk path/to/disk.raw
 ```
 
-Configured matches mount automatically; `cat /sys/storage` reports every
-device, candidate, configured role, and failure state. See the
+Entries with `activation = "auto"` attach during boot. Entries with
+`activation = "manual"` are retained as validated providers until
+`mount VOLUME`; plain `mount` lists policy and state. `cat /sys/storage` reports
+every device, candidate, configured role, and failure state. See the
 [volume-table format](docs/formats/volume-table-v1.md) for the complete schema.
 
 ### Networking

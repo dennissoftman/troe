@@ -117,6 +117,7 @@ class MountSpec:
     disk_guid: bytes
     partition_guid: bytes
     filesystem_identity: bytes
+    activation: str = "auto"
 
 
 def default_mount_specs() -> tuple[MountSpec, ...]:
@@ -171,10 +172,6 @@ def _validated_mount_specs(entries: object) -> tuple[MountSpec, ...]:
             access = _required_string(raw, "access", index)
             availability = _required_string(raw, "availability", index)
             activation = _required_string(raw, "activation", index)
-            if activation != "auto":
-                raise ValueError(
-                    f"volume {name!r} activation must be 'auto'; manual mounts are not implemented"
-                )
             common = {
                 "name",
                 "selector",
@@ -238,6 +235,7 @@ def _validated_mount_specs(entries: object) -> tuple[MountSpec, ...]:
                 disk_guid=disk_guid,
                 partition_guid=partition_guid,
                 filesystem_identity=filesystem_identity,
+                activation=activation,
             )
         else:
             raise ValueError(f"volume {index} must be a TOML table")
@@ -256,12 +254,16 @@ def _validated_mount_specs(entries: object) -> tuple[MountSpec, ...]:
             raise ValueError(f"volume {spec.name!r} has an invalid access policy")
         if spec.availability not in {"optional", "required"}:
             raise ValueError(f"volume {spec.name!r} has an invalid availability policy")
+        if spec.activation not in {"auto", "manual"}:
+            raise ValueError(f"volume {spec.name!r} has an invalid activation policy")
         if spec.selector not in {"gpt", "whole-device"}:
             raise ValueError(f"volume {spec.name!r} has an invalid selector")
         if spec.selector == "whole-device" and spec.filesystem != "ext4-v1":
             raise ValueError("whole-device selectors currently support only ext4-v1")
         if spec.name == "root" and spec.filesystem != "ext4-v1":
             raise ValueError("the reserved root volume must use ext4-v1")
+        if spec.name == "root" and spec.activation != "auto":
+            raise ValueError("the reserved root volume must activate automatically")
         if spec.name == "boot" and spec.filesystem != "fat32":
             raise ValueError("the reserved boot volume must use fat32")
         if any(
@@ -356,7 +358,7 @@ def build_manifest(entries: object | None = None) -> bytes:
     image = bytearray(total_bytes)
     image[:8] = b"BMNTv1\0\0"
     struct.pack_into(
-        "<HHHHI", image, 8, 1, 0, BMNT_HEADER_BYTES, BMNT_RECORD_BYTES, total_bytes
+        "<HHHHI", image, 8, 1, 1, BMNT_HEADER_BYTES, BMNT_RECORD_BYTES, total_bytes
     )
     struct.pack_into("<H", image, 24, len(specs))
     struct.pack_into("<I", image, 28, sum(len(name) for name in names))
@@ -370,6 +372,7 @@ def build_manifest(entries: object | None = None) -> bytes:
         record[1] = {"fat32": 1, "ext4-v1": 2}[spec.filesystem]
         record[2] = {"read-only": 1, "read-write": 2}[spec.access]
         record[3] = {"optional": 1, "required": 2}[spec.availability]
+        record[10] = {"auto": 1, "manual": 2}[spec.activation]
         struct.pack_into("<IH", record, 4, string_offset, len(name))
         record[16:32] = spec.disk_guid
         record[32:48] = spec.partition_guid
@@ -1294,10 +1297,16 @@ def decode_manifest(manifest: bytes) -> tuple[MountSpec, ...]:
     """Independently decode and validate one canonical BMNT v1 image."""
     if not BMNT_HEADER_BYTES <= len(manifest) <= BMNT_MAX_BYTES:
         raise ValueError("BMNT size is outside the format bounds")
+    major, minor, header_bytes, record_bytes, total_bytes = struct.unpack_from(
+        "<HHHHI", manifest, 8
+    )
     if (
         manifest[:8] != b"BMNTv1\0\0"
-        or struct.unpack_from("<HHHHI", manifest, 8)
-        != (1, 0, BMNT_HEADER_BYTES, BMNT_RECORD_BYTES, len(manifest))
+        or major != 1
+        or minor != 1
+        or header_bytes != BMNT_HEADER_BYTES
+        or record_bytes != BMNT_RECORD_BYTES
+        or total_bytes != len(manifest)
         or struct.unpack_from("<H", manifest, 26)[0] != 0
         or any(manifest[32:BMNT_HEADER_BYTES])
     ):
@@ -1320,13 +1329,22 @@ def decode_manifest(manifest: bytes) -> tuple[MountSpec, ...]:
     filesystem_names = {1: "fat32", 2: "ext4-v1"}
     access_names = {1: "read-only", 2: "read-write"}
     availability_names = {1: "optional", 2: "required"}
+    activation_names = {1: "auto", 2: "manual"}
     decoded: list[MountSpec] = []
     expected_name_offset = 0
     for index in range(count):
         start = BMNT_HEADER_BYTES + index * BMNT_RECORD_BYTES
         record = manifest[start : start + BMNT_RECORD_BYTES]
-        if len(record) != BMNT_RECORD_BYTES or any(record[10:16]) or any(record[64:]):
+        if len(record) != BMNT_RECORD_BYTES or any(record[64:]):
             raise ValueError(f"BMNT record {index} uses reserved bytes")
+        if any(record[11:16]):
+            raise ValueError(f"BMNT record {index} uses reserved bytes")
+        try:
+            activation = activation_names[record[10]]
+        except KeyError as error:
+            raise ValueError(
+                f"BMNT record {index} contains an unknown activation"
+            ) from error
         try:
             selector = selector_names[record[0]]
             filesystem = filesystem_names[record[1]]
@@ -1357,6 +1375,7 @@ def decode_manifest(manifest: bytes) -> tuple[MountSpec, ...]:
             disk_guid=bytes(record[16:32]),
             partition_guid=bytes(record[32:48]),
             filesystem_identity=bytes(record[48:64]),
+            activation=activation,
         )
         decoded.append(spec)
     if expected_name_offset != len(strings):
