@@ -93,6 +93,33 @@ Entries with `activation = "auto"` attach during boot. Entries with
 every device, candidate, configured role, and failure state. See the
 [volume-table format](docs/formats/volume-table-v1.md) for the complete schema.
 
+Every `cargo qemu` invocation also creates or preserves the sparse, exact 1 GiB
+`build/troe-shared-fat32.img` and attaches it as the optional writable
+`/vol/shared` volume. Unlike the generated root fixture,
+this interchange disk is not rebuilt, so files survive normal QEMU launches:
+
+```console
+sh:/> write /vol/shared/from-troe.txt hello-from-troe
+sh:/> cat /vol/shared/from-troe.txt
+hello-from-troe
+```
+
+On macOS, stop QEMU cleanly with `poweroff`, attach the same GPT image, and use
+the mounted `TROE SHARE` volume normally:
+
+```console
+hdiutil attach build/troe-shared-fat32.img
+# edit files below /Volumes/TROE\ SHARE
+hdiutil detach /dev/diskN
+```
+
+Use the whole-disk name printed by `hdiutil` in place of `/dev/diskN`. Always
+detach it from macOS before starting QEMU; the image must never have two live
+writable mounts. `cargo qemu --reset-shared-disk` deliberately replaces it with
+an empty filesystem, while `cargo qemu --no-shared-disk` opts out for one run.
+The FAT32 medium is the cross-platform starting point; an ext4 test medium can
+use the same attachment mechanism later, but macOS does not mount ext4 natively.
+
 ### Networking
 
 This is an abridged session from the x86-64 QEMU profile:

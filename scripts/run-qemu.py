@@ -13,6 +13,9 @@ from platform_profile import PLATFORM_IDS, REPO_ROOT
 from qemu_profile import ENVIRONMENT_IDS, prepare_qemu_command
 
 
+SHARED_MEDIA_PATH = REPO_ROOT / "build" / "troe-shared-fat32.img"
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -67,7 +70,20 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="append",
         type=Path,
         default=[],
-        help="attach one additional writable raw disk image (repeatable, maximum four)",
+        help=(
+            "attach one additional writable raw disk image "
+            "(repeatable; maximum three while shared media is enabled)"
+        ),
+    )
+    parser.add_argument(
+        "--no-shared-disk",
+        action="store_true",
+        help="do not create or attach the default persistent 1 GiB FAT32 medium",
+    )
+    parser.add_argument(
+        "--reset-shared-disk",
+        action="store_true",
+        help="replace the persistent shared FAT32 medium with an empty image",
     )
     return parser.parse_args(argv)
 
@@ -75,6 +91,24 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     try:
+        if args.no_shared_disk and args.reset_shared_disk:
+            raise RuntimeError(
+                "--no-shared-disk and --reset-shared-disk are mutually exclusive"
+            )
+        data_disks = list(args.data_disk)
+        if not args.no_shared_disk:
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(REPO_ROOT / "tools" / "mkshared.py"),
+                    "--output",
+                    str(SHARED_MEDIA_PATH),
+                    *(("--reset",) if args.reset_shared_disk else ()),
+                ],
+                cwd=REPO_ROOT,
+                check=True,
+            )
+            data_disks.insert(0, SHARED_MEDIA_PATH)
         command = prepare_qemu_command(
             args.platform,
             args.environment,
@@ -84,7 +118,7 @@ def main() -> int:
             build=not args.skip_build,
             graphical=args.graphical,
             volume_table=args.volume_table,
-            data_disks=tuple(args.data_disk),
+            data_disks=tuple(data_disks),
         )
         if args.dry_run:
             print(shlex.join(command))

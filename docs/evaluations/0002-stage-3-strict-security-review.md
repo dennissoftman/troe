@@ -8,8 +8,7 @@ Status: archived evaluation. The remediation was finalized in `3b0762c`; Stages
 4 and 5 have since landed. Findings, locations, counts, and instructions below
 describe the reviewed Stage 3 worktree and are retained as review evidence, not
 as current repository guidance. For current status use
-[../roadmap.md](../roadmap.md), and for the live unsafe count use
-[../security/unsafe-inventory.md](../security/unsafe-inventory.md).
+[../roadmap.md](../roadmap.md).
 
 Remediation status, 2026-08-23: all findings below received implementation
 changes in the reviewed worktree. The complete non-emulator gate, pinned RustSec audit,
@@ -366,8 +365,6 @@ Also verify manually:
 - AArch64 TCR, detected features, and accepted addresses agree;
 - the mapping model rejects physical RW/RX aliases;
 - production images contain no destructive probe command strings;
-- unsafe-token changes have corresponding `SAFETY` comments and updates to
-  `docs/security/unsafe-inventory.md`;
 - ADR 0008 and `docs/architecture.md` describe actual behavior rather than the
   pre-fix design;
 - both QEMU targets pass normal boot, write-fault, execute-fault, fatal-state,

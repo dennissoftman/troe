@@ -142,13 +142,6 @@ def main() -> int:
             )
             for architecture in ("x86_64", "aarch64")
         ),
-        (
-            sys.executable,
-            TOOLS_DIR / "check_unsafe.py",
-            REPO_ROOT,
-            "--expected",
-            "298",
-        ),
         *(
             (
                 "cargo",

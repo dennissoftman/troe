@@ -26,6 +26,7 @@ from platform_profile import (
     X86_64_UEFI_VIRTIO_PCI,
     resolve_platform,
     root_storage_image_path,
+    shared_test_image_path,
     statefs_image_path,
     txslot_image_path,
 )
@@ -55,6 +56,8 @@ TCP_REQUEST = b"troe-tcp-request"
 TCP_REPLY = b"troe-tcp-reply\n"
 MUTABLE_ROOT_FILE = "/vol/root/troe-mutable.txt"
 MUTABLE_ROOT_CONTENT = "persistent-ext4-content"
+SHARED_FILE = "/vol/shared/host-visible.txt"
+SHARED_CONTENT = "persistent-fat32-content"
 
 
 class AcceptanceError(RuntimeError):
@@ -203,6 +206,22 @@ def reset_txslot(platform_id: str, environment: str) -> None:
             str(REPO_ROOT / "assets" / "state.prgn"),
             "--statefs-output",
             str(statefs_path(platform_id)),
+        ],
+        cwd=REPO_ROOT,
+        check=True,
+    )
+
+
+def reset_shared_media(platform_id: str) -> None:
+    """Create one empty platform-private 1 GiB FAT32 acceptance medium."""
+    path = shared_test_image_path(resolve_platform(platform_id))
+    subprocess.run(
+        [
+            sys.executable,
+            str(REPO_ROOT / "tools" / "mkshared.py"),
+            "--output",
+            str(path),
+            "--reset",
         ],
         cwd=REPO_ROOT,
         check=True,
@@ -887,9 +906,21 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
         "mount",
         cwd,
         command_timeout,
-        contains=("root /vol/root ext4-v1 rw auto mounted\n",),
+        contains=(
+            "root /vol/root ext4-v1 rw auto mounted\n",
+            "shared /vol/shared fat32 rw auto mounted\n",
+        ),
     )
     session.command("mount root", cwd, command_timeout)
+    session.command(
+        f"write {SHARED_FILE} {SHARED_CONTENT}", cwd, command_timeout
+    )
+    session.command(
+        f"cat {SHARED_FILE}",
+        cwd,
+        command_timeout,
+        contains=(SHARED_CONTENT,),
+    )
     session.command(
         "ls /", cwd, command_timeout, contains=("etc/", "man/", "sys/", "tmp/")
     )
@@ -1298,6 +1329,7 @@ def run_reboot_scenario(
     command_timeout: float,
     *,
     verify_mutable_root: bool = False,
+    verify_shared_media: bool = False,
 ) -> None:
     """Require the native reset request to terminate QEMU under -no-reboot."""
     session.wait_for(b"sh:/> ", boot_timeout)
@@ -1310,6 +1342,14 @@ def run_reboot_scenario(
             contains=(MUTABLE_ROOT_CONTENT,),
         )
         session.command(f"rm {MUTABLE_ROOT_FILE}", "/", command_timeout)
+    if verify_shared_media:
+        session.command(
+            f"cat {SHARED_FILE}",
+            "/",
+            command_timeout,
+            contains=(SHARED_CONTENT,),
+        )
+        session.command(f"rm {SHARED_FILE}", "/", command_timeout)
     session.terminal_command(
         "reboot", b"reboot: requesting cold reset", command_timeout
     )
@@ -1326,6 +1366,9 @@ def run_native_keyboard_scenario(args: argparse.Namespace) -> None:
         build=False,
         acceptance_probes=False,
         framebuffer=args.framebuffer_console,
+        data_disks=(
+            shared_test_image_path(resolve_platform(X86_64_Q35_UEFI)),
+        ),
     )
     # Keep this below macOS's short AF_UNIX path limit even when TMPDIR points
     # into a deeply nested per-user directory.
@@ -1449,6 +1492,7 @@ def test_platform(
         build=False,
         acceptance_probes=False,
         framebuffer=args.framebuffer_console,
+        data_disks=(shared_test_image_path(resolve_platform(platform_id)),),
     )
     network_selected = args.smoke or "network" in scenario_groups
     tcp_peer = (
@@ -1505,6 +1549,8 @@ def test_platform(
                 args.boot_timeout,
                 args.command_timeout,
                 verify_mutable_root=not args.smoke and "filesystem" in scenario_groups,
+                verify_shared_media=not args.smoke
+                and "filesystem" in scenario_groups,
             )
         except Exception:
             print(f"--- {platform_id} reboot transcript ---", file=sys.stderr)
@@ -1651,6 +1697,7 @@ def main() -> int:
                     )
         for platform_id in platform_ids:
             reset_txslot(platform_id, args.environment)
+            reset_shared_media(platform_id)
         if len(platform_ids) == 1:
             test_platform(platform_ids[0], args)
         else:

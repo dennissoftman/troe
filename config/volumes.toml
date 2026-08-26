@@ -13,3 +13,17 @@ filesystem_uuid = "00112233-4455-6677-8899-aabbccddeeff"
 access = "read-write"
 availability = "required"
 activation = "auto"
+
+# `cargo qemu` creates this sparse 1 GiB GPT/FAT32 image once, preserves it
+# across launches, and mounts it at /vol/shared. It remains optional so the same
+# boot image can start without QEMU's host-shared development medium.
+[[volumes]]
+name = "shared"
+selector = "gpt"
+filesystem = "fat32"
+disk_guid = "54524f45-5348-4152-4544-464154333200"
+partition_guid = "54524f45-5348-4152-4544-464154333201"
+volume_id = "54524f45"
+access = "read-write"
+availability = "optional"
+activation = "auto"

@@ -77,5 +77,13 @@ entries; run `mount NAME` for an authorized manual entry. The detailed device
 topology remains available through `cat /sys/storage`.
 
 The repository default is [`config/volumes.toml`](../../config/volumes.toml).
-The generated QEMU root image requires that canonical root entry; custom
-entries may be added alongside it.
+It contains the required generated ext4 `root` plus an optional writable FAT32
+`shared` entry. `cargo qemu` creates the latter's sparse 1 GiB GPT image once,
+preserves it at `build/troe-shared-fat32.img`, and attaches it on later runs.
+`--reset-shared-disk` is the explicit destructive reset and `--no-shared-disk`
+disables the automatic attachment. The generated QEMU root image requires the
+canonical root entry; custom entries may be added alongside it.
+
+Because this is one raw block device rather than a synchronized folder, only
+one operating system may mount it writable at a time. Power TROE off before
+attaching it on the host, and detach it from the host before launching QEMU.

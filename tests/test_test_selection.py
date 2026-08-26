@@ -113,6 +113,16 @@ class ChangedTestSelectionTests(unittest.TestCase):
         self.assertEqual(plan.qemu_scenarios, {"boot", "filesystem", "persistence"})
         self.assertTrue(plan.qemu_all_platforms)
 
+    def test_shared_media_tool_selects_builder_mount_and_qemu_coverage(self) -> None:
+        plan = test_changed.build_plan((PurePosixPath("tools/mkshared.py"),), PACKAGES)
+        self.assertFalse(plan.full_reasons)
+        self.assertEqual(
+            plan.python_tests,
+            {"test_mkshared.py", "test_mkstorage.py", "test_qemu_profile.py"},
+        )
+        self.assertEqual(plan.qemu_scenarios, {"boot", "filesystem"})
+        self.assertTrue(plan.qemu_all_platforms)
+
     def test_audit_policy_change_runs_audit_without_unknown_fallback(self) -> None:
         plan = test_changed.build_plan(
             (PurePosixPath("tools/rustsec-exceptions.json"),), PACKAGES

@@ -145,3 +145,8 @@ def txslot_image_path(profile: PlatformProfile) -> Path:
 def statefs_image_path(profile: PlatformProfile) -> Path:
     """Return the platform-qualified mutable filesystem-medium path."""
     return REPO_ROOT / "build" / f"storage-statefs-{profile.identifier}.img"
+
+
+def shared_test_image_path(profile: PlatformProfile) -> Path:
+    """Return the platform-private disposable FAT32 acceptance medium."""
+    return REPO_ROOT / "build" / f"storage-shared-{profile.identifier}.img"

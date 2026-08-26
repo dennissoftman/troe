@@ -1267,7 +1267,8 @@ mod tests {
              regions 0\n\
              volumes 0\n\
              required-roles recovery\n\
-             role root path=/vol/root filesystem=ext4-v1 access=read-write availability=required activation=auto state=missing\n"
+             role root path=/vol/root filesystem=ext4-v1 access=read-write availability=required activation=auto state=missing\n\
+             role shared path=/vol/shared filesystem=fat32 access=read-write availability=optional activation=auto state=missing\n"
         );
 
         let foreign = prepare_mounts(&manifest, vec![MemoryDevice::zeroed(64)], limits())
@@ -1285,9 +1286,13 @@ mod tests {
             "{}",
             foreign.report()
         );
-        assert!(foreign.report().ends_with(
+        assert!(foreign.report().contains(
             "role root path=/vol/root filesystem=ext4-v1 access=read-write \
              availability=required activation=auto state=missing\n"
+        ));
+        assert!(foreign.report().ends_with(
+            "role shared path=/vol/shared filesystem=fat32 access=read-write \
+             availability=optional activation=auto state=missing\n"
         ));
     }
 
@@ -1311,7 +1316,14 @@ mod tests {
                 .unwrap_or_else(|_| std::process::abort());
         assert!(unique_report.contains("required-roles available\n"));
         assert!(unique_report.contains("volume 0 device=7 first=0 blocks=128"));
-        assert!(unique_report.ends_with("state=mounted volume=0\n"));
+        assert!(unique_report.contains(
+            "role root path=/vol/root filesystem=ext4-v1 access=read-write \
+             availability=required activation=auto state=mounted volume=0\n"
+        ));
+        assert!(unique_report.ends_with(
+            "role shared path=/vol/shared filesystem=fat32 access=read-write \
+             availability=optional activation=auto state=missing\n"
+        ));
 
         let ambiguous = vec![candidate(1), candidate(9)];
         let ambiguous_resolution = manifest
@@ -1321,7 +1333,14 @@ mod tests {
             render_storage_report(&manifest, &ambiguous_resolution, &[], &[], &ambiguous, 0)
                 .unwrap_or_else(|_| std::process::abort());
         assert!(ambiguous_report.contains("required-roles recovery\n"));
-        assert!(ambiguous_report.ends_with("state=ambiguous\n"));
+        assert!(ambiguous_report.contains(
+            "role root path=/vol/root filesystem=ext4-v1 access=read-write \
+             availability=required activation=auto state=ambiguous\n"
+        ));
+        assert!(ambiguous_report.ends_with(
+            "role shared path=/vol/shared filesystem=fat32 access=read-write \
+             availability=optional activation=auto state=missing\n"
+        ));
     }
 
     #[test]

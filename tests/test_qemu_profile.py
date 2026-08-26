@@ -31,6 +31,7 @@ from platform_profile import (  # noqa: E402
     platform_manifest,
     resolve_platform,
     root_storage_image_path,
+    shared_test_image_path,
     statefs_image_path,
     txslot_image_path,
 )
@@ -314,7 +315,7 @@ class FirmwareProfileTests(unittest.TestCase):
                 "qemu-system-x86_64",
                 "q35",
                 "max",
-                "64M",
+                "128M",
                 1,
                 "virtio-blk-pci,disable-legacy=on",
                 "virtio-net-pci,disable-legacy=on",
@@ -384,6 +385,10 @@ class FirmwareProfileTests(unittest.TestCase):
                 self.assertEqual(
                     root_storage_image_path(profile),
                     REPO_ROOT / "build" / f"storage-root-{profile.identifier}.img",
+                )
+                self.assertEqual(
+                    shared_test_image_path(profile),
+                    REPO_ROOT / "build" / f"storage-shared-{profile.identifier}.img",
                 )
                 self.assertEqual(
                     txslot_image_path(profile),
@@ -480,7 +485,7 @@ class FirmwareProfileTests(unittest.TestCase):
                 "-smp",
                 "1",
                 "-m",
-                "64M",
+                "128M",
                 *common_tail,
                 "-device",
                 "virtio-blk-pci,disable-legacy=on,drive=troe-root",
@@ -598,6 +603,8 @@ class FirmwareProfileTests(unittest.TestCase):
         )
         self.assertEqual(run_args.platform, X86_64_Q35_UEFI)
         self.assertEqual(run_args.environment, QEMU_ENVIRONMENT)
+        self.assertFalse(run_args.no_shared_disk)
+        self.assertFalse(run_args.reset_shared_disk)
         custom_run_args = RUN_QEMU.parse_args(
             [
                 "--platform",
@@ -610,12 +617,24 @@ class FirmwareProfileTests(unittest.TestCase):
                 "archive.raw",
                 "--data-disk",
                 "media.raw",
+                "--no-shared-disk",
             ]
         )
         self.assertEqual(custom_run_args.volume_table, Path("custom.toml"))
         self.assertEqual(
             custom_run_args.data_disk, [Path("archive.raw"), Path("media.raw")]
         )
+        self.assertTrue(custom_run_args.no_shared_disk)
+        reset_run_args = RUN_QEMU.parse_args(
+            [
+                "--platform",
+                X86_64_Q35_UEFI,
+                "--environment",
+                QEMU_ENVIRONMENT,
+                "--reset-shared-disk",
+            ]
+        )
+        self.assertTrue(reset_run_args.reset_shared_disk)
         test_args = TEST_QEMU.parse_args(
             ["--platform", "all", "--environment", QEMU_ENVIRONMENT]
         )

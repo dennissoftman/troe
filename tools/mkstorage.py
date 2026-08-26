@@ -39,6 +39,11 @@ PARTITION_GUID = bytes.fromhex("21436587a9cbedff1032547698badcfe")
 LINUX_FILESYSTEM_TYPE_GUID = bytes.fromhex("af3dc60f838472478e793d69d8477de4")
 FILESYSTEM_UUID = bytes.fromhex("00112233445566778899aabbccddeeff")
 FILESYSTEM_UUID_TEXT = "00112233-4455-6677-8899-aabbccddeeff"
+SHARED_DISK_GUID_TEXT = "54524f45-5348-4152-4544-464154333200"
+SHARED_PARTITION_GUID_TEXT = "54524f45-5348-4152-4544-464154333201"
+SHARED_DISK_GUID = uuid.UUID(SHARED_DISK_GUID_TEXT).bytes_le
+SHARED_PARTITION_GUID = uuid.UUID(SHARED_PARTITION_GUID_TEXT).bytes_le
+SHARED_FAT32_VOLUME_ID = 0x5452_4F45
 FAKE_TIME = "1704067200"
 
 # The formatter is part of the on-media format contract. Updating this pin
@@ -132,6 +137,17 @@ def default_mount_specs() -> tuple[MountSpec, ...]:
             disk_guid=DISK_GUID,
             partition_guid=PARTITION_GUID,
             filesystem_identity=FILESYSTEM_UUID,
+        ),
+        MountSpec(
+            name="shared",
+            selector="gpt",
+            filesystem="fat32",
+            access="read-write",
+            availability="optional",
+            disk_guid=SHARED_DISK_GUID,
+            partition_guid=SHARED_PARTITION_GUID,
+            filesystem_identity=SHARED_FAT32_VOLUME_ID.to_bytes(4, "little")
+            + bytes(12),
         ),
     )
 
@@ -337,7 +353,8 @@ def load_volume_table(path: Path) -> tuple[MountSpec, ...]:
 def require_fixture_root(entries: tuple[MountSpec, ...]) -> None:
     """Require a table used with `--output` to select the generated root disk."""
     root = [entry for entry in entries if entry.name == "root"]
-    if root != list(default_mount_specs()):
+    expected = [entry for entry in default_mount_specs() if entry.name == "root"]
+    if root != expected:
         raise ValueError(
             "a generated QEMU root fixture requires the canonical root entry; "
             "custom entries may be added alongside it"

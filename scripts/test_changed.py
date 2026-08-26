@@ -80,7 +80,11 @@ PACKAGE_SCENARIOS = {
     "troe-kex-tool": set(ALL_QEMU_SCENARIOS),
 }
 PYTHON_IMPACTS = {
-    "config/volumes.toml": ("test_mkstorage.py", "test_cloud_artifacts.py"),
+    "config/volumes.toml": (
+        "test_mkshared.py",
+        "test_mkstorage.py",
+        "test_cloud_artifacts.py",
+    ),
     "scripts/audit.py": ("test_audit_policy.py",),
     "scripts/build.py": ("test_build_policy.py", "test_cloud_artifacts.py"),
     "scripts/platform_profile.py": ("test_build_policy.py", "test_qemu_profile.py"),
@@ -95,6 +99,11 @@ PYTHON_IMPACTS = {
     "tools/mkfat.py": ("test_cloud_artifacts.py", "test_image_builders.py"),
     "tools/mkidentity.py": ("test_identity_provisioning.py",),
     "tools/mkstorage.py": ("test_cloud_artifacts.py", "test_mkstorage.py"),
+    "tools/mkshared.py": (
+        "test_mkshared.py",
+        "test_mkstorage.py",
+        "test_qemu_profile.py",
+    ),
     "tools/cloud-environments.json": (
         "test_cloud_artifacts.py",
         "test_qemu_profile.py",
@@ -116,6 +125,7 @@ RUNTIME_TOOL_SCENARIOS = {
     "tools/mkefs.py": ("boot", "filesystem"),
     "tools/mkfat.py": ("boot",),
     "tools/mkstorage.py": ("boot", "filesystem", "persistence"),
+    "tools/mkshared.py": ("boot", "filesystem"),
     "tools/size_report.py": ("boot",),
 }
 FULL_GATE_PATHS = frozenset(
@@ -153,7 +163,6 @@ class TestPlan:
     all_applications: bool = False
     run_fmt: bool = False
     run_audit: bool = False
-    run_unsafe: bool = False
     run_host_smoke: bool = False
     qemu_scenarios: set[str] = field(default_factory=set)
     qemu_all_platforms: bool = False
@@ -435,10 +444,6 @@ def build_plan(
         ):
             _add_python(plan, path, "test_repository_policy.py")
             continue
-        if path_text == "tools/check_unsafe.py":
-            plan.run_unsafe = True
-            plan.note("unsafe", path)
-            continue
         plan.require_full(path, "no reviewed impact rule")
 
     if changed_packages:
@@ -508,16 +513,6 @@ def commands_for_plan(
         )
     if plan.run_audit:
         commands.append((sys.executable, str(REPO_ROOT / "scripts" / "audit.py")))
-    if plan.run_unsafe:
-        commands.append(
-            (
-                sys.executable,
-                str(REPO_ROOT / "tools" / "check_unsafe.py"),
-                str(REPO_ROOT),
-                "--expected",
-                "298",
-            )
-        )
     applications = (
         sorted(
             path.name

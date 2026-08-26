@@ -16,6 +16,20 @@ from tools import mkstorage
 class MountManifestTests(unittest.TestCase):
     """Keep the shipped persistent root role explicitly writable."""
 
+    def test_default_policy_includes_optional_writable_shared_fat32(self) -> None:
+        root, shared = mkstorage.default_mount_specs()
+        self.assertEqual((root.name, shared.name), ("root", "shared"))
+        self.assertEqual(shared.filesystem, "fat32")
+        self.assertEqual(shared.access, "read-write")
+        self.assertEqual(shared.availability, "optional")
+        self.assertEqual(shared.activation, "auto")
+        self.assertEqual(shared.disk_guid, mkstorage.SHARED_DISK_GUID)
+        self.assertEqual(shared.partition_guid, mkstorage.SHARED_PARTITION_GUID)
+        self.assertEqual(
+            shared.filesystem_identity,
+            mkstorage.SHARED_FAT32_VOLUME_ID.to_bytes(4, "little") + bytes(12),
+        )
+
     def test_root_role_is_required_read_write_ext4(self) -> None:
         manifest = mkstorage.build_manifest()
         mkstorage.verify_manifest(manifest)

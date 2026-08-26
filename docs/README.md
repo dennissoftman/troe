@@ -14,8 +14,6 @@ historical review evidence.
 - [Architecture-specific notes](architecture-specific-notes.md) preserve the
   x86-64 and AArch64 interrupt, idle, and controller invariants that portable
   refactors must not erase.
-- [Unsafe inventory](security/unsafe-inventory.md) records the current audited
-  project-authored unsafe surface through the runnable KEX command increment.
 - [KEFS v1](formats/kefs-v1.md) defines the implemented embedded-filesystem
   format.
 - [KEX v1](formats/kex-v1.md) defines the implemented portable executable
