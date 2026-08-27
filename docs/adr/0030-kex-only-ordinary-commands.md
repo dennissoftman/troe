@@ -4,6 +4,11 @@ Status: accepted and implemented for the completed Stage 9 command migration,
 2026-08-25. This supersedes only the absent-artifact recovery-fallback clauses
 of ADR 0024 and related command-service ADRs.
 
+Supersession note, 2026-08-27: ADRs 0037 and 0038 add `fg`, `jobs`, `kill`,
+`log`, `svc`, and `wait` as non-shadowable session/supervisor intrinsics. The
+KEX-only rule for ordinary commands and the original `cd`, `poweroff`, and
+`reboot` authority rationale remain unchanged.
+
 ## Decision
 
 The shell implements exactly three non-shadowable intrinsics: `cd`, `poweroff`,

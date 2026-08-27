@@ -3,21 +3,24 @@
 ## Current boundary
 
 The hosted model has the security properties of its host process and models
-only parsing, pipelines, completion, and the three session intrinsics. The
-native image exits UEFI boot services. Every ordinary command is a validated
-KEX application with a fresh ring-3/EL0 root, explicit typed handles, bounded
-memory, contained fault fate, and zeroized teardown; no privileged utility
-fallback exists. The shell retains only `cd`, `poweroff`, and `reboot`. There is
-no secure-boot integration or multi-user boundary in this milestone; package
-signing, DNS, TLS, inbound TCP listening, jobs, and general sockets remain
-future decisions.
+only parsing, sequential pipelines, redirection, completion, session state, and
+the grammar and authority checks for the nine shell intrinsics. It does not
+execute KEX applications or model native isolation. The native image exits UEFI
+boot services. Every ordinary command is a validated KEX application with a
+fresh ring-3/EL0 root, explicit typed handles, bounded memory, contained fault
+fate, and zeroized teardown; no privileged utility fallback exists. The shell
+retains only `cd`, `fg`, `jobs`, `kill`, `log`, `poweroff`, `reboot`, `svc`, and
+`wait`. There is no secure-boot integration or multi-user boundary in this
+milestone; package signing, DNS, TLS, inbound TCP listening, and general sockets
+remain future decisions.
 
 The portable crates and kernel forbid unsafe Rust. Project-authored unsafe
 operations are confined to `troe-machine` and are verified through native
 boundary contract tests, both target builds, and exhaustive QEMU acceptance
 rather than a raw token-count gate. Transitive unsafe code is limited to the
-pinned UEFI and TLSF boundaries. Console input and both filesystem image
-formats are treated as untrusted and bounded.
+pinned UEFI and TLSF boundaries. Console input, KEX packages, configuration and
+generation objects, network packets, and every supported filesystem or disk
+format are treated as untrusted and bounded.
 
 ## Invariants enforced now
 
@@ -47,10 +50,15 @@ formats are treated as untrusted and bounded.
   permissions, fixed standard ceilings, kernel-owned staging, canonical startup
   pages, explicit initial handles, and transactional zeroized reclamation;
 - application execution: reset ring-3/EL0 state, bounded saved contexts,
-  scheduler-selected resume, copied owner-checked request/reply calls, a 50 ms
-  maximum uninterrupted user lease, a 1,024-gate/10-second command ceiling,
-  and four-second hard bounds on the currently synchronous timer and datagram
-  waits;
+  scheduler-selected resume, copied owner-checked request/reply calls, and a
+  50 ms maximum uninterrupted user lease; ordinary resident commands have no
+  default total-runtime or cumulative-service-call ceiling, while every handle,
+  message, pending call, wait, mapping, heap, and stream retains its local hard
+  bound;
+- residency and supervision: at most eight retained application records, at
+  most one executing unprivileged root on the single CPU, 64 KiB recent output
+  per background job or service, owner-scoped cancellation and reaping, and
+  SCFG-bounded dependency, restart, health, lifetime, and stop policy;
 - outbound TCP: one connection per declared handle, four system-wide, one
   1,460-byte unacknowledged segment and 4 KiB receive FIFO per connection,
   exact-tuple/sequence admission, four retransmissions, four-second cancellable

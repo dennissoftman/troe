@@ -132,21 +132,24 @@ The current native command execution model remains deliberately narrow:
 There is:
 
 - one active CPU;
-- one privileged kernel root and at most one synchronously active isolated task
-  root;
+- one privileged kernel root and at most one executing isolated task root;
 - one owned kernel scheduler/handoff stack, three privileged guarded task-stack
-  slots, and one ephemeral unmapped-guard user stack per isolated launch;
+  slots, and an owned unmapped-guard user stack for each admitted isolated
+  process;
 - one global physical-memory owner;
-- one command executing at a time;
+- at most eight retained resident application records, with one selected for an
+  execution slice at a time;
 - a ring-3/EL0 memory and fault boundary for the bounded isolated continuation;
 - no application ABI for shell session or machine-control mutation;
-- cooperative continuations without preemption or protection from a task that
-  never returns through the internal gate.
+- scheduler-owned resumable preemption with a 50 ms maximum uninterrupted
+  application lease.
 
 Ordinary commands are target-native immutable KEX files, not privileged shell
-functions. The shell registry retains only names/synopses and the three
-intrinsics; the kernel resolver validates, maps, services, and tears down each
-application through ABI 1.1.
+functions. The shell registry retains only names/synopses and the nine
+session-, supervisor-, or machine-owned intrinsics. The kernel resolver
+validates and maps each application through ABI 1.1; resident ownership survives
+individual execution slices and is revoked, zeroized, and reclaimed only at its
+terminal fate.
 
 ## 7. Boot strategy
 
@@ -876,8 +879,8 @@ A release candidate MUST pass:
 
 Ordinary commands execute only as isolated KEX applications. Supervisor page
 permissions, copied messages, contained user faults, owner-revoked handles, and
-zeroized teardown protect the kernel from that execution context. The three
-intrinsics remain small kernel/session transitions and expose no general
+zeroized teardown protect the kernel from that execution context. The nine
+intrinsics remain small kernel/session/supervisor transitions and expose no general
 application-callable machine authority.
 
 Accordingly:
@@ -886,14 +889,16 @@ Accordingly:
   and inner KEX validation;
 - embedded FS input is treated as potentially malformed;
 - console input is untrusted and bounded;
-- external block filesystems remain optional until separately specified and fuzzed;
-- no network attack surface exists initially;
+- KEFS, FAT32, constrained ext4, StateFS, GPT, volume policy, configuration,
+  generation, and activation inputs are parsed through exact bounded profiles;
+- Ethernet, ARP, DHCP, IPv4, ICMP, UDP, and outbound TCP input is untrusted and
+  admitted only through the implemented bounded network profiles;
 - no command may access raw memory or devices unless explicitly given that capability;
 - release documentation MUST state whether hardware isolation exists.
 
-Application isolation does not provide preemption or make the system multi-user
-secure. Every application artifact and application-controlled address remains
-untrusted.
+Application isolation includes resumable timer preemption, but does not make the
+system multi-user secure. Every application artifact and application-controlled
+address remains untrusted.
 
 ## 23. Implemented milestones
 
