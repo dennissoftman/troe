@@ -597,7 +597,13 @@ fn encoded_rust_flags() -> ToolResult<String> {
     let linker = linker
         .to_str()
         .ok_or_else(|| ToolError::new("linker-script path must be valid UTF-8"))?;
-    Ok(RUST_FLAGS
+    let root = repo_root()
+        .canonicalize()
+        .map_err(|error| io_error("resolve", &repo_root(), &error))?;
+    let root = root
+        .to_str()
+        .ok_or_else(|| ToolError::new("repository path must be valid UTF-8"))?;
+    let mut flags = RUST_FLAGS
         .iter()
         .map(|flag| {
             if *flag == "LINKER_SCRIPT" {
@@ -606,8 +612,9 @@ fn encoded_rust_flags() -> ToolResult<String> {
                 (*flag).to_owned()
             }
         })
-        .collect::<Vec<_>>()
-        .join("\x1f"))
+        .collect::<Vec<_>>();
+    flags.push(format!("--remap-path-prefix={root}=/troe"));
+    Ok(flags.join("\x1f"))
 }
 
 fn run_cargo(manifest: &AppManifest, target: Target) -> ToolResult<PathBuf> {

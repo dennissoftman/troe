@@ -157,6 +157,10 @@ class KexToolTests(unittest.TestCase):
         checked = cargo_kex("build", "apps/echo", "--target", "x86_64", "--check")
         self.assertEqual(checked.returncode, 0, checked.stderr.decode())
         self.assertIn(b"KEX package verified", checked.stdout)
+        self.assertNotIn(
+            os.fsencode(REPO_ROOT),
+            (REPO_ROOT / "rootfs/bin/x86_64/echo.kex").read_bytes(),
+        )
 
     def test_inspection_rejects_corruption_and_command_names_are_narrow(self) -> None:
         artifact = REPO_ROOT / "rootfs" / "bin" / "x86_64" / "echo.kex"
