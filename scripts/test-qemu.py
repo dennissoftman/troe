@@ -1270,6 +1270,19 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
         contains=("lua-os\ttable\tfunction\ttrue\t5.000000000000000\n",),
     )
     session.command(
+        "lua -e 'local function target() local x=0; "
+        "for i=1,100 do x=x+i end end; local n=100000; "
+        "local start=os.clock(); for i=1,n do end; "
+        "local overhead=os.clock()-start; start=os.clock(); "
+        "for i=1,n do target() end; "
+        "local total=os.clock()-start-overhead; "
+        "print(\"lua-clock-benchmark\",type(total),total>=0)'",
+        cwd,
+        command_timeout,
+        contains=("lua-clock-benchmark\tnumber\ttrue\n",),
+        absent=("execution lease expired",),
+    )
+    session.command(
         'lua -e \'local ok,e=pcall(os.time); '
         'print("lua-os-unavailable",ok,type(e),'
         'e:match("os%.time is unavailable in TROE")~=nil)\'',

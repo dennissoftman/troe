@@ -40,8 +40,6 @@ const APPLICATION_HANDLE_CALL: u64 = 2;
 #[cfg(target_os = "uefi")]
 const APPLICATION_HEAP_GROW_CALL: u64 = 3;
 #[cfg(target_os = "uefi")]
-const APPLICATION_LEASE_MILLISECONDS: u32 = 50;
-#[cfg(target_os = "uefi")]
 const APPLICATION_STARTUP_BYTES: usize = 4096;
 #[cfg(target_os = "uefi")]
 const OUTCOME_FAULT_BIT: u64 = 1 << 63;
@@ -51,6 +49,8 @@ const OUTCOME_APPLICATION_YIELD: u64 = 1 << 62;
 const OUTCOME_APPLICATION_HANDLE_CALL: u64 = 1 << 61;
 #[cfg(target_os = "uefi")]
 const OUTCOME_APPLICATION_HEAP_GROW: u64 = 1 << 60;
+#[cfg(target_os = "uefi")]
+const OUTCOME_APPLICATION_PREEMPTED: u64 = 1 << 59;
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 const AARCH64_SPSR_MODE_MASK: u64 = 0b1111;
 
@@ -83,7 +83,7 @@ pub enum IsolatedOutcome {
     Faulted(IsolatedFault),
 }
 
-/// Terminal result from the first bounded application ABI execution lease.
+/// Result from one bounded application ABI execution timeslice.
 #[derive(Debug, Eq, PartialEq)]
 pub enum ApplicationOutcome {
     /// The application invoked ABI call 0 with a fixed-width status.
@@ -110,7 +110,11 @@ pub enum ApplicationOutcome {
         /// Validated minimum number of additional pages requested.
         request: ApplicationHeapGrowth,
     },
-    /// A native fault, invalid ABI call, or lease expiry was contained.
+    /// The execution timer ended this timeslice and retained a complete
+    /// resumable user context.
+    #[cfg(target_os = "uefi")]
+    Preempted(ApplicationSession),
+    /// A native fault or invalid ABI call was contained.
     Faulted(IsolatedFault),
 }
 
@@ -269,6 +273,8 @@ pub struct ApplicationSession {
 /// Kernel-selected completion supplied before resuming a suspended ABI call.
 #[cfg(target_os = "uefi")]
 pub enum ApplicationResume<'reply> {
+    /// Resume a timer-preempted context without publishing ABI results.
+    Timeslice,
     /// Complete one cooperative yield with zero-valued ABI results.
     Yield,
     /// Copy one successful dispatch reply and publish its typed result.
@@ -441,6 +447,7 @@ impl ApplicationSession {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[cfg(target_os = "uefi")]
 enum ApplicationPending {
+    Timeslice,
     Yield,
     HandleCall(ApplicationCall),
     HeapGrow(ApplicationHeapGrowth),
@@ -1046,7 +1053,7 @@ pub fn run_isolated(
     decode_isolated_outcome(raw)
 }
 
-/// Enter an ABI 1.x application with an armed 50 ms one-shot execution lease.
+/// Enter an ABI 1.x application with an armed 50 ms one-shot timeslice.
 ///
 /// The startup page and entry point must be readable user mappings, the entry
 /// must be executable, and the guarded stack must end at a 16-byte boundary.
@@ -1065,6 +1072,7 @@ pub fn run_application(
     stack_top: u64,
     startup_address: u64,
     startup_bytes: usize,
+    timeslice_milliseconds: u32,
 ) -> Result<ApplicationOutcome, MmuError> {
     let UserAddressSpace {
         root,
@@ -1077,6 +1085,7 @@ pub fn run_application(
         .checked_sub(8)
         .ok_or(MmuError::InvalidUserContext)?;
     if startup_bytes != APPLICATION_STARTUP_BYTES
+        || timeslice_milliseconds == 0
         || KERNEL_ROOT.load(Ordering::Acquire) == 0
         || !user_range_contains(&regions, region_count, entry, 1, false, true)
         || !user_range_contains(
@@ -1111,7 +1120,7 @@ pub fn run_application(
             pending_application: None,
         });
     }
-    if crate::mechanism::prepare_application_execution(APPLICATION_LEASE_MILLISECONDS).is_err() {
+    if crate::mechanism::prepare_application_execution(timeslice_milliseconds).is_err() {
         // SAFETY: No user entry occurred and this call still owns the state.
         unsafe { *ISOLATED_RUN.0.get() = None };
         ISOLATED_ACTIVE.store(false, Ordering::Release);
@@ -1140,7 +1149,7 @@ pub fn run_application(
     )
 }
 
-/// Resume one scheduler-selected application with a fresh 50 ms lease.
+/// Resume one scheduler-selected application with a fresh 50 ms timeslice.
 ///
 /// # Errors
 ///
@@ -1151,13 +1160,18 @@ pub fn run_application(
 pub fn resume_application(
     application: ApplicationSession,
     completion: ApplicationResume<'_>,
+    timeslice_milliseconds: u32,
 ) -> Result<ApplicationOutcome, MmuError> {
+    if timeslice_milliseconds == 0 {
+        return Err(MmuError::InvalidUserContext);
+    }
     let ApplicationSession {
         address_space,
         mut context,
         pending,
     } = application;
     match (pending, completion) {
+        (ApplicationPending::Timeslice, ApplicationResume::Timeslice) => {}
         (ApplicationPending::Yield, ApplicationResume::Yield) => {
             application_context_set_results(&mut context, 0, 0);
         }
@@ -1214,7 +1228,7 @@ pub fn resume_application(
             pending_application: None,
         });
     }
-    if crate::mechanism::prepare_application_execution(APPLICATION_LEASE_MILLISECONDS).is_err() {
+    if crate::mechanism::prepare_application_execution(timeslice_milliseconds).is_err() {
         // SAFETY: No user re-entry occurred and this call still owns the state.
         unsafe { *ISOLATED_RUN.0.get() = None };
         ISOLATED_ACTIVE.store(false, Ordering::Release);
@@ -1269,7 +1283,10 @@ fn decode_application_outcome(
     }
     if matches!(
         raw,
-        OUTCOME_APPLICATION_YIELD | OUTCOME_APPLICATION_HANDLE_CALL | OUTCOME_APPLICATION_HEAP_GROW
+        OUTCOME_APPLICATION_YIELD
+            | OUTCOME_APPLICATION_HANDLE_CALL
+            | OUTCOME_APPLICATION_HEAP_GROW
+            | OUTCOME_APPLICATION_PREEMPTED
     ) {
         let context = state
             .application_context
@@ -1285,6 +1302,9 @@ fn decode_application_outcome(
             pending,
         };
         return match (raw, pending) {
+            (OUTCOME_APPLICATION_PREEMPTED, ApplicationPending::Timeslice) => {
+                Ok(ApplicationOutcome::Preempted(application))
+            }
             (OUTCOME_APPLICATION_YIELD, ApplicationPending::Yield) => {
                 Ok(ApplicationOutcome::Yielded(application))
             }
@@ -1571,6 +1591,15 @@ fn application_syscall(
         }
         _ => encoded_fault(IsolatedFault::InvalidCall),
     }
+}
+
+#[cfg(target_os = "uefi")]
+fn preempt_application(context: ArchitectureApplicationContext) -> u64 {
+    suspend_application(
+        context,
+        ApplicationPending::Timeslice,
+        OUTCOME_APPLICATION_PREEMPTED,
+    )
 }
 
 #[cfg(target_os = "uefi")]
@@ -2623,12 +2652,28 @@ extern "C" fn x86_execution_timer_entry() -> ! {
     core::arch::naked_asm!(
         "test byte ptr [rsp + 8], 3",
         "jz 2f",
+        "push r15",
+        "push r14",
+        "push r13",
+        "push r12",
+        "push r11",
+        "push r10",
+        "push r9",
+        "push r8",
+        "push rdi",
+        "push rsi",
+        "push rbp",
+        "push rdx",
+        "push rcx",
+        "push rbx",
+        "push rax",
+        "sub rsp, 512",
+        "fxsave64 [rsp]",
         "cld",
         "pushfq",
         "btr qword ptr [rsp], 18",
         "popfq",
-        "mov rcx, [rsp + 8]",
-        "and rsp, -16",
+        "mov rcx, rsp",
         "sub rsp, 32",
         "call {handler}",
         "jmp {complete}",
@@ -2689,14 +2734,17 @@ extern "C" fn x86_runtime_timer_handler() {
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
-extern "C" fn x86_execution_timer_handler(code_selector: u64) -> u64 {
+extern "C" fn x86_execution_timer_handler(frame: *const ArchitectureApplicationContext) -> u64 {
     crate::mechanism::disarm_execution_timer();
     crate::mechanism::acknowledge_execution_timer_interrupt();
-    if code_selector & 3 == 3
+    // SAFETY: The timer gate saved a complete aligned user context on the
+    // owned exception stack before calling this synchronous handler.
+    let frame = unsafe { &*frame };
+    if frame.code_selector & 3 == 3
         && ISOLATED_ACTIVE.load(Ordering::Acquire)
         && active_run_kind() == Some(RunKind::Application)
     {
-        encoded_fault(IsolatedFault::ExecutionLeaseExpired)
+        preempt_application(frame.clone())
     } else {
         x86_exception_fatal()
     }
@@ -3530,23 +3578,7 @@ core::arch::global_asm!(
     ".balign 128",
     "troe_aarch64_irq_entry:",
     "msr daifset, #2",
-    "sub sp, sp, #784",
-    "stp q0, q1, [sp, #272]",
-    "stp q2, q3, [sp, #304]",
-    "stp q4, q5, [sp, #336]",
-    "stp q6, q7, [sp, #368]",
-    "stp q8, q9, [sp, #400]",
-    "stp q10, q11, [sp, #432]",
-    "stp q12, q13, [sp, #464]",
-    "stp q14, q15, [sp, #496]",
-    "stp q16, q17, [sp, #528]",
-    "stp q18, q19, [sp, #560]",
-    "stp q20, q21, [sp, #592]",
-    "stp q22, q23, [sp, #624]",
-    "stp q24, q25, [sp, #656]",
-    "stp q26, q27, [sp, #688]",
-    "stp q28, q29, [sp, #720]",
-    "stp q30, q31, [sp, #752]",
+    "sub sp, sp, #816",
     "stp x0, x1, [sp, #0]",
     "stp x2, x3, [sp, #16]",
     "stp x4, x5, [sp, #32]",
@@ -3563,33 +3595,66 @@ core::arch::global_asm!(
     "stp x26, x27, [sp, #208]",
     "stp x28, x29, [sp, #224]",
     "str x30, [sp, #240]",
+    "str xzr, [sp, #248]",
+    "stp q0, q1, [sp, #256]",
+    "stp q2, q3, [sp, #288]",
+    "stp q4, q5, [sp, #320]",
+    "stp q6, q7, [sp, #352]",
+    "stp q8, q9, [sp, #384]",
+    "stp q10, q11, [sp, #416]",
+    "stp q12, q13, [sp, #448]",
+    "stp q14, q15, [sp, #480]",
+    "stp q16, q17, [sp, #512]",
+    "stp q18, q19, [sp, #544]",
+    "stp q20, q21, [sp, #576]",
+    "stp q22, q23, [sp, #608]",
+    "stp q24, q25, [sp, #640]",
+    "stp q26, q27, [sp, #672]",
+    "stp q28, q29, [sp, #704]",
+    "stp q30, q31, [sp, #736]",
     "mrs x9, fpcr",
     "mrs x10, fpsr",
-    "str x9, [sp, #248]",
-    "str x10, [sp, #256]",
-    "mrs x0, spsr_el1",
+    "str x9, [sp, #768]",
+    "str x10, [sp, #776]",
+    "mrs x9, elr_el1",
+    "mrs x10, spsr_el1",
+    "str x9, [sp, #784]",
+    "str x10, [sp, #792]",
+    "mrs x9, sp_el0",
+    "str x9, [sp, #800]",
+    "mrs x9, tpidr_el0",
+    "str x9, [sp, #808]",
+    "mov x0, sp",
     "bl troe_aarch64_input_interrupt",
     "cbnz x0, troe_aarch64_isolated_complete_entry",
-    "ldr x9, [sp, #248]",
-    "ldr x10, [sp, #256]",
+    "ldr x9, [sp, #768]",
+    "ldr x10, [sp, #776]",
     "msr fpcr, x9",
     "msr fpsr, x10",
-    "ldp q0, q1, [sp, #272]",
-    "ldp q2, q3, [sp, #304]",
-    "ldp q4, q5, [sp, #336]",
-    "ldp q6, q7, [sp, #368]",
-    "ldp q8, q9, [sp, #400]",
-    "ldp q10, q11, [sp, #432]",
-    "ldp q12, q13, [sp, #464]",
-    "ldp q14, q15, [sp, #496]",
-    "ldp q16, q17, [sp, #528]",
-    "ldp q18, q19, [sp, #560]",
-    "ldp q20, q21, [sp, #592]",
-    "ldp q22, q23, [sp, #624]",
-    "ldp q24, q25, [sp, #656]",
-    "ldp q26, q27, [sp, #688]",
-    "ldp q28, q29, [sp, #720]",
-    "ldp q30, q31, [sp, #752]",
+    "ldr x9, [sp, #784]",
+    "ldr x10, [sp, #792]",
+    "msr elr_el1, x9",
+    "msr spsr_el1, x10",
+    "ldr x9, [sp, #800]",
+    "msr sp_el0, x9",
+    "ldr x9, [sp, #808]",
+    "msr tpidr_el0, x9",
+    "ldp q0, q1, [sp, #256]",
+    "ldp q2, q3, [sp, #288]",
+    "ldp q4, q5, [sp, #320]",
+    "ldp q6, q7, [sp, #352]",
+    "ldp q8, q9, [sp, #384]",
+    "ldp q10, q11, [sp, #416]",
+    "ldp q12, q13, [sp, #448]",
+    "ldp q14, q15, [sp, #480]",
+    "ldp q16, q17, [sp, #512]",
+    "ldp q18, q19, [sp, #544]",
+    "ldp q20, q21, [sp, #576]",
+    "ldp q22, q23, [sp, #608]",
+    "ldp q24, q25, [sp, #640]",
+    "ldp q26, q27, [sp, #672]",
+    "ldp q28, q29, [sp, #704]",
+    "ldp q30, q31, [sp, #736]",
     "ldp x0, x1, [sp, #0]",
     "ldp x2, x3, [sp, #16]",
     "ldp x4, x5, [sp, #32]",
@@ -3606,7 +3671,7 @@ core::arch::global_asm!(
     "ldp x26, x27, [sp, #208]",
     "ldp x28, x29, [sp, #224]",
     "ldr x30, [sp, #240]",
-    "add sp, sp, #784",
+    "add sp, sp, #816",
     "eret",
     isolated_complete = sym aarch64_isolated_complete,
 );
@@ -3655,7 +3720,10 @@ fn architecture_trigger_native_exception() -> ! {
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 #[unsafe(no_mangle)]
-extern "C" fn troe_aarch64_input_interrupt(saved_program_status: u64) -> u64 {
+extern "C" fn troe_aarch64_input_interrupt(frame: *const ArchitectureApplicationContext) -> u64 {
+    // SAFETY: The IRQ gate saved a complete aligned context on the owned
+    // exception stack before calling this synchronous handler.
+    let frame = unsafe { &*frame };
     if crate::mechanism::handle_application_interrupt() {
         let active_application = ISOLATED_ACTIVE.load(Ordering::Acquire)
             && active_run_kind() == Some(RunKind::Application);
@@ -3663,8 +3731,8 @@ extern "C" fn troe_aarch64_input_interrupt(saved_program_status: u64) -> u64 {
             // A disarmed level timer can still have one acknowledged edge in
             // flight. With no published run there is no context to complete.
             0
-        } else if saved_program_status & AARCH64_SPSR_MODE_MASK == 0 {
-            encoded_fault(IsolatedFault::ExecutionLeaseExpired)
+        } else if frame.status & AARCH64_SPSR_MODE_MASK == 0 {
+            preempt_application(frame.clone())
         } else {
             troe_aarch64_exception_fatal(0, 0)
         }

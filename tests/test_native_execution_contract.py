@@ -120,13 +120,13 @@ class NativeExecutionContractTests(unittest.TestCase):
             self,
             aarch64,
             '"msr daifset, #2"',
-            '"stp q0, q1, [sp, #272]"',
-            '"stp q30, q31, [sp, #752]"',
             '"stp x0, x1, [sp, #0]"',
             '"str x30, [sp, #240]"',
+            '"stp q0, q1, [sp, #256]"',
+            '"stp q30, q31, [sp, #736]"',
             '"bl troe_aarch64_input_interrupt"',
-            '"ldp q0, q1, [sp, #272]"',
-            '"ldp q30, q31, [sp, #752]"',
+            '"ldp q0, q1, [sp, #256]"',
+            '"ldp q30, q31, [sp, #736]"',
             '"ldp x0, x1, [sp, #0]"',
             '"ldr x30, [sp, #240]"',
             '"eret"',
@@ -143,6 +143,8 @@ class NativeExecutionContractTests(unittest.TestCase):
             entry,
             '"test byte ptr [rsp + 8], 3"',
             '"jz 2f"',
+            '"push r15"',
+            '"fxsave64 [rsp]"',
             '"call {handler}"',
             '"jmp {complete}"',
             '"2:"',
@@ -207,7 +209,7 @@ class NativeExecutionContractTests(unittest.TestCase):
             with self.subTest(gate=gate):
                 self.assertIn(f"`{gate}`", CONTRACT_SOURCE)
 
-    def test_aarch64_irq_passes_exception_origin_to_timer_handler(self) -> None:
+    def test_aarch64_irq_passes_complete_context_to_timer_handler(self) -> None:
         vectors = source_between(
             MMU_SOURCE,
             '"troe_aarch64_irq_entry:"',
@@ -216,15 +218,18 @@ class NativeExecutionContractTests(unittest.TestCase):
         require_order(
             self,
             vectors,
-            '"mrs x0, spsr_el1"',
+            '"mrs x10, spsr_el1"',
+            '"str x10, [sp, #792]"',
+            '"mov x0, sp"',
             '"bl troe_aarch64_input_interrupt"',
         )
         handler = source_between(
             MMU_SOURCE,
-            'extern "C" fn troe_aarch64_input_interrupt(saved_program_status: u64)',
+            'extern "C" fn troe_aarch64_input_interrupt(',
             'extern "C" fn troe_aarch64_isolated_syscall(',
         )
-        self.assertIn("saved_program_status & AARCH64_SPSR_MODE_MASK == 0", handler)
+        self.assertIn("status & AARCH64_SPSR_MODE_MASK == 0", handler)
+        self.assertIn("preempt_application", handler)
         self.assertIn("ISOLATED_ACTIVE.load(Ordering::Acquire)", handler)
 
     def test_application_state_is_unpublished_before_irqs_are_reenabled(self) -> None:
@@ -244,24 +249,37 @@ class NativeExecutionContractTests(unittest.TestCase):
                     "finish_application_execution()",
                 )
 
-    def test_every_resumable_application_outcome_is_charged(self) -> None:
+    def test_time_service_and_memory_budgets_are_independent(self) -> None:
         runner = source_between(
             KERNEL_SOURCE,
             "fn run_command_application(",
             "const fn task_fault(",
         )
         budget = source_between(runner, "let terminal = loop", "match outcome")
-        for outcome in ("Yielded", "HandleCall", "HeapGrow"):
+        self.assertIn("ApplicationOutcome::HandleCall", budget)
+        for outcome in ("Yielded", "Preempted", "HeapGrow"):
             with self.subTest(outcome=outcome):
-                self.assertIn(f"ApplicationOutcome::{outcome}", budget)
+                self.assertNotIn(f"ApplicationOutcome::{outcome}", budget)
         require_order(
             self,
             budget,
             "monotonic_millis()",
             "APPLICATION_COMMAND_RUNTIME_MILLISECONDS",
-            "if resumable",
-            "steps.checked_add(1)",
-            "APPLICATION_COMMAND_STEP_LIMIT",
+            "if service_call",
+            "service_calls.checked_add(1)",
+            "APPLICATION_COMMAND_SERVICE_CALL_LIMIT",
+        )
+        preemption = source_between(
+            runner,
+            "ApplicationOutcome::Preempted(application)",
+            "ApplicationOutcome::Yielded(application)",
+        )
+        require_order(
+            self,
+            preemption,
+            "scheduler.preempt_current(task_id)",
+            "dispatch_next(Capabilities::SERVICE)",
+            "ApplicationResume::Timeslice",
         )
 
     def test_deferred_calls_block_idle_wake_and_resume_in_owned_order(self) -> None:

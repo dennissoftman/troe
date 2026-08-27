@@ -351,6 +351,7 @@ def _classify_app(plan: TestPlan, path: PurePosixPath) -> bool:
     elif application == "sleep":
         _add_qemu(plan, path, "network", "shell-terminal")
     elif application == "lua":
+        _add_python(plan, path, "test_lua_app.py")
         _add_qemu(plan, path, "lua")
     elif application in TERMINAL_APPS:
         _add_qemu(plan, path, "shell-terminal")

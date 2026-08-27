@@ -129,14 +129,15 @@ mod firmware {
     const STAGE6_USER_REGIONS: usize = 3;
     const APPLICATION_FIXED_USER_REGIONS: usize = 3;
     const APPLICATION_INTERFACE_ECHO: u32 = 1;
-    const APPLICATION_COMMAND_STEP_LIMIT: u16 = 1024;
+    const APPLICATION_TIMESLICE_MILLISECONDS: u32 = 50;
+    const APPLICATION_COMMAND_SERVICE_CALL_LIMIT: u16 = 1024;
     const APPLICATION_COMMAND_RUNTIME_MILLISECONDS: u64 = 10_000;
     const APPLICATION_SYNCHRONOUS_WAIT_MILLISECONDS: u64 = 4_000;
     #[cfg(feature = "acceptance-probes")]
     const IPC_BASELINE_WARMUP_CALLS: usize = 64;
     #[cfg(feature = "acceptance-probes")]
     const IPC_BASELINE_SAMPLES: usize = 256;
-    const IPC_ISOLATED_STEP_LIMIT: u16 = 1536;
+    const IPC_ISOLATED_SERVICE_CALL_LIMIT: u16 = 1536;
     #[cfg(feature = "acceptance-probes")]
     const DIAGNOSTICS_SERVER_MAX_RETAINED_REQUESTS: usize = 1;
     #[cfg(feature = "acceptance-probes")]
@@ -911,7 +912,7 @@ mod firmware {
                 #[cfg(feature = "acceptance-probes")]
                 Self::Spin => Some(TaskFault::ExecutionLeaseExpired),
                 #[cfg(feature = "acceptance-probes")]
-                Self::HeapGrowthLimit => Some(TaskFault::ExecutionLeaseExpired),
+                Self::HeapGrowthLimit => None,
                 #[cfg(all(feature = "acceptance-probes", target_arch = "aarch64"))]
                 Self::ThreadPointer => None,
                 #[cfg(feature = "acceptance-probes")]
@@ -2466,7 +2467,7 @@ mod firmware {
                 || invalid_reused != first
                 || return_reused != first
                 || scheduler.stats().contained_faults
-                    != baseline_tasks.contained_faults.checked_add(4).ok_or(())?
+                    != baseline_tasks.contained_faults.checked_add(3).ok_or(())?
             {
                 return Err(());
             }
@@ -2530,9 +2531,9 @@ mod firmware {
             None,
             source,
             0,
-            APPLICATION_COMMAND_STEP_LIMIT,
+            APPLICATION_COMMAND_SERVICE_CALL_LIMIT,
         )? {
-            CommandApplicationOutcome::Faulted(TaskFault::ExecutionLeaseExpired) => Ok(()),
+            CommandApplicationOutcome::Exited(troe_abi::exit::SUCCESS) => Ok(()),
             CommandApplicationOutcome::Exited(_) | CommandApplicationOutcome::Faulted(_) => Err(()),
         }
     }
@@ -2734,6 +2735,7 @@ mod firmware {
                 layout.stack_top(),
                 layout.startup_address(),
                 PAGE_BYTES,
+                APPLICATION_TIMESLICE_MILLISECONDS,
             )
             .map_err(|_| ())?;
             let mut observed_yield = false;
@@ -2756,6 +2758,7 @@ mod firmware {
                         outcome = troe_machine::resume_application(
                             application,
                             troe_machine::ApplicationResume::Yield,
+                            APPLICATION_TIMESLICE_MILLISECONDS,
                         )
                         .map_err(|_| ())?;
                     }
@@ -2786,6 +2789,7 @@ mod firmware {
                                 status: reply.status().abi_value(),
                                 reply: reply.payload(),
                             },
+                            APPLICATION_TIMESLICE_MILLISECONDS,
                         )
                         .map_err(|_| ())?;
                     }
@@ -2813,6 +2817,7 @@ mod firmware {
                         outcome = troe_machine::resume_application(
                             application,
                             troe_machine::ApplicationResume::Yield,
+                            APPLICATION_TIMESLICE_MILLISECONDS,
                         )
                         .map_err(|_| ())?;
                     }
@@ -2825,12 +2830,7 @@ mod firmware {
                         break;
                     }
                     #[cfg(feature = "acceptance-probes")]
-                    (
-                        ApplicationProbe::Spin,
-                        troe_machine::ApplicationOutcome::Faulted(
-                            troe_machine::IsolatedFault::ExecutionLeaseExpired,
-                        ),
-                    ) => {
+                    (ApplicationProbe::Spin, troe_machine::ApplicationOutcome::Preempted(_)) => {
                         scheduler
                             .fault_current(task_id, TaskFault::ExecutionLeaseExpired)
                             .map_err(|_| ())?;
@@ -3216,7 +3216,7 @@ mod firmware {
                 None,
                 package.executable(),
                 1,
-                IPC_ISOLATED_STEP_LIMIT,
+                IPC_ISOLATED_SERVICE_CALL_LIMIT,
             )
         })();
         let success = outcome.is_ok();
@@ -3262,7 +3262,7 @@ mod firmware {
                 None,
                 package.executable(),
                 1,
-                APPLICATION_COMMAND_STEP_LIMIT,
+                APPLICATION_COMMAND_SERVICE_CALL_LIMIT,
             )
         })();
         let success = outcome.is_ok();
@@ -3602,6 +3602,7 @@ mod firmware {
                         status: status.abi_value(),
                         reply: &payload,
                     },
+                    APPLICATION_TIMESLICE_MILLISECONDS,
                 )
                 .map_err(|_| ())
             }
@@ -3650,6 +3651,7 @@ mod firmware {
                         status: status.abi_value(),
                         reply: &payload,
                     },
+                    APPLICATION_TIMESLICE_MILLISECONDS,
                 )
                 .map_err(|_| ())
             }
@@ -3669,7 +3671,7 @@ mod firmware {
         deferred_services: Option<&CommandDeferredServices>,
         source: &[u8],
         resource_slot: u8,
-        step_limit: u16,
+        service_call_limit: u16,
     ) -> Result<CommandApplicationOutcome, ()> {
         if services.is_empty() || services.len() > troe_dispatch::MAX_HANDLES {
             return Err(());
@@ -3886,45 +3888,62 @@ mod firmware {
                 layout.stack_top(),
                 layout.startup_address(),
                 PAGE_BYTES,
+                APPLICATION_TIMESLICE_MILLISECONDS,
             )
             .map_err(|_| ())?;
-            let mut steps = 0_u16;
+            let mut service_calls = 0_u16;
             let mut request = [0_u8; troe_abi::MAX_MESSAGE_BYTES];
             let mut direct_reply = [0_u8; troe_abi::MAX_MESSAGE_BYTES];
             let terminal = loop {
-                let resumable = matches!(
+                let service_call = matches!(
                     &outcome,
-                    troe_machine::ApplicationOutcome::Yielded(_)
-                        | troe_machine::ApplicationOutcome::HandleCall { .. }
-                        | troe_machine::ApplicationOutcome::HeapGrow { .. }
+                    troe_machine::ApplicationOutcome::HandleCall { .. }
                 );
                 let elapsed = troe_machine::monotonic_millis()
                     .ok_or(())?
                     .saturating_sub(command_started);
                 if elapsed > APPLICATION_COMMAND_RUNTIME_MILLISECONDS {
                     scheduler
-                        .fault_current(task_id, TaskFault::ExecutionLeaseExpired)
+                        .fault_current(task_id, TaskFault::CommandRuntimeExpired)
                         .map_err(|_| ())?;
-                    break CommandApplicationOutcome::Faulted(TaskFault::ExecutionLeaseExpired);
+                    break CommandApplicationOutcome::Faulted(TaskFault::CommandRuntimeExpired);
                 }
-                if resumable {
-                    steps = steps.checked_add(1).ok_or(())?;
-                    let product_step_limit = APPLICATION_COMMAND_STEP_LIMIT;
-                    let effective_step_limit = if cfg!(feature = "acceptance-probes")
-                        && step_limit == IPC_ISOLATED_STEP_LIMIT
+                if service_call {
+                    service_calls = service_calls.checked_add(1).ok_or(())?;
+                    let product_service_call_limit = APPLICATION_COMMAND_SERVICE_CALL_LIMIT;
+                    let effective_service_call_limit = if cfg!(feature = "acceptance-probes")
+                        && service_call_limit == IPC_ISOLATED_SERVICE_CALL_LIMIT
                     {
-                        step_limit
+                        service_call_limit
                     } else {
-                        product_step_limit
+                        product_service_call_limit
                     };
-                    if steps > effective_step_limit {
+                    if service_calls > effective_service_call_limit {
                         scheduler
-                            .fault_current(task_id, TaskFault::ExecutionLeaseExpired)
+                            .fault_current(task_id, TaskFault::ServiceCallLimitExceeded)
                             .map_err(|_| ())?;
-                        break CommandApplicationOutcome::Faulted(TaskFault::ExecutionLeaseExpired);
+                        break CommandApplicationOutcome::Faulted(
+                            TaskFault::ServiceCallLimitExceeded,
+                        );
                     }
                 }
                 match outcome {
+                    troe_machine::ApplicationOutcome::Preempted(application) => {
+                        scheduler.preempt_current(task_id).map_err(|_| ())?;
+                        if scheduler
+                            .dispatch_next(Capabilities::SERVICE)
+                            .map_err(|_| ())?
+                            != Some(task_id)
+                        {
+                            return Err(());
+                        }
+                        outcome = troe_machine::resume_application(
+                            application,
+                            troe_machine::ApplicationResume::Timeslice,
+                            APPLICATION_TIMESLICE_MILLISECONDS,
+                        )
+                        .map_err(|_| ())?;
+                    }
                     troe_machine::ApplicationOutcome::Yielded(application) => {
                         scheduler.yield_current(task_id).map_err(|_| ())?;
                         if scheduler
@@ -3937,6 +3956,7 @@ mod firmware {
                         outcome = troe_machine::resume_application(
                             application,
                             troe_machine::ApplicationResume::Yield,
+                            APPLICATION_TIMESLICE_MILLISECONDS,
                         )
                         .map_err(|_| ())?;
                     }
@@ -3994,6 +4014,7 @@ mod firmware {
                                             status: reply.status().abi_value(),
                                             reply: &direct_reply[..reply.payload_bytes()],
                                         },
+                                        APPLICATION_TIMESLICE_MILLISECONDS,
                                     )
                                     .map_err(|_| ())?;
                                     continue;
@@ -4025,6 +4046,7 @@ mod firmware {
                                         status: reply.status().abi_value(),
                                         reply: reply.payload(),
                                     },
+                                    APPLICATION_TIMESLICE_MILLISECONDS,
                                 )
                                 .map_err(|_| ())?;
                             }
@@ -4043,6 +4065,7 @@ mod firmware {
                                         status: status.abi_value(),
                                         reply: &payload,
                                     },
+                                    APPLICATION_TIMESLICE_MILLISECONDS,
                                 )
                                 .map_err(|_| ())?;
                             }
@@ -4116,6 +4139,7 @@ mod firmware {
                                         status: heap_growth::SUCCESS,
                                         mapped_bytes,
                                     },
+                                    APPLICATION_TIMESLICE_MILLISECONDS,
                                 )
                                 .map_err(|_| ())?;
                             }
@@ -4126,6 +4150,7 @@ mod firmware {
                                         status: heap_growth::EXHAUSTED,
                                         mapped_bytes: 0,
                                     },
+                                    APPLICATION_TIMESLICE_MILLISECONDS,
                                 )
                                 .map_err(|_| ())?;
                             }
@@ -7976,7 +8001,7 @@ mod firmware {
                 deferred_services.as_ref(),
                 package.executable(),
                 0,
-                APPLICATION_COMMAND_STEP_LIMIT,
+                APPLICATION_COMMAND_SERVICE_CALL_LIMIT,
             );
             if self
                 .scheduler
@@ -7999,6 +8024,12 @@ mod firmware {
                         TaskFault::InvalidCall => "application faulted: invalid call",
                         TaskFault::ExecutionLeaseExpired => {
                             "application faulted: execution lease expired"
+                        }
+                        TaskFault::CommandRuntimeExpired => {
+                            "application faulted: command runtime expired"
+                        }
+                        TaskFault::ServiceCallLimitExceeded => {
+                            "application faulted: service call limit exceeded"
                         }
                     };
                     shared_stderr

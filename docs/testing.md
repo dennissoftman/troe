@@ -62,7 +62,7 @@ their canonical order during the same primary guest boot where possible.
 | `network` | Link and IPv4 state, DHCP, ICMP, ARP, cancellation, UDP, bounded TCP streams |
 | `shell-terminal` | Editing, completion, history, manuals, parsing, CRLF, and clear-screen behavior |
 | `filesystem` | KEFS/ext4/FAT32 reads and writes, shared-media restart persistence, paths, pipelines, bounded `sh.kex` scripts, RAMFS mutation, read-only and error behavior |
-| `lua` | Lua inline/stdin/file loading, protected errors, math/formatting, OS-shim clock and exit behavior, cooperative yields, fragmentation, and bounded OOM recovery |
+| `lua` | Lua inline/stdin/file loading, protected errors, math/formatting, OS-shim clock and exit behavior, timer preemption, fragmentation, and bounded OOM recovery |
 | `quota-memory` | 128-entry quota, recovery, repeated transient workloads, owned heap accounting |
 | `persistence` | A second boot and native cold-reset termination after the baseline durable boot |
 | `fault-isolation` | Write, execute, guard, exception, and fatal probes with rollback validation |
@@ -153,7 +153,7 @@ x86-64 and AArch64 backends; it is not a generic ABI for other machines.
 | Gate | User fate | Required entry work |
 | --- | --- | --- |
 | `x86_isolated_syscall_entry` | suspend or terminate | hardware RSP0 stack, save all GPRs and FXSAVE state, clear DF/AC, validate active run |
-| `x86_execution_timer_entry` | terminate user lease or resume kernel deadline wait | inspect saved CS before selecting the path; user origin clears DF/AC, disarms and acknowledges the lease, then restores the published kernel context; kernel origin saves/restores every GPR and FXSAVE class, clears DF/AC, records the runtime deadline, and returns with `iretq` |
+| `x86_execution_timer_entry` | preempt a user timeslice or resume kernel deadline wait | inspect saved CS before selecting the path; user origin saves every GPR and FXSAVE class, clears DF/AC, disarms and acknowledges the timer, and publishes a resumable context; kernel origin saves/restores every GPR and FXSAVE class, clears DF/AC, records the runtime deadline, and returns with `iretq` |
 | `x86_input_interrupt_entry` | resume | save all GPRs and FXSAVE state, clear DF/AC, service bounded input, restore state, `iretq` |
 | `x86_exception_no_error_entry` | contain or fatal | clear DF/AC, pass saved CS origin, restore kernel context only for a contained user fault |
 | `x86_exception_error_entry` | contain or fatal | clear DF/AC, account for hardware error code, pass saved CS origin |
@@ -170,13 +170,11 @@ restored only when that user continuation is deliberately resumed.
 | --- | --- | --- |
 | `troe_aarch64_exception_entry` | fatal | mask DAIF, switch to the dedicated 16 KiB mapped emergency stack, pass ESR/FAR, never return |
 | `troe_aarch64_lower_sync_entry` | suspend or terminate | mask DAIF, save X0-X30, Q0-Q31, FPCR/FPSR, ELR/SPSR, SP_EL0, and TPIDR_EL0; distinguish `SVC #0` from faults |
-| `troe_aarch64_irq_entry` | resume, complete a kernel deadline, or terminate a user lease | mask IRQ, save/restore X0-X30, Q0-Q31, FPCR/FPSR, pass saved SPSR origin; only an active EL0 application timer may complete the published context, while a kernel deadline records its wake and returns through the saved IRQ frame |
+| `troe_aarch64_irq_entry` | resume, complete a kernel deadline, or preempt a user timeslice | mask IRQ and save X0-X30, Q0-Q31, FPCR/FPSR, ELR/SPSR, SP_EL0, and TPIDR_EL0; an active EL0 application timer publishes that complete resumable context, while a kernel deadline records its wake and returns through the saved IRQ frame |
 | current/lower FIQ or SError vector | fatal | route to the common fatal exception entry |
 
-Application entry resets `TPIDR_EL0`; a suspended application context preserves
-it across every yield and handle call. The IRQ frame does not copy TPIDR_EL0
-because an ordinary IRQ returns directly without switching the published
-application/kernel continuation.
+Application entry resets `TPIDR_EL0`; every syscall suspension and timer
+preemption preserves it in the complete resumable application context.
 
 ### Behavioral evidence
 
