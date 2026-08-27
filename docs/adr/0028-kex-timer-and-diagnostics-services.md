@@ -10,10 +10,12 @@ requests interface 8 version 1.0 with `timer`, or interface 9 version 1.0 with
 `diagnostics`; neither grant implies the other or any filesystem, network,
 input, memory-mutation, device, or machine-control authority.
 
-The timer service exposes only the current boot-relative monotonic millisecond
-count and a cancellable `sleep-until` operation with an exact eight-byte
-deadline. It has no wall-clock meaning, calendar state, periodic registration,
-callback, background task, or interrupt control. The kernel reuses its
+The timer service exposes the current boot-relative monotonic millisecond
+count, a cancellable `sleep-until` operation with an exact eight-byte deadline,
+and the calling process's charged CPU ticks with their counter frequency. The
+CPU-time read is self-only and does not grant process enumeration. The timer
+has no wall-clock meaning, calendar state, periodic registration, callback,
+background task, or interrupt control. The kernel reuses its
 nondecreasing monotonic runtime and cooperative cancellation checkpoints. A
 synchronous sleep may wait at most four seconds; a later deadline returns the
 stable timeout status without entering the wait. `sleep.kex` obtains `now`,

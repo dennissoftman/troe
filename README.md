@@ -194,7 +194,8 @@ streams source from `-e`, stdin, or the bounded read-only filesystem service,
 starts with a 1 MiB TLSF application heap that commits more physical memory on
 demand, and exposes only base, coroutine, table,
 string, math, UTF-8, and a capability-aware OS shim. The shim implements
-monotonic `os.clock`, controlled `os.exit`, and `os.difftime`; its remaining
+process-CPU `os.clock`, whole-second Unix `os.time`, controlled `os.exit`, and
+`os.difftime`; its remaining
 standard entries fail explicitly until TROE grants and implements the required
 authority. Lua has no ambient libc, environment, process, dynamic-module, OS,
 or raw filesystem access.

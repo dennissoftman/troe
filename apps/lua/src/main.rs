@@ -13,7 +13,7 @@ use core::{
 use troe_kex_alloc::Heap;
 use troe_kex_sdk::{
     CommandContext, INVOCATION_BUFFER_BYTES, ReadOnlyFilesystem, StandardInput, StandardOutput,
-    Timer, command, entry, exit, filesystem,
+    Timer, WallClock, command, entry, exit, filesystem,
 };
 
 const LUA_VERSION: &[u8] = b"Lua 5.5.1  Copyright (C) 1994-2026 Lua.org, PUC-Rio\n";
@@ -42,7 +42,8 @@ struct LuaHost {
     allocate: unsafe extern "C" fn(*mut c_void, *mut c_void, usize, usize) -> *mut c_void,
     read: unsafe extern "C" fn(*mut c_void, *mut u8, usize) -> isize,
     write: unsafe extern "C" fn(*mut c_void, i32, *const u8, usize) -> i32,
-    monotonic_millis: unsafe extern "C" fn(*mut c_void, *mut u64) -> i32,
+    process_cpu_time: unsafe extern "C" fn(*mut c_void, *mut u64, *mut u64) -> i32,
+    wall_time: unsafe extern "C" fn(*mut c_void, *mut u64) -> i32,
 }
 
 #[repr(C)]
@@ -117,7 +118,7 @@ struct Runtime<'invocation> {
     stdout: StandardOutput,
     stderr: StandardOutput,
     timer: Timer,
-    clock_start_millis: u64,
+    wall_clock: WallClock,
 }
 
 enum Selection<'invocation> {
@@ -231,7 +232,7 @@ fn run(command: &mut CommandContext) -> u32 {
         );
         return exit::FAILURE;
     };
-    let Ok(mut timer) = command.timer() else {
+    let Ok(timer) = command.timer() else {
         common::report(
             &mut command.stderr(),
             "lua",
@@ -239,13 +240,13 @@ fn run(command: &mut CommandContext) -> u32 {
         );
         return exit::DENIED;
     };
-    let Ok(clock_start_millis) = timer.now() else {
+    let Ok(wall_clock) = command.wall_clock() else {
         common::report(
             &mut command.stderr(),
             "lua",
-            b"timer service is unavailable",
+            b"wall-clock capability is unavailable",
         );
-        return exit::FAILURE;
+        return exit::DENIED;
     };
 
     let mut source_name_storage = [0_u8; filesystem::MAX_PATH_BYTES + 1];
@@ -319,14 +320,15 @@ fn run(command: &mut CommandContext) -> u32 {
         stdout: command.stdout(),
         stderr,
         timer,
-        clock_start_millis,
+        wall_clock,
     };
     let mut host = LuaHost {
         context: ptr::from_mut(&mut runtime).cast(),
         allocate: lua_allocate,
         read: lua_read,
         write: lua_write,
-        monotonic_millis: lua_monotonic_millis,
+        process_cpu_time: lua_process_cpu_time,
+        wall_time: lua_wall_time,
     };
     let mut configuration = LuaConfiguration {
         host: ptr::from_mut(&mut host),
@@ -461,7 +463,31 @@ unsafe extern "C" fn lua_write(
     if result.is_ok() { 0 } else { -1 }
 }
 
-unsafe extern "C" fn lua_monotonic_millis(context: *mut c_void, result: *mut u64) -> i32 {
+unsafe extern "C" fn lua_process_cpu_time(
+    context: *mut c_void,
+    ticks: *mut u64,
+    frequency_hz: *mut u64,
+) -> i32 {
+    // SAFETY: See `lua_allocate`; the C shim supplies two writable result slots.
+    let (Some(runtime), Some(mut ticks), Some(mut frequency_hz)) = (
+        unsafe { (context.cast::<Runtime<'_>>()).as_mut() },
+        NonNull::new(ticks),
+        NonNull::new(frequency_hz),
+    ) else {
+        return -1;
+    };
+    let Ok(sample) = runtime.timer.process_cpu_time() else {
+        return -1;
+    };
+    // SAFETY: The callback contract provides two writable `u64` result slots.
+    unsafe {
+        *ticks.as_mut() = sample.ticks;
+        *frequency_hz.as_mut() = sample.frequency_hz;
+    }
+    0
+}
+
+unsafe extern "C" fn lua_wall_time(context: *mut c_void, result: *mut u64) -> i32 {
     // SAFETY: See `lua_allocate`; the C shim supplies one writable result slot.
     let (Some(runtime), Some(mut result)) = (
         unsafe { (context.cast::<Runtime<'_>>()).as_mut() },
@@ -469,12 +495,12 @@ unsafe extern "C" fn lua_monotonic_millis(context: *mut c_void, result: *mut u64
     ) else {
         return -1;
     };
-    let Ok(now) = runtime.timer.now() else {
+    let Ok(seconds) = runtime.wall_clock.now() else {
         return -1;
     };
     // SAFETY: The callback contract provides one writable `u64` result slot.
     unsafe {
-        *result.as_mut() = now.saturating_sub(runtime.clock_start_millis);
+        *result.as_mut() = seconds;
     }
     0
 }

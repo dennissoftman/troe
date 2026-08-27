@@ -407,6 +407,7 @@ mod firmware {
 
     type SharedResidentLog = Rc<RefCell<BoundedLog>>;
     type SharedProcessTable = Rc<RefCell<ProcessTable>>;
+    type SharedTaskIdentity = Rc<Cell<Option<TaskId>>>;
 
     struct ApplicationEmptyInputService;
 
@@ -842,6 +843,8 @@ mod firmware {
 
     struct ApplicationTimerService {
         runtime: SharedRuntime,
+        processes: SharedProcessTable,
+        task_id: SharedTaskIdentity,
     }
 
     struct ApplicationWallClockService {
@@ -7696,6 +7699,27 @@ mod firmware {
                         &timer::encode_milliseconds(milliseconds),
                     )
                 }
+                timer::PROCESS_CPU_TIME if request.payload().is_empty() => {
+                    let task_id = self
+                        .task_id
+                        .get()
+                        .ok_or(troe_dispatch::DispatchError::AccountingOverflow)?;
+                    let ticks = self
+                        .processes
+                        .try_borrow()
+                        .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?
+                        .snapshot_for_task(task_id)
+                        .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?
+                        .cpu_ticks();
+                    let frequency_hz = troe_machine::process_accounting_frequency_hz()
+                        .ok_or(troe_dispatch::DispatchError::AccountingOverflow)?;
+                    let reply = timer::encode_process_cpu_time(timer::ProcessCpuTime {
+                        ticks,
+                        frequency_hz,
+                    })
+                    .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?;
+                    ServiceReply::with_payload(ReplyStatus::Success, &reply)
+                }
                 timer::SLEEP_UNTIL => {
                     let Ok(deadline) = timer::decode_milliseconds(request.payload()) else {
                         return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
@@ -9228,6 +9252,7 @@ mod firmware {
             } else {
                 None
             };
+            let timer_task_id = requirements.timer.then(|| Rc::new(Cell::new(None)));
 
             let services = (|| -> Result<Vec<CommandStartupService>, ()> {
                 let mut services = Vec::new();
@@ -9311,6 +9336,8 @@ mod firmware {
                             &mut dispatcher,
                             ApplicationTimerService {
                                 runtime: self.runtime.clone(),
+                                processes: self.processes.clone(),
+                                task_id: timer_task_id.as_ref().ok_or(())?.clone(),
                             },
                         )?,
                         interface: troe_abi::interface::TIMER,
@@ -9463,6 +9490,9 @@ mod firmware {
             let Ok(mut process) = process else {
                 return command_application_error(stderr, command, "application rejected");
             };
+            if let Some(task_id) = &timer_task_id {
+                task_id.set(Some(process.task_id));
+            }
             let deferred =
                 (requirements.timer || requirements.datagram).then(|| CommandDeferredServices {
                     runtime: self.runtime.clone(),
@@ -9952,6 +9982,7 @@ mod firmware {
             };
             let submitted_shell_script = shell_script_required
                 .then(|| Rc::new(RefCell::new(SubmittedShellScript::default())));
+            let timer_task_id = timer_required.then(|| Rc::new(Cell::new(None)));
             let services = (|| -> Result<Vec<CommandStartupService>, ()> {
                 let mut services = Vec::new();
                 services.try_reserve_exact(service_count).map_err(|_| ())?;
@@ -10039,6 +10070,8 @@ mod firmware {
                             &mut dispatcher,
                             ApplicationTimerService {
                                 runtime: self.runtime.clone(),
+                                processes: self.processes.clone(),
+                                task_id: timer_task_id.as_ref().ok_or(())?.clone(),
                             },
                         )?,
                         interface: troe_abi::interface::TIMER,
@@ -10212,6 +10245,9 @@ mod firmware {
             );
             let outcome = match process {
                 Ok(mut process) => {
+                    if let Some(task_id) = &timer_task_id {
+                        task_id.set(Some(process.task_id));
+                    }
                     let deferred = (timer_required || datagram_required || diagnostics_required)
                         .then(|| CommandDeferredServices {
                             runtime: self.runtime.clone(),

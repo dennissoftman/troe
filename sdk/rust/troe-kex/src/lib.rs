@@ -1159,6 +1159,20 @@ impl Timer {
         timer::decode_milliseconds(&reply[..count]).map_err(|_| Error::InvalidCall)
     }
 
+    /// Read CPU time charged to the calling process.
+    ///
+    /// The returned frequency converts `ticks` into seconds. Kernel service,
+    /// waiting, and descheduled time are not charged to this counter.
+    ///
+    /// # Errors
+    ///
+    /// Reports service, decoding, or call-gate failure.
+    pub fn process_cpu_time(&mut self) -> Result<timer::ProcessCpuTime, Error> {
+        let mut reply = [0_u8; timer::PROCESS_CPU_TIME_BYTES];
+        let count = call(self.handle, timer::PROCESS_CPU_TIME, &[], &mut reply)?;
+        timer::decode_process_cpu_time(&reply[..count]).map_err(|_| Error::InvalidCall)
+    }
+
     /// Cooperatively wait until one boot-relative monotonic deadline.
     ///
     /// # Errors
@@ -2018,7 +2032,7 @@ mod tests {
     use super::{
         ABI_MAJOR, ABI_MINOR, CommandContext, HeapRegion, KEX_HEAP_ADDRESS, KEX_STACK_TOP,
         STARTUP_HANDLE_BYTES, STARTUP_HEADER_BYTES, STARTUP_PAGE_BYTES, ServerContext, Startup,
-        StartupError, interface, stream,
+        StartupError, interface, stream, timer,
     };
 
     fn startup_page(interfaces: &[u32]) -> [u8; STARTUP_PAGE_BYTES] {
@@ -2046,13 +2060,12 @@ mod tests {
             page[offset + 8..offset + 12].copy_from_slice(&1_u32.to_le_bytes());
             page[offset + 12..offset + 16].copy_from_slice(&interface.to_le_bytes());
             page[offset + 16..offset + 18].copy_from_slice(&1_u16.to_le_bytes());
-            let minor = if matches!(
-                interface,
-                interface::STANDARD_INPUT | interface::STANDARD_OUTPUT | interface::STANDARD_ERROR
-            ) {
-                stream::MINOR
-            } else {
-                0
+            let minor = match interface {
+                interface::STANDARD_INPUT
+                | interface::STANDARD_OUTPUT
+                | interface::STANDARD_ERROR => stream::MINOR,
+                interface::TIMER => timer::MINOR,
+                _ => 0,
             };
             page[offset + 18..offset + 20].copy_from_slice(&minor.to_le_bytes());
         }

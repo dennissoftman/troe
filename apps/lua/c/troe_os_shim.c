@@ -7,12 +7,25 @@
 */
 
 static int troe_os_clock(lua_State *state) {
-  uint64_t milliseconds;
+  uint64_t ticks;
+  uint64_t frequency_hz;
   if (troe_active_host == NULL ||
-      troe_active_host->monotonic_millis(troe_active_host->context,
-                                         &milliseconds) != 0)
+      troe_active_host->process_cpu_time(troe_active_host->context, &ticks,
+                                         &frequency_hz) != 0 ||
+      frequency_hz == 0)
     return luaL_error(state, "os.clock is unavailable in TROE");
-  lua_pushnumber(state, (lua_Number)milliseconds / 1000.0);
+  lua_pushnumber(state, (lua_Number)ticks / (lua_Number)frequency_hz);
+  return 1;
+}
+
+static int troe_os_time(lua_State *state) {
+  uint64_t seconds;
+  if (!lua_isnoneornil(state, 1))
+    return luaL_error(state, "os.time table conversion is unavailable in TROE");
+  if (troe_active_host == NULL ||
+      troe_active_host->wall_time(troe_active_host->context, &seconds) != 0)
+    return luaL_error(state, "os.time is unavailable in TROE");
+  lua_pushinteger(state, (lua_Integer)seconds);
   return 1;
 }
 
@@ -62,7 +75,6 @@ TROE_OS_UNAVAILABLE(getenv)
 TROE_OS_UNAVAILABLE(remove)
 TROE_OS_UNAVAILABLE(rename)
 TROE_OS_UNAVAILABLE(setlocale)
-TROE_OS_UNAVAILABLE(time)
 TROE_OS_UNAVAILABLE(tmpname)
 
 static const luaL_Reg troe_os_functions[] = {

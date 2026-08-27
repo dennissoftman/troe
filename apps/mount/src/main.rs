@@ -5,9 +5,7 @@
 mod common;
 
 use core::fmt::Write as _;
-use troe_kex_sdk::{
-    CommandContext, Error, INVOCATION_BUFFER_BYTES, entry, exit, volume_control,
-};
+use troe_kex_sdk::{CommandContext, Error, INVOCATION_BUFFER_BYTES, entry, exit, volume_control};
 
 fn filesystem_name(filesystem: volume_control::Filesystem) -> &'static str {
     match filesystem {
@@ -77,7 +75,11 @@ fn main(command: &mut CommandContext) -> u32 {
     let list = match volumes.list(&mut buffer) {
         Ok(list) => list,
         Err(_) => {
-            common::report(&mut command.stderr(), "mount", b"cannot list configured volumes");
+            common::report(
+                &mut command.stderr(),
+                "mount",
+                b"cannot list configured volumes",
+            );
             return exit::FAILURE;
         }
     };

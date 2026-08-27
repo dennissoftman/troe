@@ -1353,12 +1353,15 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
         contains=("lua-jump\tfalse\tstring\t", "jump-ok\ttrue\n"),
     )
     session.command(
-        'lua -e \'local a=os.clock(); local x=0; '
+        'lua -e \'local a=os.clock(); local w=os.time(); local x=0; '
         'for i=1,10000 do x=x+i end; local b=os.clock(); '
-        'print("lua-os",type(os),type(os.clock),b>=a,os.difftime(7,2))\'',
+        'print("lua-os",type(os),type(os.clock),b>=a,type(w),os.time()>=w,'
+        'os.difftime(7,2))\'',
         cwd,
         command_timeout,
-        contains=("lua-os\ttable\tfunction\ttrue\t5.000000000000000\n",),
+        contains=(
+            "lua-os\ttable\tfunction\ttrue\tnumber\ttrue\t5.000000000000000\n",
+        ),
     )
     session.command(
         "lua -e 'local function target() local x=0; "
@@ -1374,9 +1377,9 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
         absent=("execution lease expired",),
     )
     session.command(
-        'lua -e \'local ok,e=pcall(os.time); '
+        'lua -e \'local ok,e=pcall(os.time,{}); '
         'print("lua-os-unavailable",ok,type(e),'
-        'e:match("os%.time is unavailable in TROE")~=nil)\'',
+        'e:match("os%.time table conversion is unavailable in TROE")~=nil)\'',
         cwd,
         command_timeout,
         contains=("lua-os-unavailable\tfalse\tstring\ttrue\n",),

@@ -556,6 +556,19 @@ impl ProcessTable {
         self.records.iter().map(|record| record.snapshot)
     }
 
+    /// Return the process record bound to one scheduler task.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unknown task identity.
+    pub fn snapshot_for_task(&self, task_id: TaskId) -> Result<ProcessSnapshot, ProcessError> {
+        self.records
+            .iter()
+            .find(|record| record.snapshot.task_id == task_id)
+            .map(|record| record.snapshot)
+            .ok_or(ProcessError::UnknownProcess)
+    }
+
     fn record_mut(&mut self, id: ProcessId) -> Result<&mut ProcessRecord, ProcessError> {
         self.records
             .iter_mut()
@@ -2121,6 +2134,11 @@ mod tests {
         assert_eq!(snapshots[0].dispatches(), 2);
         assert_eq!(snapshots[0].yields(), 1);
         assert_eq!(snapshots[0].preemptions(), 1);
+        assert_eq!(processes.snapshot_for_task(TaskId(7))?.id(), foreground);
+        assert_eq!(
+            processes.snapshot_for_task(TaskId(99)),
+            Err(ProcessError::UnknownProcess)
+        );
         assert_eq!(snapshots[1].state(), ProcessState::Blocked);
         assert_eq!(snapshots[2].resident_pages(), 29);
         assert_eq!(snapshots[2].handles(), 9);

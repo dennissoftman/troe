@@ -26,12 +26,7 @@ fn main(command: &mut CommandContext) -> u32 {
     let mut retry = 0_usize;
     let mut source_port = None;
     loop {
-        let delay = match synchronize(
-            &mut datagram,
-            &mut timer,
-            &mut clock,
-            &mut source_port,
-        ) {
+        let delay = match synchronize(&mut datagram, &mut timer, &mut clock, &mut source_port) {
             Ok(()) => {
                 common::report(&mut command.stdout(), "timesync", b"clock synchronized");
                 retry = 0;
