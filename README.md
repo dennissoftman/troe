@@ -232,6 +232,7 @@ See [ADR 0044](docs/adr/0044-transactional-system-lifecycle.md).
 
 - Rust `1.97.1` via [rustup](https://rustup.rs/); the repository toolchain file
   selects the required components and targets.
+- Git LFS; run `git lfs install` once before checking out repository artifacts.
 - Python `3.13` or newer.
 - QEMU `11.1.0` with matching x86-64 or AArch64 UEFI firmware.
 
@@ -256,7 +257,7 @@ cargo qemu --platform aarch64-virt-uefi --environment qemu
 ```
 
 Boot the pinned Alpine virtual image under the same QEMU machine resources for
-an end-to-end comparison. Each platform gets a separate persistent 8 GiB Alpine
+an end-to-end comparison. Each platform gets a separate persistent 4 GiB Alpine
 system image, while the independent shared FAT32 disk is attached as
 `TROE SHARE` so the same workload data can be used by both guests:
 
