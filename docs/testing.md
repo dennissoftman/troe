@@ -295,10 +295,11 @@ Both QEMU architecture gates require these totals for each 256-request row:
 
 The zero-byte row counts payload copies, not fixed envelope writes. x86-64
 currently reloads CR3 in each direction; AArch64 changes TTBR0 and executes a
-full `TLBI VMALLE1`. ASID/PCID retention is a justified future optimization,
-not an assumed or simulated result. One lease is deliberately programmed for
-every user-execution segment; removing that safety boundary is not an acceptable
-latency optimization.
+full `TLBI VMALLE1`. No ASID/PCID retention is implemented or simulated; the
+protected-IPC design that would add it is tracked in
+[GitHub issue #8](https://github.com/dennissoftman/troe/issues/8). One lease is
+deliberately programmed for every user-execution segment; removing that safety
+boundary is not an acceptable latency optimization.
 
 The measured optimization in the isolated slice is narrow: two transient
 kernel allocations were removed and the endpoint copies directly into

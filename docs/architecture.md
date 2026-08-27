@@ -16,10 +16,9 @@ declared optional services through generation-owned synchronous message dispatch
 without exposing kernel pointers.
 
 Repository `scripts` and Cargo commands are bootstrap developer tooling, not a
-package manager or a privileged system-control plane. The planned TROE CLI described
-in [../TOOLING-PACKAGING-SPEC.md](../TOOLING-PACKAGING-SPEC.md) must sit
-above versioned libraries and service interfaces. It does not replace the
-minimal session shell or the KEX command ABI.
+package manager or a privileged system-control plane. No public TROE package
+CLI or privileged system-control plane is implemented. That work is tracked in
+[GitHub issues](https://github.com/dennissoftman/troe/issues?q=is%3Aissue+is%3Aopen+label%3Aarea%3Atooling).
 
 `troe-platform` defines immutable named VM descriptions independently of CPU
 architecture and execution environment. Build and launch tooling selects the
@@ -62,21 +61,17 @@ firmware fails before device publication or volatile I/O.
    configuration in `/etc`, architecture-independent package data in
    producer-owned
    `/share/<name>` directories, and persistent or mounted data under `/vol`.
-   Native shared libraries will use `/lib` when dynamic linking is added;
-   executable code does not belong in `/share`.
-   `/etc` is not the future package-managed configuration ABI: ADR 0033 reserves
-   writable desired configuration under `/config` and projects the active
-   generation's resolved, non-secret configuration read-only under
-   `/sys/config`. Recovery KEFS migration remains explicit future work.
+   KEX applications are statically linked, `/lib` is not present, and
+   executable code does not belong in `/share`. The recovery image's `/etc`
+   tree is bootstrap configuration, not a package-management interface.
 6. The final output capability writes host bytes or the native UART.
    When validated GOP metadata is available, normal native shell output is also
    rendered into an owned fixed-glyph framebuffer console. UEFI text output is
    confined to the pre-handoff banner.
 
 Pipelines remain sequential even though cooperative tasks now exist. This makes
-backpressure an explicit capacity error rather than requiring hidden scheduling.
-A future bounded-ring implementation may add cooperative wakeups, but must
-preserve the current byte order, EOF, partial-I/O, and capacity-error semantics.
+backpressure an explicit capacity error rather than requiring hidden scheduling
+and preserves current byte order, EOF, partial-I/O, and capacity-error semantics.
 
 ## Authority
 
@@ -98,11 +93,12 @@ exposes no platform-transition operation.
 Native KEX interfaces follow ADR 0034: opaque handles share generation,
 ownership, accounting, cancellation, waiting, and teardown machinery, while
 files, directories, byte streams, datagrams, listeners, timers, and control
-services keep typed protocols. There is no universal native file-descriptor or
-generic socket namespace, and no `ioctl`-style escape hatch. A future
-BSD/POSIX-compatible API belongs in an optional userspace runtime over these
-capabilities. Package-managed filesystem grants will resolve to scoped
-directory roots rather than ambient access to `/`.
+services keep typed protocols. There is no universal native file-descriptor,
+generic socket namespace, `ioctl`-style escape hatch, userspace POSIX facade, or
+package-resolved scoped-root grant today. Those compatibility and authority
+extensions are tracked in
+[issues #11](https://github.com/dennissoftman/troe/issues/11) and
+[#6](https://github.com/dennissoftman/troe/issues/6).
 
 ## Allocation
 
@@ -118,7 +114,7 @@ Stage 2 begins with an architecture-independent memory-map model in
 descriptors, overlays bounded explicit reservations, and reports usable and
 reserved bytes. It also models checked, aligned monotonic allocation over one
 explicitly reserved boot arena, including padding, exhaustion, and sealing
-accounting. The UEFI adapter and later pointer boundary consume these models;
+accounting. The UEFI adapter consumes these models at its pointer boundary;
 firmware types do not enter the portable crate.
 
 The final handoff reserves a 2,084-page LoaderData arena, carves and seals a
@@ -187,8 +183,8 @@ larger than one message are split through ordinary partial-write semantics.
 Fatal diagnostics and input delivery remain direct machine mechanisms. This
 original path is still in-process dispatch, not IPC: service code shares the
 caller's privileged address space, borrowed request bytes are not a wire format,
-and service faults are not contained. The later diagnostics migration is the
-first narrow exception: its immutable snapshot crosses a canonical copied
+and service faults are not contained. Diagnostics is the first narrow
+exception: its immutable snapshot crosses a canonical copied
 receive/reply transport to an isolated KEX server, while the remaining
 registered services stay in-process.
 
@@ -197,7 +193,9 @@ endpoint encode directly into caller-owned reply storage. The protected
 receive-to-reply interval therefore performs no dynamic allocation while still
 copying across the protection boundary. The first composition retains at most
 one request and one suspended server context. It launches one server process
-per client request; persistent residency and restart remain later policy.
+per client request and implements no persistent residency or restart policy.
+Persistent services are tracked in
+[GitHub issue #8](https://github.com/dennissoftman/troe/issues/8).
 
 Stage 5.1 adds `troe-terminal`, which keeps transport-independent input
 decoding, line editing, history, and fixed-glyph text rendering outside the
@@ -206,8 +204,7 @@ and its revision-aware `/bin` catalog; both command candidates and directory
 listings are returned under caller-selected count and byte budgets. The native
 composition root uses the single Standard resource policy. x86-64 decodes
 US set-1 scan codes from q35 i8042, while both architectures retain serial
-input. AArch64 native keyboard input is deferred to a bounded
-virtio-input transport rather than adding a firmware dependency after handoff.
+input. AArch64 has no native keyboard transport and uses serial input.
 
 Stage 5.2 adds the portable `troe-driver` resource and event boundary. Queue
 capacity and maximum ISR drain come from the Standard portable policy;
@@ -323,9 +320,9 @@ discovery; it cannot name raw devices or arbitrary target paths.
 The portable block-region, GPT, VFS-provider, read/write FAT32, constrained
 metadata-preserving ext4 with bounded symbolic/hard links, native virtio
 transport, dual-slot durability, and
-selected STFS mutation pieces preserve this dependency direction. Broader
-directory, rename, journal-replay, and repair mutation is a later provider
-expansion. A transport provides bounded block-region capabilities; partition
+selected STFS mutation pieces preserve this dependency direction. Directory,
+rename, journal-replay, and repair mutation outside the documented profiles is
+unsupported. A transport provides bounded block-region capabilities; partition
 discovery turns a whole device into non-overlapping regions; independently
 selected filesystem providers expose VFS objects.
 Format-specific structures do not enter the machine backend, block transport,
@@ -371,11 +368,11 @@ side of the boundary.
 
 KEFS is the intentionally built-in recovery exception. The current FAT12 image
 is read by firmware. FAT32 and the default persistent ext4 profile are the
-implemented runtime providers; general FAT12/16, exFAT, and later NTFS remain
-separate future providers. The first exact ext4 read/write subset is fixed by
-ADR 0017. Before dynamic loading, providers may be statically selected crates,
-and later writable providers should run as capability-scoped services. An image
-does not carry providers it did not select.
+implemented runtime providers; general FAT12/16, exFAT, and NTFS are
+unsupported. The exact ext4 read/write subset is fixed by ADR 0017. Providers
+are statically selected crates, and an image does not carry providers it did
+not select. Additional profiles and provider isolation are tracked in
+[GitHub issue #12](https://github.com/dennissoftman/troe/issues/12).
 
 An external filesystem provider may be packaged under its own declared license,
 but the module label alone is not a license boundary. Differently licensed

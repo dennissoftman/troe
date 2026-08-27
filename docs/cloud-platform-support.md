@@ -154,8 +154,8 @@ The current matrix deliberately separates three states:
 | AWS Nitro | none | incompatible | unavailable | Requires validated provider discovery plus NVMe and ENA drivers. |
 | Azure Generation 2 | none | incompatible | unavailable | Requires Hyper-V/VMBus storage, network, interrupt discovery, and a provider import format. |
 
-Provider rows are engineering gap records, not promises about every present or
-future instance type. They must be rechecked against provider documentation and
+Provider rows are engineering gap records, not promises about every provider
+instance type. They must be rechecked against provider documentation and
 accepted on real instances before promotion. No qcow2, VHD, VMDK, snapshot, or
 provider-import wrapper is produced yet; raw GPT is the only implemented cloud
 artifact format.
@@ -165,6 +165,5 @@ ACPI-discovered ECAM/APIC topology, the FADT PM timer, and reset-only lifecycle
 control. The accepted AArch64 contract pins QEMU `virt,gic-version=2,acpi=off`
 and validates the edk2-published FDT for GICv2, PSCI-HVC, PL011, timer, RAM, and
 virtio-MMIO. These are exact environment claims, not generic q35/`virt` or
-provider-cloud claims. The next portability increment is a named provider only
-after its storage/network drivers, firmware contract, import format, and real
-instance acceptance exist.
+provider-cloud claims. Acceptance of the first production deployment is tracked
+in [GitHub issue #5](https://github.com/dennissoftman/troe/issues/5).

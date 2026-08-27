@@ -7,8 +7,8 @@ Historical disposition: **GO for Stage 4**
 Status: archived evaluation. The remediation was finalized in `3b0762c`; Stages
 4 and 5 have since landed. Findings, locations, counts, and instructions below
 describe the reviewed Stage 3 worktree and are retained as review evidence, not
-as current repository guidance. For current status use
-[../roadmap.md](../roadmap.md).
+as current repository guidance. For current behavior use the
+[architecture guide](../architecture.md) and current tests.
 
 Remediation status, 2026-08-23: all findings below received implementation
 changes in the reviewed worktree. The complete non-emulator gate, pinned RustSec audit,
