@@ -1213,6 +1213,46 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
         contains=("lua-jump\tfalse\tstring\t", "jump-ok\ttrue\n"),
     )
     session.command(
+        'lua -e \'local a=os.clock(); local x=0; '
+        'for i=1,10000 do x=x+i end; local b=os.clock(); '
+        'print("lua-os",type(os),type(os.clock),b>=a,os.difftime(7,2))\'',
+        cwd,
+        command_timeout,
+        contains=("lua-os\ttable\tfunction\ttrue\t5.000000000000000\n",),
+    )
+    session.command(
+        'lua -e \'local ok,e=pcall(os.time); '
+        'print("lua-os-unavailable",ok,type(e),'
+        'e:match("os%.time is unavailable in TROE")~=nil)\'',
+        cwd,
+        command_timeout,
+        contains=("lua-os-unavailable\tfalse\tstring\ttrue\n",),
+    )
+    session.command(
+        "lua -e 'pcall(function() os.exit(7) end); "
+        "print(\"lua-exit-caught\")'",
+        cwd,
+        command_timeout,
+        absent=("lua-exit-caught",),
+    )
+    session.command(
+        "lua -e 'local value <close> = setmetatable({}, "
+        "{__close=function() print(\"lua-exit-closed\") end}); "
+        "os.exit(0,false); print(\"lua-exit-after\")'",
+        cwd,
+        command_timeout,
+        absent=("lua-exit-closed", "lua-exit-after"),
+    )
+    session.command(
+        "lua -e 'local value <close> = setmetatable({}, "
+        "{__close=function() print(\"lua-exit-closed\") end}); "
+        "os.exit(0,true); print(\"lua-exit-after\")'",
+        cwd,
+        command_timeout,
+        contains=("lua-exit-closed\n",),
+        absent=("lua-exit-after",),
+    )
+    session.command(
         r"""printf 'print("lua-stdin", 6*7)\n' | lua -""",
         cwd,
         command_timeout,

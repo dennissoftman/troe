@@ -1,9 +1,8 @@
 # TROE Core Specification
 
-**Status:** Draft design specification  
+**Status:** Current system specification
 **Version:** 0.1.0  
 **Primary targets:** QEMU `x86_64`, QEMU `aarch64`  
-**Future targets:** named x86-64 and AArch64 provider-cloud VM platforms
 **Implementation language:** Rust (`no_std`)  
 
 **Implementation status:** Stages 0–8 are implemented. Stage 8 includes bounded
@@ -12,11 +11,10 @@ immutable generation content, crash-consistent activation/rollback and selected
 state mutation, plus generation-bound identity/mapping metadata. Stage 7 includes
 the portable KEX parser/load-plan policy, native
 validate/map/reclaim transactions, the complete ABI 1.1 boundary, contained
-fault fates, and enforced 50 ms execution leases. A product-facing Stage 9
+fault fates, and enforced 50 ms execution leases. The product-facing command
 slice supplies KEX-only ordinary commands, typed application services, and the
-repo-local SDK; supported deployment, update trust, and package management are
-still open. See
-[docs/roadmap.md](docs/roadmap.md).
+repo-local SDK. Work beyond the implemented contract is tracked in
+[GitHub issues](https://github.com/dennissoftman/troe/issues).
 
 The product name is TROE (Tiny Rust Operating Environment), and `troe` is the
 reserved CLI executable name. This document also uses “the project” and “the
@@ -26,11 +24,9 @@ Serialized format identifiers name only their technical formats and versions.
 They MUST NOT embed a product, repository, vendor, or TROE CLI name. A project
 rename must not invalidate KEX, KEFS, or boot-container artifacts.
 
-The future developer tooling and package-composition model is specified in
-[TOOLING-PACKAGING-SPEC.md](TOOLING-PACKAGING-SPEC.md). That document
-extends this roadmap and inherits this specification's authority, resource,
-security, and staging constraints. It does not describe functionality present
-in release 0.1.
+Repository scripts, Cargo commands, the KEX SDK, and deterministic image tools
+are the current developer surface. They do not imply a public package manager,
+registry, or privileged system-control CLI.
 
 ## 1. Purpose
 
@@ -55,7 +51,7 @@ Its influences are selective:
 
 - **Unix:** textual tools, simple names, streams, paths, composition, and unsurprising command behavior.
 - **Linux VFS:** callers use one object model while filesystem implementations remain replaceable.
-- **Hurd and microkernels:** mechanism/policy separation, service-shaped interfaces, explicit authority, and the ability to move a service behind IPC later.
+- **Hurd and microkernels:** mechanism/policy separation, service-shaped interfaces, and explicit authority across protection boundaries.
 - **PALcode-style layering:** architecture and machine details live below a narrow privileged interface rather than leaking through the portable core.
 - **Rust:** ownership and types make invalid states difficult to express; unsafe operations are explicit and reviewable.
 
@@ -91,14 +87,16 @@ The words **MUST**, **MUST NOT**, **SHOULD**, **SHOULD NOT**, and **MAY** descri
 
 ## 5. Non-goals
 
-The MVP intentionally excludes the following. These are **deferred capabilities, not permanent project prohibitions**. The purpose of this list is to protect the first implementation from becoming a general-purpose OS before its foundations are understandable and reliable.
+The current system intentionally makes none of the following claims. This list
+defines the implemented boundary; it is not automatically a backlog:
 
 - POSIX conformance;
 - `fork`, `exec`, signals, pipes as kernel objects, and a stable Unix syscall ABI;
 - ELF userspace loading or dynamic linking;
-- users, groups, discretionary permissions, ACLs, and login authentication;
+- interactive users, login authentication, or a general multi-principal
+  authorization engine;
 - preemptive multitasking, SMP, and general-purpose scheduling;
-- sockets and a network stack;
+- a POSIX socket API or general-purpose network stack;
 - a general device manager, USB stack, graphics stack, or audio stack;
 - demand paging, swap, memory overcommit, and copy-on-write;
 - a Linux-compatible `/proc`, `/sys`, or `/dev` ABI;
@@ -106,9 +104,10 @@ The MVP intentionally excludes the following. These are **deferred capabilities,
 - full shell scripting, globbing, job control, or command substitution;
 - a claim of zero defects or zero vulnerabilities.
 
-The project instead aims for **no known vulnerabilities, explicit invariants, bounded behavior, and a small auditable attack surface**. “Clean from the start” is an engineering discipline, not a proof of perfection.
-
-After the MVP proves the boot, memory, VFS, command, and architecture boundaries, the project is expected to grow into a genuinely usable small operating system. Candidate production capabilities include loadable ELF or another versioned executable container, isolated applications, networking, persistent filesystems, and a deliberately selected compatibility layer. Each addition must preserve the project's size, comprehensibility, authority, and resource-accounting principles.
+The project instead aims for **no known vulnerabilities, explicit invariants,
+bounded behavior, and a small auditable attack surface**. “Clean from the
+start” is an engineering discipline, not a proof of perfection. Only accepted
+GitHub issues represent work beyond this boundary.
 
 ## 6. System model
 
@@ -266,7 +265,7 @@ A command that receives only streams and a directory handle cannot reboot the ma
 
 ### 9.2 Service-shaped interfaces
 
-Interfaces that may later cross an IPC boundary MUST be message-shaped:
+Interfaces used across an IPC boundary MUST be message-shaped:
 
 - explicit handles instead of internal pointers;
 - owned or borrowed byte buffers with defined lifetimes;
@@ -282,7 +281,8 @@ timers, and system-control interfaces retain distinct bounded protocols. The
 native ABI MUST NOT acquire an open-ended descriptor, `ioctl`, `fcntl`, socket
 option, or generic socket escape hatch.
 
-The initial implementation MAY use direct function calls. The semantics MUST NOT depend on shared internal pointers that prevent later dispatch or IPC.
+An in-process implementation MAY use direct function calls. Its semantics MUST
+NOT depend on shared internal pointers that prevent dispatch or IPC.
 
 ## 10. Terminal and streams
 
@@ -300,7 +300,7 @@ Minimum behavior:
 - no terminal escape interpretation requirement in the first release.
 
 `stdin`, `stdout`, and `stderr` are stream capabilities. Built-ins SHOULD operate
-on streams where useful so pipelines, tests, and later composition do not depend
+on streams where useful so pipelines, tests, and composition do not depend
 on a physical console.
 
 ## 11. Shell
@@ -390,11 +390,10 @@ pub trait Directory {
 
 These signatures are illustrative, not frozen ABI. The implementation SHOULD avoid heap-allocated iterators on hot or boot paths.
 
-For package-managed applications, filesystem authority SHOULD be rooted at
-explicit directory handles selected from manifest grants. Operations resolve
-relative to those roots; an absolute path is a name, not authority by itself.
-The current command filesystem service's access to the launching shell
-namespace is an implemented bootstrap slice, not the general package contract.
+The current command filesystem service begins relative resolution at the
+launching shell's working directory and uses that live namespace. It does not
+implement package-resolved scoped roots; that authority change is tracked in
+[GitHub issue #6](https://github.com/dennissoftman/troe/issues/6).
 
 ### 12.2 Initial namespace
 
@@ -408,11 +407,9 @@ namespace is an implemented bootstrap slice, not the general package contract.
 ```
 
 This is the current embedded recovery namespace. Its `/etc` directory contains
-bootstrap files and is not a package installation or future configuration ABI.
-For the package-managed system, ADR 0033 reserves `/config` for writable desired
-configuration and `/sys/config` for the read-only configuration resolved from
-the active immutable generation. Editing `/config` does not mutate the active
-generation.
+bootstrap files and is not a package installation or live configuration API.
+No `/config` or `/sys/config` authoring surface is implemented; that work is
+tracked in [GitHub issue #4](https://github.com/dennissoftman/troe/issues/4).
 
 `/sys` and `/dev` are project-defined namespaces, not Linux-compatible ABIs.
 
@@ -468,10 +465,10 @@ Quota exhaustion MUST return `NoSpace` without destabilizing unrelated subsystem
 
 Persistent and external filesystem support MUST NOT assume that a raw numeric
 UID/GID, a Windows SID, or a familiar account name is proof of a local system
-identity. The planning direction is to use stable, opaque native principals
-and explicit mount/import identity mappings while retaining first-class
-UID/GID compatibility. Authentication, identity mapping, ownership, and active
-capability authority are separate concerns.
+identity. Stable opaque native principals and explicit mount/import mappings
+retain foreign UID/GID identity without treating it as active authority.
+Authentication, identity mapping, ownership, and capability authority are
+separate concerns.
 
 Filesystem drivers SHOULD preserve security metadata in its native form when
 the source format can be round-tripped. In particular, ext4/XFS-style numeric
@@ -492,36 +489,24 @@ formats do not silently grant those capabilities.
 
 ### 12.7 Persistent filesystem modules and partitions
 
-Persistent disk formats MUST be replaceable filesystem providers behind the
-VFS and a bounded block-region capability. The kernel composition root and
-machine backends MUST NOT absorb FAT12/16/32, exFAT, ext4, NTFS, or
-partition-format logic. Before dynamic modules exist, a build may statically
-select a provider crate; this temporary composition choice must preserve the
-same narrow interface and include only the selected providers. Writable
-providers SHOULD become capability-scoped filesystem services once the task and
-application boundaries can isolate them.
+Persistent disk formats are replaceable filesystem providers behind the VFS
+and a bounded block-region capability. The kernel machine backends do not own
+filesystem or partition-format logic. The current build statically composes
+only the selected KEFS, RAMFS, FAT32, constrained ext4 v1, and StateFS
+providers.
 
-KEFS remains the built-in immutable recovery filesystem, and the fixed FAT12
-image remains the firmware-read boot container. A separate general FAT provider
-targets read/write FAT12/16/32 media, with FAT32 first for EFI and broad
-interchange compatibility; exFAT is a complementary optional provider for
-read/write access to large removable media. These formats use synthetic
-ownership and are not journaled native stores. A constrained, versioned ext4
-profile is the default native persistent data-volume format. NTFS is a later
-optional foreign-filesystem provider, read-only before read-write, using the
-maintained Linux NTFS3 project as a behavioral and interoperability reference
-subject to license review. No raw foreign UID, GID, SID, ACL, or security
+KEFS is the immutable recovery filesystem, the fixed FAT12 image is only the
+firmware-read boot container, constrained ext4 v1 is the default persistent
+content volume, FAT32 provides bounded interoperability, and StateFS owns its
+single bounded state object. No raw foreign UID, GID, SID, ACL, or security
 descriptor gains native authority merely because a provider can parse it.
 
-Filesystem providers receive a whole-device or partition-bounded region; they
-do not discover partitions themselves. Initial installed media SHOULD use
-bounded read-only GPT discovery and a fixed host-created FAT32 EFI plus ext4
-data layout. Whole-device volumes remain valid for tests and simple
-deployments. General MBR traversal, in-kernel partition editing, resizing, LVM,
-software RAID, and automatic partition repair are deferred.
+Providers receive a whole-device or partition-bounded region and do not
+discover partitions themselves. Installed media uses bounded read-only GPT
+discovery and host-created layouts. General MBR traversal, in-kernel partition
+editing, resizing, LVM, software RAID, and automatic repair are unsupported.
 
-The accepted roles, modularity rule, ext4 profile direction, NTFS licensing
-gate, and lean partition scope are recorded in
+The accepted provider and lean-partition scope is recorded in
 [ADR 0009](docs/adr/0009-persistent-filesystems-and-partitions.md).
 
 Filesystem module packaging MAY carry a license distinct from the Apache-2.0
@@ -734,7 +719,8 @@ The initial kernel is single-core and non-preemptive. Interrupt handlers, if ena
 
 Synchronization primitives MUST NOT be introduced merely for hypothetical SMP. Interior mutability and globals still require documented ownership because interrupt context can create concurrency even on one CPU.
 
-SMP is a separate future milestone requiring a memory model, lock ordering, per-CPU state, interrupt routing, and allocator review.
+SMP is unsupported. Introducing it would require a separately accepted memory
+model, lock ordering, per-CPU state, interrupt routing, and allocator review.
 
 ## 18. Observability
 
@@ -749,9 +735,8 @@ At Stage 5, `mem` and `/sys/memory` expose:
 - cache live and limit bytes (both zero in the current configuration);
 - current memory-pressure state;
 
-Later memory-policy work SHOULD add separately charged page-table memory,
-allocated-frame totals, and reclamation counters when those distinctions become
-actionable.
+Page-table memory, allocated-frame totals, and reclamation counters are not
+separately exposed in the current observability contract.
 
 Debug builds SHOULD expose a boot log and invariant checks. Release builds MAY compile out verbose logging, but fatal diagnostics and resource counters SHOULD remain.
 
@@ -780,7 +765,7 @@ Recommended initial budgets for the 1.44 MB profile:
 | embedded filesystem content | 384 KiB |
 | format/alignment/reserve | 224 KiB |
 
-These are planning budgets, not ABI guarantees. Code clarity MUST NOT be sacrificed for tiny savings that do not affect a measured target.
+These are engineering budgets, not ABI guarantees. Code clarity MUST NOT be sacrificed for tiny savings that do not affect a measured target.
 
 ## 20. Build and source organization
 
@@ -877,7 +862,7 @@ Application isolation does not provide preemption or make the system multi-user
 secure. Every application artifact and application-controlled address remains
 untrusted.
 
-## 23. Evolution roadmap
+## 23. Implemented milestones
 
 ### Stage 0 — Portable model
 
@@ -977,8 +962,7 @@ resume, copied handle dispatch, contained call/fault fates, and execution lease
 are active on both primary architectures. The shell loads immutable
 architecture-specific `/bin/<command>.kex` packages, validates their embedded
 KCAP manifests, and grants only declared typed services. The repo-local Rust
-SDK and `cargo kex` build/inspect workflow are implemented. Registry trust,
-target locks, and signed publication remain Stage 9 work.
+SDK and `cargo kex` build/inspect workflow are implemented.
 
 - Load target-specific static KEX v1 artifacts selected by ADR 0015; keep ELF as
   a hosted toolchain interchange format rather than a kernel input.
@@ -988,13 +972,15 @@ target locks, and signed publication remain Stage 9 work.
 - Provide application startup, exit status, fault reporting, and resource reclamation.
 - Support architecture-native binaries; cross-architecture instruction emulation is not required.
 - Keep the immutable target-selected KEX root available for recovery.
-- Bind executable and least-authority manifest into one validated KEX package;
-  keep target locks, signatures, and publication metadata outside reserved
-  format bytes until their Stage 9 contracts are accepted.
+- Bind executable and least-authority manifest into one validated KEX package.
+  Current package bytes do not contain target locks, signatures, or publication
+  metadata.
 - Maintain the repo-local native SDK and hosted build/inspect tools without
   granting the tooling client ambient system authority.
 
-Dynamic linking is optional and SHOULD follow a working static executable format rather than ship with the first loader.
+Dynamic linking is not implemented; KEX v1 artifacts are static images. Its
+separate design gate is tracked in
+[GitHub issue #10](https://github.com/dennissoftman/troe/issues/10).
 
 **Exit criterion:** an untrusted test application can be loaded, run, exit, and fault without corrupting the kernel, while malformed binaries are rejected deterministically.
 
@@ -1003,7 +989,7 @@ Dynamic linking is optional and SHOULD follow a working static executable format
 **Status:** Phases A and B are implemented for two exact discoverable QEMU
 contracts under
 [ADR 0016](docs/adr/0016-hardware-targets-and-emulator-role.md). KVM and real
-provider-cloud rows remain unaccepted until their own contracts pass.
+provider-cloud rows are unsupported.
 
 - Separate reusable x86-64/AArch64 CPU mechanisms from platform integration and
   execution-environment selection.
@@ -1012,12 +998,11 @@ provider-cloud rows remain unaccepted until their own contracts pass.
   contracts.
 - Validate platform resources from an explicit profile, ACPI, device tree, or
   UEFI handoff before constructing typed machine resources.
-- Add named virtio-capable VM descriptors and bounded ACPI, device-tree, and
-  UEFI discovery without ambient probing.
-- Test a declared multi-hypervisor/cloud matrix and record the exact firmware,
-  machine type, transports, and required features for every supported entry.
-- Keep physical boards, USB/SD bring-up, and embedded/no-MMU targets outside
-  the current roadmap.
+- The two discoverable profiles use bounded ACPI or device-tree parsing and
+  UEFI handoff without ambient probing.
+- The machine-readable support matrix records exact firmware, machine type,
+  transports, and required features for every supported entry.
+- Physical boards, USB/SD bring-up, and embedded/no-MMU targets are unsupported.
 
 **Exit criterion:** both pinned QEMU platforms and every named cloud-matrix
 entry reach the recovery shell and pass bounded boot, storage, networking, and
@@ -1034,61 +1019,29 @@ through real flush/reopen cycles. CSPK/GMAN/ISEC bind SCFG plus identity registr
 foreign mapping, mount policy, and native ACL objects to immutable generations.
 Configured health failure rolls generation 2 back durably to generation 1.
 
-- Introduce network-device capabilities and a bounded-buffer network stack.
-- Begin with a small practical protocol set such as Ethernet, ARP/NDP as appropriate, IPv4 and/or IPv6, ICMP, UDP, DHCP or static configuration, and DNS.
+- Network-device capabilities expose a bounded Ethernet, ARP, DHCP, IPv4,
+  ICMP, and UDP stack.
 - Keep TCP behind the ADR 0031 typed outbound-connect service whose state,
   timer, retransmission, and memory bounds are specified and adversarially
   tested; do not widen it into a general socket interface.
 - Expose networking through handles or service interfaces rather than ambient global access.
-- Resolve the native-principal and foreign-filesystem identity-mapping ADR
-  before accepting persistent VFS metadata or enabling foreign-filesystem
-  writes.
-- Add bounded block I/O and block-region capabilities, whole-device volumes,
-  and read-only GPT discovery without an in-kernel partition editor.
-- Add the constrained ext4 provider as the default selected persistent content
-  volume and prove a bounded writable filesystem through the same block/VFS
-  capability boundary. Broader read/write ext4, FAT, and exFAT providers are
-  deployment/usability expansions after this stage and remain independently
-  selectable; NTFS remains optional and foreign.
-- Define configuration, service startup, and recovery behavior suitable for unattended use.
-- Add the persistent content store and desired-system manifest only after their
-  on-disk formats, bounds, corruption behavior, and recovery paths are tested.
-- Construct immutable system generations separately from mutable volumes and
-  secrets; activate a generation through a crash-consistent pointer.
+- Native principal and foreign-filesystem identity mappings bind persistent VFS
+  metadata and foreign writes to versioned policy objects.
+- Bounded block I/O, block-region capabilities, whole-device volumes, and
+  read-only GPT discovery operate without an in-kernel partition editor.
+- The constrained ext4 provider is the default persistent content volume;
+  FAT32 and StateFS implement their documented bounded profiles. Other
+  filesystem profiles are unsupported.
+- Versioned configuration, service startup, and recovery inputs are validated
+  before activation.
+- The persistent content store and desired-system manifest have bounded,
+  corruption-tested on-disk formats and recovery paths.
+- Immutable system generations remain separate from mutable volumes and
+  secrets and activate through a crash-consistent pointer.
 - Preserve the previous bootable generation and immutable recovery KEX root when
   activation or bounded health checks fail.
 
 **Exit criterion:** the system can boot, configure a supported network device, exchange data with another host, persist selected state, and remain within declared memory budgets under malformed and high-volume input.
-
-### Stage 9 — Production usability
-
-**Status:** in progress. The KEX-only ordinary-command set, typed application
-services, repo-local SDK, and deterministic deployment-bundle tooling form a
-complete vertical slice. Supported installation, updates, registry trust,
-configuration activation, diagnostics, and recovery procedures remain open;
-see [the implementation roadmap](docs/roadmap.md#stage-9-production-usability--in-progress).
-
-- Stabilize the native application SDK and versioned ABI policy for a release.
-- Expand utilities and services only from bounded, measured use cases.
-- Decide whether ADR 0034's optional userspace BSD/POSIX facade materially
-  improves portability without turning its universal descriptor vocabulary
-  into the native kernel ABI.
-- Add supported update, rollback, garbage-collection, crash-diagnostic, and
-  reproducible-release procedures, including explicit data-migration limits.
-- Establish registry trust roots, signature and revocation policy, provenance
-  requirements, and stable machine-readable tooling schemas.
-- Implement ADR 0033's bounded writable desired-configuration surface at
-  `/config` and generation-bound read-only active projection at `/sys/config`;
-  migrate the KEFS bootstrap `/etc` layout without treating it as a package ABI.
-- Define threat models and hardening profiles for supported deployment classes.
-- Maintain a minimal recovery image even when the full production image grows beyond the floppy-size target.
-
-**Exit criterion:** a named end-to-end deployment can be installed, operated, updated, diagnosed, and recovered using documented procedures.
-
-Preemption, SMP, additional filesystem profiles, dynamic linking, broader
-network protocols, and POSIX subsets each require focused proposals and
-security review. No specific expansion is implied merely by completing an
-earlier stage.
 
 ## 24. API evolution rule
 
@@ -1153,7 +1106,7 @@ Release 0.1 is complete when:
 - all host and QEMU acceptance tests pass;
 - every unsafe block is inventoried and justified.
 
-Fitting the same useful configuration at or below 1.44 MB is the next optimization objective, not a reason to weaken correctness or auditability.
+The 1.44 MiB target never justifies weakening correctness or auditability.
 
 ## 27. Decision principles
 
@@ -1168,29 +1121,6 @@ When design choices compete, use this order:
 7. compatibility and feature breadth.
 
 A feature belongs in the project only when its value exceeds its cost in code size, runtime memory, unsafe surface, test burden, and conceptual complexity.
-
-## 28. Open decisions
-
-Decisions resolved through the Stage 7 design are recorded in
-[docs/adr](docs/adr) and summarized in [docs/roadmap.md](docs/roadmap.md).
-The following later-stage choices remain open and require short architecture
-decision records before implementation:
-
-- canonical package-artifact encoding and digest/signature scope;
-- dependency/version semantics and multi-target lock-file representation;
-- content-store layout, generation activation record, and recovery protocol;
-- persistent-data migration and rollback contract;
-- exact versioned ext4 feature profile, journal/durability contract, recovery
-  bounds, host-tool versions, and maximum supported volume geometry;
-- exact FAT12/16/32 and exFAT interoperability profiles, mutation scope,
-  synthetic metadata policy, and dirty-volume recovery behavior;
-- filesystem-provider loading/isolation transition and the bounded GPT plus
-  block-region contract;
-- native principal/group representation, identity domains, UID/GID and SID
-  mappings, foreign security-descriptor preservation, and lossy-copy policy;
-- package trust roots, key rotation, revocation, and offline verification policy.
-
-Each decision record MUST state alternatives, measurable costs, safety impact, and conditions under which the choice should be revisited.
 
 ---
 

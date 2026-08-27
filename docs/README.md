@@ -1,7 +1,9 @@
 # Documentation guide
 
-TROE separates current behavior, normative contracts, plans, and historical
-evidence so a reader does not accidentally implement an old proposal.
+TROE keeps current behavior, normative contracts, accepted decisions, and
+historical evidence in the repository. Work that is not implemented belongs in
+the GitHub issue tracker so proposed behavior cannot be mistaken for a current
+contract.
 
 ## Where to look
 
@@ -9,15 +11,13 @@ evidence so a reader does not accidentally implement an old proposal.
 | --- | --- |
 | Project overview and quick start | [Repository README](../README.md) |
 | Current system composition and safety boundaries | [Architecture](architecture.md) |
-| Landed stages and remaining work | [Implementation roadmap](roadmap.md) |
+| Remaining work and delivery status | [GitHub issues](https://github.com/dennissoftman/troe/issues) |
+| Stage 9 production-usability work | [Stage 9 milestone](https://github.com/dennissoftman/troe/milestone/1) |
 | Test commands, selection rules, native entry contract, and IPC baseline | [Testing and verification](testing.md) |
 | Supported VM contracts and deployable raw artifacts | [Cloud platform support](cloud-platform-support.md) |
 | Security boundary and reporting | [Security policy](../SECURITY.md) |
 | Contribution and merge expectations | [Contribution guide](../CONTRIBUTING.md) |
 | Core normative requirements | [Core specification](../CORE-SPEC.md) |
-| Future package/tooling design | [Tooling and packaging specification](../TOOLING-PACKAGING-SPEC.md) |
-| Proposed persistent-service and fast-IPC implementation contract | [ADR 0035](adr/0035-persistent-isolated-services-and-fast-ipc.md) |
-| ADR closure state | [ADR implementation ledger](adr/implementation-status.md) |
 
 The current serialized contracts are versioned independently under
 [`formats/`](formats):
@@ -36,16 +36,18 @@ The current serialized contracts are versioned independently under
 
 ## How to interpret older material
 
-- Files under [`adr/`](adr) preserve accepted decisions and rationale. They are
-  not deleted when implementation lands or a later ADR narrows them. Read the
-  implementation ledger for current closure and supersession state.
+- Files under [`adr/`](adr) preserve accepted decisions and rationale for
+  implemented behavior. Each ADR's status header records implementation or
+  supersession state.
 - Files under [`evaluations/`](evaluations) are point-in-time evidence. Their
   measurements and findings remain useful, but their status prose is not live.
-- The Core Specification contains both durable requirements and staged exit
-  criteria. The roadmap carries current stage status and must be updated when
-  implementation changes it.
-- The Tooling and Packaging Specification is explicitly forward-looking. Its
-  examples are not current shell commands, public formats, or released APIs.
+- The Core Specification contains durable requirements for implemented system
+  boundaries. GitHub issues carry proposed extensions and their acceptance
+  criteria.
+
+Closing an issue does not by itself make a capability current. Source, tests,
+formats, and current-behavior documentation must land together before the
+repository claims it.
 
 When prose conflicts with an implemented serialized format, the versioned
 format wins. When current-behavior prose conflicts with source and tests, treat

@@ -12,9 +12,20 @@ DESCRIPTION
     input.
 
     The base, coroutine, table, string, math, and utf8 libraries are present.
-    package, io, os, debug, dynamic modules, environment access, and binary
-    bytecode are intentionally unavailable. The initial script file is read
-    through the declared filesystem capability.
+    A capability-aware os shim provides clock, difftime, and exit. The other
+    standard os functions remain present as extension points and raise a clear
+    "unavailable in TROE" error when called. package, io, debug, dynamic
+    modules, environment access, and binary bytecode are intentionally
+    unavailable. The initial script file is read through the declared
+    filesystem capability.
+
+    os.clock returns monotonic seconds elapsed since this Lua invocation with
+    millisecond resolution. It measures elapsed time rather than process CPU
+    time. os.exit terminates the Lua application with an optional unsigned
+    32-bit command status and cannot be caught with pcall. Its second argument
+    follows Lua semantics: false (the default) skips Lua-state closing, while
+    true closes the state and runs its closing work before termination. TROE
+    reclaims the application heap after either form.
 
     Lua uses a bounded 8 MiB TLSF heap and periodically yields to the KEX
     scheduler. Exhausting the heap raises a normal protected Lua memory error;

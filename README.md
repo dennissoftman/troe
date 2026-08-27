@@ -17,7 +17,7 @@ to one audited machine boundary; portable crates forbid it.
 
 > **Project status:** TROE runs in QEMU today. It is a research and development
 > project, not yet a general-purpose OS or production cloud image. See the
-> [roadmap](docs/roadmap.md).
+> [Stage 9 tracking issue](https://github.com/dennissoftman/troe/issues/14).
 
 ## Why TROE?
 
@@ -176,12 +176,15 @@ Start exploring with [`apps/echo`](apps/echo) and the
 streams source from `-e`, stdin, or the bounded read-only filesystem service,
 starts with a 1 MiB TLSF application heap that commits more physical memory on
 demand, and exposes only base, coroutine, table,
-string, math, and UTF-8 libraries. It has no ambient libc, environment,
-process, dynamic-module, OS, or raw filesystem access.
+string, math, UTF-8, and a capability-aware OS shim. The shim implements
+monotonic `os.clock`, controlled `os.exit`, and `os.difftime`; its remaining
+standard entries fail explicitly until TROE grants and implements the required
+authority. Lua has no ambient libc, environment, process, dynamic-module, OS,
+or raw filesystem access.
 
 KEX images are statically linked today. A bounded, single-package dynamic
-linking design for reusable libc and language runtimes is an explicit
-[planned roadmap milestone](docs/roadmap.md#dynamic-linking-and-reusable-runtimes--planned).
+linking design for reusable libc and language runtimes is tracked in
+[GitHub issue #10](https://github.com/dennissoftman/troe/issues/10).
 
 ## 🚀 Quick start
 
@@ -250,15 +253,15 @@ explicit provisioning workflow.
 | [`rootfs/`](rootfs) | Root filesystem and packaged applications |
 | [`host/`](host) | Hosted shell model |
 | [`scripts/`](scripts) | Build, test, and QEMU entry points |
-| [`docs/`](docs) | Architecture, formats, decisions, security notes, and roadmap |
+| [`docs/`](docs) | Architecture, formats, decisions, security notes, and historical evaluations |
 
 The [documentation guide](docs/README.md) indexes the deeper material:
 
 - [Architecture](docs/architecture.md)
-- [Roadmap](docs/roadmap.md)
 - [Testing guide](docs/testing.md)
 - [Cloud platform support](docs/cloud-platform-support.md)
 - [Security policy](SECURITY.md)
+- [Open work](https://github.com/dennissoftman/troe/issues)
 
 ## Contributing and license
 

@@ -21,6 +21,7 @@ fn main() {
         .unwrap_or_else(|error| panic!("clang resource directory was not UTF-8: {error}"));
     let resource_include = PathBuf::from(resource.trim()).join("include");
     let source = manifest.join("c/lua_runtime.c");
+    let os_shim = manifest.join("c/troe_os_shim.c");
     let include = manifest.join("c/include");
     let lua = manifest.join("vendor/lua-5.5.1/src");
     let nanoprintf = manifest.join("vendor/nanoprintf-0.6.1");
@@ -82,6 +83,7 @@ fn main() {
 
     println!("cargo:rustc-link-arg={}", output.display());
     println!("cargo:rerun-if-changed={}", source.display());
+    println!("cargo:rerun-if-changed={}", os_shim.display());
     println!(
         "cargo:rerun-if-changed={}",
         manifest.join("c/include").display()

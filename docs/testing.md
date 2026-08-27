@@ -62,7 +62,7 @@ their canonical order during the same primary guest boot where possible.
 | `network` | Link and IPv4 state, DHCP, ICMP, ARP, cancellation, UDP, bounded TCP streams |
 | `shell-terminal` | Editing, completion, history, manuals, parsing, CRLF, and clear-screen behavior |
 | `filesystem` | KEFS/ext4/FAT32 reads and writes, shared-media restart persistence, paths, pipelines, RAMFS mutation, read-only and error behavior |
-| `lua` | Lua inline/stdin/file loading, protected errors, math/formatting, cooperative yields, fragmentation, and bounded OOM recovery |
+| `lua` | Lua inline/stdin/file loading, protected errors, math/formatting, OS-shim clock and exit behavior, cooperative yields, fragmentation, and bounded OOM recovery |
 | `quota-memory` | 128-entry quota, recovery, repeated transient workloads, owned heap accounting |
 | `persistence` | A second boot and native cold-reset termination after the baseline durable boot |
 | `fault-isolation` | Write, execute, guard, exception, and fatal probes with rollback validation |
@@ -295,10 +295,11 @@ Both QEMU architecture gates require these totals for each 256-request row:
 
 The zero-byte row counts payload copies, not fixed envelope writes. x86-64
 currently reloads CR3 in each direction; AArch64 changes TTBR0 and executes a
-full `TLBI VMALLE1`. ASID/PCID retention is a justified future optimization,
-not an assumed or simulated result. One lease is deliberately programmed for
-every user-execution segment; removing that safety boundary is not an acceptable
-latency optimization.
+full `TLBI VMALLE1`. No ASID/PCID retention is implemented or simulated; the
+protected-IPC design that would add it is tracked in
+[GitHub issue #8](https://github.com/dennissoftman/troe/issues/8). One lease is
+deliberately programmed for every user-execution segment; removing that safety
+boundary is not an acceptable latency optimization.
 
 The measured optimization in the isolated slice is narrow: two transient
 kernel allocations were removed and the endpoint copies directly into

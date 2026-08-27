@@ -1,0 +1,83 @@
+name: Implementation work
+description: Propose a concrete, actionable outcome whose design boundaries are understood.
+title: ""
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Outcome
+      description: Describe the user- or system-visible result in one short paragraph.
+      placeholder: Implement or change X so that Y is true.
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Motivation and current evidence
+      description: Name the consumer, deployment, measurement, failure, or accepted design that justifies doing this now.
+    validations:
+      required: true
+
+  - type: textarea
+    id: scope
+    attributes:
+      label: Scope
+      description: List the exact mechanisms, interfaces, formats, and platforms included.
+      placeholder: |
+        - Included boundary
+        - Included consumer
+    validations:
+      required: true
+
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals
+      description: State nearby behavior this issue must not imply or silently expand.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: areas
+    attributes:
+      label: Areas
+      description: Select every applicable boundary; maintainers apply the matching area labels.
+      options:
+        - label: Tooling, packaging, SDK, or developer experience
+        - label: Runtime, scheduler, IPC, or services
+        - label: Storage, filesystem, persistence, or configuration
+        - label: Platform, deployment environment, or hardware
+        - label: Security, authority, trust, hardening, or recovery
+        - label: Compatibility or porting surface
+        - label: Documentation only
+
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies and related work
+      description: Link prerequisite, superseded, blocked, parent, or sibling issues and ADRs. Write "None" when independent.
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: Use measurable checkboxes. Include exact bounds, failure behavior, teardown, and cross-platform requirements where relevant.
+      placeholder: |
+        - [ ] Observable result
+        - [ ] Capacity and failure boundary
+        - [ ] Required platform matrix
+    validations:
+      required: true
+
+  - type: textarea
+    id: verification
+    attributes:
+      label: Verification plan
+      description: Name host tests, corruption or negative cases, QEMU scenarios, measurements, and documentation or format updates.
+    validations:
+      required: true
