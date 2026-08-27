@@ -29,6 +29,12 @@ pub const FILE_IO_BUFFER_BYTES: usize = 16 * 1024;
 pub const MAX_FILE_IO_BUFFER_BYTES: usize = 1024 * 1024;
 const MAX_PROVIDER_DIRECTORY_ENTRIES: usize = 1024;
 const MAX_PROVIDER_DIRECTORY_BYTES: usize = 64 * 1024;
+/// Maximum files in one active-generation `/sys/config` projection.
+pub const MAX_SYSTEM_CONFIG_FILES: usize = 128;
+/// Maximum aggregate bytes in one active-generation configuration projection.
+pub const MAX_SYSTEM_CONFIG_BYTES: usize = 64 * 1024;
+/// Maximum bytes in one projected configuration file.
+pub const MAX_SYSTEM_CONFIG_FILE_BYTES: usize = 8 * 1024;
 
 /// Node kind visible through the namespace.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -391,6 +397,7 @@ pub struct Namespace {
     ramfs_bytes: usize,
     ramfs_nodes: usize,
     ramfs_high_water: usize,
+    system_config_generation: u64,
 }
 
 impl Namespace {
@@ -401,6 +408,8 @@ impl Namespace {
         nodes.insert("/".to_string(), Node::Directory);
         nodes.insert("/tmp".to_string(), Node::Directory);
         nodes.insert("/sys".to_string(), Node::Directory);
+        nodes.insert("/config".to_string(), Node::Directory);
+        nodes.insert("/sys/config".to_string(), Node::Directory);
         Self {
             nodes,
             mounts: Vec::new(),
@@ -409,7 +418,88 @@ impl Namespace {
             ramfs_bytes: 0,
             ramfs_nodes: 0,
             ramfs_high_water: 0,
+            system_config_generation: 0,
         }
+    }
+
+    /// Atomically replace the read-only active-generation configuration view.
+    ///
+    /// Relative paths must be unique, strictly sorted, and canonical. Missing
+    /// parent directories are constructed inside the staged projection. The
+    /// desired `/config` tree is not read or changed by this operation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects generation zero, count/byte/depth limits, noncanonical paths,
+    /// duplicate or unsorted entries, and file/directory collisions without
+    /// changing the visible projection or its generation identity.
+    pub fn replace_system_config(
+        &mut self,
+        generation: u64,
+        files: &[(&str, &[u8])],
+    ) -> Result<(), FsError> {
+        if generation == 0 || files.len() > MAX_SYSTEM_CONFIG_FILES {
+            return Err(FsError::Invalid);
+        }
+        let mut total_bytes = 0_usize;
+        let mut previous: Option<&str> = None;
+        let mut staged = self.nodes.clone();
+        staged.retain(|path, _node| !path.starts_with("/sys/config/"));
+        for (relative, bytes) in files {
+            if relative.is_empty()
+                || bytes.len() > MAX_SYSTEM_CONFIG_FILE_BYTES
+                || previous.is_some_and(|value| value >= *relative)
+            {
+                return Err(FsError::Invalid);
+            }
+            previous = Some(relative);
+            total_bytes = total_bytes
+                .checked_add(bytes.len())
+                .ok_or(FsError::Overflow)?;
+            if total_bytes > MAX_SYSTEM_CONFIG_BYTES {
+                return Err(FsError::NoSpace);
+            }
+            let resolved = canonicalize_beneath("/sys/config", relative)?;
+            let expected = String::from("/sys/config/") + relative;
+            if resolved != expected {
+                return Err(FsError::Invalid);
+            }
+            let mut parent = String::from("/sys/config");
+            let mut components = relative.split('/').peekable();
+            while let Some(component) = components.next() {
+                if components.peek().is_none() {
+                    break;
+                }
+                parent.push('/');
+                parent.push_str(component);
+                match staged.get(&parent) {
+                    Some(Node::Directory) => {}
+                    Some(Node::File { .. }) => return Err(FsError::WrongType),
+                    None => {
+                        staged.insert(parent.clone(), Node::Directory);
+                    }
+                }
+            }
+            if staged.contains_key(&resolved) {
+                return Err(FsError::WrongType);
+            }
+            staged.insert(
+                resolved,
+                Node::File {
+                    bytes: bytes.to_vec(),
+                    writable: false,
+                },
+            );
+        }
+        self.nodes = staged;
+        self.system_config_generation = generation;
+        Ok(())
+    }
+
+    /// Generation whose normalized configuration is visible under `/sys/config`.
+    #[must_use]
+    pub const fn system_config_generation(&self) -> u64 {
+        self.system_config_generation
     }
 
     /// Insert an immutable directory while composing the initial namespace.
@@ -451,7 +541,7 @@ impl Namespace {
     /// Fails outside `/sys`, for an invalid path, or for a directory target.
     pub fn set_system_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), FsError> {
         let path = canonicalize("/", path)?;
-        if !path.starts_with("/sys/") {
+        if !path.starts_with("/sys/") || is_active_configuration_path(&path) {
             return Err(FsError::ReadOnly);
         }
         let parent = parent_path(&path).ok_or(FsError::Invalid)?;
@@ -472,6 +562,9 @@ impl Namespace {
     }
 
     fn insert_composed(&mut self, path: String, node: Node) -> Result<(), FsError> {
+        if is_reserved_configuration_content(&path) {
+            return Err(FsError::ReadOnly);
+        }
         if path == "/" || self.nodes.contains_key(&path) {
             return Err(FsError::Exists);
         }
@@ -497,7 +590,9 @@ impl Namespace {
         let changes_commands = parsed.iter().any(|entry| is_command_path(&entry.path));
         let mut staged = self.nodes.clone();
         for entry in parsed {
-            if self.mount_for_path(&entry.path).is_some() {
+            if is_reserved_configuration_content(&entry.path)
+                || self.mount_for_path(&entry.path).is_some()
+            {
                 return Err(FsError::ReadOnly);
             }
             let node = match entry.kind {
@@ -769,6 +864,12 @@ impl Namespace {
         writable: bool,
     ) -> Result<(), FsError> {
         let path = canonicalize("/", path)?;
+        if is_active_configuration_path(&path)
+            || path.starts_with("/config/")
+            || (path == "/config" && !writable)
+        {
+            return Err(FsError::ReadOnly);
+        }
         if path == "/" || self.mount_for_path(&path).is_some() {
             return Err(FsError::Exists);
         }
@@ -1717,6 +1818,14 @@ fn is_under_tmp(path: &str) -> bool {
     path.starts_with("/tmp/") && path.len() > "/tmp/".len()
 }
 
+fn is_active_configuration_path(path: &str) -> bool {
+    path == "/sys/config" || path.starts_with("/sys/config/")
+}
+
+fn is_reserved_configuration_content(path: &str) -> bool {
+    path.starts_with("/config/") || is_active_configuration_path(path)
+}
+
 #[derive(Debug)]
 struct EmbeddedEntry {
     path: String,
@@ -2423,5 +2532,110 @@ mod tests {
             occupied.mount_read_only("/vol/root", Box::new(TestProvider)),
             Err(FsError::Exists)
         );
+    }
+
+    #[test]
+    fn desired_and_active_configuration_namespaces_are_distinct_and_atomic() {
+        let mut fs = Namespace::new(RamFsQuota::default());
+        assert_eq!(
+            fs.mount_read_only("/config", Box::new(TestProvider)),
+            Err(FsError::ReadOnly)
+        );
+        assert_eq!(fs.mount_writable("/config", Box::new(TestProvider)), Ok(()));
+        assert_eq!(
+            fs.mount_writable("/sys/config", Box::new(TestProvider)),
+            Err(FsError::ReadOnly)
+        );
+        assert_eq!(fs.read_file("/", "/config/data"), Ok(b"mounted".to_vec()));
+        assert_eq!(fs.system_config_generation(), 0);
+
+        assert_eq!(
+            fs.replace_system_config(
+                7,
+                &[
+                    ("app/endpoint", b"old".as_slice()),
+                    ("app/limit", b"4".as_slice()),
+                ],
+            ),
+            Ok(())
+        );
+        assert_eq!(fs.system_config_generation(), 7);
+        assert_eq!(
+            fs.read_file("/", "/sys/config/app/endpoint"),
+            Ok(b"old".to_vec())
+        );
+
+        assert_eq!(
+            fs.replace_system_config(
+                8,
+                &[
+                    ("app", b"collision".as_slice()),
+                    ("app/new", b"candidate".as_slice()),
+                ],
+            ),
+            Err(FsError::WrongType)
+        );
+        assert_eq!(fs.system_config_generation(), 7);
+        assert_eq!(
+            fs.read_file("/", "/sys/config/app/endpoint"),
+            Ok(b"old".to_vec())
+        );
+        assert_eq!(
+            fs.read_file("/", "/sys/config/app/new"),
+            Err(FsError::NotFound)
+        );
+        assert_eq!(
+            fs.replace_system_config(8, &[("app/../escape", b"bad".as_slice())]),
+            Err(FsError::Invalid)
+        );
+        assert_eq!(fs.system_config_generation(), 7);
+
+        assert_eq!(
+            fs.replace_system_config(8, &[("app/endpoint", b"new".as_slice())]),
+            Ok(())
+        );
+        assert_eq!(fs.system_config_generation(), 8);
+        assert_eq!(
+            fs.read_file("/", "/sys/config/app/endpoint"),
+            Ok(b"new".to_vec())
+        );
+        assert_eq!(
+            fs.read_file("/", "/sys/config/app/limit"),
+            Err(FsError::NotFound)
+        );
+        assert_eq!(
+            fs.write_file("/", "/sys/config/app/endpoint", b"draft"),
+            Err(FsError::ReadOnly)
+        );
+        assert_eq!(
+            fs.set_system_file("/sys/config/app/endpoint", b"override"),
+            Err(FsError::ReadOnly)
+        );
+    }
+
+    #[test]
+    fn embedded_and_composed_files_cannot_populate_configuration_roots() {
+        let mut fs = Namespace::new(RamFsQuota::default());
+        assert_eq!(
+            fs.add_read_only_file("/config/default", b"ambient"),
+            Err(FsError::ReadOnly)
+        );
+        assert_eq!(
+            fs.add_read_only_file("/sys/config/default", b"ambient"),
+            Err(FsError::ReadOnly)
+        );
+
+        let path = b"/config/default";
+        let mut image = vec![0_u8; 16];
+        image[..8].copy_from_slice(&KEFS_V1_MAGIC);
+        image[8..10].copy_from_slice(&1_u16.to_le_bytes());
+        image.push(1);
+        image.extend_from_slice(&u16::try_from(path.len()).unwrap_or(0).to_le_bytes());
+        image.extend_from_slice(&0_u32.to_le_bytes());
+        image.extend_from_slice(path);
+        let image_len = u32::try_from(image.len()).unwrap_or(0);
+        image[12..16].copy_from_slice(&image_len.to_le_bytes());
+        assert_eq!(fs.mount_embedded(&image), Err(FsError::ReadOnly));
+        assert_eq!(fs.read_file("/", "/config/default"), Err(FsError::NotFound));
     }
 }

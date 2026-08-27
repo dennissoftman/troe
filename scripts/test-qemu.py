@@ -1094,10 +1094,14 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
         contains=(SHARED_CONTENT,),
     )
     session.command(
-        "ls /", cwd, command_timeout, contains=("etc/", "man/", "sys/", "tmp/")
+        "ls /",
+        cwd,
+        command_timeout,
+        contains=("config/", "man/", "recovery/", "sys/", "tmp/"),
+        absent=("etc/",),
     )
     session.command(
-        "cat /etc/motd",
+        "cat /recovery/motd",
         cwd,
         command_timeout,
         contains=(
@@ -1239,10 +1243,10 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
     )
     session.command("pwd extra", cwd, command_timeout, contains=("pwd: pwd",))
     session.command(
-        "printf nope > /etc/motd",
+        "printf nope > /recovery/motd",
         cwd,
         command_timeout,
-        contains=("sh: /etc/motd: read-only filesystem",),
+        contains=("sh: /recovery/motd: read-only filesystem",),
     )
     session.command("rm /tmp/result", cwd, command_timeout)
     session.command(
@@ -1379,7 +1383,7 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
         contains=("lua-stdin\t42\n",),
     )
     session.command(
-        "lua /etc/lua-smoke.lua hello",
+        "lua /recovery/lua-smoke.lua hello",
         cwd,
         command_timeout,
         contains=("lua-file:hello sum=1250025000 sqrt=9 pow=1024",),

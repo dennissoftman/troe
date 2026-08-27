@@ -23,6 +23,7 @@ contract.
 | Boot and on-demand service supervision | [ADR 0038](adr/0038-scfg-service-supervision.md) |
 | Wall-clock discipline and SNTP synchronization | [ADR 0039](adr/0039-wall-clock-and-sntp-service.md) |
 | Package-resolved directory authority | [ADR 0040](adr/0040-package-resolved-directory-capabilities.md) |
+| Desired and active configuration namespaces | [ADR 0043](adr/0043-desired-and-active-configuration.md) |
 
 The current serialized contracts are versioned independently under
 [`formats/`](formats):
@@ -38,6 +39,7 @@ The current serialized contracts are versioned independently under
   [SACT](formats/sact-v1.md), [CSPK](formats/cspk-v1.md),
   [package model](formats/package-model-v1.md),
   [package trust](formats/package-trust-v1.md), and
+  [configuration projection](formats/config-projection-v1.md),
   [GMAN](formats/gman-v1.md); and
 - identity and authorization metadata: [identity security v1](formats/identity-v1.md).
 

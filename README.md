@@ -61,7 +61,7 @@ commands remain immutable KEX applications discovered from `/bin`.
 ### Shell and filesystem
 
 ```console
-sh:/> cat /etc/motd
+sh:/> cat /recovery/motd
 Tiny Rust Operating Environment 0.1.0
 Small by design. Alive on the wire.
 

@@ -435,17 +435,29 @@ implement package-resolved scoped roots; that authority change is tracked in
 
 ```text
 /
+├── config/      writable desired configuration on a persistent provider
 ├── man/         embedded read-only command manual pages
-├── etc/         embedded read-only configuration
+├── recovery/    embedded read-only recovery-only bootstrap files
 ├── tmp/         writable RAMFS
-├── sys/         generated system-information nodes
+├── sys/
+│   └── config/  read-only configuration resolved for the active generation
 └── dev/         capability-backed device nodes, if enabled
 ```
 
-This is the current embedded recovery namespace. Its `/etc` directory contains
-bootstrap files and is not a package installation or live configuration API.
-No `/config` or `/sys/config` authoring surface is implemented; that work is
-tracked in [GitHub issue #4](https://github.com/dennissoftman/troe/issues/4).
+The recovery image contributes `/recovery`; it does not contribute `/etc` and
+the system defines no `/etc` compatibility alias. `/config` is the stable
+desired-state mount point and is never replaced merely because a package
+generation changes. `/sys/config` contains only the normalized, non-secret
+configuration files bound to the active generation. A candidate projection is
+validated and constructed out of view, then replaces the complete active view
+atomically. Applications cannot mutate it.
+
+Boot creates both namespace roots even when persistent storage or an active
+package generation is unavailable. In recovery that leaves `/config` without a
+writable provider and `/sys/config` empty at generation zero. Native deployment
+activation MUST attach the persistent desired-state provider before accepting
+configuration edits and MUST publish the selected immutable projection before
+starting package services.
 
 `/sys` and `/dev` are project-defined namespaces, not Linux-compatible ABIs.
 

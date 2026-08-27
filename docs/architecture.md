@@ -62,13 +62,14 @@ firmware fails before device publication or volatile I/O.
    file length is governed by the provider format, media, and configured quota.
 5. Filesystem commands ask `Namespace` to canonicalize from the logical cwd.
    Immutable KEFS nodes and writable `/tmp` nodes share one object model.
-   The current recovery root keeps executables in `/bin`, bootstrap
-   configuration in `/etc`, architecture-independent package data in
-   producer-owned
-   `/share/<name>` directories, and persistent or mounted data under `/vol`.
-   KEX applications are statically linked, `/lib` is not present, and
-   executable code does not belong in `/share`. The recovery image's `/etc`
-   tree is bootstrap configuration, not a package-management interface.
+   The current recovery root keeps executables in `/bin`, recovery-only
+   bootstrap files in `/recovery`, architecture-independent package data in
+   producer-owned `/share/<name>` directories, and persistent or mounted data
+   under `/vol`. `/config` is the persistent desired-state mount point;
+   `/sys/config` is an immutable, bounded projection resolved for exactly one
+   active package generation. The system has no `/etc` directory or alias. KEX
+   applications are statically linked, `/lib` is not present, and executable
+   code does not belong in `/share`.
 6. The final output capability writes host bytes or the native UART.
    When validated GOP metadata is available, normal native shell output is also
    rendered into an owned fixed-glyph framebuffer console. UEFI text output is
