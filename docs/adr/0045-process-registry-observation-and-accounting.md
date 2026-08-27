@@ -1,6 +1,7 @@
 # ADR 0045: Process registry, observation, and accounting
 
-Status: accepted and implemented, 2026-08-27.
+Status: accepted and implemented, 2026-08-27; fixed-capacity and control
+portions superseded by ADR 0046.
 
 ## Context
 
@@ -18,8 +19,8 @@ process API, exposing arbitrary memory, or granting global termination rights.
 ## Decision
 
 The kernel owns one bounded `troe-task` process registry covering every
-successfully committed foreground command, background job, and service. It has
-at most `troe_task::MAX_TASKS` (16) records. Each launch receives a monotonic,
+successfully committed foreground command, background job, and service. Each
+launch receives a monotonic,
 non-reused `ProcessId`; the scheduler's `TaskId` remains a separate internal
 identity, and the shell's session-local job number remains a control token only
 for that session.
@@ -48,11 +49,11 @@ supplemental table frames only when a new mapping prefix requires them. Process
 resident-page accounting therefore reports retained frames, not a conservative
 per-process reservation.
 
-Interface 19, process observation 1.0, returns one fixed-size canonical
-snapshot of at most 16 records. The `process-observe` KCAP name grants only this
-call right. It exposes no user pointers, register state, command arguments,
-memory contents, handles, or control operation. `ps.kex` prints one snapshot;
-`top.kex` refreshes once per second and accepts an optional finite count.
+Interface 19, process observation 1.0, returns one fixed-size canonical legacy
+snapshot of at most 16 records. Version 1.1 adds stable-ID pagination for the
+full registry. The `process-observe` KCAP name grants only this call right. It
+exposes no user pointers, register state, command arguments, memory contents,
+handles, or control operation. `ps.kex` and `top.kex` use pagination.
 
 ## Scheduling and concurrency
 
@@ -76,8 +77,10 @@ itself as running while its snapshot call is serviced. A process may disappear
 between snapshots after complete teardown; identities are never recycled
 within a boot.
 
-The 16-record registry is a deliberate hard bound. The separate resident job
-table remains capped at eight, and total admission can fail earlier on task,
-handle, frame, or service metadata exhaustion. Supporting SMP, shared memory,
-cross-session control, or richer historical accounting requires a separate
-authority and synchronization decision.
+ADR 0046 replaces the original small fixed tables with fallibly growing
+metadata under a 65,536-record system hard ceiling, adds owner-scoped child
+control separately from observation, and makes resident admission scale to the
+same task policy. Admission can still fail earlier on memory, handles, frames,
+or service metadata. Supporting SMP, shared memory, cross-session control, or
+richer historical accounting requires a separate authority and synchronization
+decision.

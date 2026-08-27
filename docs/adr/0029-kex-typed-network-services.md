@@ -1,15 +1,15 @@
 # ADR 0029: KEX typed network services
 
 Status: accepted and implemented for the Stage 9 network-command migration,
-2026-08-25.
+2026-08-25; neighbor-table capacity amended by ADR 0046.
 
 ## Decision
 
 Network authority is split into three least-authority KEX interfaces. Interface
 10 version 1.0, requested as `network-observe`, exposes only current link/IPv4
-status, eleven fixed counters, and the complete cache of at most eight typed
+status, eleven fixed counters, and the complete cache of at most 256 typed
 IPv4-to-Ethernet neighbors. Its exact canonical replies are 24 bytes for status,
-88 bytes for counters, and 8 to 88 bytes for the bounded neighbor list.
+88 bytes for counters, and 8 to 2,568 bytes for the bounded neighbor list.
 
 Interface 11 version 1.0, requested as `network-configure`, performs one bounded
 and cancellable DHCP discover/request exchange. Its successful reply reuses the

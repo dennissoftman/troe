@@ -8,6 +8,7 @@ publish = false
 
 [package.metadata.troe-kex]
 capabilities = ["process-observe"]
+stack-pages = 8
 
 [dependencies]
 troe-kex-sdk = { path = "../../sdk/rust/troe-kex" }

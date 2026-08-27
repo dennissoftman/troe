@@ -1176,6 +1176,24 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
     session.command("rm /vol/root/troe-mutable-soft", cwd, command_timeout)
     session.command("echo alpha beta", cwd, command_timeout, contains=("alpha beta\n",))
     session.command(
+        "spawn echo nested-inherit",
+        cwd,
+        command_timeout,
+        contains=("nested-inherit\n",),
+    )
+    session.command(
+        "spawn --capture echo nested-pipe",
+        cwd,
+        command_timeout,
+        contains=("nested-pipe\n",),
+    )
+    session.command(
+        "spawn --status cat /missing",
+        cwd,
+        command_timeout,
+        contains=("cat: /missing: not found", "spawn-status: 3\n"),
+    )
+    session.command(
         r"printf 'first\nsecond\t%s\n' value | grep second",
         cwd,
         command_timeout,

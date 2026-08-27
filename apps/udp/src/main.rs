@@ -190,6 +190,7 @@ fn network_failure(command: &CommandContext, failure: Error) -> u32 {
             ("bounded network resources exhausted", exit::FAILURE)
         }
         Error::Cancelled => ("cancelled", exit::CANCELLED),
+        Error::Denied => ("permission denied", exit::DENIED),
         Error::Failure | Error::NotFound => ("network device failed", exit::FAILURE),
         Error::InvalidCall
         | Error::InvalidRequest

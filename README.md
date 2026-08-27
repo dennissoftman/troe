@@ -33,8 +33,9 @@ to one audited machine boundary; portable crates forbid it.
   zeroizes memory, and returns owned frames.
 
 TROE also enforces W^X mappings, guarded task stacks, generation-checked handles,
-fixed-size queues, deterministic image builds, and exact dependency and firmware
-profiles. Small is a policy here, not just a current measurement.
+bounded fallibly growing resource tables, deterministic image builds, and exact
+dependency and firmware profiles. Small is a policy here, not just a current
+measurement.
 
 ## What runs today
 
@@ -50,7 +51,7 @@ profiles. Small is a policy here, not just a current measurement.
 - Ethernet, ARP, DHCP, IPv4, ICMP, UDP, and outbound TCP over virtio-net.
 - KEX applications for `arp`, `awk`, `cat`, `clear`, `dhcp`, `echo`, `grep`,
   `hexdump`, `ln`, `ls`, `lua`, `man`, `mem`, `mount`, `net`, `ping`, `printf`,
-  `ps`, `pwd`, `rm`, `sed`, `sh`, `sleep`, `tar`, `tcp`, `timesync`, `top`,
+  `ps`, `pwd`, `rm`, `sed`, `sh`, `sleep`, `spawn`, `tar`, `tcp`, `timesync`, `top`,
   `udp`, and `wc`.
 
 `cd`, session job control, `svc`, `poweroff`, and `reboot` are non-shadowable
@@ -188,6 +189,12 @@ $ cargo kex inspect rootfs/bin/x86_64/echo.kex
 
 Start exploring with [`apps/echo`](apps/echo) and the
 [`troe-kex` Rust SDK](sdk/rust/troe-kex).
+
+[`apps/spawn`](apps/spawn) is the first process-launch consumer. It resolves a
+nested KEX package through the owner-scoped launch capability, inherits or
+captures standard output through a bounded pipe, waits, reaps, and preserves
+the child's complete exit status. This proves the process mechanism without
+putting shell grammar in the kernel; `sh.kex` has not yet adopted it.
 
 [`apps/lua`](apps/lua) is a complete freestanding Lua 5.5.1 interpreter. It
 streams source from `-e`, stdin, or the bounded read-only filesystem service,

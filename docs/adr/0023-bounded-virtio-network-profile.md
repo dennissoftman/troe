@@ -1,7 +1,7 @@
 # ADR 0023: bounded virtio network and minimal protocol profile
 
 Status: accepted and implemented for Stage 8; amended by the networking
-usability and transport-safety increments, 2026-08-24.
+usability, transport-safety, and scalable-table increments, 2026-08-28.
 
 The first supported NIC is modern virtio-net on the existing AArch64 MMIO and
 x86-64 PCI buses. The initial device profile negotiates no checksum, segment,
@@ -52,8 +52,9 @@ only acknowledges the transport and coalesces a pending-work bit; parsing and
 allocation remain in cooperative context, where one poll processes at most
 eight frames. Empty receive checks never spin, and prompt idle uses the same
 lost-wakeup-safe `hlt`/`wfi` boundary as input. The
-service retains eight least-recently-observed ARP entries, eight persistent UDP
-port bindings, and at most four datagrams/4 KiB per port, dropping newest input
+service retains up to 256 least-recently-observed ARP entries and 16,384
+persistent UDP port bindings in fallibly growing tables, with at most four
+datagrams/4 KiB per port, dropping newest input
 at capacity. It answers local ARP and ICMP echo requests during prompt idle and
 cooperative command waits. `udp send --source-port`, `udp listen`, `net stats`,
 and `arp` expose that state without adding background jobs or shell loops.

@@ -153,6 +153,7 @@ class RepositoryPolicyTests(unittest.TestCase):
             "sed",
             "sh",
             "sleep",
+            "spawn",
             "tar",
             "tcp",
             "timesync",

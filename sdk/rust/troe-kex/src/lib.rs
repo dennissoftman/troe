@@ -5,9 +5,9 @@ use core::{fmt, slice};
 
 pub use troe_abi::{
     ABI_MAJOR, ABI_MINOR, clock_control, command, datagram, diagnostics, exit, filesystem,
-    filesystem_mutation, icmp_echo, interface, network_configuration, network_observation,
-    process_observation, reply, server, shell_script, tcp_connect, timer, volume_control,
-    wall_clock,
+    filesystem_mutation, icmp_echo, interface, network_configuration, network_observation, pipe,
+    process_launch, process_observation, reply, server, shell_script, tcp_connect, timer,
+    volume_control, wall_clock,
 };
 use troe_abi::{MAX_MESSAGE_BYTES, MAX_SERVICE_PAYLOAD_BYTES, heap_growth, stream};
 
@@ -29,6 +29,8 @@ const KEX_HEAP_SLOT_BYTES: u64 = KEX_LOWER_STACK_GUARD - KEX_HEAP_ADDRESS;
 
 /// Maximum stack buffer needed to receive one command invocation.
 pub const INVOCATION_BUFFER_BYTES: usize = command::MAX_INVOCATION_BYTES;
+/// Maximum stack buffer needed to receive the immutable launch environment.
+pub const ENVIRONMENT_BUFFER_BYTES: usize = command::MAX_ENCODED_ENVIRONMENT_BYTES;
 /// Maximum stack buffer needed to receive one datagram.
 pub const DATAGRAM_BUFFER_BYTES: usize = datagram::MAX_RECEIVE_REPLY_BYTES;
 /// Maximum stack buffer needed to receive one directory page.
@@ -139,6 +141,8 @@ pub enum Error {
     Overflow,
     /// A network exchange returned an invalid protocol response.
     NetworkProtocol,
+    /// The caller lacks authority for the requested operation.
+    Denied,
 }
 
 impl fmt::Display for Error {
@@ -167,6 +171,7 @@ impl fmt::Display for Error {
             Self::Unsupported => "filesystem feature is unsupported",
             Self::Overflow => "filesystem size overflow",
             Self::NetworkProtocol => "invalid network response",
+            Self::Denied => "operation denied",
         })
     }
 }
@@ -183,6 +188,8 @@ pub struct CommandContext {
     timer: Option<Handle>,
     diagnostics: Option<Handle>,
     process_observation: Option<Handle>,
+    process_launch: Option<Handle>,
+    pipe: Option<Handle>,
     network_observation: Option<Handle>,
     network_configuration: Option<Handle>,
     icmp_echo: Option<Handle>,
@@ -243,6 +250,12 @@ impl CommandContext {
                 process_observation::MAJOR,
                 process_observation::MINOR,
             )?,
+            process_launch: startup.optional_handle(
+                interface::PROCESS_LAUNCH,
+                process_launch::MAJOR,
+                process_launch::MINOR,
+            )?,
+            pipe: startup.optional_handle(interface::PIPE, pipe::MAJOR, pipe::MINOR)?,
             network_observation: startup.optional_handle(
                 interface::NETWORK_OBSERVE,
                 network_observation::MAJOR,
@@ -308,6 +321,19 @@ impl CommandContext {
     ) -> Result<command::Invocation<'buffer>, Error> {
         let count = call(self.invocation, command::GET_INVOCATION, &[], buffer)?;
         command::Invocation::parse(&buffer[..count]).map_err(|_| Error::InvalidInvocation)
+    }
+
+    /// Fetch and validate the immutable `NAME=VALUE` launch environment.
+    ///
+    /// # Errors
+    ///
+    /// Reports call, service, authority, or canonical decoding failure.
+    pub fn environment<'buffer>(
+        &self,
+        buffer: &'buffer mut [u8; ENVIRONMENT_BUFFER_BYTES],
+    ) -> Result<command::Environment<'buffer>, Error> {
+        let count = call(self.invocation, command::GET_ENVIRONMENT, &[], buffer)?;
+        command::Environment::parse(&buffer[..count]).map_err(|_| Error::InvalidInvocation)
     }
 
     /// Borrow the standard-input client.
@@ -424,6 +450,30 @@ impl CommandContext {
     pub const fn process_observation(&self) -> Result<ProcessObservation, Error> {
         match self.process_observation {
             Some(handle) => Ok(ProcessObservation { handle }),
+            None => Err(Error::MissingAuthority),
+        }
+    }
+
+    /// Borrow the optional owner-scoped child-process capability.
+    ///
+    /// # Errors
+    ///
+    /// Reports that the package did not request or receive launch authority.
+    pub const fn process_launcher(&self) -> Result<ProcessLauncher, Error> {
+        match self.process_launch {
+            Some(handle) => Ok(ProcessLauncher { handle }),
+            None => Err(Error::MissingAuthority),
+        }
+    }
+
+    /// Borrow the optional owner-scoped bounded-pipe capability.
+    ///
+    /// # Errors
+    ///
+    /// Reports that the package did not request or receive pipe authority.
+    pub const fn pipes(&self) -> Result<Pipes, Error> {
+        match self.pipe {
+            Some(handle) => Ok(Pipes { handle }),
             None => Err(Error::MissingAuthority),
         }
     }
@@ -746,6 +796,18 @@ pub struct Diagnostics {
 /// Read-only current-process observation client.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProcessObservation {
+    handle: Handle,
+}
+
+/// Owner-scoped child-process launch and lifecycle client.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessLauncher {
+    handle: Handle,
+}
+
+/// Owner-scoped bounded byte-pipe client.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Pipes {
     handle: Handle,
 }
 
@@ -1324,6 +1386,229 @@ impl ProcessObservation {
         )?;
         process_observation::decode_snapshot(&reply[..count]).map_err(|_| Error::InvalidCall)
     }
+
+    /// Read one stable-ID-cursor page of current process records.
+    ///
+    /// Pass zero to begin a scan, then pass each nonzero `next_cursor()` until
+    /// the returned cursor is zero.
+    ///
+    /// # Errors
+    ///
+    /// Reports service, decoding, or call-gate failure.
+    pub fn page(&mut self, after_process_id: u64) -> Result<process_observation::Page, Error> {
+        let request = process_observation::encode_page_request(after_process_id);
+        let mut reply = [0_u8; process_observation::PAGE_BYTES];
+        let count = call(
+            self.handle,
+            process_observation::GET_PAGE,
+            &request,
+            &mut reply,
+        )?;
+        process_observation::decode_page(&reply[..count]).map_err(|_| Error::InvalidCall)
+    }
+}
+
+impl ProcessLauncher {
+    /// Admit one child KEX application through package resolution.
+    ///
+    /// `args` includes argument zero. Environment entries must use canonical
+    /// `NAME=VALUE` form. The returned token, unlike the observable process ID,
+    /// is the authority required by all lifecycle operations.
+    ///
+    /// # Errors
+    ///
+    /// Reports malformed launch data, missing packages or capabilities,
+    /// exhausted bounded resources, invalid pipe ownership, or call failure.
+    pub fn spawn<T: AsRef<str>>(
+        &mut self,
+        cwd: &str,
+        args: &[T],
+        environment: &[&str],
+        stdin: process_launch::StreamSpec,
+        stdout: process_launch::StreamSpec,
+        stderr: process_launch::StreamSpec,
+    ) -> Result<process_launch::SpawnedChild, Error> {
+        let mut invocation = [0_u8; command::MAX_INVOCATION_BYTES];
+        let invocation_bytes =
+            command::encode(cwd, args, &mut invocation).map_err(|_| Error::InvalidInvocation)?;
+        let mut request = [0_u8; process_launch::MAX_SPAWN_BYTES];
+        let request_bytes = process_launch::encode_spawn(
+            &invocation[..invocation_bytes],
+            environment,
+            stdin,
+            stdout,
+            stderr,
+            &mut request,
+        )
+        .map_err(|_| Error::InvalidCall)?;
+        let mut reply = [0_u8; process_launch::SPAWN_REPLY_BYTES];
+        let count = call(
+            self.handle,
+            process_launch::SPAWN,
+            &request[..request_bytes],
+            &mut reply,
+        )?;
+        process_launch::decode_spawned(&reply[..count]).map_err(|_| Error::InvalidCall)
+    }
+
+    /// Return the current state of one owned child without waiting.
+    ///
+    /// # Errors
+    ///
+    /// Reports an invalid or foreign token, service failure, or invalid reply.
+    pub fn poll(
+        &mut self,
+        token: process_launch::ChildToken,
+    ) -> Result<process_launch::ChildStatus, Error> {
+        self.status_call(process_launch::POLL, token)
+    }
+
+    /// Wait cooperatively until one owned child reaches a terminal state.
+    ///
+    /// # Errors
+    ///
+    /// Reports an invalid or foreign token, cancellation, service failure, or
+    /// invalid reply.
+    pub fn wait(
+        &mut self,
+        token: process_launch::ChildToken,
+    ) -> Result<process_launch::ChildStatus, Error> {
+        self.status_call(process_launch::WAIT, token)
+    }
+
+    /// Request cancellation of one running owned child.
+    ///
+    /// Cancellation is cooperative with kernel scheduling. Use [`Self::wait`]
+    /// to observe its terminal state before reaping the token.
+    ///
+    /// # Errors
+    ///
+    /// Reports an invalid or foreign token, service failure, or invalid reply.
+    pub fn cancel(
+        &mut self,
+        token: process_launch::ChildToken,
+    ) -> Result<process_launch::ChildStatus, Error> {
+        self.status_call(process_launch::CANCEL, token)
+    }
+
+    /// Revoke one terminal child token and release its retained metadata.
+    ///
+    /// # Errors
+    ///
+    /// Reports an invalid, foreign, or still-running token or service failure.
+    pub fn reap(&mut self, token: process_launch::ChildToken) -> Result<(), Error> {
+        let request = process_launch::encode_token(token);
+        let mut reply = [];
+        let count = call(self.handle, process_launch::REAP, &request, &mut reply)?;
+        if count == 0 {
+            Ok(())
+        } else {
+            Err(Error::InvalidCall)
+        }
+    }
+
+    fn status_call(
+        &mut self,
+        opcode: u16,
+        token: process_launch::ChildToken,
+    ) -> Result<process_launch::ChildStatus, Error> {
+        let request = process_launch::encode_token(token);
+        let mut reply = [0_u8; process_launch::STATUS_BYTES];
+        let count = call(self.handle, opcode, &request, &mut reply)?;
+        process_launch::decode_status(&reply[..count]).map_err(|_| Error::InvalidCall)
+    }
+}
+
+impl Pipes {
+    /// Create one owner-scoped pipe with a fixed byte capacity.
+    ///
+    /// # Errors
+    ///
+    /// Reports an out-of-policy size, exhausted owner quota, or call failure.
+    pub fn create(&mut self, capacity: usize) -> Result<pipe::PipeToken, Error> {
+        let request = pipe::encode_create(capacity).map_err(|_| Error::InvalidCall)?;
+        let mut reply = [0_u8; pipe::TOKEN_BYTES];
+        let count = call(self.handle, pipe::CREATE, &request, &mut reply)?;
+        pipe::decode_token(&reply[..count]).map_err(|_| Error::InvalidCall)
+    }
+
+    /// Read up to `destination.len()` bytes; zero means writer-side EOF.
+    ///
+    /// The kernel suspends an empty read while a writer remains attached.
+    ///
+    /// # Errors
+    ///
+    /// Reports an invalid or foreign token, closed reader, or call failure.
+    pub fn read(&mut self, token: pipe::PipeToken, destination: &mut [u8]) -> Result<usize, Error> {
+        if destination.is_empty() {
+            return Ok(0);
+        }
+        let maximum = destination.len().min(pipe::MAX_IO_BYTES);
+        let request = pipe::encode_read(token, maximum).map_err(|_| Error::InvalidCall)?;
+        call(
+            self.handle,
+            pipe::READ,
+            &request,
+            &mut destination[..maximum],
+        )
+    }
+
+    /// Write the complete byte slice with bounded copied calls.
+    ///
+    /// The kernel suspends each chunk until enough pipe capacity is available.
+    ///
+    /// # Errors
+    ///
+    /// Reports an invalid or foreign token, reader-side EOF, or call failure.
+    pub fn write_all(&mut self, token: pipe::PipeToken, mut bytes: &[u8]) -> Result<(), Error> {
+        let mut request = [0_u8; MAX_SERVICE_PAYLOAD_BYTES];
+        let mut reply = [];
+        while !bytes.is_empty() {
+            let chunk = bytes.len().min(pipe::MAX_IO_BYTES);
+            let request_bytes = pipe::encode_write(token, &bytes[..chunk], &mut request)
+                .map_err(|_| Error::InvalidCall)?;
+            let count = call(
+                self.handle,
+                pipe::WRITE,
+                &request[..request_bytes],
+                &mut reply,
+            )?;
+            if count != 0 {
+                return Err(Error::InvalidCall);
+            }
+            bytes = &bytes[chunk..];
+        }
+        Ok(())
+    }
+
+    /// Close the owner's writer endpoint. Readers see EOF after draining data.
+    ///
+    /// # Errors
+    ///
+    /// Reports an invalid, foreign, or already closed endpoint or call failure.
+    pub fn close_writer(&mut self, token: pipe::PipeToken) -> Result<(), Error> {
+        self.close(pipe::CLOSE_WRITER, token)
+    }
+
+    /// Close the owner's reader endpoint. Subsequent writes fail.
+    ///
+    /// # Errors
+    ///
+    /// Reports an invalid, foreign, or already closed endpoint or call failure.
+    pub fn close_reader(&mut self, token: pipe::PipeToken) -> Result<(), Error> {
+        self.close(pipe::CLOSE_READER, token)
+    }
+
+    fn close(&mut self, opcode: u16, token: pipe::PipeToken) -> Result<(), Error> {
+        let request = pipe::encode_token(token);
+        let mut reply = [];
+        let count = call(self.handle, opcode, &request, &mut reply)?;
+        if count == 0 {
+            Ok(())
+        } else {
+            Err(Error::InvalidCall)
+        }
+    }
 }
 
 impl NetworkObservation {
@@ -1716,6 +2001,7 @@ fn call(
         reply::UNSUPPORTED => Err(Error::Unsupported),
         reply::OVERFLOW => Err(Error::Overflow),
         reply::NETWORK_PROTOCOL => Err(Error::NetworkProtocol),
+        reply::DENIED => Err(Error::Denied),
         _ => Err(Error::InvalidCall),
     }
 }
@@ -2032,7 +2318,7 @@ mod tests {
     use super::{
         ABI_MAJOR, ABI_MINOR, CommandContext, HeapRegion, KEX_HEAP_ADDRESS, KEX_STACK_TOP,
         STARTUP_HANDLE_BYTES, STARTUP_HEADER_BYTES, STARTUP_PAGE_BYTES, ServerContext, Startup,
-        StartupError, interface, stream, timer,
+        StartupError, command, interface, pipe, process_launch, stream, timer,
     };
 
     fn startup_page(interfaces: &[u32]) -> [u8; STARTUP_PAGE_BYTES] {
@@ -2061,10 +2347,13 @@ mod tests {
             page[offset + 12..offset + 16].copy_from_slice(&interface.to_le_bytes());
             page[offset + 16..offset + 18].copy_from_slice(&1_u16.to_le_bytes());
             let minor = match interface {
+                interface::COMMAND => command::MINOR,
                 interface::STANDARD_INPUT
                 | interface::STANDARD_OUTPUT
                 | interface::STANDARD_ERROR => stream::MINOR,
                 interface::TIMER => timer::MINOR,
+                interface::PROCESS_LAUNCH => process_launch::MINOR,
+                interface::PIPE => pipe::MINOR,
                 _ => 0,
             };
             page[offset + 18..offset + 20].copy_from_slice(&minor.to_le_bytes());
@@ -2082,6 +2371,8 @@ mod tests {
             interface::DATAGRAM,
             interface::TIMER,
             interface::DIAGNOSTICS,
+            interface::PROCESS_LAUNCH,
+            interface::PIPE,
             interface::NETWORK_OBSERVE,
             interface::NETWORK_CONFIGURE,
             interface::ICMP_ECHO,
@@ -2100,6 +2391,8 @@ mod tests {
                 assert!(command.datagram().is_ok());
                 assert!(command.timer().is_ok());
                 assert!(command.diagnostics().is_ok());
+                assert!(command.process_launcher().is_ok());
+                assert!(command.pipes().is_ok());
                 assert!(command.network_observation().is_ok());
                 assert!(command.network_configuration().is_ok());
                 assert!(command.icmp_echo().is_ok());

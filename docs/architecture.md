@@ -79,8 +79,9 @@ Pipelines remain sequential even though cooperative tasks now exist. This makes
 backpressure an explicit capacity error rather than requiring hidden scheduling
 and preserves current byte order, EOF, partial-I/O, and capacity-error semantics.
 
-A final unquoted `&` admits one external command into an eight-slot resident
-table. The shell input loop pumps resident tasks on a 10 ms boundary; background
+A final unquoted `&` admits one external command into the dynamically growing
+resident table under the system task ceiling. The shell input loop pumps
+resident tasks on a 10 ms boundary; background
 stdin is EOF and combined output/error enters a 64 KiB recent log. Stable session
 job numbers back `jobs`, `log`, `kill`, `wait`, and `fg`. SCFG services use the
 same resident mechanism under a separate bounded supervisor with exact task
@@ -187,8 +188,9 @@ unsafety can corrupt any task.
 
 Stage 5 adds `troe-dispatch` between selected clients and services. A port names
 one registered service; a generation-checked handle names explicit call
-authority to that port. Tables are bounded to 16 ports and 32 live handles, and
-stale identities remain invalid when slots are reused. One synchronous request
+authority to that port. Port and handle tables grow fallibly from small initial
+reservations to hard ceilings of 65,536 ports and 262,144 handles, and stale
+identities remain invalid when slots are reused. One synchronous request
 borrows at most 4 KiB of immutable input and produces at most 4 KiB of owned
 reply bytes with a matching monotonic request ID and typed service status.
 Because the dispatcher is exclusively borrowed for delivery, Stage 5 has no
@@ -304,15 +306,39 @@ call; the allocator's 256 KiB quantum is only a batching floor for small
 requests. Expected physical-memory exhaustion leaves the mapping unchanged;
 no fixed lifetime heap-size policy is applied.
 
-ADR 0037 retains several foreground, background, and service applications in
+ADR 0037 retains foreground, background, and service applications in
 one bounded event loop. A single CPU executes only one ring-3/EL0 continuation
 at an instant, but timer preemption, yields, service calls, and typed waits let
-the resident set make concurrent progress. ADR 0045 adds a 16-record registry
+the resident set make concurrent progress. ADR 0045 adds a process registry
 with stable process IDs, scheduler-paired ready/running/blocked/stopping states,
 exact retained-page counts, and high-resolution CPU ticks charged only around
 unprivileged execution. The `process-observe` capability exposes this bounded
 metadata to `ps.kex` and `top.kex`; it hides argv and grants neither memory
 inspection nor process control.
+
+ADR 0046 adds owner-scoped nested process launch and byte pipes. A launcher
+passes canonical cwd, argv, environment, and explicit inherited/null/pipe
+standard streams; the kernel resolves and validates `/bin/<name>.kex`, grants
+only a child-manifest attenuation of the launcher's own capabilities, and
+returns an opaque control token separate from the observable process ID.
+Blocking wait, cancellation, terminal reap, pipe backpressure/EOF, and recursive
+descendant teardown are resident-process operations. The kernel exposes no
+command parser. `spawn.kex` exercises the mechanism; the current `sh.kex`
+continues to use its transactional script sidecar until its language moves onto
+these APIs.
+
+Task, process, wait, pending-call, dispatch, child, pipe, and resident tables use
+small initial `Vec` reservations and fallible on-demand growth. Tasks, process
+records, waits, pending calls, children, and pipes have 65,536-object system
+hard ceilings; handles have a 262,144 ceiling. These are allocation and token
+safety backstops, not preallocated arrays. A future typed system configuration
+can impose lower per-process soft limits and raise them up to the compiled hard
+ceiling.
+The same registry rule gives each application up to 4,096 generation-checked
+read-only file tokens, grows UDP bindings from 64 to the 16,384-port ephemeral
+range ceiling, and grows the ARP cache to 256 entries without a maximum-sized
+initial allocation. Fixed wire batches and parser/security depth bounds remain
+separate versioned policies.
 
 The Stage 9 command slice installs one canonical package per command. Its KCAP
 manifest is validated from the same staged file before optional services are
@@ -334,7 +360,7 @@ read-only process accounting, read-only typed network observation, one DHCP exch
    configuration, echo, datagrams, and TCP are independent authorities; none
    exposes raw frames, routes, DNS, TLS, or devices. Datagram
 ports are exclusive to the launch; read-only
-open tokens are generation-checked and limited to eight; directory traversal is
+open tokens are generation-checked; directory traversal is
 lexically paginated and final-component link targets are bounded. Mutation
 working state is sequential, 16 KiB by default, and selectable through 1 MiB;
 teardown does not roll back already written bytes. Empty-directory creation is

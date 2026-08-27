@@ -32,6 +32,7 @@ const fn origin_label(origin: process_observation::Origin) -> &'static str {
         process_observation::Origin::Foreground => "fg",
         process_observation::Origin::Background => "bg",
         process_observation::Origin::Service => "svc",
+        process_observation::Origin::Child => "child",
     }
 }
 
@@ -43,22 +44,18 @@ fn ticks_to_millis(ticks: u64, frequency: u64) -> u64 {
         .saturating_add(remainder.saturating_mul(1_000) / frequency)
 }
 
-fn report(output: &mut impl fmt::Write, snapshot: &process_observation::Snapshot) -> fmt::Result {
-    writeln!(
-        output,
-        "TROE top  uptime={}ms  processes={}",
-        snapshot.observed_millis(),
-        snapshot.processes().len(),
-    )?;
-    writeln!(output, "PID ORIGIN STATE    CPU-MS PAGES HANDLES NAME")?;
-    for process in snapshot.processes() {
+fn report_page(
+    output: &mut impl fmt::Write,
+    page: &process_observation::Page,
+) -> fmt::Result {
+    for process in page.processes() {
         writeln!(
             output,
             "{} {:<6} {:<8} {} {} {} {}",
             process.id,
             origin_label(process.origin),
             state_label(process.state),
-            ticks_to_millis(process.cpu_ticks, snapshot.counter_frequency_hz()),
+            ticks_to_millis(process.cpu_ticks, page.counter_frequency_hz()),
             process.resident_pages,
             process.handles,
             process.name.as_str(),
@@ -89,23 +86,47 @@ fn main(command: &mut CommandContext) -> u32 {
         return exit::DENIED;
     };
     for index in 0..count {
-        let Ok(snapshot) = observation.snapshot() else {
-            common::report(
-                &mut command.stderr(),
-                "top",
-                b"process observation unavailable",
-            );
-            return exit::FAILURE;
-        };
-        let written = {
-            let mut stdout = command.stdout();
-            let mut output = OutputWriter(&mut stdout);
-            output
-                .write_str("\x1b[2J\x1b[H")
-                .and_then(|()| report(&mut output, &snapshot))
-        };
-        if written.is_err() {
-            return common::stream_failure(&mut command.stderr(), "top");
+        let mut cursor = 0_u64;
+        let mut first = true;
+        loop {
+            let Ok(page) = observation.page(cursor) else {
+                common::report(
+                    &mut command.stderr(),
+                    "top",
+                    b"process observation unavailable",
+                );
+                return exit::FAILURE;
+            };
+            let written = {
+                let mut stdout = command.stdout();
+                let mut output = OutputWriter(&mut stdout);
+                if first {
+                    output
+                        .write_str("\x1b[2J\x1b[H")
+                        .and_then(|()| {
+                            writeln!(
+                                output,
+                                "TROE top  uptime={}ms  processes={}",
+                                page.observed_millis(),
+                                page.total_processes(),
+                            )
+                        })
+                        .and_then(|()| {
+                            writeln!(output, "PID ORIGIN STATE    CPU-MS PAGES HANDLES NAME")
+                        })
+                        .and_then(|()| report_page(&mut output, &page))
+                } else {
+                    report_page(&mut output, &page)
+                }
+            };
+            if written.is_err() {
+                return common::stream_failure(&mut command.stderr(), "top");
+            }
+            first = false;
+            cursor = page.next_cursor();
+            if cursor == 0 {
+                break;
+            }
         }
         if index.saturating_add(1) == count {
             break;

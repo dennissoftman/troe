@@ -5,23 +5,26 @@ use alloc::vec::Vec;
 use core::fmt;
 
 /// Maximum number of simultaneously published wait registrations.
-pub const MAX_WAIT_REGISTRATIONS: usize = 16;
+pub const MAX_WAIT_REGISTRATIONS: usize = 65_536;
 /// Maximum number of simultaneously retained pending calls.
-pub const MAX_PENDING_CALLS: usize = 16;
+pub const MAX_PENDING_CALLS: usize = 65_536;
 /// Maximum bytes copied into one pending request.
 pub const MAX_PENDING_REQUEST_BYTES: usize = 4 * 1024;
+
+const INITIAL_WAIT_CAPACITY: usize = 64;
+const INITIAL_PENDING_CAPACITY: usize = 8;
 
 /// Opaque slot-plus-generation identity for one published wait.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct WaitKey {
-    slot: u16,
+    slot: u32,
     generation: u32,
 }
 
 impl WaitKey {
     /// Pool-local slot used only by diagnostics and tests.
     #[must_use]
-    pub const fn slot(self) -> u16 {
+    pub const fn slot(self) -> u32 {
         self.slot
     }
 
@@ -35,7 +38,7 @@ impl WaitKey {
 /// Opaque slot-plus-generation identity for one copied pending call.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct PendingOperationId {
-    slot: u16,
+    slot: u32,
     generation: u32,
 }
 
@@ -43,7 +46,7 @@ impl PendingOperationId {
     /// Stable opaque token suitable for round-tripping through copied IPC.
     #[must_use]
     pub const fn abi_value(self) -> u64 {
-        (self.generation as u64) << 16 | self.slot as u64
+        (self.generation as u64) << 32 | self.slot as u64
     }
 
     /// Decode one opaque copied-IPC token.
@@ -53,23 +56,20 @@ impl PendingOperationId {
     /// Rejects zero generations and noncanonical high bits. Table lookup still
     /// performs the authoritative current-generation check.
     pub const fn from_abi_value(value: u64) -> Result<Self, PendingCallError> {
-        if value >> 48 != 0 {
-            return Err(PendingCallError::StaleOperation);
-        }
         let bytes = value.to_le_bytes();
-        let generation = u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
+        let generation = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
         if generation == 0 {
             return Err(PendingCallError::StaleOperation);
         }
         Ok(Self {
-            slot: u16::from_le_bytes([bytes[0], bytes[1]]),
+            slot: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
             generation,
         })
     }
 
     /// Pool-local slot used only by diagnostics and tests.
     #[must_use]
-    pub const fn slot(self) -> u16 {
+    pub const fn slot(self) -> u32 {
         self.slot
     }
 
@@ -304,41 +304,42 @@ impl WaitCompletion {
     }
 }
 
-/// Fixed-capacity collection returned by multi-wait wake operations.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Fallibly grown collection returned by multi-wait wake operations.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WakeBatch {
-    completions: [Option<WaitCompletion>; MAX_WAIT_REGISTRATIONS],
-    len: usize,
+    completions: Vec<WaitCompletion>,
 }
 
 impl WakeBatch {
     const fn new() -> Self {
         Self {
-            completions: [None; MAX_WAIT_REGISTRATIONS],
-            len: 0,
+            completions: Vec::new(),
         }
     }
 
-    fn push(&mut self, completion: WaitCompletion) {
-        self.completions[self.len] = Some(completion);
-        self.len += 1;
+    fn push(&mut self, completion: WaitCompletion) -> Result<(), WaitError> {
+        self.completions
+            .try_reserve(1)
+            .map_err(|_| WaitError::MetadataExhausted)?;
+        self.completions.push(completion);
+        Ok(())
     }
 
     /// Number of exactly-once completions in the batch.
     #[must_use]
     pub const fn len(&self) -> usize {
-        self.len
+        self.completions.len()
     }
 
     /// Whether no registration was completed.
     #[must_use]
     pub const fn is_empty(&self) -> bool {
-        self.len == 0
+        self.completions.is_empty()
     }
 
     /// Iterate over copied completion records in slot order.
     pub fn iter(&self) -> impl Iterator<Item = WaitCompletion> + '_ {
-        self.completions[..self.len].iter().flatten().copied()
+        self.completions.iter().copied()
     }
 }
 
@@ -388,9 +389,9 @@ impl fmt::Display for WaitError {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WaitStats {
     /// Currently published registrations.
-    pub live: u16,
+    pub live: u32,
     /// Maximum simultaneously published registrations.
-    pub high_water: u16,
+    pub high_water: u32,
     /// Published registrations completed exactly once.
     pub wakes: u64,
     /// Conditions consumed before a registration was published.
@@ -429,6 +430,7 @@ struct WaitSlot {
 #[derive(Debug)]
 pub struct WaitTable {
     slots: Vec<WaitSlot>,
+    capacity: usize,
     stats: WaitStats,
 }
 
@@ -444,17 +446,11 @@ impl WaitTable {
         }
         let mut slots = Vec::new();
         slots
-            .try_reserve_exact(capacity)
+            .try_reserve_exact(capacity.min(INITIAL_WAIT_CAPACITY))
             .map_err(|_| WaitError::MetadataExhausted)?;
-        for _ in 0..capacity {
-            slots.push(WaitSlot {
-                generation: 1,
-                retired: false,
-                record: None,
-            });
-        }
         Ok(Self {
             slots,
+            capacity,
             stats: WaitStats::default(),
         })
     }
@@ -505,13 +501,28 @@ impl WaitTable {
             self.record_reason(reason, true)?;
             return Ok(WaitRegistration::Ready(reason));
         }
-        let index = self
+        let index = if let Some(index) = self
             .slots
             .iter()
             .position(|slot| slot.record.is_none() && !slot.retired)
-            .ok_or(WaitError::CapacityExhausted)?;
+        {
+            index
+        } else {
+            if self.slots.len() == self.capacity {
+                return Err(WaitError::CapacityExhausted);
+            }
+            self.slots
+                .try_reserve(1)
+                .map_err(|_| WaitError::MetadataExhausted)?;
+            self.slots.push(WaitSlot {
+                generation: 1,
+                retired: false,
+                record: None,
+            });
+            self.slots.len() - 1
+        };
         let key = WaitKey {
-            slot: u16::try_from(index).map_err(|_| WaitError::AccountingOverflow)?,
+            slot: u32::try_from(index).map_err(|_| WaitError::AccountingOverflow)?,
             generation: self.slots[index].generation,
         };
         let live = self
@@ -563,26 +574,21 @@ impl WaitTable {
                 })
             })
         });
-        let mut indices = [None; MAX_WAIT_REGISTRATIONS];
-        let mut count = 0;
-        for (index, slot) in self.slots.iter().enumerate() {
-            if slot.record.is_some_and(|record| {
+        let mut batch = WakeBatch::new();
+        for index in 0..self.slots.len() {
+            if self.slots[index].record.is_some_and(|record| {
                 record.spec.resource == Some(resource) && record.spec.accepts(reason)
             }) {
-                indices[count] = Some(index);
-                count += 1;
+                let completion = self.resolve_index(index, reason)?;
+                batch.push(completion)?;
             }
         }
-        if count == 0 && stale_generation {
+        if batch.is_empty() && stale_generation {
             self.stats.stale_wakes = self
                 .stats
                 .stale_wakes
                 .checked_add(1)
                 .ok_or(WaitError::AccountingOverflow)?;
-        }
-        let mut batch = WakeBatch::new();
-        for index in indices[..count].iter().flatten().copied() {
-            batch.push(self.resolve_index(index, reason)?);
         }
         Ok(batch)
     }
@@ -593,20 +599,15 @@ impl WaitTable {
     ///
     /// Returns checked accounting failures without publishing new waits.
     pub fn expire(&mut self, now: MonotonicMillis) -> Result<WakeBatch, WaitError> {
-        let mut indices = [None; MAX_WAIT_REGISTRATIONS];
-        let mut count = 0;
-        for (index, slot) in self.slots.iter().enumerate() {
-            if slot.record.is_some_and(|record| {
+        let mut batch = WakeBatch::new();
+        for index in 0..self.slots.len() {
+            if self.slots[index].record.is_some_and(|record| {
                 record.spec.interests.contains(WakeInterest::DEADLINE)
                     && record.spec.deadline.is_some_and(|deadline| deadline <= now)
             }) {
-                indices[count] = Some(index);
-                count += 1;
+                let completion = self.resolve_index(index, WakeReason::Deadline)?;
+                batch.push(completion)?;
             }
-        }
-        let mut batch = WakeBatch::new();
-        for index in indices[..count].iter().flatten().copied() {
-            batch.push(self.resolve_index(index, WakeReason::Deadline)?);
         }
         Ok(batch)
     }
@@ -652,7 +653,7 @@ impl WaitTable {
             .iter()
             .position(|slot| slot.record.is_some_and(|record| record.spec.owner == owner))
         {
-            batch.push(self.resolve_index(index, reason)?);
+            batch.push(self.resolve_index(index, reason)?)?;
         }
         Ok(batch)
     }
@@ -664,7 +665,7 @@ impl WaitTable {
     }
 
     fn validate_key(&mut self, key: WaitKey) -> Result<usize, WaitError> {
-        let index = usize::from(key.slot);
+        let index = usize::try_from(key.slot).map_err(|_| WaitError::StaleWait)?;
         let valid = self.slots.get(index).is_some_and(|slot| {
             slot.generation == key.generation && slot.record.is_some_and(|record| record.key == key)
         });
@@ -873,9 +874,9 @@ impl fmt::Display for PendingCallError {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PendingCallStats {
     /// Currently retained pending calls.
-    pub live: u16,
+    pub live: u32,
     /// Maximum simultaneously retained calls.
-    pub high_water: u16,
+    pub high_water: u32,
     /// Currently retained copied request bytes.
     pub retained_bytes: u32,
     /// Maximum simultaneously retained request bytes.
@@ -914,6 +915,7 @@ impl PendingSlot {
 #[derive(Debug)]
 pub struct PendingCallTable {
     slots: Vec<PendingSlot>,
+    capacity: usize,
     retained_byte_capacity: u32,
     last_request_id: u64,
     stats: PendingCallStats,
@@ -939,13 +941,11 @@ impl PendingCallTable {
         }
         let mut slots = Vec::new();
         slots
-            .try_reserve_exact(capacity)
+            .try_reserve_exact(capacity.min(INITIAL_PENDING_CAPACITY))
             .map_err(|_| PendingCallError::MetadataExhausted)?;
-        for _ in 0..capacity {
-            slots.push(PendingSlot::empty());
-        }
         Ok(Self {
             slots,
+            capacity,
             retained_byte_capacity: u32::try_from(retained_byte_capacity)
                 .map_err(|_| PendingCallError::InvalidCapacity)?,
             last_request_id: 0,
@@ -992,18 +992,29 @@ impl PendingCallTable {
         if retained_bytes > self.retained_byte_capacity {
             return Err(PendingCallError::ByteCapacityExhausted);
         }
-        let index = self
+        let index = if let Some(index) = self
             .slots
             .iter()
             .position(|slot| slot.record.is_none() && !slot.retired)
-            .ok_or(PendingCallError::CapacityExhausted)?;
+        {
+            index
+        } else {
+            if self.slots.len() == self.capacity {
+                return Err(PendingCallError::CapacityExhausted);
+            }
+            self.slots
+                .try_reserve(1)
+                .map_err(|_| PendingCallError::MetadataExhausted)?;
+            self.slots.push(PendingSlot::empty());
+            self.slots.len() - 1
+        };
         let live = self
             .stats
             .live
             .checked_add(1)
             .ok_or(PendingCallError::AccountingOverflow)?;
         let id = PendingOperationId {
-            slot: u16::try_from(index).map_err(|_| PendingCallError::AccountingOverflow)?,
+            slot: u32::try_from(index).map_err(|_| PendingCallError::AccountingOverflow)?,
             generation: self.slots[index].generation,
         };
         self.slots[index].request[..request.len()].copy_from_slice(request);
@@ -1138,11 +1149,11 @@ impl PendingCallTable {
         &mut self,
         owner: TaskId,
         reason: WakeReason,
-    ) -> Result<u16, PendingCallError> {
+    ) -> Result<u32, PendingCallError> {
         if !reason.is_terminal() {
             return Err(PendingCallError::InvalidState);
         }
-        let mut matching = 0_u16;
+        let mut matching = 0_u32;
         let mut matching_bytes = 0_u32;
         for slot in &self.slots {
             if let Some(record) = slot.record.filter(|record| record.owner == owner) {
@@ -1194,7 +1205,8 @@ impl PendingCallTable {
     }
 
     fn validate_operation(&self, operation: PendingOperationId) -> Result<usize, PendingCallError> {
-        let index = usize::from(operation.slot);
+        let index =
+            usize::try_from(operation.slot).map_err(|_| PendingCallError::StaleOperation)?;
         let valid = self.slots.get(index).is_some_and(|slot| {
             slot.generation == operation.generation
                 && slot.record.is_some_and(|record| record.id == operation)
@@ -1289,7 +1301,7 @@ mod tests {
         };
         let mut selected = None;
         for owned_slot in 0..=slot {
-            let Ok(stack) = StackResource::new(owned_slot, 1) else {
+            let Ok(stack) = StackResource::new(u32::from(owned_slot), 1) else {
                 std::process::abort()
             };
             selected = match scheduler.spawn(Capabilities::NONE, stack) {
@@ -1327,7 +1339,10 @@ mod tests {
         );
         assert_eq!(
             PendingOperationId::from_abi_value(1_u64 << 48),
-            Err(PendingCallError::StaleOperation)
+            Ok(PendingOperationId {
+                slot: 0,
+                generation: 1 << 16,
+            })
         );
         calls
             .mark_ready(first, WakeReason::ResourceReady)
@@ -1560,10 +1575,11 @@ mod tests {
         assert_eq!(completed.request_id(), 1);
         assert_eq!(calls.call(operation), Err(PendingCallError::StaleOperation));
         assert!(
-            calls.slots[usize::from(operation.slot())]
-                .request
-                .iter()
-                .all(|byte| *byte == 0)
+            calls.slots
+                [usize::try_from(operation.slot()).unwrap_or_else(|_| std::process::abort())]
+            .request
+            .iter()
+            .all(|byte| *byte == 0)
         );
         assert_eq!(calls.stats().retained_bytes, 0);
         assert_eq!(calls.stats().zeroized_bytes, 4);

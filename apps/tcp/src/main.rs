@@ -123,6 +123,7 @@ fn network_failure(command: &CommandContext, failure: Error) -> u32 {
         Error::Timeout => ("operation timed out", exit::FAILURE),
         Error::Exhausted | Error::Conflict => ("bounded TCP resources exhausted", exit::FAILURE),
         Error::Cancelled => ("cancelled", exit::CANCELLED),
+        Error::Denied => ("permission denied", exit::DENIED),
         Error::Failure => ("connection closed or reset", exit::FAILURE),
         Error::InvalidCall
         | Error::InvalidRequest

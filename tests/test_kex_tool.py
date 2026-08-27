@@ -64,7 +64,9 @@ class KexToolTests(unittest.TestCase):
                         64
                         if command == "lua"
                         else 12
-                        if command == "tar"
+                        if command in {"spawn", "tar"}
+                        else 8
+                        if command in {"arp", "ps", "top"}
                         else 20
                         if command in {"awk", "grep", "sed"}
                         else 4
@@ -138,9 +140,9 @@ class KexToolTests(unittest.TestCase):
                     elif command == "mem":
                         expected = [(9, 1, 0)]
                     elif command == "ps":
-                        expected = [(19, 1, 0)]
+                        expected = [(19, 1, 1)]
                     elif command == "top":
-                        expected = [(8, 1, 0), (19, 1, 0)]
+                        expected = [(8, 1, 0), (19, 1, 1)]
                     elif command in {"arp", "net"}:
                         expected = [(10, 1, 0)]
                     elif command == "dhcp":
@@ -153,6 +155,8 @@ class KexToolTests(unittest.TestCase):
                         expected = [(14, 1, 0)]
                     elif command == "sh":
                         expected = [(6, 1, 2), (16, 1, 0)]
+                    elif command == "spawn":
+                        expected = [(6, 1, 2), (20, 1, 0), (21, 1, 0)]
                     else:
                         expected = []
                     self.assertEqual(records, expected)

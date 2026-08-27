@@ -1,6 +1,7 @@
 # ADR 0037: Resident KEX processes and shell jobs
 
-Status: accepted; first resident-process increment implemented, 2026-08-27.
+Status: accepted; first resident-process increment implemented, 2026-08-27;
+fixed resident capacity superseded by ADR 0046.
 
 ## Context
 
@@ -55,8 +56,8 @@ handles, heap commits, file tokens, network state, and output buffers retain
 their existing local bounds. Admission failure is explicit and leaves no
 partial resident process.
 
-The first process table has eight resident records, within
-`troe_task::MAX_TASKS`. Actual admission
+The first process table had eight resident records. ADR 0046 replaces that
+fixed table with fallible growth under `troe_task::MAX_TASKS`. Actual admission
 also depends on exact available physical frames and handle/table capacity.
 Terminal records are retained only while a bounded shell or service status
 consumer needs their result, then owner-wide cancellation, handle revocation,
