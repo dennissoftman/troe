@@ -1,8 +1,10 @@
 # Cloud platform support and raw artifacts
 
-Status: Phase B implemented for two exact discoverable QEMU contracts. The
-combined cloud bundle passes the complete runtime and fault matrix on both;
-real cloud-provider entries remain unsupported until separately accepted.
+Status: Phase B is accepted for two exact discoverable QEMU contracts. The
+first non-QEMU target is now pinned to Cloud Hypervisor v53.0 on Linux/KVM
+x86-64 with a production-only live harness, but it remains
+`compatible-unverified` until that harness passes on a real KVM host. Real
+cloud-provider entries remain unsupported until separately accepted.
 
 TROE support is an exact `(platform, environment)` claim. An architecture,
 UEFI, or the presence of virtio alone is not enough. The authoritative
@@ -149,6 +151,7 @@ The current matrix deliberately separates three states:
 | pinned QEMU `virt`/GICv2 | `aarch64-virt-uefi` | compatible-unverified | host-verified | Its split-media runtime is accepted, but this exact platform has not consumed the combined bundle. |
 | QEMU discoverable UEFI/ACPI | `x86_64-uefi-virtio-pci` | accepted | host-verified | The combined bundle passes boot, reboot, persistence, networking, and all fault sessions after bounded ACPI validation. |
 | QEMU discoverable UEFI/device tree | `aarch64-uefi-virtio-mmio` | accepted | host-verified | The combined bundle passes boot, reboot, persistence, networking, and all fault sessions after bounded FDT validation. |
+| Cloud Hypervisor v53.0 on Linux/KVM x86-64 | `x86_64-uefi-virtio-pci` | compatible-unverified | host-verified | Exact VMM, control binary, firmware, machine resources, and production harness are pinned; live KVM evidence is still absent. |
 | QEMU q35 with KVM | `x86_64-q35-uefi` | compatible-unverified | host-verified | Same described machine contract, but no pinned KVM result. |
 | QEMU `virt` with KVM | `aarch64-virt-uefi` | compatible-unverified | host-verified | Same described machine contract, but no pinned AArch64 KVM result. |
 | AWS Nitro | none | incompatible | unavailable | Requires validated provider discovery plus NVMe and ENA drivers. |
@@ -160,7 +163,14 @@ accepted on real instances before promotion. No qcow2, VHD, VMDK, snapshot, or
 provider-import wrapper is produced yet; raw GPT is the only implemented cloud
 artifact format.
 
-The accepted x86 contract uses QEMU q35 with a deterministic injected SPCR,
+The exact Cloud Hypervisor threat model, artifact pins, host/TAP setup,
+hardening, production-bundle procedure, recovery flow, and live acceptance
+command are specified in
+[`cloud-hypervisor-production.md`](cloud-hypervisor-production.md). That target
+must not be promoted from `compatible-unverified` based on host-only tests or a
+QEMU result.
+
+The accepted x86 QEMU contract uses q35 with a deterministic injected SPCR,
 ACPI-discovered ECAM/APIC topology, the FADT PM timer, and reset-only lifecycle
 control. The accepted AArch64 contract pins QEMU `virt,gic-version=2,acpi=off`
 and validates the edk2-published FDT for GICv2, PSCI-HVC, PL011, timer, RAM, and

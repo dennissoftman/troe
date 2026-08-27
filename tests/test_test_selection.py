@@ -146,6 +146,20 @@ class ChangedTestSelectionTests(unittest.TestCase):
                 self.assertEqual(plan.python_tests, {test})
                 self.assertEqual(plan.qemu_scenarios, set())
 
+    def test_cloud_hypervisor_runner_selects_its_host_contract_tests(self) -> None:
+        for path in (
+            "scripts/cloud_hypervisor_profile.py",
+            "scripts/test-cloud-hypervisor.py",
+            "tools/cloud-hypervisor-profile.json",
+        ):
+            with self.subTest(path=path):
+                plan = test_changed.build_plan((PurePosixPath(path),), PACKAGES)
+                self.assertFalse(plan.full_reasons)
+                self.assertEqual(
+                    plan.python_tests, {"test_cloud_hypervisor_profile.py"}
+                )
+                self.assertEqual(plan.qemu_scenarios, set())
+
     def test_audit_policy_change_runs_audit_without_unknown_fallback(self) -> None:
         plan = test_changed.build_plan(
             (PurePosixPath("tools/rustsec-exceptions.json"),), PACKAGES

@@ -312,3 +312,12 @@ or release. The pinned environment must provide Rust 1.97.1, QEMU 11.1.0, the
 committed `edk2-stable202605-r1` firmware bytes, `cargo-audit` 0.22.1,
 e2fsprogs 1.47.4, dosfstools, and mtools. The focused selector is a development
 aid and does not replace this maintainer-owned exhaustive gate.
+
+The non-QEMU production gate is separate because it requires a Linux x86-64
+host with KVM and a pre-created isolated TAP. It verifies the exact v53.0
+Cloud Hypervisor and `ch-remote` static assets, `CLOUDHV.fd` release
+`ch-f308d878a6`, a production-identity bundle, process reopen, rollback, reboot,
+and corrupted-StateFS recovery. Run it only as documented in
+[`cloud-hypervisor-production.md`](cloud-hypervisor-production.md). A dry-run,
+host-only test, QEMU result, or fixture-identity bundle is not production
+acceptance evidence.

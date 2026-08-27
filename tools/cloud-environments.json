@@ -99,6 +99,42 @@
       "virtio_transport": "pci"
     },
     {
+      "acceptance_evidence": [],
+      "architecture": "x86_64",
+      "artifact_status": "host-verified",
+      "block_device": "virtio-blk-pci-modern",
+      "boot_contract": "cloudhv-edk2-uefi-removable-fallback-gpt-esp",
+      "environment": "cloud-hypervisor-kvm-v53",
+      "firmware": "cloud-hypervisor-edk2-ch-f308d878a6",
+      "gaps": [
+        "no live Linux KVM acceptance result for the pinned v53.0 VMM and firmware pair",
+        "the TROE ACPI, SPCR, PCI, interrupt, timer, and reset inventory has not been observed on this exact VMM",
+        "a production-identity bundle has not completed the install, update, rollback, corruption-recovery, reboot, and destroy matrix"
+      ],
+      "id": "cloud-hypervisor-v53-x86_64",
+      "image_format": "raw-gpt",
+      "interrupt_model": "cloud-hypervisor-acpi-lapic-ioapic",
+      "machine_contract": "cloud-hypervisor-v53-kvm-acpi-one-segment",
+      "missing_drivers": [],
+      "network_device": "virtio-net-pci-modern",
+      "platform": "x86_64-uefi-virtio-pci",
+      "provider": "cloud-hypervisor",
+      "required_cpu_features": [
+        "x86-64-long-mode",
+        "nx",
+        "physical-address-width-46",
+        "four-level-paging-handoff",
+        "kvm-api"
+      ],
+      "required_disks": [
+        "system",
+        "activation",
+        "state"
+      ],
+      "runtime_status": "compatible-unverified",
+      "virtio_transport": "pci"
+    },
+    {
       "acceptance_evidence": [
         "python3 scripts/test-qemu.py --platform aarch64-uefi-virtio-mmio --environment qemu --skip-build"
       ],

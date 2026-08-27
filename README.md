@@ -240,6 +240,11 @@ cargo qemu --platform x86_64-q35-uefi --environment qemu
 cargo qemu --platform aarch64-virt-uefi --environment qemu
 ```
 
+The first non-QEMU target is separately pinned to Cloud Hypervisor v53.0 on a
+Linux x86-64 KVM host. It has a production-only acceptance harness but remains
+`compatible-unverified` until the live matrix passes; see the
+[exact target and operator runbook](docs/cloud-hypervisor-production.md).
+
 Without the exact QEMU setup, the hosted model still exercises the shell parser
 and sessions. It intentionally does not execute KEX applications.
 

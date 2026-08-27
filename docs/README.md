@@ -15,6 +15,7 @@ contract.
 | Stage 9 production-usability work | [Stage 9 milestone](https://github.com/dennissoftman/troe/milestone/1) |
 | Test commands, selection rules, native entry contract, and IPC baseline | [Testing and verification](testing.md) |
 | Supported VM contracts and deployable raw artifacts | [Cloud platform support](cloud-platform-support.md) |
+| Exact Cloud Hypervisor v53 Linux/KVM target and runbook | [Cloud Hypervisor production target](cloud-hypervisor-production.md) |
 | Security boundary and reporting | [Security policy](../SECURITY.md) |
 | Contribution and merge expectations | [Contribution guide](../CONTRIBUTING.md) |
 | Core normative requirements | [Core specification](../CORE-SPEC.md) |

@@ -1,0 +1,51 @@
+{
+  "architecture": "x86_64",
+  "control": {
+    "name": "ch-remote-static",
+    "release": "v53.0",
+    "sha256": "13f32ba952e6791fd901f2279be2055fbacc64005f96c42a8e90d58860df84a7",
+    "size": 1798776,
+    "url": "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v53.0/ch-remote-static"
+  },
+  "cpus": {
+    "boot": 1,
+    "max": 1,
+    "max_phys_bits": 46
+  },
+  "disks": [
+    "system",
+    "activation",
+    "state"
+  ],
+  "environment": "cloud-hypervisor-kvm-v53",
+  "firmware": {
+    "name": "CLOUDHV.fd",
+    "release": "ch-f308d878a6",
+    "sha256": "edd3ceb8de672ec4317a9d68de1f5edc9f48ef2c0283853c7c681332573ff46a",
+    "size": 4194304,
+    "url": "https://github.com/cloud-hypervisor/edk2/releases/download/ch-f308d878a6/CLOUDHV.fd"
+  },
+  "guest_memory_bytes": 134217728,
+  "host": {
+    "architecture": "x86_64",
+    "kernel": "linux",
+    "kvm_device": "/dev/kvm",
+    "minimum_available_memory_bytes": 536870912,
+    "minimum_runtime_free_bytes": 268435456
+  },
+  "network": {
+    "guest": "10.0.2.15/24",
+    "host": "10.0.2.2/24",
+    "mac": "52:54:00:12:34:60",
+    "peer_port": 40125
+  },
+  "platform": "x86_64-uefi-virtio-pci",
+  "schema": 1,
+  "vmm": {
+    "name": "cloud-hypervisor-static",
+    "release": "v53.0",
+    "sha256": "448af3d4e59b22c2987f7df94c213ad40fb53a10d437e42b5ee6c4fce7c29ecc",
+    "size": 7062256,
+    "url": "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/v53.0/cloud-hypervisor-static"
+  }
+}

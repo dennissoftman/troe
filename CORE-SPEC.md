@@ -1096,8 +1096,9 @@ Configured health failure rolls generation 2 back durably to generation 1.
 ### Stage 9 — Production usability
 
 **Status:** package, trust, configuration, and transactional lifecycle
-foundations are implemented as hosted references. Exact non-QEMU production
-environment acceptance remains gated.
+foundations are implemented as hosted references. Cloud Hypervisor v53.0 on
+Linux/KVM x86-64 is the first exact non-QEMU target and has a pinned
+production-only harness; acceptance remains gated on a real KVM result.
 
 - Hosted Stage 9 deployment MUST verify one signed package per locked member,
   publish a complete immutable generation before its pending pointer, retain
@@ -1109,6 +1110,10 @@ environment acceptance remains gated.
 - Garbage collection MUST trace active, previous, recovery, and in-flight
   transaction roots. Persistent lifecycle diagnostics MUST remain bounded and
   every durable lifecycle boundary MUST be process-reopen testable.
+- A production-environment claim MUST bind one exact VMM, firmware, platform,
+  device/interrupt topology, resource floor, network boundary, artifact kind,
+  and live acceptance record. Host-only validation or resemblance to an
+  accepted emulator MUST NOT promote an environment claim.
 
 **Exit criterion:** operators can construct, authenticate, publish, activate,
 diagnose, roll back, and garbage-collect a complete locked system on every

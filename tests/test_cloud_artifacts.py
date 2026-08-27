@@ -189,6 +189,15 @@ class CloudEnvironmentMatrixTests(unittest.TestCase):
             "compatible-unverified",
         )
         self.assertEqual(
+            by_id["cloud-hypervisor-v53-x86_64"]["runtime_status"],
+            "compatible-unverified",
+        )
+        self.assertEqual(
+            by_id["cloud-hypervisor-v53-x86_64"]["environment"],
+            "cloud-hypervisor-kvm-v53",
+        )
+        self.assertFalse(by_id["cloud-hypervisor-v53-x86_64"]["acceptance_evidence"])
+        self.assertEqual(
             by_id["qemu-discoverable-virtio-pci-x86_64"]["runtime_status"],
             "accepted",
         )
