@@ -141,6 +141,12 @@ without forcing open files closed. `cargo qemu --reset-shared-disk`
 deliberately replaces the image with an empty filesystem, while
 `cargo qemu --no-shared-disk` opts out for one run. The FAT32 medium is the
 macOS/Linux interchange starting point; macOS does not mount ext4 natively.
+If a guest was stopped before unmounting the medium, the next interactive
+launcher or `cargo mount` validates the canonical GPT/FAT metadata and offers a
+narrow repair with a safe `y/N` default. The repair only clears the
+unclean-unmount marker and keeps the filesystem contents; other metadata
+deviations still fail closed. Use `cargo mount --repair` for the same explicit,
+lock-protected non-interactive repair without mounting the image.
 
 ### Networking
 

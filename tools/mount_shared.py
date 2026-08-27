@@ -624,6 +624,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="report whether the shared FAT32 image is attached",
     )
+    action.add_argument(
+        "--repair",
+        action="store_true",
+        help="clear a validated unclean-unmount marker without mounting",
+    )
     parser.add_argument(
         "--read-only",
         action="store_true",
@@ -635,7 +640,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="open the mounted directory in the host file manager",
     )
     args = parser.parse_args(argv)
-    if (args.unmount or args.status) and (args.read_only or args.open):
+    if (args.unmount or args.status or args.repair) and (
+        args.read_only or args.open
+    ):
         parser.error("--read-only and --open apply only when mounting")
     return args
 
@@ -677,6 +684,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print("shared FAT32: detached; it is safe to start QEMU")
                 return 0
 
+            if args.repair:
+                require_detached()
+                repaired = mkshared.repair_image(DEFAULT_IMAGE)
+                action = "repaired" if repaired else "already clean"
+                print(f"shared FAT32: {action}; it is safe to start QEMU")
+                return 0
+
             if state is not None:
                 if args.read_only and not state.read_only:
                     raise MountError(
@@ -684,14 +698,21 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
             else:
                 require_detached()
-                created = mkshared.ensure_image(DEFAULT_IMAGE)
+                created, repaired = mkshared.ensure_image_with_repair_prompt(
+                    DEFAULT_IMAGE
+                )
                 state = mount_image(DEFAULT_IMAGE, read_only=args.read_only)
                 try:
                     write_state(state)
                 except BaseException:
                     unmount_image(state)
                     raise
-                action = "created and mounted" if created else "mounted"
+                if created:
+                    action = "created and mounted"
+                elif repaired:
+                    action = "repaired and mounted"
+                else:
+                    action = "mounted"
                 mode = "read-only" if state.read_only else "read-write"
                 print(f"shared FAT32: {action} {mode} at {state.mount_point}")
             print("copy files there, then run `cargo mount --unmount` before QEMU")
