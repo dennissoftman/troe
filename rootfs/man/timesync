@@ -1,0 +1,15 @@
+TIMESYNC(8)
+
+NAME
+    timesync - keep the kernel wall clock synchronized with SNTP
+
+DESCRIPTION
+    timesync sends an SNTP request immediately at startup. After a successful
+    correction it sleeps cooperatively for one day. Failed attempts retry after
+    one minute, five minutes, thirty minutes, then hourly. It is intended to run
+    under the SCFG service supervisor.
+
+    The initial example targets the QEMU gateway at 10.0.2.2. The application
+    validates an SNTPv4 server reply, echoed originate token, stratum, source,
+    and nonzero timestamps. It supports NTP era zero through 2036 and requires
+    datagram, monotonic timer, and privileged clock-control authority.

@@ -19,6 +19,19 @@ const HEADER_BYTES: usize = 64;
 const RECORD_BYTES: usize = 64;
 const MAX_CONFIG_BYTES: usize = 16 * 1024;
 const MAX_SERVICES: usize = 32;
+/// SCFG authority bit permitting one owned IPv4 datagram endpoint.
+pub const SERVICE_CAPABILITY_DATAGRAM: u32 = 1 << 0;
+/// SCFG authority bit permitting monotonic timer access and waits.
+pub const SERVICE_CAPABILITY_TIMER: u32 = 1 << 1;
+/// SCFG authority bit permitting privileged wall-clock correction.
+pub const SERVICE_CAPABILITY_CLOCK_CONTROL: u32 = 1 << 2;
+/// SCFG authority bit permitting read-only wall-clock observation.
+pub const SERVICE_CAPABILITY_WALL_CLOCK: u32 = 1 << 3;
+/// Closed mask of service authorities understood by SCFG v1 activation.
+pub const KNOWN_SERVICE_CAPABILITIES: u32 = SERVICE_CAPABILITY_DATAGRAM
+    | SERVICE_CAPABILITY_TIMER
+    | SERVICE_CAPABILITY_CLOCK_CONTROL
+    | SERVICE_CAPABILITY_WALL_CLOCK;
 const MAX_DEPENDENCIES: usize = 4;
 const MAX_SERVICE_NAME_BYTES: usize = 32;
 const MAX_BOOT_ATTEMPTS: u8 = 8;
@@ -576,6 +589,7 @@ fn parse_service(
     let dependency_count = usize::from(record[10]);
     let health_timeout_ms = read_u32(record, 12)?;
     let lifetime_limit_ms = read_u32(record, 16)?;
+    let capability_bits = read_u32(record, 20)?;
     if execution_lease_ms == 0
         || execution_lease_ms > MAX_EXECUTION_LEASE_MS
         || initial_handles > MAX_INITIAL_HANDLES
@@ -590,6 +604,7 @@ fn parse_service(
         || (matches!(mode, StartupMode::BootRequired | StartupMode::BootOptional)
             && health_timeout_ms == 0)
         || (lifetime_limit_ms != 0 && lifetime_limit_ms < health_timeout_ms)
+        || capability_bits & !KNOWN_SERVICE_CAPABILITIES != 0
     {
         return Err(ConfigError::InvalidService);
     }
@@ -627,7 +642,7 @@ fn parse_service(
         execution_lease_ms,
         health_timeout_ms,
         lifetime_limit_ms,
-        capability_bits: read_u32(record, 20)?,
+        capability_bits,
         dependencies,
         name,
         artifact_path,

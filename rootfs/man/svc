@@ -1,0 +1,16 @@
+NAME
+    svc - inspect and control SCFG services
+
+SYNOPSIS
+    svc [list]
+    svc status [NAME]
+    svc start NAME
+    svc stop NAME
+    svc restart NAME
+    svc log NAME
+
+DESCRIPTION
+    Controls the bounded service supervisor using stable SCFG names. Services
+    remain foreground KEX processes under direct supervision; they do not
+    daemonize or use PID files. stop and restart preserve exact task ownership,
+    while log copies bounded recent service output.

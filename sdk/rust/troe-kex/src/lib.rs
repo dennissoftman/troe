@@ -4,9 +4,9 @@
 use core::{fmt, slice};
 
 pub use troe_abi::{
-    ABI_MAJOR, ABI_MINOR, command, datagram, diagnostics, exit, filesystem, filesystem_mutation,
-    icmp_echo, interface, network_configuration, network_observation, reply, server, shell_script,
-    tcp_connect, timer, volume_control,
+    ABI_MAJOR, ABI_MINOR, clock_control, command, datagram, diagnostics, exit, filesystem,
+    filesystem_mutation, icmp_echo, interface, network_configuration, network_observation, reply,
+    server, shell_script, tcp_connect, timer, volume_control, wall_clock,
 };
 use troe_abi::{MAX_MESSAGE_BYTES, MAX_SERVICE_PAYLOAD_BYTES, heap_growth, stream};
 
@@ -187,6 +187,8 @@ pub struct CommandContext {
     tcp_connect: Option<Handle>,
     volume_control: Option<Handle>,
     shell_script: Option<Handle>,
+    wall_clock: Option<Handle>,
+    clock_control: Option<Handle>,
     heap: Option<HeapRegion>,
 }
 
@@ -263,6 +265,16 @@ impl CommandContext {
                 interface::SHELL_SCRIPT,
                 shell_script::MAJOR,
                 shell_script::MINOR,
+            )?,
+            wall_clock: startup.optional_handle(
+                interface::WALL_CLOCK,
+                wall_clock::MAJOR,
+                wall_clock::MINOR,
+            )?,
+            clock_control: startup.optional_handle(
+                interface::CLOCK_CONTROL,
+                clock_control::MAJOR,
+                clock_control::MINOR,
             )?,
             heap: startup.heap_region()?,
         })
@@ -357,6 +369,30 @@ impl CommandContext {
     pub const fn timer(&self) -> Result<Timer, Error> {
         match self.timer {
             Some(handle) => Ok(Timer { handle }),
+            None => Err(Error::MissingAuthority),
+        }
+    }
+
+    /// Borrow the optional read-only wall-clock capability.
+    ///
+    /// # Errors
+    ///
+    /// Reports that the package did not request or receive wall-clock access.
+    pub const fn wall_clock(&self) -> Result<WallClock, Error> {
+        match self.wall_clock {
+            Some(handle) => Ok(WallClock { handle }),
+            None => Err(Error::MissingAuthority),
+        }
+    }
+
+    /// Borrow the optional privileged wall-clock correction capability.
+    ///
+    /// # Errors
+    ///
+    /// Reports that the package did not request or receive clock authority.
+    pub const fn clock_control(&self) -> Result<ClockControl, Error> {
+        match self.clock_control {
+            Some(handle) => Ok(ClockControl { handle }),
             None => Err(Error::MissingAuthority),
         }
     }
@@ -667,6 +703,18 @@ pub struct FilesystemMutation {
 /// Boot-relative monotonic timer client scoped to one application lifetime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Timer {
+    handle: Handle,
+}
+
+/// Read-only kernel wall-clock client.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WallClock {
+    handle: Handle,
+}
+
+/// Privileged kernel wall-clock correction client.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClockControl {
     handle: Handle,
 }
 
@@ -1095,6 +1143,37 @@ impl Timer {
         let request = timer::encode_milliseconds(deadline_milliseconds);
         let mut reply = [];
         let count = call(self.handle, timer::SLEEP_UNTIL, &request, &mut reply)?;
+        if count == 0 {
+            Ok(())
+        } else {
+            Err(Error::InvalidCall)
+        }
+    }
+}
+
+impl WallClock {
+    /// Read whole Unix seconds from the kernel's monotonic wall-clock anchor.
+    ///
+    /// # Errors
+    ///
+    /// Reports service, decoding, or call-gate failure.
+    pub fn now(&mut self) -> Result<u64, Error> {
+        let mut reply = [0_u8; wall_clock::SECONDS_BYTES];
+        let count = call(self.handle, wall_clock::NOW, &[], &mut reply)?;
+        wall_clock::decode_seconds(&reply[..count]).map_err(|_| Error::InvalidCall)
+    }
+}
+
+impl ClockControl {
+    /// Correct the kernel wall clock at the current monotonic instant.
+    ///
+    /// # Errors
+    ///
+    /// Reports an invalid timestamp, denied service, or call-gate failure.
+    pub fn set(&mut self, unix_seconds: u64) -> Result<(), Error> {
+        let request = clock_control::encode_seconds(unix_seconds);
+        let mut reply = [];
+        let count = call(self.handle, clock_control::SET, &request, &mut reply)?;
         if count == 0 {
             Ok(())
         } else {
@@ -1953,6 +2032,8 @@ mod tests {
             interface::TCP_CONNECT,
             interface::VOLUME_CONTROL,
             interface::SHELL_SCRIPT,
+            interface::WALL_CLOCK,
+            interface::CLOCK_CONTROL,
         ]);
         let startup = Startup::parse(&page);
         assert!(startup.is_ok());
@@ -1968,6 +2049,8 @@ mod tests {
                 assert!(command.icmp_echo().is_ok());
                 assert!(command.tcp_connect().is_ok());
                 assert!(command.volume_control().is_ok());
+                assert!(command.wall_clock().is_ok());
+                assert!(command.clock_control().is_ok());
                 assert!(command.shell_script().is_ok());
                 let heap = command.take_heap();
                 assert_eq!(

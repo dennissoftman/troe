@@ -1,0 +1,9 @@
+NAME
+    wait - wait for and reap one background job
+
+SYNOPSIS
+    wait JOB
+
+DESCRIPTION
+    Waits for one session-owned job to become terminal and then removes its job
+    record. Unlike fg, wait does not copy retained output.

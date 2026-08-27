@@ -133,6 +133,8 @@ class KexToolTests(unittest.TestCase):
                         expected = [(7, 2, 0)]
                     elif command == "sleep":
                         expected = [(8, 1, 0)]
+                    elif command == "timesync":
+                        expected = [(5, 1, 0), (8, 1, 0), (18, 1, 0)]
                     elif command == "mem":
                         expected = [(9, 1, 0)]
                     elif command in {"arp", "net"}:

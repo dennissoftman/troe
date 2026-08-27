@@ -249,7 +249,7 @@ class NativeExecutionContractTests(unittest.TestCase):
                     "finish_application_execution()",
                 )
 
-    def test_time_service_and_memory_budgets_are_independent(self) -> None:
+    def test_timeslices_and_local_service_budgets_do_not_cap_process_lifetime(self) -> None:
         runner = source_between(
             KERNEL_SOURCE,
             "fn run_command_application(",
@@ -257,17 +257,17 @@ class NativeExecutionContractTests(unittest.TestCase):
         )
         budget = source_between(runner, "let terminal = loop", "match outcome")
         self.assertIn("ApplicationOutcome::HandleCall", budget)
+        self.assertIn("if service_call && let Some(service_call_limit)", budget)
+        self.assertNotIn("monotonic_millis()", budget)
+        self.assertNotIn("CommandRuntimeExpired", runner)
         for outcome in ("Yielded", "Preempted", "HeapGrow"):
             with self.subTest(outcome=outcome):
                 self.assertNotIn(f"ApplicationOutcome::{outcome}", budget)
         require_order(
             self,
             budget,
-            "monotonic_millis()",
-            "APPLICATION_COMMAND_RUNTIME_MILLISECONDS",
-            "if service_call",
             "service_calls.checked_add(1)",
-            "APPLICATION_COMMAND_SERVICE_CALL_LIMIT",
+            "service_calls > service_call_limit",
         )
         preemption = source_between(
             runner,
@@ -278,7 +278,7 @@ class NativeExecutionContractTests(unittest.TestCase):
             self,
             preemption,
             "scheduler.preempt_current(task_id)",
-            "dispatch_next(Capabilities::SERVICE)",
+            "dispatch(task_id, Capabilities::SERVICE)",
             "ApplicationResume::Timeslice",
         )
 
@@ -295,7 +295,7 @@ class NativeExecutionContractTests(unittest.TestCase):
             "wait_for_runtime_event_timeout(interval)",
             "pending.resolve(completion)",
             "wake_blocked(completion.owner(), completion.key())",
-            "dispatch_next(Capabilities::SERVICE)",
+            "dispatch(task_id, Capabilities::SERVICE)",
             "suspended.take(operation)",
             "pending.finish(operation)",
         )

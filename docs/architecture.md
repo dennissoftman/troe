@@ -9,7 +9,7 @@ serial / PS/2 → IRQ → bounded queue → editor ─┘  └─ UART + GOP tex
 ```
 
 The shell owns parsing, pipelines, streamed file redirection, completion, cwd,
-and three intrinsics.
+session job control, service control, and nine non-shadowable intrinsics.
 Ordinary commands always load an immutable architecture-specific KEX artifact
 into a fresh ring-3/EL0 address space and route cwd/argv, standard streams, and
 declared optional services through generation-owned synchronous message dispatch
@@ -46,8 +46,10 @@ firmware fails before device publication or volatile I/O.
    command path. Absence reports an unavailable application and never selects
    privileged utility behavior. KEX receives bounded stdin/stdout/stderr streams
    plus only declared optional datagram, read-only VFS, streamed file mutation,
-   monotonic timer, diagnostics, network-observation, DHCP, ICMP, or outbound
-   TCP-connect handles. The `sh.kex` interpreter alone requests a bounded
+   monotonic timer, wall-clock observation or correction, diagnostics,
+   network-observation, DHCP, ICMP, or outbound TCP-connect handles. Privileged
+   wall-clock correction is service-launcher-only. The `sh.kex` interpreter
+   alone requests a bounded
    shell-script sidecar: it transactionally stages physical command lines, exits,
    and lets the resumed owning session execute them without nested KEX launch.
    No application receives ambient `Shell`, provider, block, device, or machine
@@ -76,6 +78,17 @@ Pipelines remain sequential even though cooperative tasks now exist. This makes
 backpressure an explicit capacity error rather than requiring hidden scheduling
 and preserves current byte order, EOF, partial-I/O, and capacity-error semantics.
 
+A final unquoted `&` admits one external command into an eight-slot resident
+table. The shell input loop pumps resident tasks on a 10 ms boundary; background
+stdin is EOF and combined output/error enters a 64 KiB recent log. Stable session
+job numbers back `jobs`, `log`, `kill`, `wait`, and `fg`. SCFG services use the
+same resident mechanism under a separate bounded supervisor with exact task
+ownership, dependency/restart state, and service logs. The selected boot
+configuration starts `timesync` with datagram, timer, and clock-control
+authority. Foreground KEX commands use a locally retained resident continuation
+with borrowed session streams; the shared pump continues to run background jobs
+and service processes between foreground slices and blocked waits.
+
 ## Authority
 
 There are no ambient device or reboot globals in portable crates. Only the UEFI
@@ -86,8 +99,10 @@ Ordinary commands have no shell-privileged implementation. Their task mappings
 and handles are enforced by ring-3/EL0 page permissions and generation-revoked
 ownership.
 
-The shell reserves `cd`, `poweroff`, and `reboot` as its only non-shadowable intrinsics.
-`cd` owns the logical working-directory transition, while both terminal machine
+The shell reserves `cd`, `fg`, `jobs`, `kill`, `log`, `poweroff`, `reboot`,
+`svc`, and `wait` as non-shadowable intrinsics. `cd` owns the logical
+working-directory transition, the job and service commands operate only on
+their owning bounded tables, while both terminal machine
 actions consume only the shell's machine-control grant. KEX command discovery
 resolves every ordinary command from exact immutable architecture-specific
 paths, but cannot intercept intrinsic names; ABI 1.1
@@ -270,8 +285,8 @@ Unsaved AVX-family, SVE, and SME state remains disabled rather than leaking or
 corrupting across tasks. ABI call 0 exits through the owned gate. The x86
 local-APIC and AArch64 generic physical timers now capture a complete resumable
 user context when the 50 ms timeslice expires. A separate spinning KEX proves
-that preemption boundary before acceptance cleanup, while ordinary commands are
-bounded by a command-wide monotonic runtime deadline. ABI gates also capture a
+that preemption boundary before acceptance cleanup. Ordinary commands have no
+command-wide runtime deadline. ABI gates also capture a
 bounded full user context; `yield` remains an optional scheduling hint, while
 `handle_call` validates
 complete non-overlapping ranges, copies a two-byte opcode-prefixed request,
@@ -295,10 +310,9 @@ mechanism: immutable cwd/argv, stdin, stdout, and stderr. The shell logically yi
 one foreground application runs, then resumes only after owner-wide handle
 revocation, record reaping, page zeroization, and exact frame return. Artifacts
 are read from target-selected `/bin/<name>.kex`; absence is a terminal not-found
-result. Service payloads and application service calls have hard ceilings;
-heap growth is bounded by allocator ownership and resident-page limits, while
-voluntary yields and timer preemptions are governed by the command runtime
-deadline instead of an aggregate step counter. Standard streams themselves
+result. Individual service payloads and retained tables have hard ceilings;
+ordinary applications have no cumulative service-call ceiling. Heap growth is
+bounded by allocator ownership and resident-page limits. Standard streams themselves
 forward without an aggregate byte cap. Optional interfaces
 expose only bounded IPv4/UDP send/receive, read-only VFS operations, one
 sequential streamed file mutation, a boot-relative monotonic timer, one immutable typed diagnostics

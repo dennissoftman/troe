@@ -219,6 +219,7 @@ dependencies = [
  "troe-shell",
  "troe-statefs",
  "troe-storage",
+ "troe-supervisor",
  "troe-task",
  "troe-terminal",
  "troe-vfs",
@@ -318,6 +319,14 @@ dependencies = [
  "troe-identity",
  "troe-mount",
  "troe-vfs",
+]
+
+[[package]]
+name = "troe-supervisor"
+version = "0.1.0"
+dependencies = [
+ "troe-config",
+ "troe-task",
 ]
 
 [[package]]
