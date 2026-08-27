@@ -42,7 +42,6 @@ struct LuaHost {
     allocate: unsafe extern "C" fn(*mut c_void, *mut c_void, usize, usize) -> *mut c_void,
     read: unsafe extern "C" fn(*mut c_void, *mut u8, usize) -> isize,
     write: unsafe extern "C" fn(*mut c_void, i32, *const u8, usize) -> i32,
-    yield_now: unsafe extern "C" fn(*mut c_void) -> i32,
     monotonic_millis: unsafe extern "C" fn(*mut c_void, *mut u64) -> i32,
 }
 
@@ -327,7 +326,6 @@ fn run(command: &mut CommandContext) -> u32 {
         allocate: lua_allocate,
         read: lua_read,
         write: lua_write,
-        yield_now: lua_yield,
         monotonic_millis: lua_monotonic_millis,
     };
     let mut configuration = LuaConfiguration {
@@ -461,14 +459,6 @@ unsafe extern "C" fn lua_write(
         _ => return -1,
     };
     if result.is_ok() { 0 } else { -1 }
-}
-
-unsafe extern "C" fn lua_yield(_context: *mut c_void) -> i32 {
-    if troe_kex_sdk::yield_now().is_ok() {
-        0
-    } else {
-        -1
-    }
 }
 
 unsafe extern "C" fn lua_monotonic_millis(context: *mut c_void, result: *mut u64) -> i32 {

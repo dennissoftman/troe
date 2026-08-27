@@ -211,8 +211,12 @@ pub enum TaskFault {
     IllegalInstruction,
     /// The task invoked an unknown call or supplied an invalid message range.
     InvalidCall,
-    /// The task exhausted its bounded uninterrupted execution lease.
+    /// The native machine boundary reported an unrecoverable execution lease.
     ExecutionLeaseExpired,
+    /// The command exceeded its monotonic wall-clock runtime deadline.
+    CommandRuntimeExpired,
+    /// The command exceeded its bounded application service-call count.
+    ServiceCallLimitExceeded,
 }
 
 impl StackResource {
@@ -277,6 +281,7 @@ pub struct TaskSnapshot {
     stack: StackResource,
     dispatches: u32,
     yields: u32,
+    preemptions: u32,
     exit_status: Option<u32>,
     isolation: Option<IsolationResource>,
     fault: Option<TaskFault>,
@@ -328,6 +333,12 @@ impl TaskSnapshot {
         self.yields
     }
 
+    /// Number of timer-driven timeslice preemptions.
+    #[must_use]
+    pub const fn preemptions(self) -> u32 {
+        self.preemptions
+    }
+
     /// Stable process-style completion status, once exited.
     #[must_use]
     pub const fn exit_status(self) -> Option<u32> {
@@ -374,6 +385,8 @@ pub struct TaskStats {
     pub reaped: u32,
     /// Explicit cooperative yields observed.
     pub yields: u32,
+    /// Timer-driven timeslice preemptions observed.
+    pub preemptions: u32,
     /// Running tasks transitioned to a scheduler-visible blocked state.
     pub blocks: u32,
     /// Blocked tasks returned to readiness through a matching wait key.
@@ -480,11 +493,11 @@ struct TaskRecord {
     snapshot: TaskSnapshot,
 }
 
-/// Bounded single-CPU round-robin cooperative scheduler policy.
+/// Bounded single-CPU round-robin scheduler policy.
 ///
 /// The scheduler owns records and resource accounting, but not native context
-/// switching. At most one record can be `Running`; only an explicit yield,
-/// block, exit, or contained fault returns it to scheduler control.
+/// switching. At most one record can be `Running`; an explicit yield, timer
+/// preemption, block, exit, or contained fault returns it to scheduler control.
 #[derive(Debug)]
 pub struct Scheduler {
     records: Vec<TaskRecord>,
@@ -495,6 +508,7 @@ pub struct Scheduler {
     spawned: u32,
     reaped: u32,
     total_yields: u32,
+    total_preemptions: u32,
     total_blocks: u32,
     total_wakes: u32,
     contained_faults: u32,
@@ -523,6 +537,7 @@ impl Scheduler {
             spawned: 0,
             reaped: 0,
             total_yields: 0,
+            total_preemptions: 0,
             total_blocks: 0,
             total_wakes: 0,
             contained_faults: 0,
@@ -599,6 +614,7 @@ impl Scheduler {
                 stack,
                 dispatches: 0,
                 yields: 0,
+                preemptions: 0,
                 exit_status: None,
                 isolation,
                 fault: None,
@@ -663,6 +679,35 @@ impl Scheduler {
             .ok_or(TaskError::AccountingOverflow)?;
         record.snapshot.state = TaskState::Ready;
         self.total_yields = total_yields;
+        self.current = None;
+        Ok(())
+    }
+
+    /// Return a timer-preempted running task to the ready queue.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unknown, non-running, or non-current identity and checked
+    /// counter overflow.
+    pub fn preempt_current(&mut self, id: TaskId) -> Result<(), TaskError> {
+        if self.current != Some(id) {
+            return Err(TaskError::InvalidState);
+        }
+        let total_preemptions = self
+            .total_preemptions
+            .checked_add(1)
+            .ok_or(TaskError::AccountingOverflow)?;
+        let record = self.record_mut(id)?;
+        if record.snapshot.state != TaskState::Running {
+            return Err(TaskError::InvalidState);
+        }
+        record.snapshot.preemptions = record
+            .snapshot
+            .preemptions
+            .checked_add(1)
+            .ok_or(TaskError::AccountingOverflow)?;
+        record.snapshot.state = TaskState::Ready;
+        self.total_preemptions = total_preemptions;
         self.current = None;
         Ok(())
     }
@@ -971,6 +1016,7 @@ impl Scheduler {
             live_records: u16::try_from(self.records.len()).unwrap_or(u16::MAX),
             reaped: self.reaped,
             yields: self.total_yields,
+            preemptions: self.total_preemptions,
             blocks: self.total_blocks,
             wakes: self.total_wakes,
             blocked_tasks: u16::try_from(blocked_tasks).unwrap_or(u16::MAX),
@@ -1075,6 +1121,32 @@ mod tests {
             Ok(Some(0x1_0007))
         );
         assert_eq!(scheduler.stats().yields, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn timer_preemption_is_accounted_separately_from_cooperative_yield() -> Result<(), TaskError> {
+        let mut scheduler = Scheduler::new(2)?;
+        let first = scheduler.spawn(Capabilities::SERVICE, stack(0)?)?;
+        let second = scheduler.spawn(Capabilities::SERVICE, stack(1)?)?;
+
+        assert_eq!(
+            scheduler.dispatch_next(Capabilities::SERVICE),
+            Ok(Some(first))
+        );
+        scheduler.preempt_current(first)?;
+        assert_eq!(
+            scheduler.dispatch_next(Capabilities::SERVICE),
+            Ok(Some(second))
+        );
+        scheduler.yield_current(second)?;
+
+        assert_eq!(scheduler.task(first)?.preemptions(), 1);
+        assert_eq!(scheduler.task(first)?.yields(), 0);
+        assert_eq!(scheduler.task(second)?.preemptions(), 0);
+        assert_eq!(scheduler.task(second)?.yields(), 1);
+        assert_eq!(scheduler.stats().preemptions, 1);
+        assert_eq!(scheduler.stats().yields, 1);
         Ok(())
     }
 

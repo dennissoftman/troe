@@ -27,8 +27,9 @@ to one audited machine boundary; portable crates forbid it.
   ring-3/EL0 address space with only its declared, typed capabilities.
 - ✅ **Strict at every boundary.** Executables, filesystems, configuration,
   memory mappings, and network input are bounds-checked and validated before use.
-- 🔁 **Predictable under failure.** Work has hard ceilings, application execution
-  has a 50 ms lease, faults are contained, and teardown revokes handles,
+- 🔁 **Predictable under failure.** Work has hard ceilings, applications have a
+  50 ms preemptive timeslice and a command runtime deadline, faults are contained,
+  and teardown revokes handles,
   zeroizes memory, and returns owned frames.
 
 TROE also enforces W^X mappings, guarded task stacks, generation-checked handles,

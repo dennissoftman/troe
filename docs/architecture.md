@@ -267,11 +267,13 @@ length, and enables IRQs after arming a 50 ms one-shot. x86 normalizes x87 and
 SSE operation and saves the complete FXSAVE image; AArch64 enables baseline
 FP/Advanced SIMD and saves all 32 128-bit vector registers plus FPCR/FPSR.
 Unsaved AVX-family, SVE, and SME state remains disabled rather than leaking or
-corrupting across tasks. ABI call 0 exits through
-the owned gate. A separate spinning KEX is terminated by the x86 local-APIC or
-AArch64 generic physical timer, recorded as `execution-lease-expired`, and
-reclaimed transactionally. ABI gates capture a bounded full user context;
-`yield` returns through the cooperative scheduler, while `handle_call` validates
+corrupting across tasks. ABI call 0 exits through the owned gate. The x86
+local-APIC and AArch64 generic physical timers now capture a complete resumable
+user context when the 50 ms timeslice expires. A separate spinning KEX proves
+that preemption boundary before acceptance cleanup, while ordinary commands are
+bounded by a command-wide monotonic runtime deadline. ABI gates also capture a
+bounded full user context; `yield` remains an optional scheduling hint, while
+`handle_call` validates
 complete non-overlapping ranges, copies a two-byte opcode-prefixed request,
 checks task handle ownership, and copies a successful bounded reply before a
 fresh leased resume. Unknown calls and an attempted `_start` return are
@@ -293,8 +295,11 @@ mechanism: immutable cwd/argv, stdin, stdout, and stderr. The shell logically yi
 one foreground application runs, then resumes only after owner-wide handle
 revocation, record reaping, page zeroization, and exact frame return. Artifacts
 are read from target-selected `/bin/<name>.kex`; absence is a terminal not-found
-result. Service payloads and total resumed steps have hard ceilings; standard
-streams themselves forward without an aggregate byte cap. Optional interfaces
+result. Service payloads and application service calls have hard ceilings;
+heap growth is bounded by allocator ownership and resident-page limits, while
+voluntary yields and timer preemptions are governed by the command runtime
+deadline instead of an aggregate step counter. Standard streams themselves
+forward without an aggregate byte cap. Optional interfaces
 expose only bounded IPv4/UDP send/receive, read-only VFS operations, one
 sequential streamed file mutation, a boot-relative monotonic timer, one immutable typed diagnostics
    snapshot, read-only typed network observation, one DHCP exchange, one ICMP

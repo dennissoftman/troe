@@ -97,6 +97,7 @@ class ChangedTestSelectionTests(unittest.TestCase):
         lua_plan = test_changed.build_plan(
             (PurePosixPath("apps/lua/src/main.rs"),), PACKAGES
         )
+        self.assertEqual(lua_plan.python_tests, {"test_lua_app.py"})
         self.assertEqual(lua_plan.qemu_scenarios, {"lua"})
 
     def test_allocator_sdk_selects_lua_build_and_runtime_scenario(self) -> None:

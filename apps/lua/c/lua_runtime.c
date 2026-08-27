@@ -9,7 +9,7 @@
 #include <string.h>
 #include <time.h>
 
-#if defined(__aarch64__)
+#if !defined(TROE_LUA_HOST_TEST) && defined(__aarch64__)
 __asm__(".text\n"
         ".global troe_setjmp\n"
         ".type troe_setjmp, %function\n"
@@ -59,7 +59,6 @@ typedef intptr_t (*TroeRead)(void *context, uint8_t *destination,
                              size_t capacity);
 typedef int (*TroeWrite)(void *context, int stream, const uint8_t *bytes,
                          size_t length);
-typedef int (*TroeYield)(void *context);
 typedef int (*TroeMonotonicMillis)(void *context, uint64_t *result);
 
 struct TroeLuaHost {
@@ -67,7 +66,6 @@ struct TroeLuaHost {
   TroeAllocate allocate;
   TroeRead read;
   TroeWrite write;
-  TroeYield yield_now;
   TroeMonotonicMillis monotonic_millis;
 };
 
@@ -87,6 +85,7 @@ typedef struct TroeLuaConfiguration {
   int requested_exit_close;
 } TroeLuaConfiguration;
 
+#if !defined(TROE_LUA_HOST_TEST)
 extern int troe_parse_decimal(const uint8_t *bytes, size_t length,
                               double *result);
 
@@ -507,6 +506,7 @@ int fprintf(FILE *file, const char *format, ...) {
   (void)format;
   return -1;
 }
+#endif
 
 static TroeLuaHost *troe_active_host;
 static TroeLuaConfiguration *troe_active_configuration;
@@ -612,13 +612,6 @@ static const char *troe_reader(lua_State *state, void *context, size_t *size) {
   return count == 0 ? NULL : (const char *)reader->bytes;
 }
 
-static void troe_instruction_hook(lua_State *state, lua_Debug *debug) {
-  (void)debug;
-  if (troe_active_host == NULL ||
-      troe_active_host->yield_now(troe_active_host->context) != 0)
-    luaL_error(state, "cooperative yield failed");
-}
-
 static void troe_require(lua_State *state, const char *name,
                          lua_CFunction open_function) {
   luaL_requiref(state, name, open_function, 1);
@@ -695,8 +688,6 @@ int troe_lua_run(TroeLuaConfiguration *configuration) {
     troe_active_host = NULL;
     return TROE_LUA_REQUESTED_EXIT;
   }
-  lua_sethook(state, troe_instruction_hook, LUA_MASKCOUNT, 2048);
-
   lua_pushcfunction(state, troe_configure_state);
   status = lua_pcall(state, 0, 0, 0);
   if (status != LUA_OK) {
