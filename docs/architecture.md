@@ -377,6 +377,18 @@ through TXSLOT, and attaches at `/vol/state`. The VFS mount records writable
 authority explicitly; ext4 and FAT mutate only through manifest-selected
 writable block-region capabilities.
 
+Stage 9 adds a hosted deployment control-plane reference above these native
+primitives. It consumes one complete PLOCK and active signed release per locked
+member, stages and independently verifies immutable generation objects, and
+publishes one pending/healthy pointer. Desired configuration persists outside
+generations while each generation owns an exact read-only `/sys/config`
+projection. Reversible data migrations retain canonical snapshots and roll back
+with failed health; forward-only data instead enters an explicit
+recovery-required state so predecessor code never runs over incompatible data.
+Reachability GC retains active, previous, recovery, and in-flight transaction
+roots. Native boot continues to consume CSPK/GMAN and SACT/TXSLOT rather than
+parsing hosted filesystem metadata. See [ADR 0044](adr/0044-transactional-system-lifecycle.md).
+
 The first network boundary is likewise split between safe protocol policy and
 machine transport. `troe-net` owns strict bounded Ethernet/ARP/IPv4/UDP parsing,
 construction, and count-plus-byte receive admission. `troe-machine` owns the

@@ -57,9 +57,12 @@ never returned.
 
 A TPKG v1 document contains exactly `schema`, `target`, `manifest`, `lock`, and
 canonical base64 `artifact` fields. It is limited to 8 MiB. Parsing independently
-revalidates PMAN and PLOCK, requires the manifest to be the locked root, and
-checks the artifact length and SHA-256 against the selected target. Rebuilding
-from parsed fields must reproduce every package byte.
+revalidates PMAN and PLOCK, requires the manifest to be exactly one member of
+the lock, and checks its dependency, artifact length, artifact SHA-256, SDK, and
+toolchain identities against the selected target. Packaging every locked member
+against the same PLOCK lets deployment prove it has the complete plan rather
+than trusting a root artifact to imply dependency bytes. Rebuilding from parsed
+fields must reproduce every package byte.
 
 TPKG SHA-256 supplies content integrity and deterministic addressing only.
 Publisher authentication, freshness, revocation, provenance, and atomic

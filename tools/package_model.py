@@ -326,7 +326,7 @@ def decode_json(data: bytes, label: str, maximum: int = MAX_DOCUMENT_BYTES) -> o
         )
     except UnicodeDecodeError as error:
         raise ModelError("invalid-utf8", label, str(error)) from error
-    except json.JSONDecodeError as error:
+    except (json.JSONDecodeError, RecursionError) as error:
         raise ModelError("invalid-json", label, str(error)) from error
 
 
@@ -763,9 +763,7 @@ def parse_lock(data: bytes, label: str = "lock") -> TargetLock:
 
 
 def build_package(manifest: Manifest, lock: TargetLock, artifact: bytes) -> bytes:
-    """Construct one canonical TPKG v1 artifact for the locked root and target."""
-    if manifest.name != lock.root:
-        raise ModelError("root-mismatch", "package", f"{manifest.name} != {lock.root}")
+    """Construct one canonical TPKG v1 artifact for a member of the target lock."""
     locked = next((package for package in lock.packages if package.name == manifest.name), None)
     if locked is None or locked.manifest_sha256 != manifest.digest():
         raise ModelError("manifest-mismatch", "package", manifest.name)

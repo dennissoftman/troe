@@ -32,8 +32,9 @@ can then become only `recovery-only`, never silently active.
 Registry publication stages and flushes a complete immutable generation,
 independently verifies it, and atomically replaces one small current pointer.
 No reader enumerates staging directories or guesses the latest directory name.
-Monotonic root, snapshot, and release state is owned by the later deployment
-lifecycle rather than hidden inside read-only verification.
+Monotonic root, snapshot, and release state is owned by the deployment
+lifecycle in [ADR 0044](0044-transactional-system-lifecycle.md) rather than
+hidden inside read-only verification.
 
 ## Consequences
 

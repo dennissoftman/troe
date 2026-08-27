@@ -56,5 +56,7 @@ output path that does not exist; they do not connect to a running system.
   trust policy verifies its signed release metadata.
 - Native generation construction may consume a validated locked plan; it must
   not reinterpret Cargo metadata or invoke the hosted CLI as policy.
-- Registry discovery, key management, atomic publication, install/update,
-  migration, and garbage collection remain separate boundaries and commits.
+- Registry trust/publication and transactional install/update, migration, and
+  garbage collection are implemented as the separate boundaries in
+  [ADR 0042](0042-package-trust-and-atomic-publication.md) and
+  [ADR 0044](0044-transactional-system-lifecycle.md).

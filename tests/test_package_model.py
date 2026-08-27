@@ -342,6 +342,26 @@ class PackageAndPlanTests(unittest.TestCase):
         with self.assertRaisesRegex(package_model.ModelError, "artifact-mismatch"):
             package_model.build_package(other, other_lock, artifact)
 
+    def test_every_locked_dependency_can_be_packaged_against_the_same_plan(self) -> None:
+        app = parse_fixture(
+            "app",
+            (1, 0, 0),
+            b"app",
+            dependencies=(("library", (1, 0, 0), (2, 0, 0)),),
+        )
+        library = parse_fixture("library", (1, 0, 0), b"library")
+        lock = package_model.resolve("app", TARGET, [app, library])
+        for manifest, artifact in ((app, b"app"), (library, b"library")):
+            package = package_model.build_package(manifest, lock, artifact)
+            parsed, embedded_lock, parsed_artifact = package_model.parse_package(package)
+            self.assertEqual(parsed, manifest)
+            self.assertEqual(embedded_lock, lock)
+            self.assertEqual(parsed_artifact, artifact)
+
+        outsider = parse_fixture("outsider", (1, 0, 0), b"outsider")
+        with self.assertRaisesRegex(package_model.ModelError, "manifest-mismatch"):
+            package_model.build_package(outsider, lock, b"outsider")
+
     def test_plan_reports_exact_authority_services_and_totals(self) -> None:
         manifest = parse_fixture("hello", (1, 0, 0), b"native-kex")
         lock = package_model.resolve("hello", TARGET, [manifest])

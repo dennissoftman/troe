@@ -46,6 +46,7 @@ projection during rollback.
   reverse individual configuration writes.
 - Software written only for `/etc` is not compatible until its package declares
   and consumes the TROE configuration projection explicitly.
-- Secrets, provider mounting, schema migration, health checks, and durable
-  active-generation selection remain lifecycle responsibilities; this namespace
-  boundary does not silently implement any of them.
+- Secrets and provider mounting remain separate responsibilities. Schema
+  migration, health checks, and durable active-generation selection are
+  implemented by the hosted reference in [ADR 0044](0044-transactional-system-lifecycle.md),
+  not silently by this namespace boundary.

@@ -1093,6 +1093,28 @@ Configured health failure rolls generation 2 back durably to generation 1.
 
 **Exit criterion:** the system can boot, configure a supported network device, exchange data with another host, persist selected state, and remain within declared memory budgets under malformed and high-volume input.
 
+### Stage 9 — Production usability
+
+**Status:** package, trust, configuration, and transactional lifecycle
+foundations are implemented as hosted references. Exact non-QEMU production
+environment acceptance remains gated.
+
+- Hosted Stage 9 deployment MUST verify one signed package per locked member,
+  publish a complete immutable generation before its pending pointer, retain
+  monotonic trust state, require exact downgrade authorization, and keep
+  desired configuration outside generation replacement.
+- Data migration MUST be bounded and versioned. Reversible migration restores
+  its exact durable snapshot with predecessor code; forward-only migration MUST
+  enter recovery-required state rather than run predecessor code over new data.
+- Garbage collection MUST trace active, previous, recovery, and in-flight
+  transaction roots. Persistent lifecycle diagnostics MUST remain bounded and
+  every durable lifecycle boundary MUST be process-reopen testable.
+
+**Exit criterion:** operators can construct, authenticate, publish, activate,
+diagnose, roll back, and garbage-collect a complete locked system on every
+supported production environment without weakening the immutable-generation
+or recovery contracts.
+
 ## 24. API evolution rule
 
 The intended internal progression is:

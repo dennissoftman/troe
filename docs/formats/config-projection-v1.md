@@ -1,8 +1,11 @@
 # TROE configuration projection v1
 
-Configuration projection v1 is the in-memory contract used to construct the
-read-only `/sys/config` view for one immutable deployment generation. It is not
-a disk format and does not authorize package or directory access.
+Configuration projection v1 is the canonical interchange and in-memory
+contract used to construct the read-only `/sys/config` view for one immutable
+deployment generation. It does not authorize package or directory access. The
+hosted lifecycle stores the canonical JSON/base64 form as desired state and
+materializes exact raw files inside each immutable candidate; the native VFS
+consumes the validated path/byte pairs rather than parsing JSON.
 
 ## Inputs and limits
 
@@ -12,6 +15,9 @@ One replacement operation contains:
 - zero to 128 files;
 - at most 8 KiB per file; and
 - at most 64 KiB of aggregate file payload.
+
+The canonical document contains exactly `schema: 1` and `files`. Each sorted
+file entry contains exactly a relative `path` and canonical base64 `data`.
 
 Paths are UTF-8 relative paths, are nonempty, contain no empty, `.` or `..`
 component, and are supplied in strictly increasing byte-lexical order. Absolute
