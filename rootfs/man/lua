@@ -2,39 +2,60 @@ NAME
     lua - execute Lua 5.5 source code
 
 SYNOPSIS
-    lua [-e CODE | FILE | -] [ARG...]
+    lua [OPTIONS] [SCRIPT [ARG...]]
     lua --version
 
 DESCRIPTION
-    Runs Lua 5.5.1 source from an inline -e argument, a read-only filesystem
-    file, or standard input. Remaining arguments are available in the global
+    Runs Lua 5.5.1 source from one or more -e arguments, a filesystem file, or
+    standard input. -l MODULE loads a module before the script; -l NAME=MODULE
+    also stores its result in global NAME. -E ignores environment-based Lua
+    configuration, -W enables warnings, and -v prints the version. Remaining
+    arguments are available in the global
     arg table, starting at arg[1]. With no source argument, reads standard
     input.
 
-    The base, coroutine, table, string, math, and utf8 libraries are present.
-    A capability-aware os shim provides clock, time, difftime, and exit. The
-    other standard os functions remain present as extension points and raise a clear
-    "unavailable in TROE" error when called. package, io, debug, dynamic
-    modules, environment access, and binary bytecode are intentionally
-    unavailable. The initial script file is read through the declared
-    filesystem capability.
+    The base, package, coroutine, debug, io, math, os, string, table, and utf8
+    libraries are present. loadfile, dofile, require, package.preload, and the
+    Lua-file module searcher use the declared read-only filesystem capability.
+    The default module path searches /share/lua/5.5, /share/lua, and the current
+    directory. In-memory and file-backed binary chunks are accepted.
+
+    io provides standard streams, temporary in-memory files, and filesystem
+    files, including lines, formatted reads and writes, append/update modes,
+    flushing, and seeking. Lua has explicit filesystem-read and
+    filesystem-mutation authority. Writable files are buffered in the Lua heap
+    and replaced through TROE's streamed mutation service when flushed or closed.
+    io.popen uses TROE's owner-scoped process-launch and bounded-pipe services in
+    both read and write modes. C dynamic modules remain unavailable because TROE
+    has no dynamic-loader service.
 
     os.clock follows Lua semantics and returns process CPU seconds charged while
     the application executes unprivileged code. Kernel services, waiting, and
     descheduled time are excluded. os.time() returns whole Unix seconds from
-    TROE's wall clock; table-to-time conversion is not yet available. Wall time
-    is not monotonic and may step when corrected. For an
+    TROE's wall clock. os.time(table) and os.date implement the standard calendar
+    interface in UTC; TROE currently has no per-process timezone database or
+    daylight-saving setting. Wall time is not monotonic and may step when corrected. For an
     end-to-end benchmark long enough to tolerate one-second resolution, use
     os.time() before and after the workload. That elapsed result includes kernel
     service, waiting, and descheduling time. os.exit terminates the Lua
-    application with an optional unsigned
-    32-bit command status and cannot be caught with pcall. Its second argument
+    application with an optional Unix-style low-8-bit command status and cannot
+    be caught with pcall. Its second argument
     follows Lua semantics: false (the default) skips Lua-state closing, while
     true closes the state and runs its closing work before termination. TROE
-    reclaims the application heap after either form.
+    reclaims the application heap after either form. os.remove deletes regular
+    files or symbolic links. os.rename preserves regular-file contents through a
+    replace-and-remove operation; it is not yet an atomic provider-level rename.
+    KEX invocations do not yet carry a mutable environment. os.getenv exposes
+    stable PWD, HOME, PATH, TMPDIR, SHELL, USER, and LOGNAME values and returns
+    nil for unknown names. os.execute parses one bounded direct TROE command,
+    waits for the child, and returns Lua's standard success, termination kind,
+    and status tuple. Quoted arguments and backslash escapes are supported.
+    Shell operators, expansion, and redirection are rejected because TROE does
+    not delegate the session-owned shell-script capability to nested processes.
+    io.popen uses the same command syntax. The fixed C locale is the only
+    supported locale.
 
-    Lua uses a bounded 8 MiB TLSF heap and periodically yields to the KEX
-    scheduler. Exhausting the heap raises a normal protected Lua memory error;
+    Lua uses a bounded 1 MiB TLSF heap. Exhausting the heap raises a normal protected Lua memory error;
     it cannot grow memory or access ambient host resources.
 
 EXAMPLES
@@ -43,6 +64,8 @@ EXAMPLES
         lua /share/lua/examples/strings.lua
         lua /share/lua/examples/math.lua
         lua /share/lua/examples/tables-coroutines.lua
+        lua /share/lua/examples/compatibility.lua
+        lua /share/lua/examples/files.lua
 
     Measure a sufficiently long end-to-end workload in whole wall seconds:
 

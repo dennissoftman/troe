@@ -439,7 +439,7 @@ by ARP and completes a UDP exchange with a host peer after rejecting unrelated
 traffic; no packet-declared allocation or unbounded device wait enters either
 side of the boundary.
 
-KEFS is the intentionally built-in recovery exception. The current FAT12 image
+KEFS is the intentionally built-in recovery exception. The current FAT16 image
 is read by firmware. FAT32 and the default persistent ext4 profile are the
 implemented runtime providers; general FAT12/16, exFAT, and NTFS are
 unsupported. The exact ext4 read/write subset is fixed by ADR 0017. Providers

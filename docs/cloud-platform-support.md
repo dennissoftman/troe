@@ -52,7 +52,7 @@ fallback executable.
 
 The protective MBR uses UEFI's canonical `00 02 00` starting CHS and
 `ff ff ff` ending sentinel. The ESP is FAT32 because it is a GPT EFI System
-Partition on fixed media; the smaller FAT12 image remains only the pinned-QEMU
+Partition on fixed media; the smaller FAT16 image remains only the pinned-QEMU
 source/fixture format and is not copied into `system.raw`.
 
 Every bundle has one explicit kind:

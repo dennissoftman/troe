@@ -130,7 +130,14 @@ class KexToolTests(unittest.TestCase):
                     }:
                         expected = [(6, 1, 2)]
                     elif command == "lua":
-                        expected = [(6, 1, 2), (8, 1, 0), (17, 1, 0)]
+                        expected = [
+                            (6, 1, 2),
+                            (7, 2, 0),
+                            (8, 1, 0),
+                            (17, 1, 0),
+                            (20, 1, 0),
+                            (21, 1, 0),
+                        ]
                     elif command in {"ln", "rm"}:
                         expected = [(7, 2, 0)]
                     elif command == "sleep":

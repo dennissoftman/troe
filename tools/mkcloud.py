@@ -48,7 +48,7 @@ SYSTEM_ROOT_START_LBA = SYSTEM_ESP_START_LBA + SYSTEM_ESP_SECTORS
 SYSTEM_ROOT_SECTORS = 32_768
 
 # A GPT EFI System Partition is fixed media and therefore uses FAT32, not the
-# FAT12 superfloppy used by the exact pinned-QEMU boot fixture. 34 MiB with
+# FAT16 superfloppy used by the exact pinned-QEMU boot fixture. 34 MiB with
 # one-sector clusters leaves 68,528 data clusters, safely above FAT32's 65,525
 # cluster classification boundary while keeping the complete disk below 64 MiB.
 FAT32_BYTES_PER_SECTOR = SECTOR_BYTES
