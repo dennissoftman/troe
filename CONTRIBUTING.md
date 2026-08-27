@@ -3,6 +3,42 @@
 Keep changes small enough that a reviewer can trace their authority, memory
 charge, failure behavior, and machine dependency.
 
+## Issues
+
+Repository documentation describes implemented behavior, accepted decisions,
+formats, and historical evidence. GitHub issues own unimplemented work, design
+questions, and delivery status. Search open and closed issues before filing a
+new one, then choose the matching issue form:
+
+- **Bug:** implemented behavior differs from its documented or tested contract.
+- **Implementation:** a concrete, actionable outcome with acceptance and
+  verification criteria.
+- **Design:** a decision is still required before implementation can be
+  accepted. A design issue makes no implementation claim.
+- **Tracking:** an umbrella outcome whose checklist links independently useful
+  child issues; it must not duplicate their detailed specifications.
+
+Use an imperative, outcome-oriented title. Prefix only umbrella issues with
+`[Tracking]` and design archives or broad design questions with `[Design]`.
+Every issue must identify the current evidence or motivating use case, exact
+scope, non-goals, dependencies, measurable acceptance criteria, and required
+verification. Name affected platforms and authority, memory, persistence, or
+compatibility boundaries rather than relying on a generic feature label.
+
+Apply the narrowest `area:*` labels that fit. Use `stage-9` and the Stage 9
+milestone only when the issue is required by the exit criteria in
+[the Stage 9 tracking issue](https://github.com/dennissoftman/troe/issues/14).
+Use `design` while behavior is unresolved and `tracking` only for umbrella
+issues. Explicitly unsupported behavior is not automatically backlog: a new
+feature issue needs a named consumer, deployment, measurement, or failure that
+justifies the work.
+
+Closing an issue does not by itself make a capability current. The implementing
+change must update source, tests, formats, and current-behavior documentation
+together, link the issue, and show that every acceptance criterion is satisfied.
+Report security vulnerabilities through [`SECURITY.md`](SECURITY.md), not a
+public issue.
+
 During development, run `python3 scripts/test_changed.py --explain`; it selects
 changed packages and reverse dependencies, owned Python suites, affected KEX
 apps, and granular QEMU scenarios. Unknown or global changes widen to the full

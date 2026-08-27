@@ -1,0 +1,65 @@
+name: Bug
+description: Report implemented behavior that violates a documented or tested contract.
+title: ""
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report security vulnerabilities here. Use the repository security policy instead.
+
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior
+      description: State exactly what happened, including typed errors or terminal fate.
+      placeholder: Describe the smallest observable failure.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected contract
+      description: Link the source, test, format, ADR, or current-behavior documentation that defines the expectation.
+      placeholder: The documented or tested behavior is...
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproduction
+      description: Include exact commands, inputs, platform, environment, and fixture or production identity kind.
+      render: shell
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence and impact
+      description: Add bounded logs, counters, failing tests, regression range, and authority, memory, persistence, or compatibility impact.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: platforms
+    attributes:
+      label: Affected surfaces
+      options:
+        - label: Hosted model
+        - label: x86-64 QEMU
+        - label: AArch64 QEMU
+        - label: Tooling or SDK
+        - label: Storage or serialized format
+        - label: Unknown or not yet isolated
+
+  - type: textarea
+    id: verification
+    attributes:
+      label: Regression verification
+      description: Name the narrowest test that should fail before the fix and pass afterward, plus any required full gate.
+    validations:
+      required: true
