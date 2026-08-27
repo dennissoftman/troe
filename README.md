@@ -47,7 +47,7 @@ profiles. Small is a policy here, not just a current measurement.
 - Ethernet, ARP, DHCP, IPv4, ICMP, UDP, and outbound TCP over virtio-net.
 - KEX applications for `arp`, `awk`, `cat`, `clear`, `dhcp`, `echo`, `grep`,
   `hexdump`, `ln`, `ls`, `lua`, `man`, `mem`, `mount`, `net`, `ping`, `printf`,
-  `pwd`, `rm`, `sed`, `sleep`, `tar`, `tcp`, `udp`, and `wc`.
+  `pwd`, `rm`, `sed`, `sh`, `sleep`, `tar`, `tcp`, `udp`, and `wc`.
 
 Only `cd`, `poweroff`, and `reboot` are privileged shell intrinsics. Everything
 else is an immutable KEX application discovered from `/bin`.
@@ -75,6 +75,12 @@ persistent
 
 sh:/> lua -e 'print(string.format("Lua %.1f", math.sqrt(81)))'
 Lua 9.0
+
+sh:/> cd /vol/shared
+sh:/vol/shared> sh /share/sh/bench.sh
+===== F00 building fixtures with printf
+...
+===== END of transcript
 ```
 
 Additional ext4-v1 or FAT32 partitions can be declared in the strict
@@ -181,6 +187,12 @@ monotonic `os.clock`, controlled `os.exit`, and `os.difftime`; its remaining
 standard entries fail explicitly until TROE grants and implements the required
 authority. Lua has no ambient libc, environment, process, dynamic-module, OS,
 or raw filesystem access.
+
+[`apps/sh`](apps/sh) transactionally stages a bounded UTF-8 command file through
+the typed shell-script sidecar, then the owning session executes each validated
+physical line with the normal TROE pipeline and redirection grammar. The first
+version intentionally omits variables, control flow, substitution, multiline
+constructs, and direct shebang execution.
 
 KEX images are statically linked today. A bounded, single-package dynamic
 linking design for reusable libc and language runtimes is tracked in

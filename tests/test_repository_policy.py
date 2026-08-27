@@ -150,6 +150,7 @@ class RepositoryPolicyTests(unittest.TestCase):
             "pwd",
             "rm",
             "sed",
+            "sh",
             "sleep",
             "tar",
             "tcp",

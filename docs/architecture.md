@@ -47,8 +47,11 @@ firmware fails before device publication or volatile I/O.
    privileged utility behavior. KEX receives bounded stdin/stdout/stderr streams
    plus only declared optional datagram, read-only VFS, streamed file mutation,
    monotonic timer, diagnostics, network-observation, DHCP, ICMP, or outbound
-   TCP-connect handles;
-   never ambient `Shell`, provider, block, device, or machine authority.
+   TCP-connect handles. The `sh.kex` interpreter alone requests a bounded
+   shell-script sidecar: it transactionally stages physical command lines, exits,
+   and lets the resumed owning session execute them without nested KEX launch.
+   No application receives ambient `Shell`, provider, block, device, or machine
+   authority.
 4. Each non-final command writes to a dynamically growing, 1 MiB-bounded
    `BoundedOutput`. The next stage reads the frozen result through `SliceInput`;
    a stage cannot observe mutable internals. Final output redirection instead
