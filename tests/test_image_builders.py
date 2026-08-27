@@ -1,4 +1,4 @@
-"""Regression tests for the dependency-free KEFS and FAT12 image builders."""
+"""Regression tests for the dependency-free KEFS and FAT16 image builders."""
 
 from __future__ import annotations
 
@@ -155,7 +155,7 @@ class KefsBuilderTests(unittest.TestCase):
 
 
 class FatBuilderTests(unittest.TestCase):
-    """Exercise the exact fixed FAT12 UEFI container contract."""
+    """Exercise the exact fixed 8 MiB FAT16 UEFI container contract."""
 
     PAYLOAD = bytes(range(251)) * 5
     MANIFEST = b"BMNTv1\0\0" + bytes(range(32))
@@ -182,7 +182,7 @@ class FatBuilderTests(unittest.TestCase):
         image = mkfat.build(self.PAYLOAD, boot_name)
         extra = mkfat.directory_entry(b"EXTRA   BIN", 0x20, 4, 0)
         offsets = (
-            mkfat.ROOT_OFFSET + 32,
+            mkfat.ROOT_OFFSET + 64,
             mkfat.cluster_offset(2) + 96,
             mkfat.cluster_offset(3) + 96,
         )
@@ -210,13 +210,17 @@ class FatBuilderTests(unittest.TestCase):
         fat = bytearray(
             extra_fat[mkfat.SECTOR : mkfat.SECTOR + mkfat.FAT_SECTORS * mkfat.SECTOR]
         )
-        mkfat.set_fat12(fat, 100, mkfat.END_OF_CHAIN)
+        mkfat.set_fat16(fat, 100, mkfat.END_OF_CHAIN)
         extra_fat[mkfat.SECTOR : mkfat.SECTOR + len(fat)] = fat
         extra_fat[mkfat.SECTOR + len(fat) : mkfat.SECTOR + 2 * len(fat)] = fat
         with self.assertRaises(ValueError):
             mkfat.extract(bytes(extra_fat), boot_name)
 
-        file_clusters = max(1, (len(self.PAYLOAD) + mkfat.SECTOR - 1) // mkfat.SECTOR)
+        file_clusters = max(
+            1,
+            (len(self.PAYLOAD) + mkfat.CLUSTER_BYTES - 1)
+            // mkfat.CLUSTER_BYTES,
+        )
         unused_data = bytearray(image)
         unused_data[mkfat.cluster_offset(4 + file_clusters)] = 1
         with self.assertRaises(ValueError):

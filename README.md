@@ -21,7 +21,7 @@ to one audited machine boundary; portable crates forbid it.
 
 ## Why TROE?
 
-- ⚡ **Efficient by construction.** The current boot image is 1.44 MiB, the
+- ⚡ **Efficient by construction.** The current boot image is 8 MiB, the
   kernel owns a fixed 6 MiB heap, and resources are charged only when used.
 - 🛡️ **Isolated by default.** Every ordinary command starts in a fresh
   ring-3/EL0 address space with only its declared, typed capabilities.

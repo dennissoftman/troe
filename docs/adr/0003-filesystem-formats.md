@@ -3,9 +3,9 @@
 Status: accepted, 2026-08-22.
 
 Use the documented KEFS v1 record format for embedded read-only content. Use a
-fixed 1.44 MiB FAT12 boot container containing only the architecture-native UEFI
-fallback executable. Builders are dependency-free Python and perform an exact
-round-trip verification.
+fixed 8 MiB FAT16 boot container containing only the architecture-native UEFI
+fallback executable and mount manifest. Builders are dependency-free Python and
+perform an exact round-trip verification.
 
 KEFS magic bytes and FAT OEM/volume metadata are format-specific and
 product-name-independent. The pre-release KEFS v1 magic was corrected in place

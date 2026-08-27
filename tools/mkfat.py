@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Create and verify a deterministic 1.44 MiB FAT12 UEFI boot image."""
+"""Create and verify a deterministic 8 MiB FAT16 UEFI boot image."""
 
 from __future__ import annotations
 
@@ -9,13 +9,16 @@ import sys
 from pathlib import Path
 
 SECTOR = 512
-TOTAL_SECTORS = 2880
-FAT_SECTORS = 9
+SECTORS_PER_CLUSTER = 1
+CLUSTER_BYTES = SECTOR * SECTORS_PER_CLUSTER
+TOTAL_SECTORS = 16_384
+FAT_SECTORS = 64
 ROOT_ENTRIES = 224
 ROOT_SECTORS = 14
 FIRST_DATA_SECTOR = 1 + 2 * FAT_SECTORS + ROOT_SECTORS
 IMAGE_SIZE = SECTOR * TOTAL_SECTORS
-END_OF_CHAIN = 0xFFF
+END_OF_CHAIN = 0xFFFF
+MEDIA = 0xF8
 OEM_IDENTIFIER = b"UEFIBOOT"
 VOLUME_IDENTIFIER = 0x5545_4649
 VOLUME_LABEL = b"UEFI BOOT  "
@@ -26,7 +29,7 @@ BOOT_NAMES = {
 MOUNT_MANIFEST_NAME = b"VOLUMES BMT"
 DIRECTORY_ENTRY_BYTES = 32
 ROOT_OFFSET = (1 + 2 * FAT_SECTORS) * SECTOR
-MAX_DATA_CLUSTER = TOTAL_SECTORS - FIRST_DATA_SECTOR + 1
+MAX_DATA_CLUSTER = (TOTAL_SECTORS - FIRST_DATA_SECTOR) // SECTORS_PER_CLUSTER + 1
 
 
 def directory_entry(name: bytes, attributes: int, cluster: int, size: int) -> bytes:
@@ -44,30 +47,24 @@ def directory_entry(name: bytes, attributes: int, cluster: int, size: int) -> by
     return bytes(entry)
 
 
-def set_fat12(fat: bytearray, cluster: int, value: int) -> None:
-    offset = cluster + cluster // 2
-    if offset + 1 >= len(fat) or not 0 <= value <= 0xFFF:
-        raise ValueError("FAT12 cluster is outside the allocation table")
-    if cluster % 2 == 0:
-        fat[offset] = value & 0xFF
-        fat[offset + 1] = (fat[offset + 1] & 0xF0) | ((value >> 8) & 0x0F)
-    else:
-        fat[offset] = (fat[offset] & 0x0F) | ((value << 4) & 0xF0)
-        fat[offset + 1] = (value >> 4) & 0xFF
+def set_fat16(fat: bytearray, cluster: int, value: int) -> None:
+    offset = cluster * 2
+    if cluster < 0 or offset + 2 > len(fat) or not 0 <= value <= 0xFFFF:
+        raise ValueError("FAT16 cluster is outside the allocation table")
+    struct.pack_into("<H", fat, offset, value)
 
 
-def get_fat12(fat: bytes, cluster: int) -> int:
-    offset = cluster + cluster // 2
-    if cluster < 0 or offset + 1 >= len(fat):
-        raise ValueError("FAT12 cluster is outside the allocation table")
-    pair = fat[offset] | (fat[offset + 1] << 8)
-    return (pair >> 4) & 0xFFF if cluster % 2 else pair & 0xFFF
+def get_fat16(fat: bytes, cluster: int) -> int:
+    offset = cluster * 2
+    if cluster < 0 or offset + 2 > len(fat):
+        raise ValueError("FAT16 cluster is outside the allocation table")
+    return struct.unpack_from("<H", fat, offset)[0]
 
 
 def cluster_offset(cluster: int) -> int:
     if not 2 <= cluster <= MAX_DATA_CLUSTER:
-        raise ValueError("data cluster is outside the fixed FAT12 geometry")
-    return (FIRST_DATA_SECTOR + cluster - 2) * SECTOR
+        raise ValueError("data cluster is outside the fixed FAT16 geometry")
+    return (FIRST_DATA_SECTOR + (cluster - 2) * SECTORS_PER_CLUSTER) * SECTOR
 
 
 def enumerate_directory(directory: bytes, label: str) -> list[bytes]:
@@ -94,10 +91,10 @@ def require_directory(directory: bytes, expected: list[bytes], label: str) -> No
 
 
 def file_cluster_count(byte_count: int) -> int:
-    """Return the bounded number of sectors occupied by the sole file."""
+    """Return the bounded number of clusters occupied by one file."""
     if not 0 <= byte_count <= 0xFFFF_FFFF:
-        raise ValueError("EFI executable length is outside the FAT12 field")
-    return max(1, (byte_count + SECTOR - 1) // SECTOR)
+        raise ValueError("EFI executable length is outside the FAT16 field")
+    return max(1, (byte_count + CLUSTER_BYTES - 1) // CLUSTER_BYTES)
 
 
 def build(efi: bytes, boot_name: bytes, mount_manifest: bytes | None = None) -> bytes:
@@ -111,7 +108,7 @@ def build(efi: bytes, boot_name: bytes, mount_manifest: bytes | None = None) -> 
     )
     last_cluster = 3 + file_clusters + manifest_clusters
     if last_cluster > MAX_DATA_CLUSTER:
-        raise ValueError("EFI executable does not fit in the FAT12 image")
+        raise ValueError("EFI executable does not fit in the FAT16 image")
 
     image = bytearray(IMAGE_SIZE)
     boot = memoryview(image)[:SECTOR]
@@ -122,14 +119,14 @@ def build(efi: bytes, boot_name: bytes, mount_manifest: bytes | None = None) -> 
         boot,
         11,
         SECTOR,
-        1,
+        SECTORS_PER_CLUSTER,
         1,
         2,
         ROOT_ENTRIES,
         TOTAL_SECTORS,
-        0xF0,
+        MEDIA,
         FAT_SECTORS,
-        18,
+        32,
         2,
         0,
         0,
@@ -138,29 +135,32 @@ def build(efi: bytes, boot_name: bytes, mount_manifest: bytes | None = None) -> 
     boot[38] = 0x29
     struct.pack_into("<I", boot, 39, VOLUME_IDENTIFIER)
     boot[43:54] = VOLUME_LABEL
-    boot[54:62] = b"FAT12   "
+    boot[54:62] = b"FAT16   "
     boot[510:512] = b"\x55\xaa"
 
     fat = bytearray(FAT_SECTORS * SECTOR)
-    fat[:3] = b"\xf0\xff\xff"
-    set_fat12(fat, 2, END_OF_CHAIN)
-    set_fat12(fat, 3, END_OF_CHAIN)
+    fat[:4] = bytes((MEDIA, 0xFF, 0xFF, 0xFF))
+    set_fat16(fat, 2, END_OF_CHAIN)
+    set_fat16(fat, 3, END_OF_CHAIN)
     first_file_cluster = 4
     for index in range(file_clusters):
         cluster = first_file_cluster + index
         following = END_OF_CHAIN if index + 1 == file_clusters else cluster + 1
-        set_fat12(fat, cluster, following)
+        set_fat16(fat, cluster, following)
     first_manifest_cluster = first_file_cluster + file_clusters
     for index in range(manifest_clusters):
         cluster = first_manifest_cluster + index
         following = END_OF_CHAIN if index + 1 == manifest_clusters else cluster + 1
-        set_fat12(fat, cluster, following)
+        set_fat16(fat, cluster, following)
     first_fat = SECTOR
     image[first_fat : first_fat + len(fat)] = fat
     second_fat = first_fat + len(fat)
     image[second_fat : second_fat + len(fat)] = fat
 
-    image[ROOT_OFFSET : ROOT_OFFSET + 32] = directory_entry(b"EFI        ", 0x10, 2, 0)
+    image[ROOT_OFFSET : ROOT_OFFSET + 32] = directory_entry(VOLUME_LABEL, 0x08, 0, 0)
+    image[ROOT_OFFSET + 32 : ROOT_OFFSET + 64] = directory_entry(
+        b"EFI        ", 0x10, 2, 0
+    )
 
     efi_dir = cluster_offset(2)
     image[efi_dir : efi_dir + 32] = directory_entry(b".          ", 0x10, 2, 0)
@@ -182,12 +182,14 @@ def build(efi: bytes, boot_name: bytes, mount_manifest: bytes | None = None) -> 
         )
 
     for index in range(file_clusters):
-        source = efi[index * SECTOR : (index + 1) * SECTOR]
+        source = efi[index * CLUSTER_BYTES : (index + 1) * CLUSTER_BYTES]
         destination = cluster_offset(first_file_cluster + index)
         image[destination : destination + len(source)] = source
     if mount_manifest is not None:
         for index in range(manifest_clusters):
-            source = mount_manifest[index * SECTOR : (index + 1) * SECTOR]
+            source = mount_manifest[
+                index * CLUSTER_BYTES : (index + 1) * CLUSTER_BYTES
+            ]
             destination = cluster_offset(first_manifest_cluster + index)
             image[destination : destination + len(source)] = source
     return bytes(image)
@@ -196,55 +198,55 @@ def build(efi: bytes, boot_name: bytes, mount_manifest: bytes | None = None) -> 
 def expected_fat(file_clusters: int, manifest_clusters: int = 0) -> bytes:
     """Construct the only allocation table accepted by the fixed container."""
     if not 1 <= file_clusters <= MAX_DATA_CLUSTER - 3:
-        raise ValueError("EFI executable cluster count is outside the FAT12 image")
+        raise ValueError("EFI executable cluster count is outside the FAT16 image")
     fat = bytearray(FAT_SECTORS * SECTOR)
-    fat[:3] = b"\xf0\xff\xff"
-    set_fat12(fat, 2, END_OF_CHAIN)
-    set_fat12(fat, 3, END_OF_CHAIN)
+    fat[:4] = bytes((MEDIA, 0xFF, 0xFF, 0xFF))
+    set_fat16(fat, 2, END_OF_CHAIN)
+    set_fat16(fat, 3, END_OF_CHAIN)
     for index in range(file_clusters):
         cluster = 4 + index
         following = END_OF_CHAIN if index + 1 == file_clusters else cluster + 1
-        set_fat12(fat, cluster, following)
+        set_fat16(fat, cluster, following)
     first_manifest_cluster = 4 + file_clusters
     for index in range(manifest_clusters):
         cluster = first_manifest_cluster + index
         following = END_OF_CHAIN if index + 1 == manifest_clusters else cluster + 1
-        set_fat12(fat, cluster, following)
+        set_fat16(fat, cluster, following)
     return bytes(fat)
 
 
 def extract_files(image: bytes, boot_name: bytes) -> tuple[bytes, bytes | None]:
-    """Validate the canonical FAT12 tree and return EFI and optional BMNT bytes."""
+    """Validate the canonical FAT16 tree and return EFI and optional BMNT bytes."""
     if boot_name not in BOOT_NAMES.values():
         raise ValueError("UEFI fallback name is not architecture-native")
     if len(image) != IMAGE_SIZE or image[510:512] != b"\x55\xaa":
-        raise ValueError("invalid FAT12 image size or boot signature")
+        raise ValueError("invalid FAT16 image size or boot signature")
     if (
         image[:3] != b"\xeb\x3c\x90"
         or image[3:11] != OEM_IDENTIFIER
         or struct.unpack_from("<I", image, 39)[0] != VOLUME_IDENTIFIER
         or image[43:54] != VOLUME_LABEL
-        or image[54:62] != b"FAT12   "
+        or image[54:62] != b"FAT16   "
         or image[36:39] != b"\0\0\x29"
         or any(image[62:510])
     ):
-        raise ValueError("unexpected FAT12 format identifiers")
+        raise ValueError("unexpected FAT16 format identifiers")
     geometry = struct.unpack_from("<HBHBHHBHHHII", image, 11)
     if geometry != (
         SECTOR,
-        1,
+        SECTORS_PER_CLUSTER,
         1,
         2,
         ROOT_ENTRIES,
         TOTAL_SECTORS,
-        0xF0,
+        MEDIA,
         FAT_SECTORS,
-        18,
+        32,
         2,
         0,
         0,
     ):
-        raise ValueError("unexpected FAT12 geometry")
+        raise ValueError("unexpected FAT16 geometry")
     fat_start = SECTOR
     fat = image[fat_start : fat_start + FAT_SECTORS * SECTOR]
     second = image[fat_start + len(fat) : fat_start + 2 * len(fat)]
@@ -254,10 +256,13 @@ def extract_files(image: bytes, boot_name: bytes) -> tuple[bytes, bytes | None]:
     root = image[ROOT_OFFSET : ROOT_OFFSET + ROOT_SECTORS * SECTOR]
     require_directory(
         root,
-        [directory_entry(b"EFI        ", 0x10, 2, 0)],
+        [
+            directory_entry(VOLUME_LABEL, 0x08, 0, 0),
+            directory_entry(b"EFI        ", 0x10, 2, 0),
+        ],
         "root",
     )
-    efi_dir = image[cluster_offset(2) : cluster_offset(2) + SECTOR]
+    efi_dir = image[cluster_offset(2) : cluster_offset(2) + CLUSTER_BYTES]
     require_directory(
         efi_dir,
         [
@@ -267,7 +272,7 @@ def extract_files(image: bytes, boot_name: bytes) -> tuple[bytes, bytes | None]:
         ],
         "EFI",
     )
-    boot_dir = image[cluster_offset(3) : cluster_offset(3) + SECTOR]
+    boot_dir = image[cluster_offset(3) : cluster_offset(3) + CLUSTER_BYTES]
     entries = enumerate_directory(boot_dir, "BOOT")
     if len(entries) not in (3, 4):
         raise ValueError("BOOT directory has an invalid canonical file count")
@@ -327,8 +332,8 @@ def extract_files(image: bytes, boot_name: bytes) -> tuple[bytes, bytes | None]:
             if cluster != first + index:
                 raise ValueError(f"{label} chain is not canonical")
             offset = cluster_offset(cluster)
-            payload += image[offset : offset + SECTOR]
-            cluster = get_fat12(fat, cluster)
+            payload += image[offset : offset + CLUSTER_BYTES]
+            cluster = get_fat16(fat, cluster)
         if cluster != END_OF_CHAIN:
             raise ValueError("invalid FAT end-of-chain marker")
         if any(payload[byte_count:]):
@@ -349,12 +354,12 @@ def extract_files(image: bytes, boot_name: bytes) -> tuple[bytes, bytes | None]:
     first_unused_cluster = 4 + file_clusters + manifest_clusters
     if first_unused_cluster <= MAX_DATA_CLUSTER:
         if any(image[cluster_offset(first_unused_cluster) :]):
-            raise ValueError("unused FAT12 data clusters are not zero")
+            raise ValueError("unused FAT16 data clusters are not zero")
     return efi, mount_manifest
 
 
 def extract(image: bytes, boot_name: bytes) -> bytes:
-    """Validate the complete canonical FAT12 tree and return the EFI payload."""
+    """Validate the complete canonical FAT16 tree and return the EFI payload."""
     return extract_files(image, boot_name)[0]
 
 
@@ -397,7 +402,7 @@ def main() -> int:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_bytes(image)
         print(
-            f"FAT12 {args.arch}: {len(efi)}-byte EFI, {len(image)}-byte image -> {args.output}"
+            f"FAT16 {args.arch}: {len(efi)}-byte EFI, {len(image)}-byte image -> {args.output}"
         )
         return 0
     except (OSError, ValueError) as error:
