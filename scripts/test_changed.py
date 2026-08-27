@@ -124,7 +124,9 @@ PYTHON_IMPACTS = {
         "test_qemu_profile.py",
     ),
     "tools/package_model.py": ("test_package_model.py",),
+    "tools/package_trust.py": ("test_package_trust.py",),
     "tools/troe.py": ("test_package_model.py",),
+    "tools/troe_trust.py": ("test_package_trust.py",),
     "tools/cloud-environments.json": (
         "test_cloud_artifacts.py",
         "test_qemu_profile.py",
