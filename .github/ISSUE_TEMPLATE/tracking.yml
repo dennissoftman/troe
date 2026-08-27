@@ -1,0 +1,56 @@
+name: Tracking issue
+description: Coordinate a larger outcome through independently useful child issues.
+title: "[Tracking] "
+labels:
+  - tracking
+body:
+  - type: textarea
+    id: goal
+    attributes:
+      label: Goal
+      description: State the complete user- or system-level outcome this tracker closes.
+    validations:
+      required: true
+
+  - type: textarea
+    id: foundation
+    attributes:
+      label: Landed foundation
+      description: Summarize current implemented behavior and evidence without copying child issue designs.
+    validations:
+      required: true
+
+  - type: textarea
+    id: children
+    attributes:
+      label: Child issues
+      description: Link independently actionable issues as a checklist. Do not use prose-only placeholders.
+      placeholder: |
+        - [ ] #123
+        - [ ] #124
+    validations:
+      required: true
+
+  - type: textarea
+    id: exclusions
+    attributes:
+      label: Explicit exclusions
+      description: Link related longer-term work that is not required to close this tracker.
+    validations:
+      required: true
+
+  - type: textarea
+    id: exit
+    attributes:
+      label: Exit criteria
+      description: Define the simultaneous end-to-end conditions required before closing the tracker or milestone.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: acknowledgement
+    attributes:
+      label: Tracker discipline
+      options:
+        - label: Detailed specifications and implementation status remain in child issues rather than being duplicated here.
+          required: true

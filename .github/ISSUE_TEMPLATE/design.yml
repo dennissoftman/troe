@@ -1,0 +1,69 @@
+name: Design decision
+description: Record an unresolved decision, its evidence, invariants, alternatives, and acceptance gate.
+title: "[Design] "
+labels:
+  - design
+body:
+  - type: textarea
+    id: question
+    attributes:
+      label: Decision to make
+      description: Phrase the unresolved architectural or product question precisely.
+    validations:
+      required: true
+
+  - type: textarea
+    id: trigger
+    attributes:
+      label: Trigger and evidence
+      description: Name the consumers, measurements, deployment need, or repeated failure that makes this decision timely.
+    validations:
+      required: true
+
+  - type: textarea
+    id: current_contract
+    attributes:
+      label: Current contract
+      description: Describe implemented behavior and link its source, tests, formats, and ADRs. Do not describe the proposal as current.
+    validations:
+      required: true
+
+  - type: textarea
+    id: invariants
+    attributes:
+      label: Invariants and constraints
+      description: State authority, memory, persistence, compatibility, licensing, platform, and failure properties no option may weaken.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and tradeoffs
+      description: Compare realistic options, including keeping the current behavior, using measurable cost and safety criteria.
+    validations:
+      required: true
+
+  - type: textarea
+    id: non_goals
+    attributes:
+      label: Non-goals
+      description: Name adjacent features and semantic expansions excluded from this decision.
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance gate
+      description: Define the evidence required to accept a design and the implementation/verification issues that would follow.
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: acknowledgement
+    attributes:
+      label: Status acknowledgement
+      options:
+        - label: This issue records proposed work and makes no implementation or support claim.
+          required: true

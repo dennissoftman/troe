@@ -17,7 +17,7 @@ to one audited machine boundary; portable crates forbid it.
 
 > **Project status:** TROE runs in QEMU today. It is a research and development
 > project, not yet a general-purpose OS or production cloud image. See the
-> [roadmap](docs/roadmap.md).
+> [Stage 9 tracking issue](https://github.com/dennissoftman/troe/issues/14).
 
 ## Why TROE?
 
@@ -173,8 +173,8 @@ authority. Lua has no ambient libc, environment, process, dynamic-module, OS,
 or raw filesystem access.
 
 KEX images are statically linked today. A bounded, single-package dynamic
-linking design for reusable libc and language runtimes is an explicit
-[planned roadmap milestone](docs/roadmap.md#dynamic-linking-and-reusable-runtimes--planned).
+linking design for reusable libc and language runtimes is tracked in
+[GitHub issue #10](https://github.com/dennissoftman/troe/issues/10).
 
 ## 🚀 Quick start
 
@@ -243,15 +243,15 @@ explicit provisioning workflow.
 | [`rootfs/`](rootfs) | Root filesystem and packaged applications |
 | [`host/`](host) | Hosted shell model |
 | [`scripts/`](scripts) | Build, test, and QEMU entry points |
-| [`docs/`](docs) | Architecture, formats, decisions, security notes, and roadmap |
+| [`docs/`](docs) | Architecture, formats, decisions, security notes, and historical evaluations |
 
 The [documentation guide](docs/README.md) indexes the deeper material:
 
 - [Architecture](docs/architecture.md)
-- [Roadmap](docs/roadmap.md)
 - [Testing guide](docs/testing.md)
 - [Cloud platform support](docs/cloud-platform-support.md)
 - [Security policy](SECURITY.md)
+- [Open work](https://github.com/dennissoftman/troe/issues)
 
 ## Contributing and license
 
