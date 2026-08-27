@@ -39,7 +39,7 @@ class LuaRuntimeTests(unittest.TestCase):
             "-O2",
             "-DTROE_LUA=1",
             "-DTROE_LUA_HOST_TEST=1",
-            "-DLUA_USE_C89=1",
+            "-DLUA_USE_POSIX=1",
             "-Wall",
             "-Wextra",
             "-I",
@@ -117,7 +117,13 @@ assert(os.setlocale("uk_UA.UTF-8") == nil)
 assert(os.getenv("HOME") == "/" and os.getenv("PWD") == "/")
 assert(os.getenv("PATH") == "/bin" and os.getenv("MISSING") == nil)
 local ok, kind, status = os.execute("true")
-assert(ok == nil and kind == "exit" and status == 127 and os.execute() == false)
+assert(ok == true and kind == "exit" and status == 0 and os.execute() == true)
+ok, kind, status = os.execute("false")
+assert(ok == nil and kind == "exit" and status == 1)
+local process = assert(io.popen("printf lua-popen", "r"))
+assert(process:read("a") == "lua-popen")
+ok, kind, status = process:close()
+assert(ok == true and kind == "exit" and status == 0)
 assert(type(os.tmpname()) == "string")
 assert(collectgarbage("incremental") == "generational")
 assert(type(debug.getinfo(1, "nS")) == "table")

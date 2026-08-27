@@ -197,15 +197,13 @@ the child's complete exit status. This proves the process mechanism without
 putting shell grammar in the kernel; `sh.kex` has not yet adopted it.
 
 [`apps/lua`](apps/lua) is a complete freestanding Lua 5.5.1 interpreter. It
-streams source from `-e`, stdin, or the bounded read-only filesystem service,
-starts with a 1 MiB TLSF application heap that commits more physical memory on
-demand, and exposes only base, coroutine, table,
-string, math, UTF-8, and a capability-aware OS shim. The shim implements
-process-CPU `os.clock`, whole-second Unix `os.time`, controlled `os.exit`, and
-`os.difftime`; its remaining
-standard entries fail explicitly until TROE grants and implements the required
-authority. Lua has no ambient libc, environment, process, dynamic-module, OS,
-or raw filesystem access.
+supports stock command-line actions and the complete standard library surface,
+including file mutation, `os.execute`, and read/write `io.popen` through explicit
+KEX capabilities. It starts with a 1 MiB TLSF application heap, reports
+process-CPU time through `os.clock`, and exposes whole-second Unix wall time
+through `os.time`. The remaining platform limits are explicit: UTC and the C
+locale are fixed, C dynamic modules have no loader, and Lua has no ambient libc,
+host OS, or raw filesystem access.
 
 [`apps/sh`](apps/sh) transactionally stages a bounded UTF-8 command file through
 the typed shell-script sidecar, then the owning session executes each validated

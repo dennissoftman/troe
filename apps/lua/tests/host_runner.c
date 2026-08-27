@@ -31,6 +31,20 @@ typedef int (*TroeFilePathOperation)(void *context, const uint8_t *path,
 typedef int (*TroeFileRename)(void *context, const uint8_t *old_path,
                               size_t old_path_length, const uint8_t *new_path,
                               size_t new_path_length);
+typedef int (*TroeProcessExecute)(void *context, const uint8_t *command,
+                                  size_t command_length, uint32_t *status);
+typedef int (*TroeProcessOpen)(void *context, const uint8_t *command,
+                               size_t command_length, int mode,
+                               uint64_t *child_token, uint64_t *pipe_token,
+                               uint64_t *script_identifier);
+typedef intptr_t (*TroeProcessRead)(void *context, uint64_t pipe_token,
+                                    uint8_t *destination, size_t capacity);
+typedef int (*TroeProcessWrite)(void *context, uint64_t pipe_token,
+                                const uint8_t *bytes, size_t length);
+typedef int (*TroeProcessClose)(void *context, uint64_t child_token,
+                                uint64_t pipe_token,
+                                uint64_t script_identifier, int mode,
+                                uint32_t *status);
 
 struct TroeLuaHost {
   void *context;
@@ -47,6 +61,12 @@ struct TroeLuaHost {
   TroeFilePathOperation file_remove;
   TroeFileRename file_rename;
   int file_mutation_available;
+  TroeProcessExecute process_execute;
+  TroeProcessOpen process_open;
+  TroeProcessRead process_read;
+  TroeProcessWrite process_write;
+  TroeProcessClose process_close;
+  int process_available;
 };
 
 typedef struct TroeLuaArgument {
@@ -187,6 +207,45 @@ static int host_unavailable_rename(void *context, const uint8_t *old_path,
   return -1;
 }
 
+static int host_process_execute(void *context, const uint8_t *command,
+                                size_t command_length, uint32_t *status) {
+  (void)context;
+  *status = command_length == 5 && memcmp(command, "false", 5) == 0 ? 1u : 0u;
+  return 0;
+}
+
+static int host_unavailable_process_open(
+    void *context, const uint8_t *command, size_t command_length, int mode,
+    uint64_t *child_token, uint64_t *pipe_token, uint64_t *script_identifier) {
+  (void)context; (void)command; (void)command_length; (void)mode;
+  (void)child_token; (void)pipe_token; (void)script_identifier;
+  return -1;
+}
+
+static intptr_t host_unavailable_process_read(void *context,
+                                              uint64_t pipe_token,
+                                              uint8_t *destination,
+                                              size_t capacity) {
+  (void)context; (void)pipe_token; (void)destination; (void)capacity;
+  return -1;
+}
+
+static int host_unavailable_process_write(void *context, uint64_t pipe_token,
+                                          const uint8_t *bytes,
+                                          size_t length) {
+  (void)context; (void)pipe_token; (void)bytes; (void)length;
+  return -1;
+}
+
+static int host_unavailable_process_close(void *context, uint64_t child_token,
+                                          uint64_t pipe_token,
+                                          uint64_t script_identifier,
+                                          int mode, uint32_t *status) {
+  (void)context; (void)child_token; (void)pipe_token;
+  (void)script_identifier; (void)mode; (void)status;
+  return -1;
+}
+
 int main(int argc, char **argv) {
   HostContext context;
   TroeLuaHost host;
@@ -232,6 +291,12 @@ int main(int argc, char **argv) {
       .file_remove = host_unavailable_path,
       .file_rename = host_unavailable_rename,
       .file_mutation_available = 0,
+      .process_execute = host_process_execute,
+      .process_open = host_unavailable_process_open,
+      .process_read = host_unavailable_process_read,
+      .process_write = host_unavailable_process_write,
+      .process_close = host_unavailable_process_close,
+      .process_available = 1,
   };
   configuration = (TroeLuaConfiguration){
       .host = &host,

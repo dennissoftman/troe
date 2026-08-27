@@ -81,6 +81,20 @@ typedef int (*TroeFilePathOperation)(void *context, const uint8_t *path,
 typedef int (*TroeFileRename)(void *context, const uint8_t *old_path,
                               size_t old_path_length, const uint8_t *new_path,
                               size_t new_path_length);
+typedef int (*TroeProcessExecute)(void *context, const uint8_t *command,
+                                  size_t command_length, uint32_t *status);
+typedef int (*TroeProcessOpen)(void *context, const uint8_t *command,
+                               size_t command_length, int mode,
+                               uint64_t *child_token, uint64_t *pipe_token,
+                               uint64_t *script_identifier);
+typedef intptr_t (*TroeProcessRead)(void *context, uint64_t pipe_token,
+                                    uint8_t *destination, size_t capacity);
+typedef int (*TroeProcessWrite)(void *context, uint64_t pipe_token,
+                                const uint8_t *bytes, size_t length);
+typedef int (*TroeProcessClose)(void *context, uint64_t child_token,
+                                uint64_t pipe_token,
+                                uint64_t script_identifier, int mode,
+                                uint32_t *status);
 
 struct TroeLuaHost {
   void *context;
@@ -97,6 +111,12 @@ struct TroeLuaHost {
   TroeFilePathOperation file_remove;
   TroeFileRename file_rename;
   int file_mutation_available;
+  TroeProcessExecute process_execute;
+  TroeProcessOpen process_open;
+  TroeProcessRead process_read;
+  TroeProcessWrite process_write;
+  TroeProcessClose process_close;
+  int process_available;
 };
 
 typedef struct TroeLuaArgument {
@@ -498,7 +518,8 @@ enum {
   TROE_FILE_STDIN = 1,
   TROE_FILE_STDOUT = 2,
   TROE_FILE_STDERR = 3,
-  TROE_FILE_MEMORY = 4
+  TROE_FILE_MEMORY = 4,
+  TROE_FILE_PROCESS = 5
 };
 
 struct TroeFile {
@@ -518,6 +539,10 @@ struct TroeFile {
   int eof;
   int error;
   int ungot;
+  uint64_t child_token;
+  uint64_t pipe_token;
+  uint64_t script_identifier;
+  int process_mode;
 };
 
 static struct TroeFile troe_stdin_file = {
@@ -627,12 +652,71 @@ void clearerr(FILE *file) {
   }
 }
 
+static FILE *troe_popen(const char *command, const char *mode) {
+  FILE *file;
+  uint64_t child_token = 0;
+  uint64_t pipe_token = 0;
+  uint64_t script_identifier = 0;
+  int selected_mode;
+  if (command == NULL || mode == NULL ||
+      (mode[0] != 'r' && mode[0] != 'w') || mode[1] != '\0' ||
+      troe_active_host == NULL || !troe_active_host->process_available) {
+    errno = EINVAL;
+    return NULL;
+  }
+  selected_mode = (unsigned char)mode[0];
+  if (troe_active_host->process_open(
+          troe_active_host->context, (const uint8_t *)command,
+          strlen(command), selected_mode, &child_token, &pipe_token,
+          &script_identifier) != 0) {
+    errno = EINVAL;
+    return NULL;
+  }
+  file = troe_file_new();
+  if (file == NULL) {
+    uint32_t ignored_status;
+    (void)troe_active_host->process_close(
+        troe_active_host->context, child_token, pipe_token, script_identifier,
+        selected_mode, &ignored_status);
+    return NULL;
+  }
+  file->kind = TROE_FILE_PROCESS;
+  file->readable = selected_mode == 'r';
+  file->writable = selected_mode == 'w';
+  file->child_token = child_token;
+  file->pipe_token = pipe_token;
+  file->script_identifier = script_identifier;
+  file->process_mode = selected_mode;
+  return file;
+}
+
+static int troe_pclose(FILE *file) {
+  uint32_t status = 0;
+  int result;
+  if (file == NULL || file->kind != TROE_FILE_PROCESS ||
+      troe_active_host == NULL) {
+    errno = EINVAL;
+    return -1;
+  }
+  result = troe_active_host->process_close(
+      troe_active_host->context, file->child_token, file->pipe_token,
+      file->script_identifier, file->process_mode, &status);
+  troe_file_dispose(file);
+  if (result != 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  return (int)(status & 0xffu);
+}
+
 int fclose(FILE *file) {
   int result = 0;
   if (file == NULL || file == stdin || file == stdout || file == stderr) {
     errno = EINVAL;
     return EOF;
   }
+  if (file->kind == TROE_FILE_PROCESS)
+    return troe_pclose(file);
   if (fflush(file) != 0)
     result = EOF;
   if (file->token != 0 &&
@@ -785,6 +869,18 @@ size_t fread(void *destination, size_t size, size_t count, FILE *file) {
     }
     copied += (size_t)got;
     file->position += (uint64_t)got;
+  } else if (copied < wanted && file->kind == TROE_FILE_PROCESS) {
+    intptr_t got = troe_active_host->process_read(
+        troe_active_host->context, file->pipe_token, output + copied,
+        wanted - copied);
+    if (got < 0 || (size_t)got > wanted - copied) {
+      file->error = 1;
+      return copied / size;
+    }
+    copied += (size_t)got;
+    file->position += (uint64_t)got;
+    if (got == 0)
+      file->eof = 1;
   } else if (copied < wanted && file->buffer != NULL) {
     size_t position = file->position > (uint64_t)(size_t)-1
                           ? file->length
@@ -805,7 +901,7 @@ size_t fread(void *destination, size_t size, size_t count, FILE *file) {
     copied += (size_t)got;
     file->position += (uint64_t)got;
   }
-  if (copied < wanted)
+  if (copied < wanted && file->kind != TROE_FILE_PROCESS)
     file->eof = 1;
   return copied / size;
 }
@@ -825,6 +921,16 @@ size_t fwrite(const void *source, size_t size, size_t count, FILE *file) {
     int stream = file->kind == TROE_FILE_STDOUT ? 1 : 2;
     if (troe_active_host->write(troe_active_host->context, stream,
                                 (const uint8_t *)source, wanted) != 0) {
+      file->error = 1;
+      return 0;
+    }
+    file->position += (uint64_t)wanted;
+    return count;
+  }
+  if (file->kind == TROE_FILE_PROCESS) {
+    if (troe_active_host->process_write(
+            troe_active_host->context, file->pipe_token,
+            (const uint8_t *)source, wanted) != 0) {
       file->error = 1;
       return 0;
     }
@@ -860,6 +966,10 @@ int fseek(FILE *file, long offset, int origin) {
   int64_t target;
   if (file == NULL || file->kind == TROE_FILE_STDIN ||
       file->kind == TROE_FILE_STDOUT || file->kind == TROE_FILE_STDERR) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (file->kind == TROE_FILE_PROCESS) {
     errno = EINVAL;
     return -1;
   }
@@ -1022,6 +1132,11 @@ static unsigned int troe_make_seed(void) {
   "/share/lua/5.5/?.lua;/share/lua/5.5/?/init.lua;/share/lua/?.lua;"       \
   "/share/lua/?/init.lua;./?.lua;./?/init.lua"
 #define LUA_CPATH_DEFAULT "/lib/lua/5.5/?.so;./?.so"
+#endif
+#if !defined(TROE_LUA_HOST_TEST)
+#define l_popen(L, command, mode)                                             \
+  ((void)(L), troe_popen((command), (mode)))
+#define l_pclose(L, file) ((void)(L), troe_pclose((file)))
 #endif
 #include "luaconf.h"
 

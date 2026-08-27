@@ -310,14 +310,28 @@ static int troe_os_difftime(lua_State *state) {
 }
 
 static int troe_os_execute(lua_State *state) {
+  const char *command;
+  size_t command_length;
+  uint32_t status;
   if (lua_isnoneornil(state, 1)) {
-    lua_pushboolean(state, 0);
+    lua_pushboolean(state, troe_active_host != NULL &&
+                               troe_active_host->process_available);
     return 1;
   }
-  (void)luaL_checkstring(state, 1);
-  luaL_pushfail(state);
+  command = luaL_checklstring(state, 1, &command_length);
+  if (troe_active_host == NULL || !troe_active_host->process_available ||
+      troe_active_host->process_execute(
+          troe_active_host->context, (const uint8_t *)command, command_length,
+          &status) != 0) {
+    errno = EINVAL;
+    return luaL_fileresult(state, 0, command);
+  }
+  if (status == 0)
+    lua_pushboolean(state, 1);
+  else
+    luaL_pushfail(state);
   lua_pushliteral(state, "exit");
-  lua_pushinteger(state, 127);
+  lua_pushinteger(state, (lua_Integer)status);
   return 3;
 }
 

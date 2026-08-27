@@ -12,8 +12,9 @@ use core::{
 };
 use troe_kex_alloc::Heap;
 use troe_kex_sdk::{
-    CommandContext, FilesystemMutation, INVOCATION_BUFFER_BYTES, ReadOnlyFilesystem, StandardInput,
-    StandardOutput, Timer, WallClock, command, entry, exit, filesystem,
+    CommandContext, FilesystemMutation, INVOCATION_BUFFER_BYTES, Pipes, ProcessLauncher,
+    ReadOnlyFilesystem, StandardInput, StandardOutput, Timer, WallClock, command, entry, exit,
+    filesystem, pipe, process_launch,
 };
 
 const LUA_VERSION: &[u8] = b"Lua 5.5.1  Copyright (C) 1994-2026 Lua.org, PUC-Rio\n";
@@ -68,6 +69,20 @@ struct LuaHost {
     file_remove: unsafe extern "C" fn(*mut c_void, *const u8, usize) -> i32,
     file_rename: unsafe extern "C" fn(*mut c_void, *const u8, usize, *const u8, usize) -> i32,
     file_mutation_available: i32,
+    process_execute: unsafe extern "C" fn(*mut c_void, *const u8, usize, *mut u32) -> i32,
+    process_open: unsafe extern "C" fn(
+        *mut c_void,
+        *const u8,
+        usize,
+        i32,
+        *mut u64,
+        *mut u64,
+        *mut u64,
+    ) -> i32,
+    process_read: unsafe extern "C" fn(*mut c_void, u64, *mut u8, usize) -> isize,
+    process_write: unsafe extern "C" fn(*mut c_void, u64, *const u8, usize) -> i32,
+    process_close: unsafe extern "C" fn(*mut c_void, u64, u64, u64, i32, *mut u32) -> i32,
+    process_available: i32,
 }
 
 #[repr(C)]
@@ -153,6 +168,10 @@ struct Runtime {
     stdin: StandardInput,
     filesystem: ReadOnlyFilesystem,
     mutation: FilesystemMutation,
+    launcher: ProcessLauncher,
+    pipes: Pipes,
+    current_directory: [u8; filesystem::MAX_PATH_BYTES],
+    current_directory_length: usize,
 }
 
 enum Selection<'invocation> {
@@ -350,6 +369,22 @@ fn run(command: &mut CommandContext) -> u32 {
         );
         return exit::DENIED;
     };
+    let Ok(launcher) = command.process_launcher() else {
+        common::report(
+            &mut command.stderr(),
+            "lua",
+            b"process-launch capability is unavailable",
+        );
+        return exit::DENIED;
+    };
+    let Ok(pipes) = command.pipes() else {
+        common::report(
+            &mut command.stderr(),
+            "lua",
+            b"pipe capability is unavailable",
+        );
+        return exit::DENIED;
+    };
 
     let mut source_name_storage = [0_u8; filesystem::MAX_PATH_BYTES + 1];
     let mut stderr = command.stderr();
@@ -409,6 +444,9 @@ fn run(command: &mut CommandContext) -> u32 {
         argument_count += 1;
     }
 
+    let mut current_directory = [0_u8; filesystem::MAX_PATH_BYTES];
+    let current_directory_length = invocation.cwd().len();
+    current_directory[..current_directory_length].copy_from_slice(invocation.cwd().as_bytes());
     let mut runtime = Runtime {
         heap,
         source,
@@ -419,6 +457,10 @@ fn run(command: &mut CommandContext) -> u32 {
         stdin: command.stdin(),
         filesystem,
         mutation,
+        launcher,
+        pipes,
+        current_directory,
+        current_directory_length,
     };
     let mut host = LuaHost {
         context: ptr::from_mut(&mut runtime).cast(),
@@ -435,6 +477,12 @@ fn run(command: &mut CommandContext) -> u32 {
         file_remove: lua_file_remove,
         file_rename: lua_file_rename,
         file_mutation_available: 1,
+        process_execute: lua_process_execute,
+        process_open: lua_process_open,
+        process_read: lua_process_read,
+        process_write: lua_process_write,
+        process_close: lua_process_close,
+        process_available: 1,
     };
     let mut configuration = LuaConfiguration {
         host: ptr::from_mut(&mut host),
@@ -770,6 +818,320 @@ unsafe extern "C" fn lua_file_rename(
     if replacement.commit().is_err() || runtime.mutation.remove(old_path).is_err() {
         return -1;
     }
+    0
+}
+
+fn parse_process_arguments<'storage>(
+    source: &[u8],
+    storage: &'storage mut [u8; command::MAX_ARGUMENT_BYTES],
+    ranges: &mut [(usize, usize); command::MAX_ARGUMENTS],
+) -> Result<([&'storage str; command::MAX_ARGUMENTS], usize), ()> {
+    let mut source_at = 0_usize;
+    let mut storage_at = 0_usize;
+    let mut count = 0_usize;
+    while source_at < source.len() {
+        while source.get(source_at).is_some_and(u8::is_ascii_whitespace) {
+            source_at += 1;
+        }
+        if source_at == source.len() {
+            break;
+        }
+        if count == ranges.len() {
+            return Err(());
+        }
+        let start = storage_at;
+        let mut quote = 0_u8;
+        let mut token_present = false;
+        while source_at < source.len() {
+            let byte = source[source_at];
+            if quote == 0 && byte.is_ascii_whitespace() {
+                break;
+            }
+            if byte == b'\'' && quote != b'"' {
+                token_present = true;
+                quote = if quote == b'\'' { 0 } else { b'\'' };
+                source_at += 1;
+                continue;
+            }
+            if byte == b'"' && quote != b'\'' {
+                token_present = true;
+                quote = if quote == b'"' { 0 } else { b'"' };
+                source_at += 1;
+                continue;
+            }
+            if byte == b'\\' && quote != b'\'' {
+                token_present = true;
+                source_at += 1;
+                if source_at == source.len() {
+                    return Err(());
+                }
+                if storage_at == storage.len() {
+                    return Err(());
+                }
+                storage[storage_at] = source[source_at];
+                storage_at += 1;
+                source_at += 1;
+                continue;
+            }
+            if quote == 0 && b"|&;<>()$`".contains(&byte) {
+                return Err(());
+            }
+            if storage_at == storage.len() {
+                return Err(());
+            }
+            storage[storage_at] = byte;
+            token_present = true;
+            storage_at += 1;
+            source_at += 1;
+        }
+        if quote != 0 || !token_present {
+            return Err(());
+        }
+        ranges[count] = (start, storage_at);
+        count += 1;
+    }
+    if count == 0 {
+        return Err(());
+    }
+    let mut arguments = [""; command::MAX_ARGUMENTS];
+    for (argument, (start, end)) in arguments[..count].iter_mut().zip(ranges[..count].iter()) {
+        *argument = str::from_utf8(&storage[*start..*end]).map_err(|_| ())?;
+    }
+    Ok((arguments, count))
+}
+
+fn launch_command(
+    runtime: &mut Runtime,
+    source: &[u8],
+    stdin: process_launch::StreamSpec,
+    stdout: process_launch::StreamSpec,
+) -> Result<process_launch::SpawnedChild, ()> {
+    let mut argument_bytes = [0_u8; command::MAX_ARGUMENT_BYTES];
+    let mut argument_ranges = [(0_usize, 0_usize); command::MAX_ARGUMENTS];
+    let (arguments, argument_count) =
+        parse_process_arguments(source, &mut argument_bytes, &mut argument_ranges)?;
+    let cwd = str::from_utf8(&runtime.current_directory[..runtime.current_directory_length])
+        .map_err(|_| ())?;
+    let mut pwd_bytes = [0_u8; filesystem::MAX_PATH_BYTES + 4];
+    pwd_bytes[..4].copy_from_slice(b"PWD=");
+    pwd_bytes[4..4 + cwd.len()].copy_from_slice(cwd.as_bytes());
+    let pwd = str::from_utf8(&pwd_bytes[..4 + cwd.len()]).map_err(|_| ())?;
+    let environment = [
+        "HOME=/",
+        "PATH=/bin",
+        "TMPDIR=/tmp",
+        "SHELL=/bin/sh",
+        "USER=root",
+        "LOGNAME=root",
+        pwd,
+    ];
+    runtime
+        .launcher
+        .spawn(
+            cwd,
+            &arguments[..argument_count],
+            &environment,
+            stdin,
+            stdout,
+            process_launch::StreamSpec::INHERIT,
+        )
+        .map_err(|_| ())
+}
+
+unsafe extern "C" fn lua_process_execute(
+    context: *mut c_void,
+    command: *const u8,
+    command_length: usize,
+    status: *mut u32,
+) -> i32 {
+    let (Some(runtime), Some(command), Some(mut status)) = (
+        unsafe { (context.cast::<Runtime>()).as_mut() },
+        NonNull::new(command.cast_mut()),
+        NonNull::new(status),
+    ) else {
+        return -1;
+    };
+    let command = unsafe { slice::from_raw_parts(command.as_ptr(), command_length) };
+    let Ok(child) = launch_command(
+        runtime,
+        command,
+        process_launch::StreamSpec::INHERIT,
+        process_launch::StreamSpec::INHERIT,
+    ) else {
+        return -1;
+    };
+    let result = runtime.launcher.wait(child.token);
+    let reaped = runtime.launcher.reap(child.token).is_ok();
+    let Ok(result) = result else {
+        return -1;
+    };
+    if !reaped {
+        return -1;
+    }
+    unsafe { *status.as_mut() = result.exit_status };
+    0
+}
+
+unsafe extern "C" fn lua_process_open(
+    context: *mut c_void,
+    command: *const u8,
+    command_length: usize,
+    mode: i32,
+    child_token: *mut u64,
+    pipe_token: *mut u64,
+    script_identifier: *mut u64,
+) -> i32 {
+    let (
+        Some(runtime),
+        Some(command),
+        Some(mut child_token),
+        Some(mut pipe_token),
+        Some(mut script_identifier),
+    ) = (
+        unsafe { (context.cast::<Runtime>()).as_mut() },
+        NonNull::new(command.cast_mut()),
+        NonNull::new(child_token),
+        NonNull::new(pipe_token),
+        NonNull::new(script_identifier),
+    )
+    else {
+        return -1;
+    };
+    if mode != i32::from(b'r') && mode != i32::from(b'w') {
+        return -1;
+    }
+    let command = unsafe { slice::from_raw_parts(command.as_ptr(), command_length) };
+    let Ok(pipe) = runtime.pipes.create(pipe::MIN_CAPACITY) else {
+        return -1;
+    };
+    let Ok(pipe_stream) = process_launch::StreamSpec::pipe(pipe.value()) else {
+        let _ = runtime.pipes.close_writer(pipe);
+        let _ = runtime.pipes.close_reader(pipe);
+        return -1;
+    };
+    let (stdin, stdout) = if mode == i32::from(b'r') {
+        (process_launch::StreamSpec::INHERIT, pipe_stream)
+    } else {
+        (pipe_stream, process_launch::StreamSpec::INHERIT)
+    };
+    let Ok(child) = launch_command(runtime, command, stdin, stdout) else {
+        let _ = runtime.pipes.close_writer(pipe);
+        let _ = runtime.pipes.close_reader(pipe);
+        return -1;
+    };
+    let closed = if mode == i32::from(b'r') {
+        runtime.pipes.close_writer(pipe)
+    } else {
+        runtime.pipes.close_reader(pipe)
+    };
+    if closed.is_err() {
+        let _ = runtime.launcher.cancel(child.token);
+        let _ = runtime.launcher.wait(child.token);
+        let _ = runtime.launcher.reap(child.token);
+        return -1;
+    }
+    unsafe {
+        *child_token.as_mut() = child.token.value();
+        *pipe_token.as_mut() = pipe.value();
+        *script_identifier.as_mut() = 0;
+    }
+    0
+}
+
+unsafe extern "C" fn lua_process_read(
+    context: *mut c_void,
+    pipe_token: u64,
+    destination: *mut u8,
+    capacity: usize,
+) -> isize {
+    if capacity == 0 {
+        return 0;
+    }
+    let (Some(runtime), Some(destination)) = (
+        unsafe { (context.cast::<Runtime>()).as_mut() },
+        NonNull::new(destination),
+    ) else {
+        return -1;
+    };
+    let Ok(token) = pipe::PipeToken::new(pipe_token) else {
+        return -1;
+    };
+    let destination = unsafe { slice::from_raw_parts_mut(destination.as_ptr(), capacity) };
+    runtime
+        .pipes
+        .read(token, destination)
+        .ok()
+        .and_then(|count| isize::try_from(count).ok())
+        .unwrap_or(-1)
+}
+
+unsafe extern "C" fn lua_process_write(
+    context: *mut c_void,
+    pipe_token: u64,
+    bytes: *const u8,
+    length: usize,
+) -> i32 {
+    if length == 0 {
+        return 0;
+    }
+    let (Some(runtime), Some(bytes)) = (
+        unsafe { (context.cast::<Runtime>()).as_mut() },
+        NonNull::new(bytes.cast_mut()),
+    ) else {
+        return -1;
+    };
+    let Ok(token) = pipe::PipeToken::new(pipe_token) else {
+        return -1;
+    };
+    let bytes = unsafe { slice::from_raw_parts(bytes.as_ptr(), length) };
+    if runtime.pipes.write_all(token, bytes).is_ok() {
+        0
+    } else {
+        -1
+    }
+}
+
+unsafe extern "C" fn lua_process_close(
+    context: *mut c_void,
+    child_token: u64,
+    pipe_token: u64,
+    script_identifier: u64,
+    mode: i32,
+    status: *mut u32,
+) -> i32 {
+    let (Some(runtime), Some(mut status)) = (
+        unsafe { (context.cast::<Runtime>()).as_mut() },
+        NonNull::new(status),
+    ) else {
+        return -1;
+    };
+    let (Ok(child), Ok(pipe)) = (
+        process_launch::ChildToken::new(child_token),
+        pipe::PipeToken::new(pipe_token),
+    ) else {
+        return -1;
+    };
+    let endpoint_closed = if mode == i32::from(b'r') {
+        runtime.pipes.close_reader(pipe)
+    } else if mode == i32::from(b'w') {
+        runtime.pipes.close_writer(pipe)
+    } else {
+        return -1;
+    };
+    let mut child_status = runtime.launcher.wait(child);
+    if child_status.is_err() {
+        let _ = runtime.launcher.cancel(child);
+        child_status = runtime.launcher.wait(child);
+    }
+    let reaped = runtime.launcher.reap(child).is_ok();
+    let _ = script_identifier;
+    let Ok(child_status) = child_status else {
+        return -1;
+    };
+    if endpoint_closed.is_err() || !reaped {
+        return -1;
+    }
+    unsafe { *status.as_mut() = child_status.exit_status };
     0
 }
 

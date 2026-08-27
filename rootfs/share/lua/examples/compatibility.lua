@@ -47,11 +47,19 @@ assert(load(dumped, "=(dumped)", "b")(9) == 81)
 local info = debug.getinfo(1, "S")
 local leap_day = os.time {year = 2024, month = 2, day = 29, hour = 12}
 
+local ok, kind, status = os.execute([[echo "lua execute"]])
+assert(ok and kind == "exit" and status == 0)
+local process = assert(io.popen("printf lua-popen", "r"))
+local captured = assert(process:read("a"))
+ok, kind, status = process:close()
+assert(ok and kind == "exit" and status == 0)
+
 print("lua-compat libraries", type(package), type(io), type(debug))
 print("lua-compat date", os.date("!%Y-%m-%d %A", leap_day))
 print("lua-compat file", table.concat(lines, ","))
 print("lua-compat module", module.answer, loaded_from)
 print("lua-compat bytecode", marker, info.what)
+print("lua-compat process", captured)
 
 assert(os.remove(renamed_path))
 assert(os.remove(module_path))

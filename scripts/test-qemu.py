@@ -1524,6 +1524,8 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
             "lua-compat file\talpha,beta,gamma\n",
             "lua-compat module\t42\t/tmp/lua55-showcase-module.lua\n",
             "lua-compat bytecode\t1414680389\tmain\n",
+            "lua execute\n",
+            "lua-compat process\tlua-popen\n",
             "lua-compat cleanup\ttrue\ttrue\n",
         ),
     )
@@ -1535,6 +1537,13 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
             "lua-files wrote\t36\tbytes\n",
             "lua-files cleanup\ttrue\ttrue\n",
         ),
+    )
+    session.command(
+        "lua -e 'local p=assert(io.popen(\"wc -c\",\"w\")); "
+        "assert(p:write(\"12345\")); print(p:close())'",
+        cwd,
+        command_timeout,
+        contains=("5\n", "true\texit\t0\n"),
     )
     session.command(
         "lua -e 'local t={}; local n=0; for i=1,6144 do "

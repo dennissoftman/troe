@@ -25,8 +25,9 @@ DESCRIPTION
     flushing, and seeking. Lua has explicit filesystem-read and
     filesystem-mutation authority. Writable files are buffered in the Lua heap
     and replaced through TROE's streamed mutation service when flushed or closed.
-    io.popen and C dynamic modules are unavailable because TROE has no compatible
-    pipe or dynamic-loader service.
+    io.popen uses TROE's owner-scoped process-launch and bounded-pipe services in
+    both read and write modes. C dynamic modules remain unavailable because TROE
+    has no dynamic-loader service.
 
     os.clock follows Lua semantics and returns process CPU seconds charged while
     the application executes unprivileged code. Kernel services, waiting, and
@@ -46,10 +47,15 @@ DESCRIPTION
     replace-and-remove operation; it is not yet an atomic provider-level rename.
     KEX invocations do not yet carry a mutable environment. os.getenv exposes
     stable PWD, HOME, PATH, TMPDIR, SHELL, USER, and LOGNAME values and returns
-    nil for unknown names. os.execute reports that no synchronous child-process
-    service is available. The fixed C locale is the only supported locale.
+    nil for unknown names. os.execute parses one bounded direct TROE command,
+    waits for the child, and returns Lua's standard success, termination kind,
+    and status tuple. Quoted arguments and backslash escapes are supported.
+    Shell operators, expansion, and redirection are rejected because TROE does
+    not delegate the session-owned shell-script capability to nested processes.
+    io.popen uses the same command syntax. The fixed C locale is the only
+    supported locale.
 
-    Lua uses a bounded 8 MiB TLSF heap. Exhausting the heap raises a normal protected Lua memory error;
+    Lua uses a bounded 1 MiB TLSF heap. Exhausting the heap raises a normal protected Lua memory error;
     it cannot grow memory or access ambient host resources.
 
 EXAMPLES
