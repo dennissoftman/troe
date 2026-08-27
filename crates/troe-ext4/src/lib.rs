@@ -1997,6 +1997,18 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Ext4<D> {
         })
     }
 
+    fn metadata_no_follow(&mut self, path: &str) -> Result<FileMetadata, FsError> {
+        let inode = self.resolve_no_follow(path)?;
+        Ok(FileMetadata {
+            kind: inode.kind,
+            byte_count: if inode.kind == NodeKind::File {
+                inode.size
+            } else {
+                0
+            },
+        })
+    }
+
     fn read_file(
         &mut self,
         path: &str,

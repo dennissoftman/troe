@@ -22,6 +22,7 @@ contract.
 | Resident applications and shell jobs | [ADR 0037](adr/0037-resident-kex-processes-and-jobs.md) |
 | Boot and on-demand service supervision | [ADR 0038](adr/0038-scfg-service-supervision.md) |
 | Wall-clock discipline and SNTP synchronization | [ADR 0039](adr/0039-wall-clock-and-sntp-service.md) |
+| Package-resolved directory authority | [ADR 0040](adr/0040-package-resolved-directory-capabilities.md) |
 
 The current serialized contracts are versioned independently under
 [`formats/`](formats):

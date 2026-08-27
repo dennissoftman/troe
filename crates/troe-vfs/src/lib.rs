@@ -115,6 +115,20 @@ pub trait ReadOnlyFileSystem: fmt::Debug {
     /// media, transport failures, and provider resource exhaustion.
     fn metadata(&mut self, path: &str) -> Result<FileMetadata, FsError>;
 
+    /// Resolve one path without following its final symbolic link.
+    ///
+    /// Providers without symbolic links may retain this default. Providers
+    /// that implement symbolic links must override it so directory-capability
+    /// validation can reject traversal before the requested operation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid or missing paths, corrupt media, transport failures, and
+    /// provider resource exhaustion.
+    fn metadata_no_follow(&mut self, path: &str) -> Result<FileMetadata, FsError> {
+        self.metadata(path)
+    }
+
     /// Read at most `destination.len()` bytes at an exact file offset.
     ///
     /// A successful zero return is EOF. Providers must either fill the returned
@@ -279,6 +293,56 @@ pub struct RamFsQuota {
     pub max_nodes: usize,
     /// Maximum payload bytes in one file.
     pub max_file_bytes: usize,
+}
+
+/// Closed rights attached to one package-resolved directory capability.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DirectoryRights(u8);
+
+impl DirectoryRights {
+    /// Read metadata, directory entries, links, and file bytes.
+    pub const READ: Self = Self(1);
+    /// Mutate names and file payloads without implicitly granting reads.
+    pub const MUTATE: Self = Self(2);
+    /// Read and mutate beneath the same resolved directory object.
+    pub const READ_MUTATE: Self = Self(Self::READ.0 | Self::MUTATE.0);
+
+    const fn allows(self, required: Self) -> bool {
+        self.0 & required.0 == required.0
+    }
+}
+
+/// One immutable, generation-bound directory authority.
+///
+/// Applications never receive `root` or `provider_root` as path authority.
+/// They submit relative paths through their typed service handle; the service
+/// validates those paths against this retained object before namespace access.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DirectoryCapability {
+    root: String,
+    provider_root: Option<String>,
+    generation: u64,
+    rights: DirectoryRights,
+}
+
+impl DirectoryCapability {
+    /// Absolute namespace root selected during generation activation.
+    #[must_use]
+    pub fn root(&self) -> &str {
+        &self.root
+    }
+
+    /// Immutable system generation which owns this authority.
+    #[must_use]
+    pub const fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Exact read/mutation rights fixed at activation.
+    #[must_use]
+    pub const fn rights(&self) -> DirectoryRights {
+        self.rights
+    }
 }
 
 impl Default for RamFsQuota {
@@ -479,6 +543,223 @@ impl Namespace {
         provider: Box<dyn ReadOnlyFileSystem>,
     ) -> Result<(), FsError> {
         self.mount_provider(path, provider, true)
+    }
+
+    /// Resolve one immutable directory capability during generation activation.
+    ///
+    /// The root must be an existing directory reached without symbolic-link
+    /// traversal. The returned object fixes the current provider boundary so a
+    /// later namespace mount cannot silently widen it.
+    ///
+    /// # Errors
+    ///
+    /// Rejects generation zero, invalid or non-directory roots, symbolic-link
+    /// traversal, allocation failure, and provider errors.
+    pub fn grant_directory(
+        &mut self,
+        root: &str,
+        generation: u64,
+        rights: DirectoryRights,
+    ) -> Result<DirectoryCapability, FsError> {
+        if generation == 0 {
+            return Err(FsError::Invalid);
+        }
+        let normalized_root = canonicalize("/", root)?;
+        if normalized_root == "/" || normalized_root != root {
+            return Err(FsError::Invalid);
+        }
+        let root = normalized_root;
+        let metadata = self.metadata_no_follow_absolute(&root)?;
+        if metadata.kind != NodeKind::Directory {
+            return Err(FsError::WrongType);
+        }
+        self.validate_no_symlink_path(&root, &root, false)?;
+        let provider_root = self
+            .mount_for_path(&root)
+            .map(|(index, _)| self.mounts[index].path.clone());
+        Ok(DirectoryCapability {
+            root,
+            provider_root,
+            generation,
+            rights,
+        })
+    }
+
+    /// Resolve one existing read target beneath a directory capability.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale generations, missing read authority, absolute paths,
+    /// parent escape, mount crossing, symbolic links, and provider failures.
+    pub fn resolve_directory_read(
+        &mut self,
+        capability: &DirectoryCapability,
+        active_generation: u64,
+        path: &str,
+    ) -> Result<String, FsError> {
+        self.resolve_directory_path(
+            capability,
+            active_generation,
+            path,
+            DirectoryRights::READ,
+            false,
+            false,
+        )
+    }
+
+    /// Resolve a mutation target beneath a directory capability.
+    ///
+    /// `allow_missing_final` permits creation only after every retained parent
+    /// has been proven directory-valued and symlink-free.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale generations, missing mutation authority, escape attempts,
+    /// mount crossing, symbolic links, invalid parents, and provider failures.
+    pub fn resolve_directory_mutation(
+        &mut self,
+        capability: &DirectoryCapability,
+        active_generation: u64,
+        path: &str,
+        allow_missing_final: bool,
+    ) -> Result<String, FsError> {
+        self.resolve_directory_path(
+            capability,
+            active_generation,
+            path,
+            DirectoryRights::MUTATE,
+            allow_missing_final,
+            false,
+        )
+    }
+
+    /// Resolve a final symbolic-link entry without following it.
+    ///
+    /// Intermediate symbolic links and mount crossings remain forbidden.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale generations, missing authority, escape attempts, invalid
+    /// parents, or a final non-link object.
+    pub fn resolve_directory_link(
+        &mut self,
+        capability: &DirectoryCapability,
+        active_generation: u64,
+        path: &str,
+        mutation: bool,
+    ) -> Result<String, FsError> {
+        let required = if mutation {
+            DirectoryRights::MUTATE
+        } else {
+            DirectoryRights::READ
+        };
+        let resolved = self.resolve_directory_path(
+            capability,
+            active_generation,
+            path,
+            required,
+            false,
+            true,
+        )?;
+        if self.metadata_no_follow_absolute(&resolved)?.kind != NodeKind::Symlink {
+            return Err(FsError::WrongType);
+        }
+        Ok(resolved)
+    }
+
+    fn resolve_directory_path(
+        &mut self,
+        capability: &DirectoryCapability,
+        active_generation: u64,
+        path: &str,
+        required: DirectoryRights,
+        allow_missing_final: bool,
+        allow_final_symlink: bool,
+    ) -> Result<String, FsError> {
+        if active_generation == 0
+            || active_generation != capability.generation
+            || !capability.rights.allows(required)
+        {
+            return Err(FsError::ReadOnly);
+        }
+        let resolved = canonicalize_beneath(&capability.root, path)?;
+        let current_provider = self
+            .mount_for_path(&resolved)
+            .map(|(index, _)| self.mounts[index].path.as_str());
+        if current_provider != capability.provider_root.as_deref() {
+            return Err(FsError::Invalid);
+        }
+        self.validate_no_symlink_path(&capability.root, &resolved, allow_missing_final)?;
+        if !allow_final_symlink
+            && self
+                .metadata_no_follow_absolute(&resolved)
+                .is_ok_and(|metadata| metadata.kind == NodeKind::Symlink)
+        {
+            return Err(FsError::Invalid);
+        }
+        Ok(resolved)
+    }
+
+    fn validate_no_symlink_path(
+        &mut self,
+        root: &str,
+        target: &str,
+        allow_missing_final: bool,
+    ) -> Result<(), FsError> {
+        let suffix = target
+            .strip_prefix(root)
+            .filter(|suffix| suffix.is_empty() || suffix.starts_with('/'))
+            .ok_or(FsError::Invalid)?;
+        let root_metadata = self.metadata_no_follow_absolute(root)?;
+        if root_metadata.kind != NodeKind::Directory {
+            return Err(FsError::WrongType);
+        }
+        let mut current = root.to_string();
+        let components: Vec<&str> = suffix
+            .trim_start_matches('/')
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .collect();
+        for (index, component) in components.iter().enumerate() {
+            if current != "/" {
+                current.push('/');
+            }
+            current.push_str(component);
+            let final_component = index + 1 == components.len();
+            let metadata = match self.metadata_no_follow_absolute(&current) {
+                Ok(metadata) => metadata,
+                Err(FsError::NotFound) if final_component && allow_missing_final => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            if metadata.kind == NodeKind::Symlink {
+                if final_component {
+                    return Ok(());
+                }
+                return Err(FsError::Invalid);
+            }
+            if !final_component && metadata.kind != NodeKind::Directory {
+                return Err(FsError::WrongType);
+            }
+        }
+        Ok(())
+    }
+
+    fn metadata_no_follow_absolute(&mut self, path: &str) -> Result<FileMetadata, FsError> {
+        let path = canonicalize("/", path)?;
+        if let Some((index, relative)) = self.mount_for_path(&path) {
+            return self.mounts[index].provider.metadata_no_follow(&relative);
+        }
+        match self.nodes.get(&path) {
+            Some(Node::Directory) => Ok(FileMetadata {
+                kind: NodeKind::Directory,
+                byte_count: 0,
+            }),
+            Some(Node::File { bytes, .. }) => Ok(FileMetadata {
+                kind: NodeKind::File,
+                byte_count: u64::try_from(bytes.len()).map_err(|_| FsError::Overflow)?,
+            }),
+            None => Err(FsError::NotFound),
+        }
     }
 
     fn mount_provider(
@@ -1356,6 +1637,59 @@ pub fn canonicalize(cwd: &str, path: &str) -> Result<String, FsError> {
     Ok(normalized)
 }
 
+/// Normalize one relative path without permitting escape above `root`.
+///
+/// Unlike [`canonicalize`], an absolute input or a `..` component at the root
+/// boundary is rejected rather than interpreted relative to the global
+/// namespace.
+///
+/// # Errors
+///
+/// Fails for an invalid root, empty/absolute/NUL input, parent escape, or the
+/// ordinary path length, depth, and arithmetic bounds.
+pub fn canonicalize_beneath(root: &str, path: &str) -> Result<String, FsError> {
+    if path.is_empty() || path.starts_with('/') || path.as_bytes().contains(&0) {
+        return Err(FsError::Invalid);
+    }
+    let normalized_root = canonicalize("/", root)?;
+    if normalized_root != root || root == "/" {
+        return Err(FsError::Invalid);
+    }
+    let mut components: Vec<&str> = Vec::new();
+    apply_components(&mut components, root)?;
+    let floor = components.len();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if components.len() == floor {
+                    return Err(FsError::Invalid);
+                }
+                components.pop();
+            }
+            value => {
+                if value.len() > MAX_NAME_BYTES || components.len() >= MAX_PATH_DEPTH {
+                    return Err(FsError::NoSpace);
+                }
+                components.push(value);
+            }
+        }
+    }
+    let length = 1_usize
+        .checked_add(components.iter().map(|part| part.len()).sum::<usize>())
+        .and_then(|value| value.checked_add(components.len().saturating_sub(1)))
+        .ok_or(FsError::Overflow)?;
+    if length > MAX_PATH_BYTES {
+        return Err(FsError::NoSpace);
+    }
+    let mut normalized = String::with_capacity(length);
+    for component in components {
+        normalized.push('/');
+        normalized.push_str(component);
+    }
+    Ok(normalized)
+}
+
 fn apply_components<'a>(components: &mut Vec<&'a str>, path: &'a str) -> Result<(), FsError> {
     for component in path.split('/') {
         match component {
@@ -1469,14 +1803,17 @@ fn read_u32(image: &[u8], offset: usize) -> Result<u32, FsError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DirEntry, FileMetadata, FsError, KEFS_V1_MAGIC, Namespace, NodeKind, ProviderListing,
-        RamFsQuota, ReadOnlyFileSystem, canonicalize,
+        DirEntry, DirectoryRights, FileMetadata, FsError, KEFS_V1_MAGIC, Namespace, NodeKind,
+        ProviderListing, RamFsQuota, ReadOnlyFileSystem, canonicalize, canonicalize_beneath,
     };
-    use alloc::{boxed::Box, rc::Rc, vec, vec::Vec};
+    use alloc::{boxed::Box, rc::Rc, string::String, vec, vec::Vec};
     use core::cell::RefCell;
 
     #[derive(Debug)]
     struct TestProvider;
+
+    #[derive(Debug)]
+    struct ScopedProvider;
 
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     struct CountingState {
@@ -1662,11 +1999,172 @@ mod tests {
         }
     }
 
+    impl ReadOnlyFileSystem for ScopedProvider {
+        fn metadata(&mut self, path: &str) -> Result<FileMetadata, FsError> {
+            match path {
+                "/" | "/scope" | "/outside" => Ok(FileMetadata {
+                    kind: NodeKind::Directory,
+                    byte_count: 0,
+                }),
+                "/scope/file" | "/scope/link" | "/outside/secret" => Ok(FileMetadata {
+                    kind: NodeKind::File,
+                    byte_count: 6,
+                }),
+                _ => Err(FsError::NotFound),
+            }
+        }
+
+        fn metadata_no_follow(&mut self, path: &str) -> Result<FileMetadata, FsError> {
+            if path == "/scope/link" {
+                return Ok(FileMetadata {
+                    kind: NodeKind::Symlink,
+                    byte_count: 0,
+                });
+            }
+            self.metadata(path)
+        }
+
+        fn read_file(
+            &mut self,
+            path: &str,
+            offset: u64,
+            destination: &mut [u8],
+        ) -> Result<usize, FsError> {
+            let bytes: &[u8] = match path {
+                "/scope/file" => b"inside",
+                "/scope/link" | "/outside/secret" => b"secret",
+                _ => return Err(FsError::NotFound),
+            };
+            let start = usize::try_from(offset).map_err(|_| FsError::Overflow)?;
+            if start >= bytes.len() {
+                return Ok(0);
+            }
+            let count = destination.len().min(bytes.len() - start);
+            destination[..count].copy_from_slice(&bytes[start..start + count]);
+            Ok(count)
+        }
+
+        fn list(
+            &mut self,
+            _path: &str,
+            _cursor: u64,
+            _max_entries: usize,
+            _max_name_bytes: usize,
+        ) -> Result<ProviderListing, FsError> {
+            Ok(ProviderListing {
+                entries: Vec::new(),
+                next_cursor: None,
+            })
+        }
+
+        fn read_link(&mut self, path: &str) -> Result<String, FsError> {
+            if path == "/scope/link" {
+                Ok("/outside/secret".into())
+            } else {
+                Err(FsError::WrongType)
+            }
+        }
+    }
+
     #[test]
     fn paths_are_bounded_and_cannot_escape_root() {
         assert_eq!(canonicalize("/a/b", "../../../../c"), Ok("/c".into()));
         assert_eq!(canonicalize("/", "//a/./b/../c"), Ok("/a/c".into()));
         assert_eq!(canonicalize("/", "bad\0name"), Err(FsError::Invalid));
+    }
+
+    #[test]
+    fn scoped_paths_are_relative_and_cannot_escape_the_granted_root() {
+        assert_eq!(canonicalize_beneath("/vol/app", "."), Ok("/vol/app".into()));
+        assert_eq!(
+            canonicalize_beneath("/vol/app", "data/file"),
+            Ok("/vol/app/data/file".into())
+        );
+        assert_eq!(
+            canonicalize_beneath("/vol/app", "data/../file"),
+            Ok("/vol/app/file".into())
+        );
+        for path in [
+            "",
+            "/vol/app/file",
+            "..",
+            "../outside",
+            "data/../../outside",
+        ] {
+            assert_eq!(
+                canonicalize_beneath("/vol/app", path),
+                Err(FsError::Invalid)
+            );
+        }
+        assert_eq!(canonicalize_beneath("/", "file"), Err(FsError::Invalid));
+    }
+
+    #[test]
+    fn directory_capabilities_bind_generation_rights_mounts_and_links() -> Result<(), FsError> {
+        let mut namespace = Namespace::new(RamFsQuota::default());
+        namespace.mount_read_only("/vol", Box::new(ScopedProvider))?;
+        let read = namespace.grant_directory("/vol/scope", 7, DirectoryRights::READ)?;
+        assert_eq!(read.root(), "/vol/scope");
+        assert_eq!(read.generation(), 7);
+        assert_eq!(read.rights(), DirectoryRights::READ);
+        assert_eq!(
+            namespace.resolve_directory_read(&read, 7, "file"),
+            Ok("/vol/scope/file".into())
+        );
+        assert_eq!(
+            namespace.resolve_directory_read(&read, 8, "file"),
+            Err(FsError::ReadOnly)
+        );
+        assert_eq!(
+            namespace.resolve_directory_mutation(&read, 7, "file", false),
+            Err(FsError::ReadOnly)
+        );
+        assert_eq!(
+            namespace.resolve_directory_read(&read, 7, "../outside/secret"),
+            Err(FsError::Invalid)
+        );
+        assert_eq!(
+            namespace.resolve_directory_read(&read, 7, "/outside/secret"),
+            Err(FsError::Invalid)
+        );
+        assert_eq!(
+            namespace.resolve_directory_read(&read, 7, "link"),
+            Err(FsError::Invalid)
+        );
+        assert_eq!(
+            namespace.resolve_directory_link(&read, 7, "link", false),
+            Ok("/vol/scope/link".into())
+        );
+
+        namespace.add_read_only_dir("/share")?;
+        namespace.add_read_only_dir("/share/app")?;
+        let assets = namespace.grant_directory("/share/app", 7, DirectoryRights::READ)?;
+        namespace.mount_read_only("/share/app/mounted", Box::new(TestProvider))?;
+        assert_eq!(
+            namespace.resolve_directory_read(&assets, 7, "mounted/data"),
+            Err(FsError::Invalid)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn mutation_capability_validates_existing_parents_before_creation() -> Result<(), FsError> {
+        let mut namespace = Namespace::new(RamFsQuota::default());
+        let mutation = namespace.grant_directory("/tmp", 9, DirectoryRights::READ_MUTATE)?;
+        assert_eq!(
+            namespace.resolve_directory_mutation(&mutation, 9, "new", true),
+            Ok("/tmp/new".into())
+        );
+        assert_eq!(
+            namespace.resolve_directory_mutation(&mutation, 9, "missing/new", true),
+            Err(FsError::NotFound)
+        );
+        namespace.create_directory("/tmp", "present")?;
+        assert_eq!(
+            namespace.resolve_directory_mutation(&mutation, 9, "present/new", true),
+            Ok("/tmp/present/new".into())
+        );
+        Ok(())
     }
 
     #[test]
