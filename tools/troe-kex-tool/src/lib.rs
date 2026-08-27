@@ -44,6 +44,7 @@ const RUST_FLAGS: &[&str] = &[
     "-C",
     "link-arg=max-page-size=4096",
 ];
+const RUSTC_WRAPPER_ENV: &str = "TROE_KEX_RUSTC_WRAPPER";
 
 const HELP: &str = "\
 Build, convert, and inspect canonical TROE KEX applications.
@@ -593,10 +594,6 @@ fn read_manifest(app: &Path, requested_command: Option<&str>) -> ToolResult<AppM
 }
 
 fn encoded_rust_flags() -> ToolResult<String> {
-    let linker = repo_root().join("sdk/kex.ld");
-    let linker = linker
-        .to_str()
-        .ok_or_else(|| ToolError::new("linker-script path must be valid UTF-8"))?;
     let root = repo_root()
         .canonicalize()
         .map_err(|error| io_error("resolve", &repo_root(), &error))?;
@@ -607,7 +604,7 @@ fn encoded_rust_flags() -> ToolResult<String> {
         .iter()
         .map(|flag| {
             if *flag == "LINKER_SCRIPT" {
-                format!("link-arg=-T{linker}")
+                "link-arg=-T../../sdk/kex.ld".to_owned()
             } else {
                 (*flag).to_owned()
             }
@@ -620,6 +617,8 @@ fn encoded_rust_flags() -> ToolResult<String> {
 fn run_cargo(manifest: &AppManifest, target: Target) -> ToolResult<PathBuf> {
     let target_dir = repo_root().join("target/kex").join(&manifest.command);
     let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
+    let wrapper = env::current_exe()
+        .map_err(|error| ToolError::new(format!("cannot resolve KEX tool executable: {error}")))?;
     let status = Command::new(cargo)
         .arg("build")
         .arg("--locked")
@@ -632,6 +631,8 @@ fn run_cargo(manifest: &AppManifest, target: Target) -> ToolResult<PathBuf> {
         .env("CARGO_INCREMENTAL", "0")
         .env("CARGO_TARGET_DIR", &target_dir)
         .env("CARGO_ENCODED_RUSTFLAGS", encoded_rust_flags()?)
+        .env("RUSTC_WRAPPER", wrapper)
+        .env(RUSTC_WRAPPER_ENV, "1")
         .status()
         .map_err(|error| ToolError::new(format!("cannot run Cargo: {error}")))?;
     if !status.success() {
@@ -644,6 +645,57 @@ fn run_cargo(manifest: &AppManifest, target: Target) -> ToolResult<PathBuf> {
         .join(target_triple(target))
         .join("release")
         .join(&manifest.binary))
+}
+
+fn filtered_rustc_arguments(
+    arguments: impl Iterator<Item = OsString>,
+) -> ToolResult<(OsString, Vec<OsString>)> {
+    let mut arguments = arguments.peekable();
+    let rustc = arguments
+        .next()
+        .ok_or_else(|| ToolError::new("rustc wrapper received no compiler path"))?;
+    let mut filtered = Vec::new();
+    while let Some(argument) = arguments.next() {
+        if argument == OsStr::new("-C")
+            && arguments
+                .peek()
+                .is_some_and(|value| value.to_string_lossy().starts_with("metadata="))
+        {
+            arguments.next();
+            continue;
+        }
+        if argument
+            .to_string_lossy()
+            .strip_prefix("-C")
+            .is_some_and(|value| value.starts_with("metadata="))
+        {
+            continue;
+        }
+        filtered.push(argument);
+    }
+    Ok((rustc, filtered))
+}
+
+/// Return whether this process was launched by Cargo as the canonical KEX rustc wrapper.
+#[must_use]
+pub fn is_rustc_wrapper() -> bool {
+    env::var_os(RUSTC_WRAPPER_ENV).is_some()
+}
+
+/// Run rustc after removing Cargo's checkout-path-derived crate metadata.
+///
+/// # Errors
+///
+/// Returns an error when Cargo did not provide a compiler path or rustc could
+/// not be launched.
+pub fn run_rustc_wrapper(
+    arguments: impl Iterator<Item = OsString>,
+) -> ToolResult<std::process::ExitStatus> {
+    let (rustc, arguments) = filtered_rustc_arguments(arguments)?;
+    Command::new(rustc)
+        .args(arguments)
+        .status()
+        .map_err(|error| ToolError::new(format!("cannot run rustc: {error}")))
 }
 
 fn write_or_check(path: &Path, artifact: &[u8], check: bool, label: &str) -> ToolResult<()> {
@@ -894,5 +946,42 @@ pub fn run(arguments: impl Iterator<Item = OsString>) -> Result<(), ToolError> {
             "unknown operation {}; expected build, convert, or inspect",
             operation.display()
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::filtered_rustc_arguments;
+    use std::ffi::OsString;
+
+    #[test]
+    fn rustc_wrapper_removes_only_cargo_metadata() -> Result<(), super::ToolError> {
+        let (rustc, arguments) = filtered_rustc_arguments(
+            [
+                "rustc",
+                "--crate-name",
+                "example",
+                "-C",
+                "metadata=checkout-hash",
+                "-Cmetadata=second-hash",
+                "-C",
+                "extra-filename=-checkout-hash",
+                "-Copt-level=z",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        )?;
+        assert_eq!(rustc, "rustc");
+        assert_eq!(
+            arguments,
+            [
+                "--crate-name",
+                "example",
+                "-C",
+                "extra-filename=-checkout-hash",
+                "-Copt-level=z",
+            ]
+        );
+        Ok(())
     }
 }
