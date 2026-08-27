@@ -12,6 +12,7 @@ import uuid
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 try:
     from tools import mkstorage
@@ -49,12 +50,18 @@ FAT32_MEDIA = 0xF8
 FAT32_END_OF_CHAIN = 0x0FFF_FFFF
 FAT32_CLEAN_SHUTDOWN = 0x0800_0000
 FAT32_NO_HARD_ERROR = 0x0400_0000
+FAT32_STATE_OFFSET = 65
+FAT32_STATE_DIRTY = 0x01
 FAT32_VOLUME_ID = mkstorage.SHARED_FAT32_VOLUME_ID
 FAT32_VOLUME_LABEL = b"TROE SHARE "
 FAT32_OEM_IDENTIFIER = b"TROEFAT "
 FAT32_MIN_CLUSTERS = 65_525
 FAT32_MAX_CLUSTERS = 0x0FFF_FFF5
 DEFAULT_OUTPUT = Path("build/troe-shared-fat32.img")
+
+
+class SharedImageNeedsRepair(ValueError):
+    """Report a validated image carrying only an unclean-unmount marker."""
 
 
 @dataclass(frozen=True)
@@ -253,8 +260,20 @@ def _validate_fsinfo(payload: bytes, layout: Fat32Layout) -> None:
         raise ValueError("shared FAT32 FSInfo counters are invalid")
 
 
-def verify_image(path: Path) -> None:
-    """Verify immutable geometry and clean mutable FAT32 metadata in bounded reads."""
+def _dirty_boot_sector(payload: bytes, expected: bytes) -> bool:
+    """Return whether only Linux's FAT32 unclean-unmount state byte differs."""
+    if (
+        len(payload) != len(expected)
+        or payload[FAT32_STATE_OFFSET] != FAT32_STATE_DIRTY
+    ):
+        return False
+    normalized = bytearray(payload)
+    normalized[FAT32_STATE_OFFSET] = expected[FAT32_STATE_OFFSET]
+    return normalized == expected
+
+
+def _validate_image(path: Path) -> bool:
+    """Validate one image and return whether its boot metadata needs repair."""
     if path.is_symlink() or not path.is_file() or path.stat().st_size != DISK_BYTES:
         raise ValueError("shared image is not a regular exact 1 GiB file")
     layout = fat32_layout()
@@ -293,15 +312,20 @@ def verify_image(path: Path) -> None:
         ):
             raise ValueError("shared image backup GPT header is invalid")
 
+        expected_boot = _boot_sector(layout)
         boot = _read_at(source, partition_offset, SECTOR_BYTES)
-        if boot != _boot_sector(layout):
+        if boot != expected_boot and not _dirty_boot_sector(boot, expected_boot):
             raise ValueError("shared FAT32 boot sector or identity is invalid")
-        if _read_at(
+        backup_boot = _read_at(
             source,
             partition_offset + FAT32_BACKUP_BOOT_SECTOR * SECTOR_BYTES,
             SECTOR_BYTES,
-        ) != boot:
-            raise ValueError("shared FAT32 backup boot sector differs")
+        )
+        if backup_boot != expected_boot and not _dirty_boot_sector(
+            backup_boot, expected_boot
+        ):
+            raise ValueError("shared FAT32 backup boot sector or identity is invalid")
+        needs_repair = boot != expected_boot or backup_boot != expected_boot
         fsinfo = _read_at(
             source,
             partition_offset + FAT32_FSINFO_SECTOR * SECTOR_BYTES,
@@ -329,6 +353,33 @@ def verify_image(path: Path) -> None:
             or root < 0x0FFF_FFF8
         ):
             raise ValueError("shared FAT32 core allocation entries are invalid or dirty")
+    return needs_repair
+
+
+def verify_image(path: Path) -> None:
+    """Verify immutable geometry and clean mutable FAT32 metadata in bounded reads."""
+    if _validate_image(path):
+        raise SharedImageNeedsRepair("shared FAT32 was not cleanly unmounted")
+
+
+def repair_image(path: Path) -> bool:
+    """Clear only a validated FAT32 unclean-unmount marker; return if repaired."""
+    if not _validate_image(path):
+        return False
+    partition_offset = PARTITION_START * SECTOR_BYTES
+    with path.open("r+b") as output:
+        _write_at(output, partition_offset + FAT32_STATE_OFFSET, b"\0")
+        _write_at(
+            output,
+            partition_offset
+            + FAT32_BACKUP_BOOT_SECTOR * SECTOR_BYTES
+            + FAT32_STATE_OFFSET,
+            b"\0",
+        )
+        output.flush()
+        os.fsync(output.fileno())
+    verify_image(path)
+    return True
 
 
 def ensure_image(path: Path, *, reset: bool = False) -> bool:
@@ -357,29 +408,88 @@ def ensure_image(path: Path, *, reset: bool = False) -> bool:
     return True
 
 
-def main() -> int:
+def confirm_repair(path: Path) -> bool:
+    """Offer an interactive repair with No as the safe default."""
+    if not sys.stdin.isatty():
+        print(
+            "mkshared: run `cargo mount --repair` while the image is detached "
+            "to clear the validated unclean-unmount marker",
+            file=sys.stderr,
+        )
+        return False
+    print(
+        f"Shared FAT32 {path} was not cleanly unmounted. "
+        "Repair it before launch? [y/N] ",
+        end="",
+        file=sys.stderr,
+        flush=True,
+    )
+    response = sys.stdin.readline()
+    return response.strip().lower() in {"y", "yes"}
+
+
+def ensure_image_with_repair_prompt(
+    path: Path,
+    *,
+    reset: bool = False,
+    confirmation: Callable[[Path], bool] | None = None,
+) -> tuple[bool, bool]:
+    """Ensure one image, optionally repairing its marker; return created, repaired."""
+    try:
+        return ensure_image(path, reset=reset), False
+    except SharedImageNeedsRepair:
+        selected_confirmation = confirm_repair if confirmation is None else confirmation
+        if not selected_confirmation(path):
+            raise SharedImageNeedsRepair(
+                "shared FAT32 repair declined; image was not changed"
+            ) from None
+        repair_image(path)
+        return False, True
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    confirmation: Callable[[Path], bool] | None = None,
+) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    parser.add_argument(
+    action_group = parser.add_mutually_exclusive_group()
+    action_group.add_argument(
         "--reset",
         action="store_true",
         help="replace existing shared media with a new empty filesystem",
     )
-    parser.add_argument(
+    action_group.add_argument(
         "--verify",
         action="store_true",
         help="verify an existing image without creating it",
     )
-    args = parser.parse_args()
-    if args.reset and args.verify:
-        parser.error("--reset and --verify are mutually exclusive")
+    action_group.add_argument(
+        "--repair",
+        action="store_true",
+        help="clear a validated unclean-unmount marker without prompting",
+    )
+    args = parser.parse_args(argv)
     try:
         if args.verify:
             verify_image(args.output)
             action = "verified"
+        elif args.repair:
+            repaired = repair_image(args.output)
+            action = "repaired" if repaired else "verified"
         else:
-            created = ensure_image(args.output, reset=args.reset)
-            action = "created" if created else "preserved"
+            created, repaired = ensure_image_with_repair_prompt(
+                args.output,
+                reset=args.reset,
+                confirmation=confirmation,
+            )
+            if created:
+                action = "created"
+            elif repaired:
+                action = "repaired"
+            else:
+                action = "preserved"
         print(
             f"shared GPT/FAT32: {action} {DISK_BYTES} bytes -> "
             f"{args.output.resolve(strict=True)}"

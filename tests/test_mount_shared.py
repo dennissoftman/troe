@@ -5,6 +5,8 @@ from __future__ import annotations
 import plistlib
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 from pathlib import Path
 from unittest import mock
 
@@ -198,6 +200,30 @@ class SharedMediaMountTests(unittest.TestCase):
 
         with self.assertRaisesRegex(mount_shared.MountError, "macOS and Linux"):
             mount_shared.mount_image(image, read_only=False, platform="win32")
+
+    def test_explicit_repair_is_lock_protected_and_does_not_mount(self) -> None:
+        output = StringIO()
+        with (
+            mock.patch.object(mount_shared, "SharedMediaLock") as lock,
+            mock.patch.object(mount_shared, "load_state", return_value=None),
+            mock.patch.object(mount_shared, "require_detached") as detached,
+            mock.patch.object(
+                mount_shared.mkshared, "repair_image", return_value=True
+            ) as repair,
+            mock.patch.object(mount_shared, "mount_image") as mount,
+            redirect_stdout(output),
+        ):
+            self.assertEqual(mount_shared.main(["--repair"]), 0)
+        lock.assert_called_once_with()
+        detached.assert_called_once_with()
+        repair.assert_called_once_with(mount_shared.DEFAULT_IMAGE)
+        mount.assert_not_called()
+        self.assertIn("repaired", output.getvalue())
+
+    def test_repair_cli_is_mutually_exclusive_with_mount_options(self) -> None:
+        self.assertTrue(mount_shared.parse_args(["--repair"]).repair)
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            mount_shared.parse_args(["--repair", "--read-only"])
 
     @unittest.skipIf(mount_shared.os.name == "nt", "Unix lock semantics")
     def test_media_lock_rejects_a_concurrent_owner(self) -> None:

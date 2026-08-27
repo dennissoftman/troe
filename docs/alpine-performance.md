@@ -98,6 +98,18 @@ cd /mnt/shared
 sh ./bench.sh
 ```
 
+Before shutting Alpine down, leave the shared directory and unmount it cleanly:
+
+```console
+cd /
+umount /mnt/shared
+```
+
+If Alpine was stopped first, the next interactive launcher or `cargo mount`
+offers to clear the validated unclean-unmount marker with a `y/N` default
+without erasing files. Non-interactive workflows can run
+`cargo mount --repair` while the image is detached.
+
 The label-based path is stable even though virtio enumeration order differs
 between the PCI and MMIO machines. The launcher prints the mount command before
 each interactive Alpine run. Both launchers take the same shared-media lifecycle
