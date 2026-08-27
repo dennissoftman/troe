@@ -50,6 +50,10 @@ pub mod interface {
     pub const SERVER_ENDPOINT: u32 = 15;
     /// Submit validated physical command lines to the owning shell session.
     pub const SHELL_SCRIPT: u32 = 16;
+    /// Read the kernel-maintained Unix wall clock.
+    pub const WALL_CLOCK: u32 = 17;
+    /// Privileged authority to correct the kernel wall clock.
+    pub const CLOCK_CONTROL: u32 = 18;
 }
 
 /// Canonical package-side declaration of optional startup authorities.
@@ -2303,6 +2307,50 @@ pub mod timer {
     }
 }
 
+/// Kernel-maintained Unix wall-clock protocol.
+pub mod wall_clock {
+    /// Interface major version.
+    pub const MAJOR: u16 = 1;
+    /// Interface minor version.
+    pub const MINOR: u16 = 0;
+    /// Read whole Unix seconds at the current monotonic instant.
+    pub const NOW: u16 = 1;
+    /// Exact Unix timestamp bytes.
+    pub const SECONDS_BYTES: usize = 8;
+
+    /// Invalid timestamp request or reply encoding.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct EncodingError;
+
+    /// Encode one Unix timestamp.
+    #[must_use]
+    pub const fn encode_seconds(seconds: u64) -> [u8; SECONDS_BYTES] {
+        seconds.to_le_bytes()
+    }
+
+    /// Decode one exact Unix timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Rejects every length other than eight bytes.
+    pub fn decode_seconds(bytes: &[u8]) -> Result<u64, EncodingError> {
+        let bytes: [u8; SECONDS_BYTES] = bytes.try_into().map_err(|_| EncodingError)?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+}
+
+/// Privileged kernel wall-clock correction protocol.
+pub mod clock_control {
+    pub use super::wall_clock::{EncodingError, SECONDS_BYTES, decode_seconds, encode_seconds};
+
+    /// Interface major version.
+    pub const MAJOR: u16 = 1;
+    /// Interface minor version.
+    pub const MINOR: u16 = 0;
+    /// Replace the wall-clock anchor with one Unix timestamp.
+    pub const SET: u16 = 1;
+}
+
 /// Immutable typed kernel and namespace diagnostics protocol.
 pub mod diagnostics {
     /// Interface major version.
@@ -3421,6 +3469,8 @@ mod tests {
             interface::VOLUME_CONTROL,
             interface::SERVER_ENDPOINT,
             interface::SHELL_SCRIPT,
+            interface::WALL_CLOCK,
+            interface::CLOCK_CONTROL,
         ];
         assert!(interfaces.iter().all(|value| *value != 0));
         assert!(

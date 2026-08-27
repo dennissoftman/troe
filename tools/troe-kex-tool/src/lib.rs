@@ -13,8 +13,9 @@ use std::process::Command;
 
 pub use elf::convert_elf;
 use troe_abi::{
-    datagram, diagnostics, filesystem, filesystem_mutation, icmp_echo, interface,
+    clock_control, datagram, diagnostics, filesystem, filesystem_mutation, icmp_echo, interface,
     network_configuration, network_observation, requirements, tcp_connect, timer, volume_control,
+    wall_clock,
 };
 use troe_application::{
     ABI_MAJOR, ABI_MINOR, KEX_PACKAGE_V1_MAGIC, KEX_V1_HEADER_BYTES, KEX_V1_IMAGE_BASE,
@@ -452,6 +453,16 @@ fn capability_requirement(name: &str) -> ToolResult<requirements::Requirement> {
             interface: interface::SHELL_SCRIPT,
             major: troe_abi::shell_script::MAJOR,
             minor: troe_abi::shell_script::MINOR,
+        }),
+        "wall-clock" => Ok(requirements::Requirement {
+            interface: interface::WALL_CLOCK,
+            major: wall_clock::MAJOR,
+            minor: wall_clock::MINOR,
+        }),
+        "clock-control" => Ok(requirements::Requirement {
+            interface: interface::CLOCK_CONTROL,
+            major: clock_control::MAJOR,
+            minor: clock_control::MINOR,
         }),
         _ => Err(ToolError::new(format!(
             "unknown TROE KEX capability '{name}'"

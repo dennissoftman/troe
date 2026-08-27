@@ -154,6 +154,7 @@ class RepositoryPolicyTests(unittest.TestCase):
             "sleep",
             "tar",
             "tcp",
+            "timesync",
             "udp",
             "wc",
         }

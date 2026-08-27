@@ -6,4 +6,6 @@ SYNOPSIS
 
 DESCRIPTION
     Waits for a boot-relative monotonic interval while servicing bounded
-    ambient work. Ctrl-C cancels the wait. This is not a background job.
+    ambient work. Intervals may span minutes, hours, or days; there is no
+    command-lifetime ceiling. Ctrl-C cancels a foreground wait. Append & to
+    start sleep as a session-owned background job.

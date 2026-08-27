@@ -1,0 +1,10 @@
+NAME
+    jobs - list background jobs owned by this shell session
+
+SYNOPSIS
+    jobs
+
+DESCRIPTION
+    Lists the stable session job number, current state, and invocation for each
+    retained background process. Supervised system services are shown by svc,
+    not jobs.

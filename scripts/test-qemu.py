@@ -904,6 +904,12 @@ def run_network_group(
     """Exercise bounded network observation, DHCP, ICMP, UDP, and TCP services."""
     cwd = "/"
     session.command(
+        "svc status timesync",
+        cwd,
+        command_timeout,
+        contains=("timesync ready",),
+    )
+    session.command(
         "net",
         cwd,
         command_timeout,
@@ -932,13 +938,8 @@ def run_network_group(
     idle_before = parse_runtime_counter(before_waits, "input idle waits")
     frames_before = parse_free_frames(before_waits)
     session.command("sleep 100", cwd, command_timeout)
-    session.cancelled_command("sleep 3000", cwd, command_timeout)
-    session.command(
-        "sleep 5000",
-        cwd,
-        command_timeout,
-        contains=("sleep: operation timed out",),
-    )
+    run_resident_process_checks(session, cwd, command_timeout)
+    session.cancelled_command("sleep 86400000", cwd, command_timeout)
     session.command(
         "udp send --source-port 40001 10.0.2.2 9 application-datagram",
         cwd,
@@ -946,14 +947,14 @@ def run_network_group(
         contains=("sent 20 bytes from port 40001 to 10.0.2.2:9",),
     )
     session.cancelled_command("udp listen 40000", cwd, command_timeout)
-    session.command("net stats", cwd, command_timeout, contains=("udp ports: 0",))
+    session.command("net stats", cwd, command_timeout, contains=("udp ports: 1",))
     session.command(
         "udp listen 40002",
         cwd,
         command_timeout,
         contains=("udp: operation timed out",),
     )
-    session.command("net stats", cwd, command_timeout, contains=("udp ports: 0",))
+    session.command("net stats", cwd, command_timeout, contains=("udp ports: 1",))
     after_waits = session.command("mem", cwd, command_timeout)
     idle_after = parse_runtime_counter(after_waits, "input idle waits")
     frames_after = parse_free_frames(after_waits)
@@ -976,10 +977,67 @@ def run_network_group(
         )
 
 
+def run_resident_process_checks(
+    session: SerialSession, cwd: str, command_timeout: float
+) -> None:
+    """Require foreground/background concurrency, control, and exact reaping."""
+    session.command(
+        "sleep 100 &",
+        cwd,
+        command_timeout,
+        contains=("[1] started sleep",),
+    )
+    session.command(
+        "sleep 5000",
+        cwd,
+        command_timeout,
+        absent=("sleep: application rejected", "sleep: operation timed out"),
+    )
+    session.command(
+        "jobs",
+        cwd,
+        command_timeout,
+        contains=("[1] done sleep 100",),
+    )
+    session.command("wait 1", cwd, command_timeout)
+    session.command(
+        "sleep 86400000 &",
+        cwd,
+        command_timeout,
+        contains=("[2] started sleep",),
+    )
+    session.command(
+        "echo prompt-responsive",
+        cwd,
+        command_timeout,
+        contains=("prompt-responsive\n",),
+    )
+    session.command(
+        "jobs",
+        cwd,
+        command_timeout,
+        contains=("[2] blocked sleep 86400000",),
+    )
+    session.command("kill 2", cwd, command_timeout)
+    session.command("wait 2", cwd, command_timeout)
+    session.command(
+        "sleep 100 &",
+        cwd,
+        command_timeout,
+        contains=("[3] started sleep",),
+    )
+    session.command("wait 3", cwd, command_timeout)
+
+
 def run_shell_terminal_group(session: SerialSession, command_timeout: float) -> None:
     """Exercise editing, history, completion, help, manuals, and CRLF handling."""
     cwd = "/"
-    session.edited_command("", b"\t", "", cwd, command_timeout, expected="\ncat\n")
+    # Root completion emits one line per built-in and KEX command. Once earlier
+    # groups have filled the framebuffer terminal, every candidate also scrolls
+    # the display, so use the same loaded-console allowance as long manuals.
+    session.edited_command(
+        "", b"\t", "", cwd, max(command_timeout, 30.0), expected="\ncat\n"
+    )
     session.command(
         "man echo",
         cwd,
@@ -1497,6 +1555,12 @@ def run_smoke_scenario(
     cwd = "/"
     assert_storage_report(session, cwd, command_timeout)
     session.command(
+        "svc status timesync",
+        cwd,
+        command_timeout,
+        contains=("timesync ready",),
+    )
+    session.command(
         "echo application-ready",
         cwd,
         command_timeout,
@@ -1527,13 +1591,13 @@ def run_smoke_scenario(
         contains=("rx frames:", "arp entries:", "checkpoints:"),
     )
     session.command("arp", cwd, command_timeout, contains=("10.0.2.2",))
-    session.cancelled_command("sleep 3000", cwd, command_timeout)
     session.command(
         "sleep 5000",
         cwd,
         command_timeout,
-        contains=("sleep: operation timed out",),
+        absent=("sleep: application rejected", "sleep: operation timed out"),
     )
+    session.cancelled_command("sleep 86400000", cwd, command_timeout)
     session.command(
         "udp send --source-port 40001 10.0.2.2 9 application-datagram",
         cwd,
@@ -1541,14 +1605,14 @@ def run_smoke_scenario(
         contains=("sent 20 bytes from port 40001 to 10.0.2.2:9",),
     )
     session.cancelled_command("udp listen 40000", cwd, command_timeout)
-    session.command("net stats", cwd, command_timeout, contains=("udp ports: 0",))
+    session.command("net stats", cwd, command_timeout, contains=("udp ports: 1",))
     session.command(
         "udp listen 40002",
         cwd,
         command_timeout,
         contains=("udp: operation timed out",),
     )
-    session.command("net stats", cwd, command_timeout, contains=("udp ports: 0",))
+    session.command("net stats", cwd, command_timeout, contains=("udp ports: 1",))
     session.command(
         f"tcp 10.0.2.2 {tcp_port} troe-tcp-request",
         cwd,

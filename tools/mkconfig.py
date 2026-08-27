@@ -11,10 +11,10 @@ from pathlib import Path
 
 
 def build_config(generation: int, previous: int) -> bytes:
-    """Encode one generation with one required recovery-bounded shell service."""
+    """Encode one generation with one boot-resident SNTP service."""
     if generation <= 0 or previous < 0 or previous >= generation:
         raise ValueError("invalid generation relationship")
-    strings = b"shell/bin/shell.kex"
+    strings = b"timesync/bin/timesync.kex"
     image = bytearray(64 + 64 + len(strings))
     image[:8] = b"SCFGv1\0\0"
     struct.pack_into("<HHHHI", image, 8, 1, 0, 64, 64, len(image))
@@ -27,11 +27,12 @@ def build_config(generation: int, previous: int) -> bytes:
     struct.pack_into("<I", record, 0, 1)
     record[4] = 1  # boot required
     record[5] = 3 if previous else 4  # predecessor, else static recovery shell
-    record[7] = 2  # initial handle ceiling
+    record[7] = 7  # command streams plus datagram, timer, and clock control
     struct.pack_into("<H", record, 8, 50)
-    struct.pack_into("<II", record, 12, 5_000, 60_000)
-    struct.pack_into("<IH", record, 40, 0, 5)
-    struct.pack_into("<IH", record, 48, 5, 14)
+    struct.pack_into("<II", record, 12, 5_000, 0)
+    struct.pack_into("<I", record, 20, 0b111)
+    struct.pack_into("<IH", record, 40, 0, 8)
+    struct.pack_into("<IH", record, 48, 8, 17)
     image[128:] = strings
 
     checked = bytearray(image)

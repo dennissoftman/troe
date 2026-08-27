@@ -1,0 +1,10 @@
+NAME
+    kill - cancel a background job owned by this shell session
+
+SYNOPSIS
+    kill JOB
+
+DESCRIPTION
+    Requests contained cancellation of one exact session job. TROE does not
+    provide POSIX signals or search for processes by executable name. Use wait
+    to reap the resulting terminal record.

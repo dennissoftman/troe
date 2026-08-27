@@ -24,9 +24,9 @@ mod firmware {
     use core::sync::atomic::{AtomicBool, Ordering};
 
     use troe_abi::{
-        command, datagram, diagnostics, filesystem, filesystem_mutation, heap_growth, icmp_echo,
-        network_configuration, network_observation, server, shell_script, stream, tcp_connect,
-        timer, volume_control,
+        clock_control, command, datagram, diagnostics, filesystem, filesystem_mutation,
+        heap_growth, icmp_echo, network_configuration, network_observation, server, shell_script,
+        stream, tcp_connect, timer, volume_control, wall_clock,
     };
     #[cfg(feature = "acceptance-probes")]
     use troe_application::ParseError;
@@ -37,8 +37,10 @@ mod firmware {
     };
     use troe_block::{BlockAccess, BlockRegion};
     use troe_block::{BlockDevice, BlockLimits};
-    use troe_config::{ActivationPointer, ActivationRecovery, recover_activation};
-    use troe_content::{ContentPack, MAX_PACK_BYTES};
+    use troe_config::{
+        ActivationPointer, ActivationRecovery, SystemConfig, parse_config, recover_activation,
+    };
+    use troe_content::{ContentPack, MAX_PACK_BYTES, ObjectKind};
     use troe_core::{
         CommandStatus, Input, MAX_LINE_BYTES, MachineMemoryOwner, MachineMemorySnapshot,
         MemoryStats, Output, StreamError,
@@ -70,8 +72,8 @@ mod firmware {
     };
     use troe_persist::{DualSlotStore, RegionSelector, TRANSACTION_BLOCKS};
     use troe_shell::{
-        CompletionConfig, ExternalCommand, MachineAction, SharedNamespace, Shell,
-        format_memory_report, parse_line,
+        CompletionConfig, ExecutionPlacement, ExternalCommand, JobControl, MachineAction,
+        ServiceControl, SharedNamespace, Shell, format_memory_report, parse_line,
     };
     #[cfg(feature = "acceptance-probes")]
     use troe_statefs::STATE_PATH;
@@ -80,11 +82,12 @@ mod firmware {
         ActivationLimits, MAX_STORAGE_REPORT_BYTES, PreparedMount, STORAGE_REPORT_EXTENSION_BYTES,
         prepare_mounts, read_selected_file, validate_root_activation,
     };
+    use troe_supervisor::{BoundedLog, ServiceState, Supervisor, SupervisorAction};
     use troe_task::{
         Cancelled, Capabilities, CooperativeRuntime, IsolationResource, MonotonicMillis,
         PendingCallState, PendingCallTable, PendingOperationId, Scheduler, StackResource,
-        TaskFault, TaskId, TaskStep, WaitObservation, WaitRegistration, WaitResource, WaitSpec,
-        WaitTable, WakeInterest, WakeReason,
+        TaskFault, TaskId, TaskStep, WaitKey, WaitObservation, WaitRegistration, WaitResource,
+        WaitSpec, WaitTable, WakeInterest, WakeReason,
     };
     use troe_terminal::{
         EditorConfig, EditorOutcome, FramebufferDescriptor, FramebufferPixelFormat, InputDecoder,
@@ -117,6 +120,13 @@ mod firmware {
     const SERVER_TASK_STACK_PAGES: u16 = 32;
     const SHELL_TASK_STACK_PAGES: u16 = 32;
     const TASK_STACK_COUNT: usize = 3;
+    const SHELL_SCHEDULER_SLOT: u8 = 15;
+    const RESIDENT_PROCESS_FIRST_SLOT: u8 = 3;
+    const RESIDENT_PROCESS_CAPACITY: usize = 8;
+    const RESIDENT_PROCESS_LOG_BYTES: usize = 64 * 1024;
+    const RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS: u32 = 10;
+    const RESIDENT_SERVICE_CALLS_PER_STEP: usize = 4;
+    const RESIDENT_POLL_MILLISECONDS: u32 = 10;
     const ISOLATED_TABLE_PAGES: u64 = PAGE_TABLE_BYTES / BASE_PAGE_SIZE;
     const ISOLATED_CODE_PAGES: u64 = 1;
     const ISOLATED_DATA_PAGES: u64 = 1;
@@ -130,13 +140,12 @@ mod firmware {
     const APPLICATION_FIXED_USER_REGIONS: usize = 3;
     const APPLICATION_INTERFACE_ECHO: u32 = 1;
     const APPLICATION_TIMESLICE_MILLISECONDS: u32 = 50;
-    const APPLICATION_COMMAND_SERVICE_CALL_LIMIT: u16 = 1024;
-    const APPLICATION_COMMAND_RUNTIME_MILLISECONDS: u64 = 10_000;
-    const APPLICATION_SYNCHRONOUS_WAIT_MILLISECONDS: u64 = 4_000;
+    const APPLICATION_DATAGRAM_WAIT_MILLISECONDS: u64 = 4_000;
     #[cfg(feature = "acceptance-probes")]
     const IPC_BASELINE_WARMUP_CALLS: usize = 64;
     #[cfg(feature = "acceptance-probes")]
     const IPC_BASELINE_SAMPLES: usize = 256;
+    #[cfg(feature = "acceptance-probes")]
     const IPC_ISOLATED_SERVICE_CALL_LIMIT: u16 = 1536;
     #[cfg(feature = "acceptance-probes")]
     const DIAGNOSTICS_SERVER_MAX_RETAINED_REQUESTS: usize = 1;
@@ -265,9 +274,17 @@ mod firmware {
 
     struct EmptyInput;
 
+    struct DiscardOutput;
+
     impl Input for EmptyInput {
         fn read(&mut self, _destination: &mut [u8]) -> Result<usize, StreamError> {
             Ok(0)
+        }
+    }
+
+    impl Output for DiscardOutput {
+        fn write(&mut self, bytes: &[u8]) -> Result<usize, StreamError> {
+            Ok(bytes.len())
         }
     }
 
@@ -283,6 +300,8 @@ mod firmware {
         native_blocks: RefCell<Vec<troe_machine::NativeVirtioBlock>>,
         native_statefs: RefCell<Option<Box<dyn ReadOnlyFileSystem>>>,
         native_generation: NativeGenerationState,
+        selected_config: Option<SystemConfig>,
+        firmware_wall_seconds: Option<u64>,
         boot_mount_manifest: BootMountManifest,
         runtime_mounts: SharedRuntimeMounts,
     }
@@ -291,6 +310,12 @@ mod firmware {
         blocks: Vec<troe_machine::NativeVirtioBlock>,
         statefs: Option<Box<dyn ReadOnlyFileSystem>>,
         generation: NativeGenerationState,
+        config: Option<SystemConfig>,
+    }
+
+    struct RecoveredNativeGeneration {
+        state: NativeGenerationState,
+        config: Option<SystemConfig>,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -347,6 +372,11 @@ mod firmware {
     struct KexCommandRunner<'a> {
         accounting: &'a mut OwnedAccounting,
         scheduler: &'a mut Scheduler,
+        residents: &'a mut ResidentProcessTable,
+        resident_owner: ResidentOwner,
+        service_initial_handles: Option<u8>,
+        service_capability_bits: Option<u32>,
+        service_runtime: Option<&'a mut ServiceRuntime>,
         shell_id: TaskId,
         shell_capabilities: Capabilities,
         runtime: SharedRuntime,
@@ -373,10 +403,92 @@ mod firmware {
         interface: u32,
     }
 
+    type SharedResidentLog = Rc<RefCell<BoundedLog>>;
+
+    struct ApplicationEmptyInputService;
+
+    struct ApplicationLogService {
+        log: SharedResidentLog,
+    }
+
+    enum ResidentExecution {
+        Unstarted(Box<ResidentLaunch>),
+        Pending(Box<troe_machine::ApplicationOutcome>),
+        Blocked,
+    }
+
+    struct ResidentLaunch {
+        address_space: troe_machine::UserAddressSpace,
+        entry: u64,
+        stack_top: u64,
+        startup_address: u64,
+    }
+
+    struct ResidentApplication<'service> {
+        task_id: TaskId,
+        allocation: ApplicationAllocation,
+        isolation: IsolationResource,
+        owner: HandleOwner,
+        handles: Vec<CommandApplicationHandle>,
+        handle_count: u16,
+        stack_pages: u16,
+        heap_start: u64,
+        maximum_heap_pages: u64,
+        private_pages: u64,
+        dispatcher: Dispatcher<'service>,
+        deferred_services: Option<CommandDeferredServices>,
+        deferred_state: Option<CommandDeferredState>,
+        execution: Option<ResidentExecution>,
+    }
+
+    struct ResidentJob {
+        id: u32,
+        task_id: TaskId,
+        command: String,
+        owner: ResidentOwner,
+        log: SharedResidentLog,
+        process: Option<Box<ResidentApplication<'static>>>,
+        outcome: Option<CommandApplicationOutcome>,
+        cancel_requested: bool,
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum ResidentOwner {
+        Session,
+        Service(u32),
+    }
+
+    struct ResidentProcessTable {
+        jobs: Vec<ResidentJob>,
+        next_id: u32,
+    }
+
+    struct ServiceRuntime {
+        config: SystemConfig,
+        supervisor: Supervisor,
+    }
+
     struct CommandDeferredServices {
         runtime: SharedRuntime,
         datagram: Option<SharedApplicationDatagram>,
         diagnostics: Option<Rc<[u8; diagnostics::SNAPSHOT_BYTES]>>,
+    }
+
+    #[allow(clippy::struct_excessive_bools)]
+    #[derive(Clone, Copy)]
+    struct BackgroundRequirements {
+        datagram: bool,
+        filesystem: bool,
+        filesystem_mutation: bool,
+        timer: bool,
+        diagnostics: bool,
+        network_observation: bool,
+        network_configuration: bool,
+        icmp_echo: bool,
+        tcp_connect: bool,
+        volume_control: bool,
+        wall_clock: bool,
+        clock_control: bool,
     }
 
     enum DeferredCallKind {
@@ -671,12 +783,19 @@ mod firmware {
 
     struct KernelRuntime {
         network: Option<SharedNetwork>,
+        wall_clock: Option<WallClockAnchor>,
         deferred_input: VecDeque<InputEvent>,
         control_down: bool,
         last_millis: Cell<u64>,
     }
 
     type SharedRuntime = Rc<RefCell<KernelRuntime>>;
+
+    #[derive(Clone, Copy)]
+    struct WallClockAnchor {
+        unix_seconds: u64,
+        monotonic_milliseconds: u64,
+    }
 
     struct ApplicationDatagramService {
         state: SharedApplicationDatagram,
@@ -719,6 +838,14 @@ mod firmware {
         runtime: SharedRuntime,
     }
 
+    struct ApplicationWallClockService {
+        runtime: SharedRuntime,
+    }
+
+    struct ApplicationClockControlService {
+        runtime: SharedRuntime,
+    }
+
     #[derive(Default)]
     struct SubmittedShellScript {
         lines: Vec<String>,
@@ -730,6 +857,10 @@ mod firmware {
     }
 
     struct ApplicationDiagnosticsProxyService;
+
+    struct ApplicationDiagnosticsSnapshotService {
+        snapshot: SharedDiagnosticsSnapshot,
+    }
 
     struct DiagnosticsServerExchange {
         operation: PendingOperationId,
@@ -860,6 +991,7 @@ mod firmware {
         image_layout: troe_machine::ImageLayout,
         boot_memory: BootMemory,
         framebuffer: Option<FramebufferDescriptor>,
+        firmware_wall_seconds: Option<u64>,
         boot_mount_manifest: Option<BootMountManifest>,
     }
 
@@ -1025,10 +1157,12 @@ mod firmware {
         if !troe_machine::initialize_monotonic_clock() {
             return Err(());
         }
+        let firmware_wall_seconds = firmware_unix_seconds();
         Ok(PreparedHandoff {
             image_layout,
             boot_memory,
             framebuffer,
+            firmware_wall_seconds,
             boot_mount_manifest: Some(boot_mount_manifest),
         })
     }
@@ -1123,6 +1257,8 @@ mod firmware {
             native_blocks: RefCell::new(native.blocks),
             native_statefs: RefCell::new(native.statefs),
             native_generation: native.generation,
+            selected_config: native.config,
+            firmware_wall_seconds: prepared.firmware_wall_seconds,
             boot_mount_manifest,
             runtime_mounts: Rc::new(RefCell::new(RuntimeMountRegistry::empty())),
         })
@@ -1145,7 +1281,8 @@ mod firmware {
         Ok(NativeBlockInitialization {
             blocks: devices,
             statefs,
-            generation,
+            generation: generation.state,
+            config: generation.config,
         })
     }
 
@@ -1271,7 +1408,7 @@ mod firmware {
     fn recover_native_generation(
         devices: &mut Vec<troe_machine::NativeVirtioBlock>,
         boot_mount_manifest: &BootMountManifest,
-    ) -> Result<NativeGenerationState, ()> {
+    ) -> Result<RecoveredNativeGeneration, ()> {
         recover_native_generation_inner(devices, boot_mount_manifest)
     }
 
@@ -1279,15 +1416,19 @@ mod firmware {
     fn recover_native_generation(
         devices: &mut Vec<troe_machine::NativeVirtioBlock>,
         boot_mount_manifest: &BootMountManifest,
-    ) -> NativeGenerationState {
-        recover_native_generation_inner(devices, boot_mount_manifest)
-            .unwrap_or(NativeGenerationState::Recovery)
+    ) -> RecoveredNativeGeneration {
+        recover_native_generation_inner(devices, boot_mount_manifest).unwrap_or(
+            RecoveredNativeGeneration {
+                state: NativeGenerationState::Recovery,
+                config: None,
+            },
+        )
     }
 
     fn recover_native_generation_inner(
         devices: &mut Vec<troe_machine::NativeVirtioBlock>,
         boot_mount_manifest: &BootMountManifest,
-    ) -> Result<NativeGenerationState, ()> {
+    ) -> Result<RecoveredNativeGeneration, ()> {
         let activation_limits = native_activation_limits()?;
         let content_bytes = read_selected_file(
             boot_mount_manifest,
@@ -1308,7 +1449,8 @@ mod firmware {
             None => None,
         };
         let candidate = recovered.unwrap_or(bootstrap);
-        let (pointer, validated, state) = match recover_activation(candidate, |pointer| {
+        #[allow(unused_mut)]
+        let (mut pointer, validated, state) = match recover_activation(candidate, |pointer| {
             validate_root_activation(&content, pointer, IdentityLimits::standard())
         }) {
             ActivationRecovery::Active { pointer, validated } => {
@@ -1317,7 +1459,12 @@ mod firmware {
             ActivationRecovery::Previous { pointer, validated } => {
                 (pointer, validated, NativeGenerationState::Predecessor)
             }
-            ActivationRecovery::Unavailable => return Ok(NativeGenerationState::Recovery),
+            ActivationRecovery::Unavailable => {
+                return Ok(RecoveredNativeGeneration {
+                    state: NativeGenerationState::Recovery,
+                    config: None,
+                });
+            }
         };
         let newly_published = recovered.is_none() || state == NativeGenerationState::Predecessor;
         if newly_published {
@@ -1342,6 +1489,7 @@ mod firmware {
                     return Err(());
                 }
                 store.commit(&previous_pointer.encode()).map_err(|_| ())?;
+                pointer = previous_pointer;
                 selected_state = NativeGenerationState::Predecessor;
                 if !troe_machine::write(b"native generation: health rollback committed\n") {
                     return Err(());
@@ -1364,7 +1512,15 @@ mod firmware {
         };
         #[cfg(not(feature = "acceptance-probes"))]
         let _ = validated.health_rollback();
-        Ok(state)
+        let config_object = content.get(pointer.active().digest()).ok_or(())?;
+        if config_object.kind != ObjectKind::SystemConfig {
+            return Err(());
+        }
+        let selected_config = parse_config(config_object.bytes).map_err(|_| ())?;
+        Ok(RecoveredNativeGeneration {
+            state,
+            config: Some(selected_config),
+        })
     }
 
     fn mount_native_statefs(
@@ -1775,7 +1931,7 @@ mod firmware {
         if accounting.native_blocks.borrow().len() > 8 {
             fatal(b"fatal: native block device accounting exceeded\n");
         }
-        let mut scheduler = Scheduler::new(TASK_STACK_COUNT)
+        let mut scheduler = Scheduler::new(troe_task::MAX_TASKS)
             .unwrap_or_else(|_| fatal(b"fatal: cannot create task scheduler\n"));
         run_cooperative_services(&mut scheduler, &accounting)
             .unwrap_or_else(|()| fatal(b"fatal: cooperative task verification failed\n"));
@@ -1793,7 +1949,7 @@ mod firmware {
         let capabilities = Capabilities::CONSOLE
             .union(Capabilities::FILESYSTEM)
             .union(Capabilities::MACHINE_CONTROL);
-        let stack_resource = StackResource::new(2, SHELL_TASK_STACK_PAGES)
+        let stack_resource = StackResource::new(SHELL_SCHEDULER_SLOT, SHELL_TASK_STACK_PAGES)
             .unwrap_or_else(|_| fatal(b"fatal: invalid shell task stack\n"));
         let shell_id = scheduler
             .spawn(capabilities, stack_resource)
@@ -2019,7 +2175,7 @@ mod firmware {
     }
 
     #[cfg(feature = "acceptance-probes")]
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::drop_non_drop, clippy::too_many_lines)]
     fn run_isolated_ipc_baseline_verification(
         scheduler: &mut Scheduler,
         accounting: &mut OwnedAccounting,
@@ -2524,14 +2680,7 @@ mod firmware {
         }];
         let source = native_kex_artifact(ApplicationProbe::HeapGrowthLimit);
         match run_command_application(
-            scheduler,
-            accounting,
-            dispatcher,
-            &services,
-            None,
-            source,
-            0,
-            APPLICATION_COMMAND_SERVICE_CALL_LIMIT,
+            scheduler, accounting, dispatcher, &services, None, source, 0, None,
         )? {
             CommandApplicationOutcome::Exited(troe_abi::exit::SUCCESS) => Ok(()),
             CommandApplicationOutcome::Exited(_) | CommandApplicationOutcome::Faulted(_) => Err(()),
@@ -3014,12 +3163,6 @@ mod firmware {
             };
             let deadline = MonotonicMillis::from_millis(deadline);
             let now = services.runtime.borrow().now();
-            if deadline > now.saturating_add(APPLICATION_SYNCHRONOUS_WAIT_MILLISECONDS) {
-                return Ok(DeferredCallPreparation::Immediate {
-                    status: ReplyStatus::Timeout,
-                    payload: Vec::new(),
-                });
-            }
             if deadline <= now {
                 return Ok(DeferredCallPreparation::Immediate {
                     status: ReplyStatus::Success,
@@ -3132,7 +3275,7 @@ mod firmware {
             Ok(None) => {}
         }
         let now = services.runtime.borrow().now();
-        let deadline = now.saturating_add(APPLICATION_SYNCHRONOUS_WAIT_MILLISECONDS);
+        let deadline = now.saturating_add(APPLICATION_DATAGRAM_WAIT_MILLISECONDS);
         let operation = pending
             .begin(
                 task_id,
@@ -3216,7 +3359,7 @@ mod firmware {
                 None,
                 package.executable(),
                 1,
-                IPC_ISOLATED_SERVICE_CALL_LIMIT,
+                Some(IPC_ISOLATED_SERVICE_CALL_LIMIT),
             )
         })();
         let success = outcome.is_ok();
@@ -3262,7 +3405,7 @@ mod firmware {
                 None,
                 package.executable(),
                 1,
-                APPLICATION_COMMAND_SERVICE_CALL_LIMIT,
+                None,
             )
         })();
         let success = outcome.is_ok();
@@ -3459,7 +3602,13 @@ mod firmware {
             if remaining == 0 {
                 continue;
             }
-            let interval = u32::try_from(remaining.min(u64::from(u32::MAX))).map_err(|_| ())?;
+            // A logical wait may span hours or days, while architecture
+            // one-shot counters have a much smaller exact range. Re-arm in
+            // bounded idle slices so hardware width never becomes a process
+            // lifetime limit.
+            let interval =
+                u32::try_from(remaining.min(u64::from(APPLICATION_TIMESLICE_MILLISECONDS)))
+                    .map_err(|_| ())?;
             let _deadline_fired =
                 troe_machine::wait_for_runtime_event_timeout(interval).map_err(|_| ())?;
             if pending.call(operation).map_err(|_| ())?.state() != PendingCallState::Waiting(wait) {
@@ -3470,13 +3619,9 @@ mod firmware {
         scheduler
             .wake_blocked(completion.owner(), completion.key())
             .map_err(|_| ())?;
-        if scheduler
-            .dispatch_next(Capabilities::SERVICE)
-            .map_err(|_| ())?
-            != Some(task_id)
-        {
-            return Err(());
-        }
+        scheduler
+            .dispatch(task_id, Capabilities::SERVICE)
+            .map_err(|_| ())?;
         let suspended_call = suspended.take(operation)?;
         let (status, payload) = deferred_reply(suspended_call.kind, completion.reason(), received)?;
         if payload.len() > suspended_call.call.reply_capacity() {
@@ -3534,13 +3679,9 @@ mod firmware {
         scheduler
             .wake_blocked(completion.owner(), completion.key())
             .map_err(|_| ())?;
-        if scheduler
-            .dispatch_next(Capabilities::SERVICE)
-            .map_err(|_| ())?
-            != Some(task_id)
-        {
-            return Err(());
-        }
+        scheduler
+            .dispatch(task_id, Capabilities::SERVICE)
+            .map_err(|_| ())?;
         let suspended_call = suspended.take(operation)?;
         if !matches!(
             suspended_call.kind,
@@ -3658,6 +3799,224 @@ mod firmware {
         }
     }
 
+    #[allow(clippy::drop_non_drop, clippy::too_many_lines)]
+    fn prepare_resident_application<'service>(
+        scheduler: &mut Scheduler,
+        accounting: &mut OwnedAccounting,
+        mut dispatcher: Dispatcher<'service>,
+        services: &[CommandStartupService],
+        source: &[u8],
+        resource_slot: u8,
+    ) -> Result<ResidentApplication<'service>, ()> {
+        if services.is_empty() || services.len() > troe_dispatch::MAX_HANDLES {
+            return Err(());
+        }
+        let mut transaction = LoaderTransaction::new();
+        transaction
+            .acquire(LoaderResource::Staging)
+            .map_err(|_| ())?;
+        let Ok(plan) = parse_kex(source, native_application_target(), ABI_MINOR) else {
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        };
+        let fixed_user_regions = if plan.heap_pages() == 0 {
+            APPLICATION_FIXED_USER_REGIONS - 1
+        } else {
+            APPLICATION_FIXED_USER_REGIONS
+        };
+        let application_user_regions = plan
+            .segments()
+            .count()
+            .checked_add(fixed_user_regions)
+            .ok_or(())?;
+        let heap_start = plan.layout().heap_address();
+        let maximum_heap_pages = plan
+            .layout()
+            .lower_guard_address()
+            .checked_sub(heap_start)
+            .ok_or(())?
+            / BASE_PAGE_SIZE;
+        let private_pages = plan.charges().private_pages();
+        let stack_pages = u16::try_from(plan.stack_pages()).map_err(|_| ())?;
+
+        let Ok(allocation) = allocate_application(&mut accounting.frames, &plan) else {
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        };
+        if transaction.acquire(LoaderResource::Frames).is_err() {
+            reclaim_command_application(&mut accounting.frames, allocation);
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        }
+        if prepare_application_memory(&allocation, &plan).is_err() {
+            reclaim_command_application(&mut accounting.frames, allocation);
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        }
+        let Ok(mapping_plan) = build_application_plan(
+            &accounting.kernel_plan,
+            accounting.kernel_runtime,
+            &allocation,
+            &plan,
+        ) else {
+            reclaim_command_application(&mut accounting.frames, allocation);
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        };
+        let Ok(address_space) =
+            troe_machine::build_user_address_space(&mapping_plan, allocation.tables)
+        else {
+            reclaim_command_application(&mut accounting.frames, allocation);
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        };
+        if transaction.acquire(LoaderResource::Tables).is_err() {
+            reclaim_command_application(&mut accounting.frames, allocation);
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        }
+        let table_pages = address_space.stats().table_pages;
+        if table_pages == 0
+            || table_pages > APPLICATION_TABLE_PAGES
+            || address_space.user_region_count() != application_user_regions
+        {
+            reclaim_command_application(&mut accounting.frames, allocation);
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        }
+        let handle_count = u16::try_from(services.len()).map_err(|_| ())?;
+        let retained_table_pages = allocation.tables.page_count();
+        let Ok(isolation) = IsolationResource::new(
+            resource_slot,
+            retained_table_pages,
+            private_pages,
+            handle_count,
+        ) else {
+            reclaim_command_application(&mut accounting.frames, allocation);
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        };
+        let Ok(stack_resource) = StackResource::new(resource_slot, stack_pages) else {
+            reclaim_command_application(&mut accounting.frames, allocation);
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        };
+        let Ok(task_id) =
+            scheduler.spawn_isolated(Capabilities::SERVICE, stack_resource, isolation)
+        else {
+            reclaim_command_application(&mut accounting.frames, allocation);
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        };
+        if transaction.acquire(LoaderResource::Task).is_err() {
+            rollback_command_application_task(
+                scheduler,
+                task_id,
+                &mut dispatcher,
+                None,
+                &mut accounting.frames,
+                allocation,
+            );
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        }
+
+        let entry = plan.entry_address();
+        let stack_top = plan.layout().stack_top();
+        let startup_address = plan.layout().startup_address();
+        let mut live_owner = None;
+        let setup = (|| -> Result<(HandleOwner, Vec<CommandApplicationHandle>), ()> {
+            let owner = HandleOwner::isolated(task_id.get()).map_err(|_| ())?;
+            live_owner = Some(owner);
+            let mut startup_handles = Vec::new();
+            startup_handles
+                .try_reserve_exact(services.len())
+                .map_err(|_| ())?;
+            let mut command_handles = Vec::new();
+            command_handles
+                .try_reserve_exact(services.len())
+                .map_err(|_| ())?;
+            for service in services {
+                let handle = dispatcher
+                    .open_owned(service.port, Rights::CALL, owner)
+                    .map_err(|_| ())?;
+                command_handles.push(CommandApplicationHandle {
+                    value: handle.abi_value(),
+                    interface: service.interface,
+                });
+                startup_handles.push(InitialHandle {
+                    value: handle.abi_value(),
+                    rights: Rights::CALL.bits(),
+                    interface: service.interface,
+                    major: service.major,
+                    minor: service.minor,
+                });
+            }
+            transaction
+                .acquire(LoaderResource::Handles)
+                .map_err(|_| ())?;
+            let mut startup = [0_u8; PAGE_BYTES];
+            plan.encode_startup_page(
+                StartupInfo {
+                    task_id: u64::from(task_id.get()),
+                    handles: &startup_handles,
+                },
+                &mut startup,
+            )
+            .map_err(|_| ())?;
+            troe_machine::copy_to_physical(allocation.startup, 0, &startup).map_err(|_| ())?;
+            Ok((owner, command_handles))
+        })();
+        let Ok((owner, handles)) = setup else {
+            rollback_command_application_task(
+                scheduler,
+                task_id,
+                &mut dispatcher,
+                live_owner,
+                &mut accounting.frames,
+                allocation,
+            );
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        };
+        drop(plan);
+        drop(mapping_plan);
+        if transaction.commit().is_err() {
+            rollback_command_application_task(
+                scheduler,
+                task_id,
+                &mut dispatcher,
+                live_owner,
+                &mut accounting.frames,
+                allocation,
+            );
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        }
+
+        Ok(ResidentApplication {
+            task_id,
+            allocation,
+            isolation,
+            owner,
+            handles,
+            handle_count,
+            stack_pages,
+            heap_start,
+            maximum_heap_pages,
+            private_pages,
+            dispatcher,
+            deferred_services: None,
+            deferred_state: None,
+            execution: Some(ResidentExecution::Unstarted(Box::new(ResidentLaunch {
+                address_space,
+                entry,
+                stack_top,
+                startup_address,
+            }))),
+        })
+    }
+
     #[allow(
         clippy::drop_non_drop,
         clippy::too_many_arguments,
@@ -3671,7 +4030,7 @@ mod firmware {
         deferred_services: Option<&CommandDeferredServices>,
         source: &[u8],
         resource_slot: u8,
-        service_call_limit: u16,
+        service_call_limit: Option<u16>,
     ) -> Result<CommandApplicationOutcome, ()> {
         if services.is_empty() || services.len() > troe_dispatch::MAX_HANDLES {
             return Err(());
@@ -3874,14 +4233,9 @@ mod firmware {
         };
 
         let execution = (|| -> Result<CommandApplicationOutcome, ()> {
-            if scheduler
-                .dispatch_next(Capabilities::SERVICE)
-                .map_err(|_| ())?
-                != Some(task_id)
-            {
-                return Err(());
-            }
-            let command_started = troe_machine::monotonic_millis().ok_or(())?;
+            scheduler
+                .dispatch(task_id, Capabilities::SERVICE)
+                .map_err(|_| ())?;
             let mut outcome = troe_machine::run_application(
                 address_space,
                 entry,
@@ -3899,26 +4253,9 @@ mod firmware {
                     &outcome,
                     troe_machine::ApplicationOutcome::HandleCall { .. }
                 );
-                let elapsed = troe_machine::monotonic_millis()
-                    .ok_or(())?
-                    .saturating_sub(command_started);
-                if elapsed > APPLICATION_COMMAND_RUNTIME_MILLISECONDS {
-                    scheduler
-                        .fault_current(task_id, TaskFault::CommandRuntimeExpired)
-                        .map_err(|_| ())?;
-                    break CommandApplicationOutcome::Faulted(TaskFault::CommandRuntimeExpired);
-                }
-                if service_call {
+                if service_call && let Some(service_call_limit) = service_call_limit {
                     service_calls = service_calls.checked_add(1).ok_or(())?;
-                    let product_service_call_limit = APPLICATION_COMMAND_SERVICE_CALL_LIMIT;
-                    let effective_service_call_limit = if cfg!(feature = "acceptance-probes")
-                        && service_call_limit == IPC_ISOLATED_SERVICE_CALL_LIMIT
-                    {
-                        service_call_limit
-                    } else {
-                        product_service_call_limit
-                    };
-                    if service_calls > effective_service_call_limit {
+                    if service_calls > service_call_limit {
                         scheduler
                             .fault_current(task_id, TaskFault::ServiceCallLimitExceeded)
                             .map_err(|_| ())?;
@@ -3930,13 +4267,9 @@ mod firmware {
                 match outcome {
                     troe_machine::ApplicationOutcome::Preempted(application) => {
                         scheduler.preempt_current(task_id).map_err(|_| ())?;
-                        if scheduler
-                            .dispatch_next(Capabilities::SERVICE)
-                            .map_err(|_| ())?
-                            != Some(task_id)
-                        {
-                            return Err(());
-                        }
+                        scheduler
+                            .dispatch(task_id, Capabilities::SERVICE)
+                            .map_err(|_| ())?;
                         outcome = troe_machine::resume_application(
                             application,
                             troe_machine::ApplicationResume::Timeslice,
@@ -3946,13 +4279,9 @@ mod firmware {
                     }
                     troe_machine::ApplicationOutcome::Yielded(application) => {
                         scheduler.yield_current(task_id).map_err(|_| ())?;
-                        if scheduler
-                            .dispatch_next(Capabilities::SERVICE)
-                            .map_err(|_| ())?
-                            != Some(task_id)
-                        {
-                            return Err(());
-                        }
+                        scheduler
+                            .dispatch(task_id, Capabilities::SERVICE)
+                            .map_err(|_| ())?;
                         outcome = troe_machine::resume_application(
                             application,
                             troe_machine::ApplicationResume::Yield,
@@ -4219,6 +4548,779 @@ mod firmware {
             fatal(b"fatal: application reap invariant failed\n");
         }
         Ok(terminal)
+    }
+
+    impl ResidentApplication<'_> {
+        fn install_deferred_services(
+            &mut self,
+            services: Option<CommandDeferredServices>,
+        ) -> Result<(), ()> {
+            self.deferred_state = services
+                .as_ref()
+                .map(|_| CommandDeferredState::new())
+                .transpose()?;
+            self.deferred_services = services;
+            Ok(())
+        }
+
+        #[allow(clippy::too_many_lines)]
+        fn step(
+            &mut self,
+            scheduler: &mut Scheduler,
+            accounting: &mut OwnedAccounting,
+        ) -> Result<Option<CommandApplicationOutcome>, ()> {
+            let execution = self.execution.take().ok_or(())?;
+            let mut outcome = match execution {
+                ResidentExecution::Unstarted(launch) => {
+                    scheduler
+                        .dispatch(self.task_id, Capabilities::SERVICE)
+                        .map_err(|_| ())?;
+                    troe_machine::run_application(
+                        launch.address_space,
+                        launch.entry,
+                        launch.stack_top,
+                        launch.startup_address,
+                        PAGE_BYTES,
+                        RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
+                    )
+                    .map_err(|_| ())?
+                }
+                ResidentExecution::Pending(outcome) => {
+                    scheduler
+                        .dispatch(self.task_id, Capabilities::SERVICE)
+                        .map_err(|_| ())?;
+                    match *outcome {
+                        troe_machine::ApplicationOutcome::Preempted(application) => {
+                            troe_machine::resume_application(
+                                application,
+                                troe_machine::ApplicationResume::Timeslice,
+                                RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
+                            )
+                            .map_err(|_| ())?
+                        }
+                        troe_machine::ApplicationOutcome::Yielded(application) => {
+                            troe_machine::resume_application(
+                                application,
+                                troe_machine::ApplicationResume::Yield,
+                                RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
+                            )
+                            .map_err(|_| ())?
+                        }
+                        pending @ (troe_machine::ApplicationOutcome::HandleCall { .. }
+                        | troe_machine::ApplicationOutcome::HeapGrow { .. }) => pending,
+                        troe_machine::ApplicationOutcome::Exited { .. }
+                        | troe_machine::ApplicationOutcome::Faulted(_) => return Err(()),
+                    }
+                }
+                ResidentExecution::Blocked => {
+                    let Some((application, status, payload)) =
+                        self.poll_deferred_call(scheduler, accounting)?
+                    else {
+                        self.execution = Some(ResidentExecution::Blocked);
+                        return Ok(None);
+                    };
+                    scheduler
+                        .dispatch(self.task_id, Capabilities::SERVICE)
+                        .map_err(|_| ())?;
+                    troe_machine::resume_application(
+                        application,
+                        troe_machine::ApplicationResume::HandleReply {
+                            status: status.abi_value(),
+                            reply: &payload,
+                        },
+                        RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
+                    )
+                    .map_err(|_| ())?
+                }
+            };
+
+            let mut service_calls = 0_usize;
+            let mut request = [0_u8; troe_abi::MAX_MESSAGE_BYTES];
+            let mut direct_reply = [0_u8; troe_abi::MAX_MESSAGE_BYTES];
+            loop {
+                match outcome {
+                    pending @ troe_machine::ApplicationOutcome::Preempted(_) => {
+                        scheduler.preempt_current(self.task_id).map_err(|_| ())?;
+                        self.execution = Some(ResidentExecution::Pending(Box::new(pending)));
+                        return Ok(None);
+                    }
+                    pending @ troe_machine::ApplicationOutcome::Yielded(_) => {
+                        scheduler.yield_current(self.task_id).map_err(|_| ())?;
+                        self.execution = Some(ResidentExecution::Pending(Box::new(pending)));
+                        return Ok(None);
+                    }
+                    pending @ troe_machine::ApplicationOutcome::HandleCall { .. }
+                        if service_calls >= RESIDENT_SERVICE_CALLS_PER_STEP =>
+                    {
+                        scheduler.preempt_current(self.task_id).map_err(|_| ())?;
+                        self.execution = Some(ResidentExecution::Pending(Box::new(pending)));
+                        return Ok(None);
+                    }
+                    troe_machine::ApplicationOutcome::HandleCall { application, call } => {
+                        service_calls = service_calls.checked_add(1).ok_or(())?;
+                        if call.request_bytes() < 2 {
+                            scheduler
+                                .fault_current(self.task_id, TaskFault::InvalidCall)
+                                .map_err(|_| ())?;
+                            return Ok(Some(CommandApplicationOutcome::Faulted(
+                                TaskFault::InvalidCall,
+                            )));
+                        }
+                        let request = &mut request[..call.request_bytes()];
+                        application.copy_request(request).map_err(|_| ())?;
+                        let opcode = u16::from_le_bytes([request[0], request[1]]);
+                        let preparation = if let (Some(interface), Some(services)) = (
+                            command_handle_interface(&self.handles, call.handle()),
+                            self.deferred_services.as_ref(),
+                        ) {
+                            let state = self.deferred_state.as_mut().ok_or(())?;
+                            prepare_deferred_call(
+                                self.task_id,
+                                interface,
+                                call.handle(),
+                                opcode,
+                                &request[2..],
+                                call.reply_capacity(),
+                                services,
+                                &mut state.pending,
+                                &mut state.next_request_id,
+                            )?
+                        } else {
+                            DeferredCallPreparation::NotDeferred
+                        };
+                        match preparation {
+                            DeferredCallPreparation::NotDeferred => {
+                                if command_handle_interface(&self.handles, call.handle())
+                                    == Some(troe_abi::interface::SERVER_ENDPOINT)
+                                {
+                                    let reply = self
+                                        .dispatcher
+                                        .call_owned_abi_into(
+                                            self.owner,
+                                            call.handle(),
+                                            opcode,
+                                            &request[2..],
+                                            &mut direct_reply[..call.reply_capacity()],
+                                        )
+                                        .map_err(|_| ())?;
+                                    outcome = troe_machine::resume_application(
+                                        application,
+                                        troe_machine::ApplicationResume::HandleReply {
+                                            status: reply.status().abi_value(),
+                                            reply: &direct_reply[..reply.payload_bytes()],
+                                        },
+                                        RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
+                                    )
+                                    .map_err(|_| ())?;
+                                } else {
+                                    let reply = self
+                                        .dispatcher
+                                        .call_owned_abi(
+                                            self.owner,
+                                            call.handle(),
+                                            opcode,
+                                            &request[2..],
+                                        )
+                                        .map_err(|_| ())?;
+                                    if reply.payload().len() > call.reply_capacity() {
+                                        return Err(());
+                                    }
+                                    outcome = troe_machine::resume_application(
+                                        application,
+                                        troe_machine::ApplicationResume::HandleReply {
+                                            status: reply.status().abi_value(),
+                                            reply: reply.payload(),
+                                        },
+                                        RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
+                                    )
+                                    .map_err(|_| ())?;
+                                }
+                            }
+                            DeferredCallPreparation::Immediate { status, payload } => {
+                                if payload.len() > call.reply_capacity() {
+                                    return Err(());
+                                }
+                                outcome = troe_machine::resume_application(
+                                    application,
+                                    troe_machine::ApplicationResume::HandleReply {
+                                        status: status.abi_value(),
+                                        reply: &payload,
+                                    },
+                                    RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
+                                )
+                                .map_err(|_| ())?;
+                            }
+                            DeferredCallPreparation::Blocked {
+                                operation,
+                                spec,
+                                kind,
+                            } => {
+                                let services = self.deferred_services.as_ref().ok_or(())?;
+                                let state = self.deferred_state.as_mut().ok_or(())?;
+                                let registration = state
+                                    .waits
+                                    .register(
+                                        spec,
+                                        WaitObservation::Pending,
+                                        services.runtime.borrow().now(),
+                                    )
+                                    .map_err(|_| ())?;
+                                match registration {
+                                    WaitRegistration::Ready(reason) => {
+                                        state
+                                            .pending
+                                            .mark_ready(operation, reason)
+                                            .map_err(|_| ())?;
+                                        let (status, payload) = deferred_reply(kind, reason, None)?;
+                                        state.pending.finish(operation).map_err(|_| ())?;
+                                        outcome = troe_machine::resume_application(
+                                            application,
+                                            troe_machine::ApplicationResume::HandleReply {
+                                                status: status.abi_value(),
+                                                reply: &payload,
+                                            },
+                                            RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
+                                        )
+                                        .map_err(|_| ())?;
+                                    }
+                                    WaitRegistration::Blocked(wait) => {
+                                        state.pending.bind_wait(operation, wait).map_err(|_| ())?;
+                                        state.suspended.insert(SuspendedApplicationCall {
+                                            operation,
+                                            application,
+                                            call,
+                                            kind,
+                                        })?;
+                                        scheduler
+                                            .block_current(self.task_id, wait)
+                                            .map_err(|_| ())?;
+                                        self.execution = Some(ResidentExecution::Blocked);
+                                        return Ok(None);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    troe_machine::ApplicationOutcome::HeapGrow {
+                        mut application,
+                        request,
+                    } => {
+                        match commit_application_heap_growth(
+                            &mut accounting.frames,
+                            &mut self.allocation,
+                            &mut application,
+                            self.heap_start,
+                            self.maximum_heap_pages,
+                            request.minimum_pages(),
+                        )? {
+                            ApplicationGrowth::Committed {
+                                stats,
+                                mapped_bytes,
+                            } => {
+                                let grown_private_pages = self
+                                    .private_pages
+                                    .checked_add(application_growth_pages(&self.allocation)?)
+                                    .ok_or(())?;
+                                let grown_table_pages = self
+                                    .allocation
+                                    .tables
+                                    .page_count()
+                                    .checked_add(
+                                        u64::try_from(self.allocation.growth_table_frames.len())
+                                            .map_err(|_| ())?,
+                                    )
+                                    .ok_or(())?;
+                                if stats.table_pages > grown_table_pages {
+                                    return Err(());
+                                }
+                                let grown_isolation = IsolationResource::new(
+                                    self.isolation.slot(),
+                                    grown_table_pages,
+                                    grown_private_pages,
+                                    self.isolation.handles(),
+                                )
+                                .map_err(|_| ())?;
+                                scheduler
+                                    .resize_current_isolation(self.task_id, grown_isolation)
+                                    .map_err(|_| ())?;
+                                self.isolation = grown_isolation;
+                                outcome = troe_machine::resume_application(
+                                    application,
+                                    troe_machine::ApplicationResume::HeapGrowth {
+                                        status: heap_growth::SUCCESS,
+                                        mapped_bytes,
+                                    },
+                                    RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
+                                )
+                                .map_err(|_| ())?;
+                            }
+                            ApplicationGrowth::Exhausted => {
+                                outcome = troe_machine::resume_application(
+                                    application,
+                                    troe_machine::ApplicationResume::HeapGrowth {
+                                        status: heap_growth::EXHAUSTED,
+                                        mapped_bytes: 0,
+                                    },
+                                    RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
+                                )
+                                .map_err(|_| ())?;
+                            }
+                        }
+                    }
+                    troe_machine::ApplicationOutcome::Exited { status } => {
+                        scheduler
+                            .exit_current(self.task_id, status)
+                            .map_err(|_| ())?;
+                        return Ok(Some(CommandApplicationOutcome::Exited(status)));
+                    }
+                    troe_machine::ApplicationOutcome::Faulted(fault) => {
+                        let fault = task_fault(fault);
+                        scheduler
+                            .fault_current(self.task_id, fault)
+                            .map_err(|_| ())?;
+                        return Ok(Some(CommandApplicationOutcome::Faulted(fault)));
+                    }
+                }
+            }
+        }
+
+        fn complete_diagnostics_call(
+            &mut self,
+            scheduler: &mut Scheduler,
+            accounting: &mut OwnedAccounting,
+            operation: PendingOperationId,
+            wait: WaitKey,
+            resource: WaitResource,
+        ) -> Result<Option<(troe_machine::ApplicationSession, ReplyStatus, Vec<u8>)>, ()> {
+            let services = self.deferred_services.as_ref().ok_or(())?;
+            let state = self.deferred_state.as_mut().ok_or(())?;
+            let snapshot = services.diagnostics.as_ref().ok_or(())?.clone();
+            let reply_capacity = state
+                .pending
+                .call(operation)
+                .map_err(|_| ())?
+                .reply_capacity();
+            let (reason, server_reply) =
+                run_diagnostics_server(scheduler, accounting, operation, snapshot, reply_capacity)?;
+            let completion = match reason {
+                WakeReason::ResourceReady | WakeReason::Closed => state
+                    .waits
+                    .wake_resource(resource, reason)
+                    .map_err(|_| ())?
+                    .iter()
+                    .next()
+                    .ok_or(())?,
+                WakeReason::Revoked => state
+                    .waits
+                    .cancel_operation(operation, reason)
+                    .map_err(|_| ())?
+                    .ok_or(())?,
+                WakeReason::Deadline | WakeReason::Cancelled => return Err(()),
+            };
+            if completion.key() != wait {
+                return Err(());
+            }
+            state.pending.resolve(completion).map_err(|_| ())?;
+            scheduler
+                .wake_blocked(completion.owner(), completion.key())
+                .map_err(|_| ())?;
+            let suspended = state.suspended.take(operation)?;
+            let (status, payload) = match reason {
+                WakeReason::ResourceReady => server_reply.ok_or(())?,
+                WakeReason::Closed => (ReplyStatus::Conflict, Vec::new()),
+                WakeReason::Revoked => (ReplyStatus::Cancelled, Vec::new()),
+                WakeReason::Deadline | WakeReason::Cancelled => return Err(()),
+            };
+            if payload.len() > suspended.call.reply_capacity() {
+                return Err(());
+            }
+            state.pending.finish(operation).map_err(|_| ())?;
+            Ok(Some((suspended.application, status, payload)))
+        }
+
+        fn request_deferred_cancel(&mut self, scheduler: &mut Scheduler) -> Result<bool, ()> {
+            if !matches!(self.execution, Some(ResidentExecution::Blocked)) {
+                return Ok(false);
+            }
+            let state = self.deferred_state.as_mut().ok_or(())?;
+            let operation = state.suspended.slots.first().ok_or(())?.operation;
+            let PendingCallState::Waiting(wait) =
+                state.pending.call(operation).map_err(|_| ())?.state()
+            else {
+                return Err(());
+            };
+            let completion = state
+                .waits
+                .cancel_operation(operation, WakeReason::Cancelled)
+                .map_err(|_| ())?
+                .ok_or(())?;
+            if completion.key() != wait {
+                return Err(());
+            }
+            state.pending.resolve(completion).map_err(|_| ())?;
+            scheduler
+                .wake_blocked(completion.owner(), completion.key())
+                .map_err(|_| ())?;
+            Ok(true)
+        }
+
+        fn take_ready_deferred_call(
+            &mut self,
+            operation: PendingOperationId,
+            reason: WakeReason,
+        ) -> Result<Option<(troe_machine::ApplicationSession, ReplyStatus, Vec<u8>)>, ()> {
+            let state = self.deferred_state.as_mut().ok_or(())?;
+            let suspended = state.suspended.take(operation)?;
+            let (status, payload) = deferred_reply(suspended.kind, reason, None)?;
+            if payload.len() > suspended.call.reply_capacity() {
+                return Err(());
+            }
+            state.pending.finish(operation).map_err(|_| ())?;
+            Ok(Some((suspended.application, status, payload)))
+        }
+
+        fn poll_deferred_call(
+            &mut self,
+            scheduler: &mut Scheduler,
+            accounting: &mut OwnedAccounting,
+        ) -> Result<Option<(troe_machine::ApplicationSession, ReplyStatus, Vec<u8>)>, ()> {
+            let state = self.deferred_state.as_ref().ok_or(())?;
+            let operation = state.suspended.slots.first().ok_or(())?.operation;
+            let wait = match state.pending.call(operation).map_err(|_| ())?.state() {
+                PendingCallState::Ready(reason) => {
+                    return self.take_ready_deferred_call(operation, reason);
+                }
+                PendingCallState::Waiting(wait) => wait,
+                PendingCallState::New => return Err(()),
+            };
+            if let DeferredCallKind::Diagnostics { resource } =
+                &state.suspended.get(operation)?.kind
+            {
+                return self
+                    .complete_diagnostics_call(scheduler, accounting, operation, wait, *resource);
+            }
+            let services = self.deferred_services.as_ref().ok_or(())?;
+            let state = self.deferred_state.as_mut().ok_or(())?;
+            services.runtime.borrow_mut().service_ambient();
+            let now = services.runtime.borrow().now();
+            let mut received = None;
+            let suspended = state.suspended.get(operation)?;
+            let completion = match &suspended.kind {
+                DeferredCallKind::Timer { deadline } if now >= *deadline => {
+                    state.waits.expire(now).map_err(|_| ())?.iter().next()
+                }
+                DeferredCallKind::Datagram {
+                    state: datagram,
+                    local_port,
+                    deadline,
+                    resource,
+                } => {
+                    if let Some(value) = datagram
+                        .borrow_mut()
+                        .receive_now(*local_port)
+                        .map_err(|_| ())?
+                    {
+                        received = Some(value);
+                        state
+                            .waits
+                            .wake_resource(*resource, WakeReason::ResourceReady)
+                            .map_err(|_| ())?
+                            .iter()
+                            .next()
+                    } else if now >= *deadline {
+                        state.waits.expire(now).map_err(|_| ())?.iter().next()
+                    } else {
+                        None
+                    }
+                }
+                DeferredCallKind::Timer { .. } => None,
+                DeferredCallKind::Diagnostics { .. } => return Err(()),
+            };
+            let Some(completion) = completion else {
+                return Ok(None);
+            };
+            if completion.key() != wait {
+                return Err(());
+            }
+            state.pending.resolve(completion).map_err(|_| ())?;
+            scheduler
+                .wake_blocked(completion.owner(), completion.key())
+                .map_err(|_| ())?;
+            let suspended = state.suspended.take(operation)?;
+            let (status, payload) = deferred_reply(suspended.kind, completion.reason(), received)?;
+            if payload.len() > suspended.call.reply_capacity() {
+                return Err(());
+            }
+            state.pending.finish(operation).map_err(|_| ())?;
+            Ok(Some((suspended.application, status, payload)))
+        }
+
+        fn teardown(
+            mut self,
+            scheduler: &mut Scheduler,
+            accounting: &mut OwnedAccounting,
+            outcome: CommandApplicationOutcome,
+            cancelled: bool,
+        ) -> Result<CommandApplicationOutcome, ()> {
+            if cancelled {
+                let snapshot = scheduler.task(self.task_id).map_err(|_| ())?;
+                match snapshot.state() {
+                    troe_task::TaskState::Ready => scheduler
+                        .cancel_ready(self.task_id, troe_abi::exit::CANCELLED)
+                        .map_err(|_| ())?,
+                    troe_task::TaskState::Blocked(_) => {
+                        if let Some(state) = self.deferred_state.as_mut() {
+                            state.revoke_owner(self.task_id)?;
+                        }
+                        scheduler
+                            .cancel_blocked(self.task_id, troe_abi::exit::CANCELLED)
+                            .map_err(|_| ())?;
+                    }
+                    troe_task::TaskState::Running => scheduler
+                        .exit_current(self.task_id, troe_abi::exit::CANCELLED)
+                        .map_err(|_| ())?,
+                    troe_task::TaskState::Exited | troe_task::TaskState::Faulted => {}
+                }
+            }
+            if self.dispatcher.close_owner(self.owner).map_err(|_| ())? != self.handle_count {
+                return Err(());
+            }
+            if !cancelled
+                && self
+                    .deferred_state
+                    .as_ref()
+                    .is_some_and(|state| !state.is_empty() || !state.respected_bounds())
+            {
+                return Err(());
+            }
+            self.execution.take();
+            let reaped = scheduler.reap(self.task_id).map_err(|_| ())?;
+            let expected_fault = match outcome {
+                CommandApplicationOutcome::Exited(_) => None,
+                CommandApplicationOutcome::Faulted(fault) => Some(fault),
+            };
+            let valid = reaped.isolation == Some(self.isolation)
+                && reaped.stack.mapped_pages() == self.stack_pages
+                && (cancelled || reaped.fault == expected_fault);
+            reclaim_command_application(&mut accounting.frames, self.allocation);
+            if !valid {
+                return Err(());
+            }
+            Ok(if cancelled {
+                CommandApplicationOutcome::Exited(troe_abi::exit::CANCELLED)
+            } else {
+                outcome
+            })
+        }
+    }
+
+    impl ResidentProcessTable {
+        fn new() -> Result<Self, ()> {
+            let mut jobs = Vec::new();
+            jobs.try_reserve_exact(RESIDENT_PROCESS_CAPACITY)
+                .map_err(|_| ())?;
+            Ok(Self { jobs, next_id: 1 })
+        }
+
+        fn available_slot(&self) -> Option<u8> {
+            (0..RESIDENT_PROCESS_CAPACITY).find_map(|offset| {
+                let offset = u8::try_from(offset).ok()?;
+                let slot = RESIDENT_PROCESS_FIRST_SLOT.checked_add(offset)?;
+                (!self.jobs.iter().any(|job| {
+                    job.process
+                        .as_ref()
+                        .is_some_and(|process| process.isolation.slot() == slot)
+                }))
+                .then_some(slot)
+            })
+        }
+
+        fn admit(
+            &mut self,
+            command: String,
+            owner: ResidentOwner,
+            log: SharedResidentLog,
+            process: Box<ResidentApplication<'static>>,
+        ) -> Result<u32, Box<ResidentApplication<'static>>> {
+            if self.jobs.len() >= RESIDENT_PROCESS_CAPACITY {
+                return Err(process);
+            }
+            let (id, next_id) = match owner {
+                ResidentOwner::Session => {
+                    let Some(next_id) = self.next_id.checked_add(1) else {
+                        return Err(process);
+                    };
+                    (self.next_id, next_id)
+                }
+                ResidentOwner::Service(_) => (0, self.next_id),
+            };
+            self.jobs.push(ResidentJob {
+                id,
+                task_id: process.task_id,
+                command,
+                owner,
+                log,
+                process: Some(process),
+                outcome: None,
+                cancel_requested: false,
+            });
+            self.next_id = next_id;
+            Ok(id)
+        }
+
+        fn pump(
+            &mut self,
+            scheduler: &mut Scheduler,
+            accounting: &mut OwnedAccounting,
+            shell_id: TaskId,
+            shell_capabilities: Capabilities,
+        ) -> Result<(), ()> {
+            scheduler.yield_current(shell_id).map_err(|_| ())?;
+            self.pump_processes(scheduler, accounting)?;
+            scheduler
+                .dispatch(shell_id, shell_capabilities)
+                .map_err(|_| ())?;
+            Ok(())
+        }
+
+        fn pump_processes(
+            &mut self,
+            scheduler: &mut Scheduler,
+            accounting: &mut OwnedAccounting,
+        ) -> Result<(), ()> {
+            for index in 0..self.jobs.len() {
+                if self.jobs[index].outcome.is_some() {
+                    continue;
+                }
+                let cancelled = self.jobs[index].cancel_requested;
+                let result = if cancelled {
+                    None
+                } else {
+                    self.jobs[index]
+                        .process
+                        .as_mut()
+                        .map(|process| process.step(scheduler, accounting))
+                };
+                let terminal = match result {
+                    Some(Ok(Some(outcome))) => Some((outcome, false)),
+                    Some(Ok(None)) => None,
+                    Some(Err(())) => Some((
+                        CommandApplicationOutcome::Faulted(TaskFault::InvalidCall),
+                        true,
+                    )),
+                    None => Some((
+                        CommandApplicationOutcome::Exited(troe_abi::exit::CANCELLED),
+                        true,
+                    )),
+                };
+                if let Some((outcome, force_cancel)) = terminal {
+                    let process = self.jobs[index].process.take().ok_or(())?;
+                    self.jobs[index].outcome = Some(process.teardown(
+                        scheduler,
+                        accounting,
+                        outcome,
+                        cancelled || force_cancel,
+                    )?);
+                }
+            }
+            Ok(())
+        }
+
+        fn has_runnable_process(&self) -> bool {
+            self.jobs.iter().any(|job| {
+                job.outcome.is_none()
+                    && !job.cancel_requested
+                    && job.process.as_ref().is_some_and(|process| {
+                        !matches!(process.execution, Some(ResidentExecution::Blocked))
+                    })
+            })
+        }
+
+        fn request_cancel(&mut self, job_id: u32) -> Result<(), ()> {
+            let job = self
+                .jobs
+                .iter_mut()
+                .find(|job| job.id == job_id && job.owner == ResidentOwner::Session)
+                .ok_or(())?;
+            if job.outcome.is_some() {
+                return Ok(());
+            }
+            job.cancel_requested = true;
+            Ok(())
+        }
+
+        fn is_terminal(&self, job_id: u32) -> Result<bool, ()> {
+            self.jobs
+                .iter()
+                .find(|job| job.id == job_id && job.owner == ResidentOwner::Session)
+                .map(|job| job.outcome.is_some())
+                .ok_or(())
+        }
+
+        fn copy_log(&self, job_id: u32, destination: &mut [u8]) -> Result<(usize, u64), ()> {
+            let job = self
+                .jobs
+                .iter()
+                .find(|job| job.id == job_id && job.owner == ResidentOwner::Session)
+                .ok_or(())?;
+            let log = job.log.try_borrow().map_err(|_| ())?;
+            Ok((log.copy_recent(destination), log.dropped()))
+        }
+
+        fn remove_terminal(&mut self, job_id: u32) -> Result<CommandApplicationOutcome, ()> {
+            let index = self
+                .jobs
+                .iter()
+                .position(|job| job.id == job_id && job.owner == ResidentOwner::Session)
+                .ok_or(())?;
+            let outcome = self.jobs[index].outcome.ok_or(())?;
+            self.jobs.remove(index);
+            Ok(outcome)
+        }
+
+        fn service_task(&self, service_id: u32) -> Option<TaskId> {
+            self.jobs
+                .iter()
+                .find(|job| job.owner == ResidentOwner::Service(service_id))
+                .and_then(|job| job.process.as_ref())
+                .map(|process| process.task_id)
+        }
+
+        fn request_service_cancel(&mut self, service_id: u32) -> Result<(), ()> {
+            let job = self
+                .jobs
+                .iter_mut()
+                .find(|job| job.owner == ResidentOwner::Service(service_id))
+                .ok_or(())?;
+            if job.outcome.is_none() {
+                job.cancel_requested = true;
+            }
+            Ok(())
+        }
+
+        fn copy_service_log(
+            &self,
+            service_id: u32,
+            destination: &mut [u8],
+        ) -> Option<(usize, u64)> {
+            let job = self
+                .jobs
+                .iter()
+                .find(|job| job.owner == ResidentOwner::Service(service_id))?;
+            let log = job.log.try_borrow().ok()?;
+            Some((log.copy_recent(destination), log.dropped()))
+        }
+
+        fn take_service_terminal(
+            &mut self,
+            service_id: u32,
+        ) -> Option<(TaskId, CommandApplicationOutcome, SharedResidentLog)> {
+            let index = self.jobs.iter().position(|job| {
+                job.owner == ResidentOwner::Service(service_id) && job.outcome.is_some()
+            })?;
+            let job = self.jobs.remove(index);
+            Some((job.task_id, job.outcome?, job.log))
+        }
     }
 
     const fn task_fault(fault: troe_machine::IsolatedFault) -> TaskFault {
@@ -5795,6 +6897,52 @@ mod firmware {
         }
     }
 
+    impl Service for ApplicationEmptyInputService {
+        fn call(
+            &mut self,
+            request: Request<'_>,
+        ) -> Result<ServiceReply, troe_dispatch::DispatchError> {
+            if request.opcode() != stream::READ
+                || stream::decode_read_request(request.payload()).is_err()
+            {
+                return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+            }
+            Ok(ServiceReply::empty(ReplyStatus::Success))
+        }
+    }
+
+    impl Service for ApplicationLogService {
+        fn call(
+            &mut self,
+            request: Request<'_>,
+        ) -> Result<ServiceReply, troe_dispatch::DispatchError> {
+            match request.opcode() {
+                stream::WRITE
+                    if !request.payload().is_empty()
+                        && request.payload().len() <= troe_abi::MAX_SERVICE_PAYLOAD_BYTES =>
+                {
+                    let Ok(mut log) = self.log.try_borrow_mut() else {
+                        return Ok(ServiceReply::empty(ReplyStatus::Conflict));
+                    };
+                    log.append(request.payload());
+                    Ok(ServiceReply::empty(ReplyStatus::Success))
+                }
+                stream::SET_CHUNK_SIZE => {
+                    let Ok(bytes) = stream::decode_chunk_size(request.payload()) else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    let status = if bytes == 0 {
+                        ReplyStatus::InvalidRequest
+                    } else {
+                        ReplyStatus::Success
+                    };
+                    Ok(ServiceReply::empty(status))
+                }
+                _ => Ok(ServiceReply::empty(ReplyStatus::InvalidRequest)),
+            }
+        }
+    }
+
     impl Service for ApplicationOutputService<'_> {
         fn call(
             &mut self,
@@ -6377,9 +7525,6 @@ mod firmware {
                     };
                     let deadline = MonotonicMillis::from_millis(deadline);
                     let now = self.runtime.borrow().now();
-                    if deadline > now.saturating_add(APPLICATION_SYNCHRONOUS_WAIT_MILLISECONDS) {
-                        return Ok(ServiceReply::empty(ReplyStatus::Timeout));
-                    }
                     if deadline <= now {
                         Ok(ServiceReply::empty(ReplyStatus::Success))
                     } else {
@@ -6393,6 +7538,41 @@ mod firmware {
         }
     }
 
+    impl Service for ApplicationWallClockService {
+        fn call(
+            &mut self,
+            request: Request<'_>,
+        ) -> Result<ServiceReply, troe_dispatch::DispatchError> {
+            if request.opcode() != wall_clock::NOW || !request.payload().is_empty() {
+                return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+            }
+            let Some(seconds) = self.runtime.borrow().wall_seconds() else {
+                return Ok(ServiceReply::empty(ReplyStatus::NotConfigured));
+            };
+            ServiceReply::with_payload(ReplyStatus::Success, &wall_clock::encode_seconds(seconds))
+        }
+    }
+
+    impl Service for ApplicationClockControlService {
+        fn call(
+            &mut self,
+            request: Request<'_>,
+        ) -> Result<ServiceReply, troe_dispatch::DispatchError> {
+            if request.opcode() != clock_control::SET {
+                return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+            }
+            let Ok(seconds) = clock_control::decode_seconds(request.payload()) else {
+                return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+            };
+            let status = if self.runtime.borrow_mut().set_wall_seconds(seconds).is_ok() {
+                ReplyStatus::Success
+            } else {
+                ReplyStatus::InvalidRequest
+            };
+            Ok(ServiceReply::empty(status))
+        }
+    }
+
     impl Service for ApplicationDiagnosticsProxyService {
         fn call(
             &mut self,
@@ -6401,6 +7581,18 @@ mod firmware {
             // Diagnostics calls are intercepted before synchronous dispatch
             // and completed by the isolated diagnostics server.
             Ok(ServiceReply::empty(ReplyStatus::Failure))
+        }
+    }
+
+    impl Service for ApplicationDiagnosticsSnapshotService {
+        fn call(
+            &mut self,
+            request: Request<'_>,
+        ) -> Result<ServiceReply, troe_dispatch::DispatchError> {
+            if request.opcode() != diagnostics::GET_SNAPSHOT || !request.payload().is_empty() {
+                return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+            }
+            ServiceReply::with_payload(ReplyStatus::Success, self.snapshot.as_ref())
         }
     }
 
@@ -7410,6 +8602,41 @@ mod firmware {
             .all(|((left, right), mask)| *left & mask == right & mask)
     }
 
+    fn firmware_unix_seconds() -> Option<u64> {
+        const MONTH_DAYS: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+        let time = uefi::runtime::get_time().ok()?;
+        if time.year() < 1970 {
+            return None;
+        }
+        let mut days = 0_u64;
+        for year in 1970..time.year() {
+            days = days.checked_add(if is_leap_year(year) { 366 } else { 365 })?;
+        }
+        for month in 1..time.month() {
+            let mut month_days = *MONTH_DAYS.get(usize::from(month - 1))?;
+            if month == 2 && is_leap_year(time.year()) {
+                month_days += 1;
+            }
+            days = days.checked_add(month_days)?;
+        }
+        days = days.checked_add(u64::from(time.day().checked_sub(1)?))?;
+        let local = days
+            .checked_mul(86_400)?
+            .checked_add(u64::from(time.hour()).checked_mul(3_600)?)?
+            .checked_add(u64::from(time.minute()).checked_mul(60)?)?
+            .checked_add(u64::from(time.second()))?;
+        match time.time_zone() {
+            Some(offset) if offset >= 0 => local.checked_sub(u64::from(offset.unsigned_abs()) * 60),
+            Some(offset) => local.checked_add(u64::from(offset.unsigned_abs()) * 60),
+            None => Some(local),
+        }
+    }
+
+    const fn is_leap_year(year: u16) -> bool {
+        year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
+    }
+
     const fn map_network_error(error: NetError) -> NetworkError {
         match error {
             NetError::Invalid
@@ -7426,7 +8653,10 @@ mod firmware {
         const DEFERRED_INPUT_CAPACITY: usize = 128;
         const INPUT_CHECKPOINT_BUDGET: usize = 32;
 
-        fn new(network: Option<SharedNetwork>) -> Result<Self, RuntimeInitError> {
+        fn new(
+            network: Option<SharedNetwork>,
+            firmware_wall_seconds: Option<u64>,
+        ) -> Result<Self, RuntimeInitError> {
             let initial = troe_machine::monotonic_millis().ok_or(RuntimeInitError::Clock)?;
             let mut deferred_input = VecDeque::new();
             deferred_input
@@ -7434,6 +8664,10 @@ mod firmware {
                 .map_err(|_| RuntimeInitError::InputMetadata)?;
             Ok(Self {
                 network,
+                wall_clock: firmware_wall_seconds.map(|unix_seconds| WallClockAnchor {
+                    unix_seconds,
+                    monotonic_milliseconds: initial,
+                }),
                 deferred_input,
                 control_down: false,
                 last_millis: Cell::new(initial),
@@ -7450,11 +8684,7 @@ mod firmware {
         }
 
         fn checkpoint(&mut self) -> Result<(), Cancelled> {
-            if troe_machine::take_network_interrupt()
-                && let Some(network) = &self.network
-            {
-                let _bounded_poll = network.borrow_mut().poll();
-            }
+            self.service_ambient();
             for _ in 0..Self::INPUT_CHECKPOINT_BUDGET {
                 let Some(event) = troe_machine::try_input_event() else {
                     break;
@@ -7479,14 +8709,41 @@ mod firmware {
             Ok(())
         }
 
-        fn next_input_event(&mut self) -> Option<InputEvent> {
+        fn service_ambient(&mut self) {
+            if troe_machine::take_network_interrupt()
+                && let Some(network) = &self.network
+            {
+                let _bounded_poll = network.borrow_mut().poll();
+            }
+        }
+
+        fn wall_seconds(&self) -> Option<u64> {
+            let anchor = self.wall_clock?;
+            let elapsed = self
+                .now()
+                .as_millis()
+                .saturating_sub(anchor.monotonic_milliseconds)
+                / 1_000;
+            Some(anchor.unix_seconds.saturating_add(elapsed))
+        }
+
+        fn set_wall_seconds(&mut self, unix_seconds: u64) -> Result<(), ()> {
+            if unix_seconds > 253_402_300_799 {
+                return Err(());
+            }
+            self.wall_clock = Some(WallClockAnchor {
+                unix_seconds,
+                monotonic_milliseconds: self.now().as_millis(),
+            });
+            Ok(())
+        }
+
+        fn poll_input_event(&mut self) -> Option<InputEvent> {
             let _cancel_at_prompt = self.checkpoint();
             if let Some(event) = self.deferred_input.pop_front() {
                 return Some(event);
             }
-            troe_machine::wait_for_runtime_event();
-            let _cancel_at_prompt = self.checkpoint();
-            self.deferred_input.pop_front()
+            None
         }
     }
 
@@ -7507,9 +8764,12 @@ mod firmware {
         Some(Rc::new(RefCell::new(service)))
     }
 
-    fn install_command_runtime(console: &mut dyn Output) -> (Option<NetworkStatus>, SharedRuntime) {
+    fn install_command_runtime(
+        console: &mut dyn Output,
+        firmware_wall_seconds: Option<u64>,
+    ) -> (Option<NetworkStatus>, SharedRuntime) {
         let service = discover_network_service();
-        let runtime_state = match KernelRuntime::new(service.clone()) {
+        let runtime_state = match KernelRuntime::new(service.clone(), firmware_wall_seconds) {
             Ok(runtime) => runtime,
             Err(RuntimeInitError::Clock) => fatal(b"fatal: monotonic runtime unavailable\n"),
             Err(RuntimeInitError::InputMetadata) => {
@@ -7541,8 +8801,9 @@ mod firmware {
         console: &mut dyn Output,
         motd: &[u8],
         root_mode: NativeRootMode,
+        firmware_wall_seconds: Option<u64>,
     ) -> SharedRuntime {
-        let (network_status, runtime) = install_command_runtime(console);
+        let (network_status, runtime) = install_command_runtime(console, firmware_wall_seconds);
         if !write_shell_banner(console, motd, root_mode, network_status) {
             fatal(b"fatal: native console write failed\n");
         }
@@ -7556,6 +8817,556 @@ mod firmware {
         prompt
     }
 
+    impl KexCommandRunner<'_> {
+        fn run_foreground_process(
+            &mut self,
+            mut process: ResidentApplication<'_>,
+        ) -> Result<CommandApplicationOutcome, ()> {
+            self.scheduler
+                .yield_current(self.shell_id)
+                .map_err(|_| ())?;
+            let mut cancellation_delivered = false;
+            let outcome = loop {
+                match process.step(self.scheduler, self.accounting) {
+                    Ok(Some(outcome)) => {
+                        break process.teardown(self.scheduler, self.accounting, outcome, false);
+                    }
+                    Err(()) => {
+                        break process.teardown(
+                            self.scheduler,
+                            self.accounting,
+                            CommandApplicationOutcome::Faulted(TaskFault::InvalidCall),
+                            true,
+                        );
+                    }
+                    Ok(None) => {}
+                }
+                if cancellation_delivered {
+                    break process.teardown(
+                        self.scheduler,
+                        self.accounting,
+                        CommandApplicationOutcome::Exited(troe_abi::exit::CANCELLED),
+                        true,
+                    );
+                }
+                if self.runtime.borrow_mut().checkpoint().is_err() {
+                    match process.request_deferred_cancel(self.scheduler) {
+                        Ok(true) => {
+                            cancellation_delivered = true;
+                            continue;
+                        }
+                        Ok(false) | Err(()) => {
+                            break process.teardown(
+                                self.scheduler,
+                                self.accounting,
+                                CommandApplicationOutcome::Exited(troe_abi::exit::CANCELLED),
+                                true,
+                            );
+                        }
+                    }
+                }
+                if self
+                    .residents
+                    .pump_processes(self.scheduler, self.accounting)
+                    .is_err()
+                {
+                    let _cleaned = process.teardown(
+                        self.scheduler,
+                        self.accounting,
+                        CommandApplicationOutcome::Exited(troe_abi::exit::CANCELLED),
+                        true,
+                    );
+                    break Err(());
+                }
+                let foreground_blocked =
+                    matches!(process.execution, Some(ResidentExecution::Blocked));
+                if foreground_blocked
+                    && !self.residents.has_runnable_process()
+                    && troe_machine::wait_for_runtime_event_timeout(RESIDENT_POLL_MILLISECONDS)
+                        .is_err()
+                {
+                    let _cleaned = process.teardown(
+                        self.scheduler,
+                        self.accounting,
+                        CommandApplicationOutcome::Exited(troe_abi::exit::CANCELLED),
+                        true,
+                    );
+                    break Err(());
+                }
+            };
+            if self
+                .scheduler
+                .dispatch(self.shell_id, self.shell_capabilities)
+                .is_err()
+            {
+                fatal(b"fatal: shell scheduler restore failed\n");
+            }
+            outcome
+        }
+
+        #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+        fn launch_background(
+            &mut self,
+            command: &str,
+            words: &[String],
+            cwd: &str,
+            namespace: &SharedNamespace,
+            executable: &[u8],
+            requirements: BackgroundRequirements,
+            diagnostics_snapshot: Option<&SharedDiagnosticsSnapshot>,
+            stdout: &mut dyn Output,
+            stderr: &mut dyn Output,
+        ) -> CommandStatus {
+            let Some(resource_slot) = self.residents.available_slot() else {
+                return command_application_error(stderr, command, "resident process table full");
+            };
+            if self.residents.jobs.len() >= RESIDENT_PROCESS_CAPACITY {
+                return command_application_error(
+                    stderr,
+                    command,
+                    "reap a completed job before starting another",
+                );
+            }
+            let service_count = 4
+                + usize::from(requirements.datagram)
+                + usize::from(requirements.filesystem)
+                + usize::from(requirements.filesystem_mutation)
+                + usize::from(requirements.timer)
+                + usize::from(requirements.diagnostics)
+                + usize::from(requirements.network_observation)
+                + usize::from(requirements.network_configuration)
+                + usize::from(requirements.icmp_echo)
+                + usize::from(requirements.tcp_connect)
+                + usize::from(requirements.volume_control)
+                + usize::from(requirements.wall_clock)
+                + usize::from(requirements.clock_control);
+            let Some(handle_capacity) = service_count.checked_mul(2) else {
+                return command_application_error(stderr, command, "service resources exhausted");
+            };
+            let Ok(mut dispatcher): Result<Dispatcher<'static>, _> =
+                Dispatcher::new(service_count, handle_capacity)
+            else {
+                return command_application_error(stderr, command, "service resources exhausted");
+            };
+            let Ok(log) = BoundedLog::new(RESIDENT_PROCESS_LOG_BYTES) else {
+                return command_application_error(stderr, command, "log allocation failed");
+            };
+            let log = Rc::new(RefCell::new(log));
+            let application_network = self.runtime.borrow().network.clone();
+            let application_transport_network = if requirements.datagram || requirements.tcp_connect
+            {
+                let Some(network) = application_network.clone() else {
+                    return command_application_error(
+                        stderr,
+                        command,
+                        "required capability unavailable",
+                    );
+                };
+                Some(network)
+            } else {
+                None
+            };
+            let filesystem_namespace = if requirements.filesystem
+                || requirements.filesystem_mutation
+                || requirements.volume_control
+            {
+                Some(Rc::clone(namespace))
+            } else {
+                None
+            };
+            let datagram_state = if requirements.datagram {
+                let Some(network) = application_transport_network.clone() else {
+                    return command_application_error(
+                        stderr,
+                        command,
+                        "required capability unavailable",
+                    );
+                };
+                Some(Rc::new(RefCell::new(ApplicationDatagramState::new(
+                    network,
+                ))))
+            } else {
+                None
+            };
+
+            let services = (|| -> Result<Vec<CommandStartupService>, ()> {
+                let mut services = Vec::new();
+                services.try_reserve_exact(service_count).map_err(|_| ())?;
+                services.push(CommandStartupService {
+                    port: register_command_service(
+                        &mut dispatcher,
+                        CommandInvocationService::new(cwd, words).map_err(|_| ())?,
+                    )?,
+                    interface: troe_abi::interface::COMMAND,
+                    major: command::MAJOR,
+                    minor: command::MINOR,
+                });
+                services.push(CommandStartupService {
+                    port: register_command_service(&mut dispatcher, ApplicationEmptyInputService)?,
+                    interface: troe_abi::interface::STANDARD_INPUT,
+                    major: stream::MAJOR,
+                    minor: stream::MINOR,
+                });
+                for interface in [
+                    troe_abi::interface::STANDARD_OUTPUT,
+                    troe_abi::interface::STANDARD_ERROR,
+                ] {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationLogService {
+                                log: Rc::clone(&log),
+                            },
+                        )?,
+                        interface,
+                        major: stream::MAJOR,
+                        minor: stream::MINOR,
+                    });
+                }
+                if requirements.datagram {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationDatagramService::new(
+                                datagram_state.as_ref().ok_or(())?.clone(),
+                                self.runtime.clone(),
+                            ),
+                        )?,
+                        interface: troe_abi::interface::DATAGRAM,
+                        major: datagram::MAJOR,
+                        minor: datagram::MINOR,
+                    });
+                }
+                if requirements.filesystem {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationFilesystemService::new(
+                                filesystem_namespace.as_ref().ok_or(())?.clone(),
+                                cwd,
+                            )?,
+                        )?,
+                        interface: troe_abi::interface::FILESYSTEM_READ,
+                        major: filesystem::MAJOR,
+                        minor: filesystem::MINOR,
+                    });
+                }
+                if requirements.filesystem_mutation {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationFilesystemMutationService::new(
+                                filesystem_namespace.as_ref().ok_or(())?.clone(),
+                                cwd,
+                            )?,
+                        )?,
+                        interface: troe_abi::interface::FILESYSTEM_MUTATE,
+                        major: filesystem_mutation::MAJOR,
+                        minor: filesystem_mutation::MINOR,
+                    });
+                }
+                if requirements.timer {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationTimerService {
+                                runtime: self.runtime.clone(),
+                            },
+                        )?,
+                        interface: troe_abi::interface::TIMER,
+                        major: timer::MAJOR,
+                        minor: timer::MINOR,
+                    });
+                }
+                if requirements.diagnostics {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationDiagnosticsSnapshotService {
+                                snapshot: diagnostics_snapshot.cloned().ok_or(())?,
+                            },
+                        )?,
+                        interface: troe_abi::interface::DIAGNOSTICS,
+                        major: diagnostics::MAJOR,
+                        minor: diagnostics::MINOR,
+                    });
+                }
+                if requirements.network_observation {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationNetworkObservationService {
+                                network: application_network.clone(),
+                            },
+                        )?,
+                        interface: troe_abi::interface::NETWORK_OBSERVE,
+                        major: network_observation::MAJOR,
+                        minor: network_observation::MINOR,
+                    });
+                }
+                if requirements.network_configuration {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationNetworkConfigurationService {
+                                network: application_network.clone(),
+                                runtime: self.runtime.clone(),
+                            },
+                        )?,
+                        interface: troe_abi::interface::NETWORK_CONFIGURE,
+                        major: network_configuration::MAJOR,
+                        minor: network_configuration::MINOR,
+                    });
+                }
+                if requirements.icmp_echo {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationIcmpEchoService {
+                                network: application_network.clone(),
+                                runtime: self.runtime.clone(),
+                            },
+                        )?,
+                        interface: troe_abi::interface::ICMP_ECHO,
+                        major: icmp_echo::MAJOR,
+                        minor: icmp_echo::MINOR,
+                    });
+                }
+                if requirements.tcp_connect {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationTcpConnectService::new(
+                                application_transport_network.as_ref().ok_or(())?.clone(),
+                                self.runtime.clone(),
+                            ),
+                        )?,
+                        interface: troe_abi::interface::TCP_CONNECT,
+                        major: tcp_connect::MAJOR,
+                        minor: tcp_connect::MINOR,
+                    });
+                }
+                if requirements.volume_control {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationVolumeControlService {
+                                namespace: filesystem_namespace.as_ref().ok_or(())?.clone(),
+                                mounts: self.accounting.runtime_mounts.clone(),
+                            },
+                        )?,
+                        interface: troe_abi::interface::VOLUME_CONTROL,
+                        major: volume_control::MAJOR,
+                        minor: volume_control::MINOR,
+                    });
+                }
+                if requirements.wall_clock {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationWallClockService {
+                                runtime: self.runtime.clone(),
+                            },
+                        )?,
+                        interface: troe_abi::interface::WALL_CLOCK,
+                        major: wall_clock::MAJOR,
+                        minor: wall_clock::MINOR,
+                    });
+                }
+                if requirements.clock_control {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationClockControlService {
+                                runtime: self.runtime.clone(),
+                            },
+                        )?,
+                        interface: troe_abi::interface::CLOCK_CONTROL,
+                        major: clock_control::MAJOR,
+                        minor: clock_control::MINOR,
+                    });
+                }
+                Ok(services)
+            })();
+            let Ok(services) = services else {
+                return command_application_error(stderr, command, "service setup failed");
+            };
+            let process = prepare_resident_application(
+                self.scheduler,
+                self.accounting,
+                dispatcher,
+                &services,
+                executable,
+                resource_slot,
+            );
+            let Ok(mut process) = process else {
+                return command_application_error(stderr, command, "application rejected");
+            };
+            let deferred =
+                (requirements.timer || requirements.datagram).then(|| CommandDeferredServices {
+                    runtime: self.runtime.clone(),
+                    datagram: datagram_state,
+                    diagnostics: None,
+                });
+            if process.install_deferred_services(deferred).is_err() {
+                let _cleaned = process.teardown(
+                    self.scheduler,
+                    self.accounting,
+                    CommandApplicationOutcome::Exited(troe_abi::exit::CANCELLED),
+                    true,
+                );
+                return command_application_error(stderr, command, "wait metadata exhausted");
+            }
+            let invocation = words.join(" ");
+            match self
+                .residents
+                .admit(invocation, self.resident_owner, log, Box::new(process))
+            {
+                Ok(job_id) => {
+                    let report = alloc::format!("[{job_id}] started {command}\n");
+                    if troe_core::write_all(stdout, report.as_bytes()).is_err() {
+                        CommandStatus::Failure
+                    } else {
+                        CommandStatus::Success
+                    }
+                }
+                Err(process) => {
+                    let _cleaned = (*process).teardown(
+                        self.scheduler,
+                        self.accounting,
+                        CommandApplicationOutcome::Exited(troe_abi::exit::CANCELLED),
+                        true,
+                    );
+                    command_application_error(stderr, command, "resident admission failed")
+                }
+            }
+        }
+    }
+
+    impl ServiceRuntime {
+        fn new(config: SystemConfig, recovery: bool) -> Result<Self, ()> {
+            let supervisor = Supervisor::from_config(&config, recovery).map_err(|_| ())?;
+            Ok(Self { config, supervisor })
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn drive(
+            &mut self,
+            shell: &mut Shell,
+            residents: &mut ResidentProcessTable,
+            scheduler: &mut Scheduler,
+            accounting: &mut OwnedAccounting,
+            shell_id: TaskId,
+            shell_capabilities: Capabilities,
+            runtime: &SharedRuntime,
+        ) -> Result<(), ()> {
+            let now = runtime.borrow().now();
+            for service in self.config.services() {
+                let Some((process, outcome, log)) = residents.take_service_terminal(service.id())
+                else {
+                    continue;
+                };
+                let mut bytes = Vec::new();
+                bytes
+                    .try_reserve_exact(RESIDENT_PROCESS_LOG_BYTES)
+                    .map_err(|_| ())?;
+                bytes.resize(RESIDENT_PROCESS_LOG_BYTES, 0);
+                let count = log.try_borrow().map_err(|_| ())?.copy_recent(&mut bytes);
+                self.supervisor
+                    .append_log(service.id(), &bytes[..count])
+                    .map_err(|_| ())?;
+                let state = self
+                    .supervisor
+                    .snapshot(service.id())
+                    .map_err(|_| ())?
+                    .state;
+                if matches!(state, ServiceState::Stopping { .. }) {
+                    self.supervisor
+                        .stopped(service.id(), process, now)
+                        .map_err(|_| ())?;
+                } else {
+                    let status = match outcome {
+                        CommandApplicationOutcome::Exited(status) => Some(status),
+                        CommandApplicationOutcome::Faulted(_) => None,
+                    };
+                    self.supervisor
+                        .exited(service.id(), process, status, now)
+                        .map_err(|_| ())?;
+                }
+            }
+
+            for _ in 0..=self.config.services().len() {
+                let Some(action) = self.supervisor.next_action(now) else {
+                    break;
+                };
+                match action {
+                    SupervisorAction::Launch { service_id } => {
+                        let service = self
+                            .config
+                            .services()
+                            .iter()
+                            .find(|service| service.id() == service_id)
+                            .ok_or(())?;
+                        let expected_path = alloc::format!("/bin/{}.kex", service.name());
+                        if service.artifact_path() != expected_path {
+                            self.supervisor
+                                .launch_failed(service_id, now)
+                                .map_err(|_| ())?;
+                            continue;
+                        }
+                        let line = alloc::format!("{} &", service.name());
+                        let mut input = EmptyInput;
+                        let mut output = DiscardOutput;
+                        let mut error = DiscardOutput;
+                        let mut runner = KexCommandRunner {
+                            accounting,
+                            scheduler,
+                            residents,
+                            resident_owner: ResidentOwner::Service(service_id),
+                            service_initial_handles: Some(service.initial_handles()),
+                            service_capability_bits: Some(service.capability_bits()),
+                            service_runtime: None,
+                            shell_id,
+                            shell_capabilities,
+                            runtime: runtime.clone(),
+                            pending_script_lines: None,
+                        };
+                        let status = shell.execute_with_external(
+                            &line,
+                            &mut input,
+                            &mut output,
+                            &mut error,
+                            &mut runner,
+                        );
+                        drop(runner);
+                        if status != CommandStatus::Success {
+                            self.supervisor
+                                .launch_failed(service_id, now)
+                                .map_err(|_| ())?;
+                            continue;
+                        }
+                        let process = residents.service_task(service_id).ok_or(())?;
+                        self.supervisor
+                            .launched(service_id, process, now)
+                            .map_err(|_| ())?;
+                        // SCFG v1's first resident implementation defines
+                        // readiness as successful admission into the event loop.
+                        // A typed readiness notification can tighten this
+                        // boundary without changing the supervisor state model.
+                        self.supervisor.ready(service_id, process).map_err(|_| ())?;
+                    }
+                    SupervisorAction::RequestStop { service_id, .. }
+                    | SupervisorAction::ForceStop { service_id, .. } => {
+                        residents.request_service_cancel(service_id)?;
+                    }
+                    SupervisorAction::ActivatePreviousGeneration { .. }
+                    | SupervisorAction::EnterRecovery { .. } => return Err(()),
+                }
+            }
+            Ok(())
+        }
+    }
+
     impl ExternalCommand for KexCommandRunner<'_> {
         #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
         fn execute(
@@ -7564,6 +9375,7 @@ mod firmware {
             words: &[String],
             cwd: &str,
             namespace: &SharedNamespace,
+            placement: ExecutionPlacement,
             stdin: &mut dyn Input,
             stdout: &mut dyn Output,
             stderr: &mut dyn Output,
@@ -7616,6 +9428,8 @@ mod firmware {
             let mut tcp_connect_required = false;
             let mut volume_control_required = false;
             let mut shell_script_required = false;
+            let mut wall_clock_required = false;
+            let mut clock_control_required = false;
             for requirement in capability_manifest.iter() {
                 if requirement.interface == troe_abi::interface::DATAGRAM
                     && requirement.major == datagram::MAJOR
@@ -7672,6 +9486,16 @@ mod firmware {
                     && requirement.minor == shell_script::MINOR
                 {
                     shell_script_required = true;
+                } else if requirement.interface == troe_abi::interface::WALL_CLOCK
+                    && requirement.major == wall_clock::MAJOR
+                    && requirement.minor == wall_clock::MINOR
+                {
+                    wall_clock_required = true;
+                } else if requirement.interface == troe_abi::interface::CLOCK_CONTROL
+                    && requirement.major == clock_control::MAJOR
+                    && requirement.minor == clock_control::MINOR
+                {
+                    clock_control_required = true;
                 } else {
                     return Some(command_application_error(
                         stderr,
@@ -7679,6 +9503,49 @@ mod firmware {
                         "unsupported capability requirement",
                     ));
                 }
+            }
+            let mut service_capability_bits = 0;
+            if datagram_required {
+                service_capability_bits |= troe_config::SERVICE_CAPABILITY_DATAGRAM;
+            }
+            if timer_required {
+                service_capability_bits |= troe_config::SERVICE_CAPABILITY_TIMER;
+            }
+            if clock_control_required {
+                service_capability_bits |= troe_config::SERVICE_CAPABILITY_CLOCK_CONTROL;
+            }
+            if wall_clock_required {
+                service_capability_bits |= troe_config::SERVICE_CAPABILITY_WALL_CLOCK;
+            }
+            if let (Some(initial_handles), Some(authorized)) =
+                (self.service_initial_handles, self.service_capability_bits)
+            {
+                let requested_handles = 4_usize.saturating_add(capability_manifest.len());
+                let unsupported_service_authority = filesystem_required
+                    || filesystem_mutation_required
+                    || diagnostics_required
+                    || network_observation_required
+                    || network_configuration_required
+                    || icmp_echo_required
+                    || tcp_connect_required
+                    || volume_control_required
+                    || shell_script_required;
+                if unsupported_service_authority
+                    || service_capability_bits & !authorized != 0
+                    || requested_handles > usize::from(initial_handles)
+                {
+                    return Some(command_application_error(
+                        stderr,
+                        command,
+                        "SCFG launch authority denied",
+                    ));
+                }
+            } else if clock_control_required {
+                return Some(command_application_error(
+                    stderr,
+                    command,
+                    "clock-control authority is service-only",
+                ));
             }
             let machine_memory = machine_snapshot(self.accounting);
             let machine_input = troe_machine::input_interrupt_stats();
@@ -7718,6 +9585,39 @@ mod firmware {
                     "memory report refresh failed",
                 ));
             }
+            if placement == ExecutionPlacement::Background {
+                if shell_script_required {
+                    return Some(command_application_error(
+                        stderr,
+                        command,
+                        "interpreter applications require the foreground session",
+                    ));
+                }
+                return Some(self.launch_background(
+                    command,
+                    words,
+                    cwd,
+                    namespace,
+                    package.executable(),
+                    BackgroundRequirements {
+                        datagram: datagram_required,
+                        filesystem: filesystem_required,
+                        filesystem_mutation: filesystem_mutation_required,
+                        timer: timer_required,
+                        diagnostics: diagnostics_required,
+                        network_observation: network_observation_required,
+                        network_configuration: network_configuration_required,
+                        icmp_echo: icmp_echo_required,
+                        tcp_connect: tcp_connect_required,
+                        volume_control: volume_control_required,
+                        wall_clock: wall_clock_required,
+                        clock_control: clock_control_required,
+                    },
+                    diagnostics_snapshot.as_ref(),
+                    stdout,
+                    stderr,
+                ));
+            }
             let application_network = self.runtime.borrow().network.clone();
             let application_transport_network = if datagram_required || tcp_connect_required {
                 let Some(network) = application_network.clone() else {
@@ -7742,7 +9642,9 @@ mod firmware {
                 + usize::from(icmp_echo_required)
                 + usize::from(tcp_connect_required)
                 + usize::from(volume_control_required)
-                + usize::from(shell_script_required);
+                + usize::from(shell_script_required)
+                + usize::from(wall_clock_required)
+                + usize::from(clock_control_required);
             let Some(handle_capacity) = service_count.checked_mul(2) else {
                 return Some(command_application_error(
                     stderr,
@@ -7964,6 +9866,32 @@ mod firmware {
                         minor: shell_script::MINOR,
                     });
                 }
+                if wall_clock_required {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationWallClockService {
+                                runtime: self.runtime.clone(),
+                            },
+                        )?,
+                        interface: troe_abi::interface::WALL_CLOCK,
+                        major: wall_clock::MAJOR,
+                        minor: wall_clock::MINOR,
+                    });
+                }
+                if clock_control_required {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationClockControlService {
+                                runtime: self.runtime.clone(),
+                            },
+                        )?,
+                        interface: troe_abi::interface::CLOCK_CONTROL,
+                        major: clock_control::MAJOR,
+                        minor: clock_control::MINOR,
+                    });
+                }
                 Ok(services)
             })();
             let Ok(services) = services else {
@@ -7984,36 +9912,36 @@ mod firmware {
                 return Some(status);
             };
 
-            if self.scheduler.yield_current(self.shell_id).is_err() {
-                fatal(b"fatal: shell scheduler yield failed\n");
-            }
-            let deferred_services = (timer_required || datagram_required || diagnostics_required)
-                .then(|| CommandDeferredServices {
-                    runtime: self.runtime.clone(),
-                    datagram: application_datagram_state,
-                    diagnostics: diagnostics_snapshot,
-                });
-            let outcome = run_command_application(
+            let process = prepare_resident_application(
                 self.scheduler,
                 self.accounting,
-                &mut dispatcher,
-                services.as_slice(),
-                deferred_services.as_ref(),
+                dispatcher,
+                &services,
                 package.executable(),
                 0,
-                APPLICATION_COMMAND_SERVICE_CALL_LIMIT,
             );
-            if self
-                .scheduler
-                .dispatch_next(self.shell_capabilities)
-                .ok()
-                .flatten()
-                != Some(self.shell_id)
-            {
-                fatal(b"fatal: shell scheduler restore failed\n");
-            }
-
-            drop(dispatcher);
+            let outcome = match process {
+                Ok(mut process) => {
+                    let deferred = (timer_required || datagram_required || diagnostics_required)
+                        .then(|| CommandDeferredServices {
+                            runtime: self.runtime.clone(),
+                            datagram: application_datagram_state,
+                            diagnostics: diagnostics_snapshot,
+                        });
+                    if process.install_deferred_services(deferred).is_err() {
+                        let _cleaned = process.teardown(
+                            self.scheduler,
+                            self.accounting,
+                            CommandApplicationOutcome::Exited(troe_abi::exit::CANCELLED),
+                            true,
+                        );
+                        Err(())
+                    } else {
+                        self.run_foreground_process(process)
+                    }
+                }
+                Err(()) => Err(()),
+            };
             let mut status = match outcome {
                 Ok(CommandApplicationOutcome::Exited(status)) => command_status(status),
                 Ok(CommandApplicationOutcome::Faulted(fault)) => {
@@ -8024,9 +9952,6 @@ mod firmware {
                         TaskFault::InvalidCall => "application faulted: invalid call",
                         TaskFault::ExecutionLeaseExpired => {
                             "application faulted: execution lease expired"
-                        }
-                        TaskFault::CommandRuntimeExpired => {
-                            "application faulted: command runtime expired"
                         }
                         TaskFault::ServiceCallLimitExceeded => {
                             "application faulted: service call limit exceeded"
@@ -8079,6 +10004,306 @@ mod firmware {
 
         fn take_script_lines(&mut self) -> Option<Vec<String>> {
             self.pending_script_lines.take()
+        }
+
+        fn control_job(
+            &mut self,
+            request: JobControl,
+            stdout: &mut dyn Output,
+            stderr: &mut dyn Output,
+        ) -> Option<CommandStatus> {
+            let status = match request {
+                JobControl::List => {
+                    for job in self
+                        .residents
+                        .jobs
+                        .iter()
+                        .filter(|job| job.owner == ResidentOwner::Session)
+                    {
+                        let state = if job.outcome.is_some() {
+                            "done"
+                        } else if job.cancel_requested {
+                            "stopping"
+                        } else if job.process.as_ref().is_some_and(|process| {
+                            matches!(process.execution, Some(ResidentExecution::Blocked))
+                        }) {
+                            "blocked"
+                        } else {
+                            "running"
+                        };
+                        let line = alloc::format!("[{}] {state} {}\n", job.id, job.command);
+                        if write_all(stdout, line.as_bytes()).is_err() {
+                            return Some(CommandStatus::Failure);
+                        }
+                    }
+                    CommandStatus::Success
+                }
+                JobControl::Log(job_id) => self.copy_job_log(job_id, stdout, stderr),
+                JobControl::Cancel(job_id) => {
+                    if self.residents.request_cancel(job_id).is_err() {
+                        command_application_error(stderr, "kill", "unknown job")
+                    } else if self
+                        .residents
+                        .pump(
+                            self.scheduler,
+                            self.accounting,
+                            self.shell_id,
+                            self.shell_capabilities,
+                        )
+                        .is_err()
+                    {
+                        fatal(b"fatal: resident cancellation failed\n");
+                    } else {
+                        CommandStatus::Success
+                    }
+                }
+                JobControl::Wait(job_id) | JobControl::Foreground(job_id) => {
+                    let foreground = matches!(request, JobControl::Foreground(_));
+                    let terminal = self.residents.is_terminal(job_id);
+                    if terminal.is_err() {
+                        return Some(command_application_error(
+                            stderr,
+                            if foreground { "fg" } else { "wait" },
+                            "unknown job",
+                        ));
+                    }
+                    while self.residents.is_terminal(job_id) == Ok(false) {
+                        if self.runtime.borrow_mut().checkpoint().is_err() {
+                            let _requested = self.residents.request_cancel(job_id);
+                        }
+                        if self
+                            .residents
+                            .pump(
+                                self.scheduler,
+                                self.accounting,
+                                self.shell_id,
+                                self.shell_capabilities,
+                            )
+                            .is_err()
+                        {
+                            fatal(b"fatal: resident wait failed\n");
+                        }
+                        let _event = troe_machine::wait_for_runtime_event_timeout(
+                            RESIDENT_POLL_MILLISECONDS,
+                        );
+                    }
+                    if foreground {
+                        let _status = self.copy_job_log(job_id, stdout, stderr);
+                    }
+                    match self.residents.remove_terminal(job_id) {
+                        Ok(CommandApplicationOutcome::Exited(exit_status)) => {
+                            command_status(exit_status)
+                        }
+                        Ok(CommandApplicationOutcome::Faulted(_)) => CommandStatus::Failure,
+                        Err(()) => command_application_error(
+                            stderr,
+                            if foreground { "fg" } else { "wait" },
+                            "job did not become terminal",
+                        ),
+                    }
+                }
+            };
+            Some(status)
+        }
+
+        #[allow(clippy::too_many_lines)]
+        fn control_service(
+            &mut self,
+            request: ServiceControl,
+            stdout: &mut dyn Output,
+            stderr: &mut dyn Output,
+        ) -> Option<CommandStatus> {
+            let Some(runtime) = self.service_runtime.as_mut() else {
+                return Some(command_application_error(
+                    stderr,
+                    "svc",
+                    "service supervisor unavailable",
+                ));
+            };
+            let status = match request {
+                ServiceControl::List => {
+                    for service in runtime.config.services() {
+                        let Ok(snapshot) = runtime.supervisor.snapshot(service.id()) else {
+                            return Some(command_application_error(
+                                stderr,
+                                "svc",
+                                "service state unavailable",
+                            ));
+                        };
+                        let line = alloc::format!(
+                            "{} {}\n",
+                            service.name(),
+                            service_state_label(snapshot.state)
+                        );
+                        if write_all(stdout, line.as_bytes()).is_err() {
+                            return Some(CommandStatus::Failure);
+                        }
+                    }
+                    CommandStatus::Success
+                }
+                ServiceControl::Status(name) => {
+                    let Some(service_id) = service_id_by_name(&runtime.config, &name) else {
+                        return Some(command_application_error(stderr, "svc", "unknown service"));
+                    };
+                    let Ok(snapshot) = runtime.supervisor.snapshot(service_id) else {
+                        return Some(command_application_error(
+                            stderr,
+                            "svc",
+                            "service state unavailable",
+                        ));
+                    };
+                    let line = alloc::format!(
+                        "{name} {} restarts={} log-bytes={} dropped={}\n",
+                        service_state_label(snapshot.state),
+                        snapshot.restarts,
+                        snapshot.log_bytes,
+                        snapshot.dropped_log_bytes
+                    );
+                    if write_all(stdout, line.as_bytes()).is_err() {
+                        CommandStatus::Failure
+                    } else {
+                        CommandStatus::Success
+                    }
+                }
+                ServiceControl::Start(name) => {
+                    let Some(service_id) = service_id_by_name(&runtime.config, &name) else {
+                        return Some(command_application_error(stderr, "svc", "unknown service"));
+                    };
+                    if runtime.supervisor.request_start(service_id).is_err() {
+                        command_application_error(stderr, "svc", "request rejected")
+                    } else {
+                        let line = alloc::format!("{name}: requested\n");
+                        if write_all(stdout, line.as_bytes()).is_err() {
+                            CommandStatus::Failure
+                        } else {
+                            CommandStatus::Success
+                        }
+                    }
+                }
+                ServiceControl::Stop(name) => {
+                    let Some(service_id) = service_id_by_name(&runtime.config, &name) else {
+                        return Some(command_application_error(stderr, "svc", "unknown service"));
+                    };
+                    if runtime.supervisor.request_stop(service_id).is_err() {
+                        command_application_error(stderr, "svc", "request rejected")
+                    } else {
+                        let line = alloc::format!("{name}: requested\n");
+                        if write_all(stdout, line.as_bytes()).is_err() {
+                            CommandStatus::Failure
+                        } else {
+                            CommandStatus::Success
+                        }
+                    }
+                }
+                ServiceControl::Restart(name) => {
+                    let Some(service_id) = service_id_by_name(&runtime.config, &name) else {
+                        return Some(command_application_error(stderr, "svc", "unknown service"));
+                    };
+                    if runtime.supervisor.request_restart(service_id).is_err() {
+                        command_application_error(stderr, "svc", "request rejected")
+                    } else {
+                        let line = alloc::format!("{name}: requested\n");
+                        if write_all(stdout, line.as_bytes()).is_err() {
+                            CommandStatus::Failure
+                        } else {
+                            CommandStatus::Success
+                        }
+                    }
+                }
+                ServiceControl::Log(name) => {
+                    let Some(service_id) = service_id_by_name(&runtime.config, &name) else {
+                        return Some(command_application_error(stderr, "svc", "unknown service"));
+                    };
+                    copy_service_output(self.residents, service_id, &name, runtime, stdout, stderr)
+                }
+            };
+            Some(status)
+        }
+    }
+
+    impl KexCommandRunner<'_> {
+        fn copy_job_log(
+            &self,
+            job_id: u32,
+            stdout: &mut dyn Output,
+            stderr: &mut dyn Output,
+        ) -> CommandStatus {
+            let mut bytes = Vec::new();
+            if bytes.try_reserve_exact(RESIDENT_PROCESS_LOG_BYTES).is_err() {
+                return command_application_error(stderr, "log", "buffer allocation failed");
+            }
+            bytes.resize(RESIDENT_PROCESS_LOG_BYTES, 0);
+            let Ok((count, dropped)) = self.residents.copy_log(job_id, &mut bytes) else {
+                return command_application_error(stderr, "log", "unknown job");
+            };
+            if dropped != 0 {
+                let notice = alloc::format!("[log: {dropped} earlier bytes discarded]\n");
+                if write_all(stdout, notice.as_bytes()).is_err() {
+                    return CommandStatus::Failure;
+                }
+            }
+            if write_all(stdout, &bytes[..count]).is_err() {
+                CommandStatus::Failure
+            } else {
+                CommandStatus::Success
+            }
+        }
+    }
+
+    fn copy_service_output(
+        residents: &ResidentProcessTable,
+        service_id: u32,
+        name: &str,
+        runtime: &ServiceRuntime,
+        stdout: &mut dyn Output,
+        stderr: &mut dyn Output,
+    ) -> CommandStatus {
+        let mut bytes = Vec::new();
+        if bytes.try_reserve_exact(RESIDENT_PROCESS_LOG_BYTES).is_err() {
+            return command_application_error(stderr, "svc", "buffer allocation failed");
+        }
+        bytes.resize(RESIDENT_PROCESS_LOG_BYTES, 0);
+        let (count, dropped) = if let Some(log) = residents.copy_service_log(service_id, &mut bytes)
+        {
+            log
+        } else {
+            let Ok(count) = runtime.supervisor.copy_log(service_id, &mut bytes) else {
+                return command_application_error(stderr, "svc", "service log unavailable");
+            };
+            let Ok(snapshot) = runtime.supervisor.snapshot(service_id) else {
+                return command_application_error(stderr, "svc", "service state unavailable");
+            };
+            (count, snapshot.dropped_log_bytes)
+        };
+        if dropped != 0 {
+            let notice = alloc::format!("[{name}: {dropped} earlier bytes discarded]\n");
+            if write_all(stdout, notice.as_bytes()).is_err() {
+                return CommandStatus::Failure;
+            }
+        }
+        if write_all(stdout, &bytes[..count]).is_err() {
+            CommandStatus::Failure
+        } else {
+            CommandStatus::Success
+        }
+    }
+
+    fn service_id_by_name(config: &SystemConfig, name: &str) -> Option<u32> {
+        config
+            .services()
+            .iter()
+            .find(|service| service.name() == name)
+            .map(troe_config::ServiceConfig::id)
+    }
+
+    const fn service_state_label(state: ServiceState) -> &'static str {
+        match state {
+            ServiceState::Stopped => "stopped",
+            ServiceState::Starting { .. } => "starting",
+            ServiceState::Ready { .. } => "ready",
+            ServiceState::Backoff { .. } => "backoff",
+            ServiceState::Stopping { .. } => "stopping",
+            ServiceState::Failed { .. } => "failed",
         }
     }
 
@@ -8159,7 +10384,12 @@ mod firmware {
         else {
             fatal(b"fatal: cannot compose namespace\n");
         };
-        let runtime = finish_shell_startup(&mut console, &motd, root_mode);
+        let runtime = finish_shell_startup(
+            &mut console,
+            &motd,
+            root_mode,
+            task.accounting.firmware_wall_seconds,
+        );
         let editor_config = EditorConfig::standard();
         if editor_config.max_line_bytes() > MAX_LINE_BYTES {
             fatal(b"fatal: editor line policy exceeds shell parser policy\n");
@@ -8168,6 +10398,38 @@ mod firmware {
         let mut decoder = InputDecoder::new(editor_config.input());
         let mut keyboard = Ps2Set1Decoder::new(KeyboardConfig::standard());
         let mut editor = LineEditor::new(editor_config);
+        let mut residents = ResidentProcessTable::new()
+            .unwrap_or_else(|()| fatal(b"fatal: cannot allocate resident process table\n"));
+        let mut services = task
+            .accounting
+            .selected_config
+            .take()
+            .map(|config| {
+                ServiceRuntime::new(config, matches!(root_mode, NativeRootMode::Recovery))
+            })
+            .transpose()
+            .unwrap_or_else(|()| fatal(b"fatal: cannot initialize service supervisor\n"));
+        if let Some(services) = services.as_mut() {
+            services
+                .drive(
+                    &mut shell,
+                    &mut residents,
+                    task.scheduler,
+                    task.accounting,
+                    task.task_id,
+                    task.capabilities,
+                    &runtime,
+                )
+                .unwrap_or_else(|()| fatal(b"fatal: service activation failed\n"));
+        }
+        residents
+            .pump(
+                task.scheduler,
+                task.accounting,
+                task.task_id,
+                task.capabilities,
+            )
+            .unwrap_or_else(|()| fatal(b"fatal: initial service process pump failed\n"));
 
         loop {
             let prompt = shell_prompt(&shell);
@@ -8180,6 +10442,12 @@ mod firmware {
                 &mut keyboard,
                 &mut shell,
                 &runtime,
+                &mut residents,
+                &mut services,
+                task.scheduler,
+                task.accounting,
+                task.task_id,
+                task.capabilities,
                 completion_config,
                 &prompt,
                 &mut console,
@@ -8227,6 +10495,11 @@ mod firmware {
             let mut external = KexCommandRunner {
                 accounting: task.accounting,
                 scheduler: task.scheduler,
+                residents: &mut residents,
+                resident_owner: ResidentOwner::Session,
+                service_initial_handles: None,
+                service_capability_bits: None,
+                service_runtime: services.as_mut(),
                 shell_id: task.task_id,
                 shell_capabilities: task.capabilities,
                 runtime: runtime.clone(),
@@ -8247,6 +10520,28 @@ mod firmware {
                 &mut error,
                 &mut external,
             );
+            drop(external);
+            residents
+                .pump(
+                    task.scheduler,
+                    task.accounting,
+                    task.task_id,
+                    task.capabilities,
+                )
+                .unwrap_or_else(|()| fatal(b"fatal: resident process pump failed\n"));
+            if let Some(services) = services.as_mut() {
+                services
+                    .drive(
+                        &mut shell,
+                        &mut residents,
+                        task.scheduler,
+                        task.accounting,
+                        task.task_id,
+                        task.capabilities,
+                        &runtime,
+                    )
+                    .unwrap_or_else(|()| fatal(b"fatal: service supervision failed\n"));
+            }
             #[cfg(feature = "acceptance-probes")]
             if diagnostics_fault_probe {
                 if DIAGNOSTICS_FAULT_PROBE_REQUESTED.load(Ordering::Acquire)
@@ -8289,6 +10584,12 @@ mod firmware {
         keyboard: &mut Ps2Set1Decoder,
         shell: &mut Shell,
         runtime: &SharedRuntime,
+        residents: &mut ResidentProcessTable,
+        services: &mut Option<ServiceRuntime>,
+        scheduler: &mut Scheduler,
+        accounting: &mut OwnedAccounting,
+        shell_id: TaskId,
+        shell_capabilities: Capabilities,
         completion_config: CompletionConfig,
         prompt: &str,
         console: &mut dyn Output,
@@ -8296,9 +10597,23 @@ mod firmware {
         loop {
             let key = loop {
                 let event = loop {
-                    if let Some(event) = runtime.borrow_mut().next_input_event() {
+                    if let Some(event) = runtime.borrow_mut().poll_input_event() {
                         break event;
                     }
+                    residents.pump(scheduler, accounting, shell_id, shell_capabilities)?;
+                    if let Some(services) = services.as_mut() {
+                        services.drive(
+                            shell,
+                            residents,
+                            scheduler,
+                            accounting,
+                            shell_id,
+                            shell_capabilities,
+                            runtime,
+                        )?;
+                    }
+                    let _event =
+                        troe_machine::wait_for_runtime_event_timeout(RESIDENT_POLL_MILLISECONDS);
                 };
                 let key = match event.source() {
                     InputSource::Serial => decoder.push(event.byte()),

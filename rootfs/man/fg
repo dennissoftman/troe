@@ -1,0 +1,10 @@
+NAME
+    fg - wait for a background job and copy its retained output
+
+SYNOPSIS
+    fg JOB
+
+DESCRIPTION
+    Attaches to one session-owned job until it exits, is cancelled, or faults.
+    The job's bounded recent output is copied before its terminal record is
+    reaped. JOB is the number printed when the command was started with &.

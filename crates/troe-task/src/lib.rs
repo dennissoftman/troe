@@ -213,9 +213,10 @@ pub enum TaskFault {
     InvalidCall,
     /// The native machine boundary reported an unrecoverable execution lease.
     ExecutionLeaseExpired,
-    /// The command exceeded its monotonic wall-clock runtime deadline.
-    CommandRuntimeExpired,
     /// The command exceeded its bounded application service-call count.
+    ///
+    /// This is reserved for explicitly bounded internal IPC probes. Ordinary
+    /// applications have no cumulative lifetime service-call ceiling.
     ServiceCallLimitExceeded,
 }
 
@@ -652,6 +653,40 @@ impl Scheduler {
             return Ok(Some(snapshot.id));
         }
         Ok(None)
+    }
+
+    /// Select one exact ready task after checking its required authority.
+    ///
+    /// Composition code uses exact dispatch when it already owns the native
+    /// continuation associated with `id`. This preserves the scheduler's
+    /// single-running-task invariant without requiring continuations to live
+    /// inside scheduler records.
+    ///
+    /// # Errors
+    ///
+    /// Rejects dispatch while another task is running, an unknown identity, a
+    /// task that is not ready, insufficient capability, or counter overflow.
+    pub fn dispatch(&mut self, id: TaskId, required: Capabilities) -> Result<TaskId, TaskError> {
+        if self.current.is_some() {
+            return Err(TaskError::TaskAlreadyRunning);
+        }
+        let index = self
+            .records
+            .iter()
+            .position(|record| record.snapshot.id == id)
+            .ok_or(TaskError::UnknownTask)?;
+        let snapshot = &mut self.records[index].snapshot;
+        if snapshot.state != TaskState::Ready || !snapshot.capabilities.contains(required) {
+            return Err(TaskError::InvalidState);
+        }
+        snapshot.dispatches = snapshot
+            .dispatches
+            .checked_add(1)
+            .ok_or(TaskError::AccountingOverflow)?;
+        snapshot.state = TaskState::Running;
+        self.current = Some(id);
+        self.cursor = (index + 1) % self.records.len();
+        Ok(id)
     }
 
     /// Record an explicit cooperative yield by the running task.
@@ -1313,6 +1348,31 @@ mod tests {
         assert_eq!(
             scheduler.task(unprivileged).map(TaskSnapshot::state),
             Ok(TaskState::Ready)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_dispatch_selects_the_owned_continuation() -> Result<(), TaskError> {
+        let mut scheduler = Scheduler::new(3)?;
+        let first = scheduler.spawn(Capabilities::SERVICE, stack(0)?)?;
+        let second = scheduler.spawn(Capabilities::SERVICE, stack(1)?)?;
+
+        assert_eq!(
+            scheduler.dispatch(second, Capabilities::SERVICE),
+            Ok(second)
+        );
+        scheduler.yield_current(second)?;
+        assert_eq!(scheduler.task(first)?.dispatches(), 0);
+        assert_eq!(scheduler.task(second)?.dispatches(), 1);
+        assert_eq!(
+            scheduler.dispatch(first, Capabilities::CONSOLE),
+            Err(TaskError::InvalidState)
+        );
+        assert_eq!(scheduler.dispatch(first, Capabilities::SERVICE), Ok(first));
+        assert_eq!(
+            scheduler.dispatch(second, Capabilities::SERVICE),
+            Err(TaskError::TaskAlreadyRunning)
         );
         Ok(())
     }

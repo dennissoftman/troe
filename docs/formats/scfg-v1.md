@@ -20,6 +20,21 @@ a closed startup mode and failure action; restart, initial-handle, 50 ms lease,
 health, and lifetime ceilings; capability bits; up to four dependencies that
 must name preceding records; canonical string offsets; and reserved-zero fields.
 
+The SCFG v1 service capability word is a closed launcher-authority mask:
+
+| Bit | Authority |
+| ---: | --- |
+| 0 | owned IPv4 datagram endpoint |
+| 1 | monotonic timer and waits |
+| 2 | privileged wall-clock correction |
+| 3 | read-only Unix wall clock |
+
+Every other bit is rejected. A KEX manifest must request a subset of this mask,
+and its four mandatory command/stream handles plus optional capability handles
+must fit the record's initial-handle ceiling. The current supervisor rejects
+service manifests requesting optional interfaces not expressible by this v1
+mask.
+
 Strings form one exact, gapless, non-aliased table in record/name/artifact
 order. Names contain lowercase ASCII letters, digits, `-`, or `_` and are at
 most 32 bytes. Artifact paths obey the VFS 256-byte path and depth bounds. The

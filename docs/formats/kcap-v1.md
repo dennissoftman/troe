@@ -31,7 +31,9 @@ capabilities = ["datagram"]
 The implemented closed names are `datagram`, `filesystem-read`,
 `filesystem-mutate`, `timer`, `diagnostics`, `network-observe`,
 `network-configure`, `icmp-echo`, `tcp-connect`, `volume-control`, and
-`shell-script`. Each selects one exact interface; no name implies another. The
+`shell-script`, `wall-clock`, and `clock-control`. Each selects one exact
+interface; no name implies another. `clock-control` is privileged launcher
+authority and is denied to ordinary session-launched commands. The
 `shell-script` authority stages validated physical command lines only for the
 owning shell session and never launches a nested application. In particular,
 `tcp-connect` accepts only a literal IPv4 endpoint and does not grant DNS, TLS,

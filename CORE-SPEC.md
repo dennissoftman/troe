@@ -310,9 +310,11 @@ on a physical console.
 The release 0.1 shell grammar is intentionally small:
 
 ```text
-line        := whitespace? pipeline whitespace?
+line        := whitespace? pipeline whitespace? background?
 pipeline    := stage (whitespace? "|" whitespace? stage)*
-stage       := word (whitespace word)*
+stage       := word (whitespace (word | redirection))*
+background  := "&"
+redirection := "<" word | ">" word | ">>" word
 word        := one-or-more bare or quoted byte segments
 ```
 
@@ -325,9 +327,13 @@ perform interpolation. The parser MUST:
 - avoid recursive parsing;
 - never panic on arbitrary byte input.
 
-There are no shell expansions, redirections, variables, background jobs, or
-command substitution. Pipelines contain at most eight sequential stages and
-each intermediate stream is capped at 64 KiB; overflow fails explicitly.
+There are no shell expansions, variables, or command substitution. Pipelines
+contain at most eight sequential stages and each intermediate stream is capped
+at 64 KiB; overflow fails explicitly. A final unquoted `&` is accepted only for
+one external-command stage. Background standard input is EOF and output/error
+enter a bounded 64 KiB recent log, so asynchronous bytes do not corrupt the
+interactive prompt. Concurrent background pipelines are not part of this
+grammar.
 
 ### 11.2 Command registry
 
@@ -336,14 +342,41 @@ Each package declares its name, synopsis, required typed capabilities, and entry
 point. Unknown or unavailable commands return stable distinct errors and do not
 terminate the shell.
 
-`cd`, `poweroff`, and `reboot` are the only permanent shell intrinsics and their
-names MUST NOT be shadowed or replaced by a KEX application. `cd` mutates
-shell-owned session state and therefore executes in the invoking shell. The two
+`cd`, `fg`, `jobs`, `kill`, `log`, `poweroff`, `reboot`, `svc`, and `wait` are
+permanent shell intrinsics and their names MUST NOT be shadowed or replaced by a
+KEX application. They mutate shell-session, resident-job, service-supervisor,
+or machine lifecycle state and therefore execute in the invoking shell. The two
 terminal actions remain behind the shell's explicit machine-control capability;
 ordinary KEX applications cannot acquire that authority or invoke an intrinsic
 through application ABI 1.1. No ordinary command has a privileged fallback.
 
-### 11.3 Required commands
+### 11.3 Resident jobs and services
+
+Ordinary KEX execution has no default total runtime deadline and no cumulative
+service-call ceiling. The architecture execution lease still bounds one
+uninterrupted user-mode slice; local handle, message, wait, memory, output, and
+resident-table bounds remain mandatory.
+
+A foreground KEX owns the invoking session's streams and result, but it MUST
+use the same bounded execution loop as resident work. Background jobs and
+already-launched services continue to receive execution slices and wait
+completion while the shell waits for the foreground result. Logical hour- or
+day-scale waits MUST NOT depend on fitting the entire deadline into one
+architecture timer counter.
+
+A session background job is owned by the launching shell and addressed by its
+stable job number. `jobs`, `log`, `kill`, `wait`, and `fg` MUST NOT search by
+executable name or expose another session's jobs. Cancellation is explicit
+contained teardown, not a POSIX signal ABI.
+
+SCFG services stay in the foreground under one bounded direct supervisor. They
+do not fork, detach, use PID files, or become shell jobs. The supervisor retains
+exact task ownership, desired and observed state, dependency and restart policy,
+and bounded recent logs. The `svc` intrinsic controls stable SCFG names. The
+first implementation treats transactional process admission as service
+readiness; an explicit lifecycle-ready ABI is not yet part of KEX.
+
+### 11.4 Required commands
 
 | Command | Minimum semantics |
 |---|---|

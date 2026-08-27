@@ -1,0 +1,10 @@
+NAME
+    log - copy the bounded recent output of a background job
+
+SYNOPSIS
+    log JOB
+
+DESCRIPTION
+    Copies the most recent combined standard output and error retained for one
+    session job. A notice reports bytes discarded when the fixed 64 KiB buffer
+    wrapped.

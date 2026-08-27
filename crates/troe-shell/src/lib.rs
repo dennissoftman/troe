@@ -1,4 +1,4 @@
-//! Bounded shell grammar, byte-stream pipelines, and three session intrinsics.
+//! Bounded shell grammar, byte-stream pipelines, and session/job intrinsics.
 #![no_std]
 #![forbid(unsafe_code)]
 
@@ -41,6 +41,10 @@ pub enum ParseError {
     DuplicateRedirection,
     /// Input or output redirection is attached to an unsupported pipeline stage.
     InvalidRedirectionPosition,
+    /// Background placement was not the final operator on the line.
+    InvalidBackgroundPosition,
+    /// Concurrent background pipelines are not implemented.
+    BackgroundPipeline,
 }
 
 /// Standard-output file redirection selected by one shell stage.
@@ -76,6 +80,8 @@ pub struct Stage {
 pub struct Pipeline {
     /// Parsed stages, in execution order.
     pub stages: Vec<Stage>,
+    /// Whether the launcher should return the session prompt after admission.
+    pub background: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -108,6 +114,47 @@ pub enum CommandClass {
     Application,
 }
 
+/// Placement requested by the shell for one application launch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionPlacement {
+    /// Attach the process to the owning shell's foreground job.
+    Foreground,
+    /// Retain the process as a session-owned background job.
+    Background,
+}
+
+/// Shell-owned request for one session background job.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JobControl {
+    /// List retained jobs and their current lifecycle state.
+    List,
+    /// Copy the retained output of one job.
+    Log(u32),
+    /// Request cancellation of one job.
+    Cancel(u32),
+    /// Wait for one job to become terminal.
+    Wait(u32),
+    /// Attach to one job until it becomes terminal.
+    Foreground(u32),
+}
+
+/// Shell-owned request for the SCFG service supervisor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ServiceControl {
+    /// List every configured service.
+    List,
+    /// Show one configured service.
+    Status(String),
+    /// Select the desired up state.
+    Start(String),
+    /// Select the desired down state.
+    Stop(String),
+    /// Stop and relaunch one service.
+    Restart(String),
+    /// Copy one service's retained recent output.
+    Log(String),
+}
+
 /// Application resolver used for every non-intrinsic command.
 ///
 /// Returning `None` means that no application was resolved. No shell-owned
@@ -121,6 +168,7 @@ pub trait ExternalCommand {
         words: &[String],
         cwd: &str,
         namespace: &SharedNamespace,
+        placement: ExecutionPlacement,
         stdin: &mut dyn Input,
         stdout: &mut dyn Output,
         stderr: &mut dyn Output,
@@ -132,6 +180,29 @@ pub trait ExternalCommand {
     /// exits successfully. The shell executes it synchronously in the current
     /// session, so intrinsics such as `cd` update the owning session.
     fn take_script_lines(&mut self) -> Option<Vec<String>> {
+        None
+    }
+
+    /// Perform one shell-owned job-control operation.
+    ///
+    /// Returning `None` means resident process control is unavailable in this
+    /// execution environment.
+    fn control_job(
+        &mut self,
+        _request: JobControl,
+        _stdout: &mut dyn Output,
+        _stderr: &mut dyn Output,
+    ) -> Option<CommandStatus> {
+        None
+    }
+
+    /// Perform one shell-owned service-control operation.
+    fn control_service(
+        &mut self,
+        _request: ServiceControl,
+        _stdout: &mut dyn Output,
+        _stderr: &mut dyn Output,
+    ) -> Option<CommandStatus> {
         None
     }
 }
@@ -156,6 +227,7 @@ impl ExternalCommand for NoExternalCommand {
         _words: &[String],
         _cwd: &str,
         _namespace: &SharedNamespace,
+        _placement: ExecutionPlacement,
         _stdin: &mut dyn Input,
         _stdout: &mut dyn Output,
         _stderr: &mut dyn Output,
@@ -307,8 +379,14 @@ impl Output for NamespaceFileOutput {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IntrinsicId {
     Cd,
+    Fg,
+    Jobs,
+    Kill,
+    Log,
     PowerOff,
     Reboot,
+    Svc,
+    Wait,
 }
 
 const INTRINSICS: &[IntrinsicSpec] = &[
@@ -316,6 +394,26 @@ const INTRINSICS: &[IntrinsicSpec] = &[
         id: IntrinsicId::Cd,
         name: "cd",
         synopsis: "cd PATH",
+    },
+    IntrinsicSpec {
+        id: IntrinsicId::Fg,
+        name: "fg",
+        synopsis: "fg JOB",
+    },
+    IntrinsicSpec {
+        id: IntrinsicId::Jobs,
+        name: "jobs",
+        synopsis: "jobs",
+    },
+    IntrinsicSpec {
+        id: IntrinsicId::Kill,
+        name: "kill",
+        synopsis: "kill JOB",
+    },
+    IntrinsicSpec {
+        id: IntrinsicId::Log,
+        name: "log",
+        synopsis: "log JOB",
     },
     IntrinsicSpec {
         id: IntrinsicId::PowerOff,
@@ -326,6 +424,16 @@ const INTRINSICS: &[IntrinsicSpec] = &[
         id: IntrinsicId::Reboot,
         name: "reboot",
         synopsis: "reboot",
+    },
+    IntrinsicSpec {
+        id: IntrinsicId::Svc,
+        name: "svc",
+        synopsis: "svc [status [NAME] | start|stop|restart|log NAME]",
+    },
+    IntrinsicSpec {
+        id: IntrinsicId::Wait,
+        name: "wait",
+        synopsis: "wait JOB",
     },
 ];
 
@@ -591,6 +699,7 @@ pub fn parse_line(line: &str) -> Result<Pipeline, ParseError> {
     let mut input = None;
     let mut output = None;
     let mut pending = None;
+    let mut background = false;
 
     let mut characters = line.chars().peekable();
     while let Some(character) = characters.next() {
@@ -644,6 +753,24 @@ pub fn parse_line(line: &str) -> Result<Pipeline, ParseError> {
                     words = Vec::new();
                     input = None;
                     output = None;
+                }
+                '&' => {
+                    push_token(
+                        &mut words,
+                        &mut input,
+                        &mut output,
+                        &mut pending,
+                        &mut word,
+                        &mut word_started,
+                    )?;
+                    if pending.is_some()
+                        || words.is_empty()
+                        || characters.any(|remaining| !remaining.is_whitespace())
+                    {
+                        return Err(ParseError::InvalidBackgroundPosition);
+                    }
+                    background = true;
+                    break;
                 }
                 '<' | '>' => {
                     push_token(
@@ -707,13 +834,16 @@ pub fn parse_line(line: &str) -> Result<Pipeline, ParseError> {
         input,
         output,
     });
+    if background && stages.len() != 1 {
+        return Err(ParseError::BackgroundPipeline);
+    }
     let last = stages.len().saturating_sub(1);
     if stages.iter().enumerate().any(|(index, stage)| {
         (stage.input.is_some() && index != 0) || (stage.output.is_some() && index != last)
     }) {
         return Err(ParseError::InvalidRedirectionPosition);
     }
-    Ok(Pipeline { stages })
+    Ok(Pipeline { stages, background })
 }
 
 fn push_token(
@@ -905,6 +1035,11 @@ impl Shell {
         if pipeline.stages.is_empty() {
             return CommandStatus::Success;
         }
+        let placement = if pipeline.background {
+            ExecutionPlacement::Background
+        } else {
+            ExecutionPlacement::Foreground
+        };
 
         let mut previous = Vec::new();
         for (index, stage) in pipeline.stages.iter().enumerate() {
@@ -937,6 +1072,7 @@ impl Shell {
                         &mut redirected_output,
                         stderr,
                         external,
+                        placement,
                     );
                     return match redirected_output.finish() {
                         Ok(()) => status,
@@ -954,6 +1090,7 @@ impl Shell {
                     stdout,
                     stderr,
                     external,
+                    placement,
                 );
             }
 
@@ -969,6 +1106,7 @@ impl Shell {
                 &mut next,
                 stderr,
                 external,
+                ExecutionPlacement::Foreground,
             );
             if status != CommandStatus::Success {
                 return status;
@@ -989,14 +1127,15 @@ impl Shell {
         stdout: &mut dyn Output,
         stderr: &mut dyn Output,
         external: &mut E,
+        placement: ExecutionPlacement,
     ) -> CommandStatus {
         if let Some(input) = redirected_input {
-            self.dispatch(words, input, stdout, stderr, external)
+            self.dispatch(words, input, stdout, stderr, external, placement)
         } else if first {
-            self.dispatch(words, stdin, stdout, stderr, external)
+            self.dispatch(words, stdin, stdout, stderr, external, placement)
         } else {
             let mut input = SliceInput::new(previous);
-            self.dispatch(words, &mut input, stdout, stderr, external)
+            self.dispatch(words, &mut input, stdout, stderr, external, placement)
         }
     }
 
@@ -1007,6 +1146,7 @@ impl Shell {
         stdout: &mut dyn Output,
         stderr: &mut dyn Output,
         external: &mut E,
+        placement: ExecutionPlacement,
     ) -> CommandStatus {
         let Some(command) = words.first().map(String::as_str) else {
             return CommandStatus::Success;
@@ -1018,6 +1158,7 @@ impl Shell {
                 words,
                 &self.cwd,
                 &self.namespace,
+                placement,
                 stdin,
                 stdout,
                 stderr,
@@ -1035,6 +1176,10 @@ impl Shell {
             let _ignored = write_error(stderr, command, "unknown command");
             return CommandStatus::NotFound;
         };
+        if placement == ExecutionPlacement::Background {
+            let _ignored = write_error(stderr, command, "shell intrinsic cannot run in background");
+            return CommandStatus::Usage;
+        }
         let intrinsic = spec.id;
         let args = &words[1..];
         if matches!(intrinsic, IntrinsicId::PowerOff | IntrinsicId::Reboot) && !self.machine_control
@@ -1044,10 +1189,59 @@ impl Shell {
         }
         match intrinsic {
             IntrinsicId::Cd => self.command_cd(args, stderr),
+            IntrinsicId::Fg => control_job(
+                external,
+                args,
+                "fg",
+                "fg JOB",
+                JobControl::Foreground,
+                stdout,
+                stderr,
+            ),
+            IntrinsicId::Jobs => {
+                if args.is_empty() {
+                    external
+                        .control_job(JobControl::List, stdout, stderr)
+                        .unwrap_or_else(|| {
+                            let _ignored = write_error(stderr, "jobs", "job control unavailable");
+                            CommandStatus::Failure
+                        })
+                } else {
+                    usage(stderr, "jobs", "jobs")
+                }
+            }
+            IntrinsicId::Kill => control_job(
+                external,
+                args,
+                "kill",
+                "kill JOB",
+                JobControl::Cancel,
+                stdout,
+                stderr,
+            ),
+            IntrinsicId::Log => control_job(
+                external,
+                args,
+                "log",
+                "log JOB",
+                JobControl::Log,
+                stdout,
+                stderr,
+            ),
             IntrinsicId::PowerOff => {
                 self.command_machine_action(args, stderr, MachineAction::PowerOff)
             }
             IntrinsicId::Reboot => self.command_machine_action(args, stderr, MachineAction::Reboot),
+            IntrinsicId::Svc => control_service(external, args, stdout, stderr),
+            IntrinsicId::Wait => control_job(
+                external,
+                args,
+                "wait",
+                "wait JOB",
+                JobControl::Wait,
+                stdout,
+                stderr,
+            ),
         }
     }
 
@@ -1562,7 +1756,7 @@ fn split_completion_path(prefix: &str) -> (&str, &str, &str) {
 
 fn is_bare_word_component(name: &str) -> bool {
     !name.chars().any(|character| {
-        character.is_whitespace() || matches!(character, '\'' | '"' | '|' | '<' | '>')
+        character.is_whitespace() || matches!(character, '\'' | '"' | '|' | '&' | '<' | '>')
     })
 }
 
@@ -1644,6 +1838,63 @@ fn usage(stderr: &mut dyn Output, command: &str, synopsis: &str) -> CommandStatu
     CommandStatus::Usage
 }
 
+#[allow(clippy::too_many_arguments)]
+fn control_job<E: ExternalCommand + ?Sized>(
+    external: &mut E,
+    arguments: &[String],
+    command: &str,
+    synopsis: &str,
+    operation: fn(u32) -> JobControl,
+    stdout: &mut dyn Output,
+    stderr: &mut dyn Output,
+) -> CommandStatus {
+    let Some(job) = arguments
+        .first()
+        .filter(|_| arguments.len() == 1)
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|job| *job != 0)
+    else {
+        return usage(stderr, command, synopsis);
+    };
+    external
+        .control_job(operation(job), stdout, stderr)
+        .unwrap_or_else(|| {
+            let _ignored = write_error(stderr, command, "job control unavailable");
+            CommandStatus::Failure
+        })
+}
+
+fn control_service<E: ExternalCommand + ?Sized>(
+    external: &mut E,
+    arguments: &[String],
+    stdout: &mut dyn Output,
+    stderr: &mut dyn Output,
+) -> CommandStatus {
+    let request = match arguments {
+        [] => ServiceControl::List,
+        [value] if value == "list" => ServiceControl::List,
+        [value] if value == "status" => ServiceControl::List,
+        [operation, name] if operation == "status" => ServiceControl::Status(name.clone()),
+        [operation, name] if operation == "start" => ServiceControl::Start(name.clone()),
+        [operation, name] if operation == "stop" => ServiceControl::Stop(name.clone()),
+        [operation, name] if operation == "restart" => ServiceControl::Restart(name.clone()),
+        [operation, name] if operation == "log" => ServiceControl::Log(name.clone()),
+        _ => {
+            return usage(
+                stderr,
+                "svc",
+                "svc [status [NAME] | start|stop|restart|log NAME]",
+            );
+        }
+    };
+    external
+        .control_service(request, stdout, stderr)
+        .unwrap_or_else(|| {
+            let _ignored = write_error(stderr, "svc", "service control unavailable");
+            CommandStatus::Failure
+        })
+}
+
 fn fs_failure(stderr: &mut dyn Output, command: &str, path: &str, error: FsError) -> CommandStatus {
     let _ignored = write_all(stderr, format!("{command}: {path}: {error}\n").as_bytes());
     if error == FsError::NotFound {
@@ -1667,15 +1918,17 @@ const fn parse_error_text(error: ParseError) -> &'static str {
         ParseError::MissingRedirectionTarget => "missing redirection target",
         ParseError::DuplicateRedirection => "duplicate redirection",
         ParseError::InvalidRedirectionPosition => "invalid redirection position",
+        ParseError::InvalidBackgroundPosition => "background operator must end the command",
+        ParseError::BackgroundPipeline => "background pipelines are not supported",
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandClass, CompletionConfig, CompletionConfigError, ExternalCommand, INTRINSICS,
-        MachineAction, OutputRedirection, ParseError, SharedNamespace, Shell, command_class,
-        command_synopsis, format_memory_report, parse_line,
+        CommandClass, CompletionConfig, CompletionConfigError, ExecutionPlacement, ExternalCommand,
+        INTRINSICS, JobControl, MachineAction, OutputRedirection, ParseError, ServiceControl,
+        SharedNamespace, Shell, command_class, command_synopsis, format_memory_report, parse_line,
     };
     use alloc::boxed::Box;
     use alloc::format;
@@ -1804,6 +2057,9 @@ mod tests {
     #[derive(Default)]
     struct FakeExternal {
         attempts: Vec<String>,
+        placements: Vec<ExecutionPlacement>,
+        controls: Vec<JobControl>,
+        service_controls: Vec<ServiceControl>,
         script: Option<Vec<String>>,
     }
 
@@ -1821,17 +2077,20 @@ mod tests {
     }
 
     impl ExternalCommand for FakeExternal {
+        #[allow(clippy::too_many_lines)]
         fn execute(
             &mut self,
             command: &str,
             words: &[String],
             cwd: &str,
             namespace: &SharedNamespace,
+            placement: ExecutionPlacement,
             stdin: &mut dyn Input,
             stdout: &mut dyn Output,
             stderr: &mut dyn Output,
         ) -> Option<CommandStatus> {
             self.attempts.push(command.to_string());
+            self.placements.push(placement);
             match command {
                 "script" => {
                     self.script = Some(alloc::vec![
@@ -1936,6 +2195,28 @@ mod tests {
         fn take_script_lines(&mut self) -> Option<Vec<String>> {
             self.script.take()
         }
+
+        fn control_job(
+            &mut self,
+            request: JobControl,
+            stdout: &mut dyn Output,
+            _stderr: &mut dyn Output,
+        ) -> Option<CommandStatus> {
+            self.controls.push(request);
+            let _ignored = write_all(stdout, b"job control\n");
+            Some(CommandStatus::Success)
+        }
+
+        fn control_service(
+            &mut self,
+            request: ServiceControl,
+            stdout: &mut dyn Output,
+            _stderr: &mut dyn Output,
+        ) -> Option<CommandStatus> {
+            self.service_controls.push(request);
+            let _ignored = write_all(stdout, b"service control\n");
+            Some(CommandStatus::Success)
+        }
     }
 
     #[test]
@@ -1973,6 +2254,64 @@ mod tests {
         assert_eq!(parsed.stages[1].words, ["grep", "b"]);
         assert_eq!(parse_line("echo 'bad"), Err(ParseError::UnclosedQuote));
         assert_eq!(parse_line("echo a || cat"), Err(ParseError::EmptyStage));
+    }
+
+    #[test]
+    fn background_operator_is_bounded_to_one_external_stage() {
+        let parsed = parse_line("echo 1000 &").unwrap_or_else(|_| std::process::abort());
+        assert!(parsed.background);
+        assert_eq!(parsed.stages[0].words, ["echo", "1000"]);
+
+        let quoted = parse_line("echo '&'").unwrap_or_else(|_| std::process::abort());
+        assert!(!quoted.background);
+        assert_eq!(quoted.stages[0].words, ["echo", "&"]);
+
+        assert_eq!(parse_line("&"), Err(ParseError::InvalidBackgroundPosition));
+        assert_eq!(
+            parse_line("echo & trailing"),
+            Err(ParseError::InvalidBackgroundPosition)
+        );
+        assert_eq!(
+            parse_line("echo one | copy &"),
+            Err(ParseError::BackgroundPipeline)
+        );
+    }
+
+    #[test]
+    fn background_placement_reaches_external_resolver_and_rejects_intrinsics() {
+        let mut shell = shell();
+        let mut external = FakeExternal::default();
+        let mut input = SliceInput::new(b"");
+        let mut output = BoundedOutput::new(256);
+        let mut error = BoundedOutput::new(256);
+
+        assert_eq!(
+            shell.execute_with_external(
+                "external &",
+                &mut input,
+                &mut output,
+                &mut error,
+                &mut external,
+            ),
+            CommandStatus::Success
+        );
+        assert_eq!(external.placements, [ExecutionPlacement::Background]);
+
+        assert_eq!(
+            shell.execute_with_external(
+                "cd /help &",
+                &mut input,
+                &mut output,
+                &mut error,
+                &mut external,
+            ),
+            CommandStatus::Usage
+        );
+        assert_eq!(shell.cwd(), "/");
+        assert_eq!(
+            error.as_slice(),
+            b"cd: shell intrinsic cannot run in background\n"
+        );
     }
 
     #[test]
@@ -2283,7 +2622,109 @@ mod tests {
         );
 
         let intrinsic_names: Vec<&str> = INTRINSICS.iter().map(|command| command.name).collect();
-        assert_eq!(intrinsic_names, ["cd", "poweroff", "reboot"]);
+        assert_eq!(
+            intrinsic_names,
+            [
+                "cd", "fg", "jobs", "kill", "log", "poweroff", "reboot", "svc", "wait"
+            ]
+        );
+    }
+
+    #[test]
+    fn job_control_intrinsics_are_shell_owned_and_validate_job_ids() {
+        let mut shell = shell();
+        let mut external = FakeExternal::default();
+        let mut input = SliceInput::new(b"");
+        let mut output = BoundedOutput::new(256);
+        let mut error = BoundedOutput::new(256);
+
+        for (line, expected) in [
+            ("jobs", JobControl::List),
+            ("log 7", JobControl::Log(7)),
+            ("kill 7", JobControl::Cancel(7)),
+            ("wait 7", JobControl::Wait(7)),
+            ("fg 7", JobControl::Foreground(7)),
+        ] {
+            assert_eq!(
+                shell.execute_with_external(
+                    line,
+                    &mut input,
+                    &mut output,
+                    &mut error,
+                    &mut external,
+                ),
+                CommandStatus::Success
+            );
+            assert_eq!(external.controls.last(), Some(&expected));
+        }
+        assert_eq!(
+            shell.execute_with_external(
+                "kill 0",
+                &mut input,
+                &mut output,
+                &mut error,
+                &mut external,
+            ),
+            CommandStatus::Usage
+        );
+        assert!(!external.attempts.iter().any(|name| name == "jobs"));
+    }
+
+    #[test]
+    fn service_control_is_shell_owned_and_parses_closed_operations() {
+        let mut shell = shell();
+        let mut external = FakeExternal::default();
+        let mut input = SliceInput::new(b"");
+        let mut output = BoundedOutput::new(256);
+        let mut error = BoundedOutput::new(256);
+
+        for (line, expected) in [
+            ("svc", ServiceControl::List),
+            ("svc list", ServiceControl::List),
+            ("svc status", ServiceControl::List),
+            (
+                "svc status timesync",
+                ServiceControl::Status("timesync".to_string()),
+            ),
+            (
+                "svc start timesync",
+                ServiceControl::Start("timesync".to_string()),
+            ),
+            (
+                "svc stop timesync",
+                ServiceControl::Stop("timesync".to_string()),
+            ),
+            (
+                "svc restart timesync",
+                ServiceControl::Restart("timesync".to_string()),
+            ),
+            (
+                "svc log timesync",
+                ServiceControl::Log("timesync".to_string()),
+            ),
+        ] {
+            assert_eq!(
+                shell.execute_with_external(
+                    line,
+                    &mut input,
+                    &mut output,
+                    &mut error,
+                    &mut external,
+                ),
+                CommandStatus::Success
+            );
+            assert_eq!(external.service_controls.last(), Some(&expected));
+        }
+        assert_eq!(
+            shell.execute_with_external(
+                "svc reload timesync",
+                &mut input,
+                &mut output,
+                &mut error,
+                &mut external,
+            ),
+            CommandStatus::Usage
+        );
     }
 
     #[test]

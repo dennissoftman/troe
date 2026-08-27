@@ -1,0 +1,28 @@
+[package]
+name = "troe-app-timesync"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata.troe-kex]
+capabilities = ["datagram", "timer", "clock-control"]
+
+[dependencies]
+troe-kex-sdk = { path = "../../sdk/rust/troe-kex" }
+
+[[bin]]
+name = "troe-app-timesync"
+path = "src/main.rs"
+test = false
+bench = false
+
+[profile.release]
+codegen-units = 1
+lto = false
+opt-level = "z"
+panic = "abort"
+strip = "none"
+
+[workspace]

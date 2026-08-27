@@ -28,8 +28,8 @@ to one audited machine boundary; portable crates forbid it.
 - ✅ **Strict at every boundary.** Executables, filesystems, configuration,
   memory mappings, and network input are bounds-checked and validated before use.
 - 🔁 **Predictable under failure.** Work has hard ceilings, applications have a
-  50 ms preemptive timeslice and a command runtime deadline, faults are contained,
-  and teardown revokes handles,
+  bounded preemptive timeslice without an arbitrary total runtime deadline,
+  faults are contained, and teardown revokes handles,
   zeroizes memory, and returns owned frames.
 
 TROE also enforces W^X mappings, guarded task stacks, generation-checked handles,
@@ -41,17 +41,20 @@ profiles. Small is a policy here, not just a current measurement.
 - Native UEFI boots on x86-64 and AArch64.
 - Serial and framebuffer consoles with UTF-8 line editing, history, completion,
   literal single/double quoting, pipelines, and streamed `<`, `>`, and `>>`
-  redirection.
+  redirection, plus session-owned background jobs and bounded logs.
+- SCFG boot-service supervision with stable service names, restart/backoff
+  policy, `svc` control, and an example long-running SNTP clock service.
 - A bounded VFS with KEFS, a default read-write persistent ext4 volume at
   `/vol/root`, read/write FAT32, bounded ext4 symbolic/hard links, quota-bound
   `/tmp`, live `/sys`, and crash-consistent state under `/vol/state`.
 - Ethernet, ARP, DHCP, IPv4, ICMP, UDP, and outbound TCP over virtio-net.
 - KEX applications for `arp`, `awk`, `cat`, `clear`, `dhcp`, `echo`, `grep`,
   `hexdump`, `ln`, `ls`, `lua`, `man`, `mem`, `mount`, `net`, `ping`, `printf`,
-  `pwd`, `rm`, `sed`, `sh`, `sleep`, `tar`, `tcp`, `udp`, and `wc`.
+  `pwd`, `rm`, `sed`, `sh`, `sleep`, `tar`, `tcp`, `timesync`, `udp`, and `wc`.
 
-Only `cd`, `poweroff`, and `reboot` are privileged shell intrinsics. Everything
-else is an immutable KEX application discovered from `/bin`.
+`cd`, session job control, `svc`, `poweroff`, and `reboot` are non-shadowable
+shell intrinsics because they mutate shell- or supervisor-owned state. Ordinary
+commands remain immutable KEX applications discovered from `/bin`.
 
 ## 🎬 Demos
 
