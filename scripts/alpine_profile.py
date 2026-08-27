@@ -40,7 +40,7 @@ else:
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ALPINE_PROFILE_PATH = REPO_ROOT / "tools" / "alpine-profile.json"
 ALPINE_CACHE_DIR = REPO_ROOT / "build" / "alpine"
-ALPINE_ROOT_DISK_BYTES = 8 * 1024 * 1024 * 1024
+ALPINE_ROOT_DISK_BYTES = 4 * 1024 * 1024 * 1024
 DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 
 

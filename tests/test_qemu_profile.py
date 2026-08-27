@@ -419,6 +419,24 @@ class FirmwareProfileTests(unittest.TestCase):
                     / f"cloud-{profile.identifier}-{QEMU_ENVIRONMENT}-acceptance",
                 )
 
+    def test_acceptance_shared_media_is_disposable(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="troe-shared-cleanup-") as temporary:
+            root = Path(temporary)
+            paths = {
+                platform_id: root / f"{platform_id}.img"
+                for platform_id in PLATFORM_IDS
+            }
+            for path in paths.values():
+                path.write_bytes(b"acceptance-only")
+            with mock.patch.object(
+                TEST_QEMU,
+                "shared_test_image_path",
+                side_effect=lambda profile: paths[profile.identifier],
+            ):
+                TEST_QEMU.cleanup_shared_media(PLATFORM_IDS)
+                TEST_QEMU.cleanup_shared_media(PLATFORM_IDS)
+            self.assertTrue(all(not path.exists() for path in paths.values()))
+
     def test_cloud_rebuild_preserves_last_good_bundle_on_failure(self) -> None:
         profile = resolve_platform(X86_64_UEFI_VIRTIO_PCI)
         with tempfile.TemporaryDirectory(prefix="troe-cloud-swap-") as temporary:

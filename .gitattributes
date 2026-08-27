@@ -1,3 +1,7 @@
 # Preserve byte-for-byte vendored releases even when upstream whitespace style
 # differs from TROE-authored source.
 apps/lua/vendor/** -whitespace
+
+# Store large opaque generated/test artifacts outside ordinary Git object history.
+assets/*.kefs filter=lfs diff=lfs merge=lfs -text
+tests/kex-corpus/valid-standard-max-encoded-*.kex filter=lfs diff=lfs merge=lfs -text

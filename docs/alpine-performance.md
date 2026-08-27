@@ -5,7 +5,7 @@ QEMU 11.1.0 runner record used by `cargo qemu`: the same machine type, emulated
 CPU, UEFI firmware, one virtual CPU, virtio transport, and user network. Alpine's
 current virtual ISO requires more than TROE's 128 MiB acceptance default, so the
 comparison commands give both guests 256 MiB. The launcher attaches two distinct
-writable devices: a platform-specific 8 GiB Alpine system disk and TROE's
+writable devices: a platform-specific 4 GiB Alpine system disk and TROE's
 persistent 1 GiB FAT32 interchange image.
 
 ## Install Alpine persistently

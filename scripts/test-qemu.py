@@ -244,6 +244,12 @@ def reset_shared_media(platform_id: str) -> None:
     )
 
 
+def cleanup_shared_media(platform_ids: tuple[str, ...]) -> None:
+    """Remove platform-private acceptance media that are reset on every run."""
+    for platform_id in platform_ids:
+        shared_test_image_path(resolve_platform(platform_id)).unlink(missing_ok=True)
+
+
 def dual_slot_state(platform_id: str, path: Path) -> tuple[int, bytes]:
     """Validate TXSLOT v1 and return its newest generation and payload."""
     image = path.read_bytes()
@@ -2138,6 +2144,8 @@ def main() -> int:
         return error.returncode or 1
     except KeyboardInterrupt:
         return 130
+    finally:
+        cleanup_shared_media(platform_ids)
     return 0
 
 

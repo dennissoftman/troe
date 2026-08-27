@@ -6,7 +6,8 @@ mod common;
 
 use core::str;
 use troe_app_tar::{
-    BLOCK_BYTES, EntryKind, Header, MAX_MEMBER_BYTES, decode_header, encode_header, padded_size,
+    BLOCK_BYTES, EntryKind, Header, MAX_MEMBER_BYTES, PaxMetadataValidator, decode_header,
+    encode_header, padded_size,
 };
 use troe_kex_sdk::{
     CommandContext, Error, FILESYSTEM_IO_BUFFER_BYTES, FILESYSTEM_LIST_BUFFER_BYTES,
@@ -406,7 +407,32 @@ fn extract_entry(
             reader.skip(padding)?;
             replacement.commit()
         }
+        EntryKind::Extended => Err(Error::Corrupt),
     }
+}
+
+fn consume_extended_header(
+    filesystem: &mut ReadOnlyFilesystem,
+    reader: &mut ArchiveReader,
+    size: u64,
+    scratch: &mut Scratch,
+) -> Result<(), Error> {
+    let mut validator = PaxMetadataValidator::new();
+    let mut remaining = size;
+    while remaining != 0 {
+        let count = scratch
+            .io
+            .len()
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        reader.read_exact(filesystem, &mut scratch.io[..count])?;
+        validator
+            .push(&scratch.io[..count])
+            .map_err(|_| Error::Corrupt)?;
+        remaining -= count as u64;
+    }
+    validator.finish().map_err(|_| Error::Corrupt)?;
+    let padding = padded_size(size).map_err(|_| Error::Overflow)? - size;
+    reader.skip(padding)
 }
 
 fn create<'operand>(
@@ -469,6 +495,9 @@ fn read_archive(command: &mut CommandContext, archive: &str, extract: bool) -> R
                     return Err(Error::Corrupt);
                 }
                 break;
+            }
+            Some(header) if header.kind == EntryKind::Extended => {
+                consume_extended_header(&mut filesystem, &mut reader, header.size, &mut scratch)?
             }
             Some(header) if extract => extract_entry(
                 &mut filesystem,
