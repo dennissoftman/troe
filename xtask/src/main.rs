@@ -6,6 +6,21 @@ use std::process::{Command, ExitCode};
 const DEFAULT_ENVIRONMENT: &str = "qemu";
 const X86_64_PLATFORM: &str = "x86_64-q35-uefi";
 const AARCH64_PLATFORM: &str = "aarch64-virt-uefi";
+const MOUNT_COMMAND: &str = "mount";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Tool {
+    Qemu,
+    Mount,
+}
+
+fn select_tool(arguments: Vec<OsString>) -> (Tool, Vec<OsString>) {
+    if arguments.first() == Some(&OsString::from(MOUNT_COMMAND)) {
+        (Tool::Mount, arguments.into_iter().skip(1).collect())
+    } else {
+        (Tool::Qemu, arguments)
+    }
+}
 
 fn default_platform(host_architecture: &str) -> Option<&'static str> {
     match host_architecture {
@@ -82,21 +97,30 @@ fn main() -> ExitCode {
             executable_on_path(OsStr::new(if cfg!(windows) { "python" } else { "python3" }))
         });
 
-    let host_architecture = env::consts::ARCH;
-    let (arguments, defaulted) =
-        match with_interactive_defaults(env::args_os().skip(1).collect(), host_architecture) {
-            Ok(resolved) => resolved,
-            Err(error) => {
-                eprintln!("cargo qemu: {error}");
-                return ExitCode::FAILURE;
+    let (tool, arguments) = select_tool(env::args_os().skip(1).collect());
+    let (script, arguments) = match tool {
+        Tool::Mount => (repository.join("tools/mount_shared.py"), arguments),
+        Tool::Qemu => {
+            let host_architecture = env::consts::ARCH;
+            let (arguments, defaulted) =
+                match with_interactive_defaults(arguments, host_architecture) {
+                    Ok(resolved) => resolved,
+                    Err(error) => {
+                        eprintln!("cargo qemu: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+            if defaulted {
+                eprintln!(
+                    "cargo qemu: using host architecture {host_architecture} for omitted defaults"
+                );
             }
-        };
-    if defaulted {
-        eprintln!("cargo qemu: using host architecture {host_architecture} for omitted defaults");
-    }
+            (repository.join("scripts/run-qemu.py"), arguments)
+        }
+    };
 
     match Command::new(python)
-        .arg(repository.join("scripts/run-qemu.py"))
+        .arg(script)
         .args(arguments)
         .current_dir(repository)
         .status()
@@ -113,8 +137,8 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{
-        AARCH64_PLATFORM, DEFAULT_ENVIRONMENT, X86_64_PLATFORM, default_platform,
-        with_interactive_defaults,
+        AARCH64_PLATFORM, DEFAULT_ENVIRONMENT, Tool, X86_64_PLATFORM, default_platform,
+        select_tool, with_interactive_defaults,
     };
     use std::ffi::OsString;
 
@@ -168,5 +192,17 @@ mod tests {
         let error = with_interactive_defaults(Vec::new(), "riscv64").unwrap_err();
         assert!(error.contains("unsupported host architecture \"riscv64\""));
         assert!(error.contains("pass --platform explicitly"));
+    }
+
+    #[test]
+    fn mount_subcommand_is_removed_before_python_dispatch() {
+        let (tool, arguments) =
+            select_tool(vec![OsString::from("mount"), OsString::from("--read-only")]);
+        assert_eq!(tool, Tool::Mount);
+        assert_eq!(arguments, [OsString::from("--read-only")]);
+
+        let (tool, arguments) = select_tool(vec![OsString::from("--dry-run")]);
+        assert_eq!(tool, Tool::Qemu);
+        assert_eq!(arguments, [OsString::from("--dry-run")]);
     }
 }

@@ -105,21 +105,31 @@ sh:/> cat /vol/shared/from-troe.txt
 hello-from-troe
 ```
 
-On macOS, stop QEMU cleanly with `poweroff`, attach the same GPT image, and use
-the mounted `TROE SHARE` volume normally:
+Stop QEMU cleanly with `poweroff`, then attach the persistent image through the
+host developer command:
 
 ```console
-hdiutil attach build/troe-shared-fat32.img
-# edit files below /Volumes/TROE\ SHARE
-hdiutil detach /dev/diskN
+cargo mount
+# copy files below the printed mount point
+cargo mount --unmount
 ```
 
-Use the whole-disk name printed by `hdiutil` in place of `/dev/diskN`. Always
-detach it from macOS before starting QEMU; the image must never have two live
-writable mounts. `cargo qemu --reset-shared-disk` deliberately replaces it with
-an empty filesystem, while `cargo qemu --no-shared-disk` opts out for one run.
-The FAT32 medium is the cross-platform starting point; an ext4 test medium can
-use the same attachment mechanism later, but macOS does not mount ext4 natively.
+`cargo mount` creates or validates the image, mounts it read-write, and prints
+the host path. Repeating it is idempotent. `--read-only` requests a read-only
+attachment, `--open` opens the mounted directory in Finder or the Linux file
+manager, and `--status` reports its lifecycle state. On macOS it uses the native
+DiskImages service. On Linux it prefers the unprivileged desktop UDisks service
+and falls back to direct loop devices when already running as root; install the
+distribution's `udisks2` package when `udisksctl` is absent. A native Windows
+backend is intentionally deferred.
+
+The mount command and QEMU share an exclusive lifecycle lock, and `cargo qemu`
+refuses to start while the host attachment remains live. Always detach before
+QEMU because the image must never have two writable owners. A busy detach fails
+without forcing open files closed. `cargo qemu --reset-shared-disk`
+deliberately replaces the image with an empty filesystem, while
+`cargo qemu --no-shared-disk` opts out for one run. The FAT32 medium is the
+macOS/Linux interchange starting point; macOS does not mount ext4 natively.
 
 ### Networking
 

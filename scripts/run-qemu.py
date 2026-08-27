@@ -7,13 +7,23 @@ import argparse
 import shlex
 import subprocess
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 
 from platform_profile import PLATFORM_IDS, REPO_ROOT
 from qemu_profile import ENVIRONMENT_IDS, prepare_qemu_command
 
+sys.path.insert(0, str(REPO_ROOT))
+
+from tools.mount_shared import SharedMediaLock, require_detached  # noqa: E402
+
 
 SHARED_MEDIA_PATH = REPO_ROOT / "build" / "troe-shared-fat32.img"
+
+
+def is_default_shared_disk(path: Path) -> bool:
+    """Return whether one explicit path aliases the managed shared medium."""
+    return path.resolve(strict=False) == SHARED_MEDIA_PATH.resolve(strict=False)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -95,35 +105,43 @@ def main() -> int:
             raise RuntimeError(
                 "--no-shared-disk and --reset-shared-disk are mutually exclusive"
             )
-        data_disks = list(args.data_disk)
-        if not args.no_shared_disk:
-            subprocess.run(
-                [
-                    sys.executable,
-                    str(REPO_ROOT / "tools" / "mkshared.py"),
-                    "--output",
-                    str(SHARED_MEDIA_PATH),
-                    *(("--reset",) if args.reset_shared_disk else ()),
-                ],
-                cwd=REPO_ROOT,
-                check=True,
+        if any(is_default_shared_disk(path) for path in args.data_disk):
+            raise RuntimeError(
+                "the default shared image is managed automatically; "
+                "do not pass it through --data-disk"
             )
-            data_disks.insert(0, SHARED_MEDIA_PATH)
-        command = prepare_qemu_command(
-            args.platform,
-            args.environment,
-            args.firmware_code,
-            args.firmware_vars,
-            skip_version_check=args.skip_version_check,
-            build=not args.skip_build,
-            graphical=args.graphical,
-            volume_table=args.volume_table,
-            data_disks=tuple(data_disks),
-        )
-        if args.dry_run:
-            print(shlex.join(command))
-            return 0
-        return subprocess.run(command, cwd=REPO_ROOT, check=False).returncode
+        media_lock = nullcontext() if args.no_shared_disk else SharedMediaLock()
+        with media_lock:
+            data_disks = list(args.data_disk)
+            if not args.no_shared_disk:
+                require_detached(SHARED_MEDIA_PATH)
+                subprocess.run(
+                    [
+                        sys.executable,
+                        str(REPO_ROOT / "tools" / "mkshared.py"),
+                        "--output",
+                        str(SHARED_MEDIA_PATH),
+                        *(("--reset",) if args.reset_shared_disk else ()),
+                    ],
+                    cwd=REPO_ROOT,
+                    check=True,
+                )
+                data_disks.insert(0, SHARED_MEDIA_PATH)
+            command = prepare_qemu_command(
+                args.platform,
+                args.environment,
+                args.firmware_code,
+                args.firmware_vars,
+                skip_version_check=args.skip_version_check,
+                build=not args.skip_build,
+                graphical=args.graphical,
+                volume_table=args.volume_table,
+                data_disks=tuple(data_disks),
+            )
+            if args.dry_run:
+                print(shlex.join(command))
+                return 0
+            return subprocess.run(command, cwd=REPO_ROOT, check=False).returncode
     except (FileNotFoundError, OSError, RuntimeError) as error:
         print(f"QEMU launch failed: {error}", file=sys.stderr)
         return 1

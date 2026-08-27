@@ -635,6 +635,12 @@ class FirmwareProfileTests(unittest.TestCase):
             ]
         )
         self.assertTrue(reset_run_args.reset_shared_disk)
+        self.assertTrue(
+            RUN_QEMU.is_default_shared_disk(
+                REPO_ROOT / "build" / "troe-shared-fat32.img"
+            )
+        )
+        self.assertFalse(RUN_QEMU.is_default_shared_disk(Path("archive.raw")))
         test_args = TEST_QEMU.parse_args(
             ["--platform", "all", "--environment", QEMU_ENVIRONMENT]
         )

@@ -102,6 +102,7 @@ PYTHON_IMPACTS = {
     "scripts/platform_profile.py": ("test_build_policy.py", "test_qemu_profile.py"),
     "scripts/qemu_profile.py": ("test_cloud_artifacts.py", "test_qemu_profile.py"),
     "scripts/repository_policy.py": ("test_repository_policy.py",),
+    "scripts/run-qemu.py": ("test_mount_shared.py", "test_qemu_profile.py"),
     "tools/elf2kex.py": ("test_elf2kex.py",),
     "tools/gen_kex_corpus.py": ("test_elf2kex.py",),
     "tools/mkcloud.py": ("test_cloud_artifacts.py",),
@@ -114,6 +115,11 @@ PYTHON_IMPACTS = {
     "tools/mkshared.py": (
         "test_mkshared.py",
         "test_mkstorage.py",
+        "test_qemu_profile.py",
+    ),
+    "tools/mount_shared.py": (
+        "test_mount_shared.py",
+        "test_mkshared.py",
         "test_qemu_profile.py",
     ),
     "tools/cloud-environments.json": (
@@ -131,6 +137,7 @@ PYTHON_IMPACTS = {
 RUNTIME_TOOL_SCENARIOS = {
     "config/volumes.toml": ("boot", "filesystem"),
     "scripts/build.py": ("boot",),
+    "scripts/run-qemu.py": ("boot", "filesystem"),
     "tools/mkcloud.py": ("boot", "filesystem", "persistence"),
     "tools/mkconfig.py": ("boot", "persistence"),
     "tools/mkcontent.py": ("boot", "persistence"),
@@ -138,6 +145,7 @@ RUNTIME_TOOL_SCENARIOS = {
     "tools/mkfat.py": ("boot",),
     "tools/mkstorage.py": ("boot", "filesystem", "persistence"),
     "tools/mkshared.py": ("boot", "filesystem"),
+    "tools/mount_shared.py": ("boot", "filesystem"),
     "tools/size_report.py": ("boot",),
 }
 FULL_GATE_PATHS = frozenset(

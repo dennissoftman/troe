@@ -1,3 +1,4 @@
 [alias]
 kex = "run --quiet --package troe-kex-tool --"
 qemu = "run --quiet --package troe-xtask --"
+mount = "run --quiet --package troe-xtask -- mount"

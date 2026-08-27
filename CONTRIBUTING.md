@@ -21,6 +21,12 @@ Storage-provider changes should also run
 e2fsprogs, dosfstools, and mtools installed. This makes absence of the external
 format/check oracles a failure instead of silently skipping interoperability.
 
+`cargo mount` attaches the persistent developer FAT32 interchange disk using
+native macOS facilities or Linux UDisks. Linux development hosts should install
+the distribution's `udisks2` package; already-root environments can use the
+tool's direct loop-device fallback. Detach with `cargo mount --unmount` before
+starting QEMU. A native Windows backend is not currently provided.
+
 During interactive-console development,
 `python3 scripts/test-qemu.py --platform all --environment qemu --smoke`
 provides a fast concurrent boot check for all named platforms. It does not
