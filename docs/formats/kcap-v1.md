@@ -11,7 +11,7 @@ All integers are unsigned little-endian. The 16-byte header is:
 | Offset | Bytes | Field | Rule |
 | ---: | ---: | --- | --- |
 | 0 | 8 | magic | `KCAPv1`, two zero bytes |
-| 8 | 2 | record count | 0–16 |
+| 8 | 2 | record count | 0–128 |
 | 10 | 2 | reserved | zero |
 | 12 | 4 | encoded bytes | exactly `16 + count * 8` |
 
@@ -31,7 +31,8 @@ capabilities = ["datagram"]
 The implemented closed names are `datagram`, `filesystem-read`,
 `filesystem-mutate`, `timer`, `diagnostics`, `network-observe`,
 `network-configure`, `icmp-echo`, `tcp-connect`, `volume-control`,
-`shell-script`, `wall-clock`, `clock-control`, and `process-observe`. Each selects one exact
+`shell-script`, `wall-clock`, `clock-control`, `process-observe`,
+`process-launch`, and `pipe`. Each selects one exact
 interface; no name implies another. `clock-control` is privileged launcher
 authority and is denied to ordinary session-launched commands. The
 `shell-script` authority stages validated physical command lines only for the
@@ -40,6 +41,9 @@ owning shell session and never launches a nested application. In particular,
 listening, or raw packets.
 `process-observe` returns bounded current metadata and accounting only; it does
 not grant process control or memory inspection.
+`process-launch` grants only owner-scoped child admission and lifecycle calls;
+the child's manifest must attenuate the launcher's grants. `pipe` grants only
+owner-scoped bounded byte pipes. Neither capability implies the other.
 
 The builder embeds the encoded manifest before the executable in
 `<command>.kex`; no `.kcap` sidecar is installed. A malformed, unknown,

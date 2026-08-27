@@ -10,9 +10,9 @@ use core::fmt;
 /// Maximum accepted interactive command-line length, in bytes.
 pub const MAX_LINE_BYTES: usize = 512;
 /// Maximum number of arguments in one pipeline stage, including the command.
-pub const MAX_ARGS: usize = 32;
+pub const MAX_ARGS: usize = 128;
 /// Maximum number of stages in one pipeline.
-pub const MAX_PIPELINE_STAGES: usize = 8;
+pub const MAX_PIPELINE_STAGES: usize = 255;
 /// Maximum aggregate bytes retained between sequential pipeline stages.
 ///
 /// The current shell executes stages sequentially, so an intermediate stage

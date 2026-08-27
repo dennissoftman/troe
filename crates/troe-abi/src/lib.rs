@@ -56,6 +56,10 @@ pub mod interface {
     pub const CLOCK_CONTROL: u32 = 18;
     /// Read-only bounded observation of registered application processes.
     pub const PROCESS_OBSERVE: u32 = 19;
+    /// Owner-scoped authority to launch and control child KEX processes.
+    pub const PROCESS_LAUNCH: u32 = 20;
+    /// Owner-scoped bounded byte-pipe construction and endpoint I/O.
+    pub const PIPE: u32 = 21;
 }
 
 /// Canonical package-side declaration of optional startup authorities.
@@ -67,7 +71,7 @@ pub mod requirements {
     /// Fixed bytes per required interface.
     pub const RECORD_BYTES: usize = 8;
     /// Maximum optional startup authorities declared by one package.
-    pub const MAX_REQUIREMENTS: usize = 16;
+    pub const MAX_REQUIREMENTS: usize = 128;
     /// Largest canonical manifest accepted by the kernel.
     pub const MAX_MANIFEST_BYTES: usize = HEADER_BYTES + MAX_REQUIREMENTS * RECORD_BYTES;
 
@@ -277,11 +281,13 @@ pub mod reply {
     pub const OVERFLOW: u32 = 18;
     /// A network exchange returned an invalid protocol response.
     pub const NETWORK_PROTOCOL: u32 = 19;
+    /// The caller lacks authority for the requested operation.
+    pub const DENIED: u32 = 20;
 
     /// Whether a scalar is one defined service reply value.
     #[must_use]
     pub const fn is_known(value: u32) -> bool {
-        value <= NETWORK_PROTOCOL
+        value <= DENIED
     }
 }
 
@@ -562,20 +568,31 @@ pub mod command {
     /// Interface major version.
     pub const MAJOR: u16 = 1;
     /// Interface minor version.
-    pub const MINOR: u16 = 0;
+    pub const MINOR: u16 = 1;
     /// Return the immutable invocation record.
     pub const GET_INVOCATION: u16 = 1;
+    /// Return the immutable launch environment.
+    pub const GET_ENVIRONMENT: u16 = 2;
     /// Maximum arguments including the command name.
-    pub const MAX_ARGUMENTS: usize = 32;
+    pub const MAX_ARGUMENTS: usize = 128;
     /// Maximum encoded current-directory bytes.
     pub const MAX_CWD_BYTES: usize = 256;
     /// Maximum aggregate UTF-8 argument bytes.
-    pub const MAX_ARGUMENT_BYTES: usize = 512;
+    pub const MAX_ARGUMENT_BYTES: usize = 1024;
     /// Fixed invocation header bytes.
     pub const HEADER_BYTES: usize = 8;
     /// Maximum complete canonical invocation reply.
     pub const MAX_INVOCATION_BYTES: usize =
         HEADER_BYTES + MAX_ARGUMENTS * 2 + MAX_CWD_BYTES + MAX_ARGUMENT_BYTES;
+    /// Maximum launch-environment entries.
+    pub const MAX_ENVIRONMENT: usize = 128;
+    /// Maximum aggregate UTF-8 environment bytes.
+    pub const MAX_ENVIRONMENT_BYTES: usize = 2048;
+    /// Fixed launch-environment header bytes.
+    pub const ENVIRONMENT_HEADER_BYTES: usize = 4;
+    /// Maximum canonical launch-environment reply.
+    pub const MAX_ENCODED_ENVIRONMENT_BYTES: usize =
+        ENVIRONMENT_HEADER_BYTES + MAX_ENVIRONMENT * 2 + MAX_ENVIRONMENT_BYTES;
 
     /// Invocation encoding failure.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -752,6 +769,176 @@ pub mod command {
 
     impl ExactSizeIterator for Arguments<'_> {}
 
+    /// Borrowed validated `NAME=VALUE` launch environment.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct Environment<'a> {
+        bytes: &'a [u8],
+        count: usize,
+        values_start: usize,
+    }
+
+    impl<'a> Environment<'a> {
+        /// Parse one exact canonical launch environment.
+        ///
+        /// # Errors
+        ///
+        /// Rejects malformed lengths, invalid UTF-8/names, bounds, or trailing bytes.
+        pub fn parse(bytes: &'a [u8]) -> Result<Self, DecodeError> {
+            if bytes.len() < ENVIRONMENT_HEADER_BYTES
+                || usize::from(read_u16(bytes, 0)?) != bytes.len()
+            {
+                return Err(DecodeError::InvalidEncoding);
+            }
+            let count = usize::from(read_u16(bytes, 2)?);
+            if count > MAX_ENVIRONMENT {
+                return Err(DecodeError::LimitExceeded);
+            }
+            let values_start = ENVIRONMENT_HEADER_BYTES
+                .checked_add(count.checked_mul(2).ok_or(DecodeError::InvalidEncoding)?)
+                .ok_or(DecodeError::InvalidEncoding)?;
+            if values_start > bytes.len()
+                || bytes.len().saturating_sub(values_start) > MAX_ENVIRONMENT_BYTES
+            {
+                return Err(DecodeError::LimitExceeded);
+            }
+            let environment = Self {
+                bytes,
+                count,
+                values_start,
+            };
+            let mut end = values_start;
+            for value in environment.iter() {
+                validate_environment(value).map_err(|_| DecodeError::InvalidEncoding)?;
+                end = end
+                    .checked_add(value.len())
+                    .ok_or(DecodeError::InvalidEncoding)?;
+            }
+            if end != bytes.len() {
+                return Err(DecodeError::InvalidEncoding);
+            }
+            Ok(environment)
+        }
+
+        /// Number of launch-environment entries.
+        #[must_use]
+        pub const fn len(self) -> usize {
+            self.count
+        }
+
+        /// Whether no environment entries were supplied.
+        #[must_use]
+        pub const fn is_empty(self) -> bool {
+            self.count == 0
+        }
+
+        /// Iterate over canonical `NAME=VALUE` entries in launch order.
+        #[must_use]
+        pub const fn iter(self) -> EnvironmentEntries<'a> {
+            EnvironmentEntries {
+                environment: self,
+                index: 0,
+                offset: self.values_start,
+            }
+        }
+    }
+
+    /// Iterator over validated launch-environment entries.
+    pub struct EnvironmentEntries<'a> {
+        environment: Environment<'a>,
+        index: usize,
+        offset: usize,
+    }
+
+    impl<'a> Iterator for EnvironmentEntries<'a> {
+        type Item = &'a str;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.index >= self.environment.count {
+                return None;
+            }
+            let length = usize::from(
+                read_u16(
+                    self.environment.bytes,
+                    ENVIRONMENT_HEADER_BYTES + self.index * 2,
+                )
+                .ok()?,
+            );
+            let end = self.offset.checked_add(length)?;
+            let value = str::from_utf8(self.environment.bytes.get(self.offset..end)?).ok()?;
+            self.index += 1;
+            self.offset = end;
+            Some(value)
+        }
+
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            let remaining = self.environment.count.saturating_sub(self.index);
+            (remaining, Some(remaining))
+        }
+    }
+
+    impl ExactSizeIterator for EnvironmentEntries<'_> {}
+
+    /// Encode canonical `NAME=VALUE` launch entries.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid names, bounds, arithmetic overflow, or insufficient space.
+    pub fn encode_environment(
+        environment: &[&str],
+        destination: &mut [u8],
+    ) -> Result<usize, EncodeError> {
+        if environment.len() > MAX_ENVIRONMENT {
+            return Err(EncodeError::LimitExceeded);
+        }
+        let values_bytes = environment.iter().try_fold(0_usize, |total, value| {
+            validate_environment(value)?;
+            total
+                .checked_add(value.len())
+                .ok_or(EncodeError::LimitExceeded)
+        })?;
+        if values_bytes > MAX_ENVIRONMENT_BYTES {
+            return Err(EncodeError::LimitExceeded);
+        }
+        let total = ENVIRONMENT_HEADER_BYTES
+            .checked_add(
+                environment
+                    .len()
+                    .checked_mul(2)
+                    .ok_or(EncodeError::LimitExceeded)?,
+            )
+            .and_then(|value| value.checked_add(values_bytes))
+            .ok_or(EncodeError::LimitExceeded)?;
+        if total > MAX_ENCODED_ENVIRONMENT_BYTES || destination.len() < total {
+            return Err(EncodeError::DestinationTooSmall);
+        }
+        let mut encoded = [0_u8; MAX_ENCODED_ENVIRONMENT_BYTES];
+        write_u16(
+            &mut encoded,
+            0,
+            u16::try_from(total).map_err(|_| EncodeError::LimitExceeded)?,
+        );
+        write_u16(
+            &mut encoded,
+            2,
+            u16::try_from(environment.len()).map_err(|_| EncodeError::LimitExceeded)?,
+        );
+        let mut cursor = ENVIRONMENT_HEADER_BYTES + environment.len() * 2;
+        for (index, value) in environment.iter().enumerate() {
+            write_u16(
+                &mut encoded,
+                ENVIRONMENT_HEADER_BYTES + index * 2,
+                u16::try_from(value.len()).map_err(|_| EncodeError::LimitExceeded)?,
+            );
+            let end = cursor
+                .checked_add(value.len())
+                .ok_or(EncodeError::LimitExceeded)?;
+            encoded[cursor..end].copy_from_slice(value.as_bytes());
+            cursor = end;
+        }
+        destination[..total].copy_from_slice(&encoded[..total]);
+        Ok(total)
+    }
+
     /// Encode one canonical invocation into caller-owned storage.
     ///
     /// # Errors
@@ -843,6 +1030,23 @@ pub mod command {
             .get(offset..offset + 2)
             .ok_or(DecodeError::InvalidEncoding)?;
         Ok(u16::from_le_bytes([raw[0], raw[1]]))
+    }
+
+    fn validate_environment(value: &str) -> Result<(), EncodeError> {
+        let Some((name, _)) = value.split_once('=') else {
+            return Err(EncodeError::LimitExceeded);
+        };
+        if name.is_empty()
+            || name.as_bytes().first().is_some_and(u8::is_ascii_digit)
+            || !name
+                .as_bytes()
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            || value.as_bytes().contains(&0)
+        {
+            return Err(EncodeError::LimitExceeded);
+        }
+        Ok(())
     }
 
     fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
@@ -1087,7 +1291,7 @@ pub mod filesystem {
     /// Maximum path bytes accepted by this interface.
     pub const MAX_PATH_BYTES: usize = 256;
     /// Maximum simultaneously open files per application service.
-    pub const MAX_OPEN_FILES: usize = 8;
+    pub const MAX_OPEN_FILES: usize = 4096;
     /// Maximum entries returned by one list call.
     pub const MAX_LIST_ENTRIES: usize = 64;
     /// Maximum encoded bytes in one entry name.
@@ -2705,9 +2909,11 @@ pub mod process_observation {
     /// Interface major version.
     pub const MAJOR: u16 = 1;
     /// Interface minor version.
-    pub const MINOR: u16 = 0;
+    pub const MINOR: u16 = 1;
     /// Read one current bounded process snapshot.
     pub const GET_SNAPSHOT: u16 = 1;
+    /// Read one stable-ID-cursor page of current process records.
+    pub const GET_PAGE: u16 = 2;
     /// Maximum observable live processes.
     pub const MAX_PROCESSES: usize = 16;
     /// Maximum UTF-8 bytes in one executable name.
@@ -2718,8 +2924,17 @@ pub mod process_observation {
     pub const RECORD_BYTES: usize = 112;
     /// Exact canonical snapshot bytes.
     pub const SNAPSHOT_BYTES: usize = HEADER_BYTES + MAX_PROCESSES * RECORD_BYTES;
+    /// Maximum process records returned by one paginated call.
+    pub const MAX_PAGE_PROCESSES: usize = 32;
+    /// Fixed paginated-response header bytes.
+    pub const PAGE_HEADER_BYTES: usize = 48;
+    /// Exact canonical paginated-response bytes.
+    pub const PAGE_BYTES: usize = PAGE_HEADER_BYTES + MAX_PAGE_PROCESSES * RECORD_BYTES;
+    /// Exact stable-ID cursor request bytes.
+    pub const PAGE_REQUEST_BYTES: usize = 8;
 
     const MAGIC: [u8; 8] = *b"PROCv1\0\0";
+    const PAGE_MAGIC: [u8; 8] = *b"PROCpg1\0";
 
     /// Observable launcher placement.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2731,6 +2946,8 @@ pub mod process_observation {
         Background = 2,
         /// Supervised service.
         Service = 3,
+        /// Owner-scoped nested child.
+        Child = 4,
     }
 
     /// Observable process lifecycle.
@@ -2842,6 +3059,90 @@ pub mod process_observation {
         count: usize,
     }
 
+    /// One fixed-size page from a stable-ID-cursor process scan.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct Page {
+        observed_millis: u64,
+        counter_frequency_hz: u64,
+        next_cursor: u64,
+        total_processes: u32,
+        processes: [Process; MAX_PAGE_PROCESSES],
+        count: usize,
+    }
+
+    impl Page {
+        /// Construct one canonical process page.
+        ///
+        /// # Errors
+        ///
+        /// Rejects invalid frequency, cursor, counts, ordering, or records.
+        pub fn new(
+            observed_millis: u64,
+            counter_frequency_hz: u64,
+            next_cursor: u64,
+            total_processes: u32,
+            processes: &[Process],
+        ) -> Result<Self, EncodingError> {
+            if counter_frequency_hz == 0
+                || processes.len() > MAX_PAGE_PROCESSES
+                || usize::try_from(total_processes).map_err(|_| EncodingError)? < processes.len()
+                || (processes.is_empty() && next_cursor != 0)
+                || (next_cursor != 0
+                    && processes.last().map(|process| process.id) != Some(next_cursor))
+            {
+                return Err(EncodingError);
+            }
+            let mut retained = [EMPTY_PROCESS; MAX_PAGE_PROCESSES];
+            let mut previous = 0_u64;
+            for (destination, process) in retained.iter_mut().zip(processes.iter().copied()) {
+                validate_process(process)?;
+                if process.id <= previous {
+                    return Err(EncodingError);
+                }
+                previous = process.id;
+                *destination = process;
+            }
+            Ok(Self {
+                observed_millis,
+                counter_frequency_hz,
+                next_cursor,
+                total_processes,
+                processes: retained,
+                count: processes.len(),
+            })
+        }
+
+        /// Boot-relative observation time.
+        #[must_use]
+        pub const fn observed_millis(self) -> u64 {
+            self.observed_millis
+        }
+
+        /// Counter frequency used by every record.
+        #[must_use]
+        pub const fn counter_frequency_hz(self) -> u64 {
+            self.counter_frequency_hz
+        }
+
+        /// Last returned process ID, or zero when this scan is complete.
+        #[must_use]
+        pub const fn next_cursor(self) -> u64 {
+            self.next_cursor
+        }
+
+        /// Number of live records when this page was observed.
+        #[must_use]
+        pub const fn total_processes(self) -> u32 {
+            self.total_processes
+        }
+
+        /// Records in ascending process-ID order.
+        #[must_use]
+        pub fn processes(&self) -> &[Process] {
+            &self.processes[..self.count]
+        }
+    }
+
     impl Snapshot {
         /// Construct one snapshot by copying current records.
         ///
@@ -2921,23 +3222,8 @@ pub mod process_observation {
         write_u64(&mut bytes, 16, snapshot.observed_millis);
         write_u64(&mut bytes, 24, snapshot.counter_frequency_hz);
         for (index, process) in snapshot.processes().iter().copied().enumerate() {
-            validate_process(process)?;
             let at = HEADER_BYTES + index * RECORD_BYTES;
-            write_u64(&mut bytes, at, process.id);
-            write_u64(&mut bytes, at + 8, process.task_id);
-            write_u64(&mut bytes, at + 16, process.started_millis);
-            write_u64(&mut bytes, at + 24, process.cpu_ticks);
-            write_u64(&mut bytes, at + 32, process.resident_pages);
-            write_u64(&mut bytes, at + 40, process.table_pages);
-            write_u64(&mut bytes, at + 48, process.private_pages);
-            write_u32(&mut bytes, at + 56, process.dispatches);
-            write_u32(&mut bytes, at + 60, process.yields);
-            write_u32(&mut bytes, at + 64, process.preemptions);
-            bytes[at + 68..at + 70].copy_from_slice(&process.handles.to_le_bytes());
-            bytes[at + 70] = process.state as u8;
-            bytes[at + 71] = process.origin as u8;
-            bytes[at + 72] = process.name.len;
-            bytes[at + 80..at + 112].copy_from_slice(&process.name.bytes);
+            encode_process(&mut bytes[at..at + RECORD_BYTES], process)?;
         }
         Ok(bytes)
     }
@@ -2962,49 +3248,7 @@ pub mod process_observation {
         let mut processes = [EMPTY_PROCESS; MAX_PROCESSES];
         for (index, destination) in processes.iter_mut().take(count).enumerate() {
             let at = HEADER_BYTES + index * RECORD_BYTES;
-            if bytes[at + 73..at + 80].iter().any(|byte| *byte != 0) {
-                return Err(EncodingError);
-            }
-            let name_len = usize::from(bytes[at + 72]);
-            if name_len == 0
-                || name_len > MAX_NAME_BYTES
-                || bytes[at + 80 + name_len..at + 112]
-                    .iter()
-                    .any(|byte| *byte != 0)
-            {
-                return Err(EncodingError);
-            }
-            let name =
-                str::from_utf8(&bytes[at + 80..at + 80 + name_len]).map_err(|_| EncodingError)?;
-            let process = Process {
-                id: read_u64(bytes, at)?,
-                task_id: read_u64(bytes, at + 8)?,
-                started_millis: read_u64(bytes, at + 16)?,
-                cpu_ticks: read_u64(bytes, at + 24)?,
-                resident_pages: read_u64(bytes, at + 32)?,
-                table_pages: read_u64(bytes, at + 40)?,
-                private_pages: read_u64(bytes, at + 48)?,
-                dispatches: read_u32(bytes, at + 56)?,
-                yields: read_u32(bytes, at + 60)?,
-                preemptions: read_u32(bytes, at + 64)?,
-                handles: read_u16(bytes, at + 68)?,
-                state: match bytes[at + 70] {
-                    1 => State::Ready,
-                    2 => State::Running,
-                    3 => State::Blocked,
-                    4 => State::Stopping,
-                    _ => return Err(EncodingError),
-                },
-                origin: match bytes[at + 71] {
-                    1 => Origin::Foreground,
-                    2 => Origin::Background,
-                    3 => Origin::Service,
-                    _ => return Err(EncodingError),
-                },
-                name: ProcessName::new(name)?,
-            };
-            validate_process(process)?;
-            *destination = process;
+            *destination = decode_process(&bytes[at..at + RECORD_BYTES])?;
         }
         let used = HEADER_BYTES + count * RECORD_BYTES;
         if bytes[used..].iter().any(|byte| *byte != 0) {
@@ -3015,6 +3259,168 @@ pub mod process_observation {
             read_u64(bytes, 24)?,
             &processes[..count],
         )
+    }
+
+    /// Encode one stable-ID cursor request.
+    #[must_use]
+    pub const fn encode_page_request(after_process_id: u64) -> [u8; PAGE_REQUEST_BYTES] {
+        after_process_id.to_le_bytes()
+    }
+
+    /// Decode one stable-ID cursor request.
+    ///
+    /// # Errors
+    ///
+    /// Rejects every non-exact request.
+    pub fn decode_page_request(bytes: &[u8]) -> Result<u64, EncodingError> {
+        if bytes.len() != PAGE_REQUEST_BYTES {
+            return Err(EncodingError);
+        }
+        read_u64(bytes, 0)
+    }
+
+    /// Encode one exact fixed-size process page.
+    ///
+    /// # Errors
+    ///
+    /// Rejects inconsistent page metadata or records.
+    pub fn encode_page(page: Page) -> Result<[u8; PAGE_BYTES], EncodingError> {
+        let canonical = Page::new(
+            page.observed_millis,
+            page.counter_frequency_hz,
+            page.next_cursor,
+            page.total_processes,
+            page.processes(),
+        )?;
+        let mut bytes = [0_u8; PAGE_BYTES];
+        bytes[..8].copy_from_slice(&PAGE_MAGIC);
+        bytes[8..10].copy_from_slice(
+            &u16::try_from(canonical.count)
+                .map_err(|_| EncodingError)?
+                .to_le_bytes(),
+        );
+        bytes[10..12].copy_from_slice(
+            &u16::try_from(RECORD_BYTES)
+                .map_err(|_| EncodingError)?
+                .to_le_bytes(),
+        );
+        bytes[12..16].copy_from_slice(
+            &u32::try_from(PAGE_BYTES)
+                .map_err(|_| EncodingError)?
+                .to_le_bytes(),
+        );
+        write_u64(&mut bytes, 16, canonical.observed_millis);
+        write_u64(&mut bytes, 24, canonical.counter_frequency_hz);
+        write_u64(&mut bytes, 32, canonical.next_cursor);
+        bytes[40..44].copy_from_slice(&canonical.total_processes.to_le_bytes());
+        for (index, process) in canonical.processes().iter().copied().enumerate() {
+            let at = PAGE_HEADER_BYTES + index * RECORD_BYTES;
+            encode_process(&mut bytes[at..at + RECORD_BYTES], process)?;
+        }
+        Ok(bytes)
+    }
+
+    /// Decode one exact fixed-size process page.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed, noncanonical, truncated, or inconsistent bytes.
+    pub fn decode_page(bytes: &[u8]) -> Result<Page, EncodingError> {
+        if bytes.len() != PAGE_BYTES
+            || bytes[..8] != PAGE_MAGIC
+            || usize::from(read_u16(bytes, 10)?) != RECORD_BYTES
+            || usize::try_from(read_u32(bytes, 12)?).map_err(|_| EncodingError)? != PAGE_BYTES
+            || bytes[44..PAGE_HEADER_BYTES].iter().any(|byte| *byte != 0)
+        {
+            return Err(EncodingError);
+        }
+        let count = usize::from(read_u16(bytes, 8)?);
+        if count > MAX_PAGE_PROCESSES || read_u64(bytes, 24)? == 0 {
+            return Err(EncodingError);
+        }
+        let mut processes = [EMPTY_PROCESS; MAX_PAGE_PROCESSES];
+        for (index, destination) in processes.iter_mut().take(count).enumerate() {
+            let at = PAGE_HEADER_BYTES + index * RECORD_BYTES;
+            *destination = decode_process(&bytes[at..at + RECORD_BYTES])?;
+        }
+        let used = PAGE_HEADER_BYTES + count * RECORD_BYTES;
+        if bytes[used..].iter().any(|byte| *byte != 0) {
+            return Err(EncodingError);
+        }
+        Page::new(
+            read_u64(bytes, 16)?,
+            read_u64(bytes, 24)?,
+            read_u64(bytes, 32)?,
+            read_u32(bytes, 40)?,
+            &processes[..count],
+        )
+    }
+
+    fn encode_process(bytes: &mut [u8], process: Process) -> Result<(), EncodingError> {
+        if bytes.len() != RECORD_BYTES {
+            return Err(EncodingError);
+        }
+        validate_process(process)?;
+        write_u64(bytes, 0, process.id);
+        write_u64(bytes, 8, process.task_id);
+        write_u64(bytes, 16, process.started_millis);
+        write_u64(bytes, 24, process.cpu_ticks);
+        write_u64(bytes, 32, process.resident_pages);
+        write_u64(bytes, 40, process.table_pages);
+        write_u64(bytes, 48, process.private_pages);
+        write_u32(bytes, 56, process.dispatches);
+        write_u32(bytes, 60, process.yields);
+        write_u32(bytes, 64, process.preemptions);
+        bytes[68..70].copy_from_slice(&process.handles.to_le_bytes());
+        bytes[70] = process.state as u8;
+        bytes[71] = process.origin as u8;
+        bytes[72] = process.name.len;
+        bytes[80..112].copy_from_slice(&process.name.bytes);
+        Ok(())
+    }
+
+    fn decode_process(bytes: &[u8]) -> Result<Process, EncodingError> {
+        if bytes.len() != RECORD_BYTES || bytes[73..80].iter().any(|byte| *byte != 0) {
+            return Err(EncodingError);
+        }
+        let name_len = usize::from(bytes[72]);
+        if name_len == 0
+            || name_len > MAX_NAME_BYTES
+            || bytes[80 + name_len..112].iter().any(|byte| *byte != 0)
+        {
+            return Err(EncodingError);
+        }
+        let name = str::from_utf8(&bytes[80..80 + name_len]).map_err(|_| EncodingError)?;
+        let process = Process {
+            id: read_u64(bytes, 0)?,
+            task_id: read_u64(bytes, 8)?,
+            started_millis: read_u64(bytes, 16)?,
+            cpu_ticks: read_u64(bytes, 24)?,
+            resident_pages: read_u64(bytes, 32)?,
+            table_pages: read_u64(bytes, 40)?,
+            private_pages: read_u64(bytes, 48)?,
+            dispatches: read_u32(bytes, 56)?,
+            yields: read_u32(bytes, 60)?,
+            preemptions: read_u32(bytes, 64)?,
+            handles: read_u16(bytes, 68)?,
+            state: match bytes[70] {
+                1 => State::Ready,
+                2 => State::Running,
+                3 => State::Blocked,
+                4 => State::Stopping,
+                _ => return Err(EncodingError),
+            },
+            origin: match bytes[71] {
+                1 => Origin::Foreground,
+                2 => Origin::Background,
+                3 => Origin::Service,
+                4 => Origin::Child,
+                _ => return Err(EncodingError),
+            },
+            name: ProcessName::new(name)?,
+        };
+        validate_process(process)?;
+        Ok(process)
     }
 
     fn validate_process(process: Process) -> Result<(), EncodingError> {
@@ -3056,6 +3462,750 @@ pub mod process_observation {
     }
 }
 
+/// Owner-scoped child-process launch and lifecycle protocol.
+pub mod process_launch {
+    use super::{MAX_SERVICE_PAYLOAD_BYTES, command, exit, str};
+
+    /// Interface major version.
+    pub const MAJOR: u16 = 1;
+    /// Interface minor version.
+    pub const MINOR: u16 = 0;
+    /// Admit one child and return its owner-scoped token.
+    pub const SPAWN: u16 = 1;
+    /// Return current child state without blocking.
+    pub const POLL: u16 = 2;
+    /// Wait until one child becomes terminal.
+    pub const WAIT: u16 = 3;
+    /// Request cooperative child cancellation.
+    pub const CANCEL: u16 = 4;
+    /// Revoke a terminal child token and release retained metadata.
+    pub const REAP: u16 = 5;
+    /// Maximum environment entries passed to one child.
+    pub const MAX_ENVIRONMENT: usize = command::MAX_ENVIRONMENT;
+    /// Maximum aggregate environment UTF-8 bytes.
+    pub const MAX_ENVIRONMENT_BYTES: usize = command::MAX_ENVIRONMENT_BYTES;
+    /// Fixed spawn-request header bytes.
+    pub const SPAWN_HEADER_BYTES: usize = 48;
+    /// Maximum canonical spawn payload.
+    pub const MAX_SPAWN_BYTES: usize = SPAWN_HEADER_BYTES
+        + command::MAX_INVOCATION_BYTES
+        + MAX_ENVIRONMENT * 2
+        + MAX_ENVIRONMENT_BYTES;
+    /// Exact child-token request bytes.
+    pub const TOKEN_BYTES: usize = 8;
+    /// Exact spawn reply bytes.
+    pub const SPAWN_REPLY_BYTES: usize = 16;
+    /// Exact poll/wait reply bytes.
+    pub const STATUS_BYTES: usize = 24;
+    /// Shell-visible status used for a contained child fault.
+    pub const FAULT_EXIT_STATUS: u32 = 125;
+
+    const MAGIC: [u8; 8] = *b"PSPNv1\0\0";
+
+    /// Standard-stream source or destination selected for a child.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    #[repr(u8)]
+    pub enum StreamMode {
+        /// Share the launching process's corresponding standard stream.
+        Inherit = 1,
+        /// Attach an immediate EOF input or discarded output endpoint.
+        Null = 2,
+        /// Attach the corresponding endpoint of an owner-scoped pipe.
+        Pipe = 3,
+    }
+
+    /// One child standard-stream selection.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct StreamSpec {
+        /// Endpoint behavior.
+        pub mode: StreamMode,
+        /// Nonzero pipe token only when `mode` is [`StreamMode::Pipe`].
+        pub pipe: u64,
+    }
+
+    impl StreamSpec {
+        /// Inherit the launching process's corresponding stream.
+        pub const INHERIT: Self = Self {
+            mode: StreamMode::Inherit,
+            pipe: 0,
+        };
+        /// Attach a null endpoint.
+        pub const NULL: Self = Self {
+            mode: StreamMode::Null,
+            pipe: 0,
+        };
+
+        /// Attach one owner-scoped pipe token.
+        ///
+        /// # Errors
+        ///
+        /// Rejects the reserved zero token.
+        pub const fn pipe(token: u64) -> Result<Self, EncodingError> {
+            if token == 0 {
+                Err(EncodingError)
+            } else {
+                Ok(Self {
+                    mode: StreamMode::Pipe,
+                    pipe: token,
+                })
+            }
+        }
+    }
+
+    /// Borrowed validated child launch request.
+    #[derive(Clone, Copy, Debug)]
+    pub struct SpawnRequest<'a> {
+        invocation: command::Invocation<'a>,
+        environment_table: &'a [u8],
+        environment_bytes: &'a [u8],
+        environment_count: usize,
+        stdin: StreamSpec,
+        stdout: StreamSpec,
+        stderr: StreamSpec,
+    }
+
+    impl<'a> SpawnRequest<'a> {
+        /// Validated cwd and argv record, including command name as argument zero.
+        #[must_use]
+        pub const fn invocation(self) -> command::Invocation<'a> {
+            self.invocation
+        }
+
+        /// Environment entries in canonical input order.
+        #[must_use]
+        pub const fn environment(self) -> Environment<'a> {
+            Environment {
+                lengths: self.environment_table,
+                bytes: self.environment_bytes,
+                count: self.environment_count,
+                index: 0,
+                offset: 0,
+            }
+        }
+
+        /// Child standard input selection.
+        #[must_use]
+        pub const fn stdin(self) -> StreamSpec {
+            self.stdin
+        }
+
+        /// Child standard output selection.
+        #[must_use]
+        pub const fn stdout(self) -> StreamSpec {
+            self.stdout
+        }
+
+        /// Child standard error selection.
+        #[must_use]
+        pub const fn stderr(self) -> StreamSpec {
+            self.stderr
+        }
+    }
+
+    /// Iterator over validated `NAME=VALUE` environment strings.
+    pub struct Environment<'a> {
+        lengths: &'a [u8],
+        bytes: &'a [u8],
+        count: usize,
+        index: usize,
+        offset: usize,
+    }
+
+    impl<'a> Iterator for Environment<'a> {
+        type Item = &'a str;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            if self.index >= self.count {
+                return None;
+            }
+            let at = self.index.checked_mul(2)?;
+            let length = usize::from(u16::from_le_bytes([
+                *self.lengths.get(at)?,
+                *self.lengths.get(at + 1)?,
+            ]));
+            let end = self.offset.checked_add(length)?;
+            let value = str::from_utf8(self.bytes.get(self.offset..end)?).ok()?;
+            self.index += 1;
+            self.offset = end;
+            Some(value)
+        }
+
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            let remaining = self.count.saturating_sub(self.index);
+            (remaining, Some(remaining))
+        }
+    }
+
+    impl ExactSizeIterator for Environment<'_> {}
+
+    /// Opaque owner-scoped child capability returned at admission.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct ChildToken(u64);
+
+    impl ChildToken {
+        /// Validate one nonzero opaque value.
+        ///
+        /// # Errors
+        ///
+        /// Rejects the reserved zero value.
+        pub const fn new(value: u64) -> Result<Self, EncodingError> {
+            if value == 0 {
+                Err(EncodingError)
+            } else {
+                Ok(Self(value))
+            }
+        }
+
+        /// Stable opaque ABI value.
+        #[must_use]
+        pub const fn value(self) -> u64 {
+            self.0
+        }
+    }
+
+    /// Successfully admitted child identity.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct SpawnedChild {
+        /// Owner-scoped control capability.
+        pub token: ChildToken,
+        /// Read-only global observation identity.
+        pub process_id: u64,
+    }
+
+    /// Current owner-visible child lifecycle.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    #[repr(u8)]
+    pub enum ChildState {
+        /// Child has not reached a terminal state.
+        Running = 1,
+        /// Child exited normally with the returned status.
+        Exited = 2,
+        /// Child faulted and maps to [`FAULT_EXIT_STATUS`].
+        Faulted = 3,
+        /// Owner cancellation completed.
+        Cancelled = 4,
+    }
+
+    /// Poll or wait result for one child.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct ChildStatus {
+        /// Owner-scoped child token.
+        pub token: ChildToken,
+        /// Read-only global process identity.
+        pub process_id: u64,
+        /// Preserved full application exit status.
+        pub exit_status: u32,
+        /// Current lifecycle.
+        pub state: ChildState,
+    }
+
+    /// Invalid or noncanonical process-launch payload.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct EncodingError;
+
+    /// Encode one canonical spawn request.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed invocation/environment data, stream tokens, bounds,
+    /// or insufficient destination space without modifying it.
+    pub fn encode_spawn(
+        invocation: &[u8],
+        environment: &[&str],
+        stdin: StreamSpec,
+        stdout: StreamSpec,
+        stderr: StreamSpec,
+        destination: &mut [u8],
+    ) -> Result<usize, EncodingError> {
+        let _validated = command::Invocation::parse(invocation).map_err(|_| EncodingError)?;
+        validate_stream(stdin)?;
+        validate_stream(stdout)?;
+        validate_stream(stderr)?;
+        if environment.len() > MAX_ENVIRONMENT {
+            return Err(EncodingError);
+        }
+        let mut environment_bytes = 0_usize;
+        for value in environment {
+            validate_environment(value)?;
+            environment_bytes = environment_bytes
+                .checked_add(value.len())
+                .ok_or(EncodingError)?;
+        }
+        if environment_bytes > MAX_ENVIRONMENT_BYTES {
+            return Err(EncodingError);
+        }
+        let table_bytes = environment.len().checked_mul(2).ok_or(EncodingError)?;
+        let total = SPAWN_HEADER_BYTES
+            .checked_add(invocation.len())
+            .and_then(|value| value.checked_add(table_bytes))
+            .and_then(|value| value.checked_add(environment_bytes))
+            .ok_or(EncodingError)?;
+        if total > MAX_SERVICE_PAYLOAD_BYTES || total > MAX_SPAWN_BYTES || destination.len() < total
+        {
+            return Err(EncodingError);
+        }
+        destination[..total].fill(0);
+        destination[..8].copy_from_slice(&MAGIC);
+        destination[8..10].copy_from_slice(
+            &u16::try_from(total)
+                .map_err(|_| EncodingError)?
+                .to_le_bytes(),
+        );
+        destination[10..12].copy_from_slice(
+            &u16::try_from(invocation.len())
+                .map_err(|_| EncodingError)?
+                .to_le_bytes(),
+        );
+        destination[12..14].copy_from_slice(
+            &u16::try_from(environment.len())
+                .map_err(|_| EncodingError)?
+                .to_le_bytes(),
+        );
+        destination[14..16].copy_from_slice(
+            &u16::try_from(environment_bytes)
+                .map_err(|_| EncodingError)?
+                .to_le_bytes(),
+        );
+        destination[16..24].copy_from_slice(&stdin.pipe.to_le_bytes());
+        destination[24..32].copy_from_slice(&stdout.pipe.to_le_bytes());
+        destination[32..40].copy_from_slice(&stderr.pipe.to_le_bytes());
+        destination[40] = stdin.mode as u8;
+        destination[41] = stdout.mode as u8;
+        destination[42] = stderr.mode as u8;
+        let invocation_end = SPAWN_HEADER_BYTES + invocation.len();
+        destination[SPAWN_HEADER_BYTES..invocation_end].copy_from_slice(invocation);
+        let table_start = invocation_end;
+        let values_start = table_start + table_bytes;
+        let mut cursor = values_start;
+        for (index, value) in environment.iter().enumerate() {
+            let at = table_start + index * 2;
+            destination[at..at + 2].copy_from_slice(
+                &u16::try_from(value.len())
+                    .map_err(|_| EncodingError)?
+                    .to_le_bytes(),
+            );
+            let end = cursor.checked_add(value.len()).ok_or(EncodingError)?;
+            destination[cursor..end].copy_from_slice(value.as_bytes());
+            cursor = end;
+        }
+        Ok(total)
+    }
+
+    /// Decode one exact canonical spawn request.
+    ///
+    /// # Errors
+    ///
+    /// Rejects every malformed, excessive, non-UTF-8, or trailing byte.
+    pub fn decode_spawn(bytes: &[u8]) -> Result<SpawnRequest<'_>, EncodingError> {
+        if bytes.len() < SPAWN_HEADER_BYTES
+            || bytes[..8] != MAGIC
+            || usize::from(read_u16(bytes, 8)?) != bytes.len()
+            || bytes[43..SPAWN_HEADER_BYTES].iter().any(|byte| *byte != 0)
+        {
+            return Err(EncodingError);
+        }
+        let invocation_bytes = usize::from(read_u16(bytes, 10)?);
+        let environment_count = usize::from(read_u16(bytes, 12)?);
+        let environment_bytes = usize::from(read_u16(bytes, 14)?);
+        if environment_count > MAX_ENVIRONMENT || environment_bytes > MAX_ENVIRONMENT_BYTES {
+            return Err(EncodingError);
+        }
+        let table_bytes = environment_count.checked_mul(2).ok_or(EncodingError)?;
+        let invocation_end = SPAWN_HEADER_BYTES
+            .checked_add(invocation_bytes)
+            .ok_or(EncodingError)?;
+        let table_end = invocation_end
+            .checked_add(table_bytes)
+            .ok_or(EncodingError)?;
+        let values_end = table_end
+            .checked_add(environment_bytes)
+            .ok_or(EncodingError)?;
+        if values_end != bytes.len() {
+            return Err(EncodingError);
+        }
+        let invocation = command::Invocation::parse(&bytes[SPAWN_HEADER_BYTES..invocation_end])
+            .map_err(|_| EncodingError)?;
+        let stdin = decode_stream(bytes[40], read_u64(bytes, 16)?)?;
+        let stdout = decode_stream(bytes[41], read_u64(bytes, 24)?)?;
+        let stderr = decode_stream(bytes[42], read_u64(bytes, 32)?)?;
+        let environment_table = &bytes[invocation_end..table_end];
+        let environment_values = &bytes[table_end..values_end];
+        let environment = Environment {
+            lengths: environment_table,
+            bytes: environment_values,
+            count: environment_count,
+            index: 0,
+            offset: 0,
+        };
+        let mut consumed = 0_usize;
+        for value in environment {
+            validate_environment(value)?;
+            consumed = consumed.checked_add(value.len()).ok_or(EncodingError)?;
+        }
+        if consumed != environment_bytes {
+            return Err(EncodingError);
+        }
+        Ok(SpawnRequest {
+            invocation,
+            environment_table,
+            environment_bytes: environment_values,
+            environment_count,
+            stdin,
+            stdout,
+            stderr,
+        })
+    }
+
+    /// Encode one child token request.
+    #[must_use]
+    pub const fn encode_token(token: ChildToken) -> [u8; TOKEN_BYTES] {
+        token.value().to_le_bytes()
+    }
+
+    /// Decode one exact child token request.
+    ///
+    /// # Errors
+    ///
+    /// Rejects non-exact or zero tokens.
+    pub fn decode_token(bytes: &[u8]) -> Result<ChildToken, EncodingError> {
+        if bytes.len() != TOKEN_BYTES {
+            return Err(EncodingError);
+        }
+        ChildToken::new(read_u64(bytes, 0)?)
+    }
+
+    /// Encode one successful spawn reply.
+    #[must_use]
+    pub fn encode_spawned(child: SpawnedChild) -> [u8; SPAWN_REPLY_BYTES] {
+        let mut bytes = [0_u8; SPAWN_REPLY_BYTES];
+        bytes[..8].copy_from_slice(&child.token.value().to_le_bytes());
+        bytes[8..16].copy_from_slice(&child.process_id.to_le_bytes());
+        bytes
+    }
+
+    /// Decode one successful spawn reply.
+    ///
+    /// # Errors
+    ///
+    /// Rejects non-exact, zero, or invalid identities.
+    pub fn decode_spawned(bytes: &[u8]) -> Result<SpawnedChild, EncodingError> {
+        if bytes.len() != SPAWN_REPLY_BYTES {
+            return Err(EncodingError);
+        }
+        let process_id = read_u64(bytes, 8)?;
+        if process_id == 0 {
+            return Err(EncodingError);
+        }
+        Ok(SpawnedChild {
+            token: ChildToken::new(read_u64(bytes, 0)?)?,
+            process_id,
+        })
+    }
+
+    /// Encode one canonical child status.
+    ///
+    /// # Errors
+    ///
+    /// Rejects inconsistent state/status combinations.
+    pub fn encode_status(status: ChildStatus) -> Result<[u8; STATUS_BYTES], EncodingError> {
+        validate_status(status)?;
+        let mut bytes = [0_u8; STATUS_BYTES];
+        bytes[..8].copy_from_slice(&status.token.value().to_le_bytes());
+        bytes[8..16].copy_from_slice(&status.process_id.to_le_bytes());
+        bytes[16..20].copy_from_slice(&status.exit_status.to_le_bytes());
+        bytes[20] = status.state as u8;
+        Ok(bytes)
+    }
+
+    /// Decode one exact child status.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed, reserved, or inconsistent values.
+    pub fn decode_status(bytes: &[u8]) -> Result<ChildStatus, EncodingError> {
+        if bytes.len() != STATUS_BYTES || bytes[21..].iter().any(|byte| *byte != 0) {
+            return Err(EncodingError);
+        }
+        let status = ChildStatus {
+            token: ChildToken::new(read_u64(bytes, 0)?)?,
+            process_id: read_u64(bytes, 8)?,
+            exit_status: read_u32(bytes, 16)?,
+            state: match bytes[20] {
+                1 => ChildState::Running,
+                2 => ChildState::Exited,
+                3 => ChildState::Faulted,
+                4 => ChildState::Cancelled,
+                _ => return Err(EncodingError),
+            },
+        };
+        validate_status(status)?;
+        Ok(status)
+    }
+
+    fn validate_stream(stream: StreamSpec) -> Result<(), EncodingError> {
+        if (stream.mode == StreamMode::Pipe) != (stream.pipe != 0) {
+            return Err(EncodingError);
+        }
+        Ok(())
+    }
+
+    fn decode_stream(mode: u8, pipe: u64) -> Result<StreamSpec, EncodingError> {
+        let stream = StreamSpec {
+            mode: match mode {
+                1 => StreamMode::Inherit,
+                2 => StreamMode::Null,
+                3 => StreamMode::Pipe,
+                _ => return Err(EncodingError),
+            },
+            pipe,
+        };
+        validate_stream(stream)?;
+        Ok(stream)
+    }
+
+    fn validate_environment(value: &str) -> Result<(), EncodingError> {
+        let Some((name, _value)) = value.split_once('=') else {
+            return Err(EncodingError);
+        };
+        if name.is_empty()
+            || name.as_bytes().first().is_some_and(u8::is_ascii_digit)
+            || !name
+                .as_bytes()
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            || value.as_bytes().contains(&0)
+        {
+            return Err(EncodingError);
+        }
+        Ok(())
+    }
+
+    fn validate_status(status: ChildStatus) -> Result<(), EncodingError> {
+        if status.process_id == 0
+            || (status.state == ChildState::Running && status.exit_status != 0)
+            || (status.state == ChildState::Faulted && status.exit_status != FAULT_EXIT_STATUS)
+            || (status.state == ChildState::Cancelled && status.exit_status != exit::CANCELLED)
+        {
+            return Err(EncodingError);
+        }
+        Ok(())
+    }
+
+    fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, EncodingError> {
+        let raw = bytes.get(offset..offset + 2).ok_or(EncodingError)?;
+        Ok(u16::from_le_bytes([raw[0], raw[1]]))
+    }
+
+    fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, EncodingError> {
+        let raw = bytes.get(offset..offset + 4).ok_or(EncodingError)?;
+        Ok(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+    }
+
+    fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, EncodingError> {
+        let raw = bytes.get(offset..offset + 8).ok_or(EncodingError)?;
+        Ok(u64::from_le_bytes([
+            raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+        ]))
+    }
+}
+
+/// Owner-scoped bounded byte-pipe protocol.
+pub mod pipe {
+    use super::MAX_SERVICE_PAYLOAD_BYTES;
+
+    /// Interface major version.
+    pub const MAJOR: u16 = 1;
+    /// Interface minor version.
+    pub const MINOR: u16 = 0;
+    /// Create one pipe and return its opaque owner token.
+    pub const CREATE: u16 = 1;
+    /// Write bytes to a pipe's writer endpoint.
+    pub const WRITE: u16 = 2;
+    /// Read currently available bytes from a pipe's reader endpoint.
+    pub const READ: u16 = 3;
+    /// Close the owner's writer endpoint.
+    pub const CLOSE_WRITER: u16 = 4;
+    /// Close the owner's reader endpoint.
+    pub const CLOSE_READER: u16 = 5;
+    /// Minimum pipe byte capacity.
+    pub const MIN_CAPACITY: usize = 4 * 1024;
+    /// Maximum pipe byte capacity.
+    pub const MAX_CAPACITY: usize = 1024 * 1024;
+    /// Maximum bytes transferred in one pipe operation.
+    pub const MAX_IO_BYTES: usize = MAX_SERVICE_PAYLOAD_BYTES - 8;
+    /// Exact create request bytes.
+    pub const CREATE_REQUEST_BYTES: usize = 4;
+    /// Exact token-only request or create reply bytes.
+    pub const TOKEN_BYTES: usize = 8;
+    /// Exact read request bytes.
+    pub const READ_REQUEST_BYTES: usize = 16;
+
+    /// Opaque owner-scoped pipe identity.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct PipeToken(u64);
+
+    impl PipeToken {
+        /// Validate one nonzero opaque value.
+        ///
+        /// # Errors
+        ///
+        /// Rejects the reserved zero value.
+        pub const fn new(value: u64) -> Result<Self, EncodingError> {
+            if value == 0 {
+                Err(EncodingError)
+            } else {
+                Ok(Self(value))
+            }
+        }
+
+        /// Stable opaque ABI value.
+        #[must_use]
+        pub const fn value(self) -> u64 {
+            self.0
+        }
+    }
+
+    /// Invalid or noncanonical pipe payload.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct EncodingError;
+
+    /// Encode a requested pipe capacity.
+    ///
+    /// # Errors
+    ///
+    /// Rejects values outside the closed capacity policy.
+    pub fn encode_create(capacity: usize) -> Result<[u8; CREATE_REQUEST_BYTES], EncodingError> {
+        if !(MIN_CAPACITY..=MAX_CAPACITY).contains(&capacity) {
+            return Err(EncodingError);
+        }
+        Ok(u32::try_from(capacity)
+            .map_err(|_| EncodingError)?
+            .to_le_bytes())
+    }
+
+    /// Decode one exact create request.
+    ///
+    /// # Errors
+    ///
+    /// Rejects non-exact or out-of-policy values.
+    pub fn decode_create(bytes: &[u8]) -> Result<usize, EncodingError> {
+        if bytes.len() != CREATE_REQUEST_BYTES {
+            return Err(EncodingError);
+        }
+        let capacity = usize::try_from(read_u32(bytes, 0)?).map_err(|_| EncodingError)?;
+        if !(MIN_CAPACITY..=MAX_CAPACITY).contains(&capacity) {
+            return Err(EncodingError);
+        }
+        Ok(capacity)
+    }
+
+    /// Encode one pipe token.
+    #[must_use]
+    pub const fn encode_token(token: PipeToken) -> [u8; TOKEN_BYTES] {
+        token.value().to_le_bytes()
+    }
+
+    /// Decode one exact pipe token.
+    ///
+    /// # Errors
+    ///
+    /// Rejects non-exact or zero tokens.
+    pub fn decode_token(bytes: &[u8]) -> Result<PipeToken, EncodingError> {
+        if bytes.len() != TOKEN_BYTES {
+            return Err(EncodingError);
+        }
+        PipeToken::new(read_u64(bytes, 0)?)
+    }
+
+    /// Encode one bounded pipe write request into caller storage.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty/excess payloads or insufficient destination storage.
+    pub fn encode_write(
+        token: PipeToken,
+        payload: &[u8],
+        destination: &mut [u8],
+    ) -> Result<usize, EncodingError> {
+        let total = TOKEN_BYTES
+            .checked_add(payload.len())
+            .ok_or(EncodingError)?;
+        if payload.is_empty() || payload.len() > MAX_IO_BYTES || destination.len() < total {
+            return Err(EncodingError);
+        }
+        destination[..TOKEN_BYTES].copy_from_slice(&encode_token(token));
+        destination[TOKEN_BYTES..total].copy_from_slice(payload);
+        Ok(total)
+    }
+
+    /// Decode one exact pipe write request.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty/excess payloads or invalid tokens.
+    pub fn decode_write(bytes: &[u8]) -> Result<(PipeToken, &[u8]), EncodingError> {
+        if !(TOKEN_BYTES + 1..=MAX_SERVICE_PAYLOAD_BYTES).contains(&bytes.len()) {
+            return Err(EncodingError);
+        }
+        Ok((decode_token(&bytes[..TOKEN_BYTES])?, &bytes[TOKEN_BYTES..]))
+    }
+
+    /// Encode one bounded read request.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero or excessive requested lengths.
+    pub fn encode_read(
+        token: PipeToken,
+        maximum_bytes: usize,
+    ) -> Result<[u8; READ_REQUEST_BYTES], EncodingError> {
+        if maximum_bytes == 0 || maximum_bytes > MAX_IO_BYTES {
+            return Err(EncodingError);
+        }
+        let mut bytes = [0_u8; READ_REQUEST_BYTES];
+        bytes[..8].copy_from_slice(&encode_token(token));
+        bytes[8..10].copy_from_slice(
+            &u16::try_from(maximum_bytes)
+                .map_err(|_| EncodingError)?
+                .to_le_bytes(),
+        );
+        Ok(bytes)
+    }
+
+    /// Decode one exact bounded read request.
+    ///
+    /// # Errors
+    ///
+    /// Rejects padding, invalid tokens, or invalid requested lengths.
+    pub fn decode_read(bytes: &[u8]) -> Result<(PipeToken, usize), EncodingError> {
+        if bytes.len() != READ_REQUEST_BYTES || bytes[10..].iter().any(|byte| *byte != 0) {
+            return Err(EncodingError);
+        }
+        let maximum = usize::from(read_u16(bytes, 8)?);
+        if maximum == 0 || maximum > MAX_IO_BYTES {
+            return Err(EncodingError);
+        }
+        Ok((decode_token(&bytes[..8])?, maximum))
+    }
+
+    fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, EncodingError> {
+        let raw = bytes.get(offset..offset + 2).ok_or(EncodingError)?;
+        Ok(u16::from_le_bytes([raw[0], raw[1]]))
+    }
+
+    fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, EncodingError> {
+        let raw = bytes.get(offset..offset + 4).ok_or(EncodingError)?;
+        Ok(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+    }
+
+    fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, EncodingError> {
+        let raw = bytes.get(offset..offset + 8).ok_or(EncodingError)?;
+        Ok(u64::from_le_bytes([
+            raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+        ]))
+    }
+}
+
 /// Read-only typed IPv4 configuration, counters, and neighbor protocol.
 pub mod network_observation {
     /// Interface major version.
@@ -3073,7 +4223,7 @@ pub mod network_observation {
     /// Exact counter reply bytes.
     pub const STATS_BYTES: usize = 88;
     /// Maximum retained IPv4 neighbors.
-    pub const MAX_NEIGHBORS: usize = 8;
+    pub const MAX_NEIGHBORS: usize = 256;
     /// Maximum canonical neighbor-list reply bytes.
     pub const MAX_NEIGHBOR_REPLY_BYTES: usize = 8 + MAX_NEIGHBORS * 10;
 
@@ -3855,8 +5005,8 @@ pub mod tcp_connect {
 mod tests {
     use super::{
         MAX_MESSAGE_BYTES, command, datagram, diagnostics, filesystem, filesystem_mutation,
-        icmp_echo, interface, network_observation, process_observation, reply, requirements,
-        server, shell_script, stream, tcp_connect, timer, volume_control,
+        icmp_echo, interface, network_observation, pipe, process_launch, process_observation,
+        reply, requirements, server, shell_script, stream, tcp_connect, timer, volume_control,
     };
 
     #[test]
@@ -3881,6 +5031,8 @@ mod tests {
             interface::WALL_CLOCK,
             interface::CLOCK_CONTROL,
             interface::PROCESS_OBSERVE,
+            interface::PROCESS_LAUNCH,
+            interface::PIPE,
         ];
         assert!(interfaces.iter().all(|value| *value != 0));
         assert!(
@@ -3956,6 +5108,18 @@ mod tests {
             invocation.arguments().collect::<std::vec::Vec<_>>(),
             arguments
         );
+
+        let mut environment_bytes = [0_u8; command::MAX_ENCODED_ENVIRONMENT_BYTES];
+        let count =
+            command::encode_environment(&["HOME=/vol/root", "PATH=/bin"], &mut environment_bytes)
+                .unwrap_or_else(|_| std::process::abort());
+        let environment = command::Environment::parse(&environment_bytes[..count])
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            environment.iter().collect::<std::vec::Vec<_>>(),
+            ["HOME=/vol/root", "PATH=/bin"]
+        );
+        assert!(command::encode_environment(&["BAD"], &mut environment_bytes).is_err());
     }
 
     #[test]
@@ -4344,6 +5508,109 @@ mod tests {
         assert!(
             process_observation::ProcessName::new("123456789012345678901234567890123").is_err()
         );
+
+        let page = process_observation::Page::new(200, 1_000_000, 42, 65_536, &[process])
+            .unwrap_or_else(|_| std::process::abort());
+        let page_bytes =
+            process_observation::encode_page(page).unwrap_or_else(|_| std::process::abort());
+        let decoded =
+            process_observation::decode_page(&page_bytes).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(decoded.next_cursor(), 42);
+        assert_eq!(decoded.total_processes(), 65_536);
+        assert_eq!(decoded.processes(), &[process]);
+        assert_eq!(
+            process_observation::decode_page_request(&process_observation::encode_page_request(
+                u64::MAX
+            )),
+            Ok(u64::MAX)
+        );
+    }
+
+    #[test]
+    fn process_launch_records_are_canonical_owner_scoped_and_full_status() {
+        let mut invocation = [0_u8; command::MAX_INVOCATION_BYTES];
+        let invocation_bytes = command::encode("/work", &["status", "203"], &mut invocation)
+            .unwrap_or_else(|_| std::process::abort());
+        let pipe_token =
+            pipe::PipeToken::new(0x0000_0001_0000_0001).unwrap_or_else(|_| std::process::abort());
+        let pipe_stream = process_launch::StreamSpec::pipe(pipe_token.value())
+            .unwrap_or_else(|_| std::process::abort());
+        let mut spawn = [0xa5_u8; process_launch::MAX_SPAWN_BYTES];
+        let count = process_launch::encode_spawn(
+            &invocation[..invocation_bytes],
+            &["LANG=C", "PATH=/bin"],
+            process_launch::StreamSpec::NULL,
+            pipe_stream,
+            process_launch::StreamSpec::INHERIT,
+            &mut spawn,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        let decoded =
+            process_launch::decode_spawn(&spawn[..count]).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(decoded.invocation().cwd(), "/work");
+        assert_eq!(
+            decoded
+                .invocation()
+                .arguments()
+                .collect::<std::vec::Vec<_>>(),
+            ["status", "203"]
+        );
+        assert_eq!(
+            decoded.environment().collect::<std::vec::Vec<_>>(),
+            ["LANG=C", "PATH=/bin"]
+        );
+        assert_eq!(decoded.stdout(), pipe_stream);
+        assert!(process_launch::decode_spawn(&spawn[..count - 1]).is_err());
+        assert!(
+            process_launch::encode_spawn(
+                &invocation[..invocation_bytes],
+                &["9BAD=value"],
+                process_launch::StreamSpec::NULL,
+                pipe_stream,
+                process_launch::StreamSpec::INHERIT,
+                &mut spawn,
+            )
+            .is_err()
+        );
+
+        let token = process_launch::ChildToken::new(0x0000_0002_0000_0001)
+            .unwrap_or_else(|_| std::process::abort());
+        let status = process_launch::ChildStatus {
+            token,
+            process_id: u64::MAX,
+            exit_status: u32::MAX,
+            state: process_launch::ChildState::Exited,
+        };
+        let encoded =
+            process_launch::encode_status(status).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(process_launch::decode_status(&encoded), Ok(status));
+    }
+
+    #[test]
+    fn pipe_records_are_exact_and_bounded() {
+        let token =
+            pipe::PipeToken::new(0x0000_0001_0000_0001).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            pipe::decode_create(
+                &pipe::encode_create(pipe::MAX_CAPACITY).unwrap_or_else(|_| std::process::abort())
+            ),
+            Ok(pipe::MAX_CAPACITY)
+        );
+        let mut write = [0_u8; 32];
+        let count = pipe::encode_write(token, b"stream", &mut write)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            pipe::decode_write(&write[..count]),
+            Ok((token, &b"stream"[..]))
+        );
+        assert_eq!(
+            pipe::decode_read(
+                &pipe::encode_read(token, pipe::MAX_IO_BYTES)
+                    .unwrap_or_else(|_| std::process::abort())
+            ),
+            Ok((token, pipe::MAX_IO_BYTES))
+        );
+        assert!(pipe::decode_token(&[0; pipe::TOKEN_BYTES]).is_err());
     }
 
     #[test]

@@ -15,32 +15,34 @@ use troe_core::{BoundedOutput, Output, StreamError, write_all};
 /// Hard ceiling for one request or reply payload.
 pub const MAX_MESSAGE_BYTES: usize = 4 * 1024;
 /// Hard ceiling for registered service ports.
-pub const MAX_PORTS: usize = 16;
+pub const MAX_PORTS: usize = 65_536;
 /// Hard ceiling for live client handles.
-pub const MAX_HANDLES: usize = 32;
+pub const MAX_HANDLES: usize = 262_144;
+
+const INITIAL_DISPATCH_CAPACITY: usize = 64;
 
 /// Opaque generation-checked service endpoint identity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PortId {
-    slot: u16,
+    slot: u32,
     generation: u32,
 }
 
 /// Opaque generation-checked authority to call one service port.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Handle {
-    slot: u16,
+    slot: u32,
     generation: u32,
 }
 
 impl Handle {
     /// Stable opaque value exported through the application ABI.
     ///
-    /// The low 16 bits encode a one-based slot and the high bits encode its
+    /// The low 32 bits encode a one-based slot and the high bits encode its
     /// generation. Applications must treat the result as an indivisible token.
     #[must_use]
     pub const fn abi_value(self) -> u64 {
-        ((self.generation as u64) << 16) | (self.slot as u64 + 1)
+        ((self.generation as u64) << 32) | (self.slot as u64 + 1)
     }
 
     /// Decode a stable ABI token without granting or validating authority.
@@ -50,16 +52,12 @@ impl Handle {
     /// Rejects zero, non-canonical high bits, a zero generation, or an encoded
     /// slot outside the dispatcher hard ceiling.
     pub fn from_abi_value(value: u64) -> Result<Self, DispatchError> {
-        let encoded_slot = value & 0xffff;
-        let generation = (value >> 16) & u64::from(u32::MAX);
-        if encoded_slot == 0
-            || encoded_slot > MAX_HANDLES as u64
-            || generation == 0
-            || value >> 48 != 0
-        {
+        let encoded_slot = value & u64::from(u32::MAX);
+        let generation = value >> 32;
+        if encoded_slot == 0 || encoded_slot > MAX_HANDLES as u64 || generation == 0 {
             return Err(DispatchError::InvalidHandle);
         }
-        let slot = u16::try_from(encoded_slot).map_err(|_| DispatchError::InvalidHandle)?;
+        let slot = u32::try_from(encoded_slot).map_err(|_| DispatchError::InvalidHandle)?;
         let generation = u32::try_from(generation).map_err(|_| DispatchError::InvalidHandle)?;
         Ok(Self {
             slot: slot - 1,
@@ -197,6 +195,8 @@ pub enum ReplyStatus {
     Overflow = 18,
     /// A network exchange returned an invalid protocol response.
     NetworkProtocol = 19,
+    /// The caller lacks authority for the requested operation.
+    Denied = 20,
 }
 
 impl ReplyStatus {
@@ -230,6 +230,7 @@ impl ReplyStatus {
             17 => Some(Self::Unsupported),
             18 => Some(Self::Overflow),
             19 => Some(Self::NetworkProtocol),
+            20 => Some(Self::Denied),
             _ => None,
         }
     }
@@ -528,9 +529,9 @@ struct HandleSlot {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DispatchStats {
     /// Currently registered service ports.
-    pub live_ports: u16,
+    pub live_ports: u32,
     /// Currently live client handles.
-    pub live_handles: u16,
+    pub live_handles: u32,
     /// Calls successfully delivered to a service.
     pub calls: u64,
     /// Replies successfully returned to clients.
@@ -591,11 +592,11 @@ impl<'service> Dispatcher<'service> {
         }
         let mut ports = Vec::new();
         ports
-            .try_reserve_exact(port_capacity)
+            .try_reserve_exact(port_capacity.min(INITIAL_DISPATCH_CAPACITY))
             .map_err(|_| DispatchError::MetadataExhausted)?;
         let mut handles = Vec::new();
         handles
-            .try_reserve_exact(handle_capacity)
+            .try_reserve_exact(handle_capacity.min(INITIAL_DISPATCH_CAPACITY))
             .map_err(|_| DispatchError::MetadataExhausted)?;
         Ok(Self {
             ports,
@@ -671,13 +672,16 @@ impl<'service> Dispatcher<'service> {
                 owner,
             });
             return Ok(Handle {
-                slot: u16::try_from(index).map_err(|_| DispatchError::AccountingOverflow)?,
+                slot: u32::try_from(index).map_err(|_| DispatchError::AccountingOverflow)?,
                 generation: slot.generation,
             });
         }
         if self.handles.len() == self.handle_capacity {
             return Err(DispatchError::HandleCapacityExhausted);
         }
+        self.handles
+            .try_reserve(1)
+            .map_err(|_| DispatchError::MetadataExhausted)?;
         let index = self.handles.len();
         self.handles.push(HandleSlot {
             generation: 1,
@@ -689,7 +693,7 @@ impl<'service> Dispatcher<'service> {
             }),
         });
         Ok(Handle {
-            slot: u16::try_from(index).map_err(|_| DispatchError::AccountingOverflow)?,
+            slot: u32::try_from(index).map_err(|_| DispatchError::AccountingOverflow)?,
             generation: 1,
         })
     }
@@ -756,7 +760,7 @@ impl<'service> Dispatcher<'service> {
                 }
             }
         }
-        let index = usize::from(port.slot);
+        let index = usize::try_from(port.slot).map_err(|_| DispatchError::InvalidPort)?;
         let slot = self
             .ports
             .get_mut(index)
@@ -811,7 +815,8 @@ impl<'service> Dispatcher<'service> {
         self.next_request_id = next_request_id;
         self.calls = calls;
         self.request_bytes = request_bytes;
-        let port_index = usize::from(binding.port.slot);
+        let port_index =
+            usize::try_from(binding.port.slot).map_err(|_| DispatchError::InvalidPort)?;
         let service = self
             .ports
             .get_mut(port_index)
@@ -915,8 +920,8 @@ impl<'service> Dispatcher<'service> {
             .filter(|slot| slot.binding.is_some())
             .count();
         DispatchStats {
-            live_ports: u16::try_from(live_ports).unwrap_or(u16::MAX),
-            live_handles: u16::try_from(live_handles).unwrap_or(u16::MAX),
+            live_ports: u32::try_from(live_ports).unwrap_or(u32::MAX),
+            live_handles: u32::try_from(live_handles).unwrap_or(u32::MAX),
             calls: self.calls,
             replies: self.replies,
             request_bytes: self.request_bytes,
@@ -965,7 +970,8 @@ impl<'service> Dispatcher<'service> {
         self.next_request_id = next_request_id;
         self.calls = calls;
         self.request_bytes = request_bytes;
-        let port_index = usize::from(binding.port.slot);
+        let port_index =
+            usize::try_from(binding.port.slot).map_err(|_| DispatchError::InvalidPort)?;
         let service = self
             .ports
             .get_mut(port_index)
@@ -1019,13 +1025,16 @@ impl<'service> Dispatcher<'service> {
         {
             slot.service = Some(service);
             return Ok(PortId {
-                slot: u16::try_from(index).map_err(|_| DispatchError::AccountingOverflow)?,
+                slot: u32::try_from(index).map_err(|_| DispatchError::AccountingOverflow)?,
                 generation: slot.generation,
             });
         }
         if self.ports.len() == self.port_capacity {
             return Err(DispatchError::PortCapacityExhausted);
         }
+        self.ports
+            .try_reserve(1)
+            .map_err(|_| DispatchError::MetadataExhausted)?;
         let index = self.ports.len();
         self.ports.push(PortSlot {
             generation: 1,
@@ -1033,7 +1042,7 @@ impl<'service> Dispatcher<'service> {
             service: Some(service),
         });
         Ok(PortId {
-            slot: u16::try_from(index).map_err(|_| DispatchError::AccountingOverflow)?,
+            slot: u32::try_from(index).map_err(|_| DispatchError::AccountingOverflow)?,
             generation: 1,
         })
     }
@@ -1041,7 +1050,7 @@ impl<'service> Dispatcher<'service> {
     fn validate_port(&self, port: PortId) -> Result<(), DispatchError> {
         let slot = self
             .ports
-            .get(usize::from(port.slot))
+            .get(usize::try_from(port.slot).map_err(|_| DispatchError::InvalidPort)?)
             .ok_or(DispatchError::InvalidPort)?;
         if slot.generation != port.generation || slot.service.is_none() {
             return Err(DispatchError::InvalidPort);
@@ -1052,7 +1061,7 @@ impl<'service> Dispatcher<'service> {
     fn handle_binding(&self, handle: Handle) -> Result<HandleBinding, DispatchError> {
         let slot = self
             .handles
-            .get(usize::from(handle.slot))
+            .get(usize::try_from(handle.slot).map_err(|_| DispatchError::InvalidHandle)?)
             .ok_or(DispatchError::InvalidHandle)?;
         if slot.generation != handle.generation {
             return Err(DispatchError::InvalidHandle);
@@ -1063,7 +1072,7 @@ impl<'service> Dispatcher<'service> {
     fn handle_slot_mut(&mut self, handle: Handle) -> Result<&mut HandleSlot, DispatchError> {
         let slot = self
             .handles
-            .get_mut(usize::from(handle.slot))
+            .get_mut(usize::try_from(handle.slot).map_err(|_| DispatchError::InvalidHandle)?)
             .ok_or(DispatchError::InvalidHandle)?;
         if slot.generation != handle.generation || slot.binding.is_none() {
             return Err(DispatchError::InvalidHandle);
@@ -1074,7 +1083,8 @@ impl<'service> Dispatcher<'service> {
 
 /// Immutable command-invocation service for one application launch.
 pub struct CommandInvocationService {
-    bytes: Vec<u8>,
+    invocation: Vec<u8>,
+    environment: Vec<u8>,
 }
 
 impl CommandInvocationService {
@@ -1084,24 +1094,56 @@ impl CommandInvocationService {
     ///
     /// Rejects invocation-policy excess or bounded allocation failure.
     pub fn new<T: AsRef<str>>(cwd: &str, arguments: &[T]) -> Result<Self, DispatchError> {
+        Self::new_with_environment(cwd, arguments, &[])
+    }
+
+    /// Encode one invocation and its immutable `NAME=VALUE` environment.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invocation/environment policy excess or bounded allocation failure.
+    pub fn new_with_environment<T: AsRef<str>>(
+        cwd: &str,
+        arguments: &[T],
+        environment: &[&str],
+    ) -> Result<Self, DispatchError> {
         let mut encoded = [0_u8; command::MAX_INVOCATION_BYTES];
         let count = command::encode(cwd, arguments, &mut encoded)
             .map_err(|_| DispatchError::MessageTooLarge)?;
-        let mut bytes = Vec::new();
-        bytes
+        let mut invocation = Vec::new();
+        invocation
             .try_reserve_exact(count)
             .map_err(|_| DispatchError::MetadataExhausted)?;
-        bytes.extend_from_slice(&encoded[..count]);
-        Ok(Self { bytes })
+        invocation.extend_from_slice(&encoded[..count]);
+        let mut encoded_environment = [0_u8; command::MAX_ENCODED_ENVIRONMENT_BYTES];
+        let environment_count = command::encode_environment(environment, &mut encoded_environment)
+            .map_err(|_| DispatchError::MessageTooLarge)?;
+        let mut owned_environment = Vec::new();
+        owned_environment
+            .try_reserve_exact(environment_count)
+            .map_err(|_| DispatchError::MetadataExhausted)?;
+        owned_environment.extend_from_slice(&encoded_environment[..environment_count]);
+        Ok(Self {
+            invocation,
+            environment: owned_environment,
+        })
     }
 }
 
 impl Service for CommandInvocationService {
     fn call(&mut self, request: Request<'_>) -> Result<ServiceReply, DispatchError> {
-        if request.opcode() != command::GET_INVOCATION || !request.payload().is_empty() {
+        if !request.payload().is_empty() {
             return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
         }
-        ServiceReply::with_payload(ReplyStatus::Success, &self.bytes)
+        match request.opcode() {
+            command::GET_INVOCATION => {
+                ServiceReply::with_payload(ReplyStatus::Success, &self.invocation)
+            }
+            command::GET_ENVIRONMENT => {
+                ServiceReply::with_payload(ReplyStatus::Success, &self.environment)
+            }
+            _ => Ok(ServiceReply::empty(ReplyStatus::InvalidRequest)),
+        }
     }
 }
 
@@ -1695,6 +1737,18 @@ mod tests {
         ));
         assert_eq!(dispatcher.stats().live_ports, 1);
         assert_eq!(dispatcher.stats().live_handles, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn dispatcher_metadata_grows_beyond_legacy_slot_counts() -> Result<(), DispatchError> {
+        const TEST_PORTS: usize = 1024;
+        let mut dispatcher = Dispatcher::new(TEST_PORTS, TEST_PORTS)?;
+        for _ in 0..TEST_PORTS {
+            let _registered = dispatcher.register(Box::new(EchoService), Rights::CALL)?;
+        }
+        assert_eq!(dispatcher.stats().live_ports, 1024);
+        assert_eq!(dispatcher.stats().live_handles, 1024);
         Ok(())
     }
 

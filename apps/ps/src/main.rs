@@ -4,7 +4,7 @@
 #[path = "../../common.rs"]
 mod common;
 
-use core::fmt;
+use core::fmt::{self, Write as _};
 use troe_kex_sdk::{
     CommandContext, INVOCATION_BUFFER_BYTES, StandardOutput, entry, exit, process_observation,
 };
@@ -31,6 +31,7 @@ const fn origin_label(origin: process_observation::Origin) -> &'static str {
         process_observation::Origin::Foreground => "fg",
         process_observation::Origin::Background => "bg",
         process_observation::Origin::Service => "svc",
+        process_observation::Origin::Child => "child",
     }
 }
 
@@ -42,16 +43,18 @@ fn ticks_to_millis(ticks: u64, frequency: u64) -> u64 {
         .saturating_add(remainder.saturating_mul(1_000) / frequency)
 }
 
-fn report(output: &mut impl fmt::Write, snapshot: &process_observation::Snapshot) -> fmt::Result {
-    writeln!(output, "PID ORIGIN STATE    CPU-MS PAGES HANDLES NAME")?;
-    for process in snapshot.processes() {
+fn report_page(
+    output: &mut impl fmt::Write,
+    page: &process_observation::Page,
+) -> fmt::Result {
+    for process in page.processes() {
         writeln!(
             output,
             "{} {:<6} {:<8} {} {} {} {}",
             process.id,
             origin_label(process.origin),
             state_label(process.state),
-            ticks_to_millis(process.cpu_ticks, snapshot.counter_frequency_hz()),
+            ticks_to_millis(process.cpu_ticks, page.counter_frequency_hz()),
             process.resident_pages,
             process.handles,
             process.name.as_str(),
@@ -71,22 +74,35 @@ fn main(command: &mut CommandContext) -> u32 {
     let Ok(mut observation) = command.process_observation() else {
         return exit::DENIED;
     };
-    let Ok(snapshot) = observation.snapshot() else {
-        common::report(
-            &mut command.stderr(),
-            "ps",
-            b"process observation unavailable",
-        );
-        return exit::FAILURE;
-    };
-    let result = {
-        let mut stdout = command.stdout();
-        report(&mut OutputWriter(&mut stdout), &snapshot)
-    };
-    if result.is_err() {
-        common::stream_failure(&mut command.stderr(), "ps")
-    } else {
-        exit::SUCCESS
+    let mut cursor = 0_u64;
+    let mut first = true;
+    loop {
+        let Ok(page) = observation.page(cursor) else {
+            common::report(
+                &mut command.stderr(),
+                "ps",
+                b"process observation unavailable",
+            );
+            return exit::FAILURE;
+        };
+        let result = {
+            let mut stdout = command.stdout();
+            let mut output = OutputWriter(&mut stdout);
+            if first {
+                writeln!(output, "PID ORIGIN STATE    CPU-MS PAGES HANDLES NAME")
+                    .and_then(|()| report_page(&mut output, &page))
+            } else {
+                report_page(&mut output, &page)
+            }
+        };
+        if result.is_err() {
+            return common::stream_failure(&mut command.stderr(), "ps");
+        }
+        first = false;
+        cursor = page.next_cursor();
+        if cursor == 0 {
+            return exit::SUCCESS;
+        }
     }
 }
 

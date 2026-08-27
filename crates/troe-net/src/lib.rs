@@ -36,9 +36,9 @@ pub const NETWORK_QUEUE_SIZE: u16 = 8;
 /// Modern virtio-net v1 header bytes, including the reserved buffer-count field.
 pub const VIRTIO_NET_HEADER_BYTES: usize = 12;
 /// Maximum retained IPv4-to-Ethernet neighbor records.
-pub const MAX_ARP_CACHE_ENTRIES: usize = 8;
+pub const MAX_ARP_CACHE_ENTRIES: usize = 256;
 /// Maximum persistent local UDP port bindings.
-pub const MAX_UDP_PORTS: usize = 8;
+pub const MAX_UDP_PORTS: usize = 16_384;
 /// Maximum datagrams retained for one bound UDP port.
 pub const UDP_QUEUE_DATAGRAMS: usize = 4;
 /// Maximum payload bytes retained for one bound UDP port.
@@ -300,10 +300,10 @@ pub struct ArpCacheEntry {
     generation: u64,
 }
 
-/// Fixed-size least-recently-observed ARP cache.
+/// Bounded dynamically growing least-recently-observed ARP cache.
 #[derive(Debug)]
 pub struct ArpCache {
-    entries: [Option<ArpCacheEntry>; MAX_ARP_CACHE_ENTRIES],
+    entries: Vec<ArpCacheEntry>,
     generation: u64,
 }
 
@@ -318,22 +318,25 @@ impl ArpCache {
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            entries: [None; MAX_ARP_CACHE_ENTRIES],
+            entries: Vec::new(),
             generation: 0,
         }
     }
 
     /// Learn or refresh one validated neighbor, evicting the oldest at capacity.
-    pub fn learn(&mut self, address: Ipv4Address, mac: MacAddress) {
+    ///
+    /// # Errors
+    ///
+    /// Reports fallible metadata growth failure without changing the cache.
+    pub fn learn(&mut self, address: Ipv4Address, mac: MacAddress) -> Result<(), NetError> {
         if address.bytes() == [0; 4] {
-            return;
+            return Ok(());
         }
         self.generation = self.generation.saturating_add(1);
         let generation = self.generation;
         if let Some(entry) = self
             .entries
             .iter_mut()
-            .flatten()
             .find(|entry| entry.address == address)
         {
             *entry = ArpCacheEntry {
@@ -341,25 +344,28 @@ impl ArpCache {
                 mac,
                 generation,
             };
-            return;
+            return Ok(());
+        }
+        let entry = ArpCacheEntry {
+            address,
+            mac,
+            generation,
+        };
+        if self.entries.len() < MAX_ARP_CACHE_ENTRIES {
+            self.entries
+                .try_reserve(1)
+                .map_err(|_| NetError::Exhausted)?;
+            self.entries.push(entry);
+            return Ok(());
         }
         let index = self
             .entries
             .iter()
-            .position(Option::is_none)
-            .unwrap_or_else(|| {
-                self.entries
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, entry)| entry.map(|entry| (index, entry.generation)))
-                    .min_by_key(|(_, generation)| *generation)
-                    .map_or(0, |(index, _)| index)
-            });
-        self.entries[index] = Some(ArpCacheEntry {
-            address,
-            mac,
-            generation,
-        });
+            .enumerate()
+            .min_by_key(|(_, entry)| entry.generation)
+            .map_or(0, |(index, _)| index);
+        self.entries[index] = entry;
+        Ok(())
     }
 
     /// Look up a retained neighbor without changing replacement order.
@@ -367,20 +373,19 @@ impl ArpCache {
     pub fn lookup(&self, address: Ipv4Address) -> Option<MacAddress> {
         self.entries
             .iter()
-            .flatten()
             .find(|entry| entry.address == address)
             .map(|entry| entry.mac)
     }
 
-    /// Iterate over the at-most-eight retained entries.
+    /// Iterate over retained entries.
     pub fn entries(&self) -> impl Iterator<Item = ArpCacheEntry> + '_ {
-        self.entries.iter().flatten().copied()
+        self.entries.iter().copied()
     }
 
     /// Current retained entry count.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.entries.iter().flatten().count()
+        self.entries.len()
     }
 
     /// Whether no neighbor record is retained.
@@ -440,7 +445,7 @@ pub struct UdpPortTable {
 }
 
 impl UdpPortTable {
-    /// Preallocate binding metadata for the complete hard ceiling.
+    /// Reserve a small initial metadata working set and grow fallibly on bind.
     ///
     /// # Errors
     ///
@@ -448,7 +453,7 @@ impl UdpPortTable {
     pub fn new() -> Result<Self, NetError> {
         let mut bindings = Vec::new();
         bindings
-            .try_reserve_exact(MAX_UDP_PORTS)
+            .try_reserve_exact(64)
             .map_err(|_| NetError::Exhausted)?;
         Ok(Self { bindings })
     }
@@ -468,6 +473,9 @@ impl UdpPortTable {
         if self.bindings.len() == MAX_UDP_PORTS {
             return Err(NetError::Exhausted);
         }
+        self.bindings
+            .try_reserve(1)
+            .map_err(|_| NetError::Exhausted)?;
         let mut queue = VecDeque::new();
         queue
             .try_reserve_exact(UDP_QUEUE_DATAGRAMS)
@@ -1659,17 +1667,20 @@ mod tests {
     }
 
     #[test]
-    fn arp_cache_is_fixed_and_evicts_the_oldest_neighbor() -> Result<(), NetError> {
+    fn arp_cache_grows_to_policy_and_evicts_the_oldest_neighbor() -> Result<(), NetError> {
         let mut cache = ArpCache::new();
         for index in 0..=MAX_ARP_CACHE_ENTRIES {
+            let value = u16::try_from(index + 1).map_err(|_| NetError::Exhausted)?;
+            let high = u8::try_from(value >> 8).map_err(|_| NetError::Exhausted)?;
+            let low = u8::try_from(value & 0xff).map_err(|_| NetError::Exhausted)?;
             cache.learn(
-                Ipv4Address::new([10, 0, 0, u8::try_from(index + 1).unwrap_or(u8::MAX)]),
-                mac([0x02, 0, 0, 0, 0, u8::try_from(index + 1).unwrap_or(u8::MAX)])?,
-            );
+                Ipv4Address::new([10, 0, high, low]),
+                mac([0x02, 0, 0, 0, high, low])?,
+            )?;
         }
         assert_eq!(cache.len(), MAX_ARP_CACHE_ENTRIES);
         assert_eq!(cache.lookup(Ipv4Address::new([10, 0, 0, 1])), None);
-        assert!(cache.lookup(Ipv4Address::new([10, 0, 0, 9])).is_some());
+        assert!(cache.lookup(Ipv4Address::new([10, 0, 1, 1])).is_some());
         Ok(())
     }
 

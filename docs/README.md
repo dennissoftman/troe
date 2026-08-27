@@ -27,13 +27,15 @@ contract.
 | Desired and active configuration namespaces | [ADR 0043](adr/0043-desired-and-active-configuration.md) |
 | Transactional system lifecycle and migration | [ADR 0044](adr/0044-transactional-system-lifecycle.md) |
 | Process registry, observation, and accounting | [ADR 0045](adr/0045-process-registry-observation-and-accounting.md) |
+| Owner-scoped launch, pipes, and scalable resource tables | [ADR 0046](adr/0046-owner-scoped-process-launch-and-scalable-resource-tables.md) |
 
 The current serialized contracts are versioned independently under
 [`formats/`](formats):
 
 - applications and packages: [KEX](formats/kex-v1.md),
   [KEX package](formats/kex-package-v1.md), and [KCAP](formats/kcap-v1.md);
-- process observation: [process observation 1.0](formats/process-observation-v1.md);
+- process services: [process observation 1.1](formats/process-observation-v1.md) and
+  [process launch and pipes 1.0](formats/process-launch-pipe-v1.md);
 - embedded and persistent filesystems: [KEFS](formats/kefs-v1.md) and
   [StateFS](formats/stfs-v1.md);
 - volume selection and durability: [BMNT](formats/bmnt-v1.md),

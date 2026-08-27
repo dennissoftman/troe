@@ -25,8 +25,9 @@ mod firmware {
 
     use troe_abi::{
         clock_control, command, datagram, diagnostics, filesystem, filesystem_mutation,
-        heap_growth, icmp_echo, network_configuration, network_observation, process_observation,
-        server, shell_script, stream, tcp_connect, timer, volume_control, wall_clock,
+        heap_growth, icmp_echo, network_configuration, network_observation, pipe, process_launch,
+        process_observation, server, shell_script, stream, tcp_connect, timer, volume_control,
+        wall_clock,
     };
     #[cfg(feature = "acceptance-probes")]
     use troe_application::ParseError;
@@ -71,6 +72,10 @@ mod firmware {
         parse_dhcp, parse_icmp_echo, parse_tcp, parse_udp,
     };
     use troe_persist::{DualSlotStore, RegionSelector, TRANSACTION_BLOCKS};
+    use troe_process::{
+        ChildLifecycle, ChildTable, MAX_CHILDREN_PER_OWNER, MAX_PIPES_PER_OWNER, OwnerId,
+        PipeDirection, PipeEndpoint, PipeTable, ProcessError as ChildProcessError,
+    };
     use troe_shell::{
         CompletionConfig, ExecutionPlacement, ExternalCommand, JobControl, MachineAction,
         ServiceControl, SharedNamespace, Shell, format_memory_report, parse_line,
@@ -121,9 +126,10 @@ mod firmware {
     const SERVER_TASK_STACK_PAGES: u16 = 32;
     const SHELL_TASK_STACK_PAGES: u16 = 32;
     const TASK_STACK_COUNT: usize = 3;
-    const SHELL_SCHEDULER_SLOT: u8 = 15;
-    const RESIDENT_PROCESS_FIRST_SLOT: u8 = 3;
-    const RESIDENT_PROCESS_CAPACITY: usize = 8;
+    const SHELL_SCHEDULER_SLOT: u32 = 65_536;
+    const RESIDENT_PROCESS_FIRST_SLOT: u32 = 3;
+    const RESIDENT_PROCESS_CAPACITY: usize = troe_task::MAX_TASKS - 3;
+    const INITIAL_RESIDENT_PROCESS_CAPACITY: usize = 64;
     const RESIDENT_PROCESS_LOG_BYTES: usize = 64 * 1024;
     const RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS: u32 = 10;
     const RESIDENT_SERVICE_CALLS_PER_STEP: usize = 4;
@@ -408,11 +414,70 @@ mod firmware {
     type SharedResidentLog = Rc<RefCell<BoundedLog>>;
     type SharedProcessTable = Rc<RefCell<ProcessTable>>;
     type SharedTaskIdentity = Rc<Cell<Option<TaskId>>>;
+    type SharedChildTable = Rc<RefCell<ChildTable>>;
+    type SharedPipeTable = Rc<RefCell<PipeTable>>;
+    type SharedProcessOwner = Rc<Cell<Option<OwnerId>>>;
 
     struct ApplicationEmptyInputService;
 
+    struct ApplicationDiscardOutputService;
+
     struct ApplicationLogService {
         log: SharedResidentLog,
+    }
+
+    #[derive(Clone)]
+    enum NestedInput<'stream> {
+        Empty,
+        Borrowed(Rc<RefCell<&'stream mut dyn Input>>),
+        Pipe {
+            pipes: SharedPipeTable,
+            owner: OwnerId,
+            token: pipe::PipeToken,
+        },
+    }
+
+    #[derive(Clone)]
+    enum NestedOutput<'stream> {
+        Discard,
+        Borrowed(Rc<RefCell<&'stream mut dyn Output>>),
+        Log(SharedResidentLog),
+        Pipe {
+            pipes: SharedPipeTable,
+            owner: OwnerId,
+            token: pipe::PipeToken,
+        },
+    }
+
+    #[derive(Clone)]
+    struct NestedStdio<'stream> {
+        stdin: NestedInput<'stream>,
+        stdout: NestedOutput<'stream>,
+        stderr: NestedOutput<'stream>,
+    }
+
+    #[derive(Clone)]
+    struct NestedLaunchContext<'stream> {
+        namespace: SharedNamespace,
+        runtime: SharedRuntime,
+        processes: SharedProcessTable,
+        mounts: SharedRuntimeMounts,
+        stdio: NestedStdio<'stream>,
+    }
+
+    struct NestedChild<'service> {
+        token: process_launch::ChildToken,
+        process: Option<Box<ResidentApplication<'service>>>,
+        outcome: Option<CommandApplicationOutcome>,
+    }
+
+    struct ResidentProcessControl<'service> {
+        owner: OwnerId,
+        grants: BackgroundRequirements,
+        children: SharedChildTable,
+        pipes: SharedPipeTable,
+        launch: NestedLaunchContext<'service>,
+        processes: Vec<NestedChild<'service>>,
     }
 
     enum ResidentExecution {
@@ -444,6 +509,7 @@ mod firmware {
         dispatcher: Dispatcher<'service>,
         deferred_services: Option<CommandDeferredServices>,
         deferred_state: Option<CommandDeferredState>,
+        process_control: Option<ResidentProcessControl<'service>>,
         execution: Option<ResidentExecution>,
     }
 
@@ -478,6 +544,17 @@ mod firmware {
         runtime: SharedRuntime,
         datagram: Option<SharedApplicationDatagram>,
         diagnostics: Option<Rc<[u8; diagnostics::SNAPSHOT_BYTES]>>,
+        process_owner: Option<OwnerId>,
+        children: Option<SharedChildTable>,
+        pipes: Option<SharedPipeTable>,
+        pipe_streams: Vec<PipeStreamService>,
+    }
+
+    #[derive(Clone)]
+    struct PipeStreamService {
+        interface: u32,
+        pipes: SharedPipeTable,
+        endpoint: PipeEndpoint,
     }
 
     #[allow(clippy::struct_excessive_bools)]
@@ -489,6 +566,8 @@ mod firmware {
         timer: bool,
         diagnostics: bool,
         process_observation: bool,
+        process_launch: bool,
+        pipe: bool,
         network_observation: bool,
         network_configuration: bool,
         icmp_echo: bool,
@@ -496,6 +575,134 @@ mod firmware {
         volume_control: bool,
         wall_clock: bool,
         clock_control: bool,
+    }
+
+    impl BackgroundRequirements {
+        fn attenuates(self, required: Self, shell_script: bool) -> bool {
+            !shell_script
+                && !required.clock_control
+                && (!required.datagram || self.datagram)
+                && (!required.filesystem || self.filesystem)
+                && (!required.filesystem_mutation || self.filesystem_mutation)
+                && (!required.timer || self.timer)
+                && (!required.diagnostics || self.diagnostics)
+                && (!required.process_observation || self.process_observation)
+                && (!required.process_launch || self.process_launch)
+                && (!required.pipe || self.pipe)
+                && (!required.network_observation || self.network_observation)
+                && (!required.network_configuration || self.network_configuration)
+                && (!required.icmp_echo || self.icmp_echo)
+                && (!required.tcp_connect || self.tcp_connect)
+                && (!required.volume_control || self.volume_control)
+                && (!required.wall_clock || self.wall_clock)
+        }
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn decode_application_requirements(
+        manifest: troe_abi::requirements::Manifest<'_>,
+    ) -> Result<(BackgroundRequirements, bool), ()> {
+        let mut required = BackgroundRequirements {
+            datagram: false,
+            filesystem: false,
+            filesystem_mutation: false,
+            timer: false,
+            diagnostics: false,
+            process_observation: false,
+            process_launch: false,
+            pipe: false,
+            network_observation: false,
+            network_configuration: false,
+            icmp_echo: false,
+            tcp_connect: false,
+            volume_control: false,
+            wall_clock: false,
+            clock_control: false,
+        };
+        let mut shell_script = false;
+        for requirement in manifest.iter() {
+            let supported = match requirement.interface {
+                troe_abi::interface::DATAGRAM => {
+                    required.datagram = true;
+                    requirement.major == datagram::MAJOR && requirement.minor == datagram::MINOR
+                }
+                troe_abi::interface::FILESYSTEM_READ => {
+                    required.filesystem = true;
+                    requirement.major == filesystem::MAJOR && requirement.minor == filesystem::MINOR
+                }
+                troe_abi::interface::FILESYSTEM_MUTATE => {
+                    required.filesystem_mutation = true;
+                    requirement.major == filesystem_mutation::MAJOR
+                        && requirement.minor == filesystem_mutation::MINOR
+                }
+                troe_abi::interface::TIMER => {
+                    required.timer = true;
+                    requirement.major == timer::MAJOR && requirement.minor == timer::MINOR
+                }
+                troe_abi::interface::DIAGNOSTICS => {
+                    required.diagnostics = true;
+                    requirement.major == diagnostics::MAJOR
+                        && requirement.minor == diagnostics::MINOR
+                }
+                troe_abi::interface::PROCESS_OBSERVE => {
+                    required.process_observation = true;
+                    requirement.major == process_observation::MAJOR
+                        && requirement.minor == process_observation::MINOR
+                }
+                troe_abi::interface::PROCESS_LAUNCH => {
+                    required.process_launch = true;
+                    requirement.major == process_launch::MAJOR
+                        && requirement.minor == process_launch::MINOR
+                }
+                troe_abi::interface::PIPE => {
+                    required.pipe = true;
+                    requirement.major == pipe::MAJOR && requirement.minor == pipe::MINOR
+                }
+                troe_abi::interface::NETWORK_OBSERVE => {
+                    required.network_observation = true;
+                    requirement.major == network_observation::MAJOR
+                        && requirement.minor == network_observation::MINOR
+                }
+                troe_abi::interface::NETWORK_CONFIGURE => {
+                    required.network_configuration = true;
+                    requirement.major == network_configuration::MAJOR
+                        && requirement.minor == network_configuration::MINOR
+                }
+                troe_abi::interface::ICMP_ECHO => {
+                    required.icmp_echo = true;
+                    requirement.major == icmp_echo::MAJOR && requirement.minor == icmp_echo::MINOR
+                }
+                troe_abi::interface::TCP_CONNECT => {
+                    required.tcp_connect = true;
+                    requirement.major == tcp_connect::MAJOR
+                        && requirement.minor == tcp_connect::MINOR
+                }
+                troe_abi::interface::VOLUME_CONTROL => {
+                    required.volume_control = true;
+                    requirement.major == volume_control::MAJOR
+                        && requirement.minor == volume_control::MINOR
+                }
+                troe_abi::interface::SHELL_SCRIPT => {
+                    shell_script = true;
+                    requirement.major == shell_script::MAJOR
+                        && requirement.minor == shell_script::MINOR
+                }
+                troe_abi::interface::WALL_CLOCK => {
+                    required.wall_clock = true;
+                    requirement.major == wall_clock::MAJOR && requirement.minor == wall_clock::MINOR
+                }
+                troe_abi::interface::CLOCK_CONTROL => {
+                    required.clock_control = true;
+                    requirement.major == clock_control::MAJOR
+                        && requirement.minor == clock_control::MINOR
+                }
+                _ => false,
+            };
+            if !supported {
+                return Err(());
+            }
+        }
+        Ok((required, shell_script))
     }
 
     enum DeferredCallKind {
@@ -511,6 +718,33 @@ mod firmware {
         Diagnostics {
             resource: WaitResource,
         },
+        Child {
+            children: SharedChildTable,
+            owner: OwnerId,
+            token: process_launch::ChildToken,
+            resource: WaitResource,
+        },
+        PipeRead {
+            pipes: SharedPipeTable,
+            target: DeferredPipeTarget,
+            maximum: usize,
+            resource: WaitResource,
+        },
+        PipeWrite {
+            pipes: SharedPipeTable,
+            target: DeferredPipeTarget,
+            byte_count: usize,
+            resource: WaitResource,
+        },
+    }
+
+    #[derive(Clone, Copy)]
+    enum DeferredPipeTarget {
+        Owner {
+            owner: OwnerId,
+            token: pipe::PipeToken,
+        },
+        Endpoint(PipeEndpoint),
     }
 
     struct SuspendedApplicationCall {
@@ -811,14 +1045,13 @@ mod firmware {
 
     struct ApplicationDatagramState {
         network: SharedNetwork,
-        ports: [u16; troe_net::MAX_UDP_PORTS],
-        port_count: usize,
+        ports: Vec<u16>,
     }
 
     struct ApplicationFilesystemService {
         namespace: SharedNamespace,
         cwd: String,
-        files: [ApplicationFileSlot; filesystem::MAX_OPEN_FILES],
+        files: Vec<ApplicationFileSlot>,
     }
 
     struct ApplicationInputService<'stream> {
@@ -874,6 +1107,26 @@ mod firmware {
     struct ApplicationProcessObservationService {
         processes: SharedProcessTable,
         runtime: SharedRuntime,
+    }
+
+    struct ApplicationProcessLaunchService {
+        owner: SharedProcessOwner,
+        children: SharedChildTable,
+    }
+
+    struct ApplicationPipeService {
+        owner: SharedProcessOwner,
+        pipes: SharedPipeTable,
+    }
+
+    struct ApplicationPipeInputService {
+        pipes: SharedPipeTable,
+        endpoint: PipeEndpoint,
+    }
+
+    struct ApplicationPipeOutputService {
+        pipes: SharedPipeTable,
+        endpoint: PipeEndpoint,
     }
 
     struct DiagnosticsServerExchange {
@@ -2074,7 +2327,7 @@ mod firmware {
         }
 
         let reusable = reusable.ok_or(())?;
-        let slot = usize::from(reusable.slot());
+        let slot = usize::try_from(reusable.slot()).map_err(|_| ())?;
         let reused = scheduler
             .spawn(Capabilities::SERVICE, reusable)
             .map_err(|_| ())?;
@@ -2373,7 +2626,7 @@ mod firmware {
                 &mut dispatcher,
                 port,
                 probe,
-                u8::try_from(index + 1).map_err(|_| ())?,
+                u32::try_from(index + 1).map_err(|_| ())?,
             )?;
             if accounting.frames.free_frames() != baseline_frames || resource != first {
                 return Err(());
@@ -2415,7 +2668,7 @@ mod firmware {
         dispatcher: &mut Dispatcher<'_>,
         port: troe_dispatch::PortId,
         probe: IsolationProbe,
-        address_space_slot: u8,
+        address_space_slot: u32,
     ) -> Result<u64, ()> {
         let table_pages = ISOLATED_TABLE_PAGES;
         let private_pages = ISOLATED_PRIVATE_PAGES;
@@ -3162,6 +3415,51 @@ mod firmware {
             .map(|handle| handle.interface)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_resource_wait(
+        task_id: TaskId,
+        handle: u64,
+        opcode: u16,
+        payload: &[u8],
+        reply_capacity: usize,
+        resource: WaitResource,
+        kind: DeferredCallKind,
+        pending: &mut PendingCallTable,
+        next_request_id: &mut u64,
+    ) -> Result<DeferredCallPreparation, ()> {
+        let operation = pending
+            .begin(
+                task_id,
+                *next_request_id,
+                handle,
+                opcode,
+                payload,
+                reply_capacity,
+            )
+            .map_err(|_| ())?;
+        *next_request_id = (*next_request_id).checked_add(1).ok_or(())?;
+        let spec = WaitSpec::new(
+            task_id,
+            operation,
+            Some(resource),
+            WakeInterest::RESOURCE_READY,
+            None,
+        )
+        .map_err(|_| ())?;
+        Ok(DeferredCallPreparation::Blocked {
+            operation,
+            spec,
+            kind,
+        })
+    }
+
+    fn owned_reply_payload(bytes: &[u8]) -> Result<Vec<u8>, ()> {
+        let mut payload = Vec::new();
+        payload.try_reserve_exact(bytes.len()).map_err(|_| ())?;
+        payload.extend_from_slice(bytes);
+        Ok(payload)
+    }
+
     #[inline(never)]
     #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
     fn prepare_deferred_call(
@@ -3175,6 +3473,261 @@ mod firmware {
         pending: &mut PendingCallTable,
         next_request_id: &mut u64,
     ) -> Result<DeferredCallPreparation, ()> {
+        if interface == troe_abi::interface::PROCESS_LAUNCH && opcode == process_launch::WAIT {
+            let Some(owner) = services.process_owner else {
+                return Ok(DeferredCallPreparation::Immediate {
+                    status: ReplyStatus::Conflict,
+                    payload: Vec::new(),
+                });
+            };
+            let Some(children) = &services.children else {
+                return Ok(DeferredCallPreparation::Immediate {
+                    status: ReplyStatus::NotFound,
+                    payload: Vec::new(),
+                });
+            };
+            let Ok(token) = process_launch::decode_token(payload) else {
+                return Ok(DeferredCallPreparation::Immediate {
+                    status: ReplyStatus::InvalidRequest,
+                    payload: Vec::new(),
+                });
+            };
+            let status = match children.try_borrow() {
+                Ok(children) => children.status(owner, token),
+                Err(_) => {
+                    return Ok(DeferredCallPreparation::Immediate {
+                        status: ReplyStatus::Conflict,
+                        payload: Vec::new(),
+                    });
+                }
+            };
+            let status = match status {
+                Ok(status) => status,
+                Err(error) => {
+                    return Ok(DeferredCallPreparation::Immediate {
+                        status: child_process_status(error),
+                        payload: Vec::new(),
+                    });
+                }
+            };
+            if status.state != process_launch::ChildState::Running {
+                let encoded = process_launch::encode_status(status).map_err(|_| ())?;
+                return Ok(DeferredCallPreparation::Immediate {
+                    status: ReplyStatus::Success,
+                    payload: owned_reply_payload(&encoded)?,
+                });
+            }
+            let resource = WaitResource::new(token.value(), owner.get()).map_err(|_| ())?;
+            return prepare_resource_wait(
+                task_id,
+                handle,
+                opcode,
+                payload,
+                reply_capacity,
+                resource,
+                DeferredCallKind::Child {
+                    children: children.clone(),
+                    owner,
+                    token,
+                    resource,
+                },
+                pending,
+                next_request_id,
+            );
+        }
+
+        if interface == troe_abi::interface::PIPE && matches!(opcode, pipe::READ | pipe::WRITE) {
+            let Some(owner) = services.process_owner else {
+                return Ok(DeferredCallPreparation::Immediate {
+                    status: ReplyStatus::Conflict,
+                    payload: Vec::new(),
+                });
+            };
+            let Some(pipes) = &services.pipes else {
+                return Ok(DeferredCallPreparation::Immediate {
+                    status: ReplyStatus::NotFound,
+                    payload: Vec::new(),
+                });
+            };
+            if opcode == pipe::READ {
+                let Ok((token, maximum)) = pipe::decode_read(payload) else {
+                    return Ok(DeferredCallPreparation::Immediate {
+                        status: ReplyStatus::InvalidRequest,
+                        payload: Vec::new(),
+                    });
+                };
+                let mut bytes = [0_u8; pipe::MAX_IO_BYTES];
+                let result = pipes.try_borrow_mut().map_err(|_| ())?.read_owner(
+                    owner,
+                    token,
+                    &mut bytes[..maximum],
+                );
+                return match result {
+                    Ok(count) => Ok(DeferredCallPreparation::Immediate {
+                        status: ReplyStatus::Success,
+                        payload: owned_reply_payload(&bytes[..count])?,
+                    }),
+                    Err(ChildProcessError::WouldBlock) => {
+                        let resource =
+                            WaitResource::new(token.value(), owner.get()).map_err(|_| ())?;
+                        prepare_resource_wait(
+                            task_id,
+                            handle,
+                            opcode,
+                            payload,
+                            reply_capacity,
+                            resource,
+                            DeferredCallKind::PipeRead {
+                                pipes: pipes.clone(),
+                                target: DeferredPipeTarget::Owner { owner, token },
+                                maximum,
+                                resource,
+                            },
+                            pending,
+                            next_request_id,
+                        )
+                    }
+                    Err(error) => Ok(DeferredCallPreparation::Immediate {
+                        status: child_process_status(error),
+                        payload: Vec::new(),
+                    }),
+                };
+            }
+            let Ok((token, bytes)) = pipe::decode_write(payload) else {
+                return Ok(DeferredCallPreparation::Immediate {
+                    status: ReplyStatus::InvalidRequest,
+                    payload: Vec::new(),
+                });
+            };
+            let result = pipes
+                .try_borrow_mut()
+                .map_err(|_| ())?
+                .write_owner(owner, token, bytes);
+            return match result {
+                Ok(count) if count == bytes.len() => Ok(DeferredCallPreparation::Immediate {
+                    status: ReplyStatus::Success,
+                    payload: Vec::new(),
+                }),
+                Ok(_) => Err(()),
+                Err(ChildProcessError::WouldBlock) => {
+                    let resource = WaitResource::new(token.value(), owner.get()).map_err(|_| ())?;
+                    prepare_resource_wait(
+                        task_id,
+                        handle,
+                        opcode,
+                        payload,
+                        reply_capacity,
+                        resource,
+                        DeferredCallKind::PipeWrite {
+                            pipes: pipes.clone(),
+                            target: DeferredPipeTarget::Owner { owner, token },
+                            byte_count: bytes.len(),
+                            resource,
+                        },
+                        pending,
+                        next_request_id,
+                    )
+                }
+                Err(error) => Ok(DeferredCallPreparation::Immediate {
+                    status: child_process_status(error),
+                    payload: Vec::new(),
+                }),
+            };
+        }
+
+        if matches!(
+            interface,
+            troe_abi::interface::STANDARD_INPUT
+                | troe_abi::interface::STANDARD_OUTPUT
+                | troe_abi::interface::STANDARD_ERROR
+        ) && let Some(binding) = services
+            .pipe_streams
+            .iter()
+            .find(|binding| binding.interface == interface)
+        {
+            let resource = WaitResource::new(binding.endpoint.token().value(), task_id.get())
+                .map_err(|_| ())?;
+            if interface == troe_abi::interface::STANDARD_INPUT && opcode == stream::READ {
+                let Ok(maximum) = stream::decode_read_request(payload) else {
+                    return Ok(DeferredCallPreparation::Immediate {
+                        status: ReplyStatus::InvalidRequest,
+                        payload: Vec::new(),
+                    });
+                };
+                let mut bytes = [0_u8; troe_abi::MAX_SERVICE_PAYLOAD_BYTES];
+                let result = binding
+                    .pipes
+                    .try_borrow_mut()
+                    .map_err(|_| ())?
+                    .read_endpoint(binding.endpoint, &mut bytes[..maximum]);
+                return match result {
+                    Ok(count) => Ok(DeferredCallPreparation::Immediate {
+                        status: ReplyStatus::Success,
+                        payload: owned_reply_payload(&bytes[..count])?,
+                    }),
+                    Err(ChildProcessError::WouldBlock) => prepare_resource_wait(
+                        task_id,
+                        handle,
+                        opcode,
+                        payload,
+                        reply_capacity,
+                        resource,
+                        DeferredCallKind::PipeRead {
+                            pipes: binding.pipes.clone(),
+                            target: DeferredPipeTarget::Endpoint(binding.endpoint),
+                            maximum,
+                            resource,
+                        },
+                        pending,
+                        next_request_id,
+                    ),
+                    Err(error) => Ok(DeferredCallPreparation::Immediate {
+                        status: child_process_status(error),
+                        payload: Vec::new(),
+                    }),
+                };
+            }
+            if matches!(
+                interface,
+                troe_abi::interface::STANDARD_OUTPUT | troe_abi::interface::STANDARD_ERROR
+            ) && opcode == stream::WRITE
+                && !payload.is_empty()
+            {
+                let result = binding
+                    .pipes
+                    .try_borrow_mut()
+                    .map_err(|_| ())?
+                    .write_endpoint(binding.endpoint, payload);
+                return match result {
+                    Ok(count) if count == payload.len() => Ok(DeferredCallPreparation::Immediate {
+                        status: ReplyStatus::Success,
+                        payload: Vec::new(),
+                    }),
+                    Ok(_) => Err(()),
+                    Err(ChildProcessError::WouldBlock) => prepare_resource_wait(
+                        task_id,
+                        handle,
+                        opcode,
+                        payload,
+                        reply_capacity,
+                        resource,
+                        DeferredCallKind::PipeWrite {
+                            pipes: binding.pipes.clone(),
+                            target: DeferredPipeTarget::Endpoint(binding.endpoint),
+                            byte_count: payload.len(),
+                            resource,
+                        },
+                        pending,
+                        next_request_id,
+                    ),
+                    Err(error) => Ok(DeferredCallPreparation::Immediate {
+                        status: child_process_status(error),
+                        payload: Vec::new(),
+                    }),
+                };
+            }
+        }
+
         if interface == troe_abi::interface::TIMER && opcode == timer::SLEEP_UNTIL {
             let Ok(deadline) = timer::decode_milliseconds(payload) else {
                 return Ok(DeferredCallPreparation::Immediate {
@@ -3513,10 +4066,12 @@ mod firmware {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn deferred_reply(
         kind: DeferredCallKind,
         reason: WakeReason,
         received: Option<ReceivedUdp>,
+        request: &[u8],
     ) -> Result<(ReplyStatus, Vec<u8>), ()> {
         match (kind, reason) {
             (DeferredCallKind::Timer { .. }, WakeReason::Deadline) => {
@@ -3529,6 +4084,87 @@ mod firmware {
             (DeferredCallKind::Datagram { .. }, WakeReason::Deadline) => {
                 Ok((ReplyStatus::Timeout, Vec::new()))
             }
+            (
+                DeferredCallKind::Child {
+                    children,
+                    owner,
+                    token,
+                    ..
+                },
+                WakeReason::ResourceReady,
+            ) => {
+                let status = children
+                    .try_borrow()
+                    .map_err(|_| ())?
+                    .status(owner, token)
+                    .map_err(|_| ())?;
+                if status.state == process_launch::ChildState::Running {
+                    return Err(());
+                }
+                let encoded = process_launch::encode_status(status).map_err(|_| ())?;
+                Ok((ReplyStatus::Success, owned_reply_payload(&encoded)?))
+            }
+            (
+                DeferredCallKind::PipeRead {
+                    pipes,
+                    target,
+                    maximum,
+                    ..
+                },
+                WakeReason::ResourceReady,
+            ) => {
+                let mut bytes = [0_u8; pipe::MAX_IO_BYTES];
+                let count = match target {
+                    DeferredPipeTarget::Owner { owner, token } => pipes
+                        .try_borrow_mut()
+                        .map_err(|_| ())?
+                        .read_owner(owner, token, &mut bytes[..maximum]),
+                    DeferredPipeTarget::Endpoint(endpoint) => pipes
+                        .try_borrow_mut()
+                        .map_err(|_| ())?
+                        .read_endpoint(endpoint, &mut bytes[..maximum]),
+                }
+                .map_err(|_| ())?;
+                Ok((ReplyStatus::Success, owned_reply_payload(&bytes[..count])?))
+            }
+            (
+                DeferredCallKind::PipeWrite {
+                    pipes,
+                    target,
+                    byte_count,
+                    ..
+                },
+                WakeReason::ResourceReady,
+            ) => {
+                let bytes = match target {
+                    DeferredPipeTarget::Owner { token, .. } => {
+                        let (encoded_token, bytes) = pipe::decode_write(request).map_err(|_| ())?;
+                        if encoded_token != token {
+                            return Err(());
+                        }
+                        bytes
+                    }
+                    DeferredPipeTarget::Endpoint(_) => request,
+                };
+                if bytes.len() != byte_count {
+                    return Err(());
+                }
+                let count = match target {
+                    DeferredPipeTarget::Owner { owner, token } => pipes
+                        .try_borrow_mut()
+                        .map_err(|_| ())?
+                        .write_owner(owner, token, bytes),
+                    DeferredPipeTarget::Endpoint(endpoint) => pipes
+                        .try_borrow_mut()
+                        .map_err(|_| ())?
+                        .write_endpoint(endpoint, bytes),
+                }
+                .map_err(|_| ())?;
+                if count != bytes.len() {
+                    return Err(());
+                }
+                Ok((ReplyStatus::Success, Vec::new()))
+            }
             (_, WakeReason::Cancelled | WakeReason::Revoked) => {
                 Ok((ReplyStatus::Cancelled, Vec::new()))
             }
@@ -3537,10 +4173,17 @@ mod firmware {
                 DeferredCallKind::Timer { .. } | DeferredCallKind::Diagnostics { .. },
                 WakeReason::ResourceReady,
             )
-            | (DeferredCallKind::Diagnostics { .. }, WakeReason::Deadline) => Err(()),
+            | (
+                DeferredCallKind::Diagnostics { .. }
+                | DeferredCallKind::Child { .. }
+                | DeferredCallKind::PipeRead { .. }
+                | DeferredCallKind::PipeWrite { .. },
+                WakeReason::Deadline,
+            ) => Err(()),
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn wait_for_deferred_call(
         scheduler: &mut Scheduler,
         task_id: TaskId,
@@ -3612,12 +4255,18 @@ mod firmware {
                         }
                     }
                 }
-                DeferredCallKind::Diagnostics { .. } => return Err(()),
+                DeferredCallKind::Diagnostics { .. }
+                | DeferredCallKind::Child { .. }
+                | DeferredCallKind::PipeRead { .. }
+                | DeferredCallKind::PipeWrite { .. } => return Err(()),
             }
             let deadline = match &suspended_call.kind {
                 DeferredCallKind::Timer { deadline }
                 | DeferredCallKind::Datagram { deadline, .. } => *deadline,
-                DeferredCallKind::Diagnostics { .. } => return Err(()),
+                DeferredCallKind::Diagnostics { .. }
+                | DeferredCallKind::Child { .. }
+                | DeferredCallKind::PipeRead { .. }
+                | DeferredCallKind::PipeWrite { .. } => return Err(()),
             };
             let remaining = deadline.as_millis().saturating_sub(now.as_millis());
             if remaining == 0 {
@@ -3644,7 +4293,9 @@ mod firmware {
             .dispatch(task_id, Capabilities::SERVICE)
             .map_err(|_| ())?;
         let suspended_call = suspended.take(operation)?;
-        let (status, payload) = deferred_reply(suspended_call.kind, completion.reason(), received)?;
+        let request = pending.request(operation).map_err(|_| ())?;
+        let (status, payload) =
+            deferred_reply(suspended_call.kind, completion.reason(), received, request)?;
         if payload.len() > suspended_call.call.reply_capacity() {
             return Err(());
         }
@@ -3753,7 +4404,7 @@ mod firmware {
                     .pending
                     .mark_ready(operation, reason)
                     .map_err(|_| ())?;
-                let (status, payload) = deferred_reply(kind, reason, None)?;
+                let (status, payload) = deferred_reply(kind, reason, None, &[])?;
                 if payload.len() > call.reply_capacity() {
                     return Err(());
                 }
@@ -3773,7 +4424,11 @@ mod firmware {
                     DeferredCallKind::Diagnostics { resource } => {
                         Some((Rc::clone(diagnostics_snapshot.ok_or(())?), *resource))
                     }
-                    DeferredCallKind::Timer { .. } | DeferredCallKind::Datagram { .. } => None,
+                    DeferredCallKind::Timer { .. }
+                    | DeferredCallKind::Datagram { .. }
+                    | DeferredCallKind::Child { .. }
+                    | DeferredCallKind::PipeRead { .. }
+                    | DeferredCallKind::PipeWrite { .. } => None,
                 };
                 state.pending.bind_wait(operation, wait).map_err(|_| ())?;
                 state.suspended.insert(SuspendedApplicationCall {
@@ -3831,7 +4486,7 @@ mod firmware {
         mut dispatcher: Dispatcher<'service>,
         services: &[CommandStartupService],
         source: &[u8],
-        resource_slot: u8,
+        resource_slot: u32,
         process_name: &str,
         process_origin: ProcessOrigin,
         started_millis: u64,
@@ -4064,6 +4719,7 @@ mod firmware {
             dispatcher,
             deferred_services: None,
             deferred_state: None,
+            process_control: None,
             execution: Some(ResidentExecution::Unstarted(Box::new(ResidentLaunch {
                 address_space,
                 entry,
@@ -4085,7 +4741,7 @@ mod firmware {
         services: &[CommandStartupService],
         deferred_services: Option<&CommandDeferredServices>,
         source: &[u8],
-        resource_slot: u8,
+        resource_slot: u32,
         service_call_limit: Option<u16>,
     ) -> Result<CommandApplicationOutcome, ()> {
         if services.is_empty() || services.len() > troe_dispatch::MAX_HANDLES {
@@ -4602,7 +5258,703 @@ mod firmware {
         Ok(terminal)
     }
 
-    impl ResidentApplication<'_> {
+    fn nested_input_for_spawn<'service>(
+        spec: process_launch::StreamSpec,
+        inherited: &NestedInput<'service>,
+        owner: OwnerId,
+        pipes: &SharedPipeTable,
+    ) -> Result<NestedInput<'service>, ReplyStatus> {
+        match spec.mode {
+            process_launch::StreamMode::Inherit => Ok(inherited.clone()),
+            process_launch::StreamMode::Null => Ok(NestedInput::Empty),
+            process_launch::StreamMode::Pipe => {
+                let token =
+                    pipe::PipeToken::new(spec.pipe).map_err(|_| ReplyStatus::InvalidRequest)?;
+                pipes
+                    .try_borrow_mut()
+                    .map_err(|_| ReplyStatus::Conflict)?
+                    .owner_read_ready(owner, token)
+                    .map_err(child_process_status)?;
+                Ok(NestedInput::Pipe {
+                    pipes: pipes.clone(),
+                    owner,
+                    token,
+                })
+            }
+        }
+    }
+
+    fn nested_output_for_spawn<'service>(
+        spec: process_launch::StreamSpec,
+        inherited: &NestedOutput<'service>,
+        owner: OwnerId,
+        pipes: &SharedPipeTable,
+    ) -> Result<NestedOutput<'service>, ReplyStatus> {
+        match spec.mode {
+            process_launch::StreamMode::Inherit => Ok(inherited.clone()),
+            process_launch::StreamMode::Null => Ok(NestedOutput::Discard),
+            process_launch::StreamMode::Pipe => {
+                let token =
+                    pipe::PipeToken::new(spec.pipe).map_err(|_| ReplyStatus::InvalidRequest)?;
+                // Zero-length readiness is false but still validates token,
+                // ownership, writer openness, and the existence of a reader.
+                let _ready = pipes
+                    .try_borrow_mut()
+                    .map_err(|_| ReplyStatus::Conflict)?
+                    .owner_write_ready(owner, token, 0)
+                    .map_err(child_process_status)?;
+                Ok(NestedOutput::Pipe {
+                    pipes: pipes.clone(),
+                    owner,
+                    token,
+                })
+            }
+        }
+    }
+
+    impl<'service> ResidentApplication<'service> {
+        fn spawn_child(
+            &mut self,
+            scheduler: &mut Scheduler,
+            accounting: &mut OwnedAccounting,
+            payload: &[u8],
+        ) -> Result<process_launch::SpawnedChild, ReplyStatus> {
+            let request =
+                process_launch::decode_spawn(payload).map_err(|_| ReplyStatus::InvalidRequest)?;
+            let mut control = self.process_control.take().ok_or(ReplyStatus::NotFound)?;
+            let result =
+                Self::spawn_child_with_control(&mut control, scheduler, accounting, request);
+            self.process_control = Some(control);
+            result
+        }
+
+        #[allow(clippy::ignored_unit_patterns, clippy::too_many_lines)]
+        fn spawn_child_with_control(
+            control: &mut ResidentProcessControl<'service>,
+            scheduler: &mut Scheduler,
+            accounting: &mut OwnedAccounting,
+            request: process_launch::SpawnRequest<'_>,
+        ) -> Result<process_launch::SpawnedChild, ReplyStatus> {
+            control
+                .processes
+                .try_reserve(1)
+                .map_err(|_| ReplyStatus::Exhausted)?;
+            let invocation = request.invocation();
+            let command_name = invocation.argument(0).ok_or(ReplyStatus::InvalidRequest)?;
+            if !valid_application_name(command_name) {
+                return Err(ReplyStatus::InvalidRequest);
+            }
+            let mut words = Vec::new();
+            words
+                .try_reserve_exact(invocation.len())
+                .map_err(|_| ReplyStatus::Exhausted)?;
+            for word in invocation.arguments() {
+                words.push(String::from(word));
+            }
+            let mut environment = Vec::new();
+            environment
+                .try_reserve_exact(request.environment().len())
+                .map_err(|_| ReplyStatus::Exhausted)?;
+            for value in request.environment() {
+                environment.push(String::from(value));
+            }
+            let mut environment_refs = Vec::new();
+            environment_refs
+                .try_reserve_exact(environment.len())
+                .map_err(|_| ReplyStatus::Exhausted)?;
+            for value in &environment {
+                environment_refs.push(value.as_str());
+            }
+
+            let path = alloc::format!("/bin/{command_name}.kex");
+            let metadata = control
+                .launch
+                .namespace
+                .borrow_mut()
+                .metadata("/", &path)
+                .map_err(|error| match error {
+                    troe_vfs::FsError::NotFound => ReplyStatus::NotFound,
+                    _ => ReplyStatus::Failure,
+                })?;
+            if metadata.kind != NodeKind::File {
+                return Err(ReplyStatus::NotFound);
+            }
+            let artifact = stage_artifact(metadata.byte_count, |offset, destination| {
+                control
+                    .launch
+                    .namespace
+                    .borrow_mut()
+                    .read_file_at("/", &path, offset, destination)
+                    .map_err(|_| ())
+            })
+            .map_err(|_| ReplyStatus::Failure)?;
+            let package = parse_kex_package(&artifact).map_err(|_| ReplyStatus::InvalidRequest)?;
+            let (required, shell_script_required) =
+                decode_application_requirements(package.requirements())
+                    .map_err(|_| ReplyStatus::Denied)?;
+            if !control.grants.attenuates(required, shell_script_required) {
+                return Err(ReplyStatus::Denied);
+            }
+
+            let stdin = nested_input_for_spawn(
+                request.stdin(),
+                &control.launch.stdio.stdin,
+                control.owner,
+                &control.pipes,
+            )?;
+            let stdout = nested_output_for_spawn(
+                request.stdout(),
+                &control.launch.stdio.stdout,
+                control.owner,
+                &control.pipes,
+            )?;
+            let stderr = nested_output_for_spawn(
+                request.stderr(),
+                &control.launch.stdio.stderr,
+                control.owner,
+                &control.pipes,
+            )?;
+            let child_stdio = NestedStdio {
+                stdin,
+                stdout,
+                stderr,
+            };
+
+            let application_network = control.launch.runtime.borrow().network.clone();
+            let application_transport_network = if required.datagram || required.tcp_connect {
+                Some(
+                    application_network
+                        .clone()
+                        .ok_or(ReplyStatus::NotConfigured)?,
+                )
+            } else {
+                None
+            };
+            let datagram_state = if required.datagram {
+                Some(Rc::new(RefCell::new(ApplicationDatagramState::new(
+                    application_transport_network
+                        .as_ref()
+                        .ok_or(ReplyStatus::NotConfigured)?
+                        .clone(),
+                ))))
+            } else {
+                None
+            };
+            let diagnostics_snapshot = if required.diagnostics {
+                Some(
+                    application_diagnostics_snapshot(
+                        machine_snapshot(accounting),
+                        troe_machine::input_interrupt_stats(),
+                        control.launch.namespace.borrow().memory_stats(),
+                    )
+                    .map_err(|_| ReplyStatus::Failure)?,
+                )
+            } else {
+                None
+            };
+
+            let service_count = 4
+                + usize::from(required.datagram)
+                + usize::from(required.filesystem)
+                + usize::from(required.filesystem_mutation)
+                + usize::from(required.timer)
+                + usize::from(required.diagnostics)
+                + usize::from(required.process_observation)
+                + usize::from(required.process_launch)
+                + usize::from(required.pipe)
+                + usize::from(required.network_observation)
+                + usize::from(required.network_configuration)
+                + usize::from(required.icmp_echo)
+                + usize::from(required.tcp_connect)
+                + usize::from(required.volume_control)
+                + usize::from(required.wall_clock);
+            let handle_capacity = service_count.checked_mul(2).ok_or(ReplyStatus::Exhausted)?;
+            let mut dispatcher = Dispatcher::new(service_count, handle_capacity)
+                .map_err(|_| ReplyStatus::Exhausted)?;
+            let timer_task_id = required.timer.then(|| Rc::new(Cell::new(None)));
+            let child_owner_binding = Rc::new(Cell::new(None));
+            let child_children = Rc::new(RefCell::new(
+                ChildTable::new(MAX_CHILDREN_PER_OWNER).map_err(child_process_status)?,
+            ));
+            let child_pipes = Rc::new(RefCell::new(
+                PipeTable::new(MAX_PIPES_PER_OWNER).map_err(child_process_status)?,
+            ));
+            let mut pipe_streams = Vec::new();
+            pipe_streams
+                .try_reserve_exact(3)
+                .map_err(|_| ReplyStatus::Exhausted)?;
+            let mut services = Vec::new();
+            services
+                .try_reserve_exact(service_count)
+                .map_err(|_| ReplyStatus::Exhausted)?;
+            services.push(CommandStartupService {
+                port: register_command_service(
+                    &mut dispatcher,
+                    CommandInvocationService::new_with_environment(
+                        invocation.cwd(),
+                        &words,
+                        &environment_refs,
+                    )
+                    .map_err(|_| ReplyStatus::InvalidRequest)?,
+                )
+                .map_err(|_| ReplyStatus::Exhausted)?,
+                interface: troe_abi::interface::COMMAND,
+                major: command::MAJOR,
+                minor: command::MINOR,
+            });
+            services.push(
+                register_nested_input(&mut dispatcher, &child_stdio.stdin, &mut pipe_streams)
+                    .map_err(|_| ReplyStatus::Exhausted)?,
+            );
+            services.push(
+                register_nested_output(
+                    &mut dispatcher,
+                    &child_stdio.stdout,
+                    troe_abi::interface::STANDARD_OUTPUT,
+                    &mut pipe_streams,
+                )
+                .map_err(|_| ReplyStatus::Exhausted)?,
+            );
+            services.push(
+                register_nested_output(
+                    &mut dispatcher,
+                    &child_stdio.stderr,
+                    troe_abi::interface::STANDARD_ERROR,
+                    &mut pipe_streams,
+                )
+                .map_err(|_| ReplyStatus::Exhausted)?,
+            );
+
+            if required.datagram {
+                services.push(CommandStartupService {
+                    port: register_command_service(
+                        &mut dispatcher,
+                        ApplicationDatagramService::new(
+                            datagram_state.as_ref().ok_or(ReplyStatus::Failure)?.clone(),
+                            control.launch.runtime.clone(),
+                        ),
+                    )
+                    .map_err(|_| ReplyStatus::Exhausted)?,
+                    interface: troe_abi::interface::DATAGRAM,
+                    major: datagram::MAJOR,
+                    minor: datagram::MINOR,
+                });
+            }
+            if required.filesystem {
+                services.push(CommandStartupService {
+                    port: register_command_service(
+                        &mut dispatcher,
+                        ApplicationFilesystemService::new(
+                            control.launch.namespace.clone(),
+                            invocation.cwd(),
+                        )
+                        .map_err(|_| ReplyStatus::InvalidRequest)?,
+                    )
+                    .map_err(|_| ReplyStatus::Exhausted)?,
+                    interface: troe_abi::interface::FILESYSTEM_READ,
+                    major: filesystem::MAJOR,
+                    minor: filesystem::MINOR,
+                });
+            }
+            if required.filesystem_mutation {
+                services.push(CommandStartupService {
+                    port: register_command_service(
+                        &mut dispatcher,
+                        ApplicationFilesystemMutationService::new(
+                            control.launch.namespace.clone(),
+                            invocation.cwd(),
+                        )
+                        .map_err(|_| ReplyStatus::InvalidRequest)?,
+                    )
+                    .map_err(|_| ReplyStatus::Exhausted)?,
+                    interface: troe_abi::interface::FILESYSTEM_MUTATE,
+                    major: filesystem_mutation::MAJOR,
+                    minor: filesystem_mutation::MINOR,
+                });
+            }
+            if required.timer {
+                services.push(CommandStartupService {
+                    port: register_command_service(
+                        &mut dispatcher,
+                        ApplicationTimerService {
+                            runtime: control.launch.runtime.clone(),
+                            processes: control.launch.processes.clone(),
+                            task_id: timer_task_id.as_ref().ok_or(ReplyStatus::Failure)?.clone(),
+                        },
+                    )
+                    .map_err(|_| ReplyStatus::Exhausted)?,
+                    interface: troe_abi::interface::TIMER,
+                    major: timer::MAJOR,
+                    minor: timer::MINOR,
+                });
+            }
+            if required.diagnostics {
+                services.push(CommandStartupService {
+                    port: register_command_service(
+                        &mut dispatcher,
+                        ApplicationDiagnosticsSnapshotService {
+                            snapshot: diagnostics_snapshot
+                                .as_ref()
+                                .ok_or(ReplyStatus::Failure)?
+                                .clone(),
+                        },
+                    )
+                    .map_err(|_| ReplyStatus::Exhausted)?,
+                    interface: troe_abi::interface::DIAGNOSTICS,
+                    major: diagnostics::MAJOR,
+                    minor: diagnostics::MINOR,
+                });
+            }
+            if required.process_observation {
+                services.push(CommandStartupService {
+                    port: register_command_service(
+                        &mut dispatcher,
+                        ApplicationProcessObservationService {
+                            processes: control.launch.processes.clone(),
+                            runtime: control.launch.runtime.clone(),
+                        },
+                    )
+                    .map_err(|_| ReplyStatus::Exhausted)?,
+                    interface: troe_abi::interface::PROCESS_OBSERVE,
+                    major: process_observation::MAJOR,
+                    minor: process_observation::MINOR,
+                });
+            }
+            if required.process_launch {
+                services.push(CommandStartupService {
+                    port: register_command_service(
+                        &mut dispatcher,
+                        ApplicationProcessLaunchService {
+                            owner: child_owner_binding.clone(),
+                            children: child_children.clone(),
+                        },
+                    )
+                    .map_err(|_| ReplyStatus::Exhausted)?,
+                    interface: troe_abi::interface::PROCESS_LAUNCH,
+                    major: process_launch::MAJOR,
+                    minor: process_launch::MINOR,
+                });
+            }
+            if required.pipe {
+                services.push(CommandStartupService {
+                    port: register_command_service(
+                        &mut dispatcher,
+                        ApplicationPipeService {
+                            owner: child_owner_binding.clone(),
+                            pipes: child_pipes.clone(),
+                        },
+                    )
+                    .map_err(|_| ReplyStatus::Exhausted)?,
+                    interface: troe_abi::interface::PIPE,
+                    major: pipe::MAJOR,
+                    minor: pipe::MINOR,
+                });
+            }
+            if required.network_observation {
+                services.push(CommandStartupService {
+                    port: register_command_service(
+                        &mut dispatcher,
+                        ApplicationNetworkObservationService {
+                            network: application_network.clone(),
+                        },
+                    )
+                    .map_err(|_| ReplyStatus::Exhausted)?,
+                    interface: troe_abi::interface::NETWORK_OBSERVE,
+                    major: network_observation::MAJOR,
+                    minor: network_observation::MINOR,
+                });
+            }
+            if required.network_configuration {
+                services.push(CommandStartupService {
+                    port: register_command_service(
+                        &mut dispatcher,
+                        ApplicationNetworkConfigurationService {
+                            network: application_network.clone(),
+                            runtime: control.launch.runtime.clone(),
+                        },
+                    )
+                    .map_err(|_| ReplyStatus::Exhausted)?,
+                    interface: troe_abi::interface::NETWORK_CONFIGURE,
+                    major: network_configuration::MAJOR,
+                    minor: network_configuration::MINOR,
+                });
+            }
+            if required.icmp_echo {
+                services.push(CommandStartupService {
+                    port: register_command_service(
+                        &mut dispatcher,
+                        ApplicationIcmpEchoService {
+                            network: application_network.clone(),
+                            runtime: control.launch.runtime.clone(),
+                        },
+                    )
+                    .map_err(|_| ReplyStatus::Exhausted)?,
+                    interface: troe_abi::interface::ICMP_ECHO,
+                    major: icmp_echo::MAJOR,
+                    minor: icmp_echo::MINOR,
+                });
+            }
+            if required.tcp_connect {
+                services.push(CommandStartupService {
+                    port: register_command_service(
+                        &mut dispatcher,
+                        ApplicationTcpConnectService::new(
+                            application_transport_network
+                                .as_ref()
+                                .ok_or(ReplyStatus::NotConfigured)?
+                                .clone(),
+                            control.launch.runtime.clone(),
+                        ),
+                    )
+                    .map_err(|_| ReplyStatus::Exhausted)?,
+                    interface: troe_abi::interface::TCP_CONNECT,
+                    major: tcp_connect::MAJOR,
+                    minor: tcp_connect::MINOR,
+                });
+            }
+            if required.volume_control {
+                services.push(CommandStartupService {
+                    port: register_command_service(
+                        &mut dispatcher,
+                        ApplicationVolumeControlService {
+                            namespace: control.launch.namespace.clone(),
+                            mounts: control.launch.mounts.clone(),
+                        },
+                    )
+                    .map_err(|_| ReplyStatus::Exhausted)?,
+                    interface: troe_abi::interface::VOLUME_CONTROL,
+                    major: volume_control::MAJOR,
+                    minor: volume_control::MINOR,
+                });
+            }
+            if required.wall_clock {
+                services.push(CommandStartupService {
+                    port: register_command_service(
+                        &mut dispatcher,
+                        ApplicationWallClockService {
+                            runtime: control.launch.runtime.clone(),
+                        },
+                    )
+                    .map_err(|_| ReplyStatus::Exhausted)?,
+                    interface: troe_abi::interface::WALL_CLOCK,
+                    major: wall_clock::MAJOR,
+                    minor: wall_clock::MINOR,
+                });
+            }
+            if services.len() != service_count {
+                return Err(ReplyStatus::Failure);
+            }
+
+            let resource_slot = scheduler
+                .first_available_isolation_slot(
+                    RESIDENT_PROCESS_FIRST_SLOT,
+                    u32::try_from(troe_task::MAX_TASKS).map_err(|_| ReplyStatus::Failure)?,
+                )
+                .ok_or(ReplyStatus::Exhausted)?;
+            let mut process = prepare_resident_application(
+                scheduler,
+                accounting,
+                dispatcher,
+                &services,
+                package.executable(),
+                resource_slot,
+                command_name,
+                ProcessOrigin::Child,
+                control.launch.runtime.borrow().now().as_millis(),
+                control.launch.processes.clone(),
+            )
+            .map_err(|_| ReplyStatus::Exhausted)?;
+            if let Some(task_id) = &timer_task_id {
+                task_id.set(Some(process.task_id));
+            }
+            let owner = match OwnerId::new(process.task_id.get()) {
+                Ok(owner) => owner,
+                Err(error) => {
+                    let _cleaned = process.teardown(
+                        scheduler,
+                        accounting,
+                        CommandApplicationOutcome::Exited(troe_abi::exit::CANCELLED),
+                        true,
+                    );
+                    return Err(child_process_status(error));
+                }
+            };
+            child_owner_binding.set(Some(owner));
+            let needs_deferred = required.timer
+                || required.datagram
+                || required.diagnostics
+                || required.process_launch
+                || required.pipe
+                || !pipe_streams.is_empty();
+            if needs_deferred
+                && process
+                    .install_deferred_services(Some(CommandDeferredServices {
+                        runtime: control.launch.runtime.clone(),
+                        datagram: datagram_state,
+                        diagnostics: diagnostics_snapshot,
+                        process_owner: Some(owner),
+                        children: required.process_launch.then(|| child_children.clone()),
+                        pipes: required.pipe.then(|| child_pipes.clone()),
+                        pipe_streams,
+                    }))
+                    .is_err()
+            {
+                let _cleaned = process.teardown(
+                    scheduler,
+                    accounting,
+                    CommandApplicationOutcome::Exited(troe_abi::exit::CANCELLED),
+                    true,
+                );
+                return Err(ReplyStatus::Exhausted);
+            }
+            if required.process_launch {
+                process.process_control = Some(ResidentProcessControl {
+                    owner,
+                    grants: required,
+                    children: child_children,
+                    pipes: child_pipes,
+                    launch: NestedLaunchContext {
+                        namespace: control.launch.namespace.clone(),
+                        runtime: control.launch.runtime.clone(),
+                        processes: control.launch.processes.clone(),
+                        mounts: control.launch.mounts.clone(),
+                        stdio: child_stdio,
+                    },
+                    processes: Vec::new(),
+                });
+            }
+            let process_id = process.process_id.get();
+            let token = match control
+                .children
+                .try_borrow_mut()
+                .map_err(|_| ReplyStatus::Conflict)?
+                .admit(control.owner, process_id)
+            {
+                Ok(token) => token,
+                Err(error) => {
+                    let _cleaned = process.teardown(
+                        scheduler,
+                        accounting,
+                        CommandApplicationOutcome::Exited(troe_abi::exit::CANCELLED),
+                        true,
+                    );
+                    return Err(child_process_status(error));
+                }
+            };
+            control.processes.push(NestedChild {
+                token,
+                process: Some(Box::new(process)),
+                outcome: None,
+            });
+            Ok(process_launch::SpawnedChild { token, process_id })
+        }
+
+        fn pump_children(
+            &mut self,
+            scheduler: &mut Scheduler,
+            accounting: &mut OwnedAccounting,
+        ) -> Result<(), ()> {
+            let Some(control) = self.process_control.as_mut() else {
+                return Ok(());
+            };
+            for child in &mut control.processes {
+                if child.process.is_none() {
+                    continue;
+                }
+                let cancelled = control
+                    .children
+                    .try_borrow()
+                    .map_err(|_| ())?
+                    .cancellation_requested(control.owner, child.token)
+                    .map_err(|_| ())?;
+                let step = if cancelled {
+                    None
+                } else {
+                    child
+                        .process
+                        .as_mut()
+                        .map(|process| process.step(scheduler, accounting))
+                };
+                let terminal = match step {
+                    Some(Ok(Some(outcome))) => Some((outcome, false)),
+                    Some(Ok(None)) => None,
+                    Some(Err(())) => Some((
+                        CommandApplicationOutcome::Faulted(TaskFault::InvalidCall),
+                        true,
+                    )),
+                    None => Some((
+                        CommandApplicationOutcome::Exited(troe_abi::exit::CANCELLED),
+                        true,
+                    )),
+                };
+                let Some((outcome, force_cancel)) = terminal else {
+                    continue;
+                };
+                let process = child.process.take().ok_or(())?;
+                let outcome =
+                    process.teardown(scheduler, accounting, outcome, cancelled || force_cancel)?;
+                let lifecycle = if cancelled || force_cancel {
+                    ChildLifecycle::Cancelled
+                } else {
+                    match outcome {
+                        CommandApplicationOutcome::Exited(status) => ChildLifecycle::Exited(status),
+                        CommandApplicationOutcome::Faulted(_) => ChildLifecycle::Faulted,
+                    }
+                };
+                control
+                    .children
+                    .try_borrow_mut()
+                    .map_err(|_| ())?
+                    .finish(control.owner, child.token, lifecycle)
+                    .map_err(|_| ())?;
+                child.outcome = Some(outcome);
+            }
+            control.processes.retain(|child| {
+                child.process.is_some()
+                    || control
+                        .children
+                        .try_borrow()
+                        .is_ok_and(|children| children.status(control.owner, child.token).is_ok())
+            });
+            Ok(())
+        }
+
+        fn terminate_children(
+            &mut self,
+            scheduler: &mut Scheduler,
+            accounting: &mut OwnedAccounting,
+        ) -> Result<(), ()> {
+            let Some(control) = self.process_control.as_mut() else {
+                return Ok(());
+            };
+            for child in &mut control.processes {
+                let Some(process) = child.process.take() else {
+                    continue;
+                };
+                process.teardown(
+                    scheduler,
+                    accounting,
+                    CommandApplicationOutcome::Exited(troe_abi::exit::CANCELLED),
+                    true,
+                )?;
+                if control
+                    .children
+                    .try_borrow()
+                    .map_err(|_| ())?
+                    .status(control.owner, child.token)
+                    .is_ok_and(|status| status.state == process_launch::ChildState::Running)
+                {
+                    control
+                        .children
+                        .try_borrow_mut()
+                        .map_err(|_| ())?
+                        .finish(control.owner, child.token, ChildLifecycle::Cancelled)
+                        .map_err(|_| ())?;
+                }
+            }
+            Ok(())
+        }
+
         fn request_stop(&self) -> Result<(), ()> {
             self.processes
                 .try_borrow_mut()
@@ -4645,6 +5997,7 @@ mod firmware {
             scheduler: &mut Scheduler,
             accounting: &mut OwnedAccounting,
         ) -> Result<Option<CommandApplicationOutcome>, ()> {
+            self.pump_children(scheduler, accounting)?;
             let execution = self.execution.take().ok_or(())?;
             let mut outcome = match execution {
                 ResidentExecution::Unstarted(launch) => {
@@ -4777,10 +6130,38 @@ mod firmware {
                         let request = &mut request[..call.request_bytes()];
                         application.copy_request(request).map_err(|_| ())?;
                         let opcode = u16::from_le_bytes([request[0], request[1]]);
-                        let preparation = if let (Some(interface), Some(services)) = (
-                            command_handle_interface(&self.handles, call.handle()),
-                            self.deferred_services.as_ref(),
-                        ) {
+                        let interface = command_handle_interface(&self.handles, call.handle());
+                        if interface == Some(troe_abi::interface::PROCESS_LAUNCH)
+                            && opcode == process_launch::SPAWN
+                        {
+                            let (status, payload) =
+                                match self.spawn_child(scheduler, accounting, &request[2..]) {
+                                    Ok(child) => (
+                                        ReplyStatus::Success,
+                                        owned_reply_payload(&process_launch::encode_spawned(
+                                            child,
+                                        ))?,
+                                    ),
+                                    Err(status) => (status, Vec::new()),
+                                };
+                            if payload.len() > call.reply_capacity() {
+                                return Err(());
+                            }
+                            outcome = self.execute_accounted(|| {
+                                troe_machine::resume_application(
+                                    application,
+                                    troe_machine::ApplicationResume::HandleReply {
+                                        status: status.abi_value(),
+                                        reply: &payload,
+                                    },
+                                    RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
+                                )
+                            })?;
+                            continue;
+                        }
+                        let preparation = if let (Some(interface), Some(services)) =
+                            (interface, self.deferred_services.as_ref())
+                        {
                             let state = self.deferred_state.as_mut().ok_or(())?;
                             prepare_deferred_call(
                                 self.task_id,
@@ -4882,7 +6263,8 @@ mod firmware {
                                             .pending
                                             .mark_ready(operation, reason)
                                             .map_err(|_| ())?;
-                                        let (status, payload) = deferred_reply(kind, reason, None)?;
+                                        let (status, payload) =
+                                            deferred_reply(kind, reason, None, &request[2..])?;
                                         state.pending.finish(operation).map_err(|_| ())?;
                                         outcome = self.execute_accounted(|| {
                                             troe_machine::resume_application(
@@ -5110,7 +6492,8 @@ mod firmware {
         ) -> Result<Option<(troe_machine::ApplicationSession, ReplyStatus, Vec<u8>)>, ()> {
             let state = self.deferred_state.as_mut().ok_or(())?;
             let suspended = state.suspended.take(operation)?;
-            let (status, payload) = deferred_reply(suspended.kind, reason, None)?;
+            let request = state.pending.request(operation).map_err(|_| ())?;
+            let (status, payload) = deferred_reply(suspended.kind, reason, None, request)?;
             if payload.len() > suspended.call.reply_capacity() {
                 return Err(());
             }
@@ -5118,6 +6501,7 @@ mod firmware {
             Ok(Some((suspended.application, status, payload)))
         }
 
+        #[allow(clippy::too_many_lines)]
         fn poll_deferred_call(
             &mut self,
             scheduler: &mut Scheduler,
@@ -5174,6 +6558,100 @@ mod firmware {
                 }
                 DeferredCallKind::Timer { .. } => None,
                 DeferredCallKind::Diagnostics { .. } => return Err(()),
+                DeferredCallKind::Child {
+                    children,
+                    owner,
+                    token,
+                    resource,
+                } => {
+                    let terminal = children
+                        .try_borrow()
+                        .map_err(|_| ())?
+                        .status(*owner, *token)
+                        .map(|status| status.state != process_launch::ChildState::Running);
+                    match terminal {
+                        Ok(true) => state
+                            .waits
+                            .wake_resource(*resource, WakeReason::ResourceReady)
+                            .map_err(|_| ())?
+                            .iter()
+                            .next(),
+                        Ok(false) => None,
+                        Err(ChildProcessError::InvalidToken) => state
+                            .waits
+                            .wake_resource(*resource, WakeReason::Closed)
+                            .map_err(|_| ())?
+                            .iter()
+                            .next(),
+                        Err(_) => return Err(()),
+                    }
+                }
+                DeferredCallKind::PipeRead {
+                    pipes,
+                    target,
+                    resource,
+                    ..
+                } => {
+                    let ready = match target {
+                        DeferredPipeTarget::Owner { owner, token } => pipes
+                            .try_borrow_mut()
+                            .map_err(|_| ())?
+                            .owner_read_ready(*owner, *token),
+                        DeferredPipeTarget::Endpoint(endpoint) => pipes
+                            .try_borrow_mut()
+                            .map_err(|_| ())?
+                            .endpoint_read_ready(*endpoint),
+                    };
+                    match ready {
+                        Ok(true) => state
+                            .waits
+                            .wake_resource(*resource, WakeReason::ResourceReady)
+                            .map_err(|_| ())?
+                            .iter()
+                            .next(),
+                        Ok(false) => None,
+                        Err(ChildProcessError::Closed | ChildProcessError::InvalidToken) => state
+                            .waits
+                            .wake_resource(*resource, WakeReason::Closed)
+                            .map_err(|_| ())?
+                            .iter()
+                            .next(),
+                        Err(_) => return Err(()),
+                    }
+                }
+                DeferredCallKind::PipeWrite {
+                    pipes,
+                    target,
+                    byte_count,
+                    resource,
+                } => {
+                    let ready = match target {
+                        DeferredPipeTarget::Owner { owner, token } => pipes
+                            .try_borrow_mut()
+                            .map_err(|_| ())?
+                            .owner_write_ready(*owner, *token, *byte_count),
+                        DeferredPipeTarget::Endpoint(endpoint) => pipes
+                            .try_borrow_mut()
+                            .map_err(|_| ())?
+                            .endpoint_write_ready(*endpoint, *byte_count),
+                    };
+                    match ready {
+                        Ok(true) => state
+                            .waits
+                            .wake_resource(*resource, WakeReason::ResourceReady)
+                            .map_err(|_| ())?
+                            .iter()
+                            .next(),
+                        Ok(false) => None,
+                        Err(ChildProcessError::Closed | ChildProcessError::InvalidToken) => state
+                            .waits
+                            .wake_resource(*resource, WakeReason::Closed)
+                            .map_err(|_| ())?
+                            .iter()
+                            .next(),
+                        Err(_) => return Err(()),
+                    }
+                }
             };
             let Some(completion) = completion else {
                 return Ok(None);
@@ -5191,7 +6669,9 @@ mod firmware {
                 .woke(self.process_id)
                 .map_err(|_| ())?;
             let suspended = state.suspended.take(operation)?;
-            let (status, payload) = deferred_reply(suspended.kind, completion.reason(), received)?;
+            let request = state.pending.request(operation).map_err(|_| ())?;
+            let (status, payload) =
+                deferred_reply(suspended.kind, completion.reason(), received, request)?;
             if payload.len() > suspended.call.reply_capacity() {
                 return Err(());
             }
@@ -5206,6 +6686,7 @@ mod firmware {
             outcome: CommandApplicationOutcome,
             cancelled: bool,
         ) -> Result<CommandApplicationOutcome, ()> {
+            self.terminate_children(scheduler, accounting)?;
             if cancelled {
                 self.processes
                     .try_borrow_mut()
@@ -5271,14 +6752,14 @@ mod firmware {
     impl ResidentProcessTable {
         fn new() -> Result<Self, ()> {
             let mut jobs = Vec::new();
-            jobs.try_reserve_exact(RESIDENT_PROCESS_CAPACITY)
+            jobs.try_reserve_exact(INITIAL_RESIDENT_PROCESS_CAPACITY)
                 .map_err(|_| ())?;
             Ok(Self { jobs, next_id: 1 })
         }
 
-        fn available_slot(&self) -> Option<u8> {
+        fn available_slot(&self) -> Option<u32> {
             (0..RESIDENT_PROCESS_CAPACITY).find_map(|offset| {
-                let offset = u8::try_from(offset).ok()?;
+                let offset = u32::try_from(offset).ok()?;
                 let slot = RESIDENT_PROCESS_FIRST_SLOT.checked_add(offset)?;
                 (!self.jobs.iter().any(|job| {
                     job.process
@@ -5297,6 +6778,9 @@ mod firmware {
             process: Box<ResidentApplication<'static>>,
         ) -> Result<u32, Box<ResidentApplication<'static>>> {
             if self.jobs.len() >= RESIDENT_PROCESS_CAPACITY {
+                return Err(process);
+            }
+            if self.jobs.try_reserve(1).is_err() {
                 return Err(process);
             }
             let (id, next_id) = match owner {
@@ -6713,6 +8197,7 @@ mod firmware {
             Ok(())
         }
 
+        #[allow(clippy::too_many_lines)]
         fn handle_frame(&mut self, frame: &[u8]) -> Result<(), NetworkError> {
             if let Ok(packet) = parse_dhcp(frame) {
                 if self.dhcp_inbox.len() < Self::INBOX_CAPACITY {
@@ -6721,7 +8206,9 @@ mod firmware {
                 return Ok(());
             }
             if let Ok(arp) = parse_arp(frame) {
-                self.arp.learn(arp.sender_ip, arp.sender_mac);
+                self.arp
+                    .learn(arp.sender_ip, arp.sender_mac)
+                    .map_err(map_network_error)?;
                 let Some(configuration) = self.configuration else {
                     return Ok(());
                 };
@@ -6745,7 +8232,9 @@ mod firmware {
             if let Ok(echo) = parse_icmp_echo(frame)
                 && echo.destination_ip == configuration.address
             {
-                self.arp.learn(echo.source_ip, echo.source_mac);
+                self.arp
+                    .learn(echo.source_ip, echo.source_mac)
+                    .map_err(map_network_error)?;
                 if echo.kind == 8 {
                     let reply = build_icmp_echo(
                         self.device.mac_address(),
@@ -6780,7 +8269,9 @@ mod firmware {
                         .ok_or(NetworkError::Protocol)?,
                 )
                 .map_err(map_network_error)?;
-                self.arp.learn(segment.source.address(), source_mac);
+                self.arp
+                    .learn(segment.source.address(), source_mac)
+                    .map_err(map_network_error)?;
                 if let Some(connection) = self
                     .tcp
                     .iter()
@@ -6795,7 +8286,9 @@ mod firmware {
             if let Ok(datagram) = parse_udp(frame)
                 && datagram.destination_ip == configuration.address
             {
-                self.arp.learn(datagram.source_ip, datagram.source_mac);
+                self.arp
+                    .learn(datagram.source_ip, datagram.source_mac)
+                    .map_err(map_network_error)?;
                 match self.udp.admit(datagram).map_err(map_network_error)? {
                     UdpAdmission::Retained => {
                         self.stats.udp_retained = self.stats.udp_retained.saturating_add(1);
@@ -7091,6 +8584,89 @@ mod firmware {
         }
     }
 
+    impl Service for ApplicationDiscardOutputService {
+        fn call(
+            &mut self,
+            request: Request<'_>,
+        ) -> Result<ServiceReply, troe_dispatch::DispatchError> {
+            match request.opcode() {
+                stream::WRITE if !request.payload().is_empty() => {
+                    Ok(ServiceReply::empty(ReplyStatus::Success))
+                }
+                stream::SET_CHUNK_SIZE if stream::decode_chunk_size(request.payload()).is_ok() => {
+                    Ok(ServiceReply::empty(ReplyStatus::Success))
+                }
+                _ => Ok(ServiceReply::empty(ReplyStatus::InvalidRequest)),
+            }
+        }
+    }
+
+    impl Service for ApplicationPipeInputService {
+        fn call(
+            &mut self,
+            request: Request<'_>,
+        ) -> Result<ServiceReply, troe_dispatch::DispatchError> {
+            if request.opcode() != stream::READ {
+                return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+            }
+            let Ok(maximum) = stream::decode_read_request(request.payload()) else {
+                return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+            };
+            let mut bytes = [0_u8; troe_abi::MAX_SERVICE_PAYLOAD_BYTES];
+            match self
+                .pipes
+                .try_borrow_mut()
+                .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?
+                .read_endpoint(self.endpoint, &mut bytes[..maximum])
+            {
+                Ok(count) => ServiceReply::with_payload(ReplyStatus::Success, &bytes[..count]),
+                Err(error) => Ok(ServiceReply::empty(child_process_status(error))),
+            }
+        }
+    }
+
+    impl Drop for ApplicationPipeInputService {
+        fn drop(&mut self) {
+            if let Ok(mut pipes) = self.pipes.try_borrow_mut() {
+                let _detached = pipes.detach(self.endpoint);
+            }
+        }
+    }
+
+    impl Service for ApplicationPipeOutputService {
+        fn call(
+            &mut self,
+            request: Request<'_>,
+        ) -> Result<ServiceReply, troe_dispatch::DispatchError> {
+            match request.opcode() {
+                stream::WRITE if !request.payload().is_empty() => match self
+                    .pipes
+                    .try_borrow_mut()
+                    .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?
+                    .write_endpoint(self.endpoint, request.payload())
+                {
+                    Ok(count) if count == request.payload().len() => {
+                        Ok(ServiceReply::empty(ReplyStatus::Success))
+                    }
+                    Ok(_) => Ok(ServiceReply::empty(ReplyStatus::Failure)),
+                    Err(error) => Ok(ServiceReply::empty(child_process_status(error))),
+                },
+                stream::SET_CHUNK_SIZE if stream::decode_chunk_size(request.payload()).is_ok() => {
+                    Ok(ServiceReply::empty(ReplyStatus::Success))
+                }
+                _ => Ok(ServiceReply::empty(ReplyStatus::InvalidRequest)),
+            }
+        }
+    }
+
+    impl Drop for ApplicationPipeOutputService {
+        fn drop(&mut self) {
+            if let Ok(mut pipes) = self.pipes.try_borrow_mut() {
+                let _detached = pipes.detach(self.endpoint);
+            }
+        }
+    }
+
     impl Service for ApplicationLogService {
         fn call(
             &mut self,
@@ -7202,15 +8778,12 @@ mod firmware {
             let mut owned_cwd = String::new();
             owned_cwd.try_reserve_exact(cwd.len()).map_err(|_| ())?;
             owned_cwd.push_str(cwd);
+            let mut files = Vec::new();
+            files.try_reserve_exact(64).map_err(|_| ())?;
             Ok(Self {
                 namespace,
                 cwd: owned_cwd,
-                files: core::array::from_fn(|_| ApplicationFileSlot {
-                    generation: 1,
-                    retired: false,
-                    path: None,
-                    byte_count: 0,
-                }),
+                files,
             })
         }
 
@@ -7223,15 +8796,29 @@ mod firmware {
             if metadata.kind != NodeKind::File {
                 return Err(ReplyStatus::WrongType);
             }
-            let Some((index, slot)) = self
+            let index = if let Some(index) = self
                 .files
-                .iter_mut()
-                .enumerate()
-                .find(|(_, slot)| slot.path.is_none() && !slot.retired)
-            else {
-                return Err(ReplyStatus::Exhausted);
+                .iter()
+                .position(|slot| slot.path.is_none() && !slot.retired)
+            {
+                index
+            } else {
+                if self.files.len() == filesystem::MAX_OPEN_FILES {
+                    return Err(ReplyStatus::Exhausted);
+                }
+                self.files
+                    .try_reserve(1)
+                    .map_err(|_| ReplyStatus::Exhausted)?;
+                self.files.push(ApplicationFileSlot {
+                    generation: 1,
+                    retired: false,
+                    path: None,
+                    byte_count: 0,
+                });
+                self.files.len() - 1
             };
-            if slot.generation > 0x00ff_ffff {
+            let slot = self.files.get_mut(index).ok_or(ReplyStatus::Failure)?;
+            if slot.generation > u32::from(u16::MAX) {
                 slot.retired = true;
                 return Err(ReplyStatus::Exhausted);
             }
@@ -7242,17 +8829,17 @@ mod firmware {
             owned_path.push_str(path);
             slot.path = Some(owned_path);
             slot.byte_count = metadata.byte_count;
-            let token = (slot.generation << 8)
+            let token = (slot.generation << 16)
                 | u32::try_from(index + 1).map_err(|_| ReplyStatus::Failure)?;
             filesystem::OpenFile::new(token, metadata.byte_count).map_err(|_| ReplyStatus::Failure)
         }
 
         fn slot(
-            files: &[ApplicationFileSlot; filesystem::MAX_OPEN_FILES],
+            files: &[ApplicationFileSlot],
             token: u32,
         ) -> Result<&ApplicationFileSlot, ReplyStatus> {
-            let encoded_slot = token & 0xff;
-            let generation = token >> 8;
+            let encoded_slot = token & u32::from(u16::MAX);
+            let generation = token >> 16;
             if encoded_slot == 0 || generation == 0 {
                 return Err(ReplyStatus::InvalidRequest);
             }
@@ -7266,8 +8853,8 @@ mod firmware {
         }
 
         fn close(&mut self, token: u32) -> Result<(), ReplyStatus> {
-            let encoded_slot = token & 0xff;
-            let generation = token >> 8;
+            let encoded_slot = token & u32::from(u16::MAX);
+            let generation = token >> 16;
             if encoded_slot == 0 || generation == 0 {
                 return Err(ReplyStatus::InvalidRequest);
             }
@@ -7283,7 +8870,9 @@ mod firmware {
             slot.path = None;
             slot.byte_count = 0;
             match slot.generation.checked_add(1) {
-                Some(generation) if generation <= 0x00ff_ffff => slot.generation = generation,
+                Some(generation) if u16::try_from(generation).is_ok() => {
+                    slot.generation = generation;
+                }
                 _ => slot.retired = true,
             }
             Ok(())
@@ -7797,16 +9386,159 @@ mod firmware {
         }
     }
 
+    fn child_process_status(error: ChildProcessError) -> ReplyStatus {
+        match error {
+            ChildProcessError::CapacityExhausted | ChildProcessError::MetadataExhausted => {
+                ReplyStatus::Exhausted
+            }
+            ChildProcessError::InvalidToken => ReplyStatus::NotFound,
+            ChildProcessError::ForeignOwner | ChildProcessError::Closed => ReplyStatus::Conflict,
+            ChildProcessError::WouldBlock => ReplyStatus::Failure,
+            ChildProcessError::InvalidCapacity
+            | ChildProcessError::InvalidOwner
+            | ChildProcessError::InvalidProcess
+            | ChildProcessError::InvalidState
+            | ChildProcessError::InvalidMessage => ReplyStatus::InvalidRequest,
+            ChildProcessError::GenerationExhausted | ChildProcessError::AccountingOverflow => {
+                ReplyStatus::Failure
+            }
+        }
+    }
+
+    impl Service for ApplicationProcessLaunchService {
+        fn call(
+            &mut self,
+            request: Request<'_>,
+        ) -> Result<ServiceReply, troe_dispatch::DispatchError> {
+            let Some(owner) = self.owner.get() else {
+                return Ok(ServiceReply::empty(ReplyStatus::Conflict));
+            };
+            if request.opcode() == process_launch::SPAWN {
+                // Admission needs scheduler and namespace authority and is
+                // intercepted by ResidentApplication::step.
+                return Ok(ServiceReply::empty(ReplyStatus::Failure));
+            }
+            let Ok(token) = process_launch::decode_token(request.payload()) else {
+                return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+            };
+            match request.opcode() {
+                process_launch::POLL | process_launch::WAIT => {
+                    let status = match self.children.try_borrow() {
+                        Ok(children) => children.status(owner, token),
+                        Err(_) => return Ok(ServiceReply::empty(ReplyStatus::Conflict)),
+                    };
+                    match status {
+                        Ok(status) => ServiceReply::with_payload(
+                            ReplyStatus::Success,
+                            &process_launch::encode_status(status)
+                                .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?,
+                        ),
+                        Err(error) => Ok(ServiceReply::empty(child_process_status(error))),
+                    }
+                }
+                process_launch::CANCEL => {
+                    let status = match self.children.try_borrow_mut() {
+                        Ok(mut children) => children
+                            .request_cancel(owner, token)
+                            .and_then(|_| children.status(owner, token)),
+                        Err(_) => return Ok(ServiceReply::empty(ReplyStatus::Conflict)),
+                    };
+                    match status {
+                        Ok(status) => ServiceReply::with_payload(
+                            ReplyStatus::Success,
+                            &process_launch::encode_status(status)
+                                .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?,
+                        ),
+                        Err(error) => Ok(ServiceReply::empty(child_process_status(error))),
+                    }
+                }
+                process_launch::REAP => {
+                    let result = match self.children.try_borrow_mut() {
+                        Ok(mut children) => children.reap(owner, token),
+                        Err(_) => return Ok(ServiceReply::empty(ReplyStatus::Conflict)),
+                    };
+                    match result {
+                        Ok(_) => Ok(ServiceReply::empty(ReplyStatus::Success)),
+                        Err(error) => Ok(ServiceReply::empty(child_process_status(error))),
+                    }
+                }
+                _ => Ok(ServiceReply::empty(ReplyStatus::InvalidRequest)),
+            }
+        }
+    }
+
+    impl Service for ApplicationPipeService {
+        fn call(
+            &mut self,
+            request: Request<'_>,
+        ) -> Result<ServiceReply, troe_dispatch::DispatchError> {
+            let Some(owner) = self.owner.get() else {
+                return Ok(ServiceReply::empty(ReplyStatus::Conflict));
+            };
+            let Ok(mut pipes) = self.pipes.try_borrow_mut() else {
+                return Ok(ServiceReply::empty(ReplyStatus::Conflict));
+            };
+            match request.opcode() {
+                pipe::CREATE => {
+                    let Ok(capacity) = pipe::decode_create(request.payload()) else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    match pipes.create(owner, capacity) {
+                        Ok(token) => ServiceReply::with_payload(
+                            ReplyStatus::Success,
+                            &pipe::encode_token(token),
+                        ),
+                        Err(error) => Ok(ServiceReply::empty(child_process_status(error))),
+                    }
+                }
+                pipe::WRITE => {
+                    let Ok((token, payload)) = pipe::decode_write(request.payload()) else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    match pipes.write_owner(owner, token, payload) {
+                        Ok(count) if count == payload.len() => {
+                            Ok(ServiceReply::empty(ReplyStatus::Success))
+                        }
+                        Ok(_) => Ok(ServiceReply::empty(ReplyStatus::Failure)),
+                        Err(error) => Ok(ServiceReply::empty(child_process_status(error))),
+                    }
+                }
+                pipe::READ => {
+                    let Ok((token, maximum)) = pipe::decode_read(request.payload()) else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    let mut bytes = [0_u8; pipe::MAX_IO_BYTES];
+                    match pipes.read_owner(owner, token, &mut bytes[..maximum]) {
+                        Ok(count) => {
+                            ServiceReply::with_payload(ReplyStatus::Success, &bytes[..count])
+                        }
+                        Err(error) => Ok(ServiceReply::empty(child_process_status(error))),
+                    }
+                }
+                pipe::CLOSE_WRITER | pipe::CLOSE_READER => {
+                    let Ok(token) = pipe::decode_token(request.payload()) else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    let direction = if request.opcode() == pipe::CLOSE_WRITER {
+                        PipeDirection::Writer
+                    } else {
+                        PipeDirection::Reader
+                    };
+                    match pipes.close_owner(owner, token, direction) {
+                        Ok(()) => Ok(ServiceReply::empty(ReplyStatus::Success)),
+                        Err(error) => Ok(ServiceReply::empty(child_process_status(error))),
+                    }
+                }
+                _ => Ok(ServiceReply::empty(ReplyStatus::InvalidRequest)),
+            }
+        }
+    }
+
     impl Service for ApplicationProcessObservationService {
         fn call(
             &mut self,
             request: Request<'_>,
         ) -> Result<ServiceReply, troe_dispatch::DispatchError> {
-            if request.opcode() != process_observation::GET_SNAPSHOT
-                || !request.payload().is_empty()
-            {
-                return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
-            }
             let frequency = troe_machine::process_accounting_frequency_hz()
                 .ok_or(troe_dispatch::DispatchError::AccountingOverflow)?;
             let processes = self
@@ -7840,22 +9572,60 @@ mod firmware {
                         ProcessOrigin::Foreground => process_observation::Origin::Foreground,
                         ProcessOrigin::Background => process_observation::Origin::Background,
                         ProcessOrigin::Service => process_observation::Origin::Service,
+                        ProcessOrigin::Child => process_observation::Origin::Child,
                     },
                     name: process_observation::ProcessName::new(process.name().as_str())
                         .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?,
                 });
             }
-            let snapshot = process_observation::Snapshot::new(
-                self.runtime.borrow().now().as_millis(),
-                frequency,
-                &records,
-            )
-            .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?;
-            ServiceReply::with_payload(
-                ReplyStatus::Success,
-                &process_observation::encode_snapshot(snapshot)
-                    .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?,
-            )
+            let observed_millis = self.runtime.borrow().now().as_millis();
+            match request.opcode() {
+                process_observation::GET_SNAPSHOT if request.payload().is_empty() => {
+                    let retained = records.len().min(process_observation::MAX_PROCESSES);
+                    let snapshot = process_observation::Snapshot::new(
+                        observed_millis,
+                        frequency,
+                        &records[..retained],
+                    )
+                    .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?;
+                    ServiceReply::with_payload(
+                        ReplyStatus::Success,
+                        &process_observation::encode_snapshot(snapshot)
+                            .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?,
+                    )
+                }
+                process_observation::GET_PAGE => {
+                    let Ok(after) = process_observation::decode_page_request(request.payload())
+                    else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    let start = records.partition_point(|process| process.id <= after);
+                    let end = start
+                        .saturating_add(process_observation::MAX_PAGE_PROCESSES)
+                        .min(records.len());
+                    let page_records = &records[start..end];
+                    let next_cursor = if end < records.len() {
+                        page_records.last().map_or(0, |process| process.id)
+                    } else {
+                        0
+                    };
+                    let page = process_observation::Page::new(
+                        observed_millis,
+                        frequency,
+                        next_cursor,
+                        u32::try_from(records.len())
+                            .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?,
+                        page_records,
+                    )
+                    .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?;
+                    ServiceReply::with_payload(
+                        ReplyStatus::Success,
+                        &process_observation::encode_page(page)
+                            .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?,
+                    )
+                }
+                _ => Ok(ServiceReply::empty(ReplyStatus::InvalidRequest)),
+            }
         }
     }
 
@@ -8037,7 +9807,7 @@ mod firmware {
                         .ok_or(troe_dispatch::DispatchError::AccountingOverflow)?;
                     let generation = u32::try_from(transport_index)
                         .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?;
-                    let token = u64::from(generation) << 16;
+                    let token = u64::from(generation) << 32;
                     let final_fragment = exchange.fragment_index + 1 == fragments;
                     let opcode = if final_fragment { 1 } else { 2 };
                     let encoded = server::encode_received_request(
@@ -8344,8 +10114,7 @@ mod firmware {
         fn new(network: SharedNetwork) -> Self {
             Self {
                 network,
-                ports: [0; troe_net::MAX_UDP_PORTS],
-                port_count: 0,
+                ports: Vec::new(),
             }
         }
 
@@ -8354,10 +10123,10 @@ mod firmware {
                 if port == 0 {
                     return Err(ReplyStatus::InvalidRequest);
                 }
-                if self.ports[..self.port_count].contains(&port) {
+                if self.ports.contains(&port) {
                     return Ok(port);
                 }
-                if self.port_count == self.ports.len() {
+                if self.ports.len() == troe_net::MAX_UDP_PORTS {
                     return Err(ReplyStatus::Exhausted);
                 }
                 let mut network = self.network.borrow_mut();
@@ -8370,12 +10139,15 @@ mod firmware {
                     .map_err(map_network_error)
                     .map_err(application_network_status)?;
                 drop(network);
-                self.ports[self.port_count] = port;
-                self.port_count += 1;
+                if self.ports.try_reserve(1).is_err() {
+                    let _released = self.network.borrow_mut().udp.unbind(port);
+                    return Err(ReplyStatus::Exhausted);
+                }
+                self.ports.push(port);
                 return Ok(port);
             }
 
-            if self.port_count == self.ports.len() {
+            if self.ports.len() == troe_net::MAX_UDP_PORTS {
                 return Err(ReplyStatus::Exhausted);
             }
             let mut network = self.network.borrow_mut();
@@ -8389,8 +10161,11 @@ mod firmware {
                         .map_err(map_network_error)
                         .map_err(application_network_status)?;
                     drop(network);
-                    self.ports[self.port_count] = port;
-                    self.port_count += 1;
+                    if self.ports.try_reserve(1).is_err() {
+                        let _released = self.network.borrow_mut().udp.unbind(port);
+                        return Err(ReplyStatus::Exhausted);
+                    }
+                    self.ports.push(port);
                     return Ok(port);
                 }
             }
@@ -8473,7 +10248,7 @@ mod firmware {
     impl Drop for ApplicationDatagramState {
         fn drop(&mut self) {
             let mut network = self.network.borrow_mut();
-            for port in &self.ports[..self.port_count] {
+            for port in &self.ports {
                 let _released = network.udp.unbind(*port);
             }
         }
@@ -9197,6 +10972,8 @@ mod firmware {
                 + usize::from(requirements.timer)
                 + usize::from(requirements.diagnostics)
                 + usize::from(requirements.process_observation)
+                + usize::from(requirements.process_launch)
+                + usize::from(requirements.pipe)
                 + usize::from(requirements.network_observation)
                 + usize::from(requirements.network_configuration)
                 + usize::from(requirements.icmp_echo)
@@ -9253,6 +11030,36 @@ mod firmware {
                 None
             };
             let timer_task_id = requirements.timer.then(|| Rc::new(Cell::new(None)));
+            let process_owner_binding = (requirements.process_launch || requirements.pipe)
+                .then(|| Rc::new(Cell::new(None)));
+            let process_children = if requirements.process_launch {
+                match ChildTable::new(MAX_CHILDREN_PER_OWNER) {
+                    Ok(children) => Some(Rc::new(RefCell::new(children))),
+                    Err(_) => {
+                        return command_application_error(
+                            stderr,
+                            command,
+                            "process metadata exhausted",
+                        );
+                    }
+                }
+            } else {
+                None
+            };
+            let process_pipes = if requirements.process_launch || requirements.pipe {
+                match PipeTable::new(MAX_PIPES_PER_OWNER) {
+                    Ok(pipes) => Some(Rc::new(RefCell::new(pipes))),
+                    Err(_) => {
+                        return command_application_error(
+                            stderr,
+                            command,
+                            "pipe metadata exhausted",
+                        );
+                    }
+                }
+            } else {
+                None
+            };
 
             let services = (|| -> Result<Vec<CommandStartupService>, ()> {
                 let mut services = Vec::new();
@@ -9370,6 +11177,34 @@ mod firmware {
                         interface: troe_abi::interface::PROCESS_OBSERVE,
                         major: process_observation::MAJOR,
                         minor: process_observation::MINOR,
+                    });
+                }
+                if requirements.process_launch {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationProcessLaunchService {
+                                owner: process_owner_binding.as_ref().ok_or(())?.clone(),
+                                children: process_children.as_ref().ok_or(())?.clone(),
+                            },
+                        )?,
+                        interface: troe_abi::interface::PROCESS_LAUNCH,
+                        major: process_launch::MAJOR,
+                        minor: process_launch::MINOR,
+                    });
+                }
+                if requirements.pipe {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationPipeService {
+                                owner: process_owner_binding.as_ref().ok_or(())?.clone(),
+                                pipes: process_pipes.as_ref().ok_or(())?.clone(),
+                            },
+                        )?,
+                        interface: troe_abi::interface::PIPE,
+                        major: pipe::MAJOR,
+                        minor: pipe::MINOR,
                     });
                 }
                 if requirements.network_observation {
@@ -9493,11 +11328,33 @@ mod firmware {
             if let Some(task_id) = &timer_task_id {
                 task_id.set(Some(process.task_id));
             }
-            let deferred =
-                (requirements.timer || requirements.datagram).then(|| CommandDeferredServices {
+            let process_owner = if let Some(binding) = process_owner_binding.as_ref() {
+                let Ok(owner) = OwnerId::new(process.task_id.get()) else {
+                    let _cleaned = process.teardown(
+                        self.scheduler,
+                        self.accounting,
+                        CommandApplicationOutcome::Exited(troe_abi::exit::CANCELLED),
+                        true,
+                    );
+                    return command_application_error(stderr, command, "invalid process owner");
+                };
+                binding.set(Some(owner));
+                Some(owner)
+            } else {
+                None
+            };
+            let deferred = (requirements.timer
+                || requirements.datagram
+                || requirements.process_launch
+                || requirements.pipe)
+                .then(|| CommandDeferredServices {
                     runtime: self.runtime.clone(),
                     datagram: datagram_state,
                     diagnostics: None,
+                    process_owner,
+                    children: process_children.clone(),
+                    pipes: process_pipes.clone(),
+                    pipe_streams: Vec::new(),
                 });
             if process.install_deferred_services(deferred).is_err() {
                 let _cleaned = process.teardown(
@@ -9507,6 +11364,31 @@ mod firmware {
                     true,
                 );
                 return command_application_error(stderr, command, "wait metadata exhausted");
+            }
+            if requirements.process_launch {
+                process.process_control = Some(ResidentProcessControl {
+                    owner: process_owner
+                        .unwrap_or_else(|| fatal(b"fatal: process owner missing\n")),
+                    grants: requirements,
+                    children: process_children
+                        .clone()
+                        .unwrap_or_else(|| fatal(b"fatal: child table missing\n")),
+                    pipes: process_pipes
+                        .clone()
+                        .unwrap_or_else(|| fatal(b"fatal: pipe table missing\n")),
+                    launch: NestedLaunchContext {
+                        namespace: Rc::clone(namespace),
+                        runtime: self.runtime.clone(),
+                        processes: self.processes.clone(),
+                        mounts: self.accounting.runtime_mounts.clone(),
+                        stdio: NestedStdio {
+                            stdin: NestedInput::Empty,
+                            stdout: NestedOutput::Log(log.clone()),
+                            stderr: NestedOutput::Log(log.clone()),
+                        },
+                    },
+                    processes: Vec::new(),
+                });
             }
             let invocation = words.join(" ");
             match self
@@ -9662,16 +11544,16 @@ mod firmware {
 
     impl ExternalCommand for KexCommandRunner<'_> {
         #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-        fn execute(
+        fn execute<'stream>(
             &mut self,
             command: &str,
             words: &[String],
             cwd: &str,
             namespace: &SharedNamespace,
             placement: ExecutionPlacement,
-            stdin: &mut dyn Input,
-            stdout: &mut dyn Output,
-            stderr: &mut dyn Output,
+            stdin: &'stream mut dyn Input,
+            stdout: &'stream mut dyn Output,
+            stderr: &'stream mut dyn Output,
         ) -> Option<CommandStatus> {
             self.pending_script_lines = None;
             if !valid_application_name(command) {
@@ -9716,6 +11598,8 @@ mod firmware {
             let mut timer_required = false;
             let mut diagnostics_required = false;
             let mut process_observation_required = false;
+            let mut process_launch_required = false;
+            let mut pipe_required = false;
             let mut network_observation_required = false;
             let mut network_configuration_required = false;
             let mut icmp_echo_required = false;
@@ -9755,6 +11639,16 @@ mod firmware {
                     && requirement.minor == process_observation::MINOR
                 {
                     process_observation_required = true;
+                } else if requirement.interface == troe_abi::interface::PROCESS_LAUNCH
+                    && requirement.major == process_launch::MAJOR
+                    && requirement.minor == process_launch::MINOR
+                {
+                    process_launch_required = true;
+                } else if requirement.interface == troe_abi::interface::PIPE
+                    && requirement.major == pipe::MAJOR
+                    && requirement.minor == pipe::MINOR
+                {
+                    pipe_required = true;
                 } else if requirement.interface == troe_abi::interface::NETWORK_OBSERVE
                     && requirement.major == network_observation::MAJOR
                     && requirement.minor == network_observation::MINOR
@@ -9824,6 +11718,8 @@ mod firmware {
                     || filesystem_mutation_required
                     || diagnostics_required
                     || process_observation_required
+                    || process_launch_required
+                    || pipe_required
                     || network_observation_required
                     || network_configuration_required
                     || icmp_echo_required
@@ -9906,6 +11802,8 @@ mod firmware {
                         timer: timer_required,
                         diagnostics: diagnostics_required,
                         process_observation: process_observation_required,
+                        process_launch: process_launch_required,
+                        pipe: pipe_required,
                         network_observation: network_observation_required,
                         network_configuration: network_configuration_required,
                         icmp_echo: icmp_echo_required,
@@ -9939,6 +11837,8 @@ mod firmware {
                 + usize::from(timer_required)
                 + usize::from(diagnostics_required)
                 + usize::from(process_observation_required)
+                + usize::from(process_launch_required)
+                + usize::from(pipe_required)
                 + usize::from(network_observation_required)
                 + usize::from(network_configuration_required)
                 + usize::from(icmp_echo_required)
@@ -9967,6 +11867,36 @@ mod firmware {
                 } else {
                     None
                 };
+            let process_owner_binding =
+                (process_launch_required || pipe_required).then(|| Rc::new(Cell::new(None)));
+            let process_children = if process_launch_required {
+                match ChildTable::new(MAX_CHILDREN_PER_OWNER) {
+                    Ok(children) => Some(Rc::new(RefCell::new(children))),
+                    Err(_) => {
+                        return Some(command_application_error(
+                            stderr,
+                            command,
+                            "process metadata exhausted",
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
+            let process_pipes = if process_launch_required || pipe_required {
+                match PipeTable::new(MAX_PIPES_PER_OWNER) {
+                    Ok(pipes) => Some(Rc::new(RefCell::new(pipes))),
+                    Err(_) => {
+                        return Some(command_application_error(
+                            stderr,
+                            command,
+                            "pipe metadata exhausted",
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
             let shared_stdin = Rc::new(RefCell::new(&mut *stdin));
             let shared_stdout = Rc::new(RefCell::new(&mut *stdout));
             let shared_stderr = Rc::new(RefCell::new(&mut *stderr));
@@ -10102,6 +12032,34 @@ mod firmware {
                         interface: troe_abi::interface::PROCESS_OBSERVE,
                         major: process_observation::MAJOR,
                         minor: process_observation::MINOR,
+                    });
+                }
+                if process_launch_required {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationProcessLaunchService {
+                                owner: process_owner_binding.as_ref().ok_or(())?.clone(),
+                                children: process_children.as_ref().ok_or(())?.clone(),
+                            },
+                        )?,
+                        interface: troe_abi::interface::PROCESS_LAUNCH,
+                        major: process_launch::MAJOR,
+                        minor: process_launch::MINOR,
+                    });
+                }
+                if pipe_required {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationPipeService {
+                                owner: process_owner_binding.as_ref().ok_or(())?.clone(),
+                                pipes: process_pipes.as_ref().ok_or(())?.clone(),
+                            },
+                        )?,
+                        interface: troe_abi::interface::PIPE,
+                        major: pipe::MAJOR,
+                        minor: pipe::MINOR,
                     });
                 }
                 if network_observation_required {
@@ -10248,11 +12206,30 @@ mod firmware {
                     if let Some(task_id) = &timer_task_id {
                         task_id.set(Some(process.task_id));
                     }
-                    let deferred = (timer_required || datagram_required || diagnostics_required)
+                    let process_owner = if let Some(binding) = process_owner_binding.as_ref() {
+                        match OwnerId::new(process.task_id.get()) {
+                            Ok(owner) => {
+                                binding.set(Some(owner));
+                                Some(owner)
+                            }
+                            Err(_) => fatal(b"fatal: invalid process owner\n"),
+                        }
+                    } else {
+                        None
+                    };
+                    let deferred = (timer_required
+                        || datagram_required
+                        || diagnostics_required
+                        || process_launch_required
+                        || pipe_required)
                         .then(|| CommandDeferredServices {
                             runtime: self.runtime.clone(),
                             datagram: application_datagram_state,
                             diagnostics: diagnostics_snapshot,
+                            process_owner,
+                            children: process_children.clone(),
+                            pipes: process_pipes.clone(),
+                            pipe_streams: Vec::new(),
                         });
                     if process.install_deferred_services(deferred).is_err() {
                         let _cleaned = process.teardown(
@@ -10263,6 +12240,47 @@ mod firmware {
                         );
                         Err(())
                     } else {
+                        if process_launch_required {
+                            process.process_control = Some(ResidentProcessControl {
+                                owner: process_owner
+                                    .unwrap_or_else(|| fatal(b"fatal: process owner missing\n")),
+                                grants: BackgroundRequirements {
+                                    datagram: datagram_required,
+                                    filesystem: filesystem_required,
+                                    filesystem_mutation: filesystem_mutation_required,
+                                    timer: timer_required,
+                                    diagnostics: diagnostics_required,
+                                    process_observation: process_observation_required,
+                                    process_launch: process_launch_required,
+                                    pipe: pipe_required,
+                                    network_observation: network_observation_required,
+                                    network_configuration: network_configuration_required,
+                                    icmp_echo: icmp_echo_required,
+                                    tcp_connect: tcp_connect_required,
+                                    volume_control: volume_control_required,
+                                    wall_clock: wall_clock_required,
+                                    clock_control: clock_control_required,
+                                },
+                                children: process_children
+                                    .clone()
+                                    .unwrap_or_else(|| fatal(b"fatal: child table missing\n")),
+                                pipes: process_pipes
+                                    .clone()
+                                    .unwrap_or_else(|| fatal(b"fatal: pipe table missing\n")),
+                                launch: NestedLaunchContext {
+                                    namespace: Rc::clone(namespace),
+                                    runtime: self.runtime.clone(),
+                                    processes: self.processes.clone(),
+                                    mounts: self.accounting.runtime_mounts.clone(),
+                                    stdio: NestedStdio {
+                                        stdin: NestedInput::Borrowed(Rc::clone(&shared_stdin)),
+                                        stdout: NestedOutput::Borrowed(Rc::clone(&shared_stdout)),
+                                        stderr: NestedOutput::Borrowed(Rc::clone(&shared_stderr)),
+                                    },
+                                },
+                                processes: Vec::new(),
+                            });
+                        }
                         self.run_foreground_process(process)
                     }
                 }
@@ -10642,6 +12660,108 @@ mod firmware {
             .map_err(|_| ())?;
         dispatcher.close(kernel_handle).map_err(|_| ())?;
         Ok(port)
+    }
+
+    fn register_nested_input<'service>(
+        dispatcher: &mut Dispatcher<'service>,
+        input: &NestedInput<'service>,
+        pipe_streams: &mut Vec<PipeStreamService>,
+    ) -> Result<CommandStartupService, ()> {
+        let port = match input {
+            NestedInput::Empty => {
+                register_command_service(dispatcher, ApplicationEmptyInputService)?
+            }
+            NestedInput::Borrowed(input) => register_command_service(
+                dispatcher,
+                ApplicationInputService {
+                    input: input.clone(),
+                },
+            )?,
+            NestedInput::Pipe {
+                pipes,
+                owner,
+                token,
+            } => {
+                pipe_streams.try_reserve(1).map_err(|_| ())?;
+                let endpoint = pipes
+                    .try_borrow_mut()
+                    .map_err(|_| ())?
+                    .attach(*owner, *token, PipeDirection::Reader)
+                    .map_err(|_| ())?;
+                let port = register_command_service(
+                    dispatcher,
+                    ApplicationPipeInputService {
+                        pipes: pipes.clone(),
+                        endpoint,
+                    },
+                )?;
+                pipe_streams.push(PipeStreamService {
+                    interface: troe_abi::interface::STANDARD_INPUT,
+                    pipes: pipes.clone(),
+                    endpoint,
+                });
+                port
+            }
+        };
+        Ok(CommandStartupService {
+            port,
+            interface: troe_abi::interface::STANDARD_INPUT,
+            major: stream::MAJOR,
+            minor: stream::MINOR,
+        })
+    }
+
+    fn register_nested_output<'service>(
+        dispatcher: &mut Dispatcher<'service>,
+        output: &NestedOutput<'service>,
+        interface: u32,
+        pipe_streams: &mut Vec<PipeStreamService>,
+    ) -> Result<CommandStartupService, ()> {
+        let port = match output {
+            NestedOutput::Discard => {
+                register_command_service(dispatcher, ApplicationDiscardOutputService)?
+            }
+            NestedOutput::Borrowed(output) => register_command_service(
+                dispatcher,
+                ApplicationOutputService {
+                    output: output.clone(),
+                },
+            )?,
+            NestedOutput::Log(log) => {
+                register_command_service(dispatcher, ApplicationLogService { log: log.clone() })?
+            }
+            NestedOutput::Pipe {
+                pipes,
+                owner,
+                token,
+            } => {
+                pipe_streams.try_reserve(1).map_err(|_| ())?;
+                let endpoint = pipes
+                    .try_borrow_mut()
+                    .map_err(|_| ())?
+                    .attach(*owner, *token, PipeDirection::Writer)
+                    .map_err(|_| ())?;
+                let port = register_command_service(
+                    dispatcher,
+                    ApplicationPipeOutputService {
+                        pipes: pipes.clone(),
+                        endpoint,
+                    },
+                )?;
+                pipe_streams.push(PipeStreamService {
+                    interface,
+                    pipes: pipes.clone(),
+                    endpoint,
+                });
+                port
+            }
+        };
+        Ok(CommandStartupService {
+            port,
+            interface,
+            major: stream::MAJOR,
+            minor: stream::MINOR,
+        })
     }
 
     fn command_application_error(

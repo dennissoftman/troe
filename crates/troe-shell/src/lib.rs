@@ -162,16 +162,16 @@ pub enum ServiceControl {
 pub trait ExternalCommand {
     /// Resolve and execute one complete command invocation.
     #[allow(clippy::too_many_arguments)]
-    fn execute(
+    fn execute<'stream>(
         &mut self,
         command: &str,
         words: &[String],
         cwd: &str,
         namespace: &SharedNamespace,
         placement: ExecutionPlacement,
-        stdin: &mut dyn Input,
-        stdout: &mut dyn Output,
-        stderr: &mut dyn Output,
+        stdin: &'stream mut dyn Input,
+        stdout: &'stream mut dyn Output,
+        stderr: &'stream mut dyn Output,
     ) -> Option<CommandStatus>;
 
     /// Take a successfully staged batch of physical command lines.
@@ -221,16 +221,16 @@ impl Input for EmptyScriptInput {
 struct NoExternalCommand;
 
 impl ExternalCommand for NoExternalCommand {
-    fn execute(
+    fn execute<'stream>(
         &mut self,
         _command: &str,
         _words: &[String],
         _cwd: &str,
         _namespace: &SharedNamespace,
         _placement: ExecutionPlacement,
-        _stdin: &mut dyn Input,
-        _stdout: &mut dyn Output,
-        _stderr: &mut dyn Output,
+        _stdin: &'stream mut dyn Input,
+        _stdout: &'stream mut dyn Output,
+        _stderr: &'stream mut dyn Output,
     ) -> Option<CommandStatus> {
         None
     }
@@ -2078,16 +2078,16 @@ mod tests {
 
     impl ExternalCommand for FakeExternal {
         #[allow(clippy::too_many_lines)]
-        fn execute(
+        fn execute<'stream>(
             &mut self,
             command: &str,
             words: &[String],
             cwd: &str,
             namespace: &SharedNamespace,
             placement: ExecutionPlacement,
-            stdin: &mut dyn Input,
-            stdout: &mut dyn Output,
-            stderr: &mut dyn Output,
+            stdin: &'stream mut dyn Input,
+            stdout: &'stream mut dyn Output,
+            stderr: &'stream mut dyn Output,
         ) -> Option<CommandStatus> {
             self.attempts.push(command.to_string());
             self.placements.push(placement);
@@ -2378,15 +2378,15 @@ mod tests {
             Err(ParseError::TooManyArguments)
         );
 
-        let exact_stages = core::iter::repeat_n("echo", MAX_PIPELINE_STAGES)
+        let exact_stages = core::iter::repeat_n("x", MAX_PIPELINE_STAGES)
             .collect::<Vec<_>>()
-            .join(" | ");
+            .join("|");
         assert_eq!(
             parse_line(&exact_stages).map(|pipeline| pipeline.stages.len()),
             Ok(MAX_PIPELINE_STAGES)
         );
         assert_eq!(
-            parse_line(&format!("{exact_stages} | echo")),
+            parse_line(&format!("{exact_stages}|x")),
             Err(ParseError::TooManyStages)
         );
     }

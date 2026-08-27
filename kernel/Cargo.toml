@@ -26,6 +26,7 @@ troe-memory = { path = "../crates/troe-memory" }
 troe-mount = { path = "../crates/troe-mount" }
 troe-net = { path = "../crates/troe-net" }
 troe-persist = { path = "../crates/troe-persist" }
+troe-process = { path = "../crates/troe-process" }
 troe-shell = { path = "../crates/troe-shell" }
 troe-storage = { path = "../crates/troe-storage" }
 troe-supervisor = { path = "../crates/troe-supervisor" }

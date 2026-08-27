@@ -1,6 +1,7 @@
 # ADR 0036: Bounded KEX shell scripts without nested execution
 
-Status: accepted and implemented, 2026-08-27.
+Status: accepted and implemented, 2026-08-27; nested-launch premise superseded
+by ADR 0046 while the current `sh.kex` sidecar behavior remains implemented.
 
 ## Context
 

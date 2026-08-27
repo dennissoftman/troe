@@ -87,7 +87,14 @@ pub trait CooperativeRuntime: fmt::Debug {
 }
 
 /// Maximum number of live or unreaped cooperative task records.
-pub const MAX_TASKS: usize = 16;
+///
+/// This is an identity/table policy ceiling, not eagerly reserved storage and
+/// not a promise that this many address spaces fit in memory. Admission grows
+/// metadata fallibly and remains constrained first by stacks, address spaces,
+/// handles, per-owner quotas, and physical memory.
+pub const MAX_TASKS: usize = 65_536;
+
+const INITIAL_TASK_RECORD_CAPACITY: usize = 64;
 
 /// Maximum UTF-8 bytes retained for one observable process name.
 pub const MAX_PROCESS_NAME_BYTES: usize = 32;
@@ -125,6 +132,8 @@ pub enum ProcessOrigin {
     Background,
     /// Supervised system service.
     Service,
+    /// Child admitted through one process-launch capability.
+    Child,
 }
 
 /// Observable lifecycle state independent of scheduler implementation details.
@@ -343,7 +352,7 @@ impl ProcessTable {
         }
         let mut records = Vec::new();
         records
-            .try_reserve_exact(capacity)
+            .try_reserve_exact(capacity.min(INITIAL_TASK_RECORD_CAPACITY))
             .map_err(|_| ProcessError::MetadataExhausted)?;
         Ok(Self {
             records,
@@ -380,6 +389,9 @@ impl ProcessTable {
             .next_id
             .checked_add(1)
             .ok_or(ProcessError::IdentityExhausted)?;
+        self.records
+            .try_reserve(1)
+            .map_err(|_| ProcessError::MetadataExhausted)?;
         self.records.push(ProcessRecord {
             snapshot: ProcessSnapshot {
                 id,
@@ -609,14 +621,14 @@ impl Capabilities {
 /// A reusable guarded-stack slot owned by one task until it is reaped.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StackResource {
-    slot: u8,
+    slot: u32,
     mapped_pages: u16,
 }
 
 /// Address-space, frame, and handle ownership retained by one isolated task.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct IsolationResource {
-    slot: u8,
+    slot: u32,
     table_pages: u64,
     private_pages: u64,
     handles: u16,
@@ -629,7 +641,7 @@ impl IsolationResource {
     ///
     /// Rejects resources without page tables or private user pages.
     pub const fn new(
-        slot: u8,
+        slot: u32,
         table_pages: u64,
         private_pages: u64,
         handles: u16,
@@ -647,7 +659,7 @@ impl IsolationResource {
 
     /// Pool-local address-space slot.
     #[must_use]
-    pub const fn slot(self) -> u8 {
+    pub const fn slot(self) -> u32 {
         self.slot
     }
 
@@ -702,7 +714,7 @@ impl StackResource {
     /// # Errors
     ///
     /// Rejects a stack with no mapped payload pages.
-    pub const fn new(slot: u8, mapped_pages: u16) -> Result<Self, TaskError> {
+    pub const fn new(slot: u32, mapped_pages: u16) -> Result<Self, TaskError> {
         if mapped_pages == 0 {
             return Err(TaskError::EmptyStack);
         }
@@ -711,7 +723,7 @@ impl StackResource {
 
     /// Pool-local slot number.
     #[must_use]
-    pub const fn slot(self) -> u8 {
+    pub const fn slot(self) -> u32 {
         self.slot
     }
 
@@ -857,7 +869,7 @@ pub struct TaskStats {
     /// Records spawned since scheduler creation.
     pub spawned: u32,
     /// Records currently retained, including exited records.
-    pub live_records: u16,
+    pub live_records: u32,
     /// Tasks successfully reaped.
     pub reaped: u32,
     /// Explicit cooperative yields observed.
@@ -869,11 +881,11 @@ pub struct TaskStats {
     /// Blocked tasks returned to readiness through a matching wait key.
     pub wakes: u32,
     /// Tasks currently retained in a blocked state.
-    pub blocked_tasks: u16,
+    pub blocked_tasks: u32,
     /// Mapped stack pages retained by live records.
     pub owned_stack_pages: u32,
     /// Isolated address spaces retained by live records.
-    pub owned_address_spaces: u16,
+    pub owned_address_spaces: u32,
     /// Page-table plus private frames retained by isolated records.
     pub owned_isolation_pages: u64,
     /// Handles awaiting invalidation during isolated-task teardown.
@@ -1003,7 +1015,7 @@ impl Scheduler {
         }
         let mut records = Vec::new();
         records
-            .try_reserve_exact(capacity)
+            .try_reserve_exact(capacity.min(INITIAL_TASK_RECORD_CAPACITY))
             .map_err(|_| TaskError::MetadataExhausted)?;
         Ok(Self {
             records,
@@ -1083,6 +1095,9 @@ impl Scheduler {
             .spawned
             .checked_add(1)
             .ok_or(TaskError::AccountingOverflow)?;
+        self.records
+            .try_reserve(1)
+            .map_err(|_| TaskError::MetadataExhausted)?;
         self.records.push(TaskRecord {
             snapshot: TaskSnapshot {
                 id,
@@ -1494,6 +1509,23 @@ impl Scheduler {
             .ok_or(TaskError::UnknownTask)
     }
 
+    /// Find the first unused stack and isolation slot in a half-open range.
+    ///
+    /// This selects metadata identity only; callers must still admit the task,
+    /// which revalidates uniqueness atomically against the scheduler table.
+    #[must_use]
+    pub fn first_available_isolation_slot(&self, start: u32, end: u32) -> Option<u32> {
+        (start..end).find(|candidate| {
+            self.records.iter().all(|record| {
+                record.snapshot.stack.slot != *candidate
+                    && record
+                        .snapshot
+                        .isolation
+                        .is_none_or(|isolation| isolation.slot != *candidate)
+            })
+        })
+    }
+
     /// Snapshot lifecycle and stack-ownership accounting.
     #[must_use]
     pub fn stats(&self) -> TaskStats {
@@ -1524,15 +1556,15 @@ impl Scheduler {
                 });
         TaskStats {
             spawned: self.spawned,
-            live_records: u16::try_from(self.records.len()).unwrap_or(u16::MAX),
+            live_records: u32::try_from(self.records.len()).unwrap_or(u32::MAX),
             reaped: self.reaped,
             yields: self.total_yields,
             preemptions: self.total_preemptions,
             blocks: self.total_blocks,
             wakes: self.total_wakes,
-            blocked_tasks: u16::try_from(blocked_tasks).unwrap_or(u16::MAX),
+            blocked_tasks: u32::try_from(blocked_tasks).unwrap_or(u32::MAX),
             owned_stack_pages,
-            owned_address_spaces: u16::try_from(owned_address_spaces).unwrap_or(u16::MAX),
+            owned_address_spaces: u32::try_from(owned_address_spaces).unwrap_or(u32::MAX),
             owned_isolation_pages,
             owned_handles,
             contained_faults: self.contained_faults,
@@ -1581,7 +1613,7 @@ mod tests {
         }
     }
 
-    fn stack(slot: u8) -> Result<StackResource, TaskError> {
+    fn stack(slot: u32) -> Result<StackResource, TaskError> {
         StackResource::new(slot, 8)
     }
 
@@ -1898,6 +1930,21 @@ mod tests {
             scheduler.dispatch_next(Capabilities::NONE),
             Err(TaskError::TaskAlreadyRunning)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn scheduler_metadata_grows_beyond_legacy_slot_counts() -> Result<(), TaskError> {
+        const TEST_TASKS: usize = 1024;
+        let mut scheduler = Scheduler::new(TEST_TASKS)?;
+        for slot in 0..TEST_TASKS {
+            scheduler.spawn(
+                Capabilities::NONE,
+                stack(u32::try_from(slot).map_err(|_| TaskError::AccountingOverflow)?)?,
+            )?;
+        }
+        assert_eq!(scheduler.stats().live_records, 1024);
+        assert_eq!(scheduler.stats().owned_stack_pages, 8192);
         Ok(())
     }
 

@@ -1,7 +1,7 @@
 # ADR 0026: KEX read-only filesystem service
 
 Status: accepted and implemented for the Stage 9 read-only command migration,
-2026-08-25.
+2026-08-25; open-table capacity amended by ADR 0046.
 
 ## Decision
 
@@ -15,7 +15,8 @@ mount, provider, block, device, or raw kernel authority.
 
 Requests and replies use the allocation-free codecs in `troe-abi` and remain
 inside the 4 KiB dispatcher message ceiling. Paths are at most 256 bytes.
-Each launch owns at most eight generation-checked open-file tokens. Reads are
+Each launch owns a fallibly growing table of at most 4,096 generation-checked
+open-file tokens. Reads are
 bounded by the caller's reply capacity. Directory pages are lexical, carry an
 opaque continuation cursor, and contain at most 64 entries, 64 bytes per name,
 and 3,072 aggregate name bytes. Listings distinguish regular files,

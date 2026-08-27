@@ -921,7 +921,8 @@ mod tests {
                 scheduler
                     .spawn(
                         Capabilities::NONE,
-                        StackResource::new(slot, 1).unwrap_or_else(|_| std::process::abort()),
+                        StackResource::new(u32::from(slot), 1)
+                            .unwrap_or_else(|_| std::process::abort()),
                     )
                     .unwrap_or_else(|_| std::process::abort()),
             );

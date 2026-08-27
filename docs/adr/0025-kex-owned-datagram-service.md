@@ -1,7 +1,7 @@
 # ADR 0025: KEX owned datagram service
 
 Status: accepted and implemented for the Stage 9 application-networking slice,
-2026-08-25.
+2026-08-25; binding-table capacity amended by ADR 0046.
 
 ## Decision
 
@@ -23,7 +23,7 @@ and oversize input.
 
 The per-launch service exclusively claims each requested or selected local port
 before use. A second owner cannot reuse an existing binding. Claims are bounded
-by the platform's eight-port ceiling and reuse the existing four-datagram/4 KiB
+by the platform's 16,384-port ceiling and reuse the existing four-datagram/4 KiB
 per-port drop-newest queues. `receive` waits through the existing cooperative
 runtime checkpoint so network interrupts make progress, Ctrl-C returns the
 stable cancelled status, and the hard deadline is observed. Dropping the launch
