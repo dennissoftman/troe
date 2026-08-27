@@ -40,6 +40,7 @@ FILESYSTEM_APPS = frozenset(
         "printf",
         "rm",
         "sed",
+        "sh",
         "tar",
         "wc",
     )

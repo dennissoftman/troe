@@ -26,8 +26,8 @@ shell resumes.
 The immutable target-selected KEFS root is the recovery command distribution:
 both supported images contain behavior-equivalent KEX apps for `arp`, `awk`,
 `cat`, `clear`, `dhcp`, `echo`, `grep`, `hexdump`, `ln`, `ls`, `lua`, `man`,
-`mem`, `mount`, `net`, `ping`, `printf`, `pwd`, `rm`, `sed`, `sleep`, `tar`,
-`tcp`, `udp`, and `wc`. Losing one artifact does not silently substitute
+`mem`, `mount`, `net`, `ping`, `printf`, `pwd`, `rm`, `sed`, `sh`, `sleep`,
+`tar`, `tcp`, `udp`, and `wc`. Losing one artifact does not silently substitute
 privileged code with different authority or semantics.
 `cd` cannot be external because it mutates the shell session; poweroff and
 reboot remain intrinsic because ABI 1.0 intentionally exposes no

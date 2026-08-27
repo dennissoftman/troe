@@ -145,6 +145,8 @@ class KexToolTests(unittest.TestCase):
                         expected = [(13, 1, 0)]
                     elif command == "mount":
                         expected = [(14, 1, 0)]
+                    elif command == "sh":
+                        expected = [(6, 1, 2), (16, 1, 0)]
                     else:
                         expected = []
                     self.assertEqual(records, expected)

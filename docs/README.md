@@ -18,6 +18,7 @@ contract.
 | Security boundary and reporting | [Security policy](../SECURITY.md) |
 | Contribution and merge expectations | [Contribution guide](../CONTRIBUTING.md) |
 | Core normative requirements | [Core specification](../CORE-SPEC.md) |
+| Bounded KEX command scripts without nested execution | [ADR 0036](adr/0036-bounded-kex-shell-scripts.md) |
 
 The current serialized contracts are versioned independently under
 [`formats/`](formats):

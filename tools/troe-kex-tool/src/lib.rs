@@ -447,6 +447,11 @@ fn capability_requirement(name: &str) -> ToolResult<requirements::Requirement> {
             major: troe_abi::server::MAJOR,
             minor: troe_abi::server::MINOR,
         }),
+        "shell-script" => Ok(requirements::Requirement {
+            interface: interface::SHELL_SCRIPT,
+            major: troe_abi::shell_script::MAJOR,
+            minor: troe_abi::shell_script::MINOR,
+        }),
         _ => Err(ToolError::new(format!(
             "unknown TROE KEX capability '{name}'"
         ))),

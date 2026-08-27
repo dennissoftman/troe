@@ -1,11 +1,27 @@
 NAME
-    sh - execute bounded pipelines and streamed file redirection
+    sh - execute bounded command scripts and pipelines
 
 SYNOPSIS
+    sh [FILE | -]
     COMMAND [ARG...] [< FILE] [> FILE | >> FILE]
     COMMAND... | COMMAND...
 
 DESCRIPTION
+    With FILE, sh reads one UTF-8 script from the read-only filesystem service.
+    With - or no operand, it reads standard input. Blank lines and lines whose
+    first non-whitespace byte is # are ignored. Every other physical line uses
+    the normal TROE command grammar and is executed sequentially in the owning
+    shell session after the complete script has been validated.
+
+    Script staging is transactional: malformed, excessive, failed, or faulted
+    sh.kex execution runs none of the submitted commands. Runtime command
+    failures do not stop later lines, and the script returns the last executed
+    command's status. A cd line changes the owning shell's logical directory.
+
+    Source is limited to 64 KiB, one physical command line to 512 UTF-8 bytes,
+    one batch to 1,024 commands, and nesting to four scripts within the same
+    1,024-command budget. Files are not directly executable; use sh FILE.
+
     Single and double quotes group literal text; neither performs expansion.
     An unquoted | connects bounded byte streams. Unquoted < supplies the first
     stage from FILE. Unquoted > truncates or creates FILE before execution and
@@ -14,5 +30,10 @@ DESCRIPTION
     File streams use a 16 KiB default working buffer and are not capped by the
     shell. A failing command may leave an empty file or written prefix. The
     1 MiB limit applies only between sequential pipeline stages. Redirection
-    paths do not enter command argv. Environment and variable expansion,
-    stderr redirection, heredocs, jobs, and descriptor numbers are not supported.
+    paths do not enter command argv. Variables, expansion, command substitution,
+    control flow, stderr redirection, heredocs, jobs, descriptor numbers, and
+    multiline grammar are not supported in this first script version.
+
+EXAMPLES
+    sh /share/sh/bench.sh
+    printf 'echo from-stdin\n' | sh -

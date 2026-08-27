@@ -25,8 +25,8 @@ mod firmware {
 
     use troe_abi::{
         command, datagram, diagnostics, filesystem, filesystem_mutation, heap_growth, icmp_echo,
-        network_configuration, network_observation, server, stream, tcp_connect, timer,
-        volume_control,
+        network_configuration, network_observation, server, shell_script, stream, tcp_connect,
+        timer, volume_control,
     };
     #[cfg(feature = "acceptance-probes")]
     use troe_application::ParseError;
@@ -71,7 +71,7 @@ mod firmware {
     use troe_persist::{DualSlotStore, RegionSelector, TRANSACTION_BLOCKS};
     use troe_shell::{
         CompletionConfig, ExternalCommand, MachineAction, SharedNamespace, Shell,
-        format_memory_report,
+        format_memory_report, parse_line,
     };
     #[cfg(feature = "acceptance-probes")]
     use troe_statefs::STATE_PATH;
@@ -349,6 +349,7 @@ mod firmware {
         shell_id: TaskId,
         shell_capabilities: Capabilities,
         runtime: SharedRuntime,
+        pending_script_lines: Option<Vec<String>>,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -715,6 +716,16 @@ mod firmware {
 
     struct ApplicationTimerService {
         runtime: SharedRuntime,
+    }
+
+    #[derive(Default)]
+    struct SubmittedShellScript {
+        lines: Vec<String>,
+        source_bytes: usize,
+    }
+
+    struct ApplicationShellScriptService {
+        script: Rc<RefCell<SubmittedShellScript>>,
     }
 
     struct ApplicationDiagnosticsProxyService;
@@ -5795,6 +5806,44 @@ mod firmware {
         }
     }
 
+    impl Service for ApplicationShellScriptService {
+        fn call(
+            &mut self,
+            request: Request<'_>,
+        ) -> Result<ServiceReply, troe_dispatch::DispatchError> {
+            if request.opcode() != shell_script::SUBMIT_LINE {
+                return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+            }
+            let Ok(line) = shell_script::decode_submit_line(request.payload()) else {
+                return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+            };
+            if parse_line(line.source()).is_err() {
+                return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+            }
+            let Ok(mut script) = self.script.try_borrow_mut() else {
+                return Ok(ServiceReply::empty(ReplyStatus::Conflict));
+            };
+            let Some(source_bytes) = script.source_bytes.checked_add(line.source().len()) else {
+                return Ok(ServiceReply::empty(ReplyStatus::Exhausted));
+            };
+            if script.lines.len() >= shell_script::MAX_LINES
+                || source_bytes > shell_script::MAX_SCRIPT_BYTES
+            {
+                return Ok(ServiceReply::empty(ReplyStatus::Exhausted));
+            }
+            let mut source = String::new();
+            if source.try_reserve_exact(line.source().len()).is_err()
+                || script.lines.try_reserve(1).is_err()
+            {
+                return Ok(ServiceReply::empty(ReplyStatus::Exhausted));
+            }
+            source.push_str(line.source());
+            script.lines.push(source);
+            script.source_bytes = source_bytes;
+            Ok(ServiceReply::empty(ReplyStatus::Success))
+        }
+    }
+
     impl ApplicationFilesystemService {
         fn new(namespace: SharedNamespace, cwd: &str) -> Result<Self, ()> {
             let mut owned_cwd = String::new();
@@ -7494,6 +7543,7 @@ mod firmware {
             stdout: &mut dyn Output,
             stderr: &mut dyn Output,
         ) -> Option<CommandStatus> {
+            self.pending_script_lines = None;
             if !valid_application_name(command) {
                 return None;
             }
@@ -7540,6 +7590,7 @@ mod firmware {
             let mut icmp_echo_required = false;
             let mut tcp_connect_required = false;
             let mut volume_control_required = false;
+            let mut shell_script_required = false;
             for requirement in capability_manifest.iter() {
                 if requirement.interface == troe_abi::interface::DATAGRAM
                     && requirement.major == datagram::MAJOR
@@ -7591,6 +7642,11 @@ mod firmware {
                     && requirement.minor == volume_control::MINOR
                 {
                     volume_control_required = true;
+                } else if requirement.interface == troe_abi::interface::SHELL_SCRIPT
+                    && requirement.major == shell_script::MAJOR
+                    && requirement.minor == shell_script::MINOR
+                {
+                    shell_script_required = true;
                 } else {
                     return Some(command_application_error(
                         stderr,
@@ -7660,7 +7716,8 @@ mod firmware {
                 + usize::from(network_configuration_required)
                 + usize::from(icmp_echo_required)
                 + usize::from(tcp_connect_required)
-                + usize::from(volume_control_required);
+                + usize::from(volume_control_required)
+                + usize::from(shell_script_required);
             let Some(handle_capacity) = service_count.checked_mul(2) else {
                 return Some(command_application_error(
                     stderr,
@@ -7694,6 +7751,8 @@ mod firmware {
             } else {
                 None
             };
+            let submitted_shell_script = shell_script_required
+                .then(|| Rc::new(RefCell::new(SubmittedShellScript::default())));
             let services = (|| -> Result<Vec<CommandStartupService>, ()> {
                 let mut services = Vec::new();
                 services.try_reserve_exact(service_count).map_err(|_| ())?;
@@ -7867,6 +7926,19 @@ mod firmware {
                         minor: volume_control::MINOR,
                     });
                 }
+                if shell_script_required {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationShellScriptService {
+                                script: submitted_shell_script.as_ref().ok_or(())?.clone(),
+                            },
+                        )?,
+                        interface: troe_abi::interface::SHELL_SCRIPT,
+                        major: shell_script::MAJOR,
+                        minor: shell_script::MINOR,
+                    });
+                }
                 Ok(services)
             })();
             let Ok(services) = services else {
@@ -7917,7 +7989,7 @@ mod firmware {
             }
 
             drop(dispatcher);
-            let status = match outcome {
+            let mut status = match outcome {
                 Ok(CommandApplicationOutcome::Exited(status)) => command_status(status),
                 Ok(CommandApplicationOutcome::Faulted(fault)) => {
                     let message = match fault {
@@ -7947,10 +8019,35 @@ mod firmware {
                         })
                 }
             };
+            if status == CommandStatus::Success
+                && let Some(script) = submitted_shell_script
+            {
+                match script.try_borrow_mut() {
+                    Ok(mut script) => {
+                        self.pending_script_lines = Some(core::mem::take(&mut script.lines));
+                    }
+                    Err(_) => {
+                        status = shared_stderr.try_borrow_mut().map_or(
+                            CommandStatus::Failure,
+                            |mut output| {
+                                command_application_error(
+                                    &mut **output,
+                                    command,
+                                    "script staging conflict",
+                                )
+                            },
+                        );
+                    }
+                }
+            }
             drop(shared_stdin);
             drop(shared_stdout);
             drop(shared_stderr);
             Some(status)
+        }
+
+        fn take_script_lines(&mut self) -> Option<Vec<String>> {
+            self.pending_script_lines.take()
         }
     }
 
@@ -8102,6 +8199,7 @@ mod firmware {
                 shell_id: task.task_id,
                 shell_capabilities: task.capabilities,
                 runtime: runtime.clone(),
+                pending_script_lines: None,
             };
             #[cfg(feature = "acceptance-probes")]
             let execution_line = if diagnostics_fault_probe {
