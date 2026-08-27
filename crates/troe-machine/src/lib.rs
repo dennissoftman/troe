@@ -440,17 +440,19 @@ pub use mechanism::{
     exit_boot_services_after_protocols, heap_stats, initialize_console, initialize_heap,
     initialize_input_interrupts, initialize_monotonic_clock, input_device_ranges,
     input_interrupt_stats, mark_firmware_exited, monotonic_millis, park, poweroff,
-    probe_allocation_failure, read_byte, reboot, run_task_step, take_interrupt_ownership,
-    take_network_interrupt, try_input_event, try_read_byte, try_read_keyboard_scancode,
-    wait_for_input_event, wait_for_runtime_event, wait_for_runtime_event_timeout, write,
-    zero_physical_range,
+    probe_allocation_failure, process_accounting_frequency_hz, process_accounting_ticks, read_byte,
+    reboot, run_task_step, take_interrupt_ownership, take_network_interrupt, try_input_event,
+    try_read_byte, try_read_keyboard_scancode, wait_for_input_event, wait_for_runtime_event,
+    wait_for_runtime_event_timeout, write, zero_physical_range,
 };
 
+#[cfg(test)]
+pub use mmu::required_page_table_pages;
 #[cfg(target_os = "uefi")]
 pub use mmu::{
     ApplicationCall, ApplicationResume, ApplicationSession, build_user_address_space,
-    install_exception_vectors, install_mmu, loaded_image_layout, resume_application,
-    run_application, run_isolated,
+    install_exception_vectors, install_mmu, loaded_image_layout, required_page_table_pages,
+    resume_application, run_application, run_isolated,
 };
 #[cfg(any(test, target_os = "uefi"))]
 pub use mmu::{ApplicationOutcome, IsolatedFault, IsolatedOutcome, UserAddressSpace};

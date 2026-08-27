@@ -59,6 +59,11 @@ format are treated as untrusted and bounded.
   most one executing unprivileged root on the single CPU, 64 KiB recent output
   per background job or service, owner-scoped cancellation and reaping, and
   SCFG-bounded dependency, restart, health, lifetime, and stop policy;
+- process observation: one 16-record registry spans foreground, background,
+  and service launches with monotonic non-reused process IDs, scheduler-paired
+  states, exact retained pages, and CPU ticks charged only around ring-3/EL0
+  execution; the explicit read-only capability hides argv and grants no memory
+  access or process control;
 - outbound TCP: one connection per declared handle, four system-wide, one
   1,460-byte unacknowledged segment and 4 KiB receive FIFO per connection,
   exact-tuple/sequence admission, four retransmissions, four-second cancellable

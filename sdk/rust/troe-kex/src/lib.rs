@@ -5,8 +5,9 @@ use core::{fmt, slice};
 
 pub use troe_abi::{
     ABI_MAJOR, ABI_MINOR, clock_control, command, datagram, diagnostics, exit, filesystem,
-    filesystem_mutation, icmp_echo, interface, network_configuration, network_observation, reply,
-    server, shell_script, tcp_connect, timer, volume_control, wall_clock,
+    filesystem_mutation, icmp_echo, interface, network_configuration, network_observation,
+    process_observation, reply, server, shell_script, tcp_connect, timer, volume_control,
+    wall_clock,
 };
 use troe_abi::{MAX_MESSAGE_BYTES, MAX_SERVICE_PAYLOAD_BYTES, heap_growth, stream};
 
@@ -181,6 +182,7 @@ pub struct CommandContext {
     filesystem_mutate: Option<Handle>,
     timer: Option<Handle>,
     diagnostics: Option<Handle>,
+    process_observation: Option<Handle>,
     network_observation: Option<Handle>,
     network_configuration: Option<Handle>,
     icmp_echo: Option<Handle>,
@@ -235,6 +237,11 @@ impl CommandContext {
                 interface::DIAGNOSTICS,
                 diagnostics::MAJOR,
                 diagnostics::MINOR,
+            )?,
+            process_observation: startup.optional_handle(
+                interface::PROCESS_OBSERVE,
+                process_observation::MAJOR,
+                process_observation::MINOR,
             )?,
             network_observation: startup.optional_handle(
                 interface::NETWORK_OBSERVE,
@@ -405,6 +412,18 @@ impl CommandContext {
     pub const fn diagnostics(&self) -> Result<Diagnostics, Error> {
         match self.diagnostics {
             Some(handle) => Ok(Diagnostics { handle }),
+            None => Err(Error::MissingAuthority),
+        }
+    }
+
+    /// Borrow the optional current-process observation capability.
+    ///
+    /// # Errors
+    ///
+    /// Reports that the package did not request or receive observation authority.
+    pub const fn process_observation(&self) -> Result<ProcessObservation, Error> {
+        match self.process_observation {
+            Some(handle) => Ok(ProcessObservation { handle }),
             None => Err(Error::MissingAuthority),
         }
     }
@@ -721,6 +740,12 @@ pub struct ClockControl {
 /// Immutable diagnostics client scoped to one application lifetime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Diagnostics {
+    handle: Handle,
+}
+
+/// Read-only current-process observation client.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessObservation {
     handle: Handle,
 }
 
@@ -1266,6 +1291,24 @@ impl Diagnostics {
         let mut reply = [0_u8; diagnostics::SNAPSHOT_BYTES];
         let count = call(self.handle, diagnostics::GET_SNAPSHOT, &[], &mut reply)?;
         diagnostics::decode_snapshot(&reply[..count]).map_err(|_| Error::InvalidCall)
+    }
+}
+
+impl ProcessObservation {
+    /// Read one current bounded snapshot of registered application processes.
+    ///
+    /// # Errors
+    ///
+    /// Reports service, decoding, or call-gate failure.
+    pub fn snapshot(&mut self) -> Result<process_observation::Snapshot, Error> {
+        let mut reply = [0_u8; process_observation::SNAPSHOT_BYTES];
+        let count = call(
+            self.handle,
+            process_observation::GET_SNAPSHOT,
+            &[],
+            &mut reply,
+        )?;
+        process_observation::decode_snapshot(&reply[..count]).map_err(|_| Error::InvalidCall)
     }
 }
 

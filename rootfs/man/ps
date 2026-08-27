@@ -1,0 +1,11 @@
+NAME
+    ps - report current application processes
+
+SYNOPSIS
+    ps
+
+DESCRIPTION
+    Prints the bounded kernel process registry, including stable process IDs,
+    launcher origin, lifecycle state, charged user CPU time, retained pages,
+    live handles, and executable name. Observation is read-only and does not
+    expose command arguments or process-control authority.

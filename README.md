@@ -50,7 +50,8 @@ profiles. Small is a policy here, not just a current measurement.
 - Ethernet, ARP, DHCP, IPv4, ICMP, UDP, and outbound TCP over virtio-net.
 - KEX applications for `arp`, `awk`, `cat`, `clear`, `dhcp`, `echo`, `grep`,
   `hexdump`, `ln`, `ls`, `lua`, `man`, `mem`, `mount`, `net`, `ping`, `printf`,
-  `pwd`, `rm`, `sed`, `sh`, `sleep`, `tar`, `tcp`, `timesync`, `udp`, and `wc`.
+  `ps`, `pwd`, `rm`, `sed`, `sh`, `sleep`, `tar`, `tcp`, `timesync`, `top`,
+  `udp`, and `wc`.
 
 `cd`, session job control, `svc`, `poweroff`, and `reboot` are non-shadowable
 shell intrinsics because they mutate shell- or supervisor-owned state. Ordinary

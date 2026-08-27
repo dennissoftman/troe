@@ -25,8 +25,8 @@ mod firmware {
 
     use troe_abi::{
         clock_control, command, datagram, diagnostics, filesystem, filesystem_mutation,
-        heap_growth, icmp_echo, network_configuration, network_observation, server, shell_script,
-        stream, tcp_connect, timer, volume_control, wall_clock,
+        heap_growth, icmp_echo, network_configuration, network_observation, process_observation,
+        server, shell_script, stream, tcp_connect, timer, volume_control, wall_clock,
     };
     #[cfg(feature = "acceptance-probes")]
     use troe_application::ParseError;
@@ -85,7 +85,8 @@ mod firmware {
     use troe_supervisor::{BoundedLog, ServiceState, Supervisor, SupervisorAction};
     use troe_task::{
         Cancelled, Capabilities, CooperativeRuntime, IsolationResource, MonotonicMillis,
-        PendingCallState, PendingCallTable, PendingOperationId, Scheduler, StackResource,
+        PendingCallState, PendingCallTable, PendingOperationId, ProcessId, ProcessName,
+        ProcessOrigin, ProcessRegistration, ProcessState, ProcessTable, Scheduler, StackResource,
         TaskFault, TaskId, TaskStep, WaitKey, WaitObservation, WaitRegistration, WaitResource,
         WaitSpec, WaitTable, WakeInterest, WakeReason,
     };
@@ -373,6 +374,7 @@ mod firmware {
         accounting: &'a mut OwnedAccounting,
         scheduler: &'a mut Scheduler,
         residents: &'a mut ResidentProcessTable,
+        processes: SharedProcessTable,
         resident_owner: ResidentOwner,
         service_initial_handles: Option<u8>,
         service_capability_bits: Option<u32>,
@@ -404,6 +406,7 @@ mod firmware {
     }
 
     type SharedResidentLog = Rc<RefCell<BoundedLog>>;
+    type SharedProcessTable = Rc<RefCell<ProcessTable>>;
 
     struct ApplicationEmptyInputService;
 
@@ -426,6 +429,8 @@ mod firmware {
 
     struct ResidentApplication<'service> {
         task_id: TaskId,
+        process_id: ProcessId,
+        processes: SharedProcessTable,
         allocation: ApplicationAllocation,
         isolation: IsolationResource,
         owner: HandleOwner,
@@ -482,6 +487,7 @@ mod firmware {
         filesystem_mutation: bool,
         timer: bool,
         diagnostics: bool,
+        process_observation: bool,
         network_observation: bool,
         network_configuration: bool,
         icmp_echo: bool,
@@ -862,6 +868,11 @@ mod firmware {
         snapshot: SharedDiagnosticsSnapshot,
     }
 
+    struct ApplicationProcessObservationService {
+        processes: SharedProcessTable,
+        runtime: SharedRuntime,
+    }
+
     struct DiagnosticsServerExchange {
         operation: PendingOperationId,
         snapshot: SharedDiagnosticsSnapshot,
@@ -1011,6 +1022,13 @@ mod firmware {
         heap: Option<PhysicalRange>,
         growth_ranges: Vec<PhysicalRange>,
         growth_table_frames: Vec<u64>,
+    }
+
+    struct ApplicationPrivateAllocation {
+        complete: PhysicalRange,
+        image: PhysicalRange,
+        startup: PhysicalRange,
+        heap: Option<PhysicalRange>,
         stack: PhysicalRange,
     }
 
@@ -2175,7 +2193,11 @@ mod firmware {
     }
 
     #[cfg(feature = "acceptance-probes")]
-    #[allow(clippy::drop_non_drop, clippy::too_many_lines)]
+    #[allow(
+        clippy::drop_non_drop,
+        clippy::too_many_arguments,
+        clippy::too_many_lines
+    )]
     fn run_isolated_ipc_baseline_verification(
         scheduler: &mut Scheduler,
         accounting: &mut OwnedAccounting,
@@ -2735,7 +2757,12 @@ mod firmware {
         let private_pages = plan.charges().private_pages();
         let stack_pages = u16::try_from(plan.stack_pages()).map_err(|_| ())?;
 
-        let Ok(allocation) = allocate_application(&mut accounting.frames, &plan) else {
+        let Ok((allocation, mapping_plan)) = allocate_application(
+            &mut accounting.frames,
+            &accounting.kernel_plan,
+            accounting.kernel_runtime,
+            &plan,
+        ) else {
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
@@ -2749,16 +2776,6 @@ mod firmware {
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         }
-        let Ok(mapping_plan) = build_application_plan(
-            &accounting.kernel_plan,
-            accounting.kernel_runtime,
-            &allocation,
-            &plan,
-        ) else {
-            reclaim_application(&mut accounting.frames, allocation)?;
-            clear_provisional_loader_ownership(&mut transaction);
-            return Err(());
-        };
         let Ok(address_space) =
             troe_machine::build_user_address_space(&mapping_plan, allocation.tables)
         else {
@@ -2773,6 +2790,7 @@ mod firmware {
         }
         let table_pages = address_space.stats().table_pages;
         if table_pages == 0
+            || table_pages != allocation.tables.page_count()
             || table_pages > APPLICATION_TABLE_PAGES
             || address_space.user_region_count() != application_user_regions
         {
@@ -3799,7 +3817,11 @@ mod firmware {
         }
     }
 
-    #[allow(clippy::drop_non_drop, clippy::too_many_lines)]
+    #[allow(
+        clippy::drop_non_drop,
+        clippy::too_many_arguments,
+        clippy::too_many_lines
+    )]
     fn prepare_resident_application<'service>(
         scheduler: &mut Scheduler,
         accounting: &mut OwnedAccounting,
@@ -3807,10 +3829,15 @@ mod firmware {
         services: &[CommandStartupService],
         source: &[u8],
         resource_slot: u8,
+        process_name: &str,
+        process_origin: ProcessOrigin,
+        started_millis: u64,
+        processes: SharedProcessTable,
     ) -> Result<ResidentApplication<'service>, ()> {
         if services.is_empty() || services.len() > troe_dispatch::MAX_HANDLES {
             return Err(());
         }
+        let process_name = ProcessName::new(process_name).map_err(|_| ())?;
         let mut transaction = LoaderTransaction::new();
         transaction
             .acquire(LoaderResource::Staging)
@@ -3839,7 +3866,12 @@ mod firmware {
         let private_pages = plan.charges().private_pages();
         let stack_pages = u16::try_from(plan.stack_pages()).map_err(|_| ())?;
 
-        let Ok(allocation) = allocate_application(&mut accounting.frames, &plan) else {
+        let Ok((allocation, mapping_plan)) = allocate_application(
+            &mut accounting.frames,
+            &accounting.kernel_plan,
+            accounting.kernel_runtime,
+            &plan,
+        ) else {
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
@@ -3853,16 +3885,6 @@ mod firmware {
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         }
-        let Ok(mapping_plan) = build_application_plan(
-            &accounting.kernel_plan,
-            accounting.kernel_runtime,
-            &allocation,
-            &plan,
-        ) else {
-            reclaim_command_application(&mut accounting.frames, allocation);
-            clear_provisional_loader_ownership(&mut transaction);
-            return Err(());
-        };
         let Ok(address_space) =
             troe_machine::build_user_address_space(&mapping_plan, allocation.tables)
         else {
@@ -3877,6 +3899,7 @@ mod firmware {
         }
         let table_pages = address_space.stats().table_pages;
         if table_pages == 0
+            || table_pages != allocation.tables.page_count()
             || table_pages > APPLICATION_TABLE_PAGES
             || address_space.user_region_count() != application_user_regions
         {
@@ -3981,7 +4004,35 @@ mod firmware {
         };
         drop(plan);
         drop(mapping_plan);
+        let registration = ProcessRegistration {
+            task_id,
+            name: process_name,
+            origin: process_origin,
+            started_millis,
+            table_pages: retained_table_pages,
+            private_pages,
+            handles: handle_count,
+        };
+        let Ok(process_id) = processes
+            .try_borrow_mut()
+            .map_err(|_| ())
+            .and_then(|mut table| table.register(registration).map_err(|_| ()))
+        else {
+            rollback_command_application_task(
+                scheduler,
+                task_id,
+                &mut dispatcher,
+                live_owner,
+                &mut accounting.frames,
+                allocation,
+            );
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        };
         if transaction.commit().is_err() {
+            let _removed = processes
+                .try_borrow_mut()
+                .map(|mut table| table.remove(process_id));
             rollback_command_application_task(
                 scheduler,
                 task_id,
@@ -3996,6 +4047,8 @@ mod firmware {
 
         Ok(ResidentApplication {
             task_id,
+            process_id,
+            processes,
             allocation,
             isolation,
             owner,
@@ -4063,7 +4116,12 @@ mod firmware {
         let private_pages = plan.charges().private_pages();
         let stack_pages = u16::try_from(plan.stack_pages()).map_err(|_| ())?;
 
-        let Ok(mut allocation) = allocate_application(&mut accounting.frames, &plan) else {
+        let Ok((mut allocation, mapping_plan)) = allocate_application(
+            &mut accounting.frames,
+            &accounting.kernel_plan,
+            accounting.kernel_runtime,
+            &plan,
+        ) else {
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
@@ -4077,16 +4135,6 @@ mod firmware {
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         }
-        let Ok(mapping_plan) = build_application_plan(
-            &accounting.kernel_plan,
-            accounting.kernel_runtime,
-            &allocation,
-            &plan,
-        ) else {
-            reclaim_command_application(&mut accounting.frames, allocation);
-            clear_provisional_loader_ownership(&mut transaction);
-            return Err(());
-        };
         let Ok(address_space) =
             troe_machine::build_user_address_space(&mapping_plan, allocation.tables)
         else {
@@ -4101,6 +4149,7 @@ mod firmware {
         }
         let table_pages = address_space.stats().table_pages;
         if table_pages == 0
+            || table_pages != allocation.tables.page_count()
             || table_pages > APPLICATION_TABLE_PAGES
             || address_space.user_region_count() != application_user_regions
         {
@@ -4551,6 +4600,30 @@ mod firmware {
     }
 
     impl ResidentApplication<'_> {
+        fn request_stop(&self) -> Result<(), ()> {
+            self.processes
+                .try_borrow_mut()
+                .map_err(|_| ())?
+                .stopping(self.process_id)
+                .map_err(|_| ())
+        }
+
+        fn execute_accounted<T, E>(
+            &self,
+            operation: impl FnOnce() -> Result<T, E>,
+        ) -> Result<T, ()> {
+            let started = troe_machine::process_accounting_ticks();
+            let result = operation();
+            let finished = troe_machine::process_accounting_ticks();
+            let elapsed = finished.checked_sub(started).ok_or(())?;
+            self.processes
+                .try_borrow_mut()
+                .map_err(|_| ())?
+                .charge_cpu(self.process_id, elapsed)
+                .map_err(|_| ())?;
+            result.map_err(|_| ())
+        }
+
         fn install_deferred_services(
             &mut self,
             services: Option<CommandDeferredServices>,
@@ -4575,37 +4648,48 @@ mod firmware {
                     scheduler
                         .dispatch(self.task_id, Capabilities::SERVICE)
                         .map_err(|_| ())?;
-                    troe_machine::run_application(
-                        launch.address_space,
-                        launch.entry,
-                        launch.stack_top,
-                        launch.startup_address,
-                        PAGE_BYTES,
-                        RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
-                    )
-                    .map_err(|_| ())?
+                    self.processes
+                        .try_borrow_mut()
+                        .map_err(|_| ())?
+                        .dispatch(self.process_id)
+                        .map_err(|_| ())?;
+                    self.execute_accounted(|| {
+                        troe_machine::run_application(
+                            launch.address_space,
+                            launch.entry,
+                            launch.stack_top,
+                            launch.startup_address,
+                            PAGE_BYTES,
+                            RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
+                        )
+                    })?
                 }
                 ResidentExecution::Pending(outcome) => {
                     scheduler
                         .dispatch(self.task_id, Capabilities::SERVICE)
                         .map_err(|_| ())?;
+                    self.processes
+                        .try_borrow_mut()
+                        .map_err(|_| ())?
+                        .dispatch(self.process_id)
+                        .map_err(|_| ())?;
                     match *outcome {
-                        troe_machine::ApplicationOutcome::Preempted(application) => {
-                            troe_machine::resume_application(
-                                application,
-                                troe_machine::ApplicationResume::Timeslice,
-                                RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
-                            )
-                            .map_err(|_| ())?
-                        }
-                        troe_machine::ApplicationOutcome::Yielded(application) => {
-                            troe_machine::resume_application(
-                                application,
-                                troe_machine::ApplicationResume::Yield,
-                                RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
-                            )
-                            .map_err(|_| ())?
-                        }
+                        troe_machine::ApplicationOutcome::Preempted(application) => self
+                            .execute_accounted(|| {
+                                troe_machine::resume_application(
+                                    application,
+                                    troe_machine::ApplicationResume::Timeslice,
+                                    RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
+                                )
+                            })?,
+                        troe_machine::ApplicationOutcome::Yielded(application) => self
+                            .execute_accounted(|| {
+                                troe_machine::resume_application(
+                                    application,
+                                    troe_machine::ApplicationResume::Yield,
+                                    RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
+                                )
+                            })?,
                         pending @ (troe_machine::ApplicationOutcome::HandleCall { .. }
                         | troe_machine::ApplicationOutcome::HeapGrow { .. }) => pending,
                         troe_machine::ApplicationOutcome::Exited { .. }
@@ -4622,15 +4706,21 @@ mod firmware {
                     scheduler
                         .dispatch(self.task_id, Capabilities::SERVICE)
                         .map_err(|_| ())?;
-                    troe_machine::resume_application(
-                        application,
-                        troe_machine::ApplicationResume::HandleReply {
-                            status: status.abi_value(),
-                            reply: &payload,
-                        },
-                        RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
-                    )
-                    .map_err(|_| ())?
+                    self.processes
+                        .try_borrow_mut()
+                        .map_err(|_| ())?
+                        .dispatch(self.process_id)
+                        .map_err(|_| ())?;
+                    self.execute_accounted(|| {
+                        troe_machine::resume_application(
+                            application,
+                            troe_machine::ApplicationResume::HandleReply {
+                                status: status.abi_value(),
+                                reply: &payload,
+                            },
+                            RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
+                        )
+                    })?
                 }
             };
 
@@ -4641,11 +4731,21 @@ mod firmware {
                 match outcome {
                     pending @ troe_machine::ApplicationOutcome::Preempted(_) => {
                         scheduler.preempt_current(self.task_id).map_err(|_| ())?;
+                        self.processes
+                            .try_borrow_mut()
+                            .map_err(|_| ())?
+                            .preempted(self.process_id)
+                            .map_err(|_| ())?;
                         self.execution = Some(ResidentExecution::Pending(Box::new(pending)));
                         return Ok(None);
                     }
                     pending @ troe_machine::ApplicationOutcome::Yielded(_) => {
                         scheduler.yield_current(self.task_id).map_err(|_| ())?;
+                        self.processes
+                            .try_borrow_mut()
+                            .map_err(|_| ())?
+                            .yielded(self.process_id)
+                            .map_err(|_| ())?;
                         self.execution = Some(ResidentExecution::Pending(Box::new(pending)));
                         return Ok(None);
                     }
@@ -4653,6 +4753,11 @@ mod firmware {
                         if service_calls >= RESIDENT_SERVICE_CALLS_PER_STEP =>
                     {
                         scheduler.preempt_current(self.task_id).map_err(|_| ())?;
+                        self.processes
+                            .try_borrow_mut()
+                            .map_err(|_| ())?
+                            .preempted(self.process_id)
+                            .map_err(|_| ())?;
                         self.execution = Some(ResidentExecution::Pending(Box::new(pending)));
                         return Ok(None);
                     }
@@ -4703,15 +4808,16 @@ mod firmware {
                                             &mut direct_reply[..call.reply_capacity()],
                                         )
                                         .map_err(|_| ())?;
-                                    outcome = troe_machine::resume_application(
-                                        application,
-                                        troe_machine::ApplicationResume::HandleReply {
-                                            status: reply.status().abi_value(),
-                                            reply: &direct_reply[..reply.payload_bytes()],
-                                        },
-                                        RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
-                                    )
-                                    .map_err(|_| ())?;
+                                    outcome = self.execute_accounted(|| {
+                                        troe_machine::resume_application(
+                                            application,
+                                            troe_machine::ApplicationResume::HandleReply {
+                                                status: reply.status().abi_value(),
+                                                reply: &direct_reply[..reply.payload_bytes()],
+                                            },
+                                            RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
+                                        )
+                                    })?;
                                 } else {
                                     let reply = self
                                         .dispatcher
@@ -4725,30 +4831,32 @@ mod firmware {
                                     if reply.payload().len() > call.reply_capacity() {
                                         return Err(());
                                     }
-                                    outcome = troe_machine::resume_application(
-                                        application,
-                                        troe_machine::ApplicationResume::HandleReply {
-                                            status: reply.status().abi_value(),
-                                            reply: reply.payload(),
-                                        },
-                                        RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
-                                    )
-                                    .map_err(|_| ())?;
+                                    outcome = self.execute_accounted(|| {
+                                        troe_machine::resume_application(
+                                            application,
+                                            troe_machine::ApplicationResume::HandleReply {
+                                                status: reply.status().abi_value(),
+                                                reply: reply.payload(),
+                                            },
+                                            RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
+                                        )
+                                    })?;
                                 }
                             }
                             DeferredCallPreparation::Immediate { status, payload } => {
                                 if payload.len() > call.reply_capacity() {
                                     return Err(());
                                 }
-                                outcome = troe_machine::resume_application(
-                                    application,
-                                    troe_machine::ApplicationResume::HandleReply {
-                                        status: status.abi_value(),
-                                        reply: &payload,
-                                    },
-                                    RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
-                                )
-                                .map_err(|_| ())?;
+                                outcome = self.execute_accounted(|| {
+                                    troe_machine::resume_application(
+                                        application,
+                                        troe_machine::ApplicationResume::HandleReply {
+                                            status: status.abi_value(),
+                                            reply: &payload,
+                                        },
+                                        RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
+                                    )
+                                })?;
                             }
                             DeferredCallPreparation::Blocked {
                                 operation,
@@ -4773,15 +4881,16 @@ mod firmware {
                                             .map_err(|_| ())?;
                                         let (status, payload) = deferred_reply(kind, reason, None)?;
                                         state.pending.finish(operation).map_err(|_| ())?;
-                                        outcome = troe_machine::resume_application(
-                                            application,
-                                            troe_machine::ApplicationResume::HandleReply {
-                                                status: status.abi_value(),
-                                                reply: &payload,
-                                            },
-                                            RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
-                                        )
-                                        .map_err(|_| ())?;
+                                        outcome = self.execute_accounted(|| {
+                                            troe_machine::resume_application(
+                                                application,
+                                                troe_machine::ApplicationResume::HandleReply {
+                                                    status: status.abi_value(),
+                                                    reply: &payload,
+                                                },
+                                                RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
+                                            )
+                                        })?;
                                     }
                                     WaitRegistration::Blocked(wait) => {
                                         state.pending.bind_wait(operation, wait).map_err(|_| ())?;
@@ -4793,6 +4902,11 @@ mod firmware {
                                         })?;
                                         scheduler
                                             .block_current(self.task_id, wait)
+                                            .map_err(|_| ())?;
+                                        self.processes
+                                            .try_borrow_mut()
+                                            .map_err(|_| ())?
+                                            .blocked(self.process_id)
                                             .map_err(|_| ())?;
                                         self.execution = Some(ResidentExecution::Blocked);
                                         return Ok(None);
@@ -4844,26 +4958,38 @@ mod firmware {
                                     .resize_current_isolation(self.task_id, grown_isolation)
                                     .map_err(|_| ())?;
                                 self.isolation = grown_isolation;
-                                outcome = troe_machine::resume_application(
-                                    application,
-                                    troe_machine::ApplicationResume::HeapGrowth {
-                                        status: heap_growth::SUCCESS,
-                                        mapped_bytes,
-                                    },
-                                    RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
-                                )
-                                .map_err(|_| ())?;
+                                self.processes
+                                    .try_borrow_mut()
+                                    .map_err(|_| ())?
+                                    .update_resources(
+                                        self.process_id,
+                                        grown_table_pages,
+                                        grown_private_pages,
+                                        self.handle_count,
+                                    )
+                                    .map_err(|_| ())?;
+                                outcome = self.execute_accounted(|| {
+                                    troe_machine::resume_application(
+                                        application,
+                                        troe_machine::ApplicationResume::HeapGrowth {
+                                            status: heap_growth::SUCCESS,
+                                            mapped_bytes,
+                                        },
+                                        RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
+                                    )
+                                })?;
                             }
                             ApplicationGrowth::Exhausted => {
-                                outcome = troe_machine::resume_application(
-                                    application,
-                                    troe_machine::ApplicationResume::HeapGrowth {
-                                        status: heap_growth::EXHAUSTED,
-                                        mapped_bytes: 0,
-                                    },
-                                    RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
-                                )
-                                .map_err(|_| ())?;
+                                outcome = self.execute_accounted(|| {
+                                    troe_machine::resume_application(
+                                        application,
+                                        troe_machine::ApplicationResume::HeapGrowth {
+                                            status: heap_growth::EXHAUSTED,
+                                            mapped_bytes: 0,
+                                        },
+                                        RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
+                                    )
+                                })?;
                             }
                         }
                     }
@@ -4924,6 +5050,11 @@ mod firmware {
             scheduler
                 .wake_blocked(completion.owner(), completion.key())
                 .map_err(|_| ())?;
+            self.processes
+                .try_borrow_mut()
+                .map_err(|_| ())?
+                .woke(self.process_id)
+                .map_err(|_| ())?;
             let suspended = state.suspended.take(operation)?;
             let (status, payload) = match reason {
                 WakeReason::ResourceReady => server_reply.ok_or(())?,
@@ -4960,6 +5091,11 @@ mod firmware {
             state.pending.resolve(completion).map_err(|_| ())?;
             scheduler
                 .wake_blocked(completion.owner(), completion.key())
+                .map_err(|_| ())?;
+            self.processes
+                .try_borrow_mut()
+                .map_err(|_| ())?
+                .woke(self.process_id)
                 .map_err(|_| ())?;
             Ok(true)
         }
@@ -5046,6 +5182,11 @@ mod firmware {
             scheduler
                 .wake_blocked(completion.owner(), completion.key())
                 .map_err(|_| ())?;
+            self.processes
+                .try_borrow_mut()
+                .map_err(|_| ())?
+                .woke(self.process_id)
+                .map_err(|_| ())?;
             let suspended = state.suspended.take(operation)?;
             let (status, payload) = deferred_reply(suspended.kind, completion.reason(), received)?;
             if payload.len() > suspended.call.reply_capacity() {
@@ -5063,6 +5204,11 @@ mod firmware {
             cancelled: bool,
         ) -> Result<CommandApplicationOutcome, ()> {
             if cancelled {
+                self.processes
+                    .try_borrow_mut()
+                    .map_err(|_| ())?
+                    .stopping(self.process_id)
+                    .map_err(|_| ())?;
                 let snapshot = scheduler.task(self.task_id).map_err(|_| ())?;
                 match snapshot.state() {
                     troe_task::TaskState::Ready => scheduler
@@ -5102,6 +5248,11 @@ mod firmware {
             let valid = reaped.isolation == Some(self.isolation)
                 && reaped.stack.mapped_pages() == self.stack_pages
                 && (cancelled || reaped.fault == expected_fault);
+            self.processes
+                .try_borrow_mut()
+                .map_err(|_| ())?
+                .remove(self.process_id)
+                .map_err(|_| ())?;
             reclaim_command_application(&mut accounting.frames, self.allocation);
             if !valid {
                 return Err(());
@@ -5245,6 +5396,7 @@ mod firmware {
             if job.outcome.is_some() {
                 return Ok(());
             }
+            job.process.as_ref().ok_or(())?.request_stop()?;
             job.cancel_requested = true;
             Ok(())
         }
@@ -5293,6 +5445,7 @@ mod firmware {
                 .find(|job| job.owner == ResidentOwner::Service(service_id))
                 .ok_or(())?;
             if job.outcome.is_none() {
+                job.process.as_ref().ok_or(())?.request_stop()?;
                 job.cancel_requested = true;
             }
             Ok(())
@@ -5503,20 +5656,16 @@ mod firmware {
 
     fn allocate_application(
         frames: &mut FrameAllocator,
+        kernel: &MappingPlan,
+        kernel_runtime: PhysicalRange,
         plan: &LoadPlan<'_>,
-    ) -> Result<ApplicationAllocation, ()> {
-        let resource_pages = APPLICATION_TABLE_PAGES
-            .checked_add(plan.charges().private_pages())
-            .ok_or(())?;
+    ) -> Result<(ApplicationAllocation, MappingPlan), ()> {
+        let resource_pages = plan.charges().private_pages();
         let complete = frames
             .allocate_contiguous(resource_pages, 1)
             .map_err(|_| ())?;
         let derived = (|| {
-            let tables = PhysicalRange::from_pages(complete.start(), APPLICATION_TABLE_PAGES)
-                .map_err(|_| ())?;
-            let private = PhysicalRange::from_pages(tables.end(), plan.charges().private_pages())
-                .map_err(|_| ())?;
-            let image = PhysicalRange::from_pages(private.start(), plan.charges().image_pages())
+            let image = PhysicalRange::from_pages(complete.start(), plan.charges().image_pages())
                 .map_err(|_| ())?;
             let startup = PhysicalRange::from_pages(image.end(), 1).map_err(|_| ())?;
             let heap = if plan.heap_pages() == 0 {
@@ -5530,21 +5679,47 @@ mod firmware {
             if stack.end() != complete.end() {
                 return Err(());
             }
-            Ok(ApplicationAllocation {
+            Ok(ApplicationPrivateAllocation {
                 complete,
-                tables,
                 image,
                 startup,
                 heap,
-                growth_ranges: Vec::new(),
-                growth_table_frames: Vec::new(),
                 stack,
             })
         })();
         if derived.is_err() {
             frames.free_range(complete).map_err(|_| ())?;
         }
-        derived
+        let private = derived?;
+        let Ok(mapping_plan) = build_application_plan(kernel, kernel_runtime, &private, plan)
+        else {
+            frames.free_range(private.complete).map_err(|_| ())?;
+            return Err(());
+        };
+        let Ok(table_pages) = troe_machine::required_page_table_pages(&mapping_plan) else {
+            frames.free_range(private.complete).map_err(|_| ())?;
+            return Err(());
+        };
+        if table_pages == 0 || table_pages > APPLICATION_TABLE_PAGES {
+            frames.free_range(private.complete).map_err(|_| ())?;
+            return Err(());
+        }
+        let Ok(tables) = frames.allocate_contiguous(table_pages, 1) else {
+            frames.free_range(private.complete).map_err(|_| ())?;
+            return Err(());
+        };
+        Ok((
+            ApplicationAllocation {
+                complete: private.complete,
+                tables,
+                image: private.image,
+                startup: private.startup,
+                heap: private.heap,
+                growth_ranges: Vec::new(),
+                growth_table_frames: Vec::new(),
+            },
+            mapping_plan,
+        ))
     }
 
     fn prepare_application_memory(
@@ -5569,7 +5744,7 @@ mod firmware {
     fn build_application_plan(
         kernel: &MappingPlan,
         kernel_runtime: PhysicalRange,
-        allocation: &ApplicationAllocation,
+        allocation: &ApplicationPrivateAllocation,
         application: &LoadPlan<'_>,
     ) -> Result<MappingPlan, ()> {
         let mut plan = MappingPlan::new();
@@ -5723,6 +5898,8 @@ mod firmware {
             troe_machine::zero_physical_range(range).map_err(|_| ())?;
             frames.free(frame).map_err(|_| ())?;
         }
+        troe_machine::zero_physical_range(allocation.tables).map_err(|_| ())?;
+        frames.free_range(allocation.tables).map_err(|_| ())?;
         troe_machine::zero_physical_range(allocation.complete).map_err(|_| ())?;
         frames.free_range(allocation.complete).map_err(|_| ())
     }
@@ -7596,6 +7773,68 @@ mod firmware {
         }
     }
 
+    impl Service for ApplicationProcessObservationService {
+        fn call(
+            &mut self,
+            request: Request<'_>,
+        ) -> Result<ServiceReply, troe_dispatch::DispatchError> {
+            if request.opcode() != process_observation::GET_SNAPSHOT
+                || !request.payload().is_empty()
+            {
+                return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+            }
+            let frequency = troe_machine::process_accounting_frequency_hz()
+                .ok_or(troe_dispatch::DispatchError::AccountingOverflow)?;
+            let processes = self
+                .processes
+                .try_borrow()
+                .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?;
+            let mut records = Vec::new();
+            records
+                .try_reserve_exact(processes.snapshots().len())
+                .map_err(|_| troe_dispatch::DispatchError::MetadataExhausted)?;
+            for process in processes.snapshots() {
+                records.push(process_observation::Process {
+                    id: process.id().get(),
+                    task_id: u64::from(process.task_id().get()),
+                    started_millis: process.started_millis(),
+                    cpu_ticks: process.cpu_ticks(),
+                    resident_pages: process.resident_pages(),
+                    table_pages: process.table_pages(),
+                    private_pages: process.private_pages(),
+                    dispatches: process.dispatches(),
+                    yields: process.yields(),
+                    preemptions: process.preemptions(),
+                    handles: process.handles(),
+                    state: match process.state() {
+                        ProcessState::Ready => process_observation::State::Ready,
+                        ProcessState::Running => process_observation::State::Running,
+                        ProcessState::Blocked => process_observation::State::Blocked,
+                        ProcessState::Stopping => process_observation::State::Stopping,
+                    },
+                    origin: match process.origin() {
+                        ProcessOrigin::Foreground => process_observation::Origin::Foreground,
+                        ProcessOrigin::Background => process_observation::Origin::Background,
+                        ProcessOrigin::Service => process_observation::Origin::Service,
+                    },
+                    name: process_observation::ProcessName::new(process.name().as_str())
+                        .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?,
+                });
+            }
+            let snapshot = process_observation::Snapshot::new(
+                self.runtime.borrow().now().as_millis(),
+                frequency,
+                &records,
+            )
+            .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?;
+            ServiceReply::with_payload(
+                ReplyStatus::Success,
+                &process_observation::encode_snapshot(snapshot)
+                    .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?,
+            )
+        }
+    }
+
     impl Service for DiagnosticsServerEndpoint {
         fn call(
             &mut self,
@@ -8933,6 +9172,7 @@ mod firmware {
                 + usize::from(requirements.filesystem_mutation)
                 + usize::from(requirements.timer)
                 + usize::from(requirements.diagnostics)
+                + usize::from(requirements.process_observation)
                 + usize::from(requirements.network_observation)
                 + usize::from(requirements.network_configuration)
                 + usize::from(requirements.icmp_echo)
@@ -9091,6 +9331,20 @@ mod firmware {
                         minor: diagnostics::MINOR,
                     });
                 }
+                if requirements.process_observation {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationProcessObservationService {
+                                processes: self.processes.clone(),
+                                runtime: self.runtime.clone(),
+                            },
+                        )?,
+                        interface: troe_abi::interface::PROCESS_OBSERVE,
+                        major: process_observation::MAJOR,
+                        minor: process_observation::MINOR,
+                    });
+                }
                 if requirements.network_observation {
                     services.push(CommandStartupService {
                         port: register_command_service(
@@ -9198,6 +9452,13 @@ mod firmware {
                 &services,
                 executable,
                 resource_slot,
+                command,
+                match self.resident_owner {
+                    ResidentOwner::Session => ProcessOrigin::Background,
+                    ResidentOwner::Service(_) => ProcessOrigin::Service,
+                },
+                self.runtime.borrow().now().as_millis(),
+                self.processes.clone(),
             );
             let Ok(mut process) = process else {
                 return command_application_error(stderr, command, "application rejected");
@@ -9254,6 +9515,7 @@ mod firmware {
             &mut self,
             shell: &mut Shell,
             residents: &mut ResidentProcessTable,
+            processes: &SharedProcessTable,
             scheduler: &mut Scheduler,
             accounting: &mut OwnedAccounting,
             shell_id: TaskId,
@@ -9322,6 +9584,7 @@ mod firmware {
                             accounting,
                             scheduler,
                             residents,
+                            processes: processes.clone(),
                             resident_owner: ResidentOwner::Service(service_id),
                             service_initial_handles: Some(service.initial_handles()),
                             service_capability_bits: Some(service.capability_bits()),
@@ -9422,6 +9685,7 @@ mod firmware {
             let mut filesystem_mutation_required = false;
             let mut timer_required = false;
             let mut diagnostics_required = false;
+            let mut process_observation_required = false;
             let mut network_observation_required = false;
             let mut network_configuration_required = false;
             let mut icmp_echo_required = false;
@@ -9456,6 +9720,11 @@ mod firmware {
                     && requirement.minor == diagnostics::MINOR
                 {
                     diagnostics_required = true;
+                } else if requirement.interface == troe_abi::interface::PROCESS_OBSERVE
+                    && requirement.major == process_observation::MAJOR
+                    && requirement.minor == process_observation::MINOR
+                {
+                    process_observation_required = true;
                 } else if requirement.interface == troe_abi::interface::NETWORK_OBSERVE
                     && requirement.major == network_observation::MAJOR
                     && requirement.minor == network_observation::MINOR
@@ -9524,6 +9793,7 @@ mod firmware {
                 let unsupported_service_authority = filesystem_required
                     || filesystem_mutation_required
                     || diagnostics_required
+                    || process_observation_required
                     || network_observation_required
                     || network_configuration_required
                     || icmp_echo_required
@@ -9605,6 +9875,7 @@ mod firmware {
                         filesystem_mutation: filesystem_mutation_required,
                         timer: timer_required,
                         diagnostics: diagnostics_required,
+                        process_observation: process_observation_required,
                         network_observation: network_observation_required,
                         network_configuration: network_configuration_required,
                         icmp_echo: icmp_echo_required,
@@ -9637,6 +9908,7 @@ mod firmware {
                 + usize::from(filesystem_mutation_required)
                 + usize::from(timer_required)
                 + usize::from(diagnostics_required)
+                + usize::from(process_observation_required)
                 + usize::from(network_observation_required)
                 + usize::from(network_configuration_required)
                 + usize::from(icmp_echo_required)
@@ -9785,6 +10057,20 @@ mod firmware {
                         minor: diagnostics::MINOR,
                     });
                 }
+                if process_observation_required {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationProcessObservationService {
+                                processes: self.processes.clone(),
+                                runtime: self.runtime.clone(),
+                            },
+                        )?,
+                        interface: troe_abi::interface::PROCESS_OBSERVE,
+                        major: process_observation::MAJOR,
+                        minor: process_observation::MINOR,
+                    });
+                }
                 if network_observation_required {
                     services.push(CommandStartupService {
                         port: register_command_service(
@@ -9919,6 +10205,10 @@ mod firmware {
                 &services,
                 package.executable(),
                 0,
+                command,
+                ProcessOrigin::Foreground,
+                self.runtime.borrow().now().as_millis(),
+                self.processes.clone(),
             );
             let outcome = match process {
                 Ok(mut process) => {
@@ -10400,6 +10690,10 @@ mod firmware {
         let mut editor = LineEditor::new(editor_config);
         let mut residents = ResidentProcessTable::new()
             .unwrap_or_else(|()| fatal(b"fatal: cannot allocate resident process table\n"));
+        let processes = Rc::new(RefCell::new(
+            ProcessTable::new(troe_task::MAX_TASKS)
+                .unwrap_or_else(|_| fatal(b"fatal: cannot allocate process registry\n")),
+        ));
         let mut services = task
             .accounting
             .selected_config
@@ -10414,6 +10708,7 @@ mod firmware {
                 .drive(
                     &mut shell,
                     &mut residents,
+                    &processes,
                     task.scheduler,
                     task.accounting,
                     task.task_id,
@@ -10443,6 +10738,7 @@ mod firmware {
                 &mut shell,
                 &runtime,
                 &mut residents,
+                &processes,
                 &mut services,
                 task.scheduler,
                 task.accounting,
@@ -10496,6 +10792,7 @@ mod firmware {
                 accounting: task.accounting,
                 scheduler: task.scheduler,
                 residents: &mut residents,
+                processes: processes.clone(),
                 resident_owner: ResidentOwner::Session,
                 service_initial_handles: None,
                 service_capability_bits: None,
@@ -10534,6 +10831,7 @@ mod firmware {
                     .drive(
                         &mut shell,
                         &mut residents,
+                        &processes,
                         task.scheduler,
                         task.accounting,
                         task.task_id,
@@ -10585,6 +10883,7 @@ mod firmware {
         shell: &mut Shell,
         runtime: &SharedRuntime,
         residents: &mut ResidentProcessTable,
+        processes: &SharedProcessTable,
         services: &mut Option<ServiceRuntime>,
         scheduler: &mut Scheduler,
         accounting: &mut OwnedAccounting,
@@ -10605,6 +10904,7 @@ mod firmware {
                         services.drive(
                             shell,
                             residents,
+                            processes,
                             scheduler,
                             accounting,
                             shell_id,

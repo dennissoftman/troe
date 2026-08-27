@@ -1161,6 +1161,23 @@ pub fn monotonic_millis() -> Option<u64> {
     architecture_monotonic_millis()
 }
 
+/// Read the highest-resolution counter for kernel-owned process accounting.
+///
+/// The raw current value is not exposed through the application ABI. Process
+/// observation publishes only accumulated charged deltas.
+#[must_use]
+#[cfg(target_os = "uefi")]
+pub fn process_accounting_ticks() -> u64 {
+    architecture_benchmark_counter_ticks()
+}
+
+/// Return the frequency used by accumulated process-accounting ticks.
+#[must_use]
+#[cfg(target_os = "uefi")]
+pub fn process_accounting_frequency_hz() -> Option<u64> {
+    architecture_benchmark_counter_frequency_hz()
+}
+
 /// Read the architecture's highest-resolution monotonic benchmark counter.
 ///
 /// The value is exposed only in acceptance images. QEMU results are suitable
@@ -1656,20 +1673,12 @@ fn x86_read_tsc() -> u64 {
     ticks
 }
 
-#[cfg(all(
-    target_os = "uefi",
-    target_arch = "x86_64",
-    feature = "acceptance-probes"
-))]
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 fn architecture_benchmark_counter_ticks() -> u64 {
     x86_read_tsc()
 }
 
-#[cfg(all(
-    target_os = "uefi",
-    target_arch = "x86_64",
-    feature = "acceptance-probes"
-))]
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 fn architecture_benchmark_counter_frequency_hz() -> Option<u64> {
     X86_TSC_TICKS_PER_MILLISECOND
         .load(Ordering::Relaxed)
@@ -2709,11 +2718,7 @@ fn counter_millis(counter: u64, frequency: u64) -> Option<u64> {
         .checked_add(remainder.checked_mul(1_000)?.checked_div(frequency)?)
 }
 
-#[cfg(all(
-    target_os = "uefi",
-    target_arch = "aarch64",
-    feature = "acceptance-probes"
-))]
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 fn architecture_benchmark_counter_ticks() -> u64 {
     let counter: u64;
     // SAFETY: CNTPCT_EL0 is read-only at EL1; ISB orders the timestamp after
@@ -2729,11 +2734,7 @@ fn architecture_benchmark_counter_ticks() -> u64 {
     counter
 }
 
-#[cfg(all(
-    target_os = "uefi",
-    target_arch = "aarch64",
-    feature = "acceptance-probes"
-))]
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 fn architecture_benchmark_counter_frequency_hz() -> Option<u64> {
     let frequency: u64;
     // SAFETY: CNTFRQ_EL0 is a read-only generic-timer register at EL1.
