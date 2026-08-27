@@ -125,6 +125,26 @@ pub trait ExternalCommand {
         stdout: &mut dyn Output,
         stderr: &mut dyn Output,
     ) -> Option<CommandStatus>;
+
+    /// Take a successfully staged batch of physical command lines.
+    ///
+    /// Implementations return a batch only after the interpreter application
+    /// exits successfully. The shell executes it synchronously in the current
+    /// session, so intrinsics such as `cd` update the owning session.
+    fn take_script_lines(&mut self) -> Option<Vec<String>> {
+        None
+    }
+}
+
+const MAX_SCRIPT_DEPTH: u8 = 4;
+const MAX_SCRIPT_COMMANDS: usize = 1024;
+
+struct EmptyScriptInput;
+
+impl Input for EmptyScriptInput {
+    fn read(&mut self, _destination: &mut [u8]) -> Result<usize, StreamError> {
+        Ok(0)
+    }
 }
 
 struct NoExternalCommand;
@@ -751,6 +771,8 @@ pub struct Shell {
     cwd: String,
     machine_control: bool,
     machine_action: Option<MachineAction>,
+    script_depth: u8,
+    script_commands_remaining: usize,
 }
 
 impl Shell {
@@ -777,6 +799,8 @@ impl Shell {
             cwd: "/".to_string(),
             machine_control,
             machine_action: None,
+            script_depth: 0,
+            script_commands_remaining: 0,
         })
     }
 
@@ -999,6 +1023,12 @@ impl Shell {
                 stderr,
             )
         {
+            let script = external.take_script_lines();
+            if status == CommandStatus::Success
+                && let Some(lines) = script
+            {
+                return self.execute_script_lines(lines, stdout, stderr, external);
+            }
             return status;
         }
         let Some(spec) = intrinsic else {
@@ -1019,6 +1049,43 @@ impl Shell {
             }
             IntrinsicId::Reboot => self.command_machine_action(args, stderr, MachineAction::Reboot),
         }
+    }
+
+    fn execute_script_lines<E: ExternalCommand + ?Sized>(
+        &mut self,
+        lines: Vec<String>,
+        stdout: &mut dyn Output,
+        stderr: &mut dyn Output,
+        external: &mut E,
+    ) -> CommandStatus {
+        if self.script_depth >= MAX_SCRIPT_DEPTH {
+            let _ignored = write_error(stderr, "sh", "script nesting limit exceeded");
+            return CommandStatus::Usage;
+        }
+        let outermost = self.script_depth == 0;
+        if outermost {
+            self.script_commands_remaining = MAX_SCRIPT_COMMANDS;
+        }
+        self.script_depth = self.script_depth.saturating_add(1);
+        let mut status = CommandStatus::Success;
+        for line in lines {
+            if self.script_commands_remaining == 0 {
+                let _ignored = write_error(stderr, "sh", "script command limit exceeded");
+                status = CommandStatus::Usage;
+                break;
+            }
+            self.script_commands_remaining -= 1;
+            let mut input = EmptyScriptInput;
+            status = self.execute_inner(&line, &mut input, stdout, stderr, external);
+            if self.machine_action.is_some() {
+                break;
+            }
+        }
+        self.script_depth = self.script_depth.saturating_sub(1);
+        if outermost {
+            self.script_commands_remaining = 0;
+        }
+        status
     }
 
     fn complete_paths(
@@ -1737,6 +1804,7 @@ mod tests {
     #[derive(Default)]
     struct FakeExternal {
         attempts: Vec<String>,
+        script: Option<Vec<String>>,
     }
 
     impl FakeExternal {
@@ -1765,6 +1833,15 @@ mod tests {
         ) -> Option<CommandStatus> {
             self.attempts.push(command.to_string());
             match command {
+                "script" => {
+                    self.script = Some(alloc::vec![
+                        "cd /help".to_string(),
+                        "cat readme".to_string(),
+                        "missing".to_string(),
+                        "external".to_string(),
+                    ]);
+                    Some(CommandStatus::Success)
+                }
                 "echo" | "external" => {
                     if write_all(stdout, b"external application\n").is_ok() {
                         Some(CommandStatus::Success)
@@ -1855,6 +1932,37 @@ mod tests {
                 _ => None,
             }
         }
+
+        fn take_script_lines(&mut self) -> Option<Vec<String>> {
+            self.script.take()
+        }
+    }
+
+    #[test]
+    fn staged_scripts_execute_in_the_owning_session_and_continue_after_failure() {
+        let mut shell = shell();
+        let mut external = FakeExternal::default();
+        let mut stdin = SliceInput::new(b"");
+        let mut stdout = BoundedOutput::new(4096);
+        let mut stderr = BoundedOutput::new(4096);
+        let status = shell.execute_with_external(
+            "script",
+            &mut stdin,
+            &mut stdout,
+            &mut stderr,
+            &mut external,
+        );
+        assert_eq!(status, CommandStatus::Success);
+        assert_eq!(shell.cwd(), "/help");
+        assert_eq!(
+            core::str::from_utf8(stdout.as_slice()),
+            Ok("alpha\nbeta alpha\nexternal application\n")
+        );
+        assert_eq!(
+            core::str::from_utf8(stderr.as_slice()),
+            Ok("missing: unknown command\n")
+        );
+        assert_eq!(external.attempts, ["script", "cat", "missing", "external"]);
     }
 
     #[test]

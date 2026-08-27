@@ -989,8 +989,8 @@ def run_shell_terminal_group(session: SerialSession, command_timeout: float) -> 
     session.command(
         "man sh",
         cwd,
-        command_timeout,
-        contains=("streamed file redirection", "16 KiB default working buffer"),
+        max(command_timeout, 30.0),
+        contains=("bounded command scripts", "16 KiB default working buffer"),
     )
     session.command("help", cwd, command_timeout, contains=("help: unknown command",))
     session.backspace_command(
@@ -1187,6 +1187,55 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
         contains=("sh: /etc/motd: read-only filesystem",),
     )
     session.command("rm /tmp/result", cwd, command_timeout)
+    session.command(
+        r"printf 'echo should-not-run\necho \"unterminated\n' > /tmp/rejected.sh",
+        cwd,
+        command_timeout,
+    )
+    session.command(
+        "sh /tmp/rejected.sh",
+        cwd,
+        command_timeout,
+        contains=("sh: line 2: command line was rejected",),
+        absent=("should-not-run\n",),
+    )
+    session.command("rm /tmp/rejected.sh", cwd, command_timeout)
+    session.command(
+        r"printf 'echo stdin-script\n' | sh -",
+        cwd,
+        command_timeout,
+        contains=("stdin-script\n",),
+    )
+    session.command(
+        r"printf 'cd /man\npwd\n' > /tmp/session.sh",
+        cwd,
+        command_timeout,
+    )
+    session.command(
+        "sh /tmp/session.sh",
+        cwd,
+        command_timeout,
+        contains=("/man\n",),
+        next_cwd="/man",
+    )
+    cwd = "/man"
+    session.command("rm /tmp/session.sh", cwd, command_timeout)
+    session.command("cd /vol/shared", cwd, command_timeout, next_cwd="/vol/shared")
+    cwd = "/vol/shared"
+    session.command(
+        "sh /share/sh/bench.sh",
+        cwd,
+        max(command_timeout, 180.0),
+        contains=(
+            "===== F00 building fixtures with printf",
+            "===== W30 cross-check: awk emits 2 bytes with no newline",
+            "===== S60 leading star is literal",
+            "===== A80 for loop with continue and break",
+            "===== R18 output fed back into the same program is stable",
+            "===== END of transcript\n",
+        ),
+    )
+    session.command("cd /", cwd, command_timeout, next_cwd="/")
 
 
 def run_lua_group(session: SerialSession, command_timeout: float) -> None:

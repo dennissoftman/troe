@@ -5,8 +5,8 @@ use core::{fmt, slice};
 
 pub use troe_abi::{
     ABI_MAJOR, ABI_MINOR, command, datagram, diagnostics, exit, filesystem, filesystem_mutation,
-    icmp_echo, interface, network_configuration, network_observation, reply, server, tcp_connect,
-    timer, volume_control,
+    icmp_echo, interface, network_configuration, network_observation, reply, server, shell_script,
+    tcp_connect, timer, volume_control,
 };
 use troe_abi::{MAX_MESSAGE_BYTES, MAX_SERVICE_PAYLOAD_BYTES, heap_growth, stream};
 
@@ -186,6 +186,7 @@ pub struct CommandContext {
     icmp_echo: Option<Handle>,
     tcp_connect: Option<Handle>,
     volume_control: Option<Handle>,
+    shell_script: Option<Handle>,
     heap: Option<HeapRegion>,
 }
 
@@ -257,6 +258,11 @@ impl CommandContext {
                 interface::VOLUME_CONTROL,
                 volume_control::MAJOR,
                 volume_control::MINOR,
+            )?,
+            shell_script: startup.optional_handle(
+                interface::SHELL_SCRIPT,
+                shell_script::MAJOR,
+                shell_script::MINOR,
             )?,
             heap: startup.heap_region()?,
         })
@@ -423,6 +429,19 @@ impl CommandContext {
     pub const fn volume_control(&self) -> Result<VolumeControl, Error> {
         match self.volume_control {
             Some(handle) => Ok(VolumeControl { handle }),
+            None => Err(Error::MissingAuthority),
+        }
+    }
+
+    /// Borrow the optional bounded shell-script submission capability.
+    ///
+    /// # Errors
+    ///
+    /// Reports that the package did not request or receive authority to submit
+    /// command lines to its owning shell session.
+    pub const fn shell_script(&self) -> Result<ShellScript, Error> {
+        match self.shell_script {
+            Some(handle) => Ok(ShellScript { handle }),
             None => Err(Error::MissingAuthority),
         }
     }
@@ -684,6 +703,12 @@ pub struct TcpConnect {
 /// Manifest-authorized runtime volume activation client.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VolumeControl {
+    handle: Handle,
+}
+
+/// Bounded command-line submission client for a shell interpreter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ShellScript {
     handle: Handle,
 }
 
@@ -1110,6 +1135,37 @@ impl VolumeControl {
         let reply_bytes = call(
             self.handle,
             volume_control::ACTIVATE,
+            &request[..count],
+            &mut reply,
+        )?;
+        if reply_bytes == 0 {
+            Ok(())
+        } else {
+            Err(Error::InvalidCall)
+        }
+    }
+}
+
+impl ShellScript {
+    /// Submit one nonempty physical source line for later execution by the
+    /// owning shell session.
+    ///
+    /// Submission validates and stages the line only. The owning shell begins
+    /// executing the complete staged batch after the interpreter exits
+    /// successfully; a failed or faulted interpreter discards the batch.
+    ///
+    /// # Errors
+    ///
+    /// Reports invalid source, syntax rejection, batch exhaustion, service
+    /// failure, or call-gate failure.
+    pub fn submit_line(&mut self, number: u32, source: &str) -> Result<(), Error> {
+        let mut request = [0_u8; shell_script::MAX_REQUEST_BYTES];
+        let count = shell_script::encode_submit_line(number, source, &mut request)
+            .map_err(|_| Error::InvalidCall)?;
+        let mut reply = [];
+        let reply_bytes = call(
+            self.handle,
+            shell_script::SUBMIT_LINE,
             &request[..count],
             &mut reply,
         )?;
@@ -1896,6 +1952,7 @@ mod tests {
             interface::ICMP_ECHO,
             interface::TCP_CONNECT,
             interface::VOLUME_CONTROL,
+            interface::SHELL_SCRIPT,
         ]);
         let startup = Startup::parse(&page);
         assert!(startup.is_ok());
@@ -1911,6 +1968,7 @@ mod tests {
                 assert!(command.icmp_echo().is_ok());
                 assert!(command.tcp_connect().is_ok());
                 assert!(command.volume_control().is_ok());
+                assert!(command.shell_script().is_ok());
                 let heap = command.take_heap();
                 assert_eq!(
                     heap.as_ref().map(HeapRegion::start_address),

@@ -30,8 +30,10 @@ capabilities = ["datagram"]
 
 The implemented closed names are `datagram`, `filesystem-read`,
 `filesystem-mutate`, `timer`, `diagnostics`, `network-observe`,
-`network-configure`, `icmp-echo`, `tcp-connect`, and `volume-control`. Each
-selects one exact interface; no name implies another. In particular,
+`network-configure`, `icmp-echo`, `tcp-connect`, `volume-control`, and
+`shell-script`. Each selects one exact interface; no name implies another. The
+`shell-script` authority stages validated physical command lines only for the
+owning shell session and never launches a nested application. In particular,
 `tcp-connect` accepts only a literal IPv4 endpoint and does not grant DNS, TLS,
 listening, or raw packets.
 
