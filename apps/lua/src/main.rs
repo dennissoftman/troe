@@ -12,8 +12,8 @@ use core::{
 };
 use troe_kex_alloc::Heap;
 use troe_kex_sdk::{
-    CommandContext, INVOCATION_BUFFER_BYTES, ReadOnlyFilesystem, StandardInput, StandardOutput,
-    Timer, WallClock, command, entry, exit, filesystem,
+    CommandContext, FilesystemMutation, INVOCATION_BUFFER_BYTES, ReadOnlyFilesystem, StandardInput,
+    StandardOutput, Timer, WallClock, command, entry, exit, filesystem,
 };
 
 const LUA_VERSION: &[u8] = b"Lua 5.5.1  Copyright (C) 1994-2026 Lua.org, PUC-Rio\n";
@@ -23,6 +23,8 @@ const LUA_SOURCE_FAILURE: i32 = 2;
 const LUA_OUTPUT_FAILURE: i32 = 3;
 const LUA_OUT_OF_MEMORY: i32 = 4;
 const LUA_REQUESTED_EXIT: i32 = 5;
+const LUA_ACTION_CODE: i32 = 1;
+const LUA_ACTION_REQUIRE: i32 = 2;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -36,6 +38,20 @@ const EMPTY_ARGUMENT: LuaArgument = LuaArgument {
     length: 0,
 };
 
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct LuaAction {
+    kind: i32,
+    bytes: *const u8,
+    length: usize,
+}
+
+const EMPTY_ACTION: LuaAction = LuaAction {
+    kind: 0,
+    bytes: ptr::null(),
+    length: 0,
+};
+
 #[repr(C)]
 struct LuaHost {
     context: *mut c_void,
@@ -44,6 +60,14 @@ struct LuaHost {
     write: unsafe extern "C" fn(*mut c_void, i32, *const u8, usize) -> i32,
     process_cpu_time: unsafe extern "C" fn(*mut c_void, *mut u64, *mut u64) -> i32,
     wall_time: unsafe extern "C" fn(*mut c_void, *mut u64) -> i32,
+    read_input: unsafe extern "C" fn(*mut c_void, *mut u8, usize) -> isize,
+    file_open: unsafe extern "C" fn(*mut c_void, *const u8, usize, *mut u32, *mut u64) -> i32,
+    file_read: unsafe extern "C" fn(*mut c_void, u32, u64, u64, *mut u8, usize) -> isize,
+    file_close: unsafe extern "C" fn(*mut c_void, u32, u64) -> i32,
+    file_replace: unsafe extern "C" fn(*mut c_void, *const u8, usize, *const u8, usize) -> i32,
+    file_remove: unsafe extern "C" fn(*mut c_void, *const u8, usize) -> i32,
+    file_rename: unsafe extern "C" fn(*mut c_void, *const u8, usize, *const u8, usize) -> i32,
+    file_mutation_available: i32,
 }
 
 #[repr(C)]
@@ -53,6 +77,13 @@ struct LuaConfiguration {
     source_name_length: usize,
     arguments: *const LuaArgument,
     argument_count: usize,
+    actions: *const LuaAction,
+    action_count: usize,
+    has_source: i32,
+    warnings_enabled: i32,
+    ignore_environment: i32,
+    current_directory: *const u8,
+    current_directory_length: usize,
     requested_exit: i32,
     requested_exit_status: u32,
     requested_exit_close: i32,
@@ -62,11 +93,8 @@ unsafe extern "C" {
     fn troe_lua_run(configuration: *mut LuaConfiguration) -> i32;
 }
 
-enum Source<'invocation> {
-    Inline {
-        bytes: &'invocation [u8],
-        offset: usize,
-    },
+enum Source {
+    Empty,
     StandardInput(StandardInput),
     File {
         filesystem: ReadOnlyFilesystem,
@@ -75,16 +103,10 @@ enum Source<'invocation> {
     },
 }
 
-impl Source<'_> {
+impl Source {
     fn read(&mut self, destination: &mut [u8]) -> Result<usize, ()> {
         match self {
-            Self::Inline { bytes, offset } => {
-                let remaining = bytes.get(*offset..).ok_or(())?;
-                let count = remaining.len().min(destination.len());
-                destination[..count].copy_from_slice(&remaining[..count]);
-                *offset = offset.checked_add(count).ok_or(())?;
-                Ok(count)
-            }
+            Self::Empty => Ok(0),
             Self::StandardInput(input) => input.read(destination).map_err(|_| ()),
             Self::File {
                 filesystem,
@@ -107,25 +129,33 @@ impl Source<'_> {
             Self::File {
                 filesystem, file, ..
             } => filesystem.close(*file).map_err(|_| ()),
-            Self::Inline { .. } | Self::StandardInput(_) => Ok(()),
+            Self::Empty | Self::StandardInput(_) => Ok(()),
         }
     }
 }
 
-struct Runtime<'invocation> {
+struct ParsedInvocation<'invocation> {
+    selection: Option<Selection<'invocation>>,
+    actions: [LuaAction; command::MAX_ARGUMENTS],
+    action_count: usize,
+    warnings_enabled: bool,
+    ignore_environment: bool,
+    show_version: bool,
+}
+
+struct Runtime {
     heap: Heap,
-    source: Source<'invocation>,
+    source: Source,
     stdout: StandardOutput,
     stderr: StandardOutput,
     timer: Timer,
     wall_clock: WallClock,
+    stdin: StandardInput,
+    filesystem: ReadOnlyFilesystem,
+    mutation: FilesystemMutation,
 }
 
 enum Selection<'invocation> {
-    Inline {
-        code: &'invocation str,
-        first_argument: usize,
-    },
     StandardInput {
         first_argument: usize,
     },
@@ -135,41 +165,93 @@ enum Selection<'invocation> {
     },
 }
 
-fn select_source<'invocation>(
+fn parse_invocation<'invocation>(
     invocation: command::Invocation<'invocation>,
-) -> Result<Selection<'invocation>, ()> {
-    let Some(first) = invocation.argument(1) else {
-        return Ok(Selection::StandardInput { first_argument: 2 });
+) -> Result<ParsedInvocation<'invocation>, ()> {
+    let mut parsed = ParsedInvocation {
+        selection: None,
+        actions: [EMPTY_ACTION; command::MAX_ARGUMENTS],
+        action_count: 0,
+        warnings_enabled: false,
+        ignore_environment: false,
+        show_version: false,
     };
-    match first {
-        "-e" => invocation
-            .argument(2)
-            .map(|code| Selection::Inline {
-                code,
-                first_argument: 3,
-            })
-            .ok_or(()),
-        "-" => Ok(Selection::StandardInput { first_argument: 2 }),
-        "--" => Ok(match invocation.argument(2) {
-            Some(path) => Selection::File {
-                path,
-                first_argument: 3,
-            },
-            None => Selection::StandardInput { first_argument: 3 },
-        }),
-        option if option.starts_with('-') => option
-            .strip_prefix("-e")
-            .filter(|code| !code.is_empty())
-            .map(|code| Selection::Inline {
-                code,
-                first_argument: 2,
-            })
-            .ok_or(()),
-        path => Ok(Selection::File {
-            path,
-            first_argument: 2,
-        }),
+    let mut index = 1;
+    while let Some(argument) = invocation.argument(index) {
+        let (kind, value, consumed) = match argument {
+            "--" => {
+                index += 1;
+                parsed.selection = Some(match invocation.argument(index) {
+                    Some(path) => Selection::File {
+                        path,
+                        first_argument: index + 1,
+                    },
+                    None => Selection::StandardInput {
+                        first_argument: index + 1,
+                    },
+                });
+                break;
+            }
+            "-" => {
+                parsed.selection = Some(Selection::StandardInput {
+                    first_argument: index + 1,
+                });
+                break;
+            }
+            "-E" => {
+                parsed.ignore_environment = true;
+                index += 1;
+                continue;
+            }
+            "-W" => {
+                parsed.warnings_enabled = true;
+                index += 1;
+                continue;
+            }
+            "-v" => {
+                parsed.show_version = true;
+                index += 1;
+                continue;
+            }
+            "-e" => (
+                LUA_ACTION_CODE,
+                invocation.argument(index + 1).ok_or(())?,
+                2,
+            ),
+            "-l" => (
+                LUA_ACTION_REQUIRE,
+                invocation.argument(index + 1).ok_or(())?,
+                2,
+            ),
+            option if option.starts_with("-e") && option.len() > 2 => {
+                (LUA_ACTION_CODE, &option[2..], 1)
+            }
+            option if option.starts_with("-l") && option.len() > 2 => {
+                (LUA_ACTION_REQUIRE, &option[2..], 1)
+            }
+            option if option.starts_with('-') => return Err(()),
+            path => {
+                parsed.selection = Some(Selection::File {
+                    path,
+                    first_argument: index + 1,
+                });
+                break;
+            }
+        };
+        parsed.actions[parsed.action_count] = LuaAction {
+            kind,
+            bytes: value.as_ptr(),
+            length: value.len(),
+        };
+        parsed.action_count += 1;
+        index += consumed;
     }
+    if parsed.selection.is_none() && parsed.action_count == 0 {
+        parsed.selection = Some(Selection::StandardInput {
+            first_argument: invocation.len() + 1,
+        });
+    }
+    Ok(parsed)
 }
 
 fn write_message(output: &mut StandardOutput, parts: &[&[u8]]) -> Result<(), ()> {
@@ -196,7 +278,8 @@ fn run(command: &mut CommandContext) -> u32 {
             return if write_message(
                 &mut command.stdout(),
                 &[
-                    b"usage: lua [-e CODE | FILE | -] [ARG...]\n",
+                    b"usage: lua [options] [script [args]]\n",
+                    b"options: -e CODE  -l MODULE  -E  -W  -v  --  -\n",
                     b"       lua --version\n",
                 ],
             )
@@ -209,13 +292,16 @@ fn run(command: &mut CommandContext) -> u32 {
         }
         _ => {}
     }
-    let Ok(selection) = select_source(invocation) else {
+    let Ok(parsed) = parse_invocation(invocation) else {
         return common::usage(
             &mut command.stderr(),
             "lua",
-            b"lua [-e CODE | FILE | -] [ARG...]",
+            b"lua [options] [script [args]]",
         );
     };
+    if parsed.show_version && command.stdout().write_all(LUA_VERSION).is_err() {
+        return exit::FAILURE;
+    }
     let Some(region) = command.take_heap() else {
         common::report(
             &mut command.stderr(),
@@ -248,36 +334,44 @@ fn run(command: &mut CommandContext) -> u32 {
         );
         return exit::DENIED;
     };
+    let Ok(mut filesystem) = command.filesystem() else {
+        common::report(
+            &mut command.stderr(),
+            "lua",
+            b"filesystem capability is unavailable",
+        );
+        return exit::DENIED;
+    };
+    let Ok(mutation) = command.filesystem_mutation() else {
+        common::report(
+            &mut command.stderr(),
+            "lua",
+            b"filesystem mutation capability is unavailable",
+        );
+        return exit::DENIED;
+    };
 
     let mut source_name_storage = [0_u8; filesystem::MAX_PATH_BYTES + 1];
     let mut stderr = command.stderr();
-    let (source, source_name, argument_zero, first_argument) = match selection {
-        Selection::Inline {
-            code,
-            first_argument,
-        } => (
-            Source::Inline {
-                bytes: code.as_bytes(),
-                offset: 0,
-            },
-            &b"=(command line)"[..],
+    let (source, source_name, argument_zero, first_argument, has_source) = match parsed.selection {
+        None => (
+            Source::Empty,
+            &b"=(no script)"[..],
             invocation.argument(0).unwrap_or("lua"),
-            first_argument,
+            invocation.len(),
+            false,
         ),
-        Selection::StandardInput { first_argument } => (
+        Some(Selection::StandardInput { first_argument }) => (
             Source::StandardInput(command.stdin()),
             &b"=stdin"[..],
             invocation.argument(0).unwrap_or("lua"),
             first_argument,
+            true,
         ),
-        Selection::File {
+        Some(Selection::File {
             path,
             first_argument,
-        } => {
-            let Ok(mut filesystem) = command.filesystem() else {
-                common::report(&mut stderr, "lua", b"filesystem capability is unavailable");
-                return exit::FAILURE;
-            };
+        }) => {
             let Ok(file) = filesystem.open(path) else {
                 let _ = write_message(&mut stderr, &[b"lua: cannot open ", path.as_bytes(), b"\n"]);
                 return exit::FAILURE;
@@ -293,6 +387,7 @@ fn run(command: &mut CommandContext) -> u32 {
                 &source_name_storage[..1 + path.len()],
                 path,
                 first_argument,
+                true,
             )
         }
     };
@@ -321,6 +416,9 @@ fn run(command: &mut CommandContext) -> u32 {
         stderr,
         timer,
         wall_clock,
+        stdin: command.stdin(),
+        filesystem,
+        mutation,
     };
     let mut host = LuaHost {
         context: ptr::from_mut(&mut runtime).cast(),
@@ -329,6 +427,14 @@ fn run(command: &mut CommandContext) -> u32 {
         write: lua_write,
         process_cpu_time: lua_process_cpu_time,
         wall_time: lua_wall_time,
+        read_input: lua_read_input,
+        file_open: lua_file_open,
+        file_read: lua_file_read,
+        file_close: lua_file_close,
+        file_replace: lua_file_replace,
+        file_remove: lua_file_remove,
+        file_rename: lua_file_rename,
+        file_mutation_available: 1,
     };
     let mut configuration = LuaConfiguration {
         host: ptr::from_mut(&mut host),
@@ -336,6 +442,13 @@ fn run(command: &mut CommandContext) -> u32 {
         source_name_length: source_name.len(),
         arguments: arguments.as_ptr(),
         argument_count,
+        actions: parsed.actions.as_ptr(),
+        action_count: parsed.action_count,
+        has_source: i32::from(has_source),
+        warnings_enabled: i32::from(parsed.warnings_enabled),
+        ignore_environment: i32::from(parsed.ignore_environment),
+        current_directory: invocation.cwd().as_ptr(),
+        current_directory_length: invocation.cwd().len(),
         requested_exit: 0,
         requested_exit_status: exit::SUCCESS,
         requested_exit_close: 0,
@@ -382,7 +495,7 @@ unsafe extern "C" fn lua_allocate(
 ) -> *mut c_void {
     // SAFETY: `context` is installed from the unique `Runtime` borrow around
     // `troe_lua_run` and the C bridge invokes callbacks synchronously.
-    let Some(runtime) = (unsafe { (context.cast::<Runtime<'_>>()).as_mut() }) else {
+    let Some(runtime) = (unsafe { (context.cast::<Runtime>()).as_mut() }) else {
         return ptr::null_mut();
     };
     let Some(pointer) = NonNull::new(pointer.cast::<u8>()) else {
@@ -421,7 +534,7 @@ unsafe extern "C" fn lua_read(
         return 0;
     }
     // SAFETY: See `lua_allocate`; the C bridge supplies its live reader buffer.
-    let Some(runtime) = (unsafe { (context.cast::<Runtime<'_>>()).as_mut() }) else {
+    let Some(runtime) = (unsafe { (context.cast::<Runtime>()).as_mut() }) else {
         return -1;
     };
     let Some(destination) = NonNull::new(destination) else {
@@ -437,6 +550,229 @@ unsafe extern "C" fn lua_read(
         .unwrap_or(-1)
 }
 
+unsafe extern "C" fn lua_read_input(
+    context: *mut c_void,
+    destination: *mut u8,
+    capacity: usize,
+) -> isize {
+    if capacity == 0 {
+        return 0;
+    }
+    let (Some(runtime), Some(destination)) = (
+        unsafe { (context.cast::<Runtime>()).as_mut() },
+        NonNull::new(destination),
+    ) else {
+        return -1;
+    };
+    let destination = unsafe { slice::from_raw_parts_mut(destination.as_ptr(), capacity) };
+    runtime
+        .stdin
+        .read(destination)
+        .ok()
+        .and_then(|count| isize::try_from(count).ok())
+        .unwrap_or(-1)
+}
+
+unsafe extern "C" fn lua_file_open(
+    context: *mut c_void,
+    path: *const u8,
+    path_length: usize,
+    token: *mut u32,
+    length: *mut u64,
+) -> i32 {
+    let (Some(runtime), Some(path), Some(mut token), Some(mut length)) = (
+        unsafe { (context.cast::<Runtime>()).as_mut() },
+        NonNull::new(path.cast_mut()),
+        NonNull::new(token),
+        NonNull::new(length),
+    ) else {
+        return -1;
+    };
+    let path = unsafe { slice::from_raw_parts(path.as_ptr(), path_length) };
+    let Ok(path) = str::from_utf8(path) else {
+        return -1;
+    };
+    let Ok(file) = runtime.filesystem.open(path) else {
+        return -1;
+    };
+    unsafe {
+        *token.as_mut() = file.token();
+        *length.as_mut() = file.byte_count;
+    }
+    0
+}
+
+unsafe extern "C" fn lua_file_read(
+    context: *mut c_void,
+    token: u32,
+    length: u64,
+    offset: u64,
+    destination: *mut u8,
+    capacity: usize,
+) -> isize {
+    if capacity == 0 {
+        return 0;
+    }
+    let (Some(runtime), Some(destination)) = (
+        unsafe { (context.cast::<Runtime>()).as_mut() },
+        NonNull::new(destination),
+    ) else {
+        return -1;
+    };
+    let Ok(file) = filesystem::OpenFile::new(token, length) else {
+        return -1;
+    };
+    let destination = unsafe { slice::from_raw_parts_mut(destination.as_ptr(), capacity) };
+    runtime
+        .filesystem
+        .read(file, offset, destination)
+        .ok()
+        .and_then(|count| isize::try_from(count).ok())
+        .unwrap_or(-1)
+}
+
+unsafe extern "C" fn lua_file_close(context: *mut c_void, token: u32, length: u64) -> i32 {
+    let Some(runtime) = (unsafe { (context.cast::<Runtime>()).as_mut() }) else {
+        return -1;
+    };
+    let Ok(file) = filesystem::OpenFile::new(token, length) else {
+        return -1;
+    };
+    if runtime.filesystem.close(file).is_ok() {
+        0
+    } else {
+        -1
+    }
+}
+
+unsafe extern "C" fn lua_file_replace(
+    context: *mut c_void,
+    path: *const u8,
+    path_length: usize,
+    bytes: *const u8,
+    length: usize,
+) -> i32 {
+    let (Some(runtime), Some(path)) = (
+        unsafe { (context.cast::<Runtime>()).as_mut() },
+        NonNull::new(path.cast_mut()),
+    ) else {
+        return -1;
+    };
+    let path = unsafe { slice::from_raw_parts(path.as_ptr(), path_length) };
+    let Ok(path) = str::from_utf8(path) else {
+        return -1;
+    };
+    let bytes = if length == 0 {
+        &[]
+    } else {
+        let Some(bytes) = NonNull::new(bytes.cast_mut()) else {
+            return -1;
+        };
+        unsafe { slice::from_raw_parts(bytes.as_ptr(), length) }
+    };
+    let Ok(mut replacement) = runtime.mutation.begin_replace(path) else {
+        return -1;
+    };
+    if replacement.write_all(bytes).is_err() {
+        let _ = replacement.abort();
+        return -1;
+    }
+    if replacement.commit().is_ok() { 0 } else { -1 }
+}
+
+unsafe extern "C" fn lua_file_remove(
+    context: *mut c_void,
+    path: *const u8,
+    path_length: usize,
+) -> i32 {
+    let (Some(runtime), Some(path)) = (
+        unsafe { (context.cast::<Runtime>()).as_mut() },
+        NonNull::new(path.cast_mut()),
+    ) else {
+        return -1;
+    };
+    let path = unsafe { slice::from_raw_parts(path.as_ptr(), path_length) };
+    let Ok(path) = str::from_utf8(path) else {
+        return -1;
+    };
+    if runtime.mutation.remove(path).is_ok() {
+        0
+    } else {
+        -1
+    }
+}
+
+unsafe extern "C" fn lua_file_rename(
+    context: *mut c_void,
+    old_path: *const u8,
+    old_path_length: usize,
+    new_path: *const u8,
+    new_path_length: usize,
+) -> i32 {
+    let (Some(runtime), Some(old_path), Some(new_path)) = (
+        unsafe { (context.cast::<Runtime>()).as_mut() },
+        NonNull::new(old_path.cast_mut()),
+        NonNull::new(new_path.cast_mut()),
+    ) else {
+        return -1;
+    };
+    let old_path = unsafe { slice::from_raw_parts(old_path.as_ptr(), old_path_length) };
+    let new_path = unsafe { slice::from_raw_parts(new_path.as_ptr(), new_path_length) };
+    let (Ok(old_path), Ok(new_path)) = (str::from_utf8(old_path), str::from_utf8(new_path)) else {
+        return -1;
+    };
+    if old_path == new_path {
+        return 0;
+    }
+    let Ok(source) = runtime.filesystem.open(old_path) else {
+        return -1;
+    };
+    let Ok(mut replacement) = runtime.mutation.begin_replace(new_path) else {
+        let _ = runtime.filesystem.close(source);
+        return -1;
+    };
+    let mut buffer = [0_u8; 4096];
+    let mut offset = 0_u64;
+    let mut failed = false;
+    while offset < source.byte_count {
+        let remaining = source.byte_count - offset;
+        let requested = buffer
+            .len()
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        let Ok(count) = runtime
+            .filesystem
+            .read(source, offset, &mut buffer[..requested])
+        else {
+            failed = true;
+            break;
+        };
+        if count == 0 || replacement.write_all(&buffer[..count]).is_err() {
+            failed = true;
+            break;
+        }
+        let Ok(count) = u64::try_from(count) else {
+            failed = true;
+            break;
+        };
+        let Some(next) = offset.checked_add(count) else {
+            failed = true;
+            break;
+        };
+        offset = next;
+    }
+    if runtime.filesystem.close(source).is_err() {
+        failed = true;
+    }
+    if failed {
+        let _ = replacement.abort();
+        return -1;
+    }
+    if replacement.commit().is_err() || runtime.mutation.remove(old_path).is_err() {
+        return -1;
+    }
+    0
+}
+
 unsafe extern "C" fn lua_write(
     context: *mut c_void,
     stream: i32,
@@ -447,7 +783,7 @@ unsafe extern "C" fn lua_write(
         return 0;
     }
     // SAFETY: See `lua_allocate`; the C bridge supplies a readable Lua string.
-    let Some(runtime) = (unsafe { (context.cast::<Runtime<'_>>()).as_mut() }) else {
+    let Some(runtime) = (unsafe { (context.cast::<Runtime>()).as_mut() }) else {
         return -1;
     };
     let Some(bytes) = NonNull::new(bytes.cast_mut()) else {
@@ -470,7 +806,7 @@ unsafe extern "C" fn lua_process_cpu_time(
 ) -> i32 {
     // SAFETY: See `lua_allocate`; the C shim supplies two writable result slots.
     let (Some(runtime), Some(mut ticks), Some(mut frequency_hz)) = (
-        unsafe { (context.cast::<Runtime<'_>>()).as_mut() },
+        unsafe { (context.cast::<Runtime>()).as_mut() },
         NonNull::new(ticks),
         NonNull::new(frequency_hz),
     ) else {
@@ -490,7 +826,7 @@ unsafe extern "C" fn lua_process_cpu_time(
 unsafe extern "C" fn lua_wall_time(context: *mut c_void, result: *mut u64) -> i32 {
     // SAFETY: See `lua_allocate`; the C shim supplies one writable result slot.
     let (Some(runtime), Some(mut result)) = (
-        unsafe { (context.cast::<Runtime<'_>>()).as_mut() },
+        unsafe { (context.cast::<Runtime>()).as_mut() },
         NonNull::new(result),
     ) else {
         return -1;

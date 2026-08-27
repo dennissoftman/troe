@@ -509,15 +509,11 @@ static int luaB_tostring (lua_State *L) {
 static const luaL_Reg base_funcs[] = {
   {"assert", luaB_assert},
   {"collectgarbage", luaB_collectgarbage},
-#if !defined(TROE_LUA)
   {"dofile", luaB_dofile},
-#endif
   {"error", luaB_error},
   {"getmetatable", luaB_getmetatable},
   {"ipairs", luaB_ipairs},
-#if !defined(TROE_LUA)
   {"loadfile", luaB_loadfile},
-#endif
   {"load", luaB_load},
   {"next", luaB_next},
   {"pairs", luaB_pairs},

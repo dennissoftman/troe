@@ -12,6 +12,7 @@ void exit(int status) __attribute__((noreturn));
 void free(void *pointer);
 void *malloc(size_t size);
 void *realloc(void *pointer, size_t size);
+char *getenv(const char *name);
 double strtod(const char *text, char **end);
 
 #endif

@@ -1401,13 +1401,52 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
         absent=("execution lease expired",),
     )
     session.command(
-        'lua -e \'local ok,e=pcall(os.time,{}); '
-        'print("lua-os-unavailable",ok,type(e),'
-        'e:match("os%.time table conversion is unavailable in TROE")~=nil)\'',
+        'lua -e \'local t={year=2024,month=2,day=29,hour=1,min=2,sec=3}; '
+        'local s=os.time(t); print("lua-calendar",s,'
+        'os.date("!%Y-%m-%d %H:%M:%S %a %j",s),t.wday,t.yday,t.isdst)\'',
         cwd,
         command_timeout,
-        contains=("lua-os-unavailable\tfalse\tstring\ttrue\n",),
+        contains=(
+            "lua-calendar\t1709168523\t2024-02-29 01:02:03 Thu 060\t5\t60\tfalse\n",
+        ),
     )
+    session.command(
+        "lua -e 'package.preload.p=function() return 42 end; "
+        "local m,w=require(\"p\"); print(\"lua-libraries\",m,w,type(debug),"
+        "type(io),type(loadfile),type(dofile),collectgarbage(\"incremental\"))'",
+        cwd,
+        command_timeout,
+        contains=(
+            "lua-libraries\t42\t:preload:\ttable\ttable\tfunction\tfunction\tgenerational\n",
+        ),
+    )
+    session.command(
+        "lua -E -e 'package.preload.p=function() return 40 end' "
+        "-l m=p -e 'print(\"lua-options\",m+2)'",
+        cwd,
+        command_timeout,
+        contains=("lua-options\t42\n",),
+    )
+    session.command(
+        "lua -W -e 'warn(\"cli-warning\")'",
+        cwd,
+        command_timeout,
+        contains=("Lua warning: cli-warning",),
+    )
+    session.command(
+        "lua -e 'local f=assert(io.open(\"/tmp/lua-chunk.luac\",\"w\")); "
+        "f:write(string.dump(function() print(\"lua-bytecode-file\",42) end)); "
+        "f:close()'",
+        cwd,
+        command_timeout,
+    )
+    session.command(
+        "lua /tmp/lua-chunk.luac",
+        cwd,
+        command_timeout,
+        contains=("lua-bytecode-file\t42\n",),
+    )
+    session.command("rm /tmp/lua-chunk.luac", cwd, command_timeout)
     session.command(
         "lua -e 'pcall(function() os.exit(7) end); "
         "print(\"lua-exit-caught\")'",
@@ -1473,6 +1512,28 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
             "task 1: network (priority 3)",
             "vector sum: (7, 10)",
             "square(4)=16",
+        ),
+    )
+    session.command(
+        "lua /share/lua/examples/compatibility.lua",
+        cwd,
+        command_timeout,
+        contains=(
+            "lua-compat libraries\ttable\ttable\ttable\n",
+            "lua-compat date\t2024-02-29 Thursday\n",
+            "lua-compat file\talpha,beta,gamma\n",
+            "lua-compat module\t42\t/tmp/lua55-showcase-module.lua\n",
+            "lua-compat bytecode\t1414680389\tmain\n",
+            "lua-compat cleanup\ttrue\ttrue\n",
+        ),
+    )
+    session.command(
+        "lua /share/lua/examples/files.lua",
+        cwd,
+        command_timeout,
+        contains=(
+            "lua-files wrote\t36\tbytes\n",
+            "lua-files cleanup\ttrue\ttrue\n",
         ),
     )
     session.command(
