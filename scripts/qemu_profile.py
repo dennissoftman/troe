@@ -202,6 +202,15 @@ def resolve_runner(platform_id: str, environment: str) -> RunnerProfile:
     return select_runner(RUNNER_PROFILES, platform_id, environment)
 
 
+def validate_memory_size(value: str) -> str:
+    """Return one explicit QEMU memory size or reject ambiguous syntax."""
+    if re.fullmatch(r"[1-9][0-9]*[MG]", value) is None:
+        raise RuntimeError(
+            "memory must be an integer number of MiB or GiB, such as 256M"
+        )
+    return value
+
+
 def validate_runner_catalog(
     runners: dict[tuple[str, str], RunnerProfile],
 ) -> None:
@@ -480,6 +489,7 @@ def _qemu_arguments(
     *,
     graphical: bool,
     framebuffer: bool,
+    memory: str | None = None,
     data_disks: tuple[Path, ...] = (),
 ) -> list[str]:
     """Return exact QEMU arguments from one already-resolved runner record."""
@@ -501,7 +511,7 @@ def _qemu_arguments(
     command.extend(
         (
             "-m",
-            runner.memory,
+            runner.memory if memory is None else validate_memory_size(memory),
             "-drive",
             f"if=pflash,format=raw,unit=0,readonly=on,file={firmware}",
             "-drive",
@@ -615,6 +625,7 @@ def prepare_qemu_command(
     acceptance_probes: bool = False,
     graphical: bool = False,
     framebuffer: bool = False,
+    memory: str | None = None,
     volume_table: Path | None = None,
     data_disks: tuple[Path, ...] = (),
 ) -> list[str]:
@@ -769,6 +780,7 @@ def prepare_qemu_command(
         data_disks=tuple(resolved_data_disks),
         graphical=graphical,
         framebuffer=framebuffer,
+        memory=memory,
     )
     if profile.identifier == X86_64_UEFI_VIRTIO_PCI:
         command.extend(

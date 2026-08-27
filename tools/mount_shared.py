@@ -83,8 +83,16 @@ class MountState:
 class SharedMediaLock:
     """Cross-platform non-blocking process lock for shared-media transitions."""
 
-    def __init__(self, path: Path = DEFAULT_LOCK) -> None:
+    def __init__(
+        self,
+        path: Path = DEFAULT_LOCK,
+        *,
+        busy_message: str = (
+            "shared FAT32 media is busy; stop QEMU or finish the other mount command"
+        ),
+    ) -> None:
         self.path = path
+        self.busy_message = busy_message
         self._file: BinaryIO | None = None
 
     def __enter__(self) -> SharedMediaLock:
@@ -105,9 +113,7 @@ class SharedMediaLock:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError as error:
             lock_file.close()
-            raise MountError(
-                "shared FAT32 media is busy; stop QEMU or finish the other mount command"
-            ) from error
+            raise MountError(self.busy_message) from error
         self._file = lock_file
         return self
 

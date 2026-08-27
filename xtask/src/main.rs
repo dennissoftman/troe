@@ -6,19 +6,21 @@ use std::process::{Command, ExitCode};
 const DEFAULT_ENVIRONMENT: &str = "qemu";
 const X86_64_PLATFORM: &str = "x86_64-q35-uefi";
 const AARCH64_PLATFORM: &str = "aarch64-virt-uefi";
+const ALPINE_COMMAND: &str = "alpine";
 const MOUNT_COMMAND: &str = "mount";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Tool {
     Qemu,
+    Alpine,
     Mount,
 }
 
 fn select_tool(arguments: Vec<OsString>) -> (Tool, Vec<OsString>) {
-    if arguments.first() == Some(&OsString::from(MOUNT_COMMAND)) {
-        (Tool::Mount, arguments.into_iter().skip(1).collect())
-    } else {
-        (Tool::Qemu, arguments)
+    match arguments.first().and_then(|argument| argument.to_str()) {
+        Some(ALPINE_COMMAND) => (Tool::Alpine, arguments.into_iter().skip(1).collect()),
+        Some(MOUNT_COMMAND) => (Tool::Mount, arguments.into_iter().skip(1).collect()),
+        _ => (Tool::Qemu, arguments),
     }
 }
 
@@ -98,24 +100,34 @@ fn main() -> ExitCode {
         });
 
     let (tool, arguments) = select_tool(env::args_os().skip(1).collect());
-    let (script, arguments) = match tool {
-        Tool::Mount => (repository.join("tools/mount_shared.py"), arguments),
-        Tool::Qemu => {
+    let (script, arguments, command_name) = match tool {
+        Tool::Mount => (
+            repository.join("tools/mount_shared.py"),
+            arguments,
+            tool.command_name(),
+        ),
+        Tool::Qemu | Tool::Alpine => {
             let host_architecture = env::consts::ARCH;
             let (arguments, defaulted) =
                 match with_interactive_defaults(arguments, host_architecture) {
                     Ok(resolved) => resolved,
                     Err(error) => {
-                        eprintln!("cargo qemu: {error}");
+                        eprintln!("cargo {}: {error}", tool.command_name());
                         return ExitCode::FAILURE;
                     }
                 };
             if defaulted {
                 eprintln!(
-                    "cargo qemu: using host architecture {host_architecture} for omitted defaults"
+                    "cargo {}: using host architecture {host_architecture} for omitted defaults",
+                    tool.command_name()
                 );
             }
-            (repository.join("scripts/run-qemu.py"), arguments)
+            let script = match tool {
+                Tool::Qemu => repository.join("scripts/run-qemu.py"),
+                Tool::Alpine => repository.join("scripts/run-alpine.py"),
+                Tool::Mount => unreachable!(),
+            };
+            (script, arguments, tool.command_name())
         }
     };
 
@@ -128,8 +140,18 @@ fn main() -> ExitCode {
         Ok(status) if status.success() => ExitCode::SUCCESS,
         Ok(_) => ExitCode::FAILURE,
         Err(error) => {
-            eprintln!("failed to start the QEMU launcher: {error}");
+            eprintln!("failed to start cargo {command_name}: {error}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+impl Tool {
+    const fn command_name(self) -> &'static str {
+        match self {
+            Self::Qemu => "qemu",
+            Self::Alpine => "alpine",
+            Self::Mount => "mount",
         }
     }
 }
@@ -204,5 +226,22 @@ mod tests {
         let (tool, arguments) = select_tool(vec![OsString::from("--dry-run")]);
         assert_eq!(tool, Tool::Qemu);
         assert_eq!(arguments, [OsString::from("--dry-run")]);
+    }
+
+    #[test]
+    fn alpine_subcommand_is_removed_before_python_dispatch() {
+        let (tool, arguments) = select_tool(vec![
+            OsString::from("alpine"),
+            OsString::from("--platform"),
+            OsString::from(AARCH64_PLATFORM),
+        ]);
+        assert_eq!(tool, Tool::Alpine);
+        assert_eq!(
+            arguments,
+            [
+                OsString::from("--platform"),
+                OsString::from(AARCH64_PLATFORM)
+            ]
+        );
     }
 }

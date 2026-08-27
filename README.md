@@ -241,6 +241,28 @@ cargo qemu --platform x86_64-q35-uefi --environment qemu
 cargo qemu --platform aarch64-virt-uefi --environment qemu
 ```
 
+Boot the pinned Alpine virtual image under the same QEMU machine resources for
+an end-to-end comparison. Each platform gets a separate persistent 8 GiB Alpine
+system image, while the independent shared FAT32 disk is attached as
+`TROE SHARE` so the same workload data can be used by both guests:
+
+```console
+cargo alpine --platform x86_64-q35-uefi --environment qemu
+cargo alpine --platform aarch64-virt-uefi --environment qemu
+```
+
+Alpine defaults to 256 MiB because its current ISO cannot boot with TROE's
+128 MiB acceptance limit. Use `cargo qemu --memory 256M` for matched comparison
+runs; normal TROE and acceptance launches retain their 128 MiB default. On the
+first Alpine boot, run `setup-alpine`, install to the device identified by
+`/dev/disk/by-id/virtio-ALPINE_ROOT` in `sys` mode, and reboot. The installed OS
+and packages then persist; `TROE SHARE` remains a data-only interchange disk.
+An empty system image triggers a first-install guide automatically; use
+`cargo alpine --install-help` to print it again without launching QEMU.
+
+See the [Alpine performance comparison guide](docs/alpine-performance.md) for
+the guest mount command, four-guest matrix, and interpretation limits.
+
 The first non-QEMU target is separately pinned to Cloud Hypervisor v53.0 on a
 Linux x86-64 KVM host. It has a production-only acceptance harness but remains
 `compatible-unverified` until the live matrix passes; see the
