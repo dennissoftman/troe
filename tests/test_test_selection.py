@@ -132,6 +132,14 @@ class ChangedTestSelectionTests(unittest.TestCase):
         self.assertEqual(plan.qemu_scenarios, {"boot", "filesystem"})
         self.assertTrue(plan.qemu_all_platforms)
 
+    def test_package_model_and_cli_select_only_their_host_contract_tests(self) -> None:
+        for path in ("tools/package_model.py", "tools/troe.py"):
+            with self.subTest(path=path):
+                plan = test_changed.build_plan((PurePosixPath(path),), PACKAGES)
+                self.assertFalse(plan.full_reasons)
+                self.assertEqual(plan.python_tests, {"test_package_model.py"})
+                self.assertEqual(plan.qemu_scenarios, set())
+
     def test_audit_policy_change_runs_audit_without_unknown_fallback(self) -> None:
         plan = test_changed.build_plan(
             (PurePosixPath("tools/rustsec-exceptions.json"),), PACKAGES

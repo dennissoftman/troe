@@ -35,7 +35,8 @@ The current serialized contracts are versioned independently under
   [volume table](formats/volume-table-v1.md), [PRGN](formats/prgn-v1.md), and
   [TXSLOT](formats/txslot-v1.md);
 - configuration and generations: [SCFG](formats/scfg-v1.md),
-  [SACT](formats/sact-v1.md), [CSPK](formats/cspk-v1.md), and
+  [SACT](formats/sact-v1.md), [CSPK](formats/cspk-v1.md),
+  [package model](formats/package-model-v1.md), and
   [GMAN](formats/gman-v1.md); and
 - identity and authorization metadata: [identity security v1](formats/identity-v1.md).
 
