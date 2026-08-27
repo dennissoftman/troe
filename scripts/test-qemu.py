@@ -67,15 +67,23 @@ class AcceptanceError(RuntimeError):
 class UdpAcceptancePeer:
     """Answer the guest's bounded Stage 8 UDP probe on the slirp host."""
 
-    def __init__(self, platform_id: str, environment: str) -> None:
+    def __init__(
+        self,
+        platform_id: str,
+        environment: str,
+        *,
+        bind_address: str = "127.0.0.1",
+        port: int | None = None,
+    ) -> None:
         self.platform_id = platform_id
-        runner = resolve_runner(platform_id, environment)
+        if port is None:
+            port = resolve_runner(platform_id, environment).acceptance_udp_port
         self.received = 0
         self.error: OSError | None = None
         self._stop = threading.Event()
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._socket.settimeout(0.2)
-        self._socket.bind(("127.0.0.1", runner.acceptance_udp_port))
+        self._socket.bind((bind_address, port))
         self._thread = threading.Thread(
             target=self._serve,
             name=f"udp-acceptance-{platform_id}",
@@ -114,16 +122,24 @@ class UdpAcceptancePeer:
 class TcpAcceptancePeer:
     """Answer one typed KEX TCP stream exchange on the slirp host."""
 
-    def __init__(self, platform_id: str, environment: str) -> None:
+    def __init__(
+        self,
+        platform_id: str,
+        environment: str,
+        *,
+        bind_address: str = "127.0.0.1",
+        port: int | None = None,
+    ) -> None:
         self.platform_id = platform_id
-        runner = resolve_runner(platform_id, environment)
+        if port is None:
+            port = resolve_runner(platform_id, environment).acceptance_udp_port
         self.received = 0
         self.error: OSError | None = None
         self._stop = threading.Event()
         self._socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._socket.settimeout(0.2)
-        self._socket.bind(("127.0.0.1", runner.acceptance_udp_port))
+        self._socket.bind((bind_address, port))
         self._socket.listen(1)
         self._thread = threading.Thread(
             target=self._serve,
@@ -1094,10 +1110,14 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
         contains=(SHARED_CONTENT,),
     )
     session.command(
-        "ls /", cwd, command_timeout, contains=("etc/", "man/", "sys/", "tmp/")
+        "ls /",
+        cwd,
+        command_timeout,
+        contains=("config/", "man/", "recovery/", "sys/", "tmp/"),
+        absent=("etc/",),
     )
     session.command(
-        "cat /etc/motd",
+        "cat /recovery/motd",
         cwd,
         command_timeout,
         contains=(
@@ -1239,10 +1259,10 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
     )
     session.command("pwd extra", cwd, command_timeout, contains=("pwd: pwd",))
     session.command(
-        "printf nope > /etc/motd",
+        "printf nope > /recovery/motd",
         cwd,
         command_timeout,
-        contains=("sh: /etc/motd: read-only filesystem",),
+        contains=("sh: /recovery/motd: read-only filesystem",),
     )
     session.command("rm /tmp/result", cwd, command_timeout)
     session.command(
@@ -1379,7 +1399,7 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
         contains=("lua-stdin\t42\n",),
     )
     session.command(
-        "lua /etc/lua-smoke.lua hello",
+        "lua /recovery/lua-smoke.lua hello",
         cwd,
         command_timeout,
         contains=("lua-file:hello sum=1250025000 sqrt=9 pow=1024",),

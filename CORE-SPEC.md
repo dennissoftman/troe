@@ -132,21 +132,24 @@ The current native command execution model remains deliberately narrow:
 There is:
 
 - one active CPU;
-- one privileged kernel root and at most one synchronously active isolated task
-  root;
+- one privileged kernel root and at most one executing isolated task root;
 - one owned kernel scheduler/handoff stack, three privileged guarded task-stack
-  slots, and one ephemeral unmapped-guard user stack per isolated launch;
+  slots, and an owned unmapped-guard user stack for each admitted isolated
+  process;
 - one global physical-memory owner;
-- one command executing at a time;
+- at most eight retained resident application records, with one selected for an
+  execution slice at a time;
 - a ring-3/EL0 memory and fault boundary for the bounded isolated continuation;
 - no application ABI for shell session or machine-control mutation;
-- cooperative continuations without preemption or protection from a task that
-  never returns through the internal gate.
+- scheduler-owned resumable preemption with a 50 ms maximum uninterrupted
+  application lease.
 
 Ordinary commands are target-native immutable KEX files, not privileged shell
-functions. The shell registry retains only names/synopses and the three
-intrinsics; the kernel resolver validates, maps, services, and tears down each
-application through ABI 1.1.
+functions. The shell registry retains only names/synopses and the nine
+session-, supervisor-, or machine-owned intrinsics. The kernel resolver
+validates and maps each application through ABI 1.1; resident ownership survives
+individual execution slices and is revoked, zeroized, and reclaimed only at its
+terminal fate.
 
 ## 7. Boot strategy
 
@@ -432,17 +435,29 @@ implement package-resolved scoped roots; that authority change is tracked in
 
 ```text
 /
+├── config/      writable desired configuration on a persistent provider
 ├── man/         embedded read-only command manual pages
-├── etc/         embedded read-only configuration
+├── recovery/    embedded read-only recovery-only bootstrap files
 ├── tmp/         writable RAMFS
-├── sys/         generated system-information nodes
+├── sys/
+│   └── config/  read-only configuration resolved for the active generation
 └── dev/         capability-backed device nodes, if enabled
 ```
 
-This is the current embedded recovery namespace. Its `/etc` directory contains
-bootstrap files and is not a package installation or live configuration API.
-No `/config` or `/sys/config` authoring surface is implemented; that work is
-tracked in [GitHub issue #4](https://github.com/dennissoftman/troe/issues/4).
+The recovery image contributes `/recovery`; it does not contribute `/etc` and
+the system defines no `/etc` compatibility alias. `/config` is the stable
+desired-state mount point and is never replaced merely because a package
+generation changes. `/sys/config` contains only the normalized, non-secret
+configuration files bound to the active generation. A candidate projection is
+validated and constructed out of view, then replaces the complete active view
+atomically. Applications cannot mutate it.
+
+Boot creates both namespace roots even when persistent storage or an active
+package generation is unavailable. In recovery that leaves `/config` without a
+writable provider and `/sys/config` empty at generation zero. Native deployment
+activation MUST attach the persistent desired-state provider before accepting
+configuration edits and MUST publish the selected immutable projection before
+starting package services.
 
 `/sys` and `/dev` are project-defined namespaces, not Linux-compatible ABIs.
 
@@ -876,8 +891,8 @@ A release candidate MUST pass:
 
 Ordinary commands execute only as isolated KEX applications. Supervisor page
 permissions, copied messages, contained user faults, owner-revoked handles, and
-zeroized teardown protect the kernel from that execution context. The three
-intrinsics remain small kernel/session transitions and expose no general
+zeroized teardown protect the kernel from that execution context. The nine
+intrinsics remain small kernel/session/supervisor transitions and expose no general
 application-callable machine authority.
 
 Accordingly:
@@ -886,14 +901,16 @@ Accordingly:
   and inner KEX validation;
 - embedded FS input is treated as potentially malformed;
 - console input is untrusted and bounded;
-- external block filesystems remain optional until separately specified and fuzzed;
-- no network attack surface exists initially;
+- KEFS, FAT32, constrained ext4, StateFS, GPT, volume policy, configuration,
+  generation, and activation inputs are parsed through exact bounded profiles;
+- Ethernet, ARP, DHCP, IPv4, ICMP, UDP, and outbound TCP input is untrusted and
+  admitted only through the implemented bounded network profiles;
 - no command may access raw memory or devices unless explicitly given that capability;
 - release documentation MUST state whether hardware isolation exists.
 
-Application isolation does not provide preemption or make the system multi-user
-secure. Every application artifact and application-controlled address remains
-untrusted.
+Application isolation includes resumable timer preemption, but does not make the
+system multi-user secure. Every application artifact and application-controlled
+address remains untrusted.
 
 ## 23. Implemented milestones
 
@@ -1075,6 +1092,33 @@ Configured health failure rolls generation 2 back durably to generation 1.
   activation or bounded health checks fail.
 
 **Exit criterion:** the system can boot, configure a supported network device, exchange data with another host, persist selected state, and remain within declared memory budgets under malformed and high-volume input.
+
+### Stage 9 — Production usability
+
+**Status:** package, trust, configuration, and transactional lifecycle
+foundations are implemented as hosted references. Cloud Hypervisor v53.0 on
+Linux/KVM x86-64 is the first exact non-QEMU target and has a pinned
+production-only harness; acceptance remains gated on a real KVM result.
+
+- Hosted Stage 9 deployment MUST verify one signed package per locked member,
+  publish a complete immutable generation before its pending pointer, retain
+  monotonic trust state, require exact downgrade authorization, and keep
+  desired configuration outside generation replacement.
+- Data migration MUST be bounded and versioned. Reversible migration restores
+  its exact durable snapshot with predecessor code; forward-only migration MUST
+  enter recovery-required state rather than run predecessor code over new data.
+- Garbage collection MUST trace active, previous, recovery, and in-flight
+  transaction roots. Persistent lifecycle diagnostics MUST remain bounded and
+  every durable lifecycle boundary MUST be process-reopen testable.
+- A production-environment claim MUST bind one exact VMM, firmware, platform,
+  device/interrupt topology, resource floor, network boundary, artifact kind,
+  and live acceptance record. Host-only validation or resemblance to an
+  accepted emulator MUST NOT promote an environment claim.
+
+**Exit criterion:** operators can construct, authenticate, publish, activate,
+diagnose, roll back, and garbage-collect a complete locked system on every
+supported production environment without weakening the immutable-generation
+or recovery contracts.
 
 ## 24. API evolution rule
 

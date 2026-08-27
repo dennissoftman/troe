@@ -61,7 +61,7 @@ commands remain immutable KEX applications discovered from `/bin`.
 ### Shell and filesystem
 
 ```console
-sh:/> cat /etc/motd
+sh:/> cat /recovery/motd
 Tiny Rust Operating Environment 0.1.0
 Small by design. Alive on the wire.
 
@@ -202,6 +202,15 @@ KEX images are statically linked today. A bounded, single-package dynamic
 linking design for reusable libc and language runtimes is tracked in
 [GitHub issue #10](https://github.com/dennissoftman/troe/issues/10).
 
+Hosted Stage 9 tooling now models deterministic multi-package locks, signed
+release verification, and transactional system generations without making the
+kernel invoke host tools. Start with `python3 tools/troe.py --help`,
+`python3 tools/troe_trust.py --help`, and
+`python3 tools/troe_system.py --help`. The lifecycle CLI leaves a verified
+candidate `pending`; native bounded health orchestration must report `passed` or
+`failed` before it becomes healthy or automatically returns to its predecessor.
+See [ADR 0044](docs/adr/0044-transactional-system-lifecycle.md).
+
 ## 🚀 Quick start
 
 ### Prerequisites
@@ -230,6 +239,11 @@ Choose a target explicitly when needed:
 cargo qemu --platform x86_64-q35-uefi --environment qemu
 cargo qemu --platform aarch64-virt-uefi --environment qemu
 ```
+
+The first non-QEMU target is separately pinned to Cloud Hypervisor v53.0 on a
+Linux x86-64 KVM host. It has a production-only acceptance harness but remains
+`compatible-unverified` until the live matrix passes; see the
+[exact target and operator runbook](docs/cloud-hypervisor-production.md).
 
 Without the exact QEMU setup, the hosted model still exercises the shell parser
 and sessions. It intentionally does not execute KEX applications.

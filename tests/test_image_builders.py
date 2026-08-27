@@ -112,16 +112,23 @@ class KefsBuilderTests(unittest.TestCase):
             root = Path(temporary)
             (root / "bin" / "x86_64").mkdir(parents=True)
             (root / "bin" / "aarch64").mkdir()
-            (root / "etc").mkdir()
+            (root / "recovery").mkdir()
             (root / "bin" / "x86_64" / "tool.kex").write_bytes(b"x86")
             (root / "bin" / "aarch64" / "tool.kex").write_bytes(b"arm")
-            (root / "etc" / "motd").write_bytes(b"shared")
+            (root / "recovery" / "motd").write_bytes(b"shared")
 
             x86 = mkefs.decode(mkefs.build(root, "x86_64"))
             arm = mkefs.decode(mkefs.build(root, "aarch64"))
             self.assertIn((1, "/bin/tool.kex", b"x86"), x86)
             self.assertIn((1, "/bin/tool.kex", b"arm"), arm)
-            self.assertIn((1, "/etc/motd", b"shared"), x86)
+            self.assertIn((1, "/recovery/motd", b"shared"), x86)
+            for entries in (x86, arm):
+                self.assertFalse(
+                    any(
+                        path == "/etc" or path.startswith("/etc/")
+                        for _kind, path, _payload in entries
+                    )
+                )
             self.assertNotIn((2, "/bin/x86_64", b""), x86)
             self.assertNotIn((2, "/bin/aarch64", b""), x86)
 

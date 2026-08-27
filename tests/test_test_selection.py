@@ -132,6 +132,34 @@ class ChangedTestSelectionTests(unittest.TestCase):
         self.assertEqual(plan.qemu_scenarios, {"boot", "filesystem"})
         self.assertTrue(plan.qemu_all_platforms)
 
+    def test_package_model_and_cli_select_only_their_host_contract_tests(self) -> None:
+        cases = {
+            "tools/package_model.py": "test_package_model.py",
+            "tools/troe.py": "test_package_model.py",
+            "tools/package_trust.py": "test_package_trust.py",
+            "tools/troe_trust.py": "test_package_trust.py",
+        }
+        for path, test in cases.items():
+            with self.subTest(path=path):
+                plan = test_changed.build_plan((PurePosixPath(path),), PACKAGES)
+                self.assertFalse(plan.full_reasons)
+                self.assertEqual(plan.python_tests, {test})
+                self.assertEqual(plan.qemu_scenarios, set())
+
+    def test_cloud_hypervisor_runner_selects_its_host_contract_tests(self) -> None:
+        for path in (
+            "scripts/cloud_hypervisor_profile.py",
+            "scripts/test-cloud-hypervisor.py",
+            "tools/cloud-hypervisor-profile.json",
+        ):
+            with self.subTest(path=path):
+                plan = test_changed.build_plan((PurePosixPath(path),), PACKAGES)
+                self.assertFalse(plan.full_reasons)
+                self.assertEqual(
+                    plan.python_tests, {"test_cloud_hypervisor_profile.py"}
+                )
+                self.assertEqual(plan.qemu_scenarios, set())
+
     def test_audit_policy_change_runs_audit_without_unknown_fallback(self) -> None:
         plan = test_changed.build_plan(
             (PurePosixPath("tools/rustsec-exceptions.json"),), PACKAGES

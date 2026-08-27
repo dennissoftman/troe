@@ -24,8 +24,14 @@ fn main(command: &mut CommandContext) -> u32 {
     };
 
     let mut retry = 0_usize;
+    let mut source_port = None;
     loop {
-        let delay = match synchronize(&mut datagram, &mut timer, &mut clock) {
+        let delay = match synchronize(
+            &mut datagram,
+            &mut timer,
+            &mut clock,
+            &mut source_port,
+        ) {
             Ok(()) => {
                 common::report(&mut command.stdout(), "timesync", b"clock synchronized");
                 retry = 0;
@@ -51,12 +57,14 @@ fn synchronize(
     datagram: &mut troe_kex_sdk::Datagram,
     timer: &mut Timer,
     clock: &mut troe_kex_sdk::ClockControl,
+    source_port: &mut Option<u16>,
 ) -> Result<(), ()> {
     let token = timer.now().map_err(|_| ())?.max(1);
     let request = request(token);
     let local_port = datagram
-        .send(None, NTP_SERVER, NTP_PORT, &request)
+        .send(*source_port, NTP_SERVER, NTP_PORT, &request)
         .map_err(|_| ())?;
+    *source_port = Some(local_port);
     let mut response = [0_u8; DATAGRAM_BUFFER_BYTES];
     let received = datagram
         .receive(local_port, &mut response)

@@ -62,13 +62,14 @@ firmware fails before device publication or volatile I/O.
    file length is governed by the provider format, media, and configured quota.
 5. Filesystem commands ask `Namespace` to canonicalize from the logical cwd.
    Immutable KEFS nodes and writable `/tmp` nodes share one object model.
-   The current recovery root keeps executables in `/bin`, bootstrap
-   configuration in `/etc`, architecture-independent package data in
-   producer-owned
-   `/share/<name>` directories, and persistent or mounted data under `/vol`.
-   KEX applications are statically linked, `/lib` is not present, and
-   executable code does not belong in `/share`. The recovery image's `/etc`
-   tree is bootstrap configuration, not a package-management interface.
+   The current recovery root keeps executables in `/bin`, recovery-only
+   bootstrap files in `/recovery`, architecture-independent package data in
+   producer-owned `/share/<name>` directories, and persistent or mounted data
+   under `/vol`. `/config` is the persistent desired-state mount point;
+   `/sys/config` is an immutable, bounded projection resolved for exactly one
+   active package generation. The system has no `/etc` directory or alias. KEX
+   applications are statically linked, `/lib` is not present, and executable
+   code does not belong in `/share`.
 6. The final output capability writes host bytes or the native UART.
    When validated GOP metadata is available, normal native shell output is also
    rendered into an owned fixed-glyph framebuffer console. UEFI text output is
@@ -375,6 +376,18 @@ PRGN-selected writable region, commits the entire single-file filesystem
 through TXSLOT, and attaches at `/vol/state`. The VFS mount records writable
 authority explicitly; ext4 and FAT mutate only through manifest-selected
 writable block-region capabilities.
+
+Stage 9 adds a hosted deployment control-plane reference above these native
+primitives. It consumes one complete PLOCK and active signed release per locked
+member, stages and independently verifies immutable generation objects, and
+publishes one pending/healthy pointer. Desired configuration persists outside
+generations while each generation owns an exact read-only `/sys/config`
+projection. Reversible data migrations retain canonical snapshots and roll back
+with failed health; forward-only data instead enters an explicit
+recovery-required state so predecessor code never runs over incompatible data.
+Reachability GC retains active, previous, recovery, and in-flight transaction
+roots. Native boot continues to consume CSPK/GMAN and SACT/TXSLOT rather than
+parsing hosted filesystem metadata. See [ADR 0044](adr/0044-transactional-system-lifecycle.md).
 
 The first network boundary is likewise split between safe protocol policy and
 machine transport. `troe-net` owns strict bounded Ethernet/ARP/IPv4/UDP parsing,

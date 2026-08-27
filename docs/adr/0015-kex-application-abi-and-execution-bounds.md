@@ -2,6 +2,11 @@
 
 Status: accepted and implemented, 2026-08-25.
 
+Supersession note, 2026-08-27: ADR 0037 replaces the foreground runner's
+1,024-resumption and ten-second total lifetime ceilings with supervisor-owned
+resident execution. The 50 ms maximum uninterrupted application lease and all
+local ABI, memory, message, wait, and teardown bounds remain in force.
+
 Implementation note, 2026-08-23: the portable parser, canonical virtual layout,
 startup-page encoder, and native owned-staging/validate/map/reclaim transaction
 are implemented. The native root maps only the supervisor image, devices, and

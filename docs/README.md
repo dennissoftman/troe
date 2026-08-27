@@ -15,6 +15,7 @@ contract.
 | Stage 9 production-usability work | [Stage 9 milestone](https://github.com/dennissoftman/troe/milestone/1) |
 | Test commands, selection rules, native entry contract, and IPC baseline | [Testing and verification](testing.md) |
 | Supported VM contracts and deployable raw artifacts | [Cloud platform support](cloud-platform-support.md) |
+| Exact Cloud Hypervisor v53 Linux/KVM target and runbook | [Cloud Hypervisor production target](cloud-hypervisor-production.md) |
 | Security boundary and reporting | [Security policy](../SECURITY.md) |
 | Contribution and merge expectations | [Contribution guide](../CONTRIBUTING.md) |
 | Core normative requirements | [Core specification](../CORE-SPEC.md) |
@@ -22,6 +23,9 @@ contract.
 | Resident applications and shell jobs | [ADR 0037](adr/0037-resident-kex-processes-and-jobs.md) |
 | Boot and on-demand service supervision | [ADR 0038](adr/0038-scfg-service-supervision.md) |
 | Wall-clock discipline and SNTP synchronization | [ADR 0039](adr/0039-wall-clock-and-sntp-service.md) |
+| Package-resolved directory authority | [ADR 0040](adr/0040-package-resolved-directory-capabilities.md) |
+| Desired and active configuration namespaces | [ADR 0043](adr/0043-desired-and-active-configuration.md) |
+| Transactional system lifecycle and migration | [ADR 0044](adr/0044-transactional-system-lifecycle.md) |
 
 The current serialized contracts are versioned independently under
 [`formats/`](formats):
@@ -34,7 +38,11 @@ The current serialized contracts are versioned independently under
   [volume table](formats/volume-table-v1.md), [PRGN](formats/prgn-v1.md), and
   [TXSLOT](formats/txslot-v1.md);
 - configuration and generations: [SCFG](formats/scfg-v1.md),
-  [SACT](formats/sact-v1.md), [CSPK](formats/cspk-v1.md), and
+  [SACT](formats/sact-v1.md), [CSPK](formats/cspk-v1.md),
+  [package model](formats/package-model-v1.md),
+  [package trust](formats/package-trust-v1.md), and
+  [configuration projection](formats/config-projection-v1.md),
+  [hosted system lifecycle](formats/system-lifecycle-v1.md),
   [GMAN](formats/gman-v1.md); and
 - identity and authorization metadata: [identity security v1](formats/identity-v1.md).
 

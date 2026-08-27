@@ -10375,8 +10375,8 @@ mod firmware {
         }
         let (mut namespace, root_mode) = compose_namespace(task.accounting, &mut console);
         let motd = namespace
-            .read_file("/", "/etc/motd")
-            .unwrap_or_else(|_| fatal(b"fatal: cannot read /etc/motd\n"));
+            .read_file("/", "/recovery/motd")
+            .unwrap_or_else(|_| fatal(b"fatal: cannot read /recovery/motd\n"));
         let initial_snapshot = machine_snapshot(task.accounting);
         let machine_control = task.capabilities.contains(Capabilities::MACHINE_CONTROL);
         let Ok(mut shell) =

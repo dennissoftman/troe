@@ -1,7 +1,9 @@
 # ADR 0016: VM platforms and the emulator role
 
 Status: accepted, 2026-08-24; cloud-first scope amendment and Phases A and B
-implemented for the named QEMU contracts, 2026-08-25.
+implemented for the named QEMU contracts, 2026-08-25; exact Cloud Hypervisor
+v53 production candidate and live harness added without an acceptance claim,
+2026-08-27.
 
 ## Context
 
@@ -128,6 +130,25 @@ bundle with separate mutable activation and state disks passes the complete
 boot, persistence, networking, lifecycle, and fault matrix on both exact
 discoverable QEMU environments. The machine-readable matrix records those two
 accepted claims and keeps KVM, AWS, and Azure unaccepted with explicit gaps.
+
+### Phase C production candidate
+
+The first non-QEMU candidate reuses only the discoverable
+`x86_64-uefi-virtio-pci` build platform and is separately named
+`cloud-hypervisor-kvm-v53`. It pins Cloud Hypervisor v53.0, its v53 control
+binary, Cloud Hypervisor edk2 firmware `ch-f308d878a6`, one vCPU, 128 MiB,
+one PCI segment, single-queue raw virtio-blk/virtio-net devices, an isolated
+static-address TAP, seccomp, Landlock, and three per-machine writable bundle
+clones. Its production-only harness rejects fixture identities and acceptance
+probes, then exercises rollback, process reopen, cold reboot, and corrupt
+StateFS recovery.
+
+The candidate remains `compatible-unverified`: host tests prove the pins,
+command, bundle policy, and fail-closed matrix state, but cannot prove the
+actual ACPI/SPCR/PCI/interrupt/reset inventory or KVM runtime. Only a reviewed
+live-KVM evidence record may remove those gaps and promote the row. The exact
+boundary and operator procedure are in
+[`cloud-hypervisor-production.md`](../cloud-hypervisor-production.md).
 
 ## Consequences
 
