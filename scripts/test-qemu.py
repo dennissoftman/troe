@@ -1066,6 +1066,19 @@ def run_shell_terminal_group(session: SerialSession, command_timeout: float) -> 
         max(command_timeout, 30.0),
         contains=("bounded command scripts", "16 KiB default working buffer"),
     )
+    session.command(
+        "ps",
+        cwd,
+        command_timeout,
+        contains=("PID ORIGIN STATE    CPU-MS PAGES HANDLES NAME", " ps\n"),
+    )
+    session.command(
+        "top 1",
+        cwd,
+        command_timeout,
+        raw_contains=(b"\x1b[2J\x1b[H",),
+        contains=("TROE top  uptime=", "processes=", " top\n"),
+    )
     session.command("help", cwd, command_timeout, contains=("help: unknown command",))
     session.backspace_command(
         "echo brokeX", "n", cwd, command_timeout, expected="\nbroken\n"

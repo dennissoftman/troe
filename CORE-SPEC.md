@@ -692,7 +692,10 @@ The MMU is initially used for safety and hardware correctness, not for virtual-m
 - no writable-plus-executable mappings after initialization;
 - no mapping of unusable or unowned physical memory.
 
-Demand paging, swapping, overcommit, and per-command address spaces are absent.
+Demand paging, swapping, and overcommit are absent. Each admitted KEX command
+uses a separate, eagerly populated address-space root with fixed-layout private
+image, startup, heap, guarded-stack, and page-table frames; KEX v1 makes no ASLR
+claim and defines no shared-memory mapping.
 
 ### 14.2 Mapping model
 
@@ -783,7 +786,12 @@ At Stage 5, `mem` and `/sys/memory` expose:
 - cache live and limit bytes (both zero in the current configuration);
 - current memory-pressure state;
 
-Page-table memory, allocated-frame totals, and reclamation counters are not
+The native process-observation interface additionally exposes at most 16 live
+application records with stable process identity, launch origin, lifecycle,
+charged unprivileged CPU ticks, retained page-table/private-page counts, live
+handle count, and bounded executable name. It MUST NOT expose argv, process
+memory, register contents, or control authority. Page-table memory is accounted
+per process; system-wide allocated-frame totals and reclamation counters are not
 separately exposed in the current observability contract.
 
 Debug builds SHOULD expose a boot log and invariant checks. Release builds MAY compile out verbose logging, but fatal diagnostics and resource counters SHOULD remain.

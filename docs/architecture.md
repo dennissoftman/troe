@@ -47,7 +47,7 @@ firmware fails before device publication or volatile I/O.
    privileged utility behavior. KEX receives bounded stdin/stdout/stderr streams
    plus only declared optional datagram, read-only VFS, streamed file mutation,
    monotonic timer, wall-clock observation or correction, diagnostics,
-   network-observation, DHCP, ICMP, or outbound TCP-connect handles. Privileged
+   process observation, network-observation, DHCP, ICMP, or outbound TCP-connect handles. Privileged
    wall-clock correction is service-launcher-only. The `sh.kex` interpreter
    alone requests a bounded
    shell-script sidecar: it transactionally stages physical command lines, exits,
@@ -266,15 +266,16 @@ exercise; destructive KEX payloads and malformed corpus cases are feature-gated
 and marker-rejected by the production EFI builder. See
 [ADR 0014](adr/0014-unprivileged-task-isolation-and-teardown.md).
 
-The first native Stage 7 boundary copies KEX bytes into bounded kernel staging
+The native Stage 7 boundary copies KEX bytes into bounded kernel staging
 and consumes the complete portable plan before allocating or mapping. It packs
-fresh physical image pages behind a separate table reservation, maps sparse
+fresh physical image pages beside a separate exact table allocation, maps sparse
 image virtual ranges with their closed R/RX/RW permissions, places the startup,
 heap, guards, and stack canonically, and keeps the root inactive. The root
 retains supervisor mappings for the kernel image, devices, and only the explicit
 boot-arena runtime ranges needed across an isolated transition; it does not copy
-the general free-RAM identity map. This keeps both backends within the standard
-512-page table ceiling. A provisional task receives only the
+the general free-RAM identity map. The kernel counts the exact four-level tables
+implied by the complete plan and allocates only those retained frames; both
+backends still enforce the standard 512-page ceiling. A provisional task receives only the
 loader-selected handle; boot acceptance then revokes it,
 reaps the record, zeroes every provisional frame, and verifies exact reuse.
 Malformed native corpus cases fail before frame allocation. Application entry
@@ -303,6 +304,16 @@ call; the allocator's 256 KiB quantum is only a batching floor for small
 requests. Expected physical-memory exhaustion leaves the mapping unchanged;
 no fixed lifetime heap-size policy is applied.
 
+ADR 0037 retains several foreground, background, and service applications in
+one bounded event loop. A single CPU executes only one ring-3/EL0 continuation
+at an instant, but timer preemption, yields, service calls, and typed waits let
+the resident set make concurrent progress. ADR 0045 adds a 16-record registry
+with stable process IDs, scheduler-paired ready/running/blocked/stopping states,
+exact retained-page counts, and high-resolution CPU ticks charged only around
+unprivileged execution. The `process-observe` capability exposes this bounded
+metadata to `ps.kex` and `top.kex`; it hides argv and grants neither memory
+inspection nor process control.
+
 The Stage 9 command slice installs one canonical package per command. Its KCAP
 manifest is validated from the same staged file before optional services are
 constructed, and its embedded KEX v1 executable is validated before mapping.
@@ -317,7 +328,7 @@ bounded by allocator ownership and resident-page limits. Standard streams themse
 forward without an aggregate byte cap. Optional interfaces
 expose only bounded IPv4/UDP send/receive, read-only VFS operations, one
 sequential streamed file mutation, a boot-relative monotonic timer, one immutable typed diagnostics
-   snapshot, read-only typed network observation, one DHCP exchange, one ICMP
+   snapshot, current read-only process accounting, read-only typed network observation, one DHCP exchange, one ICMP
    echo exchange, or one literal-IPv4 outbound TCP stream. Network observation,
    configuration, echo, datagrams, and TCP are independent authorities; none
    exposes raw frames, routes, DNS, TLS, or devices. Datagram

@@ -137,6 +137,10 @@ class KexToolTests(unittest.TestCase):
                         expected = [(5, 1, 0), (8, 1, 0), (18, 1, 0)]
                     elif command == "mem":
                         expected = [(9, 1, 0)]
+                    elif command == "ps":
+                        expected = [(19, 1, 0)]
+                    elif command == "top":
+                        expected = [(8, 1, 0), (19, 1, 0)]
                     elif command in {"arp", "net"}:
                         expected = [(10, 1, 0)]
                     elif command == "dhcp":

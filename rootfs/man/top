@@ -1,0 +1,10 @@
+NAME
+    top - refresh current application process accounting
+
+SYNOPSIS
+    top [COUNT]
+
+DESCRIPTION
+    Refreshes the bounded process snapshot once per second. COUNT limits the
+    number of snapshots; without it, top runs until Ctrl-C. CPU time includes
+    only charged unprivileged execution and excludes kernel service work.

@@ -8,7 +8,7 @@ use core::ptr;
 #[cfg(target_os = "uefi")]
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-#[cfg(target_os = "uefi")]
+#[cfg(any(test, target_os = "uefi"))]
 use troe_memory::MappingPlan;
 use troe_memory::{BASE_PAGE_SIZE, MappingPermissions, PhysicalRange, VirtualRange};
 #[cfg(any(test, target_os = "uefi"))]
@@ -934,6 +934,54 @@ pub fn build_user_address_space(
         region_count,
         stats,
     })
+}
+
+/// Count the exact 4-level base-page tables required by a mapping plan.
+///
+/// The count includes the root and one table for each distinct level prefix.
+/// Both supported architectures use 4 KiB granules, 512-entry tables, and the
+/// same 9/9/9/9 virtual-page partition for this initial boundary.
+///
+/// # Errors
+///
+/// Rejects an empty plan or checked address/accounting overflow.
+#[cfg(any(test, target_os = "uefi"))]
+pub fn required_page_table_pages(plan: &MappingPlan) -> Result<u64, MmuError> {
+    if plan.mappings().is_empty() {
+        return Err(MmuError::InvalidPlan);
+    }
+    let mut pages = 1_u64;
+    let mut last_level_0 = None;
+    let mut last_level_1 = None;
+    let mut last_level_2 = None;
+    for mapping in plan.mappings() {
+        for page in 0..mapping.virtual_range().page_count() {
+            let offset = page
+                .checked_mul(BASE_PAGE_SIZE)
+                .ok_or(MmuError::AddressUnsupported)?;
+            let address = mapping
+                .virtual_range()
+                .start()
+                .checked_add(offset)
+                .ok_or(MmuError::AddressUnsupported)?;
+            let level_0 = (address >> 39) & 0x1ff;
+            let level_1 = (level_0, (address >> 30) & 0x1ff);
+            let level_2 = (level_1.0, level_1.1, (address >> 21) & 0x1ff);
+            if last_level_0 != Some(level_0) {
+                pages = pages.checked_add(1).ok_or(MmuError::InvalidPlan)?;
+                last_level_0 = Some(level_0);
+            }
+            if last_level_1 != Some(level_1) {
+                pages = pages.checked_add(1).ok_or(MmuError::InvalidPlan)?;
+                last_level_1 = Some(level_1);
+            }
+            if last_level_2 != Some(level_2) {
+                pages = pages.checked_add(1).ok_or(MmuError::InvalidPlan)?;
+                last_level_2 = Some(level_2);
+            }
+        }
+    }
+    Ok(pages)
 }
 
 #[cfg(target_os = "uefi")]
@@ -3869,6 +3917,9 @@ mod tests {
     };
     use std::vec;
     use std::vec::Vec;
+    use troe_memory::{
+        Mapping, MappingLifetime, MappingOwner, MappingPlan, PhysicalRange, VirtualRange,
+    };
     use troe_memory::{MappingMemoryType, MappingPermissions, MappingPrivilege};
 
     fn image_with_sections(sections: &[(u32, u32, u32)]) -> Vec<u8> {
@@ -3890,6 +3941,34 @@ mod tests {
             image[header + 36..header + 40].copy_from_slice(&characteristics.to_le_bytes());
         }
         image
+    }
+
+    #[test]
+    fn exact_page_table_count_tracks_distinct_four_level_prefixes() {
+        let mapping = |virtual_start, physical_start, page_count| {
+            Mapping::new(
+                VirtualRange::from_pages(virtual_start, page_count)
+                    .unwrap_or_else(|_| std::process::abort()),
+                PhysicalRange::from_pages(physical_start, page_count)
+                    .unwrap_or_else(|_| std::process::abort()),
+                MappingPermissions::READ_ONLY,
+                MappingMemoryType::Normal,
+                MappingOwner::KernelRuntime,
+                MappingLifetime::Kernel,
+                false,
+            )
+            .unwrap_or_else(|_| std::process::abort())
+        };
+        let mut plan = MappingPlan::new();
+        plan.insert(mapping(0x0000_4000_0000_0000, 0x1000, 2))
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(super::required_page_table_pages(&plan), Ok(4));
+        plan.insert(mapping(0x0000_4000_0020_0000, 0x3000, 1))
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(super::required_page_table_pages(&plan), Ok(5));
+        plan.insert(mapping(0xffff_8000_0000_0000, 0x4000, 1))
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(super::required_page_table_pages(&plan), Ok(8));
     }
 
     #[test]

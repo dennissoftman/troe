@@ -81,13 +81,13 @@ and standard-policy arithmetic before allocating or mapping application memory.
 | Mapped image pages | 8,192 |
 | Stack pages | 4–256 |
 | Heap pages | 0–4,096 |
-| Initial page-table reservation | 512 pages |
+| Initial page-table ceiling | 512 pages |
 | Initial resident admission | 16,384 pages |
 
 The preliminary portable plan charges exact image, startup, initial heap, and
-stack pages plus the standard initial page-table reservation. Native launch
-construction may refine that reservation downward but may not exceed either
-initial admission bound. ABI 1.1 runtime heap and supplemental page-table
+stack pages plus the conservative table ceiling for format admission. Native
+launch counts and retains the exact tables implied by the complete mapping plan
+and may not exceed either initial admission bound. ABI 1.1 runtime heap and supplemental page-table
 commits are outside those launch bounds and are limited by available physical
 memory and the remaining user virtual range.
 

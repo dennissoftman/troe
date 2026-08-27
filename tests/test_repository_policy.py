@@ -147,6 +147,7 @@ class RepositoryPolicyTests(unittest.TestCase):
             "net",
             "ping",
             "printf",
+            "ps",
             "pwd",
             "rm",
             "sed",
@@ -155,6 +156,7 @@ class RepositoryPolicyTests(unittest.TestCase):
             "tar",
             "tcp",
             "timesync",
+            "top",
             "udp",
             "wc",
         }

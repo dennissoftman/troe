@@ -256,7 +256,7 @@ separately bounded and is released before entry.
 | Initial stack pages | 4–256 |
 | Initially mapped heap pages | 0–4,096 (0–16 MiB) |
 | Runtime heap commit | available physical frames; no fixed lifetime byte cap |
-| Initial application page-table reservation | 512 pages; grows with mappings |
+| Initial application page-table ceiling | 512 pages; exact retained allocation grows with mappings |
 | Initial resident-page admission | 16,384 (64 MiB) |
 | Initial handles | 32 |
 

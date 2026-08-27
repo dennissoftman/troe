@@ -27,7 +27,8 @@ dispatch.
 ## Decision
 
 An isolated KEX launch becomes a resident process retained in a bounded process
-table. `TaskId` remains its monotonic kernel identity. One resident slot owns the
+table. `TaskId` remains its monotonic scheduler identity; ADR 0045 adds a
+separate stable `ProcessId` for observation. One resident slot owns the
 complete launch transaction after commit:
 
 - fresh-entry metadata or one opaque resumable `ApplicationSession`;
@@ -79,8 +80,8 @@ increment accepts it only for one command stage; concurrent pipelines require a
 separate bounded stream-ring and backpressure decision because current pipelines
 are intentionally sequential. Shell-owned `jobs`, `log`, `kill`, `wait`, and
 `fg` commands operate only on the launching session's stable job numbers.
-Process-wide observation and termination remain a later typed-capability design;
-there is no ambient PID namespace or executable-name search.
+ADR 0045 adds capability-scoped process-wide observation without termination.
+There is no ambient PID namespace or executable-name search.
 
 ### Cancellation and termination
 

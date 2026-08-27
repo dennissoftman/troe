@@ -89,6 +89,9 @@ pub trait CooperativeRuntime: fmt::Debug {
 /// Maximum number of live or unreaped cooperative task records.
 pub const MAX_TASKS: usize = 16;
 
+/// Maximum UTF-8 bytes retained for one observable process name.
+pub const MAX_PROCESS_NAME_BYTES: usize = 32;
+
 /// Opaque identity allocated monotonically for one task lifetime.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct TaskId(u32);
@@ -98,6 +101,466 @@ impl TaskId {
     #[must_use]
     pub const fn get(self) -> u32 {
         self.0
+    }
+}
+
+/// Monotonic, non-reused identity for one application-process lifetime.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ProcessId(u64);
+
+impl ProcessId {
+    /// Numeric diagnostic identity.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Launcher-owned placement of one observable application process.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessOrigin {
+    /// Command attached to the shell's foreground terminal.
+    Foreground,
+    /// Session-owned background command.
+    Background,
+    /// Supervised system service.
+    Service,
+}
+
+/// Observable lifecycle state independent of scheduler implementation details.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessState {
+    /// Eligible for a future application execution slice.
+    Ready,
+    /// Currently executing at the unprivileged level.
+    Running,
+    /// Waiting for one typed completion.
+    Blocked,
+    /// Cancellation has been requested and teardown is pending.
+    Stopping,
+}
+
+/// Bounded UTF-8 executable name retained without command arguments.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessName {
+    bytes: [u8; MAX_PROCESS_NAME_BYTES],
+    len: u8,
+}
+
+impl ProcessName {
+    /// Copy one nonempty bounded UTF-8 name.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an empty name or one above [`MAX_PROCESS_NAME_BYTES`].
+    pub fn new(name: &str) -> Result<Self, ProcessError> {
+        if name.is_empty() || name.len() > MAX_PROCESS_NAME_BYTES {
+            return Err(ProcessError::InvalidName);
+        }
+        let mut bytes = [0_u8; MAX_PROCESS_NAME_BYTES];
+        bytes[..name.len()].copy_from_slice(name.as_bytes());
+        Ok(Self {
+            bytes,
+            len: u8::try_from(name.len()).map_err(|_| ProcessError::InvalidName)?,
+        })
+    }
+
+    /// Borrow the validated UTF-8 name.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.bytes[..usize::from(self.len)]).unwrap_or("invalid-process-name")
+    }
+}
+
+/// Immutable process metadata suitable for capability-scoped observation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessSnapshot {
+    id: ProcessId,
+    task_id: TaskId,
+    name: ProcessName,
+    origin: ProcessOrigin,
+    state: ProcessState,
+    started_millis: u64,
+    cpu_ticks: u64,
+    table_pages: u64,
+    private_pages: u64,
+    handles: u16,
+    dispatches: u32,
+    yields: u32,
+    preemptions: u32,
+}
+
+impl ProcessSnapshot {
+    /// Stable process identity.
+    #[must_use]
+    pub const fn id(self) -> ProcessId {
+        self.id
+    }
+
+    /// Internal scheduler identity retained for diagnostics.
+    #[must_use]
+    pub const fn task_id(self) -> TaskId {
+        self.task_id
+    }
+
+    /// Executable name without arguments.
+    #[must_use]
+    pub const fn name(self) -> ProcessName {
+        self.name
+    }
+
+    /// Launch placement.
+    #[must_use]
+    pub const fn origin(self) -> ProcessOrigin {
+        self.origin
+    }
+
+    /// Current lifecycle state.
+    #[must_use]
+    pub const fn state(self) -> ProcessState {
+        self.state
+    }
+
+    /// Boot-relative launch time.
+    #[must_use]
+    pub const fn started_millis(self) -> u64 {
+        self.started_millis
+    }
+
+    /// High-resolution execution ticks charged only around user entry.
+    #[must_use]
+    pub const fn cpu_ticks(self) -> u64 {
+        self.cpu_ticks
+    }
+
+    /// Retained page-table pages.
+    #[must_use]
+    pub const fn table_pages(self) -> u64 {
+        self.table_pages
+    }
+
+    /// Retained private image, startup, heap, and stack pages.
+    #[must_use]
+    pub const fn private_pages(self) -> u64 {
+        self.private_pages
+    }
+
+    /// Total retained application pages.
+    #[must_use]
+    pub const fn resident_pages(self) -> u64 {
+        self.table_pages.saturating_add(self.private_pages)
+    }
+
+    /// Live generation-checked handles owned by the process.
+    #[must_use]
+    pub const fn handles(self) -> u16 {
+        self.handles
+    }
+
+    /// Scheduler dispatch selections.
+    #[must_use]
+    pub const fn dispatches(self) -> u32 {
+        self.dispatches
+    }
+
+    /// Voluntary yields.
+    #[must_use]
+    pub const fn yields(self) -> u32 {
+        self.yields
+    }
+
+    /// Timer-driven resumable preemptions.
+    #[must_use]
+    pub const fn preemptions(self) -> u32 {
+        self.preemptions
+    }
+}
+
+/// Process-table registration values supplied after transactional launch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProcessRegistration {
+    /// Scheduler task backing the process.
+    pub task_id: TaskId,
+    /// Executable name without arguments.
+    pub name: ProcessName,
+    /// Launcher placement.
+    pub origin: ProcessOrigin,
+    /// Boot-relative launch time.
+    pub started_millis: u64,
+    /// Initially retained page-table pages.
+    pub table_pages: u64,
+    /// Initially retained private pages.
+    pub private_pages: u64,
+    /// Initially granted handles.
+    pub handles: u16,
+}
+
+/// Bounded process-registry failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProcessError {
+    /// Configured capacity is zero or above [`MAX_TASKS`].
+    InvalidCapacity,
+    /// Process metadata could not be reserved.
+    MetadataExhausted,
+    /// The process table is full.
+    CapacityExhausted,
+    /// The monotonic identity space is exhausted.
+    IdentityExhausted,
+    /// The supplied name is empty or too long.
+    InvalidName,
+    /// The process identity is unknown.
+    UnknownProcess,
+    /// A task already backs another registered process.
+    TaskInUse,
+    /// The requested lifecycle transition is invalid.
+    InvalidState,
+    /// A checked counter overflowed.
+    AccountingOverflow,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProcessRecord {
+    snapshot: ProcessSnapshot,
+}
+
+/// Bounded registry shared by foreground commands, background jobs, and services.
+#[derive(Debug)]
+pub struct ProcessTable {
+    records: Vec<ProcessRecord>,
+    capacity: usize,
+    next_id: u64,
+}
+
+impl ProcessTable {
+    /// Create a registry with one immutable record bound.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid capacity or metadata reservation failure.
+    pub fn new(capacity: usize) -> Result<Self, ProcessError> {
+        if capacity == 0 || capacity > MAX_TASKS {
+            return Err(ProcessError::InvalidCapacity);
+        }
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(capacity)
+            .map_err(|_| ProcessError::MetadataExhausted)?;
+        Ok(Self {
+            records,
+            capacity,
+            next_id: 1,
+        })
+    }
+
+    /// Register one successfully spawned application task.
+    ///
+    /// # Errors
+    ///
+    /// Rejects exhausted identity/record capacity, duplicate tasks, invalid
+    /// resources, or invalid names.
+    pub fn register(
+        &mut self,
+        registration: ProcessRegistration,
+    ) -> Result<ProcessId, ProcessError> {
+        if self.records.len() == self.capacity {
+            return Err(ProcessError::CapacityExhausted);
+        }
+        if self
+            .records
+            .iter()
+            .any(|record| record.snapshot.task_id == registration.task_id)
+        {
+            return Err(ProcessError::TaskInUse);
+        }
+        if registration.table_pages == 0 || registration.private_pages == 0 {
+            return Err(ProcessError::InvalidState);
+        }
+        let id = ProcessId(self.next_id);
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .ok_or(ProcessError::IdentityExhausted)?;
+        self.records.push(ProcessRecord {
+            snapshot: ProcessSnapshot {
+                id,
+                task_id: registration.task_id,
+                name: registration.name,
+                origin: registration.origin,
+                state: ProcessState::Ready,
+                started_millis: registration.started_millis,
+                cpu_ticks: 0,
+                table_pages: registration.table_pages,
+                private_pages: registration.private_pages,
+                handles: registration.handles,
+                dispatches: 0,
+                yields: 0,
+                preemptions: 0,
+            },
+        });
+        Ok(id)
+    }
+
+    /// Mark one ready process as executing.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unknown process, invalid state, or counter overflow.
+    pub fn dispatch(&mut self, id: ProcessId) -> Result<(), ProcessError> {
+        let record = self.record_mut(id)?;
+        if record.snapshot.state != ProcessState::Ready {
+            return Err(ProcessError::InvalidState);
+        }
+        record.snapshot.dispatches = record
+            .snapshot
+            .dispatches
+            .checked_add(1)
+            .ok_or(ProcessError::AccountingOverflow)?;
+        record.snapshot.state = ProcessState::Running;
+        Ok(())
+    }
+
+    /// Charge ticks spent inside one unprivileged execution boundary.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unknown/non-running process or counter overflow.
+    pub fn charge_cpu(&mut self, id: ProcessId, ticks: u64) -> Result<(), ProcessError> {
+        let record = self.record_mut(id)?;
+        if record.snapshot.state != ProcessState::Running {
+            return Err(ProcessError::InvalidState);
+        }
+        record.snapshot.cpu_ticks = record
+            .snapshot
+            .cpu_ticks
+            .checked_add(ticks)
+            .ok_or(ProcessError::AccountingOverflow)?;
+        Ok(())
+    }
+
+    /// Record a voluntary yield and return the process to ready state.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unknown/non-running process or counter overflow.
+    pub fn yielded(&mut self, id: ProcessId) -> Result<(), ProcessError> {
+        let record = self.record_mut(id)?;
+        if record.snapshot.state != ProcessState::Running {
+            return Err(ProcessError::InvalidState);
+        }
+        record.snapshot.yields = record
+            .snapshot
+            .yields
+            .checked_add(1)
+            .ok_or(ProcessError::AccountingOverflow)?;
+        record.snapshot.state = ProcessState::Ready;
+        Ok(())
+    }
+
+    /// Record timer preemption and return the process to ready state.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unknown/non-running process or counter overflow.
+    pub fn preempted(&mut self, id: ProcessId) -> Result<(), ProcessError> {
+        let record = self.record_mut(id)?;
+        if record.snapshot.state != ProcessState::Running {
+            return Err(ProcessError::InvalidState);
+        }
+        record.snapshot.preemptions = record
+            .snapshot
+            .preemptions
+            .checked_add(1)
+            .ok_or(ProcessError::AccountingOverflow)?;
+        record.snapshot.state = ProcessState::Ready;
+        Ok(())
+    }
+
+    /// Retain a typed wait for the running process.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unknown or non-running process.
+    pub fn blocked(&mut self, id: ProcessId) -> Result<(), ProcessError> {
+        let record = self.record_mut(id)?;
+        if record.snapshot.state != ProcessState::Running {
+            return Err(ProcessError::InvalidState);
+        }
+        record.snapshot.state = ProcessState::Blocked;
+        Ok(())
+    }
+
+    /// Publish completion of one retained typed wait.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unknown or non-blocked process.
+    pub fn woke(&mut self, id: ProcessId) -> Result<(), ProcessError> {
+        let record = self.record_mut(id)?;
+        if record.snapshot.state != ProcessState::Blocked {
+            return Err(ProcessError::InvalidState);
+        }
+        record.snapshot.state = ProcessState::Ready;
+        Ok(())
+    }
+
+    /// Mark cancellation without granting process-control authority to observers.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unknown process.
+    pub fn stopping(&mut self, id: ProcessId) -> Result<(), ProcessError> {
+        let record = self.record_mut(id)?;
+        record.snapshot.state = ProcessState::Stopping;
+        Ok(())
+    }
+
+    /// Replace retained resource accounting after committed heap growth.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unknown process or zero resource counts.
+    pub fn update_resources(
+        &mut self,
+        id: ProcessId,
+        table_pages: u64,
+        private_pages: u64,
+        handles: u16,
+    ) -> Result<(), ProcessError> {
+        if table_pages == 0 || private_pages == 0 {
+            return Err(ProcessError::InvalidState);
+        }
+        let record = self.record_mut(id)?;
+        record.snapshot.table_pages = table_pages;
+        record.snapshot.private_pages = private_pages;
+        record.snapshot.handles = handles;
+        Ok(())
+    }
+
+    /// Remove one process after scheduler reaping and authority revocation.
+    ///
+    /// # Errors
+    ///
+    /// Rejects an unknown process identity.
+    pub fn remove(&mut self, id: ProcessId) -> Result<ProcessSnapshot, ProcessError> {
+        let index = self
+            .records
+            .iter()
+            .position(|record| record.snapshot.id == id)
+            .ok_or(ProcessError::UnknownProcess)?;
+        Ok(self.records.remove(index).snapshot)
+    }
+
+    /// Iterate over a stable borrow of current records in registration order.
+    #[must_use]
+    pub fn snapshots(&self) -> impl ExactSizeIterator<Item = ProcessSnapshot> + '_ {
+        self.records.iter().map(|record| record.snapshot)
+    }
+
+    fn record_mut(&mut self, id: ProcessId) -> Result<&mut ProcessRecord, ProcessError> {
+        self.records
+            .iter_mut()
+            .find(|record| record.snapshot.id == id)
+            .ok_or(ProcessError::UnknownProcess)
     }
 }
 
@@ -1073,10 +1536,13 @@ impl Scheduler {
 
 #[cfg(test)]
 mod tests {
+    use alloc::vec::Vec;
+
     use super::{
         Cancelled, Capabilities, CooperativeRuntime, IsolationResource, MAX_TASKS, MonotonicMillis,
-        PendingCallSnapshot, PendingCallState, PendingCallTable, Scheduler, StackResource,
-        TaskError, TaskFault, TaskSnapshot, TaskState, TeardownError, WaitObservation,
+        PendingCallSnapshot, PendingCallState, PendingCallTable, ProcessError, ProcessName,
+        ProcessOrigin, ProcessRegistration, ProcessState, ProcessTable, Scheduler, StackResource,
+        TaskError, TaskFault, TaskId, TaskSnapshot, TaskState, TeardownError, WaitObservation,
         WaitRegistration, WaitSpec, WaitTable, WakeInterest, WakeReason,
     };
 
@@ -1600,6 +2066,110 @@ mod tests {
         let reaped = scheduler.reap(first)?;
         assert_eq!(reaped.exit_status, 9);
         assert_eq!(reaped.isolation, Some(resource));
+        Ok(())
+    }
+
+    #[test]
+    fn unified_process_table_tracks_all_origins_and_exact_accounting() -> Result<(), ProcessError> {
+        let mut processes = ProcessTable::new(3)?;
+        let foreground = processes.register(ProcessRegistration {
+            task_id: TaskId(7),
+            name: ProcessName::new("top")?,
+            origin: ProcessOrigin::Foreground,
+            started_millis: 100,
+            table_pages: 9,
+            private_pages: 12,
+            handles: 6,
+        })?;
+        let background = processes.register(ProcessRegistration {
+            task_id: TaskId(8),
+            name: ProcessName::new("sleep")?,
+            origin: ProcessOrigin::Background,
+            started_millis: 101,
+            table_pages: 7,
+            private_pages: 8,
+            handles: 5,
+        })?;
+        let service = processes.register(ProcessRegistration {
+            task_id: TaskId(9),
+            name: ProcessName::new("timesync")?,
+            origin: ProcessOrigin::Service,
+            started_millis: 102,
+            table_pages: 8,
+            private_pages: 10,
+            handles: 7,
+        })?;
+        assert_eq!(foreground.get(), 1);
+        assert_eq!(background.get(), 2);
+        assert_eq!(service.get(), 3);
+
+        processes.dispatch(foreground)?;
+        processes.charge_cpu(foreground, 41)?;
+        processes.preempted(foreground)?;
+        processes.dispatch(foreground)?;
+        processes.charge_cpu(foreground, 1)?;
+        processes.yielded(foreground)?;
+        processes.dispatch(background)?;
+        processes.blocked(background)?;
+        processes.update_resources(service, 11, 18, 9)?;
+
+        let snapshots = processes.snapshots().collect::<Vec<_>>();
+        assert_eq!(snapshots.len(), 3);
+        assert_eq!(snapshots[0].origin(), ProcessOrigin::Foreground);
+        assert_eq!(snapshots[0].state(), ProcessState::Ready);
+        assert_eq!(snapshots[0].cpu_ticks(), 42);
+        assert_eq!(snapshots[0].dispatches(), 2);
+        assert_eq!(snapshots[0].yields(), 1);
+        assert_eq!(snapshots[0].preemptions(), 1);
+        assert_eq!(snapshots[1].state(), ProcessState::Blocked);
+        assert_eq!(snapshots[2].resident_pages(), 29);
+        assert_eq!(snapshots[2].handles(), 9);
+
+        processes.woke(background)?;
+        processes.stopping(background)?;
+        assert_eq!(
+            processes
+                .snapshots()
+                .nth(1)
+                .map(super::ProcessSnapshot::state),
+            Some(ProcessState::Stopping)
+        );
+        assert_eq!(processes.remove(background)?.name().as_str(), "sleep");
+        assert_eq!(processes.snapshots().len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn process_table_rejects_stale_duplicate_and_excess_records() -> Result<(), ProcessError> {
+        assert_eq!(
+            ProcessTable::new(0).err(),
+            Some(ProcessError::InvalidCapacity)
+        );
+        assert_eq!(ProcessName::new(""), Err(ProcessError::InvalidName));
+        assert_eq!(
+            ProcessName::new("123456789012345678901234567890123"),
+            Err(ProcessError::InvalidName)
+        );
+        let mut processes = ProcessTable::new(1)?;
+        let registration = ProcessRegistration {
+            task_id: TaskId(1),
+            name: ProcessName::new("ps")?,
+            origin: ProcessOrigin::Foreground,
+            started_millis: 1,
+            table_pages: 1,
+            private_pages: 1,
+            handles: 1,
+        };
+        let id = processes.register(registration)?;
+        assert_eq!(
+            processes.register(registration),
+            Err(ProcessError::CapacityExhausted)
+        );
+        assert_eq!(processes.woke(id), Err(ProcessError::InvalidState));
+        processes.remove(id)?;
+        assert_eq!(processes.dispatch(id), Err(ProcessError::UnknownProcess));
+        let next = processes.register(registration)?;
+        assert!(next.get() > id.get());
         Ok(())
     }
 }
