@@ -13,7 +13,7 @@ use core::{
 use troe_kex_alloc::Heap;
 use troe_kex_sdk::{
     CommandContext, INVOCATION_BUFFER_BYTES, ReadOnlyFilesystem, StandardInput, StandardOutput,
-    command, entry, exit, filesystem,
+    Timer, command, entry, exit, filesystem,
 };
 
 const LUA_VERSION: &[u8] = b"Lua 5.5.1  Copyright (C) 1994-2026 Lua.org, PUC-Rio\n";
@@ -22,6 +22,7 @@ const LUA_SUCCESS: i32 = 0;
 const LUA_SOURCE_FAILURE: i32 = 2;
 const LUA_OUTPUT_FAILURE: i32 = 3;
 const LUA_OUT_OF_MEMORY: i32 = 4;
+const LUA_REQUESTED_EXIT: i32 = 5;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -42,6 +43,7 @@ struct LuaHost {
     read: unsafe extern "C" fn(*mut c_void, *mut u8, usize) -> isize,
     write: unsafe extern "C" fn(*mut c_void, i32, *const u8, usize) -> i32,
     yield_now: unsafe extern "C" fn(*mut c_void) -> i32,
+    monotonic_millis: unsafe extern "C" fn(*mut c_void, *mut u64) -> i32,
 }
 
 #[repr(C)]
@@ -51,6 +53,9 @@ struct LuaConfiguration {
     source_name_length: usize,
     arguments: *const LuaArgument,
     argument_count: usize,
+    requested_exit: i32,
+    requested_exit_status: u32,
+    requested_exit_close: i32,
 }
 
 unsafe extern "C" {
@@ -112,6 +117,8 @@ struct Runtime<'invocation> {
     source: Source<'invocation>,
     stdout: StandardOutput,
     stderr: StandardOutput,
+    timer: Timer,
+    clock_start_millis: u64,
 }
 
 enum Selection<'invocation> {
@@ -225,6 +232,22 @@ fn run(command: &mut CommandContext) -> u32 {
         );
         return exit::FAILURE;
     };
+    let Ok(mut timer) = command.timer() else {
+        common::report(
+            &mut command.stderr(),
+            "lua",
+            b"timer capability is unavailable",
+        );
+        return exit::DENIED;
+    };
+    let Ok(clock_start_millis) = timer.now() else {
+        common::report(
+            &mut command.stderr(),
+            "lua",
+            b"timer service is unavailable",
+        );
+        return exit::FAILURE;
+    };
 
     let mut source_name_storage = [0_u8; filesystem::MAX_PATH_BYTES + 1];
     let mut stderr = command.stderr();
@@ -296,6 +319,8 @@ fn run(command: &mut CommandContext) -> u32 {
         source,
         stdout: command.stdout(),
         stderr,
+        timer,
+        clock_start_millis,
     };
     let mut host = LuaHost {
         context: ptr::from_mut(&mut runtime).cast(),
@@ -303,6 +328,7 @@ fn run(command: &mut CommandContext) -> u32 {
         read: lua_read,
         write: lua_write,
         yield_now: lua_yield,
+        monotonic_millis: lua_monotonic_millis,
     };
     let mut configuration = LuaConfiguration {
         host: ptr::from_mut(&mut host),
@@ -310,6 +336,9 @@ fn run(command: &mut CommandContext) -> u32 {
         source_name_length: source_name.len(),
         arguments: arguments.as_ptr(),
         argument_count,
+        requested_exit: 0,
+        requested_exit_status: exit::SUCCESS,
+        requested_exit_close: 0,
     };
     // SAFETY: The C runtime is linked into this image. All pointed-to values
     // remain live and uniquely borrowed for the synchronous call, and every
@@ -317,7 +346,11 @@ fn run(command: &mut CommandContext) -> u32 {
     let result = unsafe { troe_lua_run(ptr::from_mut(&mut configuration)) };
     let close_failed = runtime.source.close().is_err();
     let leaked_bytes = runtime.heap.statistics().live_bytes;
-    if leaked_bytes != 0 {
+    // `os.exit(_, false)` intentionally abandons Lua allocations; KEX process
+    // teardown reclaims the complete application heap without running closers.
+    let intentionally_unclosed =
+        result == LUA_REQUESTED_EXIT && configuration.requested_exit_close == 0;
+    if leaked_bytes != 0 && !intentionally_unclosed {
         common::report(
             &mut runtime.stderr,
             "lua",
@@ -336,6 +369,7 @@ fn run(command: &mut CommandContext) -> u32 {
             common::report(&mut runtime.stderr, "lua", b"memory exhausted");
             exit::FAILURE
         }
+        LUA_REQUESTED_EXIT => configuration.requested_exit_status,
         _ => exit::FAILURE,
     }
 }
@@ -435,6 +469,24 @@ unsafe extern "C" fn lua_yield(_context: *mut c_void) -> i32 {
     } else {
         -1
     }
+}
+
+unsafe extern "C" fn lua_monotonic_millis(context: *mut c_void, result: *mut u64) -> i32 {
+    // SAFETY: See `lua_allocate`; the C shim supplies one writable result slot.
+    let (Some(runtime), Some(mut result)) = (
+        unsafe { (context.cast::<Runtime<'_>>()).as_mut() },
+        NonNull::new(result),
+    ) else {
+        return -1;
+    };
+    let Ok(now) = runtime.timer.now() else {
+        return -1;
+    };
+    // SAFETY: The callback contract provides one writable `u64` result slot.
+    unsafe {
+        *result.as_mut() = now.saturating_sub(runtime.clock_start_millis);
+    }
+    0
 }
 
 #[unsafe(no_mangle)]

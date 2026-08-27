@@ -122,12 +122,13 @@ class KexToolTests(unittest.TestCase):
                         "grep",
                         "hexdump",
                         "ls",
-                        "lua",
                         "man",
                         "sed",
                         "wc",
                     }:
                         expected = [(6, 1, 2)]
+                    elif command == "lua":
+                        expected = [(6, 1, 2), (8, 1, 0)]
                     elif command in {"ln", "rm"}:
                         expected = [(7, 2, 0)]
                     elif command == "sleep":

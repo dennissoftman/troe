@@ -1,6 +1,7 @@
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <setjmp.h>
 #include <ctype.h>
 #include <locale.h>
 #include <stdio.h>
@@ -59,6 +60,7 @@ typedef intptr_t (*TroeRead)(void *context, uint8_t *destination,
 typedef int (*TroeWrite)(void *context, int stream, const uint8_t *bytes,
                          size_t length);
 typedef int (*TroeYield)(void *context);
+typedef int (*TroeMonotonicMillis)(void *context, uint64_t *result);
 
 struct TroeLuaHost {
   void *context;
@@ -66,6 +68,7 @@ struct TroeLuaHost {
   TroeRead read;
   TroeWrite write;
   TroeYield yield_now;
+  TroeMonotonicMillis monotonic_millis;
 };
 
 typedef struct TroeLuaArgument {
@@ -79,6 +82,9 @@ typedef struct TroeLuaConfiguration {
   size_t source_name_length;
   const TroeLuaArgument *arguments;
   size_t argument_count;
+  int requested_exit;
+  uint32_t requested_exit_status;
+  int requested_exit_close;
 } TroeLuaConfiguration;
 
 extern int troe_parse_decimal(const uint8_t *bytes, size_t length,
@@ -505,6 +511,8 @@ int fprintf(FILE *file, const char *format, ...) {
 static TroeLuaHost *troe_active_host;
 static TroeLuaConfiguration *troe_active_configuration;
 static int troe_output_failed;
+static jmp_buf troe_unclosed_exit_jump;
+static int troe_exit_jump_active;
 
 static void troe_write_bytes(int stream, const char *bytes, size_t length) {
   if (length != 0 &&
@@ -581,6 +589,7 @@ static void troe_write_error(const char *format, const char *argument) {
 #include "lstrlib.c"
 #include "ltablib.c"
 #include "lutf8lib.c"
+#include "troe_os_shim.c"
 
 typedef struct TroeReader {
   TroeLuaHost *host;
@@ -624,6 +633,7 @@ static int troe_configure_state(lua_State *state) {
   troe_require(state, LUA_STRLIBNAME, luaopen_string);
   troe_require(state, LUA_MATHLIBNAME, luaopen_math);
   troe_require(state, LUA_UTF8LIBNAME, luaopen_utf8);
+  troe_require(state, LUA_OSLIBNAME, troe_luaopen_os);
 
   lua_createtable(state, (int)configuration->argument_count, 0);
   for (size_t index = 0; index < configuration->argument_count; ++index) {
@@ -657,7 +667,8 @@ enum {
   TROE_LUA_FAILURE = 1,
   TROE_LUA_SOURCE_FAILURE = 2,
   TROE_LUA_OUTPUT_FAILURE = 3,
-  TROE_LUA_OUT_OF_MEMORY = 4
+  TROE_LUA_OUT_OF_MEMORY = 4,
+  TROE_LUA_REQUESTED_EXIT = 5
 };
 
 int troe_lua_run(TroeLuaConfiguration *configuration) {
@@ -676,12 +687,21 @@ int troe_lua_run(TroeLuaConfiguration *configuration) {
     troe_active_host = NULL;
     return TROE_LUA_OUT_OF_MEMORY;
   }
+  troe_exit_jump_active = 1;
+  if (setjmp(troe_unclosed_exit_jump) != 0) {
+    /* os.exit(_, false) abandons this state exactly as process exit would. */
+    troe_exit_jump_active = 0;
+    troe_active_configuration = NULL;
+    troe_active_host = NULL;
+    return TROE_LUA_REQUESTED_EXIT;
+  }
   lua_sethook(state, troe_instruction_hook, LUA_MASKCOUNT, 2048);
 
   lua_pushcfunction(state, troe_configure_state);
   status = lua_pcall(state, 0, 0, 0);
   if (status != LUA_OK) {
     troe_report_lua_error(state);
+    troe_exit_jump_active = 0;
     lua_close(state);
     troe_active_configuration = NULL;
     troe_active_host = NULL;
@@ -699,6 +719,7 @@ int troe_lua_run(TroeLuaConfiguration *configuration) {
     if (status != LUA_OK)
       lua_pop(state, 1);
     troe_write_bytes(2, "lua: source read failed\n", 24);
+    troe_exit_jump_active = 0;
     lua_close(state);
     troe_active_configuration = NULL;
     troe_active_host = NULL;
@@ -707,6 +728,7 @@ int troe_lua_run(TroeLuaConfiguration *configuration) {
   }
   if (status != LUA_OK) {
     troe_report_lua_error(state);
+    troe_exit_jump_active = 0;
     lua_close(state);
     troe_active_configuration = NULL;
     troe_active_host = NULL;
@@ -717,9 +739,19 @@ int troe_lua_run(TroeLuaConfiguration *configuration) {
   lua_insert(state, -2);
   handler = lua_gettop(state) - 1;
   status = lua_pcall(state, 0, LUA_MULTRET, handler);
+  if (configuration->requested_exit) {
+    /* The close=true path reached us through Lua's valid base-level unwind. */
+    troe_exit_jump_active = 0;
+    if (configuration->requested_exit_close)
+      lua_close(state);
+    troe_active_configuration = NULL;
+    troe_active_host = NULL;
+    return TROE_LUA_REQUESTED_EXIT;
+  }
   lua_remove(state, handler);
   if (status != LUA_OK)
     troe_report_lua_error(state);
+  troe_exit_jump_active = 0;
   lua_close(state);
   troe_active_configuration = NULL;
   troe_active_host = NULL;

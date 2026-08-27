@@ -1,6 +1,6 @@
 # ADR implementation status
 
-Audit basis: the current working tree, inspected 2026-08-26. This
+Audit basis: the current working tree, inspected 2026-08-27. This
 ledger classifies the scope each ADR currently accepts. It does not turn a
 capability that an ADR explicitly leaves for a later decision into a closure
 gap. Evidence below names the primary implementation and the narrowest useful
@@ -14,7 +14,9 @@ mailboxes, persistent servers, and multiple live KEX tasks remain staged. ADR
 0033 accepts the future configuration-namespace direction, and ADR 0034
 consolidates the typed native-handle rule followed by existing services. Their
 scoped-directory and package-activation work is explicitly deferred, so none of
-these planning decisions changes the implemented closure set.
+these planning decisions changes the implemented closure set. ADR 0035 is a
+proposed implementation contract for persistent services, protected IPC, and
+the network/filesystem server migration; it is not accepted or implemented.
 
 ## Summary
 
@@ -24,6 +26,7 @@ these planning decisions changes the implemented closure set.
 | Superseded + implemented | 1 | 0006 |
 | Direction / deferred by explicit scope | 3 | 0009, 0033–0034 |
 | Staged implementation | 1 | 0032 |
+| Proposed implementation contract | 1 | 0035 |
 
 The accepted ADR closure set has no remaining implementation gap. Physical
 machines, embedded/no-MMU compositions, e1000, GPU, audio, broad filesystem
@@ -68,6 +71,7 @@ features.
 | [0032](0032-bounded-wait-channels-and-asynchronous-mailboxes.md) | Staged implementation | Preallocated generation-checked waits and copied pending calls in [`crates/troe-task`](../../crates/troe-task/src/lib.rs); bounded composition-owned suspended contexts, deferred timer/UDP replies, non-spinning native idle/wakeup, and the first copied isolated diagnostics server in [`kernel/src/main.rs`](../../kernel/src/main.rs); portable race/teardown tests and both-target native cancellation/fault/reclaim gates | TCP deferral, persistent independently scheduled services, multiple live KEX tasks, and any general mailbox remain explicit later slices. |
 | [0033](0033-desired-and-active-configuration-namespaces.md) | Direction / deferred by explicit scope | Existing immutable SCFG/GMAN generation configuration and the current KEFS `/etc` recovery files establish the model and migration baseline only. | Native `/config` storage and authorization, `/sys/config` generation projection, desired-versus-active tooling, and recovery namespace migration are explicitly deferred until native package activation. |
 | [0034](0034-typed-capability-handles-and-unix-compatibility.md) | Direction / deferred by explicit scope | Existing generation-checked dispatch handles, typed SDK interfaces, and the separate filesystem, mutation, datagram, timer, diagnostics, network-control, and TCP services already conform to the native typed-handle rule. | Scoped package directory roots, heterogeneous waits, listeners, and any optional userspace BSD/POSIX facade remain later work with separate acceptance gates. |
+| [0035](0035-persistent-isolated-services-and-fast-ipc.md) | Proposed implementation contract | Current one-shot diagnostics transport, copied-message counters, blocked task/wait model, bounded device transports, and typed filesystem/network ABIs establish the measured starting point only. | ABI 1.2 IPC pages, PCID/ASID retention, persistent supervision, direct handoff, wait sets, packet/block brokers, isolated network/storage/provider servers, dependency removal, and every performance/fault gate remain unimplemented. |
 
 ## Closure conclusion
 
@@ -84,4 +88,5 @@ multiple live KEX tasks, and mailboxes remain staged. ADR 0033 settles a later n
 explicitly defers its implementation, so it creates no current closure gap.
 ADR 0034 records the rule already followed by current typed services while
 deferring scoped roots and compatibility work; it likewise creates no current
-closure gap.
+closure gap. ADR 0035 is intentionally excluded from the accepted closure set
+until its complete implementation and verification contract passes.

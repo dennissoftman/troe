@@ -85,6 +85,13 @@ Still open:
 The existing synchronous service `PortId` remains a service endpoint. A future
 queued object is a mailbox, not a silent semantic expansion of that endpoint.
 
+[ADR 0035](adr/0035-persistent-isolated-services-and-fast-ipc.md) is the
+proposed end-to-end contract for this open work. It fixes a copied direct
+handoff fast path, persistent lifecycle/restart rules, tagged address spaces,
+kernel block/packet brokers, and staged network/filesystem migrations with
+structural and end-to-end performance gates. It makes no implementation claim
+until every named phase closes.
+
 ## Dynamic linking and reusable runtimes — planned
 
 KEX applications are self-contained static images. Dynamic linking is a named
