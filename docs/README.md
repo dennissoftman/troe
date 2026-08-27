@@ -16,6 +16,7 @@ evidence so a reader does not accidentally implement an old proposal.
 | Contribution and merge expectations | [Contribution guide](../CONTRIBUTING.md) |
 | Core normative requirements | [Core specification](../CORE-SPEC.md) |
 | Future package/tooling design | [Tooling and packaging specification](../TOOLING-PACKAGING-SPEC.md) |
+| Proposed persistent-service and fast-IPC implementation contract | [ADR 0035](adr/0035-persistent-isolated-services-and-fast-ipc.md) |
 | ADR closure state | [ADR implementation ledger](adr/implementation-status.md) |
 
 The current serialized contracts are versioned independently under
