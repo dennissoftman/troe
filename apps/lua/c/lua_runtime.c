@@ -59,14 +59,17 @@ typedef intptr_t (*TroeRead)(void *context, uint8_t *destination,
                              size_t capacity);
 typedef int (*TroeWrite)(void *context, int stream, const uint8_t *bytes,
                          size_t length);
-typedef int (*TroeMonotonicMillis)(void *context, uint64_t *result);
+typedef int (*TroeProcessCpuTime)(void *context, uint64_t *ticks,
+                                  uint64_t *frequency_hz);
+typedef int (*TroeWallTime)(void *context, uint64_t *seconds);
 
 struct TroeLuaHost {
   void *context;
   TroeAllocate allocate;
   TroeRead read;
   TroeWrite write;
-  TroeMonotonicMillis monotonic_millis;
+  TroeProcessCpuTime process_cpu_time;
+  TroeWallTime wall_time;
 };
 
 typedef struct TroeLuaArgument {

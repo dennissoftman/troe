@@ -99,10 +99,7 @@ fn input_report(
     )
 }
 
-fn report_snapshot(
-    output: &mut impl fmt::Write,
-    snapshot: diagnostics::Snapshot,
-) -> fmt::Result {
+fn report_snapshot(output: &mut impl fmt::Write, snapshot: diagnostics::Snapshot) -> fmt::Result {
     let architecture = match snapshot.architecture {
         diagnostics::Architecture::X86_64 => "x86_64",
         diagnostics::Architecture::Aarch64 => "aarch64",

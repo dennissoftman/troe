@@ -8,7 +8,7 @@ publish = false
 build = "build.rs"
 
 [package.metadata.troe-kex]
-capabilities = ["filesystem-read", "timer"]
+capabilities = ["filesystem-read", "timer", "wall-clock"]
 stack-pages = 64
 heap-pages = 256
 
@@ -26,7 +26,7 @@ troe-kex-sdk = { path = "../../sdk/rust/troe-kex" }
 [profile.release]
 codegen-units = 1
 lto = false
-opt-level = "z"
+opt-level = 2
 panic = "abort"
 strip = "none"
 

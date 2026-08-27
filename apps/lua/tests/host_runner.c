@@ -11,14 +11,17 @@ typedef intptr_t (*TroeRead)(void *context, uint8_t *destination,
                              size_t capacity);
 typedef int (*TroeWrite)(void *context, int stream, const uint8_t *bytes,
                          size_t length);
-typedef int (*TroeMonotonicMillis)(void *context, uint64_t *result);
+typedef int (*TroeProcessCpuTime)(void *context, uint64_t *ticks,
+                                  uint64_t *frequency_hz);
+typedef int (*TroeWallTime)(void *context, uint64_t *seconds);
 
 struct TroeLuaHost {
   void *context;
   TroeAllocate allocate;
   TroeRead read;
   TroeWrite write;
-  TroeMonotonicMillis monotonic_millis;
+  TroeProcessCpuTime process_cpu_time;
+  TroeWallTime wall_time;
 };
 
 typedef struct TroeLuaArgument {
@@ -41,7 +44,8 @@ typedef struct HostContext {
   const uint8_t *source;
   size_t source_length;
   size_t source_offset;
-  uint64_t clock_millis;
+  uint64_t cpu_ticks;
+  uint64_t wall_seconds;
 } HostContext;
 
 int troe_lua_run(TroeLuaConfiguration *configuration);
@@ -77,9 +81,19 @@ static int host_write(void *context, int stream, const uint8_t *bytes,
   return output != NULL && fwrite(bytes, 1, length, output) == length ? 0 : -1;
 }
 
-static int host_monotonic_millis(void *opaque, uint64_t *result) {
+static int host_process_cpu_time(void *opaque, uint64_t *ticks,
+                                 uint64_t *frequency_hz) {
   HostContext *context = (HostContext *)opaque;
-  *result = context->clock_millis;
+  *ticks = context->cpu_ticks;
+  *frequency_hz = 1000;
+  context->cpu_ticks += 1;
+  return 0;
+}
+
+static int host_wall_time(void *opaque, uint64_t *seconds) {
+  HostContext *context = (HostContext *)opaque;
+  *seconds = context->wall_seconds;
+  context->wall_seconds += 1;
   return 0;
 }
 
@@ -110,14 +124,16 @@ int main(int argc, char **argv) {
       .source = (const uint8_t *)argv[1],
       .source_length = strlen(argv[1]),
       .source_offset = 0,
-      .clock_millis = 0,
+      .cpu_ticks = 0,
+      .wall_seconds = 1700000000,
   };
   host = (TroeLuaHost){
       .context = &context,
       .allocate = host_allocate,
       .read = host_read,
       .write = host_write,
-      .monotonic_millis = host_monotonic_millis,
+      .process_cpu_time = host_process_cpu_time,
+      .wall_time = host_wall_time,
   };
   configuration = (TroeLuaConfiguration){
       .host = &host,

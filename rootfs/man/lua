@@ -12,16 +12,22 @@ DESCRIPTION
     input.
 
     The base, coroutine, table, string, math, and utf8 libraries are present.
-    A capability-aware os shim provides clock, difftime, and exit. The other
-    standard os functions remain present as extension points and raise a clear
+    A capability-aware os shim provides clock, time, difftime, and exit. The
+    other standard os functions remain present as extension points and raise a clear
     "unavailable in TROE" error when called. package, io, debug, dynamic
     modules, environment access, and binary bytecode are intentionally
     unavailable. The initial script file is read through the declared
     filesystem capability.
 
-    os.clock returns monotonic seconds elapsed since this Lua invocation with
-    millisecond resolution. It measures elapsed time rather than process CPU
-    time. os.exit terminates the Lua application with an optional unsigned
+    os.clock follows Lua semantics and returns process CPU seconds charged while
+    the application executes unprivileged code. Kernel services, waiting, and
+    descheduled time are excluded. os.time() returns whole Unix seconds from
+    TROE's wall clock; table-to-time conversion is not yet available. Wall time
+    is not monotonic and may step when corrected. For an
+    end-to-end benchmark long enough to tolerate one-second resolution, use
+    os.time() before and after the workload. That elapsed result includes kernel
+    service, waiting, and descheduling time. os.exit terminates the Lua
+    application with an optional unsigned
     32-bit command status and cannot be caught with pcall. Its second argument
     follows Lua semantics: false (the default) skips Lua-state closing, while
     true closes the state and runs its closing work before termination. TROE
@@ -37,6 +43,12 @@ EXAMPLES
         lua /share/lua/examples/strings.lua
         lua /share/lua/examples/math.lua
         lua /share/lua/examples/tables-coroutines.lua
+
+    Measure a sufficiently long end-to-end workload in whole wall seconds:
+
+        local t0 = os.time()
+        workload()
+        print(os.time() - t0)
 
     Read them with cat, copy one to /tmp, and adapt it there. The immutable
     originals remain available in the recovery root.

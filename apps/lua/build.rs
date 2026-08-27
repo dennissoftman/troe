@@ -31,7 +31,7 @@ fn main() {
         .arg(format!("--target={clang_target}"))
         .args([
             "-std=c11",
-            "-Oz",
+            "-O2",
             "-ffreestanding",
             "-fno-builtin",
             "-fno-stack-protector",

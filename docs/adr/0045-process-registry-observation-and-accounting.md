@@ -37,6 +37,9 @@ immediately around each ring-3/EL0 entry or resume. Only the checked delta is
 charged. Kernel dispatch, service execution, waiting, and shell work are not
 misreported as application CPU time. The observation snapshot includes the
 counter frequency so consumers can convert without assuming an architecture.
+Timer interface 1.0 additionally exposes only the calling task's charged ticks
+and frequency. This supports standard process-CPU clocks without granting the
+global `process-observe` authority.
 
 Initial page-table storage is allocated from the exact number of four-level
 tables implied by the complete mapping plan, subject to the existing 512-page

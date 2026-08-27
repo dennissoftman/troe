@@ -43,8 +43,8 @@ ABI file-size cap. Call `FileReplacement::set_chunk_size` before writing when a
 bulk workload needs a power-of-two 4 KiB–1 MiB chunk. Remove and empty-directory
 creation are separate bounded operations. Request `filesystem-mutate` only for
 create/replace/remove/link operations.
-Timer values are boot-relative monotonic milliseconds only. Request `timer`,
-form deadlines with saturation, and treat `sleep_until` as cancellable.
+`Timer::now` is boot-relative monotonic milliseconds; `process_cpu_time` returns
+self-only charged ticks and frequency. Request `timer`; waits are cancellable.
 Diagnostics is one immutable typed launch snapshot. Request `diagnostics` only
 for bounded reporting; it grants no mutable memory, input, or device access.
 Use `network-observe` only for status/stats/neighbors, `network-configure` only

@@ -327,8 +327,9 @@ ordinary applications have no cumulative service-call ceiling. Heap growth is
 bounded by allocator ownership and resident-page limits. Standard streams themselves
 forward without an aggregate byte cap. Optional interfaces
 expose only bounded IPv4/UDP send/receive, read-only VFS operations, one
-sequential streamed file mutation, a boot-relative monotonic timer, one immutable typed diagnostics
-   snapshot, current read-only process accounting, read-only typed network observation, one DHCP exchange, one ICMP
+sequential streamed file mutation, a boot-relative monotonic timer with
+self-only process CPU time, one immutable typed diagnostics snapshot, current
+read-only process accounting, read-only typed network observation, one DHCP exchange, one ICMP
    echo exchange, or one literal-IPv4 outbound TCP stream. Network observation,
    configuration, echo, datagrams, and TCP are independent authorities; none
    exposes raw frames, routes, DNS, TLS, or devices. Datagram
