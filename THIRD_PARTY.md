@@ -31,3 +31,9 @@ and the Lua C/Rust boundary are reviewed under repository policy. The complete
 lockfile is also checked by pinned
 `cargo-audit` against the committed RustSec database revision; no claim is made
 that this is a formal security audit.
+
+The optional `cargo alpine` development command downloads the official Alpine
+Linux 3.24.1 virtual ISO for x86-64 or AArch64. Those images remain external
+development inputs under Alpine's constituent package licenses and are not
+redistributed by TROE. Exact filenames, lengths, release URL, and SHA-256
+digests are pinned in `tools/alpine-profile.json`.

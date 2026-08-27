@@ -1,0 +1,17 @@
+{
+  "artifacts": {
+    "aarch64": {
+      "bytes": 92743680,
+      "filename": "alpine-virt-3.24.1-aarch64.iso",
+      "sha256": "c81699152db11d2a6dbb7d75348d632fcf5811eff414d7e71876a8bb6d48bc02"
+    },
+    "x86_64": {
+      "bytes": 69206016,
+      "filename": "alpine-virt-3.24.1-x86_64.iso",
+      "sha256": "e73a6241bd5f3c5c2d4d38c02cc52c378c0415a7c888bd292066bf36e0f41a39"
+    }
+  },
+  "base_url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/releases",
+  "schema": 1,
+  "version": "3.24.1"
+}

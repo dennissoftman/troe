@@ -11,7 +11,7 @@ from contextlib import nullcontext
 from pathlib import Path
 
 from platform_profile import PLATFORM_IDS, REPO_ROOT
-from qemu_profile import ENVIRONMENT_IDS, prepare_qemu_command
+from qemu_profile import ENVIRONMENT_IDS, prepare_qemu_command, validate_memory_size
 
 sys.path.insert(0, str(REPO_ROOT))
 
@@ -71,6 +71,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="open the owned framebuffer console while preserving serial stdio",
     )
     parser.add_argument(
+        "--memory",
+        help="override guest memory with an explicit QEMU size such as 256M",
+    )
+    parser.add_argument(
         "--volume-table",
         type=Path,
         help="build with this strict TOML custom-volume policy",
@@ -101,6 +105,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     try:
+        if args.memory is not None:
+            validate_memory_size(args.memory)
         if args.no_shared_disk and args.reset_shared_disk:
             raise RuntimeError(
                 "--no-shared-disk and --reset-shared-disk are mutually exclusive"
@@ -135,6 +141,7 @@ def main() -> int:
                 skip_version_check=args.skip_version_check,
                 build=not args.skip_build,
                 graphical=args.graphical,
+                memory=args.memory,
                 volume_table=args.volume_table,
                 data_disks=tuple(data_disks),
             )

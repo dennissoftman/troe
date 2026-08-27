@@ -578,8 +578,10 @@ class FirmwareProfileTests(unittest.TestCase):
             **paths,
             graphical=False,
             framebuffer=False,
+            memory="256M",
             data_disks=(Path("/archive.raw"), Path("/media.raw")),
         )
+        self.assertEqual(custom[custom.index("-m") + 1], "256M")
         self.assertIn(
             "if=none,format=raw,cache=writeback,id=troe-data-0,file=/archive.raw",
             custom,
@@ -588,6 +590,15 @@ class FirmwareProfileTests(unittest.TestCase):
             "virtio-blk-pci,disable-legacy=on,drive=troe-data-1",
             custom,
         )
+        with self.assertRaisesRegex(RuntimeError, "integer number of MiB or GiB"):
+            _qemu_arguments(
+                RUNNER_PROFILES[(X86_64_Q35_UEFI, QEMU_ENVIRONMENT)],
+                "/qemu-x86_64",
+                **paths,
+                graphical=False,
+                framebuffer=False,
+                memory="256",
+            )
 
     def test_launcher_and_acceptance_clis_require_platform_and_environment(
         self,
@@ -599,10 +610,13 @@ class FirmwareProfileTests(unittest.TestCase):
                 "--environment",
                 QEMU_ENVIRONMENT,
                 "--skip-build",
+                "--memory",
+                "256M",
             ]
         )
         self.assertEqual(run_args.platform, X86_64_Q35_UEFI)
         self.assertEqual(run_args.environment, QEMU_ENVIRONMENT)
+        self.assertEqual(run_args.memory, "256M")
         self.assertFalse(run_args.no_shared_disk)
         self.assertFalse(run_args.reset_shared_disk)
         custom_run_args = RUN_QEMU.parse_args(
