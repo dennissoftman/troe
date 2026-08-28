@@ -1,0 +1,3 @@
+CMPL	1	lua
+R	1	1	^-	values:-,--,--help,-E,-W,-e,-h,-l,-v
+R	1	1	*	path:file

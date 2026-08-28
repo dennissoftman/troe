@@ -33,12 +33,14 @@ history rather than in current documentation.
 | Capability-scoped private memory and configurable policy | [ADR 0048](adr/0048-capability-scoped-private-memory-and-resource-policy.md) |
 | Kernel CSPRNG, readable random capability, and KEX ASLR | [ADR 0049](adr/0049-kernel-csprng-and-kex-aslr.md) |
 | Explicit relative and absolute KEX execution paths | [ADR 0050](adr/0050-explicit-kex-path-execution.md) |
+| Package-owned declarative shell completions | [ADR 0051](adr/0051-package-owned-declarative-completions.md) |
 
 The current serialized contracts are versioned independently under
 [`formats/`](formats):
 
 - applications and packages: [KEX](formats/kex-v1.md),
-  [KEX package](formats/kex-package-v1.md), and [KCAP](formats/kcap-v1.md);
+  [KEX package](formats/kex-package-v1.md), [KCAP](formats/kcap-v1.md), and
+  [CMPL](formats/completion-v1.md);
 - process services: [process observation 1.1](formats/process-observation-v1.md) and
   [process launch and pipes 1.0](formats/process-launch-pipe-v1.md);
 - KEX filesystem services: [filesystem read 1.3 and mutation 1.2](formats/kex-filesystem-v1.md);

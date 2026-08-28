@@ -8,8 +8,12 @@ host stdin/stdout ───────────┐                 ┌─ ho
 serial / PS/2 → IRQ → bounded queue → editor ─┘  └─ UART + GOP text console
 ```
 
-The shell owns parsing, pipelines, streamed file redirection, completion, cwd,
-session job control, service control, and nine non-shadowable intrinsics.
+The shell owns parsing, pipelines, streamed file redirection, completion
+orchestration, cwd, session job control, service control, and nine
+non-shadowable intrinsics. Portable `troe-completion` descriptors select
+trusted semantic resolvers for application arguments without executing the
+application or moving replacement, quoting, sorting, and budget policy out of
+the shell.
 Ordinary commands always load an immutable architecture-specific KEX artifact
 into a fresh ring-3/EL0 address space and route cwd/argv, standard streams, and
 declared optional services through generation-owned synchronous message dispatch
@@ -229,12 +233,18 @@ Persistent services are tracked in
 
 `troe-terminal` keeps transport-independent input
 decoding, line editing, history, and fixed-glyph text rendering outside the
-machine mechanism. `troe-shell` owns completion because it has the VFS namespace
-and its revision-aware `/bin` catalog; both command candidates and directory
-listings are returned under caller-selected count and byte budgets. The native
-composition root uses the single Standard resource policy. x86-64 decodes
-US set-1 scan codes from q35 i8042, while both architectures retain serial
-input. AArch64 has no native keyboard transport and uses serial input.
+machine mechanism. `troe-shell` owns completion orchestration because it has
+the VFS namespace and its revision-aware `/bin` catalog; both command candidates
+and directory listings are returned under caller-selected count and byte
+budgets. `troe-completion` validates and evaluates bounded package-owned CMPL
+descriptors into closed semantic resolver kinds whose values may come from open
+current domains, such as filesystem entries, addresses, integers, jobs,
+services, and configured volumes. CMPL bytes are embedded in the KEX package;
+the shell reads only the fixed package header and bounded descriptor range to
+construct a revision-bound active registry. The native composition root
+uses the single Standard resource policy. x86-64 decodes US set-1 scan codes
+from q35 i8042, while both architectures retain serial input. AArch64 has no
+native keyboard transport and uses serial input.
 
 The portable `troe-driver` crate defines the resource and event boundary. Queue
 capacity and maximum ISR drain come from the Standard portable policy;

@@ -41,9 +41,10 @@ measurement.
 ## What runs
 
 - Native UEFI boots on x86-64 and AArch64.
-- Serial and framebuffer consoles with UTF-8 line editing, history, completion,
-  literal single/double quoting, pipelines, and streamed `<`, `>`, and `>>`
-  redirection, plus session-owned background jobs and bounded logs.
+- Serial and framebuffer consoles with UTF-8 line editing, history,
+  package-owned typed completion, literal single/double quoting, pipelines, and
+  streamed `<`, `>`, and `>>` redirection, plus session-owned background jobs
+  and bounded logs.
 - SCFG boot-service supervision with stable service names, restart/backoff
   policy, `svc` control, and an example long-running SNTP clock service.
 - A bounded VFS with KEFS, a default read-write persistent ext4 volume at

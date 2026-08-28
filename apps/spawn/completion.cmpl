@@ -1,0 +1,5 @@
+CMPL	1	spawn
+R	1	1	^-	values:--capture,--status
+R	2	2	*	command	eq:0:--capture
+R	2	2	*	command	eq:0:--status
+R	1	1	*	command

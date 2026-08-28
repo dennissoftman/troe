@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 troe-abi = { path = "../troe-abi" }
+troe-completion = { path = "../troe-completion" }
 
 [lints]
 workspace = true

@@ -1,0 +1,3 @@
+CMPL	1	cat
+R	1	1	^-	values:--,-A,-E,-T,-b,-e,-n,-s,-t,-u,-v
+R	1	*	*	path:file

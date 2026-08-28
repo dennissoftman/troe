@@ -7,6 +7,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+troe-application = { path = "../troe-application" }
+troe-completion = { path = "../troe-completion" }
 troe-core = { path = "../troe-core" }
 troe-driver = { path = "../troe-driver" }
 troe-vfs = { path = "../troe-vfs" }

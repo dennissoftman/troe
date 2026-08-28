@@ -6,11 +6,20 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod recovery_completion;
+
 use alloc::format;
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::cell::RefCell;
+use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use core::str::FromStr;
+use recovery_completion::{ActiveResolver, IntrinsicCompletionRegistry, PackageCompletionRegistry};
+use troe_completion::{
+    AddressConstraints, AddressFamily, CompletionLimits, CompletionRequest, IntegerConstraints,
+    IntegerRadix, PathKind, PortRequirement, Resolver,
+};
 use troe_core::{
     BoundedOutput, CommandStatus, Input, MAX_ARGS, MAX_LINE_BYTES, MAX_PIPELINE_STAGES,
     MachineMemoryOwner, MachineMemorySnapshot, MemoryStats, Output, PIPE_CAPACITY, SliceInput,
@@ -21,6 +30,35 @@ use troe_vfs::{FILE_IO_BUFFER_BYTES, FsError, MAX_FILE_IO_BUFFER_BYTES, Namespac
 
 /// Shared namespace ownership used by stream endpoints and KEX services.
 pub type SharedNamespace = Rc<RefCell<Namespace>>;
+
+/// Trusted dynamic state domains available to shell-owned completion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DynamicCompletionDomain {
+    /// Numeric identifiers for jobs owned by this shell session.
+    Job,
+    /// Stable names from the active service-supervisor configuration.
+    Service,
+    /// Stable names from the configured volume policy.
+    Volume,
+}
+
+/// Bounded visitor controlled by the shell's completion policy.
+pub trait CompletionVisitor {
+    /// Offer one current candidate. `false` asks the source to stop enumerating.
+    fn candidate(&mut self, value: &str) -> bool;
+}
+
+/// Trusted composition-root access to dynamic completion state.
+pub trait CompletionEnvironment {
+    /// Visit current values for one semantic domain without executing an app.
+    fn visit(&mut self, domain: DynamicCompletionDomain, visitor: &mut dyn CompletionVisitor);
+}
+
+struct EmptyCompletionEnvironment;
+
+impl CompletionEnvironment for EmptyCompletionEnvironment {
+    fn visit(&mut self, _domain: DynamicCompletionDomain, _visitor: &mut dyn CompletionVisitor) {}
+}
 
 /// Shell parse failures caused by untrusted command input.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -926,6 +964,8 @@ pub enum MachineAction {
 pub struct Shell {
     namespace: SharedNamespace,
     command_catalog: CommandCatalog,
+    package_completions: PackageCompletionRegistry,
+    intrinsic_completions: IntrinsicCompletionRegistry,
     cwd: String,
     machine_control: bool,
     machine_action: Option<MachineAction>,
@@ -951,9 +991,14 @@ impl Shell {
             format_memory_report(architecture, machine_memory, None, namespace.memory_stats());
         namespace.set_system_file("/sys/memory", memory_report.as_bytes())?;
         let command_catalog = CommandCatalog::new()?;
+        let package_completions = PackageCompletionRegistry::new();
+        let intrinsic_completions =
+            IntrinsicCompletionRegistry::new().map_err(|_| FsError::Corrupt)?;
         Ok(Self {
             namespace: Rc::new(RefCell::new(namespace)),
             command_catalog,
+            package_completions,
+            intrinsic_completions,
             cwd: "/".to_string(),
             machine_control,
             machine_action: None,
@@ -980,6 +1025,21 @@ impl Shell {
     /// implementation. Candidate insertion never performs shell expansion.
     #[must_use]
     pub fn complete(&mut self, line: &str, cursor: usize, config: CompletionConfig) -> Completion {
+        self.complete_with_environment(line, cursor, config, &mut EmptyCompletionEnvironment)
+    }
+
+    /// Complete with explicitly supplied trusted job, service, and volume state.
+    ///
+    /// The environment is a data source only. The shell retains filtering,
+    /// sorting, deduplication, insertion, and resource-budget ownership.
+    #[must_use]
+    pub fn complete_with_environment(
+        &mut self,
+        line: &str,
+        cursor: usize,
+        config: CompletionConfig,
+        environment: &mut dyn CompletionEnvironment,
+    ) -> Completion {
         if config.is_disabled()
             || cursor > line.len()
             || !line.is_char_boundary(cursor)
@@ -991,11 +1051,11 @@ impl Shell {
             return Completion::default();
         };
         if context.redirect_target {
-            return self.complete_paths(context, false, config);
+            return self.complete_paths(context, PathKind::Any, config);
         }
         if context.word_index == 0 {
             if context.prefix.as_bytes().contains(&b'/') {
-                return self.complete_paths(context, false, config);
+                return self.complete_paths(context, PathKind::File, config);
             }
             self.command_catalog
                 .refresh(&mut self.namespace.borrow_mut());
@@ -1006,23 +1066,113 @@ impl Shell {
                 config,
             );
         }
-        if context.command == Some("man") && context.word_index == 1 {
-            self.command_catalog
-                .refresh(&mut self.namespace.borrow_mut());
-            return complete_commands(
+        let Some(command) = context.command else {
+            return Completion::default();
+        };
+        let Ok(limits) = CompletionLimits::new(config.max_candidates(), config.max_bytes()) else {
+            return Completion::default();
+        };
+        let Ok(request) = CompletionRequest::new(
+            context.word_index,
+            context.prefix,
+            &context.arguments,
+            limits,
+        ) else {
+            return Completion::default();
+        };
+        if let Some(resolution) = self.intrinsic_completions.resolve(command, request) {
+            return self.complete_static_resolver(
                 context,
-                &self.command_catalog.names,
-                self.command_catalog.truncated,
+                resolution.resolver(),
                 config,
+                environment,
             );
         }
-        match argument_completion(context) {
-            ArgumentCompletion::None => Completion::default(),
-            ArgumentCompletion::Values(values) => complete_values(context, values, config),
-            ArgumentCompletion::Paths { directories_only } => {
-                self.complete_paths(context, directories_only, config)
+        self.package_completions
+            .refresh(&mut self.namespace.borrow_mut());
+        let Some(resolver) = self.package_completions.resolve(command, request) else {
+            return Completion::default();
+        };
+        self.complete_active_resolver(context, resolver, config, environment)
+    }
+
+    fn complete_static_resolver(
+        &mut self,
+        context: CompletionContext<'_>,
+        resolver: Resolver<'static>,
+        config: CompletionConfig,
+        environment: &mut dyn CompletionEnvironment,
+    ) -> Completion {
+        match resolver {
+            Resolver::Values(values) => complete_values(context, values, config),
+            Resolver::Path(constraints) => self.complete_paths(context, constraints.kind(), config),
+            Resolver::Command => self.complete_command_names(context, config),
+            Resolver::Address(constraints) => complete_address(context, constraints, config),
+            Resolver::Integer(constraints) => complete_integer(context, constraints, config),
+            Resolver::Job => {
+                complete_dynamic(context, DynamicCompletionDomain::Job, config, environment)
             }
+            Resolver::Service => complete_dynamic(
+                context,
+                DynamicCompletionDomain::Service,
+                config,
+                environment,
+            ),
+            Resolver::Volume => complete_dynamic(
+                context,
+                DynamicCompletionDomain::Volume,
+                config,
+                environment,
+            ),
         }
+    }
+
+    fn complete_active_resolver(
+        &mut self,
+        context: CompletionContext<'_>,
+        resolver: ActiveResolver,
+        config: CompletionConfig,
+        environment: &mut dyn CompletionEnvironment,
+    ) -> Completion {
+        match resolver {
+            ActiveResolver::Values(values) => complete_string_values(context, &values, config),
+            ActiveResolver::Path(constraints) => {
+                self.complete_paths(context, constraints.kind(), config)
+            }
+            ActiveResolver::Command => self.complete_command_names(context, config),
+            ActiveResolver::Address(constraints) => complete_address(context, constraints, config),
+            ActiveResolver::Integer(constraints) => complete_integer(context, constraints, config),
+            ActiveResolver::Job => {
+                complete_dynamic(context, DynamicCompletionDomain::Job, config, environment)
+            }
+            ActiveResolver::Service => complete_dynamic(
+                context,
+                DynamicCompletionDomain::Service,
+                config,
+                environment,
+            ),
+            ActiveResolver::Volume => complete_dynamic(
+                context,
+                DynamicCompletionDomain::Volume,
+                config,
+                environment,
+            ),
+        }
+    }
+
+    fn complete_command_names(
+        &mut self,
+        context: CompletionContext<'_>,
+        config: CompletionConfig,
+    ) -> Completion {
+        self.command_catalog
+            .refresh(&mut self.namespace.borrow_mut());
+        complete_commands(
+            context,
+            &self.command_catalog.names,
+            self.command_catalog.truncated,
+            config,
+        )
     }
 
     /// Execute a complete line, including any bounded pipeline.
@@ -1316,7 +1466,7 @@ impl Shell {
     fn complete_paths(
         &mut self,
         context: CompletionContext<'_>,
-        directories_only: bool,
+        path_kind: PathKind,
         config: CompletionConfig,
     ) -> Completion {
         let (directory, displayed_parent, name_prefix) = split_completion_path(context.prefix);
@@ -1324,7 +1474,7 @@ impl Shell {
             &self.cwd,
             directory,
             name_prefix,
-            directories_only,
+            path_kind == PathKind::Directory,
             config.max_candidates(),
             config.max_bytes(),
         ) else {
@@ -1338,6 +1488,12 @@ impl Shell {
         };
         let mut retained_bytes = 0_usize;
         for entry in listing.entries {
+            if path_kind == PathKind::File
+                && entry.kind != NodeKind::File
+                && entry.kind != NodeKind::Directory
+            {
+                continue;
+            }
             if !is_bare_word_component(&entry.name) {
                 completion.truncated = true;
                 continue;
@@ -1689,92 +1845,214 @@ fn complete_values(
     completion
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ArgumentCompletion {
-    None,
-    Values(&'static [&'static str]),
-    Paths { directories_only: bool },
+fn complete_string_values(
+    context: CompletionContext<'_>,
+    values: &[String],
+    config: CompletionConfig,
+) -> Completion {
+    let references = values.iter().map(String::as_str);
+    complete_value_iterator(context, references, config)
 }
 
-// These optional schemas enrich arguments for commands the shell understands;
-// they do not define which applications exist. The lazy `/bin` catalog is the
-// sole source for application-name discovery.
-const AWK_OPTIONS: &[&str] = &["-F"];
-const LN_OPTIONS: &[&str] = &["-s"];
-const LUA_OPTIONS: &[&str] = &["-", "-e"];
-const NET_MODES: &[&str] = &["stats"];
-const SED_OPTIONS: &[&str] = &["-e", "-n"];
-const TAR_MODES: &[&str] = &["-cf", "-tf", "-xf", "cf", "tf", "xf"];
-const UDP_MODES: &[&str] = &["listen", "send"];
-const UDP_SEND_OPTIONS: &[&str] = &["--source-port"];
-const WC_OPTIONS: &[&str] = &["-c", "-l", "-lc", "-lw", "-lwc", "-w", "-wc"];
-
-fn argument_completion(context: CompletionContext<'_>) -> ArgumentCompletion {
-    let Some(command) = context.command else {
-        return ArgumentCompletion::None;
+fn complete_value_iterator<'value>(
+    context: CompletionContext<'_>,
+    values: impl Iterator<Item = &'value str>,
+    config: CompletionConfig,
+) -> Completion {
+    let mut completion = Completion {
+        replacement_start: context.start,
+        replacement_end: context.end,
+        candidates: Vec::new(),
+        truncated: false,
     };
-    let paths = ArgumentCompletion::Paths {
-        directories_only: false,
-    };
-    match command {
-        "cd" if context.word_index == 1 => ArgumentCompletion::Paths {
-            directories_only: true,
-        },
-        "grep" if context.word_index >= 2 => paths,
-        "ln" if context.word_index == 1 && context.prefix.starts_with('-') => {
-            ArgumentCompletion::Values(LN_OPTIONS)
-        }
-        "lua" if context.word_index == 1 && context.prefix.starts_with('-') => {
-            ArgumentCompletion::Values(LUA_OPTIONS)
-        }
-        "net" if context.word_index == 1 => ArgumentCompletion::Values(NET_MODES),
-        "udp" if context.word_index == 1 => ArgumentCompletion::Values(UDP_MODES),
-        "udp"
-            if context.word_index == 2
-                && context.arguments[0] == Some("send")
-                && context.prefix.starts_with('-') =>
+    let mut retained_bytes = 0_usize;
+    for value in values.filter(|value| value.starts_with(context.prefix)) {
+        let replacement = format!("{value} ");
+        let Some(next_bytes) = retained_bytes.checked_add(replacement.len()) else {
+            completion.truncated = true;
+            break;
+        };
+        if completion.candidates.len() >= config.max_candidates() || next_bytes > config.max_bytes()
         {
-            ArgumentCompletion::Values(UDP_SEND_OPTIONS)
+            completion.truncated = true;
+            break;
         }
-        "wc" if context.word_index >= 1 && context.prefix.starts_with('-') => {
-            ArgumentCompletion::Values(WC_OPTIONS)
+        completion.candidates.push(CompletionCandidate {
+            display: value.to_string(),
+            replacement,
+        });
+        retained_bytes = next_bytes;
+    }
+    completion
+}
+
+struct DynamicCollector<'prefix> {
+    prefix: &'prefix str,
+    max_candidates: usize,
+    max_bytes: usize,
+    retained_bytes: usize,
+    values: Vec<String>,
+    truncated: bool,
+}
+
+impl CompletionVisitor for DynamicCollector<'_> {
+    fn candidate(&mut self, value: &str) -> bool {
+        if !value.starts_with(self.prefix) || !is_bare_word_component(value) || value.is_empty() {
+            return true;
         }
-        "sed" if context.word_index <= 2 && context.prefix.starts_with('-') => {
-            ArgumentCompletion::Values(SED_OPTIONS)
+        if self.values.iter().any(|candidate| candidate == value) {
+            return true;
         }
-        "sed" if context.word_index > sed_script_position(context.arguments) => paths,
-        "tar" if context.word_index == 1 => ArgumentCompletion::Values(TAR_MODES),
-        "tar" if context.word_index == 2 => paths,
-        "tar" if context.word_index >= 3 && matches!(context.arguments[0], Some("-cf" | "cf")) => {
-            paths
+        let Some(next_bytes) = self.retained_bytes.checked_add(value.len() + 1) else {
+            self.truncated = true;
+            return false;
+        };
+        if self.values.len() >= self.max_candidates || next_bytes > self.max_bytes {
+            self.truncated = true;
+            return false;
         }
-        "awk" if context.word_index == 1 && context.prefix.starts_with('-') => {
-            ArgumentCompletion::Values(AWK_OPTIONS)
+        if self.values.try_reserve(1).is_err() {
+            self.truncated = true;
+            return false;
         }
-        "awk" if context.word_index > awk_program_position(context.arguments) => paths,
-        "cat" | "ln" | "wc" if context.word_index >= 1 => paths,
-        "hexdump" | "ls" | "lua" | "rm" if context.word_index == 1 => paths,
-        _ => ArgumentCompletion::None,
+        self.values.push(value.to_string());
+        self.retained_bytes = next_bytes;
+        true
     }
 }
 
-fn sed_script_position(arguments: [Option<&str>; 4]) -> usize {
-    let mut position = 1;
-    if arguments[0] == Some("-n") {
-        position += 1;
-    }
-    if arguments.get(position - 1).copied().flatten() == Some("-e") {
-        position += 1;
-    }
-    position
+fn complete_dynamic(
+    context: CompletionContext<'_>,
+    domain: DynamicCompletionDomain,
+    config: CompletionConfig,
+    environment: &mut dyn CompletionEnvironment,
+) -> Completion {
+    let mut collector = DynamicCollector {
+        prefix: context.prefix,
+        max_candidates: config.max_candidates(),
+        max_bytes: config.max_bytes(),
+        retained_bytes: 0,
+        values: Vec::new(),
+        truncated: false,
+    };
+    environment.visit(domain, &mut collector);
+    collector.values.sort_unstable();
+    let mut completion = complete_string_values(context, &collector.values, config);
+    completion.truncated |= collector.truncated;
+    completion
 }
 
-fn awk_program_position(arguments: [Option<&str>; 4]) -> usize {
-    match arguments[0] {
-        Some("-F") => 3,
-        Some(option) if option.starts_with("-F") && option.len() > 2 => 2,
-        _ => 1,
+fn complete_integer(
+    context: CompletionContext<'_>,
+    constraints: IntegerConstraints,
+    config: CompletionConfig,
+) -> Completion {
+    let valid = parse_integer(context.prefix, constraints).is_some_and(|value| {
+        constraints.minimum().is_none_or(|minimum| value >= minimum)
+            && constraints.maximum().is_none_or(|maximum| value <= maximum)
+    });
+    complete_typed_value(context, valid, config)
+}
+
+fn parse_integer(value: &str, constraints: IntegerConstraints) -> Option<i64> {
+    if value.is_empty() || value == "-" || value.starts_with('+') {
+        return None;
     }
+    let radix = match constraints.radix() {
+        IntegerRadix::Binary => 2,
+        IntegerRadix::Octal => 8,
+        IntegerRadix::Decimal => 10,
+        IntegerRadix::Hexadecimal => 16,
+    };
+    let (negative, digits) = value
+        .strip_prefix('-')
+        .map_or((false, value), |digits| (true, digits));
+    if digits.is_empty() {
+        return None;
+    }
+    let magnitude = i64::from_str_radix(digits, radix).ok()?;
+    if negative {
+        magnitude.checked_neg()
+    } else {
+        Some(magnitude)
+    }
+}
+
+fn complete_address(
+    context: CompletionContext<'_>,
+    constraints: AddressConstraints,
+    config: CompletionConfig,
+) -> Completion {
+    complete_typed_value(context, valid_endpoint(context.prefix, constraints), config)
+}
+
+fn valid_endpoint(value: &str, constraints: AddressConstraints) -> bool {
+    match constraints.port() {
+        PortRequirement::Forbidden => valid_address(value, constraints.family()),
+        PortRequirement::Required => split_endpoint(value).is_some_and(|(address, port)| {
+            valid_address(address, constraints.family()) && port != 0
+        }),
+        PortRequirement::Optional => {
+            valid_address(value, constraints.family())
+                || split_endpoint(value).is_some_and(|(address, port)| {
+                    valid_address(address, constraints.family()) && port != 0
+                })
+        }
+    }
+}
+
+fn split_endpoint(value: &str) -> Option<(&str, u16)> {
+    if let Some(rest) = value.strip_prefix('[') {
+        let (address, port) = rest.split_once("]:")?;
+        return port.parse().ok().map(|port| (address, port));
+    }
+    let (address, port) = value.rsplit_once(':')?;
+    if address.contains(':') {
+        return None;
+    }
+    port.parse().ok().map(|port| (address, port))
+}
+
+fn valid_address(value: &str, family: AddressFamily) -> bool {
+    match family {
+        AddressFamily::Ipv4 => Ipv4Addr::from_str(value).is_ok(),
+        AddressFamily::Ipv6 => Ipv6Addr::from_str(value).is_ok(),
+        AddressFamily::Ip => IpAddr::from_str(value).is_ok(),
+        AddressFamily::HostName => valid_host_name(value),
+        AddressFamily::Any => IpAddr::from_str(value).is_ok() || valid_host_name(value),
+    }
+}
+
+fn valid_host_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 253
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && label
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .last()
+                    .is_some_and(u8::is_ascii_alphanumeric)
+                && label
+                    .as_bytes()
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+        })
+}
+
+fn complete_typed_value(
+    context: CompletionContext<'_>,
+    valid: bool,
+    config: CompletionConfig,
+) -> Completion {
+    if !valid {
+        return Completion::default();
+    }
+    complete_value_iterator(context, core::iter::once(context.prefix), config)
 }
 
 fn split_completion_path(prefix: &str) -> (&str, &str, &str) {
@@ -1957,7 +2235,8 @@ const fn parse_error_text(error: ParseError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{
-        CommandClass, CompletionConfig, CompletionConfigError, ExecutionPlacement, ExternalCommand,
+        CommandClass, CompletionConfig, CompletionConfigError, CompletionEnvironment,
+        CompletionVisitor, DynamicCompletionDomain, ExecutionPlacement, ExternalCommand,
         ExternalCommandReference, INTRINSICS, JobControl, MachineAction, OutputRedirection,
         ParseError, ServiceControl, SharedNamespace, Shell, command_class, command_synopsis,
         external_command_reference, format_memory_report, parse_line,
@@ -1968,6 +2247,7 @@ mod tests {
     use alloc::string::{String, ToString};
     use alloc::vec::Vec;
     use core::cell::RefCell;
+    use troe_application::encode_kex_package_with_completion;
     use troe_core::{
         BoundedOutput, CommandStatus, Input, MAX_ARGS, MAX_LINE_BYTES, MAX_PIPELINE_STAGES,
         MachineMemorySnapshot, Output, PIPE_CAPACITY, SliceInput, write_all,
@@ -2070,9 +2350,88 @@ mod tests {
         let mut namespace = Namespace::new(RamFsQuota::default());
         assert_eq!(namespace.add_read_only_dir("/help"), Ok(()));
         assert_eq!(namespace.add_read_only_dir("/bin"), Ok(()));
-        for command in ["cat", "echo", "hexdump", "man", "pwd"] {
+        for (command, completion) in [
+            (
+                "awk",
+                include_bytes!("../../../apps/awk/completion.cmpl").as_slice(),
+            ),
+            (
+                "cat",
+                include_bytes!("../../../apps/cat/completion.cmpl").as_slice(),
+            ),
+            (
+                "echo",
+                include_bytes!("../../../apps/echo/completion.cmpl").as_slice(),
+            ),
+            (
+                "grep",
+                include_bytes!("../../../apps/grep/completion.cmpl").as_slice(),
+            ),
+            (
+                "hexdump",
+                include_bytes!("../../../apps/hexdump/completion.cmpl").as_slice(),
+            ),
+            (
+                "ln",
+                include_bytes!("../../../apps/ln/completion.cmpl").as_slice(),
+            ),
+            (
+                "lua",
+                include_bytes!("../../../apps/lua/completion.cmpl").as_slice(),
+            ),
+            (
+                "ls",
+                include_bytes!("../../../apps/ls/completion.cmpl").as_slice(),
+            ),
+            (
+                "man",
+                include_bytes!("../../../apps/man/completion.cmpl").as_slice(),
+            ),
+            (
+                "mem",
+                include_bytes!("../../../apps/mem/completion.cmpl").as_slice(),
+            ),
+            (
+                "mount",
+                include_bytes!("../../../apps/mount/completion.cmpl").as_slice(),
+            ),
+            (
+                "net",
+                include_bytes!("../../../apps/net/completion.cmpl").as_slice(),
+            ),
+            (
+                "ping",
+                include_bytes!("../../../apps/ping/completion.cmpl").as_slice(),
+            ),
+            (
+                "pwd",
+                include_bytes!("../../../apps/pwd/completion.cmpl").as_slice(),
+            ),
+            (
+                "sed",
+                include_bytes!("../../../apps/sed/completion.cmpl").as_slice(),
+            ),
+            (
+                "sleep",
+                include_bytes!("../../../apps/sleep/completion.cmpl").as_slice(),
+            ),
+            (
+                "tar",
+                include_bytes!("../../../apps/tar/completion.cmpl").as_slice(),
+            ),
+            (
+                "udp",
+                include_bytes!("../../../apps/udp/completion.cmpl").as_slice(),
+            ),
+            (
+                "wc",
+                include_bytes!("../../../apps/wc/completion.cmpl").as_slice(),
+            ),
+        ] {
+            let package = encode_kex_package_with_completion(b"x", &[], Some(completion))
+                .unwrap_or_else(|_| std::process::abort());
             assert_eq!(
-                namespace.add_read_only_file(&format!("/bin/{command}.kex"), b"package"),
+                namespace.add_read_only_file(&format!("/bin/{command}.kex"), &package),
                 Ok(())
             );
         }
@@ -2093,6 +2452,23 @@ mod tests {
         controls: Vec<JobControl>,
         service_controls: Vec<ServiceControl>,
         script: Option<Vec<String>>,
+    }
+
+    struct FakeCompletionEnvironment;
+
+    impl CompletionEnvironment for FakeCompletionEnvironment {
+        fn visit(&mut self, domain: DynamicCompletionDomain, visitor: &mut dyn CompletionVisitor) {
+            let values: &[&str] = match domain {
+                DynamicCompletionDomain::Job => &["12", "7"],
+                DynamicCompletionDomain::Service => &["timesync", "diagnostics"],
+                DynamicCompletionDomain::Volume => &["root", "boot"],
+            };
+            for value in values {
+                if !visitor.candidate(value) {
+                    break;
+                }
+            }
+        }
     }
 
     impl FakeExternal {
@@ -2802,6 +3178,8 @@ mod tests {
 
         let file = shell.complete("cat /help/r", 11, CompletionConfig::standard());
         assert_eq!(file.candidates[0].replacement, "/help/readme ");
+        let file_traversal = shell.complete("cat /he", 7, CompletionConfig::standard());
+        assert_eq!(file_traversal.candidates[0].replacement, "/help/");
 
         for line in ["echo > /help/r", "echo >>/help/r", "copy </help/r"] {
             let completion = shell.complete(line, line.len(), CompletionConfig::standard());
@@ -2815,6 +3193,30 @@ mod tests {
         let udp_mode = "udp li";
         let completion = shell.complete(udp_mode, udp_mode.len(), CompletionConfig::standard());
         assert_eq!(completion.candidates[0].replacement, "listen ");
+
+        for (line, expected) in [
+            ("cat -A", "-A "),
+            ("echo -n", "-n "),
+            ("grep -m", "-m "),
+            ("ls -l", "-l "),
+            ("mem --s", "--self-test "),
+            ("udp re", "recv "),
+        ] {
+            assert_eq!(
+                shell
+                    .complete(line, line.len(), CompletionConfig::standard())
+                    .common_replacement(),
+                Some(expected)
+            );
+        }
+
+        let grep_count = "grep -m 25";
+        assert_eq!(
+            shell
+                .complete(grep_count, grep_count.len(), CompletionConfig::standard(),)
+                .common_replacement(),
+            Some("25 ")
+        );
 
         let wc_option = "wc -lw";
         let completion = shell.complete(wc_option, wc_option.len(), CompletionConfig::standard());
@@ -2837,11 +3239,66 @@ mod tests {
         for line in [
             "ln /help/r",
             "sed 's/a/b/' /help/r",
+            "sed -e 's/a/b/' /help/r",
+            "sed -n -e 's/a/b/' /help/r",
             "awk -F : '{ print $1 }' /help/r",
+            "awk -F: '{ print $1 }' /help/r",
             "tar -cf /tmp/archive.tar /help/r",
         ] {
             let completion = shell.complete(line, line.len(), CompletionConfig::standard());
             assert_eq!(completion.candidates[0].replacement, "/help/readme ");
+        }
+
+        for line in [
+            "sed -n /help/r",
+            "awk -F /help/r",
+            "tar -xf /tmp/archive.tar /help/r",
+            "lua -e /help/r",
+        ] {
+            assert!(
+                shell
+                    .complete(line, line.len(), CompletionConfig::standard())
+                    .candidates
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn typed_and_dynamic_resolvers_are_shell_owned() {
+        let mut shell = shell();
+        let address = shell.complete(
+            "ping 192.0.2.1",
+            "ping 192.0.2.1".len(),
+            CompletionConfig::standard(),
+        );
+        assert_eq!(address.common_replacement(), Some("192.0.2.1 "));
+        assert!(
+            shell
+                .complete(
+                    "ping 192.0.2",
+                    "ping 192.0.2".len(),
+                    CompletionConfig::standard(),
+                )
+                .candidates
+                .is_empty()
+        );
+        let integer = shell.complete("sleep 125", 9, CompletionConfig::standard());
+        assert_eq!(integer.common_replacement(), Some("125 "));
+
+        let mut environment = FakeCompletionEnvironment;
+        for (line, expected) in [
+            ("wait 1", "12 "),
+            ("svc status t", "timesync "),
+            ("mount b", "boot "),
+        ] {
+            let completion = shell.complete_with_environment(
+                line,
+                line.len(),
+                CompletionConfig::standard(),
+                &mut environment,
+            );
+            assert_eq!(completion.common_replacement(), Some(expected));
         }
     }
 

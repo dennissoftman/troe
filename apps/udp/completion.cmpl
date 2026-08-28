@@ -1,0 +1,9 @@
+CMPL	1	udp
+R	1	1	*	values:listen,recv,send
+R	2	2	^-	values:--source-port	eq:0:send
+R	2	2	*	integer:decimal:1:65535	eq:0:listen
+R	2	2	*	address:ipv4:forbidden	eq:0:send
+R	3	3	*	integer:decimal:1:65535	eq:0:send	ne:1:--source-port
+R	3	3	*	integer:decimal:1:65535	eq:0:send	eq:1:--source-port
+R	4	4	*	address:ipv4:forbidden	eq:0:send	eq:1:--source-port
+R	5	5	*	integer:decimal:1:65535	eq:0:send	eq:1:--source-port

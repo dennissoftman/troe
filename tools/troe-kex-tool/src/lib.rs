@@ -19,8 +19,10 @@ use troe_abi::{
 };
 use troe_application::{
     ABI_MAJOR, ABI_MINOR, KEX_PACKAGE_V1_MAGIC, KEX_V1_HEADER_BYTES, KEX_V1_MAGIC,
-    MAX_KEX_PACKAGE_BYTES, Target, encode_kex_package, parse_kex, parse_kex_package,
+    MAX_KEX_PACKAGE_BYTES, Target, encode_kex_package_with_completion, parse_kex,
+    parse_kex_package,
 };
+use troe_completion::{CompletionArtifact, MAX_ARTIFACT_BYTES};
 
 const DEFAULT_STACK_PAGES: u64 = 4;
 const DEFAULT_HEAP_PAGES: u64 = 0;
@@ -103,6 +105,7 @@ struct AppManifest {
     requirements: Vec<requirements::Requirement>,
     stack_pages: u64,
     heap_pages: u64,
+    completion: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -625,6 +628,20 @@ fn read_manifest(app: &Path, requested_command: Option<&str>) -> ToolResult<AppM
     let mut encoded = [0_u8; requirements::MAX_MANIFEST_BYTES];
     requirements::encode(&required, &mut encoded)
         .map_err(|_| ToolError::new("manifest capabilities must be unique and bounded"))?;
+    let completion_path = directory.join("completion.cmpl");
+    let completion = read_bounded(
+        &completion_path,
+        u64::try_from(MAX_ARTIFACT_BYTES)
+            .map_err(|_| ToolError::new("CMPL ceiling is not representable"))?,
+        "CMPL artifact",
+    )?;
+    let descriptor = CompletionArtifact::parse(&completion)
+        .map_err(|_| ToolError::new("application completion.cmpl is invalid"))?;
+    if descriptor.command() != command {
+        return Err(ToolError::new(
+            "completion.cmpl command identity differs from the installed command",
+        ));
+    }
     Ok(AppManifest {
         directory,
         binary,
@@ -632,6 +649,7 @@ fn read_manifest(app: &Path, requested_command: Option<&str>) -> ToolResult<AppM
         requirements: required,
         stack_pages: stack_pages.unwrap_or(DEFAULT_STACK_PAGES),
         heap_pages: heap_pages.unwrap_or(DEFAULT_HEAP_PAGES),
+        completion,
     })
 }
 
@@ -802,8 +820,12 @@ fn build_one(
     let executable = run_cargo(manifest, target)?;
     let image = read_bounded(&executable, ELF_MAX_BYTES, "ELF artifact")?;
     let executable = convert_elf(&image, Some(target), stack_pages, heap_pages)?;
-    let package = encode_kex_package(&executable, &manifest.requirements)
-        .map_err(|_| ToolError::new("cannot encode KEX package"))?;
+    let package = encode_kex_package_with_completion(
+        &executable,
+        &manifest.requirements,
+        Some(&manifest.completion),
+    )
+    .map_err(|_| ToolError::new("cannot encode KEX package"))?;
     let output = output
         .join(target_name(target))
         .join(format!("{}.kex", manifest.command));
@@ -993,8 +1015,9 @@ pub fn run(arguments: impl Iterator<Item = OsString>) -> Result<(), ToolError> {
 
 #[cfg(test)]
 mod tests {
-    use super::filtered_rustc_arguments;
+    use super::{filtered_rustc_arguments, read_manifest, repo_root};
     use std::ffi::OsString;
+    use std::fs;
 
     #[test]
     fn rustc_wrapper_removes_only_cargo_metadata() -> Result<(), super::ToolError> {
@@ -1025,5 +1048,35 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    #[test]
+    fn every_application_owns_a_valid_command_bound_completion_artifact() {
+        let apps = repo_root().join("apps");
+        let mut names = fs::read_dir(&apps)
+            .unwrap_or_else(|_| std::process::abort())
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().join("Cargo.toml").is_file())
+            .map(|entry| entry.file_name())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names.len(), 33);
+        for name in names {
+            let directory = apps.join(&name);
+            let manifest =
+                read_manifest(&directory, None).unwrap_or_else(|_| std::process::abort());
+            assert_eq!(manifest.command, name.to_string_lossy());
+            assert!(!manifest.completion.is_empty());
+        }
+        for (directory, command) in [
+            ("diagnostics", "diagnostics-server"),
+            ("diagnostics-benchmark", "diagnostics-benchmark-server"),
+            ("diagnostics-fault", "diagnostics-fault-server"),
+        ] {
+            let manifest =
+                read_manifest(&repo_root().join("services").join(directory), Some(command))
+                    .unwrap_or_else(|_| std::process::abort());
+            assert_eq!(manifest.command, command);
+        }
     }
 }

@@ -1,0 +1,4 @@
+CMPL	1	grep
+R	1	1	^-	values:--,-E,-F,-G,-H,-L,-b,-c,-e,-h,-i,-l,-m,-n,-o,-q,-s,-v,-w,-x
+R	2	2	*	integer:decimal:0:*	eq:0:-m
+R	2	*	*	path:file

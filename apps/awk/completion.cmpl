@@ -1,0 +1,5 @@
+CMPL	1	awk
+R	1	1	^-	values:-F
+R	4	*	*	path:file	eq:0:-F
+R	3	*	*	path:file	starts:0:-F	ne:0:-F
+R	2	*	*	path:file	not-starts:0:-F

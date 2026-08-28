@@ -23,6 +23,10 @@ pinned UEFI and TLSF boundaries. Console input, KEX packages, configuration and
 generation objects, network packets, and every supported filesystem or disk
 format are treated as untrusted and bounded.
 
+Package-owned CMPL metadata is separately bounded and validated before the
+shell selects a trusted resolver. It grants no application capability, and Tab
+never executes the ordinary application.
+
 ## Invariants enforced now
 
 - command input: 512 bytes, 128 arguments per stage, 255 stages;

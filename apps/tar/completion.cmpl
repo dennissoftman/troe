@@ -1,0 +1,5 @@
+CMPL	1	tar
+R	1	1	*	values:-cf,-tf,-xf,cf,tf,xf
+R	2	2	*	path:file
+R	3	*	*	path:any	eq:0:-cf
+R	3	*	*	path:any	eq:0:cf
