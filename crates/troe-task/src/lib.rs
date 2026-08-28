@@ -174,6 +174,27 @@ impl ProcessName {
         })
     }
 
+    /// Derive a bounded observable name from an executable reference.
+    ///
+    /// The final nonempty path component is retained. Names longer than the
+    /// observation record are truncated at a UTF-8 boundary; this affects only
+    /// diagnostics and never executable resolution or identity.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a reference with no nonempty path component.
+    pub fn from_executable_reference(reference: &str) -> Result<Self, ProcessError> {
+        let name = reference
+            .rsplit('/')
+            .find(|component| !component.is_empty())
+            .ok_or(ProcessError::InvalidName)?;
+        let mut retained = name.len().min(MAX_PROCESS_NAME_BYTES);
+        while !name.is_char_boundary(retained) {
+            retained = retained.checked_sub(1).ok_or(ProcessError::InvalidName)?;
+        }
+        Self::new(&name[..retained])
+    }
+
     /// Borrow the validated UTF-8 name.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -2213,6 +2234,25 @@ mod tests {
         assert_eq!(ProcessName::new(""), Err(ProcessError::InvalidName));
         assert_eq!(
             ProcessName::new("123456789012345678901234567890123"),
+            Err(ProcessError::InvalidName)
+        );
+        assert_eq!(
+            ProcessName::from_executable_reference("/vol/shared/echo-copy.kex")?.as_str(),
+            "echo-copy.kex"
+        );
+        assert_eq!(
+            ProcessName::from_executable_reference(
+                "/vol/shared/abcdefghijklmnopqrstuvwxyz0123456789.kex"
+            )?
+            .as_str(),
+            "abcdefghijklmnopqrstuvwxyz012345"
+        );
+        assert_eq!(
+            ProcessName::from_executable_reference("/tmp/λλλλλλλλλλλλλλλλλ")?.as_str(),
+            "λλλλλλλλλλλλλλλλ"
+        );
+        assert_eq!(
+            ProcessName::from_executable_reference("///"),
             Err(ProcessError::InvalidName)
         );
         let mut processes = ProcessTable::new(1)?;

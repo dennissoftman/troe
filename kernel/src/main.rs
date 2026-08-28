@@ -79,8 +79,9 @@ mod firmware {
     };
     use troe_random::{Generator as RandomGenerator, SEED_BYTES as RANDOM_SEED_BYTES};
     use troe_shell::{
-        CompletionConfig, ExecutionPlacement, ExternalCommand, JobControl, MachineAction,
-        ServiceControl, SharedNamespace, Shell, format_memory_report, parse_line,
+        CompletionConfig, ExecutionPlacement, ExternalCommand, ExternalCommandReference,
+        JobControl, MachineAction, ServiceControl, SharedNamespace, Shell,
+        external_command_reference, format_memory_report, parse_line,
     };
     #[cfg(feature = "acceptance-probes")]
     use troe_statefs::STATE_PATH;
@@ -103,6 +104,7 @@ mod firmware {
     };
     use troe_vfs::{
         FILE_IO_BUFFER_BYTES, FsError, Namespace, NodeKind, RamFsQuota, ReadOnlyFileSystem,
+        canonicalize,
     };
     use uefi::boot;
     use uefi::mem::memory_map::{MemoryMap, MemoryMapOwned};
@@ -4598,7 +4600,12 @@ mod firmware {
         if services.is_empty() || services.len() > troe_dispatch::MAX_HANDLES {
             return Err(());
         }
-        let process_name = ProcessName::new(process_name).map_err(|_| ())?;
+        let process_name = if process_name.as_bytes().contains(&b'/') {
+            ProcessName::from_executable_reference(process_name)
+        } else {
+            ProcessName::new(process_name)
+        }
+        .map_err(|_| ())?;
         let mut transaction = LoaderTransaction::new();
         transaction
             .acquire(LoaderResource::Staging)
@@ -5464,9 +5471,8 @@ mod firmware {
                 .map_err(|_| ReplyStatus::Exhausted)?;
             let invocation = request.invocation();
             let command_name = invocation.argument(0).ok_or(ReplyStatus::InvalidRequest)?;
-            if !valid_application_name(command_name) {
-                return Err(ReplyStatus::InvalidRequest);
-            }
+            let reference =
+                external_command_reference(command_name).ok_or(ReplyStatus::InvalidRequest)?;
             let mut words = Vec::new();
             words
                 .try_reserve_exact(invocation.len())
@@ -5489,12 +5495,19 @@ mod firmware {
                 environment_refs.push(value.as_str());
             }
 
-            let path = alloc::format!("/bin/{command_name}.kex");
+            let catalog_path = match reference {
+                ExternalCommandReference::CatalogName(name) => {
+                    Some(alloc::format!("/bin/{name}.kex"))
+                }
+                ExternalCommandReference::Path(_) => None,
+            };
+            let path = catalog_path.as_deref().unwrap_or(command_name);
+            let cwd = invocation.cwd();
             let metadata = control
                 .launch
                 .namespace
                 .borrow_mut()
-                .metadata("/", &path)
+                .metadata(cwd, path)
                 .map_err(|error| match error {
                     troe_vfs::FsError::NotFound => ReplyStatus::NotFound,
                     _ => ReplyStatus::Failure,
@@ -5507,7 +5520,7 @@ mod firmware {
                     .launch
                     .namespace
                     .borrow_mut()
-                    .read_file_at("/", &path, offset, destination)
+                    .read_file_at(cwd, path, offset, destination)
                     .map_err(|_| ())
             })
             .map_err(|_| ReplyStatus::Failure)?;
@@ -13285,13 +13298,26 @@ mod firmware {
             stderr: &'stream mut dyn Output,
         ) -> Option<CommandStatus> {
             self.pending_script_lines = None;
-            if !valid_application_name(command) {
-                return None;
-            }
-            let path = alloc::format!("/bin/{command}.kex");
-            let metadata = match namespace.borrow_mut().metadata("/", &path) {
+            let reference = external_command_reference(command)?;
+            let explicit_path = matches!(reference, ExternalCommandReference::Path(_));
+            let catalog_path = match reference {
+                ExternalCommandReference::CatalogName(name) => {
+                    Some(alloc::format!("/bin/{name}.kex"))
+                }
+                ExternalCommandReference::Path(_) => None,
+            };
+            let path = catalog_path.as_deref().unwrap_or(command);
+            let metadata = match namespace.borrow_mut().metadata(cwd, path) {
                 Ok(metadata) => metadata,
-                Err(troe_vfs::FsError::NotFound) => return None,
+                Err(troe_vfs::FsError::NotFound) if !explicit_path => return None,
+                Err(troe_vfs::FsError::NotFound) => {
+                    return Some(command_application_status_error(
+                        stderr,
+                        command,
+                        "not found",
+                        CommandStatus::NotFound,
+                    ));
+                }
                 Err(_) => return Some(command_application_error(stderr, command, "lookup failed")),
             };
             if metadata.kind != NodeKind::File {
@@ -13304,7 +13330,7 @@ mod firmware {
             let Ok(artifact) = stage_artifact(metadata.byte_count, |offset, destination| {
                 namespace
                     .borrow_mut()
-                    .read_file_at("/", &path, offset, destination)
+                    .read_file_at(cwd, path, offset, destination)
                     .map_err(|_| ())
             }) else {
                 return Some(command_application_error(
@@ -14540,8 +14566,17 @@ mod firmware {
         command: &str,
         message: &str,
     ) -> CommandStatus {
+        command_application_status_error(stderr, command, message, CommandStatus::Failure)
+    }
+
+    fn command_application_status_error(
+        stderr: &mut dyn Output,
+        command: &str,
+        message: &str,
+        status: CommandStatus,
+    ) -> CommandStatus {
         let _ignored = write_all(stderr, alloc::format!("{command}: {message}\n").as_bytes());
-        CommandStatus::Failure
+        status
     }
 
     const fn command_status(status: u32) -> CommandStatus {
@@ -14553,13 +14588,6 @@ mod firmware {
             troe_abi::exit::CANCELLED => CommandStatus::Cancelled,
             _ => CommandStatus::Failure,
         }
-    }
-
-    fn valid_application_name(name: &str) -> bool {
-        !name.is_empty()
-            && name.as_bytes().iter().all(|byte| {
-                byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
-            })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -14723,6 +14751,28 @@ mod firmware {
                     .unwrap_or_else(|_| fatal(b"fatal: guard address unsupported\n"));
                 troe_machine::trigger_write_fault(guard);
             }
+            let confirmation_cwd = String::from(shell.cwd());
+            let confirmed = confirm_untrusted_application_paths(
+                &line,
+                &confirmation_cwd,
+                &mut decoder,
+                &mut keyboard,
+                &mut shell,
+                &runtime,
+                &mut residents,
+                &processes,
+                &mut services,
+                task.scheduler,
+                task.accounting,
+                task.task_id,
+                task.capabilities,
+                completion_config,
+                &mut console,
+            )
+            .unwrap_or_else(|()| fatal(b"fatal: executable confirmation failed\n"));
+            if !confirmed {
+                continue;
+            }
             let mut input = EmptyInput;
             let mut error = NativeConsole;
             let mut external = KexCommandRunner {
@@ -14810,6 +14860,72 @@ mod firmware {
                 troe_machine::reboot();
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn confirm_untrusted_application_paths(
+        line: &str,
+        cwd: &str,
+        decoder: &mut InputDecoder,
+        keyboard: &mut Ps2Set1Decoder,
+        shell: &mut Shell,
+        runtime: &SharedRuntime,
+        residents: &mut ResidentProcessTable,
+        processes: &SharedProcessTable,
+        services: &mut Option<ServiceRuntime>,
+        scheduler: &mut Scheduler,
+        accounting: &mut OwnedAccounting,
+        shell_id: TaskId,
+        shell_capabilities: Capabilities,
+        completion_config: CompletionConfig,
+        console: &mut dyn Output,
+    ) -> Result<bool, ()> {
+        let Ok(pipeline) = parse_line(line) else {
+            return Ok(true);
+        };
+        for stage in pipeline.stages {
+            let Some(command) = stage.words.first() else {
+                continue;
+            };
+            if !matches!(
+                external_command_reference(command),
+                Some(ExternalCommandReference::Path(_))
+            ) {
+                continue;
+            }
+            let Ok(path) = canonicalize(cwd, command) else {
+                continue;
+            };
+            if path.starts_with("/bin/") {
+                continue;
+            }
+            let prompt =
+                alloc::format!("Run untrusted application '{command}' outside /bin? [y/N] ");
+            write_all(console, prompt.as_bytes())?;
+            let mut confirmation_editor = LineEditor::new(EditorConfig::standard());
+            let answer = read_edited_line(
+                &mut confirmation_editor,
+                decoder,
+                keyboard,
+                shell,
+                runtime,
+                residents,
+                processes,
+                services,
+                scheduler,
+                accounting,
+                shell_id,
+                shell_capabilities,
+                completion_config,
+                &prompt,
+                console,
+            )?;
+            if !answer.eq_ignore_ascii_case("y") {
+                write_all(console, b"execution cancelled\n")?;
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     #[allow(clippy::too_many_arguments)]

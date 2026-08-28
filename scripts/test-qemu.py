@@ -878,6 +878,60 @@ class SerialSession:
                 )
         return text
 
+    def confirmed_command(
+        self,
+        command: str,
+        cwd: str,
+        timeout: float,
+        *,
+        contains: tuple[str, ...] = (),
+        absent: tuple[str, ...] = (),
+    ) -> str:
+        """Approve one explicit-path warning, then assert command output."""
+        submitted = self.send(command, timeout)
+        marker = f"Run untrusted application '{command.split()[0]}' outside /bin? [y/N] ".encode()
+        self.wait_for(marker, timeout, submitted)
+        answered = self.send("y", timeout)
+        prompt = f"sh:{cwd}> ".encode()
+        end = self.wait_for(prompt, timeout, answered)
+        text = normalize(bytes(self.output[submitted : end - len(prompt)]))
+        for expected in contains:
+            if expected not in text:
+                raise AcceptanceError(
+                    f"{command!r} did not produce expected text {expected!r}; "
+                    f"command output was {text!r}"
+                )
+        for unexpected in absent:
+            if unexpected in text:
+                raise AcceptanceError(
+                    f"{command!r} unexpectedly produced {unexpected!r}; "
+                    f"command output was {text!r}"
+                )
+        return text
+
+    def declined_command(
+        self, command: str, cwd: str, timeout: float, *, absent: tuple[str, ...] = ()
+    ) -> str:
+        """Submit the default negative answer and require no execution."""
+        submitted = self.send(command, timeout)
+        marker = f"Run untrusted application '{command.split()[0]}' outside /bin? [y/N] ".encode()
+        self.wait_for(marker, timeout, submitted)
+        answered = self.send("", timeout)
+        prompt = f"sh:{cwd}> ".encode()
+        end = self.wait_for(prompt, timeout, answered)
+        text = normalize(bytes(self.output[submitted : end - len(prompt)]))
+        if "execution cancelled\n" not in text:
+            raise AcceptanceError(
+                f"{command!r} did not report declined execution: {text!r}"
+            )
+        for unexpected in absent:
+            if unexpected in text:
+                raise AcceptanceError(
+                    f"{command!r} unexpectedly produced {unexpected!r}; "
+                    f"command output was {text!r}"
+                )
+        return text
+
     def close(self) -> None:
         """Stop QEMU even when the guest has deliberately returned to firmware."""
         if self.process.poll() is None:
@@ -1139,6 +1193,59 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
         contains=(SHARED_CONTENT,),
     )
     session.command(
+        "cp /bin/echo.kex /vol/shared/echo-copy", cwd, command_timeout
+    )
+    session.command("cd /vol/shared", cwd, command_timeout, next_cwd="/vol/shared")
+    cwd = "/vol/shared"
+    session.declined_command(
+        "./echo-copy should-not-execute",
+        cwd,
+        command_timeout,
+        absent=("should-not-execute\n",),
+    )
+    session.confirmed_command(
+        "./echo-copy shared-relative-kex",
+        cwd,
+        command_timeout,
+        contains=("shared-relative-kex\n",),
+    )
+    session.confirmed_command(
+        "/vol/shared/echo-copy shared-absolute-kex",
+        cwd,
+        command_timeout,
+        contains=("shared-absolute-kex\n",),
+    )
+    session.command(
+        "lua -e 'local ok,kind,status=os.execute(\"./echo-copy "
+        "shared-child-kex\"); print(\"path-kex-status\",ok,kind,status)'",
+        cwd,
+        command_timeout,
+        contains=("shared-child-kex\n", "path-kex-status\ttrue\texit\t0\n"),
+    )
+    session.command(
+        "spawn echo-copy",
+        cwd,
+        command_timeout,
+        contains=("spawn: child launch failed",),
+        absent=("shared-relative-kex",),
+    )
+    session.confirmed_command(
+        "./missing-kex",
+        cwd,
+        command_timeout,
+        contains=("./missing-kex: not found",),
+    )
+    session.command("printf not-a-kex > ./malformed-kex", cwd, command_timeout)
+    session.confirmed_command(
+        "./malformed-kex",
+        cwd,
+        command_timeout,
+        contains=("./malformed-kex: application package rejected",),
+    )
+    session.command("rm ./malformed-kex", cwd, command_timeout)
+    session.command("cd /", cwd, command_timeout, next_cwd="/")
+    cwd = "/"
+    session.command(
         "ls /",
         cwd,
         command_timeout,
@@ -1170,6 +1277,16 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
         "ln -s troe-mutable.txt /vol/root/troe-mutable-soft",
         cwd,
         command_timeout,
+    )
+    session.command("cp /bin/echo.kex /vol/root/echo-copy", cwd, command_timeout)
+    session.command(
+        "ln -s echo-copy /vol/root/echo-link", cwd, command_timeout
+    )
+    session.confirmed_command(
+        "/vol/root/echo-link symlinked-kex",
+        cwd,
+        command_timeout,
+        contains=("symlinked-kex\n",),
     )
     session.command(
         "ls /vol/root",
@@ -1311,6 +1428,8 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
     )
     session.command("rm /vol/root/troe-moved.txt", cwd, command_timeout)
     session.command("rm /vol/root/troe-copy-soft", cwd, command_timeout)
+    session.command("rm /vol/root/echo-link", cwd, command_timeout)
+    session.command("rm /vol/root/echo-copy", cwd, command_timeout)
     session.command("rm /vol/root/troe-mutable-hard", cwd, command_timeout)
     session.command("rm /vol/root/troe-mutable-soft", cwd, command_timeout)
     session.command("echo alpha beta", cwd, command_timeout, contains=("alpha beta\n",))
@@ -1375,6 +1494,7 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
         contains=("read-only activation complete\n",),
     )
     session.command("cd /", cwd, command_timeout, next_cwd="/")
+    session.command("rm /vol/shared/echo-copy", "/", command_timeout)
     cwd = "/"
     session.command("echo alpha beta | grep beta > /tmp/result", cwd, command_timeout)
     session.command("cat /tmp/result", cwd, command_timeout, contains=("alpha beta\n",))

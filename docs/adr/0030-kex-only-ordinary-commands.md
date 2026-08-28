@@ -9,6 +9,10 @@ Supersession note, 2026-08-27: ADRs 0037 and 0038 add `fg`, `jobs`, `kill`,
 KEX-only rule for ordinary commands and the original `cd`, `poweroff`, and
 `reboot` authority rationale remain unchanged.
 
+Supersession note, 2026-08-28: ADR 0050 retains exact `/bin` resolution for
+bare names and adds explicit relative or absolute KEX path execution. Its
+no-fallback and complete-validation requirements remain unchanged.
+
 ## Decision
 
 The shell implements exactly three non-shadowable intrinsics: `cd`, `poweroff`,

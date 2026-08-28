@@ -105,10 +105,13 @@ The shell reserves `cd`, `fg`, `jobs`, `kill`, `log`, `poweroff`, `reboot`,
 `svc`, and `wait` as non-shadowable intrinsics. `cd` owns the logical
 working-directory transition, the job and service commands operate only on
 their owning bounded tables, while both terminal machine
-actions consume only the shell's machine-control grant. KEX command discovery
-resolves every ordinary command from exact immutable architecture-specific
-paths, but cannot intercept intrinsic names; ABI 1.1
-exposes no platform-transition operation.
+actions consume only the shell's machine-control grant. Bare KEX command
+discovery resolves immutable architecture-specific `/bin/<name>.kex` paths and
+cannot intercept intrinsic names. A token containing `/` bypasses discovery
+and selects one exact relative or absolute VFS file; it adds neither a `PATH`
+search nor implicit current-directory execution. The interactive shell asks a
+default-negative confirmation before direct execution outside `/bin`; nested
+typed process launch remains noninteractive. ABI 1.1 exposes no platform-transition operation.
 
 Native KEX interfaces follow ADR 0034: opaque handles share generation,
 ownership, accounting, cancellation, waiting, and teardown machinery, while
@@ -343,8 +346,10 @@ inspection nor process control.
 
 ADR 0046 defines owner-scoped nested process launch and byte pipes. A launcher
 passes canonical cwd, argv, environment, and explicit inherited/null/pipe
-standard streams; the kernel resolves and validates `/bin/<name>.kex`, grants
-only a child-manifest attenuation of the launcher's own capabilities, and
+standard streams. A bare `argv[0]` resolves `/bin/<name>.kex`; one containing
+`/` resolves exactly against the supplied cwd. The kernel stages and validates
+the selected regular KEX file, grants only a child-manifest attenuation of the
+launcher's own capabilities, and
 returns an opaque control token separate from the observable process ID.
 Blocking wait, cancellation, terminal reap, pipe backpressure/EOF, and recursive
 descendant teardown are resident-process operations. The kernel exposes no
@@ -375,9 +380,11 @@ constructed, and its embedded KEX v1 executable is validated before mapping.
 It layers command-invocation 1.1 and standard-stream 1.1 services on that
 mechanism: immutable cwd/argv, stdin, stdout, and stderr. The shell logically yields while
 one foreground application runs, then resumes only after owner-wide handle
-revocation, record reaping, page zeroization, and exact frame return. Artifacts
-are read from target-selected `/bin/<name>.kex`; absence is a terminal not-found
-result. Individual service payloads and retained tables have hard ceilings;
+revocation, record reaping, page zeroization, and exact frame return. Bare
+artifacts are read from target-selected `/bin/<name>.kex`; explicit path
+artifacts are resolved through the same VFS namespace against the immutable
+invocation cwd. No suffix or search path is inferred, and absence is a terminal
+not-found result. Individual service payloads and retained tables have hard ceilings;
 ordinary applications have no cumulative service-call ceiling. Heap and
 private-memory commitment are bounded by physical availability, exact owned
 accounting, and the active configurable memory policy. Standard streams themselves

@@ -552,6 +552,34 @@ fn valid_command_name(name: &str) -> bool {
         })
 }
 
+/// Resolver classification for one non-intrinsic command token.
+///
+/// Bare command names retain the trusted `/bin/<name>.kex` catalog contract.
+/// A token containing `/` is an explicit filesystem path and is never looked
+/// up in the catalog or rewritten with an extension.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExternalCommandReference<'a> {
+    /// Valid bare name eligible for `/bin` catalog lookup.
+    CatalogName(&'a str),
+    /// Exact path selected by the caller, relative to its logical cwd or absolute.
+    Path(&'a str),
+}
+
+/// Classify one non-intrinsic command token for an application resolver.
+///
+/// Invalid bare names are rejected. Explicit paths retain their exact spelling
+/// so the VFS remains the sole authority for normalization and confinement.
+#[must_use]
+pub fn external_command_reference(command: &str) -> Option<ExternalCommandReference<'_>> {
+    if command.as_bytes().contains(&b'/') {
+        Some(ExternalCommandReference::Path(command))
+    } else if valid_command_name(command) {
+        Some(ExternalCommandReference::CatalogName(command))
+    } else {
+        None
+    }
+}
+
 /// Return whether a name is reserved for shell-intrinsic execution.
 ///
 /// Application names are discovered dynamically from `/bin` and therefore do
@@ -966,6 +994,9 @@ impl Shell {
             return self.complete_paths(context, false, config);
         }
         if context.word_index == 0 {
+            if context.prefix.as_bytes().contains(&b'/') {
+                return self.complete_paths(context, false, config);
+            }
             self.command_catalog
                 .refresh(&mut self.namespace.borrow_mut());
             return complete_commands(
@@ -1927,8 +1958,9 @@ const fn parse_error_text(error: ParseError) -> &'static str {
 mod tests {
     use super::{
         CommandClass, CompletionConfig, CompletionConfigError, ExecutionPlacement, ExternalCommand,
-        INTRINSICS, JobControl, MachineAction, OutputRedirection, ParseError, ServiceControl,
-        SharedNamespace, Shell, command_class, command_synopsis, format_memory_report, parse_line,
+        ExternalCommandReference, INTRINSICS, JobControl, MachineAction, OutputRedirection,
+        ParseError, ServiceControl, SharedNamespace, Shell, command_class, command_synopsis,
+        external_command_reference, format_memory_report, parse_line,
     };
     use alloc::boxed::Box;
     use alloc::format;
@@ -2762,6 +2794,9 @@ mod tests {
         let pipeline = shell.complete("echo x | pw", 11, CompletionConfig::standard());
         assert_eq!(pipeline.candidates[0].replacement, "pwd ");
 
+        let explicit = shell.complete("/bin/ec", 7, CompletionConfig::standard());
+        assert_eq!(explicit.candidates[0].replacement, "/bin/echo.kex ");
+
         let directory = shell.complete("cd /he", 6, CompletionConfig::standard());
         assert_eq!(directory.candidates[0].replacement, "/help/");
 
@@ -2807,6 +2842,23 @@ mod tests {
         ] {
             let completion = shell.complete(line, line.len(), CompletionConfig::standard());
             assert_eq!(completion.candidates[0].replacement, "/help/readme ");
+        }
+    }
+
+    #[test]
+    fn resolver_distinguishes_catalog_names_from_exact_paths() {
+        assert_eq!(
+            external_command_reference("echo"),
+            Some(ExternalCommandReference::CatalogName("echo"))
+        );
+        for path in ["./echo", "../bin/echo.kex", "/vol/shared/tool"] {
+            assert_eq!(
+                external_command_reference(path),
+                Some(ExternalCommandReference::Path(path))
+            );
+        }
+        for invalid in ["", "Echo", "not.valid"] {
+            assert_eq!(external_command_reference(invalid), None);
         }
     }
 

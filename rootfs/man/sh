@@ -20,7 +20,18 @@ DESCRIPTION
 
     Source is limited to 64 KiB, one physical command line to 512 UTF-8 bytes,
     one batch to 1,024 commands, and nesting to four scripts within the same
-    1,024-command budget. Files are not directly executable; use sh FILE.
+    1,024-command budget. Text scripts are not directly executable and have no
+    shebang handling; use sh FILE.
+
+    A bare ordinary command resolves only /bin/COMMAND.kex. A command token
+    containing / instead names an exact KEX package path relative to the
+    current directory or absolute from /. No suffix is inferred and neither
+    PATH nor the current directory is searched implicitly. The target must be a
+    regular file containing a valid KEX package. Package capabilities are still
+    limited by the launcher; copying a package does not add authority.
+    Direct interactive execution outside /bin asks for confirmation and treats
+    Enter or any answer other than y as cancellation. The prompt is an advisory
+    provenance warning, not a filesystem permission or package-trust decision.
 
     Single and double quotes group literal text; neither performs expansion.
     An unquoted | connects bounded byte streams. Unquoted < supplies the first
@@ -37,3 +48,7 @@ DESCRIPTION
 EXAMPLES
     sh /share/sh/bench.sh
     printf 'echo from-stdin\n' | sh -
+    cp /bin/echo.kex /vol/shared/echo-copy
+    cd /vol/shared
+    ./echo-copy from-shared
+    Run untrusted application './echo-copy' outside /bin? [y/N] y
