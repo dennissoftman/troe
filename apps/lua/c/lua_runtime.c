@@ -64,6 +64,10 @@ typedef int (*TroeWrite)(void *context, int stream, const uint8_t *bytes,
 typedef int (*TroeProcessCpuTime)(void *context, uint64_t *ticks,
                                   uint64_t *frequency_hz);
 typedef int (*TroeWallTime)(void *context, uint64_t *seconds);
+typedef intptr_t (*TroeEnvironmentGet)(void *context, const uint8_t *name,
+                                       size_t name_length,
+                                       uint8_t *destination,
+                                       size_t capacity);
 typedef intptr_t (*TroeReadInput)(void *context, uint8_t *destination,
                                   size_t capacity);
 typedef int (*TroeFileOpen)(void *context, const uint8_t *path,
@@ -103,6 +107,7 @@ struct TroeLuaHost {
   TroeWrite write;
   TroeProcessCpuTime process_cpu_time;
   TroeWallTime wall_time;
+  TroeEnvironmentGet environment_get;
   TroeReadInput read_input;
   TroeFileOpen file_open;
   TroeFileRead file_read;
@@ -155,185 +160,7 @@ static jmp_buf troe_unclosed_exit_jump;
 static int troe_exit_jump_active;
 
 #if !defined(TROE_LUA_HOST_TEST)
-extern int troe_parse_decimal(const uint8_t *bytes, size_t length,
-                              double *result);
-
-int errno;
-
-void *memcpy(void *destination, const void *source, size_t size) {
-  uint8_t *out = (uint8_t *)destination;
-  const uint8_t *in = (const uint8_t *)source;
-  for (size_t index = 0; index < size; ++index)
-    out[index] = in[index];
-  return destination;
-}
-
-void *memmove(void *destination, const void *source, size_t size) {
-  uint8_t *out = (uint8_t *)destination;
-  const uint8_t *in = (const uint8_t *)source;
-  if (out < in) {
-    for (size_t index = 0; index < size; ++index)
-      out[index] = in[index];
-  } else if (out > in) {
-    while (size != 0) {
-      --size;
-      out[size] = in[size];
-    }
-  }
-  return destination;
-}
-
-void *memset(void *destination, int value, size_t size) {
-  uint8_t *out = (uint8_t *)destination;
-  for (size_t index = 0; index < size; ++index)
-    out[index] = (uint8_t)value;
-  return destination;
-}
-
-int memcmp(const void *left, const void *right, size_t size) {
-  const uint8_t *a = (const uint8_t *)left;
-  const uint8_t *b = (const uint8_t *)right;
-  for (size_t index = 0; index < size; ++index) {
-    if (a[index] != b[index])
-      return a[index] < b[index] ? -1 : 1;
-  }
-  return 0;
-}
-
-void *memchr(const void *bytes, int value, size_t size) {
-  const uint8_t *cursor = (const uint8_t *)bytes;
-  for (size_t index = 0; index < size; ++index) {
-    if (cursor[index] == (uint8_t)value)
-      return (void *)&cursor[index];
-  }
-  return NULL;
-}
-
-size_t strlen(const char *text) {
-  size_t length = 0;
-  while (text[length] != '\0')
-    ++length;
-  return length;
-}
-
-int strcmp(const char *left, const char *right) {
-  while (*left != '\0' && *left == *right) {
-    ++left;
-    ++right;
-  }
-  return (uint8_t)*left < (uint8_t)*right
-             ? -1
-             : ((uint8_t)*left != (uint8_t)*right);
-}
-
-int strncmp(const char *left, const char *right, size_t size) {
-  for (size_t index = 0; index < size; ++index) {
-    uint8_t a = (uint8_t)left[index];
-    uint8_t b = (uint8_t)right[index];
-    if (a != b)
-      return a < b ? -1 : 1;
-    if (a == 0)
-      return 0;
-  }
-  return 0;
-}
-
-int strcoll(const char *left, const char *right) { return strcmp(left, right); }
-
-char *strcpy(char *destination, const char *source) {
-  char *result = destination;
-  do {
-    *destination++ = *source;
-  } while (*source++ != '\0');
-  return result;
-}
-
-char *strchr(const char *text, int value) {
-  char wanted = (char)value;
-  do {
-    if (*text == wanted)
-      return (char *)text;
-  } while (*text++ != '\0');
-  return NULL;
-}
-
-char *strpbrk(const char *text, const char *accepted) {
-  for (; *text != '\0'; ++text) {
-    if (strchr(accepted, *text) != NULL)
-      return (char *)text;
-  }
-  return NULL;
-}
-
-size_t strspn(const char *text, const char *accepted) {
-  size_t length = 0;
-  while (text[length] != '\0' && strchr(accepted, text[length]) != NULL)
-    ++length;
-  return length;
-}
-
-char *strstr(const char *text, const char *needle) {
-  size_t needle_length = strlen(needle);
-  if (needle_length == 0)
-    return (char *)text;
-  for (; *text != '\0'; ++text) {
-    if (strncmp(text, needle, needle_length) == 0)
-      return (char *)text;
-  }
-  return NULL;
-}
-
-char *strerror(int error) {
-  switch (error) {
-  case EDOM:
-    return "numeric argument out of domain";
-  case ERANGE:
-    return "result out of range";
-  case EINVAL:
-    return "invalid argument or filesystem operation";
-  default:
-    return "KEX service operation failed";
-  }
-}
-
-static int troe_ascii(unsigned value) { return value <= 0x7f ? (int)value : -1; }
-
-int isdigit(int value) {
-  value = troe_ascii((unsigned)value);
-  return value >= '0' && value <= '9';
-}
-int islower(int value) {
-  value = troe_ascii((unsigned)value);
-  return value >= 'a' && value <= 'z';
-}
-int isupper(int value) {
-  value = troe_ascii((unsigned)value);
-  return value >= 'A' && value <= 'Z';
-}
-int isalpha(int value) { return islower(value) || isupper(value); }
-int isalnum(int value) { return isalpha(value) || isdigit(value); }
-int iscntrl(int value) {
-  value = troe_ascii((unsigned)value);
-  return value >= 0 && (value < 0x20 || value == 0x7f);
-}
-int isprint(int value) {
-  value = troe_ascii((unsigned)value);
-  return value >= 0x20 && value <= 0x7e;
-}
-int isgraph(int value) { return isprint(value) && value != ' '; }
-int isspace(int value) {
-  return value == ' ' || value == '\t' || value == '\n' || value == '\r' ||
-         value == '\f' || value == '\v';
-}
-int isxdigit(int value) {
-  return isdigit(value) || (value >= 'a' && value <= 'f') ||
-         (value >= 'A' && value <= 'F');
-}
-int ispunct(int value) { return isgraph(value) && !isalnum(value); }
-int tolower(int value) { return isupper(value) ? value + ('a' - 'A') : value; }
-int toupper(int value) { return islower(value) ? value - ('a' - 'A') : value; }
-
-int abs(int value) { return value < 0 ? -value : value; }
+#include "../../../sdk/c/troe-kex-runtime/troe_libc_core.c"
 
 void abort(void) {
   __builtin_trap();
@@ -356,160 +183,32 @@ void *realloc(void *pointer, size_t size) {
 }
 void free(void *pointer) { (void)pointer; }
 char *getenv(const char *name) {
-  (void)name;
-  return NULL;
-}
-
-struct lconv *localeconv(void) {
-  static char point[] = ".";
-  static struct lconv locale = {point};
-  return &locale;
+  static char value[2049];
+  intptr_t length;
+  if (name == NULL || troe_active_host == NULL)
+    return NULL;
+  length = troe_active_host->environment_get(
+      troe_active_host->context, (const uint8_t *)name, strlen(name),
+      (uint8_t *)value, sizeof(value) - 1);
+  if (length < 0 || (size_t)length >= sizeof(value))
+    return NULL;
+  value[length] = '\0';
+  return value;
 }
 
 time_t time(time_t *destination) {
+  uint64_t seconds;
+  time_t result;
+  if (troe_active_host == NULL ||
+      troe_active_host->wall_time(troe_active_host->context, &seconds) != 0 ||
+      seconds > (uint64_t)LONG_MAX) {
+    errno = EOVERFLOW;
+    result = (time_t)-1;
+  } else {
+    result = (time_t)seconds;
+  }
   if (destination != NULL)
-    *destination = 0;
-  return 0;
-}
-
-double strtod(const char *text, char **end) {
-  const char *start = text;
-  const char *cursor;
-  const char *exponent;
-  int digits = 0;
-  double result = 0.0;
-  while (isspace(*start))
-    ++start;
-  cursor = start;
-  if (*cursor == '+' || *cursor == '-')
-    ++cursor;
-  while (isdigit(*cursor)) {
-    ++digits;
-    ++cursor;
-  }
-  if (*cursor == '.') {
-    ++cursor;
-    while (isdigit(*cursor)) {
-      ++digits;
-      ++cursor;
-    }
-  }
-  if (digits == 0) {
-    if (end != NULL)
-      *end = (char *)text;
-    return 0.0;
-  }
-  exponent = cursor;
-  if (*cursor == 'e' || *cursor == 'E') {
-    const char *exponent_digits;
-    ++cursor;
-    if (*cursor == '+' || *cursor == '-')
-      ++cursor;
-    exponent_digits = cursor;
-    while (isdigit(*cursor))
-      ++cursor;
-    if (cursor == exponent_digits)
-      cursor = exponent;
-  }
-  if (troe_parse_decimal((const uint8_t *)start, (size_t)(cursor - start),
-                         &result) != 0) {
-    if (end != NULL)
-      *end = (char *)text;
-    return 0.0;
-  }
-  if (end != NULL)
-    *end = (char *)cursor;
-  return result;
-}
-
-typedef union TroeDoubleBits {
-  double value;
-  uint64_t bits;
-} TroeDoubleBits;
-
-#define TROE_UNARY_MATH(name)                                                \
-  extern uint64_t troe_math_##name##_bits(uint64_t value);                  \
-  double name(double value) {                                               \
-    TroeDoubleBits input = {.value = value};                                \
-    TroeDoubleBits output = {.bits = troe_math_##name##_bits(input.bits)};   \
-    return output.value;                                                     \
-  }
-
-TROE_UNARY_MATH(acos)
-TROE_UNARY_MATH(asin)
-TROE_UNARY_MATH(atan)
-TROE_UNARY_MATH(ceil)
-TROE_UNARY_MATH(cos)
-TROE_UNARY_MATH(exp)
-TROE_UNARY_MATH(fabs)
-TROE_UNARY_MATH(floor)
-TROE_UNARY_MATH(log)
-TROE_UNARY_MATH(log10)
-TROE_UNARY_MATH(sin)
-TROE_UNARY_MATH(sqrt)
-TROE_UNARY_MATH(tan)
-
-#define TROE_BINARY_MATH(name)                                               \
-  extern uint64_t troe_math_##name##_bits(uint64_t left, uint64_t right);   \
-  double name(double left, double right) {                                  \
-    TroeDoubleBits left_bits = {.value = left};                             \
-    TroeDoubleBits right_bits = {.value = right};                           \
-    TroeDoubleBits output = {                                                \
-        .bits = troe_math_##name##_bits(left_bits.bits, right_bits.bits)};   \
-    return output.value;                                                     \
-  }
-
-TROE_BINARY_MATH(atan2)
-TROE_BINARY_MATH(fmod)
-TROE_BINARY_MATH(pow)
-
-extern uint64_t troe_math_frexp_bits(uint64_t value, int *exponent);
-double frexp(double value, int *exponent) {
-  TroeDoubleBits input = {.value = value};
-  TroeDoubleBits output = {
-      .bits = troe_math_frexp_bits(input.bits, exponent)};
-  return output.value;
-}
-
-extern uint64_t troe_math_ldexp_bits(uint64_t value, int exponent);
-double ldexp(double value, int exponent) {
-  TroeDoubleBits input = {.value = value};
-  TroeDoubleBits output = {
-      .bits = troe_math_ldexp_bits(input.bits, exponent)};
-  return output.value;
-}
-
-#define NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS 1
-#define NANOPRINTF_USE_PRECISION_FORMAT_SPECIFIERS 1
-#define NANOPRINTF_USE_FLOAT_FORMAT_SPECIFIERS 1
-#define NANOPRINTF_USE_LARGE_FORMAT_SPECIFIERS 1
-#define NANOPRINTF_USE_SMALL_FORMAT_SPECIFIERS 1
-#define NANOPRINTF_USE_BINARY_FORMAT_SPECIFIERS 0
-#define NANOPRINTF_USE_WRITEBACK_FORMAT_SPECIFIERS 0
-#define NANOPRINTF_USE_ALT_FORM_FLAG 1
-#define NANOPRINTF_USE_FLOAT_SINGLE_PRECISION 0
-#define NANOPRINTF_USE_FLOAT_HEX_FORMAT_SPECIFIER 0
-#define NANOPRINTF_IMPLEMENTATION
-#include "nanoprintf.h"
-
-int vsnprintf(char *buffer, size_t size, const char *format,
-              va_list arguments) {
-  return npf_vsnprintf(buffer, size, format, arguments);
-}
-
-int snprintf(char *buffer, size_t size, const char *format, ...) {
-  va_list arguments;
-  va_start(arguments, format);
-  int result = npf_vsnprintf(buffer, size, format, arguments);
-  va_end(arguments);
-  return result;
-}
-
-int sprintf(char *buffer, const char *format, ...) {
-  va_list arguments;
-  va_start(arguments, format);
-  int result = npf_vsnprintf(buffer, (size_t)-1, format, arguments);
-  va_end(arguments);
+    *destination = result;
   return result;
 }
 
@@ -561,6 +260,14 @@ static void *troe_file_resize(void *pointer, size_t old_size,
     return NULL;
   return troe_active_host->allocate(troe_active_host->context, pointer,
                                     old_size, new_size);
+}
+
+static int troe_callback_errno(int result) {
+  return result > 0 ? result : EIO;
+}
+
+static int troe_read_errno(intptr_t result) {
+  return result < 0 && result >= -(intptr_t)INT_MAX ? (int)-result : EIO;
 }
 
 static FILE *troe_file_new(void) {
@@ -619,15 +326,16 @@ static int troe_file_load(FILE *file) {
         (uint64_t)offset, file->buffer + offset,
         (size_t)file->source_length - offset);
     if (count <= 0 || (size_t)count > (size_t)file->source_length - offset) {
-      errno = EINVAL;
+      errno = count < 0 ? troe_read_errno(count) : EIO;
       return -1;
     }
     offset += (size_t)count;
   }
   file->length = offset;
-  if (troe_active_host->file_close(troe_active_host->context, file->token,
-                                   file->source_length) != 0) {
-    errno = EINVAL;
+  int close_result = troe_active_host->file_close(
+      troe_active_host->context, file->token, file->source_length);
+  if (close_result != 0) {
+    errno = troe_callback_errno(close_result);
     return -1;
   }
   file->token = 0;
@@ -658,6 +366,7 @@ static FILE *troe_popen(const char *command, const char *mode) {
   uint64_t pipe_token = 0;
   uint64_t script_identifier = 0;
   int selected_mode;
+  int result;
   if (command == NULL || mode == NULL ||
       (mode[0] != 'r' && mode[0] != 'w') || mode[1] != '\0' ||
       troe_active_host == NULL || !troe_active_host->process_available) {
@@ -665,11 +374,11 @@ static FILE *troe_popen(const char *command, const char *mode) {
     return NULL;
   }
   selected_mode = (unsigned char)mode[0];
-  if (troe_active_host->process_open(
-          troe_active_host->context, (const uint8_t *)command,
-          strlen(command), selected_mode, &child_token, &pipe_token,
-          &script_identifier) != 0) {
-    errno = EINVAL;
+  result = troe_active_host->process_open(
+      troe_active_host->context, (const uint8_t *)command, strlen(command),
+      selected_mode, &child_token, &pipe_token, &script_identifier);
+  if (result != 0) {
+    errno = troe_callback_errno(result);
     return NULL;
   }
   file = troe_file_new();
@@ -703,7 +412,7 @@ static int troe_pclose(FILE *file) {
       file->script_identifier, file->process_mode, &status);
   troe_file_dispose(file);
   if (result != 0) {
-    errno = EINVAL;
+    errno = troe_callback_errno(result);
     return -1;
   }
   return (int)(status & 0xffu);
@@ -711,6 +420,7 @@ static int troe_pclose(FILE *file) {
 
 int fclose(FILE *file) {
   int result = 0;
+  int close_result;
   if (file == NULL || file == stdin || file == stdout || file == stderr) {
     errno = EINVAL;
     return EOF;
@@ -719,10 +429,14 @@ int fclose(FILE *file) {
     return troe_pclose(file);
   if (fflush(file) != 0)
     result = EOF;
-  if (file->token != 0 &&
-      troe_active_host->file_close(troe_active_host->context, file->token,
-                                   file->source_length) != 0)
-    result = EOF;
+  if (file->token != 0) {
+    close_result = troe_active_host->file_close(
+        troe_active_host->context, file->token, file->source_length);
+    if (close_result != 0) {
+      errno = troe_callback_errno(close_result);
+      result = EOF;
+    }
+  }
   troe_file_dispose(file);
   return result;
 }
@@ -731,15 +445,22 @@ int feof(FILE *file) { return file == NULL ? 0 : file->eof; }
 int ferror(FILE *file) { return file == NULL ? 1 : file->error; }
 
 int fflush(FILE *file) {
+  int result;
   if (file == NULL)
     return 0;
   if (!file->writable || !file->dirty || file->path == NULL)
     return file->error ? EOF : 0;
-  if (troe_active_host == NULL || troe_active_host->file_replace(
-          troe_active_host->context, (const uint8_t *)file->path,
-          file->path_length, file->buffer, file->length) != 0) {
+  if (troe_active_host == NULL) {
     file->error = 1;
     errno = EINVAL;
+    return EOF;
+  }
+  result = troe_active_host->file_replace(
+      troe_active_host->context, (const uint8_t *)file->path,
+      file->path_length, file->buffer, file->length);
+  if (result != 0) {
+    file->error = 1;
+    errno = troe_callback_errno(result);
     return EOF;
   }
   file->dirty = 0;
@@ -767,6 +488,7 @@ FILE *fopen(const char *path, const char *mode) {
   int initial;
   int plus;
   int existed = 0;
+  int open_result = ENOENT;
   uint32_t token = 0;
   uint64_t length = 0;
   if (path == NULL || mode == NULL || troe_active_host == NULL) {
@@ -796,15 +518,16 @@ FILE *fopen(const char *path, const char *mode) {
     return NULL;
   }
   if (initial == 'r' || initial == 'a') {
-    if (troe_active_host->file_open(troe_active_host->context,
-                                    (const uint8_t *)path, strlen(path),
-                                    &token, &length) == 0) {
+    open_result = troe_active_host->file_open(
+        troe_active_host->context, (const uint8_t *)path, strlen(path), &token,
+        &length);
+    if (open_result == 0) {
       file->token = token;
       file->source_length = length;
       existed = 1;
-    } else if (initial == 'r') {
+    } else if (initial == 'r' || open_result != ENOENT) {
       troe_file_dispose(file);
-      errno = EINVAL;
+      errno = troe_callback_errno(open_result);
       return NULL;
     }
   }
@@ -865,6 +588,7 @@ size_t fread(void *destination, size_t size, size_t count, FILE *file) {
                                                 wanted - copied);
     if (got < 0 || (size_t)got > wanted - copied) {
       file->error = 1;
+      errno = got < 0 ? troe_read_errno(got) : EIO;
       return copied / size;
     }
     copied += (size_t)got;
@@ -875,6 +599,7 @@ size_t fread(void *destination, size_t size, size_t count, FILE *file) {
         wanted - copied);
     if (got < 0 || (size_t)got > wanted - copied) {
       file->error = 1;
+      errno = got < 0 ? troe_read_errno(got) : EIO;
       return copied / size;
     }
     copied += (size_t)got;
@@ -896,6 +621,7 @@ size_t fread(void *destination, size_t size, size_t count, FILE *file) {
         file->position, output + copied, wanted - copied);
     if (got < 0 || (size_t)got > wanted - copied) {
       file->error = 1;
+      errno = got < 0 ? troe_read_errno(got) : EIO;
       return copied / size;
     }
     copied += (size_t)got;
@@ -919,19 +645,23 @@ size_t fwrite(const void *source, size_t size, size_t count, FILE *file) {
   wanted = size * count;
   if (file->kind == TROE_FILE_STDOUT || file->kind == TROE_FILE_STDERR) {
     int stream = file->kind == TROE_FILE_STDOUT ? 1 : 2;
-    if (troe_active_host->write(troe_active_host->context, stream,
-                                (const uint8_t *)source, wanted) != 0) {
+    int result = troe_active_host->write(
+        troe_active_host->context, stream, (const uint8_t *)source, wanted);
+    if (result != 0) {
       file->error = 1;
+      errno = troe_callback_errno(result);
       return 0;
     }
     file->position += (uint64_t)wanted;
     return count;
   }
   if (file->kind == TROE_FILE_PROCESS) {
-    if (troe_active_host->process_write(
-            troe_active_host->context, file->pipe_token,
-            (const uint8_t *)source, wanted) != 0) {
+    int result = troe_active_host->process_write(
+        troe_active_host->context, file->pipe_token, (const uint8_t *)source,
+        wanted);
+    if (result != 0) {
       file->error = 1;
+      errno = troe_callback_errno(result);
       return 0;
     }
     file->position += (uint64_t)wanted;
@@ -999,23 +729,31 @@ long ftell(FILE *file) {
 }
 
 int remove(const char *path) {
-  if (path == NULL || troe_active_host == NULL ||
-      troe_active_host->file_remove(troe_active_host->context,
-                                    (const uint8_t *)path,
-                                    strlen(path)) != 0) {
+  int result;
+  if (path == NULL || troe_active_host == NULL) {
     errno = EINVAL;
+    return -1;
+  }
+  result = troe_active_host->file_remove(
+      troe_active_host->context, (const uint8_t *)path, strlen(path));
+  if (result != 0) {
+    errno = troe_callback_errno(result);
     return -1;
   }
   return 0;
 }
 
 int rename(const char *old_path, const char *new_path) {
-  if (old_path == NULL || new_path == NULL || troe_active_host == NULL ||
-      troe_active_host->file_rename(
-          troe_active_host->context, (const uint8_t *)old_path,
-          strlen(old_path), (const uint8_t *)new_path,
-          strlen(new_path)) != 0) {
+  int result;
+  if (old_path == NULL || new_path == NULL || troe_active_host == NULL) {
     errno = EINVAL;
+    return -1;
+  }
+  result = troe_active_host->file_rename(
+      troe_active_host->context, (const uint8_t *)old_path, strlen(old_path),
+      (const uint8_t *)new_path, strlen(new_path));
+  if (result != 0) {
+    errno = troe_callback_errno(result);
     return -1;
   }
   return 0;
@@ -1095,20 +833,15 @@ static unsigned int troe_make_seed(void) {
   uint64_t ticks = 0;
   uint64_t frequency = 0;
   uintptr_t address = (uintptr_t)&wall;
-  uint64_t mixed = (uint64_t)address ^ ((uint64_t)address << 17);
+  extern uint32_t troe_runtime_mix_seed(uint64_t address,
+                                        uint64_t wall_seconds, uint64_t ticks,
+                                        uint64_t frequency_hz);
   if (troe_active_host != NULL) {
     (void)troe_active_host->wall_time(troe_active_host->context, &wall);
     (void)troe_active_host->process_cpu_time(troe_active_host->context, &ticks,
                                              &frequency);
   }
-  mixed ^= wall + 0x9e3779b97f4a7c15ULL;
-  mixed ^= ticks + (frequency << 23);
-  mixed ^= mixed >> 30;
-  mixed *= 0xbf58476d1ce4e5b9ULL;
-  mixed ^= mixed >> 27;
-  mixed *= 0x94d049bb133111ebULL;
-  mixed ^= mixed >> 31;
-  return (unsigned int)(mixed ^ (mixed >> 32));
+  return troe_runtime_mix_seed((uint64_t)address, wall, ticks, frequency);
 }
 
 #define luai_makeseed() troe_make_seed()

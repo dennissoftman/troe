@@ -19,8 +19,8 @@ test = false
 bench = false
 
 [dependencies]
-libm = { version = "=0.2.16" }
 troe-kex-alloc = { path = "../../sdk/rust/troe-kex-alloc" }
+troe-kex-runtime = { path = "../../sdk/rust/troe-kex-runtime", default-features = false, features = ["math"] }
 troe-kex-sdk = { path = "../../sdk/rust/troe-kex" }
 
 [profile.release]

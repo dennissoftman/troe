@@ -52,8 +52,8 @@ version = "0.1.0"
 name = "troe-app-lua"
 version = "0.1.0"
 dependencies = [
- "libm",
  "troe-kex-alloc",
+ "troe-kex-runtime",
  "troe-kex-sdk",
 ]
 
@@ -62,6 +62,14 @@ name = "troe-kex-alloc"
 version = "0.1.0"
 dependencies = [
  "rlsf",
+ "troe-kex-sdk",
+]
+
+[[package]]
+name = "troe-kex-runtime"
+version = "0.1.0"
+dependencies = [
+ "libm",
  "troe-kex-sdk",
 ]
 

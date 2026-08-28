@@ -11,81 +11,25 @@ typedef struct TroeCalendarTime {
   int year_day;
 } TroeCalendarTime;
 
-static const char *const troe_weekday_short[] = {"Sun", "Mon", "Tue", "Wed",
-                                                 "Thu", "Fri", "Sat"};
-static const char *const troe_weekday_long[] = {
-    "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday",
-    "Saturday"};
-static const char *const troe_month_short[] = {
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-static const char *const troe_month_long[] = {
-    "January", "February", "March",     "April",   "May",      "June",
-    "July",    "August",   "September", "October", "November", "December"};
+typedef struct TroeCalendarResult {
+  int status;
+  int64_t seconds;
+  TroeCalendarTime calendar;
+} TroeCalendarResult;
 
-static int64_t troe_floor_divide(int64_t value, int64_t divisor) {
-  int64_t quotient = value / divisor;
-  int64_t remainder = value % divisor;
-  return remainder < 0 ? quotient - 1 : quotient;
-}
+typedef struct TroeFormatResult {
+  size_t count;
+  int status;
+  int option;
+} TroeFormatResult;
 
-static int64_t troe_days_from_civil(int64_t year, int month, int day) {
-  int64_t era;
-  unsigned year_of_era;
-  unsigned day_of_year;
-  unsigned day_of_era;
-  year -= month <= 2;
-  era = troe_floor_divide(year, 400);
-  year_of_era = (unsigned)(year - era * 400);
-  day_of_year =
-      (153u * (unsigned)(month + (month > 2 ? -3 : 9)) + 2u) / 5u +
-      (unsigned)(day - 1);
-  day_of_era = year_of_era * 365u + year_of_era / 4u - year_of_era / 100u +
-               day_of_year;
-  return era * 146097 + (int64_t)day_of_era - 719468;
-}
-
-static void troe_civil_from_days(int64_t days, int64_t *year, int *month,
-                                 int *day) {
-  int64_t era;
-  unsigned day_of_era;
-  unsigned year_of_era;
-  int64_t parsed_year;
-  unsigned day_of_year;
-  unsigned month_prime;
-  days += 719468;
-  era = troe_floor_divide(days, 146097);
-  day_of_era = (unsigned)(days - era * 146097);
-  year_of_era =
-      (day_of_era - day_of_era / 1460u + day_of_era / 36524u -
-       day_of_era / 146096u) /
-      365u;
-  parsed_year = (int64_t)year_of_era + era * 400;
-  day_of_year = day_of_era -
-                (365u * year_of_era + year_of_era / 4u - year_of_era / 100u);
-  month_prime = (5u * day_of_year + 2u) / 153u;
-  *day = (int)(day_of_year - (153u * month_prime + 2u) / 5u + 1u);
-  *month = (int)month_prime + (month_prime < 10u ? 3 : -9);
-  *year = parsed_year + (*month <= 2);
-}
-
-static void troe_calendar_from_seconds(int64_t seconds,
-                                       TroeCalendarTime *calendar) {
-  int64_t days = troe_floor_divide(seconds, 86400);
-  int64_t day_seconds = seconds - days * 86400;
-  int week_day;
-  troe_civil_from_days(days, &calendar->year, &calendar->month,
-                       &calendar->day);
-  calendar->hour = (int)(day_seconds / 3600);
-  calendar->minute = (int)((day_seconds % 3600) / 60);
-  calendar->second = (int)(day_seconds % 60);
-  week_day = (int)((days + 4) % 7);
-  if (week_day < 0)
-    week_day += 7;
-  calendar->week_day = week_day;
-  calendar->year_day =
-      (int)(days - troe_days_from_civil(calendar->year, 1, 1));
-}
+extern TroeCalendarTime troe_runtime_calendar_from_seconds(int64_t seconds);
+extern TroeCalendarResult troe_runtime_normalize_calendar(
+    int64_t year, int64_t month, int64_t day, int64_t hour, int64_t minute,
+    int64_t second);
+extern TroeFormatResult troe_runtime_format_calendar(
+    TroeCalendarTime calendar, const uint8_t *format, size_t format_length,
+    uint8_t *destination, size_t capacity);
 
 static int troe_current_time(lua_State *state, int64_t *seconds) {
   uint64_t wall_seconds;
@@ -145,108 +89,14 @@ static void troe_seconds_from_table(lua_State *state, int64_t *seconds,
   int64_t hour = (int64_t)troe_get_time_field(state, "hour", 12, 0);
   int64_t minute = (int64_t)troe_get_time_field(state, "min", 0, 0);
   int64_t second = (int64_t)troe_get_time_field(state, "sec", 0, 0);
-  int64_t month_zero = month - 1;
-  int64_t month_years = troe_floor_divide(month_zero, 12);
-  int normalized_month = (int)(month_zero - month_years * 12) + 1;
-  int64_t days;
-  int64_t value;
-  int64_t component;
-  if (__builtin_add_overflow(year, month_years, &year))
-    luaL_error(state, "time result cannot be represented");
-  days = troe_days_from_civil(year, normalized_month, 1);
-  if (__builtin_add_overflow(days, day - 1, &days) ||
-      __builtin_mul_overflow(days, (int64_t)86400, &value) ||
-      __builtin_mul_overflow(hour, (int64_t)3600, &component) ||
-      __builtin_add_overflow(value, component, &value) ||
-      __builtin_mul_overflow(minute, (int64_t)60, &component) ||
-      __builtin_add_overflow(value, component, &value) ||
-      __builtin_add_overflow(value, second, &value)) {
+  TroeCalendarResult result = troe_runtime_normalize_calendar(
+      year, month, day, hour, minute, second);
+  if (result.status != 0) {
     luaL_error(state, "time result cannot be represented");
     return;
   }
-  *seconds = value;
-  troe_calendar_from_seconds(value, normalized);
-}
-
-static void troe_add_number(luaL_Buffer *buffer, const char *format,
-                            int64_t value) {
-  char bytes[64];
-  int count = snprintf(bytes, sizeof(bytes), format, (long long)value);
-  if (count > 0)
-    luaL_addlstring(buffer, bytes, (size_t)count);
-}
-
-static void troe_format_date(lua_State *state, luaL_Buffer *buffer,
-                             const char *format, size_t length,
-                             const TroeCalendarTime *calendar) {
-  size_t index;
-  for (index = 0; index < length; ++index) {
-    char option;
-    int hour12;
-    if (format[index] != '%') {
-      luaL_addchar(buffer, format[index]);
-      continue;
-    }
-    if (++index == length)
-      luaL_argerror(state, 1, "invalid conversion specifier at end of format");
-    option = format[index];
-    hour12 = calendar->hour % 12;
-    if (hour12 == 0)
-      hour12 = 12;
-    switch (option) {
-    case 'a': luaL_addstring(buffer, troe_weekday_short[calendar->week_day]); break;
-    case 'A': luaL_addstring(buffer, troe_weekday_long[calendar->week_day]); break;
-    case 'b': luaL_addstring(buffer, troe_month_short[calendar->month - 1]); break;
-    case 'B': luaL_addstring(buffer, troe_month_long[calendar->month - 1]); break;
-    case 'c':
-      luaL_addstring(buffer, troe_weekday_short[calendar->week_day]);
-      luaL_addchar(buffer, ' ');
-      luaL_addstring(buffer, troe_month_short[calendar->month - 1]);
-      troe_add_number(buffer, " %2lld", calendar->day);
-      troe_add_number(buffer, " %02lld", calendar->hour);
-      troe_add_number(buffer, ":%02lld", calendar->minute);
-      troe_add_number(buffer, ":%02lld", calendar->second);
-      troe_add_number(buffer, " %lld", calendar->year);
-      break;
-    case 'd': troe_add_number(buffer, "%02lld", calendar->day); break;
-    case 'H': troe_add_number(buffer, "%02lld", calendar->hour); break;
-    case 'I': troe_add_number(buffer, "%02lld", hour12); break;
-    case 'j': troe_add_number(buffer, "%03lld", calendar->year_day + 1); break;
-    case 'm': troe_add_number(buffer, "%02lld", calendar->month); break;
-    case 'M': troe_add_number(buffer, "%02lld", calendar->minute); break;
-    case 'p': luaL_addstring(buffer, calendar->hour < 12 ? "AM" : "PM"); break;
-    case 'S': troe_add_number(buffer, "%02lld", calendar->second); break;
-    case 'U':
-      troe_add_number(buffer, "%02lld",
-                      (calendar->year_day + 7 - calendar->week_day) / 7);
-      break;
-    case 'w': troe_add_number(buffer, "%lld", calendar->week_day); break;
-    case 'W': {
-      int monday_day = (calendar->week_day + 6) % 7;
-      troe_add_number(buffer, "%02lld",
-                      (calendar->year_day + 7 - monday_day) / 7);
-      break;
-    }
-    case 'x':
-      troe_add_number(buffer, "%02lld", calendar->month);
-      troe_add_number(buffer, "/%02lld", calendar->day);
-      troe_add_number(buffer, "/%02lld", calendar->year % 100);
-      break;
-    case 'X':
-      troe_add_number(buffer, "%02lld", calendar->hour);
-      troe_add_number(buffer, ":%02lld", calendar->minute);
-      troe_add_number(buffer, ":%02lld", calendar->second);
-      break;
-    case 'y': troe_add_number(buffer, "%02lld", calendar->year % 100); break;
-    case 'Y': troe_add_number(buffer, "%lld", calendar->year); break;
-    case 'Z': luaL_addstring(buffer, "UTC"); break;
-    case '%': luaL_addchar(buffer, '%'); break;
-    default:
-      luaL_argerror(state, 1,
-                    lua_pushfstring(state, "invalid conversion specifier '%%%c'",
-                                    option));
-    }
-  }
+  *seconds = result.seconds;
+  *normalized = result.calendar;
 }
 
 static int troe_os_clock(lua_State *state) {
@@ -262,6 +112,7 @@ static int troe_os_clock(lua_State *state) {
 }
 
 static int troe_os_date(lua_State *state) {
+  uint8_t formatted[4096];
   size_t format_length;
   const char *format = luaL_optlstring(state, 1, "%c", &format_length);
   int64_t seconds;
@@ -274,15 +125,26 @@ static int troe_os_date(lua_State *state) {
     ++format;
     --format_length;
   }
-  troe_calendar_from_seconds(seconds, &calendar);
+  calendar = troe_runtime_calendar_from_seconds(seconds);
   if (format_length == 2 && format[0] == '*' && format[1] == 't') {
     lua_createtable(state, 0, 9);
     troe_set_calendar_fields(state, &calendar);
   } else {
-    luaL_Buffer buffer;
-    luaL_buffinit(state, &buffer);
-    troe_format_date(state, &buffer, format, format_length, &calendar);
-    luaL_pushresult(&buffer);
+    TroeFormatResult result = troe_runtime_format_calendar(
+        calendar, (const uint8_t *)format, format_length, formatted,
+        sizeof(formatted));
+    if (result.status == 2) {
+      if (result.option == 0)
+        luaL_argerror(state, 1,
+                      "invalid conversion specifier at end of format");
+      luaL_argerror(
+          state, 1,
+          lua_pushfstring(state, "invalid conversion specifier '%%%c'",
+                          result.option));
+    }
+    if (result.status != 0)
+      luaL_error(state, "formatted date exceeds TROE runtime limit");
+    lua_pushlstring(state, (const char *)formatted, result.count);
   }
   return 1;
 }
@@ -319,11 +181,16 @@ static int troe_os_execute(lua_State *state) {
     return 1;
   }
   command = luaL_checklstring(state, 1, &command_length);
-  if (troe_active_host == NULL || !troe_active_host->process_available ||
-      troe_active_host->process_execute(
-          troe_active_host->context, (const uint8_t *)command, command_length,
-          &status) != 0) {
+  int result;
+  if (troe_active_host == NULL || !troe_active_host->process_available) {
     errno = EINVAL;
+    return luaL_fileresult(state, 0, command);
+  }
+  result = troe_active_host->process_execute(
+      troe_active_host->context, (const uint8_t *)command, command_length,
+      &status);
+  if (result != 0) {
+    errno = result;
     return luaL_fileresult(state, 0, command);
   }
   if (status == 0)
@@ -336,23 +203,21 @@ static int troe_os_execute(lua_State *state) {
 }
 
 static int troe_os_getenv(lua_State *state) {
-  const char *name = luaL_checkstring(state, 1);
-  if (strcmp(name, "PWD") == 0 && troe_active_configuration != NULL)
-    lua_pushlstring(
-        state, (const char *)troe_active_configuration->current_directory,
-        troe_active_configuration->current_directory_length);
-  else if (strcmp(name, "HOME") == 0)
-    lua_pushliteral(state, "/");
-  else if (strcmp(name, "PATH") == 0)
-    lua_pushliteral(state, "/bin");
-  else if (strcmp(name, "TMPDIR") == 0)
-    lua_pushliteral(state, "/tmp");
-  else if (strcmp(name, "SHELL") == 0)
-    lua_pushliteral(state, "/bin/sh");
-  else if (strcmp(name, "USER") == 0 || strcmp(name, "LOGNAME") == 0)
-    lua_pushliteral(state, "root");
-  else
+  uint8_t value[2048];
+  size_t name_length;
+  const char *name = luaL_checklstring(state, 1, &name_length);
+  intptr_t length;
+  if (troe_active_host == NULL) {
     luaL_pushfail(state);
+    return 1;
+  }
+  length = troe_active_host->environment_get(
+      troe_active_host->context, (const uint8_t *)name, name_length, value,
+      sizeof(value));
+  if (length < 0)
+    luaL_pushfail(state);
+  else
+    lua_pushlstring(state, (const char *)value, (size_t)length);
   return 1;
 }
 

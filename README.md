@@ -196,7 +196,11 @@ The essential filesystem command set now includes streamed `cp`, iterative
 and retain only fallibly grown, explicitly bounded traversal metadata. Shared
 algorithms live in the small `no_std`
 [`troe-kex-runtime`](sdk/rust/troe-kex-runtime) layer; the lower-level
-[`troe-kex`](sdk/rust/troe-kex) crate remains the typed ABI client.
+[`troe-kex`](sdk/rust/troe-kex) crate remains the typed ABI client. The runtime
+also supplies allocation-free environment, errno, direct-process, UTC calendar,
+C-locale formatting/classification, decimal/math, and non-cryptographic seed
+helpers. Allocation-backed recursive filesystem operations are a separate
+feature so embedders can retain their own allocator policy.
 
 [`apps/spawn`](apps/spawn) is the first process-launch consumer. It resolves a
 nested KEX package through the owner-scoped launch capability, inherits or
@@ -209,9 +213,12 @@ supports stock command-line actions and the complete standard library surface,
 including file mutation, `os.execute`, and read/write `io.popen` through explicit
 KEX capabilities. It starts with a 1 MiB TLSF application heap, reports
 process-CPU time through `os.clock`, and exposes whole-second Unix wall time
-through `os.time`. The remaining platform limits are explicit: UTC and the C
-locale are fixed, C dynamic modules have no loader, and Lua has no ambient libc,
-host OS, or raw filesystem access.
+through `os.time`. Lua now hard-compiles the shared Rust KEX runtime plus a
+small SDK-owned freestanding C compatibility core instead of owning duplicate
+filesystem, environment, process, calendar, decimal, math, or C-locale
+algorithms. The remaining platform limits are explicit: UTC and the C locale
+are fixed, C dynamic modules have no loader, and Lua has no ambient host OS or
+raw filesystem access.
 
 [`apps/sh`](apps/sh) transactionally stages a bounded UTF-8 command file through
 the typed shell-script sidecar, then the owning session executes each validated
