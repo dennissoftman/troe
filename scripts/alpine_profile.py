@@ -17,23 +17,25 @@ from typing import BinaryIO, Callable
 
 if __package__:
     from .qemu_profile import (
-        EXPECTED_QEMU_VERSION,
         QEMU_ENVIRONMENT,
         RunnerProfile,
+        announce_compatible_qemu,
         qemu_version,
         resolve_firmware,
         resolve_runner,
         validate_memory_size,
+        verify_qemu_version,
     )
 else:
     from qemu_profile import (
-        EXPECTED_QEMU_VERSION,
         QEMU_ENVIRONMENT,
         RunnerProfile,
+        announce_compatible_qemu,
         qemu_version,
         resolve_firmware,
         resolve_runner,
         validate_memory_size,
+        verify_qemu_version,
     )
 
 
@@ -404,6 +406,7 @@ def prepare_alpine_command(
     shared_disk: Path | None,
     reset_variables: bool = False,
     skip_version_check: bool = False,
+    strict_tool_versions: bool = False,
     graphical: bool = False,
     memory: str = "256M",
 ) -> list[str]:
@@ -412,13 +415,16 @@ def prepare_alpine_command(
     executable = shutil.which(runner.executable)
     if executable is None:
         raise FileNotFoundError(f"QEMU executable not found on PATH: {runner.executable}")
+    if skip_version_check and strict_tool_versions:
+        raise RuntimeError(
+            "--skip-version-check and --strict-tool-versions are mutually exclusive"
+        )
     if not skip_version_check:
-        version = qemu_version(executable)
-        if re.search(rf"\bversion {re.escape(EXPECTED_QEMU_VERSION)}\b", version) is None:
-            raise RuntimeError(
-                f"expected QEMU {EXPECTED_QEMU_VERSION}, got: {version} "
-                "(use --skip-version-check deliberately)"
-            )
+        version = verify_qemu_version(
+            qemu_version(executable), strict=strict_tool_versions
+        )
+        if not strict_tool_versions:
+            announce_compatible_qemu(version)
 
     selected_image = image.expanduser().resolve(strict=True)
     if not selected_image.is_file():
@@ -442,8 +448,12 @@ def prepare_alpine_command(
         if selected_shared in {selected_image, selected_root}:
             raise RuntimeError("Alpine boot, root, and shared images must be different")
 
-    firmware = resolve_firmware(firmware_code, executable, runner, "code")
-    vars_source = resolve_firmware(firmware_vars, executable, runner, "vars")
+    firmware = resolve_firmware(
+        firmware_code, executable, runner, "code", strict=strict_tool_versions
+    )
+    vars_source = resolve_firmware(
+        firmware_vars, executable, runner, "vars", strict=strict_tool_versions
+    )
     ALPINE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     variables = alpine_variables_path(platform_id)
     ensure_alpine_variables(

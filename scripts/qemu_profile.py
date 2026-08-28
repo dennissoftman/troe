@@ -44,6 +44,8 @@ else:
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_QEMU_VERSION = "11.1.0"
+MINIMUM_QEMU_VERSION = (8, 0, 0)
+MAXIMUM_QEMU_VERSION = (12, 0, 0)
 FIRMWARE_PROFILE_PATH = REPO_ROOT / "tools" / "qemu-firmware-profile.json"
 DEFAULT_VOLUME_TABLE = REPO_ROOT / "config" / "volumes.toml"
 # Split-disk QEMU profiles already expose boot, root, activation, and state
@@ -181,7 +183,8 @@ ENVIRONMENT_IDS = tuple(dict.fromkeys(key[1] for key in RUNNER_PROFILES))
 FIRMWARE_ARCHITECTURES = tuple(
     dict.fromkeys(runner.firmware_architecture for runner in RUNNER_PROFILES.values())
 )
-_VERIFIED_FIRMWARE: set[tuple[Path, int, int, str, str]] = set()
+_VERIFIED_FIRMWARE: set[tuple[Path, int, int, str, str, bool]] = set()
+_COMPATIBILITY_NOTICE_SHOWN = False
 
 
 def select_runner(
@@ -393,11 +396,36 @@ def verify_file_digest(path: Path, expected_bytes: int, expected_sha256: str) ->
         )
 
 
-def verify_firmware(path: Path, architecture: str, kind: str) -> None:
-    """Verify one selected firmware artifact against the committed profile."""
+def verify_compatible_firmware(path: Path, architecture: str, kind: str) -> None:
+    """Require a regular, flash-aligned UEFI firmware volume image."""
+    if architecture not in FIRMWARE_ARCHITECTURES or kind not in ("code", "vars"):
+        raise RuntimeError(f"invalid firmware selection: {architecture} {kind}")
+    if not path.is_file():
+        raise FileNotFoundError(f"firmware is not a regular file: {path}")
+    size = path.stat().st_size
+    minimum_bytes = 256 * 1024
+    image_alignment = 4 * 1024
+    if size < minimum_bytes or size % image_alignment != 0:
+        raise RuntimeError(
+            f"firmware image must be at least 256 KiB and 4-KiB aligned: {path}"
+        )
+    with path.open("rb") as source:
+        header = source.read(64 * 1024)
+    if b"_FVH" not in header:
+        raise RuntimeError(f"firmware image has no UEFI firmware-volume header: {path}")
+
+
+def verify_firmware(
+    path: Path, architecture: str, kind: str, *, strict: bool = False
+) -> None:
+    """Verify selected firmware structurally or against the release profile."""
     stat = path.stat()
-    cache_key = (path, stat.st_size, stat.st_mtime_ns, architecture, kind)
+    cache_key = (path, stat.st_size, stat.st_mtime_ns, architecture, kind, strict)
     if cache_key in _VERIFIED_FIRMWARE:
+        return
+    if not strict:
+        verify_compatible_firmware(path, architecture, kind)
+        _VERIFIED_FIRMWARE.add(cache_key)
         return
     profile = firmware_profile()
     artifacts = profile["artifacts"]
@@ -430,6 +458,46 @@ def qemu_version(executable: str) -> str:
         text=True,
     )
     return result.stdout.splitlines()[0] if result.stdout else "no version output"
+
+
+def verify_qemu_version(
+    version_output: str, *, strict: bool = False
+) -> tuple[int, int, int]:
+    """Validate QEMU's version line under compatible or strict policy."""
+    match = re.search(r"\bversion ([0-9]+)\.([0-9]+)(?:\.([0-9]+))?\b", version_output)
+    if match is None:
+        raise RuntimeError(f"could not parse QEMU version: {version_output}")
+    version = (
+        int(match.group(1)),
+        int(match.group(2)),
+        int(match.group(3) or 0),
+    )
+    expected = tuple(int(component) for component in EXPECTED_QEMU_VERSION.split("."))
+    if strict and version != expected:
+        raise RuntimeError(
+            f"strict tool policy requires QEMU {EXPECTED_QEMU_VERSION}; "
+            f"got {'.'.join(str(component) for component in version)}"
+        )
+    if not strict and not MINIMUM_QEMU_VERSION <= version < MAXIMUM_QEMU_VERSION:
+        raise RuntimeError(
+            "compatible tool policy requires QEMU 8.x through 11.x; "
+            f"got {'.'.join(str(component) for component in version)}"
+        )
+    return version
+
+
+def announce_compatible_qemu(version: tuple[int, int, int]) -> None:
+    """Explain once that a run is behavioral rather than strict evidence."""
+    global _COMPATIBILITY_NOTICE_SHOWN  # noqa: PLW0603 - process-local notice
+    if _COMPATIBILITY_NOTICE_SHOWN:
+        return
+    rendered = ".".join(str(component) for component in version)
+    print(
+        f"QEMU compatibility mode: {rendered}; firmware is structurally checked. "
+        "Use --strict-tool-versions for pinned release evidence.",
+        file=sys.stderr,
+    )
+    _COMPATIBILITY_NOTICE_SHOWN = True
 
 
 def firmware_search_roots(executable: str) -> tuple[Path, ...]:
@@ -472,14 +540,19 @@ def discover_firmware(executable: str, runner: RunnerProfile, kind: str) -> Path
 
 
 def resolve_firmware(
-    supplied: Path | None, executable: str, runner: RunnerProfile, kind: str
+    supplied: Path | None,
+    executable: str,
+    runner: RunnerProfile,
+    kind: str,
+    *,
+    strict: bool = False,
 ) -> Path:
-    """Resolve and verify an explicit or QEMU-bundled firmware artifact."""
+    """Resolve and verify an explicit or distribution firmware artifact."""
     if supplied is not None:
         selected = supplied.expanduser().resolve(strict=True)
     else:
         selected = discover_firmware(executable, runner, kind)
-    verify_firmware(selected, runner.firmware_architecture, kind)
+    verify_firmware(selected, runner.firmware_architecture, kind, strict=strict)
     return selected
 
 
@@ -631,6 +704,7 @@ def prepare_qemu_command(
     firmware_vars: Path | None = None,
     *,
     skip_version_check: bool = False,
+    strict_tool_versions: bool = False,
     build: bool = True,
     acceptance_probes: bool = False,
     graphical: bool = False,
@@ -647,17 +721,23 @@ def prepare_qemu_command(
     if executable is None:
         raise FileNotFoundError(f"QEMU executable not found on PATH: {executable_name}")
 
+    if skip_version_check and strict_tool_versions:
+        raise RuntimeError(
+            "--skip-version-check and --strict-tool-versions are mutually exclusive"
+        )
     if not skip_version_check:
-        version = qemu_version(executable)
-        expected_version = rf"\bversion {re.escape(EXPECTED_QEMU_VERSION)}\b"
-        if re.search(expected_version, version) is None:
-            raise RuntimeError(
-                f"expected QEMU {EXPECTED_QEMU_VERSION}, got: {version} "
-                "(use --skip-version-check deliberately)"
-            )
+        version = verify_qemu_version(
+            qemu_version(executable), strict=strict_tool_versions
+        )
+        if not strict_tool_versions:
+            announce_compatible_qemu(version)
 
-    firmware = resolve_firmware(firmware_code, executable, runner, "code")
-    vars_source = resolve_firmware(firmware_vars, executable, runner, "vars")
+    firmware = resolve_firmware(
+        firmware_code, executable, runner, "code", strict=strict_tool_versions
+    )
+    vars_source = resolve_firmware(
+        firmware_vars, executable, runner, "vars", strict=strict_tool_versions
+    )
     if len(data_disks) > MAX_EXTRA_DATA_DISKS:
         raise RuntimeError(
             f"at most {MAX_EXTRA_DATA_DISKS} additional data disks may be attached"
@@ -693,6 +773,7 @@ def prepare_qemu_command(
                 "--fixture-identities",
                 "--volume-table",
                 str(selected_volume_table),
+                *(("--strict-tool-versions",) if strict_tool_versions else ()),
                 *(("--acceptance-probes",) if acceptance_probes else ()),
             ],
             cwd=REPO_ROOT,
@@ -719,6 +800,7 @@ def prepare_qemu_command(
                 str(REPO_ROOT / "assets" / "state.prgn"),
                 "--statefs-output",
                 str(statefs_image_path(profile)),
+                *(("--strict-tool-versions",) if strict_tool_versions else ()),
             ],
             cwd=REPO_ROOT,
             check=True,

@@ -46,9 +46,12 @@ SHARED_PARTITION_GUID = uuid.UUID(SHARED_PARTITION_GUID_TEXT).bytes_le
 SHARED_FAT32_VOLUME_ID = 0x5452_4F45
 FAKE_TIME = "1704067200"
 
-# The formatter is part of the on-media format contract. Updating this pin
-# requires regenerating the fixture and reviewing every check in verify_ext4().
+# Strict release evidence uses one exact formatter. Development builds accept
+# the reviewed 1.47 feature line and then independently verify every byte-level
+# constraint in verify_ext4().
 PINNED_E2FSPROGS_VERSION = "1.47.4"
+MINIMUM_E2FSPROGS_VERSION = (1, 47, 0)
+MAXIMUM_E2FSPROGS_VERSION = (1, 48, 0)
 PINNED_E2FSPROGS_DATE = "6-Mar-2025"
 PINNED_E2FSPROGS_OUTPUT = {
     "mke2fs": (
@@ -564,29 +567,65 @@ def _bitmap_bit(bitmap: bytes | bytearray | memoryview, bit: int) -> bool:
     return bool(bitmap[bit // 8] & (1 << (bit % 8)))
 
 
-def _verify_e2fsprogs_version_output(name: str, output: str) -> None:
-    """Require the exact formatter/checker banner committed by ADR 0017."""
+def _e2fsprogs_version(version: str) -> tuple[int, int, int]:
+    """Parse a two- or three-component e2fsprogs version."""
+    components = version.split(".")
+    if len(components) not in (2, 3) or any(not part.isdigit() for part in components):
+        raise ValueError(f"invalid e2fsprogs version {version!r}")
+    values = tuple(int(part) for part in components)
+    return (values[0], values[1], values[2] if len(values) == 3 else 0)
+
+
+def _verify_e2fsprogs_version_output(
+    name: str, output: str, *, strict: bool = False
+) -> tuple[int, int, int]:
+    """Validate one formatter/checker banner under the selected tool policy."""
     expected = PINNED_E2FSPROGS_OUTPUT.get(name)
     if expected is None:
         raise ValueError(f"unsupported e2fsprogs tool name: {name}")
     actual = tuple(line.strip() for line in output.splitlines() if line.strip())
-    if actual != expected:
+    if strict:
+        if actual == expected:
+            return _e2fsprogs_version(PINNED_E2FSPROGS_VERSION)
         rendered = " | ".join(actual) if actual else "<empty output>"
         raise ValueError(
             f"{name} must be e2fsprogs {PINNED_E2FSPROGS_VERSION}; got {rendered}"
         )
+    if len(actual) != 2:
+        rendered = " | ".join(actual) if actual else "<empty output>"
+        raise ValueError(f"invalid {name} version banner: {rendered}")
+    tool_match = re.fullmatch(
+        rf"{re.escape(name)} ([0-9]+\.[0-9]+(?:\.[0-9]+)?) \(.+\)", actual[0]
+    )
+    library_match = re.fullmatch(
+        r"Using EXT2FS Library version ([0-9]+\.[0-9]+(?:\.[0-9]+)?)(?:, .+)?",
+        actual[1],
+    )
+    if tool_match is None or library_match is None:
+        raise ValueError(f"invalid {name} version banner: {' | '.join(actual)}")
+    tool_version = _e2fsprogs_version(tool_match.group(1))
+    library_version = _e2fsprogs_version(library_match.group(1))
+    if tool_version != library_version:
+        raise ValueError(
+            f"{name} and its EXT2FS library report different versions: "
+            f"{tool_match.group(1)} and {library_match.group(1)}"
+        )
+    if not MINIMUM_E2FSPROGS_VERSION <= tool_version < MAXIMUM_E2FSPROGS_VERSION:
+        raise ValueError(f"{name} must be e2fsprogs 1.47.x; got {tool_match.group(1)}")
+    return tool_version
 
 
-def require_pinned_e2fsprogs() -> tuple[str, str]:
-    """Resolve and version-check the exact e2fsprogs tools used by the builder."""
+def require_e2fsprogs(*, strict: bool = False) -> tuple[str, str]:
+    """Resolve compatible or strictly pinned e2fsprogs host tools."""
     resolved: dict[str, str] = {}
+    versions: dict[str, tuple[int, int, int]] = {}
     environment = os.environ.copy()
     environment["LC_ALL"] = "C"
     for name in ("mke2fs", "e2fsck"):
         executable = shutil.which(name)
         if executable is None:
             raise FileNotFoundError(
-                "pinned mke2fs and e2fsck are required for the QEMU storage fixture"
+                "mke2fs and e2fsck 1.47.x are required for the QEMU storage fixture"
             )
         result = subprocess.run(
             [executable, "-V"],
@@ -597,9 +636,28 @@ def require_pinned_e2fsprogs() -> tuple[str, str]:
         )
         if result.returncode != 0:
             raise ValueError(f"{name} -V failed with status {result.returncode}")
-        _verify_e2fsprogs_version_output(name, result.stdout + result.stderr)
+        versions[name] = _verify_e2fsprogs_version_output(
+            name, result.stdout + result.stderr, strict=strict
+        )
         resolved[name] = executable
+    pinned = _e2fsprogs_version(PINNED_E2FSPROGS_VERSION)
+    if not strict and any(version != pinned for version in versions.values()):
+        rendered = ", ".join(
+            f"{name}={'.'.join(str(part) for part in version)}"
+            for name, version in versions.items()
+        )
+        print(
+            f"e2fsprogs compatibility mode: {rendered}; generated ext4 bytes will "
+            "be independently verified. Use --strict-tool-versions for pinned "
+            "release evidence.",
+            file=sys.stderr,
+        )
     return resolved["mke2fs"], resolved["e2fsck"]
+
+
+def require_pinned_e2fsprogs() -> tuple[str, str]:
+    """Resolve the exact e2fsprogs tools used for strict release evidence."""
+    return require_e2fsprogs(strict=True)
 
 
 @dataclass(frozen=True)
@@ -1243,11 +1301,13 @@ def verify_ext4(image: bytes, content: bytes | None = None) -> None:
     _Ext4ProfileVerifier(image, content).verify()
 
 
-def create_ext4(content: bytes | None = None) -> bytes:
+def create_ext4(
+    content: bytes | None = None, *, strict_tool_versions: bool = False
+) -> bytes:
     """Build a clean, bounded ext4 v1 filesystem using e2fsprogs."""
     if content is not None and len(content) > EXT4_MAX_FILE_BYTES:
         raise ValueError("system.cspk exceeds the production ext4 mount ceiling")
-    mke2fs, e2fsck = require_pinned_e2fsprogs()
+    mke2fs, e2fsck = require_e2fsprogs(strict=strict_tool_versions)
 
     with tempfile.TemporaryDirectory(prefix="troe-storage-") as temporary:
         root = Path(temporary)
@@ -1426,6 +1486,11 @@ def main() -> int:
     parser.add_argument("--txslot-output", type=Path)
     parser.add_argument("--state-selector", type=Path)
     parser.add_argument("--statefs-output", type=Path)
+    parser.add_argument(
+        "--strict-tool-versions",
+        action="store_true",
+        help="require the release-pinned e2fsprogs 1.47.4 banners",
+    )
     args = parser.parse_args()
     try:
         entries = (
@@ -1449,7 +1514,9 @@ def main() -> int:
             print(f"PRGN v1: {len(selector)} bytes -> {args.persistence_selector}")
         if args.output is not None:
             content = args.content.read_bytes() if args.content is not None else None
-            disk = build_gpt(create_ext4(content))
+            disk = build_gpt(
+                create_ext4(content, strict_tool_versions=args.strict_tool_versions)
+            )
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_bytes(disk)
             print(f"GPT/ext4 fixture: {len(disk)} bytes -> {args.output}")

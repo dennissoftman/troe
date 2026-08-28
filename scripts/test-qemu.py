@@ -349,7 +349,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--firmware-code", type=Path)
     parser.add_argument("--firmware-vars", type=Path)
-    parser.add_argument("--skip-version-check", action="store_true")
+    version_policy = parser.add_mutually_exclusive_group()
+    version_policy.add_argument(
+        "--skip-version-check",
+        action="store_true",
+        help="deliberately allow QEMU outside the supported 8.x-11.x range",
+    )
+    version_policy.add_argument(
+        "--strict-tool-versions",
+        action="store_true",
+        help="require QEMU 11.1.0, pinned firmware, and e2fsprogs 1.47.4",
+    )
     parser.add_argument(
         "--smoke",
         action="store_true",
@@ -2014,6 +2024,7 @@ def run_native_keyboard_scenario(args: argparse.Namespace) -> None:
         args.firmware_code,
         args.firmware_vars,
         skip_version_check=args.skip_version_check,
+        strict_tool_versions=args.strict_tool_versions,
         build=False,
         acceptance_probes=False,
         framebuffer=args.framebuffer_console,
@@ -2157,6 +2168,7 @@ def test_platform(
         args.firmware_code,
         args.firmware_vars,
         skip_version_check=args.skip_version_check,
+        strict_tool_versions=args.strict_tool_versions,
         build=False,
         acceptance_probes=False,
         framebuffer=args.framebuffer_console,
@@ -2240,6 +2252,7 @@ def test_platform(
                     args.firmware_code,
                     args.firmware_vars,
                     skip_version_check=args.skip_version_check,
+                    strict_tool_versions=args.strict_tool_versions,
                     build=False,
                     acceptance_probes=True,
                     framebuffer=args.framebuffer_console,
@@ -2346,6 +2359,7 @@ def main() -> int:
                     build_platform,
                     "--fixture-identities",
                     *variant_arguments,
+                    *(("--strict-tool-versions",) if args.strict_tool_versions else ()),
                 ],
                 cwd=REPO_ROOT,
                 check=True,

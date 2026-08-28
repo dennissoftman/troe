@@ -163,26 +163,66 @@ class MountManifestTests(unittest.TestCase):
             )
 
 
-class E2fsprogsPinTests(unittest.TestCase):
-    """Keep the host formatter/checker version contract exact."""
+class E2fsprogsPolicyTests(unittest.TestCase):
+    """Keep compatible development and strict release policies explicit."""
 
-    def test_exact_version_banner_is_pinned(self) -> None:
+    def test_strict_version_banner_is_pinned(self) -> None:
         for name, expected in mkstorage.PINNED_E2FSPROGS_OUTPUT.items():
             with self.subTest(name=name):
                 mkstorage._verify_e2fsprogs_version_output(  # noqa: SLF001
-                    name, "\n".join(expected) + "\n"
+                    name, "\n".join(expected) + "\n", strict=True
                 )
                 wrong = "\n".join(expected).replace(
                     mkstorage.PINNED_E2FSPROGS_VERSION, "1.47.5"
                 )
                 with self.assertRaises(ValueError):
                     mkstorage._verify_e2fsprogs_version_output(  # noqa: SLF001
-                        name, wrong
+                        name, wrong, strict=True
                     )
                 with self.assertRaises(ValueError):
                     mkstorage._verify_e2fsprogs_version_output(  # noqa: SLF001
-                        name, "\n".join(expected) + "\nunreviewed wrapper\n"
+                        name,
+                        "\n".join(expected) + "\nunreviewed wrapper\n",
+                        strict=True,
                     )
+
+    def test_compatible_policy_accepts_only_the_147_feature_line(self) -> None:
+        for version in ("1.47", "1.47.0", "1.47.9"):
+            with self.subTest(version=version):
+                output = (
+                    f"mke2fs {version} (distribution build)\n"
+                    f"Using EXT2FS Library version {version}\n"
+                )
+                self.assertEqual(
+                    mkstorage._verify_e2fsprogs_version_output(  # noqa: SLF001
+                        "mke2fs", output
+                    )[:2],
+                    (1, 47),
+                )
+        for version in ("1.46.6", "1.48.0", "2.0.0"):
+            with self.subTest(version=version):
+                output = (
+                    f"e2fsck {version} (distribution build)\n"
+                    f"Using EXT2FS Library version {version}, distribution build\n"
+                )
+                with self.assertRaisesRegex(ValueError, "1.47.x"):
+                    mkstorage._verify_e2fsprogs_version_output(  # noqa: SLF001
+                        "e2fsck", output
+                    )
+
+    def test_compatible_policy_rejects_mixed_libraries_and_extra_output(self) -> None:
+        with self.assertRaisesRegex(ValueError, "different versions"):
+            mkstorage._verify_e2fsprogs_version_output(  # noqa: SLF001
+                "mke2fs",
+                "mke2fs 1.47.0 (distribution)\nUsing EXT2FS Library version 1.47.1\n",
+            )
+        with self.assertRaisesRegex(ValueError, "invalid mke2fs version banner"):
+            mkstorage._verify_e2fsprogs_version_output(  # noqa: SLF001
+                "mke2fs",
+                "mke2fs 1.47.0 (distribution)\n"
+                "Using EXT2FS Library version 1.47.0\n"
+                "wrapper output\n",
+            )
 
 
 class Ext4StorageBuilderTests(unittest.TestCase):

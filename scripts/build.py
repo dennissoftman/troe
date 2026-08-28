@@ -120,6 +120,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_VOLUME_TABLE,
         help="strict TOML source compiled into the boot mount manifest",
     )
+    parser.add_argument(
+        "--strict-tool-versions",
+        action="store_true",
+        help="require release-pinned host tool versions while building fixtures",
+    )
     return parser.parse_args(argv)
 
 
@@ -198,6 +203,7 @@ def main() -> int:
             root_source,
             "--content",
             REPO_ROOT / "assets" / "system.cspk",
+            *(("--strict-tool-versions",) if args.strict_tool_versions else ()),
         )
         for platform_id in platform_ids:
             shutil.copyfile(

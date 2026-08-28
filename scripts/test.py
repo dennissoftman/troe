@@ -48,12 +48,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-qemu",
         action="store_true",
-        help="skip boot acceptance when the pinned QEMU/firmware pair is unavailable",
+        help="skip boot acceptance when a supported QEMU/firmware pair is unavailable",
     )
     parser.add_argument(
         "--require-filesystem-tools",
         action="store_true",
         help="require and run e2fsprogs, dosfstools, and mtools interoperability tests",
+    )
+    parser.add_argument(
+        "--strict-tool-versions",
+        action="store_true",
+        help="require release-pinned QEMU, UEFI firmware, and e2fsprogs versions",
     )
     return parser.parse_args()
 
@@ -83,7 +88,9 @@ def target_clippy_commands() -> list[tuple[str | Path, ...]]:
     ]
 
 
-def image_and_qemu_commands(*, skip_qemu: bool) -> list[tuple[str | Path, ...]]:
+def image_and_qemu_commands(
+    *, skip_qemu: bool, strict_tool_versions: bool = False
+) -> list[tuple[str | Path, ...]]:
     """Return one owner for production/acceptance builds without duplication."""
     if skip_qemu:
         return [
@@ -94,6 +101,7 @@ def image_and_qemu_commands(*, skip_qemu: bool) -> list[tuple[str | Path, ...]]:
                 "all",
                 "--fixture-identities",
                 "--all-variants",
+                *(("--strict-tool-versions",) if strict_tool_versions else ()),
             )
         ]
     return [
@@ -106,6 +114,7 @@ def image_and_qemu_commands(*, skip_qemu: bool) -> list[tuple[str | Path, ...]]:
             QEMU_ENVIRONMENT,
             "--framebuffer-console",
             "--native-keyboard",
+            *(("--strict-tool-versions",) if strict_tool_versions else ()),
         )
     ]
 
@@ -196,7 +205,12 @@ def main() -> int:
             REPO_ROOT / "tests" / "smoke.sh",
         ),
     ]
-    commands.extend(image_and_qemu_commands(skip_qemu=args.skip_qemu))
+    commands.extend(
+        image_and_qemu_commands(
+            skip_qemu=args.skip_qemu,
+            strict_tool_versions=args.strict_tool_versions,
+        )
+    )
 
     try:
         for command in commands:
