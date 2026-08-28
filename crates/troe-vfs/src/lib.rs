@@ -70,6 +70,10 @@ pub enum FsError {
     Io,
     /// The media uses a feature outside the selected provider profile.
     Unsupported,
+    /// A directory removal targeted a directory that still has children.
+    NotEmpty,
+    /// A name operation crossed filesystem-provider boundaries.
+    CrossDevice,
 }
 
 impl fmt::Display for FsError {
@@ -85,6 +89,8 @@ impl fmt::Display for FsError {
             Self::Corrupt => f.write_str("filesystem metadata is corrupt"),
             Self::Io => f.write_str("filesystem transport failed"),
             Self::Unsupported => f.write_str("filesystem feature is unsupported"),
+            Self::NotEmpty => f.write_str("directory not empty"),
+            Self::CrossDevice => f.write_str("cross-device operation"),
         }
     }
 }
@@ -242,6 +248,30 @@ pub trait ReadOnlyFileSystem: fmt::Debug {
     /// The default rejects every request as read-only. Writable providers
     /// report their bounded path, corruption, or transport failures.
     fn remove_file(&mut self, _path: &str) -> Result<(), FsError> {
+        Err(FsError::ReadOnly)
+    }
+
+    /// Atomically remove one empty directory entry.
+    ///
+    /// Provider roots are never valid targets. Read-only providers retain this
+    /// default; writable providers must reject nonempty directories precisely.
+    ///
+    /// # Errors
+    ///
+    /// The default rejects every request as read-only.
+    fn remove_directory(&mut self, _path: &str) -> Result<(), FsError> {
+        Err(FsError::ReadOnly)
+    }
+
+    /// Atomically rename one object within this provider.
+    ///
+    /// Both paths are absolute within the same provider. Providers must reject
+    /// their root and must not expose a partially renamed namespace on error.
+    ///
+    /// # Errors
+    ///
+    /// The default rejects every request as read-only.
+    fn rename(&mut self, _source: &str, _destination: &str) -> Result<(), FsError> {
         Err(FsError::ReadOnly)
     }
 
@@ -939,6 +969,16 @@ impl Namespace {
         }
     }
 
+    /// Return metadata without following the final symbolic-link component.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the path is invalid, missing, or its mounted provider fails.
+    pub fn metadata_no_follow(&mut self, cwd: &str, path: &str) -> Result<FileMetadata, FsError> {
+        let path = canonicalize(cwd, path)?;
+        self.metadata_no_follow_absolute(&path)
+    }
+
     /// Read a bounded file range without retaining the complete file.
     ///
     /// # Errors
@@ -1281,6 +1321,180 @@ impl Namespace {
         Ok(())
     }
 
+    /// Remove one empty writable directory without crossing a mount boundary.
+    ///
+    /// # Errors
+    ///
+    /// Rejects roots, mountpoints, non-directories, nonempty directories,
+    /// immutable content, and provider failures.
+    pub fn remove_directory(&mut self, cwd: &str, path: &str) -> Result<(), FsError> {
+        let path = canonicalize(cwd, path)?;
+        if path == "/" || self.mounts.iter().any(|mount| mount.path == path) {
+            return Err(FsError::ReadOnly);
+        }
+        let changes_commands = is_command_path(&path);
+        if let Some((index, relative)) = self.mount_for_path(&path) {
+            if relative == "/" || !self.mounts[index].writable {
+                return Err(FsError::ReadOnly);
+            }
+            self.mounts[index].provider.remove_directory(&relative)?;
+            if changes_commands {
+                self.bump_command_revision();
+            }
+            return Ok(());
+        }
+        if !is_under_tmp(&path) || path == "/tmp" {
+            return Err(FsError::ReadOnly);
+        }
+        match self.nodes.get(&path) {
+            Some(Node::Directory) => {}
+            Some(Node::File { .. }) => return Err(FsError::WrongType),
+            None => return Err(FsError::NotFound),
+        }
+        let mut prefix = path.clone();
+        prefix.push('/');
+        if self
+            .nodes
+            .range(prefix.clone()..)
+            .next()
+            .is_some_and(|(candidate, _)| candidate.starts_with(&prefix))
+        {
+            return Err(FsError::NotEmpty);
+        }
+        self.nodes.remove(&path);
+        self.ramfs_nodes = self.ramfs_nodes.checked_sub(1).ok_or(FsError::Overflow)?;
+        if changes_commands {
+            self.bump_command_revision();
+        }
+        Ok(())
+    }
+
+    /// Atomically rename one object within one writable provider.
+    ///
+    /// The destination must not already exist. Root and mountpoint names are
+    /// immutable, and provider crossings report [`FsError::CrossDevice`].
+    ///
+    /// # Errors
+    ///
+    /// Reports invalid paths, collisions, immutable objects, provider crossings,
+    /// allocation failure, or provider-specific persistence failures.
+    pub fn rename(&mut self, cwd: &str, source: &str, destination: &str) -> Result<(), FsError> {
+        let source = canonicalize(cwd, source)?;
+        let destination = canonicalize(cwd, destination)?;
+        if source == destination {
+            return self.metadata_no_follow_absolute(&source).map(|_| ());
+        }
+        if source == "/"
+            || destination == "/"
+            || self
+                .mounts
+                .iter()
+                .any(|mount| mount.path == source || mount.path == destination)
+        {
+            return Err(FsError::ReadOnly);
+        }
+        match (
+            self.mount_for_path(&source),
+            self.mount_for_path(&destination),
+        ) {
+            (
+                Some((source_index, source_relative)),
+                Some((destination_index, destination_relative)),
+            ) => {
+                if source_index != destination_index {
+                    return Err(FsError::CrossDevice);
+                }
+                if !self.mounts[source_index].writable {
+                    return Err(FsError::ReadOnly);
+                }
+                self.mounts[source_index]
+                    .provider
+                    .rename(&source_relative, &destination_relative)?;
+            }
+            (None, None) => self.rename_ramfs(&source, &destination)?,
+            _ => return Err(FsError::CrossDevice),
+        }
+        if is_command_path(&source) || is_command_path(&destination) {
+            self.bump_command_revision();
+        }
+        Ok(())
+    }
+
+    fn rename_ramfs(&mut self, source: &str, destination: &str) -> Result<(), FsError> {
+        if !is_under_tmp(source) || !is_under_tmp(destination) || source == "/tmp" {
+            return Err(FsError::ReadOnly);
+        }
+        let source_is_directory = match self.nodes.get(source) {
+            Some(Node::Directory) => true,
+            Some(Node::File { writable: true, .. }) => false,
+            Some(Node::File { .. }) => return Err(FsError::ReadOnly),
+            None => return Err(FsError::NotFound),
+        };
+        if self.nodes.contains_key(destination) {
+            return Err(FsError::Exists);
+        }
+        let parent = parent_path(destination).ok_or(FsError::Invalid)?;
+        if !matches!(self.nodes.get(parent), Some(Node::Directory)) {
+            return Err(FsError::NotFound);
+        }
+        let mut prefix = source.to_string();
+        prefix.push('/');
+        if source_is_directory && destination.starts_with(&prefix) {
+            return Err(FsError::Invalid);
+        }
+        if self.mounts.iter().any(|mount| {
+            mount.path.starts_with(&prefix)
+                || mount
+                    .path
+                    .strip_prefix(destination)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        }) {
+            return Err(FsError::ReadOnly);
+        }
+
+        let mut moves = Vec::new();
+        for candidate in self.nodes.keys() {
+            if candidate == source || candidate.starts_with(&prefix) {
+                let suffix = &candidate[source.len()..];
+                let capacity = destination
+                    .len()
+                    .checked_add(suffix.len())
+                    .ok_or(FsError::Overflow)?;
+                if capacity > MAX_PATH_BYTES {
+                    return Err(FsError::NoSpace);
+                }
+                let mut renamed = String::new();
+                renamed
+                    .try_reserve_exact(capacity)
+                    .map_err(|_| FsError::NoSpace)?;
+                renamed.push_str(destination);
+                renamed.push_str(suffix);
+                moves.try_reserve(1).map_err(|_| FsError::NoSpace)?;
+                moves.push((candidate.clone(), renamed));
+            }
+        }
+        if moves.is_empty() {
+            return Err(FsError::NotFound);
+        }
+        if moves.iter().any(|(_, renamed)| {
+            self.nodes.contains_key(renamed)
+                && !moves.iter().any(|(original, _)| original == renamed)
+        }) {
+            return Err(FsError::Exists);
+        }
+        let mut removed = Vec::new();
+        removed
+            .try_reserve_exact(moves.len())
+            .map_err(|_| FsError::NoSpace)?;
+        for (original, _) in &moves {
+            removed.push(self.nodes.remove(original).ok_or(FsError::Corrupt)?);
+        }
+        for ((_, renamed), node) in moves.into_iter().zip(removed) {
+            self.nodes.insert(renamed, node);
+        }
+        Ok(())
+    }
+
     /// Return a mounted provider's symbolic-link target without following it.
     ///
     /// # Errors
@@ -1341,7 +1555,7 @@ impl Namespace {
         let (new_index, new_relative) =
             self.mount_for_path(&new_path).ok_or(FsError::Unsupported)?;
         if existing_index != new_index {
-            return Err(FsError::Unsupported);
+            return Err(FsError::CrossDevice);
         }
         if !self.mounts[existing_index].writable {
             return Err(FsError::ReadOnly);
@@ -2334,6 +2548,66 @@ mod tests {
             fs.create_directory("/", "/tmp/one/two"),
             Err(FsError::Exists)
         );
+    }
+
+    #[test]
+    fn ramfs_rename_and_directory_removal_are_atomic_and_precise() {
+        let mut fs = Namespace::new(RamFsQuota {
+            max_bytes: 64,
+            max_nodes: 16,
+            max_file_bytes: 64,
+        });
+        assert_eq!(fs.create_directory("/", "/tmp/tree"), Ok(()));
+        assert_eq!(fs.create_directory("/", "/tmp/tree/nested"), Ok(()));
+        assert_eq!(fs.write_file("/", "/tmp/tree/nested/file", b"data"), Ok(()));
+        assert_eq!(
+            fs.remove_directory("/", "/tmp/tree"),
+            Err(FsError::NotEmpty)
+        );
+        assert_eq!(fs.rename("/", "/tmp/tree", "/tmp/moved"), Ok(()));
+        assert_eq!(fs.metadata("/", "/tmp/tree"), Err(FsError::NotFound));
+        assert_eq!(
+            fs.read_file("/", "/tmp/moved/nested/file"),
+            Ok(b"data".to_vec())
+        );
+        assert_eq!(
+            fs.rename("/", "/tmp/moved", "/tmp/moved/nested/loop"),
+            Err(FsError::Invalid)
+        );
+        assert_eq!(fs.write_file("/", "/tmp/existing", b"keep"), Ok(()));
+        assert_eq!(
+            fs.rename("/", "/tmp/moved", "/tmp/existing"),
+            Err(FsError::Exists)
+        );
+        assert_eq!(fs.read_file("/", "/tmp/existing"), Ok(b"keep".to_vec()));
+        assert_eq!(
+            fs.read_file("/", "/tmp/moved/nested/file"),
+            Ok(b"data".to_vec())
+        );
+        assert_eq!(fs.remove_file("/", "/tmp/moved/nested/file"), Ok(()));
+        assert_eq!(fs.remove_directory("/", "/tmp/moved/nested"), Ok(()));
+        assert_eq!(fs.remove_directory("/", "/tmp/moved"), Ok(()));
+        assert_eq!(fs.remove_file("/", "/tmp/existing"), Ok(()));
+        assert_eq!(fs.remove_directory("/", "/tmp"), Err(FsError::ReadOnly));
+    }
+
+    #[test]
+    fn rename_rejects_provider_crossings_and_mountpoint_names() -> Result<(), FsError> {
+        let mut fs = Namespace::new(RamFsQuota::default());
+        fs.add_read_only_dir("/first")?;
+        fs.add_read_only_dir("/second")?;
+        fs.mount_writable("/first", Box::new(TestProvider))?;
+        fs.mount_writable("/second", Box::new(TestProvider))?;
+        assert_eq!(
+            fs.rename("/", "/first/data", "/second/moved"),
+            Err(FsError::CrossDevice)
+        );
+        assert_eq!(
+            fs.rename("/", "/first", "/tmp/first"),
+            Err(FsError::ReadOnly)
+        );
+        assert_eq!(fs.remove_directory("/", "/first"), Err(FsError::ReadOnly));
+        Ok(())
     }
 
     #[test]

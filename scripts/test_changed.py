@@ -33,12 +33,15 @@ FILESYSTEM_APPS = frozenset(
     (
         "awk",
         "cat",
+        "cp",
         "grep",
         "hexdump",
         "ln",
         "ls",
+        "mv",
         "printf",
         "rm",
+        "rmdir",
         "sed",
         "sh",
         "tar",
@@ -89,7 +92,8 @@ PACKAGE_SCENARIOS = {
     "troe-host": {"shell-terminal", "filesystem"},
     "troe-kernel": set(ALL_QEMU_SCENARIOS),
     "troe-kex": set(ALL_QEMU_SCENARIOS),
-    "troe-kex-alloc": {"lua"},
+    "troe-kex-alloc": {"filesystem", "lua"},
+    "troe-kex-runtime": {"filesystem"},
     "troe-kex-tool": set(ALL_QEMU_SCENARIOS),
 }
 PYTHON_IMPACTS = {
@@ -406,8 +410,13 @@ def build_plan(
                 plan.all_applications = True
                 plan.note("kex:all", path)
             elif package == "troe-kex-alloc":
-                plan.applications.add("lua")
-                plan.note("kex:lua", path)
+                for application in ("cp", "lua", "mv", "rm"):
+                    plan.applications.add(application)
+                    plan.note(f"kex:{application}", path)
+            elif package == "troe-kex-runtime":
+                for application in ("cp", "mv", "rm"):
+                    plan.applications.add(application)
+                    plan.note(f"kex:{application}", path)
             continue
 
         if _classify_app(plan, path):

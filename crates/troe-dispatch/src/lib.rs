@@ -197,6 +197,10 @@ pub enum ReplyStatus {
     NetworkProtocol = 19,
     /// The caller lacks authority for the requested operation.
     Denied = 20,
+    /// A directory still contains entries.
+    NotEmpty = 21,
+    /// A name operation crossed filesystem-provider boundaries.
+    CrossDevice = 22,
 }
 
 impl ReplyStatus {
@@ -231,6 +235,8 @@ impl ReplyStatus {
             18 => Some(Self::Overflow),
             19 => Some(Self::NetworkProtocol),
             20 => Some(Self::Denied),
+            21 => Some(Self::NotEmpty),
+            22 => Some(Self::CrossDevice),
             _ => None,
         }
     }

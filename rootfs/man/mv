@@ -1,0 +1,11 @@
+NAME
+    mv - atomically rename a filesystem object
+
+SYNOPSIS
+    mv SOURCE DEST
+
+DESCRIPTION
+    Renames one file, symbolic link, or directory through the owning provider's
+    atomic rename primitive. Cross-provider moves fail explicitly as
+    cross-device operations; mv does not emulate them with a partial copy and
+    delete sequence.

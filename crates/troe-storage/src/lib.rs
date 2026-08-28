@@ -897,7 +897,9 @@ const fn probe_state(error: FsError) -> ProbeState {
         | FsError::ReadOnly
         | FsError::Overflow
         | FsError::Exists
-        | FsError::Corrupt => ProbeState::Corrupt,
+        | FsError::Corrupt
+        | FsError::NotEmpty
+        | FsError::CrossDevice => ProbeState::Corrupt,
     }
 }
 

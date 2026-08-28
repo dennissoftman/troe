@@ -8971,11 +8971,17 @@ mod firmware {
                             .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?;
                     ServiceReply::with_payload(ReplyStatus::Success, &encoded[..count])
                 }
-                filesystem::METADATA => {
+                filesystem::METADATA | filesystem::METADATA_NO_FOLLOW => {
                     let Ok(path) = filesystem::decode_path_request(request.payload()) else {
                         return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
                     };
-                    let metadata = match self.namespace.borrow_mut().metadata(&self.cwd, path) {
+                    let metadata = match if request.opcode() == filesystem::METADATA {
+                        self.namespace.borrow_mut().metadata(&self.cwd, path)
+                    } else {
+                        self.namespace
+                            .borrow_mut()
+                            .metadata_no_follow(&self.cwd, path)
+                    } {
                         Ok(metadata) => metadata,
                         Err(error) => {
                             return Ok(ServiceReply::empty(application_filesystem_status(error)));
@@ -9149,6 +9155,26 @@ mod firmware {
                 .create_directory(&self.cwd, path)
                 .map_err(application_filesystem_status)
         }
+
+        fn remove_directory(&mut self, path: &str) -> Result<(), ReplyStatus> {
+            if self.pending.is_some() {
+                return Err(ReplyStatus::Conflict);
+            }
+            self.namespace
+                .borrow_mut()
+                .remove_directory(&self.cwd, path)
+                .map_err(application_filesystem_status)
+        }
+
+        fn rename(&mut self, source: &str, destination: &str) -> Result<(), ReplyStatus> {
+            if self.pending.is_some() {
+                return Err(ReplyStatus::Conflict);
+            }
+            self.namespace
+                .borrow_mut()
+                .rename(&self.cwd, source, destination)
+                .map_err(application_filesystem_status)
+        }
     }
 
     impl Service for ApplicationFilesystemMutationService {
@@ -9235,6 +9261,22 @@ mod firmware {
                         Ok(()) => Ok(ServiceReply::empty(ReplyStatus::Success)),
                         Err(status) => Ok(ServiceReply::empty(status)),
                     }
+                }
+                filesystem_mutation::REMOVE_DIRECTORY => {
+                    let Ok(path) = filesystem_mutation::decode_path_request(request.payload())
+                    else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    Ok(application_mutation_reply(self.remove_directory(path)))
+                }
+                filesystem_mutation::RENAME => {
+                    let Ok(paths) = filesystem_mutation::decode_two_path_request(request.payload())
+                    else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    Ok(application_mutation_reply(
+                        self.rename(paths.source, paths.destination),
+                    ))
                 }
                 _ => Ok(ServiceReply::empty(ReplyStatus::InvalidRequest)),
             }
@@ -10101,7 +10143,16 @@ mod firmware {
             FsError::Corrupt => ReplyStatus::Corrupt,
             FsError::Io => ReplyStatus::Io,
             FsError::Unsupported => ReplyStatus::Unsupported,
+            FsError::NotEmpty => ReplyStatus::NotEmpty,
+            FsError::CrossDevice => ReplyStatus::CrossDevice,
         }
+    }
+
+    fn application_mutation_reply(result: Result<(), ReplyStatus>) -> ServiceReply {
+        ServiceReply::empty(match result {
+            Ok(()) => ReplyStatus::Success,
+            Err(status) => status,
+        })
     }
 
     impl ApplicationDatagramService {

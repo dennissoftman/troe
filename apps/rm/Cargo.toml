@@ -7,10 +7,13 @@ license = "Apache-2.0"
 publish = false
 
 [package.metadata.troe-kex]
-capabilities = ["filesystem-mutate"]
+capabilities = ["filesystem-read", "filesystem-mutate"]
+heap-pages = 16
 
 [dependencies]
 troe-kex-sdk = { path = "../../sdk/rust/troe-kex" }
+troe-kex-alloc = { path = "../../sdk/rust/troe-kex-alloc" }
+troe-kex-runtime = { path = "../../sdk/rust/troe-kex-runtime" }
 
 [profile.release]
 codegen-units = 1

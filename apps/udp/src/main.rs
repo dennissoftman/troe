@@ -206,6 +206,8 @@ fn network_failure(command: &CommandContext, failure: Error) -> u32 {
         | Error::Overflow
         | Error::NetworkProtocol => ("invalid network response", exit::FAILURE),
         Error::UnsupportedTarget => ("unsupported application target", exit::FAILURE),
+        Error::NotEmpty => ("directory not empty", exit::FAILURE),
+        Error::CrossDevice => ("cross-device operation", exit::FAILURE),
     };
     let mut error = Writer(command.stderr());
     let _ignored = writeln!(error, "udp: {message}");

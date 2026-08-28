@@ -236,6 +236,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "troe-kex-runtime"
+version = "0.1.0"
+dependencies = [
+ "troe-kex-sdk",
+]
+
+[[package]]
 name = "troe-kex-sdk"
 version = "0.1.0"
 dependencies = [

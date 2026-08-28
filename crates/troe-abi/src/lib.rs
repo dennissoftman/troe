@@ -283,11 +283,15 @@ pub mod reply {
     pub const NETWORK_PROTOCOL: u32 = 19;
     /// The caller lacks authority for the requested operation.
     pub const DENIED: u32 = 20;
+    /// A directory still contains entries.
+    pub const NOT_EMPTY: u32 = 21;
+    /// A name operation crossed filesystem-provider boundaries.
+    pub const CROSS_DEVICE: u32 = 22;
 
     /// Whether a scalar is one defined service reply value.
     #[must_use]
     pub const fn is_known(value: u32) -> bool {
-        value <= DENIED
+        value <= CROSS_DEVICE
     }
 }
 
@@ -1275,7 +1279,7 @@ pub mod filesystem {
     /// Interface major version.
     pub const MAJOR: u16 = 1;
     /// Interface minor version.
-    pub const MINOR: u16 = 2;
+    pub const MINOR: u16 = 3;
     /// Resolve and open one regular file.
     pub const OPEN: u16 = 1;
     /// Read one bounded range through an open-file token.
@@ -1288,6 +1292,8 @@ pub mod filesystem {
     pub const METADATA: u16 = 5;
     /// Read one symbolic-link target without following the final component.
     pub const READ_LINK: u16 = 6;
+    /// Return metadata without following the final symbolic-link component.
+    pub const METADATA_NO_FOLLOW: u16 = 7;
     /// Maximum path bytes accepted by this interface.
     pub const MAX_PATH_BYTES: usize = 256;
     /// Maximum simultaneously open files per application service.
@@ -1886,9 +1892,9 @@ pub mod filesystem_mutation {
     use super::{MAX_SERVICE_PAYLOAD_BYTES, filesystem};
 
     /// Interface major version.
-    pub const MAJOR: u16 = 2;
+    pub const MAJOR: u16 = 1;
     /// Interface minor version.
-    pub const MINOR: u16 = 0;
+    pub const MINOR: u16 = 2;
     /// Truncate or create one file and begin a sequential streamed replacement.
     pub const BEGIN_REPLACE: u16 = 1;
     /// Append one sequential chunk to the pending replacement.
@@ -1907,6 +1913,10 @@ pub mod filesystem_mutation {
     pub const CREATE_DIRECTORY: u16 = 8;
     /// Select the aggregation size for one pending streamed replacement.
     pub const SET_CHUNK_SIZE: u16 = 9;
+    /// Atomically rename one same-provider object.
+    pub const RENAME: u16 = 10;
+    /// Atomically remove one empty directory.
+    pub const REMOVE_DIRECTORY: u16 = 11;
     /// Fixed bytes preceding an append payload.
     pub const APPEND_HEADER_BYTES: usize = 12;
     /// Maximum bytes carried by one append call.
@@ -1920,6 +1930,8 @@ pub mod filesystem_mutation {
     /// Largest canonical two-string link request.
     pub const MAX_LINK_REQUEST_BYTES: usize =
         LINK_REQUEST_HEADER_BYTES + 2 * filesystem::MAX_PATH_BYTES;
+    /// Largest canonical two-path request.
+    pub const MAX_TWO_PATH_REQUEST_BYTES: usize = MAX_LINK_REQUEST_BYTES;
 
     /// Invalid mutation request or reply encoding.
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1943,6 +1955,15 @@ pub mod filesystem_mutation {
         pub target: &'a str,
         /// New directory-entry path.
         pub link_path: &'a str,
+    }
+
+    /// Borrowed validated request carrying two filesystem paths.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct TwoPathRequest<'a> {
+        /// Existing source path.
+        pub source: &'a str,
+        /// New destination path.
+        pub destination: &'a str,
     }
 
     /// Encode a begin-replace or remove path request.
@@ -2025,6 +2046,34 @@ pub mod filesystem_mutation {
         validate_link_string(target)?;
         validate_link_string(link_path)?;
         Ok(LinkRequest { target, link_path })
+    }
+
+    /// Encode one exact source/destination path pair.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty, excessive, NUL-containing paths or insufficient output
+    /// without modifying it.
+    pub fn encode_two_path_request(
+        source: &str,
+        destination: &str,
+        output: &mut [u8],
+    ) -> Result<usize, EncodingError> {
+        encode_link_request(source, destination, output)
+    }
+
+    /// Decode one exact source/destination path pair.
+    ///
+    /// # Errors
+    ///
+    /// Rejects malformed lengths, invalid UTF-8, empty, excessive,
+    /// NUL-containing, or trailing bytes.
+    pub fn decode_two_path_request(bytes: &[u8]) -> Result<TwoPathRequest<'_>, EncodingError> {
+        let decoded = decode_link_request(bytes)?;
+        Ok(TwoPathRequest {
+            source: decoded.target,
+            destination: decoded.link_path,
+        })
     }
 
     /// Encode one opaque nonzero replacement token.
@@ -5226,6 +5275,10 @@ mod tests {
 
     #[test]
     fn filesystem_mutation_is_sequential_streamed_and_exact() {
+        assert_eq!(filesystem_mutation::MAJOR, 1);
+        assert_eq!(filesystem_mutation::MINOR, 2);
+        assert_eq!(filesystem::MAJOR, 1);
+        assert_eq!(filesystem::MINOR, 3);
         let token = filesystem_mutation::encode_token(7).unwrap_or_else(|_| std::process::abort());
         assert_eq!(filesystem_mutation::decode_token(&token), Ok(7));
         assert!(filesystem_mutation::decode_token(&[7, 0, 0, 0, 0]).is_err());
@@ -5266,11 +5319,28 @@ mod tests {
             })
         );
         assert!(filesystem_mutation::decode_link_request(&link_bytes[..count - 1]).is_err());
+        let count = filesystem_mutation::encode_two_path_request(
+            "/vol/root/old",
+            "/vol/root/new",
+            &mut link_bytes,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            filesystem_mutation::decode_two_path_request(&link_bytes[..count]),
+            Ok(filesystem_mutation::TwoPathRequest {
+                source: "/vol/root/old",
+                destination: "/vol/root/new",
+            })
+        );
+        assert!(filesystem_mutation::decode_two_path_request(&link_bytes[..count - 1]).is_err());
         let mut unchanged = [0xa5_u8; 7];
         assert!(
             filesystem_mutation::encode_link_request("target", "link", &mut unchanged).is_err()
         );
         assert_eq!(unchanged, [0xa5; 7]);
+        assert!(reply::is_known(reply::NOT_EMPTY));
+        assert!(reply::is_known(reply::CROSS_DEVICE));
+        assert!(!reply::is_known(reply::CROSS_DEVICE + 1));
     }
 
     #[test]

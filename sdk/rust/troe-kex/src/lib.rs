@@ -143,6 +143,10 @@ pub enum Error {
     NetworkProtocol,
     /// The caller lacks authority for the requested operation.
     Denied,
+    /// A directory still contains entries.
+    NotEmpty,
+    /// A name operation crossed filesystem-provider boundaries.
+    CrossDevice,
 }
 
 impl fmt::Display for Error {
@@ -172,6 +176,8 @@ impl fmt::Display for Error {
             Self::Overflow => "filesystem size overflow",
             Self::NetworkProtocol => "invalid network response",
             Self::Denied => "operation denied",
+            Self::NotEmpty => "directory not empty",
+            Self::CrossDevice => "cross-device operation",
         })
     }
 }
@@ -938,6 +944,25 @@ impl ReadOnlyFilesystem {
         filesystem::decode_metadata_reply(&reply[..count]).map_err(|_| Error::InvalidCall)
     }
 
+    /// Return metadata without following the final symbolic-link component.
+    ///
+    /// # Errors
+    ///
+    /// Reports path, namespace, service, or call-gate failures.
+    pub fn metadata_no_follow(&mut self, path: &str) -> Result<filesystem::Metadata, Error> {
+        let mut request = [0_u8; filesystem::MAX_PATH_BYTES];
+        let count =
+            filesystem::encode_path_request(path, &mut request).map_err(|_| Error::InvalidCall)?;
+        let mut reply = [0_u8; filesystem::METADATA_REPLY_BYTES];
+        let count = call(
+            self.handle,
+            filesystem::METADATA_NO_FOLLOW,
+            &request[..count],
+            &mut reply,
+        )?;
+        filesystem::decode_metadata_reply(&reply[..count]).map_err(|_| Error::InvalidCall)
+    }
+
     /// Return one bounded lexical directory page.
     ///
     /// The reply borrows `buffer`; pass the returned cursor to the next call.
@@ -1061,6 +1086,54 @@ impl FilesystemMutation {
         let count = call(
             self.handle,
             filesystem_mutation::CREATE_DIRECTORY,
+            &request[..count],
+            &mut reply,
+        )?;
+        if count == 0 {
+            Ok(())
+        } else {
+            Err(Error::InvalidCall)
+        }
+    }
+
+    /// Atomically remove one empty directory.
+    ///
+    /// # Errors
+    ///
+    /// Reports roots, mountpoints, wrong types, nonempty directories, immutable
+    /// targets, provider failures, or call-gate failure.
+    pub fn remove_directory(&mut self, path: &str) -> Result<(), Error> {
+        let mut request = [0_u8; filesystem::MAX_PATH_BYTES];
+        let count = filesystem_mutation::encode_path_request(path, &mut request)
+            .map_err(|_| Error::InvalidCall)?;
+        let mut reply = [];
+        let count = call(
+            self.handle,
+            filesystem_mutation::REMOVE_DIRECTORY,
+            &request[..count],
+            &mut reply,
+        )?;
+        if count == 0 {
+            Ok(())
+        } else {
+            Err(Error::InvalidCall)
+        }
+    }
+
+    /// Atomically rename one same-provider file, symbolic link, or directory.
+    ///
+    /// # Errors
+    ///
+    /// Reports invalid/missing paths, collisions, immutable targets,
+    /// cross-device operations, provider failures, or call-gate failure.
+    pub fn rename(&mut self, source: &str, destination: &str) -> Result<(), Error> {
+        let mut request = [0_u8; filesystem_mutation::MAX_TWO_PATH_REQUEST_BYTES];
+        let count = filesystem_mutation::encode_two_path_request(source, destination, &mut request)
+            .map_err(|_| Error::InvalidCall)?;
+        let mut reply = [];
+        let count = call(
+            self.handle,
+            filesystem_mutation::RENAME,
             &request[..count],
             &mut reply,
         )?;
@@ -2002,6 +2075,8 @@ fn call(
         reply::OVERFLOW => Err(Error::Overflow),
         reply::NETWORK_PROTOCOL => Err(Error::NetworkProtocol),
         reply::DENIED => Err(Error::Denied),
+        reply::NOT_EMPTY => Err(Error::NotEmpty),
+        reply::CROSS_DEVICE => Err(Error::CrossDevice),
         _ => Err(Error::InvalidCall),
     }
 }

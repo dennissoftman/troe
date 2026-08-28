@@ -994,6 +994,25 @@ impl<D: BlockDevice> Fat32<D> {
         }
         self.durability_barrier()
     }
+
+    fn update_directory_parent(
+        &mut self,
+        directory_cluster: u32,
+        parent_cluster: u32,
+    ) -> Result<(), FsError> {
+        let mut bytes = self.read_cluster(directory_cluster)?;
+        let raw = bytes
+            .get_mut(DIRECTORY_ENTRY_BYTES..2 * DIRECTORY_ENTRY_BYTES)
+            .ok_or(FsError::Corrupt)?;
+        if raw[..11] != *b"..         " || raw[11] & 0x10 == 0 {
+            return Err(FsError::Corrupt);
+        }
+        let encoded = parent_cluster.to_le_bytes();
+        raw[20..22].copy_from_slice(&encoded[2..4]);
+        raw[26..28].copy_from_slice(&encoded[..2]);
+        self.write_cluster(directory_cluster, &bytes)?;
+        self.durability_barrier()
+    }
 }
 
 impl<D: BlockDevice> ReadOnlyFileSystem for Fat32<D> {
@@ -1299,6 +1318,100 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Fat32<D> {
         if entry.byte_count != 0 {
             self.release_chain_for_bytes(entry.first_cluster, entry.byte_count)?;
         }
+        self.finish_mutation()
+    }
+
+    fn remove_directory(&mut self, path: &str) -> Result<(), FsError> {
+        self.append_cursor = None;
+        self.read_cursor = None;
+        self.ensure_writable()?;
+        let (parent, name) = self.resolve_parent(path)?;
+        let entries = self.read_directory(parent.first_cluster)?;
+        let mut matching = entries
+            .into_iter()
+            .filter(|entry| names_equal(&entry.name, &name));
+        let entry = matching.next().ok_or(FsError::NotFound)?;
+        if matching.next().is_some() {
+            return Err(FsError::Corrupt);
+        }
+        if entry.kind != NodeKind::Directory {
+            return Err(FsError::WrongType);
+        }
+        if !self.read_directory(entry.first_cluster)?.is_empty() {
+            return Err(FsError::NotEmpty);
+        }
+        let clusters = self.cluster_chain(entry.first_cluster)?;
+        self.begin_mutation()?;
+        self.delete_directory_entry(&entry)?;
+        self.release_clusters(&clusters)?;
+        self.finish_mutation()
+    }
+
+    fn rename(&mut self, source: &str, destination: &str) -> Result<(), FsError> {
+        self.append_cursor = None;
+        self.read_cursor = None;
+        self.ensure_writable()?;
+        let normalized_source = canonicalize("/", source)?;
+        let normalized_destination = canonicalize("/", destination)?;
+        if normalized_source != source || normalized_destination != destination {
+            return Err(FsError::Invalid);
+        }
+        if source == destination {
+            self.resolve(source)?;
+            return Ok(());
+        }
+        let (source_parent, source_name) = self.resolve_parent(source)?;
+        let source_entries = self.read_directory(source_parent.first_cluster)?;
+        let mut matching = source_entries
+            .iter()
+            .filter(|entry| names_equal(&entry.name, &source_name));
+        let source_entry = matching.next().cloned().ok_or(FsError::NotFound)?;
+        if matching.next().is_some() {
+            return Err(FsError::Corrupt);
+        }
+        if source_entry.kind == NodeKind::Directory {
+            let mut source_prefix = normalized_source.clone();
+            source_prefix.push('/');
+            if normalized_destination.starts_with(&source_prefix) {
+                return Err(FsError::Invalid);
+            }
+        }
+        let (destination_parent, destination_name) = self.resolve_parent(destination)?;
+        let destination_entries = self.read_directory(destination_parent.first_cluster)?;
+        if destination_entries
+            .iter()
+            .any(|entry| names_equal(&entry.name, &destination_name))
+        {
+            return Err(FsError::Exists);
+        }
+        let mut records = directory_records(
+            &destination_name,
+            &destination_entries,
+            source_entry.first_cluster,
+            u32::try_from(source_entry.byte_count).map_err(|_| FsError::Overflow)?,
+        )?;
+        if source_entry.kind == NodeKind::Directory {
+            records.last_mut().ok_or(FsError::Corrupt)?[11] = 0x10;
+        }
+
+        self.begin_mutation()?;
+        let slots =
+            self.reserve_directory_slots(destination_parent.first_cluster, records.len())?;
+        self.write_directory_records(&slots, &records)?;
+        self.durability_barrier()?;
+        if source_entry.kind == NodeKind::Directory
+            && source_parent.first_cluster != destination_parent.first_cluster
+        {
+            self.update_directory_parent(
+                source_entry.first_cluster,
+                if destination_parent.name == "/" {
+                    0
+                } else {
+                    destination_parent.first_cluster
+                },
+            )?;
+        }
+        self.delete_directory_entry(&source_entry)?;
         self.finish_mutation()
     }
 
@@ -2312,10 +2425,36 @@ mod tests {
     }
 
     #[test]
+    fn renames_files_and_directories_and_removes_only_empty_directories() -> Result<(), FsError> {
+        let mut fat = mount_writable(valid_device().map_err(|_| FsError::Io)?)?;
+        fat.rename("/HELLO.TXT", "/renamed.txt")?;
+        assert_eq!(fat.metadata("/HELLO.TXT"), Err(FsError::NotFound));
+        assert_eq!(fat.metadata("/renamed.txt")?.byte_count, 5);
+        fat.create_directory("/tree")?;
+        fat.write_file("/tree/member", b"member")?;
+        assert_eq!(fat.remove_directory("/tree"), Err(FsError::NotEmpty));
+        fat.rename("/tree", "/moved")?;
+        assert_eq!(fat.metadata("/moved/member")?.byte_count, 6);
+        assert_eq!(
+            fat.rename("/moved", "/moved/member/loop"),
+            Err(FsError::Invalid)
+        );
+        fat.remove_file("/moved/member")?;
+        fat.remove_directory("/moved")?;
+        assert_eq!(fat.metadata("/moved"), Err(FsError::NotFound));
+        Ok(())
+    }
+
+    #[test]
     fn read_only_capability_rejects_mutation() -> Result<(), FsError> {
         let mut fat = mount(valid_device().map_err(|_| FsError::Io)?)?;
         assert_eq!(fat.write_file("/new.txt", b"data"), Err(FsError::ReadOnly));
         assert_eq!(fat.remove_file("/HELLO.TXT"), Err(FsError::ReadOnly));
+        assert_eq!(fat.remove_directory("/SUBDIR"), Err(FsError::ReadOnly));
+        assert_eq!(
+            fat.rename("/HELLO.TXT", "/renamed.txt"),
+            Err(FsError::ReadOnly)
+        );
         Ok(())
     }
 
