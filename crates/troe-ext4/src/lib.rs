@@ -1938,9 +1938,6 @@ impl<D: BlockDevice> Ext4<D> {
         if matching.next().is_some() {
             return Err(FsError::Corrupt);
         }
-        if found.kind == NodeKind::Directory {
-            return Err(FsError::WrongType);
-        }
         let block_count =
             u32::try_from(directory.size / EXT4_BLOCK_BYTES_U64).map_err(|_| FsError::Overflow)?;
         for logical in 0..block_count {
@@ -1979,6 +1976,47 @@ impl<D: BlockDevice> Ext4<D> {
                 }
                 offset = offset.checked_add(record_bytes).ok_or(FsError::Overflow)?;
             }
+        }
+        Err(FsError::Corrupt)
+    }
+
+    fn update_directory_parent(
+        &mut self,
+        directory: &Inode,
+        parent_number: u32,
+    ) -> Result<(), FsError> {
+        if directory.kind != NodeKind::Directory {
+            return Err(FsError::WrongType);
+        }
+        let (physical, false) = map_block(directory, 0)?.ok_or(FsError::Corrupt)? else {
+            return Err(FsError::Corrupt);
+        };
+        let mut block = self.read_fs_block(physical)?;
+        verify_directory_checksum(self.layout.checksum_seed, directory, &block)?;
+        let tail_offset = EXT4_BLOCK_BYTES - EXT4_DIR_TAIL_BYTES;
+        let mut offset = 0_usize;
+        while offset < tail_offset {
+            let record_bytes = usize::from(read_u16(&block, offset + 4)?);
+            let name_bytes = usize::from(*block.get(offset + 6).ok_or(FsError::Corrupt)?);
+            if record_bytes < 8
+                || !record_bytes.is_multiple_of(4)
+                || offset
+                    .checked_add(record_bytes)
+                    .is_none_or(|end| end > tail_offset)
+                || name_bytes > record_bytes - 8
+            {
+                return Err(FsError::Corrupt);
+            }
+            let name = block
+                .get(offset + 8..offset + 8 + name_bytes)
+                .ok_or(FsError::Corrupt)?;
+            if name == b".." {
+                put_u32(&mut block, offset, parent_number)?;
+                refresh_directory_checksum(self.layout.checksum_seed, directory, &mut block)?;
+                self.write_fs_block(physical, &block)?;
+                return self.durability_barrier();
+            }
+            offset = offset.checked_add(record_bytes).ok_or(FsError::Overflow)?;
         }
         Err(FsError::Corrupt)
     }
@@ -2305,6 +2343,143 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Ext4<D> {
         self.clear_inode_record(inode.number)?;
         self.set_inode_allocated(inode.number, false)?;
         self.durability_barrier()?;
+        self.finish_mutation()
+    }
+
+    fn remove_directory(&mut self, path: &str) -> Result<(), FsError> {
+        self.ensure_writable()?;
+        let (parent, name) = self.resolve_parent(path)?;
+        let entries = self.read_directory(&parent)?;
+        let mut matching = entries.iter().filter(|entry| entry.name == name);
+        let entry = matching.next().ok_or(FsError::NotFound)?;
+        if matching.next().is_some() {
+            return Err(FsError::Corrupt);
+        }
+        if entry.kind != NodeKind::Directory {
+            return Err(FsError::WrongType);
+        }
+        let directory = self.read_inode(entry.inode)?;
+        if directory.kind != NodeKind::Directory {
+            return Err(FsError::Corrupt);
+        }
+        let children = self.read_directory(&directory)?;
+        if children
+            .iter()
+            .any(|child| child.name != "." && child.name != "..")
+        {
+            return Err(FsError::NotEmpty);
+        }
+        let raw = self.raw_inode_record(directory.number)?;
+        if read_u16(&raw, 26)? != 2 || read_u32(&raw, 104)? != 0 || read_u16(&raw, 118)? != 0 {
+            return Err(FsError::Unsupported);
+        }
+        let parent_raw = self.raw_inode_record(parent.number)?;
+        let parent_links = read_u16(&parent_raw, 26)?;
+        let next_parent_links = parent_links.checked_sub(1).ok_or(FsError::Corrupt)?;
+
+        self.begin_mutation()?;
+        let removed = self.remove_directory_entry(&parent, &name)?;
+        if removed.inode != directory.number || removed.kind != NodeKind::Directory {
+            return Err(FsError::Corrupt);
+        }
+        self.update_inode_links(parent.number, parent_links, next_parent_links)?;
+        self.release_extents(&directory.extents)?;
+        self.release_blocks(&directory.extent_tree_blocks)?;
+        self.clear_inode_record(directory.number)?;
+        self.set_directory_allocated(directory.number, false)?;
+        self.set_inode_allocated(directory.number, false)?;
+        self.durability_barrier()?;
+        self.finish_mutation()
+    }
+
+    fn rename(&mut self, source: &str, destination: &str) -> Result<(), FsError> {
+        self.ensure_writable()?;
+        let normalized_source = canonicalize("/", source)?;
+        let normalized_destination = canonicalize("/", destination)?;
+        if normalized_source != source || normalized_destination != destination {
+            return Err(FsError::Invalid);
+        }
+        if source == destination {
+            self.resolve_no_follow(source)?;
+            return Ok(());
+        }
+        let (source_parent, source_name) = self.resolve_parent(source)?;
+        let source_entries = self.read_directory(&source_parent)?;
+        let mut matching = source_entries
+            .iter()
+            .filter(|entry| entry.name == source_name);
+        let source_entry = matching.next().cloned().ok_or(FsError::NotFound)?;
+        if matching.next().is_some() {
+            return Err(FsError::Corrupt);
+        }
+        if source_entry.kind == NodeKind::Directory {
+            let mut source_prefix = normalized_source.clone();
+            source_prefix.push('/');
+            if normalized_destination.starts_with(&source_prefix) {
+                return Err(FsError::Invalid);
+            }
+        }
+        let (destination_parent, destination_name) = self.resolve_parent(destination)?;
+        if self
+            .read_directory(&destination_parent)?
+            .iter()
+            .any(|entry| entry.name == destination_name)
+        {
+            return Err(FsError::Exists);
+        }
+        let moving_directory = source_entry.kind == NodeKind::Directory
+            && source_parent.number != destination_parent.number;
+        let source_parent_links = if moving_directory {
+            Some(read_u16(&self.raw_inode_record(source_parent.number)?, 26)?)
+        } else {
+            None
+        };
+        let destination_parent_links = if moving_directory {
+            Some(read_u16(
+                &self.raw_inode_record(destination_parent.number)?,
+                26,
+            )?)
+        } else {
+            None
+        };
+        let next_source_links = source_parent_links
+            .map(|links| links.checked_sub(1).ok_or(FsError::Corrupt))
+            .transpose()?;
+        let next_destination_links = destination_parent_links
+            .map(|links| links.checked_add(1).ok_or(FsError::NoSpace))
+            .transpose()?;
+        let moved_inode = self.read_inode(source_entry.inode)?;
+        if moved_inode.kind != source_entry.kind {
+            return Err(FsError::Corrupt);
+        }
+
+        self.begin_mutation()?;
+        self.add_directory_entry(
+            &destination_parent,
+            &destination_name,
+            source_entry.inode,
+            source_entry.kind,
+        )?;
+        if moving_directory {
+            self.update_directory_parent(&moved_inode, destination_parent.number)?;
+            self.update_inode_links(
+                source_parent.number,
+                source_parent_links.ok_or(FsError::Corrupt)?,
+                next_source_links.ok_or(FsError::Corrupt)?,
+            )?;
+            self.update_inode_links(
+                destination_parent.number,
+                destination_parent_links.ok_or(FsError::Corrupt)?,
+                next_destination_links.ok_or(FsError::Corrupt)?,
+            )?;
+        }
+        let removed = self.remove_directory_entry(&source_parent, &source_name)?;
+        if removed.inode != source_entry.inode
+            || removed.name != source_entry.name
+            || removed.kind != source_entry.kind
+        {
+            return Err(FsError::Corrupt);
+        }
         self.finish_mutation()
     }
 
@@ -3830,6 +4005,30 @@ mod tests {
     }
 
     #[test]
+    fn renames_all_node_kinds_and_removes_only_empty_directories() -> Result<(), FsError> {
+        let mut ext4 = mount_writable(valid_device())?;
+        ext4.rename("/hello", "/renamed")?;
+        assert_eq!(ext4.metadata("/hello"), Err(FsError::NotFound));
+        assert_eq!(ext4.metadata("/renamed")?.byte_count, 4101);
+        ext4.create_symlink("/renamed", "/link")?;
+        ext4.rename("/link", "/moved-link")?;
+        assert_eq!(ext4.read_link("/moved-link")?, "/renamed");
+        ext4.create_directory("/tree")?;
+        ext4.write_file("/tree/member", b"member")?;
+        assert_eq!(ext4.remove_directory("/tree"), Err(FsError::NotEmpty));
+        ext4.rename("/tree", "/sub/moved")?;
+        assert_eq!(ext4.metadata("/sub/moved/member")?.byte_count, 6);
+        assert_eq!(
+            ext4.rename("/sub/moved", "/sub/moved/member/loop"),
+            Err(FsError::Invalid)
+        );
+        ext4.remove_file("/sub/moved/member")?;
+        ext4.remove_directory("/sub/moved")?;
+        assert_eq!(ext4.metadata("/sub/moved"), Err(FsError::NotFound));
+        Ok(())
+    }
+
+    #[test]
     fn final_unlink_with_external_xattrs_fails_without_mutation() -> Result<(), FsError> {
         let mut ext4 = mount_writable(valid_device_with_file_xattr())?;
         assert_eq!(ext4.remove_file("/hello"), Err(FsError::Unsupported));
@@ -3907,6 +4106,8 @@ mod tests {
         let mut ext4 = mount(valid_device())?;
         assert_eq!(ext4.write_file("/new", b"data"), Err(FsError::ReadOnly));
         assert_eq!(ext4.remove_file("/hello"), Err(FsError::ReadOnly));
+        assert_eq!(ext4.remove_directory("/sub"), Err(FsError::ReadOnly));
+        assert_eq!(ext4.rename("/hello", "/renamed"), Err(FsError::ReadOnly));
         assert_eq!(
             ext4.create_symlink("/hello", "/link"),
             Err(FsError::ReadOnly)

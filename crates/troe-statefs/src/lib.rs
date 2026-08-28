@@ -226,6 +226,14 @@ impl<D: BlockDevice> ReadOnlyFileSystem for StateFs<D> {
         }
         self.commit(None)
     }
+
+    fn remove_directory(&mut self, _path: &str) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+
+    fn rename(&mut self, _source: &str, _destination: &str) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
 }
 
 fn encode_image(bytes: Option<&[u8]>) -> Result<Vec<u8>, FsError> {
@@ -407,6 +415,14 @@ mod tests {
         let mut bytes = [0_u8; 16];
         assert_eq!(reopened.read_file(STATE_PATH, 0, &mut bytes)?, 10);
         assert_eq!(&bytes[..10], b"persistent");
+        assert_eq!(
+            reopened.rename(STATE_PATH, "/renamed.bin"),
+            Err(FsError::Unsupported)
+        );
+        assert_eq!(
+            reopened.remove_directory("/directory"),
+            Err(FsError::Unsupported)
+        );
         reopened.remove_file(STATE_PATH)?;
         drop(reopened);
         let mut empty = StateFs::mount(region(device).map_err(|_| FsError::Io)?)?;

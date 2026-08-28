@@ -190,6 +190,14 @@ $ cargo kex inspect rootfs/bin/x86_64/echo.kex
 Start exploring with [`apps/echo`](apps/echo) and the
 [`troe-kex` Rust SDK](sdk/rust/troe-kex).
 
+The essential filesystem command set now includes streamed `cp`, iterative
+`cp -r`/`cp -R`, atomic same-provider `mv`, recursive `rm -r`/`rm -R`, and
+`rmdir`. Recursive commands reproduce symbolic links without following them
+and retain only fallibly grown, explicitly bounded traversal metadata. Shared
+algorithms live in the small `no_std`
+[`troe-kex-runtime`](sdk/rust/troe-kex-runtime) layer; the lower-level
+[`troe-kex`](sdk/rust/troe-kex) crate remains the typed ABI client.
+
 [`apps/spawn`](apps/spawn) is the first process-launch consumer. It resolves a
 nested KEX package through the owner-scoped launch capability, inherits or
 captures standard output through a bounded pipe, waits, reaps, and preserves

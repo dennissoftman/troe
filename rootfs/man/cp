@@ -1,0 +1,13 @@
+NAME
+    cp - copy files and directory trees
+
+SYNOPSIS
+    cp SOURCE DEST
+    cp -r SOURCE DEST
+    cp -R SOURCE DEST
+
+DESCRIPTION
+    Copies regular files with bounded streamed I/O. With -r or -R, traverses
+    directory trees iteratively. Symbolic links encountered during traversal
+    are reproduced without following them. Traversal metadata grows fallibly
+    to documented runtime ceilings; file payload size is not staged in memory.

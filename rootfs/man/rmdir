@@ -1,0 +1,9 @@
+NAME
+    rmdir - remove an empty directory
+
+SYNOPSIS
+    rmdir DIRECTORY
+
+DESCRIPTION
+    Removes one empty writable directory. Nonempty directories, roots,
+    mountpoints, read-only objects, files, and symbolic links are rejected.

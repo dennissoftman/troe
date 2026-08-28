@@ -364,7 +364,12 @@ open tokens are generation-checked; directory traversal is
 lexically paginated and final-component link targets are bounded. Mutation
 working state is sequential, 16 KiB by default, and selectable through 1 MiB;
 teardown does not roll back already written bytes. Empty-directory creation is
-a separate bounded operation.
+a separate bounded operation. Mutation interface 1.2 also exposes canonical
+two-path same-provider rename and empty-directory removal, with stable
+directory-not-empty and cross-device statuses. The kernel routes these typed,
+capability-scoped primitives only; streamed copying, iterative traversal,
+recursive copy/delete, destination joining, and move behavior remain in the
+`no_std` user-space runtime.
 Timer waits are foreground
 and cancellable; diagnostics retains fixed copied bytes rather than accounting
    borrows. TCP retains at most one unacknowledged 1,460-byte segment and one
@@ -381,9 +386,10 @@ discovery; it cannot name raw devices or arbitrary target paths.
 The portable block-region, GPT, VFS-provider, read/write FAT32, constrained
 metadata-preserving ext4 with bounded symbolic/hard links, native virtio
 transport, dual-slot durability, and
-selected STFS mutation pieces preserve this dependency direction. Directory,
-rename, journal-replay, and repair mutation outside the documented profiles is
-unsupported. A transport provides bounded block-region capabilities; partition
+selected STFS mutation pieces preserve this dependency direction. Empty
+directory removal and same-provider rename are implemented for RAMFS, FAT32,
+and the constrained ext4 profile; journal replay, repair, and mutations outside
+the documented profiles remain unsupported. A transport provides bounded block-region capabilities; partition
 discovery turns a whole device into non-overlapping regions; independently
 selected filesystem providers expose VFS objects.
 Format-specific structures do not enter the machine backend, block transport,

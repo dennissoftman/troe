@@ -1178,6 +1178,129 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
         command_timeout,
         contains=(MUTABLE_ROOT_CONTENT,),
     )
+    session.command(
+        f"cp {MUTABLE_ROOT_FILE} /vol/root/troe-copy.txt", cwd, command_timeout
+    )
+    session.command(
+        "cat /vol/root/troe-copy.txt",
+        cwd,
+        command_timeout,
+        contains=(MUTABLE_ROOT_CONTENT,),
+    )
+    session.command(
+        "cp /vol/root/troe-mutable-soft /vol/root/troe-copy-soft",
+        cwd,
+        command_timeout,
+    )
+    session.command(
+        "ls /vol/root",
+        cwd,
+        command_timeout,
+        contains=("troe-copy-soft@",),
+    )
+    session.command(
+        "cat /vol/root/troe-copy-soft",
+        cwd,
+        command_timeout,
+        contains=(MUTABLE_ROOT_CONTENT,),
+    )
+    session.command(
+        "mv /vol/root/troe-copy.txt /vol/root/troe-moved.txt", cwd, command_timeout
+    )
+    session.command(
+        "cat /vol/root/troe-moved.txt",
+        cwd,
+        command_timeout,
+        contains=(MUTABLE_ROOT_CONTENT,),
+    )
+    session.command(
+        "cp -R /vol/root/nested /vol/root/troe-copy-tree", cwd, command_timeout
+    )
+    session.command(
+        "cat /vol/root/troe-copy-tree/state.txt",
+        cwd,
+        command_timeout,
+        contains=("read-only activation complete\n",),
+    )
+    session.command(
+        "mv /vol/root/troe-copy-tree /vol/root/troe-moved-tree",
+        cwd,
+        command_timeout,
+    )
+    session.command(
+        "cat /vol/root/troe-moved-tree/state.txt",
+        cwd,
+        command_timeout,
+        contains=("read-only activation complete\n",),
+    )
+    session.command("rm -r /vol/root/troe-moved-tree", cwd, command_timeout)
+    session.command(
+        "cp -r /vol/root/nested /vol/root/troe-deep", cwd, command_timeout
+    )
+    session.command(
+        "cp -r /vol/root/nested /vol/root/troe-deep/level-one",
+        cwd,
+        command_timeout,
+    )
+    session.command(
+        "cp -r /vol/root/nested /vol/root/troe-deep/level-one/level-two",
+        cwd,
+        command_timeout,
+    )
+    session.command(
+        "cp -r /vol/root/troe-deep /vol/root/troe-deep-copy",
+        cwd,
+        command_timeout,
+    )
+    session.command(
+        "cat /vol/root/troe-deep-copy/level-one/level-two/state.txt",
+        cwd,
+        command_timeout,
+        contains=("read-only activation complete\n",),
+    )
+    session.command("rm -r /vol/root/troe-deep", cwd, command_timeout)
+    session.command("rm -r /vol/root/troe-deep-copy", cwd, command_timeout)
+    session.command(
+        "cp -r /vol/root/nested /vol/root/troe-empty-test", cwd, command_timeout
+    )
+    session.command("rm /vol/root/troe-empty-test/state.txt", cwd, command_timeout)
+    session.command("rmdir /vol/root/troe-empty-test", cwd, command_timeout)
+    session.command(
+        "lua -e 'local ok,kind,status=os.execute(\"mv "
+        "/vol/root/troe-moved.txt /vol/shared/cross-device.txt\"); "
+        "print(\"mv-status\",ok,kind,status)'",
+        cwd,
+        command_timeout,
+        contains=(
+            "mv: /vol/root/troe-moved.txt: cross-device operation",
+            "mv-status\tnil\texit\t1\n",
+        ),
+    )
+    session.command(
+        "lua -e 'local ok,kind,status=os.execute(\"cp "
+        f"{MUTABLE_ROOT_FILE} /recovery/denied-copy\"); "
+        "print(\"cp-readonly-status\",ok,kind,status)'",
+        cwd,
+        command_timeout,
+        contains=("read-only filesystem", "cp-readonly-status\tnil\texit\t1\n"),
+    )
+    session.command(
+        "lua -e 'local ok,kind,status=os.execute(\"rm -R /recovery\"); "
+        "print(\"rm-readonly-status\",ok,kind,status)'",
+        cwd,
+        command_timeout,
+        contains=("read-only filesystem", "rm-readonly-status\tnil\texit\t1\n"),
+    )
+    session.command(
+        "lua -e 'local ok,kind,status=os.execute(\"cp "
+        "/missing /vol/root/missing-copy\"); "
+        "print(\"cp-missing-status\",ok,kind,status)'",
+        cwd,
+        command_timeout,
+        contains=("cp: /missing: not found", "cp-missing-status\tnil\texit\t3\n"),
+    )
+    session.command("rm /vol/root/troe-moved.txt", cwd, command_timeout)
+    session.command("rm /vol/root/troe-copy-soft", cwd, command_timeout)
     session.command("rm /vol/root/troe-mutable-hard", cwd, command_timeout)
     session.command("rm /vol/root/troe-mutable-soft", cwd, command_timeout)
     session.command("echo alpha beta", cwd, command_timeout, contains=("alpha beta\n",))

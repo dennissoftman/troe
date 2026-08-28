@@ -1,7 +1,12 @@
 //! Constant-time TLSF allocation over runtime-selected growable backing.
 #![no_std]
 
-use core::{alloc::Layout, ptr::NonNull};
+use core::{
+    alloc::{GlobalAlloc, Layout},
+    cell::UnsafeCell,
+    ptr::{self, NonNull},
+    sync::atomic::{AtomicBool, Ordering},
+};
 use rlsf::{FlexSource, FlexTlsf};
 use troe_kex_sdk::HeapRegion;
 
@@ -132,6 +137,118 @@ unsafe impl HeapSource for ApplicationHeapSource {
 pub enum InitializationError {
     /// The supplied heap is too small for TLSF metadata and one free block.
     RegionTooSmall,
+    /// A global allocator was initialized more than once.
+    AlreadyInitialized,
+}
+
+/// Dynamically initialized global allocator for allocation-using KEX runtimes.
+///
+/// The application declares one static instance with `#[global_allocator]`,
+/// then initializes it exactly once from [`troe_kex_sdk::CommandContext::take_heap`]
+/// before constructing any allocation-backed values.
+pub struct GlobalAllocator {
+    locked: AtomicBool,
+    heap: UnsafeCell<Option<Heap>>,
+}
+
+impl GlobalAllocator {
+    /// Construct one uninitialized allocator suitable for static storage.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+            heap: UnsafeCell::new(None),
+        }
+    }
+
+    /// Initialize this allocator from the application's unique heap region.
+    ///
+    /// # Errors
+    ///
+    /// Rejects insufficient backing or repeated initialization.
+    pub fn initialize(&self, region: HeapRegion) -> Result<(), InitializationError> {
+        self.lock();
+        // SAFETY: the spin lock serializes every access to this cell.
+        let slot = unsafe { &mut *self.heap.get() };
+        if slot.is_some() {
+            self.unlock();
+            return Err(InitializationError::AlreadyInitialized);
+        }
+        let heap = match Heap::new(region) {
+            Ok(heap) => heap,
+            Err(error) => {
+                self.unlock();
+                return Err(error);
+            }
+        };
+        *slot = Some(heap);
+        self.unlock();
+        Ok(())
+    }
+
+    fn lock(&self) {
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
+        }
+    }
+
+    fn unlock(&self) {
+        self.locked.store(false, Ordering::Release);
+    }
+}
+
+impl Default for GlobalAllocator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// SAFETY: `locked` serializes all access to the interior heap.
+unsafe impl Sync for GlobalAllocator {}
+
+// SAFETY: successful initialization gives this object exclusive ownership of
+// one KEX heap, and every allocator operation is serialized by `locked`.
+unsafe impl GlobalAlloc for GlobalAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        self.lock();
+        // SAFETY: the spin lock serializes access to the cell.
+        let pointer = unsafe { &mut *self.heap.get() }
+            .as_mut()
+            .and_then(|heap| heap.allocate(layout))
+            .map_or(ptr::null_mut(), NonNull::as_ptr);
+        self.unlock();
+        pointer
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        let Some(pointer) = NonNull::new(pointer) else {
+            return;
+        };
+        self.lock();
+        // SAFETY: forwarded from `GlobalAlloc`; the lock selects the owning heap.
+        if let Some(heap) = unsafe { &mut *self.heap.get() }.as_mut() {
+            unsafe { heap.deallocate(pointer, layout) };
+        }
+        self.unlock();
+    }
+
+    unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        let Some(pointer) = NonNull::new(pointer) else {
+            return ptr::null_mut();
+        };
+        self.lock();
+        // SAFETY: forwarded from `GlobalAlloc`; the lock selects the owning heap.
+        let resized = unsafe { &mut *self.heap.get() }
+            .as_mut()
+            .and_then(|heap| unsafe { heap.reallocate(pointer, layout, new_size) })
+            .map_or(ptr::null_mut(), NonNull::as_ptr);
+        self.unlock();
+        resized
+    }
 }
 
 /// Exact requested-byte counters maintained around the TLSF allocator.

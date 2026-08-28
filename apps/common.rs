@@ -137,6 +137,8 @@ pub const fn filesystem_message(error: Error) -> &'static [u8] {
         Error::Io => b"filesystem transport failed",
         Error::Unsupported => b"filesystem feature is unsupported",
         Error::Exhausted => b"bounded filesystem resources exhausted",
+        Error::NotEmpty => b"directory not empty",
+        Error::CrossDevice => b"cross-device operation",
         _ => b"filesystem service failed",
     }
 }

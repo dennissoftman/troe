@@ -64,7 +64,7 @@ class KexToolTests(unittest.TestCase):
                         64
                         if command == "lua"
                         else 12
-                        if command in {"spawn", "tar"}
+                        if command in {"cp", "spawn", "tar"}
                         else 8
                         if command in {"arp", "ps", "top"}
                         else 20
@@ -72,9 +72,13 @@ class KexToolTests(unittest.TestCase):
                         else 4
                     )
                     self.assertEqual(report["stack_pages"], expected_stack_pages)
-                    self.assertEqual(
-                        report["heap_pages"], 256 if command == "lua" else 0
-                    )
+                    expected_heap_pages = {
+                        "cp": 16,
+                        "lua": 256,
+                        "mv": 4,
+                        "rm": 16,
+                    }.get(command, 0)
+                    self.assertEqual(report["heap_pages"], expected_heap_pages)
                     package_bytes = artifact.read_bytes()
                     self.assertEqual(package_bytes[:8], b"KEXPKG\0\0")
                     (
@@ -117,7 +121,9 @@ class KexToolTests(unittest.TestCase):
                     if command == "udp":
                         expected = [(5, 1, 0)]
                     elif command == "tar":
-                        expected = [(6, 1, 2), (7, 2, 0)]
+                        expected = [(6, 1, 3), (7, 1, 2)]
+                    elif command in {"cp", "mv", "rm"}:
+                        expected = [(6, 1, 3), (7, 1, 2)]
                     elif command in {
                         "awk",
                         "cat",
@@ -128,18 +134,18 @@ class KexToolTests(unittest.TestCase):
                         "sed",
                         "wc",
                     }:
-                        expected = [(6, 1, 2)]
+                        expected = [(6, 1, 3)]
                     elif command == "lua":
                         expected = [
-                            (6, 1, 2),
-                            (7, 2, 0),
+                            (6, 1, 3),
+                            (7, 1, 2),
                             (8, 1, 0),
                             (17, 1, 0),
                             (20, 1, 0),
                             (21, 1, 0),
                         ]
-                    elif command in {"ln", "rm"}:
-                        expected = [(7, 2, 0)]
+                    elif command in {"ln", "rmdir"}:
+                        expected = [(7, 1, 2)]
                     elif command == "sleep":
                         expected = [(8, 1, 0)]
                     elif command == "timesync":
@@ -161,9 +167,9 @@ class KexToolTests(unittest.TestCase):
                     elif command == "mount":
                         expected = [(14, 1, 0)]
                     elif command == "sh":
-                        expected = [(6, 1, 2), (16, 1, 0)]
+                        expected = [(6, 1, 3), (16, 1, 0)]
                     elif command == "spawn":
-                        expected = [(6, 1, 2), (20, 1, 0), (21, 1, 0)]
+                        expected = [(6, 1, 3), (20, 1, 0), (21, 1, 0)]
                     else:
                         expected = []
                     self.assertEqual(records, expected)

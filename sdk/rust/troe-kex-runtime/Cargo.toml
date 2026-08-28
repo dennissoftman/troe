@@ -1,0 +1,14 @@
+[package]
+name = "troe-kex-runtime"
+description = "Small no_std POSIX-like filesystem runtime over typed TROE KEX capabilities"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+troe-kex-sdk = { path = "../troe-kex" }
+
+[lints]
+workspace = true

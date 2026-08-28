@@ -104,8 +104,8 @@ class ChangedTestSelectionTests(unittest.TestCase):
         plan = test_changed.build_plan(
             (PurePosixPath("sdk/rust/troe-kex-alloc/src/lib.rs"),), PACKAGES
         )
-        self.assertEqual(plan.applications, {"lua"})
-        self.assertEqual(plan.qemu_scenarios, {"lua"})
+        self.assertEqual(plan.applications, {"cp", "lua", "mv", "rm"})
+        self.assertEqual(plan.qemu_scenarios, {"filesystem", "lua"})
 
     def test_shared_sdk_selects_every_application_and_tool_regression(self) -> None:
         plan = test_changed.build_plan(

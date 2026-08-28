@@ -33,6 +33,7 @@ members = [
     "kernel",
     "sdk/rust/troe-kex",
     "sdk/rust/troe-kex-alloc",
+    "sdk/rust/troe-kex-runtime",
     "tools/troe-kex-tool",
     "xtask",
 ]
@@ -66,6 +67,7 @@ default-members = [
     "host",
     "sdk/rust/troe-kex",
     "sdk/rust/troe-kex-alloc",
+    "sdk/rust/troe-kex-runtime",
 ]
 
 [workspace.package]
