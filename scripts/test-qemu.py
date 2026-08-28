@@ -1625,6 +1625,13 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
             " 90 degrees: sin= 1.000000 cos= 0.000000",
             "mean=5.00 standard-deviation=2.00",
             "2^10=1024 log2(1024)=10 gcd(84,30)=6",
+            "random distribution\tsamples=60000 min=1 max=6 average/mean=",
+            "expected-mean=3.5000 standard-deviation=",
+            "random bucket range\tmin=",
+            " expected=10000 max-deviation=",
+            "random uniformity\tpass\tsamples=60000\n",
+            "random source\tkernel CSPRNG seed -> Lua math PRNG\n",
+            "random caveat\tuniformity is evidence, not proof or cryptographic safety\n",
         ),
     )
     session.command(
@@ -1659,6 +1666,17 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
         contains=(
             "lua-files wrote\t36\tbytes\n",
             "lua-files cleanup\ttrue\ttrue\n",
+        ),
+    )
+    session.command(
+        "lua /share/lua/examples/random.lua",
+        cwd,
+        command_timeout,
+        contains=(
+            "lua-random dice\t",
+            "lua-random choice\t",
+            "lua-random shuffle\t",
+            "lua-random checks\tok\t5\ttrue\n",
         ),
     )
     session.command(
