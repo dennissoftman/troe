@@ -64,6 +64,7 @@ class RunnerProfile:
     virtual_cpus: int
     virtio_block_device: str
     virtio_network_device: str
+    virtio_rng_device: str
     network_mac: str
     acceptance_udp_port: int
     firmware_architecture: str
@@ -87,6 +88,7 @@ RUNNER_PROFILES = {
         virtual_cpus=1,
         virtio_block_device="virtio-blk-pci,disable-legacy=on",
         virtio_network_device="virtio-net-pci,disable-legacy=on",
+        virtio_rng_device="virtio-rng-pci,disable-legacy=on",
         network_mac="52:54:00:12:34:56",
         acceptance_udp_port=40123,
         firmware_architecture="x86_64",
@@ -111,6 +113,7 @@ RUNNER_PROFILES = {
         virtual_cpus=1,
         virtio_block_device="virtio-blk-device",
         virtio_network_device="virtio-net-device",
+        virtio_rng_device="virtio-rng-device",
         network_mac="52:54:00:12:34:57",
         acceptance_udp_port=40124,
         firmware_architecture="aarch64",
@@ -133,6 +136,7 @@ RUNNER_PROFILES = {
         virtual_cpus=1,
         virtio_block_device="virtio-blk-pci,disable-legacy=on",
         virtio_network_device="virtio-net-pci,disable-legacy=on",
+        virtio_rng_device="virtio-rng-pci,disable-legacy=on",
         network_mac="52:54:00:12:34:58",
         acceptance_udp_port=40125,
         firmware_architecture="x86_64",
@@ -158,6 +162,7 @@ RUNNER_PROFILES = {
         virtual_cpus=1,
         virtio_block_device="virtio-blk-device",
         virtio_network_device="virtio-net-device",
+        virtio_rng_device="virtio-rng-device",
         network_mac="52:54:00:12:34:59",
         acceptance_udp_port=40126,
         firmware_architecture="aarch64",
@@ -229,6 +234,7 @@ def validate_runner_catalog(
             or runner.virtual_cpus != 1
             or not runner.virtio_block_device
             or not runner.virtio_network_device
+            or not runner.virtio_rng_device
             or re.fullmatch(r"(?:[0-9a-f]{2}:){5}[0-9a-f]{2}", runner.network_mac)
             is None
             or not 1 <= runner.acceptance_udp_port <= 0xFFFF
@@ -566,6 +572,10 @@ def _qemu_arguments(
             "user,id=troe-net",
             "-device",
             f"{runner.virtio_network_device},netdev=troe-net,mac={runner.network_mac}",
+            "-object",
+            "rng-random,id=troe-rng,filename=/dev/urandom",
+            "-device",
+            f"{runner.virtio_rng_device},rng=troe-rng",
             "-no-reboot",
         )
     )

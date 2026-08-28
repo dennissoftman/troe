@@ -9,6 +9,7 @@ publish = false
 [package.metadata.troe-kex]
 capabilities = ["filesystem-read", "filesystem-mutate"]
 heap-pages = 4
+stack-pages = 12
 
 [dependencies]
 troe-kex-alloc = { path = "../../sdk/rust/troe-kex-alloc" }

@@ -7,10 +7,14 @@ libc.
 The default `alloc` feature provides streamed and recursive filesystem
 algorithms with iterative no-follow traversal and fallibly grown metadata.
 Disable default features to retain the allocation-free environment, stable
-errno, direct-process, UTC calendar/formatting, C-locale ASCII, and seed
-helpers; enable the independent `math` feature for decimal/libm support. Lua
-uses `math` without `alloc` because its TLSF heap is owned by the embedded
-interpreter rather than a Rust global allocator.
+errno, direct-process, UTC calendar/formatting, C-locale ASCII, typed CSPRNG
+reads, and POSIX-shaped private-memory helpers; enable the independent `math`
+feature for decimal/libm support. The memory facade supports zeroed anonymous
+private data, read/read-write/inaccessible protection changes, and owned
+unmapping. It deliberately rejects fixed replacement, sharing, file/device
+backing, and executable mappings. Lua uses `math` without `alloc` because its
+TLSF/private-mapping hybrid heap is owned by the embedded interpreter rather
+than a Rust global allocator.
 
 The small exported C surface is intentionally limited to operations whose ABI
 can remain direct or whose pointer span can be validated once. The companion

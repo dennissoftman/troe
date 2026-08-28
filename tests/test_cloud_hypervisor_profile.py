@@ -148,6 +148,8 @@ class CloudHypervisorProfileTests(unittest.TestCase):
         self.assertIn("offload_tso=off,offload_ufo=off,offload_csum=off", joined)
         self.assertIn("--seccomp", command)
         self.assertIn("--landlock", command)
+        self.assertIn("--rng", command)
+        self.assertEqual(command[command.index("--rng") + 1], "src=/dev/urandom")
         self.assertNotIn("qemu", joined)
         self.assertNotIn("acceptance-probe", joined)
 

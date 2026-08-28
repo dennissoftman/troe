@@ -395,6 +395,8 @@ def cloud_hypervisor_command(
         "num_pci_segments=1",
         "--firmware",
         str(firmware),
+        "--rng",
+        "src=/dev/urandom",
     ]
     for role in profile.disks:
         command.extend(

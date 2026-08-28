@@ -3,8 +3,8 @@
 use std::ops::Range;
 
 use troe_application::{
-    ABI_MAJOR, ABI_MINOR, ApplicationLimits, KEX_V1_HEADER_BYTES, KEX_V1_IMAGE_BASE,
-    KEX_V1_LOAD_RECORD_BYTES, KEX_V1_MAGIC, MAX_LOAD_RECORDS, PAGE_SIZE, SegmentPermissions,
+    ABI_MAJOR, ABI_MINOR, ApplicationLimits, KEX_V1_HEADER_BYTES, KEX_V1_LOAD_RECORD_BYTES,
+    KEX_V1_MAGIC, KEX_V1_RELOCATION_RECORD_BYTES, MAX_LOAD_RECORDS, PAGE_SIZE, SegmentPermissions,
     Target, parse_kex,
 };
 
@@ -17,7 +17,7 @@ const ELF_MAX_BYTES: usize = 64 * 1024 * 1024;
 const ELF_MAX_PROGRAM_HEADERS: usize = 64;
 const ELF_MAX_SECTION_HEADERS: usize = 4096;
 
-const ELF_ET_EXEC: u16 = 2;
+const ELF_ET_DYN: u16 = 3;
 const ELF_EM_X86_64: u16 = 62;
 const ELF_EM_AARCH64: u16 = 183;
 const ELF_PT_NULL: u32 = 0;
@@ -52,10 +52,14 @@ const ELF_SHT_PREINIT_ARRAY: u32 = 16;
 const ELF_SHT_GROUP: u32 = 17;
 const ELF_SHT_SYMTAB_SHNDX: u32 = 18;
 const ELF_SHT_RELR: u32 = 19;
+const ELF_SHT_GNU_HASH: u32 = 0x6fff_fff6;
 const ELF_SHF_WRITE: u64 = 0x1;
 const ELF_SHF_ALLOC: u64 = 0x2;
 const ELF_SHF_EXECINSTR: u64 = 0x4;
 const ELF_SHF_TLS: u64 = 0x400;
+const ELF_RELA_BYTES: u64 = 24;
+const R_X86_64_RELATIVE: u32 = 8;
+const R_AARCH64_RELATIVE: u32 = 1027;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ElfLoadSegment {
@@ -71,6 +75,13 @@ struct ParsedElf {
     target: Target,
     entry: u64,
     segments: Vec<ElfLoadSegment>,
+    relocations: Vec<ElfRelativeRelocation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ElfRelativeRelocation {
+    target_offset: u64,
+    value_offset: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -253,16 +264,12 @@ fn section_name(string_table: &[u8], name_offset: u32) -> ToolResult<Option<&[u8
 }
 
 fn validate_section_kind(kind: u32) -> ToolResult<()> {
-    if matches!(kind, ELF_SHT_RELA | ELF_SHT_REL | ELF_SHT_RELR) {
-        return Err(invalid("ELF contains residual relocation records"));
-    }
-    if matches!(kind, ELF_SHT_DYNAMIC | ELF_SHT_DYNSYM) {
-        return Err(invalid("ELF contains dynamic-linker metadata"));
+    if matches!(kind, ELF_SHT_REL | ELF_SHT_RELR) {
+        return Err(invalid("ELF contains unsupported relocation records"));
     }
     if matches!(
         kind,
-        ELF_SHT_HASH
-            | ELF_SHT_NOTE
+        ELF_SHT_NOTE
             | ELF_SHT_INIT_ARRAY
             | ELF_SHT_FINI_ARRAY
             | ELF_SHT_PREINIT_ARRAY
@@ -273,7 +280,15 @@ fn validate_section_kind(kind: u32) -> ToolResult<()> {
     }
     if !matches!(
         kind,
-        ELF_SHT_PROGBITS | ELF_SHT_SYMTAB | ELF_SHT_STRTAB | ELF_SHT_NOBITS
+        ELF_SHT_PROGBITS
+            | ELF_SHT_SYMTAB
+            | ELF_SHT_STRTAB
+            | ELF_SHT_NOBITS
+            | ELF_SHT_RELA
+            | ELF_SHT_DYNAMIC
+            | ELF_SHT_DYNSYM
+            | ELF_SHT_HASH
+            | ELF_SHT_GNU_HASH
     ) {
         return Err(invalid(format!(
             "ELF section type {kind:#x} is unsupported"
@@ -414,10 +429,7 @@ fn validate_sections(
             return Err(invalid("ELF section requests writable executable memory"));
         }
         if let Some(name) = section_name(string_table, section.name_offset)?
-            && matches!(
-                name,
-                b".interp" | b".dynamic" | b".dynsym" | b".tdata" | b".tbss"
-            )
+            && matches!(name, b".interp" | b".tdata" | b".tbss")
         {
             return Err(invalid(format!(
                 "ELF contains unsupported section {}",
@@ -452,9 +464,116 @@ fn validate_sections(
         if matches!(section.kind, ELF_SHT_SYMTAB | ELF_SHT_DYNSYM) && section.entry_size == 0 {
             return Err(invalid("ELF symbol table has zero-sized entries"));
         }
+        if section.kind == ELF_SHT_RELA && section.entry_size != ELF_RELA_BYTES {
+            return Err(invalid("ELF RELA entry size is noncanonical"));
+        }
         let _ = section.info;
     }
     Ok(described)
+}
+
+fn parse_relative_relocations(
+    image: &[u8],
+    sections: &[SectionHeader],
+    string_index: usize,
+    loads: &[ElfLoadSegment],
+    target: Target,
+) -> ToolResult<Vec<ElfRelativeRelocation>> {
+    if sections.is_empty() {
+        return Ok(Vec::new());
+    }
+    let names = sections
+        .get(string_index)
+        .filter(|section| section.kind == ELF_SHT_STRTAB)
+        .ok_or_else(|| invalid("ELF section-name table is unavailable"))?;
+    let names = &image[checked_range(
+        image.len(),
+        names.offset,
+        names.size,
+        "ELF section-name table",
+    )?];
+    let expected_kind = match target {
+        Target::X86_64 => R_X86_64_RELATIVE,
+        Target::Aarch64 => R_AARCH64_RELATIVE,
+    };
+    let mut found = false;
+    let mut relocations = Vec::new();
+    for section in sections
+        .iter()
+        .copied()
+        .filter(|section| section.kind == ELF_SHT_RELA)
+    {
+        let name = section_name(names, section.name_offset)?;
+        if found || name != Some(b".rela.dyn".as_slice()) {
+            return Err(invalid("ELF contains a noncanonical relocation section"));
+        }
+        found = true;
+        if section.size % ELF_RELA_BYTES != 0 {
+            return Err(invalid("ELF RELA table is truncated"));
+        }
+        let range = checked_range(image.len(), section.offset, section.size, "ELF RELA table")?;
+        let count = usize::try_from(section.size / ELF_RELA_BYTES)
+            .map_err(|_| invalid("ELF RELA count is not representable"))?;
+        relocations
+            .try_reserve_exact(count)
+            .map_err(|_| invalid("ELF RELA metadata allocation failed"))?;
+        let record_bytes = usize::try_from(ELF_RELA_BYTES)
+            .map_err(|_| invalid("ELF RELA record size is not representable"))?;
+        for record in image[range].chunks_exact(record_bytes) {
+            let target_offset = read_u64(record, 0)?;
+            let info = read_u64(record, 8)?;
+            let addend = i64::from_le_bytes(read_array(record, 16)?);
+            let relocation_kind = u32::try_from(info & u64::from(u32::MAX))
+                .map_err(|_| invalid("ELF relocation kind is invalid"))?;
+            let symbol = info >> 32;
+            let value_offset = u64::try_from(addend)
+                .map_err(|_| invalid("ELF relative relocation addend is negative"))?;
+            let target_end = target_offset
+                .checked_add(8)
+                .ok_or_else(|| invalid("ELF relocation target overflows"))?;
+            let target_mapped = loads.iter().any(|load| {
+                load.virtual_address <= target_offset
+                    && load
+                        .virtual_address
+                        .checked_add(load.memory_bytes)
+                        .is_some_and(|end| target_end <= end)
+            });
+            let value_mapped = loads.iter().any(|load| {
+                load.virtual_address <= value_offset
+                    && load
+                        .virtual_address
+                        .checked_add(load.memory_bytes)
+                        .is_some_and(|end| value_offset < end)
+            });
+            if symbol != 0 || relocation_kind != expected_kind {
+                return Err(invalid("ELF contains a non-relative relocation"));
+            }
+            if !target_mapped {
+                return Err(invalid(
+                    "ELF relative relocation target is outside the image",
+                ));
+            }
+            if !value_mapped {
+                return Err(invalid(
+                    "ELF relative relocation value is outside the image",
+                ));
+            }
+            relocations.push(ElfRelativeRelocation {
+                target_offset,
+                value_offset,
+            });
+        }
+    }
+    relocations.sort_unstable_by_key(|relocation| relocation.target_offset);
+    if relocations
+        .windows(2)
+        .any(|pair| pair[0].target_offset == pair[1].target_offset)
+    {
+        return Err(invalid(
+            "ELF contains duplicate relative relocation targets",
+        ));
+    }
+    Ok(relocations)
 }
 
 fn validate_identification(image: &[u8]) -> ToolResult<()> {
@@ -487,6 +606,7 @@ fn validate_loads(
     let mut file_ranges: Vec<Range<usize>> = Vec::new();
     let mut phdr_virtual = None;
     let mut stack_seen = false;
+    let mut dynamic = None;
     for (index, header) in headers.iter().copied().enumerate() {
         if header.kind == ELF_PT_NULL {
             if header.flags != 0
@@ -501,10 +621,20 @@ fn validate_loads(
             }
             continue;
         }
+        if header.kind == ELF_PT_DYNAMIC {
+            if dynamic.replace(header).is_some()
+                || header.flags != ELF_PF_R | ELF_PF_W
+                || header.file_bytes == 0
+                || header.file_bytes != header.memory_bytes
+                || header.alignment != 8
+            {
+                return Err(invalid("ELF PT_DYNAMIC record is noncanonical"));
+            }
+            continue;
+        }
         if matches!(
             header.kind,
-            ELF_PT_DYNAMIC
-                | ELF_PT_INTERP
+            ELF_PT_INTERP
                 | ELF_PT_NOTE
                 | ELF_PT_SHLIB
                 | ELF_PT_TLS
@@ -604,6 +734,21 @@ fn validate_loads(
     if loads.is_empty() {
         return Err(invalid("ELF contains no PT_LOAD segment"));
     }
+    let dynamic = dynamic.ok_or_else(|| invalid("ELF contains no PT_DYNAMIC record"))?;
+    let dynamic_end = dynamic
+        .virtual_address
+        .checked_add(dynamic.memory_bytes)
+        .ok_or_else(|| invalid("ELF PT_DYNAMIC address overflows"))?;
+    if !loads.iter().any(|load| {
+        load.flags == ELF_PF_R | ELF_PF_W
+            && load.virtual_address <= dynamic.virtual_address
+            && load
+                .virtual_address
+                .checked_add(load.memory_bytes)
+                .is_some_and(|end| dynamic_end <= end)
+    }) {
+        return Err(invalid("ELF PT_DYNAMIC is outside writable image data"));
+    }
     Ok(ValidatedLoads {
         loads,
         file_ranges,
@@ -612,12 +757,9 @@ fn validate_loads(
 }
 
 fn validate_load_order_and_entry(loads: &[ElfLoadSegment], entry: u64) -> ToolResult<()> {
-    let mut previous_end = KEX_V1_IMAGE_BASE;
+    let mut previous_end = 0_u64;
     let mut executable_entry = false;
     for load in loads {
-        if load.virtual_address < KEX_V1_IMAGE_BASE {
-            return Err(invalid("ELF PT_LOAD is below the fixed KEX image base"));
-        }
         let memory_end = load
             .virtual_address
             .checked_add(round_up(load.memory_bytes, PAGE_SIZE)?)
@@ -703,6 +845,7 @@ fn validate_described_bytes(image: &[u8], mut described: Vec<Range<usize>>) -> T
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_elf(image: &[u8], expected_target: Option<Target>) -> ToolResult<ParsedElf> {
     if image.len() < ELF_HEADER_BYTES {
         return Err(invalid("ELF header is truncated"));
@@ -734,7 +877,7 @@ fn parse_elf(image: &[u8], expected_target: Option<Target>) -> ToolResult<Parsed
     if target == Target::Aarch64 && entry % 4 != 0 {
         return Err(invalid("AArch64 ELF entry is not instruction aligned"));
     }
-    if file_type != ELF_ET_EXEC
+    if file_type != ELF_ET_DYN
         || version != 1
         || flags != 0
         || usize::from(header_bytes) != ELF_HEADER_BYTES
@@ -777,6 +920,8 @@ fn parse_elf(image: &[u8], expected_target: Option<Target>) -> ToolResult<Parsed
         section_headers(image, section_offset, section_count)?
     };
     let section_ranges = validate_sections(image, &sections, section_string_index, &loads)?;
+    let relocations =
+        parse_relative_relocations(image, &sections, section_string_index, &loads, target)?;
     let mut described = vec![
         0..ELF_HEADER_BYTES,
         checked_range(
@@ -805,6 +950,7 @@ fn parse_elf(image: &[u8], expected_target: Option<Target>) -> ToolResult<Parsed
         target,
         entry,
         segments: loads,
+        relocations,
     })
 }
 
@@ -820,10 +966,7 @@ fn records<'image>(parsed: &ParsedElf, image: &'image [u8]) -> ToolResult<Vec<Ke
                 "ELF PT_LOAD",
             )?;
             Ok(KexRecord {
-                image_offset: load
-                    .virtual_address
-                    .checked_sub(KEX_V1_IMAGE_BASE)
-                    .ok_or_else(|| invalid("ELF PT_LOAD is below the fixed KEX image base"))?,
+                image_offset: load.virtual_address,
                 file_bytes: &image[range],
                 memory_bytes: round_up(load.memory_bytes, PAGE_SIZE)?,
                 permissions: permissions(load.flags)
@@ -835,8 +978,9 @@ fn records<'image>(parsed: &ParsedElf, image: &'image [u8]) -> ToolResult<Vec<Ke
 
 fn validate_policy(
     records: &[KexRecord<'_>],
-    stack_pages: u32,
-    heap_pages: u32,
+    relocations: &[ElfRelativeRelocation],
+    stack_pages: u64,
+    heap_pages: u64,
 ) -> ToolResult<usize> {
     let limits = ApplicationLimits::standard();
     let image_pages = records.iter().try_fold(0_u64, |pages, record| {
@@ -860,8 +1004,13 @@ fn validate_policy(
         .len()
         .checked_mul(KEX_V1_LOAD_RECORD_BYTES)
         .ok_or_else(|| invalid("KEX table byte count overflows"))?;
+    let relocation_bytes = relocations
+        .len()
+        .checked_mul(KEX_V1_RELOCATION_RECORD_BYTES)
+        .ok_or_else(|| invalid("KEX relocation-table byte count overflows"))?;
     let artifact_bytes = KEX_V1_HEADER_BYTES
         .checked_add(table_bytes)
+        .and_then(|bytes| bytes.checked_add(relocation_bytes))
         .and_then(|bytes| bytes.checked_add(payload_bytes))
         .ok_or_else(|| invalid("KEX encoded byte count overflows"))?;
     if records.len() > limits.load_records() {
@@ -876,20 +1025,20 @@ fn validate_policy(
         return Err(invalid("ELF mapped pages exceed the standard KEX policy"));
     }
     let (minimum_stack, maximum_stack) = limits.stack_pages();
-    if !(minimum_stack..=maximum_stack).contains(&u64::from(stack_pages)) {
+    if !(minimum_stack..=maximum_stack).contains(&stack_pages) {
         return Err(invalid(
             "requested KEX stack pages exceed the standard KEX policy",
         ));
     }
-    if u64::from(heap_pages) > limits.heap_pages() {
+    if heap_pages > limits.heap_pages() {
         return Err(invalid(
             "requested KEX heap pages exceed the standard KEX policy",
         ));
     }
     let resident = image_pages
         .checked_add(1)
-        .and_then(|pages| pages.checked_add(u64::from(stack_pages)))
-        .and_then(|pages| pages.checked_add(u64::from(heap_pages)))
+        .and_then(|pages| pages.checked_add(stack_pages))
+        .and_then(|pages| pages.checked_add(heap_pages))
         .and_then(|pages| pages.checked_add(limits.table_pages()))
         .ok_or_else(|| invalid("KEX aggregate resident charge overflows"))?;
     if resident > limits.resident_pages() {
@@ -907,18 +1056,31 @@ fn verify_generated(
     artifact: &[u8],
     parsed: &ParsedElf,
     records: &[KexRecord<'_>],
-    stack_pages: u32,
-    heap_pages: u32,
+    relocations: &[ElfRelativeRelocation],
+    stack_pages: u64,
+    heap_pages: u64,
 ) -> ToolResult<()> {
     let plan = parse_kex(artifact, parsed.target, ABI_MINOR)
         .map_err(|error| invalid(format!("generated KEX failed validation: {error}")))?;
-    if plan.entry_address() != parsed.entry
-        || plan.stack_pages() != u64::from(stack_pages)
-        || plan.heap_pages() != u64::from(heap_pages)
+    if plan.entry_address() != plan.image_base().saturating_add(parsed.entry)
+        || plan.stack_pages() != stack_pages
+        || plan.heap_pages() != heap_pages
         || plan.target() != parsed.target
         || plan.abi_minor() != ABI_MINOR
     {
         return Err(invalid("generated KEX header differs from the ELF policy"));
+    }
+    let decoded_relocations = plan.relocations().collect::<Vec<_>>();
+    if decoded_relocations.len() != relocations.len()
+        || decoded_relocations
+            .iter()
+            .zip(relocations)
+            .any(|(decoded, encoded)| {
+                decoded.target_offset() != encoded.target_offset
+                    || decoded.value_offset() != encoded.value_offset
+            })
+    {
+        return Err(invalid("generated KEX relocations differ from the ELF"));
     }
     let decoded = plan.segments().collect::<Vec<_>>();
     if decoded.len() != records.len() {
@@ -944,29 +1106,30 @@ fn verify_generated(
 ///
 /// Rejects unsupported targets, dynamic or relocatable facilities, malformed
 /// geometry, noncanonical padding, forbidden permissions, or policy overruns.
+#[allow(clippy::too_many_lines)]
 pub fn convert_elf(
     image: &[u8],
     expected_target: Option<Target>,
-    stack_pages: u32,
-    heap_pages: u32,
+    stack_pages: u64,
+    heap_pages: u64,
 ) -> ToolResult<Vec<u8>> {
     let parsed = parse_elf(image, expected_target)?;
     let records = records(&parsed, image)?;
-    let artifact_bytes = validate_policy(&records, stack_pages, heap_pages)?;
+    let artifact_bytes = validate_policy(&records, &parsed.relocations, stack_pages, heap_pages)?;
     let record_count = u16::try_from(records.len())
         .map_err(|_| invalid("KEX load-record count is not representable"))?;
-    let payload_offset = KEX_V1_HEADER_BYTES
+    let relocations_offset = KEX_V1_HEADER_BYTES
         .checked_add(records.len() * KEX_V1_LOAD_RECORD_BYTES)
+        .ok_or_else(|| invalid("KEX relocation offset overflows"))?;
+    let payload_offset = relocations_offset
+        .checked_add(parsed.relocations.len() * KEX_V1_RELOCATION_RECORD_BYTES)
         .ok_or_else(|| invalid("KEX payload offset overflows"))?;
-    let entry_offset = parsed
-        .entry
-        .checked_sub(KEX_V1_IMAGE_BASE)
-        .ok_or_else(|| invalid("ELF entry is below the fixed KEX image base"))?;
+    let entry_offset = parsed.entry;
 
     let mut output = vec![0_u8; artifact_bytes];
     output[..8].copy_from_slice(&KEX_V1_MAGIC);
     write_u16(&mut output, 8, 1);
-    write_u16(&mut output, 10, 0);
+    write_u16(&mut output, 10, 1);
     write_u16(&mut output, 12, parsed.target as u16);
     write_u16(
         &mut output,
@@ -986,27 +1149,51 @@ pub fn convert_elf(
     write_u64(&mut output, 24, entry_offset);
     write_u16(&mut output, 32, record_count);
     write_u16(&mut output, 34, 0);
-    write_u32(&mut output, 36, stack_pages);
-    write_u32(&mut output, 40, heap_pages);
+    write_u32(&mut output, 36, 0);
+    write_u64(&mut output, 40, stack_pages);
+    write_u64(&mut output, 48, heap_pages);
     write_u32(
         &mut output,
-        44,
+        56,
         u32::try_from(KEX_V1_HEADER_BYTES)
             .map_err(|_| invalid("KEX records offset is not representable"))?,
     );
     write_u32(
         &mut output,
-        48,
+        60,
         u32::try_from(payload_offset)
             .map_err(|_| invalid("KEX payload offset is not representable"))?,
     );
-    write_u32(&mut output, 52, 0);
+    write_u32(
+        &mut output,
+        64,
+        u32::try_from(relocations_offset)
+            .map_err(|_| invalid("KEX relocation offset is not representable"))?,
+    );
+    write_u32(
+        &mut output,
+        68,
+        u32::try_from(parsed.relocations.len())
+            .map_err(|_| invalid("KEX relocation count is not representable"))?,
+    );
+    write_u16(
+        &mut output,
+        72,
+        u16::try_from(KEX_V1_RELOCATION_RECORD_BYTES)
+            .map_err(|_| invalid("KEX relocation record size is not representable"))?,
+    );
     write_u64(
         &mut output,
-        56,
+        80,
         u64::try_from(artifact_bytes)
             .map_err(|_| invalid("KEX artifact size is not representable"))?,
     );
+
+    for (index, relocation) in parsed.relocations.iter().enumerate() {
+        let at = relocations_offset + index * KEX_V1_RELOCATION_RECORD_BYTES;
+        write_u64(&mut output, at, relocation.target_offset);
+        write_u64(&mut output, at + 8, relocation.value_offset);
+    }
 
     let mut next_payload = payload_offset;
     for (index, record) in records.iter().enumerate() {
@@ -1033,7 +1220,14 @@ pub fn convert_elf(
         output[next_payload..end].copy_from_slice(record.file_bytes);
         next_payload = end;
     }
-    verify_generated(&output, &parsed, &records, stack_pages, heap_pages)?;
+    verify_generated(
+        &output,
+        &parsed,
+        &records,
+        &parsed.relocations,
+        stack_pages,
+        heap_pages,
+    )?;
     Ok(output)
 }
 
@@ -1058,11 +1252,12 @@ mod tests {
             Target::X86_64 => &[0x90, 0xc3],
             Target::Aarch64 => &[0x00, 0x00, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4],
         };
-        let code_offset = ELF_HEADER_BYTES + 2 * ELF_PROGRAM_HEADER_BYTES;
-        let file_bytes = code_offset + code.len();
+        let code_offset = ELF_HEADER_BYTES + 4 * ELF_PROGRAM_HEADER_BYTES;
+        let data_offset = usize::try_from(PAGE_SIZE).unwrap_or_else(|_| unreachable!());
+        let file_bytes = data_offset + 16;
         let mut image = vec![0_u8; file_bytes];
         image[..16].copy_from_slice(b"\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00");
-        put_u16(&mut image, 16, ELF_ET_EXEC);
+        put_u16(&mut image, 16, ELF_ET_DYN);
         put_u16(
             &mut image,
             18,
@@ -1075,7 +1270,7 @@ mod tests {
         put_u64(
             &mut image,
             24,
-            KEX_V1_IMAGE_BASE + u64::try_from(code_offset).unwrap_or_else(|_| unreachable!()),
+            u64::try_from(code_offset).unwrap_or_else(|_| unreachable!()),
         );
         put_u64(&mut image, 32, ELF_HEADER_BYTES as u64);
         put_u16(
@@ -1088,30 +1283,44 @@ mod tests {
             54,
             u16::try_from(ELF_PROGRAM_HEADER_BYTES).unwrap_or_else(|_| unreachable!()),
         );
-        put_u16(&mut image, 56, 2);
+        put_u16(&mut image, 56, 4);
 
         let load = ELF_HEADER_BYTES;
         put_u32(&mut image, load, ELF_PT_LOAD);
         put_u32(&mut image, load + 4, ELF_PF_R | ELF_PF_X);
-        put_u64(&mut image, load + 16, KEX_V1_IMAGE_BASE);
-        put_u64(&mut image, load + 24, KEX_V1_IMAGE_BASE);
+        put_u64(&mut image, load + 16, 0);
+        put_u64(&mut image, load + 24, 0);
         put_u64(
             &mut image,
             load + 32,
-            u64::try_from(file_bytes).unwrap_or_else(|_| unreachable!()),
+            u64::try_from(code_offset + code.len()).unwrap_or_else(|_| unreachable!()),
         );
-        put_u64(
-            &mut image,
-            load + 40,
-            u64::try_from(file_bytes).unwrap_or_else(|_| unreachable!()),
-        );
+        put_u64(&mut image, load + 40, PAGE_SIZE);
         put_u64(&mut image, load + 48, PAGE_SIZE);
 
-        let stack = load + ELF_PROGRAM_HEADER_BYTES;
+        let data = load + ELF_PROGRAM_HEADER_BYTES;
+        put_u32(&mut image, data, ELF_PT_LOAD);
+        put_u32(&mut image, data + 4, ELF_PF_R | ELF_PF_W);
+        put_u64(&mut image, data + 8, PAGE_SIZE);
+        put_u64(&mut image, data + 16, PAGE_SIZE);
+        put_u64(&mut image, data + 32, 16);
+        put_u64(&mut image, data + 40, PAGE_SIZE);
+        put_u64(&mut image, data + 48, PAGE_SIZE);
+
+        let dynamic = data + ELF_PROGRAM_HEADER_BYTES;
+        put_u32(&mut image, dynamic, ELF_PT_DYNAMIC);
+        put_u32(&mut image, dynamic + 4, ELF_PF_R | ELF_PF_W);
+        put_u64(&mut image, dynamic + 8, PAGE_SIZE);
+        put_u64(&mut image, dynamic + 16, PAGE_SIZE);
+        put_u64(&mut image, dynamic + 32, 16);
+        put_u64(&mut image, dynamic + 40, 16);
+        put_u64(&mut image, dynamic + 48, 8);
+
+        let stack = dynamic + ELF_PROGRAM_HEADER_BYTES;
         put_u32(&mut image, stack, ELF_PT_GNU_STACK);
         put_u32(&mut image, stack + 4, ELF_PF_R | ELF_PF_W);
         put_u64(&mut image, stack + 48, 16);
-        image[code_offset..].copy_from_slice(code);
+        image[code_offset..code_offset + code.len()].copy_from_slice(code);
         image
     }
 
@@ -1157,6 +1366,6 @@ mod tests {
         let image = fixture(Target::Aarch64);
         assert!(convert_elf(&image, Some(Target::X86_64), 4, 0).is_err());
         assert!(convert_elf(&image, Some(Target::Aarch64), 3, 0).is_err());
-        assert!(convert_elf(&image, Some(Target::Aarch64), 4, 4097).is_err());
+        assert!(convert_elf(&image, Some(Target::Aarch64), 4, (1 << 32) + 1).is_err());
     }
 }

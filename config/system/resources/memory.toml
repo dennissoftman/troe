@@ -1,0 +1,23 @@
+schema = 1
+
+[system]
+minimum_free_pages = 8192
+
+[system.application_commit]
+limited = false
+
+[process.default.committed_pages]
+limited = false
+
+[process.default.reserved_pages]
+limited = false
+
+[process.default.mappings]
+maximum = 65536
+
+[process.default.metadata_bytes]
+maximum = 8388608
+
+[kernel]
+global_metadata_bytes = 33554432
+operation_quantum_pages = 256

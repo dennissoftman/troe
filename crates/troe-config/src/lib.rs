@@ -6,6 +6,7 @@ extern crate alloc;
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
+use core::fmt::Write;
 use troe_content::ContentDigest;
 use troe_vfs::{MAX_PATH_BYTES, canonicalize};
 
@@ -15,7 +16,7 @@ pub const CONFIG_V1_MAGIC: [u8; 8] = *b"SCFGv1\0\0";
 pub const ACTIVATION_V1_MAGIC: [u8; 8] = *b"SACTv1\0\0";
 /// Exact encoded activation-pointer size.
 pub const ACTIVATION_V1_BYTES: usize = 128;
-const HEADER_BYTES: usize = 64;
+const HEADER_BYTES: usize = 144;
 const RECORD_BYTES: usize = 64;
 const MAX_CONFIG_BYTES: usize = 16 * 1024;
 const MAX_SERVICES: usize = 32;
@@ -43,6 +44,454 @@ const FLAG_RECOVERY_SHELL: u8 = 1 << 1;
 const KNOWN_FLAGS: u8 = FLAG_FALLBACK_PREVIOUS | FLAG_RECOVERY_SHELL;
 const ACTIVATION_PREVIOUS: u16 = 1;
 const ACTIVATION_CHECKSUM_OFFSET: usize = 112;
+const MEMORY_POLICY_FLAGS_OFFSET: usize = 64;
+const MEMORY_POLICY_MINIMUM_FREE_OFFSET: usize = 72;
+const MEMORY_POLICY_SYSTEM_MAXIMUM_OFFSET: usize = 80;
+const MEMORY_POLICY_COMMITTED_MAXIMUM_OFFSET: usize = 88;
+const MEMORY_POLICY_RESERVED_MAXIMUM_OFFSET: usize = 96;
+const MEMORY_POLICY_MAPPINGS_OFFSET: usize = 104;
+const MEMORY_POLICY_METADATA_OFFSET: usize = 112;
+const MEMORY_POLICY_GLOBAL_METADATA_OFFSET: usize = 120;
+const MEMORY_POLICY_QUANTUM_OFFSET: usize = 128;
+const MEMORY_POLICY_RESERVED_OFFSET: usize = 136;
+const MEMORY_POLICY_SYSTEM_LIMITED: u64 = 1 << 0;
+const MEMORY_POLICY_COMMITTED_LIMITED: u64 = 1 << 1;
+const MEMORY_POLICY_RESERVED_LIMITED: u64 = 1 << 2;
+const KNOWN_MEMORY_POLICY_FLAGS: u64 =
+    MEMORY_POLICY_SYSTEM_LIMITED | MEMORY_POLICY_COMMITTED_LIMITED | MEMORY_POLICY_RESERVED_LIMITED;
+/// Compiled mapping-record safety backstop. Active policy may select less.
+pub const MAX_PRIVATE_MAPPINGS: u64 = 1_048_576;
+/// Compiled per-process VM metadata safety backstop.
+pub const MAX_PRIVATE_METADATA_BYTES: u64 = 64 * 1024 * 1024;
+/// Compiled boot-wide VM metadata safety backstop.
+pub const MAX_GLOBAL_PRIVATE_METADATA_BYTES: u64 = 256 * 1024 * 1024;
+/// Largest scheduler work quantum accepted from configuration.
+pub const MAX_PRIVATE_OPERATION_QUANTUM_PAGES: u64 = 1_048_576;
+
+/// One optional nonzero resource ceiling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OptionalLimit {
+    maximum: Option<u64>,
+}
+
+impl OptionalLimit {
+    /// Construct an explicitly unlimited policy value.
+    #[must_use]
+    pub const fn unlimited() -> Self {
+        Self { maximum: None }
+    }
+
+    /// Construct one enabled nonzero ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero.
+    pub const fn limited(maximum: u64) -> Result<Self, MemoryPolicyError> {
+        if maximum == 0 {
+            Err(MemoryPolicyError::InvalidValue)
+        } else {
+            Ok(Self {
+                maximum: Some(maximum),
+            })
+        }
+    }
+
+    /// Whether an additional configured ceiling is enabled.
+    #[must_use]
+    pub const fn is_limited(self) -> bool {
+        self.maximum.is_some()
+    }
+
+    /// Enabled maximum, or `None` when no additional policy ceiling applies.
+    #[must_use]
+    pub const fn maximum(self) -> Option<u64> {
+        self.maximum
+    }
+}
+
+/// Fully validated private-memory resource policy for one generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MemoryPolicy {
+    minimum_free_pages: u64,
+    system_application_commit: OptionalLimit,
+    default_committed_pages: OptionalLimit,
+    default_reserved_pages: OptionalLimit,
+    default_maximum_mappings: u64,
+    default_maximum_metadata_bytes: u64,
+    global_metadata_bytes: u64,
+    operation_quantum_pages: u64,
+}
+
+impl MemoryPolicy {
+    /// Repository recovery/default policy used by deterministic fixtures.
+    #[must_use]
+    pub const fn standard() -> Self {
+        Self {
+            minimum_free_pages: 8_192,
+            system_application_commit: OptionalLimit::unlimited(),
+            default_committed_pages: OptionalLimit::unlimited(),
+            default_reserved_pages: OptionalLimit::unlimited(),
+            default_maximum_mappings: 65_536,
+            default_maximum_metadata_bytes: 8 * 1024 * 1024,
+            global_metadata_bytes: 32 * 1024 * 1024,
+            operation_quantum_pages: 256,
+        }
+    }
+
+    /// Construct and validate one complete typed policy.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero mandatory values, inconsistent limits, or compiled
+    /// safety-backstop violations.
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        minimum_free_pages: u64,
+        system_application_commit: OptionalLimit,
+        default_committed_pages: OptionalLimit,
+        default_reserved_pages: OptionalLimit,
+        default_maximum_mappings: u64,
+        default_maximum_metadata_bytes: u64,
+        global_metadata_bytes: u64,
+        operation_quantum_pages: u64,
+    ) -> Result<Self, MemoryPolicyError> {
+        if minimum_free_pages == 0
+            || default_maximum_mappings == 0
+            || default_maximum_mappings > MAX_PRIVATE_MAPPINGS
+            || default_maximum_metadata_bytes == 0
+            || default_maximum_metadata_bytes > MAX_PRIVATE_METADATA_BYTES
+            || global_metadata_bytes < default_maximum_metadata_bytes
+            || global_metadata_bytes > MAX_GLOBAL_PRIVATE_METADATA_BYTES
+            || operation_quantum_pages == 0
+            || operation_quantum_pages > MAX_PRIVATE_OPERATION_QUANTUM_PAGES
+            || matches!(
+                (
+                    system_application_commit.maximum(),
+                    default_committed_pages.maximum()
+                ),
+                (Some(system), Some(process)) if process > system
+            )
+        {
+            return Err(MemoryPolicyError::InvalidValue);
+        }
+        Ok(Self {
+            minimum_free_pages,
+            system_application_commit,
+            default_committed_pages,
+            default_reserved_pages,
+            default_maximum_mappings,
+            default_maximum_metadata_bytes,
+            global_metadata_bytes,
+            operation_quantum_pages,
+        })
+    }
+
+    /// Frames protected from application commitment.
+    #[must_use]
+    pub const fn minimum_free_pages(self) -> u64 {
+        self.minimum_free_pages
+    }
+
+    /// Optional boot-wide application commitment ceiling.
+    #[must_use]
+    pub const fn system_application_commit(self) -> OptionalLimit {
+        self.system_application_commit
+    }
+
+    /// Default per-process committed-page ceiling.
+    #[must_use]
+    pub const fn default_committed_pages(self) -> OptionalLimit {
+        self.default_committed_pages
+    }
+
+    /// Default per-process reserved-page ceiling.
+    #[must_use]
+    pub const fn default_reserved_pages(self) -> OptionalLimit {
+        self.default_reserved_pages
+    }
+
+    /// Maximum normalized dynamic mapping records per process.
+    #[must_use]
+    pub const fn default_maximum_mappings(self) -> u64 {
+        self.default_maximum_mappings
+    }
+
+    /// Maximum charged dynamic VM metadata bytes per process.
+    #[must_use]
+    pub const fn default_maximum_metadata_bytes(self) -> u64 {
+        self.default_maximum_metadata_bytes
+    }
+
+    /// Boot-wide charged dynamic VM metadata budget.
+    #[must_use]
+    pub const fn global_metadata_bytes(self) -> u64 {
+        self.global_metadata_bytes
+    }
+
+    /// Pages processed by one deferred VM transaction step.
+    #[must_use]
+    pub const fn operation_quantum_pages(self) -> u64 {
+        self.operation_quantum_pages
+    }
+}
+
+/// Stable restricted-TOML memory-policy rejection.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemoryPolicyError {
+    /// UTF-8, table, key, value, duplication, or canonical structure failed.
+    InvalidSyntax,
+    /// A typed value is zero, contradictory, or outside a safety backstop.
+    InvalidValue,
+    /// Normalized output metadata could not be retained.
+    MetadataExhausted,
+}
+
+/// Parse one restricted operator-authored memory-policy TOML document.
+///
+/// Comments and insignificant whitespace are accepted. Only the closed tables,
+/// keys, decimal `u64` integers, and booleans defined by memory-policy v1 are
+/// recognized.
+///
+/// # Errors
+///
+/// Rejects unknown or duplicate input, unsupported TOML constructs, missing
+/// fields, contradictory optional limits, and safety-backstop violations.
+#[allow(clippy::too_many_lines)]
+pub fn parse_memory_policy_toml(source: &str) -> Result<MemoryPolicy, MemoryPolicyError> {
+    #[derive(Clone, Copy)]
+    enum Table {
+        Root,
+        System,
+        SystemCommit,
+        ProcessCommit,
+        ProcessReserve,
+        ProcessMappings,
+        ProcessMetadata,
+        Kernel,
+    }
+
+    let mut table = Table::Root;
+    let mut tables = 0_u8;
+    let mut schema = None;
+    let mut minimum_free_pages = None;
+    let mut system_limited = None;
+    let mut system_maximum = None;
+    let mut committed_limited = None;
+    let mut committed_maximum = None;
+    let mut reserved_limited = None;
+    let mut reserved_maximum = None;
+    let mut maximum_mappings = None;
+    let mut maximum_metadata_bytes = None;
+    let mut global_metadata_bytes = None;
+    let mut operation_quantum_pages = None;
+
+    for physical_line in source.lines() {
+        let line = physical_line
+            .split_once('#')
+            .map_or(physical_line, |(before, _comment)| before)
+            .trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            if !line.ends_with(']')
+                || line.starts_with("[[")
+                || line.ends_with("]]")
+                || line[1..line.len() - 1].contains(['[', ']'])
+            {
+                return Err(MemoryPolicyError::InvalidSyntax);
+            }
+            let (next, bit) = match &line[1..line.len() - 1] {
+                "system" => (Table::System, 1 << 0),
+                "system.application_commit" => (Table::SystemCommit, 1 << 1),
+                "process.default.committed_pages" => (Table::ProcessCommit, 1 << 2),
+                "process.default.reserved_pages" => (Table::ProcessReserve, 1 << 3),
+                "process.default.mappings" => (Table::ProcessMappings, 1 << 4),
+                "process.default.metadata_bytes" => (Table::ProcessMetadata, 1 << 5),
+                "kernel" => (Table::Kernel, 1 << 6),
+                _ => return Err(MemoryPolicyError::InvalidSyntax),
+            };
+            if tables & bit != 0 {
+                return Err(MemoryPolicyError::InvalidSyntax);
+            }
+            tables |= bit;
+            table = next;
+            continue;
+        }
+        let Some((raw_key, raw_value)) = line.split_once('=') else {
+            return Err(MemoryPolicyError::InvalidSyntax);
+        };
+        if raw_value.contains('=') {
+            return Err(MemoryPolicyError::InvalidSyntax);
+        }
+        let key = raw_key.trim();
+        let value = raw_value.trim();
+        if key.is_empty() || value.is_empty() || !key.bytes().all(is_bare_key_byte) {
+            return Err(MemoryPolicyError::InvalidSyntax);
+        }
+        match (table, key) {
+            (Table::Root, "schema") => {
+                set_once(&mut schema, parse_u64(value)?)?;
+            }
+            (Table::System, "minimum_free_pages") => {
+                set_once(&mut minimum_free_pages, parse_u64(value)?)?;
+            }
+            (Table::SystemCommit, "limited") => {
+                set_once(&mut system_limited, parse_bool(value)?)?;
+            }
+            (Table::SystemCommit, "maximum") => {
+                set_once(&mut system_maximum, parse_u64(value)?)?;
+            }
+            (Table::ProcessCommit, "limited") => {
+                set_once(&mut committed_limited, parse_bool(value)?)?;
+            }
+            (Table::ProcessCommit, "maximum") => {
+                set_once(&mut committed_maximum, parse_u64(value)?)?;
+            }
+            (Table::ProcessReserve, "limited") => {
+                set_once(&mut reserved_limited, parse_bool(value)?)?;
+            }
+            (Table::ProcessReserve, "maximum") => {
+                set_once(&mut reserved_maximum, parse_u64(value)?)?;
+            }
+            (Table::ProcessMappings, "maximum") => {
+                set_once(&mut maximum_mappings, parse_u64(value)?)?;
+            }
+            (Table::ProcessMetadata, "maximum") => {
+                set_once(&mut maximum_metadata_bytes, parse_u64(value)?)?;
+            }
+            (Table::Kernel, "global_metadata_bytes") => {
+                set_once(&mut global_metadata_bytes, parse_u64(value)?)?;
+            }
+            (Table::Kernel, "operation_quantum_pages") => {
+                set_once(&mut operation_quantum_pages, parse_u64(value)?)?;
+            }
+            _ => return Err(MemoryPolicyError::InvalidSyntax),
+        }
+    }
+    if tables != 0x7f || schema != Some(1) {
+        return Err(MemoryPolicyError::InvalidSyntax);
+    }
+    MemoryPolicy::new(
+        minimum_free_pages.ok_or(MemoryPolicyError::InvalidSyntax)?,
+        parsed_optional_limit(system_limited, system_maximum)?,
+        parsed_optional_limit(committed_limited, committed_maximum)?,
+        parsed_optional_limit(reserved_limited, reserved_maximum)?,
+        maximum_mappings.ok_or(MemoryPolicyError::InvalidSyntax)?,
+        maximum_metadata_bytes.ok_or(MemoryPolicyError::InvalidSyntax)?,
+        global_metadata_bytes.ok_or(MemoryPolicyError::InvalidSyntax)?,
+        operation_quantum_pages.ok_or(MemoryPolicyError::InvalidSyntax)?,
+    )
+}
+
+/// Emit deterministic normalized memory-policy v1 TOML.
+///
+/// # Errors
+///
+/// Reports fallible string growth failure.
+pub fn normalize_memory_policy_toml(policy: MemoryPolicy) -> Result<String, MemoryPolicyError> {
+    let mut output = String::new();
+    output
+        .try_reserve(640)
+        .map_err(|_| MemoryPolicyError::MetadataExhausted)?;
+    writeln!(output, "schema = 1\n").map_err(|_| MemoryPolicyError::MetadataExhausted)?;
+    writeln!(
+        output,
+        "[system]\nminimum_free_pages = {}\n",
+        policy.minimum_free_pages()
+    )
+    .map_err(|_| MemoryPolicyError::MetadataExhausted)?;
+    write_optional_limit(
+        &mut output,
+        "system.application_commit",
+        policy.system_application_commit(),
+    )?;
+    write_optional_limit(
+        &mut output,
+        "process.default.committed_pages",
+        policy.default_committed_pages(),
+    )?;
+    write_optional_limit(
+        &mut output,
+        "process.default.reserved_pages",
+        policy.default_reserved_pages(),
+    )?;
+    writeln!(
+        output,
+        "[process.default.mappings]\nmaximum = {}\n",
+        policy.default_maximum_mappings()
+    )
+    .map_err(|_| MemoryPolicyError::MetadataExhausted)?;
+    writeln!(
+        output,
+        "[process.default.metadata_bytes]\nmaximum = {}\n",
+        policy.default_maximum_metadata_bytes()
+    )
+    .map_err(|_| MemoryPolicyError::MetadataExhausted)?;
+    writeln!(
+        output,
+        "[kernel]\nglobal_metadata_bytes = {}\noperation_quantum_pages = {}",
+        policy.global_metadata_bytes(),
+        policy.operation_quantum_pages()
+    )
+    .map_err(|_| MemoryPolicyError::MetadataExhausted)?;
+    Ok(output)
+}
+
+fn write_optional_limit(
+    output: &mut String,
+    table: &str,
+    limit: OptionalLimit,
+) -> Result<(), MemoryPolicyError> {
+    writeln!(output, "[{table}]").map_err(|_| MemoryPolicyError::MetadataExhausted)?;
+    writeln!(output, "limited = {}", limit.is_limited())
+        .map_err(|_| MemoryPolicyError::MetadataExhausted)?;
+    if let Some(maximum) = limit.maximum() {
+        writeln!(output, "maximum = {maximum}")
+            .map_err(|_| MemoryPolicyError::MetadataExhausted)?;
+    }
+    writeln!(output).map_err(|_| MemoryPolicyError::MetadataExhausted)
+}
+
+const fn is_bare_key_byte(byte: u8) -> bool {
+    byte.is_ascii_lowercase() || byte == b'_'
+}
+
+fn parse_u64(value: &str) -> Result<u64, MemoryPolicyError> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(MemoryPolicyError::InvalidSyntax);
+    }
+    value
+        .parse::<u64>()
+        .map_err(|_| MemoryPolicyError::InvalidValue)
+}
+
+fn parse_bool(value: &str) -> Result<bool, MemoryPolicyError> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(MemoryPolicyError::InvalidSyntax),
+    }
+}
+
+fn set_once<T>(slot: &mut Option<T>, value: T) -> Result<(), MemoryPolicyError> {
+    if slot.replace(value).is_some() {
+        Err(MemoryPolicyError::InvalidSyntax)
+    } else {
+        Ok(())
+    }
+}
+
+fn parsed_optional_limit(
+    limited: Option<bool>,
+    maximum: Option<u64>,
+) -> Result<OptionalLimit, MemoryPolicyError> {
+    match (limited, maximum) {
+        (Some(false), None) => Ok(OptionalLimit::unlimited()),
+        (Some(true), Some(maximum)) => OptionalLimit::limited(maximum),
+        _ => Err(MemoryPolicyError::InvalidSyntax),
+    }
+}
 
 /// Immutable identity of one fully validated SCFG image.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -413,6 +862,7 @@ pub struct SystemConfig {
     generation: u64,
     previous_generation: Option<u64>,
     recovery: RecoveryPolicy,
+    memory: MemoryPolicy,
     services: Vec<ServiceConfig>,
 }
 
@@ -435,6 +885,12 @@ impl SystemConfig {
         self.recovery
     }
 
+    /// Active typed private-memory resource policy.
+    #[must_use]
+    pub const fn memory(&self) -> MemoryPolicy {
+        self.memory
+    }
+
     /// Canonically ID-sorted service records.
     #[must_use]
     pub fn services(&self) -> &[ServiceConfig] {
@@ -455,6 +911,8 @@ pub enum ConfigError {
     InvalidDependency,
     /// A name or artifact string is invalid, aliased, or noncanonical.
     InvalidString,
+    /// The typed private-memory policy is invalid or noncanonical.
+    InvalidMemoryPolicy,
     /// The bounded parser could not retain validated metadata.
     MetadataExhausted,
 }
@@ -466,17 +924,21 @@ pub enum ConfigError {
 /// Rejects every unknown version or flag, invalid length/checksum/reserved byte,
 /// invalid recovery policy, unsorted/cyclic dependency, invalid string, and
 /// allocation failure before returning a partial configuration.
+#[allow(clippy::too_many_lines)]
 pub fn parse_config(bytes: &[u8]) -> Result<SystemConfig, ConfigError> {
     if bytes.len() < HEADER_BYTES
         || bytes.len() > MAX_CONFIG_BYTES
         || bytes.get(..8) != Some(&CONFIG_V1_MAGIC)
         || read_u16(bytes, 8)? != 1
-        || read_u16(bytes, 10)? != 0
-        || read_u16(bytes, 12)? != 64
+        || read_u16(bytes, 10)? != 1
+        || usize::from(read_u16(bytes, 12)?) != HEADER_BYTES
         || read_u16(bytes, 14)? != 64
         || usize::try_from(read_u32(bytes, 16)?).map_err(|_| ConfigError::InvalidHeader)?
             != bytes.len()
-        || bytes[52..HEADER_BYTES].iter().any(|byte| *byte != 0)
+        || bytes[52..64].iter().any(|byte| *byte != 0)
+        || bytes[MEMORY_POLICY_RESERVED_OFFSET..HEADER_BYTES]
+            .iter()
+            .any(|byte| *byte != 0)
     {
         return Err(ConfigError::InvalidHeader);
     }
@@ -524,6 +986,40 @@ pub fn parse_config(bytes: &[u8]) -> Result<SystemConfig, ConfigError> {
         fallback_previous: flags & FLAG_FALLBACK_PREVIOUS != 0,
         recovery_shell: true,
     };
+    let memory_flags = read_u64(bytes, MEMORY_POLICY_FLAGS_OFFSET)?;
+    if memory_flags & !KNOWN_MEMORY_POLICY_FLAGS != 0 {
+        return Err(ConfigError::InvalidMemoryPolicy);
+    }
+    let optional_limit = |flag, offset| {
+        let maximum = read_u64(bytes, offset)?;
+        if memory_flags & flag != 0 {
+            OptionalLimit::limited(maximum).map_err(|_| ConfigError::InvalidMemoryPolicy)
+        } else if maximum == 0 {
+            Ok(OptionalLimit::unlimited())
+        } else {
+            Err(ConfigError::InvalidMemoryPolicy)
+        }
+    };
+    let memory = MemoryPolicy::new(
+        read_u64(bytes, MEMORY_POLICY_MINIMUM_FREE_OFFSET)?,
+        optional_limit(
+            MEMORY_POLICY_SYSTEM_LIMITED,
+            MEMORY_POLICY_SYSTEM_MAXIMUM_OFFSET,
+        )?,
+        optional_limit(
+            MEMORY_POLICY_COMMITTED_LIMITED,
+            MEMORY_POLICY_COMMITTED_MAXIMUM_OFFSET,
+        )?,
+        optional_limit(
+            MEMORY_POLICY_RESERVED_LIMITED,
+            MEMORY_POLICY_RESERVED_MAXIMUM_OFFSET,
+        )?,
+        read_u64(bytes, MEMORY_POLICY_MAPPINGS_OFFSET)?,
+        read_u64(bytes, MEMORY_POLICY_METADATA_OFFSET)?,
+        read_u64(bytes, MEMORY_POLICY_GLOBAL_METADATA_OFFSET)?,
+        read_u64(bytes, MEMORY_POLICY_QUANTUM_OFFSET)?,
+    )
+    .map_err(|_| ConfigError::InvalidMemoryPolicy)?;
     let string_table = bytes
         .get(string_start..)
         .ok_or(ConfigError::InvalidHeader)?;
@@ -547,6 +1043,7 @@ pub fn parse_config(bytes: &[u8]) -> Result<SystemConfig, ConfigError> {
         generation,
         previous_generation: (previous_raw != 0).then_some(previous_raw),
         recovery,
+        memory,
         services,
     })
 }
@@ -801,7 +1298,11 @@ mod tests {
     use super::{
         ACTIVATION_V1_BYTES, ActivationError, ActivationPointer, ActivationRecovery,
         CONFIG_V1_MAGIC, ConfigError, ConfigReference, ContentDigest, FailureAction, HEADER_BYTES,
-        RECORD_BYTES, StartupMode, crc32, parse_config, recover_activation,
+        MEMORY_POLICY_GLOBAL_METADATA_OFFSET, MEMORY_POLICY_MAPPINGS_OFFSET,
+        MEMORY_POLICY_METADATA_OFFSET, MEMORY_POLICY_MINIMUM_FREE_OFFSET,
+        MEMORY_POLICY_QUANTUM_OFFSET, MemoryPolicy, MemoryPolicyError, RECORD_BYTES, StartupMode,
+        crc32, normalize_memory_policy_toml, parse_config, parse_memory_policy_toml,
+        recover_activation,
     };
 
     fn valid_config() -> Vec<u8> {
@@ -809,7 +1310,8 @@ mod tests {
         let mut bytes = vec![0_u8; HEADER_BYTES + 2 * RECORD_BYTES + strings.len()];
         bytes[..8].copy_from_slice(&CONFIG_V1_MAGIC);
         put_u16(&mut bytes, 8, 1);
-        put_u16(&mut bytes, 12, 64);
+        put_u16(&mut bytes, 10, 1);
+        put_u16(&mut bytes, 12, u16::try_from(HEADER_BYTES).unwrap_or(0));
         put_u16(&mut bytes, 14, 64);
         let total = u32::try_from(bytes.len()).unwrap_or(0);
         put_u32(&mut bytes, 16, total);
@@ -820,9 +1322,38 @@ mod tests {
         bytes[43] = 3;
         put_u32(&mut bytes, 44, 30_000);
         put_u32(&mut bytes, 48, u32::try_from(strings.len()).unwrap_or(0));
-        service_record(&mut bytes[64..128], 1, 0, 7, 16, 0, 0);
-        service_record(&mut bytes[128..192], 2, 23, 5, 14, 0, 1);
-        bytes[192..].copy_from_slice(strings);
+        let memory = MemoryPolicy::standard();
+        put_u64(
+            &mut bytes,
+            MEMORY_POLICY_MINIMUM_FREE_OFFSET,
+            memory.minimum_free_pages(),
+        );
+        put_u64(
+            &mut bytes,
+            MEMORY_POLICY_MAPPINGS_OFFSET,
+            memory.default_maximum_mappings(),
+        );
+        put_u64(
+            &mut bytes,
+            MEMORY_POLICY_METADATA_OFFSET,
+            memory.default_maximum_metadata_bytes(),
+        );
+        put_u64(
+            &mut bytes,
+            MEMORY_POLICY_GLOBAL_METADATA_OFFSET,
+            memory.global_metadata_bytes(),
+        );
+        put_u64(
+            &mut bytes,
+            MEMORY_POLICY_QUANTUM_OFFSET,
+            memory.operation_quantum_pages(),
+        );
+        let first = HEADER_BYTES;
+        let second = first + RECORD_BYTES;
+        let string_start = second + RECORD_BYTES;
+        service_record(&mut bytes[first..second], 1, 0, 7, 16, 0, 0);
+        service_record(&mut bytes[second..string_start], 2, 23, 5, 14, 0, 1);
+        bytes[string_start..].copy_from_slice(strings);
         refresh_crc(&mut bytes);
         bytes
     }
@@ -879,6 +1410,7 @@ mod tests {
         assert_eq!(config.previous_generation(), Some(6));
         assert!(config.recovery().fallback_previous());
         assert!(config.recovery().recovery_shell());
+        assert_eq!(config.memory(), MemoryPolicy::standard());
         assert_eq!(config.services().len(), 2);
         assert_eq!(config.services()[0].name(), "storage");
         assert_eq!(config.services()[1].dependencies(), &[1]);
@@ -932,7 +1464,11 @@ mod tests {
     #[test]
     fn service_order_dependencies_and_strings_are_canonical() {
         let mut dependency = valid_config();
-        put_u32(&mut dependency[128..192], 24, 2);
+        put_u32(
+            &mut dependency[HEADER_BYTES + RECORD_BYTES..HEADER_BYTES + 2 * RECORD_BYTES],
+            24,
+            2,
+        );
         refresh_crc(&mut dependency);
         assert_eq!(
             parse_config(&dependency),
@@ -940,9 +1476,57 @@ mod tests {
         );
 
         let mut alias = valid_config();
-        put_u32(&mut alias[128..192], 40, 0);
+        put_u32(
+            &mut alias[HEADER_BYTES + RECORD_BYTES..HEADER_BYTES + 2 * RECORD_BYTES],
+            40,
+            0,
+        );
         refresh_crc(&mut alias);
         assert_eq!(parse_config(&alias), Err(ConfigError::InvalidString));
+    }
+
+    #[test]
+    fn memory_policy_toml_normalizes_and_rejects_magic_sentinels() -> Result<(), MemoryPolicyError>
+    {
+        let source = r"
+            # Desired policy can retain operator comments.
+            schema = 1
+            [system]
+            minimum_free_pages = 8192
+            [system.application_commit]
+            limited = false
+            [process.default.committed_pages]
+            limited = false
+            [process.default.reserved_pages]
+            limited = false
+            [process.default.mappings]
+            maximum = 65536
+            [process.default.metadata_bytes]
+            maximum = 8388608
+            [kernel]
+            global_metadata_bytes = 33554432
+            operation_quantum_pages = 256
+        ";
+        let policy = parse_memory_policy_toml(source)?;
+        assert_eq!(policy, MemoryPolicy::standard());
+        let normalized = normalize_memory_policy_toml(policy)?;
+        assert_eq!(parse_memory_policy_toml(&normalized), Ok(policy));
+        assert!(normalized.ends_with('\n'));
+        assert!(!normalized.contains('#'));
+        assert!(parse_memory_policy_toml(&source.replace("false", "\"available\"")).is_err());
+        assert!(
+            parse_memory_policy_toml(
+                &source.replace("limited = false", "limited = false\nmaximum = 1")
+            )
+            .is_err()
+        );
+        assert!(
+            parse_memory_policy_toml(
+                &source.replace("maximum = 65536", "maximum = 18446744073709551616")
+            )
+            .is_err()
+        );
+        Ok(())
     }
 
     #[test]
@@ -952,7 +1536,7 @@ mod tests {
         assert!(active.matches(&config));
         let previous = ConfigReference {
             generation: 6,
-            byte_count: 64,
+            byte_count: u32::try_from(HEADER_BYTES).unwrap_or(0),
             checksum: 0x1234_5678,
             digest: ContentDigest::of(b"previous"),
         };
@@ -989,7 +1573,7 @@ mod tests {
         let active = ConfigReference::from_bytes(&valid_config())?;
         let previous = ConfigReference {
             generation: 6,
-            byte_count: 64,
+            byte_count: u32::try_from(HEADER_BYTES).unwrap_or(0),
             checksum: 0x1234_5678,
             digest: ContentDigest::of(b"previous"),
         };
@@ -1016,7 +1600,7 @@ mod tests {
         let active = ConfigReference::from_bytes(&valid_config())?;
         let previous = ConfigReference {
             generation: 6,
-            byte_count: 64,
+            byte_count: u32::try_from(HEADER_BYTES).unwrap_or(0),
             checksum: 0x1234_5678,
             digest: ContentDigest::of(b"previous"),
         };
@@ -1049,7 +1633,7 @@ mod tests {
         let active = ConfigReference::from_bytes(&valid_config())?;
         let previous = ConfigReference {
             generation: 6,
-            byte_count: 64,
+            byte_count: u32::try_from(HEADER_BYTES).unwrap_or(0),
             checksum: 0x1234_5678,
             digest: ContentDigest::of(b"previous"),
         };

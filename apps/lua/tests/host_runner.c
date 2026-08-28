@@ -95,11 +95,6 @@ TroeFormatResult troe_runtime_format_calendar(
 
 typedef struct TroeLuaHost TroeLuaHost;
 
-uint32_t troe_runtime_mix_seed(uint64_t address, uint64_t wall_seconds,
-                               uint64_t ticks, uint64_t frequency_hz) {
-  return (uint32_t)(address ^ wall_seconds ^ ticks ^ frequency_hz);
-}
-
 typedef void *(*TroeAllocate)(void *context, void *pointer, size_t old_size,
                               size_t new_size);
 typedef intptr_t (*TroeRead)(void *context, uint8_t *destination,
@@ -196,6 +191,7 @@ typedef struct TroeLuaConfiguration {
   int requested_exit;
   uint32_t requested_exit_status;
   int requested_exit_close;
+  uint32_t seed;
 } TroeLuaConfiguration;
 
 typedef struct HostContext {
@@ -438,6 +434,7 @@ int main(int argc, char **argv) {
       .requested_exit = 0,
       .requested_exit_status = 0,
       .requested_exit_close = 0,
+      .seed = 0x5eed1234,
   };
 
   result = troe_lua_run(&configuration);

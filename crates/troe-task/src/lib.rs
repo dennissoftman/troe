@@ -622,7 +622,7 @@ impl Capabilities {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StackResource {
     slot: u32,
-    mapped_pages: u16,
+    mapped_pages: u64,
 }
 
 /// Address-space, frame, and handle ownership retained by one isolated task.
@@ -714,7 +714,7 @@ impl StackResource {
     /// # Errors
     ///
     /// Rejects a stack with no mapped payload pages.
-    pub const fn new(slot: u32, mapped_pages: u16) -> Result<Self, TaskError> {
+    pub const fn new(slot: u32, mapped_pages: u64) -> Result<Self, TaskError> {
         if mapped_pages == 0 {
             return Err(TaskError::EmptyStack);
         }
@@ -729,7 +729,7 @@ impl StackResource {
 
     /// Mapped payload pages, excluding guard pages.
     #[must_use]
-    pub const fn mapped_pages(self) -> u16 {
+    pub const fn mapped_pages(self) -> u64 {
         self.mapped_pages
     }
 }
@@ -883,7 +883,7 @@ pub struct TaskStats {
     /// Tasks currently retained in a blocked state.
     pub blocked_tasks: u32,
     /// Mapped stack pages retained by live records.
-    pub owned_stack_pages: u32,
+    pub owned_stack_pages: u64,
     /// Isolated address spaces retained by live records.
     pub owned_address_spaces: u32,
     /// Page-table plus private frames retained by isolated records.
@@ -1529,8 +1529,8 @@ impl Scheduler {
     /// Snapshot lifecycle and stack-ownership accounting.
     #[must_use]
     pub fn stats(&self) -> TaskStats {
-        let owned_stack_pages = self.records.iter().fold(0_u32, |total, record| {
-            total.saturating_add(u32::from(record.snapshot.stack.mapped_pages))
+        let owned_stack_pages = self.records.iter().fold(0_u64, |total, record| {
+            total.saturating_add(record.snapshot.stack.mapped_pages)
         });
         let owned_address_spaces = self
             .records

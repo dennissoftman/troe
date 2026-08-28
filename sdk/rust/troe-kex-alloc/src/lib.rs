@@ -8,11 +8,18 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 use rlsf::{FlexSource, FlexTlsf};
-use troe_kex_sdk::HeapRegion;
+use troe_kex_sdk::{HeapRegion, PrivateMemory, private_memory};
 
 const PAGE_BYTES: usize = 4096;
 const GROWTH_QUANTUM_PAGES: usize = 64;
-type ApplicationTlsf<S> = FlexTlsf<S, u32, u16, 20, 16>;
+/// Allocation size at which independent private mappings avoid fragmenting the
+/// contiguous TLSF arena. This is a tuning boundary, not a functional limit.
+pub const PRIVATE_MAPPING_THRESHOLD_BYTES: usize = 8 * 1024 * 1024;
+const MAPPED_ALLOCATION_MAGIC: u64 = 0x544d_4150_4b45_5831;
+// 4-byte base alignment gives TLSF five granularity bits on 64-bit targets.
+// Fifty-nine first-level classes therefore cover the complete `usize` domain
+// instead of imposing the former approximately 32 MiB maximum block size.
+type ApplicationTlsf<S> = FlexTlsf<S, u64, u16, 59, 16>;
 
 /// Backing-store contract used by the shared KEX heap.
 ///
@@ -259,11 +266,11 @@ unsafe impl GlobalAlloc for GlobalAllocator {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Statistics {
     /// Bytes in the heap pool accepted by TLSF during initialization.
-    pub capacity_bytes: usize,
+    pub capacity_bytes: u64,
     /// Sum of requested sizes for currently live allocations.
-    pub live_bytes: usize,
+    pub live_bytes: u64,
     /// Highest observed `live_bytes` value.
-    pub high_water_bytes: usize,
+    pub high_water_bytes: u64,
     /// Successful fresh allocations.
     pub allocations: u64,
     /// Successful deallocations, including zero-sized reallocations.
@@ -276,6 +283,10 @@ pub struct Statistics {
     pub moved_bytes: u64,
     /// Successful backing-store growth operations.
     pub growths: u64,
+    /// Bytes currently owned by independent private mappings.
+    pub private_mapped_bytes: u64,
+    /// Currently live independent private mappings.
+    pub private_mappings: u64,
 }
 
 /// One TLSF allocator owning one validated KEX heap region.
@@ -284,7 +295,18 @@ pub struct Statistics {
 /// time when it can resize in place and linear only when it must copy a block.
 pub struct Heap<S: HeapSource = ApplicationHeapSource> {
     tlsf: ApplicationTlsf<S>,
+    private_memory: Option<PrivateMemory>,
     statistics: Statistics,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct MappedAllocationHeader {
+    magic: u64,
+    address: u64,
+    page_count: u64,
+    requested_bytes: u64,
+    alignment: u64,
 }
 
 impl Heap<ApplicationHeapSource> {
@@ -300,6 +322,22 @@ impl Heap<ApplicationHeapSource> {
         // validating the kernel-owned startup page. Its range is writable,
         // initially zeroed, and remains mapped for the complete app lifetime.
         unsafe { Self::from_raw_parts(start_address, byte_len) }
+    }
+
+    /// Initialize TLSF and route large allocations through independent private
+    /// mappings so one contiguous heap never becomes a functional ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InitializationError::RegionTooSmall`] when the initial heap
+    /// cannot hold TLSF's minimum free-block representation.
+    pub fn new_with_private_memory(
+        region: HeapRegion,
+        private_memory: PrivateMemory,
+    ) -> Result<Self, InitializationError> {
+        let mut heap = Self::new(region)?;
+        heap.private_memory = Some(private_memory);
+        Ok(heap)
     }
 
     unsafe fn from_raw_parts(address: usize, byte_len: usize) -> Result<Self, InitializationError> {
@@ -326,9 +364,10 @@ impl<S: HeapSource> Heap<S> {
             .ok_or(InitializationError::RegionTooSmall)?;
         // SAFETY: `bootstrap` was just allocated with alignment one.
         unsafe { tlsf.deallocate(bootstrap, 1) };
-        let capacity_bytes = tlsf.source_ref().capacity_bytes();
+        let capacity_bytes = u64::try_from(tlsf.source_ref().capacity_bytes()).unwrap_or(u64::MAX);
         Ok(Self {
             tlsf,
+            private_memory: None,
             statistics: Statistics {
                 capacity_bytes,
                 ..Statistics::default()
@@ -348,6 +387,16 @@ impl<S: HeapSource> Heap<S> {
     /// cannot provide enough contiguous virtual space or the size cannot be
     /// represented.
     pub fn allocate(&mut self, layout: Layout) -> Option<NonNull<u8>> {
+        if self.private_memory.is_some() && layout.size() >= PRIVATE_MAPPING_THRESHOLD_BYTES {
+            let pointer = self.allocate_private(layout);
+            if pointer.is_some() {
+                self.statistics.allocations = self.statistics.allocations.saturating_add(1);
+                self.add_live_bytes(layout.size());
+            } else {
+                self.statistics.failures = self.statistics.failures.saturating_add(1);
+            }
+            return pointer;
+        }
         let pointer = self.tlsf.allocate(layout);
         self.sync_source_statistics();
         if pointer.is_some() {
@@ -366,9 +415,24 @@ impl<S: HeapSource> Heap<S> {
     /// `pointer` must still denote a live allocation from this `Heap`, and
     /// `layout` must be the layout used to allocate it.
     pub unsafe fn deallocate(&mut self, pointer: NonNull<u8>, layout: Layout) {
+        if self.private_memory.is_some() && layout.size() >= PRIVATE_MAPPING_THRESHOLD_BYTES {
+            if self.deallocate_private(pointer, layout) {
+                self.statistics.live_bytes = self
+                    .statistics
+                    .live_bytes
+                    .saturating_sub(u64::try_from(layout.size()).unwrap_or(u64::MAX));
+                self.statistics.deallocations = self.statistics.deallocations.saturating_add(1);
+            } else {
+                self.statistics.failures = self.statistics.failures.saturating_add(1);
+            }
+            return;
+        }
         // SAFETY: The caller upholds TLSF's pointer and alignment contract.
         unsafe { self.tlsf.deallocate(pointer, layout.align()) };
-        self.statistics.live_bytes = self.statistics.live_bytes.saturating_sub(layout.size());
+        self.statistics.live_bytes = self
+            .statistics
+            .live_bytes
+            .saturating_sub(u64::try_from(layout.size()).unwrap_or(u64::MAX));
         self.statistics.deallocations = self.statistics.deallocations.saturating_add(1);
     }
 
@@ -396,6 +460,29 @@ impl<S: HeapSource> Heap<S> {
             self.statistics.failures = self.statistics.failures.saturating_add(1);
             return None;
         };
+        let old_private =
+            self.private_memory.is_some() && old_layout.size() >= PRIVATE_MAPPING_THRESHOLD_BYTES;
+        let new_private =
+            self.private_memory.is_some() && new_size >= PRIVATE_MAPPING_THRESHOLD_BYTES;
+        if old_private || new_private {
+            let new_pointer = self.allocate(new_layout)?;
+            // SAFETY: Both allocations are live and disjoint, and the smaller
+            // requested span is initialized according to the allocator contract.
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    pointer.as_ptr(),
+                    new_pointer.as_ptr(),
+                    old_layout.size().min(new_size),
+                );
+                self.deallocate(pointer, old_layout);
+            }
+            self.statistics.reallocations = self.statistics.reallocations.saturating_add(1);
+            self.statistics.moved_bytes = self
+                .statistics
+                .moved_bytes
+                .saturating_add(u64::try_from(old_layout.size().min(new_size)).unwrap_or(u64::MAX));
+            return Some(new_pointer);
+        }
         // SAFETY: The caller upholds TLSF's pointer and alignment contract.
         let resized = unsafe { self.tlsf.reallocate(pointer, new_layout) };
         self.sync_source_statistics();
@@ -404,7 +491,10 @@ impl<S: HeapSource> Heap<S> {
             return None;
         };
         self.statistics.reallocations = self.statistics.reallocations.saturating_add(1);
-        self.statistics.live_bytes = self.statistics.live_bytes.saturating_sub(old_layout.size());
+        self.statistics.live_bytes = self
+            .statistics
+            .live_bytes
+            .saturating_sub(u64::try_from(old_layout.size()).unwrap_or(u64::MAX));
         self.add_live_bytes(new_size);
         if new_pointer != pointer {
             self.statistics.moved_bytes = self
@@ -416,7 +506,10 @@ impl<S: HeapSource> Heap<S> {
     }
 
     fn add_live_bytes(&mut self, bytes: usize) {
-        self.statistics.live_bytes = self.statistics.live_bytes.saturating_add(bytes);
+        self.statistics.live_bytes = self
+            .statistics
+            .live_bytes
+            .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
         self.statistics.high_water_bytes = self
             .statistics
             .high_water_bytes
@@ -424,8 +517,85 @@ impl<S: HeapSource> Heap<S> {
     }
 
     fn sync_source_statistics(&mut self) {
-        self.statistics.capacity_bytes = self.tlsf.source_ref().capacity_bytes();
+        self.statistics.capacity_bytes =
+            u64::try_from(self.tlsf.source_ref().capacity_bytes()).unwrap_or(u64::MAX);
         self.statistics.growths = self.tlsf.source_ref().growths();
+    }
+
+    fn allocate_private(&mut self, layout: Layout) -> Option<NonNull<u8>> {
+        let header_bytes = core::mem::size_of::<MappedAllocationHeader>();
+        let total = layout
+            .size()
+            .checked_add(header_bytes)?
+            .checked_add(layout.align().checked_sub(1)?)?;
+        let page_count = total.checked_add(PAGE_BYTES - 1)? / PAGE_BYTES;
+        let page_count = u64::try_from(page_count).ok()?;
+        let memory = self.private_memory.as_mut()?;
+        let address = memory
+            .map_zeroed(page_count, 1, 0, private_memory::Protection::ReadWrite)
+            .ok()?;
+        let initialized = (|| {
+            let raw = usize::try_from(address).ok()?;
+            let alignment_mask = layout.align().checked_sub(1)?;
+            let payload = raw.checked_add(header_bytes)?;
+            let aligned = payload.checked_add(alignment_mask)? & !alignment_mask;
+            let header_address = aligned.checked_sub(header_bytes)?;
+            let pointer = NonNull::new(aligned as *mut u8)?;
+            let header = MappedAllocationHeader {
+                magic: MAPPED_ALLOCATION_MAGIC,
+                address,
+                page_count,
+                requested_bytes: u64::try_from(layout.size()).ok()?,
+                alignment: u64::try_from(layout.align()).ok()?,
+            };
+            let mapped_bytes = page_count.checked_mul(PAGE_BYTES as u64)?;
+            Some((pointer, header_address, header, mapped_bytes))
+        })();
+        let Some((pointer, header_address, header, mapped_bytes)) = initialized else {
+            let _cleaned = memory.unmap(address, page_count);
+            return None;
+        };
+        // SAFETY: The header lies inside the fresh writable zeroed mapping and
+        // precedes the aligned payload without overlap.
+        unsafe {
+            (header_address as *mut MappedAllocationHeader).write_unaligned(header);
+        }
+        self.statistics.private_mapped_bytes = self
+            .statistics
+            .private_mapped_bytes
+            .saturating_add(mapped_bytes);
+        self.statistics.private_mappings = self.statistics.private_mappings.saturating_add(1);
+        Some(pointer)
+    }
+
+    fn deallocate_private(&mut self, pointer: NonNull<u8>, layout: Layout) -> bool {
+        let Some(header_address) =
+            (pointer.as_ptr() as usize).checked_sub(core::mem::size_of::<MappedAllocationHeader>())
+        else {
+            return false;
+        };
+        // SAFETY: The allocator contract requires this live pointer and its
+        // original layout, so the immediately preceding mapping header exists.
+        let header = unsafe { (header_address as *const MappedAllocationHeader).read_unaligned() };
+        if header.magic != MAPPED_ALLOCATION_MAGIC
+            || header.requested_bytes != u64::try_from(layout.size()).unwrap_or(u64::MAX)
+            || header.alignment != u64::try_from(layout.align()).unwrap_or(u64::MAX)
+        {
+            return false;
+        }
+        let Some(memory) = self.private_memory.as_mut() else {
+            return false;
+        };
+        if memory.unmap(header.address, header.page_count).is_err() {
+            return false;
+        }
+        let mapped_bytes = header.page_count.saturating_mul(PAGE_BYTES as u64);
+        self.statistics.private_mapped_bytes = self
+            .statistics
+            .private_mapped_bytes
+            .saturating_sub(mapped_bytes);
+        self.statistics.private_mappings = self.statistics.private_mappings.saturating_sub(1);
+        true
     }
 }
 

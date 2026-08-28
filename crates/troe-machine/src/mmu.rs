@@ -9,6 +9,8 @@ use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[cfg(any(test, target_os = "uefi"))]
+use alloc::vec::Vec;
+#[cfg(any(test, target_os = "uefi"))]
 use troe_memory::MappingPlan;
 use troe_memory::{BASE_PAGE_SIZE, MappingPermissions, PhysicalRange, VirtualRange};
 #[cfg(any(test, target_os = "uefi"))]
@@ -28,7 +30,6 @@ const SECTION_WRITE: u32 = 0x8000_0000;
 // Shared Stage 7 storage: Full KEX permits sixteen image segments plus startup,
 // heap, and stack. The Stage 6 composition remains independently capped at
 // eight regions and currently constructs exactly code, data, and stack.
-const MAX_USER_REGIONS: usize = 19;
 #[cfg(target_os = "uefi")]
 const ISOLATED_EXIT_CALL: u64 = 1;
 #[cfg(target_os = "uefi")]
@@ -123,15 +124,11 @@ pub enum ApplicationOutcome {
 pub struct UserAddressSpace {
     root: u64,
     table_arena: PhysicalRange,
-    regions: [Option<UserRegion>; MAX_USER_REGIONS],
-    region_count: usize,
+    regions: Vec<UserRegion>,
     stats: MmuStats,
 }
 
 impl UserAddressSpace {
-    /// Maximum user regions retained by the shared Stage 7 address-space context.
-    pub const MAX_REGIONS: usize = MAX_USER_REGIONS;
-
     /// Page-table and mapped-page accounting for teardown validation.
     #[must_use]
     pub const fn stats(&self) -> MmuStats {
@@ -141,7 +138,7 @@ impl UserAddressSpace {
     /// Number of validated user regions retained by this address space.
     #[must_use]
     pub const fn user_region_count(&self) -> usize {
-        self.region_count
+        self.regions.len()
     }
 }
 
@@ -319,7 +316,6 @@ impl ApplicationSession {
         copy_user_from_physical(
             self.address_space.root,
             &self.address_space.regions,
-            self.address_space.region_count,
             call.request_address,
             destination,
         )
@@ -352,18 +348,17 @@ impl ApplicationSession {
         if page_count < request.minimum_pages || physical_ranges.is_empty() {
             return Err(MmuError::InvalidUserContext);
         }
-        let region_index = self.address_space.regions[..self.address_space.region_count]
+        let region_index = self
+            .address_space
+            .regions
             .iter()
             .position(|region| {
-                region.is_some_and(|region| {
-                    region.range.start() == heap_start
-                        && region.permissions.write
-                        && !region.permissions.execute
-                })
+                region.range.start() == heap_start
+                    && region.permissions.write
+                    && !region.permissions.execute
             })
             .ok_or(MmuError::InvalidUserContext)?;
-        let region =
-            self.address_space.regions[region_index].ok_or(MmuError::InvalidUserContext)?;
+        let region = self.address_space.regions[region_index];
         let added_bytes = page_count
             .checked_mul(BASE_PAGE_SIZE)
             .ok_or(MmuError::AddressUnsupported)?;
@@ -375,11 +370,13 @@ impl ApplicationSession {
         let grown = VirtualRange::from_pages(heap_start, region.range.page_count() + page_count)
             .map_err(|_| MmuError::InvalidUserContext)?;
         if grown.end() != new_end
-            || self.address_space.regions[..self.address_space.region_count]
+            || self
+                .address_space
+                .regions
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| *index != region_index)
-                .filter_map(|(_, region)| *region)
+                .map(|(_, region)| *region)
                 .any(|other| heap_start < other.range.end() && other.range.start() < new_end)
         {
             return Err(MmuError::InvalidUserContext);
@@ -429,10 +426,10 @@ impl ApplicationSession {
                     .ok_or(MmuError::AddressUnsupported)?;
             }
         }
-        self.address_space.regions[region_index] = Some(UserRegion {
+        self.address_space.regions[region_index] = UserRegion {
             range: grown,
             permissions: region.permissions,
-        });
+        };
         self.address_space.stats.mapped_pages = self
             .address_space
             .stats
@@ -442,6 +439,225 @@ impl ApplicationSession {
         self.address_space.stats.table_pages = arena.used_pages;
         Ok(self.address_space.stats)
     }
+
+    /// Replace accessibility for one caller-private physical backing range.
+    ///
+    /// The application must be suspended in a handle call. `was_mapped`
+    /// describes whether every supplied backing page currently has a leaf.
+    /// `permissions == None` removes leaves while retaining physical ownership;
+    /// a value maps or reprotects read-only/read-write non-executable data.
+    ///
+    /// Every physical page and supplemental table page remains owned by the
+    /// caller. Failure after the first page-table mutation is terminal for the
+    /// application session and must trigger complete task teardown.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a non-handle-call session, empty/overflowing geometry,
+    /// executable or unreadable permissions, mismatched physical leaves,
+    /// metadata allocation failure, and page-table failure.
+    #[allow(clippy::too_many_lines)]
+    pub fn replace_private_access(
+        &mut self,
+        virtual_start: u64,
+        physical_ranges: &[PhysicalRange],
+        was_mapped: bool,
+        permissions: Option<MappingPermissions>,
+        supplemental_table_pages: &[u64],
+    ) -> Result<MmuStats, MmuError> {
+        if !matches!(self.pending, ApplicationPending::HandleCall(_))
+            || virtual_start == 0
+            || !virtual_start.is_multiple_of(BASE_PAGE_SIZE)
+            || physical_ranges.is_empty()
+            || permissions.is_some_and(|value| !value.read || value.execute)
+        {
+            return Err(MmuError::InvalidUserContext);
+        }
+        let page_count = physical_ranges
+            .iter()
+            .try_fold(0_u64, |total, range| {
+                if range.start() == 0 {
+                    return None;
+                }
+                total.checked_add(range.page_count())
+            })
+            .ok_or(MmuError::InvalidUserContext)?;
+        if page_count == 0 {
+            return Err(MmuError::InvalidUserContext);
+        }
+        let target = VirtualRange::from_pages(virtual_start, page_count)
+            .map_err(|_| MmuError::InvalidUserContext)?;
+        let updated_regions =
+            updated_user_regions(&self.address_space.regions, target, permissions)?;
+        let mut virtual_address = virtual_start;
+        for range in physical_ranges {
+            let mut physical = range.start();
+            for _ in 0..range.page_count() {
+                match (
+                    was_mapped,
+                    architecture_translate_page(self.address_space.root, virtual_address),
+                ) {
+                    (true, Ok(mapped)) if mapped == physical => {}
+                    (false, Err(MmuError::InvalidUserContext)) => {}
+                    _ => return Err(MmuError::InvalidUserContext),
+                }
+                virtual_address = virtual_address
+                    .checked_add(BASE_PAGE_SIZE)
+                    .ok_or(MmuError::AddressUnsupported)?;
+                physical = physical
+                    .checked_add(BASE_PAGE_SIZE)
+                    .ok_or(MmuError::AddressUnsupported)?;
+            }
+        }
+        if virtual_address != target.end() {
+            return Err(MmuError::InvalidUserContext);
+        }
+        let capabilities = architecture_mmu_capabilities()?;
+        let mut arena = TableArena::resume(
+            self.address_space.table_arena,
+            self.address_space.stats.table_pages,
+            supplemental_table_pages,
+        )?;
+        let mut virtual_address = virtual_start;
+        for range in physical_ranges {
+            let mut physical = range.start();
+            for _ in 0..range.page_count() {
+                match (was_mapped, permissions) {
+                    (false, Some(permissions)) => architecture_map_page(
+                        &mut arena,
+                        self.address_space.root,
+                        virtual_address,
+                        physical,
+                        permissions,
+                        MappingMemoryType::Normal,
+                        MappingPrivilege::User,
+                        capabilities,
+                    )?,
+                    (true, Some(permissions)) => {
+                        let retained = architecture_protect_page(
+                            self.address_space.root,
+                            virtual_address,
+                            permissions,
+                        )?;
+                        if retained != physical {
+                            return Err(MmuError::InvalidUserContext);
+                        }
+                    }
+                    (true, None) => {
+                        let removed =
+                            architecture_unmap_page(self.address_space.root, virtual_address)?;
+                        if removed != physical {
+                            return Err(MmuError::InvalidUserContext);
+                        }
+                    }
+                    (false, None) => return Err(MmuError::InvalidUserContext),
+                }
+                virtual_address = virtual_address
+                    .checked_add(BASE_PAGE_SIZE)
+                    .ok_or(MmuError::AddressUnsupported)?;
+                physical = physical
+                    .checked_add(BASE_PAGE_SIZE)
+                    .ok_or(MmuError::AddressUnsupported)?;
+            }
+        }
+        self.address_space.regions = updated_regions;
+        self.address_space.stats.mapped_pages = match (was_mapped, permissions.is_some()) {
+            (false, true) => self
+                .address_space
+                .stats
+                .mapped_pages
+                .checked_add(page_count)
+                .ok_or(MmuError::InvalidUserContext)?,
+            (true, false) => self
+                .address_space
+                .stats
+                .mapped_pages
+                .checked_sub(page_count)
+                .ok_or(MmuError::InvalidUserContext)?,
+            _ => self.address_space.stats.mapped_pages,
+        };
+        self.address_space.stats.table_pages = arena.used_pages;
+        Ok(self.address_space.stats)
+    }
+}
+
+fn updated_user_regions(
+    current: &[UserRegion],
+    target: VirtualRange,
+    replacement: Option<MappingPermissions>,
+) -> Result<Vec<UserRegion>, MmuError> {
+    let mut updated = Vec::new();
+    let maximum_regions = current
+        .len()
+        .checked_add(2)
+        .ok_or(MmuError::InvalidUserContext)?;
+    updated
+        .try_reserve(maximum_regions)
+        .map_err(|_| MmuError::InvalidUserContext)?;
+    for region in current {
+        if region.range.end() <= target.start() || target.end() <= region.range.start() {
+            updated.push(*region);
+            continue;
+        }
+        if region.range.start() < target.start() {
+            updated.push(UserRegion {
+                range: VirtualRange::from_pages(
+                    region.range.start(),
+                    (target.start() - region.range.start()) / BASE_PAGE_SIZE,
+                )
+                .map_err(|_| MmuError::InvalidUserContext)?,
+                permissions: region.permissions,
+            });
+        }
+        if target.end() < region.range.end() {
+            updated.push(UserRegion {
+                range: VirtualRange::from_pages(
+                    target.end(),
+                    (region.range.end() - target.end()) / BASE_PAGE_SIZE,
+                )
+                .map_err(|_| MmuError::InvalidUserContext)?,
+                permissions: region.permissions,
+            });
+        }
+    }
+    if let Some(permissions) = replacement {
+        updated.push(UserRegion {
+            range: target,
+            permissions,
+        });
+    }
+    updated.sort_unstable_by_key(|region| region.range.start());
+    let mut write = 0_usize;
+    for read in 0..updated.len() {
+        let region = updated[read];
+        if write != 0 {
+            let previous = updated[write - 1];
+            if previous.range.end() > region.range.start() {
+                return Err(MmuError::InvalidUserContext);
+            }
+            if previous.range.end() == region.range.start()
+                && previous.permissions == region.permissions
+            {
+                updated[write - 1] = UserRegion {
+                    range: VirtualRange::from_pages(
+                        previous.range.start(),
+                        previous
+                            .range
+                            .page_count()
+                            .checked_add(region.range.page_count())
+                            .ok_or(MmuError::InvalidUserContext)?,
+                    )
+                    .map_err(|_| MmuError::InvalidUserContext)?,
+                    permissions: previous.permissions,
+                };
+                continue;
+            }
+        }
+        updated[write] = region;
+        write = write.checked_add(1).ok_or(MmuError::InvalidUserContext)?;
+    }
+    updated.truncate(write);
+    Ok(updated)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -456,8 +672,7 @@ enum ApplicationPending {
 #[cfg(target_os = "uefi")]
 struct IsolatedRunState {
     kind: RunKind,
-    regions: [Option<UserRegion>; MAX_USER_REGIONS],
-    region_count: usize,
+    regions: Vec<UserRegion>,
     destination: *mut u8,
     destination_len: usize,
     application_context: Option<ArchitectureApplicationContext>,
@@ -714,7 +929,10 @@ fn push_image_region(
     let range = PhysicalRange::from_pages(absolute_start, page_count)
         .map_err(|_| MmuError::InvalidImage)?;
     layout.regions[layout.region_count] = Some(ImageRegion { range, permissions });
-    layout.region_count += 1;
+    layout.region_count = layout
+        .region_count
+        .checked_add(1)
+        .ok_or(MmuError::InvalidImage)?;
     Ok(())
 }
 
@@ -903,25 +1121,31 @@ pub fn build_user_address_space(
     plan: &MappingPlan,
     table_arena: PhysicalRange,
 ) -> Result<UserAddressSpace, MmuError> {
-    let mut regions = [None; MAX_USER_REGIONS];
-    let mut region_count = 0_usize;
+    let user_count = plan
+        .mappings()
+        .iter()
+        .filter(|mapping| mapping.privilege() == MappingPrivilege::User)
+        .count();
+    let mut regions = Vec::new();
+    regions
+        .try_reserve_exact(user_count)
+        .map_err(|_| MmuError::InvalidUserContext)?;
     let mut executable = false;
     let mut writable = false;
     for mapping in plan.mappings() {
         if mapping.privilege() != MappingPrivilege::User {
             continue;
         }
-        if mapping.memory_type() != MappingMemoryType::Normal || region_count == MAX_USER_REGIONS {
+        if mapping.memory_type() != MappingMemoryType::Normal {
             return Err(MmuError::InvalidUserContext);
         }
         let permissions = mapping.permissions();
         executable |= permissions.execute;
         writable |= permissions.write;
-        regions[region_count] = Some(UserRegion {
+        regions.push(UserRegion {
             range: mapping.virtual_range(),
             permissions,
         });
-        region_count += 1;
     }
     if !executable || !writable {
         return Err(MmuError::InvalidUserContext);
@@ -931,7 +1155,6 @@ pub fn build_user_address_space(
         root,
         table_arena,
         regions,
-        region_count,
         stats,
     })
 }
@@ -982,6 +1205,36 @@ pub fn required_page_table_pages(plan: &MappingPlan) -> Result<u64, MmuError> {
         }
     }
     Ok(pages)
+}
+
+/// Count the maximum new page-table pages needed for one contiguous range.
+///
+/// The count excludes the existing root and assumes none of the three lower
+/// level tables touched by the range already exists. Callers may retain unused
+/// supplemental pages for later mappings; this keeps admission atomic without
+/// walking or mutating live page tables before resources are secured.
+///
+/// # Errors
+///
+/// Rejects an empty or unrepresentable range.
+#[cfg(any(test, target_os = "uefi"))]
+pub fn maximum_additional_page_table_pages(range: VirtualRange) -> Result<u64, MmuError> {
+    let first_page = range.start() / BASE_PAGE_SIZE;
+    let last_page = range
+        .end()
+        .checked_sub(1)
+        .ok_or(MmuError::AddressUnsupported)?
+        / BASE_PAGE_SIZE;
+    [512_u64, 512 * 512, 512 * 512 * 512]
+        .into_iter()
+        .try_fold(0_u64, |total, coverage| {
+            let touched = last_page
+                .checked_div(coverage)?
+                .checked_sub(first_page.checked_div(coverage)?)?
+                .checked_add(1)?;
+            total.checked_add(touched)
+        })
+        .ok_or(MmuError::AddressUnsupported)
 }
 
 #[cfg(target_os = "uefi")]
@@ -1059,16 +1312,15 @@ pub fn run_isolated(
         root,
         table_arena: _,
         regions,
-        region_count,
         stats: _,
     } = address_space;
     if message_destination.is_empty()
         || message_destination.len() > 4 * 1024
         || KERNEL_ROOT.load(Ordering::Acquire) == 0
-        || !user_range_contains(&regions, region_count, entry, 1, false, true)
+        || !user_range_contains(&regions, entry, 1, false, true)
         || stack_top == 0
         || !stack_top.is_multiple_of(16)
-        || !user_range_contains(&regions, region_count, stack_top - 1, 1, true, false)
+        || !user_range_contains(&regions, stack_top - 1, 1, true, false)
     {
         return Err(MmuError::InvalidUserContext);
     }
@@ -1085,7 +1337,6 @@ pub fn run_isolated(
         *ISOLATED_RUN.0.get() = Some(IsolatedRunState {
             kind: RunKind::Stage6Probe,
             regions,
-            region_count,
             destination: message_destination.as_mut_ptr(),
             destination_len: message_destination.len(),
             application_context: None,
@@ -1126,7 +1377,6 @@ pub fn run_application(
         root,
         table_arena,
         regions,
-        region_count,
         stats,
     } = address_space;
     let user_stack = stack_top
@@ -1135,17 +1385,10 @@ pub fn run_application(
     if startup_bytes != APPLICATION_STARTUP_BYTES
         || timeslice_milliseconds == 0
         || KERNEL_ROOT.load(Ordering::Acquire) == 0
-        || !user_range_contains(&regions, region_count, entry, 1, false, true)
-        || !user_range_contains(
-            &regions,
-            region_count,
-            startup_address,
-            startup_bytes,
-            false,
-            false,
-        )
+        || !user_range_contains(&regions, entry, 1, false, true)
+        || !user_range_contains(&regions, startup_address, startup_bytes, false, false)
         || !stack_top.is_multiple_of(16)
-        || !user_range_contains(&regions, region_count, user_stack, 8, true, false)
+        || !user_range_contains(&regions, user_stack, 8, true, false)
     {
         return Err(MmuError::InvalidUserContext);
     }
@@ -1161,7 +1404,6 @@ pub fn run_application(
         *ISOLATED_RUN.0.get() = Some(IsolatedRunState {
             kind: RunKind::Application,
             regions,
-            region_count,
             destination: ptr::null_mut(),
             destination_len: 0,
             application_context: None,
@@ -1183,14 +1425,14 @@ pub fn run_application(
     let state = unsafe { (*ISOLATED_RUN.0.get()).take() };
     ISOLATED_ACTIVE.store(false, Ordering::Release);
     crate::mechanism::finish_application_execution();
-    let state = state.ok_or(MmuError::InvalidUserContext)?;
+    let mut state = state.ok_or(MmuError::InvalidUserContext)?;
+    let regions = core::mem::take(&mut state.regions);
     decode_application_outcome(
         raw,
         UserAddressSpace {
             root,
             table_arena,
             regions,
-            region_count,
             stats,
         },
         state,
@@ -1233,7 +1475,6 @@ pub fn resume_application(
             copy_user_to_physical(
                 address_space.root,
                 &address_space.regions,
-                address_space.region_count,
                 call.reply_address,
                 reply,
             )?;
@@ -1260,7 +1501,6 @@ pub fn resume_application(
         root,
         table_arena,
         regions,
-        region_count,
         stats,
     } = address_space;
     // SAFETY: The active transition grants unique state ownership until the
@@ -1269,7 +1509,6 @@ pub fn resume_application(
         *ISOLATED_RUN.0.get() = Some(IsolatedRunState {
             kind: RunKind::Application,
             regions,
-            region_count,
             destination: ptr::null_mut(),
             destination_len: 0,
             application_context: None,
@@ -1291,14 +1530,14 @@ pub fn resume_application(
     let state = unsafe { (*ISOLATED_RUN.0.get()).take() };
     ISOLATED_ACTIVE.store(false, Ordering::Release);
     crate::mechanism::finish_application_execution();
-    let state = state.ok_or(MmuError::InvalidUserContext)?;
+    let mut state = state.ok_or(MmuError::InvalidUserContext)?;
+    let regions = core::mem::take(&mut state.regions);
     decode_application_outcome(
         raw,
         UserAddressSpace {
             root,
             table_arena,
             regions,
-            region_count,
             stats,
         },
         state,
@@ -1386,8 +1625,7 @@ fn decode_fault(raw: u64) -> Result<IsolatedFault, MmuError> {
 
 #[cfg(target_os = "uefi")]
 fn user_range_contains(
-    regions: &[Option<UserRegion>; MAX_USER_REGIONS],
-    count: usize,
+    regions: &[UserRegion],
     start: u64,
     byte_count: usize,
     require_write: bool,
@@ -1400,7 +1638,7 @@ fn user_range_contains(
         return false;
     };
     byte_count != 0
-        && regions[..count].iter().flatten().any(|region| {
+        && regions.iter().any(|region| {
             start >= region.range.start()
                 && end <= region.range.end()
                 && (!require_write || region.permissions.write)
@@ -1410,13 +1648,12 @@ fn user_range_contains(
 
 #[cfg(target_os = "uefi")]
 fn user_range_valid(
-    regions: &[Option<UserRegion>; MAX_USER_REGIONS],
-    count: usize,
+    regions: &[UserRegion],
     start: u64,
     byte_count: usize,
     require_write: bool,
 ) -> bool {
-    byte_count == 0 || user_range_contains(regions, count, start, byte_count, require_write, false)
+    byte_count == 0 || user_range_contains(regions, start, byte_count, require_write, false)
 }
 
 #[cfg(target_os = "uefi")]
@@ -1442,8 +1679,7 @@ fn user_ranges_overlap(first: u64, first_bytes: usize, second: u64, second_bytes
 #[cfg(target_os = "uefi")]
 fn copy_user_from_physical(
     root: u64,
-    regions: &[Option<UserRegion>; MAX_USER_REGIONS],
-    count: usize,
+    regions: &[UserRegion],
     start: u64,
     destination: &mut [u8],
 ) -> Result<(), MmuError> {
@@ -1454,9 +1690,8 @@ fn copy_user_from_physical(
     let end = start
         .checked_add(byte_count)
         .ok_or(MmuError::InvalidUserContext)?;
-    if !regions[..count]
+    if !regions
         .iter()
-        .flatten()
         .any(|region| start >= region.range.start() && end <= region.range.end())
     {
         return Err(MmuError::InvalidUserContext);
@@ -1487,15 +1722,14 @@ fn copy_user_from_physical(
 #[cfg(target_os = "uefi")]
 fn copy_user_to_physical(
     root: u64,
-    regions: &[Option<UserRegion>; MAX_USER_REGIONS],
-    count: usize,
+    regions: &[UserRegion],
     start: u64,
     source: &[u8],
 ) -> Result<(), MmuError> {
     if source.is_empty() {
         return Ok(());
     }
-    if !user_range_contains(regions, count, start, source.len(), true, false) {
+    if !user_range_contains(regions, start, source.len(), true, false) {
         return Err(MmuError::InvalidUserContext);
     }
     let mut copied = 0_usize;
@@ -1534,14 +1768,7 @@ fn isolated_syscall(opcode: u64, address: u64, length: u64, status: u64) -> u64 
         return OUTCOME_FAULT_BIT | 4;
     };
     if length > state.destination_len
-        || !user_range_contains(
-            &state.regions,
-            state.region_count,
-            address,
-            length,
-            false,
-            false,
-        )
+        || !user_range_contains(&state.regions, address, length, false, false)
     {
         return OUTCOME_FAULT_BIT | 4;
     }
@@ -1598,19 +1825,9 @@ fn application_syscall(
             let Some(state) = (unsafe { &mut *ISOLATED_RUN.0.get() }).as_ref() else {
                 return encoded_fault(IsolatedFault::InvalidCall);
             };
-            if !user_range_valid(
-                &state.regions,
-                state.region_count,
-                arguments[1],
-                request_bytes,
-                false,
-            ) || !user_range_valid(
-                &state.regions,
-                state.region_count,
-                arguments[3],
-                reply_capacity,
-                true,
-            ) {
+            if !user_range_valid(&state.regions, arguments[1], request_bytes, false)
+                || !user_range_valid(&state.regions, arguments[3], reply_capacity, true)
+            {
                 return encoded_fault(IsolatedFault::InvalidCall);
             }
             let call = ApplicationCall {
@@ -2053,6 +2270,68 @@ fn architecture_translate_page(root: u64, virtual_address: u64) -> Result<u64, M
         table = value & X86_ADDRESS_MASK;
     }
     Err(MmuError::InvalidUserContext)
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn architecture_protect_page(
+    root: u64,
+    virtual_address: u64,
+    permissions: MappingPermissions,
+) -> Result<u64, MmuError> {
+    let leaf = x86_leaf_entry(root, virtual_address)?;
+    // SAFETY: The suspended task's retained page-table tree is exclusively
+    // mutable through this kernel path.
+    let current = unsafe { ptr::read_volatile(leaf) };
+    if current & X86_PRESENT == 0 {
+        return Err(MmuError::InvalidUserContext);
+    }
+    let physical = current & X86_ADDRESS_MASK;
+    let flags = x86_leaf_attributes(
+        permissions,
+        MappingMemoryType::Normal,
+        MappingPrivilege::User,
+    )?;
+    // SAFETY: The physical address is unchanged and the closed attributes are
+    // validated above. Resume reloads CR3 and flushes stale translations.
+    unsafe { ptr::write_volatile(leaf, physical | flags) };
+    Ok(physical)
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn architecture_unmap_page(root: u64, virtual_address: u64) -> Result<u64, MmuError> {
+    let leaf = x86_leaf_entry(root, virtual_address)?;
+    // SAFETY: The suspended task's leaf belongs exclusively to this root.
+    let current = unsafe { ptr::read_volatile(leaf) };
+    if current & X86_PRESENT == 0 {
+        return Err(MmuError::InvalidUserContext);
+    }
+    // SAFETY: Clearing the complete leaf removes access. Resume reloads CR3.
+    unsafe { ptr::write_volatile(leaf, 0) };
+    Ok(current & X86_ADDRESS_MASK)
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn x86_leaf_entry(root: u64, virtual_address: u64) -> Result<*mut u64, MmuError> {
+    if !x86_virtual_address_is_canonical(virtual_address) {
+        return Err(MmuError::AddressUnsupported);
+    }
+    let indexes = [
+        ((virtual_address >> 39) & 0x1ff) as usize,
+        ((virtual_address >> 30) & 0x1ff) as usize,
+        ((virtual_address >> 21) & 0x1ff) as usize,
+        ((virtual_address >> 12) & 0x1ff) as usize,
+    ];
+    let mut table = root;
+    for index in indexes.iter().take(3).copied() {
+        let entry = table_entry(table, index)?;
+        // SAFETY: Retained page-table pages stay identity mapped and owned.
+        let value = unsafe { ptr::read_volatile(entry) };
+        if value & X86_PRESENT == 0 || value & (1 << 7) != 0 {
+            return Err(MmuError::InvalidUserContext);
+        }
+        table = value & X86_ADDRESS_MASK;
+    }
+    table_entry(table, indexes[3])
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
@@ -3145,6 +3424,67 @@ fn architecture_translate_page(root: u64, virtual_address: u64) -> Result<u64, M
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn architecture_protect_page(
+    root: u64,
+    virtual_address: u64,
+    permissions: MappingPermissions,
+) -> Result<u64, MmuError> {
+    let leaf = aarch64_leaf_entry(root, virtual_address)?;
+    // SAFETY: The suspended task's retained page-table tree is exclusively
+    // mutable through this kernel path.
+    let current = unsafe { ptr::read_volatile(leaf) };
+    if current & AARCH64_TABLE_OR_PAGE != AARCH64_TABLE_OR_PAGE {
+        return Err(MmuError::InvalidUserContext);
+    }
+    let physical = current & AARCH64_ADDRESS_MASK;
+    let flags = aarch64_leaf_attributes(
+        permissions,
+        MappingMemoryType::Normal,
+        MappingPrivilege::User,
+    )?;
+    // SAFETY: The physical address is unchanged and attributes are closed.
+    unsafe { ptr::write_volatile(leaf, physical | flags) };
+    Ok(physical)
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn architecture_unmap_page(root: u64, virtual_address: u64) -> Result<u64, MmuError> {
+    let leaf = aarch64_leaf_entry(root, virtual_address)?;
+    // SAFETY: The suspended task's leaf belongs exclusively to this root.
+    let current = unsafe { ptr::read_volatile(leaf) };
+    if current & AARCH64_TABLE_OR_PAGE != AARCH64_TABLE_OR_PAGE {
+        return Err(MmuError::InvalidUserContext);
+    }
+    // SAFETY: Clearing the descriptor removes access; resume performs TLBI.
+    unsafe { ptr::write_volatile(leaf, 0) };
+    Ok(current & AARCH64_ADDRESS_MASK)
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn aarch64_leaf_entry(root: u64, virtual_address: u64) -> Result<*mut u64, MmuError> {
+    if virtual_address >= (1_u64 << 48) {
+        return Err(MmuError::AddressUnsupported);
+    }
+    let indexes = [
+        ((virtual_address >> 39) & 0x1ff) as usize,
+        ((virtual_address >> 30) & 0x1ff) as usize,
+        ((virtual_address >> 21) & 0x1ff) as usize,
+        ((virtual_address >> 12) & 0x1ff) as usize,
+    ];
+    let mut table = root;
+    for index in indexes.iter().take(3).copied() {
+        let entry = table_entry(table, index)?;
+        // SAFETY: Retained page-table pages stay identity mapped and owned.
+        let value = unsafe { ptr::read_volatile(entry) };
+        if value & AARCH64_TABLE_OR_PAGE != AARCH64_TABLE_OR_PAGE {
+            return Err(MmuError::InvalidUserContext);
+        }
+        table = value & AARCH64_ADDRESS_MASK;
+    }
+    table_entry(table, indexes[3])
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 fn table_entry(table: u64, index: usize) -> Result<*mut u64, MmuError> {
     let base = usize::try_from(table).map_err(|_| MmuError::AddressUnsupported)?;
     let offset = index
@@ -3911,16 +4251,15 @@ mod tests {
     extern crate std;
 
     use super::{
-        MAX_PE_SECTIONS, MmuError, SECTION_HEADER_BYTES, X86_CODE_SELECTOR,
-        aarch64_leaf_attributes, checked_image_slice_bounds, ensure_leaf_unmapped,
-        parse_image_layout, x86_interrupt_gate, x86_leaf_attributes,
+        BASE_PAGE_SIZE, MAX_PE_SECTIONS, MappingPermissions, MmuError, SECTION_HEADER_BYTES,
+        UserRegion, VirtualRange, X86_CODE_SELECTOR, aarch64_leaf_attributes,
+        checked_image_slice_bounds, ensure_leaf_unmapped, maximum_additional_page_table_pages,
+        parse_image_layout, updated_user_regions, x86_interrupt_gate, x86_leaf_attributes,
     };
     use std::vec;
     use std::vec::Vec;
-    use troe_memory::{
-        Mapping, MappingLifetime, MappingOwner, MappingPlan, PhysicalRange, VirtualRange,
-    };
-    use troe_memory::{MappingMemoryType, MappingPermissions, MappingPrivilege};
+    use troe_memory::{Mapping, MappingLifetime, MappingOwner, MappingPlan, PhysicalRange};
+    use troe_memory::{MappingMemoryType, MappingPrivilege};
 
     fn image_with_sections(sections: &[(u32, u32, u32)]) -> Vec<u8> {
         let mut image = vec![0_u8; 0x5000];
@@ -3969,6 +4308,19 @@ mod tests {
         plan.insert(mapping(0xffff_8000_0000_0000, 0x4000, 1))
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(super::required_page_table_pages(&plan), Ok(8));
+    }
+
+    #[test]
+    fn private_range_table_reservation_includes_each_first_lower_level_table() {
+        let one_page =
+            VirtualRange::from_pages(0x4000_0000_0000, 1).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(maximum_additional_page_table_pages(one_page), Ok(3));
+
+        let forty_eight_mib = VirtualRange::from_pages(0x4000_001f_f000, 12_288)
+            .unwrap_or_else(|_| std::process::abort());
+        // The deliberately unaligned start crosses 25 leaf-table regions while
+        // remaining within one table at each higher level.
+        assert_eq!(maximum_additional_page_table_pages(forty_eight_mib), Ok(27));
     }
 
     #[test]
@@ -4351,6 +4703,28 @@ mod tests {
             Err(MmuError::InvalidImage)
         );
         assert_eq!(checked_image_slice_bounds(0x20_0000, 0x5000), Ok(0x5000));
+    }
+
+    #[test]
+    fn private_region_updates_split_and_recoalesce_without_fixed_tables() {
+        let original = UserRegion {
+            range: VirtualRange::from_pages(0x20_0000, 4).unwrap_or_else(|_| unreachable!()),
+            permissions: MappingPermissions::READ_WRITE,
+        };
+        let middle = VirtualRange::from_pages(0x20_0000 + BASE_PAGE_SIZE, 2)
+            .unwrap_or_else(|_| unreachable!());
+        let split = updated_user_regions(&[original], middle, Some(MappingPermissions::READ_ONLY))
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(split.len(), 3);
+        assert_eq!(split[1].range, middle);
+        assert_eq!(split[1].permissions, MappingPermissions::READ_ONLY);
+
+        let merged = updated_user_regions(&split, middle, Some(MappingPermissions::READ_WRITE))
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(merged, vec![original]);
+        assert!(
+            updated_user_regions(&merged, middle, None).is_ok_and(|regions| regions.len() == 2)
+        );
     }
 
     #[test]

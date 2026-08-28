@@ -104,6 +104,7 @@ struct LuaConfiguration {
     requested_exit: i32,
     requested_exit_status: u32,
     requested_exit_close: i32,
+    seed: u32,
 }
 
 unsafe extern "C" {
@@ -336,7 +337,27 @@ fn run(command: &mut CommandContext) -> u32 {
         );
         return exit::FAILURE;
     };
-    let Ok(heap) = Heap::new(region) else {
+    let Ok(private_memory) = command.private_memory() else {
+        common::report(
+            &mut command.stderr(),
+            "lua",
+            b"private-memory capability is unavailable",
+        );
+        return exit::DENIED;
+    };
+    let Ok(mut random) = command.random() else {
+        common::report(
+            &mut command.stderr(),
+            "lua",
+            b"random capability is unavailable",
+        );
+        return exit::DENIED;
+    };
+    let Ok(seed) = kex_runtime::random::next_u32(&mut random) else {
+        common::report(&mut command.stderr(), "lua", b"random service failed");
+        return exit::FAILURE;
+    };
+    let Ok(heap) = Heap::new_with_private_memory(region, private_memory) else {
         common::report(
             &mut command.stderr(),
             "lua",
@@ -510,6 +531,7 @@ fn run(command: &mut CommandContext) -> u32 {
         requested_exit: 0,
         requested_exit_status: exit::SUCCESS,
         requested_exit_close: 0,
+        seed,
     };
     // SAFETY: The C runtime is linked into this image. All pointed-to values
     // remain live and uniquely borrowed for the synchronous call, and every

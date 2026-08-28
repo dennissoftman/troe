@@ -64,7 +64,7 @@ class KexToolTests(unittest.TestCase):
                         64
                         if command == "lua"
                         else 12
-                        if command in {"cp", "spawn", "tar"}
+                        if command in {"cp", "mv", "rm", "spawn", "tar"}
                         else 8
                         if command in {"arp", "ps", "top"}
                         else 20
@@ -143,6 +143,8 @@ class KexToolTests(unittest.TestCase):
                             (17, 1, 0),
                             (20, 1, 0),
                             (21, 1, 0),
+                            (22, 1, 0),
+                            (23, 1, 0),
                         ]
                     elif command in {"ln", "rmdir"}:
                         expected = [(7, 1, 2)]
@@ -151,7 +153,7 @@ class KexToolTests(unittest.TestCase):
                     elif command == "timesync":
                         expected = [(5, 1, 0), (8, 1, 0), (18, 1, 0)]
                     elif command == "mem":
-                        expected = [(9, 1, 0)]
+                        expected = [(9, 1, 0), (22, 1, 0), (23, 1, 0)]
                     elif command == "ps":
                         expected = [(19, 1, 1)]
                     elif command == "top":

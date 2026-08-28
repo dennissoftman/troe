@@ -25,21 +25,22 @@ mod firmware {
 
     use troe_abi::{
         clock_control, command, datagram, diagnostics, filesystem, filesystem_mutation,
-        heap_growth, icmp_echo, network_configuration, network_observation, pipe, process_launch,
-        process_observation, server, shell_script, stream, tcp_connect, timer, volume_control,
-        wall_clock,
+        heap_growth, icmp_echo, network_configuration, network_observation, pipe, private_memory,
+        process_launch, process_observation, random, server, shell_script, stream, tcp_connect,
+        timer, volume_control, wall_clock,
+    };
+    use troe_application::{
+        ABI_MINOR, ApplicationLimits, InitialHandle, KEX_V1_IMAGE_ALIGNMENT, KEX_V1_MIN_IMAGE_BASE,
+        KEX_V1_USER_END, LoadPlacement, LoadPlan, LoaderResource, LoaderTransaction, PAGE_BYTES,
+        SegmentPermissions, StartupInfo, Target, parse_kex_at, parse_kex_package, stage_artifact,
     };
     #[cfg(feature = "acceptance-probes")]
-    use troe_application::ParseError;
-    use troe_application::{
-        ABI_MINOR, ApplicationLimits, InitialHandle, LoadPlan, LoaderResource, LoaderTransaction,
-        MAX_LOAD_RECORDS, PAGE_BYTES, SegmentPermissions, StartupInfo, Target, parse_kex,
-        parse_kex_package, stage_artifact,
-    };
+    use troe_application::{ParseError, parse_kex};
     use troe_block::{BlockAccess, BlockRegion};
     use troe_block::{BlockDevice, BlockLimits};
     use troe_config::{
-        ActivationPointer, ActivationRecovery, SystemConfig, parse_config, recover_activation,
+        ActivationPointer, ActivationRecovery, MemoryPolicy, SystemConfig,
+        normalize_memory_policy_toml, parse_config, recover_activation,
     };
     use troe_content::{ContentPack, MAX_PACK_BYTES, ObjectKind};
     use troe_core::{
@@ -76,6 +77,7 @@ mod firmware {
         ChildLifecycle, ChildTable, MAX_CHILDREN_PER_OWNER, MAX_PIPES_PER_OWNER, OwnerId,
         PipeDirection, PipeEndpoint, PipeTable, ProcessError as ChildProcessError,
     };
+    use troe_random::{Generator as RandomGenerator, SEED_BYTES as RANDOM_SEED_BYTES};
     use troe_shell::{
         CompletionConfig, ExecutionPlacement, ExternalCommand, JobControl, MachineAction,
         ServiceControl, SharedNamespace, Shell, format_memory_report, parse_line,
@@ -106,6 +108,7 @@ mod firmware {
     use uefi::mem::memory_map::{MemoryMap, MemoryMapOwned};
     use uefi::prelude::*;
     use uefi::proto::console::gop::{GraphicsOutput, PixelFormat as GopPixelFormat};
+    use uefi::proto::rng::{Rng, RngAlgorithmType};
 
     #[cfg(target_arch = "x86_64")]
     const ROOTFS: &[u8] = include_bytes!("../../assets/root-x86_64.kefs");
@@ -122,9 +125,9 @@ mod firmware {
     const SERVER_TASK_STACK_BYTES: u64 = 128 * 1024;
     const SHELL_TASK_STACK_BYTES: u64 = 128 * 1024;
     const TASK_GUARD_BYTES: u64 = BASE_PAGE_SIZE;
-    const TASK_STACK_PAGES: u16 = 16;
-    const SERVER_TASK_STACK_PAGES: u16 = 32;
-    const SHELL_TASK_STACK_PAGES: u16 = 32;
+    const TASK_STACK_PAGES: u64 = 16;
+    const SERVER_TASK_STACK_PAGES: u64 = 32;
+    const SHELL_TASK_STACK_PAGES: u64 = 32;
     const TASK_STACK_COUNT: usize = 3;
     const SHELL_SCHEDULER_SLOT: u32 = 65_536;
     const RESIDENT_PROCESS_FIRST_SLOT: u32 = 3;
@@ -141,7 +144,6 @@ mod firmware {
     const ISOLATED_PRIVATE_PAGES: u64 =
         ISOLATED_CODE_PAGES + ISOLATED_DATA_PAGES + ISOLATED_STACK_PAGES;
     const ISOLATED_RESOURCE_PAGES: u64 = ISOLATED_TABLE_PAGES + ISOLATED_PRIVATE_PAGES;
-    const APPLICATION_TABLE_PAGES: u64 = 512;
     const STAGE6_USER_REGION_LIMIT: usize = 8;
     const STAGE6_USER_REGIONS: usize = 3;
     const APPLICATION_FIXED_USER_REGIONS: usize = 3;
@@ -176,18 +178,12 @@ mod firmware {
     const BOOT_MEMORY_LABEL: &str = "Initializing memory and protection";
     const BOOT_DEVICES_LABEL: &str = "Starting devices and input";
     const BOOT_RUNTIME_LABEL: &str = "Starting task and application runtime";
-    const _: () = assert!(TASK_STACK_BYTES == TASK_STACK_PAGES as u64 * BASE_PAGE_SIZE);
-    const _: () =
-        assert!(SERVER_TASK_STACK_BYTES == SERVER_TASK_STACK_PAGES as u64 * BASE_PAGE_SIZE);
-    const _: () = assert!(SHELL_TASK_STACK_BYTES == SHELL_TASK_STACK_PAGES as u64 * BASE_PAGE_SIZE);
+    const _: () = assert!(TASK_STACK_BYTES == TASK_STACK_PAGES * BASE_PAGE_SIZE);
+    const _: () = assert!(SERVER_TASK_STACK_BYTES == SERVER_TASK_STACK_PAGES * BASE_PAGE_SIZE);
+    const _: () = assert!(SHELL_TASK_STACK_BYTES == SHELL_TASK_STACK_PAGES * BASE_PAGE_SIZE);
     const _: () = assert!(TASK_GUARD_BYTES == BASE_PAGE_SIZE);
     const _: () = assert!(TASK_STACK_COUNT == 3);
     const _: () = assert!(STAGE6_USER_REGIONS <= STAGE6_USER_REGION_LIMIT);
-    const _: () = assert!(STAGE6_USER_REGION_LIMIT <= troe_machine::UserAddressSpace::MAX_REGIONS);
-    const _: () = assert!(
-        MAX_LOAD_RECORDS + APPLICATION_FIXED_USER_REGIONS
-            == troe_machine::UserAddressSpace::MAX_REGIONS
-    );
 
     struct FirmwareConsole;
 
@@ -308,6 +304,10 @@ mod firmware {
         native_statefs: RefCell<Option<Box<dyn ReadOnlyFileSystem>>>,
         native_generation: NativeGenerationState,
         selected_config: Option<SystemConfig>,
+        memory_policy: MemoryPolicy,
+        application_committed_pages: u64,
+        private_metadata_bytes: u64,
+        random: SharedRandom,
         firmware_wall_seconds: Option<u64>,
         boot_mount_manifest: BootMountManifest,
         runtime_mounts: SharedRuntimeMounts,
@@ -416,11 +416,20 @@ mod firmware {
     type SharedTaskIdentity = Rc<Cell<Option<TaskId>>>;
     type SharedChildTable = Rc<RefCell<ChildTable>>;
     type SharedPipeTable = Rc<RefCell<PipeTable>>;
+    type SharedRandom = Rc<RefCell<RandomGenerator>>;
     type SharedProcessOwner = Rc<Cell<Option<OwnerId>>>;
 
     struct ApplicationEmptyInputService;
 
     struct ApplicationDiscardOutputService;
+
+    /// Registration marker. Calls are intercepted while the application is
+    /// suspended so the dispatcher never receives memory-management state.
+    struct ApplicationPrivateMemoryService;
+
+    struct ApplicationRandomService {
+        random: SharedRandom,
+    }
 
     struct ApplicationLogService {
         log: SharedResidentLog,
@@ -502,7 +511,7 @@ mod firmware {
         owner: HandleOwner,
         handles: Vec<CommandApplicationHandle>,
         handle_count: u16,
-        stack_pages: u16,
+        stack_pages: u64,
         heap_start: u64,
         maximum_heap_pages: u64,
         private_pages: u64,
@@ -575,6 +584,8 @@ mod firmware {
         volume_control: bool,
         wall_clock: bool,
         clock_control: bool,
+        private_memory: bool,
+        random: bool,
     }
 
     impl BackgroundRequirements {
@@ -595,6 +606,8 @@ mod firmware {
                 && (!required.tcp_connect || self.tcp_connect)
                 && (!required.volume_control || self.volume_control)
                 && (!required.wall_clock || self.wall_clock)
+                && (!required.private_memory || self.private_memory)
+                && (!required.random || self.random)
         }
     }
 
@@ -618,6 +631,8 @@ mod firmware {
             volume_control: false,
             wall_clock: false,
             clock_control: false,
+            private_memory: false,
+            random: false,
         };
         let mut shell_script = false;
         for requirement in manifest.iter() {
@@ -695,6 +710,15 @@ mod firmware {
                     required.clock_control = true;
                     requirement.major == clock_control::MAJOR
                         && requirement.minor == clock_control::MINOR
+                }
+                troe_abi::interface::PRIVATE_MEMORY => {
+                    required.private_memory = true;
+                    requirement.major == private_memory::MAJOR
+                        && requirement.minor == private_memory::MINOR
+                }
+                troe_abi::interface::RANDOM => {
+                    required.random = true;
+                    requirement.major == random::MAJOR && requirement.minor == random::MINOR
                 }
                 _ => false,
             };
@@ -1260,6 +1284,7 @@ mod firmware {
         framebuffer: Option<FramebufferDescriptor>,
         firmware_wall_seconds: Option<u64>,
         boot_mount_manifest: Option<BootMountManifest>,
+        entropy_seed: [u8; RANDOM_SEED_BYTES],
     }
 
     struct IsolatedAllocation {
@@ -1278,6 +1303,73 @@ mod firmware {
         heap: Option<PhysicalRange>,
         growth_ranges: Vec<PhysicalRange>,
         growth_table_frames: Vec<u64>,
+        private_memory: ApplicationPrivateMemory,
+    }
+
+    struct ApplicationPrivateMemory {
+        mappings: Vec<ApplicationPrivateMapping>,
+        arena_end: u64,
+        maximum_committed_pages: Option<u64>,
+        maximum_reserved_pages: Option<u64>,
+        maximum_mappings: u64,
+        maximum_metadata_bytes: u64,
+        operation_quantum_pages: u64,
+        reserved_pages: u64,
+        committed_pages: u64,
+        metadata_bytes: u64,
+        high_water_reserved_pages: u64,
+        high_water_committed_pages: u64,
+        high_water_mappings: u64,
+        high_water_metadata_bytes: u64,
+    }
+
+    struct ApplicationPrivateMapping {
+        range: VirtualRange,
+        protection: private_memory::Protection,
+        backing: Vec<PhysicalRange>,
+    }
+
+    impl ApplicationPrivateMemory {
+        fn new(policy: MemoryPolicy, arena_end: u64) -> Self {
+            Self {
+                mappings: Vec::new(),
+                arena_end,
+                maximum_committed_pages: policy.default_committed_pages().maximum(),
+                maximum_reserved_pages: policy.default_reserved_pages().maximum(),
+                maximum_mappings: policy.default_maximum_mappings(),
+                maximum_metadata_bytes: policy.default_maximum_metadata_bytes(),
+                operation_quantum_pages: policy.operation_quantum_pages(),
+                reserved_pages: 0,
+                committed_pages: 0,
+                metadata_bytes: 0,
+                high_water_reserved_pages: 0,
+                high_water_committed_pages: 0,
+                high_water_mappings: 0,
+                high_water_metadata_bytes: 0,
+            }
+        }
+
+        fn statistics(&self) -> private_memory::Statistics {
+            private_memory::Statistics {
+                flags: (u64::from(self.maximum_committed_pages.is_some())
+                    * private_memory::COMMITTED_LIMITED)
+                    | (u64::from(self.maximum_reserved_pages.is_some())
+                        * private_memory::RESERVED_LIMITED),
+                maximum_committed_pages: self.maximum_committed_pages.unwrap_or(0),
+                maximum_reserved_pages: self.maximum_reserved_pages.unwrap_or(0),
+                maximum_mappings: self.maximum_mappings,
+                maximum_metadata_bytes: self.maximum_metadata_bytes,
+                operation_quantum_pages: self.operation_quantum_pages,
+                reserved_pages: self.reserved_pages,
+                committed_pages: self.committed_pages,
+                mappings: u64::try_from(self.mappings.len()).unwrap_or(u64::MAX),
+                metadata_bytes: self.metadata_bytes,
+                high_water_reserved_pages: self.high_water_reserved_pages,
+                high_water_committed_pages: self.high_water_committed_pages,
+                high_water_mappings: self.high_water_mappings,
+                high_water_metadata_bytes: self.high_water_metadata_bytes,
+            }
+        }
     }
 
     struct ApplicationPrivateAllocation {
@@ -1294,6 +1386,17 @@ mod firmware {
             mapped_bytes: u64,
         },
         Exhausted,
+    }
+
+    enum PrivateMemoryError {
+        Reply(ReplyStatus),
+        Terminal,
+    }
+
+    struct PrivateMemoryReply {
+        status: ReplyStatus,
+        payload: Vec<u8>,
+        resources_changed: bool,
     }
 
     #[derive(Clone, Copy, Eq, PartialEq)]
@@ -1432,13 +1535,31 @@ mod firmware {
             return Err(());
         }
         let firmware_wall_seconds = firmware_unix_seconds();
+        let entropy_seed = capture_entropy_seed()?;
         Ok(PreparedHandoff {
             image_layout,
             boot_memory,
             framebuffer,
             firmware_wall_seconds,
             boot_mount_manifest: Some(boot_mount_manifest),
+            entropy_seed,
         })
+    }
+
+    fn capture_entropy_seed() -> Result<[u8; RANDOM_SEED_BYTES], ()> {
+        let handle = boot::get_handle_for_protocol::<Rng>().map_err(|_| ())?;
+        let mut rng = boot::open_protocol_exclusive::<Rng>(handle).map_err(|_| ())?;
+        let mut seed = [0_u8; RANDOM_SEED_BYTES];
+        if rng
+            .get_rng(Some(RngAlgorithmType::ALGORITHM_RAW), &mut seed)
+            .is_err()
+        {
+            rng.get_rng(None, &mut seed).map_err(|_| ())?;
+        }
+        if seed.iter().all(|byte| *byte == 0) {
+            return Err(());
+        }
+        Ok(seed)
     }
 
     fn load_boot_mount_manifest() -> Result<BootMountManifest, ()> {
@@ -1518,6 +1639,15 @@ mod firmware {
         if !write_machine_boot_status(BOOT_DEVICES_LABEL, true) {
             return Err(());
         }
+        let memory_policy = native
+            .config
+            .as_ref()
+            .map_or_else(MemoryPolicy::standard, SystemConfig::memory);
+        let entropy_seed =
+            core::mem::replace(&mut prepared.entropy_seed, [0_u8; RANDOM_SEED_BYTES]);
+        let random = Rc::new(RefCell::new(
+            RandomGenerator::new(entropy_seed).map_err(|_| ())?,
+        ));
         Ok(OwnedAccounting {
             map,
             frames,
@@ -1532,6 +1662,10 @@ mod firmware {
             native_statefs: RefCell::new(native.statefs),
             native_generation: native.generation,
             selected_config: native.config,
+            memory_policy,
+            application_committed_pages: 0,
+            private_metadata_bytes: 0,
+            random,
             firmware_wall_seconds: prepared.firmware_wall_seconds,
             boot_mount_manifest,
             runtime_mounts: Rc::new(RefCell::new(RuntimeMountRegistry::empty())),
@@ -2232,7 +2366,7 @@ mod firmware {
             .dispatch_next(capabilities)
             .unwrap_or_else(|_| fatal(b"fatal: shell task dispatch failed\n"));
         if dispatched != Some(shell_id)
-            || scheduler.stats().owned_stack_pages != u32::from(SHELL_TASK_STACK_PAGES)
+            || scheduler.stats().owned_stack_pages != SHELL_TASK_STACK_PAGES
         {
             fatal(b"fatal: shell task accounting failed\n");
         }
@@ -2257,9 +2391,9 @@ mod firmware {
     ) -> Result<(), ()> {
         for (slot, layout) in accounting.task_stacks.iter().copied().enumerate() {
             let expected_pages = match slot {
-                0 => u64::from(TASK_STACK_PAGES),
-                1 => u64::from(SERVER_TASK_STACK_PAGES),
-                2 => u64::from(SHELL_TASK_STACK_PAGES),
+                0 => TASK_STACK_PAGES,
+                1 => SERVER_TASK_STACK_PAGES,
+                2 => SHELL_TASK_STACK_PAGES,
                 _ => return Err(()),
             };
             if layout.lower_guard.end() != layout.stack.start()
@@ -2672,7 +2806,7 @@ mod firmware {
     ) -> Result<u64, ()> {
         let table_pages = ISOLATED_TABLE_PAGES;
         let private_pages = ISOLATED_PRIVATE_PAGES;
-        let stack_pages = u16::try_from(ISOLATED_STACK_PAGES).map_err(|_| ())?;
+        let stack_pages = ISOLATED_STACK_PAGES;
         let isolation = IsolationResource::new(address_space_slot, table_pages, private_pages, 1)
             .map_err(|_| ())?;
         let stack_resource = StackResource::new(address_space_slot, stack_pages).map_err(|_| ())?;
@@ -2996,7 +3130,7 @@ mod firmware {
         transaction
             .acquire(LoaderResource::Staging)
             .map_err(|_| ())?;
-        let Ok(plan) = parse_kex(&staging, native_application_target(), ABI_MINOR) else {
+        let Ok(plan) = parse_native_application(accounting, &staging) else {
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
@@ -3011,76 +3145,65 @@ mod firmware {
             .checked_add(fixed_user_regions)
             .ok_or(())?;
         let private_pages = plan.charges().private_pages();
-        let stack_pages = u16::try_from(plan.stack_pages()).map_err(|_| ())?;
+        let stack_pages = plan.stack_pages();
 
-        let Ok((allocation, mapping_plan)) = allocate_application(
-            &mut accounting.frames,
-            &accounting.kernel_plan,
-            accounting.kernel_runtime,
-            &plan,
-        ) else {
+        let Ok((allocation, mapping_plan)) = allocate_application(accounting, &plan) else {
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
         if transaction.acquire(LoaderResource::Frames).is_err() {
-            reclaim_application(&mut accounting.frames, allocation)?;
+            reclaim_application(accounting, allocation)?;
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         }
         if prepare_application_memory(&allocation, &plan).is_err() {
-            reclaim_application(&mut accounting.frames, allocation)?;
+            reclaim_application(accounting, allocation)?;
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         }
         let Ok(address_space) =
             troe_machine::build_user_address_space(&mapping_plan, allocation.tables)
         else {
-            reclaim_application(&mut accounting.frames, allocation)?;
+            reclaim_application(accounting, allocation)?;
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
         if transaction.acquire(LoaderResource::Tables).is_err() {
-            reclaim_application(&mut accounting.frames, allocation)?;
+            reclaim_application(accounting, allocation)?;
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         }
         let table_pages = address_space.stats().table_pages;
         if table_pages == 0
             || table_pages != allocation.tables.page_count()
-            || table_pages > APPLICATION_TABLE_PAGES
             || address_space.user_region_count() != application_user_regions
         {
-            reclaim_application(&mut accounting.frames, allocation)?;
+            reclaim_application(accounting, allocation)?;
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         }
         let retained_table_pages = allocation.tables.page_count();
         let Ok(isolation) = IsolationResource::new(0, retained_table_pages, private_pages, 1)
         else {
-            reclaim_application(&mut accounting.frames, allocation)?;
+            reclaim_application(accounting, allocation)?;
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
         let Ok(stack_resource) = StackResource::new(0, stack_pages) else {
-            reclaim_application(&mut accounting.frames, allocation)?;
+            reclaim_application(accounting, allocation)?;
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
         let Ok(task_id) =
             scheduler.spawn_isolated(Capabilities::SERVICE, stack_resource, isolation)
         else {
-            reclaim_application(&mut accounting.frames, allocation)?;
+            reclaim_application(accounting, allocation)?;
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
         if transaction.acquire(LoaderResource::Task).is_err() {
             rollback_application_task(
-                scheduler,
-                task_id,
-                dispatcher,
-                None,
-                &mut accounting.frames,
-                allocation,
+                scheduler, task_id, dispatcher, None, accounting, allocation,
             )?;
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
@@ -3119,12 +3242,7 @@ mod firmware {
         })();
         let Ok((owner, handle)) = setup else {
             rollback_application_task(
-                scheduler,
-                task_id,
-                dispatcher,
-                live_owner,
-                &mut accounting.frames,
-                allocation,
+                scheduler, task_id, dispatcher, live_owner, accounting, allocation,
             )?;
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
@@ -3134,12 +3252,7 @@ mod firmware {
         drop(mapping_plan);
         if transaction.commit().is_err() {
             rollback_application_task(
-                scheduler,
-                task_id,
-                dispatcher,
-                live_owner,
-                &mut accounting.frames,
-                allocation,
+                scheduler, task_id, dispatcher, live_owner, accounting, allocation,
             )?;
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
@@ -3299,30 +3412,20 @@ mod firmware {
         })();
         if committed.is_err() {
             rollback_application_task(
-                scheduler,
-                task_id,
-                dispatcher,
-                live_owner,
-                &mut accounting.frames,
-                allocation,
+                scheduler, task_id, dispatcher, live_owner, accounting, allocation,
             )?;
             return Err(());
         }
         let Ok(reaped) = scheduler.reap(task_id) else {
             rollback_application_task(
-                scheduler,
-                task_id,
-                dispatcher,
-                live_owner,
-                &mut accounting.frames,
-                allocation,
+                scheduler, task_id, dispatcher, live_owner, accounting, allocation,
             )?;
             return Err(());
         };
         let valid_reap = reaped.isolation == Some(isolation)
             && reaped.stack.mapped_pages() == stack_pages
             && reaped.fault == probe.expected_fault();
-        reclaim_application(&mut accounting.frames, allocation)?;
+        reclaim_application(accounting, allocation)?;
         if !valid_reap {
             return Err(());
         }
@@ -4500,7 +4603,7 @@ mod firmware {
         transaction
             .acquire(LoaderResource::Staging)
             .map_err(|_| ())?;
-        let Ok(plan) = parse_kex(source, native_application_target(), ABI_MINOR) else {
+        let Ok(plan) = parse_native_application(accounting, source) else {
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
@@ -4522,46 +4625,40 @@ mod firmware {
             .ok_or(())?
             / BASE_PAGE_SIZE;
         let private_pages = plan.charges().private_pages();
-        let stack_pages = u16::try_from(plan.stack_pages()).map_err(|_| ())?;
+        let stack_pages = plan.stack_pages();
 
-        let Ok((allocation, mapping_plan)) = allocate_application(
-            &mut accounting.frames,
-            &accounting.kernel_plan,
-            accounting.kernel_runtime,
-            &plan,
-        ) else {
+        let Ok((allocation, mapping_plan)) = allocate_application(accounting, &plan) else {
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
         if transaction.acquire(LoaderResource::Frames).is_err() {
-            reclaim_command_application(&mut accounting.frames, allocation);
+            reclaim_command_application(accounting, allocation);
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         }
         if prepare_application_memory(&allocation, &plan).is_err() {
-            reclaim_command_application(&mut accounting.frames, allocation);
+            reclaim_command_application(accounting, allocation);
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         }
         let Ok(address_space) =
             troe_machine::build_user_address_space(&mapping_plan, allocation.tables)
         else {
-            reclaim_command_application(&mut accounting.frames, allocation);
+            reclaim_command_application(accounting, allocation);
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
         if transaction.acquire(LoaderResource::Tables).is_err() {
-            reclaim_command_application(&mut accounting.frames, allocation);
+            reclaim_command_application(accounting, allocation);
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         }
         let table_pages = address_space.stats().table_pages;
         if table_pages == 0
             || table_pages != allocation.tables.page_count()
-            || table_pages > APPLICATION_TABLE_PAGES
             || address_space.user_region_count() != application_user_regions
         {
-            reclaim_command_application(&mut accounting.frames, allocation);
+            reclaim_command_application(accounting, allocation);
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         }
@@ -4573,19 +4670,19 @@ mod firmware {
             private_pages,
             handle_count,
         ) else {
-            reclaim_command_application(&mut accounting.frames, allocation);
+            reclaim_command_application(accounting, allocation);
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
         let Ok(stack_resource) = StackResource::new(resource_slot, stack_pages) else {
-            reclaim_command_application(&mut accounting.frames, allocation);
+            reclaim_command_application(accounting, allocation);
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
         let Ok(task_id) =
             scheduler.spawn_isolated(Capabilities::SERVICE, stack_resource, isolation)
         else {
-            reclaim_command_application(&mut accounting.frames, allocation);
+            reclaim_command_application(accounting, allocation);
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
@@ -4595,7 +4692,7 @@ mod firmware {
                 task_id,
                 &mut dispatcher,
                 None,
-                &mut accounting.frames,
+                accounting,
                 allocation,
             );
             clear_provisional_loader_ownership(&mut transaction);
@@ -4654,7 +4751,7 @@ mod firmware {
                 task_id,
                 &mut dispatcher,
                 live_owner,
-                &mut accounting.frames,
+                accounting,
                 allocation,
             );
             clear_provisional_loader_ownership(&mut transaction);
@@ -4681,7 +4778,7 @@ mod firmware {
                 task_id,
                 &mut dispatcher,
                 live_owner,
-                &mut accounting.frames,
+                accounting,
                 allocation,
             );
             clear_provisional_loader_ownership(&mut transaction);
@@ -4696,7 +4793,7 @@ mod firmware {
                 task_id,
                 &mut dispatcher,
                 live_owner,
-                &mut accounting.frames,
+                accounting,
                 allocation,
             );
             clear_provisional_loader_ownership(&mut transaction);
@@ -4751,7 +4848,7 @@ mod firmware {
         transaction
             .acquire(LoaderResource::Staging)
             .map_err(|_| ())?;
-        let Ok(plan) = parse_kex(source, native_application_target(), ABI_MINOR) else {
+        let Ok(plan) = parse_native_application(accounting, source) else {
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
@@ -4773,46 +4870,40 @@ mod firmware {
             .ok_or(())?
             / BASE_PAGE_SIZE;
         let private_pages = plan.charges().private_pages();
-        let stack_pages = u16::try_from(plan.stack_pages()).map_err(|_| ())?;
+        let stack_pages = plan.stack_pages();
 
-        let Ok((mut allocation, mapping_plan)) = allocate_application(
-            &mut accounting.frames,
-            &accounting.kernel_plan,
-            accounting.kernel_runtime,
-            &plan,
-        ) else {
+        let Ok((mut allocation, mapping_plan)) = allocate_application(accounting, &plan) else {
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
         if transaction.acquire(LoaderResource::Frames).is_err() {
-            reclaim_command_application(&mut accounting.frames, allocation);
+            reclaim_command_application(accounting, allocation);
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         }
         if prepare_application_memory(&allocation, &plan).is_err() {
-            reclaim_command_application(&mut accounting.frames, allocation);
+            reclaim_command_application(accounting, allocation);
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         }
         let Ok(address_space) =
             troe_machine::build_user_address_space(&mapping_plan, allocation.tables)
         else {
-            reclaim_command_application(&mut accounting.frames, allocation);
+            reclaim_command_application(accounting, allocation);
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
         if transaction.acquire(LoaderResource::Tables).is_err() {
-            reclaim_command_application(&mut accounting.frames, allocation);
+            reclaim_command_application(accounting, allocation);
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         }
         let table_pages = address_space.stats().table_pages;
         if table_pages == 0
             || table_pages != allocation.tables.page_count()
-            || table_pages > APPLICATION_TABLE_PAGES
             || address_space.user_region_count() != application_user_regions
         {
-            reclaim_command_application(&mut accounting.frames, allocation);
+            reclaim_command_application(accounting, allocation);
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         }
@@ -4824,30 +4915,25 @@ mod firmware {
             private_pages,
             handle_count,
         ) else {
-            reclaim_command_application(&mut accounting.frames, allocation);
+            reclaim_command_application(accounting, allocation);
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
         let Ok(stack_resource) = StackResource::new(resource_slot, stack_pages) else {
-            reclaim_command_application(&mut accounting.frames, allocation);
+            reclaim_command_application(accounting, allocation);
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
         let Ok(task_id) =
             scheduler.spawn_isolated(Capabilities::SERVICE, stack_resource, isolation)
         else {
-            reclaim_command_application(&mut accounting.frames, allocation);
+            reclaim_command_application(accounting, allocation);
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
         if transaction.acquire(LoaderResource::Task).is_err() {
             rollback_command_application_task(
-                scheduler,
-                task_id,
-                dispatcher,
-                None,
-                &mut accounting.frames,
-                allocation,
+                scheduler, task_id, dispatcher, None, accounting, allocation,
             );
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
@@ -4900,12 +4986,7 @@ mod firmware {
         })();
         let Ok((owner, command_handles)) = setup else {
             rollback_command_application_task(
-                scheduler,
-                task_id,
-                dispatcher,
-                live_owner,
-                &mut accounting.frames,
-                allocation,
+                scheduler, task_id, dispatcher, live_owner, accounting, allocation,
             );
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
@@ -4914,12 +4995,7 @@ mod firmware {
         drop(mapping_plan);
         if transaction.commit().is_err() {
             rollback_command_application_task(
-                scheduler,
-                task_id,
-                dispatcher,
-                live_owner,
-                &mut accounting.frames,
-                allocation,
+                scheduler, task_id, dispatcher, live_owner, accounting, allocation,
             );
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
@@ -4930,12 +5006,7 @@ mod firmware {
             .transpose();
         let Ok(mut deferred_state) = deferred_state else {
             rollback_command_application_task(
-                scheduler,
-                task_id,
-                dispatcher,
-                live_owner,
-                &mut accounting.frames,
-                allocation,
+                scheduler, task_id, dispatcher, live_owner, accounting, allocation,
             );
             return Err(());
         };
@@ -4997,7 +5068,10 @@ mod firmware {
                         )
                         .map_err(|_| ())?;
                     }
-                    troe_machine::ApplicationOutcome::HandleCall { application, call } => {
+                    troe_machine::ApplicationOutcome::HandleCall {
+                        mut application,
+                        call,
+                    } => {
                         if call.request_bytes() < 2 {
                             scheduler
                                 .fault_current(task_id, TaskFault::InvalidCall)
@@ -5007,10 +5081,69 @@ mod firmware {
                         let request = &mut request[..call.request_bytes()];
                         application.copy_request(request).map_err(|_| ())?;
                         let opcode = u16::from_le_bytes([request[0], request[1]]);
-                        let preparation = if let (Some(interface), Some(deferred_services)) = (
-                            command_handle_interface(&command_handles, call.handle()),
-                            deferred_services,
-                        ) {
+                        let interface = command_handle_interface(&command_handles, call.handle());
+                        if interface == Some(troe_abi::interface::PRIVATE_MEMORY) {
+                            let reply = match handle_private_memory_call(
+                                accounting,
+                                &mut allocation,
+                                &mut application,
+                                heap_start,
+                                opcode,
+                                &request[2..],
+                            ) {
+                                Ok(reply) => reply,
+                                Err(PrivateMemoryError::Reply(status)) => PrivateMemoryReply {
+                                    status,
+                                    payload: Vec::new(),
+                                    resources_changed: false,
+                                },
+                                Err(PrivateMemoryError::Terminal) => {
+                                    scheduler
+                                        .fault_current(task_id, TaskFault::InvalidCall)
+                                        .map_err(|_| ())?;
+                                    break CommandApplicationOutcome::Faulted(
+                                        TaskFault::InvalidCall,
+                                    );
+                                }
+                            };
+                            if reply.payload.len() > call.reply_capacity() {
+                                scheduler
+                                    .fault_current(task_id, TaskFault::InvalidCall)
+                                    .map_err(|_| ())?;
+                                break CommandApplicationOutcome::Faulted(TaskFault::InvalidCall);
+                            }
+                            if reply.resources_changed {
+                                let (table_pages, private_page_count) =
+                                    application_resource_totals(&allocation, private_pages)?;
+                                if application.stats().table_pages > table_pages {
+                                    return Err(());
+                                }
+                                let grown_isolation = IsolationResource::new(
+                                    isolation.slot(),
+                                    table_pages,
+                                    private_page_count,
+                                    isolation.handles(),
+                                )
+                                .map_err(|_| ())?;
+                                scheduler
+                                    .resize_current_isolation(task_id, grown_isolation)
+                                    .map_err(|_| ())?;
+                                isolation = grown_isolation;
+                            }
+                            outcome = troe_machine::resume_application(
+                                application,
+                                troe_machine::ApplicationResume::HandleReply {
+                                    status: reply.status.abi_value(),
+                                    reply: &reply.payload,
+                                },
+                                APPLICATION_TIMESLICE_MILLISECONDS,
+                            )
+                            .map_err(|_| ())?;
+                            continue;
+                        }
+                        let preparation = if let (Some(interface), Some(deferred_services)) =
+                            (interface, deferred_services)
+                        {
                             let state = deferred_state.as_mut().ok_or(())?;
                             prepare_deferred_call(
                                 task_id,
@@ -5134,7 +5267,7 @@ mod firmware {
                         request,
                     } => {
                         match commit_application_heap_growth(
-                            &mut accounting.frames,
+                            accounting,
                             &mut allocation,
                             &mut application,
                             heap_start,
@@ -5224,23 +5357,13 @@ mod firmware {
                 fatal(b"fatal: deferred application cleanup failed\n");
             }
             rollback_command_application_task(
-                scheduler,
-                task_id,
-                dispatcher,
-                live_owner,
-                &mut accounting.frames,
-                allocation,
+                scheduler, task_id, dispatcher, live_owner, accounting, allocation,
             );
             return Err(());
         };
         let Ok(reaped) = scheduler.reap(task_id) else {
             rollback_command_application_task(
-                scheduler,
-                task_id,
-                dispatcher,
-                live_owner,
-                &mut accounting.frames,
-                allocation,
+                scheduler, task_id, dispatcher, live_owner, accounting, allocation,
             );
             return Err(());
         };
@@ -5251,7 +5374,7 @@ mod firmware {
         let valid_reap = reaped.isolation == Some(isolation)
             && reaped.stack.mapped_pages() == stack_pages
             && reaped.fault == expected_fault;
-        reclaim_command_application(&mut accounting.frames, allocation);
+        reclaim_command_application(accounting, allocation);
         if !valid_reap {
             fatal(b"fatal: application reap invariant failed\n");
         }
@@ -5467,7 +5590,9 @@ mod firmware {
                 + usize::from(required.icmp_echo)
                 + usize::from(required.tcp_connect)
                 + usize::from(required.volume_control)
-                + usize::from(required.wall_clock);
+                + usize::from(required.wall_clock)
+                + usize::from(required.private_memory)
+                + usize::from(required.random);
             let handle_capacity = service_count.checked_mul(2).ok_or(ReplyStatus::Exhausted)?;
             let mut dispatcher = Dispatcher::new(service_count, handle_capacity)
                 .map_err(|_| ReplyStatus::Exhausted)?;
@@ -5739,6 +5864,32 @@ mod firmware {
                     interface: troe_abi::interface::WALL_CLOCK,
                     major: wall_clock::MAJOR,
                     minor: wall_clock::MINOR,
+                });
+            }
+            if required.private_memory {
+                services.push(CommandStartupService {
+                    port: register_command_service(
+                        &mut dispatcher,
+                        ApplicationPrivateMemoryService,
+                    )
+                    .map_err(|_| ReplyStatus::Exhausted)?,
+                    interface: troe_abi::interface::PRIVATE_MEMORY,
+                    major: private_memory::MAJOR,
+                    minor: private_memory::MINOR,
+                });
+            }
+            if required.random {
+                services.push(CommandStartupService {
+                    port: register_command_service(
+                        &mut dispatcher,
+                        ApplicationRandomService {
+                            random: accounting.random.clone(),
+                        },
+                    )
+                    .map_err(|_| ReplyStatus::Exhausted)?,
+                    interface: troe_abi::interface::RANDOM,
+                    major: random::MAJOR,
+                    minor: random::MINOR,
                 });
             }
             if services.len() != service_count {
@@ -6117,7 +6268,10 @@ mod firmware {
                         self.execution = Some(ResidentExecution::Pending(Box::new(pending)));
                         return Ok(None);
                     }
-                    troe_machine::ApplicationOutcome::HandleCall { application, call } => {
+                    troe_machine::ApplicationOutcome::HandleCall {
+                        mut application,
+                        call,
+                    } => {
                         service_calls = service_calls.checked_add(1).ok_or(())?;
                         if call.request_bytes() < 2 {
                             scheduler
@@ -6131,6 +6285,75 @@ mod firmware {
                         application.copy_request(request).map_err(|_| ())?;
                         let opcode = u16::from_le_bytes([request[0], request[1]]);
                         let interface = command_handle_interface(&self.handles, call.handle());
+                        if interface == Some(troe_abi::interface::PRIVATE_MEMORY) {
+                            let reply = match handle_private_memory_call(
+                                accounting,
+                                &mut self.allocation,
+                                &mut application,
+                                self.heap_start,
+                                opcode,
+                                &request[2..],
+                            ) {
+                                Ok(reply) => reply,
+                                Err(PrivateMemoryError::Reply(status)) => PrivateMemoryReply {
+                                    status,
+                                    payload: Vec::new(),
+                                    resources_changed: false,
+                                },
+                                Err(PrivateMemoryError::Terminal) => {
+                                    scheduler
+                                        .fault_current(self.task_id, TaskFault::InvalidCall)
+                                        .map_err(|_| ())?;
+                                    return Ok(Some(CommandApplicationOutcome::Faulted(
+                                        TaskFault::InvalidCall,
+                                    )));
+                                }
+                            };
+                            if reply.payload.len() > call.reply_capacity() {
+                                return Err(());
+                            }
+                            if reply.resources_changed {
+                                let (table_pages, private_pages) = application_resource_totals(
+                                    &self.allocation,
+                                    self.private_pages,
+                                )?;
+                                if application.stats().table_pages > table_pages {
+                                    return Err(());
+                                }
+                                let grown_isolation = IsolationResource::new(
+                                    self.isolation.slot(),
+                                    table_pages,
+                                    private_pages,
+                                    self.isolation.handles(),
+                                )
+                                .map_err(|_| ())?;
+                                scheduler
+                                    .resize_current_isolation(self.task_id, grown_isolation)
+                                    .map_err(|_| ())?;
+                                self.isolation = grown_isolation;
+                                self.processes
+                                    .try_borrow_mut()
+                                    .map_err(|_| ())?
+                                    .update_resources(
+                                        self.process_id,
+                                        table_pages,
+                                        private_pages,
+                                        self.handle_count,
+                                    )
+                                    .map_err(|_| ())?;
+                            }
+                            outcome = self.execute_accounted(|| {
+                                troe_machine::resume_application(
+                                    application,
+                                    troe_machine::ApplicationResume::HandleReply {
+                                        status: reply.status.abi_value(),
+                                        reply: &reply.payload,
+                                    },
+                                    RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS,
+                                )
+                            })?;
+                            continue;
+                        }
                         if interface == Some(troe_abi::interface::PROCESS_LAUNCH)
                             && opcode == process_launch::SPAWN
                         {
@@ -6305,7 +6528,7 @@ mod firmware {
                         request,
                     } => {
                         match commit_application_heap_growth(
-                            &mut accounting.frames,
+                            accounting,
                             &mut self.allocation,
                             &mut application,
                             self.heap_start,
@@ -6737,7 +6960,7 @@ mod firmware {
                 .map_err(|_| ())?
                 .remove(self.process_id)
                 .map_err(|_| ())?;
-            reclaim_command_application(&mut accounting.frames, self.allocation);
+            reclaim_command_application(accounting, self.allocation);
             if !valid {
                 return Err(());
             }
@@ -6973,8 +7196,1213 @@ mod firmware {
         }
     }
 
-    fn commit_application_heap_growth(
+    fn private_permissions(protection: private_memory::Protection) -> Option<MappingPermissions> {
+        match protection {
+            private_memory::Protection::None => None,
+            private_memory::Protection::Read => Some(MappingPermissions::READ_ONLY),
+            private_memory::Protection::ReadWrite => Some(MappingPermissions::READ_WRITE),
+        }
+    }
+
+    fn random_application_placement(random: &SharedRandom) -> Result<LoadPlacement, ()> {
+        const IMAGE_LIMIT: u64 = 0x0000_4000_0000_0000;
+        const STACK_MINIMUM: u64 = 0x0000_6000_0000_0000;
+
+        fn aligned_draw(
+            generator: &mut RandomGenerator,
+            minimum: u64,
+            exclusive_limit: u64,
+        ) -> Result<u64, ()> {
+            if !minimum.is_multiple_of(KEX_V1_IMAGE_ALIGNMENT)
+                || !exclusive_limit.is_multiple_of(KEX_V1_IMAGE_ALIGNMENT)
+                || minimum >= exclusive_limit
+            {
+                return Err(());
+            }
+            let slots = exclusive_limit
+                .checked_sub(minimum)
+                .and_then(|bytes| bytes.checked_div(KEX_V1_IMAGE_ALIGNMENT))
+                .ok_or(())?;
+            let selected = generator.uniform_u64(slots).map_err(|_| ())?;
+            minimum
+                .checked_add(selected.checked_mul(KEX_V1_IMAGE_ALIGNMENT).ok_or(())?)
+                .ok_or(())
+        }
+
+        let mut generator = random.try_borrow_mut().map_err(|_| ())?;
+        let image_base = aligned_draw(&mut generator, KEX_V1_MIN_IMAGE_BASE, IMAGE_LIMIT)?;
+        let stack_top = aligned_draw(&mut generator, STACK_MINIMUM, KEX_V1_USER_END)?;
+        Ok(LoadPlacement::new(image_base, stack_top))
+    }
+
+    fn parse_native_application<'artifact>(
+        accounting: &OwnedAccounting,
+        artifact: &'artifact [u8],
+    ) -> Result<LoadPlan<'artifact>, ()> {
+        let placement = random_application_placement(&accounting.random)?;
+        parse_kex_at(artifact, native_application_target(), ABI_MINOR, placement).map_err(|_| ())
+    }
+
+    fn private_metadata_bytes(mappings: &[ApplicationPrivateMapping]) -> Option<u64> {
+        let mapping_count = u64::try_from(mappings.len()).ok()?;
+        let extent_count = mappings.iter().try_fold(0_u64, |total, mapping| {
+            total.checked_add(u64::try_from(mapping.backing.len()).ok()?)
+        })?;
+        mapping_count
+            .checked_mul(u64::try_from(core::mem::size_of::<ApplicationPrivateMapping>()).ok()?)?
+            .checked_add(
+                extent_count
+                    .checked_mul(u64::try_from(core::mem::size_of::<PhysicalRange>()).ok()?)?,
+            )
+    }
+
+    fn private_heap_end(
+        allocation: &ApplicationAllocation,
+        heap_start: u64,
+    ) -> Result<u64, PrivateMemoryError> {
+        let pages = allocation
+            .heap
+            .map_or(0, PhysicalRange::page_count)
+            .checked_add(
+                application_growth_pages(allocation).map_err(|()| PrivateMemoryError::Terminal)?,
+            )
+            .ok_or(PrivateMemoryError::Terminal)?;
+        heap_start
+            .checked_add(
+                pages
+                    .checked_mul(BASE_PAGE_SIZE)
+                    .ok_or(PrivateMemoryError::Terminal)?,
+            )
+            .ok_or(PrivateMemoryError::Terminal)
+    }
+
+    fn private_range_available(
+        state: &ApplicationPrivateMemory,
+        floor: u64,
+        range: VirtualRange,
+    ) -> bool {
+        range.start() >= floor
+            && range.end() <= state.arena_end
+            && state.mappings.iter().all(|mapping| {
+                mapping.range.end() <= range.start() || range.end() <= mapping.range.start()
+            })
+    }
+
+    fn align_down(value: u64, alignment: u64) -> Option<u64> {
+        if alignment == 0 || !alignment.is_power_of_two() {
+            return None;
+        }
+        Some(value & !(alignment - 1))
+    }
+
+    fn align_up(value: u64, alignment: u64) -> Option<u64> {
+        value
+            .checked_add(alignment.checked_sub(1)?)
+            .and_then(|rounded| align_down(rounded, alignment))
+    }
+
+    fn private_gap_slots(
+        gap_start: u64,
+        gap_end: u64,
+        byte_count: u64,
+        alignment: u64,
+    ) -> Option<(u64, u64)> {
+        let first = align_up(gap_start, alignment)?;
+        let last = gap_end
+            .checked_sub(byte_count)
+            .and_then(|value| align_down(value, alignment))?;
+        if first > last {
+            return None;
+        }
+        let slots = last
+            .checked_sub(first)?
+            .checked_div(alignment)?
+            .checked_add(1)?;
+        Some((first, slots))
+    }
+
+    fn select_private_gap(
+        gap_start: u64,
+        gap_end: u64,
+        byte_count: u64,
+        alignment: u64,
+        selected: &mut u64,
+    ) -> Result<Option<u64>, PrivateMemoryError> {
+        let Some((first, slots)) = private_gap_slots(gap_start, gap_end, byte_count, alignment)
+        else {
+            return Ok(None);
+        };
+        if *selected >= slots {
+            *selected = selected
+                .checked_sub(slots)
+                .ok_or(PrivateMemoryError::Terminal)?;
+            return Ok(None);
+        }
+        let offset = selected
+            .checked_mul(alignment)
+            .ok_or(PrivateMemoryError::Terminal)?;
+        Ok(Some(
+            first
+                .checked_add(offset)
+                .ok_or(PrivateMemoryError::Terminal)?,
+        ))
+    }
+
+    fn choose_private_range(
+        state: &ApplicationPrivateMemory,
+        floor: u64,
+        request: private_memory::MapRequest,
+        random: &SharedRandom,
+    ) -> Result<VirtualRange, PrivateMemoryError> {
+        let byte_count = request
+            .page_count
+            .checked_mul(BASE_PAGE_SIZE)
+            .ok_or(PrivateMemoryError::Reply(ReplyStatus::Overflow))?;
+        let alignment = request
+            .alignment_pages
+            .checked_mul(BASE_PAGE_SIZE)
+            .ok_or(PrivateMemoryError::Reply(ReplyStatus::Overflow))?;
+        if request.address_hint != 0
+            && request.address_hint.is_multiple_of(alignment)
+            && let Ok(range) = VirtualRange::from_pages(request.address_hint, request.page_count)
+            && private_range_available(state, floor, range)
+        {
+            return Ok(range);
+        }
+        let mut total_slots = 0_u64;
+        let mut gap_start = floor;
+        for mapping in &state.mappings {
+            if let Some((_, slots)) =
+                private_gap_slots(gap_start, mapping.range.start(), byte_count, alignment)
+            {
+                total_slots = total_slots
+                    .checked_add(slots)
+                    .ok_or(PrivateMemoryError::Reply(ReplyStatus::Overflow))?;
+            }
+            gap_start = mapping.range.end().max(gap_start);
+        }
+        if let Some((_, slots)) =
+            private_gap_slots(gap_start, state.arena_end, byte_count, alignment)
+        {
+            total_slots = total_slots
+                .checked_add(slots)
+                .ok_or(PrivateMemoryError::Reply(ReplyStatus::Overflow))?;
+        }
+        if total_slots == 0 {
+            return Err(PrivateMemoryError::Reply(ReplyStatus::Exhausted));
+        }
+        let mut selected = random
+            .try_borrow_mut()
+            .map_err(|_| PrivateMemoryError::Terminal)?
+            .uniform_u64(total_slots)
+            .map_err(|_| PrivateMemoryError::Terminal)?;
+        gap_start = floor;
+        let mut selected_start = None;
+        for mapping in &state.mappings {
+            if let Some(start) = select_private_gap(
+                gap_start,
+                mapping.range.start(),
+                byte_count,
+                alignment,
+                &mut selected,
+            )? {
+                selected_start = Some(start);
+                break;
+            }
+            gap_start = mapping.range.end().max(gap_start);
+        }
+        if selected_start.is_none() {
+            selected_start = select_private_gap(
+                gap_start,
+                state.arena_end,
+                byte_count,
+                alignment,
+                &mut selected,
+            )?;
+        }
+        let range = VirtualRange::from_pages(
+            selected_start.ok_or(PrivateMemoryError::Terminal)?,
+            request.page_count,
+        )
+        .map_err(|_| PrivateMemoryError::Reply(ReplyStatus::Overflow))?;
+        Ok(range)
+    }
+
+    fn append_private_extent(
+        extents: &mut Vec<PhysicalRange>,
+        frame: u64,
+    ) -> Result<(), PrivateMemoryError> {
+        if let Some(last) = extents.last_mut()
+            && last.end() == frame
+        {
+            *last = PhysicalRange::from_pages(
+                last.start(),
+                last.page_count()
+                    .checked_add(1)
+                    .ok_or(PrivateMemoryError::Terminal)?,
+            )
+            .map_err(|_| PrivateMemoryError::Terminal)?;
+            return Ok(());
+        }
+        extents
+            .try_reserve(1)
+            .map_err(|_| PrivateMemoryError::Reply(ReplyStatus::Exhausted))?;
+        extents
+            .push(PhysicalRange::from_pages(frame, 1).map_err(|_| PrivateMemoryError::Terminal)?);
+        Ok(())
+    }
+
+    fn release_private_extents(
         frames: &mut FrameAllocator,
+        extents: &[PhysicalRange],
+    ) -> Result<(), PrivateMemoryError> {
+        for range in extents {
+            troe_machine::zero_physical_range(*range).map_err(|_| PrivateMemoryError::Terminal)?;
+            frames
+                .free_range(*range)
+                .map_err(|_| PrivateMemoryError::Terminal)?;
+        }
+        Ok(())
+    }
+
+    fn allocate_private_extents(
+        frames: &mut FrameAllocator,
+        page_count: u64,
+        operation_quantum_pages: u64,
+    ) -> Result<Vec<PhysicalRange>, PrivateMemoryError> {
+        if operation_quantum_pages == 0 {
+            return Err(PrivateMemoryError::Terminal);
+        }
+        let mut extents = Vec::new();
+        let mut remaining = page_count;
+        while remaining != 0 {
+            let quantum = remaining.min(operation_quantum_pages);
+            match frames.allocate_contiguous(quantum, 1) {
+                Ok(range) => {
+                    if extents.try_reserve(1).is_err() {
+                        frames
+                            .free_range(range)
+                            .map_err(|_| PrivateMemoryError::Terminal)?;
+                        release_private_extents(frames, &extents)?;
+                        return Err(PrivateMemoryError::Reply(ReplyStatus::Exhausted));
+                    }
+                    if troe_machine::zero_physical_range(range).is_err() {
+                        frames
+                            .free_range(range)
+                            .map_err(|_| PrivateMemoryError::Terminal)?;
+                        release_private_extents(frames, &extents)?;
+                        return Err(PrivateMemoryError::Terminal);
+                    }
+                    extents.push(range);
+                }
+                Err(FrameAllocationError::Exhausted) => {
+                    for _ in 0..quantum {
+                        let Ok(frame) = frames.allocate() else {
+                            release_private_extents(frames, &extents)?;
+                            return Err(PrivateMemoryError::Reply(ReplyStatus::Exhausted));
+                        };
+                        let range = PhysicalRange::from_pages(frame, 1)
+                            .map_err(|_| PrivateMemoryError::Terminal)?;
+                        if troe_machine::zero_physical_range(range).is_err() {
+                            frames
+                                .free(frame)
+                                .map_err(|_| PrivateMemoryError::Terminal)?;
+                            release_private_extents(frames, &extents)?;
+                            return Err(PrivateMemoryError::Terminal);
+                        }
+                        if let Err(error) = append_private_extent(&mut extents, frame) {
+                            frames
+                                .free(frame)
+                                .map_err(|_| PrivateMemoryError::Terminal)?;
+                            release_private_extents(frames, &extents)?;
+                            return Err(error);
+                        }
+                    }
+                }
+                Err(_) => {
+                    release_private_extents(frames, &extents)?;
+                    return Err(PrivateMemoryError::Terminal);
+                }
+            }
+            remaining = remaining
+                .checked_sub(quantum)
+                .ok_or(PrivateMemoryError::Terminal)?;
+        }
+        Ok(extents)
+    }
+
+    fn private_policy_allows(
+        accounting: &OwnedAccounting,
+        allocation: &ApplicationAllocation,
+        reserved_pages: u64,
+        committed_pages: u64,
+        mappings: u64,
+        metadata_bytes: u64,
+    ) -> Result<(), PrivateMemoryError> {
+        let state = &allocation.private_memory;
+        let process_commit = allocation
+            .complete
+            .page_count()
+            .checked_add(
+                application_growth_pages(allocation).map_err(|()| PrivateMemoryError::Terminal)?,
+            )
+            .and_then(|pages| pages.checked_add(committed_pages))
+            .ok_or(PrivateMemoryError::Terminal)?;
+        if state
+            .maximum_reserved_pages
+            .is_some_and(|maximum| reserved_pages > maximum)
+            || state
+                .maximum_committed_pages
+                .is_some_and(|maximum| process_commit > maximum)
+            || mappings > state.maximum_mappings
+            || metadata_bytes > state.maximum_metadata_bytes
+        {
+            return Err(PrivateMemoryError::Reply(ReplyStatus::ResourceLimit));
+        }
+        let global_metadata = accounting
+            .private_metadata_bytes
+            .checked_sub(state.metadata_bytes)
+            .and_then(|value| value.checked_add(metadata_bytes))
+            .ok_or(PrivateMemoryError::Terminal)?;
+        let system_commit = accounting
+            .application_committed_pages
+            .checked_sub(state.committed_pages)
+            .and_then(|value| value.checked_add(committed_pages))
+            .ok_or(PrivateMemoryError::Terminal)?;
+        if global_metadata > accounting.memory_policy.global_metadata_bytes()
+            || accounting
+                .memory_policy
+                .system_application_commit()
+                .maximum()
+                .is_some_and(|maximum| system_commit > maximum)
+        {
+            return Err(PrivateMemoryError::Reply(ReplyStatus::ResourceLimit));
+        }
+        Ok(())
+    }
+
+    fn commit_private_accounting(
+        accounting: &mut OwnedAccounting,
+        state: &mut ApplicationPrivateMemory,
+        reserved_pages: u64,
+        committed_pages: u64,
+        metadata_bytes: u64,
+    ) -> Result<(), PrivateMemoryError> {
+        accounting.private_metadata_bytes = accounting
+            .private_metadata_bytes
+            .checked_sub(state.metadata_bytes)
+            .and_then(|value| value.checked_add(metadata_bytes))
+            .ok_or(PrivateMemoryError::Terminal)?;
+        accounting.application_committed_pages = accounting
+            .application_committed_pages
+            .checked_sub(state.committed_pages)
+            .and_then(|value| value.checked_add(committed_pages))
+            .ok_or(PrivateMemoryError::Terminal)?;
+        state.reserved_pages = reserved_pages;
+        state.committed_pages = committed_pages;
+        state.metadata_bytes = metadata_bytes;
+        state.high_water_reserved_pages = state.high_water_reserved_pages.max(reserved_pages);
+        state.high_water_committed_pages = state.high_water_committed_pages.max(committed_pages);
+        state.high_water_mappings = state
+            .high_water_mappings
+            .max(u64::try_from(state.mappings.len()).map_err(|_| PrivateMemoryError::Terminal)?);
+        state.high_water_metadata_bytes = state.high_water_metadata_bytes.max(metadata_bytes);
+        Ok(())
+    }
+
+    fn reserve_private_table_frames(
+        frames: &mut FrameAllocator,
+        allocation: &mut ApplicationAllocation,
+        application: &troe_machine::ApplicationSession,
+        virtual_start: u64,
+        page_count: u64,
+        minimum_free_pages: u64,
+    ) -> Result<usize, PrivateMemoryError> {
+        let range = VirtualRange::from_pages(virtual_start, page_count)
+            .map_err(|_| PrivateMemoryError::Terminal)?;
+        let required = troe_machine::maximum_additional_page_table_pages(range)
+            .map_err(|_| PrivateMemoryError::Terminal)?;
+        let retained = allocation
+            .tables
+            .page_count()
+            .checked_add(
+                u64::try_from(allocation.growth_table_frames.len())
+                    .map_err(|_| PrivateMemoryError::Terminal)?,
+            )
+            .ok_or(PrivateMemoryError::Terminal)?;
+        let available = retained
+            .checked_sub(application.stats().table_pages)
+            .ok_or(PrivateMemoryError::Terminal)?;
+        let deficit = usize::try_from(required.saturating_sub(available))
+            .map_err(|_| PrivateMemoryError::Reply(ReplyStatus::Exhausted))?;
+        allocation
+            .growth_table_frames
+            .try_reserve_exact(deficit)
+            .map_err(|_| PrivateMemoryError::Reply(ReplyStatus::Exhausted))?;
+        let needed = u64::try_from(deficit).map_err(|_| PrivateMemoryError::Terminal)?;
+        if frames.free_frames().saturating_sub(minimum_free_pages) < needed {
+            return Err(PrivateMemoryError::Reply(ReplyStatus::Exhausted));
+        }
+        let retained_len = allocation.growth_table_frames.len();
+        for _ in 0..deficit {
+            let Ok(frame) = frames.allocate() else {
+                while allocation.growth_table_frames.len() > retained_len {
+                    let frame = allocation
+                        .growth_table_frames
+                        .pop()
+                        .ok_or(PrivateMemoryError::Terminal)?;
+                    frames
+                        .free(frame)
+                        .map_err(|_| PrivateMemoryError::Terminal)?;
+                }
+                return Err(PrivateMemoryError::Reply(ReplyStatus::Exhausted));
+            };
+            allocation.growth_table_frames.push(frame);
+        }
+        Ok(retained_len)
+    }
+
+    fn insert_private_mapping(
+        state: &mut ApplicationPrivateMemory,
+        mapping: ApplicationPrivateMapping,
+    ) -> Result<(), PrivateMemoryError> {
+        state
+            .mappings
+            .try_reserve(1)
+            .map_err(|_| PrivateMemoryError::Reply(ReplyStatus::Exhausted))?;
+        let index = state
+            .mappings
+            .binary_search_by_key(&mapping.range.start(), |current| current.range.start())
+            .unwrap_or_else(|index| index);
+        state.mappings.insert(index, mapping);
+        Ok(())
+    }
+
+    fn private_extent_slice(
+        extents: &[PhysicalRange],
+        start_page: u64,
+        page_count: u64,
+    ) -> Result<Vec<PhysicalRange>, PrivateMemoryError> {
+        let wanted_end = start_page
+            .checked_add(page_count)
+            .ok_or(PrivateMemoryError::Terminal)?;
+        let mut result = Vec::new();
+        let mut logical_start = 0_u64;
+        for extent in extents {
+            let logical_end = logical_start
+                .checked_add(extent.page_count())
+                .ok_or(PrivateMemoryError::Terminal)?;
+            let overlap_start = logical_start.max(start_page);
+            let overlap_end = logical_end.min(wanted_end);
+            if overlap_start < overlap_end {
+                result
+                    .try_reserve(1)
+                    .map_err(|_| PrivateMemoryError::Reply(ReplyStatus::Exhausted))?;
+                result.push(
+                    PhysicalRange::from_pages(
+                        extent
+                            .start()
+                            .checked_add(
+                                overlap_start
+                                    .checked_sub(logical_start)
+                                    .ok_or(PrivateMemoryError::Terminal)?
+                                    .checked_mul(BASE_PAGE_SIZE)
+                                    .ok_or(PrivateMemoryError::Terminal)?,
+                            )
+                            .ok_or(PrivateMemoryError::Terminal)?,
+                        overlap_end
+                            .checked_sub(overlap_start)
+                            .ok_or(PrivateMemoryError::Terminal)?,
+                    )
+                    .map_err(|_| PrivateMemoryError::Terminal)?,
+                );
+            }
+            logical_start = logical_end;
+        }
+        let represented = result.iter().try_fold(0_u64, |pages, extent| {
+            pages.checked_add(extent.page_count())
+        });
+        if represented != Some(page_count) {
+            return Err(PrivateMemoryError::Terminal);
+        }
+        Ok(result)
+    }
+
+    fn private_subrange(
+        range: VirtualRange,
+        start_page: u64,
+        page_count: u64,
+    ) -> Result<VirtualRange, PrivateMemoryError> {
+        let byte_offset = start_page
+            .checked_mul(BASE_PAGE_SIZE)
+            .ok_or(PrivateMemoryError::Terminal)?;
+        VirtualRange::from_pages(
+            range
+                .start()
+                .checked_add(byte_offset)
+                .ok_or(PrivateMemoryError::Terminal)?,
+            page_count,
+        )
+        .map_err(|_| PrivateMemoryError::Terminal)
+    }
+
+    fn private_backing_slice(
+        mapping: &ApplicationPrivateMapping,
+        start_page: u64,
+        page_count: u64,
+    ) -> Result<Vec<PhysicalRange>, PrivateMemoryError> {
+        if mapping.backing.is_empty() {
+            Ok(Vec::new())
+        } else {
+            private_extent_slice(&mapping.backing, start_page, page_count)
+        }
+    }
+
+    fn split_private_mapping(
+        mapping: &ApplicationPrivateMapping,
+        address: u64,
+        page_count: u64,
+        middle_protection: Option<private_memory::Protection>,
+        new_middle_backing: Option<Vec<PhysicalRange>>,
+    ) -> Result<(Vec<ApplicationPrivateMapping>, Vec<PhysicalRange>), PrivateMemoryError> {
+        let request = VirtualRange::from_pages(address, page_count)
+            .map_err(|_| PrivateMemoryError::Reply(ReplyStatus::InvalidRequest))?;
+        if request.start() < mapping.range.start() || request.end() > mapping.range.end() {
+            return Err(PrivateMemoryError::Reply(ReplyStatus::NotFound));
+        }
+        let before_pages = request
+            .start()
+            .checked_sub(mapping.range.start())
+            .and_then(|bytes| bytes.checked_div(BASE_PAGE_SIZE))
+            .ok_or(PrivateMemoryError::Terminal)?;
+        let after_pages = mapping
+            .range
+            .page_count()
+            .checked_sub(before_pages)
+            .and_then(|pages| pages.checked_sub(page_count))
+            .ok_or(PrivateMemoryError::Terminal)?;
+        if new_middle_backing.is_some() && !mapping.backing.is_empty() {
+            return Err(PrivateMemoryError::Terminal);
+        }
+        let mut replacements = Vec::new();
+        replacements
+            .try_reserve_exact(usize::from(before_pages != 0) + usize::from(after_pages != 0) + 1)
+            .map_err(|_| PrivateMemoryError::Reply(ReplyStatus::Exhausted))?;
+        if before_pages != 0 {
+            replacements.push(ApplicationPrivateMapping {
+                range: private_subrange(mapping.range, 0, before_pages)?,
+                protection: mapping.protection,
+                backing: private_backing_slice(mapping, 0, before_pages)?,
+            });
+        }
+        let existing_middle = private_backing_slice(mapping, before_pages, page_count)?;
+        let (middle_backing, removed) = if middle_protection.is_some() {
+            (
+                Some(new_middle_backing.unwrap_or(existing_middle)),
+                Vec::new(),
+            )
+        } else {
+            (None, existing_middle)
+        };
+        if let Some(protection) = middle_protection {
+            replacements.push(ApplicationPrivateMapping {
+                range: request,
+                protection,
+                backing: middle_backing.ok_or(PrivateMemoryError::Terminal)?,
+            });
+        }
+        if after_pages != 0 {
+            replacements.push(ApplicationPrivateMapping {
+                range: private_subrange(
+                    mapping.range,
+                    before_pages
+                        .checked_add(page_count)
+                        .ok_or(PrivateMemoryError::Terminal)?,
+                    after_pages,
+                )?,
+                protection: mapping.protection,
+                backing: private_backing_slice(
+                    mapping,
+                    before_pages
+                        .checked_add(page_count)
+                        .ok_or(PrivateMemoryError::Terminal)?,
+                    after_pages,
+                )?,
+            });
+        }
+        Ok((replacements, removed))
+    }
+
+    fn private_replacement_metadata(
+        state: &ApplicationPrivateMemory,
+        index: usize,
+        replacements: &[ApplicationPrivateMapping],
+    ) -> Result<(u64, u64), PrivateMemoryError> {
+        let old = state
+            .mappings
+            .get(index)
+            .ok_or(PrivateMemoryError::Terminal)?;
+        let mapping_count = u64::try_from(state.mappings.len())
+            .map_err(|_| PrivateMemoryError::Terminal)?
+            .checked_sub(1)
+            .and_then(|count| count.checked_add(u64::try_from(replacements.len()).ok()?))
+            .ok_or(PrivateMemoryError::Terminal)?;
+        let old_extent_bytes = u64::try_from(old.backing.len())
+            .map_err(|_| PrivateMemoryError::Terminal)?
+            .checked_mul(
+                u64::try_from(core::mem::size_of::<PhysicalRange>())
+                    .map_err(|_| PrivateMemoryError::Terminal)?,
+            )
+            .ok_or(PrivateMemoryError::Terminal)?;
+        let replacement_extent_count = replacements.iter().try_fold(0_u64, |count, mapping| {
+            count.checked_add(u64::try_from(mapping.backing.len()).ok()?)
+        });
+        let replacement_extent_bytes = replacement_extent_count
+            .ok_or(PrivateMemoryError::Terminal)?
+            .checked_mul(
+                u64::try_from(core::mem::size_of::<PhysicalRange>())
+                    .map_err(|_| PrivateMemoryError::Terminal)?,
+            )
+            .ok_or(PrivateMemoryError::Terminal)?;
+        let mapping_bytes = mapping_count
+            .checked_mul(
+                u64::try_from(core::mem::size_of::<ApplicationPrivateMapping>())
+                    .map_err(|_| PrivateMemoryError::Terminal)?,
+            )
+            .ok_or(PrivateMemoryError::Terminal)?;
+        let current_extent_bytes = state
+            .metadata_bytes
+            .checked_sub(
+                u64::try_from(state.mappings.len())
+                    .map_err(|_| PrivateMemoryError::Terminal)?
+                    .checked_mul(
+                        u64::try_from(core::mem::size_of::<ApplicationPrivateMapping>())
+                            .map_err(|_| PrivateMemoryError::Terminal)?,
+                    )
+                    .ok_or(PrivateMemoryError::Terminal)?,
+            )
+            .ok_or(PrivateMemoryError::Terminal)?;
+        let metadata_bytes = current_extent_bytes
+            .checked_sub(old_extent_bytes)
+            .and_then(|bytes| bytes.checked_add(replacement_extent_bytes))
+            .and_then(|bytes| bytes.checked_add(mapping_bytes))
+            .ok_or(PrivateMemoryError::Terminal)?;
+        Ok((mapping_count, metadata_bytes))
+    }
+
+    fn install_private_replacements(
+        state: &mut ApplicationPrivateMemory,
+        index: usize,
+        replacements: Vec<ApplicationPrivateMapping>,
+    ) -> Result<(), PrivateMemoryError> {
+        let additional = replacements.len().saturating_sub(1);
+        state
+            .mappings
+            .try_reserve(additional)
+            .map_err(|_| PrivateMemoryError::Reply(ReplyStatus::Exhausted))?;
+        let _removed = state.mappings.remove(index);
+        for (offset, replacement) in replacements.into_iter().enumerate() {
+            state.mappings.insert(index + offset, replacement);
+        }
+        Ok(())
+    }
+
+    fn coalesce_private_mappings(
+        state: &mut ApplicationPrivateMemory,
+    ) -> Result<(), PrivateMemoryError> {
+        let mut index = 1_usize;
+        while index < state.mappings.len() {
+            let left_index = index - 1;
+            let compatible = {
+                let left = &state.mappings[left_index];
+                let right = &state.mappings[index];
+                left.range.end() == right.range.start()
+                    && left.protection == right.protection
+                    && left.backing.is_empty() == right.backing.is_empty()
+            };
+            if !compatible {
+                index = index.checked_add(1).ok_or(PrivateMemoryError::Terminal)?;
+                continue;
+            }
+            let merged_range = {
+                let left = &state.mappings[left_index];
+                let right = &state.mappings[index];
+                VirtualRange::from_pages(
+                    left.range.start(),
+                    left.range
+                        .page_count()
+                        .checked_add(right.range.page_count())
+                        .ok_or(PrivateMemoryError::Terminal)?,
+                )
+                .map_err(|_| PrivateMemoryError::Terminal)?
+            };
+            let boundary_merges = state.mappings[left_index]
+                .backing
+                .last()
+                .zip(state.mappings[index].backing.first())
+                .is_some_and(|(left, right)| left.end() == right.start());
+            let additional_extents = state.mappings[index]
+                .backing
+                .len()
+                .saturating_sub(usize::from(boundary_merges));
+            if state.mappings[left_index]
+                .backing
+                .try_reserve(additional_extents)
+                .is_err()
+            {
+                index = index.checked_add(1).ok_or(PrivateMemoryError::Terminal)?;
+                continue;
+            }
+            let right = state.mappings.remove(index);
+            let left = &mut state.mappings[left_index];
+            left.range = merged_range;
+            let mut skip = 0_usize;
+            if boundary_merges {
+                let left_extent = left
+                    .backing
+                    .last_mut()
+                    .ok_or(PrivateMemoryError::Terminal)?;
+                let right_extent = right.backing.first().ok_or(PrivateMemoryError::Terminal)?;
+                *left_extent = PhysicalRange::from_pages(
+                    left_extent.start(),
+                    left_extent
+                        .page_count()
+                        .checked_add(right_extent.page_count())
+                        .ok_or(PrivateMemoryError::Terminal)?,
+                )
+                .map_err(|_| PrivateMemoryError::Terminal)?;
+                skip = 1;
+            }
+            left.backing.extend_from_slice(&right.backing[skip..]);
+        }
+        Ok(())
+    }
+
+    fn private_address_reply(address: u64) -> Result<Vec<u8>, PrivateMemoryError> {
+        let encoded =
+            private_memory::encode_address(address).map_err(|_| PrivateMemoryError::Terminal)?;
+        owned_reply_payload(&encoded)
+            .map_err(|()| PrivateMemoryError::Reply(ReplyStatus::Exhausted))
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn handle_private_memory_call(
+        accounting: &mut OwnedAccounting,
+        allocation: &mut ApplicationAllocation,
+        application: &mut troe_machine::ApplicationSession,
+        heap_start: u64,
+        opcode: u16,
+        payload: &[u8],
+    ) -> Result<PrivateMemoryReply, PrivateMemoryError> {
+        if opcode == private_memory::QUERY {
+            if !payload.is_empty() {
+                return Err(PrivateMemoryError::Reply(ReplyStatus::InvalidRequest));
+            }
+            let encoded = private_memory::encode_statistics(allocation.private_memory.statistics())
+                .map_err(|_| PrivateMemoryError::Terminal)?;
+            return Ok(PrivateMemoryReply {
+                status: ReplyStatus::Success,
+                payload: owned_reply_payload(&encoded)
+                    .map_err(|()| PrivateMemoryError::Reply(ReplyStatus::Exhausted))?,
+                resources_changed: false,
+            });
+        }
+
+        if matches!(opcode, private_memory::RESERVE | private_memory::MAP_ZEROED) {
+            let request = private_memory::decode_map_request(payload)
+                .map_err(|_| PrivateMemoryError::Reply(ReplyStatus::InvalidRequest))?;
+            if opcode == private_memory::RESERVE
+                && request.protection != private_memory::Protection::None
+            {
+                return Err(PrivateMemoryError::Reply(ReplyStatus::InvalidRequest));
+            }
+            let floor = private_heap_end(allocation, heap_start)?;
+            let range = choose_private_range(
+                &allocation.private_memory,
+                floor,
+                request,
+                &accounting.random,
+            )?;
+            let address_reply = private_address_reply(range.start())?;
+            allocation
+                .private_memory
+                .mappings
+                .try_reserve(1)
+                .map_err(|_| PrivateMemoryError::Reply(ReplyStatus::Exhausted))?;
+            let mut backing = Vec::new();
+            if opcode == private_memory::MAP_ZEROED {
+                let minimum_free = accounting.memory_policy.minimum_free_pages();
+                let available = accounting.frames.free_frames().saturating_sub(minimum_free);
+                if request.page_count > available {
+                    return Err(PrivateMemoryError::Reply(ReplyStatus::Exhausted));
+                }
+                backing = allocate_private_extents(
+                    &mut accounting.frames,
+                    request.page_count,
+                    accounting.memory_policy.operation_quantum_pages(),
+                )?;
+            }
+            let retained_tables = if opcode == private_memory::MAP_ZEROED
+                && request.protection != private_memory::Protection::None
+            {
+                match reserve_private_table_frames(
+                    &mut accounting.frames,
+                    allocation,
+                    application,
+                    range.start(),
+                    range.page_count(),
+                    accounting.memory_policy.minimum_free_pages(),
+                ) {
+                    Ok(retained) => Some(retained),
+                    Err(error) => {
+                        release_private_extents(&mut accounting.frames, &backing)?;
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            };
+            let mapping = ApplicationPrivateMapping {
+                range,
+                protection: request.protection,
+                backing,
+            };
+            insert_private_mapping(&mut allocation.private_memory, mapping)?;
+            let reserved = allocation
+                .private_memory
+                .reserved_pages
+                .checked_add(request.page_count)
+                .ok_or(PrivateMemoryError::Terminal)?;
+            let committed = allocation
+                .private_memory
+                .committed_pages
+                .checked_add(u64::from(opcode == private_memory::MAP_ZEROED) * request.page_count)
+                .ok_or(PrivateMemoryError::Terminal)?;
+            let metadata = private_metadata_bytes(&allocation.private_memory.mappings)
+                .ok_or(PrivateMemoryError::Terminal)?;
+            let mapping_count = u64::try_from(allocation.private_memory.mappings.len())
+                .map_err(|_| PrivateMemoryError::Terminal)?;
+            if let Err(error) = private_policy_allows(
+                accounting,
+                allocation,
+                reserved,
+                committed,
+                mapping_count,
+                metadata,
+            ) {
+                let mapping = allocation.private_memory.mappings.remove(
+                    allocation
+                        .private_memory
+                        .mappings
+                        .iter()
+                        .position(|mapping| mapping.range == range)
+                        .ok_or(PrivateMemoryError::Terminal)?,
+                );
+                release_private_extents(&mut accounting.frames, &mapping.backing)?;
+                if let Some(retained) = retained_tables {
+                    while allocation.growth_table_frames.len() > retained {
+                        let frame = allocation
+                            .growth_table_frames
+                            .pop()
+                            .ok_or(PrivateMemoryError::Terminal)?;
+                        accounting
+                            .frames
+                            .free(frame)
+                            .map_err(|_| PrivateMemoryError::Terminal)?;
+                    }
+                }
+                return Err(error);
+            }
+            commit_private_accounting(
+                accounting,
+                &mut allocation.private_memory,
+                reserved,
+                committed,
+                metadata,
+            )?;
+            if opcode == private_memory::MAP_ZEROED
+                && request.protection != private_memory::Protection::None
+            {
+                let mapping = allocation
+                    .private_memory
+                    .mappings
+                    .iter()
+                    .find(|mapping| mapping.range == range)
+                    .ok_or(PrivateMemoryError::Terminal)?;
+                application
+                    .replace_private_access(
+                        range.start(),
+                        &mapping.backing,
+                        false,
+                        private_permissions(request.protection),
+                        &allocation.growth_table_frames,
+                    )
+                    .map_err(|_| PrivateMemoryError::Terminal)?;
+            }
+            return Ok(PrivateMemoryReply {
+                status: ReplyStatus::Success,
+                payload: address_reply,
+                resources_changed: opcode == private_memory::MAP_ZEROED,
+            });
+        }
+
+        if opcode == private_memory::PROTECT {
+            let request = private_memory::decode_protect_request(payload)
+                .map_err(|_| PrivateMemoryError::Reply(ReplyStatus::InvalidRequest))?;
+            let request_range = VirtualRange::from_pages(request.address, request.page_count)
+                .map_err(|_| PrivateMemoryError::Reply(ReplyStatus::InvalidRequest))?;
+            let index = allocation
+                .private_memory
+                .mappings
+                .iter()
+                .position(|mapping| {
+                    mapping.range.start() <= request_range.start()
+                        && request_range.end() <= mapping.range.end()
+                })
+                .ok_or(PrivateMemoryError::Reply(ReplyStatus::NotFound))?;
+            let old_protection = allocation.private_memory.mappings[index].protection;
+            if old_protection == request.protection {
+                return Ok(PrivateMemoryReply {
+                    status: ReplyStatus::Success,
+                    payload: Vec::new(),
+                    resources_changed: false,
+                });
+            }
+            let needs_backing = allocation.private_memory.mappings[index].backing.is_empty()
+                && request.protection != private_memory::Protection::None;
+            let (mut replacements, removed) = split_private_mapping(
+                &allocation.private_memory.mappings[index],
+                request.address,
+                request.page_count,
+                Some(request.protection),
+                None,
+            )?;
+            if !removed.is_empty() {
+                return Err(PrivateMemoryError::Terminal);
+            }
+            let middle = replacements
+                .iter()
+                .position(|mapping| mapping.range == request_range)
+                .ok_or(PrivateMemoryError::Terminal)?;
+            if needs_backing {
+                let available = accounting
+                    .frames
+                    .free_frames()
+                    .saturating_sub(accounting.memory_policy.minimum_free_pages());
+                if request.page_count > available {
+                    return Err(PrivateMemoryError::Reply(ReplyStatus::Exhausted));
+                }
+                replacements[middle].backing = allocate_private_extents(
+                    &mut accounting.frames,
+                    request.page_count,
+                    accounting.memory_policy.operation_quantum_pages(),
+                )?;
+            }
+            let committed = allocation
+                .private_memory
+                .committed_pages
+                .checked_add(u64::from(needs_backing) * request.page_count)
+                .ok_or(PrivateMemoryError::Terminal)?;
+            let (mapping_count, metadata) =
+                private_replacement_metadata(&allocation.private_memory, index, &replacements)?;
+            if let Err(error) = private_policy_allows(
+                accounting,
+                allocation,
+                allocation.private_memory.reserved_pages,
+                committed,
+                mapping_count,
+                metadata,
+            ) {
+                if needs_backing {
+                    release_private_extents(&mut accounting.frames, &replacements[middle].backing)?;
+                }
+                return Err(error);
+            }
+            let additional = replacements.len().saturating_sub(1);
+            if allocation
+                .private_memory
+                .mappings
+                .try_reserve(additional)
+                .is_err()
+            {
+                if needs_backing {
+                    release_private_extents(&mut accounting.frames, &replacements[middle].backing)?;
+                }
+                return Err(PrivateMemoryError::Reply(ReplyStatus::Exhausted));
+            }
+            let retained_tables = if request.protection == private_memory::Protection::None {
+                None
+            } else {
+                match reserve_private_table_frames(
+                    &mut accounting.frames,
+                    allocation,
+                    application,
+                    request.address,
+                    request.page_count,
+                    accounting.memory_policy.minimum_free_pages(),
+                ) {
+                    Ok(retained) => Some(retained),
+                    Err(error) => {
+                        if needs_backing {
+                            release_private_extents(
+                                &mut accounting.frames,
+                                &replacements[middle].backing,
+                            )?;
+                        }
+                        return Err(error);
+                    }
+                }
+            };
+            if !replacements[middle].backing.is_empty()
+                && application
+                    .replace_private_access(
+                        request.address,
+                        &replacements[middle].backing,
+                        !allocation.private_memory.mappings[index].backing.is_empty()
+                            && old_protection != private_memory::Protection::None,
+                        private_permissions(request.protection),
+                        &allocation.growth_table_frames,
+                    )
+                    .is_err()
+            {
+                if let Some(retained) = retained_tables {
+                    while allocation.growth_table_frames.len() > retained {
+                        let frame = allocation
+                            .growth_table_frames
+                            .pop()
+                            .ok_or(PrivateMemoryError::Terminal)?;
+                        accounting
+                            .frames
+                            .free(frame)
+                            .map_err(|_| PrivateMemoryError::Terminal)?;
+                    }
+                }
+                if needs_backing {
+                    release_private_extents(&mut accounting.frames, &replacements[middle].backing)?;
+                }
+                return Err(PrivateMemoryError::Terminal);
+            }
+            install_private_replacements(&mut allocation.private_memory, index, replacements)?;
+            coalesce_private_mappings(&mut allocation.private_memory)?;
+            let metadata = private_metadata_bytes(&allocation.private_memory.mappings)
+                .ok_or(PrivateMemoryError::Terminal)?;
+            let reserved = allocation.private_memory.reserved_pages;
+            commit_private_accounting(
+                accounting,
+                &mut allocation.private_memory,
+                reserved,
+                committed,
+                metadata,
+            )?;
+            return Ok(PrivateMemoryReply {
+                status: ReplyStatus::Success,
+                payload: Vec::new(),
+                resources_changed: needs_backing,
+            });
+        }
+
+        if opcode == private_memory::UNMAP {
+            let request = private_memory::decode_unmap_request(payload)
+                .map_err(|_| PrivateMemoryError::Reply(ReplyStatus::InvalidRequest))?;
+            let request_range = VirtualRange::from_pages(request.address, request.page_count)
+                .map_err(|_| PrivateMemoryError::Reply(ReplyStatus::InvalidRequest))?;
+            let index = allocation
+                .private_memory
+                .mappings
+                .iter()
+                .position(|mapping| {
+                    mapping.range.start() <= request_range.start()
+                        && request_range.end() <= mapping.range.end()
+                })
+                .ok_or(PrivateMemoryError::Reply(ReplyStatus::NotFound))?;
+            let old_protection = allocation.private_memory.mappings[index].protection;
+            let (replacements, removed_backing) = split_private_mapping(
+                &allocation.private_memory.mappings[index],
+                request.address,
+                request.page_count,
+                None,
+                None,
+            )?;
+            let committed_removed = removed_backing
+                .iter()
+                .try_fold(0_u64, |total, range| total.checked_add(range.page_count()))
+                .ok_or(PrivateMemoryError::Terminal)?;
+            let reserved = allocation
+                .private_memory
+                .reserved_pages
+                .checked_sub(request.page_count)
+                .ok_or(PrivateMemoryError::Terminal)?;
+            let committed = allocation
+                .private_memory
+                .committed_pages
+                .checked_sub(committed_removed)
+                .ok_or(PrivateMemoryError::Terminal)?;
+            let (mapping_count, metadata) =
+                private_replacement_metadata(&allocation.private_memory, index, &replacements)?;
+            private_policy_allows(
+                accounting,
+                allocation,
+                reserved,
+                committed,
+                mapping_count,
+                metadata,
+            )?;
+            allocation
+                .private_memory
+                .mappings
+                .try_reserve(replacements.len().saturating_sub(1))
+                .map_err(|_| PrivateMemoryError::Reply(ReplyStatus::Exhausted))?;
+            if !removed_backing.is_empty() && old_protection != private_memory::Protection::None {
+                application
+                    .replace_private_access(
+                        request.address,
+                        &removed_backing,
+                        true,
+                        None,
+                        &allocation.growth_table_frames,
+                    )
+                    .map_err(|_| PrivateMemoryError::Terminal)?;
+            }
+            install_private_replacements(&mut allocation.private_memory, index, replacements)?;
+            release_private_extents(&mut accounting.frames, &removed_backing)?;
+            coalesce_private_mappings(&mut allocation.private_memory)?;
+            let metadata = private_metadata_bytes(&allocation.private_memory.mappings)
+                .ok_or(PrivateMemoryError::Terminal)?;
+            commit_private_accounting(
+                accounting,
+                &mut allocation.private_memory,
+                reserved,
+                committed,
+                metadata,
+            )?;
+            return Ok(PrivateMemoryReply {
+                status: ReplyStatus::Success,
+                payload: Vec::new(),
+                resources_changed: committed_removed != 0,
+            });
+        }
+
+        Err(PrivateMemoryError::Reply(ReplyStatus::InvalidRequest))
+    }
+
+    fn application_resource_totals(
+        allocation: &ApplicationAllocation,
+        initial_private_pages: u64,
+    ) -> Result<(u64, u64), ()> {
+        let table_pages = allocation
+            .tables
+            .page_count()
+            .checked_add(u64::try_from(allocation.growth_table_frames.len()).map_err(|_| ())?)
+            .ok_or(())?;
+        let private_pages = initial_private_pages
+            .checked_add(application_growth_pages(allocation)?)
+            .and_then(|value| value.checked_add(allocation.private_memory.committed_pages))
+            .ok_or(())?;
+        Ok((table_pages, private_pages))
+    }
+    #[allow(clippy::too_many_lines)]
+    fn commit_application_heap_growth(
+        accounting: &mut OwnedAccounting,
         allocation: &mut ApplicationAllocation,
         application: &mut troe_machine::ApplicationSession,
         heap_start: u64,
@@ -6985,6 +8413,14 @@ mod firmware {
         let current_pages = initial_pages
             .checked_add(application_growth_pages(allocation)?)
             .ok_or(())?;
+        let private_ceiling_pages = allocation
+            .private_memory
+            .mappings
+            .first()
+            .map_or(maximum_heap_pages, |mapping| {
+                mapping.range.start().saturating_sub(heap_start) / BASE_PAGE_SIZE
+            });
+        let maximum_heap_pages = maximum_heap_pages.min(private_ceiling_pages);
         let remaining = maximum_heap_pages.checked_sub(current_pages).ok_or(())?;
         if minimum_pages == 0 || minimum_pages > remaining {
             return Ok(ApplicationGrowth::Exhausted);
@@ -7016,55 +8452,119 @@ mod firmware {
         let needed_frames = minimum_pages
             .checked_add(u64::try_from(table_deficit).map_err(|_| ())?)
             .ok_or(())?;
-        if needed_frames > frames.free_frames() {
+        let application_commit = accounting
+            .application_committed_pages
+            .checked_add(minimum_pages)
+            .ok_or(())?;
+        let process_commit = allocation
+            .complete
+            .page_count()
+            .checked_add(application_growth_pages(allocation)?)
+            .and_then(|pages| pages.checked_add(allocation.private_memory.committed_pages))
+            .and_then(|pages| pages.checked_add(minimum_pages))
+            .ok_or(())?;
+        if accounting
+            .memory_policy
+            .system_application_commit()
+            .maximum()
+            .is_some_and(|maximum| application_commit > maximum)
+            || allocation
+                .private_memory
+                .maximum_committed_pages
+                .is_some_and(|maximum| process_commit > maximum)
+            || needed_frames
+                > accounting
+                    .frames
+                    .free_frames()
+                    .saturating_sub(accounting.memory_policy.minimum_free_pages())
+        {
             return Ok(ApplicationGrowth::Exhausted);
         }
         let start = allocation.growth_ranges.len();
         let table_start = allocation.growth_table_frames.len();
         for _ in 0..table_deficit {
-            let Ok(frame) = frames.allocate() else {
-                release_application_growth_suffix(frames, allocation, start, table_start)?;
+            let Ok(frame) = accounting.frames.allocate() else {
+                release_application_growth_suffix(
+                    &mut accounting.frames,
+                    allocation,
+                    start,
+                    table_start,
+                )?;
                 return Ok(ApplicationGrowth::Exhausted);
             };
             allocation.growth_table_frames.push(frame);
         }
-        match frames.allocate_contiguous(minimum_pages, 1) {
+        match accounting.frames.allocate_contiguous(minimum_pages, 1) {
             Ok(range) => {
                 if troe_machine::zero_physical_range(range).is_err() {
-                    frames.free_range(range).map_err(|_| ())?;
-                    release_application_growth_suffix(frames, allocation, start, table_start)?;
+                    accounting.frames.free_range(range).map_err(|_| ())?;
+                    release_application_growth_suffix(
+                        &mut accounting.frames,
+                        allocation,
+                        start,
+                        table_start,
+                    )?;
                     return Err(());
                 }
                 allocation.growth_ranges.push(range);
             }
             Err(FrameAllocationError::Exhausted) => {
                 for _ in 0..minimum_pages {
-                    let Ok(frame) = frames.allocate() else {
-                        release_application_growth_suffix(frames, allocation, start, table_start)?;
+                    let Ok(frame) = accounting.frames.allocate() else {
+                        release_application_growth_suffix(
+                            &mut accounting.frames,
+                            allocation,
+                            start,
+                            table_start,
+                        )?;
                         return Ok(ApplicationGrowth::Exhausted);
                     };
                     let range = PhysicalRange::from_pages(frame, 1).map_err(|_| ())?;
                     if troe_machine::zero_physical_range(range).is_err() {
-                        frames.free(frame).map_err(|_| ())?;
-                        release_application_growth_suffix(frames, allocation, start, table_start)?;
+                        accounting.frames.free(frame).map_err(|_| ())?;
+                        release_application_growth_suffix(
+                            &mut accounting.frames,
+                            allocation,
+                            start,
+                            table_start,
+                        )?;
                         return Err(());
                     }
                     if !append_application_growth_frame(allocation, start, frame)? {
-                        frames.free(frame).map_err(|_| ())?;
-                        release_application_growth_suffix(frames, allocation, start, table_start)?;
+                        accounting.frames.free(frame).map_err(|_| ())?;
+                        release_application_growth_suffix(
+                            &mut accounting.frames,
+                            allocation,
+                            start,
+                            table_start,
+                        )?;
                         return Ok(ApplicationGrowth::Exhausted);
                     }
                 }
             }
             Err(_) => {
-                release_application_growth_suffix(frames, allocation, start, table_start)?;
+                release_application_growth_suffix(
+                    &mut accounting.frames,
+                    allocation,
+                    start,
+                    table_start,
+                )?;
                 return Err(());
             }
         }
         let new_ranges = &allocation.growth_ranges[start..];
-        let stats = application
-            .commit_heap_growth(heap_start, new_ranges, &allocation.growth_table_frames)
-            .map_err(|_| ())?;
+        let Ok(stats) =
+            application.commit_heap_growth(heap_start, new_ranges, &allocation.growth_table_frames)
+        else {
+            release_application_growth_suffix(
+                &mut accounting.frames,
+                allocation,
+                start,
+                table_start,
+            )?;
+            return Err(());
+        };
+        accounting.application_committed_pages = application_commit;
         let mapped_pages = current_pages.checked_add(minimum_pages).ok_or(())?;
         let mapped_bytes = mapped_pages.checked_mul(BASE_PAGE_SIZE).ok_or(())?;
         Ok(ApplicationGrowth::Committed {
@@ -7141,14 +8641,36 @@ mod firmware {
             .ok_or(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn allocate_application(
-        frames: &mut FrameAllocator,
-        kernel: &MappingPlan,
-        kernel_runtime: PhysicalRange,
+        accounting: &mut OwnedAccounting,
         plan: &LoadPlan<'_>,
     ) -> Result<(ApplicationAllocation, MappingPlan), ()> {
         let resource_pages = plan.charges().private_pages();
-        let complete = frames
+        let committed_pages = accounting
+            .application_committed_pages
+            .checked_add(resource_pages)
+            .ok_or(())?;
+        if accounting
+            .memory_policy
+            .system_application_commit()
+            .maximum()
+            .is_some_and(|maximum| committed_pages > maximum)
+            || accounting
+                .memory_policy
+                .default_committed_pages()
+                .maximum()
+                .is_some_and(|maximum| resource_pages > maximum)
+            || resource_pages
+                > accounting
+                    .frames
+                    .free_frames()
+                    .saturating_sub(accounting.memory_policy.minimum_free_pages())
+        {
+            return Err(());
+        }
+        let complete = accounting
+            .frames
             .allocate_contiguous(resource_pages, 1)
             .map_err(|_| ())?;
         let derived = (|| {
@@ -7175,26 +8697,49 @@ mod firmware {
             })
         })();
         if derived.is_err() {
-            frames.free_range(complete).map_err(|_| ())?;
+            accounting.frames.free_range(complete).map_err(|_| ())?;
         }
         let private = derived?;
-        let Ok(mapping_plan) = build_application_plan(kernel, kernel_runtime, &private, plan)
-        else {
-            frames.free_range(private.complete).map_err(|_| ())?;
+        let Ok(mapping_plan) = build_application_plan(
+            &accounting.kernel_plan,
+            accounting.kernel_runtime,
+            &private,
+            plan,
+        ) else {
+            accounting
+                .frames
+                .free_range(private.complete)
+                .map_err(|_| ())?;
             return Err(());
         };
         let Ok(table_pages) = troe_machine::required_page_table_pages(&mapping_plan) else {
-            frames.free_range(private.complete).map_err(|_| ())?;
+            accounting
+                .frames
+                .free_range(private.complete)
+                .map_err(|_| ())?;
             return Err(());
         };
-        if table_pages == 0 || table_pages > APPLICATION_TABLE_PAGES {
-            frames.free_range(private.complete).map_err(|_| ())?;
+        if table_pages == 0
+            || table_pages
+                > accounting
+                    .frames
+                    .free_frames()
+                    .saturating_sub(accounting.memory_policy.minimum_free_pages())
+        {
+            accounting
+                .frames
+                .free_range(private.complete)
+                .map_err(|_| ())?;
             return Err(());
         }
-        let Ok(tables) = frames.allocate_contiguous(table_pages, 1) else {
-            frames.free_range(private.complete).map_err(|_| ())?;
+        let Ok(tables) = accounting.frames.allocate_contiguous(table_pages, 1) else {
+            accounting
+                .frames
+                .free_range(private.complete)
+                .map_err(|_| ())?;
             return Err(());
         };
+        accounting.application_committed_pages = committed_pages;
         Ok((
             ApplicationAllocation {
                 complete: private.complete,
@@ -7204,6 +8749,10 @@ mod firmware {
                 heap: private.heap,
                 growth_ranges: Vec::new(),
                 growth_table_frames: Vec::new(),
+                private_memory: ApplicationPrivateMemory::new(
+                    accounting.memory_policy,
+                    plan.layout().lower_guard_address(),
+                ),
             },
             mapping_plan,
         ))
@@ -7224,6 +8773,40 @@ mod firmware {
         }
         if physical_start != allocation.image.end() {
             return Err(());
+        }
+        for relocation in plan.relocations() {
+            let target_end = relocation.target_offset().checked_add(8).ok_or(())?;
+            let mut physical_start = allocation.image.start();
+            let mut target = None;
+            for segment in plan.segments() {
+                let segment_end = segment
+                    .image_offset()
+                    .checked_add(segment.memory_bytes())
+                    .ok_or(())?;
+                let physical = PhysicalRange::from_pages(
+                    physical_start,
+                    segment.memory_bytes() / BASE_PAGE_SIZE,
+                )
+                .map_err(|_| ())?;
+                if segment.image_offset() <= relocation.target_offset() && target_end <= segment_end
+                {
+                    let byte_offset = relocation
+                        .target_offset()
+                        .checked_sub(segment.image_offset())
+                        .and_then(|offset| usize::try_from(offset).ok())
+                        .ok_or(())?;
+                    target = Some((physical, byte_offset));
+                    break;
+                }
+                physical_start = physical.end();
+            }
+            let (physical, byte_offset) = target.ok_or(())?;
+            let value = plan
+                .image_base()
+                .checked_add(relocation.value_offset())
+                .ok_or(())?;
+            troe_machine::copy_to_physical(physical, byte_offset, &value.to_le_bytes())
+                .map_err(|_| ())?;
         }
         Ok(())
     }
@@ -7316,11 +8899,11 @@ mod firmware {
         task_id: TaskId,
         dispatcher: &mut Dispatcher<'_>,
         owner: Option<HandleOwner>,
-        frames: &mut FrameAllocator,
+        accounting: &mut OwnedAccounting,
         allocation: ApplicationAllocation,
     ) -> Result<(), ()> {
         terminate_revoke_and_reap_task(scheduler, task_id, dispatcher, owner)?;
-        reclaim_application(frames, allocation)
+        reclaim_application(accounting, allocation)
     }
 
     fn rollback_command_application_task(
@@ -7328,18 +8911,23 @@ mod firmware {
         task_id: TaskId,
         dispatcher: &mut Dispatcher<'_>,
         owner: Option<HandleOwner>,
-        frames: &mut FrameAllocator,
+        accounting: &mut OwnedAccounting,
         allocation: ApplicationAllocation,
     ) {
-        if rollback_application_task(scheduler, task_id, dispatcher, owner, frames, allocation)
-            .is_err()
+        if rollback_application_task(
+            scheduler, task_id, dispatcher, owner, accounting, allocation,
+        )
+        .is_err()
         {
             fatal(b"fatal: application rollback invariant failed\n");
         }
     }
 
-    fn reclaim_command_application(frames: &mut FrameAllocator, allocation: ApplicationAllocation) {
-        if reclaim_application(frames, allocation).is_err() {
+    fn reclaim_command_application(
+        accounting: &mut OwnedAccounting,
+        allocation: ApplicationAllocation,
+    ) {
+        if reclaim_application(accounting, allocation).is_err() {
             fatal(b"fatal: application reclaim invariant failed\n");
         }
     }
@@ -7373,22 +8961,48 @@ mod firmware {
 
     #[allow(clippy::needless_pass_by_value)]
     fn reclaim_application(
-        frames: &mut FrameAllocator,
+        accounting: &mut OwnedAccounting,
         allocation: ApplicationAllocation,
     ) -> Result<(), ()> {
+        let committed_pages = allocation
+            .complete
+            .page_count()
+            .checked_add(application_growth_pages(&allocation)?)
+            .and_then(|pages| pages.checked_add(allocation.private_memory.committed_pages))
+            .ok_or(())?;
+        accounting.application_committed_pages = accounting
+            .application_committed_pages
+            .checked_sub(committed_pages)
+            .ok_or(())?;
+        accounting.private_metadata_bytes = accounting
+            .private_metadata_bytes
+            .checked_sub(allocation.private_memory.metadata_bytes)
+            .ok_or(())?;
+        for mapping in allocation.private_memory.mappings {
+            for range in mapping.backing {
+                troe_machine::zero_physical_range(range).map_err(|_| ())?;
+                accounting.frames.free_range(range).map_err(|_| ())?;
+            }
+        }
         for range in allocation.growth_ranges {
             troe_machine::zero_physical_range(range).map_err(|_| ())?;
-            frames.free_range(range).map_err(|_| ())?;
+            accounting.frames.free_range(range).map_err(|_| ())?;
         }
         for frame in allocation.growth_table_frames {
             let range = PhysicalRange::from_pages(frame, 1).map_err(|_| ())?;
             troe_machine::zero_physical_range(range).map_err(|_| ())?;
-            frames.free(frame).map_err(|_| ())?;
+            accounting.frames.free(frame).map_err(|_| ())?;
         }
         troe_machine::zero_physical_range(allocation.tables).map_err(|_| ())?;
-        frames.free_range(allocation.tables).map_err(|_| ())?;
+        accounting
+            .frames
+            .free_range(allocation.tables)
+            .map_err(|_| ())?;
         troe_machine::zero_physical_range(allocation.complete).map_err(|_| ())?;
-        frames.free_range(allocation.complete).map_err(|_| ())
+        accounting
+            .frames
+            .free_range(allocation.complete)
+            .map_err(|_| ())
     }
 
     const fn native_application_target() -> Target {
@@ -8598,6 +10212,44 @@ mod firmware {
                 }
                 _ => Ok(ServiceReply::empty(ReplyStatus::InvalidRequest)),
             }
+        }
+    }
+
+    impl Service for ApplicationPrivateMemoryService {
+        fn call(
+            &mut self,
+            _request: Request<'_>,
+        ) -> Result<ServiceReply, troe_dispatch::DispatchError> {
+            Ok(ServiceReply::empty(ReplyStatus::InvalidRequest))
+        }
+    }
+
+    impl Service for ApplicationRandomService {
+        fn call(
+            &mut self,
+            request: Request<'_>,
+        ) -> Result<ServiceReply, troe_dispatch::DispatchError> {
+            if request.opcode() != random::GET {
+                return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+            }
+            let Ok(byte_count) = random::decode_request(request.payload()) else {
+                return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+            };
+            let Ok(byte_count) = usize::try_from(byte_count) else {
+                return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+            };
+            let mut bytes = Vec::new();
+            if bytes.try_reserve_exact(byte_count).is_err() {
+                return Ok(ServiceReply::empty(ReplyStatus::Exhausted));
+            }
+            bytes.resize(byte_count, 0);
+            let Ok(mut generator) = self.random.try_borrow_mut() else {
+                return Ok(ServiceReply::empty(ReplyStatus::Conflict));
+            };
+            if generator.fill(&mut bytes).is_err() {
+                return Ok(ServiceReply::empty(ReplyStatus::Failure));
+            }
+            ServiceReply::with_payload(ReplyStatus::Success, &bytes)
         }
     }
 
@@ -11031,7 +12683,9 @@ mod firmware {
                 + usize::from(requirements.tcp_connect)
                 + usize::from(requirements.volume_control)
                 + usize::from(requirements.wall_clock)
-                + usize::from(requirements.clock_control);
+                + usize::from(requirements.clock_control)
+                + usize::from(requirements.private_memory)
+                + usize::from(requirements.random);
             let Some(handle_capacity) = service_count.checked_mul(2) else {
                 return command_application_error(stderr, command, "service resources exhausted");
             };
@@ -11353,6 +13007,30 @@ mod firmware {
                         minor: clock_control::MINOR,
                     });
                 }
+                if requirements.private_memory {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationPrivateMemoryService,
+                        )?,
+                        interface: troe_abi::interface::PRIVATE_MEMORY,
+                        major: private_memory::MAJOR,
+                        minor: private_memory::MINOR,
+                    });
+                }
+                if requirements.random {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationRandomService {
+                                random: self.accounting.random.clone(),
+                            },
+                        )?,
+                        interface: troe_abi::interface::RANDOM,
+                        major: random::MAJOR,
+                        minor: random::MINOR,
+                    });
+                }
                 Ok(services)
             })();
             let Ok(services) = services else {
@@ -11659,6 +13337,8 @@ mod firmware {
             let mut shell_script_required = false;
             let mut wall_clock_required = false;
             let mut clock_control_required = false;
+            let mut private_memory_required = false;
+            let mut random_required = false;
             for requirement in capability_manifest.iter() {
                 if requirement.interface == troe_abi::interface::DATAGRAM
                     && requirement.major == datagram::MAJOR
@@ -11740,6 +13420,16 @@ mod firmware {
                     && requirement.minor == clock_control::MINOR
                 {
                     clock_control_required = true;
+                } else if requirement.interface == troe_abi::interface::PRIVATE_MEMORY
+                    && requirement.major == private_memory::MAJOR
+                    && requirement.minor == private_memory::MINOR
+                {
+                    private_memory_required = true;
+                } else if requirement.interface == troe_abi::interface::RANDOM
+                    && requirement.major == random::MAJOR
+                    && requirement.minor == random::MINOR
+                {
+                    random_required = true;
                 } else {
                     return Some(command_application_error(
                         stderr,
@@ -11862,6 +13552,8 @@ mod firmware {
                         volume_control: volume_control_required,
                         wall_clock: wall_clock_required,
                         clock_control: clock_control_required,
+                        private_memory: private_memory_required,
+                        random: random_required,
                     },
                     diagnostics_snapshot.as_ref(),
                     stdout,
@@ -11897,7 +13589,9 @@ mod firmware {
                 + usize::from(volume_control_required)
                 + usize::from(shell_script_required)
                 + usize::from(wall_clock_required)
-                + usize::from(clock_control_required);
+                + usize::from(clock_control_required)
+                + usize::from(private_memory_required)
+                + usize::from(random_required);
             let Some(handle_capacity) = service_count.checked_mul(2) else {
                 return Some(command_application_error(
                     stderr,
@@ -12220,6 +13914,30 @@ mod firmware {
                         minor: clock_control::MINOR,
                     });
                 }
+                if private_memory_required {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationPrivateMemoryService,
+                        )?,
+                        interface: troe_abi::interface::PRIVATE_MEMORY,
+                        major: private_memory::MAJOR,
+                        minor: private_memory::MINOR,
+                    });
+                }
+                if random_required {
+                    services.push(CommandStartupService {
+                        port: register_command_service(
+                            &mut dispatcher,
+                            ApplicationRandomService {
+                                random: self.accounting.random.clone(),
+                            },
+                        )?,
+                        interface: troe_abi::interface::RANDOM,
+                        major: random::MAJOR,
+                        minor: random::MINOR,
+                    });
+                }
                 Ok(services)
             })();
             let Ok(services) = services else {
@@ -12311,6 +14029,8 @@ mod firmware {
                                     volume_control: volume_control_required,
                                     wall_clock: wall_clock_required,
                                     clock_control: clock_control_required,
+                                    private_memory: private_memory_required,
+                                    random: random_required,
                                 },
                                 children: process_children
                                     .clone()
@@ -12871,6 +14591,16 @@ mod firmware {
             fatal(b"fatal: framebuffer console write failed\n");
         }
         let (mut namespace, root_mode) = compose_namespace(task.accounting, &mut console);
+        if let Some(config) = task.accounting.selected_config.as_ref() {
+            let active_memory = normalize_memory_policy_toml(config.memory())
+                .unwrap_or_else(|_| fatal(b"fatal: cannot normalize active memory policy\n"));
+            namespace
+                .replace_system_config(
+                    config.generation(),
+                    &[("system/resources/memory.toml", active_memory.as_bytes())],
+                )
+                .unwrap_or_else(|_| fatal(b"fatal: cannot project active configuration\n"));
+        }
         let motd = namespace
             .read_file("/", "/recovery/motd")
             .unwrap_or_else(|_| fatal(b"fatal: cannot read /recovery/motd\n"));

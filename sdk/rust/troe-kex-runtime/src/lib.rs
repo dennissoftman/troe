@@ -13,6 +13,8 @@ pub mod environment;
 pub mod errno;
 #[cfg(feature = "math")]
 pub mod math;
+#[allow(unsafe_code)]
+pub mod memory;
 pub mod process;
 pub mod random;
 pub mod time;

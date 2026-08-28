@@ -13,14 +13,20 @@ pub use troe_abi::{ABI_MAJOR, ABI_MINOR};
 pub const PAGE_SIZE: u64 = 4096;
 /// KEX v1 base page size as a host slice length.
 pub const PAGE_BYTES: usize = 4096;
-/// Fixed virtual base of every separately isolated KEX v1 image.
+/// Canonical deterministic KEX v1 image base used by hosted inspection/tests.
 pub const KEX_V1_IMAGE_BASE: u64 = 0x0000_4000_0000_0000;
+/// Lowest admitted randomized application image base.
+pub const KEX_V1_MIN_IMAGE_BASE: u64 = 0x0000_0001_0000_0000;
+/// Required image-base randomization granularity.
+pub const KEX_V1_IMAGE_ALIGNMENT: u64 = 2 * 1024 * 1024;
 /// Exclusive upper bound of the application half of the initial 48-bit roots.
 pub const KEX_V1_USER_END: u64 = 0x0000_8000_0000_0000;
 /// KEX v1 header length in bytes.
-pub const KEX_V1_HEADER_BYTES: usize = 64;
+pub const KEX_V1_HEADER_BYTES: usize = 88;
 /// KEX v1 load-record length in bytes.
 pub const KEX_V1_LOAD_RECORD_BYTES: usize = 40;
+/// KEX v1 relative-relocation record length in bytes.
+pub const KEX_V1_RELOCATION_RECORD_BYTES: usize = 16;
 /// Product-name-independent KEX v1 format identifier.
 pub const KEX_V1_MAGIC: [u8; 8] = *b"KEX\0FMT\0";
 /// KEX package v1 header length in bytes.
@@ -30,8 +36,10 @@ pub const KEX_PACKAGE_V1_MAGIC: [u8; 8] = *b"KEXPKG\0\0";
 /// Maximum load records accepted by the standard application policy.
 pub const MAX_LOAD_RECORDS: usize = 16;
 const CONTAINER_MAJOR: u16 = 1;
-const CONTAINER_MINOR: u16 = 0;
+const CONTAINER_MINOR: u16 = 1;
 const STARTUP_PAGES: u64 = 1;
+const MAX_INITIAL_STACK_PAGES: u64 = 1 << 32;
+const MAX_INITIAL_HEAP_PAGES: u64 = 1 << 32;
 const STARTUP_FIXED_BYTES: usize = 64;
 const STARTUP_HANDLE_BYTES: usize = 24;
 
@@ -46,12 +54,17 @@ const HEADER_FLAGS: usize = 22;
 const HEADER_ENTRY_OFFSET: usize = 24;
 const HEADER_RECORD_COUNT: usize = 32;
 const HEADER_RESERVED16: usize = 34;
-const HEADER_STACK_PAGES: usize = 36;
-const HEADER_HEAP_PAGES: usize = 40;
-const HEADER_RECORDS_OFFSET: usize = 44;
-const HEADER_PAYLOAD_OFFSET: usize = 48;
-const HEADER_RESERVED32: usize = 52;
-const HEADER_ARTIFACT_BYTES: usize = 56;
+const HEADER_RESERVED32: usize = 36;
+const HEADER_STACK_PAGES: usize = 40;
+const HEADER_HEAP_PAGES: usize = 48;
+const HEADER_RECORDS_OFFSET: usize = 56;
+const HEADER_PAYLOAD_OFFSET: usize = 60;
+const HEADER_RELOCATIONS_OFFSET: usize = 64;
+const HEADER_RELOCATION_COUNT: usize = 68;
+const HEADER_RELOCATION_BYTES: usize = 72;
+const HEADER_RESERVED_RELOCATION16: usize = 74;
+const HEADER_RESERVED_RELOCATION32: usize = 76;
+const HEADER_ARTIFACT_BYTES: usize = 80;
 
 const RECORD_IMAGE_OFFSET: usize = 0;
 const RECORD_FILE_OFFSET: usize = 8;
@@ -59,6 +72,9 @@ const RECORD_FILE_BYTES: usize = 16;
 const RECORD_MEMORY_BYTES: usize = 24;
 const RECORD_PERMISSIONS: usize = 32;
 const RECORD_RESERVED: usize = 36;
+
+const RELOCATION_TARGET_OFFSET: usize = 0;
+const RELOCATION_VALUE_OFFSET: usize = 8;
 
 const PACKAGE_MAJOR: u16 = 1;
 const PACKAGE_MINOR: u16 = 0;
@@ -180,6 +196,44 @@ pub enum SegmentPermissions {
     ReadWrite = 3,
 }
 
+/// Kernel-selected virtual placement for one independently isolated image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LoadPlacement {
+    image_base: u64,
+    stack_top: u64,
+}
+
+impl LoadPlacement {
+    /// Construct an explicit image/stack placement.
+    ///
+    /// Full validation is performed together with the executable's requested
+    /// heap and stack geometry by [`parse_kex_at`].
+    #[must_use]
+    pub const fn new(image_base: u64, stack_top: u64) -> Self {
+        Self {
+            image_base,
+            stack_top,
+        }
+    }
+
+    /// First virtual byte of the image window.
+    #[must_use]
+    pub const fn image_base(self) -> u64 {
+        self.image_base
+    }
+
+    /// Exclusive top of the initially mapped stack.
+    #[must_use]
+    pub const fn stack_top(self) -> u64 {
+        self.stack_top
+    }
+
+    const STANDARD: Self = Self {
+        image_base: KEX_V1_IMAGE_BASE,
+        stack_top: KEX_V1_USER_END - PAGE_SIZE,
+    };
+}
+
 impl SegmentPermissions {
     const fn from_raw(raw: u32) -> Option<Self> {
         match raw {
@@ -225,10 +279,10 @@ impl ApplicationLimits {
         image_span_bytes: 128 * 1024 * 1024,
         image_pages: 8192,
         minimum_stack_pages: 4,
-        maximum_stack_pages: 256,
-        heap_pages: 4096,
+        maximum_stack_pages: MAX_INITIAL_STACK_PAGES,
+        heap_pages: MAX_INITIAL_HEAP_PAGES,
         table_pages: 512,
-        resident_pages: 16_384,
+        resident_pages: 2 * (1 << 32) + 8192 + 1 + 512,
         initial_handles: 32,
     };
 
@@ -296,6 +350,7 @@ impl ApplicationLimits {
 /// One validated KEX load segment borrowing its staged payload bytes.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LoadSegment<'artifact> {
+    image_base: u64,
     image_offset: u64,
     memory_bytes: u64,
     file_byte_count: u64,
@@ -310,10 +365,10 @@ impl<'artifact> LoadSegment<'artifact> {
         self.image_offset
     }
 
-    /// Absolute first virtual byte at the fixed KEX v1 base.
+    /// Absolute first virtual byte at the kernel-selected KEX v1 base.
     #[must_use]
     pub const fn virtual_address(self) -> u64 {
-        KEX_V1_IMAGE_BASE + self.image_offset
+        self.image_base + self.image_offset
     }
 
     /// Mapped bytes, including the zero-filled suffix.
@@ -338,6 +393,27 @@ impl<'artifact> LoadSegment<'artifact> {
     #[must_use]
     pub const fn zero_fill_bytes(self) -> u64 {
         self.memory_bytes - self.file_byte_count
+    }
+}
+
+/// One validated image-relative pointer fixup.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RelativeRelocation {
+    target_offset: u64,
+    value_offset: u64,
+}
+
+impl RelativeRelocation {
+    /// Image-relative writable address receiving one little-endian `u64`.
+    #[must_use]
+    pub const fn target_offset(self) -> u64 {
+        self.target_offset
+    }
+
+    /// Image-relative value added to the selected image base.
+    #[must_use]
+    pub const fn value_offset(self) -> u64 {
+        self.value_offset
     }
 }
 
@@ -642,11 +718,14 @@ impl LoadCharges {
 pub struct LoadPlan<'artifact> {
     target: Target,
     abi_minor: u16,
+    image_base: u64,
     entry_offset: u64,
     stack_pages: u64,
     heap_pages: u64,
     segments: [Option<LoadSegment<'artifact>>; MAX_LOAD_RECORDS],
     segment_count: usize,
+    relocations: &'artifact [u8],
+    relocation_count: usize,
     charges: LoadCharges,
     layout: ApplicationLayout,
 }
@@ -664,10 +743,16 @@ impl<'artifact> LoadPlan<'artifact> {
         self.abi_minor
     }
 
+    /// Kernel-selected image base.
+    #[must_use]
+    pub const fn image_base(&self) -> u64 {
+        self.image_base
+    }
+
     /// Fixed virtual entry address.
     #[must_use]
     pub const fn entry_address(&self) -> u64 {
-        KEX_V1_IMAGE_BASE + self.entry_offset
+        self.image_base + self.entry_offset
     }
 
     /// Requested initial stack pages.
@@ -688,6 +773,25 @@ impl<'artifact> LoadPlan<'artifact> {
             .iter()
             .flatten()
             .copied()
+    }
+
+    /// Ordered validated image-relative pointer fixups.
+    pub fn relocations(&self) -> impl Iterator<Item = RelativeRelocation> + '_ {
+        self.relocations
+            .chunks_exact(KEX_V1_RELOCATION_RECORD_BYTES)
+            .take(self.relocation_count)
+            .map(|record| RelativeRelocation {
+                target_offset: u64::from_le_bytes(
+                    record[RELOCATION_TARGET_OFFSET..RELOCATION_TARGET_OFFSET + 8]
+                        .try_into()
+                        .unwrap_or_else(|_| unreachable!()),
+                ),
+                value_offset: u64::from_le_bytes(
+                    record[RELOCATION_VALUE_OFFSET..RELOCATION_VALUE_OFFSET + 8]
+                        .try_into()
+                        .unwrap_or_else(|_| unreachable!()),
+                ),
+            })
     }
 
     /// Preliminary staging and page charges.
@@ -744,7 +848,7 @@ impl<'artifact> LoadPlan<'artifact> {
         write_u32(destination, 8, 4096);
         write_u16(destination, 12, 0);
         write_u16(destination, 14, handle_count);
-        write_u64(destination, 16, KEX_V1_IMAGE_BASE);
+        write_u64(destination, 16, self.image_base);
         write_u64(destination, 24, self.layout.heap_address);
         write_u64(destination, 32, self.layout.heap_bytes);
         write_u64(destination, 40, self.layout.stack_bottom);
@@ -809,6 +913,10 @@ pub enum ParseError {
     MissingExecutableSegment,
     /// Entry is outside all executable segments.
     InvalidEntryPoint,
+    /// Kernel-selected image/heap/stack placement is noncanonical.
+    InvalidPlacement,
+    /// A relative relocation is malformed, unordered, or targets outside the image.
+    InvalidRelocation,
 }
 
 impl fmt::Display for ParseError {
@@ -836,6 +944,8 @@ impl fmt::Display for ParseError {
             Self::ResidentBudgetExceeded => "KEX resident-page charge exceeds the standard policy",
             Self::MissingExecutableSegment => "KEX has no executable segment",
             Self::InvalidEntryPoint => "KEX entry point is not executable",
+            Self::InvalidPlacement => "KEX virtual placement is invalid",
+            Self::InvalidRelocation => "KEX relative relocation is invalid",
         })
     }
 }
@@ -1083,6 +1193,28 @@ pub fn parse_kex(
         expected_target,
         supported_abi_minor,
         ApplicationLimits::standard(),
+        LoadPlacement::STANDARD,
+    )
+}
+
+/// Parse and validate a KEX artifact at one explicit randomized placement.
+///
+/// # Errors
+///
+/// Returns the same deterministic format errors as [`parse_kex`], plus
+/// [`ParseError::InvalidPlacement`] for noncanonical or overlapping geometry.
+pub fn parse_kex_at(
+    artifact: &[u8],
+    expected_target: Target,
+    supported_abi_minor: u16,
+    placement: LoadPlacement,
+) -> Result<LoadPlan<'_>, ParseError> {
+    parse_with_limits(
+        artifact,
+        expected_target,
+        supported_abi_minor,
+        ApplicationLimits::standard(),
+        placement,
     )
 }
 
@@ -1091,12 +1223,14 @@ fn parse_with_limits(
     expected_target: Target,
     supported_abi_minor: u16,
     limits: ApplicationLimits,
+    placement: LoadPlacement,
 ) -> Result<LoadPlan<'_>, ParseError> {
     if artifact.len() > limits.encoded_bytes {
         return Err(ParseError::ArtifactTooLarge);
     }
     let header = parse_header(artifact, expected_target, supported_abi_minor, limits)?;
-    let parsed = parse_segments(artifact, header, limits)?;
+    let parsed = parse_segments(artifact, header, limits, placement.image_base)?;
+    let relocations = parse_relocations(artifact, header, &parsed)?;
     let private_pages = parsed
         .image_pages
         .checked_add(header.stack_pages)
@@ -1114,16 +1248,20 @@ fn parse_with_limits(
         header.heap_pages,
         header.abi_minor,
         limits,
+        placement,
     )?;
 
     Ok(LoadPlan {
         target: header.target,
         abi_minor: header.abi_minor,
+        image_base: placement.image_base,
         entry_offset: header.entry_offset,
         stack_pages: header.stack_pages,
         heap_pages: header.heap_pages,
         segments: parsed.segments,
         segment_count: header.record_count,
+        relocations,
+        relocation_count: header.relocation_count,
         charges: LoadCharges {
             staging_bytes: artifact.len(),
             image_pages: parsed.image_pages,
@@ -1141,8 +1279,17 @@ fn application_layout(
     heap_pages: u64,
     abi_minor: u16,
     limits: ApplicationLimits,
+    placement: LoadPlacement,
 ) -> Result<ApplicationLayout, ParseError> {
-    let startup_address = KEX_V1_IMAGE_BASE
+    if placement.image_base < KEX_V1_MIN_IMAGE_BASE
+        || !placement.image_base.is_multiple_of(KEX_V1_IMAGE_ALIGNMENT)
+        || !placement.stack_top.is_multiple_of(PAGE_SIZE)
+        || placement.stack_top >= KEX_V1_USER_END
+    {
+        return Err(ParseError::InvalidPlacement);
+    }
+    let startup_address = placement
+        .image_base
         .checked_add(limits.image_span_bytes)
         .ok_or(ParseError::ArithmeticOverflow)?;
     let heap_address = startup_address
@@ -1169,9 +1316,7 @@ fn application_layout(
             .ok_or(ParseError::ArithmeticOverflow)?;
         (lower_guard_address, upper_guard_address)
     } else {
-        let upper_guard_address = KEX_V1_USER_END
-            .checked_sub(PAGE_SIZE)
-            .ok_or(ParseError::ArithmeticOverflow)?;
+        let upper_guard_address = placement.stack_top;
         let lower_guard_address = upper_guard_address
             .checked_sub(stack_slot_bytes)
             .and_then(|stack_slot| stack_slot.checked_sub(PAGE_SIZE))
@@ -1191,7 +1336,7 @@ fn application_layout(
         .checked_add(heap_bytes)
         .ok_or(ParseError::ArithmeticOverflow)?;
     if initial_heap_end > lower_guard_address || user_end > KEX_V1_USER_END {
-        return Err(ParseError::ArithmeticOverflow);
+        return Err(ParseError::InvalidPlacement);
     }
     Ok(ApplicationLayout {
         startup_address,
@@ -1214,6 +1359,8 @@ struct ParsedHeader {
     payload_offset: usize,
     stack_pages: u64,
     heap_pages: u64,
+    relocations_offset: usize,
+    relocation_count: usize,
 }
 
 fn parse_header(
@@ -1251,6 +1398,8 @@ fn parse_header(
     if read_u16(header, HEADER_FLAGS)? != 0
         || read_u16(header, HEADER_RESERVED16)? != 0
         || read_u32(header, HEADER_RESERVED32)? != 0
+        || read_u16(header, HEADER_RESERVED_RELOCATION16)? != 0
+        || read_u32(header, HEADER_RESERVED_RELOCATION32)? != 0
     {
         return Err(ParseError::NonzeroReserved);
     }
@@ -1268,22 +1417,36 @@ fn parse_header(
         .map_err(|_| ParseError::ArithmeticOverflow)?;
     let payload_offset = usize::try_from(read_u32(header, HEADER_PAYLOAD_OFFSET)?)
         .map_err(|_| ParseError::ArithmeticOverflow)?;
+    let relocations_offset = usize::try_from(read_u32(header, HEADER_RELOCATIONS_OFFSET)?)
+        .map_err(|_| ParseError::ArithmeticOverflow)?;
+    let relocation_count = usize::try_from(read_u32(header, HEADER_RELOCATION_COUNT)?)
+        .map_err(|_| ParseError::ArithmeticOverflow)?;
+    if usize::from(read_u16(header, HEADER_RELOCATION_BYTES)?) != KEX_V1_RELOCATION_RECORD_BYTES {
+        return Err(ParseError::InvalidLayout);
+    }
     let records_bytes = record_count
         .checked_mul(KEX_V1_LOAD_RECORD_BYTES)
         .ok_or(ParseError::ArithmeticOverflow)?;
     let records_end = records_offset
         .checked_add(records_bytes)
         .ok_or(ParseError::ArithmeticOverflow)?;
+    let relocation_table_bytes = relocation_count
+        .checked_mul(KEX_V1_RELOCATION_RECORD_BYTES)
+        .ok_or(ParseError::ArithmeticOverflow)?;
+    let relocations_end = relocations_offset
+        .checked_add(relocation_table_bytes)
+        .ok_or(ParseError::ArithmeticOverflow)?;
     if records_offset != KEX_V1_HEADER_BYTES
-        || payload_offset != records_end
+        || relocations_offset != records_end
+        || payload_offset != relocations_end
         || payload_offset > artifact.len()
     {
         return Err(ParseError::InvalidLayout);
     }
 
     let entry_offset = read_u64(header, HEADER_ENTRY_OFFSET)?;
-    let stack_pages = u64::from(read_u32(header, HEADER_STACK_PAGES)?);
-    let heap_pages = u64::from(read_u32(header, HEADER_HEAP_PAGES)?);
+    let stack_pages = read_u64(header, HEADER_STACK_PAGES)?;
+    let heap_pages = read_u64(header, HEADER_HEAP_PAGES)?;
     if stack_pages < limits.minimum_stack_pages || stack_pages > limits.maximum_stack_pages {
         return Err(ParseError::StackBudgetExceeded);
     }
@@ -1300,6 +1463,8 @@ fn parse_header(
         payload_offset,
         stack_pages,
         heap_pages,
+        relocations_offset,
+        relocation_count,
     })
 }
 
@@ -1308,10 +1473,60 @@ struct ParsedSegments<'artifact> {
     image_pages: u64,
 }
 
+fn parse_relocations<'artifact>(
+    artifact: &'artifact [u8],
+    header: ParsedHeader,
+    parsed: &ParsedSegments<'artifact>,
+) -> Result<&'artifact [u8], ParseError> {
+    let byte_count = header
+        .relocation_count
+        .checked_mul(KEX_V1_RELOCATION_RECORD_BYTES)
+        .ok_or(ParseError::ArithmeticOverflow)?;
+    let end = header
+        .relocations_offset
+        .checked_add(byte_count)
+        .ok_or(ParseError::ArithmeticOverflow)?;
+    let records = artifact
+        .get(header.relocations_offset..end)
+        .ok_or(ParseError::InvalidLayout)?;
+    let image_end = parsed
+        .segments
+        .iter()
+        .flatten()
+        .try_fold(0_u64, |end, segment| {
+            segment
+                .image_offset
+                .checked_add(segment.memory_bytes)
+                .map(|segment_end| end.max(segment_end))
+        })
+        .ok_or(ParseError::ArithmeticOverflow)?;
+    let mut previous_target = None;
+    for record in records.chunks_exact(KEX_V1_RELOCATION_RECORD_BYTES) {
+        let target_offset = read_u64(record, RELOCATION_TARGET_OFFSET)?;
+        let value_offset = read_u64(record, RELOCATION_VALUE_OFFSET)?;
+        let target_end = target_offset
+            .checked_add(8)
+            .ok_or(ParseError::InvalidRelocation)?;
+        if previous_target.is_some_and(|previous| target_offset <= previous)
+            || value_offset >= image_end
+            || !parsed.segments.iter().flatten().any(|segment| {
+                let segment_end = segment.image_offset.checked_add(segment.memory_bytes);
+                segment.image_offset <= target_offset
+                    && segment_end.is_some_and(|end| target_end <= end)
+            })
+        {
+            return Err(ParseError::InvalidRelocation);
+        }
+        previous_target = Some(target_offset);
+    }
+    Ok(records)
+}
+
 fn parse_segments(
     artifact: &[u8],
     header: ParsedHeader,
     limits: ApplicationLimits,
+    image_base: u64,
 ) -> Result<ParsedSegments<'_>, ParseError> {
     let mut segments = [None; MAX_LOAD_RECORDS];
     let mut expected_file_offset = header.payload_offset;
@@ -1342,6 +1557,7 @@ fn parse_segments(
             previous_image_end,
             index != 0,
             limits,
+            image_base,
         )?;
         previous_image_end = parsed.image_end;
         expected_file_offset = parsed.file_end;
@@ -1393,6 +1609,7 @@ fn parse_record<'artifact>(
     previous_image_end: u64,
     has_predecessor: bool,
     limits: ApplicationLimits,
+    image_base: u64,
 ) -> Result<ParsedRecord<'artifact>, ParseError> {
     let image_offset = read_u64(record, RECORD_IMAGE_OFFSET)?;
     let file_offset = usize::try_from(read_u64(record, RECORD_FILE_OFFSET)?)
@@ -1416,7 +1633,7 @@ fn parse_record<'artifact>(
     let image_end = image_offset
         .checked_add(memory_bytes)
         .ok_or(ParseError::ArithmeticOverflow)?;
-    KEX_V1_IMAGE_BASE
+    image_base
         .checked_add(image_end)
         .ok_or(ParseError::ArithmeticOverflow)?;
     if has_predecessor && image_offset < previous_image_end {
@@ -1437,6 +1654,7 @@ fn parse_record<'artifact>(
 
     Ok(ParsedRecord {
         segment: LoadSegment {
+            image_base,
             image_offset,
             memory_bytes,
             file_byte_count,
@@ -1500,6 +1718,12 @@ mod tests {
         payload: &'bytes [u8],
     }
 
+    #[derive(Clone, Copy)]
+    struct TestRelocation {
+        target_offset: u64,
+        value_offset: u64,
+    }
+
     fn put_u16(bytes: &mut [u8], offset: usize, value: u16) {
         bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
     }
@@ -1524,12 +1748,18 @@ mod tests {
         u64::try_from(value).unwrap_or_else(|_| unreachable!())
     }
 
-    fn artifact(target: Target, segments: &[TestSegment<'_>]) -> Vec<u8> {
+    fn artifact_with_relocations(
+        target: Target,
+        segments: &[TestSegment<'_>],
+        relocations: &[TestRelocation],
+    ) -> Vec<u8> {
         let payload_bytes = segments
             .iter()
             .map(|segment| segment.payload.len())
             .sum::<usize>();
-        let payload_offset = KEX_V1_HEADER_BYTES + segments.len() * KEX_V1_LOAD_RECORD_BYTES;
+        let relocations_offset = KEX_V1_HEADER_BYTES + segments.len() * KEX_V1_LOAD_RECORD_BYTES;
+        let payload_offset =
+            relocations_offset + relocations.len() * KEX_V1_RELOCATION_RECORD_BYTES;
         let artifact_bytes = payload_offset + payload_bytes;
         let mut bytes = vec![0_u8; artifact_bytes];
         bytes[..8].copy_from_slice(&KEX_V1_MAGIC);
@@ -1546,15 +1776,44 @@ mod tests {
         put_u16(&mut bytes, HEADER_ABI_MINOR, ABI_MINOR);
         put_u64(&mut bytes, HEADER_ENTRY_OFFSET, 0);
         put_u16(&mut bytes, HEADER_RECORD_COUNT, usize_u16(segments.len()));
-        put_u32(&mut bytes, HEADER_STACK_PAGES, 4);
-        put_u32(&mut bytes, HEADER_HEAP_PAGES, 0);
+        put_u64(&mut bytes, HEADER_STACK_PAGES, 4);
+        put_u64(&mut bytes, HEADER_HEAP_PAGES, 0);
         put_u32(
             &mut bytes,
             HEADER_RECORDS_OFFSET,
             usize_u32(KEX_V1_HEADER_BYTES),
         );
+        put_u32(
+            &mut bytes,
+            HEADER_RELOCATIONS_OFFSET,
+            usize_u32(relocations_offset),
+        );
+        put_u32(
+            &mut bytes,
+            HEADER_RELOCATION_COUNT,
+            usize_u32(relocations.len()),
+        );
+        put_u16(
+            &mut bytes,
+            HEADER_RELOCATION_BYTES,
+            usize_u16(KEX_V1_RELOCATION_RECORD_BYTES),
+        );
         put_u32(&mut bytes, HEADER_PAYLOAD_OFFSET, usize_u32(payload_offset));
         put_u64(&mut bytes, HEADER_ARTIFACT_BYTES, usize_u64(artifact_bytes));
+
+        for (index, relocation) in relocations.iter().enumerate() {
+            let start = relocations_offset + index * KEX_V1_RELOCATION_RECORD_BYTES;
+            put_u64(
+                &mut bytes,
+                start + RELOCATION_TARGET_OFFSET,
+                relocation.target_offset,
+            );
+            put_u64(
+                &mut bytes,
+                start + RELOCATION_VALUE_OFFSET,
+                relocation.value_offset,
+            );
+        }
 
         let mut file_offset = payload_offset;
         for (index, segment) in segments.iter().enumerate() {
@@ -1585,6 +1844,10 @@ mod tests {
             file_offset = end;
         }
         bytes
+    }
+
+    fn artifact(target: Target, segments: &[TestSegment<'_>]) -> Vec<u8> {
+        artifact_with_relocations(target, segments, &[])
     }
 
     fn valid_artifact(target: Target) -> Vec<u8> {
@@ -1756,6 +2019,71 @@ mod tests {
     }
 
     #[test]
+    fn relative_relocations_and_randomized_placement_are_exact() {
+        let segments = [
+            TestSegment {
+                image_offset: 0,
+                memory_bytes: PAGE_SIZE,
+                permissions: SegmentPermissions::ReadExecute as u32,
+                payload: &[0x90, 0xc3],
+            },
+            TestSegment {
+                image_offset: PAGE_SIZE,
+                memory_bytes: PAGE_SIZE,
+                permissions: SegmentPermissions::ReadOnly as u32,
+                payload: &[0; 16],
+            },
+        ];
+        let relocation = [TestRelocation {
+            target_offset: PAGE_SIZE,
+            value_offset: 1,
+        }];
+        let artifact = artifact_with_relocations(Target::X86_64, &segments, &relocation);
+        let placement = LoadPlacement::new(
+            KEX_V1_MIN_IMAGE_BASE + 6 * KEX_V1_IMAGE_ALIGNMENT,
+            0x0000_7000_1000_0000,
+        );
+        let plan = parse_kex_at(&artifact, Target::X86_64, ABI_MINOR, placement)
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(plan.image_base(), placement.image_base());
+        assert_eq!(plan.entry_address(), placement.image_base());
+        assert_eq!(plan.layout().stack_top(), placement.stack_top());
+        assert_eq!(
+            plan.segments().nth(1).map(LoadSegment::virtual_address),
+            Some(placement.image_base() + PAGE_SIZE)
+        );
+        assert_eq!(
+            plan.relocations().collect::<Vec<_>>(),
+            [RelativeRelocation {
+                target_offset: PAGE_SIZE,
+                value_offset: 1,
+            }]
+        );
+
+        let mut invalid = artifact.clone();
+        put_u64(
+            &mut invalid,
+            KEX_V1_HEADER_BYTES
+                + segments.len() * KEX_V1_LOAD_RECORD_BYTES
+                + RELOCATION_TARGET_OFFSET,
+            2 * PAGE_SIZE,
+        );
+        assert_eq!(
+            parse_kex_at(&invalid, Target::X86_64, ABI_MINOR, placement),
+            Err(ParseError::InvalidRelocation)
+        );
+        assert_eq!(
+            parse_kex_at(
+                &artifact,
+                Target::X86_64,
+                ABI_MINOR,
+                LoadPlacement::new(0, placement.stack_top())
+            ),
+            Err(ParseError::InvalidPlacement)
+        );
+    }
+
+    #[test]
     fn startup_page_is_canonical_and_rejections_are_atomic() {
         let bytes = valid_artifact(Target::X86_64);
         let plan = parse_standard(&bytes, Target::X86_64).unwrap_or_else(|_| unreachable!());
@@ -1882,7 +2210,7 @@ mod tests {
         assert_ne!(legacy.layout().stack_top(), current.layout().stack_top());
         assert_eq!(
             legacy.layout().lower_guard_address(),
-            legacy.layout().heap_address() + 4096 * PAGE_SIZE
+            legacy.layout().heap_address() + ApplicationLimits::standard().heap_pages() * PAGE_SIZE
         );
     }
 
@@ -1894,10 +2222,10 @@ mod tests {
         assert_eq!(standard.load_records(), 16);
         assert_eq!(standard.image_span_bytes(), 128 * 1024 * 1024);
         assert_eq!(standard.image_pages(), 8192);
-        assert_eq!(standard.stack_pages(), (4, 256));
-        assert_eq!(standard.heap_pages(), 4096);
+        assert_eq!(standard.stack_pages(), (4, 1 << 32));
+        assert_eq!(standard.heap_pages(), 1 << 32);
         assert_eq!(standard.table_pages(), 512);
-        assert_eq!(standard.resident_pages(), 16_384);
+        assert_eq!(standard.resident_pages(), 2 * (1 << 32) + 8192 + 1 + 512);
         assert_eq!(standard.initial_handles(), 32);
     }
 
@@ -2142,16 +2470,16 @@ mod tests {
     #[test]
     fn rejects_stack_heap_and_aggregate_resident_budgets() {
         let valid = valid_artifact(Target::X86_64);
-        for stack_pages in [0, 3, 257] {
+        for stack_pages in [0_u64, 3, (1 << 32) + 1] {
             let mut bytes = valid.clone();
-            put_u32(&mut bytes, HEADER_STACK_PAGES, stack_pages);
+            put_u64(&mut bytes, HEADER_STACK_PAGES, stack_pages);
             assert_eq!(
                 parse_standard(&bytes, Target::X86_64),
                 Err(ParseError::StackBudgetExceeded)
             );
         }
         let mut heap = valid.clone();
-        put_u32(&mut heap, HEADER_HEAP_PAGES, 4097);
+        put_u64(&mut heap, HEADER_HEAP_PAGES, (1 << 32) + 1);
         assert_eq!(
             parse_standard(&heap, Target::X86_64),
             Err(ParseError::HeapBudgetExceeded)
@@ -2162,7 +2490,13 @@ mod tests {
             ..ApplicationLimits::STANDARD
         };
         assert_eq!(
-            parse_with_limits(&valid, Target::X86_64, ABI_MINOR, limits,),
+            parse_with_limits(
+                &valid,
+                Target::X86_64,
+                ABI_MINOR,
+                limits,
+                LoadPlacement::STANDARD,
+            ),
             Err(ParseError::ResidentBudgetExceeded)
         );
     }
@@ -2316,8 +2650,8 @@ mod tests {
             let mut bytes = artifact(target, &segments);
             let stack_pages = u32::try_from(4 + state % 253).unwrap_or_else(|_| unreachable!());
             let heap_pages = u32::try_from(state % 4097).unwrap_or_else(|_| unreachable!());
-            put_u32(&mut bytes, HEADER_STACK_PAGES, stack_pages);
-            put_u32(&mut bytes, HEADER_HEAP_PAGES, heap_pages);
+            put_u64(&mut bytes, HEADER_STACK_PAGES, u64::from(stack_pages));
+            put_u64(&mut bytes, HEADER_HEAP_PAGES, u64::from(heap_pages));
             let plan = parse_standard(&bytes, target).unwrap_or_else(|_| unreachable!());
             let parsed = plan.segments().collect::<Vec<_>>();
             assert_eq!(parsed.len(), count);

@@ -14,22 +14,24 @@ use std::process::Command;
 pub use elf::convert_elf;
 use troe_abi::{
     clock_control, datagram, diagnostics, filesystem, filesystem_mutation, icmp_echo, interface,
-    network_configuration, network_observation, pipe, process_launch, process_observation,
-    requirements, tcp_connect, timer, volume_control, wall_clock,
+    network_configuration, network_observation, pipe, private_memory, process_launch,
+    process_observation, random, requirements, tcp_connect, timer, volume_control, wall_clock,
 };
 use troe_application::{
-    ABI_MAJOR, ABI_MINOR, KEX_PACKAGE_V1_MAGIC, KEX_V1_HEADER_BYTES, KEX_V1_IMAGE_BASE,
-    KEX_V1_MAGIC, MAX_KEX_PACKAGE_BYTES, Target, encode_kex_package, parse_kex, parse_kex_package,
+    ABI_MAJOR, ABI_MINOR, KEX_PACKAGE_V1_MAGIC, KEX_V1_HEADER_BYTES, KEX_V1_MAGIC,
+    MAX_KEX_PACKAGE_BYTES, Target, encode_kex_package, parse_kex, parse_kex_package,
 };
 
-const DEFAULT_STACK_PAGES: u32 = 4;
-const DEFAULT_HEAP_PAGES: u32 = 0;
+const DEFAULT_STACK_PAGES: u64 = 4;
+const DEFAULT_HEAP_PAGES: u64 = 0;
 const ELF_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const RUST_FLAGS: &[&str] = &[
     "-C",
-    "relocation-model=static",
+    "relocation-model=pic",
     "-C",
-    "code-model=large",
+    "code-model=small",
+    "-C",
+    "link-arg=-pie",
     "-C",
     "LINKER_SCRIPT",
     "-C",
@@ -40,6 +42,10 @@ const RUST_FLAGS: &[&str] = &[
     "link-arg=-z",
     "-C",
     "link-arg=norelro",
+    "-C",
+    "link-arg=-z",
+    "-C",
+    "link-arg=notext",
     "-C",
     "link-arg=-z",
     "-C",
@@ -95,8 +101,8 @@ struct AppManifest {
     binary: String,
     command: String,
     requirements: Vec<requirements::Requirement>,
-    stack_pages: u32,
-    heap_pages: u32,
+    stack_pages: u64,
+    heap_pages: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -105,8 +111,8 @@ struct BuildOptions {
     command: Option<String>,
     target: TargetSelection,
     output: PathBuf,
-    stack_pages: Option<u32>,
-    heap_pages: Option<u32>,
+    stack_pages: Option<u64>,
+    heap_pages: Option<u64>,
     check: bool,
 }
 
@@ -115,8 +121,8 @@ struct ConvertOptions {
     input: PathBuf,
     output: PathBuf,
     target: Option<Target>,
-    stack_pages: u32,
-    heap_pages: u32,
+    stack_pages: u64,
+    heap_pages: u64,
     check: bool,
 }
 
@@ -164,10 +170,10 @@ impl Arguments {
             .map_err(|_| ToolError::new(format!("{option} must be valid UTF-8")))
     }
 
-    fn number(&mut self, option: &str) -> ToolResult<u32> {
+    fn number(&mut self, option: &str) -> ToolResult<u64> {
         self.string(option)?
-            .parse::<u32>()
-            .map_err(|_| ToolError::new(format!("{option} must be an unsigned 32-bit integer")))
+            .parse::<u64>()
+            .map_err(|_| ToolError::new(format!("{option} must be an unsigned 64-bit integer")))
     }
 }
 
@@ -378,7 +384,7 @@ fn parse_simple_string_array(line: &str, key: &str) -> ToolResult<Option<Vec<Str
     Ok(Some(values))
 }
 
-fn parse_simple_u32(line: &str, key: &str) -> ToolResult<Option<u32>> {
+fn parse_simple_u64(line: &str, key: &str) -> ToolResult<Option<u64>> {
     let Some((candidate, value)) = line.split_once('=') else {
         return Ok(None);
     };
@@ -387,9 +393,9 @@ fn parse_simple_u32(line: &str, key: &str) -> ToolResult<Option<u32>> {
     }
     value
         .trim()
-        .parse::<u32>()
+        .parse::<u64>()
         .map(Some)
-        .map_err(|_| ToolError::new(format!("manifest {key} must be an unsigned 32-bit integer")))
+        .map_err(|_| ToolError::new(format!("manifest {key} must be an unsigned 64-bit integer")))
 }
 
 fn capability_requirement(name: &str) -> ToolResult<requirements::Requirement> {
@@ -479,6 +485,16 @@ fn capability_requirement(name: &str) -> ToolResult<requirements::Requirement> {
             major: pipe::MAJOR,
             minor: pipe::MINOR,
         }),
+        "private-memory" => Ok(requirements::Requirement {
+            interface: interface::PRIVATE_MEMORY,
+            major: private_memory::MAJOR,
+            minor: private_memory::MINOR,
+        }),
+        "random" => Ok(requirements::Requirement {
+            interface: interface::RANDOM,
+            major: random::MAJOR,
+            minor: random::MINOR,
+        }),
         _ => Err(ToolError::new(format!(
             "unknown TROE KEX capability '{name}'"
         ))),
@@ -564,14 +580,14 @@ fn read_manifest(app: &Path, requested_command: Option<&str>) -> ToolResult<AppM
                 ));
             }
         } else if section == "[package.metadata.troe-kex]"
-            && let Some(value) = parse_simple_u32(line, "stack-pages")?
+            && let Some(value) = parse_simple_u64(line, "stack-pages")?
             && stack_pages.replace(value).is_some()
         {
             return Err(ToolError::new(
                 "manifest declares stack-pages more than once",
             ));
         } else if section == "[package.metadata.troe-kex]"
-            && let Some(value) = parse_simple_u32(line, "heap-pages")?
+            && let Some(value) = parse_simple_u64(line, "heap-pages")?
             && heap_pages.replace(value).is_some()
         {
             return Err(ToolError::new(
@@ -779,8 +795,8 @@ fn build_one(
     manifest: &AppManifest,
     target: Target,
     output: &Path,
-    stack_pages: u32,
-    heap_pages: u32,
+    stack_pages: u64,
+    heap_pages: u64,
     check: bool,
 ) -> ToolResult<()> {
     let executable = run_cargo(manifest, target)?;
@@ -871,7 +887,7 @@ fn inspect(path: &Path) -> ToolResult<InspectReport> {
         .map_err(|error| ToolError::new(format!("invalid embedded KEX executable: {error}")))?;
     let entry_offset = plan
         .entry_address()
-        .checked_sub(KEX_V1_IMAGE_BASE)
+        .checked_sub(plan.image_base())
         .ok_or_else(|| ToolError::new("KEX entry is below the image base"))?;
     Ok(InspectReport {
         package,

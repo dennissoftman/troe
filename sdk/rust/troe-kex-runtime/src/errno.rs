@@ -52,7 +52,7 @@ pub const ECANCELED: i32 = 125;
 pub const fn from_kex(error: KexError) -> i32 {
     match error {
         KexError::NotFound => ENOENT,
-        KexError::Exhausted => ENOMEM,
+        KexError::Exhausted | KexError::ResourceLimit => ENOMEM,
         KexError::Denied | KexError::MissingAuthority => EACCES,
         KexError::Conflict => EBUSY,
         KexError::TooLarge => EFBIG,

@@ -20,6 +20,7 @@ MAX_TARGETS = 2
 MAX_CAPABILITIES = 32
 MAX_DIRECTORIES = 8
 MAX_SERVICES = 16
+U64_MAX = (1 << 64) - 1
 SUPPORTED_TARGETS = {
     "aarch64-unknown-uefi": "aarch64",
     "x86_64-unknown-uefi": "x86_64",
@@ -29,6 +30,7 @@ KNOWN_CAPABILITIES = {
     "clock.control",
     "fs.directory.read",
     "fs.directory.mutate",
+    "memory.private",
     "network.datagram",
     "network.tcp-connect",
     "timer.wait",
@@ -497,8 +499,8 @@ def parse_manifest(data: bytes, label: str = "manifest") -> Manifest:
     resources = ResourceLimits(
         _bounded_int(resource["execution_ms"], f"{label}.resources.execution_ms", 1, 50),
         _bounded_int(resource["handles"], f"{label}.resources.handles", 1, 8),
-        _bounded_int(resource["heap_bytes"], f"{label}.resources.heap_bytes", 4096, 64 * 1024 * 1024),
-        _bounded_int(resource["stack_bytes"], f"{label}.resources.stack_bytes", 4096, 1024 * 1024),
+        _bounded_int(resource["heap_bytes"], f"{label}.resources.heap_bytes", 4096, U64_MAX),
+        _bounded_int(resource["stack_bytes"], f"{label}.resources.stack_bytes", 4096, U64_MAX),
     )
 
     raw_services = _array(document["services"], f"{label}.services", MAX_SERVICES)
@@ -842,9 +844,9 @@ def plan(lock: TargetLock, manifests: Mapping[tuple[str, Version], Manifest]) ->
         raise ModelError("plan-capacity", "plan.artifact_bytes", str(totals["artifact_bytes"]))
     if totals["handles"] > 256:
         raise ModelError("plan-capacity", "plan.handles", str(totals["handles"]))
-    if totals["heap_bytes"] > 512 * 1024 * 1024:
+    if totals["heap_bytes"] > U64_MAX:
         raise ModelError("plan-capacity", "plan.heap_bytes", str(totals["heap_bytes"]))
-    if totals["stack_bytes"] > 16 * 1024 * 1024:
+    if totals["stack_bytes"] > U64_MAX:
         raise ModelError("plan-capacity", "plan.stack_bytes", str(totals["stack_bytes"]))
     return {
         "lock_sha256": lock.digest(),

@@ -66,8 +66,17 @@ DESCRIPTION
     image statically links that code. The runtime is neither a complete libc nor
     dynamically linked.
 
-    Lua uses a bounded 1 MiB TLSF heap. Exhausting the heap raises a normal protected Lua memory error;
-    it cannot grow memory or access ambient host resources.
+    Lua's standard math.random generator is seeded automatically from TROE's
+    kernel CSPRNG on every launch. It is suitable for games, simulations,
+    shuffling, and sampling, but remains a pseudorandom math API rather than a
+    cryptographic byte interface. Explicit math.randomseed arguments retain
+    normal Lua reproducibility.
+
+    Lua uses an initial TLSF arena and capability-backed private mappings for
+    larger allocations. Configured process/system ceilings and available owned
+    frames bound growth without a legacy 1 MiB application limit. Exhaustion
+    raises a normal protected Lua memory error and cannot access ambient host
+    resources.
 
 EXAMPLES
     Working example programs are shipped as architecture-independent data:
@@ -77,6 +86,7 @@ EXAMPLES
         lua /share/lua/examples/tables-coroutines.lua
         lua /share/lua/examples/compatibility.lua
         lua /share/lua/examples/files.lua
+        lua /share/lua/examples/random.lua
 
     Measure a sufficiently long end-to-end workload in whole wall seconds:
 
