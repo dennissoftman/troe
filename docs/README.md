@@ -31,6 +31,7 @@ history rather than in current documentation.
 | Owner-scoped launch, pipes, and scalable resource tables | [ADR 0046](adr/0046-owner-scoped-process-launch-and-scalable-resource-tables.md) |
 | Filesystem rename/removal and user-space POSIX facade | [ADR 0047](adr/0047-kex-filesystem-tools-and-runtime.md) |
 | Capability-scoped private memory and configurable policy | [ADR 0048](adr/0048-capability-scoped-private-memory-and-resource-policy.md) |
+| Kernel CSPRNG, readable random capability, and KEX ASLR | [ADR 0049](adr/0049-kernel-csprng-and-kex-aslr.md) |
 
 The current serialized contracts are versioned independently under
 [`formats/`](formats):

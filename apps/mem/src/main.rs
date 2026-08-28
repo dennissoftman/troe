@@ -5,9 +5,13 @@
 mod common;
 
 use core::fmt;
+use core::fmt::Write as _;
 use troe_kex_sdk::{
     CommandContext, INVOCATION_BUFFER_BYTES, StandardOutput, diagnostics, entry, exit,
+    private_memory,
 };
+
+const PAGE_BYTES: u64 = 4096;
 
 struct OutputWriter<'output>(&'output mut StandardOutput);
 
@@ -133,13 +137,95 @@ fn report_snapshot(output: &mut impl fmt::Write, snapshot: diagnostics::Snapshot
     }
 }
 
+fn memory_self_test(command: &mut CommandContext) -> Result<(), ()> {
+    let mut memory = command.private_memory().map_err(|_| ())?;
+    let before = memory.statistics().map_err(|_| ())?;
+    if before.operation_quantum_pages == 0 {
+        return Err(());
+    }
+    let address = memory
+        .map_zeroed(3, 1, 0, private_memory::Protection::ReadWrite)
+        .map_err(|_| ())?;
+    let pointer = usize::try_from(address).map_err(|_| ())? as *mut u8;
+    if pointer.is_null() {
+        let _cleaned = memory.unmap(address, 3);
+        return Err(());
+    }
+    // SAFETY: The typed capability just returned three uniquely owned,
+    // writable pages to this single-threaded application.
+    unsafe {
+        if pointer.read() != 0
+            || pointer.add(PAGE_BYTES as usize).read() != 0
+            || pointer.add(2 * PAGE_BYTES as usize).read() != 0
+        {
+            let _cleaned = memory.unmap(address, 3);
+            return Err(());
+        }
+        pointer.write(0x11);
+        pointer.add(PAGE_BYTES as usize).write(0x22);
+        pointer.add(2 * PAGE_BYTES as usize).write(0x33);
+    }
+    let middle = address.checked_add(PAGE_BYTES).ok_or(())?;
+    memory
+        .protect(middle, 1, private_memory::Protection::None)
+        .map_err(|_| ())?;
+    memory
+        .protect(middle, 1, private_memory::Protection::Read)
+        .map_err(|_| ())?;
+    // SAFETY: The middle page was restored read-only and remains owned.
+    if unsafe { pointer.add(PAGE_BYTES as usize).read() } != 0x22 {
+        let _cleaned = memory.unmap(address, 3);
+        return Err(());
+    }
+    memory.unmap(middle, 1).map_err(|_| ())?;
+    memory.unmap(address, 1).map_err(|_| ())?;
+    memory
+        .unmap(address.checked_add(2 * PAGE_BYTES).ok_or(())?, 1)
+        .map_err(|_| ())?;
+    let after = memory.statistics().map_err(|_| ())?;
+    if after.reserved_pages != before.reserved_pages
+        || after.committed_pages != before.committed_pages
+        || after.mappings != before.mappings
+        || after.metadata_bytes != before.metadata_bytes
+    {
+        return Err(());
+    }
+
+    let mut random = command.random().map_err(|_| ())?;
+    let mut first = [0_u8; 64];
+    let mut second = [0_u8; 64];
+    random.fill(&mut first).map_err(|_| ())?;
+    random.fill(&mut second).map_err(|_| ())?;
+    if first == second || (first.iter().all(|byte| *byte == 0) && second.iter().all(|byte| *byte == 0))
+    {
+        return Err(());
+    }
+
+    let mut stdout = command.stdout();
+    writeln!(
+        OutputWriter(&mut stdout),
+        "memory-self-test ok image={:#x} quantum={}",
+        main as *const () as usize,
+        before.operation_quantum_pages,
+    )
+    .map_err(|_| ())
+}
+
 fn main(command: &mut CommandContext) -> u32 {
     let mut invocation_bytes = [0_u8; INVOCATION_BUFFER_BYTES];
     let Ok(invocation) = command.invocation(&mut invocation_bytes) else {
         return exit::FAILURE;
     };
+    if invocation.len() == 2 && invocation.argument(1) == Some("--self-test") {
+        return if memory_self_test(command).is_ok() {
+            exit::SUCCESS
+        } else {
+            common::report(&mut command.stderr(), "mem", b"private memory self-test failed");
+            exit::FAILURE
+        };
+    }
     if invocation.len() != 1 {
-        return common::usage(&mut command.stderr(), "mem", b"mem");
+        return common::usage(&mut command.stderr(), "mem", b"mem [--self-test]");
     }
     let Ok(mut diagnostics) = command.diagnostics() else {
         return exit::DENIED;

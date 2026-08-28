@@ -213,21 +213,25 @@ def _rejections(target: str, base: bytes) -> dict[str, tuple[bytes, str]]:
     )
     add(
         "container-minor",
-        _put_u16(bytearray(base), 10, 1),
+        _put_u16(bytearray(base), 10, 2),
         "UnsupportedContainerVersion",
     )
     other_target = 2 if target == "x86_64" else 1
     add("wrong-target", _put_u16(bytearray(base), 12, other_target), "WrongTarget")
     add("header-bytes", _put_u16(bytearray(base), 14, 65), "InvalidLayout")
     add("record-bytes", _put_u16(bytearray(base), 16, 41), "InvalidLayout")
-    add("records-offset", _put_u32(bytearray(base), 44, 65), "InvalidLayout")
-    add("payload-offset", _put_u32(bytearray(base), 48, 105), "InvalidLayout")
+    add("records-offset", _put_u32(bytearray(base), 56, 65), "InvalidLayout")
+    add("payload-offset", _put_u32(bytearray(base), 60, 105), "InvalidLayout")
     invalid = bytearray(base)
     invalid[22] = 1
     add("header-flags", bytes(invalid), "NonzeroReserved")
     add("header-reserved16", _put_u16(bytearray(base), 34, 1), "NonzeroReserved")
-    add("header-reserved32", _put_u32(bytearray(base), 52, 1), "NonzeroReserved")
-    add("record-reserved", _put_u32(bytearray(base), 64 + 36, 1), "NonzeroReserved")
+    add("header-reserved32", _put_u32(bytearray(base), 36, 1), "NonzeroReserved")
+    add(
+        "record-reserved",
+        _put_u32(bytearray(base), elf2kex.KEX_HEADER_BYTES + 36, 1),
+        "NonzeroReserved",
+    )
     add("abi-major", _put_u16(bytearray(base), 18, 2), "UnsupportedAbi")
     add(
         "abi-minor",
@@ -236,7 +240,7 @@ def _rejections(target: str, base: bytes) -> dict[str, tuple[bytes, str]]:
     )
     add(
         "length-mismatch",
-        _put_u64(bytearray(base), 56, len(base) + 1),
+        _put_u64(bytearray(base), 80, len(base) + 1),
         "LengthMismatch",
     )
     add("record-count-zero", _put_u16(bytearray(base), 32, 0), "InvalidRecordCount")
@@ -247,60 +251,88 @@ def _rejections(target: str, base: bytes) -> dict[str, tuple[bytes, str]]:
     )
     add(
         "arithmetic-overflow",
-        _put_u64(bytearray(base), 64, 0xFFFF_FFFF_FFFF_F000),
+        _put_u64(
+            bytearray(base), elf2kex.KEX_HEADER_BYTES, 0xFFFF_FFFF_FFFF_F000
+        ),
         "ArithmeticOverflow",
     )
-    add("permissions-zero", _put_u32(bytearray(base), 64 + 32, 0), "InvalidPermissions")
-    add("permissions-four", _put_u32(bytearray(base), 64 + 32, 4), "InvalidPermissions")
-    add("image-unaligned", _put_u64(bytearray(base), 64, 1), "InvalidSegmentRange")
-    add("memory-zero", _put_u64(bytearray(base), 64 + 24, 0), "InvalidSegmentRange")
     add(
-        "memory-unaligned",
-        _put_u64(bytearray(base), 64 + 24, 4095),
+        "permissions-zero",
+        _put_u32(bytearray(base), elf2kex.KEX_HEADER_BYTES + 32, 0),
+        "InvalidPermissions",
+    )
+    add(
+        "permissions-four",
+        _put_u32(bytearray(base), elf2kex.KEX_HEADER_BYTES + 32, 4),
+        "InvalidPermissions",
+    )
+    add(
+        "image-unaligned",
+        _put_u64(bytearray(base), elf2kex.KEX_HEADER_BYTES, 1),
         "InvalidSegmentRange",
     )
-    file_bytes = struct.unpack_from("<Q", base, 64 + 16)[0]
+    add(
+        "memory-zero",
+        _put_u64(bytearray(base), elf2kex.KEX_HEADER_BYTES + 24, 0),
+        "InvalidSegmentRange",
+    )
+    add(
+        "memory-unaligned",
+        _put_u64(bytearray(base), elf2kex.KEX_HEADER_BYTES + 24, 4095),
+        "InvalidSegmentRange",
+    )
+    file_bytes = struct.unpack_from("<Q", base, elf2kex.KEX_HEADER_BYTES + 16)[0]
     add(
         "file-exceeds-memory",
-        _put_u64(bytearray(base), 64 + 24, file_bytes - 1),
+        _put_u64(
+            bytearray(base), elf2kex.KEX_HEADER_BYTES + 24, file_bytes - 1
+        ),
         "InvalidSegmentRange",
     )
     two = _canonical(target, NATIVE_CODE[target]["calls"], segment_count=2)
-    add("segments-overlap", _put_u64(bytearray(two), 104, 0), "OverlappingSegments")
-    first_payload = struct.unpack_from("<Q", base, 64 + 8)[0]
+    add(
+        "segments-overlap",
+        _put_u64(bytearray(two), elf2kex.KEX_HEADER_BYTES + elf2kex.KEX_RECORD_BYTES, 0),
+        "OverlappingSegments",
+    )
+    first_payload = struct.unpack_from("<Q", base, elf2kex.KEX_HEADER_BYTES + 8)[0]
     add(
         "payload-gap",
-        _put_u64(bytearray(base), 64 + 8, first_payload + 1),
+        _put_u64(bytearray(base), elf2kex.KEX_HEADER_BYTES + 8, first_payload + 1),
         "NoncanonicalPayload",
     )
     trailing = bytearray(base)
     trailing.append(0)
-    _put_u64(trailing, 56, len(trailing))
+    _put_u64(trailing, 80, len(trailing))
     add("payload-trailing", bytes(trailing), "NoncanonicalPayload")
     add(
         "image-span-exceeded",
-        _put_u64(bytearray(base), 64, 128 * 1024 * 1024),
+        _put_u64(bytearray(base), elf2kex.KEX_HEADER_BYTES, 128 * 1024 * 1024),
         "ImageSpanExceeded",
     )
     add(
         "image-pages-exceeded",
-        _put_u64(bytearray(base), 64 + 24, 8193 * elf2kex.KEX_PAGE_BYTES),
+        _put_u64(
+            bytearray(base),
+            elf2kex.KEX_HEADER_BYTES + 24,
+            8193 * elf2kex.KEX_PAGE_BYTES,
+        ),
         "ImagePagesExceeded",
     )
-    add("stack-below-minimum", _put_u32(bytearray(base), 36, 3), "StackBudgetExceeded")
+    add("stack-below-minimum", _put_u64(bytearray(base), 40, 3), "StackBudgetExceeded")
     add(
         "stack-above-maximum",
-        _put_u32(bytearray(base), 36, 257),
+        _put_u64(bytearray(base), 40, (1 << 32) + 1),
         "StackBudgetExceeded",
     )
     add(
         "heap-above-maximum",
-        _put_u32(bytearray(base), 40, 4097),
+        _put_u64(bytearray(base), 48, (1 << 32) + 1),
         "HeapBudgetExceeded",
     )
     add(
         "missing-executable",
-        _put_u32(bytearray(base), 64 + 32, 1),
+        _put_u32(bytearray(base), elf2kex.KEX_HEADER_BYTES + 32, 1),
         "MissingExecutableSegment",
     )
     add(
@@ -377,8 +409,8 @@ def generate_corpus() -> dict[str, bytes]:
             "standard-max-stack-heap": elf2kex.convert_elf(
                 build_static_elf(target, NATIVE_CODE[target]["calls"]),
                 expected_target=target,
-                stack_pages=256,
-                heap_pages=4096,
+                stack_pages=1 << 32,
+                heap_pages=1 << 32,
             ),
             "standard-max-encoded": _canonical(
                 target,

@@ -7,6 +7,13 @@ Supersession note, 2026-08-27: ADR 0037 replaces the foreground runner's
 resident execution. The 50 ms maximum uninterrupted application lease and all
 local ABI, memory, message, wait, and teardown bounds remain in force.
 
+Amendment, 2026-08-28: [ADR 0048](0048-capability-scoped-private-memory-and-resource-policy.md)
+adds private data mappings and active 64-bit resource policy, while
+[ADR 0049](0049-kernel-csprng-and-kex-aslr.md) revises pre-release KEX container
+1.1 to position-independent images, relative relocations, full-width
+stack/heap quantities, and kernel-selected ASLR. Fixed-base and no-`mmap`
+statements below describe the original Stage 7 decision and are superseded.
+
 Implementation note, 2026-08-23: the portable parser, canonical virtual layout,
 startup-page encoder, and native owned-staging/validate/map/reclaim transaction
 are implemented. The native root maps only the supervisor image, devices, and
@@ -253,20 +260,20 @@ separately bounded and is released before entry.
 | Load records | 16 |
 | Image virtual span | 128 MiB |
 | Mapped image pages | 8,192 |
-| Initial stack pages | 4–256 |
-| Initially mapped heap pages | 0–4,096 (0–16 MiB) |
-| Runtime heap commit | available physical frames; no fixed lifetime byte cap |
-| Initial application page-table ceiling | 512 pages; exact retained allocation grows with mappings |
-| Initial resident-page admission | 16,384 (64 MiB) |
+| Initial stack pages | 4–4,294,967,296 (16 TiB) |
+| Initially mapped heap pages | 0–4,294,967,296 (16 TiB) |
+| Runtime heap/private commit | active 64-bit policy, minimum-free reserve, and available frames |
+| Format page-table charge | 512 pages; native launch retains the exact fallibly allocated amount |
+| Initial resident-page admission | 8,589,943,297 pages |
 | Initial handles | 32 |
 
 There is one initial application resource policy. These values are launch
 safety maxima, not a machine-size selector. Every launch charges its
 exact staging, image, startup, heap, and stack ownership, plus bounded table,
 task, address-space, and handle capacity before commit. There is no overcommit,
-demand paging, stack growth, arbitrary `brk`, `mmap`, shared page, or runtime
-executable-memory operation in ABI v1. ABI 1.1's sole virtual-memory mutation
-is committed growth inside the unused virtual gap before the guarded stack.
+demand paging, stack growth, arbitrary `brk`, shared page, or runtime
+executable-memory operation in ABI v1. ABI 1.1 supports heap growth plus
+capability-scoped anonymous private data mappings.
 The startup page describes
 the initially mapped prefix; a shared allocator or future libc may request
 additional committed pages through call 3.
@@ -351,8 +358,8 @@ The first Stage 7 increment has one small parser and no in-kernel ELF, dynamic
 linker, relocation engine, symbol resolver, executable allocator, or package
 trust policy. Conventional compilers remain usable through the hosted KEX
 converter, at the cost of making raw third-party ELF binaries unsupported.
-The fixed v1 image base also excludes load-time ASLR; adding relocation-aware
-loading requires a separately reviewed container revision.
+Container 1.1 now provides the separately reviewed relative-relocation and ASLR
+revision described by ADR 0049.
 
 Direct in-kernel ELF loading was rejected because program headers, section
 headers, interpreter and dynamic metadata, relocation families, notes, and

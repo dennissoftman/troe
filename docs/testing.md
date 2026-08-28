@@ -62,8 +62,8 @@ their canonical order during the same primary guest boot where possible.
 | `network` | Link and IPv4 state, DHCP, ICMP, ARP, cancellation, UDP, bounded TCP streams |
 | `shell-terminal` | Editing, completion, history, manuals, parsing, CRLF, and clear-screen behavior |
 | `filesystem` | KEFS/ext4/FAT32 reads and writes, shared-media restart persistence, paths, pipelines, bounded `sh.kex` scripts, RAMFS mutation, read-only and error behavior |
-| `lua` | Lua inline/stdin/file loading, protected errors, shared-runtime math/calendar/environment/process behavior, typed filesystem errno failures, OS-shim clock and exit behavior, timer preemption, fragmentation, and bounded OOM recovery |
-| `quota-memory` | 128-entry quota, recovery, repeated transient workloads, owned heap accounting |
+| `lua` | Lua inline/stdin/file loading, protected errors, shared-runtime math/calendar/environment/process/random behavior, typed filesystem errno failures, OS-shim clock and exit behavior, timer preemption, fragmentation, a 48 MiB private allocation beyond the former narrow TLSF geometry, and bounded OOM recovery |
+| `quota-memory` | 128-entry quota, recovery, repeated transient workloads, exact initial/heap/private commitment accounting, zeroed private mappings, partial protect/unmap and recoalescing, typed CSPRNG reads, and independently randomized KEX image bases |
 | `persistence` | A second boot and native cold-reset termination after the baseline durable boot |
 | `fault-isolation` | Write, execute, guard, exception, and fatal probes with rollback validation |
 | `framebuffer-keyboard` | Owned framebuffer activation and native x86 PS/2 input; selecting it enables both device checks |

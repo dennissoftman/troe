@@ -6,8 +6,8 @@ use core::{fmt, slice};
 pub use troe_abi::{
     ABI_MAJOR, ABI_MINOR, clock_control, command, datagram, diagnostics, exit, filesystem,
     filesystem_mutation, icmp_echo, interface, network_configuration, network_observation, pipe,
-    process_launch, process_observation, reply, server, shell_script, tcp_connect, timer,
-    volume_control, wall_clock,
+    private_memory, process_launch, process_observation, random, reply, server, shell_script,
+    tcp_connect, timer, volume_control, wall_clock,
 };
 use troe_abi::{MAX_MESSAGE_BYTES, MAX_SERVICE_PAYLOAD_BYTES, heap_growth, stream};
 
@@ -15,17 +15,20 @@ const STARTUP_PAGE_BYTES: usize = 4096;
 const STARTUP_HEADER_BYTES: usize = 64;
 const STARTUP_HANDLE_BYTES: usize = 24;
 const CALL_RIGHT: u32 = 1;
+#[cfg(test)]
 const KEX_IMAGE_BASE: u64 = 0x0000_4000_0000_0000;
+const KEX_MIN_IMAGE_BASE: u64 = 0x0000_0001_0000_0000;
+const KEX_IMAGE_ALIGNMENT: u64 = 2 * 1024 * 1024;
 const KEX_IMAGE_SPAN_BYTES: u64 = 128 * 1024 * 1024;
 const KEX_USER_END: u64 = 0x0000_8000_0000_0000;
 const KEX_MAXIMUM_STACK_BYTES: u64 = 256 * STARTUP_PAGE_BYTES as u64;
 const KEX_MINIMUM_STACK_BYTES: u64 = 4 * STARTUP_PAGE_BYTES as u64;
+#[cfg(test)]
 const KEX_STARTUP_ADDRESS: u64 = KEX_IMAGE_BASE + KEX_IMAGE_SPAN_BYTES;
+#[cfg(test)]
 const KEX_HEAP_ADDRESS: u64 = KEX_STARTUP_ADDRESS + STARTUP_PAGE_BYTES as u64;
+#[cfg(test)]
 const KEX_STACK_TOP: u64 = KEX_USER_END - STARTUP_PAGE_BYTES as u64;
-const KEX_LOWER_STACK_GUARD: u64 =
-    KEX_STACK_TOP - KEX_MAXIMUM_STACK_BYTES - STARTUP_PAGE_BYTES as u64;
-const KEX_HEAP_SLOT_BYTES: u64 = KEX_LOWER_STACK_GUARD - KEX_HEAP_ADDRESS;
 
 /// Maximum stack buffer needed to receive one command invocation.
 pub const INVOCATION_BUFFER_BYTES: usize = command::MAX_INVOCATION_BYTES;
@@ -147,6 +150,8 @@ pub enum Error {
     NotEmpty,
     /// A name operation crossed filesystem-provider boundaries.
     CrossDevice,
+    /// An explicit configured resource policy rejected the request.
+    ResourceLimit,
 }
 
 impl fmt::Display for Error {
@@ -178,6 +183,7 @@ impl fmt::Display for Error {
             Self::Denied => "operation denied",
             Self::NotEmpty => "directory not empty",
             Self::CrossDevice => "cross-device operation",
+            Self::ResourceLimit => "configured resource limit exceeded",
         })
     }
 }
@@ -204,10 +210,13 @@ pub struct CommandContext {
     shell_script: Option<Handle>,
     wall_clock: Option<Handle>,
     clock_control: Option<Handle>,
+    private_memory: Option<Handle>,
+    random: Option<Handle>,
     heap: Option<HeapRegion>,
 }
 
 impl CommandContext {
+    #[allow(clippy::too_many_lines)]
     fn from_startup(startup: &Startup<'_>) -> Result<Self, StartupError> {
         Ok(Self {
             invocation: startup.required_handle(
@@ -302,6 +311,12 @@ impl CommandContext {
                 clock_control::MAJOR,
                 clock_control::MINOR,
             )?,
+            private_memory: startup.optional_handle(
+                interface::PRIVATE_MEMORY,
+                private_memory::MAJOR,
+                private_memory::MINOR,
+            )?,
+            random: startup.optional_handle(interface::RANDOM, random::MAJOR, random::MINOR)?,
             heap: startup.heap_region()?,
         })
     }
@@ -396,6 +411,31 @@ impl CommandContext {
     pub const fn filesystem_mutation(&self) -> Result<FilesystemMutation, Error> {
         match self.filesystem_mutate {
             Some(handle) => Ok(FilesystemMutation { handle }),
+            None => Err(Error::MissingAuthority),
+        }
+    }
+
+    /// Borrow the optional caller-private anonymous-memory capability.
+    ///
+    /// # Errors
+    ///
+    /// Reports that the package did not request or receive private-memory
+    /// authority.
+    pub const fn private_memory(&self) -> Result<PrivateMemory, Error> {
+        match self.private_memory {
+            Some(handle) => Ok(PrivateMemory { handle }),
+            None => Err(Error::MissingAuthority),
+        }
+    }
+
+    /// Borrow the optional cryptographically secure random-byte capability.
+    ///
+    /// # Errors
+    ///
+    /// Reports that the package did not request or receive random authority.
+    pub const fn random(&self) -> Result<Random, Error> {
+        match self.random {
+            Some(handle) => Ok(Random { handle }),
             None => Err(Error::MissingAuthority),
         }
     }
@@ -669,9 +709,7 @@ pub unsafe fn grow_heap(minimum_additional_pages: usize) -> Result<usize, Error>
     let (status, mapped_bytes) = native_grow_heap(pages)?;
     match status {
         heap_growth::SUCCESS
-            if mapped_bytes != 0
-                && u64::try_from(mapped_bytes).is_ok_and(|bytes| bytes <= KEX_HEAP_SLOT_BYTES)
-                && mapped_bytes.is_multiple_of(STARTUP_PAGE_BYTES) =>
+            if mapped_bytes != 0 && mapped_bytes.is_multiple_of(STARTUP_PAGE_BYTES) =>
         {
             Ok(mapped_bytes)
         }
@@ -817,6 +855,18 @@ pub struct Pipes {
     handle: Handle,
 }
 
+/// Caller-private anonymous virtual-memory client.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PrivateMemory {
+    handle: Handle,
+}
+
+/// Cryptographically secure kernel random-byte client.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Random {
+    handle: Handle,
+}
+
 /// Read-only typed network-observation client.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NetworkObservation {
@@ -865,6 +915,174 @@ pub struct FileReplacement {
     handle: Handle,
     token: u32,
     offset: u64,
+}
+
+impl PrivateMemory {
+    /// Reserve inaccessible virtual pages without committing physical frames.
+    ///
+    /// A zero hint lets the kernel select an address. A nonzero hint remains
+    /// advisory and must be page aligned.
+    ///
+    /// # Errors
+    ///
+    /// Reports malformed geometry, policy/address-space exhaustion, metadata
+    /// allocation failure, or a call-gate failure.
+    pub fn reserve(
+        &mut self,
+        page_count: u64,
+        alignment_pages: u64,
+        address_hint: u64,
+    ) -> Result<u64, Error> {
+        self.map_request(
+            private_memory::RESERVE,
+            private_memory::MapRequest {
+                page_count,
+                alignment_pages,
+                address_hint,
+                protection: private_memory::Protection::None,
+            },
+        )
+    }
+
+    /// Map a newly owned zeroed private data range.
+    ///
+    /// # Errors
+    ///
+    /// Reports inaccessible/unsupported protection, malformed geometry,
+    /// configured limits, physical or metadata exhaustion, or call failure.
+    pub fn map_zeroed(
+        &mut self,
+        page_count: u64,
+        alignment_pages: u64,
+        address_hint: u64,
+        protection: private_memory::Protection,
+    ) -> Result<u64, Error> {
+        self.map_request(
+            private_memory::MAP_ZEROED,
+            private_memory::MapRequest {
+                page_count,
+                alignment_pages,
+                address_hint,
+                protection,
+            },
+        )
+    }
+
+    /// Replace access over one complete owned page range.
+    ///
+    /// Changing an unbacked reservation to readable or writable commits fresh
+    /// zeroed pages. Changing committed pages to inaccessible retains contents.
+    ///
+    /// # Errors
+    ///
+    /// Reports malformed or unowned ranges, configured limits, exhaustion, or
+    /// a call-gate failure.
+    pub fn protect(
+        &mut self,
+        address: u64,
+        page_count: u64,
+        protection: private_memory::Protection,
+    ) -> Result<(), Error> {
+        let request = private_memory::encode_protect_request(private_memory::ProtectRequest {
+            address,
+            page_count,
+            protection,
+        })
+        .map_err(|_| Error::InvalidCall)?;
+        let mut reply = [];
+        let count = call(self.handle, private_memory::PROTECT, &request, &mut reply)?;
+        if count == 0 {
+            Ok(())
+        } else {
+            Err(Error::InvalidCall)
+        }
+    }
+
+    /// Remove one complete or partial owned page range.
+    ///
+    /// # Errors
+    ///
+    /// Reports malformed or unowned ranges, kernel failure, or a call-gate
+    /// failure.
+    pub fn unmap(&mut self, address: u64, page_count: u64) -> Result<(), Error> {
+        let request = private_memory::encode_unmap_request(private_memory::UnmapRequest {
+            address,
+            page_count,
+        })
+        .map_err(|_| Error::InvalidCall)?;
+        let mut reply = [];
+        let count = call(self.handle, private_memory::UNMAP, &request, &mut reply)?;
+        if count == 0 {
+            Ok(())
+        } else {
+            Err(Error::InvalidCall)
+        }
+    }
+
+    /// Read granted limits and current/high-water private-memory use.
+    ///
+    /// # Errors
+    ///
+    /// Reports a malformed kernel reply or call-gate failure.
+    pub fn statistics(&self) -> Result<private_memory::Statistics, Error> {
+        let mut reply = [0_u8; private_memory::STATISTICS_REPLY_BYTES];
+        let count = call(self.handle, private_memory::QUERY, &[], &mut reply)?;
+        private_memory::decode_statistics(&reply[..count]).map_err(|_| Error::InvalidCall)
+    }
+
+    fn map_request(
+        &mut self,
+        opcode: u16,
+        request: private_memory::MapRequest,
+    ) -> Result<u64, Error> {
+        let request =
+            private_memory::encode_map_request(request).map_err(|_| Error::InvalidCall)?;
+        let mut reply = [0_u8; private_memory::ADDRESS_REPLY_BYTES];
+        let count = call(self.handle, opcode, &request, &mut reply)?;
+        private_memory::decode_address(&reply[..count]).map_err(|_| Error::InvalidCall)
+    }
+}
+
+impl Random {
+    /// Fill the complete destination with cryptographically secure bytes.
+    ///
+    /// Large destinations are split into bounded copied ABI calls. An empty
+    /// destination succeeds without invoking the kernel.
+    ///
+    /// # Errors
+    ///
+    /// Reports entropy-service, call-gate, or malformed-completion failure.
+    pub fn fill(&mut self, mut destination: &mut [u8]) -> Result<(), Error> {
+        while !destination.is_empty() {
+            let maximum = usize::try_from(random::MAX_BYTES).map_err(|_| Error::InvalidCall)?;
+            let count = destination.len().min(maximum);
+            let request =
+                random::encode_request(u64::try_from(count).map_err(|_| Error::InvalidCall)?)
+                    .map_err(|_| Error::InvalidCall)?;
+            let completed = call(
+                self.handle,
+                random::GET,
+                &request,
+                &mut destination[..count],
+            )?;
+            if completed != count {
+                return Err(Error::InvalidCall);
+            }
+            destination = &mut destination[count..];
+        }
+        Ok(())
+    }
+
+    /// Read one uniformly distributed native-width unsigned value.
+    ///
+    /// # Errors
+    ///
+    /// Reports entropy-service, call-gate, or malformed-completion failure.
+    pub fn next_u64(&mut self) -> Result<u64, Error> {
+        let mut bytes = [0_u8; 8];
+        self.fill(&mut bytes)?;
+        Ok(u64::from_le_bytes(bytes))
+    }
 }
 
 impl ReadOnlyFilesystem {
@@ -1932,20 +2150,36 @@ impl<'a> Startup<'a> {
         }
         let handle_count = usize::from(read_u16(bytes, 14)?);
         let encoded_bytes = STARTUP_HEADER_BYTES + handle_count * STARTUP_HANDLE_BYTES;
+        let image_base = read_u64(bytes, 16)?;
         let heap_address = read_u64(bytes, 24)?;
         let heap_bytes = read_u64(bytes, 32)?;
         let stack_bottom = read_u64(bytes, 40)?;
         let stack_top = read_u64(bytes, 48)?;
+        let image_end = image_base
+            .checked_add(KEX_IMAGE_SPAN_BYTES)
+            .ok_or(StartupError::InvalidPage)?;
+        let expected_heap_address = image_end
+            .checked_add(STARTUP_PAGE_BYTES as u64)
+            .ok_or(StartupError::InvalidPage)?;
+        let lower_guard = stack_top
+            .checked_sub(KEX_MAXIMUM_STACK_BYTES)
+            .and_then(|value| value.checked_sub(STARTUP_PAGE_BYTES as u64))
+            .ok_or(StartupError::InvalidPage)?;
+        let heap_end = heap_address
+            .checked_add(heap_bytes)
+            .ok_or(StartupError::InvalidPage)?;
         if handle_count > 32
             || encoded_bytes > bytes.len()
             || bytes[encoded_bytes..].iter().any(|byte| *byte != 0)
-            || read_u64(bytes, 16)? != KEX_IMAGE_BASE
-            || heap_address != KEX_HEAP_ADDRESS
-            || heap_bytes > KEX_HEAP_SLOT_BYTES
+            || image_base < KEX_MIN_IMAGE_BASE
+            || !image_base.is_multiple_of(KEX_IMAGE_ALIGNMENT)
+            || heap_address != expected_heap_address
+            || heap_end > lower_guard
             || !heap_bytes.is_multiple_of(STARTUP_PAGE_BYTES as u64)
             || read_u64(bytes, 56)? == 0
             || !stack_bottom.is_multiple_of(STARTUP_PAGE_BYTES as u64)
-            || stack_top != KEX_STACK_TOP
+            || !stack_top.is_multiple_of(STARTUP_PAGE_BYTES as u64)
+            || stack_top >= KEX_USER_END
             || stack_bottom >= stack_top
             || stack_bottom < stack_top - KEX_MAXIMUM_STACK_BYTES
             || stack_bottom > stack_top - KEX_MINIMUM_STACK_BYTES
@@ -2077,6 +2311,7 @@ fn call(
         reply::DENIED => Err(Error::Denied),
         reply::NOT_EMPTY => Err(Error::NotEmpty),
         reply::CROSS_DEVICE => Err(Error::CrossDevice),
+        reply::RESOURCE_LIMIT => Err(Error::ResourceLimit),
         _ => Err(Error::InvalidCall),
     }
 }
@@ -2393,7 +2628,8 @@ mod tests {
     use super::{
         ABI_MAJOR, ABI_MINOR, CommandContext, HeapRegion, KEX_HEAP_ADDRESS, KEX_STACK_TOP,
         STARTUP_HANDLE_BYTES, STARTUP_HEADER_BYTES, STARTUP_PAGE_BYTES, ServerContext, Startup,
-        StartupError, command, interface, pipe, process_launch, stream, timer,
+        StartupError, command, interface, pipe, private_memory, process_launch, random, stream,
+        timer,
     };
 
     fn startup_page(interfaces: &[u32]) -> [u8; STARTUP_PAGE_BYTES] {
@@ -2429,6 +2665,8 @@ mod tests {
                 interface::TIMER => timer::MINOR,
                 interface::PROCESS_LAUNCH => process_launch::MINOR,
                 interface::PIPE => pipe::MINOR,
+                interface::PRIVATE_MEMORY => private_memory::MINOR,
+                interface::RANDOM => random::MINOR,
                 _ => 0,
             };
             page[offset + 18..offset + 20].copy_from_slice(&minor.to_le_bytes());
@@ -2456,6 +2694,8 @@ mod tests {
             interface::SHELL_SCRIPT,
             interface::WALL_CLOCK,
             interface::CLOCK_CONTROL,
+            interface::PRIVATE_MEMORY,
+            interface::RANDOM,
         ]);
         let startup = Startup::parse(&page);
         assert!(startup.is_ok());
@@ -2476,6 +2716,8 @@ mod tests {
                 assert!(command.wall_clock().is_ok());
                 assert!(command.clock_control().is_ok());
                 assert!(command.shell_script().is_ok());
+                assert!(command.private_memory().is_ok());
+                assert!(command.random().is_ok());
                 let heap = command.take_heap();
                 assert_eq!(
                     heap.as_ref().map(HeapRegion::start_address),

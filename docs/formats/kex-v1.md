@@ -9,20 +9,21 @@ commands carry this executable inside the
 
 All integers are unsigned little-endian values. KEX structures are decoded from
 bytes and have no Rust or C in-memory-layout contract. The v1 base page size is
-4,096 bytes and the statically linked image base is
-`0x0000_4000_0000_0000`.
+4,096 bytes. Container 1.1 images are position-independent and use
+image-relative addresses; `0x0000_4000_0000_0000` is only the deterministic
+hosted inspection placement.
 
 ## Header
 
-The header is exactly 64 bytes.
+The container-1.1 header is exactly 88 bytes.
 
 | Offset | Bytes | Field | KEX v1 rule |
 | ---: | ---: | --- | --- |
 | 0 | 8 | magic | `KEX`, zero, `FMT`, zero (`4b 45 58 00 46 4d 54 00`) |
 | 8 | 2 | container major | 1 |
-| 10 | 2 | container minor | 0 |
+| 10 | 2 | container minor | 1 |
 | 12 | 2 | target | 1 = x86-64, 2 = AArch64 |
-| 14 | 2 | header bytes | 64 |
+| 14 | 2 | header bytes | 88 |
 | 16 | 2 | load-record bytes | 40 |
 | 18 | 2 | ABI major | 1 |
 | 20 | 2 | minimum ABI minor | at most the kernel-supported minor; currently 1 |
@@ -30,12 +31,17 @@ The header is exactly 64 bytes.
 | 24 | 8 | entry offset | image-relative byte inside an RX segment |
 | 32 | 2 | load-record count | bounded, nonzero |
 | 34 | 2 | reserved | zero |
-| 36 | 4 | initial stack pages | within the standard range |
-| 40 | 4 | zeroed heap pages | within the standard ceiling |
-| 44 | 4 | load-record offset | 64 |
-| 48 | 4 | payload offset | `64 + record_count * 40` |
-| 52 | 4 | reserved | zero |
-| 56 | 8 | artifact bytes | exact input length |
+| 36 | 4 | reserved | zero |
+| 40 | 8 | initial stack pages | within the standard range |
+| 48 | 8 | zeroed heap pages | within the standard ceiling |
+| 56 | 4 | load-record offset | 88 |
+| 60 | 4 | payload offset | exact byte after the relocation table |
+| 64 | 4 | relocation-table offset | `88 + record_count * 40` |
+| 68 | 4 | relocation count | bounded by exact artifact layout |
+| 72 | 2 | relocation-record bytes | 16 |
+| 74 | 2 | reserved | zero |
+| 76 | 4 | reserved | zero |
+| 80 | 8 | artifact bytes | exact input length |
 
 Header sizes and offsets are exact canonical values, not forward-extension
 fields. Unknown container versions, targets, flags, and ABI requirements are
@@ -48,7 +54,7 @@ Each 40-byte record has this layout:
 
 | Offset | Bytes | Field | KEX v1 rule |
 | ---: | ---: | --- | --- |
-| 0 | 8 | image offset | 4 KiB aligned, relative to the fixed image base |
+| 0 | 8 | image offset | 4 KiB aligned, relative to the selected image base |
 | 8 | 8 | file offset | exact next byte in the canonical payload stream |
 | 16 | 8 | file bytes | at most `memory bytes` |
 | 24 | 8 | memory bytes | nonzero multiple of 4 KiB |
@@ -60,6 +66,18 @@ not overlap. Gaps in virtual space are permitted only within the standard
 image-span ceiling; they remain unmapped. Writable-executable and
 execute-only encodings do not exist.
 
+The load-record table is followed by sorted 16-byte relative-relocation records.
+Each contains an image-relative data target offset and an image-relative value
+offset. Each eight-byte target span is unique, ordered by byte offset, wholly
+inside one mapped image segment, and its value lies inside the image span. The
+byte offset itself may be unaligned because Rust target libraries can place
+pointer constants in packed read-only data and, on some targets, instruction
+literals. This permits position-independent prebuilt `core`/`alloc` without a
+custom sysroot. The loader patches fresh owned backing before installing the
+final RX/R/RW mappings, so no executable or read-only runtime page is ever
+temporarily writable and no writable-executable alias exists. No symbol,
+import, or general relocation kind is representable.
+
 File payloads are tightly concatenated in record order beginning at the header's
 payload offset. A zero-length payload uses the current file offset and advances
 it by zero. The final payload ends exactly at `artifact bytes`; gaps, duplicate
@@ -67,7 +85,7 @@ descriptions, and trailing bytes are noncanonical. Each segment's remaining
 `memory bytes - file bytes` are zero-filled in fresh frames.
 
 At least one segment is RX, and the single entry byte must fall within an RX
-segment. The loader verifies all header, table, file, image, fixed-base, page,
+segment. The loader verifies all header, table, file, image, placement, page,
 and standard-policy arithmetic before allocating or mapping application memory.
 
 ## Standard ceilings
@@ -78,35 +96,40 @@ and standard-policy arithmetic before allocating or mapping application memory.
 | Load records | 16 |
 | Image span | 128 MiB |
 | Mapped image pages | 8,192 |
-| Stack pages | 4–256 |
-| Heap pages | 0–4,096 |
-| Initial page-table ceiling | 512 pages |
-| Initial resident admission | 16,384 pages |
+| Stack pages | 4–4,294,967,296 (16 TiB) |
+| Heap pages | 0–4,294,967,296 (16 TiB) |
+| Conservative format table charge | 512 pages |
+| Initial resident admission | 8,589,943,297 pages |
 
 The preliminary portable plan charges exact image, startup, initial heap, and
-stack pages plus the conservative table ceiling for format admission. Native
-launch counts and retains the exact tables implied by the complete mapping plan
-and may not exceed either initial admission bound. ABI 1.1 runtime heap and supplemental page-table
-commits are outside those launch bounds and are limited by available physical
-memory and the remaining user virtual range.
+stack pages plus a conservative table amount for format admission. Native
+launch computes and retains the exact tables implied by the complete mapping
+plan. Physical availability, the active 64-bit memory policy, and the protected
+free-frame reserve decide whether a valid large request is admitted; no maximum
+table is preallocated. ABI 1.1 heap growth and private mappings use the same
+system/process commitment accounting.
 
 ## Hosted ELF input contract
 
 `tools/troe-kex-tool` is the canonical dependency-free Rust converter. Its
-input is a final, statically linked, little-endian System V ELF64 `ET_EXEC` for
-x86-64 or AArch64 at the fixed KEX image base. Program headers begin at byte 64
+input is a final, statically linked, position-independent little-endian System V
+ELF64 `ET_DYN` for x86-64 or AArch64 linked at virtual base zero. Program headers begin at byte 64
 and use 56-byte records. `PT_LOAD` records use 4 KiB-aligned file and virtual
 addresses, are ordered and page-disjoint, and request only R, RX, or RW. The
 entry is file-backed RX (and four-byte aligned on AArch64). A consistent
 read-only `PT_PHDR` and a non-executable GNU stack record are the only other
 accepted program types.
 
-The SDK linker resolves link-time relocations. The converter rejects residual
-`REL`, `RELA`, or `RELR` sections rather than carrying relocations into KEX. It
-also rejects interpreters, dynamic metadata, TLS, notes, GNU properties,
-unwind-header/RELRO requirements, unknown program records, W+X, noncanonical
-section metadata, and unexplained nonzero bytes. An optional section table is
-validation input only and is never copied as KEX metadata. After conversion,
+The SDK linker resolves symbols and emits only `R_X86_64_RELATIVE` or
+`R_AARCH64_RELATIVE` dynamic relocations, including data relocations needed by
+the target's prebuilt Rust `core`/`alloc`. The converter requires one canonical
+writable `PT_DYNAMIC`, converts those records into the closed KEX relocation
+table, sorts unique in-image targets canonically, and rejects imports,
+symbol-based relocations, `REL`, `RELR`, negative or out-of-image addends, and
+every unknown kind. It also rejects interpreters, TLS,
+notes, GNU properties, unwind-header/RELRO requirements, unknown program
+records, W+X, noncanonical section metadata, and unexplained nonzero bytes. An
+optional section table is validation input only and is never copied as KEX metadata. After conversion,
 an independent KEX decoder compares every emitted record and payload with the
 validated loads and rechecks canonical layout and exact standard budgets.
 
@@ -123,19 +146,21 @@ the build entrypoint.
 The shared generated corpus lives under `tests/kex-corpus`; its exact file set
 and bytes are checked with `python3 tools/gen_kex_corpus.py --check`.
 
-## ABI 1.1 virtual layout and startup page
+## ABI 1.1 randomized virtual layout and startup page
 
-The portable plan fixes the non-image virtual regions so every native backend
-consumes identical checked address arithmetic. The startup page begins at
-`image base + standard image-span ceiling`. For an application requiring ABI
+The kernel draws an independently randomized 2 MiB-aligned image base from the
+4 GiB–64 TiB window and a 2 MiB-aligned stack placement from the 96–128 TiB
+window. Placement uses the kernel CSPRNG and fails closed if firmware entropy
+was unavailable at boot. The startup page begins at `selected image base +
+standard image-span ceiling`. For an application requiring ABI
 minor 1, the heap follows it and may grow through the otherwise unused user
 virtual-address gap. A lower guard and the fixed maximum stack slot are placed
 at the top of the user half; the requested stack pages are mapped at the top of
 that slot so they end immediately before an unmapped upper guard. All
 uncommitted heap-gap and unused stack-slot pages remain unmapped and consume no
-physical frames. ABI-minor-0 artifacts retain their original 16 MiB fixed heap
-slot and adjacent guarded stack layout, so an ABI 1.1 kernel remains compatible
-with existing binaries.
+physical frames. ABI-minor-0 artifacts retain their adjacent guarded-stack
+layout selected by the startup page; no pre-release artifact may assume a
+literal virtual address.
 
 The startup page is 4 KiB, little-endian, and zero-padded. Its fixed header is
 64 bytes:
@@ -171,10 +196,8 @@ available physical memory is the practical bound.
 
 ## Deliberate omissions
 
-KEX v1 carries no sections, symbols, interpreter, dynamic metadata, imports,
-exports, relocations, TLS, compression, capabilities, signatures, device
-mappings, or shared-memory contract. The hosted SDK must resolve link-time
-relocations for the fixed image base and reject every residual runtime
-requirement before emitting KEX. Package identity and trust metadata wrap KEX
-through their separately versioned formats rather than changing this executable
-parser implicitly.
+KEX v1 carries no sections, symbols, interpreter, imports, exports, general
+dynamic linking, TLS, compression, capabilities, signatures, device mappings,
+or shared-memory contract. Its relative relocation table is deliberately only
+the load-time mechanism needed for ASLR. Future package identity and trust
+metadata wrap KEX rather than changing this executable parser implicitly.

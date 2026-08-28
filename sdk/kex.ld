@@ -5,12 +5,13 @@ PHDRS
   text PT_LOAD FLAGS(5);
   rodata PT_LOAD FLAGS(4);
   data PT_LOAD FLAGS(6);
+  dynamic PT_DYNAMIC FLAGS(6);
   stack PT_GNU_STACK FLAGS(6);
 }
 
 SECTIONS
 {
-  . = 0x0000400000000000;
+  . = 0;
 
   .text : ALIGN(4096)
   {
@@ -30,6 +31,16 @@ SECTIONS
   {
     *(.data .data.* .ldata .ldata.*)
     *(.got .got.*)
+  } :data
+
+  .dynamic :
+  {
+    *(.dynamic)
+  } :data :dynamic
+
+  .rela.dyn :
+  {
+    *(.rela.dyn)
   } :data
 
   .bss : ALIGN(16)

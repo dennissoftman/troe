@@ -7,7 +7,7 @@ license = "Apache-2.0"
 publish = false
 
 [package.metadata.troe-kex]
-capabilities = ["diagnostics"]
+capabilities = ["diagnostics", "private-memory", "random"]
 
 [dependencies]
 troe-kex-sdk = { path = "../../sdk/rust/troe-kex" }

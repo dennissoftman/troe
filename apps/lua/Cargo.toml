@@ -8,7 +8,7 @@ publish = false
 build = "build.rs"
 
 [package.metadata.troe-kex]
-capabilities = ["filesystem-read", "filesystem-mutate", "timer", "wall-clock", "process-launch", "pipe"]
+capabilities = ["filesystem-read", "filesystem-mutate", "timer", "wall-clock", "process-launch", "pipe", "private-memory", "random"]
 stack-pages = 64
 heap-pages = 256
 

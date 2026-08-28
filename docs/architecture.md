@@ -307,10 +307,29 @@ ABI 1.1 also suspends on `grow_heap`; the kernel atomically commits owned,
 zeroed physical extents at the end of the virtual heap prefix, falling back to
 discontiguous frames when necessary, adds page-table frames as mappings
 require, updates scheduler ownership accounting, and resumes with the new
-mapped length. A large allocation requests its complete page deficit in one
-call; the allocator's 256 KiB quantum is only a batching floor for small
-requests. Expected physical-memory exhaustion leaves the mapping unchanged;
-no fixed lifetime heap-size policy is applied.
+mapped length. Expected physical-memory exhaustion leaves the mapping
+unchanged. Initial mappings, heap growth, and dynamic private mappings share
+full-width per-process and system commitment accounting under the active SCFG
+memory policy; the kernel protects a configured minimum-free reserve without
+preallocating any policy ceiling.
+
+ADR 0048 adds a separate typed private-memory capability for zeroed anonymous
+data. It provides reservation, mapping, partial protection, partial unmapping,
+and statistics without exposing page tables, physical addresses, executable
+memory, other processes, or a POSIX policy surface. Metadata starts empty,
+grows fallibly under configured record/byte budgets, and recoalesces compatible
+neighbors. Large requests are acquired and zeroed in configured work quanta,
+but the quantum is not a mapping-size limit. The shared `no_std` runtime owns
+the POSIX-shaped `mmap`/`mprotect`/`munmap` facade and the hybrid allocator can
+return large Lua allocations to the system during the process lifetime.
+
+ADR 0049 adds boot-seeded kernel randomness and KEX ASLR. UEFI must supply an
+approved seed before application admission; the kernel retains a ChaCha20
+CSPRNG and exposes fresh bytes only through the caller's typed `random`
+capability. There is a bounded request size but no artificial lifetime entropy
+quota. Container-1.1 KEX images carry only validated relative relocations and
+receive independent randomized image and stack placements; private mappings
+also use unbiased randomized free-slot selection.
 
 ADR 0037 retains foreground, background, and service applications in
 one bounded event loop. A single CPU executes only one ring-3/EL0 continuation
@@ -337,8 +356,13 @@ Task, process, wait, pending-call, dispatch, child, pipe, and resident tables us
 small initial `Vec` reservations and fallible on-demand growth. Tasks, process
 records, waits, pending calls, children, and pipes have 65,536-object system
 hard ceilings; handles have a 262,144 ceiling. These are allocation and token
-safety backstops, not preallocated arrays. No typed per-process soft-limit
-configuration is implemented, so the compiled hard ceilings are authoritative.
+safety backstops, not preallocated arrays. These object registries do not yet
+have typed per-process soft-limit configuration, so their compiled hard ceilings
+are authoritative. Memory policy is already typed: desired restricted TOML under
+`/config/system/resources/memory.toml` is compiled into the immutable SCFG
+record consumed by the kernel and a normalized read-only
+`/sys/config/system/resources/memory.toml` projection. The kernel never parses
+the human-readable projection.
 The same registry rule gives each application up to 4,096 generation-checked
 read-only file tokens, grows UDP bindings from 64 to the 16,384-port ephemeral
 range ceiling, and grows the ARP cache to 256 entries without a maximum-sized
@@ -354,13 +378,15 @@ one foreground application runs, then resumes only after owner-wide handle
 revocation, record reaping, page zeroization, and exact frame return. Artifacts
 are read from target-selected `/bin/<name>.kex`; absence is a terminal not-found
 result. Individual service payloads and retained tables have hard ceilings;
-ordinary applications have no cumulative service-call ceiling. Heap growth is
-bounded by allocator ownership and resident-page limits. Standard streams themselves
+ordinary applications have no cumulative service-call ceiling. Heap and
+private-memory commitment are bounded by physical availability, exact owned
+accounting, and the active configurable memory policy. Standard streams themselves
 forward without an aggregate byte cap. Optional interfaces
 expose only bounded IPv4/UDP send/receive, read-only VFS operations, one
 sequential streamed file mutation, a boot-relative monotonic timer with
 self-only process CPU time, one immutable typed diagnostics snapshot, current
-read-only process accounting, read-only typed network observation, one DHCP exchange, one ICMP
+read-only process accounting, caller-private anonymous memory, fresh CSPRNG
+bytes, read-only typed network observation, one DHCP exchange, one ICMP
    echo exchange, or one literal-IPv4 outbound TCP stream. Network observation,
    configuration, echo, datagrams, and TCP are independent authorities; none
    exposes raw frames, routes, DNS, TLS, or devices. Datagram

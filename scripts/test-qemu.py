@@ -1677,6 +1677,21 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
         contains=("lua-grow\t6144\t6291456\n",),
     )
     session.command(
+        "lua -e 'local s=string.rep(\"x\",48*1024*1024); "
+        "print(\"lua-large-private\",#s); s=nil; collectgarbage()'",
+        cwd,
+        command_timeout,
+        contains=("lua-large-private\t50331648\n",),
+        absent=("not enough memory", "execution lease expired"),
+    )
+    session.command(
+        "lua -e 'local a,b=math.randomseed(); local r=math.random(); "
+        "print(\"lua-random\",type(a),type(b),r>=0,r<1)'",
+        cwd,
+        command_timeout,
+        contains=("lua-random\tnumber\tnumber\ttrue\ttrue\n",),
+    )
+    session.command(
         "lua -e 'error(\"expected-error\")'",
         cwd,
         command_timeout,
@@ -1695,6 +1710,25 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
 def run_quota_memory_group(session: SerialSession, command_timeout: float) -> None:
     """Exercise the RAMFS quota and bounded transient-allocation accounting."""
     cwd = "/"
+    first_memory = session.command(
+        "mem --self-test",
+        cwd,
+        command_timeout,
+        contains=("memory-self-test ok image=0x", "quantum="),
+    )
+    second_memory = session.command(
+        "mem --self-test",
+        cwd,
+        command_timeout,
+        contains=("memory-self-test ok image=0x", "quantum="),
+    )
+    first_image = re.search(r"image=(0x[0-9a-f]+)", first_memory)
+    second_image = re.search(r"image=(0x[0-9a-f]+)", second_memory)
+    if first_image is None or second_image is None or first_image.group(1) == second_image.group(1):
+        raise AcceptanceError(
+            "independent KEX launches did not demonstrate randomized image placement: "
+            f"{first_memory!r} / {second_memory!r}"
+        )
     for index in range(128):
         session.command(f"printf x > /tmp/q{index:03}", cwd, command_timeout)
     session.command(

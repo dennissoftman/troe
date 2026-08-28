@@ -59,8 +59,9 @@ ELF_SHF_EXECINSTR = 0x4
 ELF_SHF_TLS = 0x400
 
 KEX_MAGIC = b"KEX\0FMT\0"
-KEX_HEADER_BYTES = 64
+KEX_HEADER_BYTES = 88
 KEX_RECORD_BYTES = 40
+KEX_RELOCATION_BYTES = 16
 KEX_IMAGE_BASE = 0x0000_4000_0000_0000
 KEX_PAGE_BYTES = 4096
 KEX_ABI_MAJOR = 1
@@ -78,10 +79,10 @@ STANDARD_LIMITS = {
     "image_span": 128 * 1024 * 1024,
     "image_pages": 8192,
     "stack_min": 4,
-    "stack_max": 256,
-    "heap_pages": 4096,
+    "stack_max": 1 << 32,
+    "heap_pages": 1 << 32,
     "table_pages": 512,
-    "resident_pages": 16_384,
+    "resident_pages": 2 * (1 << 32) + 8192 + 1 + 512,
 }
 
 
@@ -535,7 +536,7 @@ def verify_kex(
         raise ValueError("KEX output exceeds the standard encoded-byte ceiling")
     if artifact[:8] != KEX_MAGIC:
         raise ValueError("KEX output magic is invalid")
-    if struct.unpack_from("<HH", artifact, 8) != (1, 0):
+    if struct.unpack_from("<HH", artifact, 8) != (1, 1):
         raise ValueError("KEX output container version is invalid")
     if struct.unpack_from("<H", artifact, 12)[0] != KEX_TARGETS[target]:
         raise ValueError("KEX output target is invalid")
@@ -549,17 +550,25 @@ def verify_kex(
         raise ValueError("KEX output fixed header fields are noncanonical")
     encoded_entry = struct.unpack_from("<Q", artifact, 24)[0]
     count, reserved = struct.unpack_from("<HH", artifact, 32)
-    encoded_stack, encoded_heap, table_offset, payload_offset, reserved32 = (
-        struct.unpack_from("<IIIII", artifact, 36)
+    reserved32 = struct.unpack_from("<I", artifact, 36)[0]
+    encoded_stack, encoded_heap = struct.unpack_from("<QQ", artifact, 40)
+    table_offset, payload_offset = struct.unpack_from("<II", artifact, 56)
+    artifact_bytes = struct.unpack_from("<Q", artifact, 80)[0]
+    relocation_offset, relocation_count, relocation_bytes, relocation_reserved16, relocation_reserved32 = struct.unpack_from(
+        "<IIHHI", artifact, 64
     )
-    artifact_bytes = struct.unpack_from("<Q", artifact, 56)[0]
     if (
         count == 0
         or count > limits["records"]
         or reserved != 0
         or reserved32 != 0
         or table_offset != KEX_HEADER_BYTES
-        or payload_offset != KEX_HEADER_BYTES + count * KEX_RECORD_BYTES
+        or relocation_offset != KEX_HEADER_BYTES + count * KEX_RECORD_BYTES
+        or relocation_count != 0
+        or relocation_bytes != KEX_RELOCATION_BYTES
+        or relocation_reserved16 != 0
+        or relocation_reserved32 != 0
+        or payload_offset != relocation_offset
         or artifact_bytes != len(artifact)
     ):
         raise ValueError("KEX output table or length is noncanonical")
@@ -661,11 +670,11 @@ def convert_elf(
     output = bytearray(artifact_bytes)
     output[:8] = KEX_MAGIC
     struct.pack_into(
-        "<HHHHHHHHQHHIIIIIQ",
+        "<HHHHHHHHQHHIQQII",
         output,
         8,
         1,
-        0,
+        1,
         KEX_TARGETS[parsed.target],
         KEX_HEADER_BYTES,
         KEX_RECORD_BYTES,
@@ -675,14 +684,24 @@ def convert_elf(
         parsed.entry - KEX_IMAGE_BASE,
         len(records),
         0,
+        0,
         stack_pages,
         heap_pages,
         KEX_HEADER_BYTES,
         KEX_HEADER_BYTES + len(records) * KEX_RECORD_BYTES,
-        0,
-        artifact_bytes,
     )
     payload_offset = KEX_HEADER_BYTES + len(records) * KEX_RECORD_BYTES
+    struct.pack_into(
+        "<IIHHI",
+        output,
+        64,
+        payload_offset,
+        0,
+        KEX_RELOCATION_BYTES,
+        0,
+        0,
+    )
+    struct.pack_into("<Q", output, 80, artifact_bytes)
     for index, record in enumerate(records):
         record_offset = KEX_HEADER_BYTES + index * KEX_RECORD_BYTES
         struct.pack_into(

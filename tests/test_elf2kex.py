@@ -182,11 +182,15 @@ class Elf2KexTests(unittest.TestCase):
                     struct.unpack_from("<H", first, 12)[0], elf2kex.KEX_TARGETS[target]
                 )
                 self.assertEqual(struct.unpack_from("<H", first, 32)[0], 2)
-                self.assertEqual(struct.unpack_from("<I", first, 64 + 32)[0], 2)
-                self.assertEqual(struct.unpack_from("<I", first, 104 + 32)[0], 3)
-                self.assertEqual(struct.unpack_from("<Q", first, 104 + 24)[0], 8192)
+                self.assertEqual(
+                    struct.unpack_from("<I", first, elf2kex.KEX_HEADER_BYTES + 32)[0],
+                    2,
+                )
+                second = elf2kex.KEX_HEADER_BYTES + elf2kex.KEX_RECORD_BYTES
+                self.assertEqual(struct.unpack_from("<I", first, second + 32)[0], 3)
+                self.assertEqual(struct.unpack_from("<Q", first, second + 24)[0], 8192)
 
-    def test_rust_converter_is_byte_exact_with_python_oracle(self) -> None:
+    def test_rust_converter_rejects_legacy_static_oracle_inputs(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             for target in elf2kex.KEX_TARGETS:
@@ -208,11 +212,8 @@ class Elf2KexTests(unittest.TestCase):
                         check=False,
                         capture_output=True,
                     )
-                    self.assertEqual(converted.returncode, 0, converted.stderr.decode())
-                    self.assertEqual(
-                        output.read_bytes(),
-                        elf2kex.convert_elf(image, expected_target=target),
-                    )
+                    self.assertNotEqual(converted.returncode, 0)
+                    self.assertFalse(output.exists())
 
     def test_rust_converter_matches_closed_python_rejections(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -271,7 +272,9 @@ class Elf2KexTests(unittest.TestCase):
             assert_rust_rejects(self.make_elf() + b"\0")
             assert_rust_rejects(self.make_elf(), "--target", "aarch64")
             assert_rust_rejects(self.make_elf(), "--stack-pages", "3")
-            assert_rust_rejects(self.make_elf(), "--heap-pages", "4097")
+            assert_rust_rejects(
+                self.make_elf(), "--heap-pages", str((1 << 32) + 1)
+            )
 
     def test_dynamic_interpreter_tls_notes_relro_and_relocations_are_rejected(
         self,
@@ -341,12 +344,12 @@ class Elf2KexTests(unittest.TestCase):
 
     def test_standard_stack_heap_record_and_image_bounds_are_enforced(self) -> None:
         elf = self.make_elf()
-        for stack in (0, 3, 257):
+        for stack in (0, 3, (1 << 32) + 1):
             with self.subTest(stack=stack):
                 with self.assertRaises(ValueError):
                     elf2kex.convert_elf(elf, stack_pages=stack)
         with self.assertRaises(ValueError):
-            elf2kex.convert_elf(elf, heap_pages=4097)
+            elf2kex.convert_elf(elf, heap_pages=(1 << 32) + 1)
         sparse = self.make_elf(
             virtual_address=elf2kex.KEX_IMAGE_BASE + 128 * 1024 * 1024
         )
@@ -367,16 +370,26 @@ class Elf2KexTests(unittest.TestCase):
     def test_kex_self_validation_rejects_corruption(self) -> None:
         artifact = elf2kex.convert_elf(self.make_elf())
         corruptions: list[bytes] = [artifact[:-1]]
-        for offset in (0, 22, 48, 64 + 32, 64 + 36):
+        for offset in (
+            0,
+            22,
+            60,
+            elf2kex.KEX_HEADER_BYTES + 32,
+            elf2kex.KEX_HEADER_BYTES + 36,
+        ):
             corrupt = bytearray(artifact)
             corrupt[offset] ^= 1
             corruptions.append(bytes(corrupt))
         for offset, format_, value in (
             (32, "<H", 17),
-            (36, "<I", 257),
-            (40, "<I", 4097),
-            (64, "<Q", 128 * 1024 * 1024),
-            (64 + 24, "<Q", 8193 * elf2kex.KEX_PAGE_BYTES),
+            (40, "<Q", (1 << 32) + 1),
+            (48, "<Q", (1 << 32) + 1),
+            (elf2kex.KEX_HEADER_BYTES, "<Q", 128 * 1024 * 1024),
+            (
+                elf2kex.KEX_HEADER_BYTES + 24,
+                "<Q",
+                8193 * elf2kex.KEX_PAGE_BYTES,
+            ),
         ):
             corrupt = bytearray(artifact)
             struct.pack_into(format_, corrupt, offset, value)

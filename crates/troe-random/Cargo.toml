@@ -1,0 +1,10 @@
+[package]
+name = "troe-random"
+description = "Kernel CSPRNG core and bounded random-byte service for TROE"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

@@ -31,8 +31,10 @@ A manifest has exactly these fields:
 - `directories`: at most eight unique sorted package root declarations. Roles
   are `assets`, `config`, or `data`; assets and resolved configuration are
   read-only, while data may separately request `read-mutate`;
-- `resources`: 1–50 ms execution lease, 1–8 initial handles, 4 KiB–64 MiB heap,
-  and 4 KiB–1 MiB stack; and
+- `resources`: 1–50 ms execution lease, 1–8 initial handles, and 4 KiB through
+  unsigned-64-bit heap and stack requests; physical availability and the active
+  deployment/kernel memory policy decide admission rather than this hosted
+  interchange format; and
 - `services`: at most 16 unique sorted service names bound to package commands.
 
 An absolute host or guest path is not part of a directory declaration. Native

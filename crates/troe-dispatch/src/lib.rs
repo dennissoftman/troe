@@ -201,6 +201,8 @@ pub enum ReplyStatus {
     NotEmpty = 21,
     /// A name operation crossed filesystem-provider boundaries.
     CrossDevice = 22,
+    /// A configured resource-policy ceiling was reached.
+    ResourceLimit = 23,
 }
 
 impl ReplyStatus {
@@ -237,6 +239,7 @@ impl ReplyStatus {
             20 => Some(Self::Denied),
             21 => Some(Self::NotEmpty),
             22 => Some(Self::CrossDevice),
+            23 => Some(Self::ResourceLimit),
             _ => None,
         }
     }

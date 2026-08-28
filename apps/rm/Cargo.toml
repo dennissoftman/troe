@@ -8,6 +8,7 @@ publish = false
 
 [package.metadata.troe-kex]
 capabilities = ["filesystem-read", "filesystem-mutate"]
+stack-pages = 12
 heap-pages = 16
 
 [dependencies]

@@ -1,9 +1,6 @@
 # ADR 0048: capability-scoped private memory and configurable resource policy
 
-Status: accepted for the private-memory increment, 2026-08-28. The design is
-recorded before implementation; its status becomes implemented only when the
-typed service, policy pipeline, runtime facade, accounting, and native
-acceptance evidence land together.
+Status: accepted and implemented, 2026-08-28.
 
 ## Context
 
@@ -42,7 +39,7 @@ The raw interface provides these mechanisms:
 
 - reserve a page-aligned private virtual range without backing frames;
 - map a new zeroed private range read-only or read-write;
-- change a complete owned range between inaccessible, read-only, and
+- change a complete or partial owned range between inaccessible, read-only, and
   read-write states;
 - unmap a complete or partial owned range and return its zeroed frames; and
 - query the caller's granted limits, current use, and high-water accounting.
@@ -75,14 +72,16 @@ mapping-record and metadata-byte limits plus a boot-wide metadata budget bound
 fragmentation attacks and protect the owned kernel heap. The limits do not
 preallocate their maximum and do not limit the byte size of one mapping.
 
-Large map, protection, and unmap requests are deferred kernel transactions.
-The caller remains suspended while the kernel processes a configured number of
-pages per scheduler turn. The work quantum bounds latency, not total operation
-size. Before publishing a successful change, the kernel reserves all required
-metadata and page-table resources. Ordinary allocation failure rolls a map back
-to its previous externally visible state. An impossible failure after a
-destructive page-table mutation terminalizes the task and follows the complete
-teardown path rather than resuming a partially changed address space.
+Large backing allocations are acquired and zeroed in configured page quanta so
+no contiguous-allocation search or zeroing substep scales to the total request.
+The quantum is a kernel work/allocation tuning value, not a total mapping-size
+limit. The current single-core call transaction remains externally atomic;
+future scheduler-interleaved VM transactions may reuse the same quantum without
+changing the ABI. Before publishing a successful change, the kernel reserves
+required metadata and page-table resources. Ordinary allocation failure rolls
+a map back to its previous externally visible state. An impossible failure
+after a destructive page-table mutation terminalizes the task and follows the
+complete teardown path rather than resuming a partially changed address space.
 
 The reusable Rust runtime exposes POSIX-shaped anonymous `mmap`, `mprotect`, and
 `munmap` behavior over the typed SDK without hiding the raw capability model.
@@ -178,4 +177,7 @@ The kernel retains typed capability-scoped primitives and no POSIX parser,
 descriptor table, allocator, or filesystem algorithm. The raw SDK remains
 distinct from the higher-level runtime. This increment is a complete private
 data-memory facility, not a claim of complete libc, demand paging, shared
-memory, dynamic linking, executable allocation, threads, `fork`, or swap.
+memory, general dynamic linking, executable allocation, threads, `fork`, or
+swap. The kernel CSPRNG, position-independent KEX relocation, randomized
+image/stack placement, and randomized private-gap selection are implemented by
+[ADR 0049](0049-kernel-csprng-and-kex-aslr.md).

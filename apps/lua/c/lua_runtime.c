@@ -151,6 +151,7 @@ typedef struct TroeLuaConfiguration {
   int requested_exit;
   uint32_t requested_exit_status;
   int requested_exit_close;
+  uint32_t seed;
 } TroeLuaConfiguration;
 
 static TroeLuaHost *troe_active_host;
@@ -829,19 +830,8 @@ static void troe_write_error(const char *format, const char *argument) {
   troe_write_error((format), (argument))
 
 static unsigned int troe_make_seed(void) {
-  uint64_t wall = 0;
-  uint64_t ticks = 0;
-  uint64_t frequency = 0;
-  uintptr_t address = (uintptr_t)&wall;
-  extern uint32_t troe_runtime_mix_seed(uint64_t address,
-                                        uint64_t wall_seconds, uint64_t ticks,
-                                        uint64_t frequency_hz);
-  if (troe_active_host != NULL) {
-    (void)troe_active_host->wall_time(troe_active_host->context, &wall);
-    (void)troe_active_host->process_cpu_time(troe_active_host->context, &ticks,
-                                             &frequency);
-  }
-  return troe_runtime_mix_seed((uint64_t)address, wall, ticks, frequency);
+  return troe_active_configuration == NULL ? 0
+                                            : troe_active_configuration->seed;
 }
 
 #define luai_makeseed() troe_make_seed()

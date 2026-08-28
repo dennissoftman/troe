@@ -223,6 +223,7 @@ dependencies = [
  "troe-net",
  "troe-persist",
  "troe-process",
+ "troe-random",
  "troe-shell",
  "troe-statefs",
  "troe-storage",
@@ -309,6 +310,10 @@ version = "0.1.0"
 dependencies = [
  "troe-abi",
 ]
+
+[[package]]
+name = "troe-random"
+version = "0.1.0"
 
 [[package]]
 name = "troe-shell"

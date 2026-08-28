@@ -60,9 +60,9 @@ virtual-memory state.
 
 - `global_metadata_bytes`: a mandatory nonzero boot-wide budget for charged
   dynamic virtual-memory metadata; and
-- `operation_quantum_pages`: a mandatory nonzero number of pages processed by
-  one deferred VM transaction step. This bounds scheduling latency and is not
-  a limit on the total request.
+- `operation_quantum_pages`: a mandatory nonzero maximum extent used by one
+  private-backing allocation/zeroing substep. It bounds contiguous allocator
+  work and is not a limit on the total request.
 
 All page counts refer to TROE's 4 KiB page. Multiplication by page size and
 conversion to target address types use checked arithmetic.
@@ -73,7 +73,7 @@ conversion to target address types use checked arithmetic.
 schema = 1
 
 [system]
-minimum_free_pages = 16384
+minimum_free_pages = 8192
 
 [system.application_commit]
 limited = false
@@ -123,12 +123,14 @@ publishes that distinction through diagnostics.
 ## Attenuation and observation
 
 Package resource requests and explicit launch limits may only attenuate these
-defaults. A missing optional system or process limit means no additional policy
-ceiling; architectural address-space bounds, available committed frames, the
-minimum free-frame reserve, mapping count, metadata budgets, and ownership
-checks still apply.
+defaults. A process committed-page limit covers its initial image, startup page,
+heap, stack, heap growth, and committed private mappings. A missing optional
+system or process limit means no additional policy ceiling; architectural
+address-space bounds, available committed frames, the minimum free-frame
+reserve, mapping count, metadata budgets, and ownership checks still apply.
 
-The active TOML reports generation policy, not live use. Typed process
-observation reports each process's granted reserved, committed, mapping, and
-metadata limits together with current and high-water use. Diagnostics report
-boot-wide commitment, free-frame reserve, metadata use, and rejection counts.
+The active TOML reports generation policy, not live use. The private-memory
+capability query reports the caller's granted limits plus current and high-water
+dynamic mapping use. Existing process observation reports aggregate retained
+private pages; richer boot-wide commitment/rejection diagnostics remain future
+typed observation work.

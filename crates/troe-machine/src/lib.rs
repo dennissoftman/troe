@@ -56,7 +56,7 @@ compile_error!("the selected x86-64 platform requires the x86_64 target architec
 ))]
 compile_error!("the selected AArch64 platform requires the AArch64 target architecture");
 
-#[cfg(target_os = "uefi")]
+#[cfg(any(test, target_os = "uefi"))]
 extern crate alloc;
 
 #[cfg(target_os = "uefi")]
@@ -446,18 +446,19 @@ pub use mechanism::{
     wait_for_runtime_event_timeout, write, zero_physical_range,
 };
 
-#[cfg(test)]
-pub use mmu::required_page_table_pages;
 #[cfg(target_os = "uefi")]
 pub use mmu::{
     ApplicationCall, ApplicationResume, ApplicationSession, build_user_address_space,
-    install_exception_vectors, install_mmu, loaded_image_layout, required_page_table_pages,
-    resume_application, run_application, run_isolated,
+    install_exception_vectors, install_mmu, loaded_image_layout,
+    maximum_additional_page_table_pages, required_page_table_pages, resume_application,
+    run_application, run_isolated,
 };
 #[cfg(any(test, target_os = "uefi"))]
 pub use mmu::{ApplicationOutcome, IsolatedFault, IsolatedOutcome, UserAddressSpace};
 #[cfg(any(test, target_os = "uefi"))]
 pub use mmu::{ImageLayout, ImageRegion, MmuError, MmuStats};
+#[cfg(test)]
+pub use mmu::{maximum_additional_page_table_pages, required_page_table_pages};
 #[cfg(all(target_os = "uefi", feature = "acceptance-probes"))]
 pub use mmu::{trigger_execute_fault, trigger_native_exception, trigger_write_fault};
 

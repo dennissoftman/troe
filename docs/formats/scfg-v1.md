@@ -4,11 +4,23 @@ SCFG v1 is the immutable desired-system and service-startup configuration used
 by the current configuration boundary. All integers are little-endian.
 The product-name-independent magic is `SCFGv1`, followed by two zero bytes.
 
-The 64-byte header contains the format major/minor, fixed header and record
+The 144-byte header contains the format major/minor, fixed header and record
 sizes, exact total bytes, a CRC-32 covering the complete image with its own
 field zeroed, nonzero generation and optional predecessor identities, service
 count, bounded activation attempts, recovery flags, generation health window,
-and exact string-table bytes. Every reserved byte is zero.
+and exact string-table bytes. SCFG 1.1 adds the typed memory-policy fields
+defined below. Every reserved byte is zero.
+
+The first 64 bytes retain the SCFG 1.0 generation and service-table fields.
+Bytes 64 through 135 contain nine little-endian `u64` values: optional-limit
+flags, minimum free pages, system application-commit maximum, default process
+committed-page maximum, default process reserved-page maximum, default maximum
+mapping records, default maximum metadata bytes, global metadata bytes, and VM
+operation quantum pages. Bytes 136 through 143 are zero. Optional maxima are
+nonzero exactly when their flag is true and zero otherwise; zero is an encoded
+absence only inside SCFG and is never operator-authored policy syntax. The full
+validation and TOML projection are specified by
+[`memory-policy-v1.md`](memory-policy-v1.md).
 
 The recovery-shell flag is mandatory. Previous-generation fallback is present
 if and only if the predecessor identity is nonzero, and a generation cannot
