@@ -7,6 +7,14 @@ SYNOPSIS
 DESCRIPTION
     Writes FORMAT without adding a newline. C-style escapes in FORMAT include
     \\, \a, \b, \e, \f, \n, \r, \t, \v, octal, hexadecimal, and Unicode
-    escapes. \c stops output. %% writes %, %s writes an argument, and %b writes
-    an argument after interpreting its escapes. FORMAT repeats to consume extra
-    arguments used by %s or %b.
+    escapes. \c stops output. %% writes %, %s writes a string, %b interprets
+    escapes in a string, and %c writes the first character. %d and %i write a
+    signed decimal integer; %u, %o, %x, and %X write unsigned decimal, octal,
+    or hexadecimal integers. Integer arguments accept signs, 0-prefixed octal,
+    0x-prefixed hexadecimal, and quoted character values. FORMAT repeats to
+    consume extra conversion arguments.
+
+    The flags #, -, +, space, and 0, numeric or * field widths, and numeric or
+    * precisions are supported for string, character, and integer conversions.
+    Width and precision are bounded at 65536 bytes. Floating-point conversions
+    are not implemented.

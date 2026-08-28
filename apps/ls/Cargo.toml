@@ -10,6 +10,7 @@ publish = false
 capabilities = ["filesystem-read"]
 
 [dependencies]
+troe-kex-runtime = { path = "../../sdk/rust/troe-kex-runtime", default-features = false }
 troe-kex-sdk = { path = "../../sdk/rust/troe-kex" }
 
 [profile.release]

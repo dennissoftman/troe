@@ -1,9 +1,47 @@
 NAME
-    grep - print lines containing a literal pattern
+    grep - search input lines for patterns
 
 SYNOPSIS
-    grep PATTERN [FILE...]
+    grep [-EFGivnbcqsowxhHlL] [-e PATTERN] [-m NUM]
+         [PATTERN] [FILE...]
 
 DESCRIPTION
-    Prints each input line containing PATTERN as literal bytes. With only a
-    pattern, reads standard input. Regular expressions are not implemented.
+    Selects lines matching any pattern. The default syntax is a POSIX-style
+    basic regular expression (BRE); -E selects extended expressions (ERE),
+    and -F selects literal strings. With no FILE, reads standard input. A FILE
+    of - also selects standard input. Multiple files receive filename prefixes
+    by default.
+
+    The bounded byte-oriented engine supports grouping, alternation,
+    concatenation, ., ^, $, *, +, ?, intervals such as {2,4}, bracket ranges,
+    negated brackets, and the ASCII POSIX classes alnum, alpha, blank, cntrl,
+    digit, graph, lower, print, punct, space, upper, and xdigit. BRE grouping,
+    alternation, +, ?, and intervals use backslashes. Backreferences,
+    locale-specific collation, recursion, context output, and pattern files are
+    not implemented. Programs are limited to 512 instructions, 16 patterns,
+    nesting depth 32, and repetition bounds up to 64.
+
+OPTIONS
+    -E  Interpret patterns as extended regular expressions.
+    -F  Interpret patterns as fixed strings.
+    -G  Interpret patterns as basic regular expressions; this is the default.
+    -e PATTERN  Add a pattern. May be repeated; attached -ePATTERN is accepted.
+    -i  Compare ASCII letters without regard to case.
+    -v  Select nonmatching lines.
+    -n  Prefix selected output with its one-based line number.
+    -b  Prefix selected output with its zero-based byte offset.
+    -c  Print only the selected-line count for each input.
+    -q  Write no output and stop when the result is known.
+    -s  Suppress filesystem error messages.
+    -o  Print each nonempty matching portion on a separate line.
+    -w  Require matches to be bounded by non-word bytes.
+    -x  Require a match of the complete line.
+    -h  Suppress filename prefixes.
+    -H  Always print filename prefixes.
+    -l  Print only names of inputs containing a selected line.
+    -L  Print only names of inputs containing no selected line.
+    -m NUM  Stop after NUM selected lines per input.
+
+    Options may be combined when they take no argument. -- ends option parsing.
+    Status is zero when the requested selection succeeds, one when it does not,
+    and another nonzero status for invalid patterns or I/O errors.

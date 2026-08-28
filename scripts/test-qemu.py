@@ -1128,7 +1128,10 @@ def run_shell_terminal_group(session: SerialSession, command_timeout: float) -> 
         "man echo",
         cwd,
         command_timeout,
-        contains=("NAME\n    echo - write arguments", "SYNOPSIS\n    echo [ARG...]"),
+        contains=(
+            "NAME\n    echo - write arguments",
+            "SYNOPSIS\n    echo [-n] [-e|-E] [ARG...]",
+        ),
     )
     session.command(
         "man sh",
@@ -1249,7 +1252,7 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
         "ls /",
         cwd,
         command_timeout,
-        contains=("config/", "man/", "recovery/", "sys/", "tmp/"),
+        contains=("config", "man", "recovery", "sys", "tmp"),
         absent=("etc/",),
     )
     session.command(
@@ -1292,7 +1295,7 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
         "ls /vol/root",
         cwd,
         command_timeout,
-        contains=("troe-mutable-hard", "troe-mutable-soft@"),
+        contains=("troe-mutable-hard", "troe-mutable-soft"),
     )
     session.command(
         f"printf %s {MUTABLE_ROOT_CONTENT} > /vol/root/troe-mutable-soft",
@@ -1323,7 +1326,7 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
         "ls /vol/root",
         cwd,
         command_timeout,
-        contains=("troe-copy-soft@",),
+        contains=("troe-copy-soft",),
     )
     session.command(
         "cat /vol/root/troe-copy-soft",
@@ -1433,6 +1436,118 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
     session.command("rm /vol/root/troe-mutable-hard", cwd, command_timeout)
     session.command("rm /vol/root/troe-mutable-soft", cwd, command_timeout)
     session.command("echo alpha beta", cwd, command_timeout, contains=("alpha beta\n",))
+    session.command("echo -n no-newline", cwd, command_timeout, contains=("no-newline",))
+    session.command(
+        r"echo -e 'one\ntwo'", cwd, command_timeout, contains=("one\ntwo\n",)
+    )
+    session.command(
+        r"printf '%d %x\n' -42 255", cwd, command_timeout, contains=("-42 ff\n",)
+    )
+    session.command(
+        r"printf '%#08x|%-5s|%.3s\n' 42 hi abcdef",
+        cwd,
+        command_timeout,
+        contains=("0x00002a|hi   |abc\n",),
+    )
+    session.command(
+        r"printf 'alpha\n\n\nbeta\n' > /tmp/text-options", cwd, command_timeout
+    )
+    session.command(r"printf 'a\tb\n' > /tmp/visible-options", cwd, command_timeout)
+    session.command(
+        "cat -ns /tmp/text-options",
+        cwd,
+        command_timeout,
+        contains=("     1\talpha\n     2\t\n     3\tbeta\n",),
+    )
+    session.command(
+        "cat -ET /tmp/visible-options",
+        cwd,
+        command_timeout,
+        contains=("a^Ib$\n",),
+    )
+    session.command(
+        "grep -in ALPHA /tmp/text-options",
+        cwd,
+        command_timeout,
+        contains=("1:alpha\n",),
+    )
+    session.command(
+        "grep -c a /tmp/text-options", cwd, command_timeout, contains=("2\n",)
+    )
+    session.command(
+        r"grep -En '^(alpha|beta)$' /tmp/text-options",
+        cwd,
+        command_timeout,
+        contains=("1:alpha\n4:beta\n",),
+    )
+    session.command(
+        r"grep -n 'alpha\|beta' /tmp/text-options",
+        cwd,
+        command_timeout,
+        contains=("1:alpha\n4:beta\n",),
+    )
+    session.command(
+        "grep -Eo '[[:alpha:]]+' /tmp/text-options",
+        cwd,
+        command_timeout,
+        contains=("alpha\nbeta\n",),
+    )
+    session.command(
+        "grep -m 1 -e alpha -e beta /tmp/text-options",
+        cwd,
+        command_timeout,
+        contains=("alpha\n",),
+        absent=("beta\n",),
+    )
+    session.command(
+        "spawn --status grep -F 'alpha|beta' /tmp/text-options",
+        cwd,
+        command_timeout,
+        contains=("spawn-status: 1\n",),
+    )
+    session.command(
+        "spawn --status grep absent /tmp/text-options",
+        cwd,
+        command_timeout,
+        contains=("spawn-status: 1\n",),
+    )
+    session.command(
+        "ls -1 /tmp", cwd, command_timeout, contains=("text-options\n",)
+    )
+    session.command(
+        "ls -l /tmp", cwd, command_timeout, contains=("13 text-options\n",)
+    )
+    session.command(
+        "ls -lh /tmp", cwd, command_timeout, contains=("13 B text-options\n",)
+    )
+    session.command("printf hidden > /tmp/.hidden-options", cwd, command_timeout)
+    session.command(
+        "ls -1 /tmp",
+        cwd,
+        command_timeout,
+        absent=(".hidden-options\n",),
+    )
+    session.command(
+        "ls -1A /tmp",
+        cwd,
+        command_timeout,
+        contains=(".hidden-options\n",),
+    )
+    session.command(
+        "ls -1F /", cwd, command_timeout, contains=("config/\n",)
+    )
+    session.command(
+        "ls -dF /tmp",
+        cwd,
+        command_timeout,
+        contains=("/tmp/\n",),
+    )
+    session.command(
+        "ls -d /tmp/text-options /tmp",
+        cwd,
+        command_timeout,
+        contains=("/tmp/text-options\n\n/tmp\n",),
+    )
     session.command(
         "spawn echo nested-inherit",
         cwd,

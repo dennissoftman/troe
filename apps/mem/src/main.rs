@@ -6,6 +6,7 @@ mod common;
 
 use core::fmt;
 use core::fmt::Write as _;
+use troe_kex_runtime::units::HumanBytes;
 use troe_kex_sdk::{
     CommandContext, INVOCATION_BUFFER_BYTES, StandardOutput, diagnostics, entry, exit,
     private_memory,
@@ -22,27 +23,7 @@ impl fmt::Write for OutputWriter<'_> {
 }
 
 fn human_bytes(output: &mut impl fmt::Write, bytes: u64) -> fmt::Result {
-    const KIB: u64 = 1024;
-    const MIB: u64 = KIB * 1024;
-    const GIB: u64 = MIB * 1024;
-    let (unit, label) = if bytes >= GIB {
-        (GIB, "GiB")
-    } else if bytes >= MIB {
-        (MIB, "MiB")
-    } else if bytes >= KIB {
-        (KIB, "KiB")
-    } else {
-        return write!(output, "{bytes} B");
-    };
-    let whole = bytes / unit;
-    let hundredths = ((bytes % unit) * 100) / unit;
-    if hundredths == 0 {
-        write!(output, "{whole} {label}")
-    } else if hundredths.is_multiple_of(10) {
-        write!(output, "{whole}.{} {label}", hundredths / 10)
-    } else {
-        write!(output, "{whole}.{hundredths:02} {label}")
-    }
+    write!(output, "{}", HumanBytes::new(bytes))
 }
 
 fn byte_count(output: &mut impl fmt::Write, bytes: u64) -> fmt::Result {
@@ -196,7 +177,8 @@ fn memory_self_test(command: &mut CommandContext) -> Result<(), ()> {
     let mut second = [0_u8; 64];
     random.fill(&mut first).map_err(|_| ())?;
     random.fill(&mut second).map_err(|_| ())?;
-    if first == second || (first.iter().all(|byte| *byte == 0) && second.iter().all(|byte| *byte == 0))
+    if first == second
+        || (first.iter().all(|byte| *byte == 0) && second.iter().all(|byte| *byte == 0))
     {
         return Err(());
     }
@@ -220,7 +202,11 @@ fn main(command: &mut CommandContext) -> u32 {
         return if memory_self_test(command).is_ok() {
             exit::SUCCESS
         } else {
-            common::report(&mut command.stderr(), "mem", b"private memory self-test failed");
+            common::report(
+                &mut command.stderr(),
+                "mem",
+                b"private memory self-test failed",
+            );
             exit::FAILURE
         };
     }

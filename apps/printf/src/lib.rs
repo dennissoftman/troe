@@ -8,6 +8,8 @@ extern crate std;
 pub enum PrintError<OutputError> {
     /// The format contains an unsupported conversion or invalid numeric escape.
     InvalidFormat,
+    /// A numeric conversion received an invalid integer argument.
+    InvalidNumber,
     /// The standard-output service rejected a write.
     Output(OutputError),
 }
@@ -18,11 +20,52 @@ enum Flow {
     Stop,
 }
 
+const MAX_FIELD_WIDTH: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Default)]
+struct FormatSpec {
+    alternate: bool,
+    left: bool,
+    plus: bool,
+    space: bool,
+    zero: bool,
+    width: Option<usize>,
+    precision: Option<usize>,
+    conversion: u8,
+}
+
+/// Result of interpreting backslash escapes in one string.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EscapeOutcome {
+    /// The complete string was rendered.
+    Complete,
+    /// A `\c` escape requested that all output stop.
+    Stop,
+}
+
+/// Render C-style escapes from one string without allocation.
+///
+/// This is shared with commands such as `echo -e` so escape semantics remain
+/// identical to `printf %b`.
+pub fn render_escapes<Write, OutputError>(
+    value: &str,
+    mut write: Write,
+) -> Result<EscapeOutcome, PrintError<OutputError>>
+where
+    Write: FnMut(&[u8]) -> Result<(), OutputError>,
+{
+    write_escaped(value.as_bytes(), &mut write).map(|flow| match flow {
+        Flow::Continue => EscapeOutcome::Complete,
+        Flow::Stop => EscapeOutcome::Stop,
+    })
+}
+
 /// Render one bounded `printf` format without allocation.
 ///
-/// The format supports C-style escapes, `%%`, `%s`, and `%b`. It is repeated
-/// when needed to consume additional arguments, matching the useful shell
-/// `printf` behavior without introducing numeric formatting policy.
+/// The format supports C-style escapes, `%%`, `%s`, `%b`, `%c`, the standard
+/// flags, bounded field widths and precisions, and the integer conversions
+/// `%d`, `%i`, `%u`, `%o`, `%x`, and `%X`. It is repeated when needed to
+/// consume additional arguments.
 pub fn render<'argument, Arguments, Write, OutputError>(
     format: &str,
     arguments: Arguments,
@@ -67,25 +110,83 @@ where
             }
             b'%' => {
                 write_bytes(write, &bytes[literal_start..cursor])?;
-                let Some(conversion) = bytes.get(cursor + 1).copied() else {
-                    return Err(PrintError::InvalidFormat);
-                };
-                match conversion {
-                    b'%' => write_bytes(write, b"%")?,
+                let (spec, next, consumed) = parse_spec(bytes, cursor, arguments)?;
+                substitutions += consumed;
+                match spec.conversion {
+                    b'%' => write_padded(write, b"%", spec)?,
                     b's' => {
-                        write_bytes(write, arguments.next().unwrap_or("").as_bytes())?;
+                        let argument = arguments.next().unwrap_or("").as_bytes();
                         substitutions += 1;
+                        let length = spec
+                            .precision
+                            .map_or(argument.len(), |maximum| argument.len().min(maximum));
+                        write_padded(write, &argument[..length], spec)?;
                     }
                     b'b' => {
                         let argument = arguments.next().unwrap_or("");
                         substitutions += 1;
+                        let (length, measured_flow) = measure_escaped(argument.as_bytes())
+                            .map_err(|()| PrintError::InvalidFormat)?;
+                        write_padding(
+                            write,
+                            spec.width.unwrap_or(0).saturating_sub(length),
+                            b' ',
+                            !spec.left,
+                        )?;
                         if write_escaped(argument.as_bytes(), write)? == Flow::Stop {
                             return Ok((Flow::Stop, substitutions));
                         }
+                        if measured_flow == Flow::Continue {
+                            write_padding(
+                                write,
+                                spec.width.unwrap_or(0).saturating_sub(length),
+                                b' ',
+                                spec.left,
+                            )?;
+                        }
+                    }
+                    b'c' => {
+                        let argument = arguments.next().unwrap_or("");
+                        substitutions += 1;
+                        if let Some(character) = argument.chars().next() {
+                            let mut encoded = [0_u8; 4];
+                            write_padded(
+                                write,
+                                character.encode_utf8(&mut encoded).as_bytes(),
+                                spec,
+                            )?;
+                        } else {
+                            write_padded(write, b"", spec)?;
+                        }
+                    }
+                    b'd' | b'i' => {
+                        let argument = arguments.next().unwrap_or("0");
+                        substitutions += 1;
+                        let (negative, magnitude) = parse_integer(argument)?;
+                        if magnitude > i64::MAX as u64 + u64::from(negative) {
+                            return Err(PrintError::InvalidNumber);
+                        }
+                        write_integer(write, magnitude, negative, 10, false, spec)?;
+                    }
+                    b'u' | b'o' | b'x' | b'X' => {
+                        let argument = arguments.next().unwrap_or("0");
+                        substitutions += 1;
+                        let (negative, magnitude) = parse_integer(argument)?;
+                        let value = if negative {
+                            0_u64.wrapping_sub(magnitude)
+                        } else {
+                            magnitude
+                        };
+                        let radix = match spec.conversion {
+                            b'o' => 8,
+                            b'x' | b'X' => 16,
+                            _ => 10,
+                        };
+                        write_integer(write, value, false, radix, spec.conversion == b'X', spec)?;
                     }
                     _ => return Err(PrintError::InvalidFormat),
                 }
-                cursor += 2;
+                cursor = next;
                 literal_start = cursor;
             }
             _ => cursor += 1,
@@ -93,6 +194,236 @@ where
     }
     write_bytes(write, &bytes[literal_start..])?;
     Ok((Flow::Continue, substitutions))
+}
+
+fn parse_spec<'argument, Arguments, OutputError>(
+    bytes: &[u8],
+    percent: usize,
+    arguments: &mut core::iter::Peekable<Arguments>,
+) -> Result<(FormatSpec, usize, usize), PrintError<OutputError>>
+where
+    Arguments: Iterator<Item = &'argument str>,
+{
+    let mut spec = FormatSpec::default();
+    let mut cursor = percent + 1;
+    while let Some(flag) = bytes.get(cursor).copied() {
+        match flag {
+            b'#' => spec.alternate = true,
+            b'-' => spec.left = true,
+            b'+' => spec.plus = true,
+            b' ' => spec.space = true,
+            b'0' => spec.zero = true,
+            _ => break,
+        }
+        cursor += 1;
+    }
+    let mut consumed = 0_usize;
+    if bytes.get(cursor) == Some(&b'*') {
+        let width = parse_decimal(arguments.next().unwrap_or("0"))?;
+        consumed += 1;
+        cursor += 1;
+        if width < 0 {
+            spec.left = true;
+        }
+        spec.width = Some(limit_width(width.unsigned_abs())?);
+    } else {
+        let (width, next) = parse_format_number(bytes, cursor)?;
+        spec.width = width;
+        cursor = next;
+    }
+    if bytes.get(cursor) == Some(&b'.') {
+        cursor += 1;
+        if bytes.get(cursor) == Some(&b'*') {
+            let precision = parse_decimal(arguments.next().unwrap_or("0"))?;
+            consumed += 1;
+            cursor += 1;
+            if precision >= 0 {
+                spec.precision = Some(limit_width(precision as u64)?);
+            }
+        } else {
+            let (precision, next) = parse_format_number(bytes, cursor)?;
+            spec.precision = Some(precision.unwrap_or(0));
+            cursor = next;
+        }
+    }
+    spec.conversion = *bytes.get(cursor).ok_or(PrintError::InvalidFormat)?;
+    if spec.conversion == b'%' && consumed != 0 {
+        return Err(PrintError::InvalidFormat);
+    }
+    Ok((spec, cursor + 1, consumed))
+}
+
+fn parse_format_number<OutputError>(
+    bytes: &[u8],
+    start: usize,
+) -> Result<(Option<usize>, usize), PrintError<OutputError>> {
+    let mut cursor = start;
+    let mut value = 0_usize;
+    while let Some(byte @ b'0'..=b'9') = bytes.get(cursor).copied() {
+        value = value
+            .checked_mul(10)
+            .and_then(|value| value.checked_add(usize::from(byte - b'0')))
+            .ok_or(PrintError::InvalidFormat)?;
+        if value > MAX_FIELD_WIDTH {
+            return Err(PrintError::InvalidFormat);
+        }
+        cursor += 1;
+    }
+    Ok(((cursor != start).then_some(value), cursor))
+}
+
+fn limit_width<OutputError>(value: u64) -> Result<usize, PrintError<OutputError>> {
+    let value = usize::try_from(value).map_err(|_| PrintError::InvalidFormat)?;
+    (value <= MAX_FIELD_WIDTH)
+        .then_some(value)
+        .ok_or(PrintError::InvalidFormat)
+}
+
+fn parse_decimal<OutputError>(value: &str) -> Result<i64, PrintError<OutputError>> {
+    value.parse().map_err(|_| PrintError::InvalidNumber)
+}
+
+fn parse_integer<OutputError>(value: &str) -> Result<(bool, u64), PrintError<OutputError>> {
+    if let Some(quoted) = value.strip_prefix(['\'', '"']) {
+        let character = quoted.chars().next().unwrap_or('\0');
+        return Ok((false, u64::from(character as u32)));
+    }
+    let (negative, unsigned) = if let Some(value) = value.strip_prefix('-') {
+        (true, value)
+    } else {
+        (false, value.strip_prefix('+').unwrap_or(value))
+    };
+    let (radix, digits) = if let Some(value) = unsigned
+        .strip_prefix("0x")
+        .or_else(|| unsigned.strip_prefix("0X"))
+    {
+        (16, value)
+    } else if unsigned.len() > 1 && unsigned.starts_with('0') {
+        (8, &unsigned[1..])
+    } else {
+        (10, unsigned)
+    };
+    if digits.is_empty() {
+        return if unsigned == "0" {
+            Ok((negative, 0))
+        } else {
+            Err(PrintError::InvalidNumber)
+        };
+    }
+    let magnitude = u64::from_str_radix(digits, radix).map_err(|_| PrintError::InvalidNumber)?;
+    Ok((negative, magnitude))
+}
+
+fn write_integer<Write, OutputError>(
+    write: &mut Write,
+    mut value: u64,
+    negative: bool,
+    radix: u64,
+    uppercase: bool,
+    spec: FormatSpec,
+) -> Result<(), PrintError<OutputError>>
+where
+    Write: FnMut(&[u8]) -> Result<(), OutputError>,
+{
+    let digits = if uppercase {
+        b"0123456789ABCDEF"
+    } else {
+        b"0123456789abcdef"
+    };
+    let original = value;
+    let mut buffer = [0_u8; 64];
+    let mut cursor = buffer.len();
+    while value != 0 {
+        cursor -= 1;
+        buffer[cursor] = digits[usize::try_from(value % radix).unwrap_or(0)];
+        value /= radix;
+    }
+    if original == 0 && spec.precision != Some(0) {
+        cursor -= 1;
+        buffer[cursor] = b'0';
+    }
+    let sign = if negative {
+        Some(b'-')
+    } else if spec.plus {
+        Some(b'+')
+    } else if spec.space {
+        Some(b' ')
+    } else {
+        None
+    };
+    let prefix = if spec.alternate && radix == 16 && original != 0 {
+        if uppercase {
+            b"0X".as_slice()
+        } else {
+            b"0x".as_slice()
+        }
+    } else if spec.alternate && radix == 8 && (cursor == buffer.len() || buffer[cursor] != b'0') {
+        b"0".as_slice()
+    } else {
+        b"".as_slice()
+    };
+    let digits_length = buffer.len() - cursor;
+    let precision_zeros = spec.precision.unwrap_or(0).saturating_sub(digits_length);
+    let content_length = usize::from(sign.is_some())
+        .saturating_add(prefix.len())
+        .saturating_add(precision_zeros)
+        .saturating_add(digits_length);
+    let field_padding = spec.width.unwrap_or(0).saturating_sub(content_length);
+    let zero_padding = spec.zero && !spec.left && spec.precision.is_none();
+    write_padding(write, field_padding, b' ', !spec.left && !zero_padding)?;
+    if let Some(sign) = sign {
+        write_bytes(write, &[sign])?;
+    }
+    write_bytes(write, prefix)?;
+    write_padding(write, field_padding, b'0', zero_padding)?;
+    write_padding(write, precision_zeros, b'0', true)?;
+    write_bytes(write, &buffer[cursor..])?;
+    write_padding(write, field_padding, b' ', spec.left)
+}
+
+fn write_padded<Write, OutputError>(
+    write: &mut Write,
+    value: &[u8],
+    spec: FormatSpec,
+) -> Result<(), PrintError<OutputError>>
+where
+    Write: FnMut(&[u8]) -> Result<(), OutputError>,
+{
+    let padding = spec.width.unwrap_or(0).saturating_sub(value.len());
+    write_padding(write, padding, b' ', !spec.left)?;
+    write_bytes(write, value)?;
+    write_padding(write, padding, b' ', spec.left)
+}
+
+fn write_padding<Write, OutputError>(
+    write: &mut Write,
+    mut count: usize,
+    byte: u8,
+    enabled: bool,
+) -> Result<(), PrintError<OutputError>>
+where
+    Write: FnMut(&[u8]) -> Result<(), OutputError>,
+{
+    if !enabled {
+        return Ok(());
+    }
+    let bytes = [byte; 64];
+    while count != 0 {
+        let chunk = count.min(bytes.len());
+        write_bytes(write, &bytes[..chunk])?;
+        count -= chunk;
+    }
+    Ok(())
+}
+
+fn measure_escaped(bytes: &[u8]) -> Result<(usize, Flow), ()> {
+    let mut length = 0_usize;
+    let flow = write_escaped(bytes, &mut |chunk| {
+        length = length.checked_add(chunk.len()).ok_or(())?;
+        Ok::<(), ()>(())
+    })
+    .map_err(|_| ())?;
+    Ok((length, flow))
 }
 
 fn write_escaped<Write, OutputError>(
@@ -251,7 +582,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{PrintError, render};
+    use super::{EscapeOutcome, PrintError, render, render_escapes};
     use std::vec::Vec;
 
     fn output(format: &str, arguments: &[&str]) -> Result<Vec<u8>, PrintError<()>> {
@@ -303,7 +634,50 @@ mod tests {
     #[test]
     fn unknown_escapes_are_preserved_and_bad_conversions_fail() {
         assert_eq!(output(r"\q", &[]), Ok(br"\q".to_vec()));
-        assert_eq!(output("%d", &["1"]), Err(PrintError::InvalidFormat));
+        assert_eq!(output("%f", &["1"]), Err(PrintError::InvalidFormat));
         assert_eq!(output(r"\x", &[]), Err(PrintError::InvalidFormat));
+    }
+
+    #[test]
+    fn character_and_integer_conversions_cover_standard_radices() {
+        assert_eq!(
+            output(
+                "%c %d %i %u %o %x %X",
+                &["λ", "-42", "7", "42", "42", "42", "42"]
+            ),
+            Ok("λ -42 7 42 52 2a 2A".as_bytes().to_vec())
+        );
+        assert_eq!(output("%d", &["nope"]), Err(PrintError::InvalidNumber));
+    }
+
+    #[test]
+    fn flags_width_precision_and_dynamic_fields_are_bounded() {
+        assert_eq!(
+            output(
+                "%#08x|%-5s|%.3s|%+d|% d|%.0d",
+                &["42", "hi", "abcdef", "7", "7", "0"]
+            ),
+            Ok(b"0x00002a|hi   |abc|+7| 7|".to_vec())
+        );
+        assert_eq!(
+            output("%*.*s", &["-6", "3", "abcdef"]),
+            Ok(b"abc   ".to_vec())
+        );
+        assert_eq!(
+            output("%d %d %d", &["'A", "0x10", "010"]),
+            Ok(b"65 16 8".to_vec())
+        );
+        assert_eq!(output("%65537s", &["x"]), Err(PrintError::InvalidFormat));
+    }
+
+    #[test]
+    fn public_escape_renderer_matches_percent_b_and_reports_stop() {
+        let mut bytes = Vec::new();
+        let outcome = render_escapes(r"one\ntwo\cignored", |chunk| {
+            bytes.extend_from_slice(chunk);
+            Ok::<(), ()>(())
+        });
+        assert_eq!(outcome, Ok(EscapeOutcome::Stop));
+        assert_eq!(bytes, b"one\ntwo".to_vec());
     }
 }

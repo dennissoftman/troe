@@ -6,4 +6,5 @@ SYNOPSIS
 
 DESCRIPTION
     Prints current machine-memory, allocator, input-queue, RAMFS, cache, and
-    pressure counters and refreshes /sys/memory.
+    pressure counters and refreshes /sys/memory. Human-readable byte values are
+    rounded with 1024-based IEC units such as KiB, MiB, and GiB.
