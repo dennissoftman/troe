@@ -35,7 +35,7 @@ manifest is intentional rather than missing. KEX v1 likewise remains the
 strict executable subformat and continues to reject capabilities, signatures,
 and unrelated metadata inside its load image.
 
-The hosted builder emits one package file and removes an adjacent legacy
-`.kcap` left by an older build. Check mode rejects such sidecars. Package
-identity, content hashes, and signatures may wrap or version this envelope in a
-future publication design; they are not inferred from reserved bytes.
+The hosted builder emits one package file and removes any adjacent `.kcap`
+sidecar. Check mode rejects such sidecars. Package
+identity, content hashes, and signatures belong to the separate package-model
+and trust formats; they are not inferred from reserved bytes in this envelope.

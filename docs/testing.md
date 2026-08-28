@@ -191,13 +191,9 @@ exhaustive QEMU profiles remain mandatory after a gate change.
 
 ## IPC baseline and measurement contract
 
-This section records both the pre-scheduler synchronous in-process dispatcher
-and the first protected diagnostics-server path. It measures mechanisms in the
-tree. QEMU validates counters and bounds; publishable latency claims still
-require named real hardware.
-
-The host timing table below is point-in-time evidence, not a current performance
-promise. The matrix dimensions and structural counters are the durable contract.
+This section defines repeatable measurements for the current synchronous
+in-process dispatcher and protected diagnostics-server path. QEMU validates
+counters and bounds; publishable latency claims require named real hardware.
 
 ### Reproducing the host matrix
 
@@ -220,22 +216,6 @@ current path a request is borrowed directly, so the dispatcher performs no
 request copy or request allocation. A non-empty echo reply performs exactly one
 bounded payload copy into one owned allocation. There is no privilege or
 address-space transition, TLB invalidation, or timer program in this path.
-
-### Recorded host result
-
-Collected on 2026-08-26 with macOS 26.5.2 arm64, repository commit `f04de1a`
-plus the baseline instrumentation in that change:
-
-| Payload | p50 ns | p95 ns | p99 ns | max ns | Calls | Request copies / allocs | Reply copies / allocs | AS switches / TLB / timer |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 0 | 41 | 42 | 42 | 1,416 | 50,000 | 0 / 0 | 0 / 0 | 0 / 0 / 0 |
-| 64 | 41 | 42 | 42 | 250 | 50,000 | 0 / 0 | 50,000 / 50,000 | 0 / 0 / 0 |
-| 256 | 41 | 42 | 42 | 3,417 | 50,000 | 0 / 0 | 50,000 / 50,000 | 0 / 0 / 0 |
-| 4096 | 83 | 84 | 125 | 8,584 | 50,000 | 0 / 0 | 50,000 / 50,000 | 0 / 0 / 0 |
-
-The maxima are retained for completeness, not treated as stable performance
-claims on a non-realtime host. The percentile shape and structural events are
-the useful baseline.
 
 ### Native acceptance matrix
 
@@ -275,10 +255,10 @@ receive-to-reply interval must have exactly zero owned-heap allocation calls.
 Construction and final client-reply ownership remain bounded setup/teardown
 outside that steady interval.
 
-The first server composition has hard ceilings of one retained request and one
-suspended server context. The ordinary command step limit remains 1024; only
-the acceptance benchmark uses 1536 so 320 two-fragment warmup and measured
-exchanges fit in one server lifetime.
+The current diagnostics-server composition has hard ceilings of one retained request and one
+suspended server context. The acceptance-probe build permits 1536 isolated
+service calls so 320 two-fragment warmup and measured exchanges fit in one
+server lifetime.
 
 ### Deterministic native structural result
 
@@ -299,10 +279,10 @@ protected-IPC design that would add it is tracked in
 deliberately programmed for every user-execution segment; removing that safety
 boundary is not an acceptable latency optimization.
 
-The measured optimization in the isolated slice is narrow: two transient
-kernel allocations were removed and the endpoint copies directly into
-caller-owned bounded storage. Reply ownership, token generation checks,
-server-fault fate, and teardown are unchanged.
+The isolated path performs no transient kernel allocation in its measured
+receive-to-reply interval and copies directly into caller-owned bounded storage.
+Reply ownership, token generation checks, server-fault fate, and teardown remain
+part of the current contract.
 
 ## Maintainer release gate
 

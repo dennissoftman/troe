@@ -10,9 +10,10 @@ boot services. Every ordinary command is a validated KEX application with a
 fresh ring-3/EL0 root, explicit typed handles, bounded memory, contained fault
 fate, and zeroized teardown; no privileged utility fallback exists. The shell
 retains only `cd`, `fg`, `jobs`, `kill`, `log`, `poweroff`, `reboot`, `svc`, and
-`wait`. There is no secure-boot integration or multi-user boundary in this
-milestone; package signing, DNS, TLS, inbound TCP listening, and general sockets
-remain future decisions.
+`wait`. Hosted tooling verifies the current signed package/trust formats, but
+the native image has no secure-boot integration, accepted production
+publication path, or multi-user boundary. DNS, TLS, inbound TCP listening, and
+general sockets are not implemented.
 
 The portable crates and kernel forbid unsafe Rust. Project-authored unsafe
 operations are confined to `troe-machine` and are verified through native
@@ -24,28 +25,29 @@ format are treated as untrusted and bounded.
 
 ## Invariants enforced now
 
-- command input: 512 bytes, 32 words per stage, 8 stages;
-- intermediate pipeline: 64 KiB and atomic overflow failure;
+- command input: 512 bytes, 128 arguments per stage, 255 stages;
+- sequential intermediate pipeline: 1 MiB and atomic overflow failure;
 - paths: 256 bytes, 64-byte names, 16 components, no NUL or root escape;
 - RAMFS: explicit total-byte, file-byte, and node limits;
 - KEFS: magic, version, exact total length, sorted unique normalized paths,
   checked arithmetic, valid kinds, and exact record consumption;
 - FAT builder: fixed geometry, duplicated FATs, finite acyclic chain, and exact
   executable round-trip verification;
-- release boot images: 16 MiB hard ceiling (currently exactly 1.44 MiB).
+- release boot images: fixed 8 MiB FAT16 container and 16 MiB hard ceiling;
 - owned heap: 6 MiB fixed arena with use, high-water, and failure accounting;
 - physical frames: checked 4 KiB bitmap with invalid/double-free detection;
-- native UART transmit waits: finite polling bound on both architectures.
+- native UART transmit waits: finite polling bound on both architectures;
 - active kernel stack: explicit LoaderData reservation, RW/NX mapping, and
   post-handoff stack-pointer assertion before frame allocation;
 - mappings: no virtual or physical overlap, no writable executable mapping, and
   CPU-reported physical-address limits checked before activation;
 - exception state: interrupts masked during ownership transition, all x86
   exception gates present, and double fault uses a dedicated IST stack;
-- tasks: at most 16 records, with monotonic identities, explicit capabilities,
-  deterministic lifecycle accounting, and guarded native stack payloads;
-- dispatch: at most 16 ports and 32 handles, generation-checked identities,
-  explicit call rights, and 4 KiB request/reply limits;
+- tasks and process records: at most 65,536, with monotonic identities, explicit
+  capabilities, deterministic lifecycle accounting, fallible metadata growth,
+  and guarded native stack payloads;
+- dispatch: at most 65,536 ports and 262,144 handles, generation-checked
+  identities, explicit call rights, and 4 KiB request/reply limits;
 - KEX: exact target/version/layout validation before allocation, closed R/RX/RW
   permissions, fixed standard ceilings, kernel-owned staging, canonical startup
   pages, explicit initial handles, and transactional zeroized reclamation;
@@ -55,13 +57,18 @@ format are treated as untrusted and bounded.
   default total-runtime or cumulative-service-call ceiling, while every handle,
   message, pending call, wait, mapping, heap, and stream retains its local hard
   bound;
-- residency and supervision: at most eight retained application records, at
-  most one executing unprivileged root on the single CPU, 64 KiB recent output
-  per background job or service, owner-scoped cancellation and reaping, and
-  SCFG-bounded dependency, restart, health, lifetime, and stop policy;
-- process observation: one 16-record registry spans foreground, background,
-  and service launches with monotonic non-reused process IDs, scheduler-paired
-  states, exact retained pages, and CPU ticks charged only around ring-3/EL0
+- residency and supervision: at most 65,533 retained application records under
+  the system task ceiling, at most one executing unprivileged root on the single
+  CPU, 64 KiB recent output per background job or service, owner-scoped
+  cancellation and reaping, and SCFG-bounded dependency, restart, health,
+  lifetime, and stop policy;
+- process launch: at most 65,536 retained children and 65,536 pipes per owner,
+  256 MiB aggregate pipe capacity per owner, explicit attenuation, recursive
+  descendant teardown, and generation-checked lifecycle and pipe tokens;
+- process observation: the system registry spans up to 65,536 foreground,
+  background, nested, and service launches and is exposed in stable-ID pages of
+  at most 16 records; monotonic non-reused process IDs, scheduler-paired states,
+  exact retained pages, and CPU ticks are charged only around ring-3/EL0
   execution; the explicit read-only capability hides argv and grants no memory
   access or process control;
 - outbound TCP: one connection per declared handle, four system-wide, one

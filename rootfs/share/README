@@ -5,8 +5,8 @@ TROE shared data
 Each producer owns a directory named /share/<producer> so examples, templates,
 schemas, themes, and similar assets remain easy to find and cannot collide.
 
-Executables belong in /bin, persistent or mounted data in /vol, and future
-native shared libraries in /lib. Recovery-only bootstrap files live under
-/recovery. The package-managed namespace uses writable desired configuration
+Executables belong in /bin and persistent or mounted data in /vol. KEX
+applications are statically linked, so /lib is absent. Recovery-only bootstrap
+files live under /recovery. The package-managed namespace uses writable desired configuration
 in /config and exposes the active generation's resolved, non-secret
 configuration read-only in /sys/config; /etc is absent and is not an alias.
