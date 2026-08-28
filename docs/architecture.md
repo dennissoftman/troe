@@ -114,9 +114,13 @@ Native KEX interfaces follow ADR 0034: opaque handles share generation,
 ownership, accounting, cancellation, waiting, and teardown machinery, while
 files, directories, byte streams, datagrams, listeners, timers, and control
 services keep typed protocols. There is no universal native file-descriptor,
-generic socket namespace, `ioctl`-style escape hatch, userspace POSIX facade, or
-package-resolved scoped-root grant today. Those compatibility and authority
-extensions are tracked in
+generic socket namespace, `ioctl`-style escape hatch, kernel POSIX subsystem, or
+package-resolved scoped-root grant today. A small `no_std` user-space facade now
+layers filesystem algorithms, immutable environment handling, direct process
+launch, stable errno translation, UTC calendar/formatting, decimal/math, and
+C-locale helpers over typed capabilities. It is statically compiled into each
+consumer and does not manufacture ambient authority or claim to be a complete
+libc. Broader compatibility and authority extensions are tracked in
 [issues #11](https://github.com/dennissoftman/troe/issues/11) and
 [#6](https://github.com/dennissoftman/troe/issues/6).
 

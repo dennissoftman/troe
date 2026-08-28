@@ -1,14 +1,28 @@
 [package]
 name = "troe-kex-runtime"
-description = "Small no_std POSIX-like filesystem runtime over typed TROE KEX capabilities"
+description = "Small no_std POSIX-like runtime over typed TROE KEX capabilities"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = ["alloc"]
+alloc = []
+math = ["dep:libm"]
+
 [dependencies]
+libm = { version = "=0.2.16", optional = true }
 troe-kex-sdk = { path = "../troe-kex" }
 
-[lints]
-workspace = true
+[lints.rust]
+unsafe_code = "allow"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"

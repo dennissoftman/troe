@@ -11,10 +11,11 @@ use core::{
     slice, str,
 };
 use troe_kex_alloc::Heap;
+use troe_kex_runtime::{self as kex_runtime, process::PipeMode};
 use troe_kex_sdk::{
-    CommandContext, FilesystemMutation, INVOCATION_BUFFER_BYTES, Pipes, ProcessLauncher,
-    ReadOnlyFilesystem, StandardInput, StandardOutput, Timer, WallClock, command, entry, exit,
-    filesystem, pipe, process_launch,
+    CommandContext, ENVIRONMENT_BUFFER_BYTES, Error as KexError, FilesystemMutation,
+    INVOCATION_BUFFER_BYTES, Pipes, ProcessLauncher, ReadOnlyFilesystem, StandardInput,
+    StandardOutput, Timer, WallClock, command, entry, exit, filesystem, pipe, process_launch,
 };
 
 const LUA_VERSION: &[u8] = b"Lua 5.5.1  Copyright (C) 1994-2026 Lua.org, PUC-Rio\n";
@@ -61,6 +62,7 @@ struct LuaHost {
     write: unsafe extern "C" fn(*mut c_void, i32, *const u8, usize) -> i32,
     process_cpu_time: unsafe extern "C" fn(*mut c_void, *mut u64, *mut u64) -> i32,
     wall_time: unsafe extern "C" fn(*mut c_void, *mut u64) -> i32,
+    environment_get: unsafe extern "C" fn(*mut c_void, *const u8, usize, *mut u8, usize) -> isize,
     read_input: unsafe extern "C" fn(*mut c_void, *mut u8, usize) -> isize,
     file_open: unsafe extern "C" fn(*mut c_void, *const u8, usize, *mut u32, *mut u64) -> i32,
     file_read: unsafe extern "C" fn(*mut c_void, u32, u64, u64, *mut u8, usize) -> isize,
@@ -119,31 +121,29 @@ enum Source {
 }
 
 impl Source {
-    fn read(&mut self, destination: &mut [u8]) -> Result<usize, ()> {
+    fn read(&mut self, destination: &mut [u8]) -> Result<usize, KexError> {
         match self {
             Self::Empty => Ok(0),
-            Self::StandardInput(input) => input.read(destination).map_err(|_| ()),
+            Self::StandardInput(input) => input.read(destination),
             Self::File {
                 filesystem,
                 file,
                 offset,
             } => {
-                let count = filesystem
-                    .read(*file, *offset, destination)
-                    .map_err(|_| ())?;
+                let count = filesystem.read(*file, *offset, destination)?;
                 *offset = offset
-                    .checked_add(u64::try_from(count).map_err(|_| ())?)
-                    .ok_or(())?;
+                    .checked_add(u64::try_from(count).map_err(|_| KexError::Overflow)?)
+                    .ok_or(KexError::Overflow)?;
                 Ok(count)
             }
         }
     }
 
-    fn close(&mut self) -> Result<(), ()> {
+    fn close(&mut self) -> Result<(), KexError> {
         match self {
             Self::File {
                 filesystem, file, ..
-            } => filesystem.close(*file).map_err(|_| ()),
+            } => filesystem.close(*file),
             Self::Empty | Self::StandardInput(_) => Ok(()),
         }
     }
@@ -172,6 +172,8 @@ struct Runtime {
     pipes: Pipes,
     current_directory: [u8; filesystem::MAX_PATH_BYTES],
     current_directory_length: usize,
+    environment: [u8; ENVIRONMENT_BUFFER_BYTES],
+    environment_length: usize,
 }
 
 enum Selection<'invocation> {
@@ -285,6 +287,11 @@ fn run(command: &mut CommandContext) -> u32 {
     let Ok(invocation) = command.invocation(&mut invocation_bytes) else {
         return exit::FAILURE;
     };
+    let mut environment = [0_u8; ENVIRONMENT_BUFFER_BYTES];
+    if command.environment(&mut environment).is_err() {
+        return exit::FAILURE;
+    }
+    let environment_length = usize::from(u16::from_le_bytes([environment[0], environment[1]]));
     match invocation.argument(1) {
         Some("-v" | "--version") if invocation.len() == 2 => {
             return if command.stdout().write_all(LUA_VERSION).is_ok() {
@@ -461,6 +468,8 @@ fn run(command: &mut CommandContext) -> u32 {
         pipes,
         current_directory,
         current_directory_length,
+        environment,
+        environment_length,
     };
     let mut host = LuaHost {
         context: ptr::from_mut(&mut runtime).cast(),
@@ -469,6 +478,7 @@ fn run(command: &mut CommandContext) -> u32 {
         write: lua_write,
         process_cpu_time: lua_process_cpu_time,
         wall_time: lua_wall_time,
+        environment_get: lua_environment_get,
         read_input: lua_read_input,
         file_open: lua_file_open,
         file_read: lua_file_read,
@@ -573,6 +583,19 @@ unsafe extern "C" fn lua_allocate(
         .map_or(ptr::null_mut(), |allocated| allocated.as_ptr().cast())
 }
 
+fn negative_errno(error: i32) -> isize {
+    isize::try_from(error).map_or(-1, |value| -value)
+}
+
+fn read_result(result: Result<usize, KexError>) -> isize {
+    match result {
+        Ok(count) => {
+            isize::try_from(count).unwrap_or_else(|_| negative_errno(kex_runtime::errno::EOVERFLOW))
+        }
+        Err(error) => negative_errno(kex_runtime::errno::from_kex(error)),
+    }
+}
+
 unsafe extern "C" fn lua_read(
     context: *mut c_void,
     destination: *mut u8,
@@ -583,19 +606,56 @@ unsafe extern "C" fn lua_read(
     }
     // SAFETY: See `lua_allocate`; the C bridge supplies its live reader buffer.
     let Some(runtime) = (unsafe { (context.cast::<Runtime>()).as_mut() }) else {
-        return -1;
+        return negative_errno(kex_runtime::errno::EINVAL);
     };
     let Some(destination) = NonNull::new(destination) else {
-        return -1;
+        return negative_errno(kex_runtime::errno::EINVAL);
     };
     // SAFETY: The callback contract provides `capacity` writable bytes.
     let destination = unsafe { slice::from_raw_parts_mut(destination.as_ptr(), capacity) };
-    runtime
-        .source
-        .read(destination)
-        .ok()
-        .and_then(|count| isize::try_from(count).ok())
-        .unwrap_or(-1)
+    read_result(runtime.source.read(destination))
+}
+
+unsafe extern "C" fn lua_environment_get(
+    context: *mut c_void,
+    name: *const u8,
+    name_length: usize,
+    destination: *mut u8,
+    capacity: usize,
+) -> isize {
+    let (Some(runtime), Some(name)) = (
+        unsafe { (context.cast::<Runtime>()).as_ref() },
+        NonNull::new(name.cast_mut()),
+    ) else {
+        return negative_errno(kex_runtime::errno::EINVAL);
+    };
+    let name = unsafe { slice::from_raw_parts(name.as_ptr(), name_length) };
+    let Ok(name) = str::from_utf8(name) else {
+        return negative_errno(kex_runtime::errno::EINVAL);
+    };
+    let Ok(cwd) = str::from_utf8(&runtime.current_directory[..runtime.current_directory_length])
+    else {
+        return negative_errno(kex_runtime::errno::EINVAL);
+    };
+    let Ok(environment) =
+        command::Environment::parse(&runtime.environment[..runtime.environment_length])
+    else {
+        return negative_errno(kex_runtime::errno::EINVAL);
+    };
+    let Some(value) = kex_runtime::environment::get(environment, cwd, name) else {
+        return negative_errno(kex_runtime::errno::ENOENT);
+    };
+    if value.len() > capacity {
+        return negative_errno(kex_runtime::errno::EOVERFLOW);
+    }
+    if !value.is_empty() {
+        let Some(destination) = NonNull::new(destination) else {
+            return negative_errno(kex_runtime::errno::EINVAL);
+        };
+        let destination = unsafe { slice::from_raw_parts_mut(destination.as_ptr(), value.len()) };
+        destination.copy_from_slice(value.as_bytes());
+    }
+    isize::try_from(value.len()).unwrap_or_else(|_| negative_errno(kex_runtime::errno::EOVERFLOW))
 }
 
 unsafe extern "C" fn lua_read_input(
@@ -610,15 +670,10 @@ unsafe extern "C" fn lua_read_input(
         unsafe { (context.cast::<Runtime>()).as_mut() },
         NonNull::new(destination),
     ) else {
-        return -1;
+        return negative_errno(kex_runtime::errno::EINVAL);
     };
     let destination = unsafe { slice::from_raw_parts_mut(destination.as_ptr(), capacity) };
-    runtime
-        .stdin
-        .read(destination)
-        .ok()
-        .and_then(|count| isize::try_from(count).ok())
-        .unwrap_or(-1)
+    read_result(runtime.stdin.read(destination))
 }
 
 unsafe extern "C" fn lua_file_open(
@@ -634,14 +689,15 @@ unsafe extern "C" fn lua_file_open(
         NonNull::new(token),
         NonNull::new(length),
     ) else {
-        return -1;
+        return kex_runtime::errno::EINVAL;
     };
     let path = unsafe { slice::from_raw_parts(path.as_ptr(), path_length) };
     let Ok(path) = str::from_utf8(path) else {
-        return -1;
+        return kex_runtime::errno::EINVAL;
     };
-    let Ok(file) = runtime.filesystem.open(path) else {
-        return -1;
+    let file = match runtime.filesystem.open(path) {
+        Ok(file) => file,
+        Err(error) => return kex_runtime::errno::from_kex(error),
     };
     unsafe {
         *token.as_mut() = file.token();
@@ -665,31 +721,25 @@ unsafe extern "C" fn lua_file_read(
         unsafe { (context.cast::<Runtime>()).as_mut() },
         NonNull::new(destination),
     ) else {
-        return -1;
+        return negative_errno(kex_runtime::errno::EINVAL);
     };
     let Ok(file) = filesystem::OpenFile::new(token, length) else {
-        return -1;
+        return negative_errno(kex_runtime::errno::EINVAL);
     };
     let destination = unsafe { slice::from_raw_parts_mut(destination.as_ptr(), capacity) };
-    runtime
-        .filesystem
-        .read(file, offset, destination)
-        .ok()
-        .and_then(|count| isize::try_from(count).ok())
-        .unwrap_or(-1)
+    read_result(runtime.filesystem.read(file, offset, destination))
 }
 
 unsafe extern "C" fn lua_file_close(context: *mut c_void, token: u32, length: u64) -> i32 {
     let Some(runtime) = (unsafe { (context.cast::<Runtime>()).as_mut() }) else {
-        return -1;
+        return kex_runtime::errno::EINVAL;
     };
     let Ok(file) = filesystem::OpenFile::new(token, length) else {
-        return -1;
+        return kex_runtime::errno::EINVAL;
     };
-    if runtime.filesystem.close(file).is_ok() {
-        0
-    } else {
-        -1
+    match runtime.filesystem.close(file) {
+        Ok(()) => 0,
+        Err(error) => kex_runtime::errno::from_kex(error),
     }
 }
 
@@ -704,28 +754,24 @@ unsafe extern "C" fn lua_file_replace(
         unsafe { (context.cast::<Runtime>()).as_mut() },
         NonNull::new(path.cast_mut()),
     ) else {
-        return -1;
+        return kex_runtime::errno::EINVAL;
     };
     let path = unsafe { slice::from_raw_parts(path.as_ptr(), path_length) };
     let Ok(path) = str::from_utf8(path) else {
-        return -1;
+        return kex_runtime::errno::EINVAL;
     };
     let bytes = if length == 0 {
         &[]
     } else {
         let Some(bytes) = NonNull::new(bytes.cast_mut()) else {
-            return -1;
+            return kex_runtime::errno::EINVAL;
         };
         unsafe { slice::from_raw_parts(bytes.as_ptr(), length) }
     };
-    let Ok(mut replacement) = runtime.mutation.begin_replace(path) else {
-        return -1;
-    };
-    if replacement.write_all(bytes).is_err() {
-        let _ = replacement.abort();
-        return -1;
+    match kex_runtime::replace_bytes(&mut runtime.mutation, path, bytes) {
+        Ok(()) => 0,
+        Err(error) => kex_runtime::errno::from_runtime(error),
     }
-    if replacement.commit().is_ok() { 0 } else { -1 }
 }
 
 unsafe extern "C" fn lua_file_remove(
@@ -737,16 +783,15 @@ unsafe extern "C" fn lua_file_remove(
         unsafe { (context.cast::<Runtime>()).as_mut() },
         NonNull::new(path.cast_mut()),
     ) else {
-        return -1;
+        return kex_runtime::errno::EINVAL;
     };
     let path = unsafe { slice::from_raw_parts(path.as_ptr(), path_length) };
     let Ok(path) = str::from_utf8(path) else {
-        return -1;
+        return kex_runtime::errno::EINVAL;
     };
-    if runtime.mutation.remove(path).is_ok() {
-        0
-    } else {
-        -1
+    match kex_runtime::remove_path(&mut runtime.filesystem, &mut runtime.mutation, path) {
+        Ok(()) => 0,
+        Err(error) => kex_runtime::errno::from_runtime(error),
     }
 }
 
@@ -762,142 +807,20 @@ unsafe extern "C" fn lua_file_rename(
         NonNull::new(old_path.cast_mut()),
         NonNull::new(new_path.cast_mut()),
     ) else {
-        return -1;
+        return kex_runtime::errno::EINVAL;
     };
     let old_path = unsafe { slice::from_raw_parts(old_path.as_ptr(), old_path_length) };
     let new_path = unsafe { slice::from_raw_parts(new_path.as_ptr(), new_path_length) };
     let (Ok(old_path), Ok(new_path)) = (str::from_utf8(old_path), str::from_utf8(new_path)) else {
-        return -1;
+        return kex_runtime::errno::EINVAL;
     };
     if old_path == new_path {
         return 0;
     }
-    let Ok(source) = runtime.filesystem.open(old_path) else {
-        return -1;
-    };
-    let Ok(mut replacement) = runtime.mutation.begin_replace(new_path) else {
-        let _ = runtime.filesystem.close(source);
-        return -1;
-    };
-    let mut buffer = [0_u8; 4096];
-    let mut offset = 0_u64;
-    let mut failed = false;
-    while offset < source.byte_count {
-        let remaining = source.byte_count - offset;
-        let requested = buffer
-            .len()
-            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
-        let Ok(count) = runtime
-            .filesystem
-            .read(source, offset, &mut buffer[..requested])
-        else {
-            failed = true;
-            break;
-        };
-        if count == 0 || replacement.write_all(&buffer[..count]).is_err() {
-            failed = true;
-            break;
-        }
-        let Ok(count) = u64::try_from(count) else {
-            failed = true;
-            break;
-        };
-        let Some(next) = offset.checked_add(count) else {
-            failed = true;
-            break;
-        };
-        offset = next;
+    match runtime.mutation.rename(old_path, new_path) {
+        Ok(()) => 0,
+        Err(error) => kex_runtime::errno::from_kex(error),
     }
-    if runtime.filesystem.close(source).is_err() {
-        failed = true;
-    }
-    if failed {
-        let _ = replacement.abort();
-        return -1;
-    }
-    if replacement.commit().is_err() || runtime.mutation.remove(old_path).is_err() {
-        return -1;
-    }
-    0
-}
-
-fn parse_process_arguments<'storage>(
-    source: &[u8],
-    storage: &'storage mut [u8; command::MAX_ARGUMENT_BYTES],
-    ranges: &mut [(usize, usize); command::MAX_ARGUMENTS],
-) -> Result<([&'storage str; command::MAX_ARGUMENTS], usize), ()> {
-    let mut source_at = 0_usize;
-    let mut storage_at = 0_usize;
-    let mut count = 0_usize;
-    while source_at < source.len() {
-        while source.get(source_at).is_some_and(u8::is_ascii_whitespace) {
-            source_at += 1;
-        }
-        if source_at == source.len() {
-            break;
-        }
-        if count == ranges.len() {
-            return Err(());
-        }
-        let start = storage_at;
-        let mut quote = 0_u8;
-        let mut token_present = false;
-        while source_at < source.len() {
-            let byte = source[source_at];
-            if quote == 0 && byte.is_ascii_whitespace() {
-                break;
-            }
-            if byte == b'\'' && quote != b'"' {
-                token_present = true;
-                quote = if quote == b'\'' { 0 } else { b'\'' };
-                source_at += 1;
-                continue;
-            }
-            if byte == b'"' && quote != b'\'' {
-                token_present = true;
-                quote = if quote == b'"' { 0 } else { b'"' };
-                source_at += 1;
-                continue;
-            }
-            if byte == b'\\' && quote != b'\'' {
-                token_present = true;
-                source_at += 1;
-                if source_at == source.len() {
-                    return Err(());
-                }
-                if storage_at == storage.len() {
-                    return Err(());
-                }
-                storage[storage_at] = source[source_at];
-                storage_at += 1;
-                source_at += 1;
-                continue;
-            }
-            if quote == 0 && b"|&;<>()$`".contains(&byte) {
-                return Err(());
-            }
-            if storage_at == storage.len() {
-                return Err(());
-            }
-            storage[storage_at] = byte;
-            token_present = true;
-            storage_at += 1;
-            source_at += 1;
-        }
-        if quote != 0 || !token_present {
-            return Err(());
-        }
-        ranges[count] = (start, storage_at);
-        count += 1;
-    }
-    if count == 0 {
-        return Err(());
-    }
-    let mut arguments = [""; command::MAX_ARGUMENTS];
-    for (argument, (start, end)) in arguments[..count].iter_mut().zip(ranges[..count].iter()) {
-        *argument = str::from_utf8(&storage[*start..*end]).map_err(|_| ())?;
-    }
-    Ok((arguments, count))
 }
 
 fn launch_command(
@@ -905,37 +828,27 @@ fn launch_command(
     source: &[u8],
     stdin: process_launch::StreamSpec,
     stdout: process_launch::StreamSpec,
-) -> Result<process_launch::SpawnedChild, ()> {
-    let mut argument_bytes = [0_u8; command::MAX_ARGUMENT_BYTES];
-    let mut argument_ranges = [(0_usize, 0_usize); command::MAX_ARGUMENTS];
-    let (arguments, argument_count) =
-        parse_process_arguments(source, &mut argument_bytes, &mut argument_ranges)?;
+) -> Result<process_launch::SpawnedChild, i32> {
     let cwd = str::from_utf8(&runtime.current_directory[..runtime.current_directory_length])
-        .map_err(|_| ())?;
+        .map_err(|_| kex_runtime::errno::EINVAL)?;
+    let environment =
+        command::Environment::parse(&runtime.environment[..runtime.environment_length])
+            .map_err(|_| kex_runtime::errno::EINVAL)?;
     let mut pwd_bytes = [0_u8; filesystem::MAX_PATH_BYTES + 4];
-    pwd_bytes[..4].copy_from_slice(b"PWD=");
-    pwd_bytes[4..4 + cwd.len()].copy_from_slice(cwd.as_bytes());
-    let pwd = str::from_utf8(&pwd_bytes[..4 + cwd.len()]).map_err(|_| ())?;
-    let environment = [
-        "HOME=/",
-        "PATH=/bin",
-        "TMPDIR=/tmp",
-        "SHELL=/bin/sh",
-        "USER=root",
-        "LOGNAME=root",
-        pwd,
-    ];
-    runtime
-        .launcher
-        .spawn(
-            cwd,
-            &arguments[..argument_count],
-            &environment,
-            stdin,
-            stdout,
-            process_launch::StreamSpec::INHERIT,
-        )
-        .map_err(|_| ())
+    let mut entries = [""; command::MAX_ENVIRONMENT];
+    let count =
+        kex_runtime::environment::child_entries(environment, cwd, &mut pwd_bytes, &mut entries)
+            .map_err(kex_runtime::errno::from_environment)?;
+    kex_runtime::process::spawn_direct(
+        &mut runtime.launcher,
+        source,
+        cwd,
+        &entries[..count],
+        stdin,
+        stdout,
+        process_launch::StreamSpec::INHERIT,
+    )
+    .map_err(kex_runtime::errno::from_process)
 }
 
 unsafe extern "C" fn lua_process_execute(
@@ -949,25 +862,22 @@ unsafe extern "C" fn lua_process_execute(
         NonNull::new(command.cast_mut()),
         NonNull::new(status),
     ) else {
-        return -1;
+        return kex_runtime::errno::EINVAL;
     };
     let command = unsafe { slice::from_raw_parts(command.as_ptr(), command_length) };
-    let Ok(child) = launch_command(
+    let child = match launch_command(
         runtime,
         command,
         process_launch::StreamSpec::INHERIT,
         process_launch::StreamSpec::INHERIT,
-    ) else {
-        return -1;
+    ) {
+        Ok(child) => child,
+        Err(error) => return error,
     };
-    let result = runtime.launcher.wait(child.token);
-    let reaped = runtime.launcher.reap(child.token).is_ok();
-    let Ok(result) = result else {
-        return -1;
+    let result = match kex_runtime::process::finish_child(&mut runtime.launcher, child.token) {
+        Ok(result) => result,
+        Err(error) => return kex_runtime::errno::from_process(error),
     };
-    if !reaped {
-        return -1;
-    }
     unsafe { *status.as_mut() = result.exit_status };
     0
 }
@@ -995,44 +905,51 @@ unsafe extern "C" fn lua_process_open(
         NonNull::new(script_identifier),
     )
     else {
-        return -1;
+        return kex_runtime::errno::EINVAL;
     };
     if mode != i32::from(b'r') && mode != i32::from(b'w') {
-        return -1;
+        return kex_runtime::errno::EINVAL;
     }
     let command = unsafe { slice::from_raw_parts(command.as_ptr(), command_length) };
-    let Ok(pipe) = runtime.pipes.create(pipe::MIN_CAPACITY) else {
-        return -1;
+    let cwd = match str::from_utf8(&runtime.current_directory[..runtime.current_directory_length]) {
+        Ok(cwd) => cwd,
+        Err(_) => return kex_runtime::errno::EINVAL,
     };
-    let Ok(pipe_stream) = process_launch::StreamSpec::pipe(pipe.value()) else {
-        let _ = runtime.pipes.close_writer(pipe);
-        let _ = runtime.pipes.close_reader(pipe);
-        return -1;
+    let environment =
+        match command::Environment::parse(&runtime.environment[..runtime.environment_length]) {
+            Ok(environment) => environment,
+            Err(_) => return kex_runtime::errno::EINVAL,
+        };
+    let mut pwd_bytes = [0_u8; filesystem::MAX_PATH_BYTES + 4];
+    let mut entries = [""; command::MAX_ENVIRONMENT];
+    let count = match kex_runtime::environment::child_entries(
+        environment,
+        cwd,
+        &mut pwd_bytes,
+        &mut entries,
+    ) {
+        Ok(count) => count,
+        Err(error) => return kex_runtime::errno::from_environment(error),
     };
-    let (stdin, stdout) = if mode == i32::from(b'r') {
-        (process_launch::StreamSpec::INHERIT, pipe_stream)
+    let selected_mode = if mode == i32::from(b'r') {
+        PipeMode::Read
     } else {
-        (pipe_stream, process_launch::StreamSpec::INHERIT)
+        PipeMode::Write
     };
-    let Ok(child) = launch_command(runtime, command, stdin, stdout) else {
-        let _ = runtime.pipes.close_writer(pipe);
-        let _ = runtime.pipes.close_reader(pipe);
-        return -1;
+    let child = match kex_runtime::process::open_piped_direct(
+        &mut runtime.launcher,
+        &mut runtime.pipes,
+        command,
+        cwd,
+        &entries[..count],
+        selected_mode,
+    ) {
+        Ok(child) => child,
+        Err(error) => return kex_runtime::errno::from_process(error),
     };
-    let closed = if mode == i32::from(b'r') {
-        runtime.pipes.close_writer(pipe)
-    } else {
-        runtime.pipes.close_reader(pipe)
-    };
-    if closed.is_err() {
-        let _ = runtime.launcher.cancel(child.token);
-        let _ = runtime.launcher.wait(child.token);
-        let _ = runtime.launcher.reap(child.token);
-        return -1;
-    }
     unsafe {
-        *child_token.as_mut() = child.token.value();
-        *pipe_token.as_mut() = pipe.value();
+        *child_token.as_mut() = child.child.value();
+        *pipe_token.as_mut() = child.pipe.value();
         *script_identifier.as_mut() = 0;
     }
     0
@@ -1051,18 +968,13 @@ unsafe extern "C" fn lua_process_read(
         unsafe { (context.cast::<Runtime>()).as_mut() },
         NonNull::new(destination),
     ) else {
-        return -1;
+        return negative_errno(kex_runtime::errno::EINVAL);
     };
     let Ok(token) = pipe::PipeToken::new(pipe_token) else {
-        return -1;
+        return negative_errno(kex_runtime::errno::EINVAL);
     };
     let destination = unsafe { slice::from_raw_parts_mut(destination.as_ptr(), capacity) };
-    runtime
-        .pipes
-        .read(token, destination)
-        .ok()
-        .and_then(|count| isize::try_from(count).ok())
-        .unwrap_or(-1)
+    read_result(runtime.pipes.read(token, destination))
 }
 
 unsafe extern "C" fn lua_process_write(
@@ -1078,16 +990,15 @@ unsafe extern "C" fn lua_process_write(
         unsafe { (context.cast::<Runtime>()).as_mut() },
         NonNull::new(bytes.cast_mut()),
     ) else {
-        return -1;
+        return kex_runtime::errno::EINVAL;
     };
     let Ok(token) = pipe::PipeToken::new(pipe_token) else {
-        return -1;
+        return kex_runtime::errno::EINVAL;
     };
     let bytes = unsafe { slice::from_raw_parts(bytes.as_ptr(), length) };
-    if runtime.pipes.write_all(token, bytes).is_ok() {
-        0
-    } else {
-        -1
+    match runtime.pipes.write_all(token, bytes) {
+        Ok(()) => 0,
+        Err(error) => kex_runtime::errno::from_kex(error),
     }
 }
 
@@ -1103,34 +1014,30 @@ unsafe extern "C" fn lua_process_close(
         unsafe { (context.cast::<Runtime>()).as_mut() },
         NonNull::new(status),
     ) else {
-        return -1;
+        return kex_runtime::errno::EINVAL;
     };
     let (Ok(child), Ok(pipe)) = (
         process_launch::ChildToken::new(child_token),
         pipe::PipeToken::new(pipe_token),
     ) else {
-        return -1;
+        return kex_runtime::errno::EINVAL;
     };
-    let endpoint_closed = if mode == i32::from(b'r') {
-        runtime.pipes.close_reader(pipe)
+    let mode = if mode == i32::from(b'r') {
+        PipeMode::Read
     } else if mode == i32::from(b'w') {
-        runtime.pipes.close_writer(pipe)
+        PipeMode::Write
     } else {
-        return -1;
+        return kex_runtime::errno::EINVAL;
     };
-    let mut child_status = runtime.launcher.wait(child);
-    if child_status.is_err() {
-        let _ = runtime.launcher.cancel(child);
-        child_status = runtime.launcher.wait(child);
-    }
-    let reaped = runtime.launcher.reap(child).is_ok();
     let _ = script_identifier;
-    let Ok(child_status) = child_status else {
-        return -1;
+    let child_status = match kex_runtime::process::close_piped(
+        &mut runtime.launcher,
+        &mut runtime.pipes,
+        kex_runtime::process::PipedChild { child, pipe, mode },
+    ) {
+        Ok(status) => status,
+        Err(error) => return kex_runtime::errno::from_process(error),
     };
-    if endpoint_closed.is_err() || !reaped {
-        return -1;
-    }
     unsafe { *status.as_mut() = child_status.exit_status };
     0
 }
@@ -1146,19 +1053,22 @@ unsafe extern "C" fn lua_write(
     }
     // SAFETY: See `lua_allocate`; the C bridge supplies a readable Lua string.
     let Some(runtime) = (unsafe { (context.cast::<Runtime>()).as_mut() }) else {
-        return -1;
+        return kex_runtime::errno::EINVAL;
     };
     let Some(bytes) = NonNull::new(bytes.cast_mut()) else {
-        return -1;
+        return kex_runtime::errno::EINVAL;
     };
     // SAFETY: The callback contract provides `length` readable bytes.
     let bytes = unsafe { slice::from_raw_parts(bytes.as_ptr(), length) };
     let result = match stream {
         1 => runtime.stdout.write_all(bytes),
         2 => runtime.stderr.write_all(bytes),
-        _ => return -1,
+        _ => return kex_runtime::errno::EINVAL,
     };
-    if result.is_ok() { 0 } else { -1 }
+    match result {
+        Ok(()) => 0,
+        Err(error) => kex_runtime::errno::from_kex(error),
+    }
 }
 
 unsafe extern "C" fn lua_process_cpu_time(
@@ -1172,10 +1082,11 @@ unsafe extern "C" fn lua_process_cpu_time(
         NonNull::new(ticks),
         NonNull::new(frequency_hz),
     ) else {
-        return -1;
+        return kex_runtime::errno::EINVAL;
     };
-    let Ok(sample) = runtime.timer.process_cpu_time() else {
-        return -1;
+    let sample = match runtime.timer.process_cpu_time() {
+        Ok(sample) => sample,
+        Err(error) => return kex_runtime::errno::from_kex(error),
     };
     // SAFETY: The callback contract provides two writable `u64` result slots.
     unsafe {
@@ -1191,10 +1102,11 @@ unsafe extern "C" fn lua_wall_time(context: *mut c_void, result: *mut u64) -> i3
         unsafe { (context.cast::<Runtime>()).as_mut() },
         NonNull::new(result),
     ) else {
-        return -1;
+        return kex_runtime::errno::EINVAL;
     };
-    let Ok(seconds) = runtime.wall_clock.now() else {
-        return -1;
+    let seconds = match runtime.wall_clock.now() {
+        Ok(seconds) => seconds,
+        Err(error) => return kex_runtime::errno::from_kex(error),
     };
     // SAFETY: The callback contract provides one writable `u64` result slot.
     unsafe {
@@ -1204,78 +1116,34 @@ unsafe extern "C" fn lua_wall_time(context: *mut c_void, result: *mut u64) -> i3
 }
 
 #[unsafe(no_mangle)]
-unsafe extern "C" fn troe_parse_decimal(bytes: *const u8, length: usize, result: *mut f64) -> i32 {
-    if length == 0 {
-        return -1;
-    }
-    let (Some(bytes), Some(mut result)) = (NonNull::new(bytes.cast_mut()), NonNull::new(result))
-    else {
-        return -1;
+unsafe extern "C" fn troe_parse_decimal(
+    bytes: *const u8,
+    length: usize,
+) -> kex_runtime::math::DecimalResult {
+    let invalid = kex_runtime::math::DecimalResult {
+        status: 1,
+        consumed: 0,
+        value: 0.0,
     };
-    // SAFETY: The C scanner passes its live ASCII numeric token.
+    if length == 0 {
+        return invalid;
+    }
+    let Some(bytes) = NonNull::new(bytes.cast_mut()) else {
+        return invalid;
+    };
+    // SAFETY: The C scanner passes its live NUL-terminated input span.
     let bytes = unsafe { slice::from_raw_parts(bytes.as_ptr(), length) };
     let Ok(text) = str::from_utf8(bytes) else {
-        return -1;
+        return invalid;
     };
-    let Ok(value) = text.parse::<f64>() else {
-        return -1;
+    let Some((value, consumed)) = kex_runtime::math::parse_decimal_prefix(text) else {
+        return invalid;
     };
-    // SAFETY: The C scanner passes one writable `double` result slot.
-    unsafe { *result.as_mut() = value };
-    0
-}
-
-macro_rules! unary_math {
-    ($bridge:ident, $name:ident) => {
-        #[unsafe(no_mangle)]
-        extern "C" fn $bridge(value_bits: u64) -> u64 {
-            libm::$name(f64::from_bits(value_bits)).to_bits()
-        }
-    };
-}
-
-unary_math!(troe_math_acos_bits, acos);
-unary_math!(troe_math_asin_bits, asin);
-unary_math!(troe_math_atan_bits, atan);
-unary_math!(troe_math_ceil_bits, ceil);
-unary_math!(troe_math_cos_bits, cos);
-unary_math!(troe_math_exp_bits, exp);
-unary_math!(troe_math_fabs_bits, fabs);
-unary_math!(troe_math_floor_bits, floor);
-unary_math!(troe_math_log_bits, log);
-unary_math!(troe_math_log10_bits, log10);
-unary_math!(troe_math_sin_bits, sin);
-unary_math!(troe_math_sqrt_bits, sqrt);
-unary_math!(troe_math_tan_bits, tan);
-
-#[unsafe(no_mangle)]
-extern "C" fn troe_math_atan2_bits(y_bits: u64, x_bits: u64) -> u64 {
-    libm::atan2(f64::from_bits(y_bits), f64::from_bits(x_bits)).to_bits()
-}
-
-#[unsafe(no_mangle)]
-extern "C" fn troe_math_fmod_bits(x_bits: u64, y_bits: u64) -> u64 {
-    libm::fmod(f64::from_bits(x_bits), f64::from_bits(y_bits)).to_bits()
-}
-
-#[unsafe(no_mangle)]
-unsafe extern "C" fn troe_math_frexp_bits(value_bits: u64, exponent: *mut i32) -> u64 {
-    let (fraction, parsed_exponent) = libm::frexp(f64::from_bits(value_bits));
-    if let Some(mut exponent) = NonNull::new(exponent) {
-        // SAFETY: The C caller supplies a writable exponent result slot.
-        unsafe { *exponent.as_mut() = parsed_exponent };
+    kex_runtime::math::DecimalResult {
+        status: 0,
+        consumed,
+        value,
     }
-    fraction.to_bits()
-}
-
-#[unsafe(no_mangle)]
-extern "C" fn troe_math_ldexp_bits(value_bits: u64, exponent: i32) -> u64 {
-    libm::ldexp(f64::from_bits(value_bits), exponent).to_bits()
-}
-
-#[unsafe(no_mangle)]
-extern "C" fn troe_math_pow_bits(x_bits: u64, y_bits: u64) -> u64 {
-    libm::pow(f64::from_bits(x_bits), f64::from_bits(y_bits)).to_bits()
 }
 
 entry!(run);

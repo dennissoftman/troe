@@ -1,17 +1,65 @@
-//! Small `no_std` POSIX-like helpers over TROE's typed KEX filesystem ABI.
+//! Small `no_std` POSIX-like helpers over TROE's typed KEX ABI.
 //!
 //! This layer owns command algorithms and bounded allocation policy. It does
 //! not widen kernel authority and is intentionally not a complete libc.
 #![no_std]
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
+#[cfg(feature = "alloc")]
 extern crate alloc;
 
+mod ascii;
+pub mod environment;
+pub mod errno;
+#[cfg(feature = "math")]
+pub mod math;
+pub mod process;
+pub mod random;
+pub mod time;
+
+#[cfg(feature = "alloc")]
 use alloc::{string::String, vec::Vec};
-use troe_kex_sdk::{
-    Error as KexError, FILESYSTEM_IO_BUFFER_BYTES, FILESYSTEM_LIST_BUFFER_BYTES,
-    FilesystemMutation, ReadOnlyFilesystem, filesystem,
-};
+use troe_kex_sdk::{Error as KexError, FilesystemMutation, ReadOnlyFilesystem, filesystem};
+#[cfg(feature = "alloc")]
+use troe_kex_sdk::{FILESYSTEM_IO_BUFFER_BYTES, FILESYSTEM_LIST_BUFFER_BYTES};
+
+/// Atomically replace one file with the supplied bytes.
+///
+/// The pending replacement is aborted if any streamed write fails.
+///
+/// # Errors
+///
+/// Reports typed mutation, partial-write, flush, or commit failures.
+pub fn replace_bytes(
+    mutation: &mut FilesystemMutation,
+    path: &str,
+    bytes: &[u8],
+) -> Result<(), Error> {
+    let mut replacement = mutation.begin_replace(path)?;
+    if let Err(error) = replacement.write_all(bytes) {
+        let _ignored = replacement.abort();
+        return Err(error.into());
+    }
+    replacement.commit().map_err(Into::into)
+}
+
+/// Remove one file, symbolic link, or empty directory without following links.
+///
+/// # Errors
+///
+/// Reports typed metadata or mutation failures. Nonempty directories remain
+/// unchanged.
+pub fn remove_path(
+    filesystem: &mut ReadOnlyFilesystem,
+    mutation: &mut FilesystemMutation,
+    path: &str,
+) -> Result<(), Error> {
+    match filesystem.metadata_no_follow(path)?.kind {
+        filesystem::NodeKind::Directory => mutation.remove_directory(path)?,
+        filesystem::NodeKind::File | filesystem::NodeKind::Symlink => mutation.remove(path)?,
+    }
+    Ok(())
+}
 
 /// Maximum retained objects in one recursive operation.
 pub const MAX_TRAVERSAL_ENTRIES: usize = 4096;
@@ -47,6 +95,7 @@ impl Error {
 }
 
 #[derive(Debug)]
+#[cfg(feature = "alloc")]
 struct WalkEntry {
     path: String,
     relative: String,
@@ -67,6 +116,7 @@ pub fn basename(path: &str) -> Option<&str> {
 /// # Errors
 ///
 /// Rejects invalid names, path-length overflow, or allocation failure.
+#[cfg(feature = "alloc")]
 pub fn join(base: &str, name: &str) -> Result<String, Error> {
     if base.is_empty()
         || name.is_empty()
@@ -97,6 +147,7 @@ pub fn join(base: &str, name: &str) -> Result<String, Error> {
     Ok(output)
 }
 
+#[cfg(feature = "alloc")]
 fn join_relative(base: &str, relative: &str) -> Result<String, Error> {
     let mut output = owned(base)?;
     for component in relative.split('/') {
@@ -105,6 +156,7 @@ fn join_relative(base: &str, relative: &str) -> Result<String, Error> {
     Ok(output)
 }
 
+#[cfg(feature = "alloc")]
 fn owned(value: &str) -> Result<String, Error> {
     if value.is_empty() || value.len() > filesystem::MAX_PATH_BYTES || value.as_bytes().contains(&0)
     {
@@ -118,6 +170,7 @@ fn owned(value: &str) -> Result<String, Error> {
     Ok(output)
 }
 
+#[cfg(feature = "alloc")]
 fn destination_for_source(
     filesystem: &mut ReadOnlyFilesystem,
     source: &str,
@@ -132,6 +185,7 @@ fn destination_for_source(
     }
 }
 
+#[cfg(feature = "alloc")]
 fn push_walk(
     entries: &mut Vec<WalkEntry>,
     metadata_bytes: &mut usize,
@@ -154,6 +208,7 @@ fn push_walk(
     Ok(())
 }
 
+#[cfg(feature = "alloc")]
 fn walk_no_follow(
     filesystem: &mut ReadOnlyFilesystem,
     root: &str,
@@ -227,6 +282,7 @@ fn walk_no_follow(
     Ok(entries)
 }
 
+#[cfg(feature = "alloc")]
 fn copy_regular_file(
     filesystem: &mut ReadOnlyFilesystem,
     mutation: &mut FilesystemMutation,
@@ -291,6 +347,7 @@ fn copy_regular_file(
     Ok(())
 }
 
+#[cfg(feature = "alloc")]
 fn copy_symlink(
     filesystem: &mut ReadOnlyFilesystem,
     mutation: &mut FilesystemMutation,
@@ -308,6 +365,7 @@ fn copy_symlink(
     Ok(())
 }
 
+#[cfg(feature = "alloc")]
 fn copy_node(
     filesystem: &mut ReadOnlyFilesystem,
     mutation: &mut FilesystemMutation,
@@ -328,6 +386,7 @@ fn copy_node(
 ///
 /// Rejects directories and reports all typed read, write, allocation, and
 /// partial-I/O failures.
+#[cfg(feature = "alloc")]
 pub fn copy(
     filesystem: &mut ReadOnlyFilesystem,
     mutation: &mut FilesystemMutation,
@@ -345,6 +404,7 @@ pub fn copy(
 ///
 /// Reports typed filesystem failures, malformed paths, or traversal metadata
 /// exhaustion. Already-created destinations can remain after a later I/O error.
+#[cfg(feature = "alloc")]
 pub fn copy_recursive(
     filesystem: &mut ReadOnlyFilesystem,
     mutation: &mut FilesystemMutation,
@@ -391,6 +451,7 @@ pub fn copy_recursive(
 ///
 /// Reports typed filesystem failures or traversal metadata exhaustion. Symbolic
 /// links are removed as links and are never traversed.
+#[cfg(feature = "alloc")]
 pub fn remove_recursive(
     filesystem: &mut ReadOnlyFilesystem,
     mutation: &mut FilesystemMutation,
@@ -415,6 +476,7 @@ pub fn remove_recursive(
 /// # Errors
 ///
 /// Reports destination resolution and rename failures.
+#[cfg(feature = "alloc")]
 pub fn move_path(
     filesystem: &mut ReadOnlyFilesystem,
     mutation: &mut FilesystemMutation,
@@ -426,7 +488,7 @@ pub fn move_path(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "alloc"))]
 mod tests {
     extern crate std;
 

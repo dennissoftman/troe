@@ -94,6 +94,7 @@ class RepositoryPolicyTests(unittest.TestCase):
             {
                 "troe-kernel": {("uefi", "=0.39.0", True)},
                 "troe-kex-alloc": {("rlsf", "=0.2.3", False)},
+                "troe-kex-runtime": {("libm", "=0.2.16", True)},
                 "troe-machine": {
                     ("rlsf", "=0.2.3", False),
                     ("uefi", "=0.39.0", True),

@@ -2,8 +2,103 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+
+typedef struct TroeCalendarTime {
+  int64_t year;
+  int month;
+  int day;
+  int hour;
+  int minute;
+  int second;
+  int week_day;
+  int year_day;
+} TroeCalendarTime;
+
+typedef struct TroeCalendarResult {
+  int status;
+  int64_t seconds;
+  TroeCalendarTime calendar;
+} TroeCalendarResult;
+
+typedef struct TroeFormatResult {
+  size_t count;
+  int status;
+  int option;
+} TroeFormatResult;
+
+extern time_t timegm(struct tm *calendar);
+
+TroeCalendarTime troe_runtime_calendar_from_seconds(int64_t seconds) {
+  time_t value = (time_t)seconds;
+  struct tm *calendar = gmtime(&value);
+  if (calendar == NULL)
+    return (TroeCalendarTime){0};
+  return (TroeCalendarTime){
+      .year = (int64_t)calendar->tm_year + 1900,
+      .month = calendar->tm_mon + 1,
+      .day = calendar->tm_mday,
+      .hour = calendar->tm_hour,
+      .minute = calendar->tm_min,
+      .second = calendar->tm_sec,
+      .week_day = calendar->tm_wday,
+      .year_day = calendar->tm_yday,
+  };
+}
+
+TroeCalendarResult troe_runtime_normalize_calendar(
+    int64_t year, int64_t month, int64_t day, int64_t hour, int64_t minute,
+    int64_t second) {
+  struct tm calendar = {
+      .tm_year = (int)(year - 1900),
+      .tm_mon = (int)(month - 1),
+      .tm_mday = (int)day,
+      .tm_hour = (int)hour,
+      .tm_min = (int)minute,
+      .tm_sec = (int)second,
+  };
+  time_t seconds = timegm(&calendar);
+  return (TroeCalendarResult){
+      .status = 0,
+      .seconds = (int64_t)seconds,
+      .calendar = troe_runtime_calendar_from_seconds((int64_t)seconds),
+  };
+}
+
+TroeFormatResult troe_runtime_format_calendar(
+    TroeCalendarTime calendar, const uint8_t *format, size_t format_length,
+    uint8_t *destination, size_t capacity) {
+  char pattern[4097];
+  struct tm value = {
+      .tm_year = (int)(calendar.year - 1900),
+      .tm_mon = calendar.month - 1,
+      .tm_mday = calendar.day,
+      .tm_hour = calendar.hour,
+      .tm_min = calendar.minute,
+      .tm_sec = calendar.second,
+      .tm_wday = calendar.week_day,
+      .tm_yday = calendar.year_day,
+  };
+  if (format_length == 0)
+    return (TroeFormatResult){.count = 0, .status = 0, .option = 0};
+  if (format_length >= sizeof(pattern))
+    return (TroeFormatResult){.status = 3};
+  memcpy(pattern, format, format_length);
+  pattern[format_length] = '\0';
+  size_t count = strftime((char *)destination, capacity, pattern, &value);
+  return (TroeFormatResult){
+      .count = count,
+      .status = count == 0 ? 3 : 0,
+      .option = 0,
+  };
+}
 
 typedef struct TroeLuaHost TroeLuaHost;
+
+uint32_t troe_runtime_mix_seed(uint64_t address, uint64_t wall_seconds,
+                               uint64_t ticks, uint64_t frequency_hz) {
+  return (uint32_t)(address ^ wall_seconds ^ ticks ^ frequency_hz);
+}
 
 typedef void *(*TroeAllocate)(void *context, void *pointer, size_t old_size,
                               size_t new_size);
@@ -14,6 +109,10 @@ typedef int (*TroeWrite)(void *context, int stream, const uint8_t *bytes,
 typedef int (*TroeProcessCpuTime)(void *context, uint64_t *ticks,
                                   uint64_t *frequency_hz);
 typedef int (*TroeWallTime)(void *context, uint64_t *seconds);
+typedef intptr_t (*TroeEnvironmentGet)(void *context, const uint8_t *name,
+                                       size_t name_length,
+                                       uint8_t *destination,
+                                       size_t capacity);
 typedef intptr_t (*TroeReadInput)(void *context, uint8_t *destination,
                                   size_t capacity);
 typedef int (*TroeFileOpen)(void *context, const uint8_t *path,
@@ -53,6 +152,7 @@ struct TroeLuaHost {
   TroeWrite write;
   TroeProcessCpuTime process_cpu_time;
   TroeWallTime wall_time;
+  TroeEnvironmentGet environment_get;
   TroeReadInput read_input;
   TroeFileOpen file_open;
   TroeFileRead file_read;
@@ -153,6 +253,29 @@ static int host_wall_time(void *opaque, uint64_t *seconds) {
   *seconds = context->wall_seconds;
   context->wall_seconds += 1;
   return 0;
+}
+
+static intptr_t host_environment_get(void *context, const uint8_t *name,
+                                     size_t name_length,
+                                     uint8_t *destination, size_t capacity) {
+  static const char *const entries[] = {
+      "HOME=/",       "PATH=/bin",   "TMPDIR=/tmp", "SHELL=/bin/sh",
+      "USER=root",    "LOGNAME=root", "PWD=/",
+  };
+  (void)context;
+  for (size_t index = 0; index < sizeof(entries) / sizeof(entries[0]); ++index) {
+    const char *separator = strchr(entries[index], '=');
+    size_t entry_name_length = (size_t)(separator - entries[index]);
+    size_t value_length = strlen(separator + 1);
+    if (entry_name_length == name_length &&
+        memcmp(entries[index], name, name_length) == 0) {
+      if (value_length > capacity)
+        return -75;
+      memcpy(destination, separator + 1, value_length);
+      return (intptr_t)value_length;
+    }
+  }
+  return -2;
 }
 
 static intptr_t host_unavailable_read(void *context, uint8_t *destination,
@@ -283,6 +406,7 @@ int main(int argc, char **argv) {
       .write = host_write,
       .process_cpu_time = host_process_cpu_time,
       .wall_time = host_wall_time,
+      .environment_get = host_environment_get,
       .read_input = host_unavailable_read,
       .file_open = host_unavailable_open,
       .file_read = host_unavailable_file_read,
