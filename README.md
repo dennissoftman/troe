@@ -258,7 +258,10 @@ See [ADR 0044](docs/adr/0044-transactional-system-lifecycle.md).
   selects the required components and targets.
 - Git LFS; run `git lfs install` once before checking out repository artifacts.
 - Python `3.13` or newer.
-- QEMU `11.1.0` with matching x86-64 or AArch64 UEFI firmware.
+- e2fsprogs `1.47.x` (`mke2fs` and `e2fsck`).
+- QEMU `8.x` through `11.x` with matching x86-64 or AArch64 distribution UEFI
+  firmware. QEMU `11.1.0` and the committed firmware digests remain the strict
+  release-evidence profile.
 
 From a repository checkout, build and boot the platform matching your host:
 
@@ -311,7 +314,7 @@ Linux x86-64 KVM host. It has a production-only acceptance harness but remains
 `compatible-unverified` until the live matrix passes; see the
 [exact target and operator runbook](docs/cloud-hypervisor-production.md).
 
-Without the exact QEMU setup, the hosted model still exercises the shell parser
+Without a supported QEMU setup, the hosted model still exercises the shell parser
 and sessions. It intentionally does not execute KEX applications.
 
 ```console
@@ -333,10 +336,15 @@ python3 scripts/test.py
 python3 scripts/test_changed.py --explain
 ```
 
-Use `python3 scripts/test.py --skip-qemu` when the pinned emulator and firmware
-are unavailable. Fixture identities are test data and cannot produce deployment
-artifacts; see the [cloud platform guide](docs/cloud-platform-support.md) for the
-explicit provisioning workflow.
+The normal build and test commands accept the compatible tool ranges above and
+still enforce the same ext4 byte-level verifier and guest acceptance scenarios.
+Use `python3 scripts/test.py --strict-tool-versions --require-filesystem-tools`
+for release-grade evidence tied to QEMU `11.1.0`, the committed firmware
+digests, and e2fsprogs `1.47.4`. Use `--skip-qemu` only when no supported
+emulator and firmware are available. Fixture identities are test data and
+cannot produce deployment artifacts; see the
+[cloud platform guide](docs/cloud-platform-support.md) for the explicit
+provisioning workflow.
 
 ## Project guide
 

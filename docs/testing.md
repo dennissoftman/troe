@@ -284,14 +284,20 @@ receive-to-reply interval and copies directly into caller-owned bounded storage.
 Reply ownership, token generation checks, server-fault fate, and teardown remain
 part of the current contract.
 
-## Maintainer release gate
+## Maintainer merge and release gates
 
 The repository intentionally has no GitHub Actions workflow. The maintainer
-runs `python3 scripts/test.py --require-filesystem-tools` locally before a merge
-or release. The pinned environment must provide Rust 1.97.1, QEMU 11.1.0, the
-committed `edk2-stable202605-r1` firmware bytes, `cargo-audit` 0.22.1,
-e2fsprogs 1.47.4, dosfstools, and mtools. The focused selector is a development
-aid and does not replace this maintainer-owned exhaustive gate.
+runs `python3 scripts/test.py --require-filesystem-tools` locally before a
+merge. This exhaustive behavioral gate accepts QEMU `8.x` through `11.x`,
+structurally valid matching distribution UEFI firmware, and e2fsprogs `1.47.x`;
+the ext4 byte verifier and all guest scenarios remain unchanged.
+
+Release-grade reproducibility evidence uses
+`python3 scripts/test.py --strict-tool-versions --require-filesystem-tools`.
+That strict environment must provide Rust 1.97.1, QEMU 11.1.0, the committed
+`edk2-stable202605-r1` firmware bytes, `cargo-audit` 0.22.1, e2fsprogs 1.47.4,
+dosfstools, and mtools. The focused selector is a development aid and does not
+replace the maintainer-owned exhaustive gate.
 
 The non-QEMU production gate is separate because it requires a Linux x86-64
 host with KVM and a pre-created isolated TAP. It verifies the exact v53.0

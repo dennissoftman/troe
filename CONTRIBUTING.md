@@ -50,8 +50,10 @@ changed packages and reverse dependencies, owned Python suites, affected KEX
 apps, and granular QEMU scenarios. Unknown or global changes widen to the full
 gate. Before submitting a change, run `python3 scripts/test.py`, which includes
 all QEMU platforms and scenario groups, or require the repository's exhaustive
-merge check. Use `--skip-qemu` only when the pinned emulator and firmware are
-unavailable, and ensure the full gate runs before merge. See
+merge check. QEMU `8.x` through `11.x` and matching distribution UEFI firmware
+are accepted. Use `--skip-qemu` only when a supported emulator and firmware are
+unavailable, and ensure the full gate runs before merge. Release evidence uses
+`python3 scripts/test.py --strict-tool-versions --require-filesystem-tools`. See
 [`docs/testing.md`](docs/testing.md) for impact rules and LLM instructions. New
 parsers require corrupt and boundary tests. New caches require
 an owner, hard cap, eviction policy, pressure behavior, and accounting. New
@@ -60,8 +62,9 @@ and a narrowly scoped crate boundary.
 
 Storage-provider changes should also run
 `python3 scripts/test.py --skip-qemu --require-filesystem-tools` with
-e2fsprogs, dosfstools, and mtools installed. This makes absence of the external
-format/check oracles a failure instead of silently skipping interoperability.
+e2fsprogs `1.47.x`, dosfstools, and mtools installed. This makes absence of the
+external format/check oracles a failure instead of silently skipping
+interoperability.
 
 `cargo mount` attaches the persistent developer FAT32 interchange disk using
 native macOS facilities or Linux UDisks. Linux development hosts should install

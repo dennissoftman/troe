@@ -4,8 +4,17 @@ Status: accepted, 2026-08-22.
 
 Implementation note, 2026-08-24: `tools/qemu-firmware-profile.json` records the
 exact code and variable-store sizes and SHA-256 digests for both architecture
-artifacts. Discovery and explicit overrides are accepted only after matching
-that manifest; a filename or QEMU version match alone is insufficient.
+artifacts. Strict release evidence accepts discovery and explicit overrides
+only after matching that manifest; a filename or QEMU version match alone is
+insufficient.
+
+Compatibility amendment, 2026-08-28: ordinary development and exhaustive merge
+verification accept QEMU 8.x through 11.x and matching distribution firmware.
+Firmware must be a regular image of at least 256 KiB, be 4-KiB aligned, and
+contain a UEFI firmware-volume header. Those runs retain the exact machine
+records and guest assertions but are behavioral compatibility evidence, not a
+reproduction of the pinned release environment. `--strict-tool-versions`
+selects the original QEMU 11.1.0 and exact-digest policy.
 
 Stage 1 targets Rust's `x86_64-unknown-uefi` and `aarch64-unknown-uefi` using
 UEFI Simple Text Input/Output and the firmware allocator. The repeatable test
