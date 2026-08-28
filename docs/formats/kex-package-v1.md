@@ -1,9 +1,10 @@
 # KEX package v1
 
-KEX package v1 is the canonical single-file application artifact installed as
-`/bin/<command>.kex`. It binds one KCAP v1 capability manifest to one
-architecture-specific KEX v1 executable so launch never depends on an adjacent
-sidecar. The kernel validates the complete envelope and manifest before it
+KEX package v1 is the canonical single-file application artifact. Installed
+bare commands live at `/bin/<command>.kex`; the same canonical package may be
+selected through an explicit VFS path. It binds one KCAP v1 capability manifest
+to one architecture-specific KEX v1 executable so launch never depends on an
+adjacent sidecar. The kernel validates the complete envelope and manifest before it
 constructs optional services, then validates the embedded executable before
 allocating or mapping application pages.
 

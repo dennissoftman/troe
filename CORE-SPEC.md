@@ -346,6 +346,20 @@ Each package declares its name, synopsis, required typed capabilities, and entry
 point. Unknown or unavailable commands return stable distinct errors and do not
 terminate the shell.
 
+A bare ordinary command MUST resolve only through the bounded immutable
+`/bin/<name>.kex` catalog. A command token containing `/` MUST instead resolve
+the exact relative or absolute VFS path against the invocation cwd, without
+extension inference or a directory search. The target MUST be a regular file
+whose complete package, capability manifest, target, and embedded executable
+validate before admission. Explicit path selection MUST NOT manufacture
+capabilities: nested launch requirements remain an attenuation of the
+launcher's authority. Writable mounts are therefore usable only through an
+explicit path such as `./app`, never through implicit current-directory lookup.
+Under the current policy, a direct interactive path outside `/bin` MUST require
+an explicit `y` confirmation and default to denial. The warning is advisory:
+already-running applications with process-launch authority use their typed
+launch capability without a kernel terminal prompt.
+
 `cd`, `fg`, `jobs`, `kill`, `log`, `poweroff`, `reboot`, `svc`, and `wait` are
 permanent shell intrinsics and their names MUST NOT be shadowed or replaced by a
 KEX application. They mutate shell-session, resident-job, service-supervisor,

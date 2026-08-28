@@ -4,6 +4,11 @@ Status: accepted and implemented for the Stage 9 application vertical slice,
 2026-08-25. ADR 0030 supersedes only this ADR's absent-artifact recovery
 fallback; all ordinary commands are now KEX-only.
 
+Supersession note, 2026-08-28: ADR 0050 replaces this ADR's writable-state
+execution prohibition with explicit path execution. Bare-name resolution still
+uses only the immutable `/bin` catalog, and writable directories are never
+searched implicitly.
+
 ## Decision
 
 TROE command applications are immutable KEX package v1 files installed at

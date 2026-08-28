@@ -2,6 +2,11 @@
 
 Status: accepted and implemented, 2026-08-28.
 
+Supersession note, 2026-08-28: ADR 0050 extends package selection to an exact
+relative or absolute path when `argv[0]` contains `/`. Bare-name lookup,
+capability attenuation, owner-scoped lifecycle tokens, and teardown are
+unchanged.
+
 ## Context
 
 The resident-process and observation work left command evaluation split across
@@ -109,8 +114,8 @@ stream, and pipe mechanisms without knowing shell syntax. `sh.kex` can later
 become the evaluator for `&&`, `||`, conditionals, loops, and eventually a
 larger POSIX grammar while the kernel remains grammar-free.
 
-This increment does not implement `fork`, shared address spaces, POSIX signals,
-process groups, descriptor duplication, arbitrary executable paths, command
-substitution, or a POSIX conformance claim. Pipes are concurrent across
+This increment did not implement `fork`, shared address spaces, POSIX signals,
+process groups, descriptor duplication, command substitution, or a POSIX
+conformance claim. ADR 0050 subsequently added explicit KEX paths. Pipes are concurrent across
 resident processes, but the existing interactive shell's own pipeline executor
 remains unchanged until `sh.kex` adopts the new APIs.

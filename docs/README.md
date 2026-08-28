@@ -32,6 +32,7 @@ history rather than in current documentation.
 | Filesystem rename/removal and user-space POSIX facade | [ADR 0047](adr/0047-kex-filesystem-tools-and-runtime.md) |
 | Capability-scoped private memory and configurable policy | [ADR 0048](adr/0048-capability-scoped-private-memory-and-resource-policy.md) |
 | Kernel CSPRNG, readable random capability, and KEX ASLR | [ADR 0049](adr/0049-kernel-csprng-and-kex-aslr.md) |
+| Explicit relative and absolute KEX execution paths | [ADR 0050](adr/0050-explicit-kex-path-execution.md) |
 
 The current serialized contracts are versioned independently under
 [`formats/`](formats):

@@ -50,14 +50,17 @@ measurement.
   `/vol/root`, read/write FAT32, bounded ext4 symbolic/hard links, quota-bound
   `/tmp`, live `/sys`, and crash-consistent state under `/vol/state`.
 - Ethernet, ARP, DHCP, IPv4, ICMP, UDP, and outbound TCP over virtio-net.
-- KEX applications for `arp`, `awk`, `cat`, `clear`, `dhcp`, `echo`, `grep`,
-  `hexdump`, `ln`, `ls`, `lua`, `man`, `mem`, `mount`, `net`, `ping`, `printf`,
-  `ps`, `pwd`, `rm`, `sed`, `sh`, `sleep`, `spawn`, `tar`, `tcp`, `timesync`, `top`,
-  `udp`, and `wc`.
+- KEX applications for `arp`, `awk`, `cat`, `clear`, `cp`, `dhcp`, `echo`,
+  `grep`, `hexdump`, `ln`, `ls`, `lua`, `man`, `mem`, `mount`, `mv`, `net`,
+  `ping`, `printf`, `ps`, `pwd`, `rm`, `rmdir`, `sed`, `sh`, `sleep`, `spawn`,
+  `tar`, `tcp`, `timesync`, `top`, `udp`, and `wc`.
 
 `cd`, session job control, `svc`, `poweroff`, and `reboot` are non-shadowable
 shell intrinsics because they mutate shell- or supervisor-owned state. Ordinary
-commands remain immutable KEX applications discovered from `/bin`.
+bare commands remain immutable KEX applications discovered from `/bin`.
+An explicit command token containing `/` instead resolves the exact KEX file
+through the caller's VFS working directory, so copied applications can be run
+as `./app` without adding writable volumes to an ambient search path.
 
 ## 🎬 Demos
 
@@ -79,6 +82,12 @@ sh:/> printf persistent > /vol/root/note
 sh:/> ln -s note /vol/root/latest
 sh:/> cat /vol/root/latest
 persistent
+
+sh:/> cp /bin/echo.kex /vol/shared/echo-copy
+sh:/> cd /vol/shared
+sh:/vol/shared> ./echo-copy explicit KEX path
+Run untrusted application './echo-copy' outside /bin? [y/N] y
+explicit KEX path
 
 sh:/> lua -e 'print(string.format("Lua %.1f", math.sqrt(81)))'
 Lua 9.0
@@ -190,6 +199,16 @@ $ cargo kex inspect rootfs/bin/x86_64/echo.kex
 
 Start exploring with [`apps/echo`](apps/echo) and the
 [`troe-kex` Rust SDK](sdk/rust/troe-kex).
+
+Bare names use the bounded `/bin/<name>.kex` catalog. Tokens containing `/`
+are exact relative or absolute VFS paths: no `.kex` suffix is inferred, and
+there is no `PATH` or implicit current-directory search. The selected regular
+file must pass the same complete package, manifest, target, and executable
+validation as an installed command. Symlinks may resolve to a regular KEX file;
+package requirements still cannot exceed the launcher's authority.
+The interactive shell asks for a default-negative confirmation before directly
+executing a path outside `/bin`. This is an advisory provenance warning, not a
+substitute for executable permission bits or package trust policy.
 
 The essential filesystem command set includes streamed `cp`, iterative
 `cp -r`/`cp -R`, atomic same-provider `mv`, recursive `rm -r`/`rm -R`, and

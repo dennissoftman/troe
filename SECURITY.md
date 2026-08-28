@@ -51,6 +51,12 @@ format are treated as untrusted and bounded.
 - KEX: exact target/version/layout validation before allocation, closed R/RX/RW
   permissions, fixed standard ceilings, kernel-owned staging, canonical startup
   pages, explicit initial handles, and transactional zeroized reclamation;
+- KEX resolution: bare names select only `/bin/<name>.kex`; a command containing
+  `/` selects one exact VFS path relative to its explicit cwd, with no suffix
+  inference, `PATH`, or implicit writable-directory search; every selected file
+  passes the same complete KEX/KCAP validation and capability attenuation, and
+  direct interactive execution outside `/bin` requires a default-negative
+  confirmation;
 - application execution: reset ring-3/EL0 state, bounded saved contexts,
   scheduler-selected resume, copied owner-checked request/reply calls, and a
   50 ms maximum uninterrupted user lease; ordinary resident commands have no
