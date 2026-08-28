@@ -45,6 +45,7 @@ class AlpineProfileTests(unittest.TestCase):
                 "aarch64-virt-uefi",
                 "--environment",
                 "qemu",
+                "--gui",
                 "--install-help",
             ],
             cwd=alpine_profile.REPO_ROOT,

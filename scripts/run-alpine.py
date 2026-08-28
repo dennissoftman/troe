@@ -132,9 +132,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="prepare images and print the QEMU command without starting it",
     )
     parser.add_argument(
+        "--gui",
         "--graphical",
+        dest="graphical",
         action="store_true",
-        help="open a graphical display while preserving serial stdio",
+        help=(
+            "open a graphical display while preserving serial stdio; keyboard "
+            "input goes to Alpine while the QEMU window is focused"
+        ),
     )
     parser.add_argument(
         "--memory",

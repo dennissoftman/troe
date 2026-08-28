@@ -66,9 +66,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="run an existing image and storage fixtures without rebuilding",
     )
     parser.add_argument(
+        "--gui",
         "--graphical",
+        dest="graphical",
         action="store_true",
-        help="open the owned framebuffer console while preserving serial stdio",
+        help=(
+            "open the owned framebuffer console while preserving serial stdio; "
+            "keyboard input goes to the guest while the QEMU window is focused"
+        ),
     )
     parser.add_argument(
         "--memory",

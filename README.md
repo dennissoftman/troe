@@ -241,11 +241,15 @@ cargo qemu
 ```
 
 The launcher opens TROE on the serial console. Use `poweroff` inside the guest
-to shut it down, or add `--graphical` to open the framebuffer console:
+to shut it down, or add `--gui` to open the framebuffer console:
 
 ```console
-cargo qemu --graphical
+cargo qemu --gui
 ```
+
+Focus the QEMU window to send keyboard input, including `Ctrl-C`, to the guest.
+`Ctrl-C` in the host terminal still cancels QEMU. The older `--graphical` name
+remains an alias for `--gui`. The same option is available for `cargo alpine`.
 
 Choose a target explicitly when needed:
 

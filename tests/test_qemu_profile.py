@@ -637,6 +637,16 @@ class FirmwareProfileTests(unittest.TestCase):
         self.assertEqual(run_args.memory, "256M")
         self.assertFalse(run_args.no_shared_disk)
         self.assertFalse(run_args.reset_shared_disk)
+        gui_run_args = RUN_QEMU.parse_args(
+            [
+                "--platform",
+                X86_64_Q35_UEFI,
+                "--environment",
+                QEMU_ENVIRONMENT,
+                "--gui",
+            ]
+        )
+        self.assertTrue(gui_run_args.graphical)
         custom_run_args = RUN_QEMU.parse_args(
             [
                 "--platform",

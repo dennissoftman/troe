@@ -81,6 +81,11 @@ cargo qemu --platform aarch64-virt-uefi --environment qemu --memory 256M
 cargo alpine --platform aarch64-virt-uefi --environment qemu
 ```
 
+Add `--gui` to either `cargo qemu` or `cargo alpine` to open the QEMU window.
+While that window is focused, keyboard input such as `Ctrl-C` is delivered to
+the guest instead of cancelling the host-side serial runner. `--graphical`
+remains a compatibility alias.
+
 `cargo alpine` downloads the architecture's pinned official virtual ISO on its
 first run and verifies its exact length and SHA-256. Later runs verify and reuse
 the cached image under `build/alpine/`. `--refresh` deliberately replaces that
