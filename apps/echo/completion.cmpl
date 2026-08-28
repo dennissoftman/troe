@@ -1,0 +1,2 @@
+CMPL	1	echo
+R	1	1	^-	values:--,-E,-e,-n

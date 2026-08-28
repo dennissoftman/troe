@@ -1,0 +1,2 @@
+CMPL	1	rmdir
+R	1	1	*	path:directory

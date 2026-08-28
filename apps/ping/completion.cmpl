@@ -1,0 +1,2 @@
+CMPL	1	ping
+R	1	1	*	address:ipv4:forbidden

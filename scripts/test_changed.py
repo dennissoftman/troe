@@ -67,6 +67,7 @@ PACKAGE_SCENARIOS = {
     "troe-abi": set(ALL_QEMU_SCENARIOS),
     "troe-application": set(ALL_QEMU_SCENARIOS),
     "troe-block": {"boot", "filesystem", "persistence"},
+    "troe-completion": {"boot", "shell-terminal", "filesystem"},
     "troe-config": {"boot", "filesystem", "persistence"},
     "troe-content": {"boot", "filesystem", "persistence"},
     "troe-core": {"boot", "shell-terminal"},

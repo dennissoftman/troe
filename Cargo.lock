@@ -131,10 +131,15 @@ name = "troe-application"
 version = "0.1.0"
 dependencies = [
  "troe-abi",
+ "troe-completion",
 ]
 
 [[package]]
 name = "troe-block"
+version = "0.1.0"
+
+[[package]]
+name = "troe-completion"
 version = "0.1.0"
 
 [[package]]
@@ -263,6 +268,7 @@ version = "0.1.0"
 dependencies = [
  "troe-abi",
  "troe-application",
+ "troe-completion",
 ]
 
 [[package]]
@@ -319,6 +325,8 @@ version = "0.1.0"
 name = "troe-shell"
 version = "0.1.0"
 dependencies = [
+ "troe-application",
+ "troe-completion",
  "troe-core",
  "troe-driver",
  "troe-vfs",

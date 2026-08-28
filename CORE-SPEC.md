@@ -360,6 +360,13 @@ an explicit `y` confirmation and default to denial. The warning is advisory:
 already-running applications with process-launch authority use their typed
 launch capability without a kernel terminal prompt.
 
+An installed package MAY embed one bounded canonical CMPL descriptor for its
+command arguments. The shell MUST validate package and command identity before
+using it and MUST retain authority over replacement offsets, quoting, sorting,
+deduplication, candidate budgets, and trusted dynamic resolvers. Pressing Tab
+MUST NOT execute the ordinary application or grant its runtime capabilities.
+Completion metadata is not authority and MUST NOT be interpreted as KCAP.
+
 `cd`, `fg`, `jobs`, `kill`, `log`, `poweroff`, `reboot`, `svc`, and `wait` are
 permanent shell intrinsics and their names MUST NOT be shadowed or replaced by a
 KEX application. They mutate shell-session, resident-job, service-supervisor,

@@ -1,0 +1,3 @@
+CMPL	1	wc
+R	1	*	^-	values:-c,-l,-lc,-lw,-lwc,-w,-wc
+R	1	*	*	path:file

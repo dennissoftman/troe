@@ -21,6 +21,11 @@ def package(
 
 
 PACKAGES = {
+    "troe-completion": package(
+        "troe-completion", "crates/troe-completion", "troe-shell"
+    ),
+    "troe-shell": package("troe-shell", "crates/troe-shell", "troe-host", "troe-kernel"),
+    "troe-host": package("troe-host", "host"),
     "troe-net": package("troe-net", "crates/troe-net", "troe-machine", "troe-kernel"),
     "troe-machine": package("troe-machine", "crates/troe-machine", "troe-kernel"),
     "troe-kernel": package("troe-kernel", "kernel"),
@@ -42,6 +47,18 @@ class ChangedTestSelectionTests(unittest.TestCase):
         )
         self.assertEqual(plan.qemu_scenarios, {"boot", "network"})
         self.assertFalse(plan.qemu_all_platforms)
+
+    def test_completion_policy_change_selects_shell_consumers_and_behavior(self) -> None:
+        path = PurePosixPath("crates/troe-completion/src/lib.rs")
+        plan = test_changed.build_plan((path,), PACKAGES)
+        self.assertFalse(plan.full_reasons)
+        self.assertEqual(
+            plan.rust_packages,
+            {"troe-completion", "troe-shell", "troe-host", "troe-kernel"},
+        )
+        self.assertEqual(
+            plan.qemu_scenarios, {"boot", "shell-terminal", "filesystem"}
+        )
 
     def test_git_collection_includes_deletions_and_both_sides_of_renames(self) -> None:
         with mock.patch.object(

@@ -1,0 +1,6 @@
+CMPL	1	sed
+R	1	2	^-	values:-e,-n
+R	4	*	*	path:file	eq:0:-n	eq:1:-e
+R	3	*	*	path:file	eq:0:-n	ne:1:-e
+R	3	*	*	path:file	eq:0:-e
+R	2	*	*	path:file	ne:0:-n	ne:0:-e

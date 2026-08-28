@@ -1,0 +1,3 @@
+CMPL	1	ls
+R	1	1	^-	values:--,-1,-A,-C,-F,-a,-d,-h,-l,-p
+R	1	*	*	path:any

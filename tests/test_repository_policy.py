@@ -190,6 +190,50 @@ class RepositoryPolicyTests(unittest.TestCase):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, shell)
 
+    def test_completion_policy_is_portable_and_kcap_remains_authority_only(self) -> None:
+        completion_root = REPO_ROOT / "crates" / "troe-completion"
+        manifest = tomllib.loads(
+            (completion_root / "Cargo.toml").read_text(encoding="utf-8")
+        )
+        self.assertNotIn("dependencies", manifest)
+        source = (completion_root / "src" / "lib.rs").read_text(encoding="utf-8")
+        self.assertIn("#![no_std]", source)
+        self.assertIn("pub enum Resolver", source)
+        self.assertIn("Address(AddressConstraints)", source)
+        self.assertIn("Integer(IntegerConstraints)", source)
+
+        shell = (REPO_ROOT / "crates" / "troe-shell" / "src" / "lib.rs").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("fn argument_completion", shell)
+        registry = (
+            REPO_ROOT / "crates" / "troe-shell" / "src" / "recovery_completion.rs"
+        ).read_text(encoding="utf-8")
+        self.assertIn("CompletionDescriptor", registry)
+        self.assertIn("PackageCompletionRegistry", registry)
+        self.assertIn("kex_package_completion_range", registry)
+
+        apps = sorted(
+            path
+            for path in (REPO_ROOT / "apps").iterdir()
+            if path.is_dir() and (path / "Cargo.toml").is_file()
+        )
+        self.assertEqual(len(apps), 33)
+        for app in apps:
+            descriptor = app / "completion.cmpl"
+            self.assertTrue(descriptor.is_file(), app.name)
+            source = descriptor.read_text(encoding="utf-8")
+            self.assertTrue(source.endswith("\n"), app.name)
+            self.assertEqual(source.splitlines()[0], f"CMPL\t1\t{app.name}")
+
+        for root in (REPO_ROOT / "rootfs" / "bin").iterdir():
+            self.assertEqual(list(root.glob("*.complete")), [])
+
+        kcap = (REPO_ROOT / "docs" / "formats" / "kcap-v1.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("completion descriptor", kcap.lower())
+
     def test_superseded_resource_profiles_cannot_reenter_source_apis(self) -> None:
         forbidden_rust = ("ResourceProfile", "ResourcePolicy", "::tiny()", "::full()")
         for root in (REPO_ROOT / "crates", REPO_ROOT / "kernel"):

@@ -91,22 +91,30 @@ class KexToolTests(unittest.TestCase):
                         capability_offset,
                         capability_bytes,
                         executable_offset,
-                        reserved,
+                        completion_offset,
                         executable_bytes,
                         encoded_bytes,
                     ) = struct.unpack_from("<HHHHIIIIQQ", package_bytes, 8)
-                    self.assertEqual((major, minor, header_bytes, flags), (1, 0, 48, 0))
+                    self.assertEqual((major, minor, header_bytes, flags), (1, 0, 48, 1))
                     self.assertEqual(capability_offset, header_bytes)
                     self.assertEqual(
                         executable_offset, capability_offset + capability_bytes
                     )
-                    self.assertEqual(reserved, 0)
                     self.assertEqual(
-                        executable_offset + executable_bytes, len(package_bytes)
+                        executable_offset + executable_bytes, completion_offset
                     )
+                    self.assertLess(completion_offset, len(package_bytes))
                     self.assertEqual(encoded_bytes, len(package_bytes))
                     self.assertEqual(report["bytes"], len(package_bytes))
                     self.assertEqual(report["executable_bytes"], executable_bytes)
+                    completion = package_bytes[completion_offset:]
+                    self.assertEqual(
+                        completion,
+                        (REPO_ROOT / "apps" / command / "completion.cmpl").read_bytes(),
+                    )
+                    self.assertEqual(
+                        completion.splitlines()[0], f"CMPL\t1\t{command}".encode()
+                    )
                     capability_bytes = package_bytes[
                         capability_offset:executable_offset
                     ]
@@ -194,8 +202,9 @@ class KexToolTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             package_bytes = artifact.read_bytes()
             executable_offset = struct.unpack_from("<I", package_bytes, 24)[0]
+            completion_offset = struct.unpack_from("<I", package_bytes, 28)[0]
             raw = Path(directory) / "raw.kex"
-            raw.write_bytes(package_bytes[executable_offset:])
+            raw.write_bytes(package_bytes[executable_offset:completion_offset])
             raw_inspection = cargo_kex("inspect", raw, "--json")
             self.assertEqual(
                 raw_inspection.returncode, 0, raw_inspection.stderr.decode()

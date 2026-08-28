@@ -79,9 +79,10 @@ mod firmware {
     };
     use troe_random::{Generator as RandomGenerator, SEED_BYTES as RANDOM_SEED_BYTES};
     use troe_shell::{
-        CompletionConfig, ExecutionPlacement, ExternalCommand, ExternalCommandReference,
-        JobControl, MachineAction, ServiceControl, SharedNamespace, Shell,
-        external_command_reference, format_memory_report, parse_line,
+        CompletionConfig, CompletionEnvironment, CompletionVisitor, DynamicCompletionDomain,
+        ExecutionPlacement, ExternalCommand, ExternalCommandReference, JobControl, MachineAction,
+        ServiceControl, SharedNamespace, Shell, external_command_reference, format_memory_report,
+        parse_line,
     };
     #[cfg(feature = "acceptance-probes")]
     use troe_statefs::STATE_PATH;
@@ -14995,7 +14996,19 @@ mod firmware {
                     redraw_editor(editor, prompt, console)?;
                 }
                 EditorOutcome::CompletionRequested => {
-                    complete_editor(editor, shell, completion_config, prompt, console)?;
+                    let mut environment = NativeCompletionEnvironment {
+                        residents,
+                        services: services.as_ref(),
+                        volumes: &accounting.boot_mount_manifest,
+                    };
+                    complete_editor(
+                        editor,
+                        shell,
+                        completion_config,
+                        &mut environment,
+                        prompt,
+                        console,
+                    )?;
                 }
                 EditorOutcome::LimitReached => write_all(console, b"\x07")?,
                 EditorOutcome::Ignored => {}
@@ -15025,10 +15038,12 @@ mod firmware {
         editor: &mut LineEditor,
         shell: &mut Shell,
         config: CompletionConfig,
+        environment: &mut dyn CompletionEnvironment,
         prompt: &str,
         console: &mut dyn Output,
     ) -> Result<(), ()> {
-        let completion = shell.complete(editor.line(), editor.cursor(), config);
+        let completion =
+            shell.complete_with_environment(editor.line(), editor.cursor(), config, environment);
         if completion.candidates.is_empty() {
             write_all(console, b"\x07")?;
             return Ok(());
@@ -15060,6 +15075,49 @@ mod firmware {
             )?;
         }
         redraw_editor(editor, prompt, console)
+    }
+
+    struct NativeCompletionEnvironment<'state> {
+        residents: &'state ResidentProcessTable,
+        services: Option<&'state ServiceRuntime>,
+        volumes: &'state BootMountManifest,
+    }
+
+    impl CompletionEnvironment for NativeCompletionEnvironment<'_> {
+        fn visit(&mut self, domain: DynamicCompletionDomain, visitor: &mut dyn CompletionVisitor) {
+            match domain {
+                DynamicCompletionDomain::Job => {
+                    for job in self
+                        .residents
+                        .jobs
+                        .iter()
+                        .filter(|job| job.owner == ResidentOwner::Session)
+                    {
+                        let id = alloc::format!("{}", job.id);
+                        if !visitor.candidate(&id) {
+                            break;
+                        }
+                    }
+                }
+                DynamicCompletionDomain::Service => {
+                    let Some(services) = self.services else {
+                        return;
+                    };
+                    for service in services.config.services() {
+                        if !visitor.candidate(service.name()) {
+                            break;
+                        }
+                    }
+                }
+                DynamicCompletionDomain::Volume => {
+                    for volume in self.volumes.entries() {
+                        if !visitor.candidate(volume.name()) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn machine_snapshot(accounting: &OwnedAccounting) -> MachineMemorySnapshot {

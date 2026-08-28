@@ -85,20 +85,23 @@ const PACKAGE_HEADER_FLAGS: usize = 14;
 const PACKAGE_HEADER_MANIFEST_OFFSET: usize = 16;
 const PACKAGE_HEADER_MANIFEST_BYTES: usize = 20;
 const PACKAGE_HEADER_EXECUTABLE_OFFSET: usize = 24;
-const PACKAGE_HEADER_RESERVED: usize = 28;
+const PACKAGE_HEADER_COMPLETION_OFFSET: usize = 28;
 const PACKAGE_HEADER_EXECUTABLE_BYTES: usize = 32;
 const PACKAGE_HEADER_PACKAGE_BYTES: usize = 40;
+const PACKAGE_FLAG_COMPLETION: u16 = 1;
 
 /// Maximum complete package bytes admitted by the standard application policy.
 pub const MAX_KEX_PACKAGE_BYTES: usize = KEX_PACKAGE_V1_HEADER_BYTES
     + requirements::MAX_MANIFEST_BYTES
-    + ApplicationLimits::STANDARD.encoded_bytes;
+    + ApplicationLimits::STANDARD.encoded_bytes
+    + troe_completion::MAX_ARTIFACT_BYTES;
 
 /// One validated single-file package borrowing its manifest and KEX executable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct KexPackage<'package> {
     manifest: requirements::Manifest<'package>,
     executable: &'package [u8],
+    completion: Option<&'package [u8]>,
 }
 
 impl<'package> KexPackage<'package> {
@@ -112,6 +115,12 @@ impl<'package> KexPackage<'package> {
     #[must_use]
     pub const fn executable(self) -> &'package [u8] {
         self.executable
+    }
+
+    /// Canonical package-owned CMPL artifact, when present.
+    #[must_use]
+    pub const fn completion(self) -> Option<&'package [u8]> {
+        self.completion
     }
 }
 
@@ -128,12 +137,14 @@ pub enum PackageError {
     UnsupportedVersion,
     /// Fixed header or embedded ranges are noncanonical.
     InvalidLayout,
-    /// A package flag or reserved field is nonzero.
+    /// An unsupported package flag or reserved field is nonzero.
     NonzeroReserved,
     /// Declared package size differs from the exact input length.
     LengthMismatch,
     /// Embedded capability requirements are malformed.
     InvalidManifest,
+    /// Embedded package-owned completion metadata is malformed.
+    InvalidCompletion,
 }
 
 impl fmt::Display for PackageError {
@@ -144,9 +155,10 @@ impl fmt::Display for PackageError {
             Self::InvalidMagic => "KEX package magic is invalid",
             Self::UnsupportedVersion => "KEX package version is unsupported",
             Self::InvalidLayout => "KEX package layout is noncanonical",
-            Self::NonzeroReserved => "KEX package reserved field or flag is nonzero",
+            Self::NonzeroReserved => "KEX package reserved field or unsupported flag is nonzero",
             Self::LengthMismatch => "KEX package declared length differs from its input length",
             Self::InvalidManifest => "KEX package capability manifest is invalid",
+            Self::InvalidCompletion => "KEX package completion artifact is invalid",
         })
     }
 }
@@ -158,6 +170,8 @@ pub enum PackageEncodeError {
     InvalidExecutable,
     /// The requirements are excessive, duplicate, unordered, or invalid.
     InvalidManifest,
+    /// The supplied CMPL artifact is malformed or excessive.
+    InvalidCompletion,
     /// Checked package layout arithmetic overflowed.
     ArithmeticOverflow,
     /// Exact output allocation failed.
@@ -960,8 +974,27 @@ pub fn encode_kex_package(
     executable: &[u8],
     required: &[requirements::Requirement],
 ) -> Result<Vec<u8>, PackageEncodeError> {
+    encode_kex_package_with_completion(executable, required, None)
+}
+
+/// Encode one canonical package with an optional package-owned CMPL artifact.
+///
+/// # Errors
+///
+/// Rejects malformed completion bytes in addition to the ordinary package
+/// encoder failures. Completion is appended after the executable and bound by
+/// the package envelope; it is never installed as a loose sidecar.
+pub fn encode_kex_package_with_completion(
+    executable: &[u8],
+    required: &[requirements::Requirement],
+    completion: Option<&[u8]>,
+) -> Result<Vec<u8>, PackageEncodeError> {
     if executable.is_empty() || executable.len() > ApplicationLimits::standard().encoded_bytes() {
         return Err(PackageEncodeError::InvalidExecutable);
+    }
+    if let Some(bytes) = completion {
+        troe_completion::CompletionArtifact::parse(bytes)
+            .map_err(|_| PackageEncodeError::InvalidCompletion)?;
     }
     let mut manifest = [0_u8; requirements::MAX_MANIFEST_BYTES];
     let manifest_bytes = requirements::encode(required, &mut manifest)
@@ -969,8 +1002,11 @@ pub fn encode_kex_package(
     let executable_offset = KEX_PACKAGE_V1_HEADER_BYTES
         .checked_add(manifest_bytes)
         .ok_or(PackageEncodeError::ArithmeticOverflow)?;
-    let package_bytes = executable_offset
+    let executable_end = executable_offset
         .checked_add(executable.len())
+        .ok_or(PackageEncodeError::ArithmeticOverflow)?;
+    let package_bytes = executable_end
+        .checked_add(completion.map_or(0, <[u8]>::len))
         .ok_or(PackageEncodeError::ArithmeticOverflow)?;
     if package_bytes > MAX_KEX_PACKAGE_BYTES {
         return Err(PackageEncodeError::InvalidExecutable);
@@ -983,6 +1019,15 @@ pub fn encode_kex_package(
     package[..8].copy_from_slice(&KEX_PACKAGE_V1_MAGIC);
     write_u16(&mut package, PACKAGE_HEADER_MAJOR, PACKAGE_MAJOR);
     write_u16(&mut package, PACKAGE_HEADER_MINOR, PACKAGE_MINOR);
+    write_u16(
+        &mut package,
+        PACKAGE_HEADER_FLAGS,
+        if completion.is_some() {
+            PACKAGE_FLAG_COMPLETION
+        } else {
+            0
+        },
+    );
     write_u16(
         &mut package,
         PACKAGE_HEADER_BYTES,
@@ -1005,6 +1050,13 @@ pub fn encode_kex_package(
         PACKAGE_HEADER_EXECUTABLE_OFFSET,
         u32::try_from(executable_offset).map_err(|_| PackageEncodeError::ArithmeticOverflow)?,
     );
+    if completion.is_some() {
+        write_u32(
+            &mut package,
+            PACKAGE_HEADER_COMPLETION_OFFSET,
+            u32::try_from(executable_end).map_err(|_| PackageEncodeError::ArithmeticOverflow)?,
+        );
+    }
     write_u64(
         &mut package,
         PACKAGE_HEADER_EXECUTABLE_BYTES,
@@ -1017,11 +1069,14 @@ pub fn encode_kex_package(
     );
     package[KEX_PACKAGE_V1_HEADER_BYTES..executable_offset]
         .copy_from_slice(&manifest[..manifest_bytes]);
-    package[executable_offset..].copy_from_slice(executable);
+    package[executable_offset..executable_end].copy_from_slice(executable);
+    if let Some(completion) = completion {
+        package[executable_end..].copy_from_slice(completion);
+    }
     Ok(package)
 }
 
-/// Parse one exact single-file KEX application package without allocation.
+/// Parse one exact single-file KEX application package.
 ///
 /// This validates the envelope and capability manifest. Call [`parse_kex`] on
 /// [`KexPackage::executable`] before allocating or mapping application pages.
@@ -1045,9 +1100,8 @@ pub fn parse_kex_package(package: &[u8]) -> Result<KexPackage<'_>, PackageError>
     {
         return Err(PackageError::UnsupportedVersion);
     }
-    if read_package_u16(package, PACKAGE_HEADER_FLAGS)? != 0
-        || read_package_u32(package, PACKAGE_HEADER_RESERVED)? != 0
-    {
+    let flags = read_package_u16(package, PACKAGE_HEADER_FLAGS)?;
+    if flags & !PACKAGE_FLAG_COMPLETION != 0 {
         return Err(PackageError::NonzeroReserved);
     }
     let header_bytes = usize::from(read_package_u16(package, PACKAGE_HEADER_BYTES)?);
@@ -1061,6 +1115,9 @@ pub fn parse_kex_package(package: &[u8]) -> Result<KexPackage<'_>, PackageError>
             .map_err(|_| PackageError::InvalidLayout)?;
     let executable_bytes =
         usize::try_from(read_package_u64(package, PACKAGE_HEADER_EXECUTABLE_BYTES)?)
+            .map_err(|_| PackageError::InvalidLayout)?;
+    let completion_offset =
+        usize::try_from(read_package_u32(package, PACKAGE_HEADER_COMPLETION_OFFSET)?)
             .map_err(|_| PackageError::InvalidLayout)?;
     let package_bytes = usize::try_from(read_package_u64(package, PACKAGE_HEADER_PACKAGE_BYTES)?)
         .map_err(|_| PackageError::LengthMismatch)?;
@@ -1079,7 +1136,11 @@ pub fn parse_kex_package(package: &[u8]) -> Result<KexPackage<'_>, PackageError>
         || executable_offset != manifest_end
         || executable_bytes == 0
         || executable_bytes > ApplicationLimits::standard().encoded_bytes()
-        || executable_end != package.len()
+        || (flags == 0 && (completion_offset != 0 || executable_end != package.len()))
+        || (flags == PACKAGE_FLAG_COMPLETION
+            && (completion_offset != executable_end
+                || completion_offset >= package.len()
+                || package.len() - completion_offset > troe_completion::MAX_ARTIFACT_BYTES))
     {
         return Err(PackageError::InvalidLayout);
     }
@@ -1092,10 +1153,97 @@ pub fn parse_kex_package(package: &[u8]) -> Result<KexPackage<'_>, PackageError>
     let executable = package
         .get(executable_offset..executable_end)
         .ok_or(PackageError::InvalidLayout)?;
+    let completion = if flags == PACKAGE_FLAG_COMPLETION {
+        let bytes = package
+            .get(completion_offset..)
+            .ok_or(PackageError::InvalidLayout)?;
+        troe_completion::CompletionArtifact::parse(bytes)
+            .map_err(|_| PackageError::InvalidCompletion)?;
+        Some(bytes)
+    } else {
+        None
+    };
     Ok(KexPackage {
         manifest,
         executable,
+        completion,
     })
+}
+
+/// Locate an embedded CMPL artifact using only the fixed package header and
+/// authoritative file length.
+///
+/// This is the bounded activation-registry path: callers can read 48 header
+/// bytes and then only the small completion range instead of staging an entire
+/// executable. Full application launch still uses [`parse_kex_package`].
+///
+/// # Errors
+///
+/// Rejects incomplete headers, unknown flags or versions, inconsistent file
+/// lengths, and noncanonical completion placement.
+pub fn kex_package_completion_range(
+    header: &[u8],
+    file_bytes: u64,
+) -> Result<Option<(u64, usize)>, PackageError> {
+    if header.len() != KEX_PACKAGE_V1_HEADER_BYTES {
+        return Err(PackageError::TruncatedHeader);
+    }
+    if header[..8] != KEX_PACKAGE_V1_MAGIC {
+        return Err(PackageError::InvalidMagic);
+    }
+    if read_package_u16(header, PACKAGE_HEADER_MAJOR)? != PACKAGE_MAJOR
+        || read_package_u16(header, PACKAGE_HEADER_MINOR)? != PACKAGE_MINOR
+    {
+        return Err(PackageError::UnsupportedVersion);
+    }
+    if usize::from(read_package_u16(header, PACKAGE_HEADER_BYTES)?) != KEX_PACKAGE_V1_HEADER_BYTES {
+        return Err(PackageError::InvalidLayout);
+    }
+    let flags = read_package_u16(header, PACKAGE_HEADER_FLAGS)?;
+    if flags & !PACKAGE_FLAG_COMPLETION != 0 {
+        return Err(PackageError::NonzeroReserved);
+    }
+    let declared = read_package_u64(header, PACKAGE_HEADER_PACKAGE_BYTES)?;
+    if declared != file_bytes
+        || file_bytes > u64::try_from(MAX_KEX_PACKAGE_BYTES).unwrap_or(u64::MAX)
+    {
+        return Err(PackageError::LengthMismatch);
+    }
+    let manifest_offset = u64::from(read_package_u32(header, PACKAGE_HEADER_MANIFEST_OFFSET)?);
+    let manifest_bytes = u64::from(read_package_u32(header, PACKAGE_HEADER_MANIFEST_BYTES)?);
+    let executable_offset = u64::from(read_package_u32(header, PACKAGE_HEADER_EXECUTABLE_OFFSET)?);
+    let executable_bytes = read_package_u64(header, PACKAGE_HEADER_EXECUTABLE_BYTES)?;
+    if manifest_offset != u64::try_from(KEX_PACKAGE_V1_HEADER_BYTES).unwrap_or(u64::MAX)
+        || manifest_bytes > u64::try_from(requirements::MAX_MANIFEST_BYTES).unwrap_or(u64::MAX)
+        || executable_offset != manifest_offset.saturating_add(manifest_bytes)
+        || executable_bytes == 0
+        || executable_bytes
+            > u64::try_from(ApplicationLimits::standard().encoded_bytes()).unwrap_or(u64::MAX)
+    {
+        return Err(PackageError::InvalidLayout);
+    }
+    let executable_end = executable_offset
+        .checked_add(executable_bytes)
+        .ok_or(PackageError::InvalidLayout)?;
+    let completion_offset = u64::from(read_package_u32(header, PACKAGE_HEADER_COMPLETION_OFFSET)?);
+    if flags == 0 {
+        if completion_offset != 0 || executable_end != file_bytes {
+            return Err(PackageError::InvalidLayout);
+        }
+        return Ok(None);
+    }
+    let completion_bytes = file_bytes
+        .checked_sub(completion_offset)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or(PackageError::InvalidLayout)?;
+    if flags != PACKAGE_FLAG_COMPLETION
+        || completion_offset != executable_end
+        || completion_bytes == 0
+        || completion_bytes > troe_completion::MAX_ARTIFACT_BYTES
+    {
+        return Err(PackageError::InvalidLayout);
+    }
+    Ok(Some((completion_offset, completion_bytes)))
 }
 
 fn read_package_u16(bytes: &[u8], offset: usize) -> Result<u16, PackageError> {
@@ -1898,6 +2046,24 @@ mod tests {
     }
 
     #[test]
+    fn package_round_trip_binds_and_locates_completion_without_staging_executable() {
+        let executable = valid_artifact(Target::X86_64);
+        let completion = b"CMPL\t1\techo\n";
+        let bytes = encode_kex_package_with_completion(&executable, &[], Some(completion))
+            .unwrap_or_else(|_| std::process::abort());
+        let package = parse_kex_package(&bytes).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(package.completion(), Some(completion.as_slice()));
+        let range = kex_package_completion_range(
+            &bytes[..KEX_PACKAGE_V1_HEADER_BYTES],
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        )
+        .unwrap_or_else(|_| std::process::abort())
+        .unwrap_or_else(|| std::process::abort());
+        assert_eq!(&bytes[usize::try_from(range.0).unwrap_or(0)..], completion);
+        assert_eq!(range.1, completion.len());
+    }
+
+    #[test]
     fn package_parser_rejects_every_noncanonical_boundary() {
         let executable = valid_artifact(Target::Aarch64);
         let canonical =
@@ -1916,7 +2082,7 @@ mod tests {
             Err(PackageError::UnsupportedVersion)
         );
         invalid = canonical.clone();
-        put_u16(&mut invalid, PACKAGE_HEADER_FLAGS, 1);
+        put_u16(&mut invalid, PACKAGE_HEADER_FLAGS, 2);
         assert_eq!(
             parse_kex_package(&invalid),
             Err(PackageError::NonzeroReserved)
