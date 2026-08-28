@@ -121,10 +121,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="redownload and replace the cached pinned Alpine image",
     )
-    parser.add_argument(
+    version_policy = parser.add_mutually_exclusive_group()
+    version_policy.add_argument(
         "--skip-version-check",
         action="store_true",
-        help="deliberately allow a QEMU version other than the pinned version",
+        help="deliberately allow QEMU outside the supported 8.x-11.x range",
+    )
+    version_policy.add_argument(
+        "--strict-tool-versions",
+        action="store_true",
+        help="require QEMU 11.1.0 and the release-pinned firmware digests",
     )
     parser.add_argument(
         "--dry-run",
@@ -243,6 +249,7 @@ def main() -> int:
                 shared_disk=shared_disk,
                 reset_variables=root_created or args.reset_root_disk,
                 skip_version_check=args.skip_version_check,
+                strict_tool_versions=args.strict_tool_versions,
                 graphical=args.graphical,
                 memory=args.memory,
             )

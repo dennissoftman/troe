@@ -48,7 +48,9 @@ from qemu_profile import (  # noqa: E402
     select_runner,
     validate_runner_catalog,
     variable_store_path,
+    verify_compatible_firmware,
     verify_file_digest,
+    verify_qemu_version,
 )
 import qemu_profile  # noqa: E402
 
@@ -108,6 +110,38 @@ class FirmwareProfileTests(unittest.TestCase):
             artifact.write_bytes(payload[:-1] + b"!")
             with self.assertRaisesRegex(RuntimeError, "digest mismatch"):
                 verify_file_digest(artifact, len(payload), expected)
+
+    def test_compatible_firmware_requires_flash_geometry_and_volume_header(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(prefix="troe-firmware-test-") as directory:
+            artifact = Path(directory) / "OVMF_CODE.fd"
+            payload = bytearray(4 * 64 * 1024)
+            payload[40:44] = b"_FVH"
+            artifact.write_bytes(payload)
+            verify_compatible_firmware(artifact, "x86_64", "code")
+            artifact.write_bytes(payload[:-1])
+            with self.assertRaisesRegex(RuntimeError, "4-KiB aligned"):
+                verify_compatible_firmware(artifact, "x86_64", "code")
+            artifact.write_bytes(bytes(len(payload)))
+            with self.assertRaisesRegex(RuntimeError, "no UEFI firmware-volume"):
+                verify_compatible_firmware(artifact, "x86_64", "code")
+
+    def test_qemu_compatibility_range_and_strict_pin_are_separate(self) -> None:
+        self.assertEqual(
+            verify_qemu_version("QEMU emulator version 8.2.2 (Debian)"),
+            (8, 2, 2),
+        )
+        self.assertEqual(
+            verify_qemu_version("QEMU emulator version 11.1.0", strict=True),
+            (11, 1, 0),
+        )
+        for version in ("7.2.0", "12.0.0"):
+            with self.subTest(version=version):
+                with self.assertRaisesRegex(RuntimeError, "8.x through 11.x"):
+                    verify_qemu_version(f"QEMU emulator version {version}")
+        with self.assertRaisesRegex(RuntimeError, "requires QEMU 11.1.0"):
+            verify_qemu_version("QEMU emulator version 8.2.2", strict=True)
 
     def test_platform_manifest_is_canonical_and_matches_rust_descriptors(self) -> None:
         manifest = platform_manifest()
@@ -653,6 +687,7 @@ class FirmwareProfileTests(unittest.TestCase):
         self.assertEqual(run_args.memory, "256M")
         self.assertFalse(run_args.no_shared_disk)
         self.assertFalse(run_args.reset_shared_disk)
+        self.assertFalse(run_args.strict_tool_versions)
         gui_run_args = RUN_QEMU.parse_args(
             [
                 "--platform",
@@ -704,6 +739,7 @@ class FirmwareProfileTests(unittest.TestCase):
         )
         self.assertEqual(test_args.platform, "all")
         self.assertEqual(test_args.environment, QEMU_ENVIRONMENT)
+        self.assertFalse(test_args.strict_tool_versions)
         self.assertEqual(
             TEST_QEMU.selected_scenarios(test_args), TEST_QEMU.DEFAULT_SCENARIOS
         )
@@ -754,6 +790,29 @@ class FirmwareProfileTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "mutually exclusive"):
             TEST_QEMU.selected_scenarios(smoke_with_scenario)
+
+        strict_run_args = RUN_QEMU.parse_args(
+            [
+                "--platform",
+                X86_64_Q35_UEFI,
+                "--environment",
+                QEMU_ENVIRONMENT,
+                "--strict-tool-versions",
+            ]
+        )
+        self.assertTrue(strict_run_args.strict_tool_versions)
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                RUN_QEMU.parse_args(
+                    [
+                        "--platform",
+                        X86_64_Q35_UEFI,
+                        "--environment",
+                        QEMU_ENVIRONMENT,
+                        "--strict-tool-versions",
+                        "--skip-version-check",
+                    ]
+                )
 
         rejected_argv = (
             (RUN_QEMU, []),

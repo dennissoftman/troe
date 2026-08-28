@@ -1,7 +1,7 @@
 # Comparing TROE with Alpine Linux
 
 `cargo alpine` boots the pinned Alpine Linux 3.24.1 virtual image with the same
-QEMU 11.1.0 runner record used by `cargo qemu`: the same machine type, emulated
+QEMU runner record used by `cargo qemu`: the same machine type, emulated
 CPU, UEFI firmware, one virtual CPU, virtio transport, and user network. Alpine's
 current virtual ISO requires more than TROE's 128 MiB acceptance default, so the
 comparison commands give both guests 256 MiB. The launcher attaches two distinct

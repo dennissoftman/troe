@@ -38,6 +38,7 @@ class ProductionBuildPolicyTests(unittest.TestCase):
         self.assertTrue(parsed.fixture_identities)
         self.assertFalse(parsed.acceptance_probes)
         self.assertFalse(parsed.all_variants)
+        self.assertFalse(parsed.strict_tool_versions)
         self.assertEqual(parsed.volume_table, build.DEFAULT_VOLUME_TABLE)
         custom = build.parse_args(
             [
@@ -53,6 +54,15 @@ class ProductionBuildPolicyTests(unittest.TestCase):
             ["--platform", "all", "--fixture-identities", "--all-variants"]
         )
         self.assertTrue(all_variants.all_variants)
+        strict = build.parse_args(
+            [
+                "--platform",
+                "all",
+                "--fixture-identities",
+                "--strict-tool-versions",
+            ]
+        )
+        self.assertTrue(strict.strict_tool_versions)
         self.assertEqual(build.requested_variants(parsed), (False,))
         self.assertEqual(build.requested_variants(all_variants), (False, True))
         with contextlib.redirect_stderr(io.StringIO()):
@@ -155,6 +165,14 @@ class ProductionBuildPolicyTests(unittest.TestCase):
         self.assertEqual(len(with_qemu), 1)
         self.assertIn("test-qemu.py", str(with_qemu[0][1]))
         self.assertNotIn("build.py", str(with_qemu[0][1]))
+        strict_without_qemu = verification.image_and_qemu_commands(
+            skip_qemu=True, strict_tool_versions=True
+        )
+        strict_with_qemu = verification.image_and_qemu_commands(
+            skip_qemu=False, strict_tool_versions=True
+        )
+        self.assertIn("--strict-tool-versions", strict_without_qemu[0])
+        self.assertIn("--strict-tool-versions", strict_with_qemu[0])
 
     def test_rootfs_image_is_selected_only_by_architecture(self) -> None:
         for architecture in ("x86_64", "aarch64"):
