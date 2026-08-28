@@ -30,6 +30,7 @@ history rather than in current documentation.
 | Process registry, observation, and accounting | [ADR 0045](adr/0045-process-registry-observation-and-accounting.md) |
 | Owner-scoped launch, pipes, and scalable resource tables | [ADR 0046](adr/0046-owner-scoped-process-launch-and-scalable-resource-tables.md) |
 | Filesystem rename/removal and user-space POSIX facade | [ADR 0047](adr/0047-kex-filesystem-tools-and-runtime.md) |
+| Capability-scoped private memory and configurable policy | [ADR 0048](adr/0048-capability-scoped-private-memory-and-resource-policy.md) |
 
 The current serialized contracts are versioned independently under
 [`formats/`](formats):
@@ -50,7 +51,8 @@ The current serialized contracts are versioned independently under
   [package trust](formats/package-trust-v1.md), and
   [configuration projection](formats/config-projection-v1.md),
   [hosted system lifecycle](formats/system-lifecycle-v1.md),
-  [GMAN](formats/gman-v1.md); and
+  [GMAN](formats/gman-v1.md), and
+  [memory policy](formats/memory-policy-v1.md); and
 - identity and authorization metadata: [identity security v1](formats/identity-v1.md).
 
 ## Document status and precedence
