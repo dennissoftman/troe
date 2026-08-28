@@ -2,7 +2,15 @@ NAME
     echo - write arguments
 
 SYNOPSIS
-    echo [ARG...]
+    echo [-n] [-e|-E] [ARG...]
 
 DESCRIPTION
     Writes arguments separated by one space, followed by one newline.
+
+OPTIONS
+    -n  Do not write the trailing newline.
+    -e  Interpret the same C-style escapes accepted by printf %b. A \c escape
+        stops all output, including the trailing newline.
+    -E  Disable escape interpretation; this is the default.
+
+    Compatible options may be combined. -- ends option parsing.

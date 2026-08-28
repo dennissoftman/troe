@@ -63,12 +63,14 @@ class KexToolTests(unittest.TestCase):
                     expected_stack_pages = (
                         64
                         if command == "lua"
+                        else 64
+                        if command == "grep"
                         else 12
                         if command in {"cp", "mv", "rm", "spawn", "tar"}
                         else 8
                         if command in {"arp", "ps", "top"}
                         else 20
-                        if command in {"awk", "grep", "sed"}
+                        if command in {"awk", "sed"}
                         else 4
                     )
                     self.assertEqual(report["stack_pages"], expected_stack_pages)

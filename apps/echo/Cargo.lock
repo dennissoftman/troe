@@ -10,6 +10,14 @@ version = "0.1.0"
 name = "troe-app-echo"
 version = "0.1.0"
 dependencies = [
+ "troe-app-printf",
+ "troe-kex-sdk",
+]
+
+[[package]]
+name = "troe-app-printf"
+version = "0.1.0"
+dependencies = [
  "troe-kex-sdk",
 ]
 

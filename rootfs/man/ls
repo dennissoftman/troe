@@ -1,10 +1,29 @@
 NAME
-    ls - list one directory
+    ls - list files and directories
 
 SYNOPSIS
-    ls [PATH]
+    ls [-1ACFadhlp] [PATH...]
 
 DESCRIPTION
-    Lists immediate children in deterministic lexical order. Directories have
-    a trailing slash and symbolic links have a trailing @. PATH defaults to the
-    current directory.
+    Lists each file operand or the immediate children of each directory in
+    deterministic lexical order. By default, dot names are hidden and entries
+    are placed in rows that fit COLUMNS, or 80 columns when COLUMNS is
+    unavailable. PATH defaults to the current directory. Multiple directory
+    operands receive headings.
+
+OPTIONS
+    -1  Print one entry per line.
+    -C  Use terminal-width columns; this is the default unless -1 is used.
+    -a  Include names beginning with a dot.
+    -A  Include dot names except the special . and .. entries.
+    -d  List directory operands themselves instead of their contents.
+    -F  Append / to directories and @ to symbolic links. The filesystem ABI
+        does not expose executable-mode or special-file classifiers.
+    -p  Append / to directories.
+    -l  Print one entry per line with a node-type marker and byte size. TROE's
+        filesystem ABI does not expose POSIX ownership, modes, or timestamps.
+    -h  With -l, round sizes using 1024-based IEC units such as KiB and GiB.
+
+    Options may be combined. -- ends option parsing. Recursive listing and
+    sorting by size or time are not provided because directory enumeration is
+    intentionally bounded and the filesystem ABI exposes no timestamps.

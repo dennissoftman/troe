@@ -24,6 +24,10 @@ fn main(command: &mut CommandContext) -> u32 {
             common::report(&mut command.stderr(), "printf", b"invalid format");
             exit::USAGE
         }
+        Err(PrintError::InvalidNumber) => {
+            common::report(&mut command.stderr(), "printf", b"invalid number");
+            exit::USAGE
+        }
         Err(PrintError::Output(_)) => common::stream_failure(&mut command.stderr(), "printf"),
     }
 }

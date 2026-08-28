@@ -7,6 +7,8 @@
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
 mod ascii;
 pub mod environment;
@@ -18,6 +20,7 @@ pub mod memory;
 pub mod process;
 pub mod random;
 pub mod time;
+pub mod units;
 
 #[cfg(feature = "alloc")]
 use alloc::{string::String, vec::Vec};

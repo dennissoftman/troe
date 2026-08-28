@@ -7,6 +7,7 @@ license = "Apache-2.0"
 publish = false
 
 [dependencies]
+troe-app-printf = { path = "../printf" }
 troe-kex-sdk = { path = "../../sdk/rust/troe-kex" }
 
 [profile.release]

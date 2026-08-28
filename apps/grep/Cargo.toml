@@ -8,7 +8,7 @@ publish = false
 
 [package.metadata.troe-kex]
 capabilities = ["filesystem-read"]
-stack-pages = 20
+stack-pages = 64
 
 [dependencies]
 troe-kex-sdk = { path = "../../sdk/rust/troe-kex" }

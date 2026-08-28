@@ -2,9 +2,24 @@ NAME
     cat - copy file or input bytes
 
 SYNOPSIS
-    cat [FILE...]
+    cat [-AbEnstTuv] [FILE...]
 
 DESCRIPTION
     Copies each file to standard output in argument order. With no file,
-    copies standard input. Reads are bounded by the mounted filesystem and
-    shell stream limits.
+    copies standard input. A FILE of - also selects standard input. Processing
+    state continues across operands, as though their bytes were concatenated.
+    Reads are bounded by the mounted filesystem and shell stream limits.
+
+OPTIONS
+    -A  Show nonprinting bytes, line ends, and tabs; equivalent to -vET.
+    -b  Number nonempty output lines, overriding -n.
+    -e  Show nonprinting bytes and mark each line end with $; equivalent to -vE.
+    -E  Mark each line end with $.
+    -n  Number every output line.
+    -s  Replace each run of repeated blank lines with one blank line.
+    -t  Show nonprinting bytes and render tabs as ^I; equivalent to -vT.
+    -T  Render tabs as ^I.
+    -u  Write without the 512-byte output aggregation buffer.
+    -v  Render control and high-bit bytes visibly using ^ and M- notation.
+
+    Options may be combined. -- ends option parsing.
