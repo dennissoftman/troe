@@ -115,26 +115,26 @@ ownership, accounting, cancellation, waiting, and teardown machinery, while
 files, directories, byte streams, datagrams, listeners, timers, and control
 services keep typed protocols. There is no universal native file-descriptor,
 generic socket namespace, `ioctl`-style escape hatch, kernel POSIX subsystem, or
-package-resolved scoped-root grant today. A small `no_std` user-space facade now
-layers filesystem algorithms, immutable environment handling, direct process
+package-resolved scoped-root grant in the native recovery command path. A small
+`no_std` user-space facade layers filesystem algorithms, immutable environment handling, direct process
 launch, stable errno translation, UTC calendar/formatting, decimal/math, and
 C-locale helpers over typed capabilities. It is statically compiled into each
 consumer and does not manufacture ambient authority or claim to be a complete
-libc. Broader compatibility and authority extensions are tracked in
-[issues #11](https://github.com/dennissoftman/troe/issues/11) and
-[#6](https://github.com/dennissoftman/troe/issues/6).
+libc. Hosted package resolution already validates generation-scoped directory
+grants; broader native compatibility is tracked in
+[issue #11](https://github.com/dennissoftman/troe/issues/11), while production
+package activation remains in the Stage 9 tracker.
 
 ## Allocation
 
 Portable components use `alloc` but every untrusted growth path has a local
-hard bound. Stage 1 obtained allocation from UEFI. Stage 2 installs a hybrid
-adapter: it delegates only before the explicit arena exists, then routes all new
-allocations to the owned TLSF heap. Once handoff completes, firmware fallback is
-permanently disabled. Pre-arena loader allocations, if any, are retained rather
-than passed to dead boot services.
+hard bound. Before the explicit arena exists, the hybrid adapter delegates to
+UEFI; afterward it routes every new allocation to the owned TLSF heap. Once
+handoff completes, firmware fallback is permanently disabled. Pre-arena loader
+allocations, if any, are retained rather than passed to dead boot services.
 
-Stage 2 begins with an architecture-independent memory-map model in
-`troe-memory`. It validates checked 4 KiB ranges, normalizes unordered firmware
+The architecture-independent memory-map model in `troe-memory` validates
+checked 4 KiB ranges, normalizes unordered firmware
 descriptors, overlays bounded explicit reservations, and reports usable and
 reserved bytes. It also models checked, aligned monotonic allocation over one
 explicitly reserved boot arena, including padding, exhaustion, and sealing
@@ -154,7 +154,7 @@ memory and never aliases a normal-memory mapping. `mem` and `/sys/memory`
 publish owned-map bytes, free/total frames, and live heap use, capacity,
 high-water, and failure counts.
 
-Stage 3 adds a pure, bounded mapping plan. The composition root identity-maps
+A pure, bounded mapping plan identity-maps
 only runtime RAM, PE-classified image sections, the boot arena, framebuffer,
 and selected UART/interrupt-controller apertures. Physical aliases are accepted
 only when their combined permissions preserve global W^X. The native backend
@@ -169,7 +169,7 @@ The post-handoff shell invokes no firmware protocol or allocator and cannot
 manipulate page tables or exception vectors. Authorized `poweroff` and `reboot`
 use the pinned platform profile's native ACPI/PSCI control mechanism; a request
 that unexpectedly returns parks the CPU terminally.
-Stage 4 adds a bounded cooperative scheduler policy in `troe-task`. Task IDs
+`troe-task` provides a bounded cooperative scheduler policy. Task IDs
 are monotonic, records have ready/running/exited lifecycles, capability sets are
 checked during dispatch, and a record retains its stack resource until explicit
 reaping. The native mechanism executes one continuation step synchronously on
@@ -186,29 +186,31 @@ both sides, while the payload is RW/NX. Boot verification
 interleaves two services, checks deterministic yield/exit counts, reaps their
 records, and reuses a returned slot before launching the shell on the third.
 The shell record alone carries console, filesystem, and machine-control
-capabilities. Cooperative scheduling still provides no preemption or hardware
-isolation: code that never yields can monopolize the CPU, and privileged memory
-unsafety can corrupt any task.
+capabilities. This privileged cooperative scheduler does not preempt its own
+continuations or provide a protection boundary: code that never yields can
+monopolize the CPU, and privileged memory unsafety can corrupt any task.
+Isolated KEX applications use the separate 50 ms leased preemption boundary
+described below.
 
-Stage 5 adds `troe-dispatch` between selected clients and services. A port names
+`troe-dispatch` connects selected clients and services. A port names
 one registered service; a generation-checked handle names explicit call
 authority to that port. Port and handle tables grow fallibly from small initial
 reservations to hard ceilings of 65,536 ports and 262,144 handles, and stale
 identities remain invalid when slots are reused. One synchronous request
 borrows at most 4 KiB of immutable input and produces at most 4 KiB of owned
 reply bytes with a matching monotonic request ID and typed service status.
-Because the dispatcher is exclusively borrowed for delivery, Stage 5 has no
+Because the dispatcher is exclusively borrowed for delivery, it has no
 queued cancellation state: closing before a call invalidates the handle, and a
 delivered call completes before another mutation can occur.
 
-The first switched edge is native console output. `ConsoleService` converts a
+Native console output uses `ConsoleService` to convert a
 bounded write request into the existing `Output` operation, while
 `DispatchedOutput` presents the same byte-stream trait to the shell. Requests
 larger than one message are split through ordinary partial-write semantics.
 Fatal diagnostics and input delivery remain direct machine mechanisms. This
-original path is still in-process dispatch, not IPC: service code shares the
+path is in-process dispatch, not IPC: service code shares the
 caller's privileged address space, borrowed request bytes are not a wire format,
-and service faults are not contained. Diagnostics is the first narrow
+and service faults are not contained. Diagnostics is a narrow
 exception: its immutable snapshot crosses a canonical copied
 receive/reply transport to an isolated KEX server, while the remaining
 registered services stay in-process.
@@ -216,13 +218,13 @@ registered services stay in-process.
 Server-endpoint calls use fixed kernel request/reply buffers and let the
 endpoint encode directly into caller-owned reply storage. The protected
 receive-to-reply interval therefore performs no dynamic allocation while still
-copying across the protection boundary. The first composition retains at most
+copying across the protection boundary. The diagnostics composition retains at most
 one request and one suspended server context. It launches one server process
 per client request and implements no persistent residency or restart policy.
 Persistent services are tracked in
 [GitHub issue #8](https://github.com/dennissoftman/troe/issues/8).
 
-Stage 5.1 adds `troe-terminal`, which keeps transport-independent input
+`troe-terminal` keeps transport-independent input
 decoding, line editing, history, and fixed-glyph text rendering outside the
 machine mechanism. `troe-shell` owns completion because it has the VFS namespace
 and its revision-aware `/bin` catalog; both command candidates and directory
@@ -231,7 +233,7 @@ composition root uses the single Standard resource policy. x86-64 decodes
 US set-1 scan codes from q35 i8042, while both architectures retain serial
 input. AArch64 has no native keyboard transport and uses serial input.
 
-Stage 5.2 adds the portable `troe-driver` resource and event boundary. Queue
+The portable `troe-driver` crate defines the resource and event boundary. Queue
 capacity and maximum ISR drain come from the Standard portable policy;
 controller routes, vectors, trigger/polarity, and priority come from the
 validated VM platform descriptor. The pinned x86-64 platform
@@ -242,18 +244,18 @@ state, perform bounded non-allocating device work, and enqueue typed raw bytes;
 decoding and editing remain in main context. An empty queue executes a
 lost-wakeup-safe `sti; hlt` or IRQ-masked `dsb; wfi` transition followed by
 pending-handler dispatch. Direct polling is retained only for bootstrap and
-fatal recovery, and no timer or preemption is introduced. `mem` and
+fatal recovery. `mem` and
 `/sys/memory` expose queue, interrupt, delivery, drop,
 idle, and wakeup accounting; byte-valued memory counters retain exact values
 and add binary IEC `KiB`/`MiB`/`GiB` displays.
 
-Stage 6 adds fresh task roots built from the supervisor kernel plan. Stage 7
-raises the bounded user-region summary to nineteen: at most sixteen KEX image
+Fresh task roots are built from the supervisor kernel plan. The bounded
+user-region summary has nineteen entries: at most sixteen KEX image
 segments plus startup, heap, and stack. x86 page-table traversal and leaves use
 U/S and enter through a DPL-3 gate with TSS RSP0; AArch64 leaves use AP/PXN/UXN
 and enter EL0t through the lower-EL vector with SP_EL1. The native boundary
-preserves ABI callee-saved integer and floating-point/SIMD state and masks
-interrupts for the current cooperative, non-preemptive continuation.
+preserves ABI callee-saved integer and floating-point/SIMD state for the current
+resumable leased continuation.
 
 One internal exit gate validates opcode, status, the complete readable user
 range, and a preallocated 4 KiB destination before copying. Its result becomes
@@ -272,7 +274,7 @@ exercise; destructive KEX payloads and malformed corpus cases are feature-gated
 and marker-rejected by the production EFI builder. See
 [ADR 0014](adr/0014-unprivileged-task-isolation-and-teardown.md).
 
-The native Stage 7 boundary copies KEX bytes into bounded kernel staging
+The native KEX boundary copies executable bytes into bounded kernel staging
 and consumes the complete portable plan before allocating or mapping. It packs
 fresh physical image pages beside a separate exact table allocation, maps sparse
 image virtual ranges with their closed R/RX/RW permissions, places the startup,
@@ -285,13 +287,13 @@ backends still enforce the standard 512-page ceiling. A provisional task receive
 loader-selected handle; boot acceptance then revokes it,
 reaps the record, zeroes every provisional frame, and verifies exact reuse.
 Malformed native corpus cases fail before frame allocation. Application entry
-now resets visible register/control state, passes only the startup address and
+resets visible register/control state, passes only the startup address and
 length, and enables IRQs after arming a 50 ms one-shot. x86 normalizes x87 and
 SSE operation and saves the complete FXSAVE image; AArch64 enables baseline
 FP/Advanced SIMD and saves all 32 128-bit vector registers plus FPCR/FPSR.
 Unsaved AVX-family, SVE, and SME state remains disabled rather than leaking or
 corrupting across tasks. ABI call 0 exits through the owned gate. The x86
-local-APIC and AArch64 generic physical timers now capture a complete resumable
+local-APIC and AArch64 generic physical timers capture a complete resumable
 user context when the 50 ms timeslice expires. A separate spinning KEX proves
 that preemption boundary before acceptance cleanup. Ordinary commands have no
 command-wide runtime deadline. ABI gates also capture a
@@ -313,14 +315,14 @@ no fixed lifetime heap-size policy is applied.
 ADR 0037 retains foreground, background, and service applications in
 one bounded event loop. A single CPU executes only one ring-3/EL0 continuation
 at an instant, but timer preemption, yields, service calls, and typed waits let
-the resident set make concurrent progress. ADR 0045 adds a process registry
+the resident set make concurrent progress. ADR 0045 defines a process registry
 with stable process IDs, scheduler-paired ready/running/blocked/stopping states,
 exact retained-page counts, and high-resolution CPU ticks charged only around
 unprivileged execution. The `process-observe` capability exposes this bounded
 metadata to `ps.kex` and `top.kex`; it hides argv and grants neither memory
 inspection nor process control.
 
-ADR 0046 adds owner-scoped nested process launch and byte pipes. A launcher
+ADR 0046 defines owner-scoped nested process launch and byte pipes. A launcher
 passes canonical cwd, argv, environment, and explicit inherited/null/pipe
 standard streams; the kernel resolves and validates `/bin/<name>.kex`, grants
 only a child-manifest attenuation of the launcher's own capabilities, and
@@ -335,19 +337,18 @@ Task, process, wait, pending-call, dispatch, child, pipe, and resident tables us
 small initial `Vec` reservations and fallible on-demand growth. Tasks, process
 records, waits, pending calls, children, and pipes have 65,536-object system
 hard ceilings; handles have a 262,144 ceiling. These are allocation and token
-safety backstops, not preallocated arrays. A future typed system configuration
-can impose lower per-process soft limits and raise them up to the compiled hard
-ceiling.
+safety backstops, not preallocated arrays. No typed per-process soft-limit
+configuration is implemented, so the compiled hard ceilings are authoritative.
 The same registry rule gives each application up to 4,096 generation-checked
 read-only file tokens, grows UDP bindings from 64 to the 16,384-port ephemeral
 range ceiling, and grows the ARP cache to 256 entries without a maximum-sized
 initial allocation. Fixed wire batches and parser/security depth bounds remain
 separate versioned policies.
 
-The Stage 9 command slice installs one canonical package per command. Its KCAP
+The command path installs one canonical package per command. Its KCAP
 manifest is validated from the same staged file before optional services are
 constructed, and its embedded KEX v1 executable is validated before mapping.
-It layers command-invocation 1.0 and standard-stream 1.1 services on that
+It layers command-invocation 1.1 and standard-stream 1.1 services on that
 mechanism: immutable cwd/argv, stdin, stdout, and stderr. The shell logically yields while
 one foreground application runs, then resumes only after owner-wide handle
 revocation, record reaping, page zeroization, and exact frame return. Artifacts
@@ -385,7 +386,7 @@ granted. The separate volume-control interface can list the boot policy and
 activate only a BMNT-authorized provider already prepared by stable-identity
 discovery; it cannot name raw devices or arbitrary target paths.
 
-## Stage 8 persistent-storage boundary
+## Persistent-storage boundary
 
 The portable block-region, GPT, VFS-provider, read/write FAT32, constrained
 metadata-preserving ext4 with bounded symbolic/hard links, native virtio
@@ -425,8 +426,8 @@ through TXSLOT, and attaches at `/vol/state`. The VFS mount records writable
 authority explicitly; ext4 and FAT mutate only through manifest-selected
 writable block-region capabilities.
 
-Stage 9 adds a hosted deployment control-plane reference above these native
-primitives. It consumes one complete PLOCK and active signed release per locked
+The hosted deployment control-plane reference consumes one complete PLOCK and
+active signed release per locked
 member, stages and independently verifies immutable generation objects, and
 publishes one pending/healthy pointer. Desired configuration persists outside
 generations while each generation owns an exact read-only `/sys/config`
@@ -437,7 +438,7 @@ Reachability GC retains active, previous, recovery, and in-flight transaction
 roots. Native boot continues to consume CSPK/GMAN and SACT/TXSLOT rather than
 parsing hosted filesystem metadata. See [ADR 0044](adr/0044-transactional-system-lifecycle.md).
 
-The first network boundary is likewise split between safe protocol policy and
+The network boundary is split between safe protocol policy and
 machine transport. `troe-net` owns strict bounded Ethernet/ARP/IPv4/UDP parsing,
 construction, and count-plus-byte receive admission. `troe-machine` owns the
 fixed-buffer modern virtio-net queues for the pinned PCI and MMIO profiles.

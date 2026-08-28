@@ -9,7 +9,7 @@ DESCRIPTION
     one minute, five minutes, thirty minutes, then hourly. It is intended to run
     under the SCFG service supervisor.
 
-    The initial example targets the QEMU gateway at 10.0.2.2. The application
+    The bundled example targets the QEMU gateway at 10.0.2.2. The application
     validates an SNTPv4 server reply, echoed originate token, stratum, source,
     and nonzero timestamps. It supports NTP era zero through 2036 and requires
     datagram, monotonic timer, and privileged clock-control authority.

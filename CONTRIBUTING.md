@@ -5,10 +5,11 @@ charge, failure behavior, and machine dependency.
 
 ## Issues
 
-Repository documentation describes implemented behavior, accepted decisions,
-formats, and historical evidence. GitHub issues own unimplemented work, design
-questions, and delivery status. Search open and closed issues before filing a
-new one, then choose the matching issue form:
+Repository documentation describes current implemented behavior, accepted
+decisions, formats, and verification. GitHub issues own unimplemented work,
+design questions, and delivery status. Git history owns obsolete behavior and
+past evidence. Search open and closed issues before filing a new one, then
+choose the matching issue form:
 
 - **Bug:** implemented behavior differs from its documented or tested contract.
 - **Implementation:** a concrete, actionable outcome with acceptance and
@@ -36,6 +37,11 @@ justifies the work.
 Closing an issue does not by itself make a capability current. The implementing
 change must update source, tests, formats, and current-behavior documentation
 together, link the issue, and show that every acceptance criterion is satisfied.
+Before removing useful roadmap or deferred-work direction from documentation,
+ensure that it is represented by a live issue or milestone; move it there first
+when necessary. Do not retain superseded limits, old status snapshots, or
+point-in-time measurements outside ADRs merely as an archive because Git
+already preserves them.
 Report security vulnerabilities through [`SECURITY.md`](SECURITY.md), not a
 public issue.
 

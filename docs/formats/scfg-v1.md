@@ -1,7 +1,7 @@
 # SCFG version 1
 
 SCFG v1 is the immutable desired-system and service-startup configuration used
-by the first Stage 8 configuration boundary. All integers are little-endian.
+by the current configuration boundary. All integers are little-endian.
 The product-name-independent magic is `SCFGv1`, followed by two zero bytes.
 
 The 64-byte header contains the format major/minor, fixed header and record

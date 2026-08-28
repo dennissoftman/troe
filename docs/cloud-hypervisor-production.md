@@ -171,7 +171,7 @@ failed run is not acceptance evidence, even if an earlier phase passed.
 - The host cost is one Linux x86-64 KVM machine for the duration of acceptance.
   No cloud vendor, paid instance type, or recurring service is implied. Provider
   pricing and tenancy are outside this environment claim and must be recorded
-  if a future provider-specific row is proposed.
+  for any separately proposed provider-specific row.
 
 ## Recovery and operator diagnostics
 

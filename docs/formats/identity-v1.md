@@ -1,6 +1,6 @@
 # Identity security formats v1
 
-Stage 8 identity state is four immutable, checksummed objects selected together
+Generation identity state is four immutable, checksummed objects selected together
 by one ISEC v1 content-store manifest. All integers are little-endian. Every
 format requires major/minor `1.0`, exact total length, CRC32 coverage with the
 checksum field zero, and zero reserved bytes. The standard policy accepts

@@ -1,7 +1,6 @@
 # KEX v1 executable format
 
-KEX v1 is the canonical static executable input for the Stage 7 application
-loader selected by
+KEX v1 is the canonical static executable input for the application loader selected by
 [ADR 0015](../adr/0015-kex-application-abi-and-execution-bounds.md). The
 portable application-format parser is authoritative. This document fixes its
 byte representation for SDK converters and rejection-corpus tools. Installed
@@ -118,8 +117,8 @@ cargo kex convert app.elf app.kex --target x86_64
 cargo kex convert app.elf app.kex --target x86_64 --check
 ```
 
-The prior `tools/elf2kex.py` implementation remains an independent parity and
-rejection oracle during the Rust-tool migration; it is not the build entrypoint.
+`tools/elf2kex.py` remains an independent parity and rejection oracle; it is not
+the build entrypoint.
 
 The shared generated corpus lives under `tests/kex-corpus`; its exact file set
 and bytes are checked with `python3 tools/gen_kex_corpus.py --check`.
@@ -176,5 +175,6 @@ KEX v1 carries no sections, symbols, interpreter, dynamic metadata, imports,
 exports, relocations, TLS, compression, capabilities, signatures, device
 mappings, or shared-memory contract. The hosted SDK must resolve link-time
 relocations for the fixed image base and reject every residual runtime
-requirement before emitting KEX. Future package identity and trust metadata wrap
-KEX rather than changing this executable parser implicitly.
+requirement before emitting KEX. Package identity and trust metadata wrap KEX
+through their separately versioned formats rather than changing this executable
+parser implicitly.

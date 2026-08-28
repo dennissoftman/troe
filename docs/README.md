@@ -1,9 +1,10 @@
 # Documentation guide
 
 TROE keeps current behavior, normative contracts, accepted decisions, and
-historical evidence in the repository. Work that is not implemented belongs in
-the GitHub issue tracker so proposed behavior cannot be mistaken for a current
-contract.
+current verification guidance in the repository. Work that is not implemented
+belongs in the GitHub issue tracker so proposed behavior cannot be mistaken for
+a current contract. Obsolete behavior and past evidence remain available in Git
+history rather than in current documentation.
 
 ## Where to look
 
@@ -52,16 +53,20 @@ The current serialized contracts are versioned independently under
   [GMAN](formats/gman-v1.md); and
 - identity and authorization metadata: [identity security v1](formats/identity-v1.md).
 
-## How to interpret older material
+## Document status and precedence
 
-- Files under [`adr/`](adr) preserve accepted decisions and rationale for
-  implemented behavior. Each ADR's status header records implementation or
-  supersession state.
-- Files under [`evaluations/`](evaluations) are point-in-time evidence. Their
-  measurements and findings remain useful, but their status prose is not live.
+- Files under [`adr/`](adr) are the only documentation allowed to preserve
+  historical decisions and rationale. Each ADR's status header records
+  implementation or supersession state.
+- Other repository documentation describes the current implementation,
+  contracts, and verification only. Point-in-time results, previous limits, and
+  superseded behavior belong in Git history.
 - The Core Specification contains durable requirements for implemented system
   boundaries. GitHub issues carry proposed extensions and their acceptance
   criteria.
+
+Before deleting still-useful roadmap or deferred-work direction, verify that a
+live issue or milestone carries it and move it there first if necessary.
 
 Closing an issue does not by itself make a capability current. Source, tests,
 formats, and current-behavior documentation must land together before the

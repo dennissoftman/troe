@@ -9,11 +9,11 @@ and reserving a range never changes the ownership of a live allocation. Debug an
 model builds detect invalid and double frees. Use a bounded monotonic allocator
 before the general heap.
 
-The general-heap evaluation selected pinned `rlsf` 0.2.3: a maintained,
+The general-heap decision selected pinned `rlsf` 0.2.3: a maintained,
 constant-time, two-level segregated-fit implementation supporting `no_std` and
 MIT OR Apache-2.0 licensing. The machine adapter supplies locking, UEFI fallback
 before arena installation, ownership switching, counters, and bounded failure
-probing. See [../evaluations/0001-general-heap.md](../evaluations/0001-general-heap.md).
+probing.
 
 A linked-list-only frame allocator was rejected because fragmented firmware
 maps make ownership queries and invalid-free detection harder. A general buddy

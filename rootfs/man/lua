@@ -33,7 +33,7 @@ DESCRIPTION
     the application executes unprivileged code. Kernel services, waiting, and
     descheduled time are excluded. os.time() returns whole Unix seconds from
     TROE's wall clock. os.time(table) and os.date implement the standard calendar
-    interface in UTC; TROE currently has no per-process timezone database or
+    interface in UTC; TROE has no per-process timezone database or
     daylight-saving setting. Wall time is not monotonic and may step when corrected. For an
     end-to-end benchmark long enough to tolerate one-second resolution, use
     os.time() before and after the workload. That elapsed result includes kernel
@@ -63,8 +63,8 @@ DESCRIPTION
 
     Filesystem, environment, process, errno, calendar, decimal, math, and
     C-locale algorithms come from the shared no_std TROE KEX runtime. The Lua
-    image hard-compiles that code today; it is not yet a complete or dynamically
-    linked libc.
+    image statically links that code. The runtime is neither a complete libc nor
+    dynamically linked.
 
     Lua uses a bounded 1 MiB TLSF heap. Exhausting the heap raises a normal protected Lua memory error;
     it cannot grow memory or access ambient host resources.

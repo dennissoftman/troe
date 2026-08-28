@@ -17,7 +17,8 @@ can remain direct or whose pointer span can be validated once. The companion
 [`sdk/c/troe-kex-runtime`](../../c/troe-kex-runtime) source supplies standard C
 symbols that inherently operate on C pointers or varargs.
 
-Planned layers are a frozen C ABI and errno contract, capability-scoped file
-descriptors, `stat`/`open`/`read`/`write`, bounded `DIR` iteration, allocator
-integration, and finally reusable buffered `FILE` streams. Until those exist,
-this crate must not be described as libc.
+The current surface does not include a frozen general C ABI, capability-scoped
+file descriptors, `stat`/`open`/`read`/`write`, bounded `DIR` iteration, a shared
+allocator ABI, or reusable buffered `FILE` streams. This crate must therefore
+not be described as libc. Reusable-runtime and optional compatibility direction
+is tracked in GitHub issues #10 and #11.

@@ -15,8 +15,9 @@ isolated command-line applications, persistent state, and virtio networking.
 Most of TROE is portable `no_std` Rust. Project-authored unsafe code is confined
 to one audited machine boundary; portable crates forbid it.
 
-> **Project status:** TROE runs in QEMU today. It is a research and development
-> project, not yet a general-purpose OS or production cloud image. See the
+> **Project status:** TROE runs in the accepted QEMU environments. It is a
+> research and development project, not a general-purpose OS or production
+> cloud image. See the
 > [Stage 9 tracking issue](https://github.com/dennissoftman/troe/issues/14).
 
 ## Why TROE?
@@ -37,7 +38,7 @@ bounded fallibly growing resource tables, deterministic image builds, and exact
 dependency and firmware profiles. Small is a policy here, not just a current
 measurement.
 
-## What runs today
+## What runs
 
 - Native UEFI boots on x86-64 and AArch64.
 - Serial and framebuffer consoles with UTF-8 line editing, history, completion,
@@ -190,7 +191,7 @@ $ cargo kex inspect rootfs/bin/x86_64/echo.kex
 Start exploring with [`apps/echo`](apps/echo) and the
 [`troe-kex` Rust SDK](sdk/rust/troe-kex).
 
-The essential filesystem command set now includes streamed `cp`, iterative
+The essential filesystem command set includes streamed `cp`, iterative
 `cp -r`/`cp -R`, atomic same-provider `mv`, recursive `rm -r`/`rm -R`, and
 `rmdir`. Recursive commands reproduce symbolic links without following them
 and retain only fallibly grown, explicitly bounded traversal metadata. Shared
@@ -202,18 +203,17 @@ C-locale formatting/classification, decimal/math, and non-cryptographic seed
 helpers. Allocation-backed recursive filesystem operations are a separate
 feature so embedders can retain their own allocator policy.
 
-[`apps/spawn`](apps/spawn) is the first process-launch consumer. It resolves a
+[`apps/spawn`](apps/spawn) resolves a
 nested KEX package through the owner-scoped launch capability, inherits or
 captures standard output through a bounded pipe, waits, reaps, and preserves
-the child's complete exit status. This proves the process mechanism without
-putting shell grammar in the kernel; `sh.kex` has not yet adopted it.
+the child's complete exit status without putting shell grammar in the kernel.
 
 [`apps/lua`](apps/lua) is a complete freestanding Lua 5.5.1 interpreter. It
 supports stock command-line actions and the complete standard library surface,
 including file mutation, `os.execute`, and read/write `io.popen` through explicit
 KEX capabilities. It starts with a 1 MiB TLSF application heap, reports
 process-CPU time through `os.clock`, and exposes whole-second Unix wall time
-through `os.time`. Lua now hard-compiles the shared Rust KEX runtime plus a
+through `os.time`. Lua statically links the shared Rust KEX runtime plus a
 small SDK-owned freestanding C compatibility core instead of owning duplicate
 filesystem, environment, process, calendar, decimal, math, or C-locale
 algorithms. The remaining platform limits are explicit: UTC and the C locale
@@ -222,15 +222,15 @@ raw filesystem access.
 
 [`apps/sh`](apps/sh) transactionally stages a bounded UTF-8 command file through
 the typed shell-script sidecar, then the owning session executes each validated
-physical line with the normal TROE pipeline and redirection grammar. The first
-version intentionally omits variables, control flow, substitution, multiline
+physical line with the normal TROE pipeline and redirection grammar. The
+current grammar omits variables, control flow, substitution, multiline
 constructs, and direct shebang execution.
 
-KEX images are statically linked today. A bounded, single-package dynamic
+KEX images are statically linked. A bounded, single-package dynamic
 linking design for reusable libc and language runtimes is tracked in
 [GitHub issue #10](https://github.com/dennissoftman/troe/issues/10).
 
-Hosted Stage 9 tooling now models deterministic multi-package locks, signed
+Hosted Stage 9 tooling models deterministic multi-package locks, signed
 release verification, and transactional system generations without making the
 kernel invoke host tools. Start with `python3 tools/troe.py --help`,
 `python3 tools/troe_trust.py --help`, and
@@ -338,7 +338,7 @@ explicit provisioning workflow.
 | [`rootfs/`](rootfs) | Root filesystem and packaged applications |
 | [`host/`](host) | Hosted shell model |
 | [`scripts/`](scripts) | Build, test, and QEMU entry points |
-| [`docs/`](docs) | Architecture, formats, decisions, security notes, and historical evaluations |
+| [`docs/`](docs) | Current architecture, formats, decisions, security, and testing guidance |
 
 The [documentation guide](docs/README.md) indexes the deeper material:
 

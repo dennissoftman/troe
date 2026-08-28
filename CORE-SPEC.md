@@ -5,15 +5,12 @@
 **Primary targets:** QEMU `x86_64`, QEMU `aarch64`  
 **Implementation language:** Rust (`no_std`)  
 
-**Implementation status:** Stages 0–8 are implemented. Stage 8 includes bounded
-native block/network transports, deterministic persistent-volume selection,
-immutable generation content, crash-consistent activation/rollback and selected
-state mutation, plus generation-bound identity/mapping metadata. Stage 7 includes
-the portable KEX parser/load-plan policy, native
-validate/map/reclaim transactions, the complete ABI 1.1 boundary, contained
-fault fates, and enforced 50 ms execution leases. The product-facing command
-slice supplies KEX-only ordinary commands, typed application services, and the
-repo-local SDK. Work beyond the implemented contract is tracked in
+**Implementation status:** The current native system has bounded block/network
+transports, deterministic persistent-volume selection, immutable generations,
+crash-consistent activation/rollback, generation-bound identity/configuration,
+static KEX validation and isolation, resident scheduling and process launch,
+typed application services, and a repo-local SDK. No non-QEMU production
+environment is accepted. Work beyond the implemented contract is tracked in
 [GitHub issues](https://github.com/dennissoftman/troe/issues).
 
 The product name is TROE (Tiny Rust Operating Environment), and `troe` is the
@@ -38,10 +35,14 @@ It is an experiment in whether an operating environment can be simultaneously:
 - useful enough for interactive inspection and text manipulation;
 - portable across x86-64 and AArch64 through a narrow machine boundary;
 - robust by construction, with unsafe code isolated and audited;
-- capable of evolving toward tasks, message passing, and isolation without beginning as a full microkernel;
-- compact enough to aspire to a 1.44 MB boot image, while never exceeding a 16 MB experimental ceiling without an explicit specification change.
+- built around bounded tasks, typed message passing, and isolated KEX processes
+  without claiming a complete microkernel service split; and
+- compact enough to fit the current 8 MiB boot container while never exceeding
+  a 16 MiB experimental ceiling without an explicit specification change.
 
-The system is not a miniature Linux distribution. It does not initially host conventional userspace programs, implement POSIX, or reproduce historical Unix internals. It borrows selected ideas and discards their accidental complexity.
+The system is not a miniature Linux distribution. It does not load conventional
+host ELF programs, implement POSIX, or reproduce Unix internals wholesale. It
+borrows selected ideas and discards their accidental complexity.
 
 ## 2. Design thesis
 
@@ -91,17 +92,17 @@ The current system intentionally makes none of the following claims. This list
 defines the implemented boundary; it is not automatically a backlog:
 
 - POSIX conformance;
-- `fork`, `exec`, signals, pipes as kernel objects, and a stable Unix syscall ABI;
+- `fork`, address-space replacement `exec`, signals, and a stable Unix syscall ABI;
 - ELF userspace loading or dynamic linking;
 - interactive users, login authentication, or a general multi-principal
   authorization engine;
-- preemptive multitasking, SMP, and general-purpose scheduling;
+- SMP and general-purpose scheduling policy;
 - a POSIX socket API or general-purpose network stack;
 - a general device manager, USB stack, graphics stack, or audio stack;
 - demand paging, swap, memory overcommit, and copy-on-write;
 - a Linux-compatible `/proc`, `/sys`, or `/dev` ABI;
 - arbitrary loadable kernel modules;
-- full shell scripting, globbing, job control, or command substitution;
+- full shell scripting, globbing, POSIX process groups, or command substitution;
 - a claim of zero defects or zero vulnerabilities.
 
 The project instead aims for **no known vulnerabilities, explicit invariants,
@@ -114,19 +115,19 @@ GitHub issues represent work beyond this boundary.
 The current native command execution model remains deliberately narrow:
 
 ```text
-+------------------------------------------+
-| session shell: cd, poweroff, reboot      |
-+------------------------------------------+
-| scheduler | handles | copied call gate  |
-+------------------------------------------+
-| one bounded ring-3/EL0 KEX application   |
-+------------------------------------------+
-| streams | VFS | memory | terminal       |
-+------------------------------------------+
-| compile-time x86-64/AArch64 backend      |
-+------------------------------------------+
-| UEFI bootstrap / QEMU / hardware         |
-+------------------------------------------+
++--------------------------------------------------------------+
+| shell: cwd, jobs, services, lifecycle, immutable KEX lookup   |
++--------------------------------------------------------------+
+| resident scheduler | process registry | handles | copied IPC |
++--------------------------------------------------------------+
+| isolated KEX set; one ring-3/EL0 continuation executes/CPU   |
++--------------------------------------------------------------+
+| typed streams | pipes | VFS | network | timer | diagnostics  |
++--------------------------------------------------------------+
+| named x86-64/AArch64 platform and execution environment      |
++--------------------------------------------------------------+
+| UEFI bootstrap and owned kernel machine boundary             |
++--------------------------------------------------------------+
 ```
 
 There is:
@@ -137,8 +138,8 @@ There is:
   slots, and an owned unmapped-guard user stack for each admitted isolated
   process;
 - one global physical-memory owner;
-- at most eight retained resident application records, with one selected for an
-  execution slice at a time;
+- at most 65,533 retained resident application records under the 65,536-task
+  system ceiling, with one selected for an execution slice at a time;
 - a ring-3/EL0 memory and fault boundary for the bounded isolated continuation;
 - no application ABI for shell session or machine-control mutation;
 - scheduler-owned resumable preemption with a 50 ms maximum uninterrupted
@@ -331,8 +332,8 @@ perform interpolation. The parser MUST:
 - never panic on arbitrary byte input.
 
 There are no shell expansions, variables, or command substitution. Pipelines
-contain at most eight sequential stages and each intermediate stream is capped
-at 64 KiB; overflow fails explicitly. A final unquoted `&` is accepted only for
+contain at most 255 sequential stages and each intermediate stream is capped
+at 1 MiB; overflow fails explicitly. A final unquoted `&` is accepted only for
 one external-command stage. Background standard input is EOF and output/error
 enter a bounded 64 KiB recent log, so asynchronous bytes do not corrupt the
 interactive prompt. Concurrent background pipelines are not part of this
@@ -375,9 +376,9 @@ contained teardown, not a POSIX signal ABI.
 SCFG services stay in the foreground under one bounded direct supervisor. They
 do not fork, detach, use PID files, or become shell jobs. The supervisor retains
 exact task ownership, desired and observed state, dependency and restart policy,
-and bounded recent logs. The `svc` intrinsic controls stable SCFG names. The
-first implementation treats transactional process admission as service
-readiness; an explicit lifecycle-ready ABI is not yet part of KEX.
+and bounded recent logs. The `svc` intrinsic controls stable SCFG names.
+Transactional process admission is the current service-readiness signal; KEX
+has no explicit lifecycle-ready ABI.
 
 ### 11.4 Required commands
 
@@ -543,7 +544,7 @@ filesystem or partition-format logic. The current build statically composes
 only the selected KEFS, RAMFS, FAT32, constrained ext4 v1, and StateFS
 providers.
 
-KEFS is the immutable recovery filesystem, the fixed FAT12 image is only the
+KEFS is the immutable recovery filesystem, the fixed FAT16 image is only the
 firmware-read boot container, constrained ext4 v1 is the default persistent
 content volume, FAT32 provides bounded interoperability, and StateFS owns its
 single bounded state object. No raw foreign UID, GID, SID, ACL, or security
@@ -766,7 +767,10 @@ CI MUST report unsafe block count and SHOULD fail if it increases without an acc
 
 ## 17. Concurrency and synchronization
 
-The initial kernel is single-core and non-preemptive. Interrupt handlers, if enabled, MUST do bounded work and MUST NOT allocate unless the allocator explicitly supports that context.
+The kernel is single-core. The resident scheduler may preempt an unprivileged
+application at the 50 ms lease boundary; only one isolated continuation executes
+at a time. Interrupt handlers MUST do bounded work and MUST NOT allocate unless
+the allocator explicitly supports that context.
 
 Synchronization primitives MUST NOT be introduced merely for hypothetical SMP. Interior mutability and globals still require documented ownership because interrupt context can create concurrency even on one CPU.
 
@@ -775,7 +779,7 @@ model, lock ordering, per-CPU state, interrupt routing, and allocator review.
 
 ## 18. Observability
 
-At Stage 5, `mem` and `/sys/memory` expose:
+`mem` and `/sys/memory` expose:
 
 - total normalized usable RAM;
 - permanently reserved RAM;
@@ -786,13 +790,14 @@ At Stage 5, `mem` and `/sys/memory` expose:
 - cache live and limit bytes (both zero in the current configuration);
 - current memory-pressure state;
 
-The native process-observation interface additionally exposes at most 16 live
-application records with stable process identity, launch origin, lifecycle,
-charged unprivileged CPU ticks, retained page-table/private-page counts, live
-handle count, and bounded executable name. It MUST NOT expose argv, process
-memory, register contents, or control authority. Page-table memory is accounted
-per process; system-wide allocated-frame totals and reclamation counters are not
-separately exposed in the current observability contract.
+The native process-observation interface additionally exposes the bounded live
+registry through stable-ID pagination of at most 16 records per reply. Records
+carry process identity, launch origin, lifecycle, charged unprivileged CPU
+ticks, retained page-table/private-page counts, live handle count, and bounded
+executable name. The interface MUST NOT expose argv, process memory, register
+contents, or control authority. Page-table memory is accounted per process;
+system-wide allocated-frame totals and reclamation counters are not separately
+exposed in the current observability contract.
 
 Debug builds SHOULD expose a boot log and invariant checks. Release builds MAY compile out verbose logging, but fatal diagnostics and resource counters SHOULD remain.
 
@@ -800,10 +805,12 @@ Debug builds SHOULD expose a boot log and invariant checks. Release builds MAY c
 
 ### 19.1 Image limits
 
-- **Aspirational target:** a useful bootable image at or below 1,474,560 bytes (1.44 MB).
+- **Current boot container:** fixed 8 MiB FAT16 image.
 - **Hard experimental ceiling:** 16 MiB for a release image, including boot container and embedded filesystem.
 
-Crossing 1.44 MB is not a correctness failure, but MUST be visible in CI. Crossing 16 MiB fails the release build unless this specification is deliberately revised with a recorded rationale.
+Crossing 16 MiB fails the release build unless this specification is
+deliberately revised with a recorded rationale. Container growth below that
+ceiling MUST remain visible in verification output.
 
 Debug symbols and host-side test artifacts are excluded. A stripped deployable image is measured.
 
@@ -811,17 +818,8 @@ Debug symbols and host-side test artifacts are excluded. A stripped deployable i
 
 Every optional feature SHOULD report its approximate image-size and steady-state memory delta. Size regressions MUST be attributed to code, read-only data, embedded files, alignment, or boot-container overhead.
 
-Recommended initial budgets for the 1.44 MB profile:
-
-| Component | Budget |
-|---|---:|
-| boot and architecture backend | 192 KiB |
-| portable kernel/core services | 384 KiB |
-| shell and commands | 256 KiB |
-| embedded filesystem content | 384 KiB |
-| format/alignment/reserve | 224 KiB |
-
-These are engineering budgets, not ABI guarantees. Code clarity MUST NOT be sacrificed for tiny savings that do not affect a measured target.
+Code clarity MUST NOT be sacrificed for tiny savings that do not affect the
+measured 8 MiB container or 16 MiB hard ceiling.
 
 ## 20. Build and source organization
 
@@ -920,213 +918,31 @@ Application isolation includes resumable timer preemption, but does not make the
 system multi-user secure. Every application artifact and application-controlled
 address remains untrusted.
 
-## 23. Implemented milestones
+## 23. Current delivery boundary
 
-### Stage 0 — Portable model
+TROE currently boots native x86-64 and AArch64 UEFI images under the four exact
+QEMU contracts in the support matrix. It owns memory and page tables after UEFI
+handoff, enforces W^X and isolated KEX address spaces, and contains application
+faults with generation-checked capability teardown.
 
-**Status:** complete.
+The current runtime includes resident foreground commands, session background
+jobs, supervised services, timer preemption, stable process observation,
+owner-scoped nested KEX launch, and bounded byte pipes. Static KEX v1 packages
+receive only typed declared services. Dynamic linking and shared objects are not
+implemented; their design gate is tracked in
+[issue #10](https://github.com/dennissoftman/troe/issues/10).
 
-- Host executable with shell, streams, VFS, embedded FS, RAMFS, and commands.
-- No unsafe code in portable crates.
-- Resource quotas and deterministic tests.
+The implemented data plane includes the documented bounded VFS providers,
+persistent generations and configuration projection, virtio block/network,
+Ethernet/ARP/DHCP/IPv4/ICMP/UDP, and typed outbound TCP. Hosted tools implement
+the current package-model, trust, publication, and transactional-lifecycle
+formats without claiming that host tooling is a native package manager.
 
-**Exit criterion:** arbitrary parser and filesystem test inputs do not panic; required commands pass host tests.
-
-### Stage 1 — Firmware-hosted QEMU environment
-
-**Status:** complete.
-
-- UEFI x86-64 and AArch64 images.
-- Firmware console and memory services.
-- Same portable command and VFS code.
-
-**Exit criterion:** both targets boot and pass serial smoke tests.
-
-### Stage 2 — Machine-owning kernel
-
-**Status:** complete.
-
-- Exit firmware boot services.
-- Boot allocator, physical allocator, heap, native console.
-- Exception handling and explicit memory accounting.
-
-**Exit criterion:** repeated command and RAMFS workloads run without leaks or firmware services.
-
-### Stage 3 — MMU hardening
-
-**Status:** complete and verified.
-
-- Owned page tables.
-- W^X kernel mappings, device memory types, guarded stacks where feasible.
-- Permission-fault integration tests.
-
-**Exit criterion:** mapping invariants hold on both architectures and deliberate violations fault predictably.
-
-### Stage 4 — Cooperative tasks
-
-**Status:** complete.
-
-- Multiple tasks in one address space.
-- Explicit stacks, lifecycle states, and capabilities.
-- Cooperative yield only; no preemption requirement.
-
-**Exit criterion:** multiple continuations yield and exit deterministically, and
-task identity, capability, lifecycle, and stack ownership are accounted. This
-stage does not claim fault containment or protection from memory-unsafe code.
-
-### Stage 5 — In-process message dispatch
-
-**Status:** complete.
-
-- Handles, ports, bounded messages, request/reply semantics.
-- Selected direct service calls move behind dispatch without changing their conceptual API.
-
-**Exit criterion:** filesystem or console service can switch between direct and dispatched implementations in tests.
-
-### Stage 5.1 — Native text console and shell usability
-
-**Status:** complete; accepted by
-[ADR 0012](docs/adr/0012-native-text-console-and-editor-policy.md).
-
-- Portable, policy-configured terminal input and cursor-aware line editing.
-- Bounded volatile history and shell/VFS completion.
-- Owned framebuffer text output while UART remains the recovery and acceptance
-  transport.
-
-**Exit criterion:** both architectures support the owned text-console
-abstraction within explicit input, history, completion, and framebuffer bounds,
-without weakening deterministic UART recovery and acceptance.
-
-### Stage 6 — Optional isolation
-
-**Status:** complete; accepted by
-[ADR 0014](docs/adr/0014-unprivileged-task-isolation-and-teardown.md).
-
-- Per-task address spaces.
-- Bounded copied-message transfer; no shared-memory contract.
-- Fault containment and task teardown.
-- Owner-scoped handle revocation and zeroized frame reclamation.
-
-**Exit criterion:** met on both primary architectures. An isolated task fault
-does not corrupt the kernel or unrelated service, authority transfer is
-explicit, and all owned resources are revoked, zeroed, and reclaimed.
-
-### Stage 7 — Loadable applications
-
-**Status:** implemented from the design accepted by
-[ADR 0015](docs/adr/0015-kex-application-abi-and-execution-bounds.md). The
-portable KEX plan, native transaction, complete ABI 1.1 gate, scheduler-owned
-resume, copied handle dispatch, contained call/fault fates, and execution lease
-are active on both primary architectures. The shell loads immutable
-architecture-specific `/bin/<command>.kex` packages, validates their embedded
-KCAP manifests, and grants only declared typed services. The repo-local Rust
-SDK and `cargo kex` build/inspect workflow are implemented.
-
-- Load target-specific static KEX v1 artifacts selected by ADR 0015; keep ELF as
-  a hosted toolchain interchange format rather than a kernel input.
-- Validate every header, segment, permission, alignment, relocation, entry point, and address range before mapping.
-- Give each application an explicit set of handles/capabilities and a bounded memory budget.
-- Implement the small versioned application ABI 1.1 independently of POSIX.
-- Provide application startup, exit status, fault reporting, and resource reclamation.
-- Support architecture-native binaries; cross-architecture instruction emulation is not required.
-- Keep the immutable target-selected KEX root available for recovery.
-- Bind executable and least-authority manifest into one validated KEX package.
-  Current package bytes do not contain target locks, signatures, or publication
-  metadata.
-- Maintain the repo-local native SDK and hosted build/inspect tools without
-  granting the tooling client ambient system authority.
-
-Dynamic linking is not implemented; KEX v1 artifacts are static images. Its
-separate design gate is tracked in
-[GitHub issue #10](https://github.com/dennissoftman/troe/issues/10).
-
-**Exit criterion:** an untrusted test application can be loaded, run, exit, and fault without corrupting the kernel, while malformed binaries are rejected deterministically.
-
-### Stage 7.5 — Cloud platform separation
-
-**Status:** Phases A and B are implemented for two exact discoverable QEMU
-contracts under
-[ADR 0016](docs/adr/0016-hardware-targets-and-emulator-role.md). KVM and real
-provider-cloud rows are unsupported.
-
-- Separate reusable x86-64/AArch64 CPU mechanisms from platform integration and
-  execution-environment selection.
-- Preserve q35 and QEMU `virt` as pinned deterministic test profiles without
-  treating their devices, addresses, or firmware behavior as architecture
-  contracts.
-- Validate platform resources from an explicit profile, ACPI, device tree, or
-  UEFI handoff before constructing typed machine resources.
-- The two discoverable profiles use bounded ACPI or device-tree parsing and
-  UEFI handoff without ambient probing.
-- The machine-readable support matrix records exact firmware, machine type,
-  transports, and required features for every supported entry.
-- Physical boards, USB/SD bring-up, and embedded/no-MMU targets are unsupported.
-
-**Exit criterion:** both pinned QEMU platforms and every named cloud-matrix
-entry reach the recovery shell and pass bounded boot, storage, networking, and
-lifecycle smoke tests without introducing VM assumptions into portable crates
-or architecture-wide mechanisms.
-
-### Stage 8 — Networking and persistent operation
-
-**Status:** implemented. Portable block/GPT/VFS/config/content/identity layers
-are host verified. Both native virtio block and network transports are QEMU
-verified on x86-64 PCI and AArch64 MMIO. Exact BMNT/GPT/ext4 selection activates
-`/vol/root`; PRGN/TXSLOT persists SACT activation and a separate STFS mutation
-through real flush/reopen cycles. CSPK/GMAN/ISEC bind SCFG plus identity registry,
-foreign mapping, mount policy, and native ACL objects to immutable generations.
-Configured health failure rolls generation 2 back durably to generation 1.
-
-- Network-device capabilities expose a bounded Ethernet, ARP, DHCP, IPv4,
-  ICMP, and UDP stack.
-- Keep TCP behind the ADR 0031 typed outbound-connect service whose state,
-  timer, retransmission, and memory bounds are specified and adversarially
-  tested; do not widen it into a general socket interface.
-- Expose networking through handles or service interfaces rather than ambient global access.
-- Native principal and foreign-filesystem identity mappings bind persistent VFS
-  metadata and foreign writes to versioned policy objects.
-- Bounded block I/O, block-region capabilities, whole-device volumes, and
-  read-only GPT discovery operate without an in-kernel partition editor.
-- The constrained ext4 provider is the default persistent content volume;
-  FAT32 and StateFS implement their documented bounded profiles. Other
-  filesystem profiles are unsupported.
-- Versioned configuration, service startup, and recovery inputs are validated
-  before activation.
-- The persistent content store and desired-system manifest have bounded,
-  corruption-tested on-disk formats and recovery paths.
-- Immutable system generations remain separate from mutable volumes and
-  secrets and activate through a crash-consistent pointer.
-- Preserve the previous bootable generation and immutable recovery KEX root when
-  activation or bounded health checks fail.
-
-**Exit criterion:** the system can boot, configure a supported network device, exchange data with another host, persist selected state, and remain within declared memory budgets under malformed and high-volume input.
-
-### Stage 9 — Production usability
-
-**Status:** package, trust, configuration, and transactional lifecycle
-foundations are implemented as hosted references. Cloud Hypervisor v53.0 on
-Linux/KVM x86-64 is the first exact non-QEMU target and has a pinned
-production-only harness; acceptance remains gated on a real KVM result.
-
-- Hosted Stage 9 deployment MUST verify one signed package per locked member,
-  publish a complete immutable generation before its pending pointer, retain
-  monotonic trust state, require exact downgrade authorization, and keep
-  desired configuration outside generation replacement.
-- Data migration MUST be bounded and versioned. Reversible migration restores
-  its exact durable snapshot with predecessor code; forward-only migration MUST
-  enter recovery-required state rather than run predecessor code over new data.
-- Garbage collection MUST trace active, previous, recovery, and in-flight
-  transaction roots. Persistent lifecycle diagnostics MUST remain bounded and
-  every durable lifecycle boundary MUST be process-reopen testable.
-- A production-environment claim MUST bind one exact VMM, firmware, platform,
-  device/interrupt topology, resource floor, network boundary, artifact kind,
-  and live acceptance record. Host-only validation or resemblance to an
-  accepted emulator MUST NOT promote an environment claim.
-
-**Exit criterion:** operators can construct, authenticate, publish, activate,
-diagnose, roll back, and garbage-collect a complete locked system on every
-supported production environment without weakening the immutable-generation
-or recovery contracts.
+TROE is not a production release and no non-QEMU environment is accepted. The
+live production exit criteria and remaining work are maintained only in the
+[Stage 9 milestone](https://github.com/dennissoftman/troe/milestone/1) and
+[tracking issue #14](https://github.com/dennissoftman/troe/issues/14), with
+concrete lifecycle and deployment work in issues #3, #5, and #21.
 
 ## 24. API evolution rule
 
@@ -1176,22 +992,14 @@ that were never deployed.
 
 Command behavior SHOULD remain backward compatible within a minor release series, but POSIX compatibility MUST NOT be inferred from familiar command names.
 
-## 26. Definition of the first useful release
+## 26. Current release boundary
 
-Release 0.1 is complete when:
-
-- separate x86-64 and AArch64 images boot under pinned QEMU configurations;
-- each reaches an interactive recovery prompt;
-- `cat`, `echo`, literal `grep`, `ls`, `pwd`, `cd`, `man`, `mem`, and `halt` work as specified;
-- `/` includes an embedded read-only filesystem and `/tmp` is a quota-bound RAMFS;
-- `/sys/arch`, `/sys/version`, and `/sys/memory` are readable through the VFS;
-- malformed input, nonexistent paths, oversized input, and memory exhaustion fail cleanly;
-- the build reports image and runtime memory budgets;
-- the stripped image is below 16 MiB;
-- all host and QEMU acceptance tests pass;
-- every unsafe block is inventoried and justified.
-
-The 1.44 MiB target never justifies weakening correctness or auditability.
+TROE remains an experimental QEMU-targeted system rather than a production
+release. Every accepted revision MUST keep both architecture images below the
+16 MiB ceiling, pass the complete host and four-platform QEMU gate, fail cleanly
+under malformed and exhausted inputs, and keep every authored unsafe boundary
+inventoried and justified. A production claim additionally requires the live
+Stage 9 milestone to close on an exact non-QEMU environment.
 
 ## 27. Decision principles
 

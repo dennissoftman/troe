@@ -32,7 +32,7 @@ DESCRIPTION
     1 MiB limit applies only between sequential pipeline stages. Redirection
     paths do not enter command argv. Variables, expansion, command substitution,
     control flow, stderr redirection, heredocs, jobs, descriptor numbers, and
-    multiline grammar are not supported in this first script version.
+    multiline grammar are not supported by the current script grammar.
 
 EXAMPLES
     sh /share/sh/bench.sh
