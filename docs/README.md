@@ -35,6 +35,10 @@ history rather than in current documentation.
 | Explicit relative and absolute KEX execution paths | [ADR 0050](adr/0050-explicit-kex-path-execution.md) |
 | Package-owned declarative shell completions | [ADR 0051](adr/0051-package-owned-declarative-completions.md) |
 | Streamed KEX loading, shared runtime trees, and static C runtime | [ADR 0052](adr/0052-streamed-kex-and-static-c-runtime.md) |
+| Session terminal input as a foreground loan | [ADR 0053](adr/0053-session-terminal-input-loan.md) |
+| Launch environment composition | [ADR 0054](adr/0054-launch-environment-composition.md) |
+| Journaled ext4 mutation and bounded recovery | [ADR 0055](adr/0055-journaled-ext4-mutation-and-recovery.md) |
+| General ext4 compatibility profile | [ADR 0056](adr/0056-general-ext4-compatibility-profile.md) |
 
 The current serialized contracts are versioned independently under
 [`formats/`](formats):

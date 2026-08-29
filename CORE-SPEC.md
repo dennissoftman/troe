@@ -653,11 +653,11 @@ formats do not silently grant those capabilities.
 Persistent disk formats are replaceable filesystem providers behind the VFS
 and a bounded block-region capability. The kernel machine backends do not own
 filesystem or partition-format logic. The current build statically composes
-only the selected KEFS, RAMFS, FAT32, constrained ext4 v1, and StateFS
+only the selected KEFS, RAMFS, FAT32, ext4, and StateFS
 providers.
 
 KEFS is the immutable recovery filesystem, the fixed FAT16 image is only the
-firmware-read boot container, constrained ext4 v1 is the default persistent
+firmware-read boot container, ext4 is the default persistent
 content volume, FAT32 provides bounded interoperability, and StateFS owns its
 single bounded state object. No raw foreign UID, GID, SID, ACL, or security
 descriptor gains native authority merely because a provider can parse it.
@@ -1019,7 +1019,7 @@ Accordingly:
   and inner KEX validation;
 - embedded FS input is treated as potentially malformed;
 - console input is untrusted and bounded;
-- KEFS, FAT32, constrained ext4, StateFS, GPT, volume policy, configuration,
+- KEFS, FAT32, ext4, StateFS, GPT, volume policy, configuration,
   generation, and activation inputs are parsed through exact bounded profiles;
 - Ethernet, ARP, DHCP, IPv4, ICMP, UDP, and outbound TCP input is untrusted and
   admitted only through the implemented bounded network profiles;
