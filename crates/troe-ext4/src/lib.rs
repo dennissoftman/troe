@@ -150,10 +150,12 @@ const EXT4_FEATURE_RO_COMPAT: u32 =
 const CRC32C_POLYNOMIAL: u32 = 0x82f6_3b78;
 /// Hard ceiling on block groups.
 ///
-/// At the 32 KiB-per-group ext4 default a group covers 128 MiB, so this admits
-/// volumes up to 1 TiB. Allocation stays bounded because the free-block scan
+/// A group holds at most [`EXT4_BITMAP_BITS`] blocks, so this covers the whole
+/// 32-bit block space: 16 TiB at the 4 KiB block size. A volume larger than
+/// that sets `s_blocks_count_hi`, which the mount parser refuses rather than
+/// truncating to 32 bits. Allocation stays bounded because the free-block scan
 /// stops as soon as the retained runs can satisfy the request.
-const HARD_MAX_GROUPS: u32 = 8192;
+const HARD_MAX_GROUPS: u32 = 131_072;
 const HARD_MAX_INODES_PER_OPERATION: u32 = 64;
 const HARD_MAX_DIRECTORY_BLOCKS: u32 = 256;
 const HARD_MAX_DIRECTORY_ENTRIES: u32 = 4096;
@@ -6333,6 +6335,51 @@ mod tests {
             parse_extents(&root, 700_000),
             Err(FsError::Unsupported)
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn writes_to_a_volume_past_one_tebibyte() -> Result<(), String> {
+        let Some(mke2fs) = e2fs_tool("mke2fs") else {
+            return unavailable_tool("mke2fs");
+        };
+        let Some(e2fsck) = e2fs_tool("e2fsck") else {
+            return unavailable_tool("e2fsck");
+        };
+        let temporary = TestDirectory::create("ext4-huge")?;
+        let image = temporary.path().join("huge.ext4");
+        File::create(&image)
+            .and_then(|file| file.set_len(2 * 1024 * 1024 * 1024 * 1024))
+            .map_err(|error| error.to_string())?;
+        // The inode and journal ceilings only keep the sparse image small; the
+        // point of this volume is its 16384 block groups.
+        let format = Command::new(&mke2fs)
+            .args(["-q", "-F", "-t", "ext4", "-N", "65536", "-J", "size=16"])
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&format, "mke2fs two-tebibyte")?;
+
+        {
+            let mut ext4 = mount_file_writable_with_limits(&image, default_volume_limits()?)?;
+            ext4.write_file("/created.txt", b"written past a tebibyte\n")
+                .map_err(|error| format!("cannot write past a tebibyte: {error:?}"))?;
+            ext4.create_directory("/archive")
+                .map_err(|error| format!("cannot mkdir past a tebibyte: {error:?}"))?;
+        }
+        let check = Command::new(&e2fsck)
+            .args(["-f", "-n"])
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&check, "e2fsck after a two-tebibyte mutation")?;
+
+        let mut ext4 = mount_file_with_limits(&image, default_volume_limits()?)?;
+        let mut bytes = [0_u8; 32];
+        let read = ext4
+            .read_file("/created.txt", 0, &mut bytes)
+            .map_err(|error| format!("cannot read back: {error:?}"))?;
+        assert_eq!(&bytes[..read], b"written past a tebibyte\n");
         Ok(())
     }
 
