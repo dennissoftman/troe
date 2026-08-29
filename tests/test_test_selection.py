@@ -128,7 +128,7 @@ class ChangedTestSelectionTests(unittest.TestCase):
             (PurePosixPath("apps/lua/src/main.rs"),), PACKAGES
         )
         self.assertEqual(lua_plan.python_tests, {"test_lua_app.py"})
-        self.assertEqual(lua_plan.qemu_scenarios, {"lua"})
+        self.assertEqual(lua_plan.qemu_scenarios, {"lua", "filesystem"})
 
     def test_allocator_sdk_selects_lua_build_and_runtime_scenario(self) -> None:
         plan = test_changed.build_plan(
@@ -295,7 +295,9 @@ class ChangedTestSelectionTests(unittest.TestCase):
         )
         self.assertIn("cpython", test_scenarios.SCENARIO_IDS)
         self.assertNotIn("cpython", test_scenarios.DEFAULT_SCENARIOS)
-        self.assertEqual(test_scenarios.OPTIONAL_SCENARIOS, frozenset({"cpython"}))
+        self.assertEqual(
+            test_scenarios.OPTIONAL_SCENARIOS, frozenset({"cpython", "lua"})
+        )
 
     def test_selector_and_qemu_scenario_catalogs_are_exactly_aligned(self) -> None:
         self.assertEqual(
@@ -306,7 +308,6 @@ class ChangedTestSelectionTests(unittest.TestCase):
                     "network",
                     "shell-terminal",
                     "filesystem",
-                    "lua",
                     "quota-memory",
                     "persistence",
                     "fault-isolation",

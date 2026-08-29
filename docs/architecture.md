@@ -74,7 +74,7 @@ firmware fails before device publication or volatile I/O.
    active package generation. The system has no `/etc` directory or alias. KEX
    applications are statically linked, `/lib` is not present, and executable
    code does not belong in `/share`. Optional large runtime executables live
-   only in `/vol/shared/runtime/v1/<architecture>/bin`, outside rootfs and EFI,
+   only in `/vol/shared/bin/<architecture>`, outside rootfs and EFI,
    and optional runtimes own `/vol/shared/bin/<architecture>` with their
    libraries in `/vol/shared/lib/<architecture>` on the same terms.
 6. The final output capability writes host bytes or the native UART.
@@ -83,7 +83,7 @@ firmware fails before device publication or volatile I/O.
    confined to the pre-handoff banner.
 
 `tools/mkruntime.py` owns the shared runtime-tree boundary. It emits the exact
-`runtime/v1` layout, canonical path-sorted length/SHA-256 manifest, and at most
+`bin/<architecture>` layout, canonical path-sorted length/SHA-256 manifest, and at most
 128 architecture-owned KEX entries. Verification rejects symlinks, extra or
 missing files, noncanonical records, unsupported schemas, wrong lengths,
 oversized artifacts, and digest changes. Mounted-root and detached-image

@@ -45,7 +45,7 @@ The current serialized contracts are versioned independently under
 
 - applications and packages: [KEX](formats/kex-v1.md),
   [KEX package](formats/kex-package-v1.md),
-  [shared runtime tree](formats/runtime-tree-v1.md), [KCAP](formats/kcap-v1.md),
+  [shared runtime tree](formats/runtime-tree-v2.md), [KCAP](formats/kcap-v1.md),
   and [CMPL](formats/completion-v1.md);
 - process services: [process observation 1.1](formats/process-observation-v1.md) and
   [process launch and pipes 1.0](formats/process-launch-pipe-v1.md);

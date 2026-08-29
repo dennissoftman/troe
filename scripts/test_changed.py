@@ -400,7 +400,7 @@ def _classify_app(plan: TestPlan, path: PurePosixPath) -> bool:
         _add_qemu(plan, path, "shell-terminal")
     elif application == "lua":
         _add_python(plan, path, "test_lua_app.py")
-        _add_qemu(plan, path, "lua")
+        _add_qemu(plan, path, "lua", "filesystem")
     elif application == "python":
         _add_python(plan, path, "test_cpython_integration.py")
         _add_qemu(plan, path, "cpython")

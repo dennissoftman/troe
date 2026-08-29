@@ -18,7 +18,7 @@ _ADVISORY_PATTERN = re.compile(r"RUSTSEC-[0-9]{4}-[0-9]{4}")
 _EXCEPTION_FIELDS = {"advisory", "owner", "rationale", "expires"}
 
 
-SHARED_VOLUME_APPLICATIONS = frozenset({"python"})
+SHARED_VOLUME_APPLICATIONS = frozenset({"lua", "python"})
 
 
 def application_directories(root: Path = REPO_ROOT) -> tuple[Path, ...]:
