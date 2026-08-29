@@ -26,7 +26,8 @@ use troe_core::{
     StreamError, write_all,
 };
 use troe_driver::InputQueueStats;
-use troe_vfs::{FILE_IO_BUFFER_BYTES, FsError, MAX_FILE_IO_BUFFER_BYTES, Namespace, NodeKind};
+use troe_fs_api::{FILE_IO_BUFFER_BYTES, FsError, MAX_FILE_IO_BUFFER_BYTES, NodeKind};
+use troe_vfs::Namespace;
 
 /// Shared namespace ownership used by stream endpoints and KEX services.
 pub type SharedNamespace = Rc<RefCell<Namespace>>;
@@ -2403,10 +2404,11 @@ mod tests {
         MachineMemorySnapshot, Output, PIPE_CAPACITY, SliceInput, write_all,
     };
     use troe_driver::InputQueueStats;
-    use troe_vfs::{
-        FILE_IO_BUFFER_BYTES, FileMetadata, FsError, MAX_FILE_IO_BUFFER_BYTES, Namespace, NodeKind,
-        ProviderListing, RamFsQuota, ReadOnlyFileSystem,
+    use troe_fs_api::{
+        FILE_IO_BUFFER_BYTES, FileMetadata, FileSystemProvider, FsError, MAX_FILE_IO_BUFFER_BYTES,
+        NodeKind, ProviderListing,
     };
+    use troe_vfs::{Namespace, RamFsQuota};
 
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     struct StreamState {
@@ -2420,7 +2422,7 @@ mod tests {
         state: Rc<RefCell<StreamState>>,
     }
 
-    impl ReadOnlyFileSystem for StreamProvider {
+    impl FileSystemProvider for StreamProvider {
         fn metadata(&mut self, path: &str) -> Result<FileMetadata, FsError> {
             match path {
                 "/" => Ok(FileMetadata {

@@ -12,8 +12,8 @@ use alloc::vec::Vec;
 use core::char::decode_utf16;
 use core::fmt;
 use troe_block::{BlockAccess, BlockDevice, BlockError, BlockRegion};
-use troe_vfs::{
-    DirEntry, FileMetadata, FsError, MAX_NAME_BYTES, NodeKind, ProviderListing, ReadOnlyFileSystem,
+use troe_fs_api::{
+    DirEntry, FileMetadata, FileSystemProvider, FsError, MAX_NAME_BYTES, NodeKind, ProviderListing,
     canonicalize,
 };
 
@@ -1015,7 +1015,7 @@ impl<D: BlockDevice> Fat32<D> {
     }
 }
 
-impl<D: BlockDevice> ReadOnlyFileSystem for Fat32<D> {
+impl<D: BlockDevice> FileSystemProvider for Fat32<D> {
     fn metadata(&mut self, path: &str) -> Result<FileMetadata, FsError> {
         let entry = self.resolve(path)?;
         Ok(FileMetadata {
@@ -1903,8 +1903,8 @@ mod tests {
     use troe_block::{BlockAccess, BlockGeometry, BlockLimits};
 
     use super::{
-        BlockDevice, BlockError, BlockRegion, Fat32, Fat32Limits, FsError, NodeKind,
-        ReadOnlyFileSystem, short_name_checksum,
+        BlockDevice, BlockError, BlockRegion, Fat32, Fat32Limits, FileSystemProvider, FsError,
+        NodeKind, short_name_checksum,
     };
 
     const BLOCK_BYTES: usize = 512;

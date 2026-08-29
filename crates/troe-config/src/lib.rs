@@ -8,7 +8,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt::Write;
 use troe_content::ContentDigest;
-use troe_vfs::{MAX_PATH_BYTES, canonicalize};
+use troe_fs_api::{MAX_PATH_BYTES, canonicalize};
 
 /// Product-name-independent system-configuration v1 format identifier.
 pub const CONFIG_V1_MAGIC: [u8; 8] = *b"SCFGv1\0\0";

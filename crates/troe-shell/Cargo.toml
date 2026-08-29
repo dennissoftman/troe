@@ -10,6 +10,7 @@ license.workspace = true
 troe-application = { path = "../troe-application" }
 troe-completion = { path = "../troe-completion" }
 troe-core = { path = "../troe-core" }
+troe-fs-api = { path = "../troe-fs-api" }
 troe-driver = { path = "../troe-driver" }
 troe-vfs = { path = "../troe-vfs" }
 

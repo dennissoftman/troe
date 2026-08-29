@@ -12,9 +12,9 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::{fmt, str};
 use troe_block::{BlockAccess, BlockDevice, BlockError, BlockRegion};
-use troe_vfs::{
-    DirEntry, FileMetadata, FsError, MAX_NAME_BYTES, MAX_PATH_BYTES, NodeKind, ProviderListing,
-    ReadOnlyFileSystem, canonicalize,
+use troe_fs_api::{
+    DirEntry, FileMetadata, FileSystemProvider, FsError, MAX_NAME_BYTES, MAX_PATH_BYTES, NodeKind,
+    ProviderListing, canonicalize,
 };
 
 const EXT4_MAGIC: u16 = 0xef53;
@@ -2399,7 +2399,7 @@ impl<D: BlockDevice> Ext4<D> {
     }
 }
 
-impl<D: BlockDevice> ReadOnlyFileSystem for Ext4<D> {
+impl<D: BlockDevice> FileSystemProvider for Ext4<D> {
     fn metadata(&mut self, path: &str) -> Result<FileMetadata, FsError> {
         self.abort_mutation();
         let inode = self.resolve(path)?;
@@ -3600,9 +3600,9 @@ mod tests {
         BlockDevice, BlockRegion, CRC32C_POLYNOMIAL, EXT4_BLOCK_BYTES, EXT4_BLOCK_BYTES_U32,
         EXT4_BLOCK_BYTES_U64, EXT4_EXTENT_TAIL_OFFSET, EXT4_EXTENTS_FL, EXT4_FAST_SYMLINK_BYTES,
         EXT4_FEATURE_COMPAT, EXT4_FEATURE_INCOMPAT, EXT4_FEATURE_RO_COMPAT, EXT4_INODE_BYTES,
-        EXT4_JOURNAL_INO, EXT4_ROOT_INO, EXT4_VALID_FS, Ext4, Ext4Limits, Extent, FsError,
-        NodeKind, ReadOnlyFileSystem, RecoveryOutcome, crc32c, parse_extent_leaf, parse_extents,
-        read_u16, read_u32,
+        EXT4_JOURNAL_INO, EXT4_ROOT_INO, EXT4_VALID_FS, Ext4, Ext4Limits, Extent,
+        FileSystemProvider, FsError, NodeKind, RecoveryOutcome, crc32c, parse_extent_leaf,
+        parse_extents, read_u16, read_u32,
     };
 
     const DEVICE_BLOCK_BYTES_U32: u32 = 512;

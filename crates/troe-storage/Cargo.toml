@@ -12,6 +12,7 @@ troe-config = { path = "../troe-config" }
 troe-content = { path = "../troe-content" }
 troe-ext4 = { path = "../troe-ext4" }
 troe-fat = { path = "../troe-fat" }
+troe-fs-api = { path = "../troe-fs-api" }
 troe-gpt = { path = "../troe-gpt" }
 troe-identity = { path = "../troe-identity" }
 troe-mount = { path = "../troe-mount" }

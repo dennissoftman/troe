@@ -9,8 +9,8 @@ extern crate std;
 use alloc::string::String;
 use alloc::{vec, vec::Vec};
 use troe_block::{BlockDevice, BlockRegion};
+use troe_fs_api::{DirEntry, FileMetadata, FileSystemProvider, FsError, NodeKind, ProviderListing};
 use troe_persist::{DualSlotStore, PersistError};
-use troe_vfs::{DirEntry, FileMetadata, FsError, NodeKind, ProviderListing, ReadOnlyFileSystem};
 
 /// Product-independent state-filesystem image identifier.
 pub const STATEFS_MAGIC: [u8; 8] = *b"STFSv1\0\0";
@@ -77,7 +77,7 @@ impl<D: BlockDevice> StateFs<D> {
     }
 }
 
-impl<D: BlockDevice> ReadOnlyFileSystem for StateFs<D> {
+impl<D: BlockDevice> FileSystemProvider for StateFs<D> {
     fn metadata(&mut self, path: &str) -> Result<FileMetadata, FsError> {
         match path {
             "/" => Ok(FileMetadata {
@@ -329,8 +329,9 @@ mod tests {
     use troe_block::{
         BlockAccess, BlockDevice, BlockError, BlockGeometry, BlockLimits, BlockRegion,
     };
+    use troe_fs_api::{FileSystemProvider, FsError};
     use troe_persist::DualSlotStore;
-    use troe_vfs::{FsError, Namespace, RamFsQuota, ReadOnlyFileSystem};
+    use troe_vfs::{Namespace, RamFsQuota};
 
     #[derive(Clone)]
     struct MemoryDevice(Rc<RefCell<Vec<u8>>>);

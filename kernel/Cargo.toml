@@ -21,6 +21,7 @@ troe-config = { path = "../crates/troe-config" }
 troe-content = { path = "../crates/troe-content" }
 troe-core = { path = "../crates/troe-core" }
 troe-dispatch = { path = "../crates/troe-dispatch" }
+troe-fs-api = { path = "../crates/troe-fs-api" }
 troe-driver = { path = "../crates/troe-driver" }
 troe-memory = { path = "../crates/troe-memory" }
 troe-mount = { path = "../crates/troe-mount" }

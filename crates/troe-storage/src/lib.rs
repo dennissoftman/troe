@@ -22,12 +22,13 @@ use core::fmt::{self, Write};
 use troe_block::{BlockAccess, BlockDevice, BlockError, BlockGeometry, BlockLimits, BlockRegion};
 use troe_ext4::{Ext4, Ext4Limits};
 use troe_fat::{Fat32, Fat32Limits};
+use troe_fs_api::{FileSystemProvider, FsError, NodeKind};
 use troe_gpt::{GptError, GptGuid, GptLimits, GptPartition, discover};
 use troe_mount::{
     AccessMode, ActivationMode, AvailabilityPolicy, BootMountManifest, FilesystemProfile,
     MAX_DISCOVERED_VOLUMES, MatchState, MountEntry, MountResolution, SelectorKind, VolumeSelector,
 };
-use troe_vfs::{FsError, Namespace, NodeKind, ReadOnlyFileSystem};
+use troe_vfs::Namespace;
 
 /// Hard ceiling for one early-activation file read.
 pub const MAX_SELECTED_FILE_BYTES: usize = 4 * 1024 * 1024;
@@ -93,7 +94,7 @@ impl ActivationLimits {
 /// One fully validated provider ready to attach below `/vol`.
 pub struct PreparedMount {
     path: String,
-    provider: Box<dyn ReadOnlyFileSystem>,
+    provider: Box<dyn FileSystemProvider>,
     writable: bool,
     activation: ActivationMode,
 }
@@ -128,7 +129,7 @@ impl PreparedMount {
 
     /// Consume this plan and return its validated provider.
     #[must_use]
-    pub fn into_provider(self) -> Box<dyn ReadOnlyFileSystem> {
+    pub fn into_provider(self) -> Box<dyn FileSystemProvider> {
         self.provider
     }
 
@@ -237,7 +238,7 @@ pub enum SelectedFileError {
 
 struct Candidate {
     selector: VolumeSelector,
-    provider: Option<Box<dyn ReadOnlyFileSystem>>,
+    provider: Option<Box<dyn FileSystemProvider>>,
     device_index: u8,
     first_block: u64,
     block_count: u64,
@@ -865,7 +866,7 @@ fn selected_block_access(
 fn push_candidate(
     candidates: &mut Vec<Candidate>,
     selector: VolumeSelector,
-    provider: Box<dyn ReadOnlyFileSystem>,
+    provider: Box<dyn FileSystemProvider>,
     device_index: u8,
     first_block: u64,
     block_count: u64,

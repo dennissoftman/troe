@@ -8,7 +8,7 @@ license.workspace = true
 
 [dependencies]
 troe-block = { path = "../troe-block" }
-troe-vfs = { path = "../troe-vfs" }
+troe-fs-api = { path = "../troe-fs-api" }
 
 [lints]
 workspace = true

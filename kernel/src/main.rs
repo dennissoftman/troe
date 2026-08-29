@@ -56,6 +56,7 @@ mod firmware {
     use troe_driver::{InputEvent, InputQueueConfig, InputQueueStats, InputSource};
     use troe_ext4::Ext4Limits;
     use troe_fat::Fat32Limits;
+    use troe_fs_api::{FILE_IO_BUFFER_BYTES, FileSystemProvider, FsError, NodeKind, canonicalize};
     use troe_gpt::{GptGuid, GptLimits, discover};
     use troe_identity::IdentityLimits;
     use troe_memory::{
@@ -106,10 +107,7 @@ mod firmware {
         InputDecoder, KeyEvent, KeyboardConfig, LineEditor, Ps2Set1Decoder, TextConsole,
         TextConsoleConfig,
     };
-    use troe_vfs::{
-        FILE_IO_BUFFER_BYTES, FsError, Namespace, NodeKind, RamFsQuota, ReadOnlyFileSystem,
-        canonicalize,
-    };
+    use troe_vfs::{Namespace, RamFsQuota};
     use uefi::boot;
     use uefi::mem::memory_map::{MemoryMap, MemoryMapOwned};
     use uefi::prelude::*;
@@ -584,7 +582,7 @@ mod firmware {
         kernel_runtime: PhysicalRange,
         kernel_plan: MappingPlan,
         native_blocks: RefCell<Vec<troe_machine::NativeVirtioBlock>>,
-        native_statefs: RefCell<Option<Box<dyn ReadOnlyFileSystem>>>,
+        native_statefs: RefCell<Option<Box<dyn FileSystemProvider>>>,
         native_generation: NativeGenerationState,
         selected_config: Option<SystemConfig>,
         memory_policy: MemoryPolicy,
@@ -598,7 +596,7 @@ mod firmware {
 
     struct NativeBlockInitialization {
         blocks: Vec<troe_machine::NativeVirtioBlock>,
-        statefs: Option<Box<dyn ReadOnlyFileSystem>>,
+        statefs: Option<Box<dyn FileSystemProvider>>,
         generation: NativeGenerationState,
         config: Option<SystemConfig>,
     }
@@ -2233,7 +2231,7 @@ mod firmware {
     #[cfg(feature = "acceptance-probes")]
     fn recover_native_statefs(
         devices: &mut Vec<troe_machine::NativeVirtioBlock>,
-    ) -> Result<Option<Box<dyn ReadOnlyFileSystem>>, ()> {
+    ) -> Result<Option<Box<dyn FileSystemProvider>>, ()> {
         let statefs = mount_native_statefs(devices)?;
         let mut statefs = statefs;
         probe_native_statefs_mutation(&mut statefs)?;
@@ -2243,10 +2241,10 @@ mod firmware {
     #[cfg(not(feature = "acceptance-probes"))]
     fn recover_native_statefs(
         devices: &mut Vec<troe_machine::NativeVirtioBlock>,
-    ) -> Option<Box<dyn ReadOnlyFileSystem>> {
+    ) -> Option<Box<dyn FileSystemProvider>> {
         mount_native_statefs(devices)
             .ok()
-            .map(|statefs| Box::new(statefs) as Box<dyn ReadOnlyFileSystem>)
+            .map(|statefs| Box::new(statefs) as Box<dyn FileSystemProvider>)
     }
 
     #[cfg(feature = "acceptance-probes")]

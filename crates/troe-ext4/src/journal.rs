@@ -15,7 +15,7 @@
 //! replay would then silently clobber it.
 
 use alloc::vec::Vec;
-use troe_vfs::FsError;
+use troe_fs_api::FsError;
 
 /// Every JBD2 block begins with this magic in big-endian byte order.
 pub(crate) const JBD2_MAGIC: u32 = 0xC03B_3998;
@@ -385,7 +385,7 @@ mod tests {
     };
     use alloc::vec;
     use alloc::vec::Vec;
-    use troe_vfs::FsError;
+    use troe_fs_api::FsError;
 
     const BLOCK_BYTES: usize = 4096;
     const UUID: [u8; 16] = *b"troe-ext4-test!!";

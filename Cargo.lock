@@ -147,7 +147,7 @@ name = "troe-config"
 version = "0.1.0"
 dependencies = [
  "troe-content",
- "troe-vfs",
+ "troe-fs-api",
 ]
 
 [[package]]
@@ -175,7 +175,7 @@ name = "troe-ext4"
 version = "0.1.0"
 dependencies = [
  "troe-block",
- "troe-vfs",
+ "troe-fs-api",
 ]
 
 [[package]]
@@ -183,8 +183,12 @@ name = "troe-fat"
 version = "0.1.0"
 dependencies = [
  "troe-block",
- "troe-vfs",
+ "troe-fs-api",
 ]
+
+[[package]]
+name = "troe-fs-api"
+version = "0.1.0"
 
 [[package]]
 name = "troe-gpt"
@@ -220,6 +224,7 @@ dependencies = [
  "troe-driver",
  "troe-ext4",
  "troe-fat",
+ "troe-fs-api",
  "troe-gpt",
  "troe-identity",
  "troe-machine",
@@ -338,6 +343,7 @@ dependencies = [
  "troe-completion",
  "troe-core",
  "troe-driver",
+ "troe-fs-api",
  "troe-vfs",
 ]
 
@@ -346,6 +352,7 @@ name = "troe-statefs"
 version = "0.1.0"
 dependencies = [
  "troe-block",
+ "troe-fs-api",
  "troe-persist",
  "troe-vfs",
 ]
@@ -359,6 +366,7 @@ dependencies = [
  "troe-content",
  "troe-ext4",
  "troe-fat",
+ "troe-fs-api",
  "troe-gpt",
  "troe-identity",
  "troe-mount",
@@ -389,6 +397,7 @@ name = "troe-vfs"
 version = "0.1.0"
 dependencies = [
  "troe-core",
+ "troe-fs-api",
 ]
 
 [[package]]

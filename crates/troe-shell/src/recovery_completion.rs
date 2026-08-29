@@ -8,7 +8,8 @@ use troe_completion::{
     CompletionDescriptor, CompletionRequest, CompletionResolution, CompletionRule, DescriptorError,
     IntegerConstraints, PathConstraints, PathKind, PrefixPredicate, Resolver, ValidatedDescriptor,
 };
-use troe_vfs::{FsError, Namespace, NodeKind};
+use troe_fs_api::{FsError, NodeKind};
+use troe_vfs::Namespace;
 
 const REGISTRY_MAX_ENTRIES: usize = 1024;
 const REGISTRY_MAX_BYTES: usize = 1024 * 1024;
