@@ -260,14 +260,24 @@ static intptr_t host_environment_get(void *context, const uint8_t *name,
       "HOME=/",       "PATH=/bin",   "TMPDIR=/tmp", "SHELL=/bin/sh",
       "USER=root",    "LOGNAME=root", "PWD=/",
   };
+  static const char prefix[] = "TROE_TEST_ENV_";
+  const size_t prefix_length = sizeof(prefix) - 1;
+  char lookup[128];
   (void)context;
-  if (name_length == 12 && memcmp(name, "LUA_INIT_5_5", 12) == 0) {
-    const char *initialization = getenv("TROE_TEST_LUA_INIT");
-    if (initialization != NULL) {
-      size_t value_length = strlen(initialization);
+  /* Tests inject one guest entry per TROE_TEST_ENV_<NAME> host variable, so a
+     single mechanism covers initialization chunks, module paths, and names the
+     launcher deliberately does not supply. */
+  if (name_length + prefix_length + 1 <= sizeof(lookup)) {
+    const char *injected;
+    memcpy(lookup, prefix, prefix_length);
+    memcpy(lookup + prefix_length, name, name_length);
+    lookup[prefix_length + name_length] = '\0';
+    injected = getenv(lookup);
+    if (injected != NULL) {
+      size_t value_length = strlen(injected);
       if (value_length > capacity)
         return -75;
-      memcpy(destination, initialization, value_length);
+      memcpy(destination, injected, value_length);
       return (intptr_t)value_length;
     }
   }
@@ -444,7 +454,7 @@ int main(int argc, char **argv) {
       .action_count = 0,
       .has_source = 1,
       .warnings_enabled = 0,
-      .ignore_environment = 0,
+      .ignore_environment = getenv("TROE_TEST_LUA_IGNORE_ENV") != NULL,
       .current_directory = (const uint8_t *)"/",
       .current_directory_length = 1,
       .requested_exit = 0,

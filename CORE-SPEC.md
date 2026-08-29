@@ -389,6 +389,33 @@ an explicit `y` confirmation and default to denial. The warning is advisory:
 already-running applications with process-launch authority use their typed
 launch capability without a kernel terminal prompt.
 
+### 11.3 Launch environment
+
+Every launch carries one bounded immutable `NAME=VALUE` environment: at most
+128 entries and 2,048 aggregate UTF-8 bytes. A name is a nonempty ASCII
+alphanumeric or underscore identifier that does not begin with a digit, and a
+value contains no NUL.
+
+A name MUST carry exactly one value. Duplicate names are rejected at the
+canonical encoding boundary, on both the encoding and the decoding side, so no
+consumer resolves an ambiguous environment by position and no reply can smuggle
+one past a decoder.
+
+The **launcher** composes an environment; the application only reads one. A
+trusted top-level component supplies deployment and session values explicitly,
+and the interactive session supplies `HOME`, `PATH`, `TMPDIR`, `SHELL`, `USER`,
+and `LOGNAME`. `PWD` is not stored: it resolves from the invocation's current
+directory, so it is always the launch directory. An application MUST NOT
+synthesize a value the launcher did not supply; an absent name is absent.
+
+A launcher narrows a child environment by replacing the inherited entry of the
+same name, never by appending a second one. Composition, bounds, and duplicate
+failures MUST be detected before any child is created, leaving no partial
+launch. Process observation and diagnostics MUST expose neither environment
+names nor values.
+
+### 11.4 Command completion metadata
+
 An installed package MAY embed one bounded canonical CMPL descriptor for its
 command arguments. The shell MUST validate package and command identity before
 using it and MUST retain authority over replacement offsets, quoting, sorting,
@@ -433,7 +460,7 @@ terminal actions remain behind the shell's explicit machine-control capability;
 ordinary KEX applications cannot acquire that authority or invoke an intrinsic
 through application ABI 1.1. No ordinary command has a privileged fallback.
 
-### 11.3 Resident jobs and services
+### 11.5 Resident jobs and services
 
 Ordinary KEX execution has no default total runtime deadline and no cumulative
 service-call ceiling. The architecture execution lease still bounds one
@@ -459,7 +486,7 @@ and bounded recent logs. The `svc` intrinsic controls stable SCFG names.
 Transactional process admission is the current service-readiness signal; KEX
 has no explicit lifecycle-ready ABI.
 
-### 11.4 Required commands
+### 11.6 Required commands
 
 | Command | Minimum semantics |
 |---|---|

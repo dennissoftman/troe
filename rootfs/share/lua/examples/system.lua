@@ -93,9 +93,23 @@ local read_only, read_only_message, read_only_errno = io.open("/recovery/motd", 
 assert(read_only == nil and read_only_errno == 30)
 assert(read_only_message:match("read%-only filesystem"))
 
+-- The session is the trusted top-level composer. An application reads the
+-- values it was given; nothing is synthesized from state inside the program.
 assert(os.getenv("PWD") == "/" and os.getenv("HOME") == "/")
 assert(os.getenv("PATH") == "/bin" and os.getenv("MISSING") == nil)
+assert(os.getenv("SHELL") == "/bin/sh" and os.getenv("TMPDIR") == "/tmp")
+assert(os.getenv("USER") == "root" and os.getenv("LOGNAME") == "root")
+-- Names the launcher did not supply have no value at all.
+assert(os.getenv("LUA_PATH_5_5") == nil and os.getenv("LUA_PATH") == nil)
+assert(os.getenv("LUA_INIT_5_5") == nil and os.getenv("LUA_INIT") == nil)
+-- A direct child inherits those values, with PWD narrowed to its own directory.
 assert(os.execute([[lua -e 'assert(os.getenv("PWD") == "/")']]))
+assert(os.execute(
+  [[lua -e 'assert(os.getenv("HOME") == "/" and os.getenv("USER") == "root")']]))
+local inherited = assert(io.popen(
+  [[lua -e 'io.write(os.getenv("PATH"), " ", os.getenv("PWD"))']], "r"))
+local inherited_values = assert(inherited:read("a"))
+assert(inherited:close())
 
 print("lua-system libraries", type(package), type(io), type(debug))
 print("lua-system date", os.date("!%Y-%m-%d %A", leap_day))
@@ -103,6 +117,7 @@ print("lua-system file", table.concat(lines, ","))
 print("lua-system module", module.answer, loaded_from)
 print("lua-system bytecode", marker, info.what)
 print("lua-system process", captured)
+print("lua-system environment", inherited_values)
 
 assert(os.remove(renamed_path))
 assert(os.remove(module_path))

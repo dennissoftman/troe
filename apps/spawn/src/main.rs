@@ -6,6 +6,27 @@ use troe_kex_sdk::{
     process_launch,
 };
 
+/// Iterate the `--env` values among the leading options before `end`.
+///
+/// A value always contains `=`, so it can never be the literal `--env` and a
+/// simple scan cannot mistake one for an option.
+fn overrides<'a>(
+    invocation: &'a command::Invocation<'a>,
+    end: usize,
+) -> impl Iterator<Item = &'a str> {
+    (1..end).filter_map(move |index| {
+        (invocation.argument(index) == Some("--env"))
+            .then(|| invocation.argument(index + 1))
+            .flatten()
+    })
+}
+
+/// Split one canonical `NAME=VALUE` entry into its nonempty name and value.
+fn split_entry(entry: &str) -> Option<(&str, &str)> {
+    let (name, value) = entry.split_once('=')?;
+    (!name.is_empty()).then_some((name, value))
+}
+
 fn failure(command: &mut CommandContext, message: &[u8], status: u32) -> u32 {
     let mut stderr = command.stderr();
     let _ignored = stderr.write_all(b"spawn: ");
@@ -37,13 +58,44 @@ fn main(command: &mut CommandContext) -> u32 {
     let Ok(invocation) = command.invocation(&mut invocation_bytes) else {
         return failure(command, b"invalid invocation", exit::FAILURE);
     };
-    let capture = invocation.argument(1) == Some("--capture");
-    let report = invocation.argument(1) == Some("--status");
-    let first_child_argument = if capture || report { 2 } else { 1 };
+    // Options may appear in any order before the child invocation. Overrides
+    // are read back out of the invocation rather than copied into a second
+    // table, so parsing them costs no additional stack.
+    let mut capture = false;
+    let mut report = false;
+    let mut first_child_argument = 1;
+    loop {
+        match invocation.argument(first_child_argument) {
+            Some("--capture") => {
+                capture = true;
+                first_child_argument += 1;
+            }
+            Some("--status") => {
+                report = true;
+                first_child_argument += 1;
+            }
+            Some("--env") => {
+                let Some(entry) = invocation.argument(first_child_argument + 1) else {
+                    return failure(command, b"--env requires NAME=VALUE", exit::USAGE);
+                };
+                let Some((name, _)) = split_entry(entry) else {
+                    return failure(command, b"--env requires NAME=VALUE", exit::USAGE);
+                };
+                if overrides(&invocation, first_child_argument)
+                    .any(|earlier| split_entry(earlier).is_some_and(|(other, _)| other == name))
+                {
+                    return failure(command, b"--env repeats one name", exit::USAGE);
+                }
+                first_child_argument += 2;
+            }
+            _ => break,
+        }
+    }
+    let option_end = first_child_argument;
     if invocation.len() <= first_child_argument {
         return failure(
             command,
-            b"usage: spawn [--capture|--status] COMMAND [ARG...]",
+            b"usage: spawn [--capture|--status] [--env NAME=VALUE]... COMMAND [ARG...]",
             exit::USAGE,
         );
     }
@@ -64,12 +116,38 @@ fn main(command: &mut CommandContext) -> u32 {
     let Ok(environment) = command.environment(&mut environment_bytes) else {
         return failure(command, b"invalid environment", exit::FAILURE);
     };
+    // Narrow the inherited environment before launch: an override replaces the
+    // inherited entry of the same name so the child receives one canonical
+    // value per name, which the encoding boundary requires.
     let mut environment_values = [""; command::MAX_ENVIRONMENT];
-    for (destination, value) in environment_values[..environment.len()]
-        .iter_mut()
-        .zip(environment.iter())
-    {
-        *destination = value;
+    let mut environment_count = 0_usize;
+    for value in environment.iter() {
+        let Some((name, _)) = split_entry(value) else {
+            return failure(command, b"invalid environment", exit::FAILURE);
+        };
+        let replacement = overrides(&invocation, option_end)
+            .find(|entry| split_entry(entry).is_some_and(|(other, _)| other == name));
+        if environment_count == environment_values.len() {
+            return failure(command, b"child environment is full", exit::FAILURE);
+        }
+        environment_values[environment_count] = replacement.unwrap_or(value);
+        environment_count += 1;
+    }
+    for entry in overrides(&invocation, option_end) {
+        let Some((name, _)) = split_entry(entry) else {
+            return failure(command, b"--env requires NAME=VALUE", exit::USAGE);
+        };
+        let inherited = environment_values[..environment_count]
+            .iter()
+            .any(|existing| split_entry(existing).is_some_and(|(other, _)| other == name));
+        if inherited {
+            continue;
+        }
+        if environment_count == environment_values.len() {
+            return failure(command, b"child environment is full", exit::FAILURE);
+        }
+        environment_values[environment_count] = entry;
+        environment_count += 1;
     }
 
     let mut pipes = if capture {
@@ -103,7 +181,7 @@ fn main(command: &mut CommandContext) -> u32 {
     let child = match launcher.spawn(
         invocation.cwd(),
         &arguments[..argument_count],
-        &environment_values[..environment.len()],
+        &environment_values[..environment_count],
         process_launch::StreamSpec::INHERIT,
         child_stdout,
         process_launch::StreamSpec::INHERIT,

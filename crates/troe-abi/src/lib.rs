@@ -1016,6 +1016,20 @@ pub mod command {
     /// Maximum complete canonical invocation reply.
     pub const MAX_INVOCATION_BYTES: usize =
         HEADER_BYTES + MAX_ARGUMENTS * 2 + MAX_CWD_BYTES + MAX_ARGUMENT_BYTES;
+    /// Conventional values a trusted top-level launcher supplies.
+    ///
+    /// These belong to whichever component composes a launch. An application
+    /// never synthesizes them: it reads only what its launcher supplied, so
+    /// this list is shared by the composing side of every boundary rather than
+    /// compiled into the programs being launched.
+    pub const CONVENTIONAL_ENVIRONMENT: [&str; 6] = [
+        "HOME=/",
+        "PATH=/bin",
+        "TMPDIR=/tmp",
+        "SHELL=/bin/sh",
+        "USER=root",
+        "LOGNAME=root",
+    ];
     /// Maximum launch-environment entries.
     pub const MAX_ENVIRONMENT: usize = 128;
     /// Maximum aggregate UTF-8 environment bytes.
@@ -1245,7 +1259,7 @@ pub mod command {
                     .checked_add(value.len())
                     .ok_or(DecodeError::InvalidEncoding)?;
             }
-            if end != bytes.len() {
+            if end != bytes.len() || has_duplicate_name(environment.iter()) {
                 return Err(DecodeError::InvalidEncoding);
             }
             Ok(environment)
@@ -1275,6 +1289,7 @@ pub mod command {
     }
 
     /// Iterator over validated launch-environment entries.
+    #[derive(Clone)]
     pub struct EnvironmentEntries<'a> {
         environment: Environment<'a>,
         index: usize,
@@ -1328,6 +1343,9 @@ pub mod command {
                 .checked_add(value.len())
                 .ok_or(EncodeError::LimitExceeded)
         })?;
+        if has_duplicate_name(environment.iter().copied()) {
+            return Err(EncodeError::LimitExceeded);
+        }
         if values_bytes > MAX_ENVIRONMENT_BYTES {
             return Err(EncodeError::LimitExceeded);
         }
@@ -1462,6 +1480,31 @@ pub mod command {
             .get(offset..offset + 2)
             .ok_or(DecodeError::InvalidEncoding)?;
         Ok(u16::from_le_bytes([raw[0], raw[1]]))
+    }
+
+    /// Whether any two validated entries declare the same name.
+    ///
+    /// Duplicate names are rejected at the canonical boundary rather than
+    /// resolved by position, so no consumer has to remember a precedence rule
+    /// and no reply can carry an ambiguous environment.
+    fn has_duplicate_name<'a, I>(entries: I) -> bool
+    where
+        I: Iterator<Item = &'a str> + Clone,
+    {
+        let mut remaining = entries;
+        while let Some(entry) = remaining.next() {
+            let Some((name, _)) = entry.split_once('=') else {
+                continue;
+            };
+            if remaining
+                .clone()
+                .filter_map(|later| later.split_once('=').map(|(later, _)| later))
+                .any(|later| later == name)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     fn validate_environment(value: &str) -> Result<(), EncodeError> {
@@ -4119,6 +4162,7 @@ pub mod process_launch {
     }
 
     /// Iterator over validated `NAME=VALUE` environment strings.
+    #[derive(Clone)]
     pub struct Environment<'a> {
         lengths: &'a [u8],
         bytes: &'a [u8],
@@ -4240,6 +4284,9 @@ pub mod process_launch {
         if environment.len() > MAX_ENVIRONMENT {
             return Err(EncodingError);
         }
+        if has_duplicate_name(environment.iter().copied()) {
+            return Err(EncodingError);
+        }
         let mut environment_bytes = 0_usize;
         for value in environment {
             validate_environment(value)?;
@@ -4354,11 +4401,11 @@ pub mod process_launch {
             offset: 0,
         };
         let mut consumed = 0_usize;
-        for value in environment {
+        for value in environment.clone() {
             validate_environment(value)?;
             consumed = consumed.checked_add(value.len()).ok_or(EncodingError)?;
         }
-        if consumed != environment_bytes {
+        if consumed != environment_bytes || has_duplicate_name(environment) {
             return Err(EncodingError);
         }
         Ok(SpawnRequest {
@@ -4477,6 +4524,27 @@ pub mod process_launch {
         };
         validate_stream(stream)?;
         Ok(stream)
+    }
+
+    /// Whether any two validated entries declare the same name.
+    fn has_duplicate_name<'a, I>(entries: I) -> bool
+    where
+        I: Iterator<Item = &'a str> + Clone,
+    {
+        let mut remaining = entries;
+        while let Some(entry) = remaining.next() {
+            let Some((name, _)) = entry.split_once('=') else {
+                continue;
+            };
+            if remaining
+                .clone()
+                .filter_map(|later| later.split_once('=').map(|(later, _)| later))
+                .any(|later| later == name)
+            {
+                return true;
+            }
+        }
+        false
     }
 
     fn validate_environment(value: &str) -> Result<(), EncodingError> {
@@ -5639,6 +5707,45 @@ mod tests {
             ["HOME=/vol/root", "PATH=/bin"]
         );
         assert!(command::encode_environment(&["BAD"], &mut environment_bytes).is_err());
+    }
+
+    #[test]
+    fn environment_rejects_duplicate_names_at_both_boundaries() {
+        let mut bytes = [0_u8; command::MAX_ENCODED_ENVIRONMENT_BYTES];
+        assert!(command::encode_environment(&["HOME=/", "HOME=/other"], &mut bytes).is_err());
+        assert!(command::encode_environment(&["HOME=/", "HOME=/"], &mut bytes).is_err());
+        // A prefix is not a duplicate; only the exact name collides.
+        let count = command::encode_environment(&["HOME=/", "HOMEDIR=/other"], &mut bytes)
+            .unwrap_or_else(|_| std::process::abort());
+        assert!(command::Environment::parse(&bytes[..count]).is_ok());
+
+        // A reply that smuggles duplicates past the encoder is still rejected.
+        let mut forged = [0_u8; command::MAX_ENCODED_ENVIRONMENT_BYTES];
+        let count = command::encode_environment(&["A=1", "B=2"], &mut forged)
+            .unwrap_or_else(|_| std::process::abort());
+        let values = &mut forged[..count];
+        let start = values
+            .windows(3)
+            .position(|window| window == b"B=2")
+            .unwrap_or_else(|| std::process::abort());
+        values[start] = b'A';
+        assert!(command::Environment::parse(&forged[..count]).is_err());
+
+        let mut invocation = [0_u8; MAX_MESSAGE_BYTES];
+        let invocation_bytes = command::encode("/", &["child"], &mut invocation)
+            .unwrap_or_else(|_| std::process::abort());
+        let mut spawn = [0_u8; process_launch::MAX_SPAWN_BYTES];
+        assert!(
+            process_launch::encode_spawn(
+                &invocation[..invocation_bytes],
+                &["PATH=/bin", "PATH=/vol"],
+                process_launch::StreamSpec::INHERIT,
+                process_launch::StreamSpec::INHERIT,
+                process_launch::StreamSpec::INHERIT,
+                &mut spawn,
+            )
+            .is_err()
+        );
     }
 
     #[test]

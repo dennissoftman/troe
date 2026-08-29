@@ -54,11 +54,21 @@ DESCRIPTION
     files, symbolic links, or directories within one writable filesystem
     provider. Cross-provider renames and existing destinations fail without
     changing either path.
-    KEX invocations carry a bounded immutable launch environment. os.getenv
-    reads its explicit values, overlays stable PWD, HOME, PATH, TMPDIR, SHELL,
-    USER, and LOGNAME defaults, and returns nil for unknown names. Direct child
-    processes inherit that same canonical environment with PWD updated to the
-    launch directory. os.execute parses one bounded direct TROE command, waits
+    KEX invocations carry a bounded immutable launch environment composed by
+    the launcher, not by the application. os.getenv reads exactly the entries
+    the launcher supplied, resolves PWD from the invocation directory, and
+    returns nil for every other name; nothing is supplied from inside lua
+    itself. An interactive session supplies HOME, PATH, TMPDIR, SHELL, USER,
+    and LOGNAME. Direct child processes inherit that same canonical environment
+    with PWD updated to the launch directory. One name carries at most one
+    value: a duplicate name is refused when the environment is encoded, so a
+    launcher replaces an inherited entry rather than appending to it.
+
+    LUA_PATH_5_5 and LUA_CPATH_5_5 take precedence over LUA_PATH and LUA_CPATH,
+    and LUA_INIT_5_5 takes precedence over LUA_INIT. -E ignores all of them
+    before the libraries open, so module paths keep their built-in defaults and
+    no initialization chunk runs. -E does not change os.getenv, which is not
+    Lua configuration. os.execute parses one bounded direct TROE command, waits
     for the child, and returns Lua's standard success, termination kind, and
     status tuple. Its command may use a bare /bin name or an explicit relative
     or absolute KEX path. Quoted arguments and backslash escapes are supported.

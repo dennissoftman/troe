@@ -2,15 +2,14 @@
 
 use troe_kex_sdk::command;
 
-/// Conventional immutable values supplied when a launch has no explicit entry.
-pub const DEFAULT_ENTRIES: [&str; 6] = [
-    "HOME=/",
-    "PATH=/bin",
-    "TMPDIR=/tmp",
-    "SHELL=/bin/sh",
-    "USER=root",
-    "LOGNAME=root",
-];
+/// Conventional values a trusted launcher composes into a child environment.
+///
+/// These belong to whoever composes a launch, never to the application being
+/// launched. [`get`] deliberately does not consult them: an application reads
+/// only the values it was given, so a missing name is missing rather than
+/// silently satisfied from state compiled into the application. The list is
+/// the one the ABI defines, so every composing component agrees.
+pub use troe_kex_sdk::command::CONVENTIONAL_ENVIRONMENT as LAUNCHER_ENTRIES;
 
 /// Environment construction failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -26,7 +25,11 @@ fn split(entry: &str) -> Option<(&str, &str)> {
     (!name.is_empty()).then_some((name, value))
 }
 
-/// Look up one immutable value, applying TROE's conventional defaults.
+/// Look up one value in the immutable launch environment.
+///
+/// Only entries the launcher supplied are visible, plus `PWD`, which the
+/// invocation's current directory always defines. An absent name returns
+/// `None`; there is no ambient fallback.
 #[must_use]
 pub fn get<'a>(environment: command::Environment<'a>, cwd: &'a str, name: &str) -> Option<&'a str> {
     if name.is_empty() || name.as_bytes().contains(&b'=') {
@@ -43,21 +46,14 @@ pub fn get<'a>(environment: command::Environment<'a>, cwd: &'a str, name: &str) 
             return Some(value);
         }
     }
-    for entry in DEFAULT_ENTRIES {
-        let Some((candidate, value)) = split(entry) else {
-            continue;
-        };
-        if candidate == name {
-            return Some(value);
-        }
-    }
     None
 }
 
 /// Build the immutable environment inherited by a direct child launch.
 ///
-/// Explicit entries retain launch order. Conventional defaults fill only
-/// missing names, and `PWD` always reflects `cwd`.
+/// Explicit entries retain launch order. The conventional launcher entries
+/// fill only missing names, and `PWD` always reflects `cwd`. The result carries
+/// no duplicate name, so it satisfies the canonical encoding boundary.
 ///
 /// # Errors
 ///
@@ -87,7 +83,7 @@ pub fn child_entries<'a>(
             count += 1;
         }
     }
-    for default in DEFAULT_ENTRIES {
+    for default in LAUNCHER_ENTRIES {
         let Some((name, _)) = split(default) else {
             return Err(Error::InvalidValue);
         };
@@ -121,7 +117,7 @@ mod tests {
     use troe_kex_sdk::command;
 
     #[test]
-    fn defaults_and_explicit_entries_are_bounded_and_inherited() {
+    fn applications_read_only_supplied_values() {
         let mut encoded = [0_u8; command::MAX_ENCODED_ENVIRONMENT_BYTES];
         let count = command::encode_environment(&["HOME=/custom", "LANG=C"], &mut encoded)
             .unwrap_or_else(|_| std::process::abort());
@@ -129,7 +125,21 @@ mod tests {
             .unwrap_or_else(|_| std::process::abort());
         assert_eq!(get(environment, "/work", "HOME"), Some("/custom"));
         assert_eq!(get(environment, "/work", "PWD"), Some("/work"));
-        assert_eq!(get(environment, "/work", "PATH"), Some("/bin"));
+        // The launcher supplied no PATH, so the application sees none rather
+        // than a value compiled into itself.
+        assert_eq!(get(environment, "/work", "PATH"), None);
+        assert_eq!(get(environment, "/work", "MISSING"), None);
+        assert_eq!(get(environment, "/work", ""), None);
+        assert_eq!(get(environment, "/work", "HOME=x"), None);
+    }
+
+    #[test]
+    fn launcher_composition_fills_defaults_without_duplicating_names() {
+        let mut encoded = [0_u8; command::MAX_ENCODED_ENVIRONMENT_BYTES];
+        let count = command::encode_environment(&["HOME=/custom", "LANG=C"], &mut encoded)
+            .unwrap_or_else(|_| std::process::abort());
+        let environment = command::Environment::parse(&encoded[..count])
+            .unwrap_or_else(|_| std::process::abort());
         let mut pwd = [0_u8; command::MAX_CWD_BYTES + 4];
         let mut entries = [""; command::MAX_ENVIRONMENT];
         let count = child_entries(environment, "/work", &mut pwd, &mut entries)
@@ -145,5 +155,9 @@ mod tests {
                 .count(),
             1
         );
+        // Composition output must satisfy the canonical encoding boundary,
+        // which rejects duplicate names outright.
+        let mut child = [0_u8; command::MAX_ENCODED_ENVIRONMENT_BYTES];
+        assert!(command::encode_environment(&entries[..count], &mut child).is_ok());
     }
 }
