@@ -11383,6 +11383,38 @@ mod firmware {
             Ok(())
         }
 
+        fn read_replacement(
+            &mut self,
+            token: u32,
+            offset: u64,
+            destination: &mut [u8],
+        ) -> Result<usize, ReplyStatus> {
+            let pending = self.pending.as_mut().ok_or(ReplyStatus::InvalidRequest)?;
+            if pending.token != token || offset > pending.offset {
+                return Err(ReplyStatus::InvalidRequest);
+            }
+            // Reads observe every staged byte, so flush the aggregation buffer
+            // before consulting the streamed file.
+            if !pending.bytes.is_empty() {
+                self.namespace
+                    .borrow_mut()
+                    .append_file(&self.cwd, &pending.path, &pending.bytes)
+                    .map_err(application_filesystem_status)?;
+                pending.bytes.clear();
+            }
+            let available = pending.offset - offset;
+            let limit = usize::try_from(available).unwrap_or(usize::MAX);
+            let count = destination.len().min(limit);
+            if count == 0 {
+                return Ok(0);
+            }
+            let path = pending.path.clone();
+            self.namespace
+                .borrow_mut()
+                .read_file_at(&self.cwd, &path, offset, &mut destination[..count])
+                .map_err(application_filesystem_status)
+        }
+
         fn set_chunk_size(&mut self, token: u32, bytes: usize) -> Result<(), ReplyStatus> {
             let pending = self.pending.as_mut().ok_or(ReplyStatus::InvalidRequest)?;
             if pending.token != token
@@ -11520,6 +11552,20 @@ mod firmware {
                         Ok(()) => Ok(ServiceReply::empty(ReplyStatus::Success)),
                         Err(status) => Ok(ServiceReply::empty(status)),
                     }
+                }
+                filesystem_mutation::READ_REPLACEMENT => {
+                    let Ok((token, offset, length)) =
+                        filesystem_mutation::decode_read_request(request.payload())
+                    else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    let mut staged = [0_u8; filesystem_mutation::MAX_READ_BYTES];
+                    let limit = length.min(staged.len());
+                    let count = match self.read_replacement(token, offset, &mut staged[..limit]) {
+                        Ok(count) => count,
+                        Err(status) => return Ok(ServiceReply::empty(status)),
+                    };
+                    ServiceReply::with_payload(ReplyStatus::Success, &staged[..count])
                 }
                 filesystem_mutation::SET_CHUNK_SIZE => {
                     let Ok((token, bytes)) =

@@ -17,6 +17,8 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from repository_policy import (  # noqa: E402
     AUDIT_EXCEPTIONS_FILE,
+    SHARED_VOLUME_APPLICATIONS,
+    application_directories,
     load_audit_exceptions,
     require_supported_python,
 )
@@ -165,12 +167,10 @@ class RepositoryPolicyTests(unittest.TestCase):
             "udp",
             "wc",
         }
-        apps = {
-            path.name
-            for path in (REPO_ROOT / "apps").iterdir()
-            if path.is_dir() and (path / "Cargo.toml").is_file()
-        }
-        self.assertEqual(apps, ordinary)
+        apps = {path.name for path in application_directories()}
+        self.assertEqual(apps, ordinary | SHARED_VOLUME_APPLICATIONS)
+        self.assertEqual(SHARED_VOLUME_APPLICATIONS, {"python"})
+        self.assertFalse(ordinary & SHARED_VOLUME_APPLICATIONS)
         for architecture in ("x86_64", "aarch64"):
             root = REPO_ROOT / "rootfs" / "bin" / architecture
             installed = {path.stem for path in root.glob("*.kex")}
@@ -213,12 +213,8 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn("PackageCompletionRegistry", registry)
         self.assertIn("kex_package_completion_range", registry)
 
-        apps = sorted(
-            path
-            for path in (REPO_ROOT / "apps").iterdir()
-            if path.is_dir() and (path / "Cargo.toml").is_file()
-        )
-        self.assertEqual(len(apps), 33)
+        apps = list(application_directories())
+        self.assertEqual(len(apps), 34)
         for app in apps:
             descriptor = app / "completion.cmpl"
             self.assertTrue(descriptor.is_file(), app.name)

@@ -18,6 +18,33 @@ _ADVISORY_PATTERN = re.compile(r"RUSTSEC-[0-9]{4}-[0-9]{4}")
 _EXCEPTION_FIELDS = {"advisory", "owner", "rationale", "expires"}
 
 
+SHARED_VOLUME_APPLICATIONS = frozenset({"python"})
+
+
+def application_directories(root: Path = REPO_ROOT) -> tuple[Path, ...]:
+    """Return every application directory in deterministic order."""
+    return tuple(
+        sorted(
+            path
+            for path in (root / "apps").iterdir()
+            if path.is_dir() and (path / "Cargo.toml").is_file()
+        )
+    )
+
+
+def rootfs_application_directories(root: Path = REPO_ROOT) -> tuple[Path, ...]:
+    """Return only applications installed into the read-only rootfs image.
+
+    Shared-volume deliverables exceed the rootfs and EFI budgets and ship below
+    ``/vol/shared`` from their own versioned package tree instead.
+    """
+    return tuple(
+        path
+        for path in application_directories(root)
+        if path.name not in SHARED_VOLUME_APPLICATIONS
+    )
+
+
 def require_supported_python(version: Sequence[int] = sys.version_info) -> None:
     """Reject repository-tool execution on an unsupported Python runtime."""
     actual = tuple(version[:2])

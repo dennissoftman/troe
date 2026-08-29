@@ -74,7 +74,8 @@ firmware fails before device publication or volatile I/O.
    active package generation. The system has no `/etc` directory or alias. KEX
    applications are statically linked, `/lib` is not present, and executable
    code does not belong in `/share`. Optional large runtime executables live
-   only in `/vol/shared/runtime/v1/<architecture>/bin`, outside rootfs and EFI.
+   only in `/vol/shared/runtime/v1/<architecture>/bin`, outside rootfs and EFI,
+   and the CPython package owns `/vol/shared/cpython/v1` on the same terms.
 6. The final output capability writes host bytes or the native UART.
    When validated GOP metadata is available, normal native shell output is also
    rendered into an owned fixed-glyph framebuffer console. UEFI text output is
@@ -88,6 +89,16 @@ oversized artifacts, and digest changes. Mounted-root and detached-image
 installation both verify the source and destination; unavailable shared media
 is an explicit terminal error. Rootfs and EFI builders do not consume this
 tree.
+
+`tools/build_cpython.py` owns the CPython package boundary on the same terms.
+It emits `cpython/v1/<architecture>/{bin,lib}` with version-addressable
+interpreters, a default `python.kex` alias for the newest pinned release, the
+filtered pure-Python library, per-release build and module manifests, and one
+path-sorted SHA-256 manifest for the whole tree. Installation verifies the
+source tree, rejects a medium that already owns the directory, and re-reads
+every installed byte. Administrator-supplied pure-Python packages install
+separately below `cpython/v1/packages`; bytecode caches and non-Python files are
+refused. Rootfs and EFI builders do not consume this tree either.
 
 Pipelines remain sequential even though cooperative tasks now exist. This makes
 backpressure an explicit capacity error rather than requiring hidden scheduling
@@ -145,7 +156,8 @@ services keep typed protocols. There is no universal native file-descriptor,
 generic socket namespace, `ioctl`-style escape hatch, kernel POSIX subsystem, or
 package-resolved scoped-root grant in the native recovery command path. Shared
 `no_std` Rust services and the freestanding C sysroot layer filesystem
-algorithms, the hybrid allocator, bounded descriptors, buffered `FILE` and
+algorithms, the hybrid allocator, bounded descriptors that may be opened
+read-write over one streamed replacement, buffered `FILE` and
 directory streams, immutable environment handling, exit processing, clocks,
 UTC calendar/formatting, UTF-8/wide conversion, C-locale helpers, randomness,
 `setjmp`, and single-execution-thread pthread-compatible locks and TSS over

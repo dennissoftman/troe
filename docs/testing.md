@@ -63,6 +63,7 @@ their canonical order during the same primary guest boot where possible.
 | `shell-terminal` | Editing, completion, history, manuals, parsing, CRLF, clear-screen behavior, and the foreground session terminal-input loan: typed lines, end of input, cancellation, background and nested end-of-input, resident-job and service coexistence, and unchanged redirection and pipelines |
 | `filesystem` | KEFS/ext4/FAT32 reads and writes, shared-media restart persistence, paths, logical lists, pipelines, bounded `sh.kex` scripts, RAMFS mutation, read-only and error behavior, plus repeated direct and nested launches of the large shared-media C runtime probe |
 | `lua` | Lua inline/stdin/file loading, the portable compute/allocation benchmark, consolidated language/numeric/system examples, script argument/`-l` compatibility, exact binary64 formatting, complete pipe reads, buffering modes, protected errors, shared-runtime math/calendar/environment/process/random behavior, typed filesystem errno failures, OS-shim clock and exit behavior, timer preemption, fragmentation, a 48 MiB private allocation beyond the former narrow TLSF geometry, and bounded OOM recovery |
+| `cpython` | Version-addressable and default interpreters, explicit-path execution consent, `-c`, arguments after `--`, scripts, `-m`, redirected stdin, an interactive REPL that retains state and ends on end of input, upstream Unicode/GC/weakref/traceback semantics, the shipped library profile plus a full shipped-module import sweep, TROE-backed filesystem/temporary-file/clock/entropy behavior, excluded modules and explicit thread-creation failure, withheld random and mutation authority, and kernel-frame reclamation across repeated successful and failing launches. Not selected by default: it consumes the separately built interpreter package (see below) |
 | `quota-memory` | 128-entry quota, recovery, repeated transient workloads, exact initial/heap/private commitment accounting, zeroed private mappings, partial protect/unmap and recoalescing, typed CSPRNG reads, and independently randomized KEX image bases |
 | `persistence` | A second boot and native cold-reset termination after the baseline durable boot |
 | `fault-isolation` | Write, execute, guard, exception, and fatal probes with rollback validation |
@@ -91,6 +92,30 @@ python3 scripts/test-qemu.py \
   --platform all --environment qemu \
   --framebuffer-console --native-keyboard
 ```
+
+## CPython acceptance inputs
+
+The `cpython` group runs against the authenticated interpreter package rather
+than rebuilding it, so build the package and the capability-negative
+interpreters into `build/` first. The package build fetches, digest-checks, and
+Sigstore-verifies each pinned upstream release, so it needs the `sigstore` CLI
+and an exact build Python for every pinned series.
+
+```console
+python3 tools/build_cpython.py build build/cpython-package \
+  --source-cache "$TROE_CPYTHON_CACHE" --work-directory "$TROE_CPYTHON_WORK"
+
+python3 tools/build_cpython.py variants build/cpython-diagnostics \
+  --work-directory "$TROE_CPYTHON_WORK"
+
+python3 scripts/test-qemu.py \
+  --platform all --environment qemu --scenario cpython
+```
+
+`--check` builds the package twice in independent directories and compares
+every output byte. Reuse the retained work directory for `variants`: the
+capability-negative interpreters relink the already-built library rather than
+rebuilding CPython.
 
 `fault-isolation` automatically causes production and acceptance-probe images
 to be built. Other focused groups build only production images. `--skip-build`
