@@ -141,6 +141,65 @@ changes, unexpected allocation, and schema extensions are rejected. GPT CRCs
 do not cover partition payloads, so bundle SHA-256 records bind every complete
 disk and every partition payload separately.
 
+## Install a clean machine
+
+`setup-troe` is the one supported way to provision a clean machine from a
+bundle. It is a fixed-profile installer for the exact three-target topology
+below and claims no general GPT, filesystem, firmware, physical-device, or
+cloud-provider support.
+
+The complete bundle is verified before any destination is touched. Production
+is authorized by default; a development or acceptance bundle requires
+`--allow-test-artifacts` and never describes a supported machine.
+
+Provision one private per-machine directory of raw images:
+
+```sh
+python3 tools/setup_troe.py install   --bundle build/cloud-x86_64-q35-uefi-qemu   --runtime-dir build/machines/prod0
+```
+
+The destination must not already exist. It is created `0o700`, receives the
+three raw images and the bundle manifest, and records the installation in
+`install.json`.
+
+### Target topology and destructive boundary
+
+Installation writes exactly three targets, each named by its role:
+
+| Role | Bundle image | Contents |
+| --- | --- | --- |
+| `system` | `system.raw` | FAT32 ESP and the constrained ext4 root |
+| `activation` | `activation.raw` | empty TXSLOT activation seed |
+| `state` | `state.raw` | empty StateFS seed |
+
+Enumeration order never assigns a role. Raw-device installation names every
+role explicitly and requires a durable record path so an interruption stays
+identifiable:
+
+```sh
+python3 tools/setup_troe.py install   --bundle build/cloud-x86_64-q35-uefi-qemu   --device system=/dev/disk9   --device activation=/dev/disk10   --device state=/dev/disk11   --record build/machines/prod0-install.json   --confirm-destroy
+```
+
+Writing a raw device destroys every existing byte on it. The installer resolves
+each target to a stable identity, reports its length and any recognizable
+existing signature, and refuses symbolic links, non-devices, duplicate or
+aliased targets, mounted or busy devices, and destinations shorter than their
+image. `--confirm-destroy` is required for non-interactive use; an interactive
+run without it lists the resolved targets and requires the operator to type
+`destroy`.
+
+Each target is written with bounded buffers, flushed, and read back in full and
+matched against the digest the verified bundle declares. Only then is the
+installation recorded as `verified`. An interrupted installation stays
+`writing` and is never mistaken for a completed deployment. Re-verify one at
+any time:
+
+```sh
+python3 tools/setup_troe.py verify --record build/machines/prod0/install.json
+```
+
+The record format is [installation record v1](formats/installation-record-v1.md).
+
 ## Acceptance matrix
 
 The current matrix deliberately separates three states:

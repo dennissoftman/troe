@@ -21,7 +21,7 @@ from platform_profile import REPO_ROOT, resolve_platform
 
 sys.path.insert(0, str(REPO_ROOT))
 
-from tools import mkcloud  # noqa: E402
+from tools import mkcloud, setup_troe  # noqa: E402
 
 
 PROFILE_PATH = REPO_ROOT / "tools" / "cloud-hypervisor-profile.json"
@@ -339,24 +339,13 @@ def verify_production_bundle(
 
 
 def stage_runtime_bundle(bundle: Path, runtime: Path) -> dict[str, Path]:
-    """Create per-machine writable copies without mutating the verified seeds."""
-    if runtime.exists():
-        raise ValueError(f"runtime directory already exists: {runtime}")
-    runtime.mkdir(parents=True, mode=0o700)
-    runtime.chmod(0o700)
-    staged: dict[str, Path] = {}
-    try:
-        for role, filename in mkcloud.BUNDLE_FILENAMES.items():
-            destination = runtime / filename
-            shutil.copyfile(bundle / filename, destination)
-            staged[role] = destination
-        shutil.copyfile(
-            bundle / mkcloud.BUNDLE_MANIFEST, runtime / mkcloud.BUNDLE_MANIFEST
-        )
-    except Exception:
-        shutil.rmtree(runtime, ignore_errors=True)
-        raise
-    return staged
+    """Create per-machine writable copies without mutating the verified seeds.
+
+    Staging goes through the shared ``setup_troe`` provisioning boundary so this
+    harness and the supported installer use one durable copy path: bounded
+    buffers, a flush per file, and a complete read-back before success.
+    """
+    return setup_troe.stage_bundle_directory(bundle, runtime)
 
 
 def validate_tap_name(tap: str) -> str:

@@ -161,7 +161,9 @@ class ChangedTestSelectionTests(unittest.TestCase):
     def test_runtime_image_tool_selects_owned_host_and_boot_suites(self) -> None:
         plan = test_changed.build_plan((PurePosixPath("tools/mkcloud.py"),), PACKAGES)
         self.assertFalse(plan.full_reasons)
-        self.assertEqual(plan.python_tests, {"test_cloud_artifacts.py"})
+        self.assertEqual(
+            plan.python_tests, {"test_cloud_artifacts.py", "test_setup_troe.py"}
+        )
         self.assertEqual(plan.qemu_scenarios, {"boot", "filesystem", "persistence"})
         self.assertTrue(plan.qemu_all_platforms)
 
@@ -203,18 +205,35 @@ class ChangedTestSelectionTests(unittest.TestCase):
                 self.assertEqual(plan.qemu_scenarios, set())
 
     def test_cloud_hypervisor_runner_selects_its_host_contract_tests(self) -> None:
-        for path in (
-            "scripts/cloud_hypervisor_profile.py",
-            "scripts/test-cloud-hypervisor.py",
-            "tools/cloud-hypervisor-profile.json",
-        ):
+        cases = {
+            "scripts/cloud_hypervisor_profile.py": {
+                "test_cloud_hypervisor_profile.py",
+                "test_setup_troe.py",
+            },
+            "scripts/test-cloud-hypervisor.py": {"test_cloud_hypervisor_profile.py"},
+            "tools/cloud-hypervisor-profile.json": {
+                "test_cloud_hypervisor_profile.py"
+            },
+        }
+        for path, expected in cases.items():
             with self.subTest(path=path):
                 plan = test_changed.build_plan((PurePosixPath(path),), PACKAGES)
                 self.assertFalse(plan.full_reasons)
-                self.assertEqual(
-                    plan.python_tests, {"test_cloud_hypervisor_profile.py"}
-                )
+                self.assertEqual(plan.python_tests, expected)
                 self.assertEqual(plan.qemu_scenarios, set())
+
+    def test_provisioning_boundary_selects_installer_and_harness_contracts(
+        self,
+    ) -> None:
+        plan = test_changed.build_plan(
+            (PurePosixPath("tools/setup_troe.py"),), PACKAGES
+        )
+        self.assertFalse(plan.full_reasons)
+        self.assertEqual(
+            plan.python_tests,
+            {"test_setup_troe.py", "test_cloud_hypervisor_profile.py"},
+        )
+        self.assertEqual(plan.qemu_scenarios, set())
 
     def test_audit_policy_change_runs_audit_without_unknown_fallback(self) -> None:
         plan = test_changed.build_plan(

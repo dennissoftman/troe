@@ -321,6 +321,13 @@ candidate `pending`; native bounded health orchestration must report `passed` or
 `failed` before it becomes healthy or automatically returns to its predecessor.
 See [ADR 0044](docs/adr/0044-transactional-system-lifecycle.md).
 
+`python3 tools/setup_troe.py install` provisions a clean machine from one
+verified bundle onto the exact `system`, `activation`, and `state` targets. It
+verifies every bundle byte before touching a destination, reads every installed
+byte back, and records the result so an interrupted install is never mistaken
+for a completed one. See
+[cloud platform support](docs/cloud-platform-support.md).
+
 ## 🚀 Quick start
 
 ### Prerequisites
