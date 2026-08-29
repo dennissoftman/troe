@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 troe-content = { path = "../troe-content" }
+troe-checksum = { path = "../troe-checksum" }
 troe-fs-api = { path = "../troe-fs-api" }
 
 [lints]

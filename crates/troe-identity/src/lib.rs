@@ -1190,19 +1190,7 @@ fn crc32_zeroed(bytes: &[u8], zero_offset: usize) -> Result<u32, IdentityError> 
     {
         return Err(IdentityError::InvalidHeader);
     }
-    let mut crc = !0_u32;
-    for (index, byte) in bytes.iter().copied().enumerate() {
-        let value = if (zero_offset..zero_offset + 4).contains(&index) {
-            0
-        } else {
-            byte
-        };
-        crc ^= u32::from(value);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xedb8_8320 & 0_u32.wrapping_sub(crc & 1));
-        }
-    }
-    Ok(!crc)
+    Ok(troe_checksum::crc32_with_zeroed_field(bytes, zero_offset))
 }
 
 #[cfg(test)]

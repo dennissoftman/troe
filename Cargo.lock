@@ -139,6 +139,10 @@ name = "troe-block"
 version = "0.1.0"
 
 [[package]]
+name = "troe-checksum"
+version = "0.1.0"
+
+[[package]]
 name = "troe-completion"
 version = "0.1.0"
 
@@ -146,6 +150,7 @@ version = "0.1.0"
 name = "troe-config"
 version = "0.1.0"
 dependencies = [
+ "troe-checksum",
  "troe-content",
  "troe-fs-api",
 ]
@@ -153,6 +158,9 @@ dependencies = [
 [[package]]
 name = "troe-content"
 version = "0.1.0"
+dependencies = [
+ "troe-checksum",
+]
 
 [[package]]
 name = "troe-core"
@@ -195,6 +203,7 @@ name = "troe-gpt"
 version = "0.1.0"
 dependencies = [
  "troe-block",
+ "troe-checksum",
 ]
 
 [[package]]
@@ -209,6 +218,9 @@ dependencies = [
 [[package]]
 name = "troe-identity"
 version = "0.1.0"
+dependencies = [
+ "troe-checksum",
+]
 
 [[package]]
 name = "troe-kernel"
@@ -308,6 +320,9 @@ version = "0.1.0"
 [[package]]
 name = "troe-mount"
 version = "0.1.0"
+dependencies = [
+ "troe-checksum",
+]
 
 [[package]]
 name = "troe-net"
@@ -318,6 +333,7 @@ name = "troe-persist"
 version = "0.1.0"
 dependencies = [
  "troe-block",
+ "troe-checksum",
 ]
 
 [[package]]
@@ -352,6 +368,7 @@ name = "troe-statefs"
 version = "0.1.0"
 dependencies = [
  "troe-block",
+ "troe-checksum",
  "troe-fs-api",
  "troe-persist",
  "troe-vfs",
@@ -362,6 +379,7 @@ name = "troe-storage"
 version = "0.1.0"
 dependencies = [
  "troe-block",
+ "troe-checksum",
  "troe-config",
  "troe-content",
  "troe-ext4",
