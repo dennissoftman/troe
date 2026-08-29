@@ -4146,6 +4146,7 @@ mod tests {
     use std::process::{Command, Output};
     use std::time::{SystemTime, UNIX_EPOCH};
     use troe_block::{BlockAccess, BlockError, BlockGeometry, BlockLimits};
+    use troe_vfs::MAX_NAME_BYTES;
 
     use super::{
         BlockDevice, BlockRegion, CRC32C_POLYNOMIAL, EXT4_BLOCK_BYTES, EXT4_BLOCK_BYTES_U32,
@@ -5643,8 +5644,16 @@ mod tests {
         };
         let temporary = TestDirectory::create("ext4-default")?;
         let image = default_mke2fs_image(temporary.path(), &mke2fs, 1024 * 1024 * 1024)?;
-        let limits = Ext4Limits::new(HARD_MAX_GROUPS, 64, 256, 4096, 1 << 40, 1024 * 1024, 64)
-            .map_err(|error| format!("invalid default-volume limits: {error:?}"))?;
+        let limits = Ext4Limits::new(
+            HARD_MAX_GROUPS,
+            64,
+            256,
+            4096,
+            1 << 40,
+            1024 * 1024,
+            MAX_NAME_BYTES,
+        )
+        .map_err(|error| format!("invalid default-volume limits: {error:?}"))?;
         let device = FileDevice::open(&image)?;
         let block_limits = BlockLimits::new(8, EXT4_BLOCK_BYTES, 1)
             .map_err(|error| format!("invalid block limits: {error:?}"))?;
@@ -5685,8 +5694,16 @@ mod tests {
     }
 
     fn default_volume_limits() -> Result<Ext4Limits, String> {
-        Ext4Limits::new(HARD_MAX_GROUPS, 64, 256, 4096, 1 << 40, 1024 * 1024, 64)
-            .map_err(|error| format!("invalid default-volume limits: {error:?}"))
+        Ext4Limits::new(
+            HARD_MAX_GROUPS,
+            64,
+            256,
+            4096,
+            1 << 40,
+            1024 * 1024,
+            MAX_NAME_BYTES,
+        )
+        .map_err(|error| format!("invalid default-volume limits: {error:?}"))
     }
 
     #[test]
@@ -5866,8 +5883,16 @@ mod tests {
         };
         let temporary = TestDirectory::create("ext4-hashed")?;
         let image = hashed_directory_image(temporary.path(), &mke2fs, &e2fsck, NAMES)?;
-        let limits = Ext4Limits::new(HARD_MAX_GROUPS, 64, 256, 4096, 1 << 40, 1024 * 1024, 64)
-            .map_err(|error| format!("invalid limits: {error:?}"))?;
+        let limits = Ext4Limits::new(
+            HARD_MAX_GROUPS,
+            64,
+            256,
+            4096,
+            1 << 40,
+            1024 * 1024,
+            MAX_NAME_BYTES,
+        )
+        .map_err(|error| format!("invalid limits: {error:?}"))?;
         let mut ext4 = mount_file_with_limits(&image, limits)?;
 
         // Every name the index describes must be enumerated exactly once.
@@ -5911,8 +5936,16 @@ mod tests {
         };
         let temporary = TestDirectory::create("ext4-hash-agree")?;
         let image = hashed_directory_image(temporary.path(), &mke2fs, &e2fsck, NAMES)?;
-        let limits = Ext4Limits::new(HARD_MAX_GROUPS, 64, 256, 4096, 1 << 40, 1024 * 1024, 64)
-            .map_err(|error| format!("invalid limits: {error:?}"))?;
+        let limits = Ext4Limits::new(
+            HARD_MAX_GROUPS,
+            64,
+            256,
+            4096,
+            1 << 40,
+            1024 * 1024,
+            MAX_NAME_BYTES,
+        )
+        .map_err(|error| format!("invalid limits: {error:?}"))?;
         let mut ext4 = mount_file_with_limits(&image, limits)?;
 
         let hash = ext4
@@ -5983,8 +6016,16 @@ mod tests {
         };
         let temporary = TestDirectory::create("ext4-hashed-write")?;
         let image = hashed_directory_image(temporary.path(), &mke2fs, &e2fsck, NAMES)?;
-        let limits = Ext4Limits::new(HARD_MAX_GROUPS, 64, 256, 4096, 1 << 40, 1024 * 1024, 64)
-            .map_err(|error| format!("invalid limits: {error:?}"))?;
+        let limits = Ext4Limits::new(
+            HARD_MAX_GROUPS,
+            64,
+            256,
+            4096,
+            1 << 40,
+            1024 * 1024,
+            MAX_NAME_BYTES,
+        )
+        .map_err(|error| format!("invalid limits: {error:?}"))?;
         {
             let mut ext4 = mount_file_writable_with_limits(&image, limits)?;
             ext4.remove_file(TARGET)
@@ -6018,6 +6059,56 @@ mod tests {
             .read_file(TARGET, 0, &mut bytes)
             .map_err(|error| format!("cannot read the reinserted name: {error:?}"))?;
         assert_eq!(&bytes[..read], b"rewritten by troe\n");
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_the_longest_name_ext4_allows() -> Result<(), String> {
+        const LENGTH: usize = 255;
+        let Some(mke2fs) = e2fs_tool("mke2fs") else {
+            return unavailable_tool("mke2fs");
+        };
+        let Some(e2fsck) = e2fs_tool("e2fsck") else {
+            return unavailable_tool("e2fsck");
+        };
+        let temporary = TestDirectory::create("ext4-long-name")?;
+        let image = default_mke2fs_image(temporary.path(), &mke2fs, 1024 * 1024 * 1024)?;
+        let name: String = core::iter::repeat_n('n', LENGTH).collect();
+        let path = format!("/{name}");
+        assert_eq!(name.len(), LENGTH);
+        {
+            let mut ext4 = mount_file_writable_with_limits(&image, default_volume_limits()?)?;
+            ext4.write_file(&path, b"a very long name\n")
+                .map_err(|error| format!("cannot create a {LENGTH}-byte name: {error:?}"))?;
+        }
+        let check = Command::new(&e2fsck)
+            .args(["-f", "-n"])
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&check, "e2fsck after a long-name insert")?;
+
+        let mut ext4 = mount_file_with_limits(&image, default_volume_limits()?)?;
+        let mut bytes = [0_u8; 32];
+        let read = ext4
+            .read_file(&path, 0, &mut bytes)
+            .map_err(|error| format!("cannot read a {LENGTH}-byte name: {error:?}"))?;
+        assert_eq!(&bytes[..read], b"a very long name\n");
+        // The listing byte budget is an aggregate, so a 255-byte name may need
+        // its own page.
+        let mut found = false;
+        let mut cursor = 0_u64;
+        loop {
+            let page = ext4
+                .list("/", cursor, 8, MAX_NAME_BYTES)
+                .map_err(|error| format!("cannot list: {error:?}"))?;
+            found |= page.entries.iter().any(|entry| entry.name == name);
+            match page.next_cursor {
+                Some(next) => cursor = next,
+                None => break,
+            }
+        }
+        assert!(found, "the long name must be enumerable");
         Ok(())
     }
 
