@@ -80,6 +80,10 @@ const EXT4_LEAF_EXTENTS: usize = leaf_extents(EXT4_BLOCK_BYTES);
 const EXT4_EXTENT_TAIL_OFFSET: usize =
     EXT4_EXTENT_HEADER_BYTES + EXT4_LEAF_EXTENTS * EXT4_EXTENT_RECORD_BYTES;
 const EXT4_ROOT_INDEXES: usize = 4;
+/// Deepest extent tree this provider walks; ext4 itself never exceeds five.
+const EXT4_MAX_EXTENT_DEPTH: u16 = 5;
+/// Hard ceiling on interior blocks one extent tree may occupy.
+const EXT4_MAX_EXTENT_TREE_BLOCKS: usize = 2048;
 const EXT4_FT_REG_FILE: u8 = 1;
 const EXT4_FT_DIR: u8 = 2;
 const EXT4_FT_SYMLINK: u8 = 7;
@@ -352,6 +356,8 @@ struct Extent {
 
 #[derive(Clone, Debug)]
 struct ParsedExtentRoot {
+    /// Tree depth: zero when the root holds extents directly.
+    depth: u16,
     extents: Vec<Extent>,
     tree_blocks: Vec<u32>,
     tree_logicals: Vec<u32>,
@@ -368,6 +374,11 @@ struct Inode {
     indexed: bool,
     extents: Vec<Extent>,
     extent_tree_blocks: Vec<u32>,
+    /// Depth of the extent tree this inode's root describes.
+    extent_depth: u16,
+    /// Interior tree blocks above the leaf level, recorded so a rewrite can
+    /// release the entire tree.
+    interior_extent_blocks: Vec<u32>,
     extent_tree_logicals: Vec<u32>,
 }
 
@@ -1958,6 +1969,9 @@ impl<D: BlockDevice> Ext4<D> {
         if reuse_tree {
             Ok(())
         } else {
+            // Release every level, not just the leaves, so a deeper tree
+            // leaves nothing allocated behind.
+            self.release_blocks(&existing.interior_extent_blocks)?;
             self.release_blocks(&existing.extent_tree_blocks)
         }
     }
@@ -2116,6 +2130,58 @@ impl<D: BlockDevice> Ext4<D> {
         Ok(descriptor)
     }
 
+    /// Walk an extent tree down to the level that holds its leaves.
+    ///
+    /// Above depth one the root's children are interior nodes, so each level is
+    /// expanded in turn. Every interior block stays recorded so a later rewrite
+    /// releases the whole tree rather than leaking its upper levels.
+    fn descend_extent_tree(&mut self, inode: &mut Inode) -> Result<(), FsError> {
+        let mut depth = inode.extent_depth;
+        while depth > 1 {
+            let mut children = Vec::new();
+            let mut logicals = Vec::new();
+            for block in inode.extent_tree_blocks.iter().copied() {
+                let node = self.read_fs_block(block)?;
+                let parsed = parse_extent_index_block(
+                    &node,
+                    self.layout.blocks,
+                    depth - 1,
+                    self.layout.checksum_seed,
+                    inode.number,
+                    inode.generation,
+                )?;
+                if children
+                    .len()
+                    .checked_add(parsed.len())
+                    .is_none_or(|total| total > EXT4_MAX_EXTENT_TREE_BLOCKS)
+                {
+                    return Err(FsError::NoSpace);
+                }
+                children
+                    .try_reserve(parsed.len())
+                    .map_err(|_| FsError::NoSpace)?;
+                logicals
+                    .try_reserve(parsed.len())
+                    .map_err(|_| FsError::NoSpace)?;
+                for (logical, physical) in parsed {
+                    logicals.push(logical);
+                    children.push(physical);
+                }
+            }
+            inode
+                .interior_extent_blocks
+                .try_reserve(inode.extent_tree_blocks.len())
+                .map_err(|_| FsError::NoSpace)?;
+            inode
+                .interior_extent_blocks
+                .extend_from_slice(&inode.extent_tree_blocks);
+            inode.extent_tree_blocks = children;
+            inode.extent_tree_logicals = logicals;
+            depth -= 1;
+        }
+        Ok(())
+    }
+
     fn read_inode(&mut self, number: u32) -> Result<Inode, FsError> {
         if number == 0 || number > self.layout.inodes {
             return Err(FsError::Corrupt);
@@ -2173,6 +2239,7 @@ impl<D: BlockDevice> Ext4<D> {
             .ok_or(FsError::Corrupt)?;
         let mut inode = parse_inode(raw, number, self.layout, self.limits)?;
         if !inode.extent_tree_blocks.is_empty() {
+            self.descend_extent_tree(&mut inode)?;
             let mut extents = Vec::new();
             for (index, block) in inode.extent_tree_blocks.iter().copied().enumerate() {
                 let leaf = self.read_fs_block(block)?;
@@ -3665,6 +3732,7 @@ fn parse_inode(
             return Err(FsError::Corrupt);
         }
         ParsedExtentRoot {
+            depth: 0,
             extents: Vec::new(),
             tree_blocks: Vec::new(),
             tree_logicals: Vec::new(),
@@ -3693,6 +3761,8 @@ fn parse_inode(
         indexed: kind == NodeKind::Directory && flags & EXT4_INDEX_FL != 0,
         extents: parsed_extents.extents,
         extent_tree_blocks: parsed_extents.tree_blocks,
+        extent_depth: parsed_extents.depth,
+        interior_extent_blocks: Vec::new(),
         extent_tree_logicals: parsed_extents.tree_logicals,
     })
 }
@@ -3710,7 +3780,10 @@ fn parse_extents(raw: &[u8], volume_blocks: u32) -> Result<ParsedExtentRoot, FsE
     if count > 4 {
         return Err(FsError::Corrupt);
     }
-    if depth == 1 {
+    if depth > EXT4_MAX_EXTENT_DEPTH {
+        return Err(FsError::Unsupported);
+    }
+    if depth >= 1 {
         let mut tree_blocks = Vec::new();
         tree_blocks
             .try_reserve_exact(usize::from(count))
@@ -3737,13 +3810,11 @@ fn parse_extents(raw: &[u8], volume_blocks: u32) -> Result<ParsedExtentRoot, FsE
             tree_blocks.push(physical);
         }
         return Ok(ParsedExtentRoot {
+            depth,
             extents: Vec::new(),
             tree_blocks,
             tree_logicals,
         });
-    }
-    if depth != 0 {
-        return Err(FsError::Unsupported);
     }
     let mut extents = Vec::new();
     extents
@@ -3785,10 +3856,73 @@ fn parse_extents(raw: &[u8], volume_blocks: u32) -> Result<ParsedExtentRoot, FsE
         previous_end = logical_end;
     }
     Ok(ParsedExtentRoot {
+        depth: 0,
         extents,
         tree_blocks: Vec::new(),
         tree_logicals: Vec::new(),
     })
+}
+
+/// Parse one interior extent-tree node into its child logicals and blocks.
+///
+/// # Errors
+///
+/// Returns [`FsError::Corrupt`] when the node is malformed and
+/// [`FsError::Unsupported`] when it declares a depth outside the tree.
+fn parse_extent_index_block(
+    raw: &[u8],
+    volume_blocks: u32,
+    expected_depth: u16,
+    seed: u32,
+    inode_number: u32,
+    inode_generation: u32,
+) -> Result<Vec<(u32, u32)>, FsError> {
+    if !matches!(raw.len(), 1024 | 2048 | 4096)
+        || read_u16(raw, 0)? != EXT4_EXT_MAGIC
+        || read_u16(raw, 6)? != expected_depth
+        || read_u32(raw, 8)? != 0
+    {
+        return Err(FsError::Corrupt);
+    }
+    let capacity =
+        (raw.len() - EXT4_EXTENT_HEADER_BYTES - EXT4_EXTENT_TAIL_BYTES) / EXT4_EXTENT_RECORD_BYTES;
+    if usize::from(read_u16(raw, 4)?) != capacity {
+        return Err(FsError::Corrupt);
+    }
+    let count = usize::from(read_u16(raw, 2)?);
+    if count == 0 || count > capacity {
+        return Err(FsError::Corrupt);
+    }
+    let tail_offset = EXT4_EXTENT_HEADER_BYTES + capacity * EXT4_EXTENT_RECORD_BYTES;
+    let inode_seed = crc32c(
+        crc32c(seed, &inode_number.to_le_bytes()),
+        &inode_generation.to_le_bytes(),
+    );
+    if read_u32(raw, tail_offset)?
+        != crc32c(inode_seed, raw.get(..tail_offset).ok_or(FsError::Corrupt)?)
+    {
+        return Err(FsError::Corrupt);
+    }
+    let mut children = Vec::new();
+    children
+        .try_reserve_exact(count)
+        .map_err(|_| FsError::NoSpace)?;
+    let mut previous = None;
+    for index in 0..count {
+        let offset = EXT4_EXTENT_HEADER_BYTES + index * EXT4_EXTENT_RECORD_BYTES;
+        let logical = read_u32(raw, offset)?;
+        let physical = read_u32(raw, offset + 4)?;
+        if physical == 0
+            || physical >= volume_blocks
+            || read_u16(raw, offset + 8)? != 0
+            || previous.is_some_and(|last: u32| logical <= last)
+        {
+            return Err(FsError::Corrupt);
+        }
+        previous = Some(logical);
+        children.push((logical, physical));
+    }
+    Ok(children)
 }
 
 fn parse_extent_leaf(
@@ -4134,7 +4268,10 @@ fn crc32c(seed: u32, bytes: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use crate::{htree, parse_directory_block};
+    use crate::{
+        EXT4_EXT_MAGIC, EXT4_EXTENT_HEADER_BYTES, EXT4_EXTENT_RECORD_BYTES, EXT4_EXTENT_TAIL_BYTES,
+        EXT4_MAX_EXTENT_DEPTH, htree, parse_directory_block, parse_extent_index_block,
+    };
     use alloc::collections::BTreeMap;
     use alloc::format;
     use alloc::string::{String, ToString};
@@ -6109,6 +6246,93 @@ mod tests {
             }
         }
         assert!(found, "the long name must be enumerable");
+        Ok(())
+    }
+
+    /// Build one interior extent node with the given children.
+    fn extent_index_block(depth: u16, children: &[(u32, u32)], seed: u32) -> Vec<u8> {
+        let mut raw = alloc::vec![0_u8; EXT4_BLOCK_BYTES];
+        let capacity = (EXT4_BLOCK_BYTES - EXT4_EXTENT_HEADER_BYTES - EXT4_EXTENT_TAIL_BYTES)
+            / EXT4_EXTENT_RECORD_BYTES;
+        put_u16(&mut raw, 0, EXT4_EXT_MAGIC);
+        put_u16(&mut raw, 2, u16::try_from(children.len()).unwrap_or(0));
+        put_u16(&mut raw, 4, u16::try_from(capacity).unwrap_or(0));
+        put_u16(&mut raw, 6, depth);
+        for (index, (logical, physical)) in children.iter().enumerate() {
+            let offset = EXT4_EXTENT_HEADER_BYTES + index * EXT4_EXTENT_RECORD_BYTES;
+            put_u32(&mut raw, offset, *logical);
+            put_u32(&mut raw, offset + 4, *physical);
+        }
+        let tail = EXT4_EXTENT_HEADER_BYTES + capacity * EXT4_EXTENT_RECORD_BYTES;
+        let checksum = crc32c(seed, &raw[..tail]);
+        put_u32(&mut raw, tail, checksum);
+        raw
+    }
+
+    #[test]
+    fn walks_an_extent_tree_deeper_than_one_level() -> Result<(), FsError> {
+        let seed = crc32c(u32::MAX, &UUID);
+        let inode_seed = crc32c(
+            crc32c(seed, &3_u32.to_le_bytes()),
+            &FILE_GENERATION.to_le_bytes(),
+        );
+
+        // A root two levels above its leaves is accepted and reports its depth.
+        let mut root = [0_u8; 60];
+        put_u16(&mut root, 0, EXT4_EXT_MAGIC);
+        put_u16(&mut root, 2, 1);
+        put_u16(&mut root, 4, 4);
+        put_u16(&mut root, 6, 2);
+        put_u32(&mut root, 12, 0);
+        put_u32(&mut root, 16, 30);
+        let parsed = parse_extents(&root, 700_000)?;
+        assert_eq!(parsed.depth, 2);
+        assert_eq!(parsed.tree_blocks, [30]);
+
+        // A node one level down names the leaves.
+        let node = extent_index_block(1, &[(0, 31), (16, 32)], inode_seed);
+        assert_eq!(
+            parse_extent_index_block(&node, 700_000, 1, seed, 3, FILE_GENERATION)?,
+            alloc::vec![(0, 31), (16, 32)]
+        );
+
+        // A node whose declared depth disagrees with its parent is refused,
+        // because a mismatched level would be read as the wrong record kind.
+        assert_eq!(
+            parse_extent_index_block(&node, 700_000, 2, seed, 3, FILE_GENERATION),
+            Err(FsError::Corrupt)
+        );
+        // So is a child pointing outside the volume, or a broken checksum.
+        assert_eq!(
+            parse_extent_index_block(&node, 31, 1, seed, 3, FILE_GENERATION),
+            Err(FsError::Corrupt)
+        );
+        let mut torn = node.clone();
+        torn[EXT4_EXTENT_HEADER_BYTES] ^= 0xFF;
+        assert_eq!(
+            parse_extent_index_block(&torn, 700_000, 1, seed, 3, FILE_GENERATION),
+            Err(FsError::Corrupt)
+        );
+        // Children must ascend, so an out-of-order pair is refused.
+        let unordered = extent_index_block(1, &[(16, 31), (0, 32)], inode_seed);
+        assert_eq!(
+            parse_extent_index_block(&unordered, 700_000, 1, seed, 3, FILE_GENERATION),
+            Err(FsError::Corrupt)
+        );
+        // Truncation never panics.
+        for length in 0..node.len() {
+            assert!(
+                parse_extent_index_block(&node[..length], 700_000, 1, seed, 3, FILE_GENERATION)
+                    .is_err()
+            );
+        }
+
+        // A tree deeper than ext4 itself builds is refused rather than walked.
+        put_u16(&mut root, 6, EXT4_MAX_EXTENT_DEPTH + 1);
+        assert!(matches!(
+            parse_extents(&root, 700_000),
+            Err(FsError::Unsupported)
+        ));
         Ok(())
     }
 
