@@ -6,7 +6,7 @@ import unittest
 from pathlib import PurePosixPath
 from unittest import mock
 
-from scripts import test_changed
+from scripts import test_changed, test_scenarios
 
 
 def package(
@@ -128,7 +128,7 @@ class ChangedTestSelectionTests(unittest.TestCase):
             (PurePosixPath("apps/lua/src/main.rs"),), PACKAGES
         )
         self.assertEqual(lua_plan.python_tests, {"test_lua_app.py"})
-        self.assertEqual(lua_plan.qemu_scenarios, {"lua"})
+        self.assertEqual(lua_plan.qemu_scenarios, {"lua", "filesystem"})
 
     def test_allocator_sdk_selects_lua_build_and_runtime_scenario(self) -> None:
         plan = test_changed.build_plan(
@@ -275,6 +275,30 @@ class ChangedTestSelectionTests(unittest.TestCase):
         self.assertIn("--skip-qemu", skipped)
         self.assertIn("--require-filesystem-tools", skipped)
 
+    def test_cpython_paths_select_their_own_gate_without_a_rootfs_kex_build(self) -> None:
+        paths = (
+            PurePosixPath("apps/python/src/main.rs"),
+            PurePosixPath("tools/build_cpython.py"),
+            PurePosixPath("tests/fixtures/cpython/language_probe.py"),
+            PurePosixPath("tests/python-no-random/Cargo.toml"),
+        )
+        plan = test_changed.build_plan(paths, {})
+        self.assertEqual(plan.full_reasons, [])
+        self.assertEqual(plan.python_tests, {"test_cpython_integration.py"})
+        self.assertEqual(plan.qemu_scenarios, {"cpython"})
+        self.assertEqual(plan.applications, {"python"})
+        commands = test_changed.commands_for_plan(
+            plan, skip_qemu=False, require_filesystem_tools=False
+        )
+        self.assertFalse(
+            [command for command in commands if "kex" in command], commands
+        )
+        self.assertIn("cpython", test_scenarios.SCENARIO_IDS)
+        self.assertNotIn("cpython", test_scenarios.DEFAULT_SCENARIOS)
+        self.assertEqual(
+            test_scenarios.OPTIONAL_SCENARIOS, frozenset({"cpython", "lua"})
+        )
+
     def test_selector_and_qemu_scenario_catalogs_are_exactly_aligned(self) -> None:
         self.assertEqual(
             test_changed.ALL_QEMU_SCENARIOS,
@@ -284,7 +308,6 @@ class ChangedTestSelectionTests(unittest.TestCase):
                     "network",
                     "shell-terminal",
                     "filesystem",
-                    "lua",
                     "quota-memory",
                     "persistence",
                     "fault-isolation",

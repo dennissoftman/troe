@@ -165,7 +165,7 @@ deviations still fail closed. Use `cargo mount --repair` for the same explicit,
 lock-protected non-interactive repair without mounting the image.
 
 Large optional runtime executables use the versioned
-`/vol/shared/runtime/v1/<architecture>/bin/<name>.kex` tree. They are never
+`/vol/shared/bin/<architecture>/<name>.kex` tree. They are never
 copied into rootfs, KEFS, or the EFI image. `tools/mkruntime.py` builds a
 canonical SHA-256 manifest, verifies the exact file set and every artifact
 byte, and installs either below a mounted shared-media root or directly into a
@@ -271,7 +271,11 @@ nested KEX package through the owner-scoped launch capability, inherits or
 captures standard output through a bounded pipe, waits, reaps, and preserves
 the child's complete exit status without putting shell grammar in the kernel.
 
-[`apps/lua`](apps/lua) is a complete freestanding Lua 5.5.1 interpreter. It
+[`apps/lua`](apps/lua) is a complete freestanding Lua 5.5.1 interpreter. Like
+CPython it is an optional runtime rather than a recovery command: it ships on
+`/vol/shared/bin/<architecture>` and is reached by explicit path, so the
+read-only root keeps only what booting, recovering, and administering a
+machine actually needs. It
 supports the stock batch command-line actions and standard library surface,
 including file mutation, `os.execute`, and read/write `io.popen` through explicit
 KEX capabilities. It starts with a 1 MiB TLSF application heap, reports
@@ -287,6 +291,36 @@ interactive `-i`/REPL operation is absent, UTC and the C locale are fixed, C
 dynamic modules have no loader, and Lua has no ambient host OS or raw filesystem
 access.
 
+[`apps/python`](apps/python) is upstream CPython built as one statically linked
+KEX. It is the only application delivered on `/vol/shared` instead of rootfs:
+the interpreter and its library do not fit the rootfs and EFI budgets.
+`tools/build_cpython.py` authenticates and cross-builds the pinned 3.14.7,
+3.13.15, and 3.12.14 releases for both targets, and the package exposes
+version-addressable `python3.14.7.kex` through `python3.12.kex` names plus a
+`python.kex` default bound to the newest pinned release. Initialization is an
+explicit isolated `PyConfig`: fixed TROE paths, UTF-8 mode, no ambient
+environment, no user site directory, and no bytecode writes, so a read-only
+interpreter tree stays fully usable. Imports resolve from the shipped library
+and from `/vol/shared/lib/<architecture>/packages`, where bootstrap tooling installs
+ordinary pure-Python packages. File I/O, the working directory, clocks, private
+memory, temporary files, and `os.urandom`/`secrets` reach the granted
+capabilities through the shared C runtime; withholding entropy authority stops
+interpreter initialization outright rather than falling back to weak seeding.
+`sys.platform` is `troe` rather than a POSIX claim. The limits are explicit and
+tested: no `pip`, virtual environments,
+shared libraries, native extensions, `ctypes`, sockets, TLS, SQLite,
+subprocesses, real threads, or signals; creating a thread fails explicitly while
+main-thread locks and thread-local storage work; and every module needing an
+excluded facility is absent rather than broken. Every build records its own
+interpreter, mapped-page, and library measurements next to the accepted
+per-component ceilings and fails when any one regresses past them. Started with
+no arguments on the terminal it runs its basic REPL over the session
+terminal-input loan, retaining state between statements and ending on end of
+input; redirected and piped standard input keep their noninteractive behavior.
+`site` is never imported, so no search path, per-user directory, or `.pth` file
+can affect startup; the launcher installs only that module's `exit` and `quit`
+conveniences.
+
 The reusable freestanding C SDK lives under
 [`sdk/c`](sdk/c/troe-kex-sysroot). `tools/build_c_sysroot.py` produces an LP64
 sysroot for both supported targets with target headers and
@@ -294,7 +328,8 @@ sysroot for both supported targets with target headers and
 is a build sysroot library, not a guest `/lib` payload. The
 static library owns the C allocator ABI, UTF-8 and wide-character conversion,
 `setjmp`/`longjmp`, bounded descriptors, buffered `FILE` and directory streams,
-filesystem replacement, preserved append, and links, argv/environment,
+filesystem replacement, preserved append, read-write descriptors that read back
+their own staged bytes, and links, argv/environment,
 UTC/C-locale time, secure
 randomness, exit handling, and coherent single-execution-thread locks and TSS.
 The Rust [`troe-kex-c-runtime`](sdk/rust/troe-kex-c-runtime) bridge supplies only

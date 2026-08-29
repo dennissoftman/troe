@@ -1,0 +1,320 @@
+{
+  "schema": 1,
+  "default": {
+    "include": "platform-independent pure-Python source",
+    "reason": "available on the TROE compatibility runtime without a native extension or an excluded facility"
+  },
+  "limits": {
+    "kex_bytes": 10485760,
+    "image_mapped_pages": 2560,
+    "stdlib_bytes": 8388608
+  },
+  "exclude": [
+    {
+      "paths": [
+        "__phello__",
+        "__hello__.py",
+        "antigravity.py",
+        "this.py"
+      ],
+      "reason": "demonstration module, not runtime functionality"
+    },
+    {
+      "paths": [
+        "_aix_support.py",
+        "_android_support.py",
+        "_apple_support.py",
+        "_ios_support.py",
+        "_osx_support.py"
+      ],
+      "reason": "host-platform build support is not applicable to TROE"
+    },
+    {
+      "paths": [
+        "_pyrepl",
+        "curses",
+        "idlelib",
+        "readline.py",
+        "rlcompleter.py",
+        "tty.py"
+      ],
+      "reason": "advanced terminal, readline, and curses support is intentionally unavailable; CPython uses its basic REPL"
+    },
+    {
+      "paths": [
+        "asyncio",
+        "concurrent",
+        "multiprocessing",
+        "subprocess.py"
+      ],
+      "reason": "additional execution threads, processes, and subprocesses are intentionally unavailable"
+    },
+    {
+      "paths": [
+        "bz2.py",
+        "compression",
+        "gzip.py",
+        "lzma.py"
+      ],
+      "reason": "the required native compression codec is intentionally unavailable"
+    },
+    {
+      "paths": [
+        "cProfile.py"
+      ],
+      "reason": "the native _lsprof accelerator is intentionally unavailable"
+    },
+    {
+      "paths": [
+        "ctypes"
+      ],
+      "reason": "dynamic native library and ctypes loading is intentionally unavailable"
+    },
+    {
+      "paths": [
+        "dbm",
+        "sqlite3"
+      ],
+      "reason": "native database backends are intentionally unavailable"
+    },
+    {
+      "paths": [
+        "doctest.py",
+        "mailbox.py",
+        "pdb.py",
+        "plistlib.py",
+        "pydoc.py",
+        "pydoc_data",
+        "unittest"
+      ],
+      "reason": "requires the signal, fcntl, or pyexpat extension modules that this milestone excludes, so the module cannot be imported at all"
+    },
+    {
+      "paths": [
+        "ensurepip",
+        "venv"
+      ],
+      "reason": "pip, package resolution, and virtual environments are outside the TROE runtime contract"
+    },
+    {
+      "paths": [
+        "ftplib.py",
+        "http",
+        "imaplib.py",
+        "poplib.py",
+        "selectors.py",
+        "smtplib.py",
+        "socket.py",
+        "socketserver.py",
+        "ssl.py",
+        "urllib",
+        "wsgiref",
+        "xmlrpc"
+      ],
+      "reason": "networking and TLS are intentionally unavailable"
+    },
+    {
+      "paths": [
+        "pty.py"
+      ],
+      "reason": "process creation and pseudo-terminal control are intentionally unavailable"
+    },
+    {
+      "paths": [
+        "signal.py"
+      ],
+      "reason": "signals are intentionally unavailable"
+    },
+    {
+      "paths": [
+        "site-packages"
+      ],
+      "reason": "third-party packages are supplied only through the explicit TROE package roots"
+    },
+    {
+      "paths": [
+        "test",
+        "tkinter",
+        "turtledemo",
+        "turtle.py"
+      ],
+      "reason": "upstream tests and GUI support are not runtime library content"
+    },
+    {
+      "paths": [
+        "tracemalloc.py"
+      ],
+      "reason": "the native tracemalloc backend is intentionally unavailable"
+    },
+    {
+      "paths": [
+        "webbrowser.py"
+      ],
+      "reason": "external GUI and subprocess launching are intentionally unavailable"
+    },
+    {
+      "paths": [
+        "xml"
+      ],
+      "reason": "the native expat parser is intentionally unavailable"
+    },
+    {
+      "paths": [
+        "zoneinfo"
+      ],
+      "reason": "timezone databases and the native zoneinfo backend are intentionally unavailable"
+    }
+  ],
+  "excluded_builtins": [
+    {
+      "modules": [
+        "_asyncio"
+      ],
+      "reason": "async I/O backends depend on unavailable polling, sockets, or threads"
+    },
+    {
+      "modules": [
+        "_bz2",
+        "_lzma",
+        "_zstd",
+        "zlib"
+      ],
+      "reason": "native compression codecs are intentionally unavailable"
+    },
+    {
+      "modules": [
+        "_ctypes",
+        "_ctypes_test"
+      ],
+      "reason": "ctypes and dynamic native loading are intentionally unavailable"
+    },
+    {
+      "modules": [
+        "_curses",
+        "_curses_panel",
+        "readline",
+        "termios"
+      ],
+      "reason": "readline, curses, and terminal control are intentionally unavailable"
+    },
+    {
+      "modules": [
+        "_dbm",
+        "_gdbm",
+        "_sqlite3"
+      ],
+      "reason": "native database backends are intentionally unavailable"
+    },
+    {
+      "modules": [
+        "_decimal"
+      ],
+      "reason": "the pure-Python decimal implementation is shipped instead of the native accelerator"
+    },
+    {
+      "modules": [
+        "_elementtree",
+        "pyexpat"
+      ],
+      "reason": "the native expat and ElementTree accelerators are intentionally unavailable"
+    },
+    {
+      "modules": [
+        "_hashlib",
+        "_ssl"
+      ],
+      "reason": "OpenSSL and TLS are intentionally unavailable; pinned built-in HACL hashes provide supported digest algorithms"
+    },
+    {
+      "modules": [
+        "_interpreters",
+        "_interpchannels",
+        "_interpqueues"
+      ],
+      "reason": "additional interpreter execution contexts are outside the single-thread runtime contract"
+    },
+    {
+      "modules": [
+        "_lsprof"
+      ],
+      "reason": "the native deterministic-profiler accelerator is not in the built-in allowlist"
+    },
+    {
+      "modules": [
+        "_multiprocessing",
+        "_posixshmem",
+        "_posixsubprocess"
+      ],
+      "reason": "processes, shared memory, and subprocesses are intentionally unavailable"
+    },
+    {
+      "modules": [
+        "_remote_debugging"
+      ],
+      "reason": "remote debugging and its process access are intentionally unavailable"
+    },
+    {
+      "modules": [
+        "_scproxy",
+        "_socket"
+      ],
+      "reason": "networking is intentionally unavailable"
+    },
+    {
+      "modules": [
+        "_tkinter"
+      ],
+      "reason": "GUI support is intentionally unavailable"
+    },
+    {
+      "modules": [
+        "_uuid"
+      ],
+      "reason": "the optional native UUID accelerator is not shipped; pure-Python UUID operations remain available"
+    },
+    {
+      "modules": [
+        "_zoneinfo"
+      ],
+      "reason": "timezone databases are intentionally unavailable"
+    },
+    {
+      "modules": [
+        "fcntl",
+        "grp",
+        "mmap",
+        "pwd",
+        "resource",
+        "select",
+        "syslog"
+      ],
+      "reason": "the corresponding complete POSIX facility is not part of the TROE compatibility contract"
+    },
+    {
+      "modules": [
+        "faulthandler",
+        "_signal",
+        "_tracemalloc"
+      ],
+      "reason": "signals, fault handlers, and native allocation tracing are intentionally unavailable"
+    },
+    {
+      "modules": [
+        "_testbuffer",
+        "_testcapi",
+        "_testclinic",
+        "_testclinic_limited",
+        "_testimportmultiple",
+        "_testinternalcapi",
+        "_testlimitedcapi",
+        "_testmultiphase",
+        "_testsinglephase",
+        "_xxtestfuzz",
+        "xxlimited",
+        "xxlimited_35",
+        "xxsubtype"
+      ],
+      "reason": "upstream native test modules are not runtime functionality"
+    }
+  ]
+}

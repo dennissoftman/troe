@@ -6,6 +6,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod htree;
 mod journal;
 
 use alloc::string::{String, ToString};
@@ -21,28 +22,68 @@ const EXT4_MAGIC: u16 = 0xef53;
 const EXT4_DYNAMIC_REV: u32 = 1;
 const EXT4_VALID_FS: u16 = 1;
 const EXT4_ERROR_FS: u16 = 2;
+/// Largest filesystem block this provider reads or writes.
+const EXT4_MAX_BLOCK_BYTES: usize = 4096;
+/// Smallest filesystem block ext4 defines.
+const EXT4_MIN_BLOCK_BYTES: usize = 1024;
 const EXT4_BLOCK_BYTES: usize = 4096;
+#[cfg(test)]
 const EXT4_BLOCK_BYTES_U32: u32 = 4096;
+#[cfg(test)]
 const EXT4_BLOCK_BYTES_U64: u64 = 4096;
 const EXT4_INODE_BYTES: usize = 256;
 const EXT4_INODE_BYTES_U16: u16 = 256;
 const EXT4_GROUP_DESC_BYTES: usize = 32;
 const EXT4_GROUP_DESC_BYTES_U16: u16 = 32;
+/// Largest group descriptor this provider reads or writes.
+const EXT4_GROUP_DESC_MAX: usize = 64;
+/// Superblock offset of the checksum seed used when `metadata_csum_seed` is set.
+const EXT4_SUPER_CHECKSUM_SEED: usize = 0x270;
 const EXT4_BITMAP_BITS: u32 = 32_768;
 const EXT4_ROOT_INO: u32 = 2;
 const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
+/// Set on a directory whose entries are described by a hashed index.
+const EXT4_INDEX_FL: u32 = 0x0000_1000;
+/// Group flag: the inode table and bitmap were never initialized.
+const EXT4_BG_INODE_UNINIT: u16 = 0x0001;
+/// Group flag: the block bitmap was never initialized.
+const EXT4_BG_BLOCK_UNINIT: u16 = 0x0002;
+/// Group descriptor offset of the flag word.
+const EXT4_BG_FLAGS_OFFSET: usize = 18;
+/// Group descriptor offsets of the block bitmap checksum halves.
+const EXT4_BG_BLOCK_CSUM_LO: usize = 24;
+const EXT4_BG_BLOCK_CSUM_HI: usize = 56;
+/// Group descriptor offsets of the inode bitmap checksum halves.
+const EXT4_BG_INODE_CSUM_LO: usize = 26;
+const EXT4_BG_INODE_CSUM_HI: usize = 58;
 const EXT4_EXT_MAGIC: u16 = 0xf30a;
 const EXT4_INLINE_EXTENTS: usize = 4;
 const EXT4_EXTENT_HEADER_BYTES: usize = 12;
 const EXT4_EXTENT_RECORD_BYTES: usize = 12;
 const EXT4_EXTENT_TAIL_BYTES: usize = 4;
-const EXT4_LEAF_EXTENTS: usize =
-    (EXT4_BLOCK_BYTES - EXT4_EXTENT_HEADER_BYTES - EXT4_EXTENT_TAIL_BYTES)
-        / EXT4_EXTENT_RECORD_BYTES;
+/// Extents one leaf block can hold at the given block size.
+const fn leaf_extents(block_bytes: usize) -> usize {
+    (block_bytes - EXT4_EXTENT_HEADER_BYTES - EXT4_EXTENT_TAIL_BYTES) / EXT4_EXTENT_RECORD_BYTES
+}
+
+/// Offset of the checksum tail inside one extent leaf block.
+const fn extent_tail_offset(block_bytes: usize) -> usize {
+    EXT4_EXTENT_HEADER_BYTES + leaf_extents(block_bytes) * EXT4_EXTENT_RECORD_BYTES
+}
+
+/// Largest extent count a depth-one tree can describe at the given block size.
+const fn max_depth_one_extents(block_bytes: usize) -> usize {
+    leaf_extents(block_bytes) * EXT4_ROOT_INDEXES
+}
+
+const EXT4_LEAF_EXTENTS: usize = leaf_extents(EXT4_BLOCK_BYTES);
 const EXT4_EXTENT_TAIL_OFFSET: usize =
     EXT4_EXTENT_HEADER_BYTES + EXT4_LEAF_EXTENTS * EXT4_EXTENT_RECORD_BYTES;
 const EXT4_ROOT_INDEXES: usize = 4;
-const EXT4_MAX_DEPTH_ONE_EXTENTS: usize = EXT4_LEAF_EXTENTS * EXT4_ROOT_INDEXES;
+/// Deepest extent tree this provider walks; ext4 itself never exceeds five.
+const EXT4_MAX_EXTENT_DEPTH: u16 = 5;
+/// Hard ceiling on interior blocks one extent tree may occupy.
+const EXT4_MAX_EXTENT_TREE_BLOCKS: usize = 2048;
 const EXT4_FT_REG_FILE: u8 = 1;
 const EXT4_FT_DIR: u8 = 2;
 const EXT4_FT_SYMLINK: u8 = 7;
@@ -52,12 +93,69 @@ const EXT4_DIR_TAIL_FT: u8 = 0xde;
 const EXT4_DIR_TAIL_BYTES: usize = 12;
 const EXT4_DIR_TAIL_BYTES_U16: u16 = 12;
 const EXT4_JOURNAL_INO: u32 = 8;
+
+// Compatible features never change how existing metadata is read, so an
+// unknown one is ignored. `dir_index` is listed because directory mutation
+// must keep a hashed index consistent, not because reading needs it.
+#[cfg(test)]
+const EXT4_COMPAT_DIR_INDEX: u32 = 0x0000_0020;
+
+// Incompatible features change on-disk structure. An unknown one must refuse
+// the volume outright rather than risk misreading it.
+const EXT4_INCOMPAT_FILETYPE: u32 = 0x0000_0002;
 const EXT4_FEATURE_INCOMPAT_RECOVER: u32 = 0x0000_0004;
+const EXT4_INCOMPAT_EXTENTS: u32 = 0x0000_0040;
+const EXT4_INCOMPAT_64BIT: u32 = 0x0000_0080;
+const EXT4_INCOMPAT_FLEX_BG: u32 = 0x0000_0200;
+const EXT4_INCOMPAT_CSUM_SEED: u32 = 0x0000_2000;
+
+// Read-only-compatible features only change how a writer must maintain
+// metadata. An unknown one downgrades the volume to read-only instead of
+// refusing it, so foreign media stays readable and untouched.
+const EXT4_RO_COMPAT_SPARSE_SUPER: u32 = 0x0000_0001;
+const EXT4_RO_COMPAT_LARGE_FILE: u32 = 0x0000_0002;
+const EXT4_RO_COMPAT_HUGE_FILE: u32 = 0x0000_0008;
+const EXT4_RO_COMPAT_DIR_NLINK: u32 = 0x0000_0020;
+const EXT4_RO_COMPAT_EXTRA_ISIZE: u32 = 0x0000_0040;
+const EXT4_RO_COMPAT_METADATA_CSUM: u32 = 0x0000_0400;
+
+/// Incompatible features this provider understands well enough to mount.
+const EXT4_KNOWN_INCOMPAT: u32 = EXT4_INCOMPAT_FILETYPE
+    | EXT4_FEATURE_INCOMPAT_RECOVER
+    | EXT4_INCOMPAT_EXTENTS
+    | EXT4_INCOMPAT_64BIT
+    | EXT4_INCOMPAT_FLEX_BG
+    | EXT4_INCOMPAT_CSUM_SEED;
+
+/// Read-only-compatible features this provider maintains correctly on write.
+const EXT4_KNOWN_RO_COMPAT: u32 = EXT4_RO_COMPAT_SPARSE_SUPER
+    | EXT4_RO_COMPAT_LARGE_FILE
+    | EXT4_RO_COMPAT_HUGE_FILE
+    | EXT4_RO_COMPAT_DIR_NLINK
+    | EXT4_RO_COMPAT_EXTRA_ISIZE
+    | EXT4_RO_COMPAT_METADATA_CSUM;
+
+/// Structure this provider requires in every volume it will mount.
+const EXT4_REQUIRED_INCOMPAT: u32 = EXT4_INCOMPAT_FILETYPE | EXT4_INCOMPAT_EXTENTS;
+const EXT4_REQUIRED_RO_COMPAT: u32 = EXT4_RO_COMPAT_EXTRA_ISIZE | EXT4_RO_COMPAT_METADATA_CSUM;
+
+/// The exact feature set TROE's own image recipe produces.
+#[cfg(test)]
 const EXT4_FEATURE_COMPAT: u32 = 0x0000_0004 | 0x0000_0008;
-const EXT4_FEATURE_INCOMPAT: u32 = 0x0000_0002 | 0x0000_0040;
-const EXT4_FEATURE_RO_COMPAT: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0040 | 0x0000_0400;
+#[cfg(test)]
+const EXT4_FEATURE_INCOMPAT: u32 = EXT4_REQUIRED_INCOMPAT;
+#[cfg(test)]
+const EXT4_FEATURE_RO_COMPAT: u32 =
+    EXT4_RO_COMPAT_SPARSE_SUPER | EXT4_RO_COMPAT_LARGE_FILE | EXT4_REQUIRED_RO_COMPAT;
 const CRC32C_POLYNOMIAL: u32 = 0x82f6_3b78;
-const HARD_MAX_GROUPS: u32 = 32;
+/// Hard ceiling on block groups.
+///
+/// A group holds at most [`EXT4_BITMAP_BITS`] blocks, so this covers the whole
+/// 32-bit block space: 16 TiB at the 4 KiB block size. A volume larger than
+/// that sets `s_blocks_count_hi`, which the mount parser refuses rather than
+/// truncating to 32 bits. Allocation stays bounded because the free-block scan
+/// stops as soon as the retained runs can satisfy the request.
+const HARD_MAX_GROUPS: u32 = 131_072;
 const HARD_MAX_INODES_PER_OPERATION: u32 = 64;
 const HARD_MAX_DIRECTORY_BLOCKS: u32 = 256;
 const HARD_MAX_DIRECTORY_ENTRIES: u32 = 4096;
@@ -233,8 +331,21 @@ struct Layout {
     first_inode: u32,
     groups: u32,
     device_blocks_per_fs_block: u32,
+    /// Filesystem block size in bytes: 1024, 2048, or 4096.
+    block_bytes: usize,
+    /// First block that may hold data; 1 only at the 1 KiB block size.
+    first_data_block: u32,
+    /// The same block size as a 32-bit value.
+    block_bytes_u32: u32,
+    /// The same block size as a 64-bit value.
+    block_bytes_u64: u64,
     checksum_seed: u32,
+    /// On-disk group descriptor size; 64 whenever the `64bit` feature is set.
+    desc_size: usize,
     uuid: Ext4Uuid,
+    /// Cleared when the volume declares a read-only-compatible feature this
+    /// provider cannot maintain, so foreign media stays readable but untouched.
+    writable: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -247,6 +358,8 @@ struct Extent {
 
 #[derive(Clone, Debug)]
 struct ParsedExtentRoot {
+    /// Tree depth: zero when the root holds extents directly.
+    depth: u16,
     extents: Vec<Extent>,
     tree_blocks: Vec<u32>,
     tree_logicals: Vec<u32>,
@@ -258,8 +371,16 @@ struct Inode {
     generation: u32,
     kind: NodeKind,
     size: u64,
+    /// Set when this directory carries a hashed index this provider does not
+    /// maintain. Its blocks do not follow the linear record layout.
+    indexed: bool,
     extents: Vec<Extent>,
     extent_tree_blocks: Vec<u32>,
+    /// Depth of the extent tree this inode's root describes.
+    extent_depth: u16,
+    /// Interior tree blocks above the leaf level, recorded so a rewrite can
+    /// release the entire tree.
+    interior_extent_blocks: Vec<u32>,
     extent_tree_logicals: Vec<u32>,
 }
 
@@ -305,6 +426,20 @@ pub struct Ext4<D: BlockDevice> {
     write_defaults: Ext4WriteDefaults,
     journal: Option<JournalGeometry>,
     transaction: Option<Transaction>,
+    /// Seconds since the epoch stamped into mutated inodes.
+    ///
+    /// Zero means the owner supplied no clock, in which case timestamps are
+    /// left exactly as they were rather than invented.
+    wall_clock_seconds: u32,
+}
+
+/// Which timestamps one inode write should advance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InodeTouch {
+    /// Only the inode itself changed, so the change time advances.
+    Metadata,
+    /// The file's contents changed, so the modification time advances too.
+    Content,
 }
 
 /// Where the internal journal lives, resolved once from inode 8.
@@ -438,27 +573,29 @@ impl<D: BlockDevice> Ext4<D> {
         let device_block_bytes =
             usize::try_from(info.block_bytes()).map_err(|_| FsError::Overflow)?;
         if info.required_alignment_blocks() != 1
-            || device_block_bytes > EXT4_BLOCK_BYTES
-            || !EXT4_BLOCK_BYTES.is_multiple_of(device_block_bytes)
+            || device_block_bytes > EXT4_MIN_BLOCK_BYTES
+            || !EXT4_MIN_BLOCK_BYTES.is_multiple_of(device_block_bytes)
         {
             return Err(FsError::Unsupported);
         }
-        let device_blocks_per_fs_block =
-            u32::try_from(EXT4_BLOCK_BYTES / device_block_bytes).map_err(|_| FsError::Overflow)?;
-        if info.limits().max_transfer_blocks() < device_blocks_per_fs_block
-            || info.limits().max_transfer_bytes() < EXT4_BLOCK_BYTES
-        {
-            return Err(FsError::Unsupported);
-        }
-        let block_zero = read_raw_fs_block(&mut region, 0, device_blocks_per_fs_block)?;
-        let superblock = block_zero.get(1024..2048).ok_or(FsError::Corrupt)?;
+        // The superblock always lives at byte 1024 regardless of block size, so
+        // it is read before the block size it declares is known.
+        let probe_blocks = u32::try_from(EXT4_MAX_BLOCK_BYTES / device_block_bytes)
+            .map_err(|_| FsError::Overflow)?;
+        let probe = read_raw_device_span(&mut region, 0, probe_blocks, EXT4_MAX_BLOCK_BYTES)?;
+        let superblock = probe.get(1024..2048).ok_or(FsError::Corrupt)?;
         let layout = parse_superblock(
             superblock,
             info.block_count(),
-            device_blocks_per_fs_block,
+            device_block_bytes,
             limits,
             admission,
         )?;
+        if info.limits().max_transfer_blocks() < layout.device_blocks_per_fs_block
+            || info.limits().max_transfer_bytes() < layout.block_bytes
+        {
+            return Err(FsError::Unsupported);
+        }
         let mut mounted = Self {
             region,
             limits,
@@ -466,6 +603,7 @@ impl<D: BlockDevice> Ext4<D> {
             write_defaults,
             journal: None,
             transaction: None,
+            wall_clock_seconds: 0,
         };
         // A half-checkpointed volume may hold a torn root directory that
         // replay is about to restore, so recovery validates the root only
@@ -540,6 +678,14 @@ impl<D: BlockDevice> Ext4<D> {
         })
     }
 
+    /// Supply the wall clock this provider stamps into mutated inodes.
+    ///
+    /// Timestamps are left untouched until an owner provides a time, so a
+    /// provider without a clock never invents one.
+    pub const fn set_wall_clock_seconds(&mut self, seconds: u32) {
+        self.wall_clock_seconds = seconds;
+    }
+
     /// Filesystem UUID validated at mount.
     #[must_use]
     pub const fn uuid(&self) -> Ext4Uuid {
@@ -563,10 +709,26 @@ impl<D: BlockDevice> Ext4<D> {
             &mut self.region,
             block,
             self.layout.device_blocks_per_fs_block,
+            self.layout.block_bytes,
         )
     }
 
+    /// Block holding the superblock, and its offset inside that block.
+    ///
+    /// The superblock always lives at byte 1024, which is block 1 at the 1 KiB
+    /// block size and an offset inside block 0 at every larger size.
+    const fn superblock_location(&self) -> (u32, usize) {
+        if self.layout.block_bytes == EXT4_MIN_BLOCK_BYTES {
+            (1, 0)
+        } else {
+            (0, 1024)
+        }
+    }
+
     fn ensure_writable(&self) -> Result<(), FsError> {
+        if !self.layout.writable {
+            return Err(FsError::ReadOnly);
+        }
         let info = self.region.info();
         if info.access() != BlockAccess::ReadWrite {
             return Err(FsError::ReadOnly);
@@ -583,7 +745,7 @@ impl<D: BlockDevice> Ext4<D> {
     }
 
     fn write_fs_block(&mut self, block: u32, bytes: &[u8]) -> Result<(), FsError> {
-        if block >= self.layout.blocks || bytes.len() != EXT4_BLOCK_BYTES {
+        if block >= self.layout.blocks || bytes.len() != self.layout.block_bytes {
             return Err(FsError::Invalid);
         }
         if let Some(transaction) = self.transaction.as_mut() {
@@ -593,7 +755,7 @@ impl<D: BlockDevice> Ext4<D> {
     }
 
     fn write_fs_block_direct(&mut self, block: u32, bytes: &[u8]) -> Result<(), FsError> {
-        if block >= self.layout.blocks || bytes.len() != EXT4_BLOCK_BYTES {
+        if block >= self.layout.blocks || bytes.len() != self.layout.block_bytes {
             return Err(FsError::Invalid);
         }
         let start = u64::from(block)
@@ -625,9 +787,16 @@ impl<D: BlockDevice> Ext4<D> {
     /// The ordinary mount refuses on either signal, and a foreign Linux host is
     /// forced to recover rather than mount half-applied metadata.
     fn set_clean_state(&mut self, clean: bool) -> Result<(), FsError> {
-        let mut block =
-            read_raw_fs_block(&mut self.region, 0, self.layout.device_blocks_per_fs_block)?;
-        let superblock = block.get_mut(1024..2048).ok_or(FsError::Corrupt)?;
+        let (holder, holder_offset) = self.superblock_location();
+        let mut block = read_raw_fs_block(
+            &mut self.region,
+            holder,
+            self.layout.device_blocks_per_fs_block,
+            self.layout.block_bytes,
+        )?;
+        let superblock = block
+            .get_mut(holder_offset..holder_offset + 1024)
+            .ok_or(FsError::Corrupt)?;
         let state = read_u16(superblock, 58)?;
         let updated = if clean {
             (state | EXT4_VALID_FS) & !EXT4_ERROR_FS
@@ -645,7 +814,7 @@ impl<D: BlockDevice> Ext4<D> {
         superblock[1020..1024].fill(0);
         let checksum = crc32c(u32::MAX, &superblock[..1020]);
         put_u32(superblock, 1020, checksum)?;
-        self.write_fs_block_direct(0, &block)?;
+        self.write_fs_block_direct(holder, &block)?;
         self.durability_barrier()
     }
 
@@ -668,7 +837,7 @@ impl<D: BlockDevice> Ext4<D> {
         }
         let first_block = extent.physical;
         let image = self.read_fs_block(first_block)?;
-        let superblock = journal::JournalSuperblock::parse(&image, EXT4_BLOCK_BYTES_U32)?;
+        let superblock = journal::JournalSuperblock::parse(&image, self.layout.block_bytes_u32)?;
         if u32::from(extent.blocks) != superblock.maxlen {
             return Err(FsError::Corrupt);
         }
@@ -774,6 +943,7 @@ impl<D: BlockDevice> Ext4<D> {
             &mut self.region,
             geometry.first_block,
             self.layout.device_blocks_per_fs_block,
+            self.layout.block_bytes,
         )?;
         journal::JournalSuperblock::write_head(&mut image, head, sequence)?;
         self.write_fs_block_direct(geometry.first_block, &image)?;
@@ -794,6 +964,7 @@ impl<D: BlockDevice> Ext4<D> {
             &mut self.region,
             geometry.first_block,
             self.layout.device_blocks_per_fs_block,
+            self.layout.block_bytes,
         )?;
         journal::JournalSuperblock::write_head(&mut image, 0, next)?;
         self.write_fs_block_direct(geometry.first_block, &image)?;
@@ -815,41 +986,53 @@ impl<D: BlockDevice> Ext4<D> {
         self.transaction = None;
     }
 
-    fn write_group_descriptor(
-        &mut self,
-        group: u32,
-        mut descriptor: [u8; EXT4_GROUP_DESC_BYTES],
-    ) -> Result<(), FsError> {
+    /// Locate one group descriptor as a table block and byte offset inside it.
+    fn descriptor_location(&self, group: u32) -> Result<(u32, usize), FsError> {
         if group >= self.layout.groups {
             return Err(FsError::Corrupt);
         }
+        let byte_offset = usize::try_from(group)
+            .ok()
+            .and_then(|value| value.checked_mul(self.layout.desc_size))
+            .ok_or(FsError::Overflow)?;
+        let table_block = self
+            .layout
+            .first_data_block
+            .checked_add(1)
+            .and_then(|first| {
+                first.checked_add(u32::try_from(byte_offset / self.layout.block_bytes).ok()?)
+            })
+            .ok_or(FsError::Overflow)?;
+        Ok((table_block, byte_offset % self.layout.block_bytes))
+    }
+
+    fn write_group_descriptor(
+        &mut self,
+        group: u32,
+        mut descriptor: [u8; EXT4_GROUP_DESC_MAX],
+    ) -> Result<(), FsError> {
+        let (table_block, offset) = self.descriptor_location(group)?;
+        let size = self.layout.desc_size;
         descriptor[30..32].fill(0);
         let checksum = crc32c(
             crc32c(self.layout.checksum_seed, &group.to_le_bytes()),
-            &descriptor,
+            descriptor.get(..size).ok_or(FsError::Corrupt)?,
         );
         descriptor[30..32].copy_from_slice(&checksum.to_le_bytes()[..2]);
-        let byte_offset = usize::try_from(group)
-            .ok()
-            .and_then(|value| value.checked_mul(EXT4_GROUP_DESC_BYTES))
-            .ok_or(FsError::Overflow)?;
-        let table_block = 1_u32
-            .checked_add(
-                u32::try_from(byte_offset / EXT4_BLOCK_BYTES).map_err(|_| FsError::Overflow)?,
-            )
-            .ok_or(FsError::Overflow)?;
-        let offset = byte_offset % EXT4_BLOCK_BYTES;
         let mut block = self.read_fs_block(table_block)?;
         block
-            .get_mut(offset..offset + EXT4_GROUP_DESC_BYTES)
+            .get_mut(offset..offset + size)
             .ok_or(FsError::Corrupt)?
-            .copy_from_slice(&descriptor);
+            .copy_from_slice(descriptor.get(..size).ok_or(FsError::Corrupt)?);
         self.write_fs_block(table_block, &block)
     }
 
     fn adjust_superblock_counter(&mut self, offset: usize, allocate: bool) -> Result<(), FsError> {
-        let mut block = self.read_fs_block(0)?;
-        let superblock = block.get_mut(1024..2048).ok_or(FsError::Corrupt)?;
+        let (holder, holder_offset) = self.superblock_location();
+        let mut block = self.read_fs_block(holder)?;
+        let superblock = block
+            .get_mut(holder_offset..holder_offset + 1024)
+            .ok_or(FsError::Corrupt)?;
         let current = read_u32(superblock, offset)?;
         let updated = if allocate {
             current.checked_sub(1)
@@ -861,7 +1044,52 @@ impl<D: BlockDevice> Ext4<D> {
         superblock[1020..1024].fill(0);
         let checksum = crc32c(u32::MAX, &superblock[..1020]);
         put_u32(superblock, 1020, checksum)?;
-        self.write_fs_block(0, &block)
+        self.write_fs_block(holder, &block)
+    }
+
+    /// Whether this volume stores the upper half of a bitmap checksum.
+    ///
+    /// The high half exists only when the group descriptor is long enough to
+    /// contain it, which is exactly what `e2fsprogs` tests before using it.
+    fn has_checksum_high(&self, high_offset: usize) -> bool {
+        self.layout.desc_size >= high_offset + 2
+    }
+
+    /// Read a stored bitmap checksum, joining both halves when present.
+    fn stored_bitmap_checksum(
+        &self,
+        descriptor: &[u8],
+        low_offset: usize,
+        high_offset: usize,
+    ) -> Result<u32, FsError> {
+        let low = u32::from(read_u16(descriptor, low_offset)?);
+        if !self.has_checksum_high(high_offset) {
+            return Ok(low);
+        }
+        Ok(low | (u32::from(read_u16(descriptor, high_offset)?) << 16))
+    }
+
+    /// Store a bitmap checksum, splitting it across both halves when present.
+    fn put_bitmap_checksum(
+        &self,
+        descriptor: &mut [u8],
+        low_offset: usize,
+        high_offset: usize,
+        checksum: u32,
+    ) -> Result<(), FsError> {
+        put_u16(
+            descriptor,
+            low_offset,
+            u16::try_from(checksum & 0xFFFF).map_err(|_| FsError::Overflow)?,
+        )?;
+        if self.has_checksum_high(high_offset) {
+            put_u16(
+                descriptor,
+                high_offset,
+                u16::try_from(checksum >> 16).map_err(|_| FsError::Overflow)?,
+            )?;
+        }
+        Ok(())
     }
 
     fn validate_bitmap_checksum(
@@ -869,15 +1097,20 @@ impl<D: BlockDevice> Ext4<D> {
         descriptor: &[u8],
         bitmap: &[u8],
         bytes: usize,
-        checksum_offset: usize,
+        low_offset: usize,
+        high_offset: usize,
     ) -> Result<(), FsError> {
-        let stored = read_u16(descriptor, checksum_offset)?;
+        let stored = self.stored_bitmap_checksum(descriptor, low_offset, high_offset)?;
         let calculated = crc32c(
             self.layout.checksum_seed,
             bitmap.get(..bytes).ok_or(FsError::Corrupt)?,
         );
-        if stored != u16::from_le_bytes([calculated.to_le_bytes()[0], calculated.to_le_bytes()[1]])
-        {
+        let expected = if self.has_checksum_high(high_offset) {
+            calculated
+        } else {
+            calculated & 0xFFFF
+        };
+        if stored != expected {
             return Err(FsError::Corrupt);
         }
         Ok(())
@@ -887,8 +1120,13 @@ impl<D: BlockDevice> Ext4<D> {
         if block_number == 0 || block_number >= self.layout.blocks {
             return Err(FsError::Corrupt);
         }
-        let group = block_number / self.layout.blocks_per_group;
-        let bit = block_number % self.layout.blocks_per_group;
+        // Bit zero of group zero describes `first_data_block`, which is block
+        // one at the 1 KiB block size.
+        let relative = block_number
+            .checked_sub(self.layout.first_data_block)
+            .ok_or(FsError::Corrupt)?;
+        let group = relative / self.layout.blocks_per_group;
+        let bit = relative % self.layout.blocks_per_group;
         let mut descriptor = self.group_descriptor(group)?;
         let bitmap_block = read_u32(&descriptor, 0)?;
         if bitmap_block == 0 || bitmap_block >= self.layout.blocks {
@@ -897,7 +1135,13 @@ impl<D: BlockDevice> Ext4<D> {
         let mut bitmap = self.read_fs_block(bitmap_block)?;
         let bitmap_bytes =
             usize::try_from(self.layout.blocks_per_group / 8).map_err(|_| FsError::Overflow)?;
-        self.validate_bitmap_checksum(&descriptor, &bitmap, bitmap_bytes, 24)?;
+        self.validate_bitmap_checksum(
+            &descriptor,
+            &bitmap,
+            bitmap_bytes,
+            EXT4_BG_BLOCK_CSUM_LO,
+            EXT4_BG_BLOCK_CSUM_HI,
+        )?;
         let bit = usize::try_from(bit).map_err(|_| FsError::Overflow)?;
         let byte = bitmap.get_mut(bit / 8).ok_or(FsError::Corrupt)?;
         let mask = 1_u8 << (bit % 8);
@@ -911,7 +1155,12 @@ impl<D: BlockDevice> Ext4<D> {
         }
         self.write_fs_block(bitmap_block, &bitmap)?;
         let checksum = crc32c(self.layout.checksum_seed, &bitmap[..bitmap_bytes]);
-        descriptor[24..26].copy_from_slice(&checksum.to_le_bytes()[..2]);
+        self.put_bitmap_checksum(
+            &mut descriptor,
+            EXT4_BG_BLOCK_CSUM_LO,
+            EXT4_BG_BLOCK_CSUM_HI,
+            checksum,
+        )?;
         let free = read_u16(&descriptor, 12)?;
         put_u16(
             &mut descriptor,
@@ -942,7 +1191,13 @@ impl<D: BlockDevice> Ext4<D> {
         let mut bitmap = self.read_fs_block(bitmap_block)?;
         let bitmap_bytes =
             usize::try_from(self.layout.inodes_per_group / 8).map_err(|_| FsError::Overflow)?;
-        self.validate_bitmap_checksum(&descriptor, &bitmap, bitmap_bytes, 26)?;
+        self.validate_bitmap_checksum(
+            &descriptor,
+            &bitmap,
+            bitmap_bytes,
+            EXT4_BG_INODE_CSUM_LO,
+            EXT4_BG_INODE_CSUM_HI,
+        )?;
         let bit = usize::try_from(bit).map_err(|_| FsError::Overflow)?;
         let byte = bitmap.get_mut(bit / 8).ok_or(FsError::Corrupt)?;
         let mask = 1_u8 << (bit % 8);
@@ -956,7 +1211,12 @@ impl<D: BlockDevice> Ext4<D> {
         }
         self.write_fs_block(bitmap_block, &bitmap)?;
         let checksum = crc32c(self.layout.checksum_seed, &bitmap[..bitmap_bytes]);
-        descriptor[26..28].copy_from_slice(&checksum.to_le_bytes()[..2]);
+        self.put_bitmap_checksum(
+            &mut descriptor,
+            EXT4_BG_INODE_CSUM_LO,
+            EXT4_BG_INODE_CSUM_HI,
+            checksum,
+        )?;
         let free = read_u16(&descriptor, 14)?;
         put_u16(
             &mut descriptor,
@@ -1034,6 +1294,11 @@ impl<D: BlockDevice> Ext4<D> {
         runs.try_reserve_exact(4).map_err(|_| FsError::NoSpace)?;
         for group in 0..self.layout.groups {
             let descriptor = self.group_descriptor(group)?;
+            // An uninitialized bitmap holds no meaningful bits and no
+            // allocations, so the group is skipped rather than misread.
+            if read_u16(&descriptor, EXT4_BG_FLAGS_OFFSET)? & EXT4_BG_BLOCK_UNINIT != 0 {
+                continue;
+            }
             let bitmap_block = read_u32(&descriptor, 0)?;
             if bitmap_block == 0 || bitmap_block >= self.layout.blocks {
                 return Err(FsError::Corrupt);
@@ -1041,9 +1306,16 @@ impl<D: BlockDevice> Ext4<D> {
             let bitmap = self.read_fs_block(bitmap_block)?;
             let bitmap_bytes =
                 usize::try_from(self.layout.blocks_per_group / 8).map_err(|_| FsError::Overflow)?;
-            self.validate_bitmap_checksum(&descriptor, &bitmap, bitmap_bytes, 24)?;
+            self.validate_bitmap_checksum(
+                &descriptor,
+                &bitmap,
+                bitmap_bytes,
+                EXT4_BG_BLOCK_CSUM_LO,
+                EXT4_BG_BLOCK_CSUM_HI,
+            )?;
             let group_start = group
                 .checked_mul(self.layout.blocks_per_group)
+                .and_then(|start| start.checked_add(self.layout.first_data_block))
                 .ok_or(FsError::Overflow)?;
             let blocks_in_group = self
                 .layout
@@ -1069,6 +1341,14 @@ impl<D: BlockDevice> Ext4<D> {
                 }
             }
             Self::retain_free_run(&mut runs, run_start, run_length);
+            // Stop as soon as the retained runs can satisfy the request, so a
+            // large volume never pays for a whole-volume bitmap scan.
+            let retained = runs.iter().try_fold(0_u32, |total, (_, length)| {
+                total.checked_add(*length).ok_or(FsError::Overflow)
+            })?;
+            if retained >= count_u32 {
+                break;
+            }
         }
         runs.sort_unstable_by(|left, right| {
             right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0))
@@ -1104,6 +1384,10 @@ impl<D: BlockDevice> Ext4<D> {
     fn find_free_inode(&mut self) -> Result<u32, FsError> {
         for group in 0..self.layout.groups {
             let descriptor = self.group_descriptor(group)?;
+            // An uninitialized inode table holds no allocated inode.
+            if read_u16(&descriptor, EXT4_BG_FLAGS_OFFSET)? & EXT4_BG_INODE_UNINIT != 0 {
+                continue;
+            }
             let bitmap_block = read_u32(&descriptor, 4)?;
             if bitmap_block == 0 || bitmap_block >= self.layout.blocks {
                 return Err(FsError::Corrupt);
@@ -1111,7 +1395,13 @@ impl<D: BlockDevice> Ext4<D> {
             let bitmap = self.read_fs_block(bitmap_block)?;
             let bitmap_bytes =
                 usize::try_from(self.layout.inodes_per_group / 8).map_err(|_| FsError::Overflow)?;
-            self.validate_bitmap_checksum(&descriptor, &bitmap, bitmap_bytes, 26)?;
+            self.validate_bitmap_checksum(
+                &descriptor,
+                &bitmap,
+                bitmap_bytes,
+                EXT4_BG_INODE_CSUM_LO,
+                EXT4_BG_INODE_CSUM_HI,
+            )?;
             let first = group
                 .checked_mul(self.layout.inodes_per_group)
                 .and_then(|value| value.checked_add(1))
@@ -1144,18 +1434,18 @@ impl<D: BlockDevice> Ext4<D> {
         }
         let count = bytes
             .len()
-            .checked_add(EXT4_BLOCK_BYTES - 1)
-            .map(|value| value / EXT4_BLOCK_BYTES)
+            .checked_add(self.layout.block_bytes - 1)
+            .map(|value| value / self.layout.block_bytes)
             .ok_or(FsError::Overflow)?;
         let blocks = self.find_free_blocks(count)?;
-        let mut payload = alloc::vec![0_u8; EXT4_BLOCK_BYTES];
+        let mut payload = alloc::vec![0_u8; self.layout.block_bytes];
         for (logical, physical) in blocks.iter().copied().enumerate() {
             payload.fill(0);
             let start = logical
-                .checked_mul(EXT4_BLOCK_BYTES)
+                .checked_mul(self.layout.block_bytes)
                 .ok_or(FsError::Overflow)?;
             let end = start
-                .checked_add(EXT4_BLOCK_BYTES)
+                .checked_add(self.layout.block_bytes)
                 .map_or(bytes.len(), |candidate| candidate.min(bytes.len()));
             payload[..end - start].copy_from_slice(&bytes[start..end]);
             self.write_fs_block(physical, &payload)?;
@@ -1208,6 +1498,7 @@ impl<D: BlockDevice> Ext4<D> {
         extents: &mut Vec<Extent>,
         mut logical: u32,
         blocks: &[u32],
+        block_bytes: usize,
     ) -> Result<(), FsError> {
         for physical in blocks.iter().copied() {
             if let Some(last) = extents.last_mut() {
@@ -1229,7 +1520,7 @@ impl<D: BlockDevice> Ext4<D> {
                     continue;
                 }
             }
-            if extents.len() >= EXT4_MAX_DEPTH_ONE_EXTENTS {
+            if extents.len() >= max_depth_one_extents(block_bytes) {
                 return Err(FsError::NoSpace);
             }
             extents.push(Extent {
@@ -1261,10 +1552,11 @@ impl<D: BlockDevice> Ext4<D> {
             .ok_or(FsError::Overflow)?;
         let block = inode_table
             .checked_add(
-                u32::try_from(byte_offset / EXT4_BLOCK_BYTES).map_err(|_| FsError::Overflow)?,
+                u32::try_from(byte_offset / self.layout.block_bytes)
+                    .map_err(|_| FsError::Overflow)?,
             )
             .ok_or(FsError::Overflow)?;
-        Ok((block, byte_offset % EXT4_BLOCK_BYTES))
+        Ok((block, byte_offset % self.layout.block_bytes))
     }
 
     fn physical_inode_blocks(inode: &Inode) -> Result<Vec<u32>, FsError> {
@@ -1316,6 +1608,13 @@ impl<D: BlockDevice> Ext4<D> {
             122,
             u16::try_from(gid >> 16).map_err(|_| FsError::Overflow)?,
         )?;
+        if self.wall_clock_seconds != 0 {
+            // A newly allocated inode is born now, so every time it carries
+            // starts at the same instant, including its creation time.
+            for offset in [8_usize, 12, 16, 144] {
+                put_u32(raw, offset, self.wall_clock_seconds)?;
+            }
+        }
         put_u32(raw, 100, self.layout.checksum_seed ^ number ^ 0xa5a5_5a5a)?;
         put_u16(raw, 128, 32)
     }
@@ -1324,14 +1623,18 @@ impl<D: BlockDevice> Ext4<D> {
         Ok(u64::from(read_u32(raw, 28)?) | (u64::from(read_u16(raw, 116)?) << 32))
     }
 
-    fn extent_sector_count(raw: &[u8], volume_blocks: u32) -> Result<u64, FsError> {
+    fn extent_sector_count(
+        raw: &[u8],
+        volume_blocks: u32,
+        block_bytes_u64: u64,
+    ) -> Result<u64, FsError> {
         let parsed = parse_extents(raw.get(40..100).ok_or(FsError::Corrupt)?, volume_blocks)?;
         if !parsed.tree_blocks.is_empty() {
             return Err(FsError::Unsupported);
         }
         parsed.extents.iter().try_fold(0_u64, |total, extent| {
             total
-                .checked_add(u64::from(extent.blocks) * (EXT4_BLOCK_BYTES_U64 / 512))
+                .checked_add(u64::from(extent.blocks) * (block_bytes_u64 / 512))
                 .ok_or(FsError::Overflow)
         })
     }
@@ -1341,6 +1644,7 @@ impl<D: BlockDevice> Ext4<D> {
         size: u64,
         blocks: &[u32],
         metadata_sectors: u64,
+        block_bytes_u64: u64,
     ) -> Result<(), FsError> {
         let size_bytes = size.to_le_bytes();
         put_u32(
@@ -1355,7 +1659,7 @@ impl<D: BlockDevice> Ext4<D> {
         )?;
         let sectors = u64::try_from(blocks.len())
             .map_err(|_| FsError::Overflow)?
-            .checked_mul(EXT4_BLOCK_BYTES_U64 / 512)
+            .checked_mul(block_bytes_u64 / 512)
             .and_then(|data_sectors| data_sectors.checked_add(metadata_sectors))
             .ok_or(FsError::Overflow)?;
         put_u32(
@@ -1416,13 +1720,15 @@ impl<D: BlockDevice> Ext4<D> {
         extents: &[Extent],
         tree_blocks: &[u32],
         metadata_sectors: u64,
+        block_bytes: usize,
     ) -> Result<(), FsError> {
+        let block_bytes_u64 = u64::try_from(block_bytes).map_err(|_| FsError::Overflow)?;
         let required_tree_blocks = if extents.len() <= EXT4_INLINE_EXTENTS {
             0
         } else {
-            extents.len().div_ceil(EXT4_LEAF_EXTENTS)
+            extents.len().div_ceil(leaf_extents(block_bytes))
         };
-        if extents.len() > EXT4_MAX_DEPTH_ONE_EXTENTS
+        if extents.len() > max_depth_one_extents(block_bytes)
             || extents.iter().any(|extent| extent.unwritten)
             || tree_blocks.len() != required_tree_blocks
         {
@@ -1447,7 +1753,7 @@ impl<D: BlockDevice> Ext4<D> {
         let sectors = data_blocks
             .checked_add(u64::try_from(tree_blocks.len()).map_err(|_| FsError::Overflow)?)
             .ok_or(FsError::Overflow)?
-            .checked_mul(EXT4_BLOCK_BYTES_U64 / 512)
+            .checked_mul(block_bytes_u64 / 512)
             .and_then(|data| data.checked_add(metadata_sectors))
             .ok_or(FsError::Overflow)?;
         put_u32(
@@ -1488,7 +1794,7 @@ impl<D: BlockDevice> Ext4<D> {
             put_u16(raw, 46, 1)?;
             for (index, block) in tree_blocks.iter().copied().enumerate() {
                 let first_extent = extents
-                    .get(index * EXT4_LEAF_EXTENTS)
+                    .get(index * leaf_extents(block_bytes))
                     .ok_or(FsError::Corrupt)?;
                 let offset = 52_usize
                     .checked_add(index.checked_mul(12).ok_or(FsError::Overflow)?)
@@ -1509,8 +1815,7 @@ impl<D: BlockDevice> Ext4<D> {
         inode_number: u32,
         inode_generation: u32,
     ) -> Result<(), FsError> {
-        if raw.len() != EXT4_BLOCK_BYTES || extents.is_empty() || extents.len() > EXT4_LEAF_EXTENTS
-        {
+        if extents.is_empty() || extents.len() > leaf_extents(raw.len()) {
             return Err(FsError::Invalid);
         }
         raw.fill(0);
@@ -1523,7 +1828,7 @@ impl<D: BlockDevice> Ext4<D> {
         put_u16(
             raw,
             4,
-            u16::try_from(EXT4_LEAF_EXTENTS).map_err(|_| FsError::Overflow)?,
+            u16::try_from(leaf_extents(raw.len())).map_err(|_| FsError::Overflow)?,
         )?;
         for (index, extent) in extents.iter().enumerate() {
             let offset = 12_usize
@@ -1538,11 +1843,24 @@ impl<D: BlockDevice> Ext4<D> {
             crc32c(checksum_seed, &inode_number.to_le_bytes()),
             &inode_generation.to_le_bytes(),
         );
-        let checksum = crc32c(inode_seed, &raw[..EXT4_EXTENT_TAIL_OFFSET]);
-        put_u32(raw, EXT4_EXTENT_TAIL_OFFSET, checksum)
+        let checksum = crc32c(inode_seed, &raw[..extent_tail_offset(raw.len())]);
+        put_u32(raw, extent_tail_offset(raw.len()), checksum)
     }
 
-    fn refresh_inode_checksum(&self, raw: &mut [u8], number: u32) -> Result<(), FsError> {
+    fn refresh_inode_checksum(
+        &self,
+        raw: &mut [u8],
+        number: u32,
+        touch: InodeTouch,
+    ) -> Result<(), FsError> {
+        if self.wall_clock_seconds != 0 {
+            // The change time advances on every inode write; the modification
+            // time only when the file's contents actually changed.
+            put_u32(raw, 12, self.wall_clock_seconds)?;
+            if touch == InodeTouch::Content {
+                put_u32(raw, 16, self.wall_clock_seconds)?;
+            }
+        }
         raw[124..126].fill(0);
         raw[130..132].fill(0);
         let generation = read_u32(raw, 100)?;
@@ -1592,11 +1910,21 @@ impl<D: BlockDevice> Ext4<D> {
                 return Err(FsError::WrongType);
             }
             Self::inode_sector_count(raw)?
-                .checked_sub(Self::extent_sector_count(raw, self.layout.blocks)?)
+                .checked_sub(Self::extent_sector_count(
+                    raw,
+                    self.layout.blocks,
+                    self.layout.block_bytes_u64,
+                )?)
                 .ok_or(FsError::Corrupt)?
         };
-        Self::encode_inode_content(raw, size, blocks, metadata_sectors)?;
-        self.refresh_inode_checksum(raw, number)?;
+        Self::encode_inode_content(
+            raw,
+            size,
+            blocks,
+            metadata_sectors,
+            self.layout.block_bytes_u64,
+        )?;
+        self.refresh_inode_checksum(raw, number, InodeTouch::Content)?;
         self.write_fs_block(table_block, &table)
     }
 
@@ -1614,7 +1942,9 @@ impl<D: BlockDevice> Ext4<D> {
         let tree_count = if extents.len() <= EXT4_INLINE_EXTENTS {
             0
         } else {
-            extents.len().div_ceil(EXT4_LEAF_EXTENTS)
+            extents
+                .len()
+                .div_ceil(leaf_extents(self.layout.block_bytes))
         };
         if tree_count > EXT4_ROOT_INDEXES {
             return Err(FsError::NoSpace);
@@ -1623,13 +1953,13 @@ impl<D: BlockDevice> Ext4<D> {
         let tree_blocks = if reuse_tree {
             existing.extent_tree_blocks.clone()
         } else {
-            let tree_zeroes = alloc::vec![0_u8; tree_count * EXT4_BLOCK_BYTES];
+            let tree_zeroes = alloc::vec![0_u8; tree_count * self.layout.block_bytes];
             self.allocate_file_blocks(&tree_zeroes)?
         };
         for (index, block) in tree_blocks.iter().copied().enumerate() {
-            let start = index * EXT4_LEAF_EXTENTS;
-            let end = (start + EXT4_LEAF_EXTENTS).min(extents.len());
-            let mut leaf = [0_u8; EXT4_BLOCK_BYTES];
+            let start = index * leaf_extents(self.layout.block_bytes);
+            let end = (start + leaf_extents(self.layout.block_bytes)).min(extents.len());
+            let mut leaf = alloc::vec![0_u8; self.layout.block_bytes];
             Self::encode_extent_leaf(
                 &mut leaf,
                 &extents[start..end],
@@ -1658,13 +1988,20 @@ impl<D: BlockDevice> Ext4<D> {
             .checked_add(
                 u64::try_from(existing.extent_tree_blocks.len()).map_err(|_| FsError::Overflow)?,
             )
-            .and_then(|blocks| blocks.checked_mul(EXT4_BLOCK_BYTES_U64 / 512))
+            .and_then(|blocks| blocks.checked_mul(self.layout.block_bytes_u64 / 512))
             .ok_or(FsError::Overflow)?;
         let metadata_sectors = Self::inode_sector_count(raw)?
             .checked_sub(allocated_sectors)
             .ok_or(FsError::Corrupt)?;
-        Self::encode_inode_extent_records(raw, size, extents, &tree_blocks, metadata_sectors)?;
-        self.refresh_inode_checksum(raw, number)?;
+        Self::encode_inode_extent_records(
+            raw,
+            size,
+            extents,
+            &tree_blocks,
+            metadata_sectors,
+            self.layout.block_bytes,
+        )?;
+        self.refresh_inode_checksum(raw, number, InodeTouch::Content)?;
         if let Err(error) = self
             .write_fs_block(table_block, &table)
             .and_then(|()| self.durability_barrier())
@@ -1677,6 +2014,9 @@ impl<D: BlockDevice> Ext4<D> {
         if reuse_tree {
             Ok(())
         } else {
+            // Release every level, not just the leaves, so a deeper tree
+            // leaves nothing allocated behind.
+            self.release_blocks(&existing.interior_extent_blocks)?;
             self.release_blocks(&existing.extent_tree_blocks)
         }
     }
@@ -1696,18 +2036,18 @@ impl<D: BlockDevice> Ext4<D> {
             return Err(FsError::NoSpace);
         }
         self.begin_mutation()?;
-        let partial =
-            usize::try_from(inode.size % EXT4_BLOCK_BYTES_U64).map_err(|_| FsError::Overflow)?;
+        let partial = usize::try_from(inode.size % self.layout.block_bytes_u64)
+            .map_err(|_| FsError::Overflow)?;
         let mut consumed = 0_usize;
         if partial != 0 {
-            let logical =
-                u32::try_from(inode.size / EXT4_BLOCK_BYTES_U64).map_err(|_| FsError::NoSpace)?;
+            let logical = u32::try_from(inode.size / self.layout.block_bytes_u64)
+                .map_err(|_| FsError::NoSpace)?;
             let (physical, unwritten) = map_block(&inode, logical)?.ok_or(FsError::Corrupt)?;
             if unwritten {
                 return Err(FsError::Corrupt);
             }
             let mut block = self.read_fs_block(physical)?;
-            consumed = bytes.len().min(EXT4_BLOCK_BYTES - partial);
+            consumed = bytes.len().min(self.layout.block_bytes - partial);
             block[partial..partial + consumed].copy_from_slice(&bytes[..consumed]);
             self.write_fs_block(physical, &block)?;
         }
@@ -1716,12 +2056,17 @@ impl<D: BlockDevice> Ext4<D> {
         let logical = u32::try_from(
             inode
                 .size
-                .checked_add(EXT4_BLOCK_BYTES_U64 - 1)
+                .checked_add(self.layout.block_bytes_u64 - 1)
                 .ok_or(FsError::Overflow)?
-                / EXT4_BLOCK_BYTES_U64,
+                / self.layout.block_bytes_u64,
         )
         .map_err(|_| FsError::NoSpace)?;
-        if let Err(error) = Self::append_physical_blocks(&mut extents, logical, &new_blocks) {
+        if let Err(error) = Self::append_physical_blocks(
+            &mut extents,
+            logical,
+            &new_blocks,
+            self.layout.block_bytes,
+        ) {
             let _ignored = self.release_blocks(&new_blocks);
             return Err(error);
         }
@@ -1766,7 +2111,7 @@ impl<D: BlockDevice> Ext4<D> {
         put_u32(raw, 32, read_u32(raw, 32)? & !EXT4_EXTENTS_FL)?;
         raw[40..100].fill(0);
         raw[40..40 + target.len()].copy_from_slice(target);
-        self.refresh_inode_checksum(raw, number)?;
+        self.refresh_inode_checksum(raw, number, InodeTouch::Content)?;
         self.write_fs_block(block, &table)
     }
 
@@ -1788,7 +2133,7 @@ impl<D: BlockDevice> Ext4<D> {
             return Err(FsError::Corrupt);
         }
         put_u16(raw, 26, replacement)?;
-        self.refresh_inode_checksum(raw, number)?;
+        self.refresh_inode_checksum(raw, number, InodeTouch::Metadata)?;
         self.write_fs_block(block, &table)
     }
 
@@ -1802,32 +2147,20 @@ impl<D: BlockDevice> Ext4<D> {
         self.write_fs_block(block, &table)
     }
 
-    fn group_descriptor(&mut self, group: u32) -> Result<[u8; EXT4_GROUP_DESC_BYTES], FsError> {
-        if group >= self.layout.groups {
-            return Err(FsError::Corrupt);
-        }
-        let byte_offset = usize::try_from(group)
-            .ok()
-            .and_then(|value| value.checked_mul(EXT4_GROUP_DESC_BYTES))
-            .ok_or(FsError::Overflow)?;
-        let table_block = 1_u32
-            .checked_add(
-                u32::try_from(byte_offset / EXT4_BLOCK_BYTES).map_err(|_| FsError::Overflow)?,
-            )
-            .ok_or(FsError::Overflow)?;
-        let offset = byte_offset % EXT4_BLOCK_BYTES;
+    fn group_descriptor(&mut self, group: u32) -> Result<[u8; EXT4_GROUP_DESC_MAX], FsError> {
+        let (table_block, offset) = self.descriptor_location(group)?;
+        let size = self.layout.desc_size;
         let bytes = self.read_fs_block(table_block)?;
-        let mut descriptor = <[u8; EXT4_GROUP_DESC_BYTES]>::try_from(
-            bytes
-                .get(offset..offset + EXT4_GROUP_DESC_BYTES)
-                .ok_or(FsError::Corrupt)?,
-        )
-        .map_err(|_| FsError::Corrupt)?;
+        let mut descriptor = [0_u8; EXT4_GROUP_DESC_MAX];
+        descriptor
+            .get_mut(..size)
+            .ok_or(FsError::Corrupt)?
+            .copy_from_slice(bytes.get(offset..offset + size).ok_or(FsError::Corrupt)?);
         let stored = read_u16(&descriptor, 30)?;
         descriptor[30..32].fill(0);
         let checksum = crc32c(
             crc32c(self.layout.checksum_seed, &group.to_le_bytes()),
-            &descriptor,
+            descriptor.get(..size).ok_or(FsError::Corrupt)?,
         );
         if stored
             != u16::from_le_bytes(
@@ -1840,6 +2173,58 @@ impl<D: BlockDevice> Ext4<D> {
         }
         descriptor[30..32].copy_from_slice(&stored.to_le_bytes());
         Ok(descriptor)
+    }
+
+    /// Walk an extent tree down to the level that holds its leaves.
+    ///
+    /// Above depth one the root's children are interior nodes, so each level is
+    /// expanded in turn. Every interior block stays recorded so a later rewrite
+    /// releases the whole tree rather than leaking its upper levels.
+    fn descend_extent_tree(&mut self, inode: &mut Inode) -> Result<(), FsError> {
+        let mut depth = inode.extent_depth;
+        while depth > 1 {
+            let mut children = Vec::new();
+            let mut logicals = Vec::new();
+            for block in inode.extent_tree_blocks.iter().copied() {
+                let node = self.read_fs_block(block)?;
+                let parsed = parse_extent_index_block(
+                    &node,
+                    self.layout.blocks,
+                    depth - 1,
+                    self.layout.checksum_seed,
+                    inode.number,
+                    inode.generation,
+                )?;
+                if children
+                    .len()
+                    .checked_add(parsed.len())
+                    .is_none_or(|total| total > EXT4_MAX_EXTENT_TREE_BLOCKS)
+                {
+                    return Err(FsError::NoSpace);
+                }
+                children
+                    .try_reserve(parsed.len())
+                    .map_err(|_| FsError::NoSpace)?;
+                logicals
+                    .try_reserve(parsed.len())
+                    .map_err(|_| FsError::NoSpace)?;
+                for (logical, physical) in parsed {
+                    logicals.push(logical);
+                    children.push(physical);
+                }
+            }
+            inode
+                .interior_extent_blocks
+                .try_reserve(inode.extent_tree_blocks.len())
+                .map_err(|_| FsError::NoSpace)?;
+            inode
+                .interior_extent_blocks
+                .extend_from_slice(&inode.extent_tree_blocks);
+            inode.extent_tree_blocks = children;
+            inode.extent_tree_logicals = logicals;
+            depth -= 1;
+        }
+        Ok(())
     }
 
     fn read_inode(&mut self, number: u32) -> Result<Inode, FsError> {
@@ -1888,17 +2273,18 @@ impl<D: BlockDevice> Ext4<D> {
             .and_then(|value| value.checked_mul(EXT4_INODE_BYTES))
             .ok_or(FsError::Overflow)?;
         let table_offset_blocks =
-            u32::try_from(byte_offset / EXT4_BLOCK_BYTES).map_err(|_| FsError::Overflow)?;
+            u32::try_from(byte_offset / self.layout.block_bytes).map_err(|_| FsError::Overflow)?;
         let table_block = inode_table
             .checked_add(table_offset_blocks)
             .ok_or(FsError::Overflow)?;
-        let offset = byte_offset % EXT4_BLOCK_BYTES;
+        let offset = byte_offset % self.layout.block_bytes;
         let block = self.read_fs_block(table_block)?;
         let raw = block
             .get(offset..offset + EXT4_INODE_BYTES)
             .ok_or(FsError::Corrupt)?;
         let mut inode = parse_inode(raw, number, self.layout, self.limits)?;
         if !inode.extent_tree_blocks.is_empty() {
+            self.descend_extent_tree(&mut inode)?;
             let mut extents = Vec::new();
             for (index, block) in inode.extent_tree_blocks.iter().copied().enumerate() {
                 let leaf = self.read_fs_block(block)?;
@@ -1921,9 +2307,9 @@ impl<D: BlockDevice> Ext4<D> {
             }
             let file_blocks = inode
                 .size
-                .checked_add(EXT4_BLOCK_BYTES_U64 - 1)
+                .checked_add(self.layout.block_bytes_u64 - 1)
                 .ok_or(FsError::Overflow)?
-                / EXT4_BLOCK_BYTES_U64;
+                / self.layout.block_bytes_u64;
             let mut previous_end = 0_u32;
             for extent in &extents {
                 let end = extent
@@ -1964,11 +2350,11 @@ impl<D: BlockDevice> Ext4<D> {
             let file_offset = offset
                 .checked_add(u64::try_from(copied).map_err(|_| FsError::Overflow)?)
                 .ok_or(FsError::Overflow)?;
-            let logical =
-                u32::try_from(file_offset / EXT4_BLOCK_BYTES_U64).map_err(|_| FsError::Overflow)?;
-            let in_block = usize::try_from(file_offset % EXT4_BLOCK_BYTES_U64)
+            let logical = u32::try_from(file_offset / self.layout.block_bytes_u64)
                 .map_err(|_| FsError::Overflow)?;
-            let count = (wanted - copied).min(EXT4_BLOCK_BYTES - in_block);
+            let in_block = usize::try_from(file_offset % self.layout.block_bytes_u64)
+                .map_err(|_| FsError::Overflow)?;
+            let count = (wanted - copied).min(self.layout.block_bytes - in_block);
             match map_block(inode, logical)? {
                 Some((physical, false)) => {
                     let block = self.read_fs_block(physical)?;
@@ -2089,15 +2475,179 @@ impl<D: BlockDevice> Ext4<D> {
         }
     }
 
+    /// Logical blocks that may hold ordinary records for this directory.
+    ///
+    /// A hashed directory keeps records only in its leaves; its root and
+    /// interior nodes hold the index instead.
+    fn record_blocks(&mut self, directory: &Inode) -> Result<Vec<u32>, FsError> {
+        if directory.indexed {
+            return self.hashed_leaf_blocks(directory);
+        }
+        let block_count = u32::try_from(directory.size / self.layout.block_bytes_u64)
+            .map_err(|_| FsError::Overflow)?;
+        let mut blocks = Vec::new();
+        blocks
+            .try_reserve_exact(usize::try_from(block_count).map_err(|_| FsError::Overflow)?)
+            .map_err(|_| FsError::NoSpace)?;
+        for logical in 0..block_count {
+            blocks.push(logical);
+        }
+        Ok(blocks)
+    }
+
+    /// The one leaf a name belongs in, chosen by the directory's own index.
+    ///
+    /// Placing a record anywhere else would leave the index describing the
+    /// wrong leaf, so a name whose hash cannot be reproduced is refused.
+    fn hashed_target_leaf(&mut self, directory: &Inode, name: &str) -> Result<u32, FsError> {
+        let hashing = self.directory_hash()?;
+        let seed = self.inode_checksum_seed(directory);
+        let root_block = self.directory_block(directory, 0)?;
+        let root = htree::parse_root(&root_block, seed, crc32c)?;
+        let value = hashing.hash(name.as_bytes(), root.hash_version)?;
+        let select = |entries: &[htree::DxEntry]| -> Result<u32, FsError> {
+            let mut chosen = entries.first().ok_or(FsError::Corrupt)?.block;
+            for entry in entries {
+                if entry.hash <= value {
+                    chosen = entry.block;
+                } else {
+                    break;
+                }
+            }
+            Ok(chosen)
+        };
+        let first = select(&root.entries)?;
+        if root.indirect_levels == 0 {
+            return Ok(first);
+        }
+        let node_block = self.directory_block(directory, first)?;
+        let node = htree::parse_node(&node_block, seed, crc32c)?;
+        select(&node)
+    }
+
+    /// Read the filesystem-wide inputs to a directory name hash.
+    fn directory_hash(&mut self) -> Result<htree::DxHash, FsError> {
+        let (holder, offset) = self.superblock_location();
+        let block = self.read_fs_block(holder)?;
+        let superblock = block.get(offset..offset + 1024).ok_or(FsError::Corrupt)?;
+        htree::DxHash::parse(superblock)
+    }
+
+    /// Seed every per-inode metadata checksum in this directory is built from.
+    fn inode_checksum_seed(&self, inode: &Inode) -> u32 {
+        crc32c(
+            crc32c(self.layout.checksum_seed, &inode.number.to_le_bytes()),
+            &inode.generation.to_le_bytes(),
+        )
+    }
+
+    /// Read one logical block of a directory.
+    fn directory_block(&mut self, inode: &Inode, logical: u32) -> Result<Vec<u8>, FsError> {
+        let (physical, unwritten) = map_block(inode, logical)?.ok_or(FsError::Corrupt)?;
+        if unwritten {
+            return Err(FsError::Corrupt);
+        }
+        self.read_fs_block(physical)
+    }
+
+    /// Collect the logical leaf blocks a hashed directory keeps its records in.
+    fn hashed_leaf_blocks(&mut self, inode: &Inode) -> Result<Vec<u32>, FsError> {
+        let seed = self.inode_checksum_seed(inode);
+        let root_block = self.directory_block(inode, 0)?;
+        let root = htree::parse_root(&root_block, seed, crc32c)?;
+        let ceiling =
+            usize::try_from(self.limits.max_directory_blocks()).map_err(|_| FsError::Overflow)?;
+
+        let mut leaves = Vec::new();
+        if root.indirect_levels == 0 {
+            leaves
+                .try_reserve_exact(root.entries.len())
+                .map_err(|_| FsError::NoSpace)?;
+            for entry in &root.entries {
+                leaves.push(entry.block);
+            }
+        } else {
+            for entry in &root.entries {
+                let node_block = self.directory_block(inode, entry.block)?;
+                let node = htree::parse_node(&node_block, seed, crc32c)?;
+                if leaves
+                    .len()
+                    .checked_add(node.len())
+                    .is_none_or(|total| total > ceiling)
+                {
+                    return Err(FsError::NoSpace);
+                }
+                leaves
+                    .try_reserve(node.len())
+                    .map_err(|_| FsError::NoSpace)?;
+                for child in &node {
+                    leaves.push(child.block);
+                }
+            }
+        }
+        if leaves.is_empty() || leaves.len() > ceiling {
+            return Err(FsError::NoSpace);
+        }
+        Ok(leaves)
+    }
+
+    /// Enumerate a hashed directory by reading every leaf the index names.
+    ///
+    /// The root block holds `.` and `..` in records whose lengths hide the
+    /// index from an unaware reader, so those two are taken directly and every
+    /// other record comes from a leaf.
+    fn read_hashed_directory(&mut self, inode: &Inode) -> Result<Vec<DirectoryEntry>, FsError> {
+        let root_block = self.directory_block(inode, 0)?;
+        let dot = read_u32(&root_block, 0)?;
+        let dot_dot = read_u32(&root_block, 12)?;
+        if dot != inode.number || dot_dot == 0 || dot_dot > self.layout.inodes {
+            return Err(FsError::Corrupt);
+        }
+        let leaves = self.hashed_leaf_blocks(inode)?;
+
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(
+                usize::try_from(self.limits.max_directory_entries())
+                    .map_err(|_| FsError::Overflow)?,
+            )
+            .map_err(|_| FsError::NoSpace)?;
+        entries.push(DirectoryEntry {
+            inode: dot,
+            name: ".".to_string(),
+            kind: NodeKind::Directory,
+        });
+        entries.push(DirectoryEntry {
+            inode: dot_dot,
+            name: "..".to_string(),
+            kind: NodeKind::Directory,
+        });
+        for logical in leaves {
+            let block = self.directory_block(inode, logical)?;
+            verify_directory_checksum(self.layout.checksum_seed, inode, &block)?;
+            parse_directory_block(
+                &block,
+                inode.number,
+                self.layout.inodes,
+                self.limits,
+                &mut entries,
+            )?;
+        }
+        Ok(entries)
+    }
+
     fn read_directory(&mut self, inode: &Inode) -> Result<Vec<DirectoryEntry>, FsError> {
         if inode.kind != NodeKind::Directory {
             return Err(FsError::WrongType);
         }
-        if inode.size == 0 || !inode.size.is_multiple_of(EXT4_BLOCK_BYTES_U64) {
+        if inode.indexed {
+            return self.read_hashed_directory(inode);
+        }
+        if inode.size == 0 || !inode.size.is_multiple_of(self.layout.block_bytes_u64) {
             return Err(FsError::Corrupt);
         }
-        let block_count =
-            u32::try_from(inode.size / EXT4_BLOCK_BYTES_U64).map_err(|_| FsError::NoSpace)?;
+        let block_count = u32::try_from(inode.size / self.layout.block_bytes_u64)
+            .map_err(|_| FsError::NoSpace)?;
         if block_count > self.limits.max_directory_blocks() {
             return Err(FsError::NoSpace);
         }
@@ -2157,7 +2707,7 @@ impl<D: BlockDevice> Ext4<D> {
     ) -> Result<bool, FsError> {
         let mut block = self.read_fs_block(physical)?;
         verify_directory_checksum(self.layout.checksum_seed, directory, &block)?;
-        let tail_offset = EXT4_BLOCK_BYTES - EXT4_DIR_TAIL_BYTES;
+        let tail_offset = self.layout.block_bytes - EXT4_DIR_TAIL_BYTES;
         let mut offset = 0_usize;
         while offset < tail_offset {
             let current_inode = read_u32(&block, offset)?;
@@ -2241,9 +2791,18 @@ impl<D: BlockDevice> Ext4<D> {
             NodeKind::Directory => EXT4_FT_DIR,
         };
         let required = directory_record_bytes(name.len())?;
-        let block_count =
-            u32::try_from(directory.size / EXT4_BLOCK_BYTES_U64).map_err(|_| FsError::Overflow)?;
-        for logical in 0..block_count {
+        // An indexed directory admits a name only into the leaf its own index
+        // maps that name's hash to.
+        let candidates = if directory.indexed {
+            let leaf = self.hashed_target_leaf(directory, name)?;
+            let mut only = Vec::new();
+            only.try_reserve_exact(1).map_err(|_| FsError::NoSpace)?;
+            only.push(leaf);
+            only
+        } else {
+            self.record_blocks(directory)?
+        };
+        for logical in candidates {
             let (physical, false) = map_block(directory, logical)?.ok_or(FsError::Corrupt)? else {
                 return Err(FsError::Corrupt);
             };
@@ -2258,15 +2817,21 @@ impl<D: BlockDevice> Ext4<D> {
                 return Ok(());
             }
         }
+        if directory.indexed {
+            // The target leaf is full. Splitting it means rewriting the index,
+            // which this provider does not do, so the insert is refused rather
+            // than placed where the index cannot find it.
+            return Err(FsError::NoSpace);
+        }
 
-        let zeroes = alloc::vec![0_u8; EXT4_BLOCK_BYTES];
+        let zeroes = alloc::vec![0_u8; self.layout.block_bytes];
         let new_blocks = self.allocate_file_blocks(&zeroes)?;
         let physical = *new_blocks.first().ok_or(FsError::NoSpace)?;
-        let mut block = alloc::vec![0_u8; EXT4_BLOCK_BYTES];
+        let mut block = alloc::vec![0_u8; self.layout.block_bytes];
         write_directory_record(
             &mut block,
             0,
-            EXT4_BLOCK_BYTES - EXT4_DIR_TAIL_BYTES,
+            self.layout.block_bytes - EXT4_DIR_TAIL_BYTES,
             inode_number,
             name.as_bytes(),
             file_type,
@@ -2291,7 +2856,7 @@ impl<D: BlockDevice> Ext4<D> {
                 NodeKind::Directory,
                 directory
                     .size
-                    .checked_add(EXT4_BLOCK_BYTES_U64)
+                    .checked_add(self.layout.block_bytes_u64)
                     .ok_or(FsError::Overflow)?,
                 &directory_blocks,
                 false,
@@ -2315,15 +2880,15 @@ impl<D: BlockDevice> Ext4<D> {
         if matching.next().is_some() {
             return Err(FsError::Corrupt);
         }
-        let block_count =
-            u32::try_from(directory.size / EXT4_BLOCK_BYTES_U64).map_err(|_| FsError::Overflow)?;
-        for logical in 0..block_count {
+        // Removing a record leaves the index still describing its leaf, so no
+        // index rewrite is needed.
+        for logical in self.record_blocks(directory)? {
             let (physical, false) = map_block(directory, logical)?.ok_or(FsError::Corrupt)? else {
                 return Err(FsError::Corrupt);
             };
             let mut block = self.read_fs_block(physical)?;
             verify_directory_checksum(self.layout.checksum_seed, directory, &block)?;
-            let tail_offset = EXT4_BLOCK_BYTES - EXT4_DIR_TAIL_BYTES;
+            let tail_offset = self.layout.block_bytes - EXT4_DIR_TAIL_BYTES;
             let mut offset = 0_usize;
             while offset < tail_offset {
                 let inode = read_u32(&block, offset)?;
@@ -2362,6 +2927,11 @@ impl<D: BlockDevice> Ext4<D> {
         directory: &Inode,
         parent_number: u32,
     ) -> Result<(), FsError> {
+        // Records live in leaf blocks the index maps by name hash, so a linear
+        // insert or removal would leave the index describing the wrong leaf.
+        if directory.indexed {
+            return Err(FsError::Unsupported);
+        }
         if directory.kind != NodeKind::Directory {
             return Err(FsError::WrongType);
         }
@@ -2370,7 +2940,7 @@ impl<D: BlockDevice> Ext4<D> {
         };
         let mut block = self.read_fs_block(physical)?;
         verify_directory_checksum(self.layout.checksum_seed, directory, &block)?;
-        let tail_offset = EXT4_BLOCK_BYTES - EXT4_DIR_TAIL_BYTES;
+        let tail_offset = self.layout.block_bytes - EXT4_DIR_TAIL_BYTES;
         let mut offset = 0_usize;
         while offset < tail_offset {
             let record_bytes = usize::from(read_u16(&block, offset + 4)?);
@@ -2611,7 +3181,7 @@ impl<D: BlockDevice> FileSystemProvider for Ext4<D> {
             let _ignored = self.set_inode_allocated(inode_number, false);
             return Err(error);
         }
-        let zeroes = alloc::vec![0_u8; EXT4_BLOCK_BYTES];
+        let zeroes = alloc::vec![0_u8; self.layout.block_bytes];
         let blocks = match self.allocate_file_blocks(&zeroes) {
             Ok(blocks) if blocks.len() == 1 => blocks,
             Ok(blocks) => {
@@ -2629,7 +3199,7 @@ impl<D: BlockDevice> FileSystemProvider for Ext4<D> {
         if let Err(error) = self.write_inode_extents(
             inode_number,
             NodeKind::Directory,
-            EXT4_BLOCK_BYTES_U64,
+            self.layout.block_bytes_u64,
             &blocks,
             true,
         ) {
@@ -2649,8 +3219,8 @@ impl<D: BlockDevice> FileSystemProvider for Ext4<D> {
                 return Err(error);
             }
         };
-        let mut block = alloc::vec![0_u8; EXT4_BLOCK_BYTES];
-        let tail = EXT4_BLOCK_BYTES - EXT4_DIR_TAIL_BYTES;
+        let mut block = alloc::vec![0_u8; self.layout.block_bytes];
+        let tail = self.layout.block_bytes - EXT4_DIR_TAIL_BYTES;
         let initialize = write_directory_record(&mut block, 0, 12, inode_number, b".", EXT4_FT_DIR)
             .and_then(|()| {
                 write_directory_record(&mut block, 12, tail - 12, parent.number, b"..", EXT4_FT_DIR)
@@ -2978,33 +3548,92 @@ fn admit_state(state: u16, needs_recovery: bool, admission: Admission) -> Result
     }
 }
 
+/// Resolve the on-disk group descriptor size.
+///
+/// `s_desc_size` is meaningful only with the 64bit feature; without it the
+/// descriptor is always the historical 32 bytes.
+fn parse_descriptor_size(superblock: &[u8], incompat: u32) -> Result<usize, FsError> {
+    let declared = read_u16(superblock, 254)?;
+    if incompat & EXT4_INCOMPAT_64BIT == 0 {
+        if !matches!(declared, 0 | EXT4_GROUP_DESC_BYTES_U16) {
+            return Err(FsError::Corrupt);
+        }
+        return Ok(EXT4_GROUP_DESC_BYTES);
+    }
+    if usize::from(declared) != EXT4_GROUP_DESC_MAX {
+        return Err(FsError::Unsupported);
+    }
+    Ok(EXT4_GROUP_DESC_MAX)
+}
+
+/// Resolve the seed every metadata checksum is computed from.
+///
+/// With `metadata_csum_seed` the seed is stored rather than derived, so a
+/// volume keeps its checksums valid across a UUID change.
+fn parse_checksum_seed(superblock: &[u8], incompat: u32, uuid: Ext4Uuid) -> Result<u32, FsError> {
+    if incompat & EXT4_INCOMPAT_CSUM_SEED == 0 {
+        return Ok(crc32c(u32::MAX, &uuid.0));
+    }
+    read_u32(superblock, EXT4_SUPER_CHECKSUM_SEED)
+}
+
+/// Resolve the filesystem block size and its device-block ratio.
+///
+/// `s_log_block_size` selects 1024, 2048 or 4096 bytes, and the cluster size
+/// must agree with it because this provider does not implement `bigalloc`.
+fn parse_block_geometry(
+    superblock: &[u8],
+    device_block_bytes: usize,
+) -> Result<(usize, u32), FsError> {
+    let log_block_size = read_u32(superblock, 24)?;
+    if log_block_size > 2 || read_u32(superblock, 28)? != log_block_size {
+        return Err(FsError::Unsupported);
+    }
+    let block_bytes = EXT4_MIN_BLOCK_BYTES
+        .checked_shl(log_block_size)
+        .ok_or(FsError::Overflow)?;
+    if !block_bytes.is_multiple_of(device_block_bytes) {
+        return Err(FsError::Unsupported);
+    }
+    let ratio = u32::try_from(block_bytes / device_block_bytes).map_err(|_| FsError::Overflow)?;
+    Ok((block_bytes, ratio))
+}
+
 fn parse_superblock(
     superblock: &[u8],
     region_device_blocks: u64,
-    device_blocks_per_fs_block: u32,
+    device_block_bytes: usize,
     limits: Ext4Limits,
     admission: Admission,
 ) -> Result<Layout, FsError> {
     if superblock.len() != 1024
         || read_u16(superblock, 56)? != EXT4_MAGIC
         || read_u32(superblock, 76)? != EXT4_DYNAMIC_REV
-        || read_u32(superblock, 24)? != 2
-        || read_u32(superblock, 28)? != 2
         || read_u32(superblock, 72)? != 0
         || read_u16(superblock, 88)? != EXT4_INODE_BYTES_U16
-        || !matches!(read_u16(superblock, 254)?, 0 | EXT4_GROUP_DESC_BYTES_U16)
         || superblock[373] != 1
-        || read_u32(superblock, 92)? != EXT4_FEATURE_COMPAT
-        || read_u32(superblock, 100)? != EXT4_FEATURE_RO_COMPAT
     {
         return Err(FsError::Unsupported);
     }
-    // Every incompatible feature outside the recovery flag must still match
-    // exactly, so an unknown bit is refused on both paths.
     let incompat = read_u32(superblock, 96)?;
-    if incompat & !EXT4_FEATURE_INCOMPAT_RECOVER != EXT4_FEATURE_INCOMPAT {
+    let ro_compat = read_u32(superblock, 100)?;
+    // An unknown incompatible feature changes structure this provider would
+    // misread, so the volume is refused outright.
+    if incompat & !EXT4_KNOWN_INCOMPAT != 0
+        || incompat & EXT4_REQUIRED_INCOMPAT != EXT4_REQUIRED_INCOMPAT
+    {
         return Err(FsError::Unsupported);
     }
+    // This provider validates metadata checksums and the extended inode area,
+    // so it cannot read a volume that lacks them.
+    if ro_compat & EXT4_REQUIRED_RO_COMPAT != EXT4_REQUIRED_RO_COMPAT {
+        return Err(FsError::Unsupported);
+    }
+    // An unknown read-only-compatible feature only affects what a writer must
+    // maintain, so the volume stays readable and is never mutated.
+    // A hashed index is a per-directory property, so the volume stays writable
+    // and only the indexed directories themselves are refused.
+    let writable = ro_compat & !EXT4_KNOWN_RO_COMPAT == 0;
     let needs_recovery = incompat & EXT4_FEATURE_INCOMPAT_RECOVER != 0;
     admit_state(read_u16(superblock, 58)?, needs_recovery, admission)?;
     let stored_checksum = read_u32(superblock, 1020)?;
@@ -3013,6 +3642,10 @@ fn parse_superblock(
     }
     let inodes = read_u32(superblock, 0)?;
     let blocks = read_u32(superblock, 4)?;
+    let (block_bytes, device_blocks_per_fs_block) =
+        parse_block_geometry(superblock, device_block_bytes)?;
+    let block_bytes_u32 = u32::try_from(block_bytes).map_err(|_| FsError::Overflow)?;
+    let block_bytes_u64 = u64::from(block_bytes_u32);
     let first_data_block = read_u32(superblock, 20)?;
     let blocks_per_group = read_u32(superblock, 32)?;
     let clusters_per_group = read_u32(superblock, 36)?;
@@ -3020,7 +3653,7 @@ fn parse_superblock(
     let journal_inode = read_u32(superblock, 224)?;
     if inodes == 0
         || blocks < 2
-        || first_data_block != 0
+        || first_data_block != u32::from(block_bytes == EXT4_MIN_BLOCK_BYTES)
         || blocks_per_group == 0
         || blocks_per_group > EXT4_BITMAP_BITS
         || !blocks_per_group.is_multiple_of(8)
@@ -3062,6 +3695,8 @@ fn parse_superblock(
     if uuid.0.iter().all(|byte| *byte == 0) {
         return Err(FsError::Corrupt);
     }
+    let desc_size = parse_descriptor_size(superblock, incompat)?;
+    let checksum_seed = parse_checksum_seed(superblock, incompat, uuid)?;
     Ok(Layout {
         blocks,
         inodes,
@@ -3070,8 +3705,14 @@ fn parse_superblock(
         first_inode: read_u32(superblock, 84)?,
         groups,
         device_blocks_per_fs_block,
-        checksum_seed: crc32c(u32::MAX, &uuid.0),
+        block_bytes,
+        first_data_block,
+        block_bytes_u32,
+        block_bytes_u64,
+        checksum_seed,
+        desc_size,
         uuid,
+        writable,
     })
 }
 
@@ -3126,7 +3767,7 @@ fn parse_inode(
     let external_xattr_block =
         u64::from(read_u32(raw, 104)?) | (u64::from(read_u16(raw, 118)?) << 32);
     let symlink_metadata_sectors = u64::from(external_xattr_block != 0)
-        .checked_mul(EXT4_BLOCK_BYTES_U64 / 512)
+        .checked_mul(layout.block_bytes_u64 / 512)
         .ok_or(FsError::Overflow)?;
     let inline_symlink = kind == NodeKind::Symlink
         && size <= u64::try_from(EXT4_FAST_SYMLINK_BYTES).map_err(|_| FsError::Overflow)?
@@ -3136,6 +3777,7 @@ fn parse_inode(
             return Err(FsError::Corrupt);
         }
         ParsedExtentRoot {
+            depth: 0,
             extents: Vec::new(),
             tree_blocks: Vec::new(),
             tree_logicals: Vec::new(),
@@ -3147,9 +3789,9 @@ fn parse_inode(
         parse_extents(raw.get(40..100).ok_or(FsError::Corrupt)?, layout.blocks)?
     };
     let file_blocks = size
-        .checked_add(EXT4_BLOCK_BYTES_U64 - 1)
+        .checked_add(layout.block_bytes_u64 - 1)
         .ok_or(FsError::Overflow)?
-        / EXT4_BLOCK_BYTES_U64;
+        / layout.block_bytes_u64;
     for extent in &parsed_extents.extents {
         let end = u64::from(extent.logical) + u64::from(extent.blocks);
         if end > file_blocks || (kind != NodeKind::File && extent.unwritten) {
@@ -3161,8 +3803,11 @@ fn parse_inode(
         generation,
         kind,
         size,
+        indexed: kind == NodeKind::Directory && flags & EXT4_INDEX_FL != 0,
         extents: parsed_extents.extents,
         extent_tree_blocks: parsed_extents.tree_blocks,
+        extent_depth: parsed_extents.depth,
+        interior_extent_blocks: Vec::new(),
         extent_tree_logicals: parsed_extents.tree_logicals,
     })
 }
@@ -3180,7 +3825,10 @@ fn parse_extents(raw: &[u8], volume_blocks: u32) -> Result<ParsedExtentRoot, FsE
     if count > 4 {
         return Err(FsError::Corrupt);
     }
-    if depth == 1 {
+    if depth > EXT4_MAX_EXTENT_DEPTH {
+        return Err(FsError::Unsupported);
+    }
+    if depth >= 1 {
         let mut tree_blocks = Vec::new();
         tree_blocks
             .try_reserve_exact(usize::from(count))
@@ -3207,13 +3855,11 @@ fn parse_extents(raw: &[u8], volume_blocks: u32) -> Result<ParsedExtentRoot, FsE
             tree_blocks.push(physical);
         }
         return Ok(ParsedExtentRoot {
+            depth,
             extents: Vec::new(),
             tree_blocks,
             tree_logicals,
         });
-    }
-    if depth != 0 {
-        return Err(FsError::Unsupported);
     }
     let mut extents = Vec::new();
     extents
@@ -3255,10 +3901,73 @@ fn parse_extents(raw: &[u8], volume_blocks: u32) -> Result<ParsedExtentRoot, FsE
         previous_end = logical_end;
     }
     Ok(ParsedExtentRoot {
+        depth: 0,
         extents,
         tree_blocks: Vec::new(),
         tree_logicals: Vec::new(),
     })
+}
+
+/// Parse one interior extent-tree node into its child logicals and blocks.
+///
+/// # Errors
+///
+/// Returns [`FsError::Corrupt`] when the node is malformed and
+/// [`FsError::Unsupported`] when it declares a depth outside the tree.
+fn parse_extent_index_block(
+    raw: &[u8],
+    volume_blocks: u32,
+    expected_depth: u16,
+    seed: u32,
+    inode_number: u32,
+    inode_generation: u32,
+) -> Result<Vec<(u32, u32)>, FsError> {
+    if !matches!(raw.len(), 1024 | 2048 | 4096)
+        || read_u16(raw, 0)? != EXT4_EXT_MAGIC
+        || read_u16(raw, 6)? != expected_depth
+        || read_u32(raw, 8)? != 0
+    {
+        return Err(FsError::Corrupt);
+    }
+    let capacity =
+        (raw.len() - EXT4_EXTENT_HEADER_BYTES - EXT4_EXTENT_TAIL_BYTES) / EXT4_EXTENT_RECORD_BYTES;
+    if usize::from(read_u16(raw, 4)?) != capacity {
+        return Err(FsError::Corrupt);
+    }
+    let count = usize::from(read_u16(raw, 2)?);
+    if count == 0 || count > capacity {
+        return Err(FsError::Corrupt);
+    }
+    let tail_offset = EXT4_EXTENT_HEADER_BYTES + capacity * EXT4_EXTENT_RECORD_BYTES;
+    let inode_seed = crc32c(
+        crc32c(seed, &inode_number.to_le_bytes()),
+        &inode_generation.to_le_bytes(),
+    );
+    if read_u32(raw, tail_offset)?
+        != crc32c(inode_seed, raw.get(..tail_offset).ok_or(FsError::Corrupt)?)
+    {
+        return Err(FsError::Corrupt);
+    }
+    let mut children = Vec::new();
+    children
+        .try_reserve_exact(count)
+        .map_err(|_| FsError::NoSpace)?;
+    let mut previous = None;
+    for index in 0..count {
+        let offset = EXT4_EXTENT_HEADER_BYTES + index * EXT4_EXTENT_RECORD_BYTES;
+        let logical = read_u32(raw, offset)?;
+        let physical = read_u32(raw, offset + 4)?;
+        if physical == 0
+            || physical >= volume_blocks
+            || read_u16(raw, offset + 8)? != 0
+            || previous.is_some_and(|last: u32| logical <= last)
+        {
+            return Err(FsError::Corrupt);
+        }
+        previous = Some(logical);
+        children.push((logical, physical));
+    }
+    Ok(children)
 }
 
 fn parse_extent_leaf(
@@ -3268,9 +3977,10 @@ fn parse_extent_leaf(
     inode_number: u32,
     inode_generation: u32,
 ) -> Result<Vec<Extent>, FsError> {
-    if raw.len() != EXT4_BLOCK_BYTES
+    if !matches!(raw.len(), 1024 | 2048 | 4096)
         || read_u16(raw, 0)? != EXT4_EXT_MAGIC
-        || read_u16(raw, 4)? != u16::try_from(EXT4_LEAF_EXTENTS).map_err(|_| FsError::Overflow)?
+        || read_u16(raw, 4)?
+            != u16::try_from(leaf_extents(raw.len())).map_err(|_| FsError::Overflow)?
         || read_u16(raw, 6)? != 0
         || read_u32(raw, 8)? != 0
     {
@@ -3350,10 +4060,10 @@ fn map_block(inode: &Inode, logical: u32) -> Result<Option<(u32, bool)>, FsError
 }
 
 fn verify_directory_checksum(seed: u32, inode: &Inode, block: &[u8]) -> Result<(), FsError> {
-    if block.len() != EXT4_BLOCK_BYTES {
+    if !matches!(block.len(), 1024 | 2048 | 4096) {
         return Err(FsError::Corrupt);
     }
-    let tail_offset = EXT4_BLOCK_BYTES - EXT4_DIR_TAIL_BYTES;
+    let tail_offset = block.len() - EXT4_DIR_TAIL_BYTES;
     let tail = &block[tail_offset..];
     if read_u32(tail, 0)? != 0
         || read_u16(tail, 4)? != EXT4_DIR_TAIL_BYTES_U16
@@ -3380,7 +4090,7 @@ fn parse_directory_block(
     limits: Ext4Limits,
     entries: &mut Vec<DirectoryEntry>,
 ) -> Result<(), FsError> {
-    let tail_offset = EXT4_BLOCK_BYTES - EXT4_DIR_TAIL_BYTES;
+    let tail_offset = block.len() - EXT4_DIR_TAIL_BYTES;
     let mut offset = 0_usize;
     while offset < tail_offset {
         let inode = read_u32(block, offset)?;
@@ -3475,10 +4185,10 @@ fn write_directory_record(
 }
 
 fn initialize_directory_tail(block: &mut [u8]) -> Result<(), FsError> {
-    if block.len() != EXT4_BLOCK_BYTES {
+    if !matches!(block.len(), 1024 | 2048 | 4096) {
         return Err(FsError::Invalid);
     }
-    let offset = EXT4_BLOCK_BYTES - EXT4_DIR_TAIL_BYTES;
+    let offset = block.len() - EXT4_DIR_TAIL_BYTES;
     let tail = &mut block[offset..];
     tail.fill(0);
     put_u16(tail, 4, EXT4_DIR_TAIL_BYTES_U16)?;
@@ -3487,10 +4197,10 @@ fn initialize_directory_tail(block: &mut [u8]) -> Result<(), FsError> {
 }
 
 fn refresh_directory_checksum(seed: u32, inode: &Inode, block: &mut [u8]) -> Result<(), FsError> {
-    if block.len() != EXT4_BLOCK_BYTES {
+    if !matches!(block.len(), 1024 | 2048 | 4096) {
         return Err(FsError::Invalid);
     }
-    let tail_offset = EXT4_BLOCK_BYTES - EXT4_DIR_TAIL_BYTES;
+    let tail_offset = block.len() - EXT4_DIR_TAIL_BYTES;
     let inode_seed = crc32c(
         crc32c(seed, &inode.number.to_le_bytes()),
         &inode.generation.to_le_bytes(),
@@ -3499,19 +4209,38 @@ fn refresh_directory_checksum(seed: u32, inode: &Inode, block: &mut [u8]) -> Res
     put_u32(block, tail_offset + 8, checksum)
 }
 
+/// Read an exact device-block span without assuming a filesystem block size.
+fn read_raw_device_span<D: BlockDevice>(
+    region: &mut BlockRegion<D>,
+    start_block: u64,
+    device_blocks: u32,
+    bytes_wanted: usize,
+) -> Result<Vec<u8>, FsError> {
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(bytes_wanted)
+        .map_err(|_| FsError::NoSpace)?;
+    bytes.resize(bytes_wanted, 0);
+    region
+        .read_blocks(start_block, device_blocks, &mut bytes)
+        .map_err(|_| FsError::Io)?;
+    Ok(bytes)
+}
+
 fn read_raw_fs_block<D: BlockDevice>(
     region: &mut BlockRegion<D>,
     fs_block: u32,
     device_blocks_per_fs_block: u32,
+    block_bytes: usize,
 ) -> Result<Vec<u8>, FsError> {
     let start = u64::from(fs_block)
         .checked_mul(u64::from(device_blocks_per_fs_block))
         .ok_or(FsError::Overflow)?;
     let mut bytes = Vec::new();
     bytes
-        .try_reserve_exact(EXT4_BLOCK_BYTES)
+        .try_reserve_exact(block_bytes)
         .map_err(|_| FsError::NoSpace)?;
-    bytes.resize(EXT4_BLOCK_BYTES, 0);
+    bytes.resize(block_bytes, 0);
     region
         .read_blocks(start, device_blocks_per_fs_block, &mut bytes)
         .map_err(|_| FsError::Io)?;
@@ -3584,6 +4313,10 @@ fn crc32c(seed: u32, bytes: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use crate::{
+        EXT4_EXT_MAGIC, EXT4_EXTENT_HEADER_BYTES, EXT4_EXTENT_RECORD_BYTES, EXT4_EXTENT_TAIL_BYTES,
+        EXT4_MAX_EXTENT_DEPTH, htree, parse_directory_block, parse_extent_index_block,
+    };
     use alloc::collections::BTreeMap;
     use alloc::format;
     use alloc::string::{String, ToString};
@@ -3595,14 +4328,16 @@ mod tests {
     use std::process::{Command, Output};
     use std::time::{SystemTime, UNIX_EPOCH};
     use troe_block::{BlockAccess, BlockError, BlockGeometry, BlockLimits};
+    use troe_fs_api::MAX_NAME_BYTES;
 
     use super::{
         BlockDevice, BlockRegion, CRC32C_POLYNOMIAL, EXT4_BLOCK_BYTES, EXT4_BLOCK_BYTES_U32,
-        EXT4_BLOCK_BYTES_U64, EXT4_EXTENT_TAIL_OFFSET, EXT4_EXTENTS_FL, EXT4_FAST_SYMLINK_BYTES,
-        EXT4_FEATURE_COMPAT, EXT4_FEATURE_INCOMPAT, EXT4_FEATURE_RO_COMPAT, EXT4_INODE_BYTES,
-        EXT4_JOURNAL_INO, EXT4_ROOT_INO, EXT4_VALID_FS, Ext4, Ext4Limits, Extent,
-        FileSystemProvider, FsError, NodeKind, RecoveryOutcome, crc32c, parse_extent_leaf,
-        parse_extents, read_u16, read_u32,
+        EXT4_BLOCK_BYTES_U64, EXT4_COMPAT_DIR_INDEX, EXT4_EXTENT_TAIL_OFFSET, EXT4_EXTENTS_FL,
+        EXT4_FAST_SYMLINK_BYTES, EXT4_FEATURE_COMPAT, EXT4_FEATURE_INCOMPAT,
+        EXT4_FEATURE_RO_COMPAT, EXT4_INCOMPAT_EXTENTS, EXT4_INDEX_FL, EXT4_INODE_BYTES,
+        EXT4_JOURNAL_INO, EXT4_RO_COMPAT_METADATA_CSUM, EXT4_ROOT_INO, EXT4_VALID_FS, Ext4,
+        Ext4Limits, Extent, FileSystemProvider, FsError, HARD_MAX_GROUPS, NodeKind,
+        RecoveryOutcome, crc32c, parse_extent_leaf, parse_extents, read_u16, read_u32,
     };
 
     const DEVICE_BLOCK_BYTES_U32: u32 = 512;
@@ -4032,6 +4767,7 @@ mod tests {
             &extents,
             &[600_000],
             0,
+            EXT4_BLOCK_BYTES,
         )?;
         let root = parse_extents(&raw[40..100], 700_000)?;
         assert_eq!(root.tree_blocks, [600_000]);
@@ -4088,6 +4824,15 @@ mod tests {
             }
         }
         Ok(SharedDevice::new(device))
+    }
+
+    fn mount_file_with_limits(path: &Path, limits: Ext4Limits) -> Result<Ext4<FileDevice>, String> {
+        let device = FileDevice::open(path)?;
+        let block_limits = BlockLimits::new(8, EXT4_BLOCK_BYTES, 1)
+            .map_err(|error| format!("invalid block limits: {error:?}"))?;
+        let region = BlockRegion::whole_device(device, BlockAccess::ReadOnly, block_limits)
+            .map_err(|error| format!("cannot grant image region: {error:?}"))?;
+        Ext4::mount(region, limits).map_err(|error| format!("cannot mount: {error:?}"))
     }
 
     fn mount_file(path: &Path) -> Result<Ext4<FileDevice>, String> {
@@ -4568,11 +5313,27 @@ mod tests {
         refresh_super_checksum(&mut dirty);
         assert!(matches!(mount(dirty), Err(FsError::Corrupt)));
 
+        // An incompatible feature this provider does not implement changes
+        // structure it would misread, so the volume is refused outright.
+        // 0x10000 is `encrypt`.
         let mut feature = valid_device();
         let superblock = &mut feature.blocks.get_mut(&0).ok_or(FsError::Io)?[1024..2048];
-        put_u32(superblock, 96, EXT4_FEATURE_INCOMPAT | 0x80);
+        put_u32(superblock, 96, EXT4_FEATURE_INCOMPAT | 0x0001_0000);
         refresh_super_checksum(&mut feature);
         assert!(matches!(mount(feature), Err(FsError::Unsupported)));
+
+        // Dropping a structural feature this provider depends on is also
+        // refused rather than guessed at.
+        for (offset, value) in [
+            (96_usize, EXT4_FEATURE_INCOMPAT & !EXT4_INCOMPAT_EXTENTS),
+            (100, EXT4_FEATURE_RO_COMPAT & !EXT4_RO_COMPAT_METADATA_CSUM),
+        ] {
+            let mut missing = valid_device();
+            let superblock = &mut missing.blocks.get_mut(&0).ok_or(FsError::Io)?[1024..2048];
+            put_u32(superblock, offset, value);
+            refresh_super_checksum(&mut missing);
+            assert!(matches!(mount(missing), Err(FsError::Unsupported)));
+        }
 
         let mut tree = valid_device();
         put_u16(
@@ -4581,6 +5342,58 @@ mod tests {
             1,
         );
         assert!(matches!(mount(tree), Err(FsError::Corrupt)));
+        Ok(())
+    }
+
+    #[test]
+    fn an_unknown_read_only_feature_keeps_the_volume_readable_but_untouched() -> Result<(), FsError>
+    {
+        // `bigalloc` (0x200) changes only how a writer must allocate, so the
+        // volume must stay readable and must never be mutated.
+        let mut device = valid_device();
+        let superblock = &mut device.blocks.get_mut(&0).ok_or(FsError::Io)?[1024..2048];
+        put_u32(superblock, 100, EXT4_FEATURE_RO_COMPAT | 0x0000_0200);
+        refresh_super_checksum(&mut device);
+
+        let mut ext4 = mount_writable(device)?;
+        let mut bytes = [0_u8; 13];
+        assert_eq!(ext4.read_file("/hello", 0, &mut bytes)?, 13);
+        assert_eq!(
+            ext4.write_file("/blocked.txt", b"nope"),
+            Err(FsError::ReadOnly),
+            "an unmaintainable feature must block every mutation"
+        );
+        assert_eq!(ext4.remove_file("/hello"), Err(FsError::ReadOnly));
+        assert_eq!(ext4.create_directory("/nope"), Err(FsError::ReadOnly));
+        Ok(())
+    }
+
+    #[test]
+    fn a_directory_claiming_an_index_it_lacks_is_refused() -> Result<(), FsError> {
+        // The feature only says indexed directories may exist, so a volume
+        // carrying it stays writable.
+        let mut device = valid_device();
+        let superblock = &mut device.blocks.get_mut(&0).ok_or(FsError::Io)?[1024..2048];
+        put_u32(superblock, 92, EXT4_FEATURE_COMPAT | EXT4_COMPAT_DIR_INDEX);
+        refresh_super_checksum(&mut device);
+        let mut ext4 = mount_writable(device)?;
+        ext4.write_file("/created.txt", b"still writable")?;
+
+        // A directory flagged as indexed whose block is an ordinary linear
+        // directory is refused rather than misread as an index.
+        let mut indexed = valid_device();
+        let superblock = &mut indexed.blocks.get_mut(&0).ok_or(FsError::Io)?[1024..2048];
+        put_u32(superblock, 92, EXT4_FEATURE_COMPAT | EXT4_COMPAT_DIR_INDEX);
+        refresh_super_checksum(&mut indexed);
+        let seed = crc32c(u32::MAX, &UUID);
+        let table = indexed
+            .blocks
+            .get_mut(&INODE_TABLE_BLOCK)
+            .ok_or(FsError::Io)?;
+        let root = table.get_mut(256..512).ok_or(FsError::Io)?;
+        put_u32(root, 32, read_u32(root, 32)? | EXT4_INDEX_FL);
+        refresh_test_inode_checksum(root, EXT4_ROOT_INO, ROOT_GENERATION, seed);
+        assert!(matches!(mount(indexed), Err(FsError::Corrupt)));
         Ok(())
     }
 
@@ -4972,6 +5785,710 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    /// Build an image with `mke2fs` defaults, i.e. what an arbitrary disk looks
+    /// like: `64bit`, `flex_bg`, `metadata_csum_seed`, `dir_index` and
+    /// `orphan_file`.
+    fn default_mke2fs_image(
+        directory: &Path,
+        mke2fs: &Path,
+        bytes: u64,
+    ) -> Result<PathBuf, String> {
+        let image = directory.join("default.ext4");
+        File::create(&image)
+            .and_then(|file| file.set_len(bytes))
+            .map_err(|error| error.to_string())?;
+        let source = directory.join("payload");
+        let nested = source.join("nested");
+        fs::create_dir_all(&nested).map_err(|error| error.to_string())?;
+        fs::write(source.join("config.txt"), b"profile=default-ext4\n")
+            .map_err(|error| error.to_string())?;
+        fs::write(nested.join("message.txt"), b"hello from a default volume\n")
+            .map_err(|error| error.to_string())?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("../config.txt", nested.join("config-link"))
+            .map_err(|error| error.to_string())?;
+        let format = Command::new(mke2fs)
+            .args(["-q", "-F", "-t", "ext4", "-d"])
+            .arg(&source)
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&format, "mke2fs default")?;
+        Ok(image)
+    }
+
+    #[test]
+    fn mounts_and_reads_a_default_mke2fs_volume() -> Result<(), String> {
+        let Some(mke2fs) = e2fs_tool("mke2fs") else {
+            return unavailable_tool("mke2fs");
+        };
+        let temporary = TestDirectory::create("ext4-default")?;
+        let image = default_mke2fs_image(temporary.path(), &mke2fs, 1024 * 1024 * 1024)?;
+        let limits = Ext4Limits::new(
+            HARD_MAX_GROUPS,
+            64,
+            256,
+            4096,
+            1 << 40,
+            1024 * 1024,
+            MAX_NAME_BYTES,
+        )
+        .map_err(|error| format!("invalid default-volume limits: {error:?}"))?;
+        let device = FileDevice::open(&image)?;
+        let block_limits = BlockLimits::new(8, EXT4_BLOCK_BYTES, 1)
+            .map_err(|error| format!("invalid block limits: {error:?}"))?;
+        let region = BlockRegion::whole_device(device, BlockAccess::ReadOnly, block_limits)
+            .map_err(|error| format!("cannot grant image region: {error:?}"))?;
+        let mut ext4 =
+            Ext4::mount(region, limits).map_err(|error| format!("cannot mount: {error:?}"))?;
+        let listing = ext4
+            .list("/", 0, 16, 64)
+            .map_err(|error| format!("cannot list default volume root: {error:?}"))?;
+        assert!(
+            listing
+                .entries
+                .iter()
+                .any(|entry| entry.name == "lost+found"),
+            "a default volume root contains lost+found"
+        );
+
+        // Real content, not just a directory listing.
+        let mut bytes = [0_u8; 32];
+        let read = ext4
+            .read_file("/config.txt", 0, &mut bytes)
+            .map_err(|error| format!("cannot read a file on a default volume: {error:?}"))?;
+        assert_eq!(&bytes[..read], b"profile=default-ext4\n");
+
+        let read = ext4
+            .read_file("/nested/message.txt", 0, &mut bytes)
+            .map_err(|error| format!("cannot read a nested file: {error:?}"))?;
+        assert_eq!(&bytes[..read], b"hello from a default volume\n");
+
+        // A symbolic link resolves through the same default metadata.
+        let read = ext4
+            .read_file("/nested/config-link", 0, &mut bytes)
+            .map_err(|error| format!("cannot follow a link: {error:?}"))?;
+        assert_eq!(&bytes[..read], b"profile=default-ext4\n");
+
+        Ok(())
+    }
+
+    fn default_volume_limits() -> Result<Ext4Limits, String> {
+        Ext4Limits::new(
+            HARD_MAX_GROUPS,
+            64,
+            256,
+            4096,
+            1 << 40,
+            1024 * 1024,
+            MAX_NAME_BYTES,
+        )
+        .map_err(|error| format!("invalid default-volume limits: {error:?}"))
+    }
+
+    #[test]
+    fn writes_to_a_default_mke2fs_volume_and_passes_e2fsck() -> Result<(), String> {
+        let Some(mke2fs) = e2fs_tool("mke2fs") else {
+            return unavailable_tool("mke2fs");
+        };
+        let Some(e2fsck) = e2fs_tool("e2fsck") else {
+            return unavailable_tool("e2fsck");
+        };
+        let temporary = TestDirectory::create("ext4-default-write")?;
+        let image = default_mke2fs_image(temporary.path(), &mke2fs, 1024 * 1024 * 1024)?;
+        {
+            let mut ext4 = mount_file_writable_with_limits(&image, default_volume_limits()?)?;
+            ext4.write_file("/created.txt", b"written by troe\n")
+                .map_err(|error| format!("cannot create on a default volume: {error:?}"))?;
+            ext4.write_file("/nested/message.txt", b"replaced by troe\n")
+                .map_err(|error| format!("cannot replace on a default volume: {error:?}"))?;
+            ext4.create_directory("/archive")
+                .map_err(|error| format!("cannot create a directory: {error:?}"))?;
+            ext4.remove_file("/config.txt")
+                .map_err(|error| format!("cannot remove on a default volume: {error:?}"))?;
+        }
+
+        // The independent oracle must accept every byte this provider wrote.
+        let check = Command::new(&e2fsck)
+            .args(["-f", "-n"])
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&check, "e2fsck after default-volume mutation")?;
+
+        let mut ext4 = mount_file_with_limits(&image, default_volume_limits()?)?;
+        let mut bytes = [0_u8; 32];
+        let read = ext4
+            .read_file("/created.txt", 0, &mut bytes)
+            .map_err(|error| format!("cannot read back: {error:?}"))?;
+        assert_eq!(&bytes[..read], b"written by troe\n");
+        let read = ext4
+            .read_file("/nested/message.txt", 0, &mut bytes)
+            .map_err(|error| format!("cannot read replacement: {error:?}"))?;
+        assert_eq!(&bytes[..read], b"replaced by troe\n");
+        assert_eq!(
+            ext4.metadata("/config.txt").err(),
+            Some(FsError::NotFound),
+            "the removed entry must be gone"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn writes_to_a_multi_group_volume_beyond_the_previous_ceiling() -> Result<(), String> {
+        let Some(mke2fs) = e2fs_tool("mke2fs") else {
+            return unavailable_tool("mke2fs");
+        };
+        let Some(e2fsck) = e2fs_tool("e2fsck") else {
+            return unavailable_tool("e2fsck");
+        };
+        let temporary = TestDirectory::create("ext4-large")?;
+        // 16 GiB is 128 groups at the ext4 default, four times the ceiling this
+        // provider previously accepted.
+        let image = default_mke2fs_image(temporary.path(), &mke2fs, 16 * 1024 * 1024 * 1024)?;
+        {
+            let mut ext4 = mount_file_writable_with_limits(&image, default_volume_limits()?)?;
+            ext4.write_file("/created.txt", b"written across many groups\n")
+                .map_err(|error| format!("cannot create on a large volume: {error:?}"))?;
+            ext4.create_directory("/archive")
+                .map_err(|error| format!("cannot create a directory: {error:?}"))?;
+        }
+        let check = Command::new(&e2fsck)
+            .args(["-f", "-n"])
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&check, "e2fsck after large-volume mutation")?;
+
+        let mut ext4 = mount_file_with_limits(&image, default_volume_limits()?)?;
+        let mut bytes = [0_u8; 32];
+        let read = ext4
+            .read_file("/created.txt", 0, &mut bytes)
+            .map_err(|error| format!("cannot read back: {error:?}"))?;
+        assert_eq!(&bytes[..read], b"written across many groups\n");
+        Ok(())
+    }
+
+    #[test]
+    fn reads_and_writes_a_kibibyte_block_volume() -> Result<(), String> {
+        let Some(mke2fs) = e2fs_tool("mke2fs") else {
+            return unavailable_tool("mke2fs");
+        };
+        let Some(e2fsck) = e2fs_tool("e2fsck") else {
+            return unavailable_tool("e2fsck");
+        };
+        let temporary = TestDirectory::create("ext4-small-block")?;
+        // `mke2fs` selects 1 KiB blocks for a small volume, so this exercises
+        // the block size the shipped profile never uses.
+        let image = default_mke2fs_image(temporary.path(), &mke2fs, 64 * 1024 * 1024)?;
+        {
+            let mut ext4 = mount_file_writable_with_limits(&image, default_volume_limits()?)?;
+            let mut bytes = [0_u8; 32];
+            let read = ext4
+                .read_file("/config.txt", 0, &mut bytes)
+                .map_err(|error| format!("cannot read a 1 KiB-block volume: {error:?}"))?;
+            assert_eq!(&bytes[..read], b"profile=default-ext4\n");
+
+            ext4.write_file("/created.txt", b"written at 1 KiB blocks\n")
+                .map_err(|error| format!("cannot create at 1 KiB blocks: {error:?}"))?;
+            ext4.create_directory("/archive")
+                .map_err(|error| format!("cannot mkdir at 1 KiB blocks: {error:?}"))?;
+            ext4.remove_file("/config.txt")
+                .map_err(|error| format!("cannot remove at 1 KiB blocks: {error:?}"))?;
+        }
+        let check = Command::new(&e2fsck)
+            .args(["-f", "-n"])
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&check, "e2fsck after 1 KiB-block mutation")?;
+
+        let mut ext4 = mount_file_with_limits(&image, default_volume_limits()?)?;
+        let mut bytes = [0_u8; 32];
+        let read = ext4
+            .read_file("/created.txt", 0, &mut bytes)
+            .map_err(|error| format!("cannot read back at 1 KiB blocks: {error:?}"))?;
+        assert_eq!(&bytes[..read], b"written at 1 KiB blocks\n");
+        Ok(())
+    }
+
+    /// Build a volume whose large directory carries a real hashed index.
+    ///
+    /// `mke2fs -d` writes linear directories at any size, so `e2fsck -D` is
+    /// used to reindex them exactly as a Linux host would.
+    fn hashed_directory_image(
+        directory: &Path,
+        mke2fs: &Path,
+        e2fsck: &Path,
+        names: usize,
+    ) -> Result<PathBuf, String> {
+        let image = directory.join("hashed.ext4");
+        File::create(&image)
+            .and_then(|file| file.set_len(256 * 1024 * 1024))
+            .map_err(|error| error.to_string())?;
+        let source = directory.join("tree");
+        let many = source.join("many");
+        fs::create_dir_all(&many).map_err(|error| error.to_string())?;
+        for index in 0..names {
+            fs::write(many.join(format!("file-{index:05}.txt")), b"x")
+                .map_err(|error| error.to_string())?;
+        }
+        let format = Command::new(mke2fs)
+            .args(["-q", "-F", "-t", "ext4", "-b", "4096", "-d"])
+            .arg(&source)
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&format, "mke2fs hashed")?;
+        // `-D` reindexes directories; it reports modification, not failure.
+        let reindex = Command::new(e2fsck)
+            .args(["-fD", "-y"])
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !matches!(reindex.status.code(), Some(0 | 1)) {
+            return Err(format!("e2fsck -D failed: {:?}", reindex.status));
+        }
+        Ok(image)
+    }
+
+    #[test]
+    fn reads_a_hashed_directory_through_its_index() -> Result<(), String> {
+        const NAMES: usize = 2000;
+        let Some(mke2fs) = e2fs_tool("mke2fs") else {
+            return unavailable_tool("mke2fs");
+        };
+        let Some(e2fsck) = e2fs_tool("e2fsck") else {
+            return unavailable_tool("e2fsck");
+        };
+        let temporary = TestDirectory::create("ext4-hashed")?;
+        let image = hashed_directory_image(temporary.path(), &mke2fs, &e2fsck, NAMES)?;
+        let limits = Ext4Limits::new(
+            HARD_MAX_GROUPS,
+            64,
+            256,
+            4096,
+            1 << 40,
+            1024 * 1024,
+            MAX_NAME_BYTES,
+        )
+        .map_err(|error| format!("invalid limits: {error:?}"))?;
+        let mut ext4 = mount_file_with_limits(&image, limits)?;
+
+        // Every name the index describes must be enumerated exactly once.
+        let mut seen = 0_usize;
+        let mut cursor = 0_u64;
+        loop {
+            let page = ext4
+                .list("/many", cursor, 64, 64)
+                .map_err(|error| format!("cannot list a hashed directory: {error:?}"))?;
+            seen += page.entries.len();
+            match page.next_cursor {
+                Some(next) => cursor = next,
+                None => break,
+            }
+        }
+        assert_eq!(seen, NAMES, "the index must enumerate every name once");
+
+        // A name resolves through the same leaves.
+        let mut bytes = [0_u8; 4];
+        let read = ext4
+            .read_file("/many/file-01234.txt", 0, &mut bytes)
+            .map_err(|error| format!("cannot read through a hashed directory: {error:?}"))?;
+        assert_eq!(&bytes[..read], b"x");
+
+        // An unindexed directory on the same volume stays writable.
+        let mut writable = mount_file_writable_with_limits(&image, limits)?;
+        writable
+            .write_file("/created.txt", b"written beside a hashed directory\n")
+            .map_err(|error| format!("cannot write beside a hashed directory: {error:?}"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn the_name_hash_agrees_with_a_real_on_disk_index() -> Result<(), String> {
+        const NAMES: usize = 2000;
+        let Some(mke2fs) = e2fs_tool("mke2fs") else {
+            return unavailable_tool("mke2fs");
+        };
+        let Some(e2fsck) = e2fs_tool("e2fsck") else {
+            return unavailable_tool("e2fsck");
+        };
+        let temporary = TestDirectory::create("ext4-hash-agree")?;
+        let image = hashed_directory_image(temporary.path(), &mke2fs, &e2fsck, NAMES)?;
+        let limits = Ext4Limits::new(
+            HARD_MAX_GROUPS,
+            64,
+            256,
+            4096,
+            1 << 40,
+            1024 * 1024,
+            MAX_NAME_BYTES,
+        )
+        .map_err(|error| format!("invalid limits: {error:?}"))?;
+        let mut ext4 = mount_file_with_limits(&image, limits)?;
+
+        let hash = ext4
+            .directory_hash()
+            .map_err(|error| format!("cannot read hash inputs: {error:?}"))?;
+        assert!(
+            hash.is_reproducible(),
+            "the volume records its byte signedness"
+        );
+        let inode = ext4
+            .resolve("/many")
+            .map_err(|error| format!("cannot resolve: {error:?}"))?;
+        assert!(inode.indexed, "e2fsck -D must have indexed this directory");
+
+        let seed = ext4.inode_checksum_seed(&inode);
+        let root_block = ext4
+            .directory_block(&inode, 0)
+            .map_err(|error| format!("cannot read root: {error:?}"))?;
+        let root = htree::parse_root(&root_block, seed, crc32c)
+            .map_err(|error| format!("cannot parse root: {error:?}"))?;
+        assert_eq!(root.indirect_levels, 0, "one level is enough for this size");
+        assert!(root.entries.len() > 1, "the directory must really be split");
+
+        // Every name a leaf holds must hash into that leaf's own range. A hash
+        // that disagreed with the kernel's would place names in the wrong leaf.
+        let mut checked = 0_usize;
+        for (index, entry) in root.entries.iter().enumerate() {
+            let upper = root.entries.get(index + 1).map(|next| next.hash);
+            let block = ext4
+                .directory_block(&inode, entry.block)
+                .map_err(|error| format!("cannot read leaf: {error:?}"))?;
+            let mut records = Vec::new();
+            parse_directory_block(&block, inode.number, 1 << 20, limits, &mut records)
+                .map_err(|error| format!("cannot parse leaf: {error:?}"))?;
+            for record in &records {
+                let computed = hash
+                    .hash(record.name.as_bytes(), root.hash_version)
+                    .map_err(|error| format!("cannot hash: {error:?}"))?;
+                assert!(
+                    computed >= entry.hash,
+                    "{} hashed to {computed:#x}, below its leaf floor {:#x}",
+                    record.name,
+                    entry.hash
+                );
+                if let Some(limit) = upper {
+                    assert!(
+                        computed < limit,
+                        "{} hashed to {computed:#x}, at or above the next leaf {limit:#x}",
+                        record.name
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, NAMES, "every name must be placed by the index");
+        Ok(())
+    }
+
+    #[test]
+    fn writes_into_a_hashed_directory_and_passes_e2fsck() -> Result<(), String> {
+        const NAMES: usize = 2000;
+        const TARGET: &str = "/many/file-01234.txt";
+        let Some(mke2fs) = e2fs_tool("mke2fs") else {
+            return unavailable_tool("mke2fs");
+        };
+        let Some(e2fsck) = e2fs_tool("e2fsck") else {
+            return unavailable_tool("e2fsck");
+        };
+        let temporary = TestDirectory::create("ext4-hashed-write")?;
+        let image = hashed_directory_image(temporary.path(), &mke2fs, &e2fsck, NAMES)?;
+        let limits = Ext4Limits::new(
+            HARD_MAX_GROUPS,
+            64,
+            256,
+            4096,
+            1 << 40,
+            1024 * 1024,
+            MAX_NAME_BYTES,
+        )
+        .map_err(|error| format!("invalid limits: {error:?}"))?;
+        {
+            let mut ext4 = mount_file_writable_with_limits(&image, limits)?;
+            ext4.remove_file(TARGET)
+                .map_err(|error| format!("cannot remove from a hashed directory: {error:?}"))?;
+            assert_eq!(ext4.metadata(TARGET).err(), Some(FsError::NotFound));
+
+            // The same name hashes to the same leaf, which now has room again.
+            ext4.write_file(TARGET, b"rewritten by troe\n")
+                .map_err(|error| format!("cannot insert into a hashed directory: {error:?}"))?;
+
+            // A brand-new name either fits its leaf or is refused; it must
+            // never be placed where the index cannot find it.
+            match ext4.write_file("/many/inserted-by-troe.txt", b"new\n") {
+                Ok(()) | Err(FsError::NoSpace) => {}
+                Err(error) => return Err(format!("unexpected insert failure: {error:?}")),
+            }
+        }
+
+        // e2fsck validates hashed-directory ordering, so a record placed in the
+        // wrong leaf would be reported here.
+        let check = Command::new(&e2fsck)
+            .args(["-f", "-n"])
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&check, "e2fsck after hashed-directory mutation")?;
+
+        let mut ext4 = mount_file_with_limits(&image, limits)?;
+        let mut bytes = [0_u8; 32];
+        let read = ext4
+            .read_file(TARGET, 0, &mut bytes)
+            .map_err(|error| format!("cannot read the reinserted name: {error:?}"))?;
+        assert_eq!(&bytes[..read], b"rewritten by troe\n");
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_the_longest_name_ext4_allows() -> Result<(), String> {
+        const LENGTH: usize = 255;
+        let Some(mke2fs) = e2fs_tool("mke2fs") else {
+            return unavailable_tool("mke2fs");
+        };
+        let Some(e2fsck) = e2fs_tool("e2fsck") else {
+            return unavailable_tool("e2fsck");
+        };
+        let temporary = TestDirectory::create("ext4-long-name")?;
+        let image = default_mke2fs_image(temporary.path(), &mke2fs, 1024 * 1024 * 1024)?;
+        let name: String = core::iter::repeat_n('n', LENGTH).collect();
+        let path = format!("/{name}");
+        assert_eq!(name.len(), LENGTH);
+        {
+            let mut ext4 = mount_file_writable_with_limits(&image, default_volume_limits()?)?;
+            ext4.write_file(&path, b"a very long name\n")
+                .map_err(|error| format!("cannot create a {LENGTH}-byte name: {error:?}"))?;
+        }
+        let check = Command::new(&e2fsck)
+            .args(["-f", "-n"])
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&check, "e2fsck after a long-name insert")?;
+
+        let mut ext4 = mount_file_with_limits(&image, default_volume_limits()?)?;
+        let mut bytes = [0_u8; 32];
+        let read = ext4
+            .read_file(&path, 0, &mut bytes)
+            .map_err(|error| format!("cannot read a {LENGTH}-byte name: {error:?}"))?;
+        assert_eq!(&bytes[..read], b"a very long name\n");
+        // The listing byte budget is an aggregate, so a 255-byte name may need
+        // its own page.
+        let mut found = false;
+        let mut cursor = 0_u64;
+        loop {
+            let page = ext4
+                .list("/", cursor, 8, MAX_NAME_BYTES)
+                .map_err(|error| format!("cannot list: {error:?}"))?;
+            found |= page.entries.iter().any(|entry| entry.name == name);
+            match page.next_cursor {
+                Some(next) => cursor = next,
+                None => break,
+            }
+        }
+        assert!(found, "the long name must be enumerable");
+        Ok(())
+    }
+
+    /// Build one interior extent node with the given children.
+    fn extent_index_block(depth: u16, children: &[(u32, u32)], seed: u32) -> Vec<u8> {
+        let mut raw = alloc::vec![0_u8; EXT4_BLOCK_BYTES];
+        let capacity = (EXT4_BLOCK_BYTES - EXT4_EXTENT_HEADER_BYTES - EXT4_EXTENT_TAIL_BYTES)
+            / EXT4_EXTENT_RECORD_BYTES;
+        put_u16(&mut raw, 0, EXT4_EXT_MAGIC);
+        put_u16(&mut raw, 2, u16::try_from(children.len()).unwrap_or(0));
+        put_u16(&mut raw, 4, u16::try_from(capacity).unwrap_or(0));
+        put_u16(&mut raw, 6, depth);
+        for (index, (logical, physical)) in children.iter().enumerate() {
+            let offset = EXT4_EXTENT_HEADER_BYTES + index * EXT4_EXTENT_RECORD_BYTES;
+            put_u32(&mut raw, offset, *logical);
+            put_u32(&mut raw, offset + 4, *physical);
+        }
+        let tail = EXT4_EXTENT_HEADER_BYTES + capacity * EXT4_EXTENT_RECORD_BYTES;
+        let checksum = crc32c(seed, &raw[..tail]);
+        put_u32(&mut raw, tail, checksum);
+        raw
+    }
+
+    #[test]
+    fn walks_an_extent_tree_deeper_than_one_level() -> Result<(), FsError> {
+        let seed = crc32c(u32::MAX, &UUID);
+        let inode_seed = crc32c(
+            crc32c(seed, &3_u32.to_le_bytes()),
+            &FILE_GENERATION.to_le_bytes(),
+        );
+
+        // A root two levels above its leaves is accepted and reports its depth.
+        let mut root = [0_u8; 60];
+        put_u16(&mut root, 0, EXT4_EXT_MAGIC);
+        put_u16(&mut root, 2, 1);
+        put_u16(&mut root, 4, 4);
+        put_u16(&mut root, 6, 2);
+        put_u32(&mut root, 12, 0);
+        put_u32(&mut root, 16, 30);
+        let parsed = parse_extents(&root, 700_000)?;
+        assert_eq!(parsed.depth, 2);
+        assert_eq!(parsed.tree_blocks, [30]);
+
+        // A node one level down names the leaves.
+        let node = extent_index_block(1, &[(0, 31), (16, 32)], inode_seed);
+        assert_eq!(
+            parse_extent_index_block(&node, 700_000, 1, seed, 3, FILE_GENERATION)?,
+            alloc::vec![(0, 31), (16, 32)]
+        );
+
+        // A node whose declared depth disagrees with its parent is refused,
+        // because a mismatched level would be read as the wrong record kind.
+        assert_eq!(
+            parse_extent_index_block(&node, 700_000, 2, seed, 3, FILE_GENERATION),
+            Err(FsError::Corrupt)
+        );
+        // So is a child pointing outside the volume, or a broken checksum.
+        assert_eq!(
+            parse_extent_index_block(&node, 31, 1, seed, 3, FILE_GENERATION),
+            Err(FsError::Corrupt)
+        );
+        let mut torn = node.clone();
+        torn[EXT4_EXTENT_HEADER_BYTES] ^= 0xFF;
+        assert_eq!(
+            parse_extent_index_block(&torn, 700_000, 1, seed, 3, FILE_GENERATION),
+            Err(FsError::Corrupt)
+        );
+        // Children must ascend, so an out-of-order pair is refused.
+        let unordered = extent_index_block(1, &[(16, 31), (0, 32)], inode_seed);
+        assert_eq!(
+            parse_extent_index_block(&unordered, 700_000, 1, seed, 3, FILE_GENERATION),
+            Err(FsError::Corrupt)
+        );
+        // Truncation never panics.
+        for length in 0..node.len() {
+            assert!(
+                parse_extent_index_block(&node[..length], 700_000, 1, seed, 3, FILE_GENERATION)
+                    .is_err()
+            );
+        }
+
+        // A tree deeper than ext4 itself builds is refused rather than walked.
+        put_u16(&mut root, 6, EXT4_MAX_EXTENT_DEPTH + 1);
+        assert!(matches!(
+            parse_extents(&root, 700_000),
+            Err(FsError::Unsupported)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn writes_to_a_volume_past_one_tebibyte() -> Result<(), String> {
+        let Some(mke2fs) = e2fs_tool("mke2fs") else {
+            return unavailable_tool("mke2fs");
+        };
+        let Some(e2fsck) = e2fs_tool("e2fsck") else {
+            return unavailable_tool("e2fsck");
+        };
+        let temporary = TestDirectory::create("ext4-huge")?;
+        let image = temporary.path().join("huge.ext4");
+        File::create(&image)
+            .and_then(|file| file.set_len(2 * 1024 * 1024 * 1024 * 1024))
+            .map_err(|error| error.to_string())?;
+        // The inode and journal ceilings only keep the sparse image small; the
+        // point of this volume is its 16384 block groups.
+        let format = Command::new(&mke2fs)
+            .args(["-q", "-F", "-t", "ext4", "-N", "65536", "-J", "size=16"])
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&format, "mke2fs two-tebibyte")?;
+
+        {
+            let mut ext4 = mount_file_writable_with_limits(&image, default_volume_limits()?)?;
+            ext4.write_file("/created.txt", b"written past a tebibyte\n")
+                .map_err(|error| format!("cannot write past a tebibyte: {error:?}"))?;
+            ext4.create_directory("/archive")
+                .map_err(|error| format!("cannot mkdir past a tebibyte: {error:?}"))?;
+        }
+        let check = Command::new(&e2fsck)
+            .args(["-f", "-n"])
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&check, "e2fsck after a two-tebibyte mutation")?;
+
+        let mut ext4 = mount_file_with_limits(&image, default_volume_limits()?)?;
+        let mut bytes = [0_u8; 32];
+        let read = ext4
+            .read_file("/created.txt", 0, &mut bytes)
+            .map_err(|error| format!("cannot read back: {error:?}"))?;
+        assert_eq!(&bytes[..read], b"written past a tebibyte\n");
+        Ok(())
+    }
+
+    #[test]
+    fn stamps_timestamps_only_when_a_clock_is_supplied() -> Result<(), String> {
+        const NOW: u32 = 1_788_000_000;
+        let Some(mke2fs) = e2fs_tool("mke2fs") else {
+            return unavailable_tool("mke2fs");
+        };
+        let Some(e2fsck) = e2fs_tool("e2fsck") else {
+            return unavailable_tool("e2fsck");
+        };
+        let temporary = TestDirectory::create("ext4-times")?;
+        let image = default_mke2fs_image(temporary.path(), &mke2fs, 1024 * 1024 * 1024)?;
+
+        // Without a clock the provider leaves every timestamp alone.
+        {
+            let mut ext4 = mount_file_writable_with_limits(&image, default_volume_limits()?)?;
+            ext4.write_file("/unstamped.txt", b"no clock\n")
+                .map_err(|error| format!("cannot create: {error:?}"))?;
+            let times = inode_times(&mut ext4, "/unstamped.txt")?;
+            assert_eq!(times, (0, 0, 0), "no clock must invent no time");
+        }
+
+        // With one, a created inode carries it and a later write advances the
+        // modification time.
+        {
+            let mut ext4 = mount_file_writable_with_limits(&image, default_volume_limits()?)?;
+            ext4.set_wall_clock_seconds(NOW);
+            ext4.write_file("/stamped.txt", b"clocked\n")
+                .map_err(|error| format!("cannot create: {error:?}"))?;
+            assert_eq!(inode_times(&mut ext4, "/stamped.txt")?, (NOW, NOW, NOW));
+
+            ext4.set_wall_clock_seconds(NOW + 60);
+            ext4.write_file("/stamped.txt", b"clocked again\n")
+                .map_err(|error| format!("cannot replace: {error:?}"))?;
+            let (atime, ctime, mtime) = inode_times(&mut ext4, "/stamped.txt")?;
+            assert_eq!(atime, NOW, "a write does not advance the access time");
+            assert_eq!(ctime, NOW + 60);
+            assert_eq!(mtime, NOW + 60);
+        }
+
+        let check = Command::new(&e2fsck)
+            .args(["-f", "-n"])
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&check, "e2fsck after stamped mutations")?;
+        Ok(())
+    }
+
+    /// Read one inode's access, change, and modification times.
+    fn inode_times<D: BlockDevice>(
+        ext4: &mut Ext4<D>,
+        path: &str,
+    ) -> Result<(u32, u32, u32), String> {
+        let inode = ext4
+            .resolve(path)
+            .map_err(|error| format!("cannot resolve {path}: {error:?}"))?;
+        let raw = ext4
+            .raw_inode_record(inode.number)
+            .map_err(|error| format!("cannot read inode: {error:?}"))?;
+        let field = |offset: usize| {
+            read_u32(&raw, offset).map_err(|error| format!("short inode: {error:?}"))
+        };
+        Ok((field(8)?, field(12)?, field(16)?))
     }
 
     fn verify_writer_interoperability(image: &Path, e2fsck: &Path) -> Result<(), String> {

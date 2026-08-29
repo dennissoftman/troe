@@ -74,20 +74,33 @@ firmware fails before device publication or volatile I/O.
    active package generation. The system has no `/etc` directory or alias. KEX
    applications are statically linked, `/lib` is not present, and executable
    code does not belong in `/share`. Optional large runtime executables live
-   only in `/vol/shared/runtime/v1/<architecture>/bin`, outside rootfs and EFI.
+   only in `/vol/shared/bin/<architecture>`, outside rootfs and EFI,
+   and optional runtimes own `/vol/shared/bin/<architecture>` with their
+   libraries in `/vol/shared/lib/<architecture>` on the same terms.
 6. The final output capability writes host bytes or the native UART.
    When validated GOP metadata is available, normal native shell output is also
    rendered into an owned fixed-glyph framebuffer console. UEFI text output is
    confined to the pre-handoff banner.
 
 `tools/mkruntime.py` owns the shared runtime-tree boundary. It emits the exact
-`runtime/v1` layout, canonical path-sorted length/SHA-256 manifest, and at most
+`bin/<architecture>` layout, canonical path-sorted length/SHA-256 manifest, and at most
 128 architecture-owned KEX entries. Verification rejects symlinks, extra or
 missing files, noncanonical records, unsupported schemas, wrong lengths,
 oversized artifacts, and digest changes. Mounted-root and detached-image
 installation both verify the source and destination; unavailable shared media
 is an explicit terminal error. Rootfs and EFI builders do not consume this
 tree.
+
+`tools/build_cpython.py` owns the CPython package boundary on the same terms.
+It emits `bin/<architecture>` and `lib/<architecture>` with version-addressable
+interpreters, a default `python.kex` alias for the newest pinned release, the
+filtered pure-Python library, per-release build and module manifests, and one
+path-sorted SHA-256 manifest for the whole tree. Installation verifies the
+source tree, rejects a medium that already owns the directory, and re-reads
+every installed byte. Administrator-supplied pure-Python packages install
+separately below `lib/<architecture>/packages` in every installed architecture;
+bytecode caches and non-Python files are
+refused. Rootfs and EFI builders do not consume this tree either.
 
 Pipelines remain sequential even though cooperative tasks now exist. This makes
 backpressure an explicit capacity error rather than requiring hidden scheduling
@@ -145,7 +158,8 @@ services keep typed protocols. There is no universal native file-descriptor,
 generic socket namespace, `ioctl`-style escape hatch, kernel POSIX subsystem, or
 package-resolved scoped-root grant in the native recovery command path. Shared
 `no_std` Rust services and the freestanding C sysroot layer filesystem
-algorithms, the hybrid allocator, bounded descriptors, buffered `FILE` and
+algorithms, the hybrid allocator, bounded descriptors that may be opened
+read-write over one streamed replacement, buffered `FILE` and
 directory streams, immutable environment handling, exit processing, clocks,
 UTC calendar/formatting, UTF-8/wide conversion, C-locale helpers, randomness,
 `setjmp`, and single-execution-thread pthread-compatible locks and TSS over
@@ -400,8 +414,10 @@ direct launches, grants only a child-manifest attenuation of the
 launcher's own capabilities, and
 returns an opaque control token separate from the observable process ID.
 Blocking wait, cancellation, terminal reap, pipe backpressure/EOF, and recursive
-descendant teardown are resident-process operations. The kernel exposes no
-command parser. `spawn.kex` exercises the mechanism; the current `sh.kex`
+descendant teardown are resident-process operations. The kernel steps a nested
+child on the launching task's stack, so nesting is bounded at eight levels below
+the session or a service and a deeper launch is refused as exhausted. The kernel
+exposes no command parser. `spawn.kex` exercises the mechanism; the current `sh.kex`
 continues to use its transactional script sidecar until its language moves onto
 these APIs.
 
@@ -474,12 +490,19 @@ metadata-preserving ext4 with bounded symbolic/hard links, native virtio
 transport, dual-slot durability, and
 selected STFS mutation pieces preserve this dependency direction. Empty
 directory removal and same-provider rename are implemented for RAMFS, FAT32,
-and the constrained ext4 profile. Constrained-ext4 metadata mutations are
+and the ext4 provider. Its ext4 mutations are
 journaled as physical block redo transactions in the profile's existing internal
 journal, and a separate explicitly authorized recovery path replays a committed
 transaction or discards an uncommitted one, so an interrupted mutation recovers
-to exactly one valid state without external repair. General ext4 repair and
-mutations outside the documented profiles remain unsupported. A transport provides bounded block-region capabilities; partition
+to exactly one valid state without external repair. The provider follows ext4's own compatibility
+rules rather than one exact feature set: an unknown incompatible feature is
+refused, an unknown read-only-compatible feature mounts read-only, and
+compatible features are ignored. It reads 1 KiB, 2 KiB and 4 KiB blocks,
+32- and 64-byte group descriptors, stored checksum seeds, flexible block
+groups, uninitialized groups, hashed directory indexes, and extent trees to the
+depth ext4 builds them, so an ordinary Linux ext4 volume mounts and takes the
+full mutation surface. General ext4 repair and mutations outside the documented
+profile remain unsupported. A transport provides bounded block-region capabilities; partition
 discovery turns a whole device into non-overlapping regions; independently
 selected filesystem providers expose VFS objects.
 Format-specific structures do not enter the machine backend, block transport,

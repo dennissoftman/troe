@@ -59,7 +59,19 @@ MUTABLE_ROOT_CONTENT = "persistent-ext4-content"
 SHARED_FILE = "/vol/shared/host-visible.txt"
 SHARED_CONTENT = "persistent-fat32-content"
 RUNTIME_PROBE_PACKAGES = REPO_ROOT / "build" / "runtime-probe-packages"
-RUNTIME_PROBE_TREE = REPO_ROOT / "build" / "runtime-tree-v1"
+RUNTIME_PROBE_TREE = REPO_ROOT / "build" / "runtime-tree-v2"
+CPYTHON_PACKAGE_TREE = REPO_ROOT / "build" / "cpython-package"
+CPYTHON_DIAGNOSTICS_TREE = (
+    REPO_ROOT / "build" / "cpython-diagnostics" / "cpython-diagnostics" / "v1"
+)
+CPYTHON_FIXTURES = REPO_ROOT / "tests" / "fixtures" / "cpython"
+SHARED_BIN = "/vol/shared/bin"
+CPYTHON_SHARED_BIN = SHARED_BIN
+CPYTHON_SHARED_LIB = "/vol/shared/lib"
+CPYTHON_DIAGNOSTICS_ROOT = "/vol/shared/cpython-diagnostics/v1"
+# Interpreter startup, standard-library imports, and cyclic collection are
+# far heavier than a coreutil launch, and both guests share one host.
+CPYTHON_TIMEOUT_SCALE = 12.0
 
 
 class AcceptanceError(RuntimeError):
@@ -231,26 +243,37 @@ def reset_txslot(platform_id: str, environment: str) -> None:
 
 
 def build_runtime_probe_tree() -> None:
-    """Build both large C probes into one versioned shared-runtime tree."""
+    """Build the optional runtimes and C probes into one shared-runtime tree."""
     if RUNTIME_PROBE_PACKAGES.exists():
         shutil.rmtree(RUNTIME_PROBE_PACKAGES)
     if RUNTIME_PROBE_TREE.exists():
         shutil.rmtree(RUNTIME_PROBE_TREE)
     RUNTIME_PROBE_PACKAGES.mkdir(parents=True, exist_ok=True)
-    subprocess.run(
-        [
-            "cargo",
-            "kex",
-            "build",
-            REPO_ROOT / "tests" / "runtime-probe",
-            "--target",
-            "all",
-            "--output",
-            RUNTIME_PROBE_PACKAGES,
-        ],
-        cwd=REPO_ROOT,
-        check=True,
-    )
+    for source in (REPO_ROOT / "tests" / "runtime-probe", REPO_ROOT / "apps" / "lua"):
+        subprocess.run(
+            [
+                "cargo",
+                "kex",
+                "build",
+                source,
+                "--target",
+                "all",
+                "--output",
+                RUNTIME_PROBE_PACKAGES,
+            ],
+            cwd=REPO_ROOT,
+            check=True,
+        )
+    artifacts = []
+    for name in ("runtime-probe", "lua"):
+        for architecture in ("x86_64", "aarch64"):
+            artifacts.extend(
+                [
+                    "--artifact",
+                    f"{architecture}:{name}="
+                    f"{RUNTIME_PROBE_PACKAGES / architecture / f'{name}.kex'}",
+                ]
+            )
     subprocess.run(
         [
             sys.executable,
@@ -258,17 +281,16 @@ def build_runtime_probe_tree() -> None:
             "build",
             "--output",
             RUNTIME_PROBE_TREE,
-            "--artifact",
-            f"x86_64:runtime-probe={RUNTIME_PROBE_PACKAGES / 'x86_64' / 'runtime-probe.kex'}",
-            "--artifact",
-            f"aarch64:runtime-probe={RUNTIME_PROBE_PACKAGES / 'aarch64' / 'runtime-probe.kex'}",
+            *artifacts,
         ],
         cwd=REPO_ROOT,
         check=True,
     )
 
 
-def reset_shared_media(platform_id: str, *, install_runtime: bool) -> None:
+def reset_shared_media(
+    platform_id: str, *, install_runtime: bool, install_cpython: bool = False
+) -> None:
     """Create one platform-private FAT32 medium and install runtime artifacts."""
     path = shared_test_image_path(resolve_platform(platform_id))
     subprocess.run(
@@ -295,6 +317,8 @@ def reset_shared_media(platform_id: str, *, install_runtime: bool) -> None:
             cwd=REPO_ROOT,
             check=True,
         )
+    if install_cpython:
+        install_cpython_media(path)
 
 
 def cleanup_shared_media(platform_ids: tuple[str, ...]) -> None:
@@ -1005,10 +1029,16 @@ class SerialSession:
         *,
         contains: tuple[str, ...] = (),
         absent: tuple[str, ...] = (),
+        program: str | None = None,
     ) -> str:
-        """Approve one explicit-path warning, then assert command output."""
+        """Approve one explicit-path warning, then assert command output.
+
+        The warning names the application, which is the first word only for a
+        single-stage command; a pipeline must state it explicitly.
+        """
         submitted = self.send(command, timeout)
-        marker = f"Run untrusted application '{command.split()[0]}' outside /bin? [y/N] ".encode()
+        warned = program if program is not None else command.split()[0]
+        marker = f"Run untrusted application '{warned}' outside /bin? [y/N] ".encode()
         self.wait_for(marker, timeout, submitted)
         answered = self.send("y", timeout)
         prompt = f"sh:{cwd}> ".encode()
@@ -1389,9 +1419,15 @@ def run_shell_terminal_group(session: SerialSession, command_timeout: float) -> 
     run_terminal_input_checks(session, cwd, command_timeout)
 
 
+def shared_lua(session: SerialSession) -> str:
+    """Return the explicit shared-media path of the optional Lua runtime."""
+    return f"{SHARED_BIN}/{session.architecture}/lua.kex"
+
+
 def run_filesystem_group(session: SerialSession, command_timeout: float) -> None:
     """Exercise mounted reads, pipelines, paths, and bounded file mutation."""
     cwd = "/"
+    lua = shared_lua(session)
     session.command(
         "mount",
         cwd,
@@ -1444,15 +1480,15 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
         command_timeout,
         contains=("shared-absolute-kex\n",),
     )
-    session.command(
-        "lua -e 'local ok,kind,status=os.execute(\"./echo-copy "
+    session.confirmed_command(
+        lua + " -e 'local ok,kind,status=os.execute(\"./echo-copy "
         "shared-child-kex\"); print(\"path-kex-status\",ok,kind,status)'",
         cwd,
         command_timeout,
         contains=("shared-child-kex\n", "path-kex-status\ttrue\texit\t0\n"),
     )
     runtime_probe = (
-        f"/vol/shared/runtime/v1/{session.architecture}/bin/runtime-probe.kex"
+        f"{SHARED_BIN}/{session.architecture}/runtime-probe.kex"
     )
     first_probe = session.confirmed_command(
         runtime_probe,
@@ -1470,8 +1506,8 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
     second_image = re.search(r"image=(0x[0-9a-f]+)", second_probe)
     if first_image is None or second_image is None or first_image.group(1) == second_image.group(1):
         raise AcceptanceError("large C runtime probe did not receive fresh ASLR placement")
-    session.command(
-        f"lua -e 'local ok,kind,status=os.execute(\"{runtime_probe}\"); "
+    session.confirmed_command(
+        lua + f" -e 'local ok,kind,status=os.execute(\"{runtime_probe}\"); "
         "print(\"runtime-child-status\",ok,kind,status)'",
         cwd,
         max(command_timeout, 30.0),
@@ -1653,8 +1689,8 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
     )
     session.command("rm /vol/root/troe-empty-test/state.txt", cwd, command_timeout)
     session.command("rmdir /vol/root/troe-empty-test", cwd, command_timeout)
-    session.command(
-        "lua -e 'local ok,kind,status=os.execute(\"mv "
+    session.confirmed_command(
+        lua + " -e 'local ok,kind,status=os.execute(\"mv "
         "/vol/root/troe-moved.txt /vol/shared/cross-device.txt\"); "
         "print(\"mv-status\",ok,kind,status)'",
         cwd,
@@ -1664,23 +1700,23 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
             "mv-status\tnil\texit\t1\n",
         ),
     )
-    session.command(
-        "lua -e 'local ok,kind,status=os.execute(\"cp "
+    session.confirmed_command(
+        lua + " -e 'local ok,kind,status=os.execute(\"cp "
         f"{MUTABLE_ROOT_FILE} /recovery/denied-copy\"); "
         "print(\"cp-readonly-status\",ok,kind,status)'",
         cwd,
         command_timeout,
         contains=("read-only filesystem", "cp-readonly-status\tnil\texit\t1\n"),
     )
-    session.command(
-        "lua -e 'local ok,kind,status=os.execute(\"rm -R /recovery\"); "
+    session.confirmed_command(
+        lua + " -e 'local ok,kind,status=os.execute(\"rm -R /recovery\"); "
         "print(\"rm-readonly-status\",ok,kind,status)'",
         cwd,
         command_timeout,
         contains=("read-only filesystem", "rm-readonly-status\tnil\texit\t1\n"),
     )
-    session.command(
-        "lua -e 'local ok,kind,status=os.execute(\"cp "
+    session.confirmed_command(
+        lua + " -e 'local ok,kind,status=os.execute(\"cp "
         "/missing /vol/root/missing-copy\"); "
         "print(\"cp-missing-status\",ok,kind,status)'",
         cwd,
@@ -1824,6 +1860,36 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
         command_timeout,
         contains=("cat: /missing: not found", "spawn-status: 3\n"),
     )
+    # Nested launch is bounded by depth because each level occupies one kernel
+    # stack frame. Eight levels are accepted; a ninth is refused at the launch
+    # boundary, whichever application launches it, and the session stays usable.
+    session.command(
+        'spawn --status spawn --status spawn --status spawn --status spawn --status spawn --status spawn --status echo nested-depth-eight',
+        cwd,
+        command_timeout,
+        contains=("nested-depth-eight\n", "spawn-status: 0\n"),
+        absent=("spawn-status: 1\n",),
+    )
+    session.command(
+        'spawn --status spawn --status spawn --status spawn --status spawn --status spawn --status spawn --status spawn --status echo nested-depth-nine',
+        cwd,
+        command_timeout,
+        contains=("spawn: child launch failed", "spawn-status: 1\n"),
+        absent=("nested-depth-nine\n",),
+    )
+    session.confirmed_command(
+        lua + " -e 'print(os.execute(\"spawn --status spawn --status spawn --status spawn --status spawn --status spawn --status spawn --status echo lua-depth-nine\"))'",
+        cwd,
+        command_timeout,
+        contains=("spawn: child launch failed", "nil\texit\t1\n"),
+        absent=("lua-depth-nine\n",),
+    )
+    session.command(
+        "echo nested-depth-survived",
+        cwd,
+        command_timeout,
+        contains=("nested-depth-survived\n",),
+    )
     session.command(
         r"printf 'first\nsecond\t%s\n' value | grep second",
         cwd,
@@ -1912,8 +1978,8 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
         contains=("00000000  41 42 43 44 ",),
     )
     session.command("wc -c < /tmp/direct", cwd, command_timeout, contains=("4\n",))
-    session.command(
-        "lua -e 'print(string.rep(\"x\",70000))' > /tmp/large-stream",
+    session.confirmed_command(
+        lua + " -e 'print(string.rep(\"x\",70000))' > /tmp/large-stream",
         cwd,
         command_timeout,
     )
@@ -2016,9 +2082,10 @@ def run_launch_environment_checks(
     session: SerialSession, cwd: str, command_timeout: float
 ) -> None:
     """Require explicit population, launcher narrowing, and no value leakage."""
+    lua = shared_lua(session)
     # -E ignores Lua configuration entries while ordinary os.getenv is unchanged.
-    session.command(
-        "lua -E -e 'print(\"env-ignored\", os.getenv(\"HOME\"), "
+    session.confirmed_command(
+        lua + " -E -e 'print(\"env-ignored\", os.getenv(\"HOME\"), "
         "package.path:find(\"/share/lua/\", 1, true) ~= nil)'",
         cwd,
         command_timeout,
@@ -2071,29 +2138,30 @@ def run_launch_environment_checks(
 def run_lua_group(session: SerialSession, command_timeout: float) -> None:
     """Exercise the freestanding Lua runtime, allocator, math, and loaders."""
     cwd = "/"
+    lua = shared_lua(session)
     run_launch_environment_checks(session, cwd, command_timeout)
-    session.command(
-        "lua --version",
+    session.confirmed_command(
+        lua + " --version",
         cwd,
         command_timeout,
         contains=("Lua 5.5.1", "Lua.org, PUC-Rio"),
     )
-    session.command(
-        'lua -e \'print("lua-inline", math.floor(math.sin(0)), '
+    session.confirmed_command(
+        lua + ' -e \'print("lua-inline", math.floor(math.sin(0)), '
         'string.format("%04d", 7))\'',
         cwd,
         command_timeout,
         contains=("lua-inline\t0\t0007\n",),
     )
-    session.command(
-        'lua -e \'local ok,e=pcall(function() error("jump-ok") end); '
+    session.confirmed_command(
+        lua + ' -e \'local ok,e=pcall(function() error("jump-ok") end); '
         'print("lua-jump", ok, type(e), e, e:match("jump%-ok") ~= nil)\'',
         cwd,
         command_timeout,
         contains=("lua-jump\tfalse\tstring\t", "jump-ok\ttrue\n"),
     )
-    session.command(
-        'lua -e \'local a=os.clock(); local w=os.time(); local x=0; '
+    session.confirmed_command(
+        lua + ' -e \'local a=os.clock(); local w=os.time(); local x=0; '
         'for i=1,10000 do x=x+i end; local b=os.clock(); '
         'print("lua-os",type(os),type(os.clock),b>=a,type(w),os.time()>=w,'
         'os.difftime(7,2))\'',
@@ -2103,8 +2171,8 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
             "lua-os\ttable\tfunction\ttrue\tnumber\ttrue\t5.0\n",
         ),
     )
-    session.command(
-        "lua -e 'local function target() local x=0; "
+    session.confirmed_command(
+        lua + " -e 'local function target() local x=0; "
         "for i=1,100 do x=x+i end end; local n=100000; "
         "local start=os.clock(); for i=1,n do end; "
         "local overhead=os.clock()-start; start=os.clock(); "
@@ -2116,8 +2184,8 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
         contains=("lua-clock-benchmark\tnumber\ttrue\n",),
         absent=("execution lease expired",),
     )
-    session.command(
-        "lua /share/lua/benchmark.lua 1 1 qemu-smoke",
+    session.confirmed_command(
+        lua + " /share/lua/benchmark.lua 1 1 qemu-smoke",
         cwd,
         max(command_timeout, 180.0),
         contains=(
@@ -2134,8 +2202,8 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
             "lua-benchmark:",
         ),
     )
-    session.command(
-        'lua -e \'local t={year=2024,month=2,day=29,hour=1,min=2,sec=3}; '
+    session.confirmed_command(
+        lua + ' -e \'local t={year=2024,month=2,day=29,hour=1,min=2,sec=3}; '
         'local s=os.time(t); print("lua-calendar",s,'
         'os.date("!%Y-%m-%d %H:%M:%S %a %j",s),t.wday,t.yday,t.isdst)\'',
         cwd,
@@ -2144,16 +2212,16 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
             "lua-calendar\t1709168523\t2024-02-29 01:02:03 Thu 060\t5\t60\tfalse\n",
         ),
     )
-    session.command(
-        "lua -e 'local t={year=2024,month=3,day=0}; local s=os.time(t); "
+    session.confirmed_command(
+        lua + " -e 'local t={year=2024,month=3,day=0}; local s=os.time(t); "
         "print(\"lua-calendar-normalize\",s,os.date(\"!%Y-%m-%d\",s),"
         "t.year,t.month,t.day)'",
         cwd,
         command_timeout,
         contains=("lua-calendar-normalize\t1709208000\t2024-02-29\t2024\t2\t29\n",),
     )
-    session.command(
-        "lua -e 'print(\"lua-floats\","
+    session.confirmed_command(
+        lua + " -e 'print(\"lua-floats\","
         "string.format(\"%.17g\",1.2345678901234567),"
         "string.format(\"%.17g\",0x1p-1022),"
         "string.format(\"%.17g\",0x1.fffffffffffffp+1023),"
@@ -2165,8 +2233,8 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
             "1.7976931348623157e+308\t1.23e+03\t1.000e+04\n",
         ),
     )
-    session.command(
-        "lua -e 'package.preload.p=function() return 42 end; "
+    session.confirmed_command(
+        lua + " -e 'package.preload.p=function() return 42 end; "
         "local m,w=require(\"p\"); print(\"lua-libraries\",m,w,type(debug),"
         "type(io),type(loadfile),type(dofile),collectgarbage(\"incremental\"))'",
         cwd,
@@ -2175,57 +2243,57 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
             "lua-libraries\t42\t:preload:\ttable\ttable\tfunction\tfunction\tgenerational\n",
         ),
     )
-    session.command(
-        "lua -E -e 'package.preload.p=function() return 40 end' "
+    session.confirmed_command(
+        lua + " -E -e 'package.preload.p=function() return 40 end' "
         "-l m=p -e 'print(\"lua-options\",m+2)'",
         cwd,
         command_timeout,
         contains=("lua-options\t42\n",),
     )
-    session.command(
-        "lua -e 'package.preload[\"plain-v1\"]=function() return 42 end' "
+    session.confirmed_command(
+        lua + " -e 'package.preload[\"plain-v1\"]=function() return 42 end' "
         "-l plain-v1 -e 'print(\"lua-option-plain\",plain)'",
         cwd,
         command_timeout,
         contains=("lua-option-plain\t42\n",),
     )
-    session.command(
-        "lua -W -e 'warn(\"cli-warning\")'",
+    session.confirmed_command(
+        lua + " -W -e 'warn(\"cli-warning\")'",
         cwd,
         command_timeout,
         contains=("Lua warning: cli-warning",),
     )
-    session.command(
-        "lua -e 'local f=assert(io.open(\"/tmp/lua-chunk.luac\",\"w\")); "
+    session.confirmed_command(
+        lua + " -e 'local f=assert(io.open(\"/tmp/lua-chunk.luac\",\"w\")); "
         "f:write(string.dump(function() print(\"lua-bytecode-file\",42) end)); "
         "f:close()'",
         cwd,
         command_timeout,
     )
-    session.command(
-        "lua /tmp/lua-chunk.luac",
+    session.confirmed_command(
+        lua + " /tmp/lua-chunk.luac",
         cwd,
         command_timeout,
         contains=("lua-bytecode-file\t42\n",),
     )
     session.command("rm /tmp/lua-chunk.luac", cwd, command_timeout)
-    session.command(
-        "lua -e 'pcall(function() os.exit(7) end); "
+    session.confirmed_command(
+        lua + " -e 'pcall(function() os.exit(7) end); "
         "print(\"lua-exit-caught\")'",
         cwd,
         command_timeout,
         absent=("lua-exit-caught",),
     )
-    session.command(
-        "lua -e 'local value <close> = setmetatable({}, "
+    session.confirmed_command(
+        lua + " -e 'local value <close> = setmetatable({}, "
         "{__close=function() print(\"lua-exit-closed\") end}); "
         "os.exit(0,false); print(\"lua-exit-after\")'",
         cwd,
         command_timeout,
         absent=("lua-exit-closed", "lua-exit-after"),
     )
-    session.command(
-        "lua -e 'local value <close> = setmetatable({}, "
+    session.confirmed_command(
+        lua + " -e 'local value <close> = setmetatable({}, "
         "{__close=function() print(\"lua-exit-closed\") end}); "
         "os.exit(0,true); print(\"lua-exit-after\")'",
         cwd,
@@ -2233,11 +2301,12 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
         contains=("lua-exit-closed\n",),
         absent=("lua-exit-after",),
     )
-    session.command(
-        r"""printf 'print("lua-stdin", 6*7)\n' | lua -""",
+    session.confirmed_command(
+        r"""printf 'print("lua-stdin", 6*7)\n' | """ + lua + " -",
         cwd,
         command_timeout,
         contains=("lua-stdin\t42\n",),
+        program=lua,
     )
     session.command(
         "printf 'local a,b=...; print(\"lua-args\",arg[-1],arg[0],"
@@ -2245,23 +2314,24 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
         cwd,
         command_timeout,
     )
-    session.command(
-        "lua /tmp/lua-args.lua first second",
+    session.confirmed_command(
+        lua + " /tmp/lua-args.lua first second",
         cwd,
         command_timeout,
         contains=(
-            "lua-args\tlua\t/tmp/lua-args.lua\tfirst\tsecond\t2\tfirst\tsecond\n",
+            "lua-args\t" + lua + "\t/tmp/lua-args.lua"
+            "\tfirst\tsecond\t2\tfirst\tsecond\n",
         ),
     )
     session.command("rm /tmp/lua-args.lua", cwd, command_timeout)
-    session.command(
-        "lua /recovery/lua-smoke.lua hello",
+    session.confirmed_command(
+        lua + " /recovery/lua-smoke.lua hello",
         cwd,
         command_timeout,
         contains=("lua-file:hello sum=1250025000 sqrt=9 pow=1024",),
     )
-    session.command(
-        "lua /share/lua/examples/language.lua",
+    session.confirmed_command(
+        lua + " /share/lua/examples/language.lua",
         cwd,
         command_timeout,
         contains=(
@@ -2274,8 +2344,8 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
             "square(4)=16",
         ),
     )
-    session.command(
-        "lua /share/lua/examples/numbers.lua",
+    session.confirmed_command(
+        lua + " /share/lua/examples/numbers.lua",
         cwd,
         command_timeout,
         contains=(
@@ -2294,8 +2364,8 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
             "random caveat\tuniformity is evidence, not proof or cryptographic safety\n",
         ),
     )
-    session.command(
-        "lua /share/lua/examples/system.lua",
+    session.confirmed_command(
+        lua + " /share/lua/examples/system.lua",
         cwd,
         command_timeout,
         contains=(
@@ -2310,23 +2380,23 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
             "lua-system cleanup\ttrue\ttrue\n",
         ),
     )
-    session.command(
-        "lua -e 'local p=assert(io.popen(\"wc -c\",\"w\")); "
+    session.confirmed_command(
+        lua + " -e 'local p=assert(io.popen(\"wc -c\",\"w\")); "
         "assert(p:write(\"12345\")); print(p:close())'",
         cwd,
         command_timeout,
         contains=("5\n", "true\texit\t0\n"),
     )
-    session.command(
-        "lua -e 'local p=assert(io.popen(\"cat /share/sh/bench.sh\",\"r\")); "
+    session.confirmed_command(
+        lua + " -e 'local p=assert(io.popen(\"cat /share/sh/bench.sh\",\"r\")); "
         "local data=assert(p:read(\"a\")); local ok=assert(p:close()); "
         "print(\"lua-popen-all\",#data,data:match(\"postests%.sh\")~=nil)'",
         cwd,
         command_timeout,
         contains=("lua-popen-all\t24980\ttrue\n",),
     )
-    session.command(
-        "lua -e 'local path=\"/tmp/lua-unbuffered\"; "
+    session.confirmed_command(
+        lua + " -e 'local path=\"/tmp/lua-unbuffered\"; "
         "local w=assert(io.open(path,\"w\")); assert(w:setvbuf(\"no\")); "
         "assert(w:write(\"visible\")); local r=assert(io.open(path,\"r\")); "
         "print(\"lua-setvbuf\",r:read(\"a\")); r:close(); w:close(); "
@@ -2335,43 +2405,253 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
         command_timeout,
         contains=("lua-setvbuf\tvisible\n",),
     )
-    session.command(
-        "lua -e 'local t={}; local n=0; for i=1,6144 do "
+    session.confirmed_command(
+        lua + " -e 'local t={}; local n=0; for i=1,6144 do "
         'local s=string.rep("x",1024); t[i]=s; n=n+#s end; '
         'print("lua-grow",#t,n)\'',
         cwd,
         command_timeout,
         contains=("lua-grow\t6144\t6291456\n",),
     )
-    session.command(
-        "lua -e 'local s=string.rep(\"x\",48*1024*1024); "
+    session.confirmed_command(
+        lua + " -e 'local s=string.rep(\"x\",48*1024*1024); "
         "print(\"lua-large-private\",#s); s=nil; collectgarbage()'",
         cwd,
         command_timeout,
         contains=("lua-large-private\t50331648\n",),
         absent=("not enough memory", "execution lease expired"),
     )
-    session.command(
-        "lua -e 'local a,b=math.randomseed(); local r=math.random(); "
+    session.confirmed_command(
+        lua + " -e 'local a,b=math.randomseed(); local r=math.random(); "
         "print(\"lua-random\",type(a),type(b),r>=0,r<1)'",
         cwd,
         command_timeout,
         contains=("lua-random\tnumber\tnumber\ttrue\ttrue\n",),
     )
-    session.command(
-        "lua -e 'error(\"expected-error\")'",
+    session.confirmed_command(
+        lua + " -e 'error(\"expected-error\")'",
         cwd,
         command_timeout,
         contains=("expected-error", "stack traceback:"),
     )
-    session.command(
-        "lua -e 'local ok=pcall(function() "
+    session.confirmed_command(
+        lua + " -e 'local ok=pcall(function() "
         'string.rep("x",16*1024*1024*1024) end); collectgarbage(); '
         'print("lua-oom",ok)\'',
         cwd,
         command_timeout,
         contains=("lua-oom\tfalse\n",),
     )
+
+
+def install_cpython_media(path: Path) -> None:
+    """Install the built interpreter package, fixtures, and negative variants."""
+    for tree in (CPYTHON_PACKAGE_TREE, CPYTHON_DIAGNOSTICS_TREE):
+        if not (tree / "MANIFEST.sha256").is_file():
+            raise AcceptanceError(
+                f"CPython acceptance needs {tree}; build it with "
+                "tools/build_cpython.py build and tools/build_cpython.py variants"
+            )
+    builder = str(REPO_ROOT / "tools" / "build_cpython.py")
+    for action, source in (
+        ("install-image", CPYTHON_PACKAGE_TREE),
+        ("install-diagnostics", CPYTHON_DIAGNOSTICS_TREE),
+        ("install-packages", CPYTHON_FIXTURES),
+    ):
+        subprocess.run(
+            [sys.executable, builder, action, str(source), "--image", str(path)],
+            cwd=REPO_ROOT,
+            check=True,
+        )
+
+
+def run_cpython_repl(session: SerialSession, cwd: str, python: str, timeout: float) -> None:
+    """Evaluate typed statements through the foreground terminal-input loan."""
+    submitted = session.send(python, timeout)
+    marker = f"Run untrusted application '{python}' outside /bin? [y/N] ".encode()
+    session.wait_for(marker, timeout, submitted)
+    answered = session.send("y", timeout)
+    banner = session.wait_for(b">>> ", timeout, answered)
+    rendered = normalize(bytes(session.output[answered:banner]))
+    if "Python 3.14.7" not in rendered or "troe" not in rendered:
+        raise AcceptanceError(f"CPython REPL banner was unexpected: {rendered!r}")
+    for statement, expected in (
+        ('print("cpy" + "-repl", 6 * 7)', "cpy-repl 42"),
+        ("value = 1 << 70", None),
+        ('print("cpy" + "-state", value)', "cpy-state 1180591620717411303424"),
+        ('print("cpy" + "-error", 1 / 0)', "ZeroDivisionError"),
+        ("print(repr(exit))", "Ctrl-D"),
+    ):
+        start = len(session.output)
+        session.send(statement, timeout)
+        end = session.wait_for(b">>> ", timeout, start)
+        if expected is None:
+            continue
+        rendered = normalize(bytes(session.output[start:end]))
+        if expected not in rendered:
+            raise AcceptanceError(
+                f"CPython REPL did not evaluate {statement!r}: {rendered!r}"
+            )
+    # `site` is not imported, so `exit` is never injected. End of input is the
+    # terminal contract's own exit and it must return the loan to the shell.
+    if session.process.stdin is None:
+        raise AcceptanceError("QEMU serial input is unavailable")
+    start = len(session.output)
+    session.process.stdin.write(b"\x04")
+    session.process.stdin.flush()
+    session.wait_for(f"sh:{cwd}> ".encode(), timeout, start)
+
+
+def run_cpython_group(session: SerialSession, command_timeout: float) -> None:
+    """Exercise the shared-volume CPython package, its profile, and its limits."""
+    cwd = "/"
+    timeout = command_timeout * CPYTHON_TIMEOUT_SCALE
+    binaries = f"{CPYTHON_SHARED_BIN}/{session.architecture}"
+    packages = f"{CPYTHON_SHARED_LIB}/{session.architecture}/packages"
+    diagnostics = f"{CPYTHON_DIAGNOSTICS_ROOT}/{session.architecture}/bin"
+    python = f"{binaries}/python.kex"
+    no_random = f"{diagnostics}/python-no-random.kex"
+    no_mutate = f"{diagnostics}/python-no-mutate.kex"
+    stdlib = f"{CPYTHON_SHARED_LIB}/{session.architecture}/python3.14.7/python3.14"
+
+    # Shared-volume interpreters stay subject to the explicit-path execution
+    # gate; declining must not start the interpreter at all.
+    session.declined_command(f"{python} --version", cwd, timeout, absent=("Python 3.",))
+
+    # The default alias and every version-addressable executable stay distinct.
+    for name, expected in (
+        ("python.kex", "Python 3.14.7"),
+        ("python3.kex", "Python 3.14.7"),
+        ("python3.14.kex", "Python 3.14.7"),
+        ("python3.13.kex", "Python 3.13.15"),
+        ("python3.12.kex", "Python 3.12.14"),
+    ):
+        session.confirmed_command(
+            f"{binaries}/{name} --version", cwd, timeout, contains=(f"{expected}\n",)
+        )
+
+    # Command-line modes: inline code, arguments, script, module, and stdin.
+    session.confirmed_command(
+        f"""{python} -c 'print("cpy-inline", 6 * 7)'""",
+        cwd,
+        timeout,
+        contains=("cpy-inline 42\n",),
+    )
+    session.confirmed_command(
+        f"""{python} -c 'import sys; print("cpy-argv", sys.argv[1:])' -- -x""",
+        cwd,
+        timeout,
+        contains=("cpy-argv ['--', '-x']\n",),
+    )
+    session.confirmed_command(
+        f"{python} {packages}/script_probe.py one two",
+        cwd,
+        timeout,
+        contains=("script-probe ['one', 'two']\n",),
+    )
+    session.confirmed_command(
+        f"{python} -m troe_fixture",
+        cwd,
+        timeout,
+        contains=("module-probe pure-package-on-shared-volume 42\n",),
+    )
+    session.confirmed_command(
+        f"{python} - < {packages}/script_probe.py",
+        cwd,
+        timeout,
+        contains=("script-probe []\n",),
+    )
+    session.confirmed_command(
+        f"""{python} -c 'print("cpy" + "-quit", callable(exit), callable(quit))'""",
+        cwd,
+        timeout,
+        contains=("cpy-quit True True\n",),
+    )
+    run_cpython_repl(session, cwd, python, timeout)
+
+    # Language semantics, the shipped library profile, and TROE-backed services.
+    session.confirmed_command(
+        f"{python} {packages}/language_probe.py",
+        cwd,
+        timeout,
+        contains=("language-probe troe 3.14.7\n",),
+    )
+    session.confirmed_command(
+        f"{python} {packages}/stdlib_probe.py",
+        cwd,
+        timeout,
+        contains=("stdlib-probe 19 1 True\n",),
+    )
+    # Every module the profile ships must actually import; a shipped module
+    # that raises ModuleNotFoundError is a manifest defect, not a limitation.
+    session.confirmed_command(
+        f"{python} {packages}/profile_probe.py",
+        cwd,
+        timeout * 4,
+        contains=("profile-probe ",),
+        absent=("profile-failures",),
+    )
+    session.confirmed_command(
+        f"{python} {packages}/runtime_probe.py",
+        cwd,
+        timeout,
+        contains=("runtime-probe 32 /vol/shared\n",),
+    )
+    session.confirmed_command(
+        f"{python} {packages}/negative_probe.py",
+        cwd,
+        timeout,
+        contains=("negative-probe 10 ",),
+    )
+
+    # The interpreter tree stays free of bytecode written during acceptance, so
+    # a read-only standard library remains fully usable.
+    session.command(
+        f"ls {stdlib}/__pycache__",
+        cwd,
+        command_timeout,
+        contains=(f"ls: {stdlib}/__pycache__: not found",),
+    )
+
+    # Missing authority fails explicitly instead of degrading or inventing data.
+    # Withheld entropy authority stops interpreter initialization outright, so
+    # no code runs on weak seeding regardless of the requested action.
+    entropy_failure = "initialization failed: failed to get random numbers"
+    session.confirmed_command(
+        f"""{no_random} -c 'import os; print("cpy" + "-entropy", os.urandom(4))'""",
+        cwd,
+        timeout,
+        contains=(entropy_failure,),
+        absent=("cpy-entropy",),
+    )
+    # Argument handling that precedes interpreter startup still answers, which
+    # keeps the failure attributable to initialization rather than the loader.
+    session.confirmed_command(
+        f"{no_random} --version", cwd, timeout, contains=("Python 3.14.7\n",)
+    )
+    session.confirmed_command(
+        f"""{no_mutate} -c 'open("/vol/shared/no.txt", "w"); print("cpy" + "-write")'""",
+        cwd,
+        timeout,
+        contains=("PermissionError: [Errno 13] permission denied",),
+        absent=("cpy-write",),
+    )
+
+    # Repeated successful and failing launches return every accounted resource.
+    baseline = parse_free_frames(session.command("mem", cwd, command_timeout))
+    for _ in range(3):
+        session.confirmed_command(
+            f"""{python} -c 'print("cpy-cycle", sum(range(1000)))'""",
+            cwd,
+            timeout,
+            contains=("cpy-cycle 499500\n",),
+        )
+        session.confirmed_command(f"""{python} -c 'raise SystemExit(3)'""", cwd, timeout)
+    recovered = parse_free_frames(session.command("mem", cwd, command_timeout))
+    if recovered != baseline:
+        raise AcceptanceError(
+            f"CPython launches did not return kernel frames: {baseline} -> {recovered}"
+        )
 
 
 def run_quota_memory_group(session: SerialSession, command_timeout: float) -> None:
@@ -2491,6 +2771,8 @@ def run_scenario(
         run_shell_terminal_group(session, command_timeout)
     if "filesystem" in scenario_groups:
         run_filesystem_group(session, command_timeout)
+    if "cpython" in scenario_groups:
+        run_cpython_group(session, command_timeout)
     if "lua" in scenario_groups:
         run_lua_group(session, command_timeout)
     if "shell-terminal" in scenario_groups:
@@ -3031,9 +3313,14 @@ def main() -> int:
                 )
             else:
                 build_runtime_probe_tree()
+        install_cpython = "cpython" in scenario_groups
         for platform_id in platform_ids:
             reset_txslot(platform_id, args.environment)
-            reset_shared_media(platform_id, install_runtime=install_runtime)
+            reset_shared_media(
+                platform_id,
+                install_runtime=install_runtime,
+                install_cpython=install_cpython,
+            )
         if len(platform_ids) == 1:
             test_platform(platform_ids[0], args)
         else:

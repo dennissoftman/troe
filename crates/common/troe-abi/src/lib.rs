@@ -1772,7 +1772,7 @@ pub mod filesystem {
     /// Maximum entries returned by one list call.
     pub const MAX_LIST_ENTRIES: usize = 64;
     /// Maximum encoded bytes in one entry name.
-    pub const MAX_NAME_BYTES: usize = 64;
+    pub const MAX_NAME_BYTES: usize = 255;
     /// Maximum aggregate name bytes returned by one list call.
     pub const MAX_LIST_NAME_BYTES: usize = 3 * 1024;
     /// Fixed open-file reply bytes.
@@ -2365,7 +2365,7 @@ pub mod filesystem_mutation {
     /// Interface major version.
     pub const MAJOR: u16 = 1;
     /// Interface minor version.
-    pub const MINOR: u16 = 3;
+    pub const MINOR: u16 = 4;
     /// Truncate or create one file and begin a sequential streamed replacement.
     pub const BEGIN_REPLACE: u16 = 1;
     /// Append one sequential chunk to the pending replacement.
@@ -2390,6 +2390,8 @@ pub mod filesystem_mutation {
     pub const REMOVE_DIRECTORY: u16 = 11;
     /// Preserve one existing regular file and begin appending at its exact end.
     pub const BEGIN_APPEND: u16 = 12;
+    /// Read already-staged bytes back from one pending streamed replacement.
+    pub const READ_REPLACEMENT: u16 = 13;
     /// Fixed bytes preceding an append payload.
     pub const APPEND_HEADER_BYTES: usize = 12;
     /// Maximum bytes carried by one append call.
@@ -2400,6 +2402,10 @@ pub mod filesystem_mutation {
     pub const BEGIN_APPEND_REPLY_BYTES: usize = 12;
     /// Exact replacement-token plus chunk-size request bytes.
     pub const CHUNK_SIZE_REQUEST_BYTES: usize = 8;
+    /// Exact staged-read request bytes: token, offset, then requested length.
+    pub const READ_REQUEST_BYTES: usize = 16;
+    /// Maximum bytes returned by one staged-read call.
+    pub const MAX_READ_BYTES: usize = MAX_SERVICE_PAYLOAD_BYTES;
     /// Fixed bytes preceding the two strings in a link request.
     pub const LINK_REQUEST_HEADER_BYTES: usize = 4;
     /// Largest canonical two-string link request.
@@ -2697,6 +2703,49 @@ pub mod filesystem_mutation {
             offset,
             bytes: payload,
         })
+    }
+
+    /// Encode one exact staged-read request.
+    ///
+    /// # Errors
+    ///
+    /// Rejects zero tokens, empty or excessive lengths, and short buffers.
+    pub fn encode_read_request(
+        token: u32,
+        offset: u64,
+        length: usize,
+        output: &mut [u8],
+    ) -> Result<usize, EncodingError> {
+        let Ok(requested) = u32::try_from(length) else {
+            return Err(EncodingError);
+        };
+        if token == 0 || length == 0 || length > MAX_READ_BYTES || output.len() < READ_REQUEST_BYTES
+        {
+            return Err(EncodingError);
+        }
+        output[..4].copy_from_slice(&token.to_le_bytes());
+        output[4..12].copy_from_slice(&offset.to_le_bytes());
+        output[12..READ_REQUEST_BYTES].copy_from_slice(&requested.to_le_bytes());
+        Ok(READ_REQUEST_BYTES)
+    }
+
+    /// Decode one exact staged-read request into token, offset, and length.
+    ///
+    /// # Errors
+    ///
+    /// Rejects noncanonical lengths, zero tokens, and empty or excessive reads.
+    pub fn decode_read_request(bytes: &[u8]) -> Result<(u32, u64, usize), EncodingError> {
+        if bytes.len() != READ_REQUEST_BYTES {
+            return Err(EncodingError);
+        }
+        let token = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let offset = u64::from_le_bytes(bytes[4..12].try_into().map_err(|_| EncodingError)?);
+        let requested = u32::from_le_bytes(bytes[12..16].try_into().map_err(|_| EncodingError)?);
+        let length = requested as usize;
+        if token == 0 || length == 0 || length > MAX_READ_BYTES {
+            return Err(EncodingError);
+        }
+        Ok((token, offset, length))
     }
 
     fn validate_link_string(value: &str) -> Result<(), EncodingError> {
@@ -5853,7 +5902,28 @@ mod tests {
     #[test]
     fn filesystem_mutation_is_sequential_streamed_and_exact() {
         assert_eq!(filesystem_mutation::MAJOR, 1);
-        assert_eq!(filesystem_mutation::MINOR, 3);
+        assert_eq!(filesystem_mutation::MINOR, 4);
+        let mut read_request = [0_u8; filesystem_mutation::READ_REQUEST_BYTES];
+        assert_eq!(
+            filesystem_mutation::encode_read_request(3, 17, 64, &mut read_request),
+            Ok(filesystem_mutation::READ_REQUEST_BYTES)
+        );
+        assert_eq!(
+            filesystem_mutation::decode_read_request(&read_request),
+            Ok((3, 17, 64))
+        );
+        assert!(filesystem_mutation::encode_read_request(0, 0, 1, &mut read_request).is_err());
+        assert!(filesystem_mutation::encode_read_request(1, 0, 0, &mut read_request).is_err());
+        assert!(
+            filesystem_mutation::encode_read_request(
+                1,
+                0,
+                filesystem_mutation::MAX_READ_BYTES + 1,
+                &mut read_request
+            )
+            .is_err()
+        );
+        assert!(filesystem_mutation::decode_read_request(&read_request[..15]).is_err());
         assert_eq!(filesystem::MAJOR, 1);
         assert_eq!(filesystem::MINOR, 3);
         let token = filesystem_mutation::encode_token(7).unwrap_or_else(|_| std::process::abort());

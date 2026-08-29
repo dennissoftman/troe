@@ -13,6 +13,16 @@ Supersession note, 2026-08-28: ADR 0050 retains exact `/bin` resolution for
 bare names and adds explicit relative or absolute KEX path execution. Its
 no-fallback and complete-validation requirements remain unchanged.
 
+Supersession note, 2026-08-30: `lua` leaves the recovery command distribution
+below and ships as an optional runtime on `/vol/shared/bin/<architecture>`
+alongside the CPython interpreter. The KEFS root remains the recovery command
+distribution; only its membership changes. Recovery-time scripting is served by
+the `sh.kex` evaluator, which gained variables, expansion, branching, a loop
+form, and a real `read` builtin, so a second language runtime is no longer
+required for recovery. The KEX-only rule, exact `/bin` resolution, and the
+no-fallback requirement are unchanged: a shared-media runtime is reached by
+explicit path and is unavailable, not substituted, when the medium is absent.
+
 ## Decision
 
 The shell implements exactly three non-shadowable intrinsics: `cd`, `poweroff`,
@@ -34,7 +44,7 @@ shell resumes.
 
 The immutable target-selected KEFS root is the recovery command distribution:
 both supported images contain behavior-equivalent KEX apps for `arp`, `awk`,
-`cat`, `clear`, `dhcp`, `echo`, `grep`, `hexdump`, `ln`, `ls`, `lua`, `man`,
+`cat`, `clear`, `dhcp`, `echo`, `grep`, `hexdump`, `ln`, `ls`, `man`,
 `mem`, `mount`, `net`, `ping`, `printf`, `pwd`, `rm`, `sed`, `sh`, `sleep`,
 `tar`, `tcp`, `udp`, and `wc`. Losing one artifact does not silently substitute
 privileged code with different authority or semantics.

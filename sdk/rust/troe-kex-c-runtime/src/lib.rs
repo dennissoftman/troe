@@ -49,6 +49,7 @@ pub struct Host {
         unsafe extern "C" fn(*mut c_void, *const u8, usize, i32, *mut u32, *mut u64) -> i32,
     replace_append: unsafe extern "C" fn(*mut c_void, u32, u64, *const u8, usize) -> i32,
     replace_finish: unsafe extern "C" fn(*mut c_void, u32, i32) -> i32,
+    replace_read: unsafe extern "C" fn(*mut c_void, u32, u64, *mut u8, usize) -> isize,
     metadata: unsafe extern "C" fn(*mut c_void, *const u8, usize, i32, *mut HostMetadata) -> i32,
     directory_next: unsafe extern "C" fn(
         *mut c_void,
@@ -164,6 +165,7 @@ impl Runtime {
             replace_begin: host_replace_begin,
             replace_append: host_replace_append,
             replace_finish: host_replace_finish,
+            replace_read: host_replace_read,
             metadata: host_metadata,
             directory_next: host_directory_next,
             path_operation: host_path_operation,
@@ -475,6 +477,31 @@ unsafe extern "C" fn host_replace_append(
     };
     pending.offset = next;
     0
+}
+
+unsafe extern "C" fn host_replace_read(
+    context: *mut c_void,
+    token: u32,
+    offset: u64,
+    destination: *mut u8,
+    capacity: usize,
+) -> isize {
+    // SAFETY: Callback pointer spans are validated before typed use.
+    let (Some(runtime), Some(destination)) = (unsafe { runtime(context) }, unsafe {
+        bytes_mut(destination, capacity)
+    }) else {
+        return -(errno::EINVAL as isize);
+    };
+    let Some(pending) = runtime.replacement.as_mut() else {
+        return -(errno::EINVAL as isize);
+    };
+    if token != 1 {
+        return -(errno::EINVAL as isize);
+    }
+    match pending.replacement.read_at(offset, destination) {
+        Ok(count) => isize::try_from(count).unwrap_or(-(errno::EOVERFLOW as isize)),
+        Err(error) => -(errno::from_kex(error) as isize),
+    }
 }
 
 unsafe extern "C" fn host_replace_finish(context: *mut c_void, token: u32, commit: i32) -> i32 {

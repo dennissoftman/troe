@@ -103,11 +103,17 @@ assert(os.getenv("USER") == "root" and os.getenv("LOGNAME") == "root")
 assert(os.getenv("LUA_PATH_5_5") == nil and os.getenv("LUA_PATH") == nil)
 assert(os.getenv("LUA_INIT_5_5") == nil and os.getenv("LUA_INIT") == nil)
 -- A direct child inherits those values, with PWD narrowed to its own directory.
-assert(os.execute([[lua -e 'assert(os.getenv("PWD") == "/")']]))
+-- The interpreter is an optional shared-media runtime, so re-invoke it through
+-- the exact path this process was launched with rather than a bare name.
+local interpreter = arg[-1]
 assert(os.execute(
-  [[lua -e 'assert(os.getenv("HOME") == "/" and os.getenv("USER") == "root")']]))
+  interpreter .. [[ -e 'assert(os.getenv("PWD") == "/")']]))
+assert(os.execute(
+  interpreter ..
+  [[ -e 'assert(os.getenv("HOME") == "/" and os.getenv("USER") == "root")']]))
 local inherited = assert(io.popen(
-  [[lua -e 'io.write(os.getenv("PATH"), " ", os.getenv("PWD"))']], "r"))
+  interpreter .. [[ -e 'io.write(os.getenv("PATH"), " ", os.getenv("PWD"))']],
+  "r"))
 local inherited_values = assert(inherited:read("a"))
 assert(inherited:close())
 

@@ -15,9 +15,11 @@ use alloc::vec::Vec;
 use core::fmt;
 
 /// Maximum encoded path length.
-pub const MAX_PATH_BYTES: usize = 256;
+pub const MAX_PATH_BYTES: usize = 1024;
 /// Maximum single path component length.
-pub const MAX_NAME_BYTES: usize = 64;
+///
+/// This is ext4's own limit, so a foreign volume's names are representable.
+pub const MAX_NAME_BYTES: usize = 255;
 /// Maximum normalized path depth.
 pub const MAX_PATH_DEPTH: usize = 16;
 

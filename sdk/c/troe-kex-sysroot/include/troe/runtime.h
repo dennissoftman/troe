@@ -45,6 +45,8 @@ struct troe_runtime_host {
   int (*replace_append)(void *context, uint32_t token, uint64_t offset,
                         const uint8_t *source, size_t length);
   int (*replace_finish)(void *context, uint32_t token, int commit);
+  intptr_t (*replace_read)(void *context, uint32_t token, uint64_t offset,
+                           uint8_t *destination, size_t capacity);
   int (*metadata)(void *context, const uint8_t *path, size_t path_length,
                   int follow, struct troe_host_metadata *metadata);
   intptr_t (*directory_next)(void *context, const uint8_t *path,

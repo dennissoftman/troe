@@ -42,6 +42,11 @@ LIMITS
     bytes, including inherited entries. Exceeding either limit, or naming one
     variable twice, fails before any child is created.
 
+    Nested launches are bounded by depth. A command started from the session is
+    the first level, so spawn's own child is the second, and at most eight
+    levels may exist. A launch past the bound fails with "child launch failed"
+    before any child is created, and the launcher keeps running.
+
 EXAMPLES
     spawn --status echo child-ready
     spawn --capture ls /bin

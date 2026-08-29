@@ -19,8 +19,10 @@ except ImportError:
     import mkshared  # type: ignore[no-redef]
 
 
-RUNTIME_SCHEMA = 1
-RUNTIME_DIRECTORY = Path("runtime") / f"v{RUNTIME_SCHEMA}"
+RUNTIME_SCHEMA = 2
+# Optional runtime executables share one architecture-split directory with
+# every other optional runtime on the medium.
+RUNTIME_DIRECTORY = PurePosixPath("bin")
 MANIFEST_NAME = "MANIFEST.sha256"
 ARCHITECTURES = ("aarch64", "x86_64")
 KEX_PACKAGE_HEADER_BYTES = 48
@@ -46,7 +48,7 @@ class Artifact:
 
     @property
     def relative_path(self) -> PurePosixPath:
-        return PurePosixPath(self.architecture, "bin", f"{self.name}.kex")
+        return PurePosixPath(self.architecture, f"{self.name}.kex")
 
 
 def _valid_name(name: str) -> bool:
@@ -157,11 +159,10 @@ def _parse_manifest(path: Path) -> list[tuple[PurePosixPath, int, str]]:
             or int(raw_bytes) <= 0
             or int(raw_bytes) > MAX_ARTIFACT_BYTES
             or relative.is_absolute()
-            or len(relative.parts) != 3
+            or len(relative.parts) != 2
             or relative.parts[0] not in ARCHITECTURES
-            or relative.parts[1] != "bin"
-            or not relative.parts[2].endswith(".kex")
-            or not _valid_name(relative.parts[2][:-4])
+            or not relative.parts[1].endswith(".kex")
+            or not _valid_name(relative.parts[1][:-4])
             or any(part in ("", ".", "..") for part in relative.parts)
             or raw_path <= previous
         ):
@@ -206,15 +207,14 @@ def install_tree(tree: Path, shared_root: Path) -> Path:
     verify_tree(tree)
     if shared_root.is_symlink() or not shared_root.is_dir():
         raise ValueError(f"shared runtime media is unavailable: {shared_root}")
-    runtime_parent = shared_root / RUNTIME_DIRECTORY.parent
-    runtime_parent.mkdir(parents=True, exist_ok=True)
-    destination = shared_root / RUNTIME_DIRECTORY
+    destination = shared_root / RUNTIME_DIRECTORY.as_posix()
+    destination.parent.mkdir(parents=True, exist_ok=True)
     build_tree(
         destination,
         [
             Artifact(
                 relative.parts[0],
-                relative.parts[2][:-4],
+                relative.parts[1][:-4],
                 tree / Path(*relative.parts),
             )
             for relative, _byte_count, _digest_value in _parse_manifest(
@@ -244,51 +244,45 @@ def _mtools(command: str, image: Path, *arguments: str, check: bool = True) -> s
 
 
 def verify_image(tree: Path, image: Path) -> None:
-    """Extract and verify the exact runtime version from one detached image."""
+    """Extract every installed entry and compare it against the source tree."""
     verify_tree(tree)
     mkshared.verify_image(image)
+    entries = _parse_manifest(tree / MANIFEST_NAME)
     with tempfile.TemporaryDirectory(prefix="troe-runtime-image-") as temporary:
-        extraction_root = Path(temporary) / "extracted"
-        extraction_root.mkdir()
-        _mtools(
-            "mcopy",
-            image,
-            "-s",
-            f"::/{RUNTIME_DIRECTORY.as_posix()}",
-            str(extraction_root),
-        )
-        extracted = extraction_root / f"v{RUNTIME_SCHEMA}"
-        verify_tree(extracted)
-        if (extracted / MANIFEST_NAME).read_bytes() != (tree / MANIFEST_NAME).read_bytes():
-            raise ValueError("shared runtime media manifest differs from source tree")
+        extraction = Path(temporary) / "extracted"
+        extraction.mkdir()
+        for relative, byte_count, digest_value in entries:
+            target = PurePosixPath(RUNTIME_DIRECTORY.as_posix()) / relative
+            installed = extraction / relative.name
+            _mtools("mcopy", image, "-o", f"::/{target.as_posix()}", str(installed))
+            if not installed.is_file():
+                raise ValueError(f"shared media entry is missing: {target.as_posix()}")
+            actual_bytes, actual_digest = _digest(installed)
+            if actual_bytes != byte_count or actual_digest != digest_value:
+                raise ValueError(f"shared media entry differs: {target.as_posix()}")
+            installed.unlink()
 
 
 def install_image(tree: Path, image: Path) -> None:
-    """Populate an empty detached GPT/FAT32 shared image and verify every byte."""
+    """Install runtime executables onto a detached GPT/FAT32 shared image.
+
+    The optional-runtime directory is shared with other runtimes, so only the
+    exact entries this tree owns are refused when they already exist.
+    """
     verify_tree(tree)
     mkshared.verify_image(image)
-    existing = _mtools(
-        "mdir", image, f"::/{RUNTIME_DIRECTORY.as_posix()}", check=False
-    )
-    if existing.returncode == 0:
-        raise ValueError(
-            f"shared runtime media already contains /{RUNTIME_DIRECTORY.as_posix()}"
-        )
     entries = _parse_manifest(tree / MANIFEST_NAME)
-    directories = {PurePosixPath("runtime"), PurePosixPath(RUNTIME_DIRECTORY.as_posix())}
+    directories = {PurePosixPath(RUNTIME_DIRECTORY.as_posix())}
     for relative, _byte_count, _digest_value in entries:
-        parent = PurePosixPath(RUNTIME_DIRECTORY.as_posix()) / relative.parent
+        target = PurePosixPath(RUNTIME_DIRECTORY.as_posix()) / relative
+        if _mtools("mdir", image, f"::/{target.as_posix()}", check=False).returncode == 0:
+            raise ValueError(f"shared media already contains /{target.as_posix()}")
+        parent = target.parent
         while parent != PurePosixPath("."):
             directories.add(parent)
             parent = parent.parent
     for directory in sorted(directories, key=lambda item: (len(item.parts), item.as_posix())):
-        _mtools("mmd", image, f"::/{directory.as_posix()}")
-    _mtools(
-        "mcopy",
-        image,
-        str(tree / MANIFEST_NAME),
-        f"::/{RUNTIME_DIRECTORY.as_posix()}/{MANIFEST_NAME}",
-    )
+        _mtools("mmd", image, f"::/{directory.as_posix()}", check=False)
     for relative, _byte_count, _digest_value in entries:
         _mtools(
             "mcopy",
@@ -297,6 +291,82 @@ def install_image(tree: Path, image: Path) -> None:
             f"::/{RUNTIME_DIRECTORY.as_posix()}/{relative.as_posix()}",
         )
     verify_image(tree, image)
+
+
+def provision_image(
+    image: Path,
+    applications: list[str],
+    cpython_package: Path | None,
+    reset: bool,
+) -> None:
+    """Build optional runtimes and install them onto one shared medium.
+
+    This is the single command that repopulates a recreated shared medium:
+    every named application is cross-built for both architectures, published
+    into the shared executable directory, and verified, and an already-built
+    CPython package is installed alongside it.
+    """
+    repository = Path(__file__).resolve().parents[1]
+    if reset:
+        run(
+            [
+                sys.executable,
+                str(repository / "tools" / "mkshared.py"),
+                "--output",
+                str(image),
+                "--reset",
+            ],
+            "reset the shared medium",
+        )
+    with tempfile.TemporaryDirectory(prefix="troe-provision-") as temporary:
+        packages = Path(temporary) / "packages"
+        tree = Path(temporary) / "tree"
+        specifications: list[str] = []
+        for application in applications:
+            source = repository / "apps" / application
+            if not (source / "Cargo.toml").is_file():
+                raise ValueError(f"application does not exist: {application}")
+            run(
+                [
+                    "cargo",
+                    "kex",
+                    "build",
+                    str(source),
+                    "--target",
+                    "all",
+                    "--output",
+                    str(packages),
+                ],
+                f"build {application}",
+                cwd=repository,
+            )
+            for architecture in ARCHITECTURES:
+                specifications.append(
+                    f"{architecture}:{application}="
+                    f"{packages / architecture / f'{application}.kex'}"
+                )
+        if specifications:
+            build_tree(tree, collect_artifacts(specifications))
+            install_image(tree, image)
+    if cpython_package is not None:
+        run(
+            [
+                sys.executable,
+                str(repository / "tools" / "build_cpython.py"),
+                "install-image",
+                str(cpython_package),
+                "--image",
+                str(image),
+            ],
+            "install the CPython package",
+        )
+
+
+def run(command: list[str], purpose: str, cwd: Path | None = None) -> None:
+    """Run one provisioning step and fail closed on any error."""
+    completed = subprocess.run(command, cwd=cwd, check=False)
+    if completed.returncode != 0:
+        raise ValueError(f"failed to {purpose}")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -315,6 +385,27 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     install_image_parser.add_argument("tree", type=Path)
     install_image_parser.add_argument("--image", type=Path, required=True)
+    provision = subparsers.add_parser(
+        "provision", help="build optional runtimes and install them onto media"
+    )
+    provision.add_argument("--image", type=Path, required=True)
+    provision.add_argument(
+        "--app",
+        action="append",
+        default=[],
+        metavar="NAME",
+        help="application directory below apps/ to build; repeatable",
+    )
+    provision.add_argument(
+        "--cpython-package",
+        type=Path,
+        help="already-built CPython package tree to install alongside",
+    )
+    provision.add_argument(
+        "--reset",
+        action="store_true",
+        help="replace the shared medium with an empty image first",
+    )
     verify_image_parser = subparsers.add_parser(
         "verify-image", help="verify a runtime tree stored in a detached image"
     )
@@ -337,6 +428,11 @@ def main(argv: list[str] | None = None) -> int:
             result = install_tree(args.tree, args.shared_root).resolve(strict=True)
         elif args.action == "install-image":
             install_image(args.tree, args.image)
+            result = args.image.resolve(strict=True)
+        elif args.action == "provision":
+            provision_image(
+                args.image, args.app, args.cpython_package, args.reset
+            )
             result = args.image.resolve(strict=True)
         else:
             verify_image(args.tree, args.image)

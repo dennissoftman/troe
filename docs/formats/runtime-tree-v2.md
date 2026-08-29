@@ -1,15 +1,21 @@
-# Shared runtime tree v1
+# Shared runtime tree v2
 
 The shared runtime tree is the canonical location for optional, large,
 architecture-specific KEX executables. One installed tree begins at
-`/vol/shared/runtime/v1` and has this exact shape:
+`/vol/shared/bin` and has this exact shape:
 
 ```text
-runtime/v1/
-├── MANIFEST.sha256
-├── aarch64/bin/<name>.kex
-└── x86_64/bin/<name>.kex
+bin/
+├── aarch64/<name>.kex
+└── x86_64/<name>.kex
 ```
+
+Version 2 replaces the private `runtime/v1` directory with the shared
+`/vol/shared/bin/<architecture>` location that every optional runtime uses,
+including interpreters installed by their own tooling. The directory is
+therefore shared: installation refuses only the exact entries a tree owns and
+creates the shared parents when they are absent. The manifest stays with the
+build output rather than the medium, so two runtimes cannot collide on it.
 
 Runtime executables are not rootfs, KEFS, EFI, or guest `/lib` contents. A
 missing `/vol/shared` medium or missing version tree is a terminal unavailable
@@ -20,7 +26,7 @@ artifact condition; launch does not fall back to an embedded copy.
 `MANIFEST.sha256` is ASCII and begins with exactly:
 
 ```text
-TROE-RUNTIME-TREE 1
+TROE-RUNTIME-TREE 2
 ```
 
 Each following line is:
@@ -46,7 +52,7 @@ records, unsupported schemas, and length or digest mismatches are invalid.
 orders records canonically, writes the manifest, verifies the result, and
 atomically publishes the requested output directory. `verify` performs the
 same exact-tree checks without mutation. `install` requires an available
-mounted shared-media directory and publishes below `runtime/v1`.
+mounted shared-media directory and publishes below `bin`.
 `install-image` requires a valid detached TROE GPT/FAT32 shared image and
 `mtools`, refuses to replace an installed v1 tree, copies every file, extracts
 the result again, and verifies it byte-for-byte. `verify-image` performs the

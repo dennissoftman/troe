@@ -79,3 +79,12 @@ every attached child endpoint close.
 
 One owner may retain at most 65,536 pipes and 256 MiB of aggregate pipe
 capacity. These are hard policy ceilings; storage is allocated only on create.
+
+## Nesting depth
+
+A launch from the interactive session or a supervised service is the first
+nested level, and a child may launch further children only while the resulting
+level is at most eight. The kernel runs a nested child on the launching task's
+stack, so depth is bounded by kernel stack rather than by table capacity. A
+`SPAWN` that would exceed the bound fails with the exhausted reply status before
+any child is created; the launcher keeps running and may report the failure.

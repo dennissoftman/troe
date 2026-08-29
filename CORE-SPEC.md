@@ -433,8 +433,14 @@ failure MUST roll back the provisional launch. Direct, background, service, and
 owner-scoped nested launch MUST preserve the same validation, W^X, randomized
 placement, capability attenuation, accounting, teardown, and reclamation.
 
+Nested launch MUST be bounded by depth. The kernel drives a nested child on the
+launching task's stack, so each level costs one kernel stack frame. A session or
+service launch is the first level and at most eight levels may exist; a launch
+that would exceed the bound MUST be refused with a typed exhausted status before
+any child is created, leaving the launcher running.
+
 Optional large runtime executables MUST be installed only below
-`/vol/shared/runtime/v1/<architecture>/bin`. A canonical version manifest MUST
+`/vol/shared/bin/<architecture>`. A canonical version manifest MUST
 bind the exact path set, byte lengths, and SHA-256 digests and reject symbolic
 links, unmanifested entries, unsupported schemas, and changed artifacts.
 Runtime artifacts MUST NOT be copied into rootfs, KEFS, or EFI, and unavailable
@@ -647,11 +653,11 @@ formats do not silently grant those capabilities.
 Persistent disk formats are replaceable filesystem providers behind the VFS
 and a bounded block-region capability. The kernel machine backends do not own
 filesystem or partition-format logic. The current build statically composes
-only the selected KEFS, RAMFS, FAT32, constrained ext4 v1, and StateFS
+only the selected KEFS, RAMFS, FAT32, ext4, and StateFS
 providers.
 
 KEFS is the immutable recovery filesystem, the fixed FAT16 image is only the
-firmware-read boot container, constrained ext4 v1 is the default persistent
+firmware-read boot container, ext4 is the default persistent
 content volume, FAT32 provides bounded interoperability, and StateFS owns its
 single bounded state object. No raw foreign UID, GID, SID, ACL, or security
 descriptor gains native authority merely because a provider can parse it.
@@ -1025,7 +1031,7 @@ Accordingly:
   and inner KEX validation;
 - embedded FS input is treated as potentially malformed;
 - console input is untrusted and bounded;
-- KEFS, FAT32, constrained ext4, StateFS, GPT, volume policy, configuration,
+- KEFS, FAT32, ext4, StateFS, GPT, volume policy, configuration,
   generation, and activation inputs are parsed through exact bounded profiles;
 - Ethernet, ARP, DHCP, IPv4, ICMP, UDP, and outbound TCP input is untrusted and
   admitted only through the implemented bounded network profiles;
@@ -1048,7 +1054,7 @@ jobs, supervised services, timer preemption, stable process observation,
 owner-scoped nested KEX launch, and bounded byte pipes. Static KEX v1 packages
 receive only typed declared services. Externally stored packages use coherent
 bounded streaming into inactive frames, and optional large runtime packages use
-the verified `/vol/shared/runtime/v1` tree. The shared freestanding C SDK and
+the verified `/vol/shared/bin` tree. The shared freestanding C SDK and
 static library provide the bounded capability-scoped single-execution-thread
 runtime surface described in section 11.2. Dynamic linking and shared objects
 are not implemented; their design gate is tracked in
