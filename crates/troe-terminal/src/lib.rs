@@ -216,6 +216,8 @@ pub enum KeyEvent {
     KillAfter,
     /// Delete the previous whitespace-delimited word.
     DeletePreviousWord,
+    /// Signal end of input to a foreground reader.
+    EndOfInput,
 }
 
 /// Observable result of one editor operation.
@@ -315,6 +317,7 @@ impl InputDecoder {
             b'\t' => Some(KeyEvent::Complete),
             b'\x01' => Some(KeyEvent::Home),
             b'\x03' => Some(KeyEvent::Cancel),
+            b'\x04' => Some(KeyEvent::EndOfInput),
             b'\x05' => Some(KeyEvent::End),
             b'\x0b' => Some(KeyEvent::KillAfter),
             b'\x0c' => Some(KeyEvent::ClearDisplay),
@@ -538,6 +541,7 @@ impl LineEditor {
             KeyEvent::KillBefore => self.kill_before(),
             KeyEvent::KillAfter => self.kill_after(),
             KeyEvent::DeletePreviousWord => self.delete_previous_word(),
+            KeyEvent::EndOfInput => EditorOutcome::Ignored,
         }
     }
 
@@ -911,6 +915,7 @@ fn control_key(character: char) -> Option<KeyEvent> {
     match character.to_ascii_lowercase() {
         'a' => Some(KeyEvent::Home),
         'c' => Some(KeyEvent::Cancel),
+        'd' => Some(KeyEvent::EndOfInput),
         'e' => Some(KeyEvent::End),
         'k' => Some(KeyEvent::KillAfter),
         'l' => Some(KeyEvent::ClearDisplay),
@@ -1870,6 +1875,27 @@ mod tests {
         assert_eq!(decoder.push(0xa9), Some(KeyEvent::Character('é')));
         assert_eq!(decoder.push(0x08), Some(KeyEvent::Backspace));
         assert_eq!(decoder.push(0x7f), Some(KeyEvent::Backspace));
+    }
+
+    #[test]
+    fn decoders_report_end_of_input_without_disturbing_the_editor() {
+        let mut decoder = InputDecoder::new(InputConfig::standard());
+        assert_eq!(decoder.push(0x04), Some(KeyEvent::EndOfInput));
+        assert_eq!(decoder.push(0x03), Some(KeyEvent::Cancel));
+
+        let mut keyboard = Ps2Set1Decoder::new(KeyboardConfig::standard());
+        assert_eq!(keyboard.push(0x1d), None);
+        assert_eq!(keyboard.push(0x20), Some(KeyEvent::EndOfInput));
+        assert_eq!(keyboard.push(0x9d), None);
+        assert_eq!(keyboard.push(0x20), Some(KeyEvent::Character('d')));
+
+        let mut editor = LineEditor::new(EditorConfig::standard());
+        assert_eq!(
+            editor.handle(KeyEvent::Character('a')),
+            EditorOutcome::Changed
+        );
+        assert_eq!(editor.handle(KeyEvent::EndOfInput), EditorOutcome::Ignored);
+        assert_eq!(editor.line(), "a");
     }
 
     #[test]

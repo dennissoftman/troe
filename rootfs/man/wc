@@ -7,6 +7,7 @@ SYNOPSIS
 DESCRIPTION
     Counts newline bytes, ASCII-whitespace-delimited words, and bytes. With no
     file, reads standard input. A FILE of - also selects standard input.
+    At an interactive prompt that reads typed lines until Ctrl-D; see man sh.
 
     The default output is lines, words, then bytes. Options select individual
     columns and may be combined. Multiple operands produce a total row.

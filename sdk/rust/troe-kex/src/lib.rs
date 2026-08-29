@@ -727,9 +727,18 @@ pub struct StandardInput {
 impl StandardInput {
     /// Read up to `destination.len()` bytes; zero is end-of-input.
     ///
+    /// A foreground command started from the interactive session reads typed
+    /// lines from the session terminal, so this call can block until the reader
+    /// types a line, ends input with Ctrl-D, or cancels. Files, pipes, and
+    /// background or service streams never block. End of input is latched:
+    /// once a read returns zero, every later read returns zero.
+    ///
     /// # Errors
     ///
-    /// Reports service, call-gate, or invalid-buffer failure.
+    /// Reports [`Error::Cancelled`] when the reader cancels a blocked terminal
+    /// read, or service, call-gate, or invalid-buffer failure. Cancellation is
+    /// an ordinary outcome and is distinct from end of input; report it as
+    /// cancellation rather than as a transport failure.
     pub fn read(&mut self, destination: &mut [u8]) -> Result<usize, Error> {
         if destination.is_empty() {
             return Ok(0);

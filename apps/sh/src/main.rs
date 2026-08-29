@@ -6,8 +6,8 @@ mod common;
 
 use core::{fmt::Write as _, str};
 use troe_kex_sdk::{
-    CommandContext, INVOCATION_BUFFER_BYTES, ReadOnlyFilesystem, ShellScript, StandardInput, entry,
-    exit, filesystem, shell_script,
+    CommandContext, Error, INVOCATION_BUFFER_BYTES, ReadOnlyFilesystem, ShellScript, StandardInput,
+    entry, exit, filesystem, shell_script,
 };
 
 const MAX_SOURCE_BYTES: u64 = 64 * 1024;
@@ -21,10 +21,23 @@ enum Source {
     },
 }
 
+/// Distinguishes cooperative cancellation from a source transport failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceError {
+    Cancelled,
+    Failed,
+}
+
 impl Source {
-    fn read(&mut self, destination: &mut [u8]) -> Result<usize, ()> {
+    fn read(&mut self, destination: &mut [u8]) -> Result<usize, SourceError> {
         match self {
-            Self::StandardInput(input) => input.read(destination).map_err(|_| ()),
+            Self::StandardInput(input) => input.read(destination).map_err(|error| {
+                if error == Error::Cancelled {
+                    SourceError::Cancelled
+                } else {
+                    SourceError::Failed
+                }
+            }),
             Self::File {
                 filesystem,
                 file,
@@ -32,10 +45,10 @@ impl Source {
             } => {
                 let count = filesystem
                     .read(*file, *offset, destination)
-                    .map_err(|_| ())?;
+                    .map_err(|_| SourceError::Failed)?;
                 *offset = offset
-                    .checked_add(u64::try_from(count).map_err(|_| ())?)
-                    .ok_or(())?;
+                    .checked_add(u64::try_from(count).map_err(|_| SourceError::Failed)?)
+                    .ok_or(SourceError::Failed)?;
                 Ok(count)
             }
         }
@@ -93,7 +106,12 @@ fn run_source(command: &mut CommandContext, mut source: Source) -> u32 {
     loop {
         let count = match source.read(&mut input) {
             Ok(count) => count,
-            Err(()) => {
+            Err(SourceError::Cancelled) => {
+                let _ignored = source.close();
+                common::report(&mut command.stderr(), "sh", b"cancelled");
+                return exit::CANCELLED;
+            }
+            Err(SourceError::Failed) => {
                 let _ignored = source.close();
                 common::report(&mut command.stderr(), "sh", b"source read failed");
                 return exit::FAILURE;

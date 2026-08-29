@@ -42,6 +42,18 @@ DESCRIPTION
     FILE. Unquoted > truncates or creates FILE before execution and streams
     final stdout, while >> creates or streams at the existing end.
 
+    A foreground command started from the prompt without < redirection reads
+    the session terminal. Typed characters are echoed, Tab inserts a literal
+    tab, backspace and Ctrl-U erase, Enter completes a line, and Ctrl-D reports
+    end of input on an empty line or submits an unterminated one. Ctrl-C cancels
+    the command. There is no completion, history, or cursor movement while a
+    command owns the terminal; arrow, Home, End, and Delete keys are ignored.
+    A pending line is limited to 512 bytes and unread input to four lines;
+    input beyond either limit is refused without echo. Background jobs,
+    services, commands staged by a script, and processes spawned by an
+    application read an empty stream and see end of input immediately, so they
+    cannot consume prompt input.
+
     File streams use a 16 KiB default working buffer and are not capped by the
     shell. A failing command may leave an empty file or written prefix. The
     1 MiB limit applies only between sequential pipeline stages. Redirection

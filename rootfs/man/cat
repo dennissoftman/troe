@@ -9,6 +9,9 @@ DESCRIPTION
     copies standard input. A FILE of - also selects standard input. Processing
     state continues across operands, as though their bytes were concatenated.
     Reads are bounded by the mounted filesystem and shell stream limits.
+    At an interactive prompt standard input is the session terminal: cat copies
+    each typed line, ends at Ctrl-D, and reports cancellation at Ctrl-C. Use -u
+    to write each line as it is read rather than aggregating it. See man sh.
 
 OPTIONS
     -A  Show nonprinting bytes, line ends, and tabs; equivalent to -vET.

@@ -27,12 +27,12 @@ impl Selection {
     }
 }
 
-fn count_stdin(command: &mut CommandContext) -> Result<Counts, ()> {
+fn count_stdin(command: &mut CommandContext) -> Result<Counts, Error> {
     let mut counts = Counts::default();
     let mut input = command.stdin();
     let mut buffer = [0_u8; 512];
     loop {
-        let count = input.read(&mut buffer).map_err(|_| ())?;
+        let count = input.read(&mut buffer)?;
         if count == 0 {
             return Ok(counts);
         }
@@ -136,7 +136,9 @@ fn main(command: &mut CommandContext) -> u32 {
     if operand_start == invocation.len() {
         let counts = match count_stdin(command) {
             Ok(counts) => counts,
-            Err(()) => return common::stream_failure(&mut command.stderr(), "wc"),
+            Err(error) => {
+                return common::stream_read_failure(&mut command.stderr(), "wc", error);
+            }
         };
         return if write_counts(command, selection, counts, None).is_ok() {
             exit::SUCCESS
@@ -167,7 +169,9 @@ fn main(command: &mut CommandContext) -> u32 {
         let counts = if path == "-" {
             match count_stdin(command) {
                 Ok(counts) => counts,
-                Err(()) => return common::stream_failure(&mut command.stderr(), "wc"),
+                Err(error) => {
+                    return common::stream_read_failure(&mut command.stderr(), "wc", error);
+                }
             }
         } else {
             let Some(filesystem) = filesystem.as_mut() else {

@@ -6,4 +6,5 @@ SYNOPSIS
 
 DESCRIPTION
     Renders one file, or standard input when omitted, as bounded hexadecimal
-    rows with byte offsets.
+    rows with byte offsets. At an interactive prompt standard input reads typed
+    lines until Ctrl-D; see man sh.

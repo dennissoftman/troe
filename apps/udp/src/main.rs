@@ -59,7 +59,9 @@ fn send(command: &CommandContext, invocation: command::Invocation<'_>) -> u32 {
         let mut input = command.stdin();
         match read_payload(&mut input, &mut payload) {
             Ok(count) => count,
-            Err(()) => return stream_failure(command),
+            Err(Error::Cancelled) => return cancelled(command),
+            Err(Error::TooLarge) => return usage(command, "packet exceeds network limit"),
+            Err(_) => return stream_failure(command),
         }
     };
 
@@ -151,20 +153,20 @@ fn join_arguments(
     Ok(count)
 }
 
-fn read_payload(input: &mut StandardInput, output: &mut [u8]) -> Result<usize, ()> {
+fn read_payload(input: &mut StandardInput, output: &mut [u8]) -> Result<usize, Error> {
     let mut count = 0_usize;
     while count < output.len() {
-        let read = input.read(&mut output[count..]).map_err(|_| ())?;
+        let read = input.read(&mut output[count..])?;
         if read == 0 {
             return Ok(count);
         }
-        count = count.checked_add(read).ok_or(())?;
+        count = count.checked_add(read).ok_or(Error::TooLarge)?;
     }
     let mut excess = [0_u8; 1];
-    if input.read(&mut excess).map_err(|_| ())? == 0 {
+    if input.read(&mut excess)? == 0 {
         Ok(count)
     } else {
-        Err(())
+        Err(Error::TooLarge)
     }
 }
 
@@ -178,6 +180,12 @@ fn stream_failure(command: &CommandContext) -> u32 {
     let mut error = Writer(command.stderr());
     let _ignored = error.write_str("udp: stream I/O failed\n");
     exit::FAILURE
+}
+
+fn cancelled(command: &CommandContext) -> u32 {
+    let mut error = Writer(command.stderr());
+    let _ignored = error.write_str("udp: cancelled\n");
+    exit::CANCELLED
 }
 
 fn network_failure(command: &CommandContext, failure: Error) -> u32 {

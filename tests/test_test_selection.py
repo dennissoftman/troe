@@ -111,9 +111,19 @@ class ChangedTestSelectionTests(unittest.TestCase):
         tar_plan = test_changed.build_plan(
             (PurePosixPath("apps/tar/src/lib.rs"),), PACKAGES
         )
-        self.assertEqual(wc_plan.qemu_scenarios, {"filesystem"})
+        self.assertEqual(wc_plan.qemu_scenarios, {"filesystem", "shell-terminal"})
         self.assertEqual(tar_plan.qemu_scenarios, {"filesystem"})
         self.assertEqual(man_plan.qemu_scenarios, {"shell-terminal"})
+        cat_plan = test_changed.build_plan(
+            (PurePosixPath("apps/cat/src/main.rs"),), PACKAGES
+        )
+        udp_plan = test_changed.build_plan(
+            (PurePosixPath("apps/udp/src/main.rs"),), PACKAGES
+        )
+        # Standard-input readers exercise the foreground terminal loan as well
+        # as the group that supplies their operands.
+        self.assertEqual(cat_plan.qemu_scenarios, {"filesystem", "shell-terminal"})
+        self.assertEqual(udp_plan.qemu_scenarios, {"network", "shell-terminal"})
         lua_plan = test_changed.build_plan(
             (PurePosixPath("apps/lua/src/main.rs"),), PACKAGES
         )

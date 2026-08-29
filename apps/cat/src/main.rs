@@ -196,15 +196,15 @@ fn parse_options(invocation: command::Invocation<'_>) -> Option<(Options, usize)
     Some((options, operand_start))
 }
 
-fn copy_input(command: &mut CommandContext, transformer: &mut Transformer) -> Result<(), ()> {
+fn copy_input(command: &mut CommandContext, transformer: &mut Transformer) -> Result<(), Error> {
     let mut input = command.stdin();
     let mut buffer = [0_u8; 512];
     loop {
-        let count = input.read(&mut buffer).map_err(|_| ())?;
+        let count = input.read(&mut buffer)?;
         if count == 0 {
             return Ok(());
         }
-        transformer.feed(&buffer[..count])?;
+        transformer.feed(&buffer[..count]).map_err(|()| Error::Io)?;
     }
 }
 
@@ -257,7 +257,10 @@ fn main(command: &mut CommandContext) -> u32 {
     };
     let mut transformer = Transformer::new(options, command.stdout());
     if operand_start == invocation.len() {
-        if copy_input(command, &mut transformer).is_err() || transformer.finish().is_err() {
+        if let Err(error) = copy_input(command, &mut transformer) {
+            return common::stream_read_failure(&mut command.stderr(), "cat", error);
+        }
+        if transformer.finish().is_err() {
             return common::stream_failure(&mut command.stderr(), "cat");
         }
         return exit::SUCCESS;
@@ -281,8 +284,8 @@ fn main(command: &mut CommandContext) -> u32 {
             return exit::FAILURE;
         };
         if path == "-" {
-            if copy_input(command, &mut transformer).is_err() {
-                return common::stream_failure(&mut command.stderr(), "cat");
+            if let Err(error) = copy_input(command, &mut transformer) {
+                return common::stream_read_failure(&mut command.stderr(), "cat", error);
             }
         } else {
             let Some(filesystem) = filesystem.as_mut() else {

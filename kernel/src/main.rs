@@ -102,8 +102,9 @@ mod firmware {
         WaitSpec, WaitTable, WakeInterest, WakeReason,
     };
     use troe_terminal::{
-        EditorConfig, EditorOutcome, FramebufferDescriptor, FramebufferPixelFormat, InputDecoder,
-        KeyEvent, KeyboardConfig, LineEditor, Ps2Set1Decoder, TextConsole, TextConsoleConfig,
+        EditorConfig, EditorOutcome, FramebufferDescriptor, FramebufferPixelFormat, InputConfig,
+        InputDecoder, KeyEvent, KeyboardConfig, LineEditor, Ps2Set1Decoder, TextConsole,
+        TextConsoleConfig,
     };
     use troe_vfs::{
         FILE_IO_BUFFER_BYTES, FsError, Namespace, NodeKind, RamFsQuota, ReadOnlyFileSystem,
@@ -290,6 +291,283 @@ mod firmware {
         }
     }
 
+    type SharedShellConsole = Rc<RefCell<NativeShellConsole>>;
+
+    /// Client for the single owned shell console.
+    ///
+    /// The dispatched console service and session terminal echo both write
+    /// through this handle, so serial and framebuffer output stay mirrored
+    /// regardless of which one produced the bytes.
+    struct SharedConsoleOutput {
+        console: SharedShellConsole,
+    }
+
+    impl SharedConsoleOutput {
+        const fn new(console: SharedShellConsole) -> Self {
+            Self { console }
+        }
+    }
+
+    impl Output for SharedConsoleOutput {
+        fn write(&mut self, bytes: &[u8]) -> Result<usize, StreamError> {
+            self.console
+                .try_borrow_mut()
+                .map_err(|_| StreamError::Device)?
+                .write(bytes)
+        }
+    }
+
+    /// Reserved generation-checked identity for one session terminal read.
+    const SESSION_TERMINAL_WAIT_IDENTITY: u64 = u64::MAX;
+    /// Cooked bytes retained for a foreground reader before input is refused.
+    const SESSION_TERMINAL_READY_BYTES: usize = 4 * (MAX_LINE_BYTES + 1);
+
+    /// The single owner of session input decoding and the cooked line
+    /// discipline.
+    ///
+    /// The line editor consumes decoded keys at the prompt. While one
+    /// foreground process holds the loan, the same decoders instead feed a
+    /// bounded cooked byte stream that the process reads through its ordinary
+    /// standard-input handle. Background jobs, services, staged script lines,
+    /// and owner-scoped children never hold the loan.
+    struct SessionTerminal {
+        runtime: SharedRuntime,
+        echo: SharedConsoleOutput,
+        input_config: InputConfig,
+        keyboard_config: KeyboardConfig,
+        decoder: InputDecoder,
+        keyboard: Ps2Set1Decoder,
+        pending: String,
+        ready: VecDeque<u8>,
+        end_of_input: bool,
+        owner: Option<TaskId>,
+    }
+
+    type SharedSessionTerminal = Rc<RefCell<SessionTerminal>>;
+
+    impl SessionTerminal {
+        fn new(
+            runtime: SharedRuntime,
+            echo: SharedConsoleOutput,
+            input_config: InputConfig,
+            keyboard_config: KeyboardConfig,
+        ) -> Result<Self, ()> {
+            let mut pending = String::new();
+            pending.try_reserve_exact(MAX_LINE_BYTES).map_err(|_| ())?;
+            let mut ready = VecDeque::new();
+            ready
+                .try_reserve_exact(SESSION_TERMINAL_READY_BYTES)
+                .map_err(|_| ())?;
+            Ok(Self {
+                runtime,
+                echo,
+                input_config,
+                keyboard_config,
+                decoder: InputDecoder::new(input_config),
+                keyboard: Ps2Set1Decoder::new(keyboard_config),
+                pending,
+                ready,
+                end_of_input: false,
+                owner: None,
+            })
+        }
+
+        /// Decode one machine event with the session-owned decoders.
+        fn decode(&mut self, event: InputEvent) -> Option<KeyEvent> {
+            match event.source() {
+                InputSource::Serial => self.decoder.push(event.byte()),
+                InputSource::Keyboard => self.keyboard.push(event.byte()),
+            }
+        }
+
+        /// Lend the terminal to one foreground process.
+        fn lend(&mut self, owner: TaskId) -> Result<(), ()> {
+            if self.owner.is_some() {
+                return Err(());
+            }
+            self.reset();
+            self.owner = Some(owner);
+            Ok(())
+        }
+
+        /// Return the loan and discard unread cooked input.
+        fn release(&mut self) {
+            self.owner = None;
+            self.reset();
+        }
+
+        fn reset(&mut self) {
+            self.pending.clear();
+            self.ready.clear();
+            self.end_of_input = false;
+            self.decoder = InputDecoder::new(self.input_config);
+            self.keyboard = Ps2Set1Decoder::new(self.keyboard_config);
+        }
+
+        /// Drain retained machine events into the cooked stream.
+        ///
+        /// Cancellation is intercepted before this point, so a cancelling key
+        /// never reaches the line discipline.
+        fn pump(&mut self) {
+            if self.owner.is_none() {
+                return;
+            }
+            loop {
+                let event = match self.runtime.try_borrow_mut() {
+                    Ok(mut runtime) => runtime.take_input_event(),
+                    Err(_) => return,
+                };
+                let Some(event) = event else {
+                    return;
+                };
+                if let Some(key) = self.decode(event) {
+                    self.apply(key);
+                }
+            }
+        }
+
+        fn apply(&mut self, key: KeyEvent) {
+            if self.end_of_input {
+                return;
+            }
+            match key {
+                KeyEvent::Character(character) => self.insert(character),
+                KeyEvent::Enter => self.submit(),
+                KeyEvent::Backspace => self.erase(),
+                KeyEvent::KillBefore => {
+                    while !self.pending.is_empty() {
+                        self.erase();
+                    }
+                }
+                KeyEvent::EndOfInput => {
+                    if self.pending.is_empty() {
+                        self.end_of_input = true;
+                    } else {
+                        self.publish(false);
+                    }
+                }
+                // The cooked discipline has no completion, history, or cursor
+                // movement, so the editor keys those transports carry are
+                // either taken literally or ignored.
+                KeyEvent::Complete => self.insert('\t'),
+                KeyEvent::Cancel
+                | KeyEvent::Delete
+                | KeyEvent::Left
+                | KeyEvent::Right
+                | KeyEvent::Home
+                | KeyEvent::End
+                | KeyEvent::Up
+                | KeyEvent::Down
+                | KeyEvent::ClearDisplay
+                | KeyEvent::KillAfter
+                | KeyEvent::DeletePreviousWord => {}
+            }
+        }
+
+        fn insert(&mut self, character: char) {
+            let width = character.len_utf8();
+            if self.pending.len().saturating_add(width) > MAX_LINE_BYTES {
+                return;
+            }
+            let mut encoded = [0_u8; 4];
+            let text = character.encode_utf8(&mut encoded);
+            if write_all(&mut self.echo, text.as_bytes()).is_err() {
+                return;
+            }
+            self.pending.push(character);
+        }
+
+        fn erase(&mut self) {
+            if self.pending.pop().is_none() {
+                return;
+            }
+            let _echo = write_all(&mut self.echo, b"\x08 \x08");
+        }
+
+        fn submit(&mut self) {
+            self.publish(true);
+        }
+
+        /// Move the pending line into the cooked stream when it fits.
+        fn publish(&mut self, newline: bool) {
+            let terminator = usize::from(newline);
+            let required = self.pending.len().saturating_add(terminator);
+            if self.ready.len().saturating_add(required) > SESSION_TERMINAL_READY_BYTES {
+                return;
+            }
+            if newline && write_all(&mut self.echo, b"\n").is_err() {
+                return;
+            }
+            for byte in self.pending.as_bytes() {
+                self.ready.push_back(*byte);
+            }
+            if newline {
+                self.ready.push_back(b'\n');
+            }
+            self.pending.clear();
+        }
+
+        /// Whether a read can complete without waiting.
+        fn read_ready(&self) -> bool {
+            !self.ready.is_empty() || self.end_of_input
+        }
+
+        /// Copy cooked bytes out of the stream. Zero means end of input.
+        fn take(&mut self, destination: &mut [u8]) -> usize {
+            let mut count = 0;
+            while count < destination.len() {
+                let Some(byte) = self.ready.pop_front() else {
+                    break;
+                };
+                destination[count] = byte;
+                count += 1;
+            }
+            count
+        }
+    }
+
+    /// Standard input bound to the session terminal loan.
+    ///
+    /// Application reads are admitted through the deferred-call path, which
+    /// blocks without starving the event loop. This direct implementation
+    /// serves shell-owned consumers that read the same stream synchronously.
+    struct SessionTerminalInput {
+        terminal: SharedSessionTerminal,
+    }
+
+    impl SessionTerminalInput {
+        const fn new(terminal: SharedSessionTerminal) -> Self {
+            Self { terminal }
+        }
+    }
+
+    impl Input for SessionTerminalInput {
+        fn read(&mut self, destination: &mut [u8]) -> Result<usize, StreamError> {
+            loop {
+                let runtime = {
+                    let mut terminal = self
+                        .terminal
+                        .try_borrow_mut()
+                        .map_err(|_| StreamError::Device)?;
+                    terminal.pump();
+                    if terminal.read_ready() {
+                        return Ok(terminal.take(destination));
+                    }
+                    terminal.runtime.clone()
+                };
+                if runtime.borrow_mut().checkpoint().is_err() {
+                    return Ok(0);
+                }
+                troe_machine::wait_for_runtime_event_timeout(RESIDENT_POLL_MILLISECONDS)
+                    .map_err(|_| StreamError::Device)?;
+            }
+        }
+
+        fn is_terminal(&self) -> bool {
+            true
+        }
+    }
+
     impl Output for DiscardOutput {
         fn write(&mut self, bytes: &[u8]) -> Result<usize, StreamError> {
             Ok(bytes.len())
@@ -393,6 +671,7 @@ mod firmware {
         shell_id: TaskId,
         shell_capabilities: Capabilities,
         runtime: SharedRuntime,
+        session_terminal: Option<SharedSessionTerminal>,
         pending_script_lines: Option<Vec<String>>,
     }
 
@@ -562,6 +841,7 @@ mod firmware {
         children: Option<SharedChildTable>,
         pipes: Option<SharedPipeTable>,
         pipe_streams: Vec<PipeStreamService>,
+        terminal: Option<SharedSessionTerminal>,
     }
 
     #[derive(Clone)]
@@ -763,6 +1043,11 @@ mod firmware {
             pipes: SharedPipeTable,
             target: DeferredPipeTarget,
             byte_count: usize,
+            resource: WaitResource,
+        },
+        TerminalRead {
+            terminal: SharedSessionTerminal,
+            maximum: usize,
             resource: WaitResource,
         },
     }
@@ -3744,6 +4029,49 @@ mod firmware {
             };
         }
 
+        if interface == troe_abi::interface::STANDARD_INPUT
+            && opcode == stream::READ
+            && let Some(terminal) = &services.terminal
+        {
+            let Ok(maximum) = stream::decode_read_request(payload) else {
+                return Ok(DeferredCallPreparation::Immediate {
+                    status: ReplyStatus::InvalidRequest,
+                    payload: Vec::new(),
+                });
+            };
+            let mut bytes = [0_u8; troe_abi::MAX_SERVICE_PAYLOAD_BYTES];
+            let ready = {
+                let mut borrowed = terminal.try_borrow_mut().map_err(|_| ())?;
+                borrowed.pump();
+                borrowed
+                    .read_ready()
+                    .then(|| borrowed.take(&mut bytes[..maximum]))
+            };
+            if let Some(count) = ready {
+                return Ok(DeferredCallPreparation::Immediate {
+                    status: ReplyStatus::Success,
+                    payload: owned_reply_payload(&bytes[..count])?,
+                });
+            }
+            let resource =
+                WaitResource::new(SESSION_TERMINAL_WAIT_IDENTITY, task_id.get()).map_err(|_| ())?;
+            return prepare_resource_wait(
+                task_id,
+                handle,
+                opcode,
+                payload,
+                reply_capacity,
+                resource,
+                DeferredCallKind::TerminalRead {
+                    terminal: Rc::clone(terminal),
+                    maximum,
+                    resource,
+                },
+                pending,
+                next_request_id,
+            );
+        }
+
         if matches!(
             interface,
             troe_abi::interface::STANDARD_INPUT
@@ -4274,6 +4602,19 @@ mod firmware {
                 }
                 Ok((ReplyStatus::Success, Vec::new()))
             }
+            (
+                DeferredCallKind::TerminalRead {
+                    terminal, maximum, ..
+                },
+                WakeReason::ResourceReady,
+            ) => {
+                let mut bytes = [0_u8; troe_abi::MAX_SERVICE_PAYLOAD_BYTES];
+                let count = terminal
+                    .try_borrow_mut()
+                    .map_err(|_| ())?
+                    .take(&mut bytes[..maximum]);
+                Ok((ReplyStatus::Success, owned_reply_payload(&bytes[..count])?))
+            }
             (_, WakeReason::Cancelled | WakeReason::Revoked) => {
                 Ok((ReplyStatus::Cancelled, Vec::new()))
             }
@@ -4286,7 +4627,8 @@ mod firmware {
                 DeferredCallKind::Diagnostics { .. }
                 | DeferredCallKind::Child { .. }
                 | DeferredCallKind::PipeRead { .. }
-                | DeferredCallKind::PipeWrite { .. },
+                | DeferredCallKind::PipeWrite { .. }
+                | DeferredCallKind::TerminalRead { .. },
                 WakeReason::Deadline,
             ) => Err(()),
         }
@@ -4367,7 +4709,8 @@ mod firmware {
                 DeferredCallKind::Diagnostics { .. }
                 | DeferredCallKind::Child { .. }
                 | DeferredCallKind::PipeRead { .. }
-                | DeferredCallKind::PipeWrite { .. } => return Err(()),
+                | DeferredCallKind::PipeWrite { .. }
+                | DeferredCallKind::TerminalRead { .. } => return Err(()),
             }
             let deadline = match &suspended_call.kind {
                 DeferredCallKind::Timer { deadline }
@@ -4375,7 +4718,8 @@ mod firmware {
                 DeferredCallKind::Diagnostics { .. }
                 | DeferredCallKind::Child { .. }
                 | DeferredCallKind::PipeRead { .. }
-                | DeferredCallKind::PipeWrite { .. } => return Err(()),
+                | DeferredCallKind::PipeWrite { .. }
+                | DeferredCallKind::TerminalRead { .. } => return Err(()),
             };
             let remaining = deadline.as_millis().saturating_sub(now.as_millis());
             if remaining == 0 {
@@ -4537,7 +4881,8 @@ mod firmware {
                     | DeferredCallKind::Datagram { .. }
                     | DeferredCallKind::Child { .. }
                     | DeferredCallKind::PipeRead { .. }
-                    | DeferredCallKind::PipeWrite { .. } => None,
+                    | DeferredCallKind::PipeWrite { .. }
+                    | DeferredCallKind::TerminalRead { .. } => None,
                 };
                 state.pending.bind_wait(operation, wait).map_err(|_| ())?;
                 state.suspended.insert(SuspendedApplicationCall {
@@ -5428,7 +5773,23 @@ mod firmware {
         pipes: &SharedPipeTable,
     ) -> Result<NestedInput<'service>, ReplyStatus> {
         match spec.mode {
-            process_launch::StreamMode::Inherit => Ok(inherited.clone()),
+            // The session terminal loan is not transitive. A child that
+            // inherits terminal-backed standard input receives an empty stream
+            // instead, so two readers never compete for one keystroke.
+            process_launch::StreamMode::Inherit => Ok(match inherited {
+                NestedInput::Borrowed(input) => {
+                    let terminal = input
+                        .try_borrow()
+                        .map_err(|_| ReplyStatus::Conflict)?
+                        .is_terminal();
+                    if terminal {
+                        NestedInput::Empty
+                    } else {
+                        inherited.clone()
+                    }
+                }
+                NestedInput::Empty | NestedInput::Pipe { .. } => inherited.clone(),
+            }),
             process_launch::StreamMode::Null => Ok(NestedInput::Empty),
             process_launch::StreamMode::Pipe => {
                 let token =
@@ -6008,6 +6369,7 @@ mod firmware {
                         children: required.process_launch.then(|| child_children.clone()),
                         pipes: required.pipe.then(|| child_pipes.clone()),
                         pipe_streams,
+                        terminal: None,
                     }))
                     .is_err()
             {
@@ -6934,6 +7296,25 @@ mod firmware {
                             .iter()
                             .next(),
                         Err(_) => return Err(()),
+                    }
+                }
+                DeferredCallKind::TerminalRead {
+                    terminal, resource, ..
+                } => {
+                    let ready = {
+                        let mut borrowed = terminal.try_borrow_mut().map_err(|_| ())?;
+                        borrowed.pump();
+                        borrowed.read_ready()
+                    };
+                    if ready {
+                        state
+                            .waits
+                            .wake_resource(*resource, WakeReason::ResourceReady)
+                            .map_err(|_| ())?
+                            .iter()
+                            .next()
+                    } else {
+                        None
                     }
                 }
             };
@@ -12737,10 +13118,15 @@ mod firmware {
 
         fn poll_input_event(&mut self) -> Option<InputEvent> {
             let _cancel_at_prompt = self.checkpoint();
-            if let Some(event) = self.deferred_input.pop_front() {
-                return Some(event);
-            }
-            None
+            self.take_input_event()
+        }
+
+        /// Take one retained event without observing cancellation.
+        ///
+        /// Foreground callers detect cancellation with their own checkpoint,
+        /// so draining here must not consume that observation.
+        fn take_input_event(&mut self) -> Option<InputEvent> {
+            self.deferred_input.pop_front()
         }
     }
 
@@ -12861,6 +13247,11 @@ mod firmware {
                             );
                         }
                     }
+                }
+                if let Some(terminal) = self.session_terminal.as_ref()
+                    && let Ok(mut terminal) = terminal.try_borrow_mut()
+                {
+                    terminal.pump();
                 }
                 if self
                     .residents
@@ -13347,6 +13738,7 @@ mod firmware {
                     children: process_children.clone(),
                     pipes: process_pipes.clone(),
                     pipe_streams: Vec::new(),
+                    terminal: None,
                 });
             if process.install_deferred_services(deferred).is_err() {
                 let _cleaned = process.teardown(
@@ -13406,6 +13798,44 @@ mod firmware {
                 }
             }
         }
+    }
+
+    /// Launch one supervised service as a session-independent background job.
+    ///
+    /// Services never hold the session terminal loan: their standard input is
+    /// always empty, so a supervised process cannot consume prompt input.
+    #[allow(clippy::too_many_arguments)]
+    fn launch_service_process(
+        service: &troe_config::ServiceConfig,
+        shell: &mut Shell,
+        residents: &mut ResidentProcessTable,
+        processes: &SharedProcessTable,
+        scheduler: &mut Scheduler,
+        accounting: &mut OwnedAccounting,
+        shell_id: TaskId,
+        shell_capabilities: Capabilities,
+        runtime: &SharedRuntime,
+    ) -> CommandStatus {
+        let line = alloc::format!("{} &", service.name());
+        let mut input = EmptyInput;
+        let mut output = DiscardOutput;
+        let mut error = DiscardOutput;
+        let mut runner = KexCommandRunner {
+            accounting,
+            scheduler,
+            residents,
+            processes: processes.clone(),
+            resident_owner: ResidentOwner::Service(service.id()),
+            service_initial_handles: Some(service.initial_handles()),
+            service_capability_bits: Some(service.capability_bits()),
+            service_runtime: None,
+            shell_id,
+            shell_capabilities,
+            runtime: runtime.clone(),
+            session_terminal: None,
+            pending_script_lines: None,
+        };
+        shell.execute_with_external(&line, &mut input, &mut output, &mut error, &mut runner)
     }
 
     impl ServiceRuntime {
@@ -13480,32 +13910,17 @@ mod firmware {
                                 .map_err(|_| ())?;
                             continue;
                         }
-                        let line = alloc::format!("{} &", service.name());
-                        let mut input = EmptyInput;
-                        let mut output = DiscardOutput;
-                        let mut error = DiscardOutput;
-                        let mut runner = KexCommandRunner {
-                            accounting,
-                            scheduler,
+                        let status = launch_service_process(
+                            service,
+                            shell,
                             residents,
-                            processes: processes.clone(),
-                            resident_owner: ResidentOwner::Service(service_id),
-                            service_initial_handles: Some(service.initial_handles()),
-                            service_capability_bits: Some(service.capability_bits()),
-                            service_runtime: None,
+                            processes,
+                            scheduler,
+                            accounting,
                             shell_id,
                             shell_capabilities,
-                            runtime: runtime.clone(),
-                            pending_script_lines: None,
-                        };
-                        let status = shell.execute_with_external(
-                            &line,
-                            &mut input,
-                            &mut output,
-                            &mut error,
-                            &mut runner,
+                            runtime,
                         );
-                        drop(runner);
                         if status != CommandStatus::Success {
                             self.supervisor
                                 .launch_failed(service_id, now)
@@ -13925,6 +14340,12 @@ mod firmware {
             } else {
                 None
             };
+            // Only the session's own terminal-backed stream takes the loan.
+            // Redirected files, pipeline slices, and empty streams do not.
+            let session_terminal = stdin
+                .is_terminal()
+                .then(|| self.session_terminal.clone())
+                .flatten();
             let shared_stdin = Rc::new(RefCell::new(&mut *stdin));
             let shared_stdout = Rc::new(RefCell::new(&mut *stdout));
             let shared_stderr = Rc::new(RefCell::new(&mut *stderr));
@@ -14279,16 +14700,18 @@ mod firmware {
                         || datagram_required
                         || diagnostics_required
                         || process_launch_required
-                        || pipe_required)
-                        .then(|| CommandDeferredServices {
-                            runtime: self.runtime.clone(),
-                            datagram: application_datagram_state,
-                            diagnostics: diagnostics_snapshot,
-                            process_owner,
-                            children: process_children.clone(),
-                            pipes: process_pipes.clone(),
-                            pipe_streams: Vec::new(),
-                        });
+                        || pipe_required
+                        || session_terminal.is_some())
+                    .then(|| CommandDeferredServices {
+                        runtime: self.runtime.clone(),
+                        datagram: application_datagram_state,
+                        diagnostics: diagnostics_snapshot,
+                        process_owner,
+                        children: process_children.clone(),
+                        pipes: process_pipes.clone(),
+                        pipe_streams: Vec::new(),
+                        terminal: session_terminal.clone(),
+                    });
                     if process.install_deferred_services(deferred).is_err() {
                         let _cleaned = process.teardown(
                             self.scheduler,
@@ -14341,7 +14764,30 @@ mod firmware {
                                 processes: Vec::new(),
                             });
                         }
-                        self.run_foreground_process(process)
+                        let loan = session_terminal.as_ref().map(|terminal| {
+                            terminal
+                                .try_borrow_mut()
+                                .map_err(|_| ())
+                                .and_then(|mut terminal| terminal.lend(process.task_id))
+                        });
+                        if matches!(loan, Some(Err(()))) {
+                            let _cleaned = process.teardown(
+                                self.scheduler,
+                                self.accounting,
+                                CommandApplicationOutcome::Exited(troe_abi::exit::CANCELLED),
+                                true,
+                            );
+                            Err(())
+                        } else {
+                            let outcome = self.run_foreground_process(process);
+                            if let Some(terminal) = session_terminal.as_ref() {
+                                match terminal.try_borrow_mut() {
+                                    Ok(mut terminal) => terminal.release(),
+                                    Err(_) => fatal(b"fatal: session terminal loan leaked\n"),
+                                }
+                            }
+                            outcome
+                        }
                     }
                 }
                 Err(()) => Err(()),
@@ -14864,13 +15310,20 @@ mod firmware {
         }
         let mut dispatcher = Dispatcher::new(1, 1)
             .unwrap_or_else(|_| fatal(b"fatal: cannot create service dispatcher\n"));
-        let mut shell_console = NativeShellConsole::new(task.accounting.framebuffer);
-        let framebuffer_ready = shell_console.has_framebuffer();
-        if shell_console.replay_completed_boot().is_err() {
+        let shell_console = Rc::new(RefCell::new(NativeShellConsole::new(
+            task.accounting.framebuffer,
+        )));
+        let framebuffer_ready = shell_console.borrow().has_framebuffer();
+        if shell_console.borrow_mut().replay_completed_boot().is_err() {
             fatal(b"fatal: framebuffer boot replay failed\n");
         }
         let (_console_port, console_handle) = dispatcher
-            .register(Box::new(ConsoleService::new(shell_console)), Rights::CALL)
+            .register(
+                Box::new(ConsoleService::new(SharedConsoleOutput::new(Rc::clone(
+                    &shell_console,
+                )))),
+                Rights::CALL,
+            )
             .unwrap_or_else(|_| fatal(b"fatal: cannot register console service\n"));
         let mut console = DispatchedOutput::new(&mut dispatcher, console_handle);
         let console_label = if framebuffer_ready {
@@ -14913,8 +15366,18 @@ mod firmware {
             fatal(b"fatal: editor line policy exceeds shell parser policy\n");
         }
         let completion_config = CompletionConfig::standard();
-        let mut decoder = InputDecoder::new(editor_config.input());
-        let mut keyboard = Ps2Set1Decoder::new(KeyboardConfig::standard());
+        // One decoder pair owns session input. Handing the terminal between the
+        // line editor and a foreground process cannot split a UTF-8 or escape
+        // sequence across two decoding states.
+        let terminal = Rc::new(RefCell::new(
+            SessionTerminal::new(
+                runtime.clone(),
+                SharedConsoleOutput::new(Rc::clone(&shell_console)),
+                editor_config.input(),
+                KeyboardConfig::standard(),
+            )
+            .unwrap_or_else(|()| fatal(b"fatal: cannot allocate session terminal\n")),
+        ));
         let mut editor = LineEditor::new(editor_config);
         let mut residents = ResidentProcessTable::new()
             .unwrap_or_else(|()| fatal(b"fatal: cannot allocate resident process table\n"));
@@ -14961,8 +15424,7 @@ mod firmware {
             }
             let Ok(line) = read_edited_line(
                 &mut editor,
-                &mut decoder,
-                &mut keyboard,
+                &terminal,
                 &mut shell,
                 &runtime,
                 &mut residents,
@@ -15018,8 +15480,7 @@ mod firmware {
             let confirmed = confirm_untrusted_application_paths(
                 &line,
                 &confirmation_cwd,
-                &mut decoder,
-                &mut keyboard,
+                &terminal,
                 &mut shell,
                 &runtime,
                 &mut residents,
@@ -15036,7 +15497,7 @@ mod firmware {
             if !confirmed {
                 continue;
             }
-            let mut input = EmptyInput;
+            let mut input = SessionTerminalInput::new(Rc::clone(&terminal));
             let mut error = NativeConsole;
             let mut external = KexCommandRunner {
                 accounting: task.accounting,
@@ -15050,6 +15511,7 @@ mod firmware {
                 shell_id: task.task_id,
                 shell_capabilities: task.capabilities,
                 runtime: runtime.clone(),
+                session_terminal: Some(Rc::clone(&terminal)),
                 pending_script_lines: None,
             };
             #[cfg(feature = "acceptance-probes")]
@@ -15129,8 +15591,7 @@ mod firmware {
     fn confirm_untrusted_application_paths(
         line: &str,
         cwd: &str,
-        decoder: &mut InputDecoder,
-        keyboard: &mut Ps2Set1Decoder,
+        terminal: &SharedSessionTerminal,
         shell: &mut Shell,
         runtime: &SharedRuntime,
         residents: &mut ResidentProcessTable,
@@ -15172,8 +15633,7 @@ mod firmware {
             let mut confirmation_editor = LineEditor::new(EditorConfig::standard());
             let answer = read_edited_line(
                 &mut confirmation_editor,
-                decoder,
-                keyboard,
+                terminal,
                 shell,
                 runtime,
                 residents,
@@ -15198,8 +15658,7 @@ mod firmware {
     #[allow(clippy::too_many_arguments)]
     fn read_edited_line(
         editor: &mut LineEditor,
-        decoder: &mut InputDecoder,
-        keyboard: &mut Ps2Set1Decoder,
+        terminal: &SharedSessionTerminal,
         shell: &mut Shell,
         runtime: &SharedRuntime,
         residents: &mut ResidentProcessTable,
@@ -15235,10 +15694,7 @@ mod firmware {
                     let _event =
                         troe_machine::wait_for_runtime_event_timeout(RESIDENT_POLL_MILLISECONDS);
                 };
-                let key = match event.source() {
-                    InputSource::Serial => decoder.push(event.byte()),
-                    InputSource::Keyboard => keyboard.push(event.byte()),
-                };
+                let key = terminal.try_borrow_mut().map_err(|_| ())?.decode(event);
                 if let Some(key) = key {
                     break key;
                 }

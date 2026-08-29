@@ -59,8 +59,8 @@ their canonical order during the same primary guest boot where possible.
 | Group | Runtime contract exercised |
 | --- | --- |
 | `boot` | Owned boot, production activation, StateFS diagnostics, packaged KEX launch |
-| `network` | Link and IPv4 state, DHCP, ICMP, ARP, cancellation, UDP, bounded TCP streams |
-| `shell-terminal` | Editing, completion, history, manuals, parsing, CRLF, and clear-screen behavior |
+| `network` | Link and IPv4 state, DHCP, ICMP, ARP, cancellation, UDP including a terminal-supplied datagram payload, bounded TCP streams |
+| `shell-terminal` | Editing, completion, history, manuals, parsing, CRLF, clear-screen behavior, and the foreground session terminal-input loan: typed lines, end of input, cancellation, background and nested end-of-input, resident-job and service coexistence, and unchanged redirection and pipelines |
 | `filesystem` | KEFS/ext4/FAT32 reads and writes, shared-media restart persistence, paths, logical lists, pipelines, bounded `sh.kex` scripts, RAMFS mutation, read-only and error behavior, plus repeated direct and nested launches of the large shared-media C runtime probe |
 | `lua` | Lua inline/stdin/file loading, the portable compute/allocation benchmark, consolidated language/numeric/system examples, script argument/`-l` compatibility, exact binary64 formatting, complete pipe reads, buffering modes, protected errors, shared-runtime math/calendar/environment/process/random behavior, typed filesystem errno failures, OS-shim clock and exit behavior, timer preemption, fragmentation, a 48 MiB private allocation beyond the former narrow TLSF geometry, and bounded OOM recovery |
 | `quota-memory` | 128-entry quota, recovery, repeated transient workloads, exact initial/heap/private commitment accounting, zeroed private mappings, partial protect/unmap and recoalescing, typed CSPRNG reads, and independently randomized KEX image bases |

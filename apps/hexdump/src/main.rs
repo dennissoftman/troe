@@ -77,7 +77,9 @@ fn dump_input(command: &mut CommandContext) -> u32 {
     loop {
         let count = match input.read(&mut buffer) {
             Ok(count) => count,
-            Err(_) => return common::stream_failure(&mut command.stderr(), "hexdump"),
+            Err(error) => {
+                return common::stream_read_failure(&mut command.stderr(), "hexdump", error);
+            }
         };
         if count == 0 {
             return if dump.finish().is_ok() {
