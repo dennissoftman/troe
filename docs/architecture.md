@@ -497,9 +497,10 @@ rules rather than one exact feature set: an unknown incompatible feature is
 refused, an unknown read-only-compatible feature mounts read-only, and
 compatible features are ignored. It reads 1 KiB, 2 KiB and 4 KiB blocks,
 32- and 64-byte group descriptors, stored checksum seeds, flexible block
-groups, and uninitialized groups, so an ordinary Linux ext4 volume mounts and
-takes the full mutation surface. General ext4 repair, hashed directory indexes,
-and mutations outside the documented profile remain unsupported. A transport provides bounded block-region capabilities; partition
+groups, uninitialized groups, hashed directory indexes, and extent trees to the
+depth ext4 builds them, so an ordinary Linux ext4 volume mounts and takes the
+full mutation surface. General ext4 repair and mutations outside the documented
+profile remain unsupported. A transport provides bounded block-region capabilities; partition
 discovery turns a whole device into non-overlapping regions; independently
 selected filesystem providers expose VFS objects.
 Format-specific structures do not enter the machine backend, block transport,

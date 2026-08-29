@@ -426,6 +426,20 @@ pub struct Ext4<D: BlockDevice> {
     write_defaults: Ext4WriteDefaults,
     journal: Option<JournalGeometry>,
     transaction: Option<Transaction>,
+    /// Seconds since the epoch stamped into mutated inodes.
+    ///
+    /// Zero means the owner supplied no clock, in which case timestamps are
+    /// left exactly as they were rather than invented.
+    wall_clock_seconds: u32,
+}
+
+/// Which timestamps one inode write should advance.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InodeTouch {
+    /// Only the inode itself changed, so the change time advances.
+    Metadata,
+    /// The file's contents changed, so the modification time advances too.
+    Content,
 }
 
 /// Where the internal journal lives, resolved once from inode 8.
@@ -589,6 +603,7 @@ impl<D: BlockDevice> Ext4<D> {
             write_defaults,
             journal: None,
             transaction: None,
+            wall_clock_seconds: 0,
         };
         // A half-checkpointed volume may hold a torn root directory that
         // replay is about to restore, so recovery validates the root only
@@ -661,6 +676,14 @@ impl<D: BlockDevice> Ext4<D> {
         Ok(RecoveryOutcome::Replayed {
             blocks: payload_len,
         })
+    }
+
+    /// Supply the wall clock this provider stamps into mutated inodes.
+    ///
+    /// Timestamps are left untouched until an owner provides a time, so a
+    /// provider without a clock never invents one.
+    pub const fn set_wall_clock_seconds(&mut self, seconds: u32) {
+        self.wall_clock_seconds = seconds;
     }
 
     /// Filesystem UUID validated at mount.
@@ -1585,6 +1608,13 @@ impl<D: BlockDevice> Ext4<D> {
             122,
             u16::try_from(gid >> 16).map_err(|_| FsError::Overflow)?,
         )?;
+        if self.wall_clock_seconds != 0 {
+            // A newly allocated inode is born now, so every time it carries
+            // starts at the same instant, including its creation time.
+            for offset in [8_usize, 12, 16, 144] {
+                put_u32(raw, offset, self.wall_clock_seconds)?;
+            }
+        }
         put_u32(raw, 100, self.layout.checksum_seed ^ number ^ 0xa5a5_5a5a)?;
         put_u16(raw, 128, 32)
     }
@@ -1817,7 +1847,20 @@ impl<D: BlockDevice> Ext4<D> {
         put_u32(raw, extent_tail_offset(raw.len()), checksum)
     }
 
-    fn refresh_inode_checksum(&self, raw: &mut [u8], number: u32) -> Result<(), FsError> {
+    fn refresh_inode_checksum(
+        &self,
+        raw: &mut [u8],
+        number: u32,
+        touch: InodeTouch,
+    ) -> Result<(), FsError> {
+        if self.wall_clock_seconds != 0 {
+            // The change time advances on every inode write; the modification
+            // time only when the file's contents actually changed.
+            put_u32(raw, 12, self.wall_clock_seconds)?;
+            if touch == InodeTouch::Content {
+                put_u32(raw, 16, self.wall_clock_seconds)?;
+            }
+        }
         raw[124..126].fill(0);
         raw[130..132].fill(0);
         let generation = read_u32(raw, 100)?;
@@ -1881,7 +1924,7 @@ impl<D: BlockDevice> Ext4<D> {
             metadata_sectors,
             self.layout.block_bytes_u64,
         )?;
-        self.refresh_inode_checksum(raw, number)?;
+        self.refresh_inode_checksum(raw, number, InodeTouch::Content)?;
         self.write_fs_block(table_block, &table)
     }
 
@@ -1958,7 +2001,7 @@ impl<D: BlockDevice> Ext4<D> {
             metadata_sectors,
             self.layout.block_bytes,
         )?;
-        self.refresh_inode_checksum(raw, number)?;
+        self.refresh_inode_checksum(raw, number, InodeTouch::Content)?;
         if let Err(error) = self
             .write_fs_block(table_block, &table)
             .and_then(|()| self.durability_barrier())
@@ -2068,7 +2111,7 @@ impl<D: BlockDevice> Ext4<D> {
         put_u32(raw, 32, read_u32(raw, 32)? & !EXT4_EXTENTS_FL)?;
         raw[40..100].fill(0);
         raw[40..40 + target.len()].copy_from_slice(target);
-        self.refresh_inode_checksum(raw, number)?;
+        self.refresh_inode_checksum(raw, number, InodeTouch::Content)?;
         self.write_fs_block(block, &table)
     }
 
@@ -2090,7 +2133,7 @@ impl<D: BlockDevice> Ext4<D> {
             return Err(FsError::Corrupt);
         }
         put_u16(raw, 26, replacement)?;
-        self.refresh_inode_checksum(raw, number)?;
+        self.refresh_inode_checksum(raw, number, InodeTouch::Metadata)?;
         self.write_fs_block(block, &table)
     }
 
@@ -6381,6 +6424,71 @@ mod tests {
             .map_err(|error| format!("cannot read back: {error:?}"))?;
         assert_eq!(&bytes[..read], b"written past a tebibyte\n");
         Ok(())
+    }
+
+    #[test]
+    fn stamps_timestamps_only_when_a_clock_is_supplied() -> Result<(), String> {
+        const NOW: u32 = 1_788_000_000;
+        let Some(mke2fs) = e2fs_tool("mke2fs") else {
+            return unavailable_tool("mke2fs");
+        };
+        let Some(e2fsck) = e2fs_tool("e2fsck") else {
+            return unavailable_tool("e2fsck");
+        };
+        let temporary = TestDirectory::create("ext4-times")?;
+        let image = default_mke2fs_image(temporary.path(), &mke2fs, 1024 * 1024 * 1024)?;
+
+        // Without a clock the provider leaves every timestamp alone.
+        {
+            let mut ext4 = mount_file_writable_with_limits(&image, default_volume_limits()?)?;
+            ext4.write_file("/unstamped.txt", b"no clock\n")
+                .map_err(|error| format!("cannot create: {error:?}"))?;
+            let times = inode_times(&mut ext4, "/unstamped.txt")?;
+            assert_eq!(times, (0, 0, 0), "no clock must invent no time");
+        }
+
+        // With one, a created inode carries it and a later write advances the
+        // modification time.
+        {
+            let mut ext4 = mount_file_writable_with_limits(&image, default_volume_limits()?)?;
+            ext4.set_wall_clock_seconds(NOW);
+            ext4.write_file("/stamped.txt", b"clocked\n")
+                .map_err(|error| format!("cannot create: {error:?}"))?;
+            assert_eq!(inode_times(&mut ext4, "/stamped.txt")?, (NOW, NOW, NOW));
+
+            ext4.set_wall_clock_seconds(NOW + 60);
+            ext4.write_file("/stamped.txt", b"clocked again\n")
+                .map_err(|error| format!("cannot replace: {error:?}"))?;
+            let (atime, ctime, mtime) = inode_times(&mut ext4, "/stamped.txt")?;
+            assert_eq!(atime, NOW, "a write does not advance the access time");
+            assert_eq!(ctime, NOW + 60);
+            assert_eq!(mtime, NOW + 60);
+        }
+
+        let check = Command::new(&e2fsck)
+            .args(["-f", "-n"])
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&check, "e2fsck after stamped mutations")?;
+        Ok(())
+    }
+
+    /// Read one inode's access, change, and modification times.
+    fn inode_times<D: BlockDevice>(
+        ext4: &mut Ext4<D>,
+        path: &str,
+    ) -> Result<(u32, u32, u32), String> {
+        let inode = ext4
+            .resolve(path)
+            .map_err(|error| format!("cannot resolve {path}: {error:?}"))?;
+        let raw = ext4
+            .raw_inode_record(inode.number)
+            .map_err(|error| format!("cannot read inode: {error:?}"))?;
+        let field = |offset: usize| {
+            read_u32(&raw, offset).map_err(|error| format!("short inode: {error:?}"))
+        };
+        Ok((field(8)?, field(12)?, field(16)?))
     }
 
     fn verify_writer_interoperability(image: &Path, e2fsck: &Path) -> Result<(), String> {
