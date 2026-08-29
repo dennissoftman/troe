@@ -28,6 +28,10 @@ const EXT4_INODE_BYTES: usize = 256;
 const EXT4_INODE_BYTES_U16: u16 = 256;
 const EXT4_GROUP_DESC_BYTES: usize = 32;
 const EXT4_GROUP_DESC_BYTES_U16: u16 = 32;
+/// Largest group descriptor this provider reads or writes.
+const EXT4_GROUP_DESC_MAX: usize = 64;
+/// Superblock offset of the checksum seed used when `metadata_csum_seed` is set.
+const EXT4_SUPER_CHECKSUM_SEED: usize = 0x270;
 const EXT4_BITMAP_BITS: u32 = 32_768;
 const EXT4_ROOT_INO: u32 = 2;
 const EXT4_EXTENTS_FL: u32 = 0x0008_0000;
@@ -283,6 +287,8 @@ struct Layout {
     groups: u32,
     device_blocks_per_fs_block: u32,
     checksum_seed: u32,
+    /// On-disk group descriptor size; 64 whenever the `64bit` feature is set.
+    desc_size: usize,
     uuid: Ext4Uuid,
     /// Cleared when the volume declares a read-only-compatible feature this
     /// provider cannot maintain, so foreign media stays readable but untouched.
@@ -870,35 +876,41 @@ impl<D: BlockDevice> Ext4<D> {
         self.transaction = None;
     }
 
-    fn write_group_descriptor(
-        &mut self,
-        group: u32,
-        mut descriptor: [u8; EXT4_GROUP_DESC_BYTES],
-    ) -> Result<(), FsError> {
+    /// Locate one group descriptor as a table block and byte offset inside it.
+    fn descriptor_location(&self, group: u32) -> Result<(u32, usize), FsError> {
         if group >= self.layout.groups {
             return Err(FsError::Corrupt);
         }
-        descriptor[30..32].fill(0);
-        let checksum = crc32c(
-            crc32c(self.layout.checksum_seed, &group.to_le_bytes()),
-            &descriptor,
-        );
-        descriptor[30..32].copy_from_slice(&checksum.to_le_bytes()[..2]);
         let byte_offset = usize::try_from(group)
             .ok()
-            .and_then(|value| value.checked_mul(EXT4_GROUP_DESC_BYTES))
+            .and_then(|value| value.checked_mul(self.layout.desc_size))
             .ok_or(FsError::Overflow)?;
         let table_block = 1_u32
             .checked_add(
                 u32::try_from(byte_offset / EXT4_BLOCK_BYTES).map_err(|_| FsError::Overflow)?,
             )
             .ok_or(FsError::Overflow)?;
-        let offset = byte_offset % EXT4_BLOCK_BYTES;
+        Ok((table_block, byte_offset % EXT4_BLOCK_BYTES))
+    }
+
+    fn write_group_descriptor(
+        &mut self,
+        group: u32,
+        mut descriptor: [u8; EXT4_GROUP_DESC_MAX],
+    ) -> Result<(), FsError> {
+        let (table_block, offset) = self.descriptor_location(group)?;
+        let size = self.layout.desc_size;
+        descriptor[30..32].fill(0);
+        let checksum = crc32c(
+            crc32c(self.layout.checksum_seed, &group.to_le_bytes()),
+            descriptor.get(..size).ok_or(FsError::Corrupt)?,
+        );
+        descriptor[30..32].copy_from_slice(&checksum.to_le_bytes()[..2]);
         let mut block = self.read_fs_block(table_block)?;
         block
-            .get_mut(offset..offset + EXT4_GROUP_DESC_BYTES)
+            .get_mut(offset..offset + size)
             .ok_or(FsError::Corrupt)?
-            .copy_from_slice(&descriptor);
+            .copy_from_slice(descriptor.get(..size).ok_or(FsError::Corrupt)?);
         self.write_fs_block(table_block, &block)
     }
 
@@ -1857,32 +1869,20 @@ impl<D: BlockDevice> Ext4<D> {
         self.write_fs_block(block, &table)
     }
 
-    fn group_descriptor(&mut self, group: u32) -> Result<[u8; EXT4_GROUP_DESC_BYTES], FsError> {
-        if group >= self.layout.groups {
-            return Err(FsError::Corrupt);
-        }
-        let byte_offset = usize::try_from(group)
-            .ok()
-            .and_then(|value| value.checked_mul(EXT4_GROUP_DESC_BYTES))
-            .ok_or(FsError::Overflow)?;
-        let table_block = 1_u32
-            .checked_add(
-                u32::try_from(byte_offset / EXT4_BLOCK_BYTES).map_err(|_| FsError::Overflow)?,
-            )
-            .ok_or(FsError::Overflow)?;
-        let offset = byte_offset % EXT4_BLOCK_BYTES;
+    fn group_descriptor(&mut self, group: u32) -> Result<[u8; EXT4_GROUP_DESC_MAX], FsError> {
+        let (table_block, offset) = self.descriptor_location(group)?;
+        let size = self.layout.desc_size;
         let bytes = self.read_fs_block(table_block)?;
-        let mut descriptor = <[u8; EXT4_GROUP_DESC_BYTES]>::try_from(
-            bytes
-                .get(offset..offset + EXT4_GROUP_DESC_BYTES)
-                .ok_or(FsError::Corrupt)?,
-        )
-        .map_err(|_| FsError::Corrupt)?;
+        let mut descriptor = [0_u8; EXT4_GROUP_DESC_MAX];
+        descriptor
+            .get_mut(..size)
+            .ok_or(FsError::Corrupt)?
+            .copy_from_slice(bytes.get(offset..offset + size).ok_or(FsError::Corrupt)?);
         let stored = read_u16(&descriptor, 30)?;
         descriptor[30..32].fill(0);
         let checksum = crc32c(
             crc32c(self.layout.checksum_seed, &group.to_le_bytes()),
-            &descriptor,
+            descriptor.get(..size).ok_or(FsError::Corrupt)?,
         );
         if stored
             != u16::from_le_bytes(
@@ -3033,6 +3033,35 @@ fn admit_state(state: u16, needs_recovery: bool, admission: Admission) -> Result
     }
 }
 
+/// Resolve the on-disk group descriptor size.
+///
+/// `s_desc_size` is meaningful only with the 64bit feature; without it the
+/// descriptor is always the historical 32 bytes.
+fn parse_descriptor_size(superblock: &[u8], incompat: u32) -> Result<usize, FsError> {
+    let declared = read_u16(superblock, 254)?;
+    if incompat & EXT4_INCOMPAT_64BIT == 0 {
+        if !matches!(declared, 0 | EXT4_GROUP_DESC_BYTES_U16) {
+            return Err(FsError::Corrupt);
+        }
+        return Ok(EXT4_GROUP_DESC_BYTES);
+    }
+    if usize::from(declared) != EXT4_GROUP_DESC_MAX {
+        return Err(FsError::Unsupported);
+    }
+    Ok(EXT4_GROUP_DESC_MAX)
+}
+
+/// Resolve the seed every metadata checksum is computed from.
+///
+/// With `metadata_csum_seed` the seed is stored rather than derived, so a
+/// volume keeps its checksums valid across a UUID change.
+fn parse_checksum_seed(superblock: &[u8], incompat: u32, uuid: Ext4Uuid) -> Result<u32, FsError> {
+    if incompat & EXT4_INCOMPAT_CSUM_SEED == 0 {
+        return Ok(crc32c(u32::MAX, &uuid.0));
+    }
+    read_u32(superblock, EXT4_SUPER_CHECKSUM_SEED)
+}
+
 fn parse_superblock(
     superblock: &[u8],
     region_device_blocks: u64,
@@ -3047,7 +3076,6 @@ fn parse_superblock(
         || read_u32(superblock, 28)? != 2
         || read_u32(superblock, 72)? != 0
         || read_u16(superblock, 88)? != EXT4_INODE_BYTES_U16
-        || !matches!(read_u16(superblock, 254)?, 0 | EXT4_GROUP_DESC_BYTES_U16)
         || superblock[373] != 1
     {
         return Err(FsError::Unsupported);
@@ -3130,6 +3158,8 @@ fn parse_superblock(
     if uuid.0.iter().all(|byte| *byte == 0) {
         return Err(FsError::Corrupt);
     }
+    let desc_size = parse_descriptor_size(superblock, incompat)?;
+    let checksum_seed = parse_checksum_seed(superblock, incompat, uuid)?;
     Ok(Layout {
         blocks,
         inodes,
@@ -3138,7 +3168,8 @@ fn parse_superblock(
         first_inode: read_u32(superblock, 84)?,
         groups,
         device_blocks_per_fs_block,
-        checksum_seed: crc32c(u32::MAX, &uuid.0),
+        checksum_seed,
+        desc_size,
         uuid,
         writable,
     })
@@ -3671,8 +3702,8 @@ mod tests {
         EXT4_FAST_SYMLINK_BYTES, EXT4_FEATURE_COMPAT, EXT4_FEATURE_INCOMPAT,
         EXT4_FEATURE_RO_COMPAT, EXT4_INCOMPAT_EXTENTS, EXT4_INODE_BYTES, EXT4_JOURNAL_INO,
         EXT4_RO_COMPAT_METADATA_CSUM, EXT4_ROOT_INO, EXT4_VALID_FS, Ext4, Ext4Limits, Extent,
-        FsError, NodeKind, ReadOnlyFileSystem, RecoveryOutcome, crc32c, parse_extent_leaf,
-        parse_extents, read_u16, read_u32,
+        FsError, HARD_MAX_GROUPS, NodeKind, ReadOnlyFileSystem, RecoveryOutcome, crc32c,
+        parse_extent_leaf, parse_extents, read_u16, read_u32,
     };
 
     const DEVICE_BLOCK_BYTES_U32: u32 = 512;
@@ -5097,6 +5128,92 @@ mod tests {
                 "boundary {boundary} tore the tail block"
             );
         }
+        Ok(())
+    }
+
+    /// Build an image with `mke2fs` defaults, i.e. what an arbitrary disk looks
+    /// like: `64bit`, `flex_bg`, `metadata_csum_seed`, `dir_index` and
+    /// `orphan_file`.
+    fn default_mke2fs_image(
+        directory: &Path,
+        mke2fs: &Path,
+        bytes: u64,
+    ) -> Result<PathBuf, String> {
+        let image = directory.join("default.ext4");
+        File::create(&image)
+            .and_then(|file| file.set_len(bytes))
+            .map_err(|error| error.to_string())?;
+        let source = directory.join("payload");
+        let nested = source.join("nested");
+        fs::create_dir_all(&nested).map_err(|error| error.to_string())?;
+        fs::write(source.join("config.txt"), b"profile=default-ext4\n")
+            .map_err(|error| error.to_string())?;
+        fs::write(nested.join("message.txt"), b"hello from a default volume\n")
+            .map_err(|error| error.to_string())?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink("../config.txt", nested.join("config-link"))
+            .map_err(|error| error.to_string())?;
+        let format = Command::new(mke2fs)
+            .args(["-q", "-F", "-t", "ext4", "-d"])
+            .arg(&source)
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&format, "mke2fs default")?;
+        Ok(image)
+    }
+
+    #[test]
+    fn mounts_and_reads_a_default_mke2fs_volume() -> Result<(), String> {
+        let Some(mke2fs) = e2fs_tool("mke2fs") else {
+            return unavailable_tool("mke2fs");
+        };
+        let temporary = TestDirectory::create("ext4-default")?;
+        let image = default_mke2fs_image(temporary.path(), &mke2fs, 1024 * 1024 * 1024)?;
+        let limits = Ext4Limits::new(HARD_MAX_GROUPS, 64, 256, 4096, 1 << 40, 1024 * 1024, 64)
+            .map_err(|error| format!("invalid default-volume limits: {error:?}"))?;
+        let device = FileDevice::open(&image)?;
+        let block_limits = BlockLimits::new(8, EXT4_BLOCK_BYTES, 1)
+            .map_err(|error| format!("invalid block limits: {error:?}"))?;
+        let region = BlockRegion::whole_device(device, BlockAccess::ReadOnly, block_limits)
+            .map_err(|error| format!("cannot grant image region: {error:?}"))?;
+        let mut ext4 =
+            Ext4::mount(region, limits).map_err(|error| format!("cannot mount: {error:?}"))?;
+        let listing = ext4
+            .list("/", 0, 16, 64)
+            .map_err(|error| format!("cannot list default volume root: {error:?}"))?;
+        assert!(
+            listing
+                .entries
+                .iter()
+                .any(|entry| entry.name == "lost+found"),
+            "a default volume root contains lost+found"
+        );
+
+        // Real content, not just a directory listing.
+        let mut bytes = [0_u8; 32];
+        let read = ext4
+            .read_file("/config.txt", 0, &mut bytes)
+            .map_err(|error| format!("cannot read a file on a default volume: {error:?}"))?;
+        assert_eq!(&bytes[..read], b"profile=default-ext4\n");
+
+        let read = ext4
+            .read_file("/nested/message.txt", 0, &mut bytes)
+            .map_err(|error| format!("cannot read a nested file: {error:?}"))?;
+        assert_eq!(&bytes[..read], b"hello from a default volume\n");
+
+        // A symbolic link resolves through the same default metadata.
+        let read = ext4
+            .read_file("/nested/config-link", 0, &mut bytes)
+            .map_err(|error| format!("cannot follow a link: {error:?}"))?;
+        assert_eq!(&bytes[..read], b"profile=default-ext4\n");
+
+        // The volume declares dir_index, so it is readable and never mutated.
+        assert_eq!(
+            ext4.write_file("/blocked.txt", b"nope"),
+            Err(FsError::ReadOnly),
+            "a default volume is not yet writable"
+        );
         Ok(())
     }
 
