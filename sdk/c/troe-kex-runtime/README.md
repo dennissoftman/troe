@@ -6,6 +6,11 @@ This directory implements the C symbols declared by the sibling
 `<architecture>/lib/libtroe_c.a`; applications link that archive into their KEX
 image. There is no dynamic linker or guest `/lib` dependency.
 
+The allocation-free binary64 formatter in `troe_printf_double.h` provides
+correctly rounded `%f`, `%e`, and `%g` conversions across the finite double
+range. Integer, pointer, string, and character conversions use the vendored
+nanoprintf implementation.
+
 The runtime owns:
 
 - allocation, zeroed allocation, reallocation, alignment, and release through

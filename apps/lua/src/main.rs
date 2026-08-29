@@ -27,6 +27,7 @@ const LUA_OUT_OF_MEMORY: i32 = 4;
 const LUA_REQUESTED_EXIT: i32 = 5;
 const LUA_ACTION_CODE: i32 = 1;
 const LUA_ACTION_REQUIRE: i32 = 2;
+const LUA_ACTION_WARNING: i32 = 3;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -94,6 +95,8 @@ struct LuaConfiguration {
     source_name_length: usize,
     arguments: *const LuaArgument,
     argument_count: usize,
+    argument_base: i64,
+    script_argument_count: usize,
     actions: *const LuaAction,
     action_count: usize,
     has_source: i32,
@@ -154,7 +157,7 @@ struct ParsedInvocation<'invocation> {
     selection: Option<Selection<'invocation>>,
     actions: [LuaAction; command::MAX_ARGUMENTS],
     action_count: usize,
-    warnings_enabled: bool,
+    has_code_action: bool,
     ignore_environment: bool,
     show_version: bool,
 }
@@ -180,10 +183,12 @@ struct Runtime {
 enum Selection<'invocation> {
     StandardInput {
         first_argument: usize,
+        script_index: usize,
     },
     File {
         path: &'invocation str,
         first_argument: usize,
+        script_index: usize,
     },
 }
 
@@ -194,7 +199,7 @@ fn parse_invocation<'invocation>(
         selection: None,
         actions: [EMPTY_ACTION; command::MAX_ARGUMENTS],
         action_count: 0,
-        warnings_enabled: false,
+        has_code_action: false,
         ignore_environment: false,
         show_version: false,
     };
@@ -207,9 +212,11 @@ fn parse_invocation<'invocation>(
                     Some(path) => Selection::File {
                         path,
                         first_argument: index + 1,
+                        script_index: index,
                     },
                     None => Selection::StandardInput {
                         first_argument: index + 1,
+                        script_index: 0,
                     },
                 });
                 break;
@@ -217,6 +224,7 @@ fn parse_invocation<'invocation>(
             "-" => {
                 parsed.selection = Some(Selection::StandardInput {
                     first_argument: index + 1,
+                    script_index: index,
                 });
                 break;
             }
@@ -226,9 +234,7 @@ fn parse_invocation<'invocation>(
                 continue;
             }
             "-W" => {
-                parsed.warnings_enabled = true;
-                index += 1;
-                continue;
+                (LUA_ACTION_WARNING, "", 1)
             }
             "-v" => {
                 parsed.show_version = true;
@@ -237,12 +243,18 @@ fn parse_invocation<'invocation>(
             }
             "-e" => (
                 LUA_ACTION_CODE,
-                invocation.argument(index + 1).ok_or(())?,
+                invocation
+                    .argument(index + 1)
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or(())?,
                 2,
             ),
             "-l" => (
                 LUA_ACTION_REQUIRE,
-                invocation.argument(index + 1).ok_or(())?,
+                invocation
+                    .argument(index + 1)
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or(())?,
                 2,
             ),
             option if option.starts_with("-e") && option.len() > 2 => {
@@ -256,6 +268,7 @@ fn parse_invocation<'invocation>(
                 parsed.selection = Some(Selection::File {
                     path,
                     first_argument: index + 1,
+                    script_index: index,
                 });
                 break;
             }
@@ -265,12 +278,14 @@ fn parse_invocation<'invocation>(
             bytes: value.as_ptr(),
             length: value.len(),
         };
+        parsed.has_code_action |= kind == LUA_ACTION_CODE;
         parsed.action_count += 1;
         index += consumed;
     }
-    if parsed.selection.is_none() && parsed.action_count == 0 {
+    if parsed.selection.is_none() && !parsed.has_code_action && !parsed.show_version {
         parsed.selection = Some(Selection::StandardInput {
             first_argument: invocation.len() + 1,
+            script_index: 0,
         });
     }
     Ok(parsed)
@@ -416,24 +431,28 @@ fn run(command: &mut CommandContext) -> u32 {
 
     let mut source_name_storage = [0_u8; filesystem::MAX_PATH_BYTES + 1];
     let mut stderr = command.stderr();
-    let (source, source_name, argument_zero, first_argument, has_source) = match parsed.selection {
+    let (source, source_name, script_index, first_argument, has_source) = match parsed.selection {
         None => (
             Source::Empty,
             &b"=(no script)"[..],
-            invocation.argument(0).unwrap_or("lua"),
+            0,
             invocation.len(),
             false,
         ),
-        Some(Selection::StandardInput { first_argument }) => (
+        Some(Selection::StandardInput {
+            first_argument,
+            script_index,
+        }) => (
             Source::StandardInput(command.stdin()),
             &b"=stdin"[..],
-            invocation.argument(0).unwrap_or("lua"),
+            script_index,
             first_argument,
             true,
         ),
         Some(Selection::File {
             path,
             first_argument,
+            script_index,
         }) => {
             let Ok(file) = filesystem.open(path) else {
                 let _ = write_message(&mut stderr, &[b"lua: cannot open ", path.as_bytes(), b"\n"]);
@@ -448,7 +467,7 @@ fn run(command: &mut CommandContext) -> u32 {
                     offset: 0,
                 },
                 &source_name_storage[..1 + path.len()],
-                path,
+                script_index,
                 first_argument,
                 true,
             )
@@ -456,12 +475,8 @@ fn run(command: &mut CommandContext) -> u32 {
     };
 
     let mut arguments = [EMPTY_ARGUMENT; command::MAX_ARGUMENTS];
-    arguments[0] = LuaArgument {
-        bytes: argument_zero.as_ptr(),
-        length: argument_zero.len(),
-    };
-    let mut argument_count = 1_usize;
-    for index in first_argument..invocation.len() {
+    let mut argument_count = 0_usize;
+    for index in 0..invocation.len() {
         let Some(argument) = invocation.argument(index) else {
             break;
         };
@@ -471,6 +486,11 @@ fn run(command: &mut CommandContext) -> u32 {
         };
         argument_count += 1;
     }
+    let script_argument_count = if script_index == 0 {
+        0
+    } else {
+        invocation.len().saturating_sub(first_argument)
+    };
 
     let mut current_directory = [0_u8; filesystem::MAX_PATH_BYTES];
     let current_directory_length = invocation.cwd().len();
@@ -521,10 +541,12 @@ fn run(command: &mut CommandContext) -> u32 {
         source_name_length: source_name.len(),
         arguments: arguments.as_ptr(),
         argument_count,
+        argument_base: -i64::try_from(script_index).unwrap_or(i64::MAX),
+        script_argument_count,
         actions: parsed.actions.as_ptr(),
         action_count: parsed.action_count,
         has_source: i32::from(has_source),
-        warnings_enabled: i32::from(parsed.warnings_enabled),
+        warnings_enabled: 0,
         ignore_environment: i32::from(parsed.ignore_environment),
         current_directory: invocation.cwd().as_ptr(),
         current_directory_length: invocation.cwd().len(),

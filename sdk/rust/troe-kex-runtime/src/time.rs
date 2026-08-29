@@ -484,6 +484,17 @@ mod tests {
             ),
             (2024, 1, 1)
         );
+        let Some(previous) = normalize(2024, 3, 0, 12, 0, 0) else {
+            std::process::abort();
+        };
+        assert_eq!(
+            (
+                previous.calendar.year,
+                previous.calendar.month,
+                previous.calendar.day
+            ),
+            (2024, 2, 29)
+        );
     }
 
     #[test]
