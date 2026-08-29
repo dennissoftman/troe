@@ -268,19 +268,20 @@ captures standard output through a bounded pipe, waits, reaps, and preserves
 the child's complete exit status without putting shell grammar in the kernel.
 
 [`apps/lua`](apps/lua) is a complete freestanding Lua 5.5.1 interpreter. It
-supports stock command-line actions and the complete standard library surface,
+supports the stock batch command-line actions and standard library surface,
 including file mutation, `os.execute`, and read/write `io.popen` through explicit
 KEX capabilities. It starts with a 1 MiB TLSF application heap, reports
 process-CPU time through `os.clock`, and exposes whole-second Unix wall time
 through `os.time`. Its hybrid allocator keeps ordinary objects in a growable
 TLSF heap and returns large private mappings during the process lifetime; Lua
 hash/math seeds come from the typed CSPRNG. Lua statically links the shared Rust
-KEX runtime plus a
-small SDK-owned freestanding C compatibility core instead of owning duplicate
-filesystem, environment, process, calendar, decimal, math, or C-locale
-algorithms. The remaining platform limits are explicit: UTC and the C locale
-are fixed, C dynamic modules have no loader, and Lua has no ambient host OS or
-raw filesystem access.
+KEX runtime plus the shared SDK-owned freestanding C runtime instead of owning
+duplicate filesystem, environment, process, calendar, decimal, math, or
+C-locale algorithms. Decimal rendering performs correctly rounded binary64
+`%f`, `%e`, and `%g` conversions. The remaining platform limits are explicit:
+interactive `-i`/REPL operation is absent, UTC and the C locale are fixed, C
+dynamic modules have no loader, and Lua has no ambient host OS or raw filesystem
+access.
 
 The reusable freestanding C SDK lives under
 [`sdk/c`](sdk/c/troe-kex-sysroot). `tools/build_c_sysroot.py` produces an LP64

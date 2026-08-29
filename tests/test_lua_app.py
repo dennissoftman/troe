@@ -25,6 +25,7 @@ class LuaRuntimeTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.temporary = tempfile.TemporaryDirectory(prefix="troe-lua-unit-")
         cls.runner = Path(cls.temporary.name) / "lua-host-runner"
+        cls.printf_runner = Path(cls.temporary.name) / "lua-printf-runner"
         cls.module_path = Path(cls.temporary.name) / "lua_module.lua"
         cls.module_path.write_text(
             "local module = {}\n"
@@ -51,20 +52,42 @@ class LuaRuntimeTests(unittest.TestCase):
             str(cls.runner),
         )
         subprocess.run(command, cwd=REPO_ROOT, check=True, capture_output=True)
+        printf_command = (
+            compiler,
+            "-std=c11",
+            "-O2",
+            "-Wall",
+            "-Wextra",
+            "-I",
+            str(REPO_ROOT / "sdk" / "c" / "troe-kex-runtime"),
+            str(LUA_ROOT / "tests" / "printf_runner.c"),
+            "-o",
+            str(cls.printf_runner),
+        )
+        subprocess.run(
+            printf_command, cwd=REPO_ROOT, check=True, capture_output=True
+        )
 
     @classmethod
     def tearDownClass(cls) -> None:
         cls.temporary.cleanup()
 
     def run_lua(
-        self, source: str, *arguments: str
+        self,
+        source: str,
+        *arguments: str,
+        environment: dict[str, str] | None = None,
     ) -> tuple[subprocess.CompletedProcess[bytes], tuple[int, int, int, int]]:
+        process_environment = os.environ.copy()
+        if environment is not None:
+            process_environment.update(environment)
         completed = subprocess.run(
             (self.runner, source, *arguments),
             cwd=REPO_ROOT,
             check=True,
             capture_output=True,
             timeout=10,
+            env=process_environment,
         )
         match = RESULT_PATTERN.search(completed.stderr)
         self.assertIsNotNone(match, completed.stderr.decode(errors="replace"))
@@ -93,6 +116,16 @@ print("lua-feature-unit", _VERSION)
         self.assertEqual(metadata[0], 0)
         self.assertIn(b"lua-feature-unit\tLua 5.5", completed.stdout)
 
+    def test_freestanding_binary64_formatter_matches_host_libc(self) -> None:
+        completed = subprocess.run(
+            (self.printf_runner,),
+            cwd=REPO_ROOT,
+            check=True,
+            capture_output=True,
+            timeout=10,
+        )
+        self.assertEqual(completed.stdout, b"troe-printf-double ok\n")
+
     def test_standard_libraries_and_utc_os_surface(self) -> None:
         source = r"""
 assert(type(package) == "table" and type(require) == "function")
@@ -112,6 +145,9 @@ assert(os.date("!%Y-%m-%d %H:%M:%S %a %j", seconds) == "2024-02-29 01:02:03 Thu 
 assert(date.wday == 5 and date.yday == 60 and date.isdst == false)
 local broken = {year=2023, month=13, day=1}
 assert(os.date("!%Y-%m-%d %H:%M:%S", os.time(broken)) == "2024-01-01 12:00:00")
+local previous = {year=2024, month=3, day=0}
+assert(os.date("!%Y-%m-%d", os.time(previous)) == "2024-02-29")
+assert(previous.year == 2024 and previous.month == 2 and previous.day == 29)
 assert(os.setlocale() == "C" and os.setlocale("C", "time") == "C")
 assert(os.setlocale("uk_UA.UTF-8") == nil)
 assert(os.getenv("HOME") == "/" and os.getenv("PWD") == "/")
@@ -165,10 +201,23 @@ print("lua-files-unit")
         self.assertEqual(metadata[0], 0)
         self.assertIn(b"Lua warning: visible-warning", completed.stderr)
 
+    def test_versioned_environment_initialization_runs_before_source(self) -> None:
+        completed, metadata = self.run_lua(
+            'assert(initialized_by_lua_init == 42); print("lua-init-unit")',
+            environment={"TROE_TEST_LUA_INIT": "initialized_by_lua_init = 42"},
+        )
+        self.assertEqual(metadata[0], 0)
+        self.assertEqual(completed.stdout, b"lua-init-unit\n")
+
     def test_arguments_and_controlled_exit_are_exact(self) -> None:
         completed, metadata = self.run_lua(
-            'assert(arg[0] == "lua" and arg[1] == "hello"); os.exit(37, true)',
+            'local first, second = ...; '
+            'assert(arg[-1] == "lua" and arg[0] == "host.lua"); '
+            'assert(arg[1] == "hello" and arg[2] == "world"); '
+            'assert(select("#", ...) == 2 and first == "hello" and second == "world"); '
+            'os.exit(37, true)',
             "hello",
+            "world",
         )
         self.assertEqual(completed.stdout, b"")
         self.assertEqual(metadata[0], 5)

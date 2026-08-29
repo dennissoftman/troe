@@ -1882,7 +1882,7 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
         cwd,
         command_timeout,
         contains=(
-            "lua-os\ttable\tfunction\ttrue\tnumber\ttrue\t5.000000000000000\n",
+            "lua-os\ttable\tfunction\ttrue\tnumber\ttrue\t5.0\n",
         ),
     )
     session.command(
@@ -1892,7 +1892,7 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
         "local overhead=os.clock()-start; start=os.clock(); "
         "for i=1,n do target() end; "
         "local total=os.clock()-start-overhead; "
-        "print(\"lua-clock-benchmark\",type(total),total>=0)'",
+        "print(\"lua-clock-benchmark\",type(total),total>0)'",
         cwd,
         command_timeout,
         contains=("lua-clock-benchmark\tnumber\ttrue\n",),
@@ -1927,6 +1927,27 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
         ),
     )
     session.command(
+        "lua -e 'local t={year=2024,month=3,day=0}; local s=os.time(t); "
+        "print(\"lua-calendar-normalize\",s,os.date(\"!%Y-%m-%d\",s),"
+        "t.year,t.month,t.day)'",
+        cwd,
+        command_timeout,
+        contains=("lua-calendar-normalize\t1709208000\t2024-02-29\t2024\t2\t29\n",),
+    )
+    session.command(
+        "lua -e 'print(\"lua-floats\","
+        "string.format(\"%.17g\",1.2345678901234567),"
+        "string.format(\"%.17g\",0x1p-1022),"
+        "string.format(\"%.17g\",0x1.fffffffffffffp+1023),"
+        "string.format(\"%.2e\",1234),string.format(\"%#.4g\",9999.5))'",
+        cwd,
+        command_timeout,
+        contains=(
+            "lua-floats\t1.2345678901234567\t2.2250738585072014e-308\t"
+            "1.7976931348623157e+308\t1.23e+03\t1.000e+04\n",
+        ),
+    )
+    session.command(
         "lua -e 'package.preload.p=function() return 42 end; "
         "local m,w=require(\"p\"); print(\"lua-libraries\",m,w,type(debug),"
         "type(io),type(loadfile),type(dofile),collectgarbage(\"incremental\"))'",
@@ -1942,6 +1963,13 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
         cwd,
         command_timeout,
         contains=("lua-options\t42\n",),
+    )
+    session.command(
+        "lua -e 'package.preload[\"plain-v1\"]=function() return 42 end' "
+        "-l plain-v1 -e 'print(\"lua-option-plain\",plain)'",
+        cwd,
+        command_timeout,
+        contains=("lua-option-plain\t42\n",),
     )
     session.command(
         "lua -W -e 'warn(\"cli-warning\")'",
@@ -1993,6 +2021,21 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
         command_timeout,
         contains=("lua-stdin\t42\n",),
     )
+    session.command(
+        "printf 'local a,b=...; print(\"lua-args\",arg[-1],arg[0],"
+        "arg[1],arg[2],select(\"#\",...),a,b)\\n' > /tmp/lua-args.lua",
+        cwd,
+        command_timeout,
+    )
+    session.command(
+        "lua /tmp/lua-args.lua first second",
+        cwd,
+        command_timeout,
+        contains=(
+            "lua-args\tlua\t/tmp/lua-args.lua\tfirst\tsecond\t2\tfirst\tsecond\n",
+        ),
+    )
+    session.command("rm /tmp/lua-args.lua", cwd, command_timeout)
     session.command(
         "lua /recovery/lua-smoke.lua hello",
         cwd,
@@ -2054,6 +2097,24 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
         cwd,
         command_timeout,
         contains=("5\n", "true\texit\t0\n"),
+    )
+    session.command(
+        "lua -e 'local p=assert(io.popen(\"cat /share/sh/bench.sh\",\"r\")); "
+        "local data=assert(p:read(\"a\")); local ok=assert(p:close()); "
+        "print(\"lua-popen-all\",#data,data:match(\"postests%.sh\")~=nil)'",
+        cwd,
+        command_timeout,
+        contains=("lua-popen-all\t24980\ttrue\n",),
+    )
+    session.command(
+        "lua -e 'local path=\"/tmp/lua-unbuffered\"; "
+        "local w=assert(io.open(path,\"w\")); assert(w:setvbuf(\"no\")); "
+        "assert(w:write(\"visible\")); local r=assert(io.open(path,\"r\")); "
+        "print(\"lua-setvbuf\",r:read(\"a\")); r:close(); w:close(); "
+        "assert(os.remove(path))'",
+        cwd,
+        command_timeout,
+        contains=("lua-setvbuf\tvisible\n",),
     )
     session.command(
         "lua -e 'local t={}; local n=0; for i=1,6144 do "

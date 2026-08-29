@@ -7,12 +7,16 @@ SYNOPSIS
 
 DESCRIPTION
     Runs Lua 5.5.1 source from one or more -e arguments, a filesystem file, or
-    standard input. -l MODULE loads a module before the script; -l NAME=MODULE
-    also stores its result in global NAME. -E ignores environment-based Lua
-    configuration, -W enables warnings, and -v prints the version. Remaining
-    arguments are available in the global
-    arg table, starting at arg[1]. With no source argument, reads standard
-    input.
+    standard input. -l MODULE loads a module before the script and stores its
+    result in the MODULE global; a -version suffix is omitted from the global
+    name. -l NAME=MODULE selects an explicit global. -E ignores
+    environment-based Lua configuration, -W enables warnings, and -v prints the
+    version. Unless -E is present, LUA_INIT_5_5 or its LUA_INIT fallback runs
+    before command-line actions. Script arguments are available both as chunk
+    varargs and at positive indices in the global arg table. arg[0] is the
+    script name and preceding interpreter options occupy negative indices. With
+    no source argument, reads standard input. Interactive -i/REPL operation is
+    not present.
 
     The base, package, coroutine, debug, io, math, os, string, table, and utf8
     libraries are present. loadfile, dofile, require, package.preload, and the
@@ -24,7 +28,9 @@ DESCRIPTION
     files, including lines, formatted reads and writes, append/update modes,
     flushing, and seeking. Lua has explicit filesystem-read and
     filesystem-mutation authority. Writable files are buffered in the Lua heap
-    and replaced through TROE's streamed mutation service when flushed or closed.
+    and replaced through TROE's streamed mutation service when flushed or
+    closed. file:setvbuf selects full, line, or unbuffered flush behavior;
+    unbuffered writes are visible through the filesystem before close.
     io.popen uses TROE's owner-scoped process-launch and bounded-pipe services in
     both read and write modes. C dynamic modules remain unavailable because TROE
     has no dynamic-loader service.
@@ -63,9 +69,10 @@ DESCRIPTION
     nonempty directories.
 
     Filesystem, environment, process, errno, calendar, decimal, math, and
-    C-locale algorithms come from the shared no_std TROE KEX runtime. The Lua
-    image statically links that code. The runtime is neither a complete libc nor
-    dynamically linked.
+    C-locale algorithms come from the shared no_std TROE KEX runtime. The
+    SDK-owned C facade performs correctly rounded binary64 formatting for Lua's
+    %f, %e, and %g conversions. The Lua image statically links that code. The
+    runtime is neither a complete libc nor dynamically linked.
 
     Lua's standard math.random generator is seeded automatically from TROE's
     kernel CSPRNG on every launch. It is suitable for games, simulations,

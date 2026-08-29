@@ -250,13 +250,13 @@ static int troe_os_setlocale(lua_State *state) {
 
 static int troe_os_tmpname(lua_State *state) {
   static uint32_t counter;
-  uint64_t wall = 0;
   char name[48];
-  if (troe_active_host != NULL)
-    (void)troe_active_host->wall_time(troe_active_host->context, &wall);
   ++counter;
-  (void)snprintf(name, sizeof(name), "/tmp/lua_%llx_%x",
-                 (unsigned long long)wall, counter);
+  (void)snprintf(name, sizeof(name), "/tmp/lua_%08x_%08x",
+                 troe_active_configuration == NULL
+                     ? 0u
+                     : troe_active_configuration->seed,
+                 counter);
   lua_pushstring(state, name);
   return 1;
 }

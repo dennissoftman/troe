@@ -103,6 +103,8 @@ typedef struct TroeLuaConfiguration {
   size_t source_name_length;
   const TroeLuaArgument *arguments;
   size_t argument_count;
+  int64_t argument_base;
+  size_t script_argument_count;
   const TroeLuaAction *actions;
   size_t action_count;
   int has_source;
@@ -205,6 +207,7 @@ struct TroeFile {
   uint64_t pipe_token;
   uint64_t script_identifier;
   int process_mode;
+  int buffer_mode;
 };
 
 static struct TroeFile troe_stdin_file = {
@@ -546,29 +549,38 @@ size_t fread(void *destination, size_t size, size_t count, FILE *file) {
     file->position++;
   }
   if (copied < wanted && file->kind == TROE_FILE_STDIN) {
-    intptr_t got = troe_active_host->read_input(troe_active_host->context,
-                                                output + copied,
-                                                wanted - copied);
-    if (got < 0 || (size_t)got > wanted - copied) {
-      file->error = 1;
-      errno = got < 0 ? troe_read_errno(got) : EIO;
-      return copied / size;
+    while (copied < wanted) {
+      intptr_t got = troe_active_host->read_input(
+          troe_active_host->context, output + copied, wanted - copied);
+      if (got < 0 || (size_t)got > wanted - copied) {
+        file->error = 1;
+        errno = got < 0 ? troe_read_errno(got) : EIO;
+        return copied / size;
+      }
+      if (got == 0) {
+        file->eof = 1;
+        break;
+      }
+      copied += (size_t)got;
+      file->position += (uint64_t)got;
     }
-    copied += (size_t)got;
-    file->position += (uint64_t)got;
   } else if (copied < wanted && file->kind == TROE_FILE_PROCESS) {
-    intptr_t got = troe_active_host->process_read(
-        troe_active_host->context, file->pipe_token, output + copied,
-        wanted - copied);
-    if (got < 0 || (size_t)got > wanted - copied) {
-      file->error = 1;
-      errno = got < 0 ? troe_read_errno(got) : EIO;
-      return copied / size;
+    while (copied < wanted) {
+      intptr_t got = troe_active_host->process_read(
+          troe_active_host->context, file->pipe_token, output + copied,
+          wanted - copied);
+      if (got < 0 || (size_t)got > wanted - copied) {
+        file->error = 1;
+        errno = got < 0 ? troe_read_errno(got) : EIO;
+        return copied / size;
+      }
+      if (got == 0) {
+        file->eof = 1;
+        break;
+      }
+      copied += (size_t)got;
+      file->position += (uint64_t)got;
     }
-    copied += (size_t)got;
-    file->position += (uint64_t)got;
-    if (got == 0)
-      file->eof = 1;
   } else if (copied < wanted && file->buffer != NULL) {
     size_t position = file->position > (uint64_t)(size_t)-1
                           ? file->length
@@ -579,16 +591,20 @@ size_t fread(void *destination, size_t size, size_t count, FILE *file) {
     copied += take;
     file->position += (uint64_t)take;
   } else if (copied < wanted && file->token != 0) {
-    intptr_t got = troe_active_host->file_read(
-        troe_active_host->context, file->token, file->source_length,
-        file->position, output + copied, wanted - copied);
-    if (got < 0 || (size_t)got > wanted - copied) {
-      file->error = 1;
-      errno = got < 0 ? troe_read_errno(got) : EIO;
-      return copied / size;
+    while (copied < wanted) {
+      intptr_t got = troe_active_host->file_read(
+          troe_active_host->context, file->token, file->source_length,
+          file->position, output + copied, wanted - copied);
+      if (got < 0 || (size_t)got > wanted - copied) {
+        file->error = 1;
+        errno = got < 0 ? troe_read_errno(got) : EIO;
+        return copied / size;
+      }
+      if (got == 0)
+        break;
+      copied += (size_t)got;
+      file->position += (uint64_t)got;
     }
-    copied += (size_t)got;
-    file->position += (uint64_t)got;
   }
   if (copied < wanted && file->kind != TROE_FILE_PROCESS)
     file->eof = 1;
@@ -651,6 +667,11 @@ size_t fwrite(const void *source, size_t size, size_t count, FILE *file) {
     file->length = position + wanted;
   file->dirty = file->path != NULL;
   file->eof = 0;
+  if (file->dirty &&
+      (file->buffer_mode == _IONBF ||
+       (file->buffer_mode == _IOLBF && memchr(source, '\n', wanted) != NULL)) &&
+      fflush(file) != 0)
+    return 0;
   return count;
 }
 
@@ -723,10 +744,16 @@ int rename(const char *old_path, const char *new_path) {
 }
 
 int setvbuf(FILE *file, char *buffer, int mode, size_t size) {
-  (void)file;
   (void)buffer;
-  (void)mode;
   (void)size;
+  if (file == NULL ||
+      (mode != _IOFBF && mode != _IOLBF && mode != _IONBF)) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (fflush(file) != 0)
+    return -1;
+  file->buffer_mode = mode;
   return 0;
 }
 
@@ -904,11 +931,15 @@ static int troe_configure_state(lua_State *state) {
   troe_require(state, LUA_UTF8LIBNAME, luaopen_utf8);
   troe_require(state, LUA_OSLIBNAME, troe_luaopen_os);
 
-  lua_createtable(state, (int)configuration->argument_count, 0);
+  lua_createtable(state, (int)configuration->script_argument_count,
+                  configuration->argument_base < 0
+                      ? (int)-configuration->argument_base
+                      : 0);
   for (size_t index = 0; index < configuration->argument_count; ++index) {
     const TroeLuaArgument *argument = &configuration->arguments[index];
     lua_pushlstring(state, (const char *)argument->bytes, argument->length);
-    lua_seti(state, -2, (lua_Integer)index);
+    lua_seti(state, -2,
+             (lua_Integer)configuration->argument_base + (lua_Integer)index);
   }
   lua_setglobal(state, "arg");
   return 0;
@@ -922,7 +953,11 @@ static int troe_traceback(lua_State *state) {
   return 1;
 }
 
-enum { TROE_LUA_ACTION_CODE = 1, TROE_LUA_ACTION_REQUIRE = 2 };
+enum {
+  TROE_LUA_ACTION_CODE = 1,
+  TROE_LUA_ACTION_REQUIRE = 2,
+  TROE_LUA_ACTION_WARNING = 3
+};
 
 static int troe_protected_call(lua_State *state, int argument_count,
                                int result_count) {
@@ -948,27 +983,71 @@ static int troe_run_action(lua_State *state, const TroeLuaAction *action) {
         (const uint8_t *)memchr(action->bytes, '=', action->length);
     const uint8_t *module = action->bytes;
     size_t module_length = action->length;
-    size_t global_length = 0;
+    size_t global_length;
     if (equals != NULL) {
       global_length = (size_t)(equals - action->bytes);
       module = equals + 1;
       module_length = action->length - global_length - 1;
+    } else {
+      const uint8_t *suffix =
+          (const uint8_t *)memchr(action->bytes, '-', action->length);
+      global_length = suffix == NULL ? action->length
+                                     : (size_t)(suffix - action->bytes);
     }
     lua_getglobal(state, "require");
     lua_pushlstring(state, (const char *)module, module_length);
     status = troe_protected_call(state, 1, 1);
-    if (status == LUA_OK && equals != NULL && global_length != 0) {
+    if (status == LUA_OK) {
       lua_pushglobaltable(state);
       lua_pushlstring(state, (const char *)action->bytes, global_length);
       lua_pushvalue(state, -3);
       lua_settable(state, -3);
+      lua_pop(state, 1);
     }
+  } else if (action->kind == TROE_LUA_ACTION_WARNING) {
+    lua_warning(state, "@on", 0);
+    status = LUA_OK;
   } else {
     lua_pushliteral(state, "invalid command-line action");
     status = LUA_ERRRUN;
   }
   if (status == LUA_OK)
     lua_settop(state, base);
+  return status;
+}
+
+static int troe_run_environment_init(lua_State *state) {
+  char value[2049];
+  const char *chunk_name = "=LUA_INIT_5_5";
+  const char *name = chunk_name + 1;
+  intptr_t length;
+  int status;
+  if (troe_active_configuration->ignore_environment)
+    return LUA_OK;
+  length = troe_active_host->environment_get(
+      troe_active_host->context, (const uint8_t *)name, strlen(name),
+      (uint8_t *)value, sizeof(value) - 1);
+  if (length < 0) {
+    chunk_name = "=LUA_INIT";
+    name = chunk_name + 1;
+    length = troe_active_host->environment_get(
+        troe_active_host->context, (const uint8_t *)name, strlen(name),
+        (uint8_t *)value, sizeof(value) - 1);
+  }
+  if (length < 0)
+    return LUA_OK;
+  if ((size_t)length >= sizeof(value)) {
+    lua_pushliteral(state, "Lua initialization value exceeds runtime limit");
+    return LUA_ERRRUN;
+  }
+  value[length] = '\0';
+  if (value[0] == '@')
+    status = luaL_loadfilex(state, value + 1, "bt");
+  else
+    status =
+        luaL_loadbufferx(state, value, (size_t)length, chunk_name, "t");
+  if (status == LUA_OK)
+    status = troe_protected_call(state, 0, 0);
   return status;
 }
 
@@ -995,6 +1074,7 @@ int troe_lua_run(TroeLuaConfiguration *configuration) {
   TroeReader reader;
   int status;
   int handler;
+  int argument_table;
   troe_active_host = configuration->host;
   troe_active_configuration = configuration;
   troe_output_failed = 0;
@@ -1032,6 +1112,24 @@ int troe_lua_run(TroeLuaConfiguration *configuration) {
     return troe_output_failed ? TROE_LUA_OUTPUT_FAILURE : TROE_LUA_FAILURE;
   }
   (void)lua_gc(state, LUA_GCGEN);
+
+  status = troe_run_environment_init(state);
+  if (configuration->requested_exit) {
+    troe_exit_jump_active = 0;
+    if (configuration->requested_exit_close)
+      lua_close(state);
+    troe_active_configuration = NULL;
+    troe_active_host = NULL;
+    return TROE_LUA_REQUESTED_EXIT;
+  }
+  if (status != LUA_OK) {
+    troe_report_lua_error(state);
+    troe_exit_jump_active = 0;
+    lua_close(state);
+    troe_active_configuration = NULL;
+    troe_active_host = NULL;
+    return troe_output_failed ? TROE_LUA_OUTPUT_FAILURE : TROE_LUA_FAILURE;
+  }
 
   for (size_t index = 0; index < configuration->action_count; ++index) {
     status = troe_run_action(state, &configuration->actions[index]);
@@ -1090,7 +1188,14 @@ int troe_lua_run(TroeLuaConfiguration *configuration) {
   lua_pushcfunction(state, troe_traceback);
   lua_insert(state, -2);
   handler = lua_gettop(state) - 1;
-  status = lua_pcall(state, 0, LUA_MULTRET, handler);
+  lua_getglobal(state, "arg");
+  argument_table = lua_gettop(state);
+  for (size_t index = 1; index <= configuration->script_argument_count;
+       ++index)
+    lua_geti(state, argument_table, (lua_Integer)index);
+  lua_remove(state, argument_table);
+  status = lua_pcall(state, (int)configuration->script_argument_count,
+                     LUA_MULTRET, handler);
   if (configuration->requested_exit) {
     /* The close=true path reached us through Lua's valid base-level unwind. */
     troe_exit_jump_active = 0;

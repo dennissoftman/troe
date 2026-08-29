@@ -181,6 +181,8 @@ typedef struct TroeLuaConfiguration {
   size_t source_name_length;
   const TroeLuaArgument *arguments;
   size_t argument_count;
+  int64_t argument_base;
+  size_t script_argument_count;
   const TroeLuaAction *actions;
   size_t action_count;
   int has_source;
@@ -259,6 +261,16 @@ static intptr_t host_environment_get(void *context, const uint8_t *name,
       "USER=root",    "LOGNAME=root", "PWD=/",
   };
   (void)context;
+  if (name_length == 12 && memcmp(name, "LUA_INIT_5_5", 12) == 0) {
+    const char *initialization = getenv("TROE_TEST_LUA_INIT");
+    if (initialization != NULL) {
+      size_t value_length = strlen(initialization);
+      if (value_length > capacity)
+        return -75;
+      memcpy(destination, initialization, value_length);
+      return (intptr_t)value_length;
+    }
+  }
   for (size_t index = 0; index < sizeof(entries) / sizeof(entries[0]); ++index) {
     const char *separator = strchr(entries[index], '=');
     size_t entry_name_length = (size_t)(separator - entries[index]);
@@ -377,15 +389,17 @@ int main(int argc, char **argv) {
     fprintf(stderr, "usage: lua-host-runner CODE [ARG...]\n");
     return 2;
   }
-  argument_count = (size_t)argc - 1;
+  argument_count = (size_t)argc;
   arguments = calloc(argument_count, sizeof(*arguments));
   if (arguments == NULL)
     return 2;
   arguments[0].bytes = (const uint8_t *)"lua";
   arguments[0].length = 3;
-  for (size_t index = 1; index < argument_count; ++index) {
-    arguments[index].bytes = (const uint8_t *)argv[index + 1];
-    arguments[index].length = strlen(argv[index + 1]);
+  arguments[1].bytes = (const uint8_t *)"host.lua";
+  arguments[1].length = 8;
+  for (size_t index = 2; index < argument_count; ++index) {
+    arguments[index].bytes = (const uint8_t *)argv[index];
+    arguments[index].length = strlen(argv[index]);
   }
 
   context = (HostContext){
@@ -424,6 +438,8 @@ int main(int argc, char **argv) {
       .source_name_length = 17,
       .arguments = arguments,
       .argument_count = argument_count,
+      .argument_base = -1,
+      .script_argument_count = argument_count - 2,
       .actions = NULL,
       .action_count = 0,
       .has_source = 1,

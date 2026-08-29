@@ -147,6 +147,17 @@ char *strstr(const char *text, const char *needle) {
 
 char *strerror(int error) {
   switch (error) {
+  case EPERM: return "operation not permitted";
+  case EIO: return "input/output error";
+  case E2BIG: return "argument list too long";
+  case ENOMEM: return "out of memory";
+  case EBUSY: return "resource busy";
+  case ENOTDIR: return "not a directory";
+  case EFBIG: return "file too large";
+  case ENOSYS: return "function not implemented";
+  case EOVERFLOW: return "value too large";
+  case ETIMEDOUT: return "operation timed out";
+  case ECANCELED: return "operation canceled";
   case EDOM: return "numeric argument out of domain";
   case ERANGE: return "result out of range";
   case ENOENT: return "no such file or directory";
@@ -266,6 +277,8 @@ double ldexp(double value, int exponent) {
   return output.value;
 }
 
+#include "troe_printf_double.h"
+
 #define NANOPRINTF_USE_FIELD_WIDTH_FORMAT_SPECIFIERS 1
 #define NANOPRINTF_USE_PRECISION_FORMAT_SPECIFIERS 1
 #define NANOPRINTF_USE_FLOAT_FORMAT_SPECIFIERS 1
@@ -281,13 +294,21 @@ double ldexp(double value, int exponent) {
 
 int vsnprintf(char *buffer, size_t size, const char *format,
               va_list arguments) {
+  va_list copy;
+  int handled;
+  int result;
+  va_copy(copy, arguments);
+  result = troe_vsnprintf_double(buffer, size, format, copy, &handled);
+  va_end(copy);
+  if (handled)
+    return result;
   return npf_vsnprintf(buffer, size, format, arguments);
 }
 
 int snprintf(char *buffer, size_t size, const char *format, ...) {
   va_list arguments;
   va_start(arguments, format);
-  int result = npf_vsnprintf(buffer, size, format, arguments);
+  int result = vsnprintf(buffer, size, format, arguments);
   va_end(arguments);
   return result;
 }
@@ -295,7 +316,7 @@ int snprintf(char *buffer, size_t size, const char *format, ...) {
 int sprintf(char *buffer, const char *format, ...) {
   va_list arguments;
   va_start(arguments, format);
-  int result = npf_vsnprintf(buffer, (size_t)-1, format, arguments);
+  int result = vsnprintf(buffer, (size_t)-1, format, arguments);
   va_end(arguments);
   return result;
 }
