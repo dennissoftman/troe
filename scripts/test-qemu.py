@@ -2012,9 +2012,66 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
     session.command("cd /", cwd, command_timeout, next_cwd="/")
 
 
+def run_launch_environment_checks(
+    session: SerialSession, cwd: str, command_timeout: float
+) -> None:
+    """Require explicit population, launcher narrowing, and no value leakage."""
+    # -E ignores Lua configuration entries while ordinary os.getenv is unchanged.
+    session.command(
+        "lua -E -e 'print(\"env-ignored\", os.getenv(\"HOME\"), "
+        "package.path:find(\"/share/lua/\", 1, true) ~= nil)'",
+        cwd,
+        command_timeout,
+        contains=("env-ignored\t/\ttrue\n",),
+    )
+    # A launcher narrows a child environment by replacing the inherited value of
+    # the same name. HOME is inherited from the session, so appending instead of
+    # replacing would produce a duplicate name, the encoding boundary would
+    # refuse it, and the launch would fail. A successful launch proves
+    # replacement; adding an unrelated name proves append still works.
+    session.command(
+        "spawn --env HOME=/override --status echo env-narrowed",
+        cwd,
+        command_timeout,
+        contains=("env-narrowed\n", "spawn-status: 0\n"),
+        absent=("child launch failed",),
+    )
+    session.command(
+        "spawn --env TROE_EXTRA=value --status echo env-appended",
+        cwd,
+        command_timeout,
+        contains=("env-appended\n", "spawn-status: 0\n"),
+        absent=("child launch failed",),
+    )
+    # Delegation failures are refused before any child is created.
+    session.command(
+        "spawn --env HOME=/a --env HOME=/b echo unreachable",
+        cwd,
+        command_timeout,
+        contains=("spawn: --env repeats one name",),
+        absent=("unreachable",),
+    )
+    session.command(
+        "spawn --env NOT_AN_ENTRY echo unreachable",
+        cwd,
+        command_timeout,
+        contains=("spawn: --env requires NAME=VALUE",),
+        absent=("unreachable",),
+    )
+    # Observation surfaces expose no environment name or value.
+    session.command(
+        "ps",
+        cwd,
+        command_timeout,
+        contains=("PID ORIGIN STATE",),
+        absent=("HOME=", "PATH=", "LOGNAME=", "/bin/sh"),
+    )
+
+
 def run_lua_group(session: SerialSession, command_timeout: float) -> None:
     """Exercise the freestanding Lua runtime, allocator, math, and loaders."""
     cwd = "/"
+    run_launch_environment_checks(session, cwd, command_timeout)
     session.command(
         "lua --version",
         cwd,
@@ -2249,6 +2306,7 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
             "lua-system bytecode\t1414680389\tmain\n",
             "lua execute\n",
             "lua-system process\tlua-popen\n",
+            "lua-system environment\t/bin /\n",
             "lua-system cleanup\ttrue\ttrue\n",
         ),
     )

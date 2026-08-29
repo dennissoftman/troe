@@ -13420,7 +13420,12 @@ mod firmware {
                 services.push(CommandStartupService {
                     port: register_command_service(
                         &mut dispatcher,
-                        CommandInvocationService::new(cwd, words).map_err(|_| ())?,
+                        CommandInvocationService::new_with_environment(
+                            cwd,
+                            words,
+                            &command::CONVENTIONAL_ENVIRONMENT,
+                        )
+                        .map_err(|_| ())?,
                     )?,
                     interface: troe_abi::interface::COMMAND,
                     major: command::MAJOR,
@@ -14368,7 +14373,12 @@ mod firmware {
                 services.push(CommandStartupService {
                     port: register_command_service(
                         &mut dispatcher,
-                        CommandInvocationService::new(cwd, words).map_err(|_| ())?,
+                        CommandInvocationService::new_with_environment(
+                            cwd,
+                            words,
+                            &command::CONVENTIONAL_ENVIRONMENT,
+                        )
+                        .map_err(|_| ())?,
                     )?,
                     interface: troe_abi::interface::COMMAND,
                     major: command::MAJOR,

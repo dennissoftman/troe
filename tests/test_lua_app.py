@@ -204,10 +204,64 @@ print("lua-files-unit")
     def test_versioned_environment_initialization_runs_before_source(self) -> None:
         completed, metadata = self.run_lua(
             'assert(initialized_by_lua_init == 42); print("lua-init-unit")',
-            environment={"TROE_TEST_LUA_INIT": "initialized_by_lua_init = 42"},
+            environment={"TROE_TEST_ENV_LUA_INIT_5_5": "initialized_by_lua_init = 42"},
         )
         self.assertEqual(metadata[0], 0)
         self.assertEqual(completed.stdout, b"lua-init-unit\n")
+
+    def test_unversioned_initialization_is_the_fallback_only(self) -> None:
+        completed, metadata = self.run_lua(
+            'assert(chosen == "plain"); print("lua-init-fallback")',
+            environment={"TROE_TEST_ENV_LUA_INIT": 'chosen = "plain"'},
+        )
+        self.assertEqual(metadata[0], 0)
+        self.assertEqual(completed.stdout, b"lua-init-fallback\n")
+
+        # With both present the versioned name wins and the fallback is unread.
+        completed, metadata = self.run_lua(
+            'assert(chosen == "versioned"); print("lua-init-precedence")',
+            environment={
+                "TROE_TEST_ENV_LUA_INIT_5_5": 'chosen = "versioned"',
+                "TROE_TEST_ENV_LUA_INIT": 'chosen = "plain"',
+            },
+        )
+        self.assertEqual(metadata[0], 0)
+        self.assertEqual(completed.stdout, b"lua-init-precedence\n")
+
+    def test_ignore_environment_suppresses_initialization_but_not_getenv(self) -> None:
+        # Module-path suppression is covered by QEMU acceptance instead: the
+        # host build links the real libc, so upstream setpath reads the host
+        # process environment rather than the injected guest environment.
+        completed, metadata = self.run_lua(
+            'assert(initialized_by_lua_init == nil); print("lua-ignore-env")',
+            environment={
+                "TROE_TEST_LUA_IGNORE_ENV": "1",
+                "TROE_TEST_ENV_LUA_INIT_5_5": "initialized_by_lua_init = 42",
+                "TROE_TEST_ENV_LUA_INIT": "initialized_by_lua_init = 7",
+            },
+        )
+        self.assertEqual(metadata[0], 0, completed.stderr.decode(errors="replace"))
+        self.assertEqual(completed.stdout, b"lua-ignore-env\n")
+
+        # It must not change ordinary os.getenv, which is not Lua configuration.
+        completed, metadata = self.run_lua(
+            'assert(os.getenv("HOME") == "/" and os.getenv("LUA_INIT_5_5") ~= nil); '
+            'print("lua-getenv-unaffected")',
+            environment={
+                "TROE_TEST_LUA_IGNORE_ENV": "1",
+                "TROE_TEST_ENV_LUA_INIT_5_5": "initialized_by_lua_init = 42",
+            },
+        )
+        self.assertEqual(metadata[0], 0, completed.stderr.decode(errors="replace"))
+        self.assertEqual(completed.stdout, b"lua-getenv-unaffected\n")
+
+    def test_absent_names_have_no_ambient_value(self) -> None:
+        completed, metadata = self.run_lua(
+            'assert(os.getenv("LUA_INIT_5_5") == nil and os.getenv("LUA_INIT") == nil); '
+            'assert(os.getenv("TOTALLY_ABSENT") == nil); print("lua-absent-env")'
+        )
+        self.assertEqual(metadata[0], 0, completed.stderr.decode(errors="replace"))
+        self.assertEqual(completed.stdout, b"lua-absent-env\n")
 
     def test_arguments_and_controlled_exit_are_exact(self) -> None:
         completed, metadata = self.run_lua(

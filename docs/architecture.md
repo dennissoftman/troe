@@ -385,9 +385,15 @@ unprivileged execution. The `process-observe` capability exposes this bounded
 metadata to `ps.kex` and `top.kex`; it hides argv and grants neither memory
 inspection nor process control.
 
-ADR 0046 defines owner-scoped nested process launch and byte pipes. A launcher
-passes canonical cwd, argv, environment, and explicit inherited/null/pipe
-standard streams. A bare `argv[0]` resolves `/bin/<name>.kex`; one containing
+ADR 0046 defines owner-scoped nested process launch and byte pipes, and ADR 0054
+defines how the environment it carries is composed. A launcher passes canonical
+cwd, argv, environment, and explicit inherited/null/pipe standard streams. The
+launcher composes that environment and the application only reads it: the
+interactive session supplies the conventional entries to every ordinary command
+and service, `PWD` resolves from the invocation directory rather than being
+stored, and a name carries exactly one value because both the encoder and the
+decoder reject a duplicate. `spawn --env NAME=VALUE` narrows a child by
+replacing an inherited entry. A bare `argv[0]` resolves `/bin/<name>.kex`; one containing
 `/` resolves exactly against the supplied cwd. The kernel streams and validates
 the selected regular KEX file through the same coherent bounded loader used by
 direct launches, grants only a child-manifest attenuation of the

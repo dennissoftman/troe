@@ -1,0 +1,51 @@
+NAME
+    spawn - launch one owner-scoped child application
+
+SYNOPSIS
+    spawn [--capture|--status] [--env NAME=VALUE]... COMMAND [ARG...]
+
+DESCRIPTION
+    Launches COMMAND as an owner-scoped child of spawn itself, waits for it,
+    and returns its exit status. The child is admitted through the process
+    launch service, so its package capabilities must attenuate spawn's own
+    manifest; a child cannot gain authority its launcher does not hold.
+
+    COMMAND resolves exactly as it does for the shell. A bare name selects
+    /bin/COMMAND.kex, and a name containing / selects that exact package path
+    relative to the current directory. No suffix, PATH search, or implicit
+    current-directory lookup is applied.
+
+    The child inherits spawn's immutable environment with PWD set to its launch
+    directory. It does not inherit the session terminal: standard input is an
+    empty stream that reports end of input immediately. Standard output and
+    error are inherited unless --capture redirects output through a pipe.
+
+OPTIONS
+    --capture      Read the child's standard output through a bounded pipe and
+                   write it after the child becomes terminal.
+    --status       Report the child's exit status on standard error as
+                   spawn-status: N.
+    --env NAME=VALUE
+                   Supply one entry to the child. An entry replaces the
+                   inherited value of the same name and is otherwise appended.
+                   NAME must be a nonempty ASCII alphanumeric or underscore
+                   identifier that does not start with a digit. Repeating one
+                   name across two --env options is rejected, because the
+                   launch environment admits exactly one value per name.
+
+    Options may appear in any order but must precede COMMAND. The first
+    argument that is not a recognized option starts the child invocation, so
+    the child receives its own options unchanged.
+
+LIMITS
+    A child environment holds at most 128 entries and 2,048 aggregate UTF-8
+    bytes, including inherited entries. Exceeding either limit, or naming one
+    variable twice, fails before any child is created.
+
+EXAMPLES
+    spawn --status echo child-ready
+    spawn --capture ls /bin
+    spawn --env LUA_PATH_5_5=/share/lua/?.lua lua -e 'print(package.path)'
+
+SEE ALSO
+    ps, sh

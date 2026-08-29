@@ -31,6 +31,10 @@ never executes the ordinary application.
 ## Invariants enforced now
 
 - command input: 512 bytes, 128 arguments per stage, 255 stages per pipeline;
+- launch environment: 128 entries and 2,048 aggregate UTF-8 bytes, one value
+  per name with duplicates rejected at both encoding boundaries, composed by the
+  launcher and never synthesized by the application, and exposed by no process
+  observation or diagnostic surface;
 - foreground terminal input: one loan at a time, held only by a foreground
   command whose standard input is the session terminal, never inherited by a
   background job, service, staged script line, or owner-scoped child; a 512-byte

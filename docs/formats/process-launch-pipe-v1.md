@@ -32,8 +32,10 @@ The canonical `SPAWN` request begins with a 48-byte header:
 The header is followed by one canonical command invocation, `count` little-
 endian `u16` environment lengths, and the concatenated UTF-8 `NAME=VALUE`
 strings. Names are nonempty ASCII alphanumeric/underscore identifiers, cannot
-start with a digit, and values cannot contain NUL. The whole request fits the
-4,094-byte service payload.
+start with a digit, and values cannot contain NUL. A name appears at most once:
+both the encoder and the decoder reject a duplicate, so a launcher replaces an
+inherited entry rather than appending a second one, and no consumer resolves
+precedence by position. The whole request fits the 4,094-byte service payload.
 
 A successful spawn reply is 16 bytes: child token at offset 0 and monotonic
 global process ID at offset 8. A poll/wait/cancel reply is 24 bytes:
