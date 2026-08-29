@@ -57,6 +57,7 @@ The current serialized contracts are versioned independently under
   [package trust](formats/package-trust-v1.md), and
   [configuration projection](formats/config-projection-v1.md),
   [hosted system lifecycle](formats/system-lifecycle-v1.md),
+  [installation record](formats/installation-record-v1.md),
   [GMAN](formats/gman-v1.md), and
   [memory policy](formats/memory-policy-v1.md); and
 - identity and authorization metadata: [identity security v1](formats/identity-v1.md).

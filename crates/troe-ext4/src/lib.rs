@@ -6,6 +6,8 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod journal;
+
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::{fmt, str};
@@ -20,7 +22,6 @@ const EXT4_DYNAMIC_REV: u32 = 1;
 const EXT4_VALID_FS: u16 = 1;
 const EXT4_ERROR_FS: u16 = 2;
 const EXT4_BLOCK_BYTES: usize = 4096;
-#[cfg(test)]
 const EXT4_BLOCK_BYTES_U32: u32 = 4096;
 const EXT4_BLOCK_BYTES_U64: u64 = 4096;
 const EXT4_INODE_BYTES: usize = 256;
@@ -50,6 +51,8 @@ const MAX_SYMLINK_EXPANSIONS: u8 = 8;
 const EXT4_DIR_TAIL_FT: u8 = 0xde;
 const EXT4_DIR_TAIL_BYTES: usize = 12;
 const EXT4_DIR_TAIL_BYTES_U16: u16 = 12;
+const EXT4_JOURNAL_INO: u32 = 8;
+const EXT4_FEATURE_INCOMPAT_RECOVER: u32 = 0x0000_0004;
 const EXT4_FEATURE_COMPAT: u32 = 0x0000_0004 | 0x0000_0008;
 const EXT4_FEATURE_INCOMPAT: u32 = 0x0000_0002 | 0x0000_0040;
 const EXT4_FEATURE_RO_COMPAT: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0040 | 0x0000_0400;
@@ -267,12 +270,95 @@ struct DirectoryEntry {
     kind: NodeKind,
 }
 
+/// Whether a parse is the ordinary fail-closed mount or an authorized recovery.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Admission {
+    /// The ordinary path. Dirty media and a pending journal are both refused.
+    Clean,
+    /// The explicitly authorized recovery path, which alone may open a volume
+    /// whose journal still needs replay.
+    Recovery,
+}
+
+/// What one bounded recovery pass did.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RecoveryOutcome {
+    /// The volume was already clean; no recovery was required.
+    AlreadyClean,
+    /// A committed transaction was replayed and checkpointed in place.
+    Replayed {
+        /// Number of filesystem blocks restored from the log.
+        blocks: u32,
+    },
+    /// An interrupted transaction never committed, so it was discarded.
+    ///
+    /// Nothing it staged had reached media, so the volume was already at its
+    /// exact pre-mutation state.
+    Discarded,
+}
+
 /// Mounted strict ext4 v1 provider owning exactly one block-region capability.
 pub struct Ext4<D: BlockDevice> {
     region: BlockRegion<D>,
     limits: Ext4Limits,
     layout: Layout,
     write_defaults: Ext4WriteDefaults,
+    journal: Option<JournalGeometry>,
+    transaction: Option<Transaction>,
+}
+
+/// Where the internal journal lives, resolved once from inode 8.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct JournalGeometry {
+    /// First physical filesystem block of the journal file.
+    first_block: u32,
+    /// Journal block count, taken from the parsed journal superblock.
+    superblock: journal::JournalSuperblock,
+}
+
+/// One in-flight metadata mutation staged entirely in memory.
+///
+/// Nothing a mutation writes reaches media until the transaction commits, so
+/// an interruption before the commit record leaves media at its exact
+/// pre-state. That is what makes recovery on an empty log safe.
+#[derive(Debug, Default)]
+struct Transaction {
+    staged: Vec<(u32, Vec<u8>)>,
+}
+
+impl Transaction {
+    fn staged_image(&self, block: u32) -> Option<&[u8]> {
+        self.staged
+            .iter()
+            .find(|(candidate, _)| *candidate == block)
+            .map(|(_, image)| image.as_slice())
+    }
+
+    fn stage(&mut self, block: u32, bytes: &[u8]) -> Result<(), FsError> {
+        if let Some(slot) = self
+            .staged
+            .iter_mut()
+            .find(|(candidate, _)| *candidate == block)
+        {
+            slot.1.clear();
+            slot.1
+                .try_reserve_exact(bytes.len())
+                .map_err(|_| FsError::NoSpace)?;
+            slot.1.extend_from_slice(bytes);
+            return Ok(());
+        }
+        if self.staged.len() >= journal::MAX_TRANSACTION_BLOCKS {
+            return Err(FsError::NoSpace);
+        }
+        let mut image = Vec::new();
+        image
+            .try_reserve_exact(bytes.len())
+            .map_err(|_| FsError::NoSpace)?;
+        image.extend_from_slice(bytes);
+        self.staged.try_reserve(1).map_err(|_| FsError::NoSpace)?;
+        self.staged.push((block, image));
+        Ok(())
+    }
 }
 
 impl<D: BlockDevice> fmt::Debug for Ext4<D> {
@@ -302,9 +388,50 @@ impl<D: BlockDevice> Ext4<D> {
     ///
     /// Applies the same strict profile checks as [`Self::mount`].
     pub fn mount_with_write_defaults(
+        region: BlockRegion<D>,
+        limits: Ext4Limits,
+        write_defaults: Ext4WriteDefaults,
+    ) -> Result<Self, FsError> {
+        Self::open(region, limits, write_defaults, Admission::Clean)
+    }
+
+    /// Replay one interrupted mutation, then mount the recovered volume.
+    ///
+    /// This is the only entry point that may open a volume whose journal still
+    /// needs replay, and it refuses a volume that is already clean. Recovery
+    /// authority is therefore explicit at the call site and unavailable to any
+    /// caller that only holds the ordinary mount path.
+    ///
+    /// Recovery is idempotent: it may be interrupted and re-run. A committed
+    /// transaction is re-applied from the log, and an uncommitted one is
+    /// discarded, because nothing it staged ever reached media.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`FsError::Invalid`] when the volume needs no recovery, and the
+    /// ordinary mount errors when the recovered volume still fails validation.
+    pub fn recover(
+        region: BlockRegion<D>,
+        limits: Ext4Limits,
+    ) -> Result<(Self, RecoveryOutcome), FsError> {
+        let mut provisional = Self::open(
+            region,
+            limits,
+            Ext4WriteDefaults::default(),
+            Admission::Recovery,
+        )?;
+        provisional.ensure_writable()?;
+        let outcome = provisional.replay()?;
+        provisional.set_clean_state(true)?;
+        let mounted = Self::mount(provisional.region, limits)?;
+        Ok((mounted, outcome))
+    }
+
+    fn open(
         mut region: BlockRegion<D>,
         limits: Ext4Limits,
         write_defaults: Ext4WriteDefaults,
+        admission: Admission,
     ) -> Result<Self, FsError> {
         validate_limits(limits)?;
         let info = region.info();
@@ -330,28 +457,87 @@ impl<D: BlockDevice> Ext4<D> {
             info.block_count(),
             device_blocks_per_fs_block,
             limits,
+            admission,
         )?;
         let mut mounted = Self {
             region,
             limits,
             layout,
             write_defaults,
+            journal: None,
+            transaction: None,
         };
-        let root = mounted.read_inode(EXT4_ROOT_INO)?;
-        if root.kind != NodeKind::Directory {
-            return Err(FsError::Corrupt);
-        }
-        let root_entries = mounted.read_directory(&root)?;
-        if !root_entries
-            .iter()
-            .any(|entry| entry.name == "." && entry.inode == EXT4_ROOT_INO)
-            || !root_entries
+        // A half-checkpointed volume may hold a torn root directory that
+        // replay is about to restore, so recovery validates the root only
+        // after it has finished and re-mounts through the ordinary path.
+        if admission == Admission::Clean {
+            let root = mounted.read_inode(EXT4_ROOT_INO)?;
+            if root.kind != NodeKind::Directory {
+                return Err(FsError::Corrupt);
+            }
+            let root_entries = mounted.read_directory(&root)?;
+            if !root_entries
                 .iter()
-                .any(|entry| entry.name == ".." && entry.inode == EXT4_ROOT_INO)
-        {
-            return Err(FsError::Corrupt);
+                .any(|entry| entry.name == "." && entry.inode == EXT4_ROOT_INO)
+                || !root_entries
+                    .iter()
+                    .any(|entry| entry.name == ".." && entry.inode == EXT4_ROOT_INO)
+            {
+                return Err(FsError::Corrupt);
+            }
         }
         Ok(mounted)
+    }
+
+    /// Replay or discard the one transaction the log may hold.
+    ///
+    /// An empty log means the volume is already consistent: either the
+    /// interrupted mutation never committed, in which case nothing it staged
+    /// reached media, or its checkpoint completed before the interruption.
+    fn replay(&mut self) -> Result<RecoveryOutcome, FsError> {
+        let geometry = self.journal_geometry()?;
+        let head = geometry.superblock.start;
+        if head == 0 {
+            return Ok(RecoveryOutcome::AlreadyClean);
+        }
+        let sequence = geometry.superblock.sequence;
+        let descriptor_block = self.journal_physical(&geometry, head)?;
+        let descriptor = self.read_fs_block(descriptor_block)?;
+        let tags = journal::decode_descriptor(&descriptor, sequence, self.layout.blocks)?;
+
+        let payload_len = u32::try_from(tags.len()).map_err(|_| FsError::Overflow)?;
+        let commit_index = head
+            .checked_add(payload_len)
+            .and_then(|index| index.checked_add(1))
+            .ok_or(FsError::Overflow)?;
+        let commit_block = self.journal_physical(&geometry, commit_index)?;
+        let commit = self.read_fs_block(commit_block)?;
+        if journal::verify_commit(&commit, sequence).is_err() {
+            // The interruption landed before the commit record, so media is
+            // still exactly the pre-mutation state.
+            self.retire_journal_head(&geometry, sequence)?;
+            return Ok(RecoveryOutcome::Discarded);
+        }
+
+        for (index, tag) in tags.iter().enumerate() {
+            let offset = u32::try_from(index).map_err(|_| FsError::Overflow)?;
+            let source = self.journal_physical(
+                &geometry,
+                head.checked_add(offset)
+                    .and_then(|value| value.checked_add(1))
+                    .ok_or(FsError::Overflow)?,
+            )?;
+            let mut image = self.read_fs_block(source)?;
+            if tag.escaped {
+                journal::unescape(&mut image)?;
+            }
+            self.write_fs_block_direct(tag.block, &image)?;
+        }
+        self.durability_barrier()?;
+        self.retire_journal_head(&geometry, sequence)?;
+        Ok(RecoveryOutcome::Replayed {
+            blocks: payload_len,
+        })
     }
 
     /// Filesystem UUID validated at mount.
@@ -363,6 +549,15 @@ impl<D: BlockDevice> Ext4<D> {
     fn read_fs_block(&mut self, block: u32) -> Result<Vec<u8>, FsError> {
         if block >= self.layout.blocks {
             return Err(FsError::Corrupt);
+        }
+        if let Some(transaction) = self.transaction.as_ref()
+            && let Some(image) = transaction.staged_image(block)
+        {
+            let mut copy = Vec::new();
+            copy.try_reserve_exact(image.len())
+                .map_err(|_| FsError::NoSpace)?;
+            copy.extend_from_slice(image);
+            return Ok(copy);
         }
         read_raw_fs_block(
             &mut self.region,
@@ -391,6 +586,16 @@ impl<D: BlockDevice> Ext4<D> {
         if block >= self.layout.blocks || bytes.len() != EXT4_BLOCK_BYTES {
             return Err(FsError::Invalid);
         }
+        if let Some(transaction) = self.transaction.as_mut() {
+            return transaction.stage(block, bytes);
+        }
+        self.write_fs_block_direct(block, bytes)
+    }
+
+    fn write_fs_block_direct(&mut self, block: u32, bytes: &[u8]) -> Result<(), FsError> {
+        if block >= self.layout.blocks || bytes.len() != EXT4_BLOCK_BYTES {
+            return Err(FsError::Invalid);
+        }
         let start = u64::from(block)
             .checked_mul(u64::from(self.layout.device_blocks_per_fs_block))
             .ok_or(FsError::Overflow)?;
@@ -412,8 +617,16 @@ impl<D: BlockDevice> Ext4<D> {
         Ok(())
     }
 
+    /// Stamp the clean marker and the recovery flag in one flushed block-0
+    /// write.
+    ///
+    /// Both signals live in the same block under the same checksum, so writing
+    /// them together keeps the cost identical to the previous dirty marker.
+    /// The ordinary mount refuses on either signal, and a foreign Linux host is
+    /// forced to recover rather than mount half-applied metadata.
     fn set_clean_state(&mut self, clean: bool) -> Result<(), FsError> {
-        let mut block = self.read_fs_block(0)?;
+        let mut block =
+            read_raw_fs_block(&mut self.region, 0, self.layout.device_blocks_per_fs_block)?;
         let superblock = block.get_mut(1024..2048).ok_or(FsError::Corrupt)?;
         let state = read_u16(superblock, 58)?;
         let updated = if clean {
@@ -422,19 +635,184 @@ impl<D: BlockDevice> Ext4<D> {
             state & !EXT4_VALID_FS
         };
         put_u16(superblock, 58, updated)?;
+        let incompat = read_u32(superblock, 96)?;
+        let features = if clean {
+            incompat & !EXT4_FEATURE_INCOMPAT_RECOVER
+        } else {
+            incompat | EXT4_FEATURE_INCOMPAT_RECOVER
+        };
+        put_u32(superblock, 96, features)?;
         superblock[1020..1024].fill(0);
         let checksum = crc32c(u32::MAX, &superblock[..1020]);
         put_u32(superblock, 1020, checksum)?;
-        self.write_fs_block(0, &block)?;
+        self.write_fs_block_direct(0, &block)?;
         self.durability_barrier()
     }
 
-    fn begin_mutation(&mut self) -> Result<(), FsError> {
-        self.set_clean_state(false)
+    /// Resolve the internal journal once from inode 8.
+    ///
+    /// The profile requires one contiguous extent covering the whole journal,
+    /// which is exactly what `mke2fs -E lazy_journal_init=0` produces.
+    fn journal_geometry(&mut self) -> Result<JournalGeometry, FsError> {
+        if let Some(geometry) = self.journal {
+            return Ok(geometry);
+        }
+        let raw = self.raw_inode_record(EXT4_JOURNAL_INO)?;
+        let inline = raw.get(40..100).ok_or(FsError::Corrupt)?;
+        let parsed = parse_extents(inline, self.layout.blocks)?;
+        let [extent] = parsed.extents.as_slice() else {
+            return Err(FsError::Unsupported);
+        };
+        if extent.logical != 0 || extent.unwritten || !parsed.tree_blocks.is_empty() {
+            return Err(FsError::Unsupported);
+        }
+        let first_block = extent.physical;
+        let image = self.read_fs_block(first_block)?;
+        let superblock = journal::JournalSuperblock::parse(&image, EXT4_BLOCK_BYTES_U32)?;
+        if u32::from(extent.blocks) != superblock.maxlen {
+            return Err(FsError::Corrupt);
+        }
+        let geometry = JournalGeometry {
+            first_block,
+            superblock,
+        };
+        self.journal = Some(geometry);
+        Ok(geometry)
     }
 
+    fn journal_physical(&self, geometry: &JournalGeometry, index: u32) -> Result<u32, FsError> {
+        if index >= geometry.superblock.maxlen {
+            return Err(FsError::Corrupt);
+        }
+        geometry
+            .first_block
+            .checked_add(index)
+            .filter(|block| *block < self.layout.blocks)
+            .ok_or(FsError::Corrupt)
+    }
+
+    fn begin_mutation(&mut self) -> Result<(), FsError> {
+        self.ensure_writable()?;
+        self.journal_geometry()?;
+        // The dirty marker and the recovery flag reach media before any
+        // staged byte, so an interruption is always visible as one or the
+        // other.
+        self.set_clean_state(false)?;
+        self.transaction = Some(Transaction::default());
+        Ok(())
+    }
+
+    /// Commit, checkpoint, and retire the open transaction.
+    ///
+    /// Ordering is load-bearing: the log payload is durable before the commit
+    /// record, the commit record is durable before any in-place checkpoint
+    /// write is issued, the checkpoint is durable before the log head is
+    /// retired, and the head is retired before the volume is marked clean.
     fn finish_mutation(&mut self) -> Result<(), FsError> {
+        let Some(transaction) = self.transaction.take() else {
+            return Err(FsError::Invalid);
+        };
+        if transaction.staged.is_empty() {
+            return self.set_clean_state(true);
+        }
+        let geometry = self.journal_geometry()?;
+        let sequence = geometry.superblock.sequence;
+        let mut staged = Vec::new();
+        staged
+            .try_reserve_exact(transaction.staged.len())
+            .map_err(|_| FsError::NoSpace)?;
+        for (block, image) in &transaction.staged {
+            let mut copy = Vec::new();
+            copy.try_reserve_exact(image.len())
+                .map_err(|_| FsError::NoSpace)?;
+            copy.extend_from_slice(image);
+            staged.push(journal::StagedBlock {
+                block: *block,
+                image: copy,
+            });
+        }
+        let images = journal::encode_transaction(&geometry.superblock, sequence, &staged)?;
+
+        let head = geometry.superblock.first;
+        for (index, image) in images.iter().enumerate().take(images.len() - 1) {
+            let offset = u32::try_from(index).map_err(|_| FsError::Overflow)?;
+            let physical = self.journal_physical(
+                &geometry,
+                head.checked_add(offset).ok_or(FsError::Overflow)?,
+            )?;
+            self.write_fs_block_direct(physical, image)?;
+        }
+        self.durability_barrier()?;
+
+        let commit = images.last().ok_or(FsError::Corrupt)?;
+        let commit_index = u32::try_from(images.len() - 1).map_err(|_| FsError::Overflow)?;
+        let commit_physical = self.journal_physical(
+            &geometry,
+            head.checked_add(commit_index).ok_or(FsError::Overflow)?,
+        )?;
+        self.arm_journal_head(&geometry, head, sequence)?;
+        self.write_fs_block_direct(commit_physical, commit)?;
+        self.durability_barrier()?;
+
+        for entry in &staged {
+            self.write_fs_block_direct(entry.block, &entry.image)?;
+        }
+        self.durability_barrier()?;
+
+        self.retire_journal_head(&geometry, sequence)?;
         self.set_clean_state(true)
+    }
+
+    /// Publish the log head so a replay can find this transaction.
+    fn arm_journal_head(
+        &mut self,
+        geometry: &JournalGeometry,
+        head: u32,
+        sequence: u32,
+    ) -> Result<(), FsError> {
+        let mut image = read_raw_fs_block(
+            &mut self.region,
+            geometry.first_block,
+            self.layout.device_blocks_per_fs_block,
+        )?;
+        journal::JournalSuperblock::write_head(&mut image, head, sequence)?;
+        self.write_fs_block_direct(geometry.first_block, &image)?;
+        self.durability_barrier()
+    }
+
+    /// Retire the log so the next mount finds nothing to replay.
+    ///
+    /// The sequence advances so a stale commit record can never be mistaken
+    /// for the next transaction.
+    fn retire_journal_head(
+        &mut self,
+        geometry: &JournalGeometry,
+        sequence: u32,
+    ) -> Result<(), FsError> {
+        let next = sequence.checked_add(1).unwrap_or(1);
+        let mut image = read_raw_fs_block(
+            &mut self.region,
+            geometry.first_block,
+            self.layout.device_blocks_per_fs_block,
+        )?;
+        journal::JournalSuperblock::write_head(&mut image, 0, next)?;
+        self.write_fs_block_direct(geometry.first_block, &image)?;
+        self.durability_barrier()?;
+        if let Some(stored) = self.journal.as_mut() {
+            stored.superblock.sequence = next;
+            stored.superblock.start = 0;
+        }
+        Ok(())
+    }
+
+    /// Abandon any open transaction without touching media.
+    ///
+    /// A mutation that fails after `begin_mutation` leaves its staged blocks
+    /// behind. Discarding them is always correct because nothing they hold
+    /// ever reached media, and it stops a later read from observing bytes that
+    /// were never committed.
+    fn abort_mutation(&mut self) {
+        self.transaction = None;
     }
 
     fn write_group_descriptor(
@@ -2023,6 +2401,7 @@ impl<D: BlockDevice> Ext4<D> {
 
 impl<D: BlockDevice> ReadOnlyFileSystem for Ext4<D> {
     fn metadata(&mut self, path: &str) -> Result<FileMetadata, FsError> {
+        self.abort_mutation();
         let inode = self.resolve(path)?;
         Ok(FileMetadata {
             kind: inode.kind,
@@ -2035,6 +2414,7 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Ext4<D> {
     }
 
     fn metadata_no_follow(&mut self, path: &str) -> Result<FileMetadata, FsError> {
+        self.abort_mutation();
         let inode = self.resolve_no_follow(path)?;
         Ok(FileMetadata {
             kind: inode.kind,
@@ -2052,6 +2432,7 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Ext4<D> {
         offset: u64,
         destination: &mut [u8],
     ) -> Result<usize, FsError> {
+        self.abort_mutation();
         if destination.len() > self.limits.max_read_bytes() {
             return Err(FsError::NoSpace);
         }
@@ -2069,6 +2450,7 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Ext4<D> {
         max_entries: usize,
         max_name_bytes: usize,
     ) -> Result<ProviderListing, FsError> {
+        self.abort_mutation();
         let inode = self.resolve(path)?;
         if inode.kind != NodeKind::Directory {
             return Err(FsError::WrongType);
@@ -2113,6 +2495,7 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Ext4<D> {
     }
 
     fn truncate_file(&mut self, path: &str) -> Result<(), FsError> {
+        self.abort_mutation();
         match self.resolve(path) {
             Ok(inode) => {
                 if inode.kind != NodeKind::File {
@@ -2129,14 +2512,17 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Ext4<D> {
     }
 
     fn append_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), FsError> {
+        self.abort_mutation();
         self.append_regular_file(path, bytes)
     }
 
     fn sync_file(&mut self, _path: &str) -> Result<(), FsError> {
+        self.abort_mutation();
         self.durability_barrier()
     }
 
     fn write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), FsError> {
+        self.abort_mutation();
         self.ensure_writable()?;
         if u64::try_from(bytes.len()).map_err(|_| FsError::NoSpace)? > self.limits.max_file_bytes()
         {
@@ -2206,6 +2592,7 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Ext4<D> {
     }
 
     fn create_directory(&mut self, path: &str) -> Result<(), FsError> {
+        self.abort_mutation();
         self.ensure_writable()?;
         let (parent, name) = self.resolve_parent(path)?;
         let entries = self.read_directory(&parent)?;
@@ -2300,6 +2687,7 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Ext4<D> {
     }
 
     fn remove_file(&mut self, path: &str) -> Result<(), FsError> {
+        self.abort_mutation();
         self.ensure_writable()?;
         let (parent, name) = self.resolve_parent(path)?;
         let entries = self.read_directory(&parent)?;
@@ -2346,6 +2734,7 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Ext4<D> {
     }
 
     fn remove_directory(&mut self, path: &str) -> Result<(), FsError> {
+        self.abort_mutation();
         self.ensure_writable()?;
         let (parent, name) = self.resolve_parent(path)?;
         let entries = self.read_directory(&parent)?;
@@ -2392,6 +2781,7 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Ext4<D> {
     }
 
     fn rename(&mut self, source: &str, destination: &str) -> Result<(), FsError> {
+        self.abort_mutation();
         self.ensure_writable()?;
         let normalized_source = canonicalize("/", source)?;
         let normalized_destination = canonicalize("/", destination)?;
@@ -2483,11 +2873,13 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Ext4<D> {
     }
 
     fn read_link(&mut self, path: &str) -> Result<String, FsError> {
+        self.abort_mutation();
         let inode = self.resolve_no_follow(path)?;
         self.read_symlink_inode(&inode)
     }
 
     fn create_symlink(&mut self, target: &str, link_path: &str) -> Result<(), FsError> {
+        self.abort_mutation();
         self.ensure_writable()?;
         if target.is_empty() || target.len() > MAX_PATH_BYTES || target.as_bytes().contains(&0) {
             return Err(FsError::Invalid);
@@ -2537,6 +2929,7 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Ext4<D> {
     }
 
     fn create_hard_link(&mut self, existing: &str, new_path: &str) -> Result<(), FsError> {
+        self.abort_mutation();
         self.ensure_writable()?;
         let inode = self.resolve_no_follow(existing)?;
         if inode.kind != NodeKind::File {
@@ -2558,11 +2951,39 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Ext4<D> {
     }
 }
 
+/// Decide whether this admission may open a volume in the recorded state.
+fn admit_state(state: u16, needs_recovery: bool, admission: Admission) -> Result<(), FsError> {
+    if state & EXT4_ERROR_FS != 0 {
+        return Err(FsError::Corrupt);
+    }
+    match admission {
+        // The ordinary mount stays fail-closed on either signal.
+        Admission::Clean => {
+            if needs_recovery {
+                return Err(FsError::Unsupported);
+            }
+            if state & EXT4_VALID_FS == 0 {
+                return Err(FsError::Corrupt);
+            }
+            Ok(())
+        }
+        // Recovery is the only path that may open an interrupted volume, and
+        // only when the volume actually says it was interrupted.
+        Admission::Recovery => {
+            if !needs_recovery && state & EXT4_VALID_FS != 0 {
+                return Err(FsError::Invalid);
+            }
+            Ok(())
+        }
+    }
+}
+
 fn parse_superblock(
     superblock: &[u8],
     region_device_blocks: u64,
     device_blocks_per_fs_block: u32,
     limits: Ext4Limits,
+    admission: Admission,
 ) -> Result<Layout, FsError> {
     if superblock.len() != 1024
         || read_u16(superblock, 56)? != EXT4_MAGIC
@@ -2574,15 +2995,18 @@ fn parse_superblock(
         || !matches!(read_u16(superblock, 254)?, 0 | EXT4_GROUP_DESC_BYTES_U16)
         || superblock[373] != 1
         || read_u32(superblock, 92)? != EXT4_FEATURE_COMPAT
-        || read_u32(superblock, 96)? != EXT4_FEATURE_INCOMPAT
         || read_u32(superblock, 100)? != EXT4_FEATURE_RO_COMPAT
     {
         return Err(FsError::Unsupported);
     }
-    let state = read_u16(superblock, 58)?;
-    if state & EXT4_VALID_FS == 0 || state & EXT4_ERROR_FS != 0 {
-        return Err(FsError::Corrupt);
+    // Every incompatible feature outside the recovery flag must still match
+    // exactly, so an unknown bit is refused on both paths.
+    let incompat = read_u32(superblock, 96)?;
+    if incompat & !EXT4_FEATURE_INCOMPAT_RECOVER != EXT4_FEATURE_INCOMPAT {
+        return Err(FsError::Unsupported);
     }
+    let needs_recovery = incompat & EXT4_FEATURE_INCOMPAT_RECOVER != 0;
+    admit_state(read_u16(superblock, 58)?, needs_recovery, admission)?;
     let stored_checksum = read_u32(superblock, 1020)?;
     if stored_checksum != crc32c(u32::MAX, &superblock[..1020]) {
         return Err(FsError::Corrupt);
@@ -3174,16 +3598,20 @@ mod tests {
 
     use super::{
         BlockDevice, BlockRegion, CRC32C_POLYNOMIAL, EXT4_BLOCK_BYTES, EXT4_BLOCK_BYTES_U32,
-        EXT4_EXTENT_TAIL_OFFSET, EXT4_EXTENTS_FL, EXT4_FAST_SYMLINK_BYTES, EXT4_FEATURE_COMPAT,
-        EXT4_FEATURE_INCOMPAT, EXT4_FEATURE_RO_COMPAT, EXT4_INODE_BYTES, EXT4_ROOT_INO,
-        EXT4_VALID_FS, Ext4, Ext4Limits, Extent, FsError, NodeKind, ReadOnlyFileSystem, crc32c,
-        parse_extent_leaf, parse_extents, read_u16, read_u32,
+        EXT4_BLOCK_BYTES_U64, EXT4_EXTENT_TAIL_OFFSET, EXT4_EXTENTS_FL, EXT4_FAST_SYMLINK_BYTES,
+        EXT4_FEATURE_COMPAT, EXT4_FEATURE_INCOMPAT, EXT4_FEATURE_RO_COMPAT, EXT4_INODE_BYTES,
+        EXT4_JOURNAL_INO, EXT4_ROOT_INO, EXT4_VALID_FS, Ext4, Ext4Limits, Extent, FsError,
+        NodeKind, ReadOnlyFileSystem, RecoveryOutcome, crc32c, parse_extent_leaf, parse_extents,
+        read_u16, read_u32,
     };
 
     const DEVICE_BLOCK_BYTES_U32: u32 = 512;
     const DEVICE_BLOCK_BYTES_USIZE: usize = 512;
     const DEVICE_BLOCKS_PER_FS_BLOCK: u32 = 8;
-    const FS_BLOCKS: u32 = 32;
+    const FS_BLOCKS: u32 = 64;
+    const BLOCK_BITMAP_BYTES: usize = FS_BLOCKS as usize / 8;
+    const JOURNAL_FIRST_BLOCK: u32 = 8;
+    const JOURNAL_BLOCKS: u16 = 16;
     const DEVICE_BLOCKS: u64 = FS_BLOCKS as u64 * DEVICE_BLOCKS_PER_FS_BLOCK as u64;
     const UUID: [u8; 16] = *b"troe-ext4-test!!";
     const INODE_BITMAP_BLOCK: u32 = 2;
@@ -3298,6 +3726,207 @@ mod tests {
 
         fn flush(&mut self) -> Result<(), BlockError> {
             self.file.sync_all().map_err(|_| BlockError::Device)
+        }
+    }
+
+    /// A device that models a volatile write-back cache and injectable faults.
+    ///
+    /// Writes land in a volatile cache and become durable only at a flush, so
+    /// unbarriered writes have no ordering, exactly like a real disk. A power
+    /// loss discards whatever has not been flushed. Faults can fail the Nth
+    /// write or flush, or tear one write so that only a prefix of its sectors
+    /// reaches the cache.
+    #[derive(Debug, Clone)]
+    struct PowerLossDevice {
+        geometry: BlockGeometry,
+        durable: BTreeMap<u64, [u8; DEVICE_BLOCK_BYTES_USIZE]>,
+        pending: BTreeMap<u64, [u8; DEVICE_BLOCK_BYTES_USIZE]>,
+        blocks: u64,
+        writes: usize,
+        flushes: usize,
+        fail_write_at: Option<usize>,
+        fail_flush_at: Option<usize>,
+        tear_write_at: Option<(usize, u32)>,
+    }
+
+    impl PowerLossDevice {
+        fn new(blocks: u64) -> Result<Self, BlockError> {
+            Ok(Self {
+                geometry: BlockGeometry::new(DEVICE_BLOCK_BYTES_U32, blocks, 1, true, false)?,
+                durable: BTreeMap::new(),
+                pending: BTreeMap::new(),
+                blocks,
+                writes: 0,
+                flushes: 0,
+                fail_write_at: None,
+                fail_flush_at: None,
+                tear_write_at: None,
+            })
+        }
+
+        /// Discard every write that has not reached durable media.
+        fn power_loss(&mut self) {
+            self.pending.clear();
+        }
+
+        /// Count the writes and flushes one operation performs.
+        fn counts(&self) -> (usize, usize) {
+            (self.writes, self.flushes)
+        }
+
+        /// Start fault counting from the next operation.
+        fn reset_counts(&mut self) {
+            self.writes = 0;
+            self.flushes = 0;
+        }
+
+        fn sector(&self, block: u64) -> [u8; DEVICE_BLOCK_BYTES_USIZE] {
+            self.pending
+                .get(&block)
+                .or_else(|| self.durable.get(&block))
+                .copied()
+                .unwrap_or([0; DEVICE_BLOCK_BYTES_USIZE])
+        }
+    }
+
+    impl BlockDevice for PowerLossDevice {
+        fn geometry(&self) -> BlockGeometry {
+            self.geometry
+        }
+
+        fn read_blocks(
+            &mut self,
+            start_block: u64,
+            block_count: u32,
+            destination: &mut [u8],
+        ) -> Result<(), BlockError> {
+            let expected = usize::try_from(block_count)
+                .ok()
+                .and_then(|count| count.checked_mul(DEVICE_BLOCK_BYTES_USIZE))
+                .ok_or(BlockError::Device)?;
+            if destination.len() != expected
+                || start_block
+                    .checked_add(u64::from(block_count))
+                    .is_none_or(|end| end > self.blocks)
+            {
+                return Err(BlockError::Device);
+            }
+            for index in 0..u64::from(block_count) {
+                let sector = self.sector(start_block + index);
+                let offset = usize::try_from(index)
+                    .ok()
+                    .and_then(|value| value.checked_mul(DEVICE_BLOCK_BYTES_USIZE))
+                    .ok_or(BlockError::Device)?;
+                destination
+                    .get_mut(offset..offset + DEVICE_BLOCK_BYTES_USIZE)
+                    .ok_or(BlockError::Device)?
+                    .copy_from_slice(&sector);
+            }
+            Ok(())
+        }
+
+        fn write_blocks(
+            &mut self,
+            start_block: u64,
+            block_count: u32,
+            source: &[u8],
+            force_unit_access: bool,
+        ) -> Result<(), BlockError> {
+            let expected = usize::try_from(block_count)
+                .ok()
+                .and_then(|count| count.checked_mul(DEVICE_BLOCK_BYTES_USIZE))
+                .ok_or(BlockError::Device)?;
+            if source.len() != expected
+                || force_unit_access
+                || start_block
+                    .checked_add(u64::from(block_count))
+                    .is_none_or(|end| end > self.blocks)
+            {
+                return Err(BlockError::Device);
+            }
+            self.writes += 1;
+            if self.fail_write_at == Some(self.writes) {
+                return Err(BlockError::Device);
+            }
+            let persisted = match self.tear_write_at {
+                Some((index, sectors)) if index == self.writes => sectors.min(block_count),
+                _ => block_count,
+            };
+            for index in 0..u64::from(persisted) {
+                let offset = usize::try_from(index)
+                    .ok()
+                    .and_then(|value| value.checked_mul(DEVICE_BLOCK_BYTES_USIZE))
+                    .ok_or(BlockError::Device)?;
+                let mut sector = [0_u8; DEVICE_BLOCK_BYTES_USIZE];
+                sector.copy_from_slice(
+                    source
+                        .get(offset..offset + DEVICE_BLOCK_BYTES_USIZE)
+                        .ok_or(BlockError::Device)?,
+                );
+                self.pending.insert(start_block + index, sector);
+            }
+            if persisted != block_count {
+                return Err(BlockError::Device);
+            }
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<(), BlockError> {
+            self.flushes += 1;
+            if self.fail_flush_at == Some(self.flushes) {
+                return Err(BlockError::Device);
+            }
+            for (block, sector) in core::mem::take(&mut self.pending) {
+                self.durable.insert(block, sector);
+            }
+            Ok(())
+        }
+    }
+
+    /// A cloneable handle so a test can inspect and fault a mounted device.
+    #[derive(Debug, Clone)]
+    struct SharedDevice(std::rc::Rc<core::cell::RefCell<PowerLossDevice>>);
+
+    impl SharedDevice {
+        fn new(device: PowerLossDevice) -> Self {
+            Self(std::rc::Rc::new(core::cell::RefCell::new(device)))
+        }
+
+        fn device(&self) -> core::cell::RefMut<'_, PowerLossDevice> {
+            self.0.borrow_mut()
+        }
+    }
+
+    impl BlockDevice for SharedDevice {
+        fn geometry(&self) -> BlockGeometry {
+            self.0.borrow().geometry
+        }
+
+        fn read_blocks(
+            &mut self,
+            start_block: u64,
+            block_count: u32,
+            destination: &mut [u8],
+        ) -> Result<(), BlockError> {
+            self.0
+                .borrow_mut()
+                .read_blocks(start_block, block_count, destination)
+        }
+
+        fn write_blocks(
+            &mut self,
+            start_block: u64,
+            block_count: u32,
+            source: &[u8],
+            force_unit_access: bool,
+        ) -> Result<(), BlockError> {
+            self.0
+                .borrow_mut()
+                .write_blocks(start_block, block_count, source, force_unit_access)
+        }
+
+        fn flush(&mut self) -> Result<(), BlockError> {
+            self.0.borrow_mut().flush()
         }
     }
 
@@ -3431,10 +4060,34 @@ mod tests {
     }
 
     fn mount_writable(device: SparseDevice) -> Result<Ext4<SparseDevice>, FsError> {
+        mount_device_writable(device)
+    }
+
+    fn mount_device_writable<D: BlockDevice>(device: D) -> Result<Ext4<D>, FsError> {
         let block_limits = BlockLimits::new(8, EXT4_BLOCK_BYTES, 1).map_err(|_| FsError::Io)?;
         let region = BlockRegion::whole_device(device, BlockAccess::ReadWrite, block_limits)
             .map_err(|_| FsError::Io)?;
         Ext4::mount(region, limits()?)
+    }
+
+    /// Seed a power-loss device with the same valid image the other tests use.
+    fn power_loss_device() -> Result<SharedDevice, FsError> {
+        let source = valid_device();
+        let mut device = PowerLossDevice::new(DEVICE_BLOCKS).map_err(|_| FsError::Io)?;
+        for (fs_block, bytes) in &source.blocks {
+            let base = u64::from(*fs_block) * u64::from(DEVICE_BLOCKS_PER_FS_BLOCK);
+            for index in 0..DEVICE_BLOCKS_PER_FS_BLOCK {
+                let offset = index as usize * DEVICE_BLOCK_BYTES_USIZE;
+                let mut sector = [0_u8; DEVICE_BLOCK_BYTES_USIZE];
+                sector.copy_from_slice(
+                    bytes
+                        .get(offset..offset + DEVICE_BLOCK_BYTES_USIZE)
+                        .ok_or(FsError::Io)?,
+                );
+                device.durable.insert(base + u64::from(index), sector);
+            }
+        }
+        Ok(SharedDevice::new(device))
     }
 
     fn mount_file(path: &Path) -> Result<Ext4<FileDevice>, String> {
@@ -3513,7 +4166,7 @@ mod tests {
         let superblock = &mut block_zero[1024..2048];
         put_u32(superblock, 0, 16);
         put_u32(superblock, 4, FS_BLOCKS);
-        put_u32(superblock, 12, 24);
+        put_u32(superblock, 12, 40);
         put_u32(superblock, 16, 11);
         put_u32(superblock, 20, 0);
         put_u32(superblock, 24, 2);
@@ -3538,12 +4191,13 @@ mod tests {
         blocks.insert(0, block_zero);
 
         let mut block_bitmap = [0xff_u8; EXT4_BLOCK_BYTES];
-        block_bitmap[..4].fill(0);
-        for block in 0_u32..=7 {
+        block_bitmap[..BLOCK_BITMAP_BYTES].fill(0);
+        let journal_last = JOURNAL_FIRST_BLOCK + u32::from(JOURNAL_BLOCKS) - 1;
+        for block in 0_u32..=journal_last {
             let bit = usize::try_from(block).unwrap_or_else(|_| unreachable!());
             block_bitmap[bit / 8] |= 1 << (bit % 8);
         }
-        let block_bitmap_checksum = crc32c(seed, &block_bitmap[..4]);
+        let block_bitmap_checksum = crc32c(seed, &block_bitmap[..BLOCK_BITMAP_BYTES]);
         blocks.insert(7, block_bitmap);
 
         let mut bitmap = [0xff_u8; EXT4_BLOCK_BYTES];
@@ -3559,7 +4213,7 @@ mod tests {
         put_u32(&mut descriptor_block, 0, 7);
         put_u32(&mut descriptor_block, 4, INODE_BITMAP_BLOCK);
         put_u32(&mut descriptor_block, 8, INODE_TABLE_BLOCK);
-        put_u16(&mut descriptor_block, 12, 24);
+        put_u16(&mut descriptor_block, 12, 40);
         put_u16(&mut descriptor_block, 14, 11);
         put_u16(&mut descriptor_block, 28, 8);
         put_u16(
@@ -3612,6 +4266,8 @@ mod tests {
         directory_tail(&mut sub, 4, SUB_GENERATION, seed);
         blocks.insert(SUB_DIRECTORY_BLOCK, sub);
 
+        blocks.insert(JOURNAL_FIRST_BLOCK, journal_superblock_image());
+
         SparseDevice { blocks }
     }
 
@@ -3623,7 +4279,7 @@ mod tests {
         let bitmap = device.blocks.get_mut(&7).unwrap_or_else(|| unreachable!());
         let bit = usize::try_from(xattr_block).unwrap_or_else(|_| unreachable!());
         bitmap[bit / 8] |= 1 << (bit % 8);
-        let bitmap_checksum = crc32c(seed, &bitmap[..4]);
+        let bitmap_checksum = crc32c(seed, &bitmap[..BLOCK_BITMAP_BYTES]);
 
         let descriptor = device.blocks.get_mut(&1).unwrap_or_else(|| unreachable!());
         put_u16(descriptor, 12, 23);
@@ -3686,6 +4342,21 @@ mod tests {
         device
     }
 
+    /// Build the clean, empty internal journal `mke2fs` writes at format time.
+    fn journal_superblock_image() -> [u8; EXT4_BLOCK_BYTES] {
+        let mut block = [0_u8; EXT4_BLOCK_BYTES];
+        block[0..4].copy_from_slice(&0xC03B_3998_u32.to_be_bytes());
+        block[4..8].copy_from_slice(&4_u32.to_be_bytes());
+        block[0x0C..0x10].copy_from_slice(&EXT4_BLOCK_BYTES_U32.to_be_bytes());
+        block[0x10..0x14].copy_from_slice(&u32::from(JOURNAL_BLOCKS).to_be_bytes());
+        block[0x14..0x18].copy_from_slice(&1_u32.to_be_bytes());
+        block[0x18..0x1C].copy_from_slice(&1_u32.to_be_bytes());
+        block[0x1C..0x20].copy_from_slice(&0_u32.to_be_bytes());
+        block[0x30..0x40].copy_from_slice(&UUID);
+        block[0x40..0x44].copy_from_slice(&1_u32.to_be_bytes());
+        block
+    }
+
     fn valid_inode_table(seed: u32) -> [u8; EXT4_BLOCK_BYTES] {
         let mut inode_table = [0_u8; EXT4_BLOCK_BYTES];
         inode(
@@ -3713,6 +4384,15 @@ mod tests {
             0x4000 | 0o700,
             EXT4_BLOCK_BYTES as u64,
             Some((0, SUB_DIRECTORY_BLOCK, 1)),
+            seed,
+        );
+        inode(
+            &mut inode_table[1792..2048],
+            EXT4_JOURNAL_INO,
+            0,
+            0x8000 | 0o600,
+            u64::from(JOURNAL_BLOCKS) * EXT4_BLOCK_BYTES_U64,
+            Some((0, JOURNAL_FIRST_BLOCK, JOURNAL_BLOCKS)),
             seed,
         );
         inode_table
@@ -4141,6 +4821,156 @@ mod tests {
         ext4.finish_mutation()?;
         let clean = ext4.read_fs_block(0)?;
         assert_ne!(read_u16(&clean[1024..2048], 58)? & super::EXT4_VALID_FS, 0);
+        Ok(())
+    }
+
+    fn recover_device<D: BlockDevice>(device: D) -> Result<(Ext4<D>, RecoveryOutcome), FsError> {
+        let block_limits = BlockLimits::new(8, EXT4_BLOCK_BYTES, 1).map_err(|_| FsError::Io)?;
+        let region = BlockRegion::whole_device(device, BlockAccess::ReadWrite, block_limits)
+            .map_err(|_| FsError::Io)?;
+        Ext4::recover(region, limits()?)
+    }
+
+    #[test]
+    fn every_interrupted_mutation_boundary_recovers_to_exactly_one_valid_state()
+    -> Result<(), FsError> {
+        const CONTENT: &[u8] = b"created by troe\n";
+
+        let baseline = power_loss_device()?;
+        {
+            let mut ext4 = mount_device_writable(baseline.clone())?;
+            ext4.write_file("/created.txt", CONTENT)?;
+        }
+        let (writes, flushes) = baseline.device().counts();
+        assert!(writes >= 3, "a journaled create performs several writes");
+        assert!(
+            flushes >= 4,
+            "commit, checkpoint, retire, and clean each flush"
+        );
+        // A completed mutation leaves a clean volume the ordinary mount opens.
+        let mut settled = mount_device_writable(baseline.clone())?;
+        let mut bytes = [0_u8; CONTENT.len()];
+        assert_eq!(
+            settled.read_file("/created.txt", 0, &mut bytes)?,
+            CONTENT.len()
+        );
+        assert_eq!(&bytes, CONTENT);
+
+        let mut replayed = 0_u32;
+        let mut discarded = 0_u32;
+        for boundary in 1..=writes {
+            let device = power_loss_device()?;
+            device.device().fail_write_at = Some(boundary);
+            {
+                let mut ext4 = mount_device_writable(device.clone())?;
+                let _interrupted = ext4.write_file("/created.txt", CONTENT);
+            }
+            device.device().power_loss();
+
+            // The ordinary mount stays fail-closed at every boundary that left
+            // the volume mid-mutation.
+            let refused = mount_device_writable(device.clone()).is_err();
+            if !refused {
+                // The interruption landed before the dirty marker reached
+                // media, so the volume never entered a mutation.
+                continue;
+            }
+            let (mut recovered, outcome) = recover_device(device.clone())?;
+            match outcome {
+                RecoveryOutcome::Replayed { .. } => replayed += 1,
+                RecoveryOutcome::Discarded | RecoveryOutcome::AlreadyClean => discarded += 1,
+            }
+            // Exactly one valid state: either the create is fully present with
+            // its exact bytes, or it is entirely absent. Never anything else.
+            let mut recovered_bytes = [0_u8; CONTENT.len()];
+            match recovered.read_file("/created.txt", 0, &mut recovered_bytes) {
+                Ok(read) => {
+                    assert_eq!(read, CONTENT.len(), "boundary {boundary} is partial");
+                    assert_eq!(
+                        &recovered_bytes, CONTENT,
+                        "boundary {boundary} recovered wrong bytes"
+                    );
+                }
+                Err(FsError::NotFound) => {}
+                Err(error) => {
+                    return Err(error);
+                }
+            }
+            // Recovery is idempotent: a volume it already fixed needs no more.
+            assert_eq!(
+                recover_device(device.clone()).err(),
+                Some(FsError::Invalid),
+                "boundary {boundary} must not need a second recovery"
+            );
+            // And the recovered volume mounts cleanly through the ordinary path.
+            mount_device_writable(device.clone())?;
+        }
+        assert!(
+            replayed > 0,
+            "some boundary must land after the commit record"
+        );
+        assert!(
+            discarded > 0,
+            "some boundary must land before the commit record"
+        );
+        Ok(())
+    }
+
+    /// A device holding one committed file with a partial tail block.
+    fn prepared_append_device() -> Result<SharedDevice, FsError> {
+        let device = power_loss_device()?;
+        {
+            let mut ext4 = mount_device_writable(device.clone())?;
+            ext4.write_file("/appendme", b"prefix")?;
+        }
+        device.device().reset_counts();
+        Ok(device)
+    }
+
+    #[test]
+    fn an_interrupted_append_never_leaves_a_torn_tail_block() -> Result<(), FsError> {
+        // The tail block of an append is rewritten in place over live, already
+        // durable bytes. Staging routes that write through the log, so an
+        // interruption can only leave the old content or the whole new
+        // content, never a mixture of the two.
+        const HEAD: &[u8] = b"prefix";
+        const TAIL: &[u8] = b"-tail";
+
+        let baseline = prepared_append_device()?;
+        {
+            let mut ext4 = mount_device_writable(baseline.clone())?;
+            ext4.append_file("/appendme", TAIL)?;
+        }
+        let (writes, _) = baseline.device().counts();
+        assert!(writes >= 3, "an append performs several writes");
+
+        for boundary in 1..=writes {
+            let device = prepared_append_device()?;
+            device.device().fail_write_at = Some(boundary);
+            {
+                let mut ext4 = mount_device_writable(device.clone())?;
+                let _interrupted = ext4.append_file("/appendme", TAIL);
+            }
+            device.device().power_loss();
+
+            let mut recovered = match mount_device_writable(device.clone()) {
+                Ok(ext4) => ext4,
+                Err(_) => recover_device(device.clone())?.0,
+            };
+            let size = recovered.metadata("/appendme")?.byte_count;
+            let appended = [HEAD, TAIL].concat();
+            assert!(
+                size == HEAD.len() as u64 || size == appended.len() as u64,
+                "boundary {boundary} left size {size}: neither pre nor post state"
+            );
+            let mut bytes = [0_u8; 16];
+            let read = recovered.read_file("/appendme", 0, &mut bytes)?;
+            let content = bytes.get(..read).ok_or(FsError::Corrupt)?;
+            assert!(
+                content == HEAD || content == appended.as_slice(),
+                "boundary {boundary} tore the tail block"
+            );
+        }
         Ok(())
     }
 
