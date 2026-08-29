@@ -94,6 +94,7 @@ PACKAGE_SCENARIOS = {
     "troe-kernel": set(ALL_QEMU_SCENARIOS),
     "troe-kex": set(ALL_QEMU_SCENARIOS),
     "troe-kex-alloc": {"filesystem", "lua"},
+    "troe-kex-c-runtime": {"filesystem"},
     "troe-kex-runtime": {"filesystem"},
     "troe-kex-tool": set(ALL_QEMU_SCENARIOS),
 }
@@ -121,6 +122,7 @@ PYTHON_IMPACTS = {
     "tools/mkefs.py": ("test_image_builders.py",),
     "tools/mkfat.py": ("test_cloud_artifacts.py", "test_image_builders.py"),
     "tools/mkidentity.py": ("test_identity_provisioning.py",),
+    "tools/mkruntime.py": ("test_mkruntime.py",),
     "tools/mkstorage.py": ("test_cloud_artifacts.py", "test_mkstorage.py"),
     "tools/mkshared.py": (
         "test_mkshared.py",
@@ -151,6 +153,7 @@ PYTHON_IMPACTS = {
     ),
     "tools/qemu-firmware-profile.json": ("test_qemu_profile.py",),
     "tools/size_report.py": ("test_build_policy.py",),
+    "tools/build_c_sysroot.py": ("test_c_sysroot.py",),
 }
 RUNTIME_TOOL_SCENARIOS = {
     "config/volumes.toml": ("boot", "filesystem"),
@@ -163,6 +166,8 @@ RUNTIME_TOOL_SCENARIOS = {
     "tools/mkfat.py": ("boot",),
     "tools/mkstorage.py": ("boot", "filesystem", "persistence"),
     "tools/mkshared.py": ("boot", "filesystem"),
+    "tools/mkruntime.py": ("filesystem",),
+    "tools/build_c_sysroot.py": ("filesystem",),
     "tools/mount_shared.py": ("boot", "filesystem"),
     "tools/size_report.py": ("boot",),
 }

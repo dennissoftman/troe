@@ -30,9 +30,11 @@ mod firmware {
         timer, volume_control, wall_clock,
     };
     use troe_application::{
-        ABI_MINOR, ApplicationLimits, InitialHandle, KEX_V1_IMAGE_ALIGNMENT, KEX_V1_MIN_IMAGE_BASE,
-        KEX_V1_USER_END, LoadPlacement, LoadPlan, LoaderResource, LoaderTransaction, PAGE_BYTES,
-        SegmentPermissions, StartupInfo, Target, parse_kex_at, parse_kex_package, stage_artifact,
+        ABI_MINOR, ApplicationLayout, ApplicationLimits, InitialHandle, KEX_V1_IMAGE_ALIGNMENT,
+        KEX_V1_MIN_IMAGE_BASE, KEX_V1_USER_END, LoadCharges, LoadPlacement, LoadPlan,
+        LoadSegmentLayout, LoaderResource, LoaderTransaction, PAGE_BYTES, SegmentPermissions,
+        StartupInfo, StreamedKexPackage, StreamedLoadPlan, Target, parse_kex_at, parse_kex_package,
+        parse_streamed_kex_package, stream_verified_segments, visit_verified_relocations,
     };
     #[cfg(feature = "acceptance-probes")]
     use troe_application::{ParseError, parse_kex};
@@ -1243,6 +1245,7 @@ mod firmware {
     struct PendingFileReplacement {
         token: u32,
         path: String,
+        start_offset: u64,
         offset: u64,
         bytes: Vec<u8>,
         chunk_bytes: usize,
@@ -4586,12 +4589,48 @@ mod firmware {
         clippy::too_many_arguments,
         clippy::too_many_lines
     )]
-    fn prepare_resident_application<'service>(
+    fn prepare_streamed_resident_application<'service>(
+        scheduler: &mut Scheduler,
+        accounting: &mut OwnedAccounting,
+        dispatcher: Dispatcher<'service>,
+        services: &[CommandStartupService],
+        package: &StreamedKexPackage,
+        mut read_at: impl FnMut(u64, &mut [u8]) -> Result<usize, ()>,
+        resource_slot: u32,
+        process_name: &str,
+        process_origin: ProcessOrigin,
+        started_millis: u64,
+        processes: SharedProcessTable,
+    ) -> Result<ResidentApplication<'service>, ()> {
+        prepare_resident_application_with_plan(
+            scheduler,
+            accounting,
+            dispatcher,
+            services,
+            package.executable(),
+            |allocation, _plan| {
+                prepare_streamed_application_memory(allocation, package, &mut read_at)
+            },
+            resource_slot,
+            process_name,
+            process_origin,
+            started_millis,
+            processes,
+        )
+    }
+
+    #[allow(
+        clippy::drop_non_drop,
+        clippy::too_many_arguments,
+        clippy::too_many_lines
+    )]
+    fn prepare_resident_application_with_plan<'service, P: NativeApplicationPlan>(
         scheduler: &mut Scheduler,
         accounting: &mut OwnedAccounting,
         mut dispatcher: Dispatcher<'service>,
         services: &[CommandStartupService],
-        source: &[u8],
+        plan: &P,
+        materialize: impl FnOnce(&ApplicationAllocation, &P) -> Result<(), ()>,
         resource_slot: u32,
         process_name: &str,
         process_origin: ProcessOrigin,
@@ -4611,18 +4650,13 @@ mod firmware {
         transaction
             .acquire(LoaderResource::Staging)
             .map_err(|_| ())?;
-        let Ok(plan) = parse_native_application(accounting, source) else {
-            clear_provisional_loader_ownership(&mut transaction);
-            return Err(());
-        };
         let fixed_user_regions = if plan.heap_pages() == 0 {
             APPLICATION_FIXED_USER_REGIONS - 1
         } else {
             APPLICATION_FIXED_USER_REGIONS
         };
         let application_user_regions = plan
-            .segments()
-            .count()
+            .segment_count()
             .checked_add(fixed_user_regions)
             .ok_or(())?;
         let heap_start = plan.layout().heap_address();
@@ -4635,7 +4669,7 @@ mod firmware {
         let private_pages = plan.charges().private_pages();
         let stack_pages = plan.stack_pages();
 
-        let Ok((allocation, mapping_plan)) = allocate_application(accounting, &plan) else {
+        let Ok((allocation, mapping_plan)) = allocate_application(accounting, plan) else {
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
@@ -4644,7 +4678,7 @@ mod firmware {
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         }
-        if prepare_application_memory(&allocation, &plan).is_err() {
+        if materialize(&allocation, plan).is_err() {
             reclaim_command_application(accounting, allocation);
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
@@ -4748,8 +4782,7 @@ mod firmware {
                     handles: &startup_handles,
                 },
                 &mut startup,
-            )
-            .map_err(|_| ())?;
+            )?;
             troe_machine::copy_to_physical(allocation.startup, 0, &startup).map_err(|_| ())?;
             Ok((owner, command_handles))
         })();
@@ -4765,7 +4798,6 @@ mod firmware {
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
-        drop(plan);
         drop(mapping_plan);
         let registration = ProcessRegistration {
             task_id,
@@ -5516,16 +5548,23 @@ mod firmware {
             if metadata.kind != NodeKind::File {
                 return Err(ReplyStatus::NotFound);
             }
-            let artifact = stage_artifact(metadata.byte_count, |offset, destination| {
-                control
-                    .launch
-                    .namespace
-                    .borrow_mut()
-                    .read_file_at(cwd, path, offset, destination)
-                    .map_err(|_| ())
-            })
-            .map_err(|_| ReplyStatus::Failure)?;
-            let package = parse_kex_package(&artifact).map_err(|_| ReplyStatus::InvalidRequest)?;
+            let placement = random_application_placement(&accounting.random)
+                .map_err(|_| ReplyStatus::Failure)?;
+            let package = parse_streamed_kex_package(
+                metadata.byte_count,
+                |offset, destination| {
+                    control
+                        .launch
+                        .namespace
+                        .borrow_mut()
+                        .read_file_at(cwd, path, offset, destination)
+                        .map_err(|_| ())
+                },
+                native_application_target(),
+                ABI_MINOR,
+                placement,
+            )
+            .map_err(|_| ReplyStatus::InvalidRequest)?;
             let (required, shell_script_required) =
                 decode_application_requirements(package.requirements())
                     .map_err(|_| ReplyStatus::Denied)?;
@@ -5916,12 +5955,20 @@ mod firmware {
                     u32::try_from(troe_task::MAX_TASKS).map_err(|_| ReplyStatus::Failure)?,
                 )
                 .ok_or(ReplyStatus::Exhausted)?;
-            let mut process = prepare_resident_application(
+            let mut process = prepare_streamed_resident_application(
                 scheduler,
                 accounting,
                 dispatcher,
                 &services,
-                package.executable(),
+                &package,
+                |offset, destination| {
+                    control
+                        .launch
+                        .namespace
+                        .borrow_mut()
+                        .read_file_at(cwd, path, offset, destination)
+                        .map_err(|_| ())
+                },
                 resource_slot,
                 command_name,
                 ProcessOrigin::Child,
@@ -7255,6 +7302,108 @@ mod firmware {
     ) -> Result<LoadPlan<'artifact>, ()> {
         let placement = random_application_placement(&accounting.random)?;
         parse_kex_at(artifact, native_application_target(), ABI_MINOR, placement).map_err(|_| ())
+    }
+
+    trait NativeApplicationPlan {
+        fn entry_address(&self) -> u64;
+        fn image_base(&self) -> u64;
+        fn heap_pages(&self) -> u64;
+        fn stack_pages(&self) -> u64;
+        fn charges(&self) -> LoadCharges;
+        fn layout(&self) -> ApplicationLayout;
+        fn segment_count(&self) -> usize;
+        fn segment(&self, index: usize) -> Option<LoadSegmentLayout>;
+        fn encode_startup_page(
+            &self,
+            info: StartupInfo<'_>,
+            destination: &mut [u8; PAGE_BYTES],
+        ) -> Result<(), ()>;
+    }
+
+    impl NativeApplicationPlan for LoadPlan<'_> {
+        fn entry_address(&self) -> u64 {
+            self.entry_address()
+        }
+
+        fn image_base(&self) -> u64 {
+            self.image_base()
+        }
+
+        fn heap_pages(&self) -> u64 {
+            self.heap_pages()
+        }
+
+        fn stack_pages(&self) -> u64 {
+            self.stack_pages()
+        }
+
+        fn charges(&self) -> LoadCharges {
+            self.charges()
+        }
+
+        fn layout(&self) -> ApplicationLayout {
+            self.layout()
+        }
+
+        fn segment_count(&self) -> usize {
+            self.segments().count()
+        }
+
+        fn segment(&self, index: usize) -> Option<LoadSegmentLayout> {
+            self.segments()
+                .nth(index)
+                .map(troe_application::LoadSegment::layout)
+        }
+
+        fn encode_startup_page(
+            &self,
+            info: StartupInfo<'_>,
+            destination: &mut [u8; PAGE_BYTES],
+        ) -> Result<(), ()> {
+            self.encode_startup_page(info, destination).map_err(|_| ())
+        }
+    }
+
+    impl NativeApplicationPlan for StreamedLoadPlan {
+        fn entry_address(&self) -> u64 {
+            self.entry_address()
+        }
+
+        fn image_base(&self) -> u64 {
+            self.image_base()
+        }
+
+        fn heap_pages(&self) -> u64 {
+            self.heap_pages()
+        }
+
+        fn stack_pages(&self) -> u64 {
+            self.stack_pages()
+        }
+
+        fn charges(&self) -> LoadCharges {
+            self.charges()
+        }
+
+        fn layout(&self) -> ApplicationLayout {
+            self.layout()
+        }
+
+        fn segment_count(&self) -> usize {
+            self.segments().count()
+        }
+
+        fn segment(&self, index: usize) -> Option<LoadSegmentLayout> {
+            self.segments().nth(index)
+        }
+
+        fn encode_startup_page(
+            &self,
+            info: StartupInfo<'_>,
+            destination: &mut [u8; PAGE_BYTES],
+        ) -> Result<(), ()> {
+            self.encode_startup_page(info, destination).map_err(|_| ())
+        }
     }
 
     fn private_metadata_bytes(mappings: &[ApplicationPrivateMapping]) -> Option<u64> {
@@ -8656,9 +8805,9 @@ mod firmware {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn allocate_application(
+    fn allocate_application<P: NativeApplicationPlan>(
         accounting: &mut OwnedAccounting,
-        plan: &LoadPlan<'_>,
+        plan: &P,
     ) -> Result<(ApplicationAllocation, MappingPlan), ()> {
         let resource_pages = plan.charges().private_pages();
         let committed_pages = accounting
@@ -8789,47 +8938,91 @@ mod firmware {
             return Err(());
         }
         for relocation in plan.relocations() {
-            let target_end = relocation.target_offset().checked_add(8).ok_or(())?;
-            let mut physical_start = allocation.image.start();
-            let mut target = None;
-            for segment in plan.segments() {
-                let segment_end = segment
-                    .image_offset()
-                    .checked_add(segment.memory_bytes())
-                    .ok_or(())?;
-                let physical = PhysicalRange::from_pages(
-                    physical_start,
-                    segment.memory_bytes() / BASE_PAGE_SIZE,
-                )
-                .map_err(|_| ())?;
-                if segment.image_offset() <= relocation.target_offset() && target_end <= segment_end
-                {
-                    let byte_offset = relocation
-                        .target_offset()
-                        .checked_sub(segment.image_offset())
-                        .and_then(|offset| usize::try_from(offset).ok())
-                        .ok_or(())?;
-                    target = Some((physical, byte_offset));
-                    break;
-                }
-                physical_start = physical.end();
-            }
-            let (physical, byte_offset) = target.ok_or(())?;
-            let value = plan
-                .image_base()
-                .checked_add(relocation.value_offset())
-                .ok_or(())?;
-            troe_machine::copy_to_physical(physical, byte_offset, &value.to_le_bytes())
-                .map_err(|_| ())?;
+            apply_application_relocation(allocation, plan, relocation)?;
         }
         Ok(())
     }
 
-    fn build_application_plan(
+    fn prepare_streamed_application_memory(
+        allocation: &ApplicationAllocation,
+        package: &StreamedKexPackage,
+        read_at: &mut impl FnMut(u64, &mut [u8]) -> Result<usize, ()>,
+    ) -> Result<(), ()> {
+        troe_machine::zero_physical_range(allocation.complete).map_err(|_| ())?;
+        stream_verified_segments(
+            package,
+            |offset, destination| read_at(offset, destination),
+            |segment_index, segment_offset, bytes| {
+                let (physical, _segment) =
+                    application_segment_physical(allocation, package.executable(), segment_index)?;
+                let byte_offset = usize::try_from(segment_offset).map_err(|_| ())?;
+                troe_machine::copy_to_physical(physical, byte_offset, bytes).map_err(|_| ())
+            },
+        )
+        .map_err(|_| ())?;
+        visit_verified_relocations(
+            package,
+            |offset, destination| read_at(offset, destination),
+            |relocation| apply_application_relocation(allocation, package.executable(), relocation),
+        )
+        .map_err(|_| ())
+    }
+
+    fn application_segment_physical<P: NativeApplicationPlan>(
+        allocation: &ApplicationAllocation,
+        plan: &P,
+        wanted_index: usize,
+    ) -> Result<(PhysicalRange, LoadSegmentLayout), ()> {
+        let mut physical_start = allocation.image.start();
+        for index in 0..plan.segment_count() {
+            let segment = plan.segment(index).ok_or(())?;
+            let physical =
+                PhysicalRange::from_pages(physical_start, segment.memory_bytes() / BASE_PAGE_SIZE)
+                    .map_err(|_| ())?;
+            if index == wanted_index {
+                return Ok((physical, segment));
+            }
+            physical_start = physical.end();
+        }
+        Err(())
+    }
+
+    fn apply_application_relocation<P: NativeApplicationPlan>(
+        allocation: &ApplicationAllocation,
+        plan: &P,
+        relocation: troe_application::RelativeRelocation,
+    ) -> Result<(), ()> {
+        let target_end = relocation.target_offset().checked_add(8).ok_or(())?;
+        let mut target = None;
+        for index in 0..plan.segment_count() {
+            let (physical, segment) = application_segment_physical(allocation, plan, index)?;
+            let segment_end = segment
+                .image_offset()
+                .checked_add(segment.memory_bytes())
+                .ok_or(())?;
+            if segment.image_offset() <= relocation.target_offset() && target_end <= segment_end {
+                let byte_offset = relocation
+                    .target_offset()
+                    .checked_sub(segment.image_offset())
+                    .and_then(|offset| usize::try_from(offset).ok())
+                    .ok_or(())?;
+                target = Some((physical, byte_offset));
+                break;
+            }
+        }
+        let (physical, byte_offset) = target.ok_or(())?;
+        let value = plan
+            .image_base()
+            .checked_add(relocation.value_offset())
+            .ok_or(())?;
+        troe_machine::copy_to_physical(physical, byte_offset, &value.to_le_bytes()).map_err(|_| ())
+    }
+
+    fn build_application_plan<P: NativeApplicationPlan>(
         kernel: &MappingPlan,
         kernel_runtime: PhysicalRange,
         allocation: &ApplicationPrivateAllocation,
-        application: &LoadPlan<'_>,
+        application: &P,
     ) -> Result<MappingPlan, ()> {
         let mut plan = MappingPlan::new();
         for mapping in kernel.mappings() {
@@ -8843,7 +9036,8 @@ mod firmware {
         }
 
         let mut physical_start = allocation.image.start();
-        for segment in application.segments() {
+        for index in 0..application.segment_count() {
+            let segment = application.segment(index).ok_or(())?;
             let physical =
                 PhysicalRange::from_pages(physical_start, segment.memory_bytes() / BASE_PAGE_SIZE)
                     .map_err(|_| ())?;
@@ -10717,11 +10911,42 @@ mod firmware {
             self.pending = Some(PendingFileReplacement {
                 token,
                 path: owned_path,
+                start_offset: 0,
                 offset: 0,
                 bytes: Vec::new(),
                 chunk_bytes: FILE_IO_BUFFER_BYTES,
             });
             Ok(token)
+        }
+
+        fn begin_append(&mut self, path: &str) -> Result<(u32, u64), ReplyStatus> {
+            if self.pending.is_some() {
+                return Err(ReplyStatus::Conflict);
+            }
+            let metadata = self
+                .namespace
+                .borrow_mut()
+                .metadata(&self.cwd, path)
+                .map_err(application_filesystem_status)?;
+            if metadata.kind != NodeKind::File {
+                return Err(ReplyStatus::WrongType);
+            }
+            let token = self.next_token.ok_or(ReplyStatus::Exhausted)?;
+            let mut owned_path = String::new();
+            owned_path
+                .try_reserve_exact(path.len())
+                .map_err(|_| ReplyStatus::Exhausted)?;
+            owned_path.push_str(path);
+            self.next_token = token.checked_add(1);
+            self.pending = Some(PendingFileReplacement {
+                token,
+                path: owned_path,
+                start_offset: metadata.byte_count,
+                offset: metadata.byte_count,
+                bytes: Vec::new(),
+                chunk_bytes: FILE_IO_BUFFER_BYTES,
+            });
+            Ok((token, metadata.byte_count))
         }
 
         fn append(
@@ -10753,7 +10978,10 @@ mod firmware {
 
         fn set_chunk_size(&mut self, token: u32, bytes: usize) -> Result<(), ReplyStatus> {
             let pending = self.pending.as_mut().ok_or(ReplyStatus::InvalidRequest)?;
-            if pending.token != token || pending.offset != 0 || !pending.bytes.is_empty() {
+            if pending.token != token
+                || pending.offset != pending.start_offset
+                || !pending.bytes.is_empty()
+            {
                 return Err(ReplyStatus::InvalidRequest);
             }
             pending.chunk_bytes = bytes;
@@ -10844,6 +11072,7 @@ mod firmware {
     }
 
     impl Service for ApplicationFilesystemMutationService {
+        #[allow(clippy::too_many_lines)]
         fn call(
             &mut self,
             request: Request<'_>,
@@ -10859,6 +11088,19 @@ mod firmware {
                         Err(status) => return Ok(ServiceReply::empty(status)),
                     };
                     let reply = filesystem_mutation::encode_token(token)
+                        .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?;
+                    ServiceReply::with_payload(ReplyStatus::Success, &reply)
+                }
+                filesystem_mutation::BEGIN_APPEND => {
+                    let Ok(path) = filesystem_mutation::decode_path_request(request.payload())
+                    else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    let (token, offset) = match self.begin_append(path) {
+                        Ok(result) => result,
+                        Err(status) => return Ok(ServiceReply::empty(status)),
+                    };
+                    let reply = filesystem_mutation::encode_begin_append_reply(token, offset)
                         .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?;
                     ServiceReply::with_payload(ReplyStatus::Success, &reply)
                 }
@@ -12666,7 +12908,8 @@ mod firmware {
             words: &[String],
             cwd: &str,
             namespace: &SharedNamespace,
-            executable: &[u8],
+            artifact_path: &str,
+            package: &StreamedKexPackage,
             requirements: BackgroundRequirements,
             diagnostics_snapshot: Option<&SharedDiagnosticsSnapshot>,
             stdout: &mut dyn Output,
@@ -13050,12 +13293,18 @@ mod firmware {
             let Ok(services) = services else {
                 return command_application_error(stderr, command, "service setup failed");
             };
-            let process = prepare_resident_application(
+            let process = prepare_streamed_resident_application(
                 self.scheduler,
                 self.accounting,
                 dispatcher,
                 &services,
-                executable,
+                package,
+                |offset, destination| {
+                    namespace
+                        .borrow_mut()
+                        .read_file_at(cwd, artifact_path, offset, destination)
+                        .map_err(|_| ())
+                },
                 resource_slot,
                 command,
                 match self.resident_owner {
@@ -13328,19 +13577,25 @@ mod firmware {
                     "artifact is not a file",
                 ));
             }
-            let Ok(artifact) = stage_artifact(metadata.byte_count, |offset, destination| {
-                namespace
-                    .borrow_mut()
-                    .read_file_at(cwd, path, offset, destination)
-                    .map_err(|_| ())
-            }) else {
+            let Ok(load_placement) = random_application_placement(&self.accounting.random) else {
                 return Some(command_application_error(
                     stderr,
                     command,
-                    "artifact staging failed",
+                    "application placement failed",
                 ));
             };
-            let Ok(package) = parse_kex_package(&artifact) else {
+            let Ok(package) = parse_streamed_kex_package(
+                metadata.byte_count,
+                |offset, destination| {
+                    namespace
+                        .borrow_mut()
+                        .read_file_at(cwd, path, offset, destination)
+                        .map_err(|_| ())
+                },
+                native_application_target(),
+                ABI_MINOR,
+                load_placement,
+            ) else {
                 return Some(command_application_error(
                     stderr,
                     command,
@@ -13562,7 +13817,8 @@ mod firmware {
                     words,
                     cwd,
                     namespace,
-                    package.executable(),
+                    path,
+                    &package,
                     BackgroundRequirements {
                         datagram: datagram_required,
                         filesystem: filesystem_required,
@@ -13985,12 +14241,18 @@ mod firmware {
                 return Some(status);
             };
 
-            let process = prepare_resident_application(
+            let process = prepare_streamed_resident_application(
                 self.scheduler,
                 self.accounting,
                 dispatcher,
                 &services,
-                package.executable(),
+                &package,
+                |offset, destination| {
+                    namespace
+                        .borrow_mut()
+                        .read_file_at(cwd, path, offset, destination)
+                        .map_err(|_| ())
+                },
                 0,
                 command,
                 ProcessOrigin::Foreground,

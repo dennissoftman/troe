@@ -1,6 +1,7 @@
 /target/
 /apps/*/target/
 /services/*/target/
+/tests/runtime-probe/target/
 /build/
 .DS_Store
 ._*

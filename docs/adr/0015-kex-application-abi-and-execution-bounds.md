@@ -14,6 +14,14 @@ adds private data mappings and active 64-bit resource policy, while
 stack/heap quantities, and kernel-selected ASLR. Fixed-base and no-`mmap`
 statements below describe the original Stage 7 decision and are superseded.
 
+Supersession note, 2026-08-29: [ADR 0052](0052-streamed-kex-and-static-c-runtime.md)
+replaces whole-artifact kernel staging for every VFS-backed launch with a
+coherent 24 KiB buffer ceiling and inactive-frame streaming, and raises the
+current encoded KEX ceiling to 32 MiB. References below to encoded-size staging
+and the 16 MiB ceiling preserve the original decision; the current loader
+charges only its fixed peak buffers and retains the same transaction, mapping,
+and teardown requirements.
+
 Implementation note, 2026-08-23: the portable parser, canonical virtual layout,
 startup-page encoder, and native owned-staging/validate/map/reclaim transaction
 are implemented. The native root maps only the supervisor image, devices, and

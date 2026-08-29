@@ -23,9 +23,9 @@ fn main() {
     let source = manifest.join("c/lua_runtime.c");
     let libc_core = manifest.join("../../sdk/c/troe-kex-runtime/troe_libc_core.c");
     let os_shim = manifest.join("c/troe_os_shim.c");
-    let include = manifest.join("c/include");
+    let include = manifest.join("../../sdk/c/troe-kex-sysroot/include");
     let lua = manifest.join("vendor/lua-5.5.1/src");
-    let nanoprintf = manifest.join("vendor/nanoprintf-0.6.1");
+    let nanoprintf = manifest.join("../../sdk/c/troe-kex-runtime/vendor/nanoprintf-0.6.1");
 
     let mut command = Command::new(&compiler);
     command
@@ -53,11 +53,11 @@ fn main() {
         .arg("-isystem")
         .arg(resource_include)
         .arg("-I")
-        .arg(include)
+        .arg(&include)
         .arg("-I")
         .arg(lua)
         .arg("-I")
-        .arg(nanoprintf)
+        .arg(&nanoprintf)
         .arg("-c")
         .arg(&source)
         .arg("-o")
@@ -85,16 +85,10 @@ fn main() {
     println!("cargo:rerun-if-changed={}", source.display());
     println!("cargo:rerun-if-changed={}", libc_core.display());
     println!("cargo:rerun-if-changed={}", os_shim.display());
-    println!(
-        "cargo:rerun-if-changed={}",
-        manifest.join("c/include").display()
-    );
+    println!("cargo:rerun-if-changed={}", include.display());
     println!(
         "cargo:rerun-if-changed={}",
         manifest.join("vendor/lua-5.5.1/src").display()
     );
-    println!(
-        "cargo:rerun-if-changed={}",
-        manifest.join("vendor/nanoprintf-0.6.1").display()
-    );
+    println!("cargo:rerun-if-changed={}", nanoprintf.display());
 }

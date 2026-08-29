@@ -16,12 +16,13 @@ where needed, ownership transition, and exact requested-byte accounting.
 `lua.kex` vendors the official Lua 5.5.1 source release under MIT. TROE builds
 the interpreter as freestanding C for both KEX targets, supplies the allocator,
 math, formatting, non-local-jump, stream, and filesystem boundaries, and omits
-the ambient `io`, `os`, `package`, and `debug` libraries. Exact archive URL,
-hash, license, and the one conditional upstream-source change are recorded in
-`apps/lua/vendor/UPSTREAM.md`.
+ambient host access from the capability-backed `io`, `os`, `package`, and
+`debug` library surface. Exact archive URL, hash, license, and the one
+conditional upstream-source change are recorded in `apps/lua/vendor/UPSTREAM.md`.
 
 Lua number formatting uses nanoprintf 0.6.1 under Unlicense OR 0BSD. The source,
-license, archive hash, and configuration are vendored with the Lua app. Lua's
+license, archive hash, and configuration are vendored once under
+`sdk/c/troe-kex-runtime/vendor` and shared with Lua. Lua's
 transcendental C symbols are backed by the pinned pure-Rust `libm` 0.2.16 crate
 under MIT OR Apache-2.0; its default architecture support uses baseline
 hardware floating-point instructions without requiring a hosted C library.

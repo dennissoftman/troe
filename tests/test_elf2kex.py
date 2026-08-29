@@ -362,7 +362,7 @@ class Elf2KexTests(unittest.TestCase):
             - elf2kex.KEX_HEADER_BYTES
             - elf2kex.KEX_RECORD_BYTES
             + 1,
-            first_memory_bytes=16 * 1024 * 1024,
+            first_memory_bytes=32 * 1024 * 1024,
         )
         with self.assertRaises(ValueError):
             elf2kex.convert_elf(oversized)

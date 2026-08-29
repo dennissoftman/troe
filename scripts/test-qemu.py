@@ -58,6 +58,8 @@ MUTABLE_ROOT_FILE = "/vol/root/troe-mutable.txt"
 MUTABLE_ROOT_CONTENT = "persistent-ext4-content"
 SHARED_FILE = "/vol/shared/host-visible.txt"
 SHARED_CONTENT = "persistent-fat32-content"
+RUNTIME_PROBE_PACKAGES = REPO_ROOT / "build" / "runtime-probe-packages"
+RUNTIME_PROBE_TREE = REPO_ROOT / "build" / "runtime-tree-v1"
 
 
 class AcceptanceError(RuntimeError):
@@ -228,8 +230,46 @@ def reset_txslot(platform_id: str, environment: str) -> None:
     )
 
 
-def reset_shared_media(platform_id: str) -> None:
-    """Create one empty platform-private 1 GiB FAT32 acceptance medium."""
+def build_runtime_probe_tree() -> None:
+    """Build both large C probes into one versioned shared-runtime tree."""
+    if RUNTIME_PROBE_PACKAGES.exists():
+        shutil.rmtree(RUNTIME_PROBE_PACKAGES)
+    if RUNTIME_PROBE_TREE.exists():
+        shutil.rmtree(RUNTIME_PROBE_TREE)
+    RUNTIME_PROBE_PACKAGES.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "cargo",
+            "kex",
+            "build",
+            REPO_ROOT / "tests" / "runtime-probe",
+            "--target",
+            "all",
+            "--output",
+            RUNTIME_PROBE_PACKAGES,
+        ],
+        cwd=REPO_ROOT,
+        check=True,
+    )
+    subprocess.run(
+        [
+            sys.executable,
+            REPO_ROOT / "tools" / "mkruntime.py",
+            "build",
+            "--output",
+            RUNTIME_PROBE_TREE,
+            "--artifact",
+            f"x86_64:runtime-probe={RUNTIME_PROBE_PACKAGES / 'x86_64' / 'runtime-probe.kex'}",
+            "--artifact",
+            f"aarch64:runtime-probe={RUNTIME_PROBE_PACKAGES / 'aarch64' / 'runtime-probe.kex'}",
+        ],
+        cwd=REPO_ROOT,
+        check=True,
+    )
+
+
+def reset_shared_media(platform_id: str, *, install_runtime: bool) -> None:
+    """Create one platform-private FAT32 medium and install runtime artifacts."""
     path = shared_test_image_path(resolve_platform(platform_id))
     subprocess.run(
         [
@@ -242,6 +282,19 @@ def reset_shared_media(platform_id: str) -> None:
         cwd=REPO_ROOT,
         check=True,
     )
+    if install_runtime:
+        subprocess.run(
+            [
+                sys.executable,
+                REPO_ROOT / "tools" / "mkruntime.py",
+                "install-image",
+                RUNTIME_PROBE_TREE,
+                "--image",
+                path,
+            ],
+            cwd=REPO_ROOT,
+            check=True,
+        )
 
 
 def cleanup_shared_media(platform_ids: tuple[str, ...]) -> None:
@@ -1236,6 +1289,38 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
         cwd,
         command_timeout,
         contains=("shared-child-kex\n", "path-kex-status\ttrue\texit\t0\n"),
+    )
+    runtime_probe = (
+        f"/vol/shared/runtime/v1/{session.architecture}/bin/runtime-probe.kex"
+    )
+    first_probe = session.confirmed_command(
+        runtime_probe,
+        cwd,
+        max(command_timeout, 30.0),
+        contains=("c-runtime-probe ok image=",),
+    )
+    second_probe = session.confirmed_command(
+        runtime_probe,
+        cwd,
+        max(command_timeout, 30.0),
+        contains=("c-runtime-probe ok image=",),
+    )
+    first_image = re.search(r"image=(0x[0-9a-f]+)", first_probe)
+    second_image = re.search(r"image=(0x[0-9a-f]+)", second_probe)
+    if first_image is None or second_image is None or first_image.group(1) == second_image.group(1):
+        raise AcceptanceError("large C runtime probe did not receive fresh ASLR placement")
+    session.command(
+        f"lua -e 'local ok,kind,status=os.execute(\"{runtime_probe}\"); "
+        "print(\"runtime-child-status\",ok,kind,status)'",
+        cwd,
+        max(command_timeout, 30.0),
+        contains=("c-runtime-probe ok image=", "runtime-child-status\ttrue\texit\t0\n"),
+    )
+    session.confirmed_command(
+        f"{runtime_probe}.missing",
+        cwd,
+        command_timeout,
+        contains=(f"{runtime_probe}.missing: not found",),
     )
     session.command(
         "spawn echo-copy",
@@ -2657,9 +2742,24 @@ def main() -> int:
                         args.environment,
                         acceptance_probes=True,
                     )
+        install_runtime = not args.smoke and "filesystem" in scenario_groups
+        if install_runtime:
+            if args.skip_build:
+                subprocess.run(
+                    [
+                        sys.executable,
+                        REPO_ROOT / "tools" / "mkruntime.py",
+                        "verify",
+                        RUNTIME_PROBE_TREE,
+                    ],
+                    cwd=REPO_ROOT,
+                    check=True,
+                )
+            else:
+                build_runtime_probe_tree()
         for platform_id in platform_ids:
             reset_txslot(platform_id, args.environment)
-            reset_shared_media(platform_id)
+            reset_shared_media(platform_id, install_runtime=install_runtime)
         if len(platform_ids) == 1:
             test_platform(platform_ids[0], args)
         else:

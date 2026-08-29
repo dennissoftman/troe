@@ -74,7 +74,7 @@ KEX_PERMISSIONS = {
     ELF_PF_R | ELF_PF_W: 3,
 }
 STANDARD_LIMITS = {
-    "encoded_bytes": 16 * 1024 * 1024,
+    "encoded_bytes": 32 * 1024 * 1024,
     "records": 16,
     "image_span": 128 * 1024 * 1024,
     "image_pages": 8192,

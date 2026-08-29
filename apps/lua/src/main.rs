@@ -1137,35 +1137,4 @@ unsafe extern "C" fn lua_wall_time(context: *mut c_void, result: *mut u64) -> i3
     0
 }
 
-#[unsafe(no_mangle)]
-unsafe extern "C" fn troe_parse_decimal(
-    bytes: *const u8,
-    length: usize,
-) -> kex_runtime::math::DecimalResult {
-    let invalid = kex_runtime::math::DecimalResult {
-        status: 1,
-        consumed: 0,
-        value: 0.0,
-    };
-    if length == 0 {
-        return invalid;
-    }
-    let Some(bytes) = NonNull::new(bytes.cast_mut()) else {
-        return invalid;
-    };
-    // SAFETY: The C scanner passes its live NUL-terminated input span.
-    let bytes = unsafe { slice::from_raw_parts(bytes.as_ptr(), length) };
-    let Ok(text) = str::from_utf8(bytes) else {
-        return invalid;
-    };
-    let Some((value, consumed)) = kex_runtime::math::parse_decimal_prefix(text) else {
-        return invalid;
-    };
-    kex_runtime::math::DecimalResult {
-        status: 0,
-        consumed,
-        value,
-    }
-}
-
 entry!(run);

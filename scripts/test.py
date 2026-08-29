@@ -196,6 +196,16 @@ def main() -> int:
         ),
         (
             "cargo",
+            "kex",
+            "build",
+            REPO_ROOT / "tests" / "runtime-probe",
+            "--target",
+            "all",
+            "--output",
+            REPO_ROOT / "build" / "runtime-probe-packages",
+        ),
+        (
+            "cargo",
             "run",
             "--quiet",
             "-p",

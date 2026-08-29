@@ -14,6 +14,7 @@ mod ascii;
 pub mod environment;
 pub mod errno;
 #[cfg(feature = "math")]
+#[allow(unsafe_code)]
 pub mod math;
 #[allow(unsafe_code)]
 pub mod memory;

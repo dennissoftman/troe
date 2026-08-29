@@ -1266,6 +1266,35 @@ impl FilesystemMutation {
         })
     }
 
+    /// Preserve one existing regular file and begin writing at its exact end.
+    ///
+    /// The returned writer carries the provider-reported initial offset, so
+    /// every following chunk remains strictly sequential and bounded.
+    ///
+    /// # Errors
+    ///
+    /// Reports invalid or missing paths, wrong node types, conflicting pending
+    /// work, exhaustion, or a service/call-gate failure.
+    pub fn begin_append(&mut self, path: &str) -> Result<FileReplacement, Error> {
+        let mut request = [0_u8; filesystem::MAX_PATH_BYTES];
+        let count = filesystem_mutation::encode_path_request(path, &mut request)
+            .map_err(|_| Error::InvalidCall)?;
+        let mut reply = [0_u8; filesystem_mutation::BEGIN_APPEND_REPLY_BYTES];
+        let count = call(
+            self.handle,
+            filesystem_mutation::BEGIN_APPEND,
+            &request[..count],
+            &mut reply,
+        )?;
+        let (token, offset) = filesystem_mutation::decode_begin_append_reply(&reply[..count])
+            .map_err(|_| Error::InvalidCall)?;
+        Ok(FileReplacement {
+            handle: self.handle,
+            token,
+            offset,
+        })
+    }
+
     /// Atomically remove one regular file or symbolic link.
     ///
     /// # Errors
@@ -1403,6 +1432,12 @@ impl FilesystemMutation {
 }
 
 impl FileReplacement {
+    /// Return the exact offset at which the next sequential write begins.
+    #[must_use]
+    pub const fn offset(&self) -> u64 {
+        self.offset
+    }
+
     /// Select the kernel aggregation size for this streamed replacement.
     ///
     /// Values are power-of-two sizes from 4 KiB through 1 MiB. Configure the

@@ -2,6 +2,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <limits.h>
 #include <locale.h>
 #include <math.h>
 #include <stdarg.h>
@@ -164,7 +165,27 @@ char *strerror(int error) {
 
 struct lconv *localeconv(void) {
   static char point[] = ".";
-  static struct lconv locale = {point};
+  static char empty[] = "";
+  static struct lconv locale = {
+      .decimal_point = point,
+      .thousands_sep = empty,
+      .grouping = empty,
+      .int_curr_symbol = empty,
+      .currency_symbol = empty,
+      .mon_decimal_point = empty,
+      .mon_thousands_sep = empty,
+      .mon_grouping = empty,
+      .positive_sign = empty,
+      .negative_sign = empty,
+      .int_frac_digits = CHAR_MAX,
+      .frac_digits = CHAR_MAX,
+      .p_cs_precedes = CHAR_MAX,
+      .p_sep_by_space = CHAR_MAX,
+      .n_cs_precedes = CHAR_MAX,
+      .n_sep_by_space = CHAR_MAX,
+      .p_sign_posn = CHAR_MAX,
+      .n_sign_posn = CHAR_MAX,
+  };
   return &locale;
 }
 

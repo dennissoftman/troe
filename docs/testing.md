@@ -61,7 +61,7 @@ their canonical order during the same primary guest boot where possible.
 | `boot` | Owned boot, production activation, StateFS diagnostics, packaged KEX launch |
 | `network` | Link and IPv4 state, DHCP, ICMP, ARP, cancellation, UDP, bounded TCP streams |
 | `shell-terminal` | Editing, completion, history, manuals, parsing, CRLF, and clear-screen behavior |
-| `filesystem` | KEFS/ext4/FAT32 reads and writes, shared-media restart persistence, paths, logical lists, pipelines, bounded `sh.kex` scripts, RAMFS mutation, read-only and error behavior |
+| `filesystem` | KEFS/ext4/FAT32 reads and writes, shared-media restart persistence, paths, logical lists, pipelines, bounded `sh.kex` scripts, RAMFS mutation, read-only and error behavior, plus repeated direct and nested launches of the large shared-media C runtime probe |
 | `lua` | Lua inline/stdin/file loading, protected errors, shared-runtime math/calendar/environment/process/random behavior, typed filesystem errno failures, OS-shim clock and exit behavior, timer preemption, fragmentation, a 48 MiB private allocation beyond the former narrow TLSF geometry, and bounded OOM recovery |
 | `quota-memory` | 128-entry quota, recovery, repeated transient workloads, exact initial/heap/private commitment accounting, zeroed private mappings, partial protect/unmap and recoalescing, typed CSPRNG reads, and independently randomized KEX image bases |
 | `persistence` | A second boot and native cold-reset termination after the baseline durable boot |
@@ -96,6 +96,26 @@ python3 scripts/test-qemu.py \
 to be built. Other focused groups build only production images. `--skip-build`
 is safe only when the required current-source images and cloud bundles were
 already produced; it must not be used merely to hide stale artifacts.
+
+The filesystem group builds `tests/runtime-probe` for both targets outside the
+production application catalog, publishes a canonical runtime tree, installs
+it only on the shared FAT32 acceptance media, and launches the architecture
+path twice directly and once through owner-scoped nested launch. The probe has
+an 8 MiB file-backed payload and exercises large allocator mappings and
+reallocation, rollback/reclamation, buffered stdio, descriptor and directory
+bounds, cwd and link mutation, UTF-8/wide conversion, UTC/C locale time,
+randomness, setjmp, single-execution-thread locks/TSS, explicit thread and flag
+rejection, missing capabilities, missing runtime files, repeated launch, ASLR,
+and zero retained allocator/private-map state. The rootfs and EFI inputs never
+contain the probe.
+
+Host-only C and runtime-tree contracts are independently reproducible with:
+
+```console
+python3 -m unittest tests.test_c_sysroot tests.test_mkruntime
+python3 tools/build_c_sysroot.py /tmp/troe-c-sysroot \
+  --architecture all --check
+```
 
 `--smoke` is a fixed quick terminal scenario and is intentionally mutually
 exclusive with `--scenario`. It remains useful for interactive console work,

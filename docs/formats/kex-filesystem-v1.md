@@ -12,7 +12,7 @@ the same path request and 16-byte metadata reply as `METADATA` but reports the
 final symbolic link itself. This lets recursive user-space algorithms avoid
 link cycles without exposing provider internals.
 
-## Filesystem mutation 1.2
+## Filesystem mutation 1.3
 
 Interface 7 is a deliberate pre-production 1.x compatibility reset of the
 briefly unreleased 2.0 streamed protocol. Its operations are:
@@ -30,6 +30,14 @@ briefly unreleased 2.0 streamed protocol. Its operations are:
 | 9 | set aggregation size | token and size |
 | 10 | same-provider rename | source and destination paths |
 | 11 | remove empty directory | one path |
+| 12 | begin preserved append | one path |
+
+`BEGIN_APPEND` succeeds only for an existing regular file and returns a
+12-byte little-endian reply containing the nonzero token and exact initial
+`u64` offset. Subsequent opcode 2 chunks must begin at that offset and remain
+strictly sequential. The service does not read or duplicate the existing file;
+the provider extends it in place with the same bounded aggregation policy used
+by replacement writes.
 
 The canonical two-path encoding starts with little-endian `u16` source and
 destination byte lengths followed by exactly those UTF-8 bytes, with no padding

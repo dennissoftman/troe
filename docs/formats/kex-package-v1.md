@@ -22,7 +22,7 @@ All integers are unsigned little-endian. The header is exactly 48 bytes:
 | 20 | 4 | manifest bytes | exact canonical KCAP v1 length |
 | 24 | 4 | executable offset | `48 + manifest_bytes` |
 | 28 | 4 | completion offset | zero without bit 0; otherwise exact executable end |
-| 32 | 8 | executable bytes | nonzero and at most 16 MiB |
+| 32 | 8 | executable bytes | nonzero and at most 32 MiB |
 | 40 | 8 | package bytes | exact input length |
 
 The KCAP bytes immediately follow the header. The KEX executable immediately
@@ -30,7 +30,7 @@ follows KCAP. When flag bit 0 is set, one nonempty canonical CMPL v1 artifact
 immediately follows the executable and consumes the remainder of the package.
 Gaps, padding, reordered members, unbound trailing bytes, unknown flags, and
 unsupported versions are noncanonical. A complete package is at most
-16,793,792 bytes: a 48-byte header, the 144-byte maximum manifest, the 16 MiB
+33,571,904 bytes: a 48-byte header, the 1,040-byte maximum manifest, the 32 MiB
 maximum executable, and the 16 KiB maximum completion artifact.
 
 KCAP and CMPL remain independently versioned encodings, but neither is
@@ -44,3 +44,18 @@ The hosted builder emits one package file and removes any adjacent `.kcap`
 sidecar. Check mode rejects such sidecars. Package
 identity, content hashes, and signatures belong to the separate package-model
 and trust formats; they are not inferred from reserved bytes in this envelope.
+
+VFS-backed launch reads the package through bounded random-access windows. The
+loader retains a 4 KiB prefix, uses a separate 4 KiB replay buffer and at most
+one fallibly allocated 16 KiB completion-validation buffer, fingerprints all `package bytes`,
+validates and fingerprints every relocation, and produces a pointer-free
+executable plan. It then streams load ranges into inactive
+zeroed frames and requires both fingerprints to match during materialization
+and relocation replay before activating the address space. A short, stalled,
+over-reported, changed, malformed, or oversized source fails without a
+package-sized kernel-heap allocation. Direct, resident, service, and nested
+launch use the same procedure.
+
+Optional large packages installed as runtime artifacts follow the
+[shared runtime tree v1](runtime-tree-v1.md) contract. Tree verification does
+not replace this package and executable validation.

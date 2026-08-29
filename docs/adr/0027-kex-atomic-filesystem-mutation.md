@@ -2,11 +2,11 @@
 
 Status: accepted and implemented for the Stage 9 mutation command migration,
 2026-08-25; amended for scalable streaming, 2026-08-26, and pre-release
-rename/directory removal, 2026-08-28.
+rename/directory removal, 2026-08-28, and preserved runtime append, 2026-08-29.
 
 ## Decision
 
-A KEX package may request optional interface 7, version 1.2, with the
+A KEX package may request optional interface 7, version 1.3, with the
 `filesystem-mutate` capability. It is distinct from ADR 0026's read-only
 interface: mutation authority does not imply read, list, metadata, provider,
 mount, block, or device access. Packages may request both interfaces when a
@@ -22,7 +22,9 @@ regular-file or symbolic-link removal, empty-directory creation, symbolic-link
 creation, same-provider regular-file hard-link creation, atomic same-provider
 rename, and empty-directory removal. `begin-replace`
 resolves paths relative to the immutable startup cwd, truncates or creates the
-file, and returns an opaque nonzero token. `append` accepts only the exact next
+file, and returns an opaque nonzero token. `begin-append` preserves an existing
+regular file and returns both its token and exact current length without reading
+or duplicating its payload. `append` accepts only the exact next
 64-bit offset and carries at most one dispatcher-sized payload. The kernel
 aggregates calls in a 16 KiB buffer by default; before writing, an application
 may select a power-of-two size from 4 KiB through 1 MiB. There is no aggregate
@@ -54,9 +56,10 @@ intentional bounded exception: its single state object must fit its dual-slot
 transaction format, so it retains that complete fixed-capacity payload until
 sync.
 
-The SDK supplies a `FileReplacement` client whose `commit` and `abort` consume
-the token plus bounded directory, symbolic-, hard-link, rename, and directory
-removal methods. KEX standard
+The SDK supplies `begin_replace` and `begin_append` constructors for a
+`FileReplacement` client whose `commit` and `abort` consume the token, plus
+bounded directory, symbolic-, hard-link, rename, and directory removal methods.
+KEX standard
 streams are forwarded directly instead of being retained by the runner. Shell
 `>` and `>>` use a 16 KiB namespace-backed output stream; `tar.kex` requests
 1 MiB for archive creation and member extraction. Ordinary `rm` and `rmdir`
