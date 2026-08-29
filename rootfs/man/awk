@@ -5,7 +5,10 @@ SYNOPSIS
     awk [-F SEP] PROGRAM [FILE...]
 
 DESCRIPTION
-    Splits records on ASCII whitespace, or on the one-byte SEP supplied by -F.
+    Reads records from the named files, or from standard input when none is
+    given; at an interactive prompt that reads typed lines until Ctrl-D, see
+    man sh. Splits records on ASCII whitespace, or on the one-byte SEP supplied
+    by -F.
     Actions use { print ITEM, ... }, where an item is $0 through $32, NR, NF,
     or a quoted literal. A missing action prints the complete record.
 

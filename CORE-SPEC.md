@@ -307,6 +307,29 @@ Minimum behavior:
 on streams where useful so pipelines, tests, and composition do not depend
 on a physical console.
 
+### 10.1 Session terminal ownership
+
+Session input is one resource. The shell MUST own its decoding and MUST lend it
+to at most one process at a time. An ordinary foreground command launched from
+the interactive session receives that loan and reads a cooked line byte stream
+through its ordinary `stdin` handle; background jobs, supervised services,
+commands staged by the script interpreter, and owner-scoped nested children
+receive an empty stream and observe end of input. Redirected and piped stages
+are not terminal-backed and take no loan.
+
+The cooked discipline echoes printable input, takes Tab literally, erases on
+backspace and Ctrl-U, completes a line on Enter, and reports end of input on
+Ctrl-D. It provides no completion, history, or cursor movement, so the remaining
+editor keys are ignored. Ctrl-C remains
+session cancellation and MUST NOT reach the discipline. A pending line is
+bounded by the shell parser's line policy and the unread cooked buffer is
+bounded at four lines; input exceeding either bound is refused without echo.
+
+A read that cannot be satisfied MUST block on a generation-checked wait rather
+than polling, so machine events, network progress, resident jobs, service
+supervision, and the architecture execution lease continue. The loan is released
+on exit, fault, or cancellation, discarding the partial line and unread bytes.
+
 ## 11. Shell
 
 ### 11.1 Grammar
@@ -340,8 +363,10 @@ precedence, associate left to right, and short-circuit on success and
 non-success respectively. A final unquoted `&` is accepted only for one
 external-command stage. Background standard input is EOF and output/error enter
 a bounded 64 KiB recent log, so asynchronous bytes do not corrupt the
-interactive prompt. Concurrent background pipelines are not part of this
-grammar.
+interactive prompt and a background job cannot consume prompt input. The first
+stage of a foreground pipeline without input redirection receives the session
+terminal loan defined in section 10.1. Concurrent background pipelines are not
+part of this grammar.
 
 ### 11.2 Command registry
 

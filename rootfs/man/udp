@@ -7,7 +7,8 @@ SYNOPSIS
 
 DESCRIPTION
     Sends one checksummed datagram from a persistent ephemeral or selected
-    source port, using standard input when TEXT is omitted. listen persistently
+    source port, using standard input when TEXT is omitted; at an interactive
+    prompt that reads typed lines until Ctrl-D. listen persistently
     binds PORT and waits cooperatively for its oldest queued datagram. Each of
     at most eight ports retains four datagrams and 4 KiB; newest input is
     dropped at capacity. Ctrl-C cancels the wait. DNS and general sockets are

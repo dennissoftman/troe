@@ -711,28 +711,94 @@ class SerialSession:
                 )
             self.output.extend(chunk)
 
+    def _write_echoed(self, text: str, timeout: float) -> None:
+        """Type printable text and require the guest to echo every chunk."""
+        assert self.process.stdin is not None
+        # Pace against guest echo so both firmware and native UART paths
+        # remain deterministic under loaded CI hosts. Eight bytes stay
+        # below the pinned UART FIFO and bounded input-queue capacities
+        # while avoiding a host round trip for every printable byte.
+        encoded = text.encode("utf-8")
+        for offset in range(0, len(encoded), 8):
+            chunk = encoded[offset : offset + 8]
+            start = len(self.output)
+            self.process.stdin.write(chunk)
+            self.process.stdin.flush()
+            self.wait_for(chunk, timeout, start)
+
+    def _write_control(self, byte: bytes) -> None:
+        """Send one unechoed control byte."""
+        assert self.process.stdin is not None
+        self.process.stdin.write(byte)
+        self.process.stdin.flush()
+
     def send(self, command: str, timeout: float, line_ending: bytes = b"\n") -> int:
         """Send one console line and return the transcript offset after its newline."""
         if self.process.stdin is None:
             raise AcceptanceError("QEMU serial input is unavailable")
         try:
-            # Pace against guest echo so both firmware and native UART paths
-            # remain deterministic under loaded CI hosts. Eight bytes stay
-            # below the pinned UART FIFO and bounded input-queue capacities
-            # while avoiding a host round trip for every printable byte.
-            encoded = command.encode("utf-8")
-            for offset in range(0, len(encoded), 8):
-                chunk = encoded[offset : offset + 8]
-                start = len(self.output)
-                self.process.stdin.write(chunk)
-                self.process.stdin.flush()
-                self.wait_for(chunk, timeout, start)
+            self._write_echoed(command, timeout)
             start = len(self.output)
             self.process.stdin.write(line_ending)
             self.process.stdin.flush()
             return self.wait_for(b"\n", timeout, start)
         except (BrokenPipeError, OSError) as error:
             raise AcceptanceError(f"cannot write QEMU serial input: {error}") from error
+
+    def typed_input_command(
+        self,
+        command: str,
+        lines: tuple[str, ...],
+        cwd: str,
+        timeout: float,
+        *,
+        settle: float = 0.0,
+        responses: tuple[str, ...] = (),
+        contains: tuple[str, ...] = (),
+        absent: tuple[str, ...] = (),
+    ) -> str:
+        """Type bounded lines into one foreground reader, then signal end of input.
+
+        Each line is echoed by the session terminal loan, exactly as the prompt
+        echoes an edited line, so the same pacing applies while the shell is not
+        the reader. A reader that answers every line shares the console with
+        that echo, so `responses` waits for the answer before typing the next
+        line instead of interleaving two concurrent writers.
+        """
+        if self.process.stdin is None:
+            raise AcceptanceError("QEMU serial input is unavailable")
+        submitted = self.send(command, timeout)
+        if settle > 0:
+            # Hold the reader blocked so unrelated deadlines must be observed
+            # while one foreground process owns the terminal.
+            time.sleep(settle)
+        try:
+            for index, line in enumerate(lines):
+                self._write_echoed(line, timeout)
+                start = len(self.output)
+                self._write_control(b"\n")
+                answered = self.wait_for(b"\n", timeout, start)
+                if index < len(responses):
+                    self.wait_for(responses[index].encode("utf-8"), timeout, answered)
+            self._write_control(b"\x04")
+        except (BrokenPipeError, OSError) as error:
+            raise AcceptanceError(f"cannot write QEMU serial input: {error}") from error
+        prompt = f"sh:{cwd}> ".encode()
+        end = self.wait_for(prompt, timeout, submitted)
+        text = normalize(bytes(self.output[submitted : end - len(prompt)]))
+        for expected in contains:
+            if expected not in text:
+                raise AcceptanceError(
+                    f"{command!r} did not consume typed input as expected; "
+                    f"missing {expected!r} in {text!r}"
+                )
+        for unexpected in absent:
+            if unexpected in text:
+                raise AcceptanceError(
+                    f"{command!r} unexpectedly produced {unexpected!r}; "
+                    f"session output was {text!r}"
+                )
+        return text
 
     def assert_terminal(self, start: int, timeout: float) -> None:
         """Require a bounded quiet, live terminal state without reboot markers."""
@@ -1085,6 +1151,15 @@ def run_network_group(
         command_timeout,
         contains=("sent 20 bytes from port 40001 to 10.0.2.2:9",),
     )
+    # Without a payload operand the datagram body is read from the foreground
+    # terminal instead of being sent empty.
+    session.typed_input_command(
+        "udp send --source-port 40003 10.0.2.2 9",
+        ("typed-datagram",),
+        cwd,
+        command_timeout,
+        contains=("sent 15 bytes from port 40003 to 10.0.2.2:9",),
+    )
     session.cancelled_command("udp listen 40000", cwd, command_timeout)
     session.command("net stats", cwd, command_timeout, contains=("udp ports: 1",))
     session.command(
@@ -1168,6 +1243,91 @@ def run_resident_process_checks(
     session.command("wait 3", cwd, command_timeout)
 
 
+def start_background_job(
+    session: SerialSession, command: str, cwd: str, timeout: float
+) -> int:
+    """Start one background job and return the identifier the shell assigned."""
+    report = session.command(command, cwd, timeout)
+    started = re.search(r"\[(\d+)\] started ", report)
+    if started is None:
+        raise AcceptanceError(f"{command!r} did not report a background job: {report!r}")
+    return int(started.group(1))
+
+
+def run_terminal_input_checks(
+    session: SerialSession, cwd: str, command_timeout: float
+) -> None:
+    """Require the foreground terminal-input loan, its bounds, and its release."""
+    # A foreground reader consumes typed lines and observes Ctrl-D end of input.
+    # Each line appears twice: once echoed by the loan, once written by `cat`.
+    session.typed_input_command(
+        "cat -u",
+        ("terminal-alpha", "terminal-beta"),
+        cwd,
+        command_timeout,
+        responses=("terminal-alpha\n", "terminal-beta\n"),
+        contains=(
+            "terminal-alpha\nterminal-alpha\n",
+            "terminal-beta\nterminal-beta\n",
+        ),
+        absent=("cat: ",),
+    )
+    # A blocked foreground read stays cancellable and restores the prompt.
+    session.cancelled_command("cat", cwd, command_timeout)
+    # A background job receives end of input and cannot consume prompt input.
+    reader = start_background_job(session, "cat -u &", cwd, command_timeout)
+    session.command(f"wait {reader}", cwd, command_timeout)
+    session.command(
+        f"log {reader}",
+        cwd,
+        command_timeout,
+        absent=("terminal-alpha", "background-visible"),
+    )
+    session.command(
+        "echo background-visible",
+        cwd,
+        command_timeout,
+        contains=("background-visible\n",),
+    )
+    # A resident background job keeps progressing while a foreground read blocks.
+    sleeper = start_background_job(session, "sleep 100 &", cwd, command_timeout)
+    session.typed_input_command(
+        "cat -u",
+        ("terminal-coexist",),
+        cwd,
+        command_timeout,
+        settle=1.0,
+        responses=("terminal-coexist\n",),
+        contains=("terminal-coexist\nterminal-coexist\n",),
+    )
+    session.command(
+        "jobs", cwd, command_timeout, contains=(f"[{sleeper}] done sleep 100",)
+    )
+    session.command(f"wait {sleeper}", cwd, command_timeout)
+    # Supervised services keep running across a blocked foreground read.
+    session.command(
+        "svc status timesync", cwd, command_timeout, contains=("timesync ready",)
+    )
+    # Redirection and pipelines stay byte-identical and take no loan.
+    session.command(
+        "cat -u < /recovery/motd",
+        cwd,
+        command_timeout,
+        contains=("Small by design. Alive on the wire.",),
+    )
+    session.command(
+        "echo piped-input | cat -u", cwd, command_timeout, contains=("piped-input\n",)
+    )
+    # An owner-scoped child never inherits the loan.
+    session.command(
+        "spawn --status cat -u",
+        cwd,
+        command_timeout,
+        contains=("spawn-status: 0\n",),
+        absent=("terminal-alpha",),
+    )
+
+
 def run_shell_terminal_group(session: SerialSession, command_timeout: float) -> None:
     """Exercise editing, history, completion, help, manuals, and CRLF handling."""
     cwd = "/"
@@ -1226,6 +1386,7 @@ def run_shell_terminal_group(session: SerialSession, command_timeout: float) -> 
         contains=("crlf-ready\n",),
         line_ending=b"\r\n",
     )
+    run_terminal_input_checks(session, cwd, command_timeout)
 
 
 def run_filesystem_group(session: SerialSession, command_timeout: float) -> None:

@@ -15,6 +15,7 @@ enum ProcessError {
     Input,
     Output,
     LineTooLong,
+    Cancelled,
 }
 
 enum FileProcessError {
@@ -93,7 +94,13 @@ fn process_stdin(
     let mut processor = Processor::new(program, separator, 0, command.stdout());
     let mut buffer = [0_u8; 512];
     loop {
-        let count = input.read(&mut buffer).map_err(|_| ProcessError::Input)?;
+        let count = input.read(&mut buffer).map_err(|error| {
+            if error == Error::Cancelled {
+                ProcessError::Cancelled
+            } else {
+                ProcessError::Input
+            }
+        })?;
         if count == 0 {
             return processor.finish();
         }
@@ -157,6 +164,10 @@ fn processing_failure(command: &mut CommandContext, error: ProcessError) -> u32 
         }
         ProcessError::Input | ProcessError::Output => {
             common::stream_failure(&mut command.stderr(), "awk")
+        }
+        ProcessError::Cancelled => {
+            common::report(&mut command.stderr(), "awk", b"cancelled");
+            exit::CANCELLED
         }
     }
 }

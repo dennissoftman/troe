@@ -71,6 +71,7 @@ enum GrepError {
     Regex(RegexError),
     Input,
     Output,
+    Cancelled,
 }
 
 enum FileGrepError {
@@ -390,6 +391,10 @@ fn matcher_failure(command: &mut CommandContext, error: GrepError) -> u32 {
         GrepError::Input | GrepError::Output => {
             common::stream_failure(&mut command.stderr(), "grep")
         }
+        GrepError::Cancelled => {
+            common::report(&mut command.stderr(), "grep", b"cancelled");
+            exit::CANCELLED
+        }
     }
 }
 
@@ -405,7 +410,13 @@ fn grep_input(
     if !matcher.should_stop() {
         let mut buffer = [0_u8; 256];
         loop {
-            let count = input.read(&mut buffer).map_err(|_| GrepError::Input)?;
+            let count = input.read(&mut buffer).map_err(|error| {
+                if error == Error::Cancelled {
+                    GrepError::Cancelled
+                } else {
+                    GrepError::Input
+                }
+            })?;
             if count == 0 || matcher.feed(&buffer[..count])? {
                 break;
             }

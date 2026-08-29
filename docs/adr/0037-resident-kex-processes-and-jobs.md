@@ -1,7 +1,9 @@
 # ADR 0037: Resident KEX processes and shell jobs
 
 Status: accepted; first resident-process increment implemented, 2026-08-27;
-fixed resident capacity superseded by ADR 0046.
+fixed resident capacity superseded by ADR 0046; the foreground terminal-input
+statement below described the intended contract before it existed and is
+superseded by ADR 0053, which defines and implements the session terminal loan.
 
 ## Context
 
@@ -70,7 +72,9 @@ Placement belongs to the launcher; an application cannot detach itself.
 - A foreground process owns the session terminal input and direct terminal
   output. The shell session waits for its terminal result while the same event
   loop continues to run resident jobs and services between its bounded
-  execution slices and deferred waits.
+  execution slices and deferred waits. ADR 0053 owns the current input contract:
+  the loan is taken only by a foreground command whose standard input is the
+  session terminal, and it is not inherited by nested children.
 - A background job remains associated with its launching shell session and
   receives EOF as terminal input. Output and error use one explicitly bounded
   64 KiB per-job log, so asynchronous bytes never corrupt the prompt.

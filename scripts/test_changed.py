@@ -49,6 +49,9 @@ FILESYSTEM_APPS = frozenset(
     )
 )
 TERMINAL_APPS = frozenset(("clear", "echo", "man", "pwd"))
+# Commands that read standard input also exercise the foreground session
+# terminal loan, not only their filesystem or network operands.
+STDIN_APPS = frozenset(("awk", "cat", "grep", "hexdump", "sed", "sh", "udp", "wc"))
 LOW_LEVEL_PACKAGES = frozenset(
     (
         "troe-block",
@@ -364,6 +367,8 @@ def _classify_app(plan: TestPlan, path: PurePosixPath) -> bool:
     plan.note(f"kex:{application}", path)
     if path.name in {"Cargo.toml", "Cargo.lock"}:
         _add_python(plan, path, "test_repository_policy.py")
+    if application in STDIN_APPS:
+        _add_qemu(plan, path, "shell-terminal")
     if application in NETWORK_APPS:
         _add_qemu(plan, path, "network")
     elif application in FILESYSTEM_APPS:

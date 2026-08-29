@@ -8,7 +8,8 @@ SYNOPSIS
 DESCRIPTION
     Selects lines matching any pattern. The default syntax is a POSIX-style
     basic regular expression (BRE); -E selects extended expressions (ERE),
-    and -F selects literal strings. With no FILE, reads standard input. A FILE
+    and -F selects literal strings. With no FILE, reads standard input; at an
+    interactive prompt that reads typed lines until Ctrl-D, see man sh. A FILE
     of - also selects standard input. Multiple files receive filename prefixes
     by default.
 

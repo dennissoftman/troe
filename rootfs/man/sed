@@ -5,8 +5,10 @@ SYNOPSIS
     sed [-n] [-e SCRIPT | SCRIPT] [FILE...]
 
 DESCRIPTION
-    Streams lines from standard input or files. The supported scripts are p,
-    d, and s/OLD/NEW/[g], optionally prefixed by one positive line number.
+    Streams lines from standard input or files. At an interactive prompt
+    standard input reads typed lines until Ctrl-D; see man sh. The supported
+    scripts are p, d, and s/OLD/NEW/[g], optionally prefixed by one positive
+    line number.
     Substitution patterns are literal bytes; & in NEW expands to OLD. The -n
     option suppresses ordinary output. Ranges, regular expressions, captures,
     multiple commands, and in-place editing are not implemented.

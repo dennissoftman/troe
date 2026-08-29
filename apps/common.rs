@@ -31,6 +31,18 @@ pub fn stream_failure(stderr: &mut StandardOutput, command: &str) -> u32 {
     exit::FAILURE
 }
 
+/// Report one failed stream operation, separating cooperative cancellation.
+///
+/// A foreground read of the session terminal blocks until input arrives, so
+/// Ctrl-C is an ordinary outcome rather than a transport failure.
+pub fn stream_read_failure(stderr: &mut StandardOutput, command: &str, error: Error) -> u32 {
+    if error == Error::Cancelled {
+        report(stderr, command, b"cancelled");
+        return exit::CANCELLED;
+    }
+    stream_failure(stderr, command)
+}
+
 pub struct OutputWriter<'output>(pub &'output mut StandardOutput);
 
 impl fmt::Write for OutputWriter<'_> {

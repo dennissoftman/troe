@@ -8,3 +8,7 @@ DESCRIPTION
     Attaches to one session-owned job until it exits, is cancelled, or faults.
     The job's bounded recent output is copied before its terminal record is
     reaped. JOB is the number printed when the command was started with &.
+
+    Standard input is bound when a job is launched, so a backgrounded command
+    keeps reading an empty stream and observing end of input. fg waits for the
+    job; it does not hand it the session terminal.

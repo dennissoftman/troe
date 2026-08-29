@@ -31,6 +31,10 @@ never executes the ordinary application.
 ## Invariants enforced now
 
 - command input: 512 bytes, 128 arguments per stage, 255 stages per pipeline;
+- foreground terminal input: one loan at a time, held only by a foreground
+  command whose standard input is the session terminal, never inherited by a
+  background job, service, staged script line, or owner-scoped child; a 512-byte
+  pending line and four unread lines, with excess refused rather than buffered;
 - shell scripts: 1,024 submitted lines, 64 KiB source, four nesting levels, and
   one shared 1,024-pipeline execution budget across nested scripts;
 - sequential intermediate pipeline: 1 MiB and atomic overflow failure;

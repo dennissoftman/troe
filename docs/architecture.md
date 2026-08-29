@@ -105,6 +105,17 @@ authority. Foreground KEX commands use a locally retained resident continuation
 with borrowed session streams; the shared pump continues to run background jobs
 and service processes between foreground slices and blocked waits.
 
+The session owns one decoder pair and one cooked line discipline, and lends them
+to at most one foreground process at a time. A foreground command started from
+the prompt without input redirection reads typed lines through its ordinary
+standard-input handle; Enter completes a line, Ctrl-D reports end of input, and
+Ctrl-C stays session cancellation. A read with nothing buffered registers a
+generation-checked wait exactly like a pipe read, so the pump keeps draining
+machine events, servicing the network, and stepping resident jobs while the
+reader blocks. Background jobs, services, staged script lines, and owner-scoped
+children never receive the loan, and the loan is released with its unread bytes
+on exit, fault, or cancellation.
+
 ## Authority
 
 There are no ambient device or reboot globals in portable crates. Only the UEFI

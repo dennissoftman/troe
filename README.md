@@ -45,6 +45,10 @@ measurement.
   package-owned typed completion, literal single/double quoting, pipelines, and
   short-circuit `&&`/`||`, and streamed `<`, `>`, and `>>` redirection, plus
   session-owned background jobs and bounded logs.
+- A foreground terminal-input loan: one interactive command at a time reads
+  typed lines from the session terminal, ends input with `Ctrl-D`, and cancels
+  with `Ctrl-C`, while background jobs and services keep observing end of input
+  and cannot consume prompt keystrokes.
 - SCFG boot-service supervision with stable service names, restart/backoff
   policy, `svc` control, and an example long-running SNTP clock service.
 - A bounded VFS with KEFS, a default read-write persistent ext4 volume at

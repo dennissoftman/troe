@@ -61,6 +61,15 @@ pub trait Input {
     /// Returns a typed stream failure without modifying bytes beyond the
     /// reported count.
     fn read(&mut self, destination: &mut [u8]) -> Result<usize, StreamError>;
+
+    /// Whether this stream is the interactive session terminal.
+    ///
+    /// Files, pipes, retained slices, and empty streams are not terminals.
+    /// Only the owning session lends its terminal, and only to one foreground
+    /// process at a time.
+    fn is_terminal(&self) -> bool {
+        false
+    }
 }
 
 /// Byte-oriented output capability.
