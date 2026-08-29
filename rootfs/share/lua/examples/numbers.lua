@@ -1,4 +1,4 @@
--- Floating-point math, integer arithmetic, and a small statistics example.
+-- Floating-point math, integer arithmetic, statistics, and random sampling.
 
 for _, degrees in ipairs({ 0, 30, 45, 60, 90 }) do
   local radians = math.rad(degrees)
@@ -42,9 +42,8 @@ print(string.format(
 ))
 
 -- TROE seeds Lua's standard generator from the kernel CSPRNG at launch. A
--- numerical distribution summary can expose obvious range or bias bugs, but
--- no finite statistical test can prove randomness or make math.random
--- cryptographic.
+-- distribution summary can expose obvious range or bias bugs, but no finite
+-- statistical test can prove randomness or make math.random cryptographic.
 local random_samples = 60000
 local buckets = { 0, 0, 0, 0, 0, 0 }
 local sample_minimum = math.huge
@@ -103,5 +102,19 @@ print(string.format(
   uniformity_sanity and "pass" or "suspicious",
   random_samples
 ))
+
+local choices = { "red", "green", "blue", "gold" }
+local choice = choices[math.random(#choices)]
+local deck = { "A", "B", "C", "D", "E" }
+for index = #deck, 2, -1 do
+  local selected = math.random(index)
+  deck[index], deck[selected] = deck[selected], deck[index]
+end
+local unit = math.random()
+assert(choice ~= nil and unit >= 0 and unit < 1)
+
+print("random choice", choice)
+print("random shuffle", table.concat(deck, ""))
+print("random checks", "ok", #deck, unit >= 0 and unit < 1)
 print("random source", "kernel CSPRNG seed -> Lua math PRNG")
 print("random caveat", "uniformity is evidence, not proof or cryptographic safety")

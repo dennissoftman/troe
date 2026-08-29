@@ -82,12 +82,14 @@ DESCRIPTION
 EXAMPLES
     Working example programs are shipped as architecture-independent data:
 
-        lua /share/lua/examples/strings.lua
-        lua /share/lua/examples/math.lua
-        lua /share/lua/examples/tables-coroutines.lua
-        lua /share/lua/examples/compatibility.lua
-        lua /share/lua/examples/files.lua
-        lua /share/lua/examples/random.lua
+        lua /share/lua/examples/language.lua
+        lua /share/lua/examples/numbers.lua
+        lua /share/lua/examples/system.lua
+
+    A portable compute and allocation benchmark can run unchanged under TROE
+    and Alpine Lua 5.5:
+
+        lua /share/lua/benchmark.lua 1 5 troe
 
     Measure a sufficiently long end-to-end workload in whole wall seconds:
 

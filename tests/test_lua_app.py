@@ -208,6 +208,23 @@ print("lua-clock-benchmark", type(total), total >= 0)
         self.assertEqual(metadata[0], 0, completed.stderr.decode(errors="replace"))
         self.assertEqual(completed.stdout, b"lua-clock-benchmark\tnumber\ttrue\n")
 
+    def test_portable_benchmark_smoke(self) -> None:
+        benchmark = REPO_ROOT / "rootfs" / "share" / "lua" / "benchmark.lua"
+        completed, metadata = self.run_lua(
+            benchmark.read_text(encoding="utf-8"), "1", "1", "host-smoke"
+        )
+        output = completed.stdout.decode()
+        self.assertEqual(metadata[0], 0, completed.stderr.decode(errors="replace"))
+        self.assertIn("BENCHMARK version=1 label=host-smoke", output)
+        for phase in (
+            "integer_mix",
+            "floating_arithmetic",
+            "retained_records",
+            "allocation_churn",
+        ):
+            self.assertIn(f"RESULT label=host-smoke name={phase}", output)
+        self.assertIn("END label=host-smoke", output)
+
 
 if __name__ == "__main__":
     unittest.main()

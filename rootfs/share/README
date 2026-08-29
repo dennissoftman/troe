@@ -10,3 +10,14 @@ applications are statically linked, so /lib is absent. Recovery-only bootstrap
 files live under /recovery. The package-managed namespace uses writable desired configuration
 in /config and exposes the active generation's resolved, non-secret
 configuration read-only in /sys/config; /etc is absent and is not an alias.
+
+/share/lua/examples contains three runnable tours: language.lua covers core
+language and library features, numbers.lua covers deterministic arithmetic and
+random sampling, and system.lua covers TROE filesystem, process, module, and
+environment integration.
+
+/share/lua/benchmark.lua is a portable Lua 5.5 compute and allocation
+benchmark. Run the same file and arguments under TROE's `lua` and Alpine's
+`lua5.5` to compare interpreter throughput and Lua-managed heap behavior.
+Its `collectgarbage("count")` fields describe Lua's heap, not whole-process or
+whole-system memory.
