@@ -95,8 +95,10 @@ never executes the ordinary application.
   cancellation and reaping, and SCFG-bounded dependency, restart, health,
   lifetime, and stop policy;
 - process launch: at most 65,536 retained children and 65,536 pipes per owner,
-  256 MiB aggregate pipe capacity per owner, explicit attenuation, recursive
-  descendant teardown, and generation-checked lifecycle and pipe tokens;
+  256 MiB aggregate pipe capacity per owner, at most eight nested application
+  levels below the session or a service because each level occupies one kernel
+  stack frame, explicit attenuation, recursive descendant teardown, and
+  generation-checked lifecycle and pipe tokens;
 - process observation: the system registry spans up to 65,536 foreground,
   background, nested, and service launches and is exposed in stable-ID pages of
   at most 16 records; monotonic non-reused process IDs, scheduler-paired states,
@@ -118,9 +120,15 @@ exceptions fail the release review and must be removed or renewed explicitly.
 ## Reporting
 
 Until a private reporting address exists, do not publish a suspected
-vulnerability with exploit details. Contact the repository owner privately.
-Reports should include affected revision, architecture, reproduction steps,
-impact, and whether malformed console or image input is involved.
+vulnerability with exploit details while it remains unfixed. Contact the
+repository owner privately. Reports should include affected revision,
+architecture, reproduction steps, impact, and whether malformed console or
+image input is involved.
+
+That restriction covers unfixed issues only. Once the fix is published, the
+change carrying it should state the mechanism, the reproduction, and the bound
+or invariant it restores, so a reader can judge whether the fix is complete. A
+fix and its full explanation may land in the same public change.
 
 No release is claimed to have zero vulnerabilities. A release may claim only
 that it has no known unresolved vulnerability at its publication time.
