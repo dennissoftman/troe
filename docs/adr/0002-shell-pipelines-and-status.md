@@ -3,10 +3,12 @@
 Status: accepted, 2026-08-22.
 
 Ship literal single and double quoting in 0.1. Ship `|` as shell-level
-composition, not as a kernel pipe object. Limit a line to 512 bytes, a command
-to 32 words, a pipeline to 8 stages, and each dynamically growing intermediate
-byte stream to 1 MiB. Execute stages sequentially and stop on the first
-non-success status.
+composition, not as a kernel pipe object. Ship left-associative, equal-precedence
+`&&` and `||` command lists that execute the next pipeline only after success or
+non-success respectively. Limit a line to 512 bytes, a command to 128 words, a
+pipeline to 255 stages, and each dynamically growing intermediate byte stream to
+1 MiB. Execute pipeline stages sequentially and stop on the first non-success
+status.
 
 Unquoted `<` supplies the first stage through incremental offset reads.
 Unquoted `>` truncates or creates its destination before execution and streams
@@ -22,7 +24,8 @@ intermediate-stage redirection remain outside this grammar.
 Statuses are stable categories (`Success`, `Failure`, `Usage`, `NotFound`,
 `Denied`, `Cancelled`) with hosted numeric mappings 0, 1, 2, 3, 126, and 130,
 respectively. `Cancelled` records an explicit cooperative user cancellation and
-does not conflate it with a command or I/O failure. Expected errors never panic.
+does not conflate it with a command or I/O failure. Every category other than
+`Success` satisfies `||` and short-circuits `&&`. Expected errors never panic.
 Stderr is not piped in 0.1.
 
 Omitting pipelines would force commands toward console coupling. Because the

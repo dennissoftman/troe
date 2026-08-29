@@ -7,6 +7,10 @@ relative or absolute path when `argv[0]` contains `/`. Bare-name lookup,
 capability attenuation, owner-scoped lifecycle tokens, and teardown are
 unchanged.
 
+Supersession note, 2026-08-29: the interactive shell now evaluates bounded
+left-associative `&&` and `||` lists. Moving a broader command language into
+`sh.kex` remains future work.
+
 ## Context
 
 The resident-process and observation work left command evaluation split across

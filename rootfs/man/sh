@@ -1,10 +1,11 @@
 NAME
-    sh - execute bounded command scripts and pipelines
+    sh - execute bounded command scripts, logical lists, and pipelines
 
 SYNOPSIS
     sh [FILE | -]
     COMMAND [ARG...] [< FILE] [> FILE | >> FILE]
     COMMAND... | COMMAND...
+    PIPELINE [&& PIPELINE | || PIPELINE]...
 
 DESCRIPTION
     With FILE, sh reads one UTF-8 script from the read-only filesystem service.
@@ -19,9 +20,10 @@ DESCRIPTION
     command's status. A cd line changes the owning shell's logical directory.
 
     Source is limited to 64 KiB, one physical command line to 512 UTF-8 bytes,
-    one batch to 1,024 commands, and nesting to four scripts within the same
-    1,024-command budget. Text scripts are not directly executable and have no
-    shebang handling; use sh FILE.
+    and one batch to 1,024 submitted lines. Nesting is limited to four scripts
+    within one shared 1,024-pipeline execution budget; every logical-list entry
+    consumes that budget even when short-circuited. Text scripts are not
+    directly executable and have no shebang handling; use sh FILE.
 
     A bare ordinary command resolves only /bin/COMMAND.kex. A command token
     containing / instead names an exact KEX package path relative to the
@@ -34,16 +36,18 @@ DESCRIPTION
     provenance warning, not a filesystem permission or package-trust decision.
 
     Single and double quotes group literal text; neither performs expansion.
-    An unquoted | connects bounded byte streams. Unquoted < supplies the first
-    stage from FILE. Unquoted > truncates or creates FILE before execution and
-    streams final stdout, while >> creates or streams at the existing end.
+    Unquoted && and || have equal precedence, associate left to right, and run
+    the next pipeline after success or non-success respectively. An unquoted |
+    connects bounded byte streams. Unquoted < supplies the first stage from
+    FILE. Unquoted > truncates or creates FILE before execution and streams
+    final stdout, while >> creates or streams at the existing end.
 
     File streams use a 16 KiB default working buffer and are not capped by the
     shell. A failing command may leave an empty file or written prefix. The
     1 MiB limit applies only between sequential pipeline stages. Redirection
     paths do not enter command argv. Variables, expansion, command substitution,
-    control flow, stderr redirection, heredocs, jobs, descriptor numbers, and
-    multiline grammar are not supported by the current script grammar.
+    control-flow blocks, stderr redirection, heredocs, jobs, descriptor numbers,
+    and multiline grammar are not supported by the current script grammar.
 
 EXAMPLES
     sh /share/sh/bench.sh

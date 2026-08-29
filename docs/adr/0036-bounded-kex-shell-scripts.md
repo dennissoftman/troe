@@ -5,16 +5,17 @@ by ADR 0046 while the current `sh.kex` sidecar behavior remains implemented.
 
 ## Context
 
-The interactive shell executes one parsed pipeline at a time and every ordinary
-command is an isolated KEX application. A conventional `sh.kex` cannot launch a
+The interactive shell executes one parsed logical command list at a time and
+every ordinary command is an isolated KEX application. A conventional `sh.kex` cannot launch a
 second KEX while it is running: native application entry deliberately rejects a
 nested launch, and granting an interpreter ambient kernel or shell authority
 would violate the typed least-authority boundary.
 
 The first required workload is an architecture-independent command transcript
 using physical command lines, blank lines, leading comments, literal quoting,
-pipelines, and `<`/`>` redirection. It does not require variables, conditionals,
-loops, substitution, multiline shell grammar, jobs, or direct executable files.
+pipelines, `&&`/`||` short-circuit lists, and `<`/`>` redirection. It does not
+require variables, control-flow blocks, loops, substitution, multiline shell
+grammar, jobs, or direct executable files.
 
 ## Decision
 
@@ -42,7 +43,8 @@ the same parser, KEX resolver, streams, and redirection paths used by interactiv
 input. This avoids nested native execution and lets `cd` update the owning
 session. Runtime command failures do not stop later physical lines. The batch
 returns the last executed command status. Script nesting is limited to four,
-and all nested batches share one 1,024-command execution budget.
+and all nested batches share one 1,024-pipeline execution budget; every entry
+in a logical list consumes that budget even when short-circuited.
 
 The runtime command is `/bin/sh.kex` and is invoked as `sh [FILE | -]`. A file
 is streamed through the existing read-only filesystem capability; `-` or no
@@ -57,9 +59,10 @@ filesystem mutation authority, process table, environment, or machine control.
 Child commands receive only their own manifests' capabilities after the
 interpreter has been reclaimed.
 
-The first language deliberately has no variables, expansion, conditionals,
-loops, functions, command substitution, multiline constructs, traps, jobs,
-descriptor syntax, stderr redirection, or POSIX compatibility claim. Each such
+The first language deliberately has no variables, expansion, control-flow
+blocks, loops, functions, command substitution, multiline constructs, traps,
+jobs, descriptor syntax, stderr redirection, or POSIX compatibility claim.
+`&&` and `||` provide only same-line status-based short circuiting. Each broader
 feature requires a later grammar/version decision and dedicated bounds. The
 accepted example under `/share/sh/bench.sh` plus transactional rejection,
 standard-input loading, cwd persistence, both-target KEX artifacts, and native

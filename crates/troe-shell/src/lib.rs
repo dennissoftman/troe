@@ -1,4 +1,4 @@
-//! Bounded shell grammar, byte-stream pipelines, and session/job intrinsics.
+//! Bounded shell grammar, logical lists, byte-stream pipelines, and session/job intrinsics.
 #![no_std]
 #![forbid(unsafe_code)]
 
@@ -73,6 +73,8 @@ pub enum ParseError {
     UnclosedQuote,
     /// A pipeline begins, ends, or contains two adjacent separators.
     EmptyStage,
+    /// A logical operator begins, ends, or contains an empty command.
+    EmptyCommand,
     /// A redirection operator has no following path.
     MissingRedirectionTarget,
     /// One stage specifies the same redirection direction more than once.
@@ -120,6 +122,31 @@ pub struct Pipeline {
     pub stages: Vec<Stage>,
     /// Whether the launcher should return the session prompt after admission.
     pub background: bool,
+}
+
+/// Short-circuit condition connecting one pipeline to the preceding pipeline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LogicalOperator {
+    /// Execute the following pipeline only after success.
+    And,
+    /// Execute the following pipeline only after non-success.
+    Or,
+}
+
+/// One pipeline in a left-associative logical command list.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandListEntry {
+    /// Condition applied to the preceding pipeline, absent for the first entry.
+    pub operator: Option<LogicalOperator>,
+    /// Pipeline executed when its condition is satisfied.
+    pub pipeline: Pipeline,
+}
+
+/// A bounded sequence of pipelines connected by `&&` and `||`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct CommandList {
+    /// Parsed pipelines and their short-circuit conditions.
+    pub entries: Vec<CommandListEntry>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -747,7 +774,7 @@ impl Completion {
     }
 }
 
-/// Parse quoting, pipelines, and bounded file redirection without expansion.
+/// Parse one pipeline with quoting and bounded file redirection without expansion.
 ///
 /// # Errors
 ///
@@ -910,6 +937,85 @@ pub fn parse_line(line: &str) -> Result<Pipeline, ParseError> {
         return Err(ParseError::InvalidRedirectionPosition);
     }
     Ok(Pipeline { stages, background })
+}
+
+/// Parse a complete line as left-associative pipelines connected by `&&` and `||`.
+///
+/// Logical operators have equal precedence. Quoted operators remain literal text.
+///
+/// # Errors
+///
+/// Fails on malformed logical operators or any error in a contained pipeline.
+pub fn parse_command_list(line: &str) -> Result<CommandList, ParseError> {
+    if line.len() > MAX_LINE_BYTES {
+        return Err(ParseError::LineTooLong);
+    }
+
+    let mut entries = Vec::new();
+    let mut quote = Quote::None;
+    let mut start = 0_usize;
+    let mut pending_operator = None;
+    let mut characters = line.char_indices().peekable();
+
+    while let Some((index, character)) = characters.next() {
+        match quote {
+            Quote::Single => {
+                if character == '\'' {
+                    quote = Quote::None;
+                }
+            }
+            Quote::Double => {
+                if character == '"' {
+                    quote = Quote::None;
+                }
+            }
+            Quote::None => match character {
+                '\'' => quote = Quote::Single,
+                '"' => quote = Quote::Double,
+                '&' | '|' => {
+                    let Some(&(next_index, next)) = characters.peek() else {
+                        continue;
+                    };
+                    if next != character {
+                        continue;
+                    }
+                    let operator = if character == '&' {
+                        LogicalOperator::And
+                    } else {
+                        LogicalOperator::Or
+                    };
+                    let pipeline = parse_line(&line[start..index])?;
+                    if pipeline.stages.is_empty() {
+                        return Err(ParseError::EmptyCommand);
+                    }
+                    if pipeline.background {
+                        return Err(ParseError::InvalidBackgroundPosition);
+                    }
+                    entries.push(CommandListEntry {
+                        operator: pending_operator,
+                        pipeline,
+                    });
+                    pending_operator = Some(operator);
+                    start = next_index + next.len_utf8();
+                    let _consumed = characters.next();
+                }
+                _ => {}
+            },
+        }
+    }
+
+    let pipeline = parse_line(&line[start..])?;
+    if pipeline.stages.is_empty() {
+        if entries.is_empty() && pending_operator.is_none() {
+            return Ok(CommandList::default());
+        }
+        return Err(ParseError::EmptyCommand);
+    }
+    entries.push(CommandListEntry {
+        operator: pending_operator,
+        pipeline,
+    });
+    Ok(CommandList { entries })
 }
 
 fn push_token(
@@ -1175,7 +1281,7 @@ impl Shell {
         )
     }
 
-    /// Execute a complete line, including any bounded pipeline.
+    /// Execute a complete line, including bounded pipelines and logical operators.
     pub fn execute(
         &mut self,
         line: &str,
@@ -1206,16 +1312,49 @@ impl Shell {
         stderr: &mut dyn Output,
         external: &mut E,
     ) -> CommandStatus {
-        let pipeline = match parse_line(line) {
+        let command_list = match parse_command_list(line) {
             Ok(value) => value,
             Err(error) => {
                 let _ignored = write_error(stderr, "parse", parse_error_text(error));
                 return CommandStatus::Usage;
             }
         };
-        if pipeline.stages.is_empty() {
-            return CommandStatus::Success;
+        self.execute_command_list(&command_list, stdin, stdout, stderr, external)
+    }
+
+    fn execute_command_list<E: ExternalCommand + ?Sized>(
+        &mut self,
+        command_list: &CommandList,
+        stdin: &mut dyn Input,
+        stdout: &mut dyn Output,
+        stderr: &mut dyn Output,
+        external: &mut E,
+    ) -> CommandStatus {
+        let mut status = CommandStatus::Success;
+        for entry in &command_list.entries {
+            let should_execute = match entry.operator {
+                None => true,
+                Some(LogicalOperator::And) => status == CommandStatus::Success,
+                Some(LogicalOperator::Or) => status != CommandStatus::Success,
+            };
+            if should_execute {
+                status = self.execute_pipeline(&entry.pipeline, stdin, stdout, stderr, external);
+                if self.machine_action.is_some() {
+                    break;
+                }
+            }
         }
+        status
+    }
+
+    fn execute_pipeline<E: ExternalCommand + ?Sized>(
+        &mut self,
+        pipeline: &Pipeline,
+        stdin: &mut dyn Input,
+        stdout: &mut dyn Output,
+        stderr: &mut dyn Output,
+        external: &mut E,
+    ) -> CommandStatus {
         let placement = if pipeline.background {
             ExecutionPlacement::Background
         } else {
@@ -1444,14 +1583,23 @@ impl Shell {
         self.script_depth = self.script_depth.saturating_add(1);
         let mut status = CommandStatus::Success;
         for line in lines {
-            if self.script_commands_remaining == 0 {
+            let command_list = match parse_command_list(&line) {
+                Ok(value) => value,
+                Err(error) => {
+                    let _ignored = write_error(stderr, "parse", parse_error_text(error));
+                    status = CommandStatus::Usage;
+                    continue;
+                }
+            };
+            let command_count = command_list.entries.len();
+            if command_count > self.script_commands_remaining {
                 let _ignored = write_error(stderr, "sh", "script command limit exceeded");
                 status = CommandStatus::Usage;
                 break;
             }
-            self.script_commands_remaining -= 1;
+            self.script_commands_remaining -= command_count;
             let mut input = EmptyScriptInput;
-            status = self.execute_inner(&line, &mut input, stdout, stderr, external);
+            status = self.execute_command_list(&command_list, &mut input, stdout, stderr, external);
             if self.machine_action.is_some() {
                 break;
             }
@@ -1666,7 +1814,7 @@ fn completion_context(line: &str, cursor: usize) -> Option<CompletionContext<'_>
                         Quote::Double
                     };
                 }
-                '|' => {
+                '|' | '&' => {
                     if word_started {
                         retain_completion_word(
                             line,
@@ -2224,6 +2372,7 @@ const fn parse_error_text(error: ParseError) -> &'static str {
         ParseError::TooManyStages => "too many pipeline stages",
         ParseError::UnclosedQuote => "unclosed quote",
         ParseError::EmptyStage => "empty pipeline stage",
+        ParseError::EmptyCommand => "empty logical command",
         ParseError::MissingRedirectionTarget => "missing redirection target",
         ParseError::DuplicateRedirection => "duplicate redirection",
         ParseError::InvalidRedirectionPosition => "invalid redirection position",
@@ -2237,9 +2386,10 @@ mod tests {
     use super::{
         CommandClass, CompletionConfig, CompletionConfigError, CompletionEnvironment,
         CompletionVisitor, DynamicCompletionDomain, ExecutionPlacement, ExternalCommand,
-        ExternalCommandReference, INTRINSICS, JobControl, MachineAction, OutputRedirection,
-        ParseError, ServiceControl, SharedNamespace, Shell, command_class, command_synopsis,
-        external_command_reference, format_memory_report, parse_line,
+        ExternalCommandReference, INTRINSICS, JobControl, LogicalOperator, MachineAction,
+        OutputRedirection, ParseError, ServiceControl, SharedNamespace, Shell, command_class,
+        command_synopsis, external_command_reference, format_memory_report, parse_command_list,
+        parse_line,
     };
     use alloc::boxed::Box;
     use alloc::format;
@@ -2655,6 +2805,25 @@ mod tests {
     }
 
     #[test]
+    fn staged_script_budget_counts_each_logical_pipeline() {
+        let mut shell = shell();
+        let mut external = FakeExternal::default();
+        let mut stdout = BoundedOutput::new(64);
+        let mut stderr = BoundedOutput::new(128);
+        let mut lines = (0..512)
+            .map(|_| "cd / && cd /".to_string())
+            .collect::<Vec<_>>();
+        lines.push("external".to_string());
+
+        assert_eq!(
+            shell.execute_script_lines(lines, &mut stdout, &mut stderr, &mut external),
+            CommandStatus::Usage
+        );
+        assert!(external.attempts.is_empty());
+        assert_eq!(stderr.as_slice(), b"sh: script command limit exceeded\n");
+    }
+
+    #[test]
     fn quotes_and_pipelines_parse_without_expansion() {
         let parsed = parse_line("echo 'a b' \"c|d\" | grep b").unwrap_or_default();
         assert_eq!(parsed.stages.len(), 2);
@@ -2662,6 +2831,47 @@ mod tests {
         assert_eq!(parsed.stages[1].words, ["grep", "b"]);
         assert_eq!(parse_line("echo 'bad"), Err(ParseError::UnclosedQuote));
         assert_eq!(parse_line("echo a || cat"), Err(ParseError::EmptyStage));
+    }
+
+    #[test]
+    fn logical_command_lists_parse_outside_quotes() {
+        let parsed =
+            parse_command_list("echo 'a && b' | copy && fail || echo Fail").unwrap_or_default();
+        assert_eq!(parsed.entries.len(), 3);
+        assert_eq!(parsed.entries[0].operator, None);
+        assert_eq!(parsed.entries[0].pipeline.stages.len(), 2);
+        assert_eq!(
+            parsed.entries[0].pipeline.stages[0].words,
+            ["echo", "a && b"]
+        );
+        assert_eq!(parsed.entries[1].operator, Some(LogicalOperator::And));
+        assert_eq!(parsed.entries[1].pipeline.stages[0].words, ["fail"]);
+        assert_eq!(parsed.entries[2].operator, Some(LogicalOperator::Or));
+        assert_eq!(parsed.entries[2].pipeline.stages[0].words, ["echo", "Fail"]);
+
+        let quoted = parse_command_list("echo \"a || b\" && external &").unwrap_or_default();
+        assert_eq!(quoted.entries.len(), 2);
+        assert_eq!(
+            quoted.entries[0].pipeline.stages[0].words,
+            ["echo", "a || b"]
+        );
+        assert!(quoted.entries[1].pipeline.background);
+
+        for malformed in ["&& echo", "echo ||", "echo && || fail"] {
+            assert_eq!(parse_command_list(malformed), Err(ParseError::EmptyCommand));
+        }
+        assert_eq!(
+            parse_command_list("echo &&& fail"),
+            Err(ParseError::InvalidBackgroundPosition)
+        );
+        assert_eq!(
+            parse_command_list("echo ||| fail"),
+            Err(ParseError::EmptyStage)
+        );
+        assert_eq!(
+            parse_command_list("external & && echo done"),
+            Err(ParseError::InvalidBackgroundPosition)
+        );
     }
 
     #[test]
@@ -2816,6 +3026,65 @@ mod tests {
         assert_eq!(status, CommandStatus::Success);
         assert_eq!(output.as_slice(), b"alpha\nbeta alpha\n");
         assert!(error.as_slice().is_empty());
+    }
+
+    #[test]
+    fn logical_operators_short_circuit_left_to_right() {
+        let mut shell = shell();
+        let mut external = FakeExternal::default();
+        let mut input = SliceInput::new(b"");
+        let mut output = BoundedOutput::new(1024);
+        let mut error = BoundedOutput::new(1024);
+
+        let status = shell.execute_with_external(
+            "fail && external || echo Fail",
+            &mut input,
+            &mut output,
+            &mut error,
+            &mut external,
+        );
+        assert_eq!(status, CommandStatus::Success);
+        assert_eq!(external.attempts, ["fail", "echo"]);
+        assert_eq!(output.as_slice(), b"external application\n");
+        assert_eq!(error.as_slice(), b"fail: requested failure\n");
+
+        external.attempts.clear();
+        output = BoundedOutput::new(1024);
+        error = BoundedOutput::new(1024);
+        let status = shell.execute_with_external(
+            "external || fail && echo OK",
+            &mut input,
+            &mut output,
+            &mut error,
+            &mut external,
+        );
+        assert_eq!(status, CommandStatus::Success);
+        assert_eq!(external.attempts, ["external", "echo"]);
+        assert_eq!(
+            output.as_slice(),
+            b"external application\nexternal application\n"
+        );
+        assert!(error.as_slice().is_empty());
+
+        external.attempts.clear();
+        external.placements.clear();
+        output = BoundedOutput::new(1024);
+        let status = shell.execute_with_external(
+            "external && external &",
+            &mut input,
+            &mut output,
+            &mut error,
+            &mut external,
+        );
+        assert_eq!(status, CommandStatus::Success);
+        assert_eq!(external.attempts, ["external", "external"]);
+        assert_eq!(
+            external.placements,
+            [
+                ExecutionPlacement::Foreground,
+                ExecutionPlacement::Background
+            ]
+        );
     }
 
     #[test]
@@ -3150,6 +3419,19 @@ mod tests {
             Some(MachineAction::PowerOff)
         );
 
+        let mut external = FakeExternal::default();
+        assert_eq!(
+            poweroff_shell.execute_with_external(
+                "poweroff && external",
+                &mut input,
+                &mut output,
+                &mut error,
+                &mut external,
+            ),
+            CommandStatus::Success
+        );
+        assert!(external.attempts.is_empty());
+
         let mut reboot_shell = shell();
         assert_eq!(
             reboot_shell.execute("reboot", &mut input, &mut output, &mut error),
@@ -3172,6 +3454,9 @@ mod tests {
 
         let explicit = shell.complete("/bin/ec", 7, CompletionConfig::standard());
         assert_eq!(explicit.candidates[0].replacement, "/bin/echo.kex ");
+
+        let logical = shell.complete("missing || ec", 13, CompletionConfig::standard());
+        assert_eq!(logical.candidates[0].replacement, "echo ");
 
         let directory = shell.complete("cd /he", 6, CompletionConfig::standard());
         assert_eq!(directory.candidates[0].replacement, "/help/");
