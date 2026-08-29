@@ -415,10 +415,10 @@ def generate_corpus() -> dict[str, bytes]:
             "standard-max-encoded": _canonical(
                 target,
                 NATIVE_CODE[target]["calls"],
-                first_file_bytes=16 * 1024 * 1024
+                first_file_bytes=32 * 1024 * 1024
                 - elf2kex.KEX_HEADER_BYTES
                 - elf2kex.KEX_RECORD_BYTES,
-                first_memory_bytes=16 * 1024 * 1024,
+                first_memory_bytes=32 * 1024 * 1024,
             ),
         }
         for label, artifact in boundary_artifacts.items():

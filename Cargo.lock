@@ -248,6 +248,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "troe-kex-c-runtime"
+version = "0.1.0"
+dependencies = [
+ "troe-kex-alloc",
+ "troe-kex-runtime",
+ "troe-kex-sdk",
+]
+
+[[package]]
 name = "troe-kex-runtime"
 version = "0.1.0"
 dependencies = [

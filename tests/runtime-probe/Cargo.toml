@@ -1,0 +1,36 @@
+[package]
+name = "troe-runtime-probe"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "Apache-2.0"
+publish = false
+build = "build.rs"
+
+[package.metadata.troe-kex]
+capabilities = ["filesystem-read", "filesystem-mutate", "timer", "wall-clock", "private-memory", "random"]
+stack-pages = 64
+heap-pages = 256
+
+[[bin]]
+name = "troe-runtime-probe"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+troe-kex-c-runtime = { path = "../../sdk/rust/troe-kex-c-runtime" }
+troe-kex-runtime = { path = "../../sdk/rust/troe-kex-runtime", default-features = false }
+troe-kex-sdk = { path = "../../sdk/rust/troe-kex" }
+
+[profile.release]
+codegen-units = 1
+lto = false
+opt-level = 2
+panic = "abort"
+strip = "none"
+
+[lints.rust]
+unsafe_code = "allow"
+
+[workspace]

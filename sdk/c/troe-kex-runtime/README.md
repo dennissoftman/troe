@@ -1,14 +1,36 @@
-# TROE freestanding C compatibility core
+# TROE freestanding C runtime
 
-`troe_libc_core.c` is a small SDK-owned source component that KEX language
-runtimes may hard-compile while TROE has no dynamic linker. It supplies the
-standard C symbols that still inherently need C pointer or varargs semantics:
-memory/string operations, `strerror`, C locale data, `strtod` dispatch, the
-floating-point ABI adapters (including the `frexp` pointer wrapper), and bounded
-nanoprintf formatting.
+This directory implements the C symbols declared by the sibling
+`troe-kex-sysroot`. `tools/build_c_sysroot.py` cross-compiles the sources with
+`-nostdlibinc` and publishes the deterministic static archive
+`<architecture>/lib/libtroe_c.a`; applications link that archive into their KEX
+image. There is no dynamic linker or guest `/lib` dependency.
 
-Safe generic algorithms live in the sibling Rust `troe-kex-runtime` crate.
-Lua-specific state, upstream Lua C sources, allocator callbacks, and its
-temporary buffered `FILE` implementation remain under `apps/lua`. This core is
-not a complete libc and does not provide descriptors, directory streams,
-allocator ownership, or ambient filesystem access.
+The runtime owns:
+
+- allocation, zeroed allocation, reallocation, alignment, and release through
+  the `troe_runtime_host` allocator callback;
+- memory, strings, conversion, sorting/searching, math/decimal adapters,
+  UTF-8/wide-character conversion, C/POSIX locale behavior, and target-native
+  `setjmp`/`longjmp` state;
+- 64 bounded descriptors, 16 directory streams, 16 buffered `FILE` objects,
+  standard streams, read-only file access, sequential replacement and
+  provider-backed preserved-append writes, metadata, cwd, directories,
+  rename/removal, and hard/symbolic links;
+- immutable argv/environment, 32 atexit callbacks, process termination, clocks,
+  UTC calendar conversion, secure random reads, and 32 coherent TSS keys; and
+- single-execution-thread mutex, once, and TSS behavior with explicit
+  `ENOTSUP` thread-creation stubs.
+
+The callback table is capability scoped. Missing file, mutation, timer,
+wall-clock, or random authority fails at the attempted operation; it is never
+replaced by ambient access. Without private-memory authority, allocation remains
+inside the growable TLSF heap and reports normal allocation failure at its
+limit. Unsupported access modes,
+random writes, process creation, signals, executable mappings, networking,
+dynamic linking, additional locales, and timezone databases fail explicitly.
+
+Nanoprintf 0.6.1 is vendored once below `vendor/` and shared by this runtime and
+Lua. Lua also consumes these headers, compatibility symbols, and setjmp source;
+application-specific Lua state and pipe-backed extensions remain in the Lua
+application.

@@ -160,6 +160,27 @@ unclean-unmount marker and keeps the filesystem contents; other metadata
 deviations still fail closed. Use `cargo mount --repair` for the same explicit,
 lock-protected non-interactive repair without mounting the image.
 
+Large optional runtime executables use the versioned
+`/vol/shared/runtime/v1/<architecture>/bin/<name>.kex` tree. They are never
+copied into rootfs, KEFS, or the EFI image. `tools/mkruntime.py` builds a
+canonical SHA-256 manifest, verifies the exact file set and every artifact
+byte, and installs either below a mounted shared-media root or directly into a
+detached TROE shared image:
+
+```console
+python3 tools/mkruntime.py build --output build/runtime-v1 \
+  --artifact x86_64:runtime=build/packages/x86_64/runtime.kex \
+  --artifact aarch64:runtime=build/packages/aarch64/runtime.kex
+python3 tools/mkruntime.py verify build/runtime-v1
+python3 tools/mkruntime.py install build/runtime-v1 --shared-root /path/to/mounted/shared
+# Or: python3 tools/mkruntime.py install-image build/runtime-v1 \
+#       --image build/troe-shared-fat32.img
+```
+
+Install and verification reject missing media, wrong schemas, symlinks,
+unmanifested files, malformed records, oversize artifacts, and hash or length
+mismatches with a specific error.
+
 ### Networking
 
 This is an abridged session from the x86-64 QEMU profile:
@@ -211,6 +232,16 @@ The interactive shell asks for a default-negative confirmation before directly
 executing a path outside `/bin`. This is an advisory provenance warning, not a
 substitute for executable permission bits or package trust policy.
 
+Externally stored packages are validated and materialized with fixed 4 KiB
+chunks and a 24 KiB format-verifier buffer ceiling, including a fallibly
+allocated maximum 16 KiB completion descriptor buffer. The kernel fingerprints every
+package byte, independently validates and fingerprints relocations, streams
+load bytes only into inactive zeroed frames, and rechecks both fingerprints
+before activation. It never retains a package-sized kernel-heap copy. Direct,
+background, service, and owner-scoped nested launch all use this path and retain
+the same W^X, ASLR, capability attenuation, transactional rollback, teardown,
+and page accounting.
+
 The essential filesystem command set includes streamed `cp`, iterative
 `cp -r`/`cp -R`, atomic same-provider `mv`, recursive `rm -r`/`rm -R`, and
 `rmdir`. Recursive commands reproduce symbolic links without following them
@@ -250,6 +281,21 @@ filesystem, environment, process, calendar, decimal, math, or C-locale
 algorithms. The remaining platform limits are explicit: UTC and the C locale
 are fixed, C dynamic modules have no loader, and Lua has no ambient host OS or
 raw filesystem access.
+
+The reusable freestanding C SDK lives under
+[`sdk/c`](sdk/c/troe-kex-sysroot). `tools/build_c_sysroot.py` produces an LP64
+sysroot for both supported targets with target headers and
+`lib/libtroe_c.a`; builds use `-nostdlibinc` and never inherit host libc. This
+is a build sysroot library, not a guest `/lib` payload. The
+static library owns the C allocator ABI, UTF-8 and wide-character conversion,
+`setjmp`/`longjmp`, bounded descriptors, buffered `FILE` and directory streams,
+filesystem replacement, preserved append, and links, argv/environment,
+UTC/C-locale time, secure
+randomness, exit handling, and coherent single-execution-thread locks and TSS.
+The Rust [`troe-kex-c-runtime`](sdk/rust/troe-kex-c-runtime) bridge supplies only
+the typed capabilities present in the package manifest. Missing capabilities
+fail with `EACCES`; unsupported flags and facilities fail explicitly. There is
+no guest `/lib` dependency because every KEX remains statically linked.
 
 [`apps/sh`](apps/sh) transactionally stages a bounded UTF-8 command file through
 the typed shell-script sidecar, then the owning session executes each validated
@@ -373,7 +419,7 @@ provisioning workflow.
 | [`kernel/`](kernel) | UEFI entry point and native kernel composition |
 | [`crates/`](crates) | Portable shell, VFS, storage, networking, task, and driver components |
 | [`apps/`](apps) | Isolated KEX command applications |
-| [`sdk/`](sdk) | Rust application SDK and linker support |
+| [`sdk/`](sdk) | Rust and freestanding C application SDKs, runtimes, and linker support |
 | [`rootfs/`](rootfs) | Root filesystem and packaged applications |
 | [`host/`](host) | Hosted shell model |
 | [`scripts/`](scripts) | Build, test, and QEMU entry points |

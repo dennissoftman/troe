@@ -1,0 +1,24 @@
+[package]
+name = "troe-kex-c-runtime"
+description = "C ABI host bridge for the freestanding TROE KEX sysroot"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+troe-kex-alloc = { path = "../troe-kex-alloc" }
+troe-kex-runtime = { path = "../troe-kex-runtime", default-features = false, features = ["math"] }
+troe-kex-sdk = { path = "../troe-kex" }
+
+[lints.rust]
+unsafe_code = "allow"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"

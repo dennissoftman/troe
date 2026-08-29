@@ -12,9 +12,5 @@ TROE carries one small conditional change in `lbaselib.c`: `dofile` and
 loads its initial file through the bounded filesystem capability instead of
 exposing an ambient libc `FILE` API.
 
-`nanoprintf-0.6.1/nanoprintf.h` and its license come from the nanoprintf v0.6.1
-release archive:
-
-- URL: <https://github.com/charlesnicholson/nanoprintf/archive/refs/tags/v0.6.1.tar.gz>
-- SHA-256: `81d4dc86e40fa80cf64b6f3bb8d2fbbaf6d54bbf971a0ccb48cf414d32f51e4f`
-- License: Unlicense or 0BSD; see `nanoprintf-0.6.1/LICENSE`
+The shared C SDK owns the nanoprintf source and license used by this runtime;
+see `sdk/c/troe-kex-runtime/vendor/nanoprintf-0.6.1`.

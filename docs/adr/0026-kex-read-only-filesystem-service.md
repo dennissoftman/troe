@@ -1,15 +1,17 @@
 # ADR 0026: KEX read-only filesystem service
 
 Status: accepted and implemented for the Stage 9 read-only command migration,
-2026-08-25; open-table capacity amended by ADR 0046.
+2026-08-25; open-table capacity amended by ADR 0046 and the current interface
+minor is 1.3.
 
 ## Decision
 
 A KEX package may request the optional `filesystem-read` capability. If the
 launching shell owns a live VFS namespace, the kernel grants interface 6,
-version 1.2, rooted at that namespace and resolving relative paths from the
+version 1.3, rooted at that namespace and resolving relative paths from the
 command's immutable startup cwd. The interface exposes only `open`, offset
-`read`, `close`, `metadata`, paginated `list`, and final-component `readlink`;
+`read`, `close`, following and no-follow `metadata`, paginated `list`, and
+final-component `readlink`;
 it grants no mutation,
 mount, provider, block, device, or raw kernel authority.
 

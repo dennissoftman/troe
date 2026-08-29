@@ -127,7 +127,7 @@ impl<'package> KexPackage<'package> {
 /// Deterministic single-file package rejection category.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PackageError {
-    /// Input exceeds the complete package staging ceiling.
+    /// Input exceeds the complete package admission ceiling.
     PackageTooLarge,
     /// Input is shorter than the fixed package header.
     TruncatedHeader,
@@ -288,7 +288,7 @@ pub struct ApplicationLimits {
 
 impl ApplicationLimits {
     const STANDARD: Self = Self {
-        encoded_bytes: 16 * 1024 * 1024,
+        encoded_bytes: 32 * 1024 * 1024,
         load_records: 16,
         image_span_bytes: 128 * 1024 * 1024,
         image_pages: 8192,
@@ -306,7 +306,7 @@ impl ApplicationLimits {
         Self::STANDARD
     }
 
-    /// Maximum encoded artifact bytes staged by the kernel.
+    /// Maximum encoded KEX bytes accepted by the standard policy.
     #[must_use]
     pub const fn encoded_bytes(self) -> usize {
         self.encoded_bytes
@@ -367,12 +367,84 @@ pub struct LoadSegment<'artifact> {
     image_base: u64,
     image_offset: u64,
     memory_bytes: u64,
+    file_offset: u64,
     file_byte_count: u64,
     permissions: SegmentPermissions,
     file_bytes: &'artifact [u8],
 }
 
+/// Pointer-free geometry for one validated KEX load segment.
+///
+/// Unlike [`LoadSegment`], this value does not borrow the complete artifact.
+/// It is therefore suitable for a bounded streaming loader which retains only
+/// format metadata while copying payload ranges directly into inactive frames.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LoadSegmentLayout {
+    image_base: u64,
+    image_offset: u64,
+    memory_bytes: u64,
+    file_offset: u64,
+    file_byte_count: u64,
+    permissions: SegmentPermissions,
+}
+
+impl LoadSegmentLayout {
+    /// Absolute first virtual byte at the kernel-selected image base.
+    #[must_use]
+    pub const fn virtual_address(self) -> u64 {
+        self.image_base + self.image_offset
+    }
+
+    /// Image-relative first byte.
+    #[must_use]
+    pub const fn image_offset(self) -> u64 {
+        self.image_offset
+    }
+
+    /// Mapped bytes, including the zero-filled suffix.
+    #[must_use]
+    pub const fn memory_bytes(self) -> u64 {
+        self.memory_bytes
+    }
+
+    /// Executable-relative first payload byte.
+    #[must_use]
+    pub const fn file_offset(self) -> u64 {
+        self.file_offset
+    }
+
+    /// Number of payload bytes copied from the artifact.
+    #[must_use]
+    pub const fn file_byte_count(self) -> u64 {
+        self.file_byte_count
+    }
+
+    /// Validated closed permission value.
+    #[must_use]
+    pub const fn permissions(self) -> SegmentPermissions {
+        self.permissions
+    }
+
+    /// Bytes zero-filled after the file payload.
+    #[must_use]
+    pub const fn zero_fill_bytes(self) -> u64 {
+        self.memory_bytes - self.file_byte_count
+    }
+}
+
 impl<'artifact> LoadSegment<'artifact> {
+    /// Return the segment's pointer-free geometry.
+    #[must_use]
+    pub const fn layout(self) -> LoadSegmentLayout {
+        LoadSegmentLayout {
+            image_base: self.image_base,
+            image_offset: self.image_offset,
+            memory_bytes: self.memory_bytes,
+            file_offset: self.file_offset,
+            file_byte_count: self.file_byte_count,
+            permissions: self.permissions,
+        }
+    }
     /// Image-relative first byte.
     #[must_use]
     pub const fn image_offset(self) -> u64 {
@@ -542,7 +614,7 @@ pub enum StartupPageError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum LoaderResource {
-    /// Kernel-owned copy of the encoded KEX artifact.
+    /// Bounded kernel-owned format-verifier scratch storage.
     Staging = 0,
     /// Zeroable private-frame allocation, including the table reservation.
     Frames = 1,
@@ -690,7 +762,7 @@ impl Default for LoaderTransaction {
 }
 
 impl LoadCharges {
-    /// Exact staged artifact bytes.
+    /// Peak source-staging bytes retained by the selected loading path.
     #[must_use]
     pub const fn staging_bytes(self) -> usize {
         self.staging_bytes
@@ -831,53 +903,69 @@ impl<'artifact> LoadPlan<'artifact> {
         info: StartupInfo<'_>,
         destination: &mut [u8; PAGE_BYTES],
     ) -> Result<(), StartupPageError> {
-        if info.task_id == 0 {
-            return Err(StartupPageError::InvalidTaskId);
-        }
-        let limits = ApplicationLimits::standard();
-        if info.handles.len() > usize::from(limits.initial_handles) {
-            return Err(StartupPageError::TooManyHandles);
-        }
-        for (index, handle) in info.handles.iter().enumerate() {
-            if handle.value == 0 {
-                return Err(StartupPageError::InvalidHandle);
-            }
-            if info.handles[..index]
-                .iter()
-                .any(|existing| existing.value == handle.value)
-            {
-                return Err(StartupPageError::DuplicateHandle);
-            }
-        }
-
-        destination.fill(0);
-        let encoded_bytes = STARTUP_FIXED_BYTES + info.handles.len() * STARTUP_HANDLE_BYTES;
-        let encoded_bytes =
-            u32::try_from(encoded_bytes).map_err(|_| StartupPageError::TooManyHandles)?;
-        let handle_count =
-            u16::try_from(info.handles.len()).map_err(|_| StartupPageError::TooManyHandles)?;
-        write_u32(destination, 0, encoded_bytes);
-        write_u16(destination, 4, ABI_MAJOR);
-        write_u16(destination, 6, self.abi_minor);
-        write_u32(destination, 8, 4096);
-        write_u16(destination, 12, 0);
-        write_u16(destination, 14, handle_count);
-        write_u64(destination, 16, self.image_base);
-        write_u64(destination, 24, self.layout.heap_address);
-        write_u64(destination, 32, self.layout.heap_bytes);
-        write_u64(destination, 40, self.layout.stack_bottom);
-        write_u64(destination, 48, self.layout.stack_top);
-        write_u64(destination, 56, info.task_id);
-        for (index, handle) in info.handles.iter().enumerate() {
-            let offset = STARTUP_FIXED_BYTES + index * STARTUP_HANDLE_BYTES;
-            write_u64(destination, offset, handle.value);
-            write_u32(destination, offset + 8, handle.rights);
-            write_u32(destination, offset + 12, handle.interface);
-            write_u16(destination, offset + 16, handle.major);
-            write_u16(destination, offset + 18, handle.minor);
-        }
-        Ok(())
+        encode_startup_page(
+            self.abi_minor,
+            self.image_base,
+            self.layout,
+            info,
+            destination,
+        )
     }
+}
+
+fn encode_startup_page(
+    abi_minor: u16,
+    image_base: u64,
+    layout: ApplicationLayout,
+    info: StartupInfo<'_>,
+    destination: &mut [u8; PAGE_BYTES],
+) -> Result<(), StartupPageError> {
+    if info.task_id == 0 {
+        return Err(StartupPageError::InvalidTaskId);
+    }
+    let limits = ApplicationLimits::standard();
+    if info.handles.len() > usize::from(limits.initial_handles) {
+        return Err(StartupPageError::TooManyHandles);
+    }
+    for (index, handle) in info.handles.iter().enumerate() {
+        if handle.value == 0 {
+            return Err(StartupPageError::InvalidHandle);
+        }
+        if info.handles[..index]
+            .iter()
+            .any(|existing| existing.value == handle.value)
+        {
+            return Err(StartupPageError::DuplicateHandle);
+        }
+    }
+
+    destination.fill(0);
+    let encoded_bytes = STARTUP_FIXED_BYTES + info.handles.len() * STARTUP_HANDLE_BYTES;
+    let encoded_bytes =
+        u32::try_from(encoded_bytes).map_err(|_| StartupPageError::TooManyHandles)?;
+    let handle_count =
+        u16::try_from(info.handles.len()).map_err(|_| StartupPageError::TooManyHandles)?;
+    write_u32(destination, 0, encoded_bytes);
+    write_u16(destination, 4, ABI_MAJOR);
+    write_u16(destination, 6, abi_minor);
+    write_u32(destination, 8, 4096);
+    write_u16(destination, 12, 0);
+    write_u16(destination, 14, handle_count);
+    write_u64(destination, 16, image_base);
+    write_u64(destination, 24, layout.heap_address);
+    write_u64(destination, 32, layout.heap_bytes);
+    write_u64(destination, 40, layout.stack_bottom);
+    write_u64(destination, 48, layout.stack_top);
+    write_u64(destination, 56, info.task_id);
+    for (index, handle) in info.handles.iter().enumerate() {
+        let offset = STARTUP_FIXED_BYTES + index * STARTUP_HANDLE_BYTES;
+        write_u64(destination, offset, handle.value);
+        write_u32(destination, offset + 8, handle.rights);
+        write_u32(destination, offset + 12, handle.interface);
+        write_u16(destination, offset + 16, handle.major);
+        write_u16(destination, offset + 18, handle.minor);
+    }
+    Ok(())
 }
 
 /// Deterministic KEX rejection category.
@@ -936,7 +1024,7 @@ pub enum ParseError {
 impl fmt::Display for ParseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
-            Self::ArtifactTooLarge => "KEX artifact exceeds the staging budget",
+            Self::ArtifactTooLarge => "KEX artifact exceeds the encoded-size budget",
             Self::TruncatedHeader => "KEX header is truncated",
             Self::InvalidMagic => "KEX magic is invalid",
             Self::UnsupportedContainerVersion => "KEX container version is unsupported",
@@ -1269,57 +1357,785 @@ fn read_package_u64(bytes: &[u8], offset: usize) -> Result<u64, PackageError> {
     ]))
 }
 
-/// Failure while copying one externally stored artifact into kernel-owned staging.
+/// Fixed prefix retained while parsing a streamed KEX package.
+///
+/// This covers the largest package header, capability manifest, executable
+/// header, and sixteen load records. Relocations and payload bytes are never
+/// retained as a whole.
+pub const STREAM_PREFIX_BYTES: usize = PAGE_BYTES;
+/// Peak byte buffers used by the format-side streaming verifier.
+pub const STREAM_WORKING_SET_BYTES: usize = 2 * PAGE_BYTES + troe_completion::MAX_ARTIFACT_BYTES;
+
+/// Failure while validating or replaying a bounded streamed package.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StageError {
-    /// Source length is zero, not representable, or above the package ceiling.
+pub enum StreamError {
+    /// Source length is empty, unrepresentable, or above the package ceiling.
     InvalidLength,
-    /// Exact staging allocation failed.
-    AllocationFailed,
-    /// The backing source reported an I/O or integrity failure.
+    /// The source reported an I/O or integrity failure.
     SourceFailed,
-    /// The backing source ended early or violated the bounded read contract.
+    /// The source ended early, made no progress, or over-reported a read.
     IncompleteRead,
+    /// Bounded verifier scratch storage could not be allocated.
+    AllocationFailed,
+    /// The package envelope or capability manifest was rejected.
+    Package(PackageError),
+    /// The embedded executable was rejected.
+    Executable(ParseError),
+    /// A replay pass did not match the bytes used to construct the plan.
+    SourceChanged,
+    /// The inactive-frame or relocation consumer rejected a verified chunk.
+    SinkFailed,
 }
 
-/// Copy one exact bounded artifact from an offset reader into owned staging.
+/// Owned, pointer-free KEX plan produced from a bounded streaming source.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamedLoadPlan {
+    target: Target,
+    abi_minor: u16,
+    image_base: u64,
+    entry_offset: u64,
+    stack_pages: u64,
+    heap_pages: u64,
+    segments: [Option<LoadSegmentLayout>; MAX_LOAD_RECORDS],
+    segment_count: usize,
+    relocations_offset: u64,
+    relocation_count: usize,
+    charges: LoadCharges,
+    layout: ApplicationLayout,
+}
+
+impl StreamedLoadPlan {
+    /// Artifact target.
+    #[must_use]
+    pub const fn target(&self) -> Target {
+        self.target
+    }
+
+    /// Minimum ABI minor required by the artifact.
+    #[must_use]
+    pub const fn abi_minor(&self) -> u16 {
+        self.abi_minor
+    }
+
+    /// Kernel-selected image base.
+    #[must_use]
+    pub const fn image_base(&self) -> u64 {
+        self.image_base
+    }
+
+    /// Absolute application entry address.
+    #[must_use]
+    pub const fn entry_address(&self) -> u64 {
+        self.image_base + self.entry_offset
+    }
+
+    /// Requested initial stack pages.
+    #[must_use]
+    pub const fn stack_pages(&self) -> u64 {
+        self.stack_pages
+    }
+
+    /// Requested initial zeroed heap pages.
+    #[must_use]
+    pub const fn heap_pages(&self) -> u64 {
+        self.heap_pages
+    }
+
+    /// Ordered validated load-segment geometry.
+    pub fn segments(&self) -> impl Iterator<Item = LoadSegmentLayout> + '_ {
+        self.segments[..self.segment_count]
+            .iter()
+            .flatten()
+            .copied()
+    }
+
+    /// Preliminary bounded-staging and page charges.
+    #[must_use]
+    pub const fn charges(&self) -> LoadCharges {
+        self.charges
+    }
+
+    /// Canonical startup, heap, guard, and stack virtual placement.
+    #[must_use]
+    pub const fn layout(&self) -> ApplicationLayout {
+        self.layout
+    }
+
+    /// Encode the immutable ABI startup page.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid task or handle metadata before modifying the page.
+    pub fn encode_startup_page(
+        &self,
+        info: StartupInfo<'_>,
+        destination: &mut [u8; PAGE_BYTES],
+    ) -> Result<(), StartupPageError> {
+        encode_startup_page(
+            self.abi_minor,
+            self.image_base,
+            self.layout,
+            info,
+            destination,
+        )
+    }
+}
+
+/// Complete validated package identity and its streamed executable plan.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StreamedKexPackage {
+    package_bytes: usize,
+    executable_offset: u64,
+    manifest: [u8; requirements::MAX_MANIFEST_BYTES],
+    manifest_bytes: usize,
+    executable: StreamedLoadPlan,
+    digest: [u8; 32],
+    relocation_digest: [u8; 32],
+}
+
+impl StreamedKexPackage {
+    /// Validated optional startup interfaces required by this package.
+    #[must_use]
+    pub fn requirements(&self) -> requirements::Manifest<'_> {
+        requirements::Manifest::parse(&self.manifest[..self.manifest_bytes])
+            .unwrap_or_else(|_| unreachable!())
+    }
+
+    /// Owned pointer-free executable plan.
+    #[must_use]
+    pub const fn executable(&self) -> &StreamedLoadPlan {
+        &self.executable
+    }
+
+    /// Exact package length replayed by the coherent verifier.
+    #[must_use]
+    pub const fn package_bytes(&self) -> usize {
+        self.package_bytes
+    }
+}
+
+/// Parse and fully validate one package through bounded random-access reads.
 ///
-/// The parser remains allocation-free; this helper owns only the explicit
-/// source-to-kernel copy required before parsing untrusted executable bytes.
-/// Reads are limited to one KEX page so a provider cannot force a larger
-/// transient request.
+/// The first pass retains a fixed one-page prefix and fingerprints every
+/// source byte. Relocations are then reread, validated, and fingerprinted
+/// independently. Later materialization APIs require both fingerprints to
+/// match before the inactive address space can be activated.
 ///
 /// # Errors
 ///
-/// Rejects invalid lengths, allocation failure, source errors, zero progress,
-/// and any provider result larger than the supplied destination window.
-pub fn stage_artifact(
+/// Rejects source contract violations, every normal package/KEX format error,
+/// and any source mutation observed between validation passes.
+pub fn parse_streamed_kex_package(
     byte_len: u64,
     mut read_at: impl FnMut(u64, &mut [u8]) -> Result<usize, ()>,
-) -> Result<Vec<u8>, StageError> {
-    let byte_len = usize::try_from(byte_len).map_err(|_| StageError::InvalidLength)?;
-    if byte_len == 0 || byte_len > MAX_KEX_PACKAGE_BYTES {
-        return Err(StageError::InvalidLength);
+    expected_target: Target,
+    supported_abi_minor: u16,
+    placement: LoadPlacement,
+) -> Result<StreamedKexPackage, StreamError> {
+    let package_bytes = usize::try_from(byte_len).map_err(|_| StreamError::InvalidLength)?;
+    if package_bytes == 0 || package_bytes > MAX_KEX_PACKAGE_BYTES {
+        return Err(StreamError::InvalidLength);
     }
-    let mut staging = Vec::new();
-    staging
-        .try_reserve_exact(byte_len)
-        .map_err(|_| StageError::AllocationFailed)?;
-    staging.resize(byte_len, 0);
+    let prefix_bytes = package_bytes.min(STREAM_PREFIX_BYTES);
+    let mut prefix = [0_u8; STREAM_PREFIX_BYTES];
+    read_stream_exact(&mut read_at, 0, &mut prefix[..prefix_bytes])?;
+
+    let parsed = parse_stream_prefix(
+        &prefix[..prefix_bytes],
+        package_bytes,
+        expected_target,
+        supported_abi_minor,
+        placement,
+    )?;
+    let relocation_start = usize::try_from(parsed.executable_offset)
+        .ok()
+        .and_then(|offset| {
+            usize::try_from(parsed.executable.relocations_offset)
+                .ok()
+                .and_then(|relocation| offset.checked_add(relocation))
+        })
+        .ok_or(StreamError::Executable(ParseError::ArithmeticOverflow))?;
+    let relocation_bytes = parsed
+        .executable
+        .relocation_count
+        .checked_mul(KEX_V1_RELOCATION_RECORD_BYTES)
+        .ok_or(StreamError::Executable(ParseError::ArithmeticOverflow))?;
+    let relocation_end = relocation_start
+        .checked_add(relocation_bytes)
+        .ok_or(StreamError::Executable(ParseError::ArithmeticOverflow))?;
+
+    let mut package_hash = Sha256::new();
+    package_hash.update(&prefix[..prefix_bytes]);
+    let mut relocation_hash = Sha256::new();
+    hash_overlap(
+        &mut relocation_hash,
+        0,
+        &prefix[..prefix_bytes],
+        relocation_start,
+        relocation_end,
+    );
+    let mut buffer = [0_u8; PAGE_BYTES];
+    let mut offset = prefix_bytes;
+    while offset < package_bytes {
+        let count = (package_bytes - offset).min(buffer.len());
+        read_stream_exact(
+            &mut read_at,
+            u64::try_from(offset).map_err(|_| StreamError::InvalidLength)?,
+            &mut buffer[..count],
+        )?;
+        package_hash.update(&buffer[..count]);
+        hash_overlap(
+            &mut relocation_hash,
+            offset,
+            &buffer[..count],
+            relocation_start,
+            relocation_end,
+        );
+        offset = offset
+            .checked_add(count)
+            .ok_or(StreamError::InvalidLength)?;
+    }
+    let digest = package_hash.finish();
+    let relocation_digest = relocation_hash.finish();
+    if let Some((completion_offset, completion_bytes)) = parsed.completion {
+        validate_streamed_completion(completion_offset, completion_bytes, &mut read_at)?;
+    }
+    validate_streamed_relocations(
+        &parsed.executable,
+        parsed.executable_offset,
+        &mut read_at,
+        relocation_digest,
+    )?;
+
+    Ok(StreamedKexPackage {
+        package_bytes,
+        executable_offset: parsed.executable_offset,
+        manifest: parsed.manifest,
+        manifest_bytes: parsed.manifest_bytes,
+        executable: parsed.executable,
+        digest,
+        relocation_digest,
+    })
+}
+
+fn validate_streamed_completion(
+    offset: u64,
+    byte_count: usize,
+    read_at: &mut impl FnMut(u64, &mut [u8]) -> Result<usize, ()>,
+) -> Result<(), StreamError> {
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(byte_count)
+        .map_err(|_| StreamError::AllocationFailed)?;
+    buffer.resize(byte_count, 0);
+    read_stream_exact(read_at, offset, &mut buffer)?;
+    troe_completion::CompletionArtifact::parse(&buffer)
+        .map_err(|_| StreamError::Package(PackageError::InvalidCompletion))?;
+    Ok(())
+}
+
+/// Replay a validated package and copy only its segment payload bytes.
+///
+/// `consume` receives a segment index, a byte offset within that segment, and
+/// one bounded verified-source chunk. A fingerprint mismatch is reported after
+/// the replay; callers must keep destination frames provisional until success.
+///
+/// # Errors
+///
+/// Reports source failures, mutation, or a rejected destination chunk.
+pub fn stream_verified_segments(
+    package: &StreamedKexPackage,
+    mut read_at: impl FnMut(u64, &mut [u8]) -> Result<usize, ()>,
+    mut consume: impl FnMut(usize, u64, &[u8]) -> Result<(), ()>,
+) -> Result<(), StreamError> {
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; PAGE_BYTES];
     let mut offset = 0_usize;
-    while offset < byte_len {
-        let end = offset.saturating_add(PAGE_BYTES).min(byte_len);
-        let count = read_at(
-            u64::try_from(offset).map_err(|_| StageError::InvalidLength)?,
-            &mut staging[offset..end],
-        )
-        .map_err(|()| StageError::SourceFailed)?;
-        if count == 0 || count > end - offset {
-            return Err(StageError::IncompleteRead);
+    while offset < package.package_bytes {
+        let count = (package.package_bytes - offset).min(buffer.len());
+        read_stream_exact(
+            &mut read_at,
+            u64::try_from(offset).map_err(|_| StreamError::InvalidLength)?,
+            &mut buffer[..count],
+        )?;
+        hash.update(&buffer[..count]);
+        let chunk_end = offset
+            .checked_add(count)
+            .ok_or(StreamError::InvalidLength)?;
+        for (index, segment) in package.executable.segments().enumerate() {
+            let start = usize::try_from(package.executable_offset)
+                .ok()
+                .and_then(|base| {
+                    usize::try_from(segment.file_offset())
+                        .ok()
+                        .and_then(|relative| base.checked_add(relative))
+                })
+                .ok_or(StreamError::InvalidLength)?;
+            let end = usize::try_from(segment.file_byte_count())
+                .ok()
+                .and_then(|bytes| start.checked_add(bytes))
+                .ok_or(StreamError::InvalidLength)?;
+            let overlap_start = offset.max(start);
+            let overlap_end = chunk_end.min(end);
+            if overlap_start < overlap_end {
+                let source_start = overlap_start - offset;
+                let source_end = overlap_end - offset;
+                consume(
+                    index,
+                    u64::try_from(overlap_start - start).map_err(|_| StreamError::InvalidLength)?,
+                    &buffer[source_start..source_end],
+                )
+                .map_err(|()| StreamError::SinkFailed)?;
+            }
         }
-        offset = offset.checked_add(count).ok_or(StageError::InvalidLength)?;
+        offset = chunk_end;
     }
-    Ok(staging)
+    if hash.finish() != package.digest {
+        return Err(StreamError::SourceChanged);
+    }
+    Ok(())
+}
+
+/// Replay and visit every validated relocation using bounded storage.
+///
+/// The relocation-table fingerprint is checked after visitation. Callers must
+/// discard provisional frames on any returned error.
+///
+/// # Errors
+///
+/// Reports source failures, mutation, malformed replay bytes, or sink failure.
+pub fn visit_verified_relocations(
+    package: &StreamedKexPackage,
+    mut read_at: impl FnMut(u64, &mut [u8]) -> Result<usize, ()>,
+    mut consume: impl FnMut(RelativeRelocation) -> Result<(), ()>,
+) -> Result<(), StreamError> {
+    let start = package
+        .executable_offset
+        .checked_add(package.executable.relocations_offset)
+        .ok_or(StreamError::InvalidLength)?;
+    let byte_count = package
+        .executable
+        .relocation_count
+        .checked_mul(KEX_V1_RELOCATION_RECORD_BYTES)
+        .ok_or(StreamError::InvalidLength)?;
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; PAGE_BYTES];
+    let mut consumed = 0_usize;
+    while consumed < byte_count {
+        let count = (byte_count - consumed).min(buffer.len());
+        let offset = start
+            .checked_add(u64::try_from(consumed).map_err(|_| StreamError::InvalidLength)?)
+            .ok_or(StreamError::InvalidLength)?;
+        read_stream_exact(&mut read_at, offset, &mut buffer[..count])?;
+        hash.update(&buffer[..count]);
+        for record in buffer[..count].chunks_exact(KEX_V1_RELOCATION_RECORD_BYTES) {
+            let relocation = RelativeRelocation {
+                target_offset: read_u64(record, RELOCATION_TARGET_OFFSET)
+                    .map_err(StreamError::Executable)?,
+                value_offset: read_u64(record, RELOCATION_VALUE_OFFSET)
+                    .map_err(StreamError::Executable)?,
+            };
+            consume(relocation).map_err(|()| StreamError::SinkFailed)?;
+        }
+        consumed = consumed
+            .checked_add(count)
+            .ok_or(StreamError::InvalidLength)?;
+    }
+    if hash.finish() != package.relocation_digest {
+        return Err(StreamError::SourceChanged);
+    }
+    Ok(())
+}
+
+struct ParsedStreamPrefix {
+    executable_offset: u64,
+    completion: Option<(u64, usize)>,
+    manifest: [u8; requirements::MAX_MANIFEST_BYTES],
+    manifest_bytes: usize,
+    executable: StreamedLoadPlan,
+}
+
+#[allow(clippy::too_many_lines)]
+fn parse_stream_prefix(
+    prefix: &[u8],
+    package_bytes: usize,
+    expected_target: Target,
+    supported_abi_minor: u16,
+    placement: LoadPlacement,
+) -> Result<ParsedStreamPrefix, StreamError> {
+    if prefix.len() < KEX_PACKAGE_V1_HEADER_BYTES {
+        return Err(StreamError::Package(PackageError::TruncatedHeader));
+    }
+    if prefix[..8] != KEX_PACKAGE_V1_MAGIC {
+        return Err(StreamError::Package(PackageError::InvalidMagic));
+    }
+    if read_package_u16(prefix, PACKAGE_HEADER_MAJOR).map_err(StreamError::Package)?
+        != PACKAGE_MAJOR
+        || read_package_u16(prefix, PACKAGE_HEADER_MINOR).map_err(StreamError::Package)?
+            != PACKAGE_MINOR
+    {
+        return Err(StreamError::Package(PackageError::UnsupportedVersion));
+    }
+    let flags = read_package_u16(prefix, PACKAGE_HEADER_FLAGS).map_err(StreamError::Package)?;
+    if flags & !PACKAGE_FLAG_COMPLETION != 0 {
+        return Err(StreamError::Package(PackageError::NonzeroReserved));
+    }
+    let header_bytes =
+        usize::from(read_package_u16(prefix, PACKAGE_HEADER_BYTES).map_err(StreamError::Package)?);
+    let manifest_offset = usize::try_from(
+        read_package_u32(prefix, PACKAGE_HEADER_MANIFEST_OFFSET).map_err(StreamError::Package)?,
+    )
+    .map_err(|_| StreamError::Package(PackageError::InvalidLayout))?;
+    let manifest_bytes = usize::try_from(
+        read_package_u32(prefix, PACKAGE_HEADER_MANIFEST_BYTES).map_err(StreamError::Package)?,
+    )
+    .map_err(|_| StreamError::Package(PackageError::InvalidLayout))?;
+    let executable_offset = usize::try_from(
+        read_package_u32(prefix, PACKAGE_HEADER_EXECUTABLE_OFFSET).map_err(StreamError::Package)?,
+    )
+    .map_err(|_| StreamError::Package(PackageError::InvalidLayout))?;
+    let completion_offset = usize::try_from(
+        read_package_u32(prefix, PACKAGE_HEADER_COMPLETION_OFFSET).map_err(StreamError::Package)?,
+    )
+    .map_err(|_| StreamError::Package(PackageError::InvalidLayout))?;
+    let executable_bytes = usize::try_from(
+        read_package_u64(prefix, PACKAGE_HEADER_EXECUTABLE_BYTES).map_err(StreamError::Package)?,
+    )
+    .map_err(|_| StreamError::Package(PackageError::InvalidLayout))?;
+    let declared_package_bytes = usize::try_from(
+        read_package_u64(prefix, PACKAGE_HEADER_PACKAGE_BYTES).map_err(StreamError::Package)?,
+    )
+    .map_err(|_| StreamError::Package(PackageError::LengthMismatch))?;
+    if declared_package_bytes != package_bytes {
+        return Err(StreamError::Package(PackageError::LengthMismatch));
+    }
+    let manifest_end = manifest_offset
+        .checked_add(manifest_bytes)
+        .ok_or(StreamError::Package(PackageError::InvalidLayout))?;
+    let executable_end = executable_offset
+        .checked_add(executable_bytes)
+        .ok_or(StreamError::Package(PackageError::InvalidLayout))?;
+    if header_bytes != KEX_PACKAGE_V1_HEADER_BYTES
+        || manifest_offset != KEX_PACKAGE_V1_HEADER_BYTES
+        || manifest_bytes > requirements::MAX_MANIFEST_BYTES
+        || executable_offset != manifest_end
+        || executable_bytes == 0
+        || executable_bytes > ApplicationLimits::standard().encoded_bytes()
+    {
+        return Err(StreamError::Package(PackageError::InvalidLayout));
+    }
+    let completion = if flags == 0 {
+        if completion_offset != 0 || executable_end != package_bytes {
+            return Err(StreamError::Package(PackageError::InvalidLayout));
+        }
+        None
+    } else {
+        let completion_bytes = package_bytes
+            .checked_sub(completion_offset)
+            .ok_or(StreamError::Package(PackageError::InvalidLayout))?;
+        if completion_offset != executable_end
+            || completion_bytes == 0
+            || completion_bytes > troe_completion::MAX_ARTIFACT_BYTES
+        {
+            return Err(StreamError::Package(PackageError::InvalidLayout));
+        }
+        Some((
+            u64::try_from(completion_offset)
+                .map_err(|_| StreamError::Package(PackageError::InvalidLayout))?,
+            completion_bytes,
+        ))
+    };
+    let manifest_source = prefix
+        .get(manifest_offset..manifest_end)
+        .ok_or(StreamError::Package(PackageError::InvalidLayout))?;
+    requirements::Manifest::parse(manifest_source)
+        .map_err(|_| StreamError::Package(PackageError::InvalidManifest))?;
+    let executable_prefix = prefix
+        .get(executable_offset..)
+        .ok_or(StreamError::Executable(ParseError::TruncatedHeader))?;
+    let header = parse_header_with_len(
+        executable_prefix,
+        executable_bytes,
+        expected_target,
+        supported_abi_minor,
+        ApplicationLimits::standard(),
+    )
+    .map_err(StreamError::Executable)?;
+    let parsed = parse_stream_segments(
+        executable_prefix,
+        executable_bytes,
+        header,
+        ApplicationLimits::standard(),
+        placement.image_base,
+    )
+    .map_err(StreamError::Executable)?;
+    let layout = application_layout(
+        header.stack_pages,
+        header.heap_pages,
+        header.abi_minor,
+        ApplicationLimits::standard(),
+        placement,
+    )
+    .map_err(StreamError::Executable)?;
+    let private_pages = parsed
+        .image_pages
+        .checked_add(header.stack_pages)
+        .and_then(|pages| pages.checked_add(header.heap_pages))
+        .and_then(|pages| pages.checked_add(STARTUP_PAGES))
+        .ok_or(StreamError::Executable(ParseError::ArithmeticOverflow))?;
+    let reserved_resident_pages = private_pages
+        .checked_add(ApplicationLimits::standard().table_pages)
+        .ok_or(StreamError::Executable(ParseError::ArithmeticOverflow))?;
+    if reserved_resident_pages > ApplicationLimits::standard().resident_pages {
+        return Err(StreamError::Executable(ParseError::ResidentBudgetExceeded));
+    }
+    let mut manifest = [0_u8; requirements::MAX_MANIFEST_BYTES];
+    manifest[..manifest_bytes].copy_from_slice(manifest_source);
+    Ok(ParsedStreamPrefix {
+        executable_offset: u64::try_from(executable_offset)
+            .map_err(|_| StreamError::Package(PackageError::InvalidLayout))?,
+        completion,
+        manifest,
+        manifest_bytes,
+        executable: StreamedLoadPlan {
+            target: header.target,
+            abi_minor: header.abi_minor,
+            image_base: placement.image_base,
+            entry_offset: header.entry_offset,
+            stack_pages: header.stack_pages,
+            heap_pages: header.heap_pages,
+            segments: parsed.segments,
+            segment_count: header.record_count,
+            relocations_offset: u64::try_from(header.relocations_offset)
+                .map_err(|_| StreamError::Executable(ParseError::ArithmeticOverflow))?,
+            relocation_count: header.relocation_count,
+            charges: LoadCharges {
+                staging_bytes: STREAM_WORKING_SET_BYTES,
+                image_pages: parsed.image_pages,
+                stack_pages: header.stack_pages,
+                heap_pages: header.heap_pages,
+                private_pages,
+                reserved_resident_pages,
+            },
+            layout,
+        },
+    })
+}
+
+struct ParsedStreamSegments {
+    segments: [Option<LoadSegmentLayout>; MAX_LOAD_RECORDS],
+    image_pages: u64,
+}
+
+fn parse_stream_segments(
+    prefix: &[u8],
+    executable_bytes: usize,
+    header: ParsedHeader,
+    limits: ApplicationLimits,
+    image_base: u64,
+) -> Result<ParsedStreamSegments, ParseError> {
+    let mut segments = [None; MAX_LOAD_RECORDS];
+    let mut expected_file_offset = header.payload_offset;
+    let mut previous_image_end = 0_u64;
+    let mut image_pages = 0_u64;
+    let mut executable = false;
+    let mut entry_is_executable = false;
+    for (index, destination) in segments[..header.record_count].iter_mut().enumerate() {
+        let record_start = header
+            .records_offset
+            .checked_add(
+                index
+                    .checked_mul(KEX_V1_LOAD_RECORD_BYTES)
+                    .ok_or(ParseError::ArithmeticOverflow)?,
+            )
+            .ok_or(ParseError::ArithmeticOverflow)?;
+        let record_end = record_start
+            .checked_add(KEX_V1_LOAD_RECORD_BYTES)
+            .ok_or(ParseError::ArithmeticOverflow)?;
+        let record = prefix
+            .get(record_start..record_end)
+            .ok_or(ParseError::InvalidLayout)?;
+        let image_offset = read_u64(record, RECORD_IMAGE_OFFSET)?;
+        let file_offset = usize::try_from(read_u64(record, RECORD_FILE_OFFSET)?)
+            .map_err(|_| ParseError::ArithmeticOverflow)?;
+        let file_byte_count = read_u64(record, RECORD_FILE_BYTES)?;
+        let file_bytes =
+            usize::try_from(file_byte_count).map_err(|_| ParseError::ArithmeticOverflow)?;
+        let memory_bytes = read_u64(record, RECORD_MEMORY_BYTES)?;
+        let permissions = SegmentPermissions::from_raw(read_u32(record, RECORD_PERMISSIONS)?)
+            .ok_or(ParseError::InvalidPermissions)?;
+        if read_u32(record, RECORD_RESERVED)? != 0 {
+            return Err(ParseError::NonzeroReserved);
+        }
+        if memory_bytes == 0
+            || !image_offset.is_multiple_of(PAGE_SIZE)
+            || !memory_bytes.is_multiple_of(PAGE_SIZE)
+            || file_byte_count > memory_bytes
+        {
+            return Err(ParseError::InvalidSegmentRange);
+        }
+        let image_end = image_offset
+            .checked_add(memory_bytes)
+            .ok_or(ParseError::ArithmeticOverflow)?;
+        image_base
+            .checked_add(image_end)
+            .ok_or(ParseError::ArithmeticOverflow)?;
+        if index != 0 && image_offset < previous_image_end {
+            return Err(ParseError::OverlappingSegments);
+        }
+        if image_end > limits.image_span_bytes {
+            return Err(ParseError::ImageSpanExceeded);
+        }
+        if file_offset != expected_file_offset {
+            return Err(ParseError::NoncanonicalPayload);
+        }
+        let file_end = file_offset
+            .checked_add(file_bytes)
+            .ok_or(ParseError::ArithmeticOverflow)?;
+        if file_end > executable_bytes {
+            return Err(ParseError::NoncanonicalPayload);
+        }
+        image_pages = image_pages
+            .checked_add(memory_bytes / PAGE_SIZE)
+            .ok_or(ParseError::ArithmeticOverflow)?;
+        if image_pages > limits.image_pages {
+            return Err(ParseError::ImagePagesExceeded);
+        }
+        if permissions.executable() {
+            executable = true;
+            let entry_end = header
+                .entry_offset
+                .checked_add(1)
+                .ok_or(ParseError::ArithmeticOverflow)?;
+            entry_is_executable |= header.entry_offset >= image_offset && entry_end <= image_end;
+        }
+        *destination = Some(LoadSegmentLayout {
+            image_base,
+            image_offset,
+            memory_bytes,
+            file_offset: u64::try_from(file_offset).map_err(|_| ParseError::ArithmeticOverflow)?,
+            file_byte_count,
+            permissions,
+        });
+        expected_file_offset = file_end;
+        previous_image_end = image_end;
+    }
+    if expected_file_offset != executable_bytes {
+        return Err(ParseError::NoncanonicalPayload);
+    }
+    if !executable {
+        return Err(ParseError::MissingExecutableSegment);
+    }
+    if !entry_is_executable {
+        return Err(ParseError::InvalidEntryPoint);
+    }
+    Ok(ParsedStreamSegments {
+        segments,
+        image_pages,
+    })
+}
+
+fn validate_streamed_relocations(
+    plan: &StreamedLoadPlan,
+    executable_offset: u64,
+    read_at: &mut impl FnMut(u64, &mut [u8]) -> Result<usize, ()>,
+    expected_digest: [u8; 32],
+) -> Result<(), StreamError> {
+    let start = executable_offset
+        .checked_add(plan.relocations_offset)
+        .ok_or(StreamError::InvalidLength)?;
+    let byte_count = plan
+        .relocation_count
+        .checked_mul(KEX_V1_RELOCATION_RECORD_BYTES)
+        .ok_or(StreamError::InvalidLength)?;
+    let image_end = plan
+        .segments()
+        .try_fold(0_u64, |end, segment| {
+            segment
+                .image_offset()
+                .checked_add(segment.memory_bytes())
+                .map(|segment_end| end.max(segment_end))
+        })
+        .ok_or(StreamError::Executable(ParseError::ArithmeticOverflow))?;
+    let mut previous_target = None;
+    let mut hash = Sha256::new();
+    let mut buffer = [0_u8; PAGE_BYTES];
+    let mut consumed = 0_usize;
+    while consumed < byte_count {
+        let count = (byte_count - consumed).min(buffer.len());
+        let offset = start
+            .checked_add(u64::try_from(consumed).map_err(|_| StreamError::InvalidLength)?)
+            .ok_or(StreamError::InvalidLength)?;
+        read_stream_exact(read_at, offset, &mut buffer[..count])?;
+        hash.update(&buffer[..count]);
+        for record in buffer[..count].chunks_exact(KEX_V1_RELOCATION_RECORD_BYTES) {
+            let target_offset =
+                read_u64(record, RELOCATION_TARGET_OFFSET).map_err(StreamError::Executable)?;
+            let value_offset =
+                read_u64(record, RELOCATION_VALUE_OFFSET).map_err(StreamError::Executable)?;
+            let target_end = target_offset
+                .checked_add(8)
+                .ok_or(StreamError::Executable(ParseError::InvalidRelocation))?;
+            if previous_target.is_some_and(|previous| target_offset <= previous)
+                || value_offset >= image_end
+                || !plan.segments().any(|segment| {
+                    let segment_end = segment.image_offset().checked_add(segment.memory_bytes());
+                    segment.image_offset() <= target_offset
+                        && segment_end.is_some_and(|end| target_end <= end)
+                })
+            {
+                return Err(StreamError::Executable(ParseError::InvalidRelocation));
+            }
+            previous_target = Some(target_offset);
+        }
+        consumed = consumed
+            .checked_add(count)
+            .ok_or(StreamError::InvalidLength)?;
+    }
+    if hash.finish() != expected_digest {
+        return Err(StreamError::SourceChanged);
+    }
+    Ok(())
+}
+
+fn read_stream_exact(
+    read_at: &mut impl FnMut(u64, &mut [u8]) -> Result<usize, ()>,
+    offset: u64,
+    destination: &mut [u8],
+) -> Result<(), StreamError> {
+    let mut filled = 0_usize;
+    while filled < destination.len() {
+        let current = offset
+            .checked_add(u64::try_from(filled).map_err(|_| StreamError::InvalidLength)?)
+            .ok_or(StreamError::InvalidLength)?;
+        let available = destination.len() - filled;
+        let count =
+            read_at(current, &mut destination[filled..]).map_err(|()| StreamError::SourceFailed)?;
+        if count == 0 || count > available {
+            return Err(StreamError::IncompleteRead);
+        }
+        filled = filled
+            .checked_add(count)
+            .ok_or(StreamError::InvalidLength)?;
+    }
+    Ok(())
+}
+
+fn hash_overlap(
+    hash: &mut Sha256,
+    chunk_start: usize,
+    chunk: &[u8],
+    range_start: usize,
+    range_end: usize,
+) {
+    let Some(chunk_end) = chunk_start.checked_add(chunk.len()) else {
+        return;
+    };
+    let start = chunk_start.max(range_start);
+    let end = chunk_end.min(range_end);
+    if start < end {
+        hash.update(&chunk[start - chunk_start..end - chunk_start]);
+    }
 }
 
 /// Parse and validate a complete KEX v1 artifact without allocating.
@@ -1517,7 +2333,23 @@ fn parse_header(
     supported_abi_minor: u16,
     limits: ApplicationLimits,
 ) -> Result<ParsedHeader, ParseError> {
-    let header = artifact
+    parse_header_with_len(
+        artifact,
+        artifact.len(),
+        expected_target,
+        supported_abi_minor,
+        limits,
+    )
+}
+
+fn parse_header_with_len(
+    artifact_prefix: &[u8],
+    artifact_len: usize,
+    expected_target: Target,
+    supported_abi_minor: u16,
+    limits: ApplicationLimits,
+) -> Result<ParsedHeader, ParseError> {
+    let header = artifact_prefix
         .get(..KEX_V1_HEADER_BYTES)
         .ok_or(ParseError::TruncatedHeader)?;
     if header.get(..KEX_V1_MAGIC.len()) != Some(KEX_V1_MAGIC.as_slice()) {
@@ -1553,7 +2385,7 @@ fn parse_header(
     }
     let declared_bytes = usize::try_from(read_u64(header, HEADER_ARTIFACT_BYTES)?)
         .map_err(|_| ParseError::ArithmeticOverflow)?;
-    if declared_bytes != artifact.len() {
+    if declared_bytes != artifact_len {
         return Err(ParseError::LengthMismatch);
     }
 
@@ -1587,7 +2419,7 @@ fn parse_header(
     if records_offset != KEX_V1_HEADER_BYTES
         || relocations_offset != records_end
         || payload_offset != relocations_end
-        || payload_offset > artifact.len()
+        || payload_offset > artifact_len
     {
         return Err(ParseError::InvalidLayout);
     }
@@ -1805,6 +2637,7 @@ fn parse_record<'artifact>(
             image_base,
             image_offset,
             memory_bytes,
+            file_offset: u64::try_from(file_offset).map_err(|_| ParseError::ArithmeticOverflow)?,
             file_byte_count,
             permissions,
             file_bytes: payload,
@@ -1847,6 +2680,136 @@ fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
 
 fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
     bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+// Incremental FIPS 180-4 SHA-256 used only to bind bounded validation and
+// replay passes. It owns 168 bytes of fixed state and performs no allocation.
+#[derive(Clone)]
+struct Sha256 {
+    state: [u32; 8],
+    block: [u8; 64],
+    buffered: usize,
+    byte_len: u64,
+}
+
+impl Sha256 {
+    const fn new() -> Self {
+        Self {
+            state: [
+                0x6a09_e667,
+                0xbb67_ae85,
+                0x3c6e_f372,
+                0xa54f_f53a,
+                0x510e_527f,
+                0x9b05_688c,
+                0x1f83_d9ab,
+                0x5be0_cd19,
+            ],
+            block: [0; 64],
+            buffered: 0,
+            byte_len: 0,
+        }
+    }
+
+    fn update(&mut self, mut bytes: &[u8]) {
+        self.byte_len = self
+            .byte_len
+            .saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
+        if self.buffered != 0 {
+            let copied = (64 - self.buffered).min(bytes.len());
+            self.block[self.buffered..self.buffered + copied].copy_from_slice(&bytes[..copied]);
+            self.buffered += copied;
+            bytes = &bytes[copied..];
+            if self.buffered == 64 {
+                Self::compress(&mut self.state, &self.block);
+                self.block.fill(0);
+                self.buffered = 0;
+            }
+        }
+        while bytes.len() >= 64 {
+            let block = <&[u8; 64]>::try_from(&bytes[..64]).unwrap_or_else(|_| unreachable!());
+            Self::compress(&mut self.state, block);
+            bytes = &bytes[64..];
+        }
+        self.block[..bytes.len()].copy_from_slice(bytes);
+        self.buffered = bytes.len();
+    }
+
+    fn finish(mut self) -> [u8; 32] {
+        let bit_len = self.byte_len.saturating_mul(8);
+        self.block[self.buffered] = 0x80;
+        self.buffered += 1;
+        if self.buffered > 56 {
+            self.block[self.buffered..].fill(0);
+            Self::compress(&mut self.state, &self.block);
+            self.block.fill(0);
+            self.buffered = 0;
+        }
+        self.block[self.buffered..56].fill(0);
+        self.block[56..64].copy_from_slice(&bit_len.to_be_bytes());
+        Self::compress(&mut self.state, &self.block);
+        let mut output = [0_u8; 32];
+        for (chunk, value) in output.chunks_exact_mut(4).zip(self.state) {
+            chunk.copy_from_slice(&value.to_be_bytes());
+        }
+        output
+    }
+
+    #[allow(clippy::many_single_char_names, clippy::unreadable_literal)]
+    fn compress(state: &mut [u32; 8], block: &[u8; 64]) {
+        const K: [u32; 64] = [
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+            0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+            0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+            0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+            0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+            0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+            0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+            0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+            0xc67178f2,
+        ];
+        let mut words = [0_u32; 64];
+        for (index, chunk) in block.chunks_exact(4).enumerate() {
+            words[index] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        for index in 16..64 {
+            let s0 = words[index - 15].rotate_right(7)
+                ^ words[index - 15].rotate_right(18)
+                ^ (words[index - 15] >> 3);
+            let s1 = words[index - 2].rotate_right(17)
+                ^ words[index - 2].rotate_right(19)
+                ^ (words[index - 2] >> 10);
+            words[index] = words[index - 16]
+                .wrapping_add(s0)
+                .wrapping_add(words[index - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
+        for index in 0..64 {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let choice = (e & f) ^ (!e & g);
+            let first = h
+                .wrapping_add(s1)
+                .wrapping_add(choice)
+                .wrapping_add(K[index])
+                .wrapping_add(words[index]);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let majority = (a & b) ^ (a & c) ^ (b & c);
+            let second = s0.wrapping_add(majority);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(first);
+            d = c;
+            c = b;
+            b = a;
+            a = first.wrapping_add(second);
+        }
+        for (slot, value) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *slot = slot.wrapping_add(value);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2061,6 +3024,233 @@ mod tests {
         .unwrap_or_else(|| std::process::abort());
         assert_eq!(&bytes[usize::try_from(range.0).unwrap_or(0)..], completion);
         assert_eq!(range.1, completion.len());
+
+        let streamed = parse_streamed_kex_package(
+            bytes.len() as u64,
+            |offset, destination| {
+                let start = usize::try_from(offset).map_err(|_| ())?;
+                let count = destination.len().min(bytes.len() - start);
+                destination[..count].copy_from_slice(&bytes[start..start + count]);
+                Ok(count)
+            },
+            Target::X86_64,
+            ABI_MINOR,
+            LoadPlacement::STANDARD,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            streamed.executable().charges().staging_bytes(),
+            STREAM_WORKING_SET_BYTES
+        );
+
+        let mut malformed = bytes.clone();
+        *malformed.last_mut().unwrap_or_else(|| unreachable!()) = b'x';
+        assert_eq!(
+            parse_streamed_kex_package(
+                malformed.len() as u64,
+                |offset, destination| {
+                    let start = usize::try_from(offset).map_err(|_| ())?;
+                    let count = destination.len().min(malformed.len() - start);
+                    destination[..count].copy_from_slice(&malformed[start..start + count]);
+                    Ok(count)
+                },
+                Target::X86_64,
+                ABI_MINOR,
+                LoadPlacement::STANDARD,
+            ),
+            Err(StreamError::Package(PackageError::InvalidCompletion))
+        );
+    }
+
+    #[test]
+    fn streamed_package_plan_replays_payload_and_relocations_boundedly() {
+        let executable = artifact_with_relocations(
+            Target::X86_64,
+            &[
+                TestSegment {
+                    image_offset: 0,
+                    memory_bytes: PAGE_SIZE,
+                    permissions: SegmentPermissions::ReadExecute as u32,
+                    payload: &[0x90, 0xc3],
+                },
+                TestSegment {
+                    image_offset: PAGE_SIZE,
+                    memory_bytes: PAGE_SIZE,
+                    permissions: SegmentPermissions::ReadWrite as u32,
+                    payload: &[0; 16],
+                },
+            ],
+            &[TestRelocation {
+                target_offset: PAGE_SIZE,
+                value_offset: 1,
+            }],
+        );
+        let required = [requirements::Requirement {
+            interface: 23,
+            major: 1,
+            minor: 0,
+        }];
+        let package =
+            encode_kex_package(&executable, &required).unwrap_or_else(|_| std::process::abort());
+        let placement = LoadPlacement::new(
+            KEX_V1_MIN_IMAGE_BASE + KEX_V1_IMAGE_ALIGNMENT,
+            KEX_V1_USER_END - KEX_V1_IMAGE_ALIGNMENT,
+        );
+        let streamed = parse_streamed_kex_package(
+            package.len() as u64,
+            |offset, destination| {
+                let start = usize::try_from(offset).map_err(|_| ())?;
+                let count = destination.len().min(37).min(package.len() - start);
+                destination[..count].copy_from_slice(&package[start..start + count]);
+                Ok(count)
+            },
+            Target::X86_64,
+            ABI_MINOR,
+            placement,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(streamed.requirements().iter().collect::<Vec<_>>(), required);
+        let conventional = parse_kex_at(&executable, Target::X86_64, ABI_MINOR, placement)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            streamed.executable().entry_address(),
+            conventional.entry_address()
+        );
+        assert_eq!(
+            streamed.executable().charges().private_pages(),
+            conventional.charges().private_pages()
+        );
+        assert_eq!(
+            streamed.executable().charges().staging_bytes(),
+            STREAM_WORKING_SET_BYTES
+        );
+        let mut copied = [Vec::new(), Vec::new()];
+        stream_verified_segments(
+            &streamed,
+            |offset, destination| {
+                let start = usize::try_from(offset).map_err(|_| ())?;
+                let count = destination.len().min(package.len() - start);
+                destination[..count].copy_from_slice(&package[start..start + count]);
+                Ok(count)
+            },
+            |segment, offset, bytes| {
+                assert_eq!(usize::try_from(offset), Ok(copied[segment].len()));
+                copied[segment].extend_from_slice(bytes);
+                Ok(())
+            },
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(copied[0], [0x90, 0xc3]);
+        assert_eq!(copied[1], [0; 16]);
+        let mut relocations = Vec::new();
+        visit_verified_relocations(
+            &streamed,
+            |offset, destination| {
+                let start = usize::try_from(offset).map_err(|_| ())?;
+                let count = destination.len().min(package.len() - start);
+                destination[..count].copy_from_slice(&package[start..start + count]);
+                Ok(count)
+            },
+            |relocation| {
+                relocations.push(relocation);
+                Ok(())
+            },
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(relocations.len(), 1);
+        assert_eq!(relocations[0].target_offset(), PAGE_SIZE);
+        assert_eq!(relocations[0].value_offset(), 1);
+    }
+
+    #[test]
+    fn streamed_package_detects_payload_and_relocation_changes_before_activation() {
+        let executable = artifact_with_relocations(
+            Target::X86_64,
+            &[
+                TestSegment {
+                    image_offset: 0,
+                    memory_bytes: PAGE_SIZE,
+                    permissions: SegmentPermissions::ReadExecute as u32,
+                    payload: &[0x90, 0xc3],
+                },
+                TestSegment {
+                    image_offset: PAGE_SIZE,
+                    memory_bytes: PAGE_SIZE,
+                    permissions: SegmentPermissions::ReadWrite as u32,
+                    payload: &[0; 16],
+                },
+            ],
+            &[TestRelocation {
+                target_offset: PAGE_SIZE,
+                value_offset: 1,
+            }],
+        );
+        let mut package =
+            encode_kex_package(&executable, &[]).unwrap_or_else(|_| std::process::abort());
+        let placement = LoadPlacement::new(
+            KEX_V1_MIN_IMAGE_BASE + KEX_V1_IMAGE_ALIGNMENT,
+            KEX_V1_USER_END - KEX_V1_IMAGE_ALIGNMENT,
+        );
+        let streamed = parse_streamed_kex_package(
+            package.len() as u64,
+            |offset, destination| {
+                let start = usize::try_from(offset).map_err(|_| ())?;
+                let count = destination.len().min(package.len() - start);
+                destination[..count].copy_from_slice(&package[start..start + count]);
+                Ok(count)
+            },
+            Target::X86_64,
+            ABI_MINOR,
+            placement,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        let payload = usize::try_from(streamed.executable_offset)
+            .unwrap_or(0)
+            .checked_add(
+                usize::try_from(
+                    streamed
+                        .executable()
+                        .segments()
+                        .next()
+                        .unwrap_or_else(|| unreachable!())
+                        .file_offset(),
+                )
+                .unwrap_or(0),
+            )
+            .unwrap_or(0);
+        package[payload] ^= 1;
+        assert_eq!(
+            stream_verified_segments(
+                &streamed,
+                |offset, destination| {
+                    let start = usize::try_from(offset).map_err(|_| ())?;
+                    let count = destination.len().min(package.len() - start);
+                    destination[..count].copy_from_slice(&package[start..start + count]);
+                    Ok(count)
+                },
+                |_segment, _offset, _bytes| Ok(()),
+            ),
+            Err(StreamError::SourceChanged)
+        );
+    }
+
+    #[test]
+    fn streamed_package_rejects_oversize_without_reading() {
+        let mut reads = 0;
+        assert_eq!(
+            parse_streamed_kex_package(
+                MAX_KEX_PACKAGE_BYTES as u64 + 1,
+                |_offset, _destination| {
+                    reads += 1;
+                    Ok(0)
+                },
+                Target::X86_64,
+                ABI_MINOR,
+                LoadPlacement::STANDARD,
+            ),
+            Err(StreamError::InvalidLength)
+        );
+        assert_eq!(reads, 0);
     }
 
     #[test]
@@ -2381,10 +3571,10 @@ mod tests {
     }
 
     #[test]
-    fn standard_limits_match_adr_0015() {
+    fn standard_limits_match_current_policy() {
         let standard = ApplicationLimits::standard();
 
-        assert_eq!(standard.encoded_bytes(), 16 * 1024 * 1024);
+        assert_eq!(standard.encoded_bytes(), 32 * 1024 * 1024);
         assert_eq!(standard.load_records(), 16);
         assert_eq!(standard.image_span_bytes(), 128 * 1024 * 1024);
         assert_eq!(standard.image_pages(), 8192);
@@ -2914,45 +4104,5 @@ mod tests {
         for length in 0..valid.len() {
             assert!(parse_standard(&valid[..length], Target::X86_64).is_err());
         }
-    }
-
-    #[test]
-    fn artifact_staging_accepts_partial_reads_and_preserves_exact_bytes() {
-        let source = valid_artifact(Target::X86_64);
-        let staged = stage_artifact(source.len() as u64, |offset, destination| {
-            let start = usize::try_from(offset).map_err(|_| ())?;
-            let count = destination.len().min(7);
-            destination[..count].copy_from_slice(&source[start..start + count]);
-            Ok(count)
-        })
-        .unwrap_or_else(|_| std::process::abort());
-        assert_eq!(staged, source);
-    }
-
-    #[test]
-    fn artifact_staging_fails_closed_on_length_source_and_progress_errors() {
-        assert_eq!(
-            stage_artifact(0, |_offset, _destination| Ok(0)),
-            Err(StageError::InvalidLength)
-        );
-        assert_eq!(
-            stage_artifact(
-                MAX_KEX_PACKAGE_BYTES as u64 + 1,
-                |_offset, _destination| Ok(0)
-            ),
-            Err(StageError::InvalidLength)
-        );
-        assert_eq!(
-            stage_artifact(1, |_offset, _destination| Err(())),
-            Err(StageError::SourceFailed)
-        );
-        assert_eq!(
-            stage_artifact(1, |_offset, _destination| Ok(0)),
-            Err(StageError::IncompleteRead)
-        );
-        assert_eq!(
-            stage_artifact(1, |_offset, destination| Ok(destination.len() + 1)),
-            Err(StageError::IncompleteRead)
-        );
     }
 }

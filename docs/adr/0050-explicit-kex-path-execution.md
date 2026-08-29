@@ -2,6 +2,10 @@
 
 Status: accepted and implemented, 2026-08-28.
 
+The whole-artifact staging detail in this decision was superseded by the
+coherent bounded streaming loader in [ADR 0052](0052-streamed-kex-and-static-c-runtime.md).
+Path selection and authority semantics are unchanged.
+
 ## Context
 
 The immutable `/bin` catalog gives recovery commands a deterministic trusted
@@ -25,8 +29,8 @@ such as `/vol/shared/tool`, are supported. The resolver does not infer a
 `.kex` suffix, search `PATH`, or search the current directory for a bare name.
 
 The resolved final node must be a regular file; a final symbolic link may be
-followed by the owning provider to such a file. The kernel stages the selected
-bytes before admission and applies the same canonical package envelope, KCAP
+followed by the owning provider to such a file. The kernel streams the selected
+bytes through bounded coherent validation before admission and applies the same canonical package envelope, KCAP
 manifest, target, inner KEX, W^X, relocation, mapping, and resource validation
 used for `/bin` applications. A malformed file, directory, missing path,
 symlink failure, or unsupported package fails without starting a process.

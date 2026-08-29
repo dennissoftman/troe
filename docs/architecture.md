@@ -73,11 +73,21 @@ firmware fails before device publication or volatile I/O.
    `/sys/config` is an immutable, bounded projection resolved for exactly one
    active package generation. The system has no `/etc` directory or alias. KEX
    applications are statically linked, `/lib` is not present, and executable
-   code does not belong in `/share`.
+   code does not belong in `/share`. Optional large runtime executables live
+   only in `/vol/shared/runtime/v1/<architecture>/bin`, outside rootfs and EFI.
 6. The final output capability writes host bytes or the native UART.
    When validated GOP metadata is available, normal native shell output is also
    rendered into an owned fixed-glyph framebuffer console. UEFI text output is
    confined to the pre-handoff banner.
+
+`tools/mkruntime.py` owns the shared runtime-tree boundary. It emits the exact
+`runtime/v1` layout, canonical path-sorted length/SHA-256 manifest, and at most
+128 architecture-owned KEX entries. Verification rejects symlinks, extra or
+missing files, noncanonical records, unsupported schemas, wrong lengths,
+oversized artifacts, and digest changes. Mounted-root and detached-image
+installation both verify the source and destination; unavailable shared media
+is an explicit terminal error. Rootfs and EFI builders do not consume this
+tree.
 
 Pipelines remain sequential even though cooperative tasks now exist. This makes
 backpressure an explicit capacity error rather than requiring hidden scheduling
@@ -122,15 +132,18 @@ ownership, accounting, cancellation, waiting, and teardown machinery, while
 files, directories, byte streams, datagrams, listeners, timers, and control
 services keep typed protocols. There is no universal native file-descriptor,
 generic socket namespace, `ioctl`-style escape hatch, kernel POSIX subsystem, or
-package-resolved scoped-root grant in the native recovery command path. A small
-`no_std` user-space facade layers filesystem algorithms, immutable environment handling, direct process
-launch, stable errno translation, UTC calendar/formatting, decimal/math, and
-C-locale helpers over typed capabilities. It is statically compiled into each
-consumer and does not manufacture ambient authority or claim to be a complete
-libc. Hosted package resolution already validates generation-scoped directory
-grants; broader native compatibility is tracked in
-[issue #11](https://github.com/dennissoftman/troe/issues/11), while production
-package activation remains in the Stage 9 tracker.
+package-resolved scoped-root grant in the native recovery command path. Shared
+`no_std` Rust services and the freestanding C sysroot layer filesystem
+algorithms, the hybrid allocator, bounded descriptors, buffered `FILE` and
+directory streams, immutable environment handling, exit processing, clocks,
+UTC calendar/formatting, UTF-8/wide conversion, C-locale helpers, randomness,
+`setjmp`, and single-execution-thread pthread-compatible locks and TSS over
+those typed handles. The C host bridge snapshots only the capabilities granted
+to the application. It returns `EACCES` at a missing-authority boundary and
+`ENOTSUP` for unsupported operations; it cannot manufacture ambient filesystem
+or process authority. Thread creation, signals, dynamic linking, executable
+private mappings, networking, additional locales, and timezone databases are
+not part of this facade.
 
 ## Allocation
 
@@ -287,9 +300,16 @@ exercise; destructive KEX payloads and malformed corpus cases are feature-gated
 and marker-rejected by the production EFI builder. See
 [ADR 0014](adr/0014-unprivileged-task-isolation-and-teardown.md).
 
-The native KEX boundary copies executable bytes into bounded kernel staging
-and consumes the complete portable plan before allocating or mapping. It packs
-fresh physical image pages beside a separate exact table allocation, maps sparse
+The native KEX boundary retains one 4 KiB format prefix, one 4 KiB replay
+buffer, and at most one fallibly allocated 16 KiB completion-validation buffer. It validates the
+complete envelope, manifest, executable geometry,
+payload, and relocation set through bounded offset reads, fingerprints the full
+source and relocations independently, and produces a pointer-free plan before
+allocating frames. It packs fresh zeroed physical image pages beside a separate
+exact table allocation, streams file-backed segment bytes into those inactive
+frames, replays validated relocations, and requires both fingerprints to match
+before activation. Source mutation, short reads, malformed data, or any sink
+failure aborts the provisional transaction. It maps sparse
 image virtual ranges with their closed R/RX/RW permissions, places the startup,
 heap, guards, and stack canonically, and keeps the root inactive. The root
 retains supervisor mappings for the kernel image, devices, and only the explicit
@@ -357,8 +377,9 @@ inspection nor process control.
 ADR 0046 defines owner-scoped nested process launch and byte pipes. A launcher
 passes canonical cwd, argv, environment, and explicit inherited/null/pipe
 standard streams. A bare `argv[0]` resolves `/bin/<name>.kex`; one containing
-`/` resolves exactly against the supplied cwd. The kernel stages and validates
-the selected regular KEX file, grants only a child-manifest attenuation of the
+`/` resolves exactly against the supplied cwd. The kernel streams and validates
+the selected regular KEX file through the same coherent bounded loader used by
+direct launches, grants only a child-manifest attenuation of the
 launcher's own capabilities, and
 returns an opaque control token separate from the observable process ID.
 Blocking wait, cancellation, terminal reap, pipe backpressure/EOF, and recursive
@@ -385,7 +406,7 @@ initial allocation. Fixed wire batches and parser/security depth bounds remain
 separate versioned policies.
 
 The command path installs one canonical package per command. Its KCAP
-manifest is validated from the same staged file before optional services are
+manifest is validated from the same coherently fingerprinted source before optional services are
 constructed, and its embedded KEX v1 executable is validated before mapping.
 It layers command-invocation 1.1 and standard-stream 1.1 services on that
 mechanism: immutable cwd/argv, stdin, stdout, and stderr. The shell logically yields while

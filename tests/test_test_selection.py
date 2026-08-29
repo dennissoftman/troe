@@ -31,6 +31,9 @@ PACKAGES = {
     "troe-kernel": package("troe-kernel", "kernel"),
     "troe-kex": package("troe-kex", "sdk/rust/troe-kex"),
     "troe-kex-alloc": package("troe-kex-alloc", "sdk/rust/troe-kex-alloc"),
+    "troe-kex-c-runtime": package(
+        "troe-kex-c-runtime", "sdk/rust/troe-kex-c-runtime"
+    ),
     "troe-kex-tool": package("troe-kex-tool", "tools/troe-kex-tool"),
 }
 
@@ -124,6 +127,19 @@ class ChangedTestSelectionTests(unittest.TestCase):
         self.assertEqual(plan.applications, {"cp", "lua", "mv", "rm"})
         self.assertEqual(plan.qemu_scenarios, {"filesystem", "lua"})
 
+    def test_c_runtime_bridge_selects_runtime_probe_scenario(self) -> None:
+        plan = test_changed.build_plan(
+            (
+                PurePosixPath(
+                    "sdk/rust/troe-kex-c-runtime/src/lib.rs"
+                ),
+            ),
+            PACKAGES,
+        )
+        self.assertFalse(plan.full_reasons)
+        self.assertEqual(plan.rust_packages, {"troe-kex-c-runtime"})
+        self.assertEqual(plan.qemu_scenarios, {"filesystem"})
+
     def test_shared_sdk_selects_every_application_and_tool_regression(self) -> None:
         plan = test_changed.build_plan(
             (PurePosixPath("sdk/rust/troe-kex/src/lib.rs"),), PACKAGES
@@ -148,6 +164,19 @@ class ChangedTestSelectionTests(unittest.TestCase):
         )
         self.assertEqual(plan.qemu_scenarios, {"boot", "filesystem"})
         self.assertTrue(plan.qemu_all_platforms)
+
+    def test_runtime_tree_and_c_sysroot_tools_select_owned_contracts(self) -> None:
+        cases = {
+            "tools/mkruntime.py": "test_mkruntime.py",
+            "tools/build_c_sysroot.py": "test_c_sysroot.py",
+        }
+        for path, test in cases.items():
+            with self.subTest(path=path):
+                plan = test_changed.build_plan((PurePosixPath(path),), PACKAGES)
+                self.assertFalse(plan.full_reasons)
+                self.assertEqual(plan.python_tests, {test})
+                self.assertEqual(plan.qemu_scenarios, {"filesystem"})
+                self.assertTrue(plan.qemu_all_platforms)
 
     def test_package_model_and_cli_select_only_their_host_contract_tests(self) -> None:
         cases = {

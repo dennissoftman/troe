@@ -92,7 +92,7 @@ and standard-policy arithmetic before allocating or mapping application memory.
 
 | Limit | Standard |
 | --- | ---: |
-| Encoded bytes | 16 MiB |
+| Encoded bytes | 32 MiB |
 | Load records | 16 |
 | Image span | 128 MiB |
 | Mapped image pages | 8,192 |

@@ -2322,7 +2322,7 @@ pub mod filesystem_mutation {
     /// Interface major version.
     pub const MAJOR: u16 = 1;
     /// Interface minor version.
-    pub const MINOR: u16 = 2;
+    pub const MINOR: u16 = 3;
     /// Truncate or create one file and begin a sequential streamed replacement.
     pub const BEGIN_REPLACE: u16 = 1;
     /// Append one sequential chunk to the pending replacement.
@@ -2345,12 +2345,16 @@ pub mod filesystem_mutation {
     pub const RENAME: u16 = 10;
     /// Atomically remove one empty directory.
     pub const REMOVE_DIRECTORY: u16 = 11;
+    /// Preserve one existing regular file and begin appending at its exact end.
+    pub const BEGIN_APPEND: u16 = 12;
     /// Fixed bytes preceding an append payload.
     pub const APPEND_HEADER_BYTES: usize = 12;
     /// Maximum bytes carried by one append call.
     pub const MAX_APPEND_BYTES: usize = MAX_SERVICE_PAYLOAD_BYTES - APPEND_HEADER_BYTES;
     /// Exact replacement-token reply/request bytes.
     pub const TOKEN_BYTES: usize = 4;
+    /// Exact begin-append reply bytes: token followed by initial offset.
+    pub const BEGIN_APPEND_REPLY_BYTES: usize = 12;
     /// Exact replacement-token plus chunk-size request bytes.
     pub const CHUNK_SIZE_REQUEST_BYTES: usize = 8;
     /// Fixed bytes preceding the two strings in a link request.
@@ -2530,6 +2534,41 @@ pub mod filesystem_mutation {
             return Err(EncodingError);
         }
         Ok(token)
+    }
+
+    /// Encode one nonzero replacement token and its exact initial offset.
+    ///
+    /// # Errors
+    ///
+    /// Rejects token zero.
+    pub fn encode_begin_append_reply(
+        token: u32,
+        offset: u64,
+    ) -> Result<[u8; BEGIN_APPEND_REPLY_BYTES], EncodingError> {
+        if token == 0 {
+            return Err(EncodingError);
+        }
+        let mut output = [0_u8; BEGIN_APPEND_REPLY_BYTES];
+        output[..4].copy_from_slice(&token.to_le_bytes());
+        output[4..].copy_from_slice(&offset.to_le_bytes());
+        Ok(output)
+    }
+
+    /// Decode one exact begin-append token and initial offset.
+    ///
+    /// # Errors
+    ///
+    /// Rejects the wrong length or token zero.
+    pub fn decode_begin_append_reply(bytes: &[u8]) -> Result<(u32, u64), EncodingError> {
+        if bytes.len() != BEGIN_APPEND_REPLY_BYTES {
+            return Err(EncodingError);
+        }
+        let token = u32::from_le_bytes(bytes[..4].try_into().map_err(|_| EncodingError)?);
+        if token == 0 {
+            return Err(EncodingError);
+        }
+        let offset = u64::from_le_bytes(bytes[4..].try_into().map_err(|_| EncodingError)?);
+        Ok((token, offset))
     }
 
     /// Encode a token-scoped streamed-write aggregation size.
@@ -5707,13 +5746,20 @@ mod tests {
     #[test]
     fn filesystem_mutation_is_sequential_streamed_and_exact() {
         assert_eq!(filesystem_mutation::MAJOR, 1);
-        assert_eq!(filesystem_mutation::MINOR, 2);
+        assert_eq!(filesystem_mutation::MINOR, 3);
         assert_eq!(filesystem::MAJOR, 1);
         assert_eq!(filesystem::MINOR, 3);
         let token = filesystem_mutation::encode_token(7).unwrap_or_else(|_| std::process::abort());
         assert_eq!(filesystem_mutation::decode_token(&token), Ok(7));
         assert!(filesystem_mutation::decode_token(&[7, 0, 0, 0, 0]).is_err());
         assert!(filesystem_mutation::encode_token(0).is_err());
+        let begin_append = filesystem_mutation::encode_begin_append_reply(9, u64::MAX - 1)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            filesystem_mutation::decode_begin_append_reply(&begin_append),
+            Ok((9, u64::MAX - 1))
+        );
+        assert!(filesystem_mutation::decode_begin_append_reply(&begin_append[..11]).is_err());
 
         let mut bytes = [0_u8; super::MAX_SERVICE_PAYLOAD_BYTES];
         let large_offset = u64::from(u32::MAX) + 9;

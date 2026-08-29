@@ -1,5 +1,5 @@
 //! Freestanding numeric helpers used by C-compatible language runtimes.
-#![allow(unsafe_code)]
+use core::{slice, str};
 
 /// Parse one complete UTF-8 decimal token.
 #[must_use]
@@ -73,6 +73,37 @@ pub struct DecimalResult {
     pub consumed: usize,
     /// Parsed value when `status` is zero.
     pub value: f64,
+}
+
+/// C ABI adapter for [`parse_decimal_prefix`].
+///
+/// # Safety
+///
+/// `bytes` must address a readable span of exactly `length` bytes. A null
+/// pointer is accepted only when `length` is zero.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn troe_parse_decimal(bytes: *const u8, length: usize) -> DecimalResult {
+    let invalid = DecimalResult {
+        status: 1,
+        consumed: 0,
+        value: 0.0,
+    };
+    if length == 0 || bytes.is_null() {
+        return invalid;
+    }
+    // SAFETY: The C caller provides the readable span required above.
+    let bytes = unsafe { slice::from_raw_parts(bytes, length) };
+    let Ok(text) = str::from_utf8(bytes) else {
+        return invalid;
+    };
+    let Some((value, consumed)) = parse_decimal_prefix(text) else {
+        return invalid;
+    };
+    DecimalResult {
+        status: 0,
+        consumed,
+        value,
+    }
 }
 
 /// Fraction and exponent returned by [`frexp`].
@@ -151,12 +182,25 @@ pub extern "C" fn troe_math_pow_bits(x_bits: u64, y_bits: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_decimal_prefix;
+    use super::{parse_decimal_prefix, troe_parse_decimal};
 
     #[test]
     fn decimal_prefix_is_bounded_and_does_not_consume_bad_exponents() {
         assert_eq!(parse_decimal_prefix("  -12.5e2tail"), Some((-1250.0, 9)));
         assert_eq!(parse_decimal_prefix("1e+tail"), Some((1.0, 1)));
         assert_eq!(parse_decimal_prefix("  .tail"), None);
+    }
+
+    #[test]
+    fn decimal_c_adapter_rejects_invalid_spans_and_reports_consumption() {
+        let text = b"  -12.5e2tail";
+        // SAFETY: `text` is a readable byte span for its full length.
+        let result = unsafe { troe_parse_decimal(text.as_ptr(), text.len()) };
+        assert_eq!(result.status, 0);
+        assert_eq!(result.consumed, 9);
+        assert_eq!(result.value.to_bits(), (-1250.0_f64).to_bits());
+        // SAFETY: Null with a zero length is explicitly accepted and rejected.
+        let invalid = unsafe { troe_parse_decimal(core::ptr::null(), 0) };
+        assert_ne!(invalid.status, 0);
     }
 }

@@ -1324,7 +1324,6 @@ impl<D: BlockDevice> Ext4<D> {
         if partial != 0 {
             let logical =
                 u32::try_from(inode.size / EXT4_BLOCK_BYTES_U64).map_err(|_| FsError::NoSpace)?;
-            let logical = logical.checked_sub(1).ok_or(FsError::Corrupt)?;
             let (physical, unwritten) = map_block(&inode, logical)?.ok_or(FsError::Corrupt)?;
             if unwritten {
                 return Err(FsError::Corrupt);
@@ -3977,6 +3976,20 @@ mod tests {
         assert_eq!(ext4.read_file("/hello", 0, &mut read_back[..4096])?, 4096);
         assert_eq!(ext4.read_file("/hello", 4096, &mut read_back[4096..])?, 904);
         assert_eq!(read_back, replacement);
+        Ok(())
+    }
+
+    #[test]
+    fn append_extends_the_existing_partial_final_block() -> Result<(), FsError> {
+        let mut ext4 = mount_writable(valid_device_with_file_xattr())?;
+        ext4.truncate_file("/partial")?;
+        ext4.append_file("/partial", b"prefix")?;
+        ext4.append_file("/partial", b"-tail")?;
+        ext4.sync_file("/partial")?;
+        assert_eq!(ext4.metadata("/partial")?.byte_count, 11);
+        let mut content = [0_u8; 11];
+        assert_eq!(ext4.read_file("/partial", 0, &mut content)?, 11);
+        assert_eq!(&content, b"prefix-tail");
         Ok(())
     }
 

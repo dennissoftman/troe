@@ -34,16 +34,18 @@ history rather than in current documentation.
 | Kernel CSPRNG, readable random capability, and KEX ASLR | [ADR 0049](adr/0049-kernel-csprng-and-kex-aslr.md) |
 | Explicit relative and absolute KEX execution paths | [ADR 0050](adr/0050-explicit-kex-path-execution.md) |
 | Package-owned declarative shell completions | [ADR 0051](adr/0051-package-owned-declarative-completions.md) |
+| Streamed KEX loading, shared runtime trees, and static C runtime | [ADR 0052](adr/0052-streamed-kex-and-static-c-runtime.md) |
 
 The current serialized contracts are versioned independently under
 [`formats/`](formats):
 
 - applications and packages: [KEX](formats/kex-v1.md),
-  [KEX package](formats/kex-package-v1.md), [KCAP](formats/kcap-v1.md), and
-  [CMPL](formats/completion-v1.md);
+  [KEX package](formats/kex-package-v1.md),
+  [shared runtime tree](formats/runtime-tree-v1.md), [KCAP](formats/kcap-v1.md),
+  and [CMPL](formats/completion-v1.md);
 - process services: [process observation 1.1](formats/process-observation-v1.md) and
   [process launch and pipes 1.0](formats/process-launch-pipe-v1.md);
-- KEX filesystem services: [filesystem read 1.3 and mutation 1.2](formats/kex-filesystem-v1.md);
+- KEX filesystem services: [filesystem read and mutation 1.3](formats/kex-filesystem-v1.md);
 - embedded and persistent filesystems: [KEFS](formats/kefs-v1.md) and
   [StateFS](formats/stfs-v1.md);
 - volume selection and durability: [BMNT](formats/bmnt-v1.md),

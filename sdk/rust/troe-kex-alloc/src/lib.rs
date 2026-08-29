@@ -16,6 +16,7 @@ const GROWTH_QUANTUM_PAGES: usize = 64;
 /// contiguous TLSF arena. This is a tuning boundary, not a functional limit.
 pub const PRIVATE_MAPPING_THRESHOLD_BYTES: usize = 8 * 1024 * 1024;
 const MAPPED_ALLOCATION_MAGIC: u64 = 0x544d_4150_4b45_5831;
+const C_ALLOCATION_MAGIC: u64 = 0x5443_414c_4c4f_4331;
 // 4-byte base alignment gives TLSF five granularity bits on 64-bit targets.
 // Fifty-nine first-level classes therefore cover the complete `usize` domain
 // instead of imposing the former approximately 32 MiB maximum block size.
@@ -599,11 +600,212 @@ impl<S: HeapSource> Heap<S> {
     }
 }
 
+/// Size-owning allocator facade for standard C allocation symbols.
+///
+/// The underlying [`Heap`] requires the original Rust [`Layout`] during
+/// deallocation. This facade stores an audited header immediately before each
+/// returned payload so `free(3)` and `realloc(3)` do not depend on caller size
+/// hints. Large requests still route through the private-mapping threshold and
+/// are reclaimed immediately by the existing hybrid allocator.
+pub struct CAllocator<S: HeapSource = ApplicationHeapSource> {
+    heap: Heap<S>,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct CAllocationHeader {
+    magic: u64,
+    base: usize,
+    allocation_size: usize,
+    allocation_align: usize,
+    requested_size: usize,
+    requested_align: usize,
+}
+
+impl CAllocator<ApplicationHeapSource> {
+    /// Initialize a C allocator from the application's growable heap and
+    /// optional large-allocation mapping authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same bootstrap error as [`Heap::new_with_private_memory`].
+    pub fn new(
+        region: HeapRegion,
+        private_memory: PrivateMemory,
+    ) -> Result<Self, InitializationError> {
+        Ok(Self {
+            heap: Heap::new_with_private_memory(region, private_memory)?,
+        })
+    }
+}
+
+impl<S: HeapSource> CAllocator<S> {
+    /// Wrap an existing heap without changing its allocation policy.
+    #[must_use]
+    pub const fn from_heap(heap: Heap<S>) -> Self {
+        Self { heap }
+    }
+
+    /// Return current allocator accounting.
+    #[must_use]
+    pub const fn statistics(&self) -> Statistics {
+        self.heap.statistics()
+    }
+
+    /// Allocate one C payload with explicit power-of-two alignment.
+    ///
+    /// A zero byte request owns a unique one-byte payload, matching the
+    /// implementation-defined but freeable behavior selected by this ABI.
+    /// `zeroed` clears the complete logical payload before returning.
+    pub fn allocate(&mut self, size: usize, alignment: usize, zeroed: bool) -> Option<NonNull<u8>> {
+        if alignment == 0 || !alignment.is_power_of_two() {
+            return None;
+        }
+        let requested_size = size.max(1);
+        let header_bytes = core::mem::size_of::<CAllocationHeader>();
+        let allocation_align = alignment.max(core::mem::align_of::<CAllocationHeader>());
+        let allocation_size = requested_size
+            .checked_add(header_bytes)?
+            .checked_add(alignment.checked_sub(1)?)?;
+        let layout = Layout::from_size_align(allocation_size, allocation_align).ok()?;
+        let base = self.heap.allocate(layout)?;
+        let initialized = (|| {
+            let base_address = base.as_ptr() as usize;
+            let payload_unaligned = base_address.checked_add(header_bytes)?;
+            let payload = payload_unaligned.checked_add(alignment - 1)? & !(alignment - 1);
+            let payload_end = payload.checked_add(requested_size)?;
+            let allocation_end = base_address.checked_add(allocation_size)?;
+            if payload_end > allocation_end {
+                return None;
+            }
+            let header_address = payload.checked_sub(header_bytes)?;
+            let pointer = NonNull::new(payload as *mut u8)?;
+            let header = CAllocationHeader {
+                magic: C_ALLOCATION_MAGIC,
+                base: base_address,
+                allocation_size,
+                allocation_align,
+                requested_size: size,
+                requested_align: alignment,
+            };
+            Some((pointer, header_address, header))
+        })();
+        let Some((pointer, header_address, header)) = initialized else {
+            // SAFETY: `base` and `layout` came from the live heap allocation.
+            unsafe { self.heap.deallocate(base, layout) };
+            return None;
+        };
+        // SAFETY: The header range lies inside the fresh allocation and ends
+        // exactly at the aligned payload.
+        unsafe {
+            (header_address as *mut CAllocationHeader).write_unaligned(header);
+            if zeroed {
+                ptr::write_bytes(pointer.as_ptr(), 0, requested_size);
+            }
+        }
+        Some(pointer)
+    }
+
+    /// Return the logical byte size recorded for a live C allocation.
+    ///
+    /// # Safety
+    ///
+    /// `pointer` must name a currently live allocation from this object.
+    pub unsafe fn allocation_size(&self, pointer: NonNull<u8>) -> Option<usize> {
+        // SAFETY: Forwarded from the caller contract and validated by magic.
+        let header = unsafe { Self::header(pointer)? };
+        Some(header.requested_size)
+    }
+
+    /// Release one C allocation, including an independent large mapping.
+    ///
+    /// Returns false for a corrupted header without mutating allocator state.
+    ///
+    /// # Safety
+    ///
+    /// `pointer` must be null or a currently live allocation from this object.
+    pub unsafe fn deallocate(&mut self, pointer: *mut u8) -> bool {
+        let Some(pointer) = NonNull::new(pointer) else {
+            return true;
+        };
+        // SAFETY: Forwarded from the caller contract and checked below.
+        let Some(header) = (unsafe { Self::header(pointer) }) else {
+            return false;
+        };
+        let Ok(layout) = Layout::from_size_align(header.allocation_size, header.allocation_align)
+        else {
+            return false;
+        };
+        let Some(base) = NonNull::new(header.base as *mut u8) else {
+            return false;
+        };
+        // SAFETY: The validated header records the exact underlying layout.
+        unsafe { self.heap.deallocate(base, layout) };
+        true
+    }
+
+    /// Resize one C allocation while preserving its common prefix.
+    ///
+    /// Allocation happens before release, so failure leaves the original
+    /// pointer and bytes unchanged. A zero new size releases the allocation.
+    ///
+    /// # Safety
+    ///
+    /// `pointer` must be null or a currently live allocation from this object.
+    pub unsafe fn reallocate(&mut self, pointer: *mut u8, new_size: usize) -> Option<NonNull<u8>> {
+        let Some(pointer) = NonNull::new(pointer) else {
+            return self.allocate(new_size, core::mem::align_of::<usize>(), false);
+        };
+        if new_size == 0 {
+            // SAFETY: Forwarded from this method's caller contract.
+            let _released = unsafe { self.deallocate(pointer.as_ptr()) };
+            return None;
+        }
+        // SAFETY: Forwarded from the caller contract and checked by magic.
+        let old = unsafe { Self::header(pointer)? };
+        let replacement = self.allocate(new_size, old.requested_align, false)?;
+        // SAFETY: Both payloads are live, nonoverlapping allocations and the
+        // copied range is within their logical sizes.
+        unsafe {
+            ptr::copy_nonoverlapping(
+                pointer.as_ptr(),
+                replacement.as_ptr(),
+                old.requested_size.min(new_size),
+            );
+        }
+        // SAFETY: Forwarded from this method's caller contract.
+        if !unsafe { self.deallocate(pointer.as_ptr()) } {
+            // SAFETY: `replacement` was allocated above and is still live.
+            let _released = unsafe { self.deallocate(replacement.as_ptr()) };
+            return None;
+        }
+        Some(replacement)
+    }
+
+    unsafe fn header(pointer: NonNull<u8>) -> Option<CAllocationHeader> {
+        let address =
+            (pointer.as_ptr() as usize).checked_sub(core::mem::size_of::<CAllocationHeader>())?;
+        // SAFETY: The caller promises a live C allocation, whose header is the
+        // immediately preceding possibly-unaligned object.
+        let header = unsafe { (address as *const CAllocationHeader).read_unaligned() };
+        if header.magic != C_ALLOCATION_MAGIC
+            || header.allocation_size == 0
+            || header.allocation_align == 0
+            || !header.allocation_align.is_power_of_two()
+            || header.requested_align == 0
+            || !header.requested_align.is_power_of_two()
+        {
+            return None;
+        }
+        Some(header)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     extern crate std;
 
-    use super::{Heap, HeapSource, growth_request_pages};
+    use super::{CAllocator, Heap, HeapSource, growth_request_pages};
     use core::{alloc::Layout, mem::MaybeUninit, ptr::NonNull};
     use rlsf::FlexSource;
     use std::vec::Vec;
@@ -817,5 +1019,39 @@ mod tests {
         assert_eq!(growth_request_pages(1), Some(64));
         assert_eq!(growth_request_pages(256 * 1024), Some(64));
         assert_eq!(growth_request_pages(100 * 1024 * 1024), Some(25_600));
+    }
+
+    #[test]
+    fn c_allocator_owns_sizes_alignment_zeroing_and_failure_rollback() {
+        let mut pool = Pool([MaybeUninit::uninit(); 16 * 1024]);
+        let heap = heap(&mut pool);
+        let mut allocator = CAllocator::from_heap(heap);
+        let pointer = allocator
+            .allocate(257, 256, true)
+            .unwrap_or_else(|| unreachable!());
+        assert_eq!(pointer.as_ptr() as usize % 256, 0);
+        // SAFETY: The returned allocation owns 257 initialized payload bytes.
+        let bytes = unsafe { core::slice::from_raw_parts_mut(pointer.as_ptr(), 257) };
+        assert!(bytes.iter().all(|byte| *byte == 0));
+        bytes.fill(0x5a);
+        // SAFETY: `pointer` remains live in this allocator.
+        assert_eq!(unsafe { allocator.allocation_size(pointer) }, Some(257));
+        // SAFETY: `pointer` remains live and is resized exactly once.
+        let grown = unsafe { allocator.reallocate(pointer.as_ptr(), 4096) }
+            .unwrap_or_else(|| unreachable!());
+        assert_eq!(grown.as_ptr() as usize % 256, 0);
+        // SAFETY: The grown payload preserves the original 257 bytes.
+        let prefix = unsafe { core::slice::from_raw_parts(grown.as_ptr(), 257) };
+        assert!(prefix.iter().all(|byte| *byte == 0x5a));
+        // An impossible request cannot release or alter the current payload.
+        // SAFETY: `grown` is live throughout the failed resize.
+        assert!(unsafe { allocator.reallocate(grown.as_ptr(), usize::MAX) }.is_none());
+        // SAFETY: Failed realloc preserves all 4096 payload bytes.
+        let preserved = unsafe { core::slice::from_raw_parts(grown.as_ptr(), 257) };
+        assert!(preserved.iter().all(|byte| *byte == 0x5a));
+        // SAFETY: `grown` is released exactly once.
+        assert!(unsafe { allocator.deallocate(grown.as_ptr()) });
+        assert_eq!(allocator.statistics().live_bytes, 0);
+        assert!(allocator.allocate(8, 3, false).is_none());
     }
 }
