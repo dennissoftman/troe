@@ -38,7 +38,9 @@ CONFIG_SITE = APP_ROOT / "config" / "config.site"
 CONFIGURE_STUBS = APP_ROOT / "config" / "configure-stubs.c"
 EPOCH = "946684800"
 MANIFEST_NAME = "MANIFEST.sha256"
-PACKAGE_DIRECTORY = PurePosixPath("cpython") / "v1"
+# Optional runtimes share one architecture-split layout on the medium:
+# executables in bin/<architecture>, libraries in lib/<architecture>.
+MEDIA_DIRECTORIES = (PurePosixPath("bin"), PurePosixPath("lib"))
 DIAGNOSTICS_DIRECTORY = PurePosixPath("cpython-diagnostics") / "v1"
 NEGATIVE_VARIANTS = ("python-no-random", "python-no-mutate", "python-no-clock")
 ARCHITECTURES = {
@@ -435,7 +437,7 @@ def configure_options(release: Release, architecture: str, build_python: str) ->
     options = [
         f"--host={architecture}-unknown-none",
         f"--with-build-python={build_python}",
-        f"--prefix=/vol/shared/cpython/v1/{architecture}/lib/python{release.version}",
+        f"--prefix=/vol/shared/lib/{architecture}/python{release.version}",
         "--disable-shared",
         "--without-ensurepip",
         "--without-pkg-config",
@@ -699,8 +701,8 @@ def install_release(
     artifact: Path,
     policy: dict[str, Any],
 ) -> None:
-    architecture_root = package_root / architecture
-    bin_root = architecture_root / "bin"
+    bin_root = package_root / "bin" / architecture
+    architecture_root = package_root / "lib" / architecture
     names = [f"python{release.version}.kex", f"python{release.series}.kex"]
     if release.version == DEFAULT_VERSION:
         names.extend(["python3.kex", "python.kex"])
@@ -710,12 +712,7 @@ def install_release(
     if inspect.get("target") != architecture or inspect.get("format") != "KEX package v1":
         raise RuntimeError(f"CPython KEX inspection did not match {architecture}: {artifact}")
     write_json(bin_root / f"python{release.version}.inspect.json", inspect)
-    stdlib = (
-        architecture_root
-        / "lib"
-        / f"python{release.version}"
-        / f"python{release.series}"
-    )
+    stdlib = architecture_root / f"python{release.version}" / f"python{release.series}"
     metrics = install_stdlib(release, source, build, stdlib, policy)
     measured = {
         "kex_bytes": artifact.stat().st_size,
@@ -729,7 +726,7 @@ def install_release(
                 f"{measured[name]}, above the accepted ceiling {ceiling}"
             )
     write_json(
-        architecture_root / "lib" / f"python{release.version}" / "TROE-BUILD.json",
+        architecture_root / f"python{release.version}" / "TROE-BUILD.json",
         {
             "schema": 1,
             "architecture": architecture,
@@ -805,27 +802,21 @@ def mtools(
     )
 
 
-def install_package_image(
-    root: Path, image: Path, directory: PurePosixPath = PACKAGE_DIRECTORY
+def install_single_root_image(
+    root: Path, image: Path, directory: PurePosixPath
 ) -> None:
-    """Install one verified package tree onto a detached shared image."""
-    verify_package(root)
-    mkshared.verify_image(image)
-    existing = mtools("mdir", image, f"::/{directory.as_posix()}", check=False)
-    if existing.returncode == 0:
-        raise RuntimeError(f"shared media already contains /{directory.as_posix()}")
-    mtools("mmd", image, f"::/{directory.parts[0]}")
-    mtools("mcopy", image, "-s", str(root), f"::/{directory.parts[0]}/")
-    verify_package_image(root, image, directory)
+    """Install one self-contained tree below its own directory on the medium.
 
-
-def verify_package_image(
-    root: Path, image: Path, directory: PurePosixPath = PACKAGE_DIRECTORY
-) -> None:
-    """Extract the installed tree and compare every recorded byte."""
+    Acceptance-only diagnostics keep a private root instead of sharing the
+    optional-runtime ``bin`` and ``lib`` directories.
+    """
     entries = verify_package(root)
     mkshared.verify_image(image)
-    with tempfile.TemporaryDirectory(prefix="troe-cpython-image-") as temporary:
+    if mtools("mdir", image, f"::/{directory.as_posix()}", check=False).returncode == 0:
+        raise RuntimeError(f"shared media already contains /{directory.as_posix()}")
+    mtools("mmd", image, f"::/{directory.parts[0]}", check=False)
+    mtools("mcopy", image, "-s", str(root), f"::/{directory.parts[0]}/")
+    with tempfile.TemporaryDirectory(prefix="troe-cpython-single-") as temporary:
         extraction = Path(temporary) / "extracted"
         extraction.mkdir()
         mtools("mcopy", image, "-s", f"::/{directory.as_posix()}", str(extraction))
@@ -833,9 +824,47 @@ def verify_package_image(
         for relative, digest in entries:
             path = installed / Path(*relative.parts)
             if not path.is_file() or sha256(path) != digest:
+                raise RuntimeError(f"shared media entry differs: {relative}")
+
+
+def install_package_image(root: Path, image: Path) -> None:
+    """Install one verified package onto a detached shared image.
+
+    The medium receives exactly the runtime layout: ``bin`` and ``lib`` are
+    shared with other optional runtimes, so only the entries this package owns
+    are refused when they already exist.
+    """
+    entries = verify_package(root)
+    mkshared.verify_image(image)
+    for relative, _digest in entries:
+        if mtools("mdir", image, f"::/{relative.as_posix()}", check=False).returncode == 0:
+            raise RuntimeError(f"shared media already contains /{relative.as_posix()}")
+    for directory in MEDIA_DIRECTORIES:
+        source = root / directory.as_posix()
+        if not source.is_dir():
+            continue
+        mtools("mmd", image, f"::/{directory.as_posix()}", check=False)
+        for child in sorted(item for item in source.iterdir() if item.is_dir()):
+            mtools("mcopy", image, "-s", str(child), f"::/{directory.as_posix()}/")
+        for child in sorted(item for item in source.iterdir() if item.is_file()):
+            mtools("mcopy", image, str(child), f"::/{directory.as_posix()}/{child.name}")
+    verify_package_image(root, image)
+
+
+def verify_package_image(root: Path, image: Path) -> None:
+    """Extract every installed entry and compare it against the source tree."""
+    entries = verify_package(root)
+    mkshared.verify_image(image)
+    with tempfile.TemporaryDirectory(prefix="troe-cpython-image-") as temporary:
+        extraction = Path(temporary) / "extracted"
+        extraction.mkdir()
+        for directory in MEDIA_DIRECTORIES:
+            if (root / directory.as_posix()).is_dir():
+                mtools("mcopy", image, "-s", f"::/{directory.as_posix()}", str(extraction))
+        for relative, digest in entries:
+            path = extraction / Path(*relative.parts)
+            if not path.is_file() or sha256(path) != digest:
                 raise RuntimeError(f"shared media package entry differs: {relative}")
-        if (installed / MANIFEST_NAME).read_bytes() != (root / MANIFEST_NAME).read_bytes():
-            raise RuntimeError("shared media package manifest differs from source tree")
 
 
 def collect_pure_python(source: Path) -> list[PurePosixPath]:
@@ -864,36 +893,53 @@ def install_packages_image(source: Path, image: Path) -> None:
     """Install administrator-supplied pure-Python packages onto shared media."""
     entries = collect_pure_python(source)
     mkshared.verify_image(image)
-    packages = PACKAGE_DIRECTORY / "packages"
-    if mtools("mdir", image, f"::/{packages.as_posix()}", check=False).returncode != 0:
-        raise RuntimeError(f"shared media has no installed package tree: {image}")
-    directories = sorted(
-        {packages / relative.parent for relative in entries if relative.parent != PurePosixPath(".")},
-        key=lambda item: (len(item.parts), item.as_posix()),
-    )
-    for directory in directories:
-        mtools("mmd", image, f"::/{directory.as_posix()}")
-    for relative in entries:
-        mtools(
-            "mcopy",
-            image,
-            str(source / Path(*relative.parts)),
-            f"::/{(packages / relative).as_posix()}",
+    architectures = [
+        name
+        for name in ARCHITECTURES
+        if mtools("mdir", image, f"::/lib/{name}", check=False).returncode == 0
+    ]
+    if not architectures:
+        raise RuntimeError(f"shared media has no installed interpreter library: {image}")
+    for architecture in architectures:
+        packages = PurePosixPath("lib") / architecture / "packages"
+        directories = sorted(
+            {packages}
+            | {
+                packages / relative.parent
+                for relative in entries
+                if relative.parent != PurePosixPath(".")
+            },
+            key=lambda item: (len(item.parts), item.as_posix()),
         )
-    with tempfile.TemporaryDirectory(prefix="troe-cpython-packages-") as temporary:
-        extraction = Path(temporary) / "extracted"
-        extraction.mkdir()
+        for directory in directories:
+            mtools("mmd", image, f"::/{directory.as_posix()}", check=False)
         for relative in entries:
             mtools(
                 "mcopy",
                 image,
+                "-o",
+                str(source / Path(*relative.parts)),
                 f"::/{(packages / relative).as_posix()}",
-                str(extraction / relative.name),
             )
-            installed = extraction / relative.name
-            if sha256(installed) != sha256(source / Path(*relative.parts)):
-                raise RuntimeError(f"shared media package entry differs: {relative}")
-            installed.unlink()
+    with tempfile.TemporaryDirectory(prefix="troe-cpython-packages-") as temporary:
+        extraction = Path(temporary) / "extracted"
+        extraction.mkdir()
+        for architecture in architectures:
+            packages = PurePosixPath("lib") / architecture / "packages"
+            for relative in entries:
+                mtools(
+                    "mcopy",
+                    image,
+                    "-o",
+                    f"::/{(packages / relative).as_posix()}",
+                    str(extraction / relative.name),
+                )
+                installed = extraction / relative.name
+                if sha256(installed) != sha256(source / Path(*relative.parts)):
+                    raise RuntimeError(
+                        f"shared media package entry differs: {architecture} {relative}"
+                    )
+                installed.unlink()
 
 
 def build_variant_kex(
@@ -991,7 +1037,7 @@ def build_package(
     sysroot_command.extend(["--cc", cc, "--ar", archiver])
     run(sysroot_command)
     policy = load_json(STDLIB_POLICY)
-    package_root = output / "cpython" / "v1"
+    package_root = output
     authenticated: list[dict[str, str]] = []
     for release in selected:
         archive = authenticate_source(release, cache, sigstore, offline)
@@ -1029,14 +1075,14 @@ def build_package(
                 artifact,
                 policy,
             )
-    write_json(package_root / "TROE-SOURCES.json", {"schema": 1, "releases": authenticated})
+    write_json(package_root / "lib" / "TROE-SOURCES.json", {"schema": 1, "releases": authenticated})
     write_json(
-        package_root / "packages" / "TROE-PACKAGES.json",
+        package_root / "lib" / "TROE-PACKAGES.json",
         {
             "schema": 1,
             "search_paths": [
-                "/vol/shared/cpython/v1/packages",
-                "/vol/shared/cpython/v1/packages/python<major.minor>",
+                "/vol/shared/lib/<architecture>/packages",
+                "/vol/shared/lib/<architecture>/packages/python<major.minor>",
             ],
             "content": "administrator-supplied pure-Python source packages only",
         },
@@ -1060,7 +1106,7 @@ def main() -> int:
             print(f"TROE CPython shared media verified: {args.image}")
             return 0
         if args.action == "install-diagnostics":
-            install_package_image(args.tree, args.image, DIAGNOSTICS_DIRECTORY)
+            install_single_root_image(args.tree, args.image, DIAGNOSTICS_DIRECTORY)
             print(f"TROE CPython diagnostics installed: {args.image}")
             return 0
         if args.action == "variants":

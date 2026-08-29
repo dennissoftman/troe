@@ -285,8 +285,8 @@ class CpythonIntegrationTests(unittest.TestCase):
                 (
                     root
                     / "accepted"
-                    / "x86_64"
                     / "lib"
+                    / "x86_64"
                     / f"python{release.version}"
                     / "TROE-BUILD.json"
                 ).read_text(encoding="utf-8")
@@ -331,7 +331,7 @@ class CpythonIntegrationTests(unittest.TestCase):
                         artifact,
                         policy,
                     )
-            binaries = {path.name for path in (root / "package" / "x86_64" / "bin").glob("*.kex")}
+            binaries = {path.name for path in (root / "package" / "bin" / "x86_64").glob("*.kex")}
             self.assertEqual(
                 binaries,
                 {

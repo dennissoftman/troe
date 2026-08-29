@@ -60,12 +60,13 @@ SHARED_FILE = "/vol/shared/host-visible.txt"
 SHARED_CONTENT = "persistent-fat32-content"
 RUNTIME_PROBE_PACKAGES = REPO_ROOT / "build" / "runtime-probe-packages"
 RUNTIME_PROBE_TREE = REPO_ROOT / "build" / "runtime-tree-v1"
-CPYTHON_PACKAGE_TREE = REPO_ROOT / "build" / "cpython-package" / "cpython" / "v1"
+CPYTHON_PACKAGE_TREE = REPO_ROOT / "build" / "cpython-package"
 CPYTHON_DIAGNOSTICS_TREE = (
     REPO_ROOT / "build" / "cpython-diagnostics" / "cpython-diagnostics" / "v1"
 )
 CPYTHON_FIXTURES = REPO_ROOT / "tests" / "fixtures" / "cpython"
-CPYTHON_SHARED_ROOT = "/vol/shared/cpython/v1"
+CPYTHON_SHARED_BIN = "/vol/shared/bin"
+CPYTHON_SHARED_LIB = "/vol/shared/lib"
 CPYTHON_DIAGNOSTICS_ROOT = "/vol/shared/cpython-diagnostics/v1"
 # Interpreter startup, standard-library imports, and cyclic collection are
 # far heavier than a coreutil launch, and both guests share one host.
@@ -2480,13 +2481,13 @@ def run_cpython_group(session: SerialSession, command_timeout: float) -> None:
     """Exercise the shared-volume CPython package, its profile, and its limits."""
     cwd = "/"
     timeout = command_timeout * CPYTHON_TIMEOUT_SCALE
-    binaries = f"{CPYTHON_SHARED_ROOT}/{session.architecture}/bin"
-    packages = f"{CPYTHON_SHARED_ROOT}/packages"
+    binaries = f"{CPYTHON_SHARED_BIN}/{session.architecture}"
+    packages = f"{CPYTHON_SHARED_LIB}/{session.architecture}/packages"
     diagnostics = f"{CPYTHON_DIAGNOSTICS_ROOT}/{session.architecture}/bin"
     python = f"{binaries}/python.kex"
     no_random = f"{diagnostics}/python-no-random.kex"
     no_mutate = f"{diagnostics}/python-no-mutate.kex"
-    stdlib = f"{CPYTHON_SHARED_ROOT}/{session.architecture}/lib/python3.14.7/python3.14"
+    stdlib = f"{CPYTHON_SHARED_LIB}/{session.architecture}/python3.14.7/python3.14"
 
     # Shared-volume interpreters stay subject to the explicit-path execution
     # gate; declining must not start the interpreter at all.

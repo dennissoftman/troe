@@ -75,7 +75,8 @@ firmware fails before device publication or volatile I/O.
    applications are statically linked, `/lib` is not present, and executable
    code does not belong in `/share`. Optional large runtime executables live
    only in `/vol/shared/runtime/v1/<architecture>/bin`, outside rootfs and EFI,
-   and the CPython package owns `/vol/shared/cpython/v1` on the same terms.
+   and optional runtimes own `/vol/shared/bin/<architecture>` with their
+   libraries in `/vol/shared/lib/<architecture>` on the same terms.
 6. The final output capability writes host bytes or the native UART.
    When validated GOP metadata is available, normal native shell output is also
    rendered into an owned fixed-glyph framebuffer console. UEFI text output is
@@ -91,13 +92,14 @@ is an explicit terminal error. Rootfs and EFI builders do not consume this
 tree.
 
 `tools/build_cpython.py` owns the CPython package boundary on the same terms.
-It emits `cpython/v1/<architecture>/{bin,lib}` with version-addressable
+It emits `bin/<architecture>` and `lib/<architecture>` with version-addressable
 interpreters, a default `python.kex` alias for the newest pinned release, the
 filtered pure-Python library, per-release build and module manifests, and one
 path-sorted SHA-256 manifest for the whole tree. Installation verifies the
 source tree, rejects a medium that already owns the directory, and re-reads
 every installed byte. Administrator-supplied pure-Python packages install
-separately below `cpython/v1/packages`; bytecode caches and non-Python files are
+separately below `lib/<architecture>/packages` in every installed architecture;
+bytecode caches and non-Python files are
 refused. Rootfs and EFI builders do not consume this tree either.
 
 Pipelines remain sequential even though cooperative tasks now exist. This makes

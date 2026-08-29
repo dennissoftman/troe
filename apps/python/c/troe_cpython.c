@@ -11,15 +11,19 @@
 #error "TROE_CPYTHON_SERIES is required"
 #endif
 
-#define TROE_CPYTHON_ROOT                                                     \
-  "/vol/shared/cpython/v1/" TROE_CPYTHON_ARCHITECTURE
+// Optional runtimes share one architecture-split layout on /vol/shared:
+// executables in bin/<architecture> and their libraries in lib/<architecture>,
+// so a future native-extension directory stays architecture-correct.
+#define TROE_CPYTHON_LIB_ROOT                                                 \
+  "/vol/shared/lib/" TROE_CPYTHON_ARCHITECTURE
 #define TROE_CPYTHON_HOME                                                     \
-  TROE_CPYTHON_ROOT "/lib/python" TROE_CPYTHON_VERSION
+  TROE_CPYTHON_LIB_ROOT "/python" TROE_CPYTHON_VERSION
 #define TROE_CPYTHON_STDLIB                                                   \
   TROE_CPYTHON_HOME "/python" TROE_CPYTHON_SERIES
 #define TROE_CPYTHON_EXECUTABLE                                               \
-  TROE_CPYTHON_ROOT "/bin/python" TROE_CPYTHON_SERIES ".kex"
-#define TROE_CPYTHON_PACKAGES "/vol/shared/cpython/v1/packages"
+  "/vol/shared/bin/" TROE_CPYTHON_ARCHITECTURE "/python" TROE_CPYTHON_SERIES  \
+  ".kex"
+#define TROE_CPYTHON_PACKAGES TROE_CPYTHON_LIB_ROOT "/packages"
 #define TROE_CPYTHON_SERIES_PACKAGES                                          \
   TROE_CPYTHON_PACKAGES "/python" TROE_CPYTHON_SERIES
 
