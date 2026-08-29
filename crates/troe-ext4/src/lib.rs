@@ -52,10 +52,59 @@ const EXT4_DIR_TAIL_FT: u8 = 0xde;
 const EXT4_DIR_TAIL_BYTES: usize = 12;
 const EXT4_DIR_TAIL_BYTES_U16: u16 = 12;
 const EXT4_JOURNAL_INO: u32 = 8;
+
+// Compatible features never change how existing metadata is read, so an
+// unknown one is ignored. `dir_index` is listed because directory mutation
+// must keep a hashed index consistent, not because reading needs it.
+const EXT4_COMPAT_DIR_INDEX: u32 = 0x0000_0020;
+
+// Incompatible features change on-disk structure. An unknown one must refuse
+// the volume outright rather than risk misreading it.
+const EXT4_INCOMPAT_FILETYPE: u32 = 0x0000_0002;
 const EXT4_FEATURE_INCOMPAT_RECOVER: u32 = 0x0000_0004;
+const EXT4_INCOMPAT_EXTENTS: u32 = 0x0000_0040;
+const EXT4_INCOMPAT_64BIT: u32 = 0x0000_0080;
+const EXT4_INCOMPAT_FLEX_BG: u32 = 0x0000_0200;
+const EXT4_INCOMPAT_CSUM_SEED: u32 = 0x0000_2000;
+
+// Read-only-compatible features only change how a writer must maintain
+// metadata. An unknown one downgrades the volume to read-only instead of
+// refusing it, so foreign media stays readable and untouched.
+const EXT4_RO_COMPAT_SPARSE_SUPER: u32 = 0x0000_0001;
+const EXT4_RO_COMPAT_LARGE_FILE: u32 = 0x0000_0002;
+const EXT4_RO_COMPAT_HUGE_FILE: u32 = 0x0000_0008;
+const EXT4_RO_COMPAT_DIR_NLINK: u32 = 0x0000_0020;
+const EXT4_RO_COMPAT_EXTRA_ISIZE: u32 = 0x0000_0040;
+const EXT4_RO_COMPAT_METADATA_CSUM: u32 = 0x0000_0400;
+
+/// Incompatible features this provider understands well enough to mount.
+const EXT4_KNOWN_INCOMPAT: u32 = EXT4_INCOMPAT_FILETYPE
+    | EXT4_FEATURE_INCOMPAT_RECOVER
+    | EXT4_INCOMPAT_EXTENTS
+    | EXT4_INCOMPAT_64BIT
+    | EXT4_INCOMPAT_FLEX_BG
+    | EXT4_INCOMPAT_CSUM_SEED;
+
+/// Read-only-compatible features this provider maintains correctly on write.
+const EXT4_KNOWN_RO_COMPAT: u32 = EXT4_RO_COMPAT_SPARSE_SUPER
+    | EXT4_RO_COMPAT_LARGE_FILE
+    | EXT4_RO_COMPAT_HUGE_FILE
+    | EXT4_RO_COMPAT_DIR_NLINK
+    | EXT4_RO_COMPAT_EXTRA_ISIZE
+    | EXT4_RO_COMPAT_METADATA_CSUM;
+
+/// Structure this provider requires in every volume it will mount.
+const EXT4_REQUIRED_INCOMPAT: u32 = EXT4_INCOMPAT_FILETYPE | EXT4_INCOMPAT_EXTENTS;
+const EXT4_REQUIRED_RO_COMPAT: u32 = EXT4_RO_COMPAT_EXTRA_ISIZE | EXT4_RO_COMPAT_METADATA_CSUM;
+
+/// The exact feature set TROE's own image recipe produces.
+#[cfg(test)]
 const EXT4_FEATURE_COMPAT: u32 = 0x0000_0004 | 0x0000_0008;
-const EXT4_FEATURE_INCOMPAT: u32 = 0x0000_0002 | 0x0000_0040;
-const EXT4_FEATURE_RO_COMPAT: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0040 | 0x0000_0400;
+#[cfg(test)]
+const EXT4_FEATURE_INCOMPAT: u32 = EXT4_REQUIRED_INCOMPAT;
+#[cfg(test)]
+const EXT4_FEATURE_RO_COMPAT: u32 =
+    EXT4_RO_COMPAT_SPARSE_SUPER | EXT4_RO_COMPAT_LARGE_FILE | EXT4_REQUIRED_RO_COMPAT;
 const CRC32C_POLYNOMIAL: u32 = 0x82f6_3b78;
 const HARD_MAX_GROUPS: u32 = 32;
 const HARD_MAX_INODES_PER_OPERATION: u32 = 64;
@@ -235,6 +284,9 @@ struct Layout {
     device_blocks_per_fs_block: u32,
     checksum_seed: u32,
     uuid: Ext4Uuid,
+    /// Cleared when the volume declares a read-only-compatible feature this
+    /// provider cannot maintain, so foreign media stays readable but untouched.
+    writable: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -567,6 +619,9 @@ impl<D: BlockDevice> Ext4<D> {
     }
 
     fn ensure_writable(&self) -> Result<(), FsError> {
+        if !self.layout.writable {
+            return Err(FsError::ReadOnly);
+        }
         let info = self.region.info();
         if info.access() != BlockAccess::ReadWrite {
             return Err(FsError::ReadOnly);
@@ -2994,17 +3049,30 @@ fn parse_superblock(
         || read_u16(superblock, 88)? != EXT4_INODE_BYTES_U16
         || !matches!(read_u16(superblock, 254)?, 0 | EXT4_GROUP_DESC_BYTES_U16)
         || superblock[373] != 1
-        || read_u32(superblock, 92)? != EXT4_FEATURE_COMPAT
-        || read_u32(superblock, 100)? != EXT4_FEATURE_RO_COMPAT
     {
         return Err(FsError::Unsupported);
     }
-    // Every incompatible feature outside the recovery flag must still match
-    // exactly, so an unknown bit is refused on both paths.
+    let compat = read_u32(superblock, 92)?;
     let incompat = read_u32(superblock, 96)?;
-    if incompat & !EXT4_FEATURE_INCOMPAT_RECOVER != EXT4_FEATURE_INCOMPAT {
+    let ro_compat = read_u32(superblock, 100)?;
+    // An unknown incompatible feature changes structure this provider would
+    // misread, so the volume is refused outright.
+    if incompat & !EXT4_KNOWN_INCOMPAT != 0
+        || incompat & EXT4_REQUIRED_INCOMPAT != EXT4_REQUIRED_INCOMPAT
+    {
         return Err(FsError::Unsupported);
     }
+    // This provider validates metadata checksums and the extended inode area,
+    // so it cannot read a volume that lacks them.
+    if ro_compat & EXT4_REQUIRED_RO_COMPAT != EXT4_REQUIRED_RO_COMPAT {
+        return Err(FsError::Unsupported);
+    }
+    // An unknown read-only-compatible feature only affects what a writer must
+    // maintain, so the volume stays readable and is never mutated.
+    // A hashed directory index must stay consistent with the entries it
+    // describes. Until this provider maintains one, such a volume is readable
+    // but never mutated.
+    let writable = ro_compat & !EXT4_KNOWN_RO_COMPAT == 0 && compat & EXT4_COMPAT_DIR_INDEX == 0;
     let needs_recovery = incompat & EXT4_FEATURE_INCOMPAT_RECOVER != 0;
     admit_state(read_u16(superblock, 58)?, needs_recovery, admission)?;
     let stored_checksum = read_u32(superblock, 1020)?;
@@ -3072,6 +3140,7 @@ fn parse_superblock(
         device_blocks_per_fs_block,
         checksum_seed: crc32c(u32::MAX, &uuid.0),
         uuid,
+        writable,
     })
 }
 
@@ -3598,11 +3667,12 @@ mod tests {
 
     use super::{
         BlockDevice, BlockRegion, CRC32C_POLYNOMIAL, EXT4_BLOCK_BYTES, EXT4_BLOCK_BYTES_U32,
-        EXT4_BLOCK_BYTES_U64, EXT4_EXTENT_TAIL_OFFSET, EXT4_EXTENTS_FL, EXT4_FAST_SYMLINK_BYTES,
-        EXT4_FEATURE_COMPAT, EXT4_FEATURE_INCOMPAT, EXT4_FEATURE_RO_COMPAT, EXT4_INODE_BYTES,
-        EXT4_JOURNAL_INO, EXT4_ROOT_INO, EXT4_VALID_FS, Ext4, Ext4Limits, Extent, FsError,
-        NodeKind, ReadOnlyFileSystem, RecoveryOutcome, crc32c, parse_extent_leaf, parse_extents,
-        read_u16, read_u32,
+        EXT4_BLOCK_BYTES_U64, EXT4_COMPAT_DIR_INDEX, EXT4_EXTENT_TAIL_OFFSET, EXT4_EXTENTS_FL,
+        EXT4_FAST_SYMLINK_BYTES, EXT4_FEATURE_COMPAT, EXT4_FEATURE_INCOMPAT,
+        EXT4_FEATURE_RO_COMPAT, EXT4_INCOMPAT_EXTENTS, EXT4_INODE_BYTES, EXT4_JOURNAL_INO,
+        EXT4_RO_COMPAT_METADATA_CSUM, EXT4_ROOT_INO, EXT4_VALID_FS, Ext4, Ext4Limits, Extent,
+        FsError, NodeKind, ReadOnlyFileSystem, RecoveryOutcome, crc32c, parse_extent_leaf,
+        parse_extents, read_u16, read_u32,
     };
 
     const DEVICE_BLOCK_BYTES_U32: u32 = 512;
@@ -4568,11 +4638,27 @@ mod tests {
         refresh_super_checksum(&mut dirty);
         assert!(matches!(mount(dirty), Err(FsError::Corrupt)));
 
+        // An incompatible feature this provider does not implement changes
+        // structure it would misread, so the volume is refused outright.
+        // 0x10000 is `encrypt`.
         let mut feature = valid_device();
         let superblock = &mut feature.blocks.get_mut(&0).ok_or(FsError::Io)?[1024..2048];
-        put_u32(superblock, 96, EXT4_FEATURE_INCOMPAT | 0x80);
+        put_u32(superblock, 96, EXT4_FEATURE_INCOMPAT | 0x0001_0000);
         refresh_super_checksum(&mut feature);
         assert!(matches!(mount(feature), Err(FsError::Unsupported)));
+
+        // Dropping a structural feature this provider depends on is also
+        // refused rather than guessed at.
+        for (offset, value) in [
+            (96_usize, EXT4_FEATURE_INCOMPAT & !EXT4_INCOMPAT_EXTENTS),
+            (100, EXT4_FEATURE_RO_COMPAT & !EXT4_RO_COMPAT_METADATA_CSUM),
+        ] {
+            let mut missing = valid_device();
+            let superblock = &mut missing.blocks.get_mut(&0).ok_or(FsError::Io)?[1024..2048];
+            put_u32(superblock, offset, value);
+            refresh_super_checksum(&mut missing);
+            assert!(matches!(mount(missing), Err(FsError::Unsupported)));
+        }
 
         let mut tree = valid_device();
         put_u16(
@@ -4581,6 +4667,46 @@ mod tests {
             1,
         );
         assert!(matches!(mount(tree), Err(FsError::Corrupt)));
+        Ok(())
+    }
+
+    #[test]
+    fn an_unknown_read_only_feature_keeps_the_volume_readable_but_untouched() -> Result<(), FsError>
+    {
+        // `bigalloc` (0x200) changes only how a writer must allocate, so the
+        // volume must stay readable and must never be mutated.
+        let mut device = valid_device();
+        let superblock = &mut device.blocks.get_mut(&0).ok_or(FsError::Io)?[1024..2048];
+        put_u32(superblock, 100, EXT4_FEATURE_RO_COMPAT | 0x0000_0200);
+        refresh_super_checksum(&mut device);
+
+        let mut ext4 = mount_writable(device)?;
+        let mut bytes = [0_u8; 13];
+        assert_eq!(ext4.read_file("/hello", 0, &mut bytes)?, 13);
+        assert_eq!(
+            ext4.write_file("/blocked.txt", b"nope"),
+            Err(FsError::ReadOnly),
+            "an unmaintainable feature must block every mutation"
+        );
+        assert_eq!(ext4.remove_file("/hello"), Err(FsError::ReadOnly));
+        assert_eq!(ext4.create_directory("/nope"), Err(FsError::ReadOnly));
+        Ok(())
+    }
+
+    #[test]
+    fn a_hashed_directory_index_is_readable_but_not_yet_mutable() -> Result<(), FsError> {
+        let mut device = valid_device();
+        let superblock = &mut device.blocks.get_mut(&0).ok_or(FsError::Io)?[1024..2048];
+        put_u32(superblock, 92, EXT4_FEATURE_COMPAT | EXT4_COMPAT_DIR_INDEX);
+        refresh_super_checksum(&mut device);
+
+        let mut ext4 = mount_writable(device)?;
+        let mut bytes = [0_u8; 13];
+        assert_eq!(ext4.read_file("/hello", 0, &mut bytes)?, 13);
+        assert_eq!(
+            ext4.write_file("/blocked.txt", b"nope"),
+            Err(FsError::ReadOnly)
+        );
         Ok(())
     }
 
