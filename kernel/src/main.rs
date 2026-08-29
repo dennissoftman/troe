@@ -56,6 +56,7 @@ mod firmware {
     use troe_driver::{InputEvent, InputQueueConfig, InputQueueStats, InputSource};
     use troe_ext4::Ext4Limits;
     use troe_fat::Fat32Limits;
+    use troe_fmt_prgn::RegionSelector;
     use troe_fs_api::{FILE_IO_BUFFER_BYTES, FileSystemProvider, FsError, NodeKind, canonicalize};
     use troe_gpt::{GptGuid, GptLimits, discover};
     use troe_identity::IdentityLimits;
@@ -75,7 +76,6 @@ mod firmware {
         build_dhcp_discover, build_dhcp_request, build_icmp_echo, build_tcp, build_udp, parse_arp,
         parse_dhcp, parse_icmp_echo, parse_tcp, parse_udp,
     };
-    use troe_persist::{DualSlotStore, RegionSelector, TRANSACTION_BLOCKS};
     use troe_process::{
         ChildLifecycle, ChildTable, MAX_CHILDREN_PER_OWNER, MAX_PIPES_PER_OWNER, OwnerId,
         PipeDirection, PipeEndpoint, PipeTable, ProcessError as ChildProcessError,
@@ -107,6 +107,7 @@ mod firmware {
         InputDecoder, KeyEvent, KeyboardConfig, LineEditor, Ps2Set1Decoder, TextConsole,
         TextConsoleConfig,
     };
+    use troe_txslot::{DualSlotStore, TRANSACTION_BLOCKS};
     use troe_vfs::{Namespace, RamFsQuota};
     use uefi::boot;
     use uefi::mem::memory_map::{MemoryMap, MemoryMapOwned};

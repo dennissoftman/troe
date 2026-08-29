@@ -195,6 +195,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "troe-fmt-prgn"
+version = "0.1.0"
+dependencies = [
+ "troe-checksum",
+]
+
+[[package]]
 name = "troe-fs-api"
 version = "0.1.0"
 
@@ -236,6 +243,7 @@ dependencies = [
  "troe-driver",
  "troe-ext4",
  "troe-fat",
+ "troe-fmt-prgn",
  "troe-fs-api",
  "troe-gpt",
  "troe-identity",
@@ -243,7 +251,6 @@ dependencies = [
  "troe-memory",
  "troe-mount",
  "troe-net",
- "troe-persist",
  "troe-process",
  "troe-random",
  "troe-shell",
@@ -252,6 +259,7 @@ dependencies = [
  "troe-supervisor",
  "troe-task",
  "troe-terminal",
+ "troe-txslot",
  "troe-vfs",
  "uefi",
 ]
@@ -329,14 +337,6 @@ name = "troe-net"
 version = "0.1.0"
 
 [[package]]
-name = "troe-persist"
-version = "0.1.0"
-dependencies = [
- "troe-block",
- "troe-checksum",
-]
-
-[[package]]
 name = "troe-platform"
 version = "0.1.0"
 
@@ -370,7 +370,7 @@ dependencies = [
  "troe-block",
  "troe-checksum",
  "troe-fs-api",
- "troe-persist",
+ "troe-txslot",
  "troe-vfs",
 ]
 
@@ -408,6 +408,14 @@ name = "troe-terminal"
 version = "0.1.0"
 dependencies = [
  "troe-core",
+]
+
+[[package]]
+name = "troe-txslot"
+version = "0.1.0"
+dependencies = [
+ "troe-block",
+ "troe-checksum",
 ]
 
 [[package]]

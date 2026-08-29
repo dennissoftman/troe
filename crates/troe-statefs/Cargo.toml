@@ -10,7 +10,7 @@ license.workspace = true
 troe-block = { path = "../troe-block" }
 troe-checksum = { path = "../troe-checksum" }
 troe-fs-api = { path = "../troe-fs-api" }
-troe-persist = { path = "../troe-persist" }
+troe-txslot = { path = "../troe-txslot" }
 
 [lints]
 workspace = true

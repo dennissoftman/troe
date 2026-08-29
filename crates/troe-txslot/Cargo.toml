@@ -1,6 +1,6 @@
 [package]
-name = "troe-persist"
-description = "Bounded crash-consistent dual-slot persistence transactions for TROE"
+name = "troe-txslot"
+description = "Bounded crash-consistent dual-slot block transactions for TROE"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

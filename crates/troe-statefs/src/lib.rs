@@ -10,7 +10,7 @@ use alloc::string::String;
 use alloc::{vec, vec::Vec};
 use troe_block::{BlockDevice, BlockRegion};
 use troe_fs_api::{DirEntry, FileMetadata, FileSystemProvider, FsError, NodeKind, ProviderListing};
-use troe_persist::{DualSlotStore, PersistError};
+use troe_txslot::{DualSlotStore, PersistError};
 
 /// Product-independent state-filesystem image identifier.
 pub const STATEFS_MAGIC: [u8; 8] = *b"STFSv1\0\0";
@@ -318,7 +318,7 @@ mod tests {
         BlockAccess, BlockDevice, BlockError, BlockGeometry, BlockLimits, BlockRegion,
     };
     use troe_fs_api::{FileSystemProvider, FsError};
-    use troe_persist::DualSlotStore;
+    use troe_txslot::DualSlotStore;
     use troe_vfs::{Namespace, RamFsQuota};
 
     #[derive(Clone)]
