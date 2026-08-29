@@ -2255,7 +2255,7 @@ mod firmware {
         let mut prior = [0_u8; 8];
         let next = match statefs.read_file(STATE_PATH, 0, &mut prior) {
             Ok(8) => u64::from_le_bytes(prior).checked_add(1).ok_or(())?,
-            Err(troe_vfs::FsError::NotFound) => 1,
+            Err(troe_fs_api::FsError::NotFound) => 1,
             _ => return Err(()),
         };
         statefs
@@ -5902,7 +5902,7 @@ mod firmware {
                 .borrow_mut()
                 .metadata(cwd, path)
                 .map_err(|error| match error {
-                    troe_vfs::FsError::NotFound => ReplyStatus::NotFound,
+                    troe_fs_api::FsError::NotFound => ReplyStatus::NotFound,
                     _ => ReplyStatus::Failure,
                 })?;
             if metadata.kind != NodeKind::File {
@@ -13978,8 +13978,8 @@ mod firmware {
             let path = catalog_path.as_deref().unwrap_or(command);
             let metadata = match namespace.borrow_mut().metadata(cwd, path) {
                 Ok(metadata) => metadata,
-                Err(troe_vfs::FsError::NotFound) if !explicit_path => return None,
-                Err(troe_vfs::FsError::NotFound) => {
+                Err(troe_fs_api::FsError::NotFound) if !explicit_path => return None,
+                Err(troe_fs_api::FsError::NotFound) => {
                     return Some(command_application_status_error(
                         stderr,
                         command,
