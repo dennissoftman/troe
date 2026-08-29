@@ -8,9 +8,9 @@ host stdin/stdout ───────────┐                 ┌─ ho
 serial / PS/2 → IRQ → bounded queue → editor ─┘  └─ UART + GOP text console
 ```
 
-The shell owns parsing, pipelines, streamed file redirection, completion
-orchestration, cwd, session job control, service control, and nine
-non-shadowable intrinsics. Portable `troe-completion` descriptors select
+The shell owns parsing, short-circuit logical lists, pipelines, streamed file
+redirection, completion orchestration, cwd, session job control, service
+control, and nine non-shadowable intrinsics. Portable `troe-completion` descriptors select
 trusted semantic resolvers for application arguments without executing the
 application or moving replacement, quoting, sorting, and budget policy out of
 the shell.
@@ -44,8 +44,8 @@ firmware fails before device publication or volatile I/O.
    same event type outside interrupt context.
 2. The shell crate tokenizes iteratively. Single and double quotes group literal
    bytes; no expansion, recursion, substitution, environment lookup, or
-   globbing occurs. Unquoted `<`, `>`, and `>>` select bounded-memory file
-   streams.
+   globbing occurs. Unquoted `&&` and `||` form left-associative short-circuit
+   lists; `<`, `>`, and `>>` select bounded-memory file streams.
 3. The pipeline executor protects shell intrinsics, then resolves the exact KEX
    command path. Absence reports an unavailable application and never selects
    privileged utility behavior. KEX receives bounded stdin/stdout/stderr streams

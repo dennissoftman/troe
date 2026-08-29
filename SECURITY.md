@@ -3,8 +3,9 @@
 ## Current boundary
 
 The hosted model has the security properties of its host process and models
-only parsing, sequential pipelines, redirection, completion, session state, and
-the grammar and authority checks for the nine shell intrinsics. It does not
+only parsing, short-circuit logical lists, sequential pipelines, redirection,
+completion, session state, and the grammar and authority checks for the nine
+shell intrinsics. It does not
 execute KEX applications or model native isolation. The native image exits UEFI
 boot services. Every ordinary command is a validated KEX application with a
 fresh ring-3/EL0 root, explicit typed handles, bounded memory, contained fault
@@ -29,7 +30,9 @@ never executes the ordinary application.
 
 ## Invariants enforced now
 
-- command input: 512 bytes, 128 arguments per stage, 255 stages;
+- command input: 512 bytes, 128 arguments per stage, 255 stages per pipeline;
+- shell scripts: 1,024 submitted lines, 64 KiB source, four nesting levels, and
+  one shared 1,024-pipeline execution budget across nested scripts;
 - sequential intermediate pipeline: 1 MiB and atomic overflow failure;
 - paths: 256 bytes, 64-byte names, 16 components, no NUL or root escape;
 - RAMFS: explicit total-byte, file-byte, and node limits;

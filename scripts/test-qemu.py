@@ -1206,11 +1206,23 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
         command_timeout,
         absent=("should-not-execute\n",),
     )
+    session.declined_command(
+        "./echo-copy logical-declined && echo should-not-execute",
+        cwd,
+        command_timeout,
+        absent=("logical-declined\n", "should-not-execute\n"),
+    )
     session.confirmed_command(
         "./echo-copy shared-relative-kex",
         cwd,
         command_timeout,
         contains=("shared-relative-kex\n",),
+    )
+    session.confirmed_command(
+        "./echo-copy logical-path && echo logical-followup",
+        cwd,
+        command_timeout,
+        contains=("logical-path\n", "logical-followup\n"),
     )
     session.confirmed_command(
         "/vol/shared/echo-copy shared-absolute-kex",
@@ -1579,6 +1591,26 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
         contains=("2 3 14\n",),
     )
     session.command(
+        "missing-logical && echo should-not-run || echo logical-fallback",
+        cwd,
+        command_timeout,
+        contains=("missing-logical: unknown command", "logical-fallback\n"),
+        absent=("should-not-run\n",),
+    )
+    session.command(
+        "echo logical-first || echo should-not-run && echo logical-tail",
+        cwd,
+        command_timeout,
+        contains=("logical-first\n", "logical-tail\n"),
+        absent=("should-not-run\n",),
+    )
+    session.command(
+        "echo 'quoted && literal || operators'",
+        cwd,
+        command_timeout,
+        contains=("quoted && literal || operators\n",),
+    )
+    session.command(
         r"printf 'alpha beta\nbeta gamma\n' | sed 's/beta/B/g'",
         cwd,
         command_timeout,
@@ -1689,6 +1721,19 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
         command_timeout,
         contains=("stdin-script\n",),
     )
+    session.command(
+        r"printf 'missing-script && echo should-not-run || echo script-fallback\n' > /tmp/logical.sh",
+        cwd,
+        command_timeout,
+    )
+    session.command(
+        "sh /tmp/logical.sh",
+        cwd,
+        command_timeout,
+        contains=("missing-script: unknown command", "script-fallback\n"),
+        absent=("should-not-run\n",),
+    )
+    session.command("rm /tmp/logical.sh", cwd, command_timeout)
     session.command(
         r"printf 'cd /man\npwd\n' > /tmp/session.sh",
         cwd,

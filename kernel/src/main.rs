@@ -82,7 +82,7 @@ mod firmware {
         CompletionConfig, CompletionEnvironment, CompletionVisitor, DynamicCompletionDomain,
         ExecutionPlacement, ExternalCommand, ExternalCommandReference, JobControl, MachineAction,
         ServiceControl, SharedNamespace, Shell, external_command_reference, format_memory_report,
-        parse_line,
+        parse_command_list,
     };
     #[cfg(feature = "acceptance-probes")]
     use troe_statefs::STATE_PATH;
@@ -10412,7 +10412,7 @@ mod firmware {
             let Ok(line) = shell_script::decode_submit_line(request.payload()) else {
                 return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
             };
-            if parse_line(line.source()).is_err() {
+            if parse_command_list(line.source()).is_err() {
                 return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
             }
             let Ok(mut script) = self.script.try_borrow_mut() else {
@@ -14881,10 +14881,14 @@ mod firmware {
         completion_config: CompletionConfig,
         console: &mut dyn Output,
     ) -> Result<bool, ()> {
-        let Ok(pipeline) = parse_line(line) else {
+        let Ok(command_list) = parse_command_list(line) else {
             return Ok(true);
         };
-        for stage in pipeline.stages {
+        for stage in command_list
+            .entries
+            .into_iter()
+            .flat_map(|entry| entry.pipeline.stages)
+        {
             let Some(command) = stage.words.first() else {
                 continue;
             };

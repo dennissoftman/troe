@@ -314,7 +314,9 @@ on a physical console.
 The release 0.1 shell grammar is intentionally small:
 
 ```text
-line        := whitespace? pipeline whitespace? background?
+line        := whitespace? command-list whitespace? background?
+command-list := pipeline (whitespace? logical whitespace? pipeline)*
+logical     := "&&" | "||"
 pipeline    := stage (whitespace? "|" whitespace? stage)*
 stage       := word (whitespace (word | redirection))*
 background  := "&"
@@ -333,9 +335,11 @@ perform interpolation. The parser MUST:
 
 There are no shell expansions, variables, or command substitution. Pipelines
 contain at most 255 sequential stages and each intermediate stream is capped
-at 1 MiB; overflow fails explicitly. A final unquoted `&` is accepted only for
-one external-command stage. Background standard input is EOF and output/error
-enter a bounded 64 KiB recent log, so asynchronous bytes do not corrupt the
+at 1 MiB; overflow fails explicitly. Unquoted `&&` and `||` have equal
+precedence, associate left to right, and short-circuit on success and
+non-success respectively. A final unquoted `&` is accepted only for one
+external-command stage. Background standard input is EOF and output/error enter
+a bounded 64 KiB recent log, so asynchronous bytes do not corrupt the
 interactive prompt. Concurrent background pipelines are not part of this
 grammar.
 

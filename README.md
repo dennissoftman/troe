@@ -43,8 +43,8 @@ measurement.
 - Native UEFI boots on x86-64 and AArch64.
 - Serial and framebuffer consoles with UTF-8 line editing, history,
   package-owned typed completion, literal single/double quoting, pipelines, and
-  streamed `<`, `>`, and `>>` redirection, plus session-owned background jobs
-  and bounded logs.
+  short-circuit `&&`/`||`, and streamed `<`, `>`, and `>>` redirection, plus
+  session-owned background jobs and bounded logs.
 - SCFG boot-service supervision with stable service names, restart/backoff
   policy, `svc` control, and an example long-running SNTP clock service.
 - A bounded VFS with KEFS, a default read-write persistent ext4 volume at
@@ -253,9 +253,9 @@ raw filesystem access.
 
 [`apps/sh`](apps/sh) transactionally stages a bounded UTF-8 command file through
 the typed shell-script sidecar, then the owning session executes each validated
-physical line with the normal TROE pipeline and redirection grammar. The
-current grammar omits variables, control flow, substitution, multiline
-constructs, and direct shebang execution.
+physical line with the normal TROE logical-list, pipeline, and redirection
+grammar. The current grammar omits variables, control-flow blocks, substitution,
+multiline constructs, and direct shebang execution.
 
 KEX images are statically linked. A bounded, single-package dynamic
 linking design for reusable libc and language runtimes is tracked in
