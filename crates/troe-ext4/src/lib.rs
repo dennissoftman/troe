@@ -6,6 +6,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod htree;
 mod journal;
 
 use alloc::string::{String, ToString};
@@ -2362,15 +2363,173 @@ impl<D: BlockDevice> Ext4<D> {
         }
     }
 
+    /// Logical blocks that may hold ordinary records for this directory.
+    ///
+    /// A hashed directory keeps records only in its leaves; its root and
+    /// interior nodes hold the index instead.
+    fn record_blocks(&mut self, directory: &Inode) -> Result<Vec<u32>, FsError> {
+        if directory.indexed {
+            return self.hashed_leaf_blocks(directory);
+        }
+        let block_count = u32::try_from(directory.size / self.layout.block_bytes_u64)
+            .map_err(|_| FsError::Overflow)?;
+        let mut blocks = Vec::new();
+        blocks
+            .try_reserve_exact(usize::try_from(block_count).map_err(|_| FsError::Overflow)?)
+            .map_err(|_| FsError::NoSpace)?;
+        for logical in 0..block_count {
+            blocks.push(logical);
+        }
+        Ok(blocks)
+    }
+
+    /// The one leaf a name belongs in, chosen by the directory's own index.
+    ///
+    /// Placing a record anywhere else would leave the index describing the
+    /// wrong leaf, so a name whose hash cannot be reproduced is refused.
+    fn hashed_target_leaf(&mut self, directory: &Inode, name: &str) -> Result<u32, FsError> {
+        let hashing = self.directory_hash()?;
+        let seed = self.inode_checksum_seed(directory);
+        let root_block = self.directory_block(directory, 0)?;
+        let root = htree::parse_root(&root_block, seed, crc32c)?;
+        let value = hashing.hash(name.as_bytes(), root.hash_version)?;
+        let select = |entries: &[htree::DxEntry]| -> Result<u32, FsError> {
+            let mut chosen = entries.first().ok_or(FsError::Corrupt)?.block;
+            for entry in entries {
+                if entry.hash <= value {
+                    chosen = entry.block;
+                } else {
+                    break;
+                }
+            }
+            Ok(chosen)
+        };
+        let first = select(&root.entries)?;
+        if root.indirect_levels == 0 {
+            return Ok(first);
+        }
+        let node_block = self.directory_block(directory, first)?;
+        let node = htree::parse_node(&node_block, seed, crc32c)?;
+        select(&node)
+    }
+
+    /// Read the filesystem-wide inputs to a directory name hash.
+    fn directory_hash(&mut self) -> Result<htree::DxHash, FsError> {
+        let (holder, offset) = self.superblock_location();
+        let block = self.read_fs_block(holder)?;
+        let superblock = block.get(offset..offset + 1024).ok_or(FsError::Corrupt)?;
+        htree::DxHash::parse(superblock)
+    }
+
+    /// Seed every per-inode metadata checksum in this directory is built from.
+    fn inode_checksum_seed(&self, inode: &Inode) -> u32 {
+        crc32c(
+            crc32c(self.layout.checksum_seed, &inode.number.to_le_bytes()),
+            &inode.generation.to_le_bytes(),
+        )
+    }
+
+    /// Read one logical block of a directory.
+    fn directory_block(&mut self, inode: &Inode, logical: u32) -> Result<Vec<u8>, FsError> {
+        let (physical, unwritten) = map_block(inode, logical)?.ok_or(FsError::Corrupt)?;
+        if unwritten {
+            return Err(FsError::Corrupt);
+        }
+        self.read_fs_block(physical)
+    }
+
+    /// Collect the logical leaf blocks a hashed directory keeps its records in.
+    fn hashed_leaf_blocks(&mut self, inode: &Inode) -> Result<Vec<u32>, FsError> {
+        let seed = self.inode_checksum_seed(inode);
+        let root_block = self.directory_block(inode, 0)?;
+        let root = htree::parse_root(&root_block, seed, crc32c)?;
+        let ceiling =
+            usize::try_from(self.limits.max_directory_blocks()).map_err(|_| FsError::Overflow)?;
+
+        let mut leaves = Vec::new();
+        if root.indirect_levels == 0 {
+            leaves
+                .try_reserve_exact(root.entries.len())
+                .map_err(|_| FsError::NoSpace)?;
+            for entry in &root.entries {
+                leaves.push(entry.block);
+            }
+        } else {
+            for entry in &root.entries {
+                let node_block = self.directory_block(inode, entry.block)?;
+                let node = htree::parse_node(&node_block, seed, crc32c)?;
+                if leaves
+                    .len()
+                    .checked_add(node.len())
+                    .is_none_or(|total| total > ceiling)
+                {
+                    return Err(FsError::NoSpace);
+                }
+                leaves
+                    .try_reserve(node.len())
+                    .map_err(|_| FsError::NoSpace)?;
+                for child in &node {
+                    leaves.push(child.block);
+                }
+            }
+        }
+        if leaves.is_empty() || leaves.len() > ceiling {
+            return Err(FsError::NoSpace);
+        }
+        Ok(leaves)
+    }
+
+    /// Enumerate a hashed directory by reading every leaf the index names.
+    ///
+    /// The root block holds `.` and `..` in records whose lengths hide the
+    /// index from an unaware reader, so those two are taken directly and every
+    /// other record comes from a leaf.
+    fn read_hashed_directory(&mut self, inode: &Inode) -> Result<Vec<DirectoryEntry>, FsError> {
+        let root_block = self.directory_block(inode, 0)?;
+        let dot = read_u32(&root_block, 0)?;
+        let dot_dot = read_u32(&root_block, 12)?;
+        if dot != inode.number || dot_dot == 0 || dot_dot > self.layout.inodes {
+            return Err(FsError::Corrupt);
+        }
+        let leaves = self.hashed_leaf_blocks(inode)?;
+
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(
+                usize::try_from(self.limits.max_directory_entries())
+                    .map_err(|_| FsError::Overflow)?,
+            )
+            .map_err(|_| FsError::NoSpace)?;
+        entries.push(DirectoryEntry {
+            inode: dot,
+            name: ".".to_string(),
+            kind: NodeKind::Directory,
+        });
+        entries.push(DirectoryEntry {
+            inode: dot_dot,
+            name: "..".to_string(),
+            kind: NodeKind::Directory,
+        });
+        for logical in leaves {
+            let block = self.directory_block(inode, logical)?;
+            verify_directory_checksum(self.layout.checksum_seed, inode, &block)?;
+            parse_directory_block(
+                &block,
+                inode.number,
+                self.layout.inodes,
+                self.limits,
+                &mut entries,
+            )?;
+        }
+        Ok(entries)
+    }
+
     fn read_directory(&mut self, inode: &Inode) -> Result<Vec<DirectoryEntry>, FsError> {
         if inode.kind != NodeKind::Directory {
             return Err(FsError::WrongType);
         }
-        // A hashed directory stores its records in a tree whose interior blocks
-        // do not follow the linear layout, so it is refused explicitly instead
-        // of being misparsed.
         if inode.indexed {
-            return Err(FsError::Unsupported);
+            return self.read_hashed_directory(inode);
         }
         if inode.size == 0 || !inode.size.is_multiple_of(self.layout.block_bytes_u64) {
             return Err(FsError::Corrupt);
@@ -2520,9 +2679,18 @@ impl<D: BlockDevice> Ext4<D> {
             NodeKind::Directory => EXT4_FT_DIR,
         };
         let required = directory_record_bytes(name.len())?;
-        let block_count = u32::try_from(directory.size / self.layout.block_bytes_u64)
-            .map_err(|_| FsError::Overflow)?;
-        for logical in 0..block_count {
+        // An indexed directory admits a name only into the leaf its own index
+        // maps that name's hash to.
+        let candidates = if directory.indexed {
+            let leaf = self.hashed_target_leaf(directory, name)?;
+            let mut only = Vec::new();
+            only.try_reserve_exact(1).map_err(|_| FsError::NoSpace)?;
+            only.push(leaf);
+            only
+        } else {
+            self.record_blocks(directory)?
+        };
+        for logical in candidates {
             let (physical, false) = map_block(directory, logical)?.ok_or(FsError::Corrupt)? else {
                 return Err(FsError::Corrupt);
             };
@@ -2536,6 +2704,12 @@ impl<D: BlockDevice> Ext4<D> {
             )? {
                 return Ok(());
             }
+        }
+        if directory.indexed {
+            // The target leaf is full. Splitting it means rewriting the index,
+            // which this provider does not do, so the insert is refused rather
+            // than placed where the index cannot find it.
+            return Err(FsError::NoSpace);
         }
 
         let zeroes = alloc::vec![0_u8; self.layout.block_bytes];
@@ -2594,9 +2768,9 @@ impl<D: BlockDevice> Ext4<D> {
         if matching.next().is_some() {
             return Err(FsError::Corrupt);
         }
-        let block_count = u32::try_from(directory.size / self.layout.block_bytes_u64)
-            .map_err(|_| FsError::Overflow)?;
-        for logical in 0..block_count {
+        // Removing a record leaves the index still describing its leaf, so no
+        // index rewrite is needed.
+        for logical in self.record_blocks(directory)? {
             let (physical, false) = map_block(directory, logical)?.ok_or(FsError::Corrupt)? else {
                 return Err(FsError::Corrupt);
             };
@@ -2641,6 +2815,11 @@ impl<D: BlockDevice> Ext4<D> {
         directory: &Inode,
         parent_number: u32,
     ) -> Result<(), FsError> {
+        // Records live in leaf blocks the index maps by name hash, so a linear
+        // insert or removal would leave the index describing the wrong leaf.
+        if directory.indexed {
+            return Err(FsError::Unsupported);
+        }
         if directory.kind != NodeKind::Directory {
             return Err(FsError::WrongType);
         }
@@ -3955,6 +4134,7 @@ fn crc32c(seed: u32, bytes: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use crate::{htree, parse_directory_block};
     use alloc::collections::BTreeMap;
     use alloc::format;
     use alloc::string::{String, ToString};
@@ -5006,7 +5186,7 @@ mod tests {
     }
 
     #[test]
-    fn a_hashed_index_blocks_only_the_indexed_directory() -> Result<(), FsError> {
+    fn a_directory_claiming_an_index_it_lacks_is_refused() -> Result<(), FsError> {
         // The feature only says indexed directories may exist, so a volume
         // carrying it stays writable.
         let mut device = valid_device();
@@ -5016,8 +5196,8 @@ mod tests {
         let mut ext4 = mount_writable(device)?;
         ext4.write_file("/created.txt", b"still writable")?;
 
-        // A directory that actually carries an index stores its records in a
-        // tree this provider does not parse, so it is refused explicitly.
+        // A directory flagged as indexed whose block is an ordinary linear
+        // directory is refused rather than misread as an index.
         let mut indexed = valid_device();
         let superblock = &mut indexed.blocks.get_mut(&0).ok_or(FsError::Io)?[1024..2048];
         put_u32(superblock, 92, EXT4_FEATURE_COMPAT | EXT4_COMPAT_DIR_INDEX);
@@ -5030,7 +5210,7 @@ mod tests {
         let root = table.get_mut(256..512).ok_or(FsError::Io)?;
         put_u32(root, 32, read_u32(root, 32)? | EXT4_INDEX_FL);
         refresh_test_inode_checksum(root, EXT4_ROOT_INO, ROOT_GENERATION, seed);
-        assert!(matches!(mount(indexed), Err(FsError::Unsupported)));
+        assert!(matches!(mount(indexed), Err(FsError::Corrupt)));
         Ok(())
     }
 
@@ -5632,6 +5812,212 @@ mod tests {
             .read_file("/created.txt", 0, &mut bytes)
             .map_err(|error| format!("cannot read back at 1 KiB blocks: {error:?}"))?;
         assert_eq!(&bytes[..read], b"written at 1 KiB blocks\n");
+        Ok(())
+    }
+
+    /// Build a volume whose large directory carries a real hashed index.
+    ///
+    /// `mke2fs -d` writes linear directories at any size, so `e2fsck -D` is
+    /// used to reindex them exactly as a Linux host would.
+    fn hashed_directory_image(
+        directory: &Path,
+        mke2fs: &Path,
+        e2fsck: &Path,
+        names: usize,
+    ) -> Result<PathBuf, String> {
+        let image = directory.join("hashed.ext4");
+        File::create(&image)
+            .and_then(|file| file.set_len(256 * 1024 * 1024))
+            .map_err(|error| error.to_string())?;
+        let source = directory.join("tree");
+        let many = source.join("many");
+        fs::create_dir_all(&many).map_err(|error| error.to_string())?;
+        for index in 0..names {
+            fs::write(many.join(format!("file-{index:05}.txt")), b"x")
+                .map_err(|error| error.to_string())?;
+        }
+        let format = Command::new(mke2fs)
+            .args(["-q", "-F", "-t", "ext4", "-b", "4096", "-d"])
+            .arg(&source)
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&format, "mke2fs hashed")?;
+        // `-D` reindexes directories; it reports modification, not failure.
+        let reindex = Command::new(e2fsck)
+            .args(["-fD", "-y"])
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !matches!(reindex.status.code(), Some(0 | 1)) {
+            return Err(format!("e2fsck -D failed: {:?}", reindex.status));
+        }
+        Ok(image)
+    }
+
+    #[test]
+    fn reads_a_hashed_directory_through_its_index() -> Result<(), String> {
+        const NAMES: usize = 2000;
+        let Some(mke2fs) = e2fs_tool("mke2fs") else {
+            return unavailable_tool("mke2fs");
+        };
+        let Some(e2fsck) = e2fs_tool("e2fsck") else {
+            return unavailable_tool("e2fsck");
+        };
+        let temporary = TestDirectory::create("ext4-hashed")?;
+        let image = hashed_directory_image(temporary.path(), &mke2fs, &e2fsck, NAMES)?;
+        let limits = Ext4Limits::new(HARD_MAX_GROUPS, 64, 256, 4096, 1 << 40, 1024 * 1024, 64)
+            .map_err(|error| format!("invalid limits: {error:?}"))?;
+        let mut ext4 = mount_file_with_limits(&image, limits)?;
+
+        // Every name the index describes must be enumerated exactly once.
+        let mut seen = 0_usize;
+        let mut cursor = 0_u64;
+        loop {
+            let page = ext4
+                .list("/many", cursor, 64, 64)
+                .map_err(|error| format!("cannot list a hashed directory: {error:?}"))?;
+            seen += page.entries.len();
+            match page.next_cursor {
+                Some(next) => cursor = next,
+                None => break,
+            }
+        }
+        assert_eq!(seen, NAMES, "the index must enumerate every name once");
+
+        // A name resolves through the same leaves.
+        let mut bytes = [0_u8; 4];
+        let read = ext4
+            .read_file("/many/file-01234.txt", 0, &mut bytes)
+            .map_err(|error| format!("cannot read through a hashed directory: {error:?}"))?;
+        assert_eq!(&bytes[..read], b"x");
+
+        // An unindexed directory on the same volume stays writable.
+        let mut writable = mount_file_writable_with_limits(&image, limits)?;
+        writable
+            .write_file("/created.txt", b"written beside a hashed directory\n")
+            .map_err(|error| format!("cannot write beside a hashed directory: {error:?}"))?;
+        Ok(())
+    }
+
+    #[test]
+    fn the_name_hash_agrees_with_a_real_on_disk_index() -> Result<(), String> {
+        const NAMES: usize = 2000;
+        let Some(mke2fs) = e2fs_tool("mke2fs") else {
+            return unavailable_tool("mke2fs");
+        };
+        let Some(e2fsck) = e2fs_tool("e2fsck") else {
+            return unavailable_tool("e2fsck");
+        };
+        let temporary = TestDirectory::create("ext4-hash-agree")?;
+        let image = hashed_directory_image(temporary.path(), &mke2fs, &e2fsck, NAMES)?;
+        let limits = Ext4Limits::new(HARD_MAX_GROUPS, 64, 256, 4096, 1 << 40, 1024 * 1024, 64)
+            .map_err(|error| format!("invalid limits: {error:?}"))?;
+        let mut ext4 = mount_file_with_limits(&image, limits)?;
+
+        let hash = ext4
+            .directory_hash()
+            .map_err(|error| format!("cannot read hash inputs: {error:?}"))?;
+        assert!(
+            hash.is_reproducible(),
+            "the volume records its byte signedness"
+        );
+        let inode = ext4
+            .resolve("/many")
+            .map_err(|error| format!("cannot resolve: {error:?}"))?;
+        assert!(inode.indexed, "e2fsck -D must have indexed this directory");
+
+        let seed = ext4.inode_checksum_seed(&inode);
+        let root_block = ext4
+            .directory_block(&inode, 0)
+            .map_err(|error| format!("cannot read root: {error:?}"))?;
+        let root = htree::parse_root(&root_block, seed, crc32c)
+            .map_err(|error| format!("cannot parse root: {error:?}"))?;
+        assert_eq!(root.indirect_levels, 0, "one level is enough for this size");
+        assert!(root.entries.len() > 1, "the directory must really be split");
+
+        // Every name a leaf holds must hash into that leaf's own range. A hash
+        // that disagreed with the kernel's would place names in the wrong leaf.
+        let mut checked = 0_usize;
+        for (index, entry) in root.entries.iter().enumerate() {
+            let upper = root.entries.get(index + 1).map(|next| next.hash);
+            let block = ext4
+                .directory_block(&inode, entry.block)
+                .map_err(|error| format!("cannot read leaf: {error:?}"))?;
+            let mut records = Vec::new();
+            parse_directory_block(&block, inode.number, 1 << 20, limits, &mut records)
+                .map_err(|error| format!("cannot parse leaf: {error:?}"))?;
+            for record in &records {
+                let computed = hash
+                    .hash(record.name.as_bytes(), root.hash_version)
+                    .map_err(|error| format!("cannot hash: {error:?}"))?;
+                assert!(
+                    computed >= entry.hash,
+                    "{} hashed to {computed:#x}, below its leaf floor {:#x}",
+                    record.name,
+                    entry.hash
+                );
+                if let Some(limit) = upper {
+                    assert!(
+                        computed < limit,
+                        "{} hashed to {computed:#x}, at or above the next leaf {limit:#x}",
+                        record.name
+                    );
+                }
+                checked += 1;
+            }
+        }
+        assert_eq!(checked, NAMES, "every name must be placed by the index");
+        Ok(())
+    }
+
+    #[test]
+    fn writes_into_a_hashed_directory_and_passes_e2fsck() -> Result<(), String> {
+        const NAMES: usize = 2000;
+        const TARGET: &str = "/many/file-01234.txt";
+        let Some(mke2fs) = e2fs_tool("mke2fs") else {
+            return unavailable_tool("mke2fs");
+        };
+        let Some(e2fsck) = e2fs_tool("e2fsck") else {
+            return unavailable_tool("e2fsck");
+        };
+        let temporary = TestDirectory::create("ext4-hashed-write")?;
+        let image = hashed_directory_image(temporary.path(), &mke2fs, &e2fsck, NAMES)?;
+        let limits = Ext4Limits::new(HARD_MAX_GROUPS, 64, 256, 4096, 1 << 40, 1024 * 1024, 64)
+            .map_err(|error| format!("invalid limits: {error:?}"))?;
+        {
+            let mut ext4 = mount_file_writable_with_limits(&image, limits)?;
+            ext4.remove_file(TARGET)
+                .map_err(|error| format!("cannot remove from a hashed directory: {error:?}"))?;
+            assert_eq!(ext4.metadata(TARGET).err(), Some(FsError::NotFound));
+
+            // The same name hashes to the same leaf, which now has room again.
+            ext4.write_file(TARGET, b"rewritten by troe\n")
+                .map_err(|error| format!("cannot insert into a hashed directory: {error:?}"))?;
+
+            // A brand-new name either fits its leaf or is refused; it must
+            // never be placed where the index cannot find it.
+            match ext4.write_file("/many/inserted-by-troe.txt", b"new\n") {
+                Ok(()) | Err(FsError::NoSpace) => {}
+                Err(error) => return Err(format!("unexpected insert failure: {error:?}")),
+            }
+        }
+
+        // e2fsck validates hashed-directory ordering, so a record placed in the
+        // wrong leaf would be reported here.
+        let check = Command::new(&e2fsck)
+            .args(["-f", "-n"])
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&check, "e2fsck after hashed-directory mutation")?;
+
+        let mut ext4 = mount_file_with_limits(&image, limits)?;
+        let mut bytes = [0_u8; 32];
+        let read = ext4
+            .read_file(TARGET, 0, &mut bytes)
+            .map_err(|error| format!("cannot read the reinserted name: {error:?}"))?;
+        assert_eq!(&bytes[..read], b"rewritten by troe\n");
         Ok(())
     }
 
