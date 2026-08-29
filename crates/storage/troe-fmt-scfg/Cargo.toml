@@ -1,0 +1,15 @@
+[package]
+name = "troe-fmt-scfg"
+description = "Versioned bounded system and service-startup configuration for TROE"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+troe-fmt-cspk = { path = "../troe-fmt-cspk" }
+troe-checksum = { path = "../../common/troe-checksum" }
+troe-fs-api = { path = "../troe-fs-api" }
+
+[lints]
+workspace = true

@@ -934,13 +934,23 @@ Current workspace structure:
 ```text
 troe/
 ├── crates/
-│   ├── troe-core/        portable types and bounded streams
-│   ├── troe-dispatch/    bounded synchronous service dispatch
-│   ├── troe-machine/     audited x86-64/AArch64 mechanisms
-│   ├── troe-memory/      memory-map, frame, and mapping models
-│   ├── troe-shell/       parser, pipelines, and session intrinsics
-│   ├── troe-task/        cooperative task policy
-│   └── troe-vfs/         KEFS, RAMFS, namespace, and generated nodes
+│   ├── common/           vocabulary shared by every layer
+│   │   ├── troe-abi/         allocation-free application wire contract
+│   │   ├── troe-checksum/    reflected CRC-32 primitives
+│   │   ├── troe-completion/  bounded package-owned CMPL descriptors
+│   │   └── troe-core/        portable types and bounded streams
+│   ├── storage/          filesystem contract, providers, formats, and policy
+│   │   ├── troe-fs-api/      error, metadata, path, and provider contract
+│   │   ├── troe-fs-*/        ext4, FAT32, and StateFS providers
+│   │   ├── troe-fmt-*/       GPT, BMNT, CSPK, SCFG, and PRGN codecs
+│   │   ├── troe-txslot/      dual-slot crash-consistent transactions
+│   │   ├── troe-identity/    principals, ACLs, and mount policy
+│   │   ├── troe-vfs/         KEFS, RAMFS, namespace, and generated nodes
+│   │   └── troe-volume/      volume discovery and mount activation
+│   ├── net/              Ethernet, ARP, IPv4, UDP, DHCP, ICMP, and TCP
+│   ├── device/           block, driver, virtio, and platform boundaries
+│   ├── runtime/          task, dispatch, memory, machine, and supervision
+│   └── shell/            parser, pipelines, session intrinsics, and terminal
 ├── host/                 hosted composition and acceptance runner
 ├── kernel/               native UEFI entry and composition root
 ├── xtask/                Cargo QEMU launcher shim
@@ -950,7 +960,9 @@ troe/
 └── docs/                 architecture, decisions, evaluations, and audits
 ```
 
-Crates are boundaries for reasoning, testing, and unsafe-code policy. They SHOULD NOT become tiny crates without a concrete ownership or dependency benefit.
+Crates are boundaries for reasoning, testing, and unsafe-code policy. A crate's
+directory names its domain and its name names its role, so neither repeats the
+other. They SHOULD NOT become tiny crates without a concrete ownership or dependency benefit.
 
 Production targets use `no_std`. `alloc` MAY be used after the global allocator is initialized. Portable crates SHOULD support host tests with `std` behind test or feature configuration.
 

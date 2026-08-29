@@ -7,9 +7,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-troe-core = { path = "../crates/troe-core" }
-troe-shell = { path = "../crates/troe-shell" }
-troe-vfs = { path = "../crates/troe-vfs" }
+troe-core = { path = "../crates/common/troe-core" }
+troe-shell = { path = "../crates/shell/troe-shell" }
+troe-vfs = { path = "../crates/storage/troe-vfs" }
 
 [lints]
 workspace = true

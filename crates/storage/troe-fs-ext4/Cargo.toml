@@ -1,0 +1,14 @@
+[package]
+name = "troe-fs-ext4"
+description = "Strict bounded metadata-preserving ext4 filesystem provider for TROE"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+troe-block = { path = "../../device/troe-block" }
+troe-fs-api = { path = "../troe-fs-api" }
+
+[lints]
+workspace = true

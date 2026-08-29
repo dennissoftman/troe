@@ -147,22 +147,6 @@ name = "troe-completion"
 version = "0.1.0"
 
 [[package]]
-name = "troe-config"
-version = "0.1.0"
-dependencies = [
- "troe-checksum",
- "troe-content",
- "troe-fs-api",
-]
-
-[[package]]
-name = "troe-content"
-version = "0.1.0"
-dependencies = [
- "troe-checksum",
-]
-
-[[package]]
 name = "troe-core"
 version = "0.1.0"
 
@@ -179,19 +163,25 @@ name = "troe-driver"
 version = "0.1.0"
 
 [[package]]
-name = "troe-ext4"
+name = "troe-fmt-bmnt"
 version = "0.1.0"
 dependencies = [
- "troe-block",
- "troe-fs-api",
+ "troe-checksum",
 ]
 
 [[package]]
-name = "troe-fat"
+name = "troe-fmt-cspk"
+version = "0.1.0"
+dependencies = [
+ "troe-checksum",
+]
+
+[[package]]
+name = "troe-fmt-gpt"
 version = "0.1.0"
 dependencies = [
  "troe-block",
- "troe-fs-api",
+ "troe-checksum",
 ]
 
 [[package]]
@@ -202,15 +192,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "troe-fmt-scfg"
+version = "0.1.0"
+dependencies = [
+ "troe-checksum",
+ "troe-fmt-cspk",
+ "troe-fs-api",
+]
+
+[[package]]
 name = "troe-fs-api"
 version = "0.1.0"
 
 [[package]]
-name = "troe-gpt"
+name = "troe-fs-ext4"
+version = "0.1.0"
+dependencies = [
+ "troe-block",
+ "troe-fs-api",
+]
+
+[[package]]
+name = "troe-fs-fat"
+version = "0.1.0"
+dependencies = [
+ "troe-block",
+ "troe-fs-api",
+]
+
+[[package]]
+name = "troe-fs-statefs"
 version = "0.1.0"
 dependencies = [
  "troe-block",
  "troe-checksum",
+ "troe-fs-api",
+ "troe-txslot",
+ "troe-vfs",
 ]
 
 [[package]]
@@ -236,31 +254,31 @@ dependencies = [
  "troe-abi",
  "troe-application",
  "troe-block",
- "troe-config",
- "troe-content",
  "troe-core",
  "troe-dispatch",
  "troe-driver",
- "troe-ext4",
- "troe-fat",
+ "troe-fmt-bmnt",
+ "troe-fmt-cspk",
+ "troe-fmt-gpt",
  "troe-fmt-prgn",
+ "troe-fmt-scfg",
  "troe-fs-api",
- "troe-gpt",
+ "troe-fs-ext4",
+ "troe-fs-fat",
+ "troe-fs-statefs",
  "troe-identity",
  "troe-machine",
  "troe-memory",
- "troe-mount",
  "troe-net",
  "troe-process",
  "troe-random",
  "troe-shell",
- "troe-statefs",
- "troe-storage",
  "troe-supervisor",
  "troe-task",
  "troe-terminal",
  "troe-txslot",
  "troe-vfs",
+ "troe-volume",
  "uefi",
 ]
 
@@ -326,13 +344,6 @@ name = "troe-memory"
 version = "0.1.0"
 
 [[package]]
-name = "troe-mount"
-version = "0.1.0"
-dependencies = [
- "troe-checksum",
-]
-
-[[package]]
 name = "troe-net"
 version = "0.1.0"
 
@@ -364,38 +375,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "troe-statefs"
-version = "0.1.0"
-dependencies = [
- "troe-block",
- "troe-checksum",
- "troe-fs-api",
- "troe-txslot",
- "troe-vfs",
-]
-
-[[package]]
-name = "troe-storage"
-version = "0.1.0"
-dependencies = [
- "troe-block",
- "troe-checksum",
- "troe-config",
- "troe-content",
- "troe-ext4",
- "troe-fat",
- "troe-fs-api",
- "troe-gpt",
- "troe-identity",
- "troe-mount",
- "troe-vfs",
-]
-
-[[package]]
 name = "troe-supervisor"
 version = "0.1.0"
 dependencies = [
- "troe-config",
+ "troe-fmt-scfg",
  "troe-task",
 ]
 
@@ -431,6 +414,23 @@ name = "troe-virtio"
 version = "0.1.0"
 dependencies = [
  "troe-block",
+]
+
+[[package]]
+name = "troe-volume"
+version = "0.1.0"
+dependencies = [
+ "troe-block",
+ "troe-checksum",
+ "troe-fmt-bmnt",
+ "troe-fmt-cspk",
+ "troe-fmt-gpt",
+ "troe-fmt-scfg",
+ "troe-fs-api",
+ "troe-fs-ext4",
+ "troe-fs-fat",
+ "troe-identity",
+ "troe-vfs",
 ]
 
 [[package]]

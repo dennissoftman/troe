@@ -177,7 +177,7 @@ class RepositoryPolicyTests(unittest.TestCase):
             self.assertEqual(installed, ordinary)
             self.assertEqual(list(root.glob("*.kcap")), [])
 
-        shell = (REPO_ROOT / "crates/troe-shell/src/lib.rs").read_text(encoding="utf-8")
+        shell = (REPO_ROOT / "crates/shell/troe-shell/src/lib.rs").read_text(encoding="utf-8")
         self.assertEqual(shell.count("\n    fn command_"), 2)
         self.assertIn("fn command_cd", shell)
         self.assertIn("fn command_machine_action", shell)
@@ -191,7 +191,7 @@ class RepositoryPolicyTests(unittest.TestCase):
                 self.assertNotIn(forbidden, shell)
 
     def test_completion_policy_is_portable_and_kcap_remains_authority_only(self) -> None:
-        completion_root = REPO_ROOT / "crates" / "troe-completion"
+        completion_root = REPO_ROOT / "crates" / "common" / "troe-completion"
         manifest = tomllib.loads(
             (completion_root / "Cargo.toml").read_text(encoding="utf-8")
         )
@@ -202,12 +202,12 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn("Address(AddressConstraints)", source)
         self.assertIn("Integer(IntegerConstraints)", source)
 
-        shell = (REPO_ROOT / "crates" / "troe-shell" / "src" / "lib.rs").read_text(
+        shell = (REPO_ROOT / "crates" / "shell" / "troe-shell" / "src" / "lib.rs").read_text(
             encoding="utf-8"
         )
         self.assertNotIn("fn argument_completion", shell)
         registry = (
-            REPO_ROOT / "crates" / "troe-shell" / "src" / "recovery_completion.rs"
+            REPO_ROOT / "crates" / "shell" / "troe-shell" / "src" / "recovery_completion.rs"
         ).read_text(encoding="utf-8")
         self.assertIn("CompletionDescriptor", registry)
         self.assertIn("PackageCompletionRegistry", registry)
@@ -255,7 +255,7 @@ class RepositoryPolicyTests(unittest.TestCase):
     def test_platform_facts_and_virtio_transport_selection_stay_below_kernel(
         self,
     ) -> None:
-        machine_sources = tuple((REPO_ROOT / "crates/troe-machine/src").glob("*.rs"))
+        machine_sources = tuple((REPO_ROOT / "crates/runtime/troe-machine/src").glob("*.rs"))
         kernel_sources = tuple((REPO_ROOT / "kernel/src").glob("*.rs"))
         fixed_platform_literals = (
             "0xfee00000",
@@ -283,7 +283,7 @@ class RepositoryPolicyTests(unittest.TestCase):
             with self.subTest(transport_api=transport_api):
                 self.assertNotIn(transport_api, kernel)
 
-        machine = (REPO_ROOT / "crates/troe-machine/src/lib.rs").read_text(
+        machine = (REPO_ROOT / "crates/runtime/troe-machine/src/lib.rs").read_text(
             encoding="utf-8"
         )
         self.assertEqual(
@@ -291,6 +291,97 @@ class RepositoryPolicyTests(unittest.TestCase):
             2,
             "target_arch may only guard platform/CPU compatibility, not select transport",
         )
+
+    def test_crate_domains_and_roles_stay_layered(self) -> None:
+        """Directories name the domain, crate names name the role, and neither
+        may depend upward. This is the layering ADR 0035 Phase E relies on: a
+        provider must be linkable without a namespace, and a format codec must
+        be linkable without either."""
+        manifests = {
+            path.parent.name: (path.parent.parent.name, tomllib.loads(path.read_text("utf-8")))
+            for path in (REPO_ROOT / "crates").rglob("Cargo.toml")
+        }
+        self.assertEqual(
+            {domain for domain, _ in manifests.values()},
+            {"common", "storage", "net", "device", "runtime", "shell"},
+        )
+
+        def troe_dependencies(manifest: dict) -> set[str]:
+            names: set[str] = set()
+            for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+                names.update(
+                    name for name in manifest.get(section, {}) if name.startswith("troe-")
+                )
+            for target in manifest.get("target", {}).values():
+                for section in ("dependencies", "dev-dependencies"):
+                    names.update(
+                        name for name in target.get(section, {}) if name.startswith("troe-")
+                    )
+            return names
+
+        for crate, (domain, manifest) in manifests.items():
+            self.assertEqual(
+                manifest["package"]["name"],
+                crate,
+                f"{crate} directory and package name must match",
+            )
+            dependencies = troe_dependencies(manifest)
+            if crate.startswith("troe-fmt-"):
+                for dependency in dependencies:
+                    self.assertTrue(
+                        dependency in {"troe-block", "troe-checksum", "troe-fs-api"}
+                        or dependency.startswith("troe-fmt-"),
+                        f"{crate} is a format codec: {dependency} is not a leaf"
+                        " vocabulary. A block-resident format may read through"
+                        " troe-block, but no format may reach a provider,"
+                        " namespace, or policy crate.",
+                    )
+            if crate.startswith("troe-fs-") and crate != "troe-fs-api":
+                self.assertLessEqual(
+                    dependencies - {"troe-vfs"},
+                    {"troe-fs-api", "troe-block", "troe-txslot", "troe-core", "troe-checksum"},
+                    f"{crate} is a provider: it may not reach past the filesystem contract",
+                )
+                self.assertNotIn(
+                    "troe-vfs",
+                    manifest.get("dependencies", {}),
+                    f"{crate} must not link the namespace outside its own tests",
+                )
+            if crate == "troe-fs-api":
+                self.assertEqual(
+                    dependencies, set(), "the filesystem contract must stay dependency-free"
+                )
+            if crate == "troe-vfs":
+                self.assertNotIn(
+                    "troe-volume", dependencies, "the namespace may not depend on volume policy"
+                )
+                for dependency in dependencies:
+                    self.assertFalse(
+                        dependency.startswith(("troe-fs-", "troe-fmt-"))
+                        and dependency != "troe-fs-api",
+                        f"the namespace may not link the {dependency} implementation",
+                    )
+
+    def test_kernel_storage_dependencies_are_recorded_for_phase_e(self) -> None:
+        """The kernel still links every filesystem format and the network stack.
+        Pin that list so ADR 0035 Phase D and E removals are a visible diff and
+        cannot regress silently in the other direction."""
+        manifest = tomllib.loads((REPO_ROOT / "kernel" / "Cargo.toml").read_text("utf-8"))
+        linked = {name for name in manifest["dependencies"] if name.startswith("troe-")}
+        self.assertEqual(
+            linked & {
+                "troe-fmt-bmnt", "troe-fmt-cspk", "troe-fmt-gpt", "troe-fmt-prgn",
+                "troe-fmt-scfg", "troe-fs-ext4", "troe-fs-fat", "troe-fs-statefs",
+                "troe-identity", "troe-net", "troe-txslot", "troe-vfs", "troe-volume",
+            },
+            {
+                "troe-fmt-bmnt", "troe-fmt-cspk", "troe-fmt-gpt", "troe-fmt-prgn",
+                "troe-fmt-scfg", "troe-fs-ext4", "troe-fs-fat", "troe-fs-statefs",
+                "troe-identity", "troe-net", "troe-txslot", "troe-vfs", "troe-volume",
+            },
+            "kernel storage/network linkage changed: update this gate with the migration",
+        )
+
 
 
 if __name__ == "__main__":

@@ -1,0 +1,18 @@
+[package]
+name = "troe-shell"
+description = "Bounded parser, pipeline executor, and session intrinsics for TROE"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+troe-application = { path = "../../runtime/troe-application" }
+troe-completion = { path = "../../common/troe-completion" }
+troe-core = { path = "../../common/troe-core" }
+troe-fs-api = { path = "../../storage/troe-fs-api" }
+troe-driver = { path = "../../device/troe-driver" }
+troe-vfs = { path = "../../storage/troe-vfs" }
+
+[lints]
+workspace = true

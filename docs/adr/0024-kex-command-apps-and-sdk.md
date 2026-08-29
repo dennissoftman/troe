@@ -47,7 +47,7 @@ handles and pages are reclaimed. This first increment permits one foreground
 application at a time; it does not claim jobs, shared memory, threads, or
 preemption.
 
-`crates/troe-abi` is the allocation-free wire contract. The repo-local Rust SDK
+`crates/common/troe-abi` is the allocation-free wire contract. The repo-local Rust SDK
 in `sdk/rust/troe-kex` owns startup validation and architecture call gates, and
 applications use its `entry!` macro instead of defining raw syscalls. The
 dependency-free Rust `troe-kex-tool` command builds both pinned `*-unknown-none`

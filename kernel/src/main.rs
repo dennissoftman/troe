@@ -40,11 +40,6 @@ mod firmware {
     use troe_application::{ParseError, parse_kex};
     use troe_block::{BlockAccess, BlockRegion};
     use troe_block::{BlockDevice, BlockLimits};
-    use troe_config::{
-        ActivationPointer, ActivationRecovery, MemoryPolicy, SystemConfig,
-        normalize_memory_policy_toml, parse_config, recover_activation,
-    };
-    use troe_content::{ContentPack, MAX_PACK_BYTES, ObjectKind};
     use troe_core::{
         CommandStatus, Input, MAX_LINE_BYTES, MachineMemoryOwner, MachineMemorySnapshot,
         MemoryStats, Output, StreamError,
@@ -54,20 +49,28 @@ mod firmware {
         HandleOwner, ReplyStatus, Request, Rights, Service, ServiceReply, ServiceReplyInfo,
     };
     use troe_driver::{InputEvent, InputQueueConfig, InputQueueStats, InputSource};
-    use troe_ext4::Ext4Limits;
-    use troe_fat::Fat32Limits;
+    use troe_fmt_bmnt::{
+        AccessMode, ActivationMode, BootMountManifest, FilesystemProfile, MAX_MANIFEST_BYTES,
+        parse_manifest,
+    };
+    use troe_fmt_cspk::{ContentPack, MAX_PACK_BYTES, ObjectKind};
+    use troe_fmt_gpt::{GptGuid, GptLimits, discover};
     use troe_fmt_prgn::RegionSelector;
+    use troe_fmt_scfg::{
+        ActivationPointer, ActivationRecovery, MemoryPolicy, SystemConfig,
+        normalize_memory_policy_toml, parse_config, recover_activation,
+    };
     use troe_fs_api::{FILE_IO_BUFFER_BYTES, FileSystemProvider, FsError, NodeKind, canonicalize};
-    use troe_gpt::{GptGuid, GptLimits, discover};
+    use troe_fs_ext4::Ext4Limits;
+    use troe_fs_fat::Fat32Limits;
+    #[cfg(feature = "acceptance-probes")]
+    use troe_fs_statefs::STATE_PATH;
+    use troe_fs_statefs::StateFs;
     use troe_identity::IdentityLimits;
     use troe_memory::{
         BASE_PAGE_SIZE, BootAllocator, FrameAllocationError, FrameAllocator, MAX_FIRMWARE_REGIONS,
         Mapping, MappingLifetime, MappingMemoryType, MappingOwner, MappingPermissions, MappingPlan,
         MemoryMapStats, MemoryRegion, NormalizedMemoryMap, PhysicalRange, RegionKind, VirtualRange,
-    };
-    use troe_mount::{
-        AccessMode, ActivationMode, BootMountManifest, FilesystemProfile, MAX_MANIFEST_BYTES,
-        parse_manifest,
     };
     use troe_net::{
         ArpCache, DhcpMessageType, DhcpPacket, Ipv4Address, MAX_UDP_PAYLOAD_BYTES, MacAddress,
@@ -87,13 +90,6 @@ mod firmware {
         ServiceControl, SharedNamespace, Shell, external_command_reference, format_memory_report,
         parse_command_list,
     };
-    #[cfg(feature = "acceptance-probes")]
-    use troe_statefs::STATE_PATH;
-    use troe_statefs::StateFs;
-    use troe_storage::{
-        ActivationLimits, MAX_STORAGE_REPORT_BYTES, PreparedMount, STORAGE_REPORT_EXTENSION_BYTES,
-        prepare_mounts, read_selected_file, validate_root_activation,
-    };
     use troe_supervisor::{BoundedLog, ServiceState, Supervisor, SupervisorAction};
     use troe_task::{
         Cancelled, Capabilities, CooperativeRuntime, IsolationResource, MonotonicMillis,
@@ -109,6 +105,10 @@ mod firmware {
     };
     use troe_txslot::{DualSlotStore, TRANSACTION_BLOCKS};
     use troe_vfs::{Namespace, RamFsQuota};
+    use troe_volume::{
+        ActivationLimits, MAX_STORAGE_REPORT_BYTES, PreparedMount, STORAGE_REPORT_EXTENSION_BYTES,
+        prepare_mounts, read_selected_file, validate_root_activation,
+    };
     use uefi::boot;
     use uefi::mem::memory_map::{MemoryMap, MemoryMapOwned};
     use uefi::prelude::*;
@@ -13810,7 +13810,7 @@ mod firmware {
     /// always empty, so a supervised process cannot consume prompt input.
     #[allow(clippy::too_many_arguments)]
     fn launch_service_process(
-        service: &troe_config::ServiceConfig,
+        service: &troe_fmt_scfg::ServiceConfig,
         shell: &mut Shell,
         residents: &mut ResidentProcessTable,
         processes: &SharedProcessTable,
@@ -14141,16 +14141,16 @@ mod firmware {
             }
             let mut service_capability_bits = 0;
             if datagram_required {
-                service_capability_bits |= troe_config::SERVICE_CAPABILITY_DATAGRAM;
+                service_capability_bits |= troe_fmt_scfg::SERVICE_CAPABILITY_DATAGRAM;
             }
             if timer_required {
-                service_capability_bits |= troe_config::SERVICE_CAPABILITY_TIMER;
+                service_capability_bits |= troe_fmt_scfg::SERVICE_CAPABILITY_TIMER;
             }
             if clock_control_required {
-                service_capability_bits |= troe_config::SERVICE_CAPABILITY_CLOCK_CONTROL;
+                service_capability_bits |= troe_fmt_scfg::SERVICE_CAPABILITY_CLOCK_CONTROL;
             }
             if wall_clock_required {
-                service_capability_bits |= troe_config::SERVICE_CAPABILITY_WALL_CLOCK;
+                service_capability_bits |= troe_fmt_scfg::SERVICE_CAPABILITY_WALL_CLOCK;
             }
             if let (Some(initial_handles), Some(authorized)) =
                 (self.service_initial_handles, self.service_capability_bits)
@@ -15152,7 +15152,7 @@ mod firmware {
             .services()
             .iter()
             .find(|service| service.name() == name)
-            .map(troe_config::ServiceConfig::id)
+            .map(troe_fmt_scfg::ServiceConfig::id)
     }
 
     const fn service_state_label(state: ServiceState) -> &'static str {

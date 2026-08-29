@@ -1,0 +1,39 @@
+[package]
+name = "troe-machine"
+description = "Audited native architecture and platform mechanisms for TROE"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[features]
+acceptance-probes = []
+platform-aarch64-virt-uefi = []
+platform-aarch64-uefi-virtio-mmio = []
+platform-x86_64-q35-uefi = []
+platform-x86_64-uefi-virtio-pci = []
+
+[dependencies]
+troe-block = { path = "../../device/troe-block" }
+troe-driver = { path = "../../device/troe-driver" }
+troe-memory = { path = "../troe-memory" }
+troe-net = { path = "../../net/troe-net" }
+troe-platform = { path = "../../device/troe-platform" }
+troe-task = { path = "../troe-task" }
+troe-terminal = { path = "../../shell/troe-terminal" }
+troe-virtio = { path = "../../device/troe-virtio" }
+rlsf = { version = "=0.2.3", default-features = false }
+
+[target.'cfg(target_os = "uefi")'.dependencies]
+uefi = { version = "=0.39.0" }
+
+[lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
