@@ -68,6 +68,25 @@ point. Copy `rootfs/share/sh/bench.sh` to the shared disk. It exercises `printf`
 `wc`, `sed`, and `awk`; elapsed time measures their complete guest stacks, not
 just their kernels.
 
+For a like-for-like Lua comparison, also copy
+`rootfs/share/lua/benchmark.lua`. The script runs unchanged on TROE and Alpine
+with Lua 5.5. Use identical scale and sample arguments in both guests:
+
+```console
+# TROE
+lua /vol/shared/benchmark.lua 1 5 troe-x86_64
+
+# Alpine, after mounting the shared volume and installing lua5.5
+lua5.5 /mnt/shared/benchmark.lua 1 5 alpine-x86_64
+```
+
+Repeat with architecture-specific labels on AArch64. The first argument scales
+the work from 1 through 4 and the second selects 1 through 9 measured samples;
+the defaults are `1 5`. Each phase performs its own warmup and prints median,
+minimum, maximum, throughput, and a deterministic checksum. Compare matching
+`RESULT` rows rather than combining them into one score. A checksum mismatch
+between guests invalidates that row.
+
 ## Run the four-guest matrix
 
 Run TROE and Alpine once per architecture. Keep QEMU, firmware, host load, and
@@ -145,3 +164,12 @@ workload on both sides and count operations, bytes, allocations, and context
 switches alongside elapsed time. TROE's diagnostics benchmark is valuable for
 internal protected-IPC regressions, but it has no direct Alpine equivalent and
 should not be presented as a cross-kernel result.
+
+The Lua benchmark's compute timings use `os.clock`, so they measure process CPU
+time rather than boot or wall-clock latency. Its allocation fields come from
+`collectgarbage("count")`: `live_kib` is the retained Lua-heap growth at the end
+of a phase, `peak_kib` is an observed Lua-heap high-water delta, and
+`reclaimed_kib` is the portion released by a full collection. They exclude the
+interpreter executable, native allocator overhead, kernel memory, and guest
+page accounting. Use guest-level memory telemetry as a separate measurement
+when comparing total footprint.

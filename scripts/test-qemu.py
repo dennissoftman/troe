@@ -1899,6 +1899,24 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
         absent=("execution lease expired",),
     )
     session.command(
+        "lua /share/lua/benchmark.lua 1 1 qemu-smoke",
+        cwd,
+        max(command_timeout, 180.0),
+        contains=(
+            "BENCHMARK version=1 label=qemu-smoke",
+            "RESULT label=qemu-smoke name=integer_mix",
+            "RESULT label=qemu-smoke name=floating_arithmetic",
+            "RESULT label=qemu-smoke name=retained_records",
+            "RESULT label=qemu-smoke name=allocation_churn",
+            "END label=qemu-smoke",
+        ),
+        absent=(
+            "not enough memory",
+            "execution lease expired",
+            "lua-benchmark:",
+        ),
+    )
+    session.command(
         'lua -e \'local t={year=2024,month=2,day=29,hour=1,min=2,sec=3}; '
         'local s=os.time(t); print("lua-calendar",s,'
         'os.date("!%Y-%m-%d %H:%M:%S %a %j",s),t.wday,t.yday,t.isdst)\'',
@@ -1982,7 +2000,7 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
         contains=("lua-file:hello sum=1250025000 sqrt=9 pow=1024",),
     )
     session.command(
-        "lua /share/lua/examples/strings.lua",
+        "lua /share/lua/examples/language.lua",
         cwd,
         command_timeout,
         contains=(
@@ -1990,10 +2008,13 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
             "match=8..11 upper=HELLO, TROE!",
             "packed=4 bytes values=-123,456",
             "utf8=1 codepoint, 2 bytes, U+03BB",
+            "task 1: network (priority 3)",
+            "vector sum: (7, 10)",
+            "square(4)=16",
         ),
     )
     session.command(
-        "lua /share/lua/examples/math.lua",
+        "lua /share/lua/examples/numbers.lua",
         cwd,
         command_timeout,
         contains=(
@@ -2005,53 +2026,26 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
             "random bucket range\tmin=",
             " expected=10000 max-deviation=",
             "random uniformity\tpass\tsamples=60000\n",
+            "random choice\t",
+            "random shuffle\t",
+            "random checks\tok\t5\ttrue\n",
             "random source\tkernel CSPRNG seed -> Lua math PRNG\n",
             "random caveat\tuniformity is evidence, not proof or cryptographic safety\n",
         ),
     )
     session.command(
-        "lua /share/lua/examples/tables-coroutines.lua",
+        "lua /share/lua/examples/system.lua",
         cwd,
         command_timeout,
         contains=(
-            "task 1: network (priority 3)",
-            "vector sum: (7, 10)",
-            "square(4)=16",
-        ),
-    )
-    session.command(
-        "lua /share/lua/examples/compatibility.lua",
-        cwd,
-        command_timeout,
-        contains=(
-            "lua-compat libraries\ttable\ttable\ttable\n",
-            "lua-compat date\t2024-02-29 Thursday\n",
-            "lua-compat file\talpha,beta,gamma\n",
-            "lua-compat module\t42\t/tmp/lua55-showcase-module.lua\n",
-            "lua-compat bytecode\t1414680389\tmain\n",
+            "lua-system libraries\ttable\ttable\ttable\n",
+            "lua-system date\t2024-02-29 Thursday\n",
+            "lua-system file\talpha,beta,gamma\n",
+            "lua-system module\t42\t/tmp/lua-system-module.lua\n",
+            "lua-system bytecode\t1414680389\tmain\n",
             "lua execute\n",
-            "lua-compat process\tlua-popen\n",
-            "lua-compat cleanup\ttrue\ttrue\n",
-        ),
-    )
-    session.command(
-        "lua /share/lua/examples/files.lua",
-        cwd,
-        command_timeout,
-        contains=(
-            "lua-files wrote\t36\tbytes\n",
-            "lua-files cleanup\ttrue\ttrue\n",
-        ),
-    )
-    session.command(
-        "lua /share/lua/examples/random.lua",
-        cwd,
-        command_timeout,
-        contains=(
-            "lua-random dice\t",
-            "lua-random choice\t",
-            "lua-random shuffle\t",
-            "lua-random checks\tok\t5\ttrue\n",
+            "lua-system process\tlua-popen\n",
+            "lua-system cleanup\ttrue\ttrue\n",
         ),
     )
     session.command(
