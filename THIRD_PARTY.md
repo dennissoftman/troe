@@ -20,6 +20,26 @@ ambient host access from the capability-backed `io`, `os`, `package`, and
 `debug` library surface. Exact archive URL, hash, license, and the one
 conditional upstream-source change are recorded in `apps/lua/vendor/UPSTREAM.md`.
 
+`python.kex` builds the official CPython 3.14.7, 3.13.15, and 3.12.14 source
+releases under the Python Software Foundation License 2.0. TROE does not vendor
+them: `tools/build_cpython.py` fetches each archive from python.org into a
+caller-supplied cache, checks its pinned SHA-256, and verifies its Sigstore
+bundle offline against the recorded release-manager identity and issuer before
+any byte is used. Exact URLs, digests, signer identities, and issuers are pinned
+in `apps/python/sources.lock.json`. The reviewed upstream changes are held
+separately in `apps/python/patches/troe.patch` and apply unmodified to all three
+releases; they recognize the freestanding target during configure, force UTF-8
+semantics, model the core thread-local slot under the single-execution-thread
+contract, erase the build-tree path from runtime metadata, and remove upstream's
+time/process-identifier seeding fallback so withheld entropy authority fails
+instead of degrading. The statically linked C module allowlist and the shipped
+pure-Python profile are declared in `apps/python/config/Setup.local` and
+`apps/python/stdlib-policy.json`, and every built package records its own
+included and excluded module manifests with reasons. Interpreter builds compile
+the HACL* hash implementations distributed inside the CPython source tree under
+Apache-2.0 OR MIT; the excluded modules do not build CPython's vendored
+mpdecimal, Expat, or zlib copies.
+
 Lua number formatting uses nanoprintf 0.6.1 under Unlicense OR 0BSD. The source,
 license, archive hash, and configuration are vendored once under
 `sdk/c/troe-kex-runtime/vendor` and shared with Lua. Lua's

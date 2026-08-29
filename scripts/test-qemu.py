@@ -60,6 +60,16 @@ SHARED_FILE = "/vol/shared/host-visible.txt"
 SHARED_CONTENT = "persistent-fat32-content"
 RUNTIME_PROBE_PACKAGES = REPO_ROOT / "build" / "runtime-probe-packages"
 RUNTIME_PROBE_TREE = REPO_ROOT / "build" / "runtime-tree-v1"
+CPYTHON_PACKAGE_TREE = REPO_ROOT / "build" / "cpython-package" / "cpython" / "v1"
+CPYTHON_DIAGNOSTICS_TREE = (
+    REPO_ROOT / "build" / "cpython-diagnostics" / "cpython-diagnostics" / "v1"
+)
+CPYTHON_FIXTURES = REPO_ROOT / "tests" / "fixtures" / "cpython"
+CPYTHON_SHARED_ROOT = "/vol/shared/cpython/v1"
+CPYTHON_DIAGNOSTICS_ROOT = "/vol/shared/cpython-diagnostics/v1"
+# Interpreter startup, standard-library imports, and cyclic collection are
+# far heavier than a coreutil launch, and both guests share one host.
+CPYTHON_TIMEOUT_SCALE = 12.0
 
 
 class AcceptanceError(RuntimeError):
@@ -268,7 +278,9 @@ def build_runtime_probe_tree() -> None:
     )
 
 
-def reset_shared_media(platform_id: str, *, install_runtime: bool) -> None:
+def reset_shared_media(
+    platform_id: str, *, install_runtime: bool, install_cpython: bool = False
+) -> None:
     """Create one platform-private FAT32 medium and install runtime artifacts."""
     path = shared_test_image_path(resolve_platform(platform_id))
     subprocess.run(
@@ -295,6 +307,8 @@ def reset_shared_media(platform_id: str, *, install_runtime: bool) -> None:
             cwd=REPO_ROOT,
             check=True,
         )
+    if install_cpython:
+        install_cpython_media(path)
 
 
 def cleanup_shared_media(platform_ids: tuple[str, ...]) -> None:
@@ -2374,6 +2388,216 @@ def run_lua_group(session: SerialSession, command_timeout: float) -> None:
     )
 
 
+def install_cpython_media(path: Path) -> None:
+    """Install the built interpreter package, fixtures, and negative variants."""
+    for tree in (CPYTHON_PACKAGE_TREE, CPYTHON_DIAGNOSTICS_TREE):
+        if not (tree / "MANIFEST.sha256").is_file():
+            raise AcceptanceError(
+                f"CPython acceptance needs {tree}; build it with "
+                "tools/build_cpython.py build and tools/build_cpython.py variants"
+            )
+    builder = str(REPO_ROOT / "tools" / "build_cpython.py")
+    for action, source in (
+        ("install-image", CPYTHON_PACKAGE_TREE),
+        ("install-diagnostics", CPYTHON_DIAGNOSTICS_TREE),
+        ("install-packages", CPYTHON_FIXTURES),
+    ):
+        subprocess.run(
+            [sys.executable, builder, action, str(source), "--image", str(path)],
+            cwd=REPO_ROOT,
+            check=True,
+        )
+
+
+def run_cpython_repl(session: SerialSession, cwd: str, python: str, timeout: float) -> None:
+    """Evaluate typed statements through the foreground terminal-input loan."""
+    submitted = session.send(python, timeout)
+    marker = f"Run untrusted application '{python}' outside /bin? [y/N] ".encode()
+    session.wait_for(marker, timeout, submitted)
+    answered = session.send("y", timeout)
+    banner = session.wait_for(b">>> ", timeout, answered)
+    rendered = normalize(bytes(session.output[answered:banner]))
+    if "Python 3.14.7" not in rendered or "troe" not in rendered:
+        raise AcceptanceError(f"CPython REPL banner was unexpected: {rendered!r}")
+    for statement, expected in (
+        ('print("cpy" + "-repl", 6 * 7)', "cpy-repl 42"),
+        ("value = 1 << 70", None),
+        ('print("cpy" + "-state", value)', "cpy-state 1180591620717411303424"),
+        ('print("cpy" + "-error", 1 / 0)', "ZeroDivisionError"),
+        ("print(repr(exit))", "Ctrl-D"),
+    ):
+        start = len(session.output)
+        session.send(statement, timeout)
+        end = session.wait_for(b">>> ", timeout, start)
+        if expected is None:
+            continue
+        rendered = normalize(bytes(session.output[start:end]))
+        if expected not in rendered:
+            raise AcceptanceError(
+                f"CPython REPL did not evaluate {statement!r}: {rendered!r}"
+            )
+    # `site` is not imported, so `exit` is never injected. End of input is the
+    # terminal contract's own exit and it must return the loan to the shell.
+    if session.process.stdin is None:
+        raise AcceptanceError("QEMU serial input is unavailable")
+    start = len(session.output)
+    session.process.stdin.write(b"\x04")
+    session.process.stdin.flush()
+    session.wait_for(f"sh:{cwd}> ".encode(), timeout, start)
+
+
+def run_cpython_group(session: SerialSession, command_timeout: float) -> None:
+    """Exercise the shared-volume CPython package, its profile, and its limits."""
+    cwd = "/"
+    timeout = command_timeout * CPYTHON_TIMEOUT_SCALE
+    binaries = f"{CPYTHON_SHARED_ROOT}/{session.architecture}/bin"
+    packages = f"{CPYTHON_SHARED_ROOT}/packages"
+    diagnostics = f"{CPYTHON_DIAGNOSTICS_ROOT}/{session.architecture}/bin"
+    python = f"{binaries}/python.kex"
+    no_random = f"{diagnostics}/python-no-random.kex"
+    no_mutate = f"{diagnostics}/python-no-mutate.kex"
+    stdlib = f"{CPYTHON_SHARED_ROOT}/{session.architecture}/lib/python3.14.7/python3.14"
+
+    # Shared-volume interpreters stay subject to the explicit-path execution
+    # gate; declining must not start the interpreter at all.
+    session.declined_command(f"{python} --version", cwd, timeout, absent=("Python 3.",))
+
+    # The default alias and every version-addressable executable stay distinct.
+    for name, expected in (
+        ("python.kex", "Python 3.14.7"),
+        ("python3.kex", "Python 3.14.7"),
+        ("python3.14.kex", "Python 3.14.7"),
+        ("python3.13.kex", "Python 3.13.15"),
+        ("python3.12.kex", "Python 3.12.14"),
+    ):
+        session.confirmed_command(
+            f"{binaries}/{name} --version", cwd, timeout, contains=(f"{expected}\n",)
+        )
+
+    # Command-line modes: inline code, arguments, script, module, and stdin.
+    session.confirmed_command(
+        f"""{python} -c 'print("cpy-inline", 6 * 7)'""",
+        cwd,
+        timeout,
+        contains=("cpy-inline 42\n",),
+    )
+    session.confirmed_command(
+        f"""{python} -c 'import sys; print("cpy-argv", sys.argv[1:])' -- -x""",
+        cwd,
+        timeout,
+        contains=("cpy-argv ['--', '-x']\n",),
+    )
+    session.confirmed_command(
+        f"{python} {packages}/script_probe.py one two",
+        cwd,
+        timeout,
+        contains=("script-probe ['one', 'two']\n",),
+    )
+    session.confirmed_command(
+        f"{python} -m troe_fixture",
+        cwd,
+        timeout,
+        contains=("module-probe pure-package-on-shared-volume 42\n",),
+    )
+    session.confirmed_command(
+        f"{python} - < {packages}/script_probe.py",
+        cwd,
+        timeout,
+        contains=("script-probe []\n",),
+    )
+    session.confirmed_command(
+        f"""{python} -c 'print("cpy" + "-quit", callable(exit), callable(quit))'""",
+        cwd,
+        timeout,
+        contains=("cpy-quit True True\n",),
+    )
+    run_cpython_repl(session, cwd, python, timeout)
+
+    # Language semantics, the shipped library profile, and TROE-backed services.
+    session.confirmed_command(
+        f"{python} {packages}/language_probe.py",
+        cwd,
+        timeout,
+        contains=("language-probe troe 3.14.7\n",),
+    )
+    session.confirmed_command(
+        f"{python} {packages}/stdlib_probe.py",
+        cwd,
+        timeout,
+        contains=("stdlib-probe 19 1 True\n",),
+    )
+    # Every module the profile ships must actually import; a shipped module
+    # that raises ModuleNotFoundError is a manifest defect, not a limitation.
+    session.confirmed_command(
+        f"{python} {packages}/profile_probe.py",
+        cwd,
+        timeout * 4,
+        contains=("profile-probe ",),
+        absent=("profile-failures",),
+    )
+    session.confirmed_command(
+        f"{python} {packages}/runtime_probe.py",
+        cwd,
+        timeout,
+        contains=("runtime-probe 32 /vol/shared\n",),
+    )
+    session.confirmed_command(
+        f"{python} {packages}/negative_probe.py",
+        cwd,
+        timeout,
+        contains=("negative-probe 10 ",),
+    )
+
+    # The interpreter tree stays free of bytecode written during acceptance, so
+    # a read-only standard library remains fully usable.
+    session.command(
+        f"ls {stdlib}/__pycache__",
+        cwd,
+        command_timeout,
+        contains=(f"ls: {stdlib}/__pycache__: not found",),
+    )
+
+    # Missing authority fails explicitly instead of degrading or inventing data.
+    # Withheld entropy authority stops interpreter initialization outright, so
+    # no code runs on weak seeding regardless of the requested action.
+    entropy_failure = "initialization failed: failed to get random numbers"
+    session.confirmed_command(
+        f"""{no_random} -c 'import os; print("cpy" + "-entropy", os.urandom(4))'""",
+        cwd,
+        timeout,
+        contains=(entropy_failure,),
+        absent=("cpy-entropy",),
+    )
+    # Argument handling that precedes interpreter startup still answers, which
+    # keeps the failure attributable to initialization rather than the loader.
+    session.confirmed_command(
+        f"{no_random} --version", cwd, timeout, contains=("Python 3.14.7\n",)
+    )
+    session.confirmed_command(
+        f"""{no_mutate} -c 'open("/vol/shared/no.txt", "w"); print("cpy" + "-write")'""",
+        cwd,
+        timeout,
+        contains=("PermissionError: [Errno 13] permission denied",),
+        absent=("cpy-write",),
+    )
+
+    # Repeated successful and failing launches return every accounted resource.
+    baseline = parse_free_frames(session.command("mem", cwd, command_timeout))
+    for _ in range(3):
+        session.confirmed_command(
+            f"""{python} -c 'print("cpy-cycle", sum(range(1000)))'""",
+            cwd,
+            timeout,
+            contains=("cpy-cycle 499500\n",),
+        )
+        session.confirmed_command(f"""{python} -c 'raise SystemExit(3)'""", cwd, timeout)
+    recovered = parse_free_frames(session.command("mem", cwd, command_timeout))
+    if recovered != baseline:
+        raise AcceptanceError(
+            f"CPython launches did not return kernel frames: {baseline} -> {recovered}"
+        )
+
+
 def run_quota_memory_group(session: SerialSession, command_timeout: float) -> None:
     """Exercise the RAMFS quota and bounded transient-allocation accounting."""
     cwd = "/"
@@ -2491,6 +2715,8 @@ def run_scenario(
         run_shell_terminal_group(session, command_timeout)
     if "filesystem" in scenario_groups:
         run_filesystem_group(session, command_timeout)
+    if "cpython" in scenario_groups:
+        run_cpython_group(session, command_timeout)
     if "lua" in scenario_groups:
         run_lua_group(session, command_timeout)
     if "shell-terminal" in scenario_groups:
@@ -3031,9 +3257,14 @@ def main() -> int:
                 )
             else:
                 build_runtime_probe_tree()
+        install_cpython = "cpython" in scenario_groups
         for platform_id in platform_ids:
             reset_txslot(platform_id, args.environment)
-            reset_shared_media(platform_id, install_runtime=install_runtime)
+            reset_shared_media(
+                platform_id,
+                install_runtime=install_runtime,
+                install_cpython=install_cpython,
+            )
         if len(platform_ids) == 1:
             test_platform(platform_ids[0], args)
         else:

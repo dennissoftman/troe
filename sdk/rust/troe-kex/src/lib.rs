@@ -1510,6 +1510,32 @@ impl FileReplacement {
         Ok(())
     }
 
+    /// Read already-staged bytes back from this pending replacement.
+    ///
+    /// Offsets beyond the staged end report zero, so a caller can distinguish
+    /// end of staged content from a failure. This reads only what this
+    /// replacement has written; it never observes unrelated file content.
+    ///
+    /// # Errors
+    ///
+    /// Reports invalid offsets, stale tokens, filesystem failures, or a
+    /// service/call-gate failure.
+    pub fn read_at(&mut self, offset: u64, destination: &mut [u8]) -> Result<usize, Error> {
+        if destination.is_empty() || offset >= self.offset {
+            return Ok(0);
+        }
+        let requested = destination.len().min(filesystem_mutation::MAX_READ_BYTES);
+        let mut request = [0_u8; filesystem_mutation::READ_REQUEST_BYTES];
+        filesystem_mutation::encode_read_request(self.token, offset, requested, &mut request)
+            .map_err(|_| Error::InvalidCall)?;
+        call(
+            self.handle,
+            filesystem_mutation::READ_REPLACEMENT,
+            &request,
+            &mut destination[..requested],
+        )
+    }
+
     /// Flush and durably order the streamed bytes, then consume this token.
     ///
     /// # Errors
