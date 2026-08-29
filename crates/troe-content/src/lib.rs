@@ -774,18 +774,7 @@ fn crc32_zeroed(bytes: &[u8]) -> u32 {
 }
 
 fn crc32_with_zeroed(bytes: &[u8], zero_offset: usize) -> u32 {
-    let mut crc = u32::MAX;
-    for (index, byte) in bytes.iter().copied().enumerate() {
-        crc ^= u32::from(if (zero_offset..zero_offset + 4).contains(&index) {
-            0
-        } else {
-            byte
-        });
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xedb8_8320 & 0_u32.wrapping_sub(crc & 1));
-        }
-    }
-    !crc
+    troe_checksum::crc32_with_zeroed_field(bytes, zero_offset)
 }
 
 // FIPS 180-4 SHA-256 with fixed stack state and no allocation.

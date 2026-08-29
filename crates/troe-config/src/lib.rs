@@ -7,6 +7,7 @@ extern crate alloc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt::Write;
+use troe_checksum::crc32;
 use troe_content::ContentDigest;
 use troe_vfs::{MAX_PATH_BYTES, canonicalize};
 
@@ -1276,18 +1277,6 @@ fn write_reference(bytes: &mut [u8], offset: usize, reference: ConfigReference) 
     bytes[offset + 8..offset + 12].copy_from_slice(&reference.byte_count.to_le_bytes());
     bytes[offset + 12..offset + 16].copy_from_slice(&reference.checksum.to_le_bytes());
     bytes[offset + 16..offset + 48].copy_from_slice(&reference.digest.bytes());
-}
-
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = u32::MAX;
-    for byte in bytes {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            let mask = 0_u32.wrapping_sub(crc & 1);
-            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
-        }
-    }
-    !crc
 }
 
 #[cfg(test)]

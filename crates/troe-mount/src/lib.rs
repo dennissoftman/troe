@@ -23,7 +23,6 @@ pub const MAX_DISCOVERED_VOLUMES: usize = 64;
 const HEADER_BYTES: usize = 64;
 const RECORD_BYTES: usize = 96;
 const CHECKSUM_OFFSET: usize = 20;
-const CHECKSUM_END: usize = 24;
 
 /// Whether a selector names an unpartitioned device or one GPT partition.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -644,20 +643,7 @@ fn array_16(bytes: &[u8], offset: usize) -> Result<[u8; 16], ManifestError> {
 }
 
 fn crc32_with_zeroed_checksum(bytes: &[u8]) -> u32 {
-    let mut crc = u32::MAX;
-    for (index, byte) in bytes.iter().copied().enumerate() {
-        let byte = if (CHECKSUM_OFFSET..CHECKSUM_END).contains(&index) {
-            0
-        } else {
-            byte
-        };
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            let mask = 0_u32.wrapping_sub(crc & 1);
-            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
-        }
-    }
-    !crc
+    troe_checksum::crc32_with_zeroed_field(bytes, CHECKSUM_OFFSET)
 }
 
 #[cfg(test)]

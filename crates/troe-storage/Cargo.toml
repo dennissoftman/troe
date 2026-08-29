@@ -19,3 +19,6 @@ troe-vfs = { path = "../troe-vfs" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+troe-checksum = { path = "../troe-checksum" }

@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 troe-block = { path = "../troe-block" }
+troe-checksum = { path = "../troe-checksum" }
 
 [lints]
 workspace = true

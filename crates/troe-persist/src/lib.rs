@@ -391,20 +391,7 @@ fn copy_guid(bytes: &[u8], offset: usize) -> Result<[u8; 16], SelectorError> {
 }
 
 fn crc32_zeroed_checksum(bytes: &[u8]) -> u32 {
-    let mut crc = u32::MAX;
-    for (index, byte) in bytes.iter().copied().enumerate() {
-        let byte = if (CHECKSUM_OFFSET..CHECKSUM_END).contains(&index) {
-            0
-        } else {
-            byte
-        };
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            let mask = 0_u32.wrapping_sub(crc & 1);
-            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
-        }
-    }
-    !crc
+    troe_checksum::crc32_with_zeroed_field(bytes, CHECKSUM_OFFSET)
 }
 
 #[cfg(test)]

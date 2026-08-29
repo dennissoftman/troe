@@ -7,6 +7,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::char::decode_utf16;
 use troe_block::{BlockDevice, BlockError, BlockRegion};
+use troe_checksum::crc32;
 
 const GPT_SIGNATURE: &[u8; 8] = b"EFI PART";
 const GPT_REVISION_1_0: u32 = 0x0001_0000;
@@ -633,18 +634,6 @@ fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, GptError> {
         .and_then(|value| <[u8; 8]>::try_from(value).ok())
         .ok_or(GptError::InvalidHeader)?;
     Ok(u64::from_le_bytes(array))
-}
-
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = u32::MAX;
-    for byte in bytes {
-        crc ^= u32::from(*byte);
-        for _ in 0..8 {
-            let mask = 0_u32.wrapping_sub(crc & 1);
-            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
-        }
-    }
-    !crc
 }
 
 #[cfg(test)]

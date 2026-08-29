@@ -1,12 +1,10 @@
 [package]
-name = "troe-identity"
+name = "troe-checksum"
+description = "Reflected CRC-32 primitives shared by TROE on-disk format codecs"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-
-[dependencies]
-troe-checksum = { path = "../troe-checksum" }
 
 [lints]
 workspace = true

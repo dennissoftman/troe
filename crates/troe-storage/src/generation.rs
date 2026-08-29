@@ -319,15 +319,7 @@ mod tests {
     }
 
     fn crc32(bytes: &[u8]) -> u32 {
-        let mut crc = u32::MAX;
-        for byte in bytes {
-            crc ^= u32::from(*byte);
-            for _ in 0..8 {
-                let mask = 0_u32.wrapping_sub(crc & 1);
-                crc = (crc >> 1) ^ (0xedb8_8320 & mask);
-            }
-        }
-        !crc
+        troe_checksum::crc32(bytes)
     }
 
     #[test]

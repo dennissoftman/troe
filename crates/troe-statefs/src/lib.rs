@@ -296,19 +296,7 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, FsError> {
 }
 
 fn crc32_zeroed(bytes: &[u8]) -> u32 {
-    let mut crc = u32::MAX;
-    for (index, byte) in bytes.iter().copied().enumerate() {
-        let byte = if (CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4).contains(&index) {
-            0
-        } else {
-            byte
-        };
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            crc = (crc >> 1) ^ (0xedb8_8320 & 0_u32.wrapping_sub(crc & 1));
-        }
-    }
-    !crc
+    troe_checksum::crc32_with_zeroed_field(bytes, CHECKSUM_OFFSET)
 }
 
 fn map_persist(error: PersistError) -> FsError {
