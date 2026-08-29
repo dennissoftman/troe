@@ -440,7 +440,7 @@ that would exceed the bound MUST be refused with a typed exhausted status before
 any child is created, leaving the launcher running.
 
 Optional large runtime executables MUST be installed only below
-`/vol/shared/runtime/v1/<architecture>/bin`. A canonical version manifest MUST
+`/vol/shared/bin/<architecture>`. A canonical version manifest MUST
 bind the exact path set, byte lengths, and SHA-256 digests and reject symbolic
 links, unmanifested entries, unsupported schemas, and changed artifacts.
 Runtime artifacts MUST NOT be copied into rootfs, KEFS, or EFI, and unavailable
@@ -1042,7 +1042,7 @@ jobs, supervised services, timer preemption, stable process observation,
 owner-scoped nested KEX launch, and bounded byte pipes. Static KEX v1 packages
 receive only typed declared services. Externally stored packages use coherent
 bounded streaming into inactive frames, and optional large runtime packages use
-the verified `/vol/shared/runtime/v1` tree. The shared freestanding C SDK and
+the verified `/vol/shared/bin` tree. The shared freestanding C SDK and
 static library provide the bounded capability-scoped single-execution-thread
 runtime surface described in section 11.2. Dynamic linking and shared objects
 are not implemented; their design gate is tracked in

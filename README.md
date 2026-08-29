@@ -165,7 +165,7 @@ deviations still fail closed. Use `cargo mount --repair` for the same explicit,
 lock-protected non-interactive repair without mounting the image.
 
 Large optional runtime executables use the versioned
-`/vol/shared/runtime/v1/<architecture>/bin/<name>.kex` tree. They are never
+`/vol/shared/bin/<architecture>/<name>.kex` tree. They are never
 copied into rootfs, KEFS, or the EFI image. `tools/mkruntime.py` builds a
 canonical SHA-256 manifest, verifies the exact file set and every artifact
 byte, and installs either below a mounted shared-media root or directly into a
@@ -271,7 +271,11 @@ nested KEX package through the owner-scoped launch capability, inherits or
 captures standard output through a bounded pipe, waits, reaps, and preserves
 the child's complete exit status without putting shell grammar in the kernel.
 
-[`apps/lua`](apps/lua) is a complete freestanding Lua 5.5.1 interpreter. It
+[`apps/lua`](apps/lua) is a complete freestanding Lua 5.5.1 interpreter. Like
+CPython it is an optional runtime rather than a recovery command: it ships on
+`/vol/shared/bin/<architecture>` and is reached by explicit path, so the
+read-only root keeps only what booting, recovering, and administering a
+machine actually needs. It
 supports the stock batch command-line actions and standard library surface,
 including file mutation, `os.execute`, and read/write `io.popen` through explicit
 KEX capabilities. It starts with a 1 MiB TLSF application heap, reports

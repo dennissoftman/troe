@@ -76,7 +76,7 @@ never executes the ordinary application.
   direct interactive execution outside `/bin` requires a default-negative
   confirmation;
 - runtime media: optional large executables exist only in the exact
-  `/vol/shared/runtime/v1/<architecture>/bin` tree; the canonical manifest
+  `/vol/shared/bin/<architecture>` tree; the canonical manifest
   binds every path, length, and SHA-256 digest, and missing, extra, linked,
   malformed, oversized, or changed artifacts fail before launch;
 - C facade: bounded process-local descriptor, `FILE`, directory, environment,

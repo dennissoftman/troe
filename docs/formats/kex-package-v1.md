@@ -57,5 +57,5 @@ package-sized kernel-heap allocation. Direct, resident, service, and nested
 launch use the same procedure.
 
 Optional large packages installed as runtime artifacts follow the
-[shared runtime tree v1](runtime-tree-v1.md) contract. Tree verification does
+[shared runtime tree v2](runtime-tree-v2.md) contract. Tree verification does
 not replace this package and executable validation.

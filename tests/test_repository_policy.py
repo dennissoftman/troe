@@ -144,7 +144,6 @@ class RepositoryPolicyTests(unittest.TestCase):
             "hexdump",
             "ln",
             "ls",
-            "lua",
             "man",
             "mem",
             "mount",
@@ -169,7 +168,7 @@ class RepositoryPolicyTests(unittest.TestCase):
         }
         apps = {path.name for path in application_directories()}
         self.assertEqual(apps, ordinary | SHARED_VOLUME_APPLICATIONS)
-        self.assertEqual(SHARED_VOLUME_APPLICATIONS, {"python"})
+        self.assertEqual(SHARED_VOLUME_APPLICATIONS, {"lua", "python"})
         self.assertFalse(ordinary & SHARED_VOLUME_APPLICATIONS)
         for architecture in ("x86_64", "aarch64"):
             root = REPO_ROOT / "rootfs" / "bin" / architecture

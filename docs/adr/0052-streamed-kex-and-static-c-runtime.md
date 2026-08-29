@@ -31,7 +31,7 @@ mutation, no-progress or over-reported reads, malformed and oversized input,
 and sink failures without activating the root.
 
 Optional runtime KEX packages are installed only below the versioned
-`/vol/shared/runtime/v1/<architecture>/bin` tree. Its canonical manifest binds
+`/vol/shared/bin/<architecture>` tree. Its canonical manifest binds
 the exact sorted path set, byte lengths, and SHA-256 digests. Deterministic host
 tooling builds, verifies, and installs mounted or detached shared media. Rootfs,
 KEFS, and EFI builds do not consume runtime trees, and no embedded fallback is
@@ -62,5 +62,5 @@ launched with the normal application isolation and teardown contract.
 
 The static archive belongs in the build sysroot's architecture `lib`
 directory. TROE still has no guest `/lib`: an executable carries the symbols it
-uses, and `/vol/shared/runtime/v1/<architecture>/bin` contains runnable KEX
+uses, and `/vol/shared/bin/<architecture>` contains runnable KEX
 packages rather than link-time objects.

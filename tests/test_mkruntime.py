@@ -46,10 +46,10 @@ class RuntimeTreeTests(unittest.TestCase):
             )
             for architecture in mkruntime.ARCHITECTURES:
                 self.assertTrue(
-                    (first / architecture / "bin" / "runtime-probe.kex").is_file()
+                    (first / architecture / "runtime-probe.kex").is_file()
                 )
             self.assertEqual(
-                mkruntime.RUNTIME_DIRECTORY.as_posix(), "runtime/v1"
+                mkruntime.RUNTIME_DIRECTORY.as_posix(), "bin"
             )
 
     def test_verifier_rejects_tampering_and_unmanifested_files(self) -> None:
@@ -57,7 +57,7 @@ class RuntimeTreeTests(unittest.TestCase):
             root = Path(temporary)
             tree = root / "tree"
             mkruntime.build_tree(tree, self._artifacts(root))
-            artifact = tree / "x86_64" / "bin" / "runtime-probe.kex"
+            artifact = tree / "x86_64" / "runtime-probe.kex"
             artifact.write_bytes(b"changed")
             with self.assertRaisesRegex(ValueError, "verification failed"):
                 mkruntime.verify_tree(tree)
@@ -77,7 +77,7 @@ class RuntimeTreeTests(unittest.TestCase):
             shared = root / "shared"
             shared.mkdir()
             destination = mkruntime.install_tree(tree, shared)
-            self.assertEqual(destination, shared / "runtime" / "v1")
+            self.assertEqual(destination, shared / "bin")
             mkruntime.verify_tree(destination)
 
     def test_invalid_or_duplicate_artifact_specs_fail_closed(self) -> None:
