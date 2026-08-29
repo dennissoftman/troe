@@ -488,12 +488,19 @@ metadata-preserving ext4 with bounded symbolic/hard links, native virtio
 transport, dual-slot durability, and
 selected STFS mutation pieces preserve this dependency direction. Empty
 directory removal and same-provider rename are implemented for RAMFS, FAT32,
-and the constrained ext4 profile. Constrained-ext4 metadata mutations are
+and the ext4 provider. Its ext4 mutations are
 journaled as physical block redo transactions in the profile's existing internal
 journal, and a separate explicitly authorized recovery path replays a committed
 transaction or discards an uncommitted one, so an interrupted mutation recovers
-to exactly one valid state without external repair. General ext4 repair and
-mutations outside the documented profiles remain unsupported. A transport provides bounded block-region capabilities; partition
+to exactly one valid state without external repair. The provider follows ext4's own compatibility
+rules rather than one exact feature set: an unknown incompatible feature is
+refused, an unknown read-only-compatible feature mounts read-only, and
+compatible features are ignored. It reads 1 KiB, 2 KiB and 4 KiB blocks,
+32- and 64-byte group descriptors, stored checksum seeds, flexible block
+groups, uninitialized groups, hashed directory indexes, and extent trees to the
+depth ext4 builds them, so an ordinary Linux ext4 volume mounts and takes the
+full mutation surface. General ext4 repair and mutations outside the documented
+profile remain unsupported. A transport provides bounded block-region capabilities; partition
 discovery turns a whole device into non-overlapping regions; independently
 selected filesystem providers expose VFS objects.
 Format-specific structures do not enter the machine backend, block transport,

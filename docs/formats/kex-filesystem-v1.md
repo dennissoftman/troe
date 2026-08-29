@@ -51,8 +51,8 @@ by replacement writes.
 
 The canonical two-path encoding starts with little-endian `u16` source and
 destination byte lengths followed by exactly those UTF-8 bytes, with no padding
-or trailing data. Each path is at most 256 bytes; the request is at most 516
-bytes. Rename rejects existing destinations, roots, mountpoints, immutable
+or trailing data. Each path is at most 1024 bytes and each path component at
+most 255, which is ext4's own name limit; the request is at most 2052 bytes. Rename rejects existing destinations, roots, mountpoints, immutable
 objects, and provider crossings. Directory removal rejects roots, mountpoints,
 files, symlinks, and nonempty directories.
 

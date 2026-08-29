@@ -1772,7 +1772,7 @@ pub mod filesystem {
     /// Maximum entries returned by one list call.
     pub const MAX_LIST_ENTRIES: usize = 64;
     /// Maximum encoded bytes in one entry name.
-    pub const MAX_NAME_BYTES: usize = 64;
+    pub const MAX_NAME_BYTES: usize = 255;
     /// Maximum aggregate name bytes returned by one list call.
     pub const MAX_LIST_NAME_BYTES: usize = 3 * 1024;
     /// Fixed open-file reply bytes.

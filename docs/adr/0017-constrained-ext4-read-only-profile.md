@@ -1,7 +1,9 @@
 # ADR 0017: constrained ext4 profile v1
 
 Status: accepted and implemented, 2026-08-24; amended with streamed writes and
-checksummed depth-one extent leaves, 2026-08-26. The no-replay and external
+checksummed depth-one extent leaves, 2026-08-26. The exact-feature and fixed-geometry
+decision below is superseded by ADR 0056, which implements ext4's own
+compatibility rules. The no-replay and external
 `e2fsck` recovery statements below are superseded by ADR 0055, which journals
 metadata mutations and adds a bounded recovery path; the incompatible-feature
 set below is extended there with `needs_recovery`.
