@@ -125,7 +125,12 @@ const EXT4_FEATURE_INCOMPAT: u32 = EXT4_REQUIRED_INCOMPAT;
 const EXT4_FEATURE_RO_COMPAT: u32 =
     EXT4_RO_COMPAT_SPARSE_SUPER | EXT4_RO_COMPAT_LARGE_FILE | EXT4_REQUIRED_RO_COMPAT;
 const CRC32C_POLYNOMIAL: u32 = 0x82f6_3b78;
-const HARD_MAX_GROUPS: u32 = 32;
+/// Hard ceiling on block groups.
+///
+/// At the 32 KiB-per-group ext4 default a group covers 128 MiB, so this admits
+/// volumes up to 1 TiB. Allocation stays bounded because the free-block scan
+/// stops as soon as the retained runs can satisfy the request.
+const HARD_MAX_GROUPS: u32 = 8192;
 const HARD_MAX_INODES_PER_OPERATION: u32 = 64;
 const HARD_MAX_DIRECTORY_BLOCKS: u32 = 256;
 const HARD_MAX_DIRECTORY_ENTRIES: u32 = 4096;
@@ -1237,6 +1242,14 @@ impl<D: BlockDevice> Ext4<D> {
                 }
             }
             Self::retain_free_run(&mut runs, run_start, run_length);
+            // Stop as soon as the retained runs can satisfy the request, so a
+            // large volume never pays for a whole-volume bitmap scan.
+            let retained = runs.iter().try_fold(0_u32, |total, (_, length)| {
+                total.checked_add(*length).ok_or(FsError::Overflow)
+            })?;
+            if retained >= count_u32 {
+                break;
+            }
         }
         runs.sort_unstable_by(|left, right| {
             right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0))
@@ -5398,6 +5411,41 @@ mod tests {
             Some(FsError::NotFound),
             "the removed entry must be gone"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn writes_to_a_multi_group_volume_beyond_the_previous_ceiling() -> Result<(), String> {
+        let Some(mke2fs) = e2fs_tool("mke2fs") else {
+            return unavailable_tool("mke2fs");
+        };
+        let Some(e2fsck) = e2fs_tool("e2fsck") else {
+            return unavailable_tool("e2fsck");
+        };
+        let temporary = TestDirectory::create("ext4-large")?;
+        // 16 GiB is 128 groups at the ext4 default, four times the ceiling this
+        // provider previously accepted.
+        let image = default_mke2fs_image(temporary.path(), &mke2fs, 16 * 1024 * 1024 * 1024)?;
+        {
+            let mut ext4 = mount_file_writable_with_limits(&image, default_volume_limits()?)?;
+            ext4.write_file("/created.txt", b"written across many groups\n")
+                .map_err(|error| format!("cannot create on a large volume: {error:?}"))?;
+            ext4.create_directory("/archive")
+                .map_err(|error| format!("cannot create a directory: {error:?}"))?;
+        }
+        let check = Command::new(&e2fsck)
+            .args(["-f", "-n"])
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&check, "e2fsck after large-volume mutation")?;
+
+        let mut ext4 = mount_file_with_limits(&image, default_volume_limits()?)?;
+        let mut bytes = [0_u8; 32];
+        let read = ext4
+            .read_file("/created.txt", 0, &mut bytes)
+            .map_err(|error| format!("cannot read back: {error:?}"))?;
+        assert_eq!(&bytes[..read], b"written across many groups\n");
         Ok(())
     }
 
