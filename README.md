@@ -297,7 +297,7 @@ version-addressable `python3.14.7.kex` through `python3.12.kex` names plus a
 explicit isolated `PyConfig`: fixed TROE paths, UTF-8 mode, no ambient
 environment, no user site directory, and no bytecode writes, so a read-only
 interpreter tree stays fully usable. Imports resolve from the shipped library
-and from `/vol/shared/cpython/v1/packages`, where bootstrap tooling installs
+and from `/vol/shared/lib/<architecture>/packages`, where bootstrap tooling installs
 ordinary pure-Python packages. File I/O, the working directory, clocks, private
 memory, temporary files, and `os.urandom`/`secrets` reach the granted
 capabilities through the shared C runtime; withholding entropy authority stops
