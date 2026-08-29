@@ -433,6 +433,12 @@ failure MUST roll back the provisional launch. Direct, background, service, and
 owner-scoped nested launch MUST preserve the same validation, W^X, randomized
 placement, capability attenuation, accounting, teardown, and reclamation.
 
+Nested launch MUST be bounded by depth. The kernel drives a nested child on the
+launching task's stack, so each level costs one kernel stack frame. A session or
+service launch is the first level and at most eight levels may exist; a launch
+that would exceed the bound MUST be refused with a typed exhausted status before
+any child is created, leaving the launcher running.
+
 Optional large runtime executables MUST be installed only below
 `/vol/shared/runtime/v1/<architecture>/bin`. A canonical version manifest MUST
 bind the exact path set, byte lengths, and SHA-256 digests and reject symbolic

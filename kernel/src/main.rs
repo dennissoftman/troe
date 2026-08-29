@@ -140,6 +140,14 @@ mod firmware {
     const RESIDENT_PROCESS_CAPACITY: usize = troe_task::MAX_TASKS - 3;
     const INITIAL_RESIDENT_PROCESS_CAPACITY: usize = 64;
     const RESIDENT_PROCESS_LOG_BYTES: usize = 64 * 1024;
+    // Nested children run on the launching task's kernel stack: pumping a child
+    // re-enters `ResidentApplication::step`, so nesting costs one frame per
+    // level. `step` keeps only the pump on that recursive path and leaves its
+    // message buffers and service handlers in `run_execution_slice`, which is
+    // never recursive, so a level costs about 1 KiB and the one running slice
+    // about 53 KiB. Eight levels stay near two thirds of
+    // SHELL_TASK_STACK_BYTES on both architectures.
+    const MAX_LAUNCH_DEPTH: u32 = 8;
     const RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS: u32 = 10;
     const RESIDENT_SERVICE_CALLS_PER_STEP: usize = 4;
     const RESIDENT_POLL_MILLISECONDS: u32 = 10;
@@ -766,6 +774,7 @@ mod firmware {
 
     struct ResidentProcessControl<'service> {
         owner: OwnerId,
+        depth: u32,
         grants: BackgroundRequirements,
         children: SharedChildTable,
         pipes: SharedPipeTable,
@@ -5859,6 +5868,11 @@ mod firmware {
             accounting: &mut OwnedAccounting,
             request: process_launch::SpawnRequest<'_>,
         ) -> Result<process_launch::SpawnedChild, ReplyStatus> {
+            let depth = control
+                .depth
+                .checked_add(1)
+                .filter(|depth| *depth <= MAX_LAUNCH_DEPTH)
+                .ok_or(ReplyStatus::Exhausted)?;
             control
                 .processes
                 .try_reserve(1)
@@ -6384,6 +6398,7 @@ mod firmware {
             if required.process_launch {
                 process.process_control = Some(ResidentProcessControl {
                     owner,
+                    depth,
                     grants: required,
                     children: child_children,
                     pipes: child_pipes,
@@ -6565,13 +6580,24 @@ mod firmware {
             Ok(())
         }
 
-        #[allow(clippy::too_many_lines)]
         fn step(
             &mut self,
             scheduler: &mut Scheduler,
             accounting: &mut OwnedAccounting,
         ) -> Result<Option<CommandApplicationOutcome>, ()> {
             self.pump_children(scheduler, accounting)?;
+            self.run_execution_slice(scheduler, accounting)
+        }
+
+        // Kept out of `step` so its frame leaves the recursive pump path: the
+        // launch depth bound is sized against the small frame that remains.
+        #[allow(clippy::too_many_lines)]
+        #[inline(never)]
+        fn run_execution_slice(
+            &mut self,
+            scheduler: &mut Scheduler,
+            accounting: &mut OwnedAccounting,
+        ) -> Result<Option<CommandApplicationOutcome>, ()> {
             let execution = self.execution.take().ok_or(())?;
             let mut outcome = match execution {
                 ResidentExecution::Unstarted(launch) => {
@@ -13804,6 +13830,7 @@ mod firmware {
                 process.process_control = Some(ResidentProcessControl {
                     owner: process_owner
                         .unwrap_or_else(|| fatal(b"fatal: process owner missing\n")),
+                    depth: 1,
                     grants: requirements,
                     children: process_children
                         .clone()
@@ -14781,6 +14808,7 @@ mod firmware {
                             process.process_control = Some(ResidentProcessControl {
                                 owner: process_owner
                                     .unwrap_or_else(|| fatal(b"fatal: process owner missing\n")),
+                                depth: 1,
                                 grants: BackgroundRequirements {
                                     datagram: datagram_required,
                                     filesystem: filesystem_required,

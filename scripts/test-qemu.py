@@ -1838,6 +1838,36 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
         command_timeout,
         contains=("cat: /missing: not found", "spawn-status: 3\n"),
     )
+    # Nested launch is bounded by depth because each level occupies one kernel
+    # stack frame. Eight levels are accepted; a ninth is refused at the launch
+    # boundary, whichever application launches it, and the session stays usable.
+    session.command(
+        'spawn --status spawn --status spawn --status spawn --status spawn --status spawn --status spawn --status echo nested-depth-eight',
+        cwd,
+        command_timeout,
+        contains=("nested-depth-eight\n", "spawn-status: 0\n"),
+        absent=("spawn-status: 1\n",),
+    )
+    session.command(
+        'spawn --status spawn --status spawn --status spawn --status spawn --status spawn --status spawn --status spawn --status echo nested-depth-nine',
+        cwd,
+        command_timeout,
+        contains=("spawn: child launch failed", "spawn-status: 1\n"),
+        absent=("nested-depth-nine\n",),
+    )
+    session.command(
+        "lua -e 'print(os.execute(\"spawn --status spawn --status spawn --status spawn --status spawn --status spawn --status spawn --status echo lua-depth-nine\"))'",
+        cwd,
+        command_timeout,
+        contains=("spawn: child launch failed", "nil\texit\t1\n"),
+        absent=("lua-depth-nine\n",),
+    )
+    session.command(
+        "echo nested-depth-survived",
+        cwd,
+        command_timeout,
+        contains=("nested-depth-survived\n",),
+    )
     session.command(
         r"printf 'first\nsecond\t%s\n' value | grep second",
         cwd,

@@ -412,8 +412,10 @@ direct launches, grants only a child-manifest attenuation of the
 launcher's own capabilities, and
 returns an opaque control token separate from the observable process ID.
 Blocking wait, cancellation, terminal reap, pipe backpressure/EOF, and recursive
-descendant teardown are resident-process operations. The kernel exposes no
-command parser. `spawn.kex` exercises the mechanism; the current `sh.kex`
+descendant teardown are resident-process operations. The kernel steps a nested
+child on the launching task's stack, so nesting is bounded at eight levels below
+the session or a service and a deeper launch is refused as exhausted. The kernel
+exposes no command parser. `spawn.kex` exercises the mechanism; the current `sh.kex`
 continues to use its transactional script sidecar until its language moves onto
 these APIs.
 

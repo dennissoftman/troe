@@ -11,6 +11,13 @@ Supersession note, 2026-08-29: the interactive shell now evaluates bounded
 left-associative `&&` and `||` lists. Moving a broader command language into
 `sh.kex` remains future work.
 
+Supersession note, 2026-08-29: nesting is bounded by depth. This ADR described
+nesting as recursive without stating a depth ceiling, but the kernel drives a
+nested child on the launching task's stack, so each level costs one kernel stack
+frame. Launch depth is now capped at eight levels and a deeper launch is refused
+with the exhausted status. Attenuation, lifecycle tokens, and teardown are
+unchanged.
+
 ## Context
 
 The resident-process and observation work left command evaluation split across
@@ -59,7 +66,8 @@ pipe behavior.
 Parent teardown recursively cancels and reaps every retained descendant before
 revoking the parent's handles and memory. TROE does not adopt or orphan a child
 in this increment. A child can itself receive attenuated launch/pipe handles,
-so nesting is recursive without adding a kernel shell or parser.
+so nesting is recursive without adding a kernel shell or parser, bounded by the
+launch depth ceiling recorded above.
 
 Resource registries now use fallibly growing `Vec` storage with small initial
 reservations instead of maximum-sized arrays. The scheduler and process
@@ -74,6 +82,7 @@ are:
 | dispatcher ports | 65,536 | 64 |
 | dispatcher handles | 262,144 | 64 |
 | retained children per launch authority | 65,536 | 64 |
+| nested launch depth below a session or service | 8 | one level |
 | pipes per pipe authority | 65,536 | 64 |
 | aggregate pipe capacity per owner | 256 MiB | zero bytes |
 | read-only open files per application | 4,096 | 64 |
