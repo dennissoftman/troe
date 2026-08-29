@@ -303,9 +303,8 @@ int open(const char *path, int flags, ...) {
   if ((flags & ~known) != 0)
     return troe_fail(ENOTSUP);
   int access_mode = flags & O_ACCMODE;
-  if (access_mode == O_RDWR)
-    return troe_fail(ENOTSUP);
-  if (access_mode != O_RDONLY && access_mode != O_WRONLY)
+  if (access_mode != O_RDONLY && access_mode != O_WRONLY &&
+      access_mode != O_RDWR)
     return troe_fail(EINVAL);
   char resolved[TROE_PATH_BUFFER];
   if (troe_resolve(path, resolved) != 0)
@@ -317,10 +316,14 @@ int open(const char *path, int flags, ...) {
     int result = troe_host->metadata(troe_host->context,
                                      (const uint8_t *)resolved,
                                      strlen(resolved), 0, &metadata);
-    if (result != 0)
+    if (result == 0) {
+      if (metadata.kind == TROE_NODE_SYMLINK)
+        return troe_fail(ELOOP);
+      // O_NOFOLLOW constrains an existing final component only. A creating
+      // open of a missing name stays valid and is resolved below.
+    } else if (troe_host_error(result) != ENOENT || (flags & O_CREAT) == 0) {
       return troe_fail(troe_host_error(result));
-    if (metadata.kind == TROE_NODE_SYMLINK)
-      return troe_fail(ELOOP);
+    }
   }
   int descriptor = troe_descriptor_allocate();
   if (descriptor < 0)
@@ -382,12 +385,20 @@ int open(const char *path, int flags, ...) {
   if (exists && (flags & (O_TRUNC | O_APPEND)) == 0)
     return troe_fail(ENOTSUP);
 
+  // A read-write descriptor reads back only what this replacement staged, so
+  // rewinding and re-reading works while rewriting earlier bytes does not.
+  if (access_mode == O_RDWR &&
+      (troe_host == NULL || troe_host->replace_read == NULL))
+    return troe_fail(ENOTSUP);
+
   int preserve = exists && (flags & O_APPEND) != 0 && (flags & O_TRUNC) == 0;
   int result = troe_begin_replacement(entry, resolved, preserve);
   if (result != 0)
     return troe_fail(result);
   if (preserve)
     entry->append = 1;
+  if (access_mode == O_RDWR)
+    entry->readable = 1;
   return descriptor;
 }
 
@@ -435,6 +446,11 @@ ssize_t read(int descriptor, void *destination, size_t capacity) {
       return (ssize_t)troe_fail(EACCES);
     count = troe_host->file_read(troe_host->context, entry->token,
                                  entry->position, destination, capacity);
+  } else if (entry->kind == TROE_DESCRIPTOR_REPLACEMENT) {
+    if (troe_host == NULL || troe_host->replace_read == NULL)
+      return (ssize_t)troe_fail(EACCES);
+    count = troe_host->replace_read(troe_host->context, entry->token,
+                                    entry->position, destination, capacity);
   } else {
     return (ssize_t)troe_fail(EBADF);
   }
@@ -463,6 +479,10 @@ ssize_t write(int descriptor, const void *source, size_t length) {
   } else if (entry->kind == TROE_DESCRIPTOR_REPLACEMENT) {
     if (troe_host == NULL || troe_host->replace_append == NULL)
       return (ssize_t)troe_fail(EACCES);
+    // Staged bytes are immutable once written, so a rewound read-write
+    // descriptor must return to the end before it can extend the stream.
+    if (entry->position != entry->byte_count)
+      return (ssize_t)troe_fail(ENOTSUP);
     int result = troe_host->replace_append(troe_host->context, entry->token,
                                            entry->position, source, length);
     if (result != 0)
@@ -502,7 +522,11 @@ off_t lseek(int descriptor, off_t offset, int origin) {
              target > (uint64_t)LONG_MAX) {
     return (off_t)troe_fail(EOVERFLOW);
   }
-  if (entry->kind == TROE_DESCRIPTOR_REPLACEMENT && target != entry->position)
+  // A write-only replacement stays strictly sequential. A read-write
+  // replacement may seek anywhere it has already staged so that a caller can
+  // rewind and re-read; writing still resumes only at the staged end.
+  if (entry->kind == TROE_DESCRIPTOR_REPLACEMENT && target != entry->position &&
+      (!entry->readable || target > entry->byte_count))
     return (off_t)troe_fail(ENOTSUP);
   entry->position = target;
   return (off_t)target;

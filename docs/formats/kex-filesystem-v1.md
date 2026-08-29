@@ -12,7 +12,7 @@ the same path request and 16-byte metadata reply as `METADATA` but reports the
 final symbolic link itself. This lets recursive user-space algorithms avoid
 link cycles without exposing provider internals.
 
-## Filesystem mutation 1.3
+## Filesystem mutation 1.4
 
 Interface 7 is a deliberate pre-production 1.x compatibility reset of the
 briefly unreleased 2.0 streamed protocol. Its operations are:
@@ -31,6 +31,16 @@ briefly unreleased 2.0 streamed protocol. Its operations are:
 | 10 | same-provider rename | source and destination paths |
 | 11 | remove empty directory | one path |
 | 12 | begin preserved append | one path |
+| 13 | read staged replacement bytes | token, `u64` offset, `u32` length |
+
+`READ_REPLACEMENT` reads back bytes the active replacement has already staged.
+Its 16-byte request is a little-endian nonzero token, `u64` offset, and nonzero
+`u32` length; the reply carries only the bytes actually available. Offsets at or
+beyond the staged end return an empty reply, so end of staged content is
+distinguishable from failure. The service flushes its aggregation buffer before
+reading, and it never exposes content the caller did not stage. Minor 1.4 adds
+this operation; the interface remains an exact-minor match, so every consumer is
+rebuilt when it changes.
 
 `BEGIN_APPEND` succeeds only for an existing regular file and returns a
 12-byte little-endian reply containing the nonzero token and exact initial

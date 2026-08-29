@@ -1,0 +1,110 @@
+diff --git a/Include/pyport.h b/Include/pyport.h
+--- a/Include/pyport.h
++++ b/Include/pyport.h
+@@ -514,7 +514,12 @@
+ #      error "HAVE_THREAD_LOCAL is already defined"
+ #    endif
+ #    define HAVE_THREAD_LOCAL 1
+-#    ifdef thread_local
++#    ifdef __TROE__
++       // TROE executes each KEX on exactly one thread. Process-global state
++       // therefore has thread-local semantics without requiring an ELF TLS
++       // segment, which the KEX ABI intentionally does not provide.
++#      define _Py_thread_local
++#    elif defined(thread_local)
+ #      define _Py_thread_local thread_local
+ #    elif __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_THREADS__)
+ #      define _Py_thread_local _Thread_local
+@@ -529,7 +534,7 @@
+ #  endif
+ #endif
+ 
+-#if defined(__ANDROID__) || defined(__VXWORKS__)
++#if defined(__ANDROID__) || defined(__VXWORKS__) || defined(__TROE__)
+    // Use UTF-8 as the locale encoding, ignore the LC_CTYPE locale.
+    // See _Py_GetLocaleEncoding(), PyUnicode_DecodeLocale()
+    // and PyUnicode_EncodeLocale().
+diff --git a/Modules/getpath.c b/Modules/getpath.c
+--- a/Modules/getpath.c
++++ b/Modules/getpath.c
+@@ -33,6 +33,13 @@
+ #error "PREFIX, EXEC_PREFIX, VERSION, VPATH and PLATLIBDIR macros must be defined"
+ #endif
+ 
++#ifdef __TROE__
++// The explicit PyConfig search path makes the source-tree VPATH irrelevant.
++// Do not expose a nondeterministic build-host path through sysconfig.
++#  undef VPATH
++#  define VPATH ""
++#endif
++
+ #if !defined(PYDEBUGEXT)
+ #define PYDEBUGEXT NULL
+ #endif
+diff --git a/configure b/configure
+--- a/configure
++++ b/configure
+@@ -4130,6 +4130,9 @@ then
+ 	*-*-wasi*)
+ 	    ac_sys_system=WASI
+ 	    ;;
++	*-*-none*)
++	    ac_sys_system=TROE
++	    ;;
+ 	*)
+ 		# for now, limit cross builds to known configurations
+ 		MACHDEP="unknown"
+@@ -4634,6 +4637,9 @@ then
+ 	wasm32-*-* | wasm64-*-*)
+ 		_host_ident=$host_cpu
+ 		;;
++	*-*-none*)
++		_host_ident=$host_cpu
++		;;
+ 	*)
+ 		# for now, limit cross builds to known configurations
+ 		MACHDEP="unknown"
+diff --git a/configure.ac b/configure.ac
+--- a/configure.ac
++++ b/configure.ac
+@@ -343,6 +343,9 @@ then
+ 	*-*-wasi*)
+ 	    ac_sys_system=WASI
+ 	    ;;
++	*-*-none*)
++	    ac_sys_system=TROE
++	    ;;
+ 	*)
+ 		# for now, limit cross builds to known configurations
+		MACHDEP="unknown"
+@@ -595,6 +598,9 @@ if test "$cross_compiling" = yes; then
+	wasm32-*-* | wasm64-*-*)
+		_host_ident=$host_cpu
+ 		;;
++	*-*-none*)
++		_host_ident=$host_cpu
++		;;
+	*)
+		# for now, limit cross builds to known configurations
+		MACHDEP="unknown"
+diff --git a/Modules/_randommodule.c b/Modules/_randommodule.c
+--- a/Modules/_randommodule.c
++++ b/Modules/_randommodule.c
+@@ -301,6 +301,10 @@ random_seed(RandomObject *self, PyObject *arg)
+     int res;
+ 
+     if (arg == NULL || arg == Py_None) {
++#ifdef __TROE__
++        /* TROE never falls back from its capability-backed random service. */
++        return random_seed_urandom(self);
++#else
+        if (random_seed_urandom(self) < 0) {
+             PyErr_Clear();
+ 
+@@ -316,5 +320,6 @@ random_seed(RandomObject *self, PyObject *arg)
+         }
+         return 0;
++#endif
+     }
+ 
+     /* This algorithm relies on the number being unsigned.

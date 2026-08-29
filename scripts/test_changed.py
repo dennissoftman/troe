@@ -15,13 +15,23 @@ from typing import Iterable
 if __package__:
     from .platform_profile import X86_64_Q35_UEFI
     from .qemu_profile import QEMU_ENVIRONMENT
-    from .repository_policy import require_supported_python
+    from .repository_policy import (
+        SHARED_VOLUME_APPLICATIONS,
+        application_directories,
+        require_supported_python,
+        rootfs_application_directories,
+    )
     from .test import target_clippy_commands
     from .test_scenarios import DEFAULT_SCENARIOS
 else:
     from platform_profile import X86_64_Q35_UEFI
     from qemu_profile import QEMU_ENVIRONMENT
-    from repository_policy import require_supported_python
+    from repository_policy import (
+        SHARED_VOLUME_APPLICATIONS,
+        application_directories,
+        require_supported_python,
+        rootfs_application_directories,
+    )
     from test import target_clippy_commands
     from test_scenarios import DEFAULT_SCENARIOS
 
@@ -164,6 +174,7 @@ PYTHON_IMPACTS = {
     "tools/qemu-firmware-profile.json": ("test_qemu_profile.py",),
     "tools/size_report.py": ("test_build_policy.py",),
     "tools/build_c_sysroot.py": ("test_c_sysroot.py",),
+    "tools/build_cpython.py": ("test_cpython_integration.py",),
 }
 RUNTIME_TOOL_SCENARIOS = {
     "config/volumes.toml": ("boot", "filesystem"),
@@ -178,6 +189,7 @@ RUNTIME_TOOL_SCENARIOS = {
     "tools/mkshared.py": ("boot", "filesystem"),
     "tools/mkruntime.py": ("filesystem",),
     "tools/build_c_sysroot.py": ("filesystem",),
+    "tools/build_cpython.py": ("cpython",),
     "tools/mount_shared.py": ("boot", "filesystem"),
     "tools/size_report.py": ("boot",),
 }
@@ -389,6 +401,9 @@ def _classify_app(plan: TestPlan, path: PurePosixPath) -> bool:
     elif application == "lua":
         _add_python(plan, path, "test_lua_app.py")
         _add_qemu(plan, path, "lua")
+    elif application == "python":
+        _add_python(plan, path, "test_cpython_integration.py")
+        _add_qemu(plan, path, "cpython")
     elif application in TERMINAL_APPS:
         _add_qemu(plan, path, "shell-terminal")
     else:
@@ -469,6 +484,11 @@ def build_plan(
             _add_qemu(plan, path, *ALL_QEMU_SCENARIOS)
             plan.qemu_all_platforms = True
             continue
+        if path_text.startswith("tests/fixtures/cpython/") or path_text.startswith(
+            "tests/python-no-"
+        ):
+            _add_qemu(plan, path, "cpython")
+            continue
         if path_text == "tests/smoke.sh":
             plan.run_host_smoke = True
             plan.note("host-smoke", path)
@@ -539,11 +559,7 @@ def commands_for_plan(
     if plan.run_fmt:
         commands.append(("cargo", "fmt", "--all", "--", "--check"))
         format_applications = (
-            sorted(
-                path.name
-                for path in (REPO_ROOT / "apps").iterdir()
-                if path.is_dir() and (path / "Cargo.toml").is_file()
-            )
+            sorted(path.name for path in application_directories())
             if plan.all_applications
             else sorted(plan.applications)
         )
@@ -579,13 +595,9 @@ def commands_for_plan(
     if plan.run_audit:
         commands.append((sys.executable, str(REPO_ROOT / "scripts" / "audit.py")))
     applications = (
-        sorted(
-            path.name
-            for path in (REPO_ROOT / "apps").iterdir()
-            if path.is_dir() and (path / "Cargo.toml").is_file()
-        )
+        sorted(path.name for path in rootfs_application_directories())
         if plan.all_applications
-        else sorted(plan.applications)
+        else sorted(plan.applications - SHARED_VOLUME_APPLICATIONS)
     )
     for application in applications:
         commands.append(

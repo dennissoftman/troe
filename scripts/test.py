@@ -12,22 +12,22 @@ from pathlib import Path
 if __package__:
     from .platform_profile import PLATFORM_PROFILES
     from .qemu_profile import QEMU_ENVIRONMENT
-    from .repository_policy import require_supported_python
+    from .repository_policy import (
+        require_supported_python,
+        rootfs_application_directories,
+    )
 else:
     from platform_profile import PLATFORM_PROFILES
     from qemu_profile import QEMU_ENVIRONMENT
-    from repository_policy import require_supported_python
+    from repository_policy import (
+        require_supported_python,
+        rootfs_application_directories,
+    )
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOLS_DIR = REPO_ROOT / "tools"
-KEX_APPLICATIONS = tuple(
-    sorted(
-        path
-        for path in (REPO_ROOT / "apps").iterdir()
-        if path.is_dir() and (path / "Cargo.toml").is_file()
-    )
-)
+KEX_APPLICATIONS = rootfs_application_directories()
 KEX_SERVICES = (
     (REPO_ROOT / "services" / "diagnostics", "diagnostics-server", 8),
     (

@@ -6,18 +6,19 @@ import json
 import os
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "scripts"))
+
+from repository_policy import rootfs_application_directories  # noqa: E402
+
 KEX_APPLICATION_NAMES = tuple(
-    sorted(
-        path.name
-        for path in (REPO_ROOT / "apps").iterdir()
-        if path.is_dir() and (path / "Cargo.toml").is_file()
-    )
+    path.name for path in rootfs_application_directories(REPO_ROOT)
 )
 KEX_TOOL = Path(os.environ.get("CARGO_TARGET_DIR", REPO_ROOT / "target"))
 if not KEX_TOOL.is_absolute():
@@ -131,9 +132,9 @@ class KexToolTests(unittest.TestCase):
                     if command == "udp":
                         expected = [(5, 1, 0)]
                     elif command == "tar":
-                        expected = [(6, 1, 3), (7, 1, 3)]
+                        expected = [(6, 1, 3), (7, 1, 4)]
                     elif command in {"cp", "mv", "rm"}:
-                        expected = [(6, 1, 3), (7, 1, 3)]
+                        expected = [(6, 1, 3), (7, 1, 4)]
                     elif command in {
                         "awk",
                         "cat",
@@ -148,7 +149,7 @@ class KexToolTests(unittest.TestCase):
                     elif command == "lua":
                         expected = [
                             (6, 1, 3),
-                            (7, 1, 3),
+                            (7, 1, 4),
                             (8, 1, 0),
                             (17, 1, 0),
                             (20, 1, 0),
@@ -157,7 +158,7 @@ class KexToolTests(unittest.TestCase):
                             (23, 1, 0),
                         ]
                     elif command in {"ln", "rmdir"}:
-                        expected = [(7, 1, 3)]
+                        expected = [(7, 1, 4)]
                     elif command == "sleep":
                         expected = [(8, 1, 0)]
                     elif command == "timesync":

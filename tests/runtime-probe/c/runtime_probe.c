@@ -199,10 +199,40 @@ int troe_c_runtime_probe(int argc, char **argv) {
       unlink("renamed.txt") != 0 || chdir("/") != 0 || rmdir(directory_path) != 0)
     return fail("filesystem cleanup");
 
-  if (system("true") != -1 || errno != ENOTSUP ||
-      open("/tmp/unsupported", O_RDWR | O_CREAT, 0600) != -1 ||
-      errno != ENOTSUP)
+  if (system("true") != -1 || errno != ENOTSUP)
     return fail("unsupported operations");
+
+  // A read-write descriptor stages new content and reads back exactly what it
+  // wrote; rewriting already-staged bytes stays unsupported.
+  const char *staged_path = "/vol/root/c-runtime-staged.txt";
+  (void)remove(staged_path);
+  int staged =
+      open(staged_path, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
+  if (staged < 0)
+    return fail("read-write open");
+  char staged_content[16] = {0};
+  if (write(staged, "staged-rw", 9) != 9)
+    return fail("read-write write");
+  if (lseek(staged, 0, SEEK_SET) != 0)
+    return fail("read-write rewind");
+  if (read(staged, staged_content, sizeof(staged_content)) != 9)
+    return fail("read-write read");
+  if (memcmp(staged_content, "staged-rw", 9) != 0)
+    return fail("read-write content");
+  if (lseek(staged, 0, SEEK_END) != 9 || write(staged, "!", 1) != 1 ||
+      close(staged) != 0)
+    return fail("read-write append");
+  if (lseek(staged, 0, SEEK_SET) != -1 || errno != EBADF)
+    return fail("closed read-write descriptor");
+  int reopened = open(staged_path, O_RDONLY);
+  char committed[16] = {0};
+  if (reopened < 0 || read(reopened, committed, sizeof(committed)) != 10 ||
+      memcmp(committed, "staged-rw!", 10) != 0 || close(reopened) != 0)
+    return fail("committed read-write content");
+  if (open(staged_path, O_RDWR) != -1 || errno != ENOTSUP)
+    return fail("in-place read-write");
+  if (remove(staged_path) != 0)
+    return fail("read-write cleanup");
   printf("c-runtime-probe ok image=0x%lx wall=%ld monotonic=%ld\n",
          (unsigned long)(uintptr_t)troe_large_kex_payload, (long)wall,
          (long)monotonic.tv_sec);
