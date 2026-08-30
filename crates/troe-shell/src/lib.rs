@@ -1246,6 +1246,15 @@ impl Shell {
         })
     }
 
+    /// Namespace this session owns, shared with its stream endpoints.
+    ///
+    /// The owner needs it to install session-wide namespace state, such as the
+    /// wall clock its mounted providers stamp with.
+    #[must_use]
+    pub const fn namespace(&self) -> &SharedNamespace {
+        &self.namespace
+    }
+
     /// Terminal platform transition requested by an authorized command.
     #[must_use]
     pub const fn machine_action(&self) -> Option<MachineAction> {

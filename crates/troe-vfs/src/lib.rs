@@ -6,6 +6,7 @@ extern crate alloc;
 
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
+use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::{fmt, str};
@@ -113,6 +114,20 @@ pub struct ProviderListing {
     pub entries: Vec<DirEntry>,
     /// Opaque provider cursor for the next page, or `None` at end-of-directory.
     pub next_cursor: Option<u64>,
+}
+
+/// Source of Unix UTC seconds for the timestamps providers write.
+///
+/// The namespace owns one clock and hands the same handle to every provider,
+/// so no mount captures an instant: a provider asks the clock again at each
+/// mutation and therefore never stamps its own mount time onto a later write.
+/// `None` means no wall time is known; a provider that reads it must leave the
+/// timestamps it would otherwise write exactly as they were rather than
+/// inventing one. A clock that moves backwards is recorded as it reads,
+/// because a provider reports the time it was told, not a time of its own.
+pub trait WallClock: fmt::Debug {
+    /// Current Unix UTC time in whole seconds, or `None` when it is unknown.
+    fn unix_seconds(&self) -> Option<u64>;
 }
 
 /// Narrow filesystem-provider interface consumed by the VFS.
@@ -305,6 +320,13 @@ pub trait ReadOnlyFileSystem: fmt::Debug {
     fn create_hard_link(&mut self, _existing: &str, _new_path: &str) -> Result<(), FsError> {
         Err(FsError::ReadOnly)
     }
+
+    /// Adopt the namespace's wall clock.
+    ///
+    /// Providers that write no timestamps retain this default. A provider that
+    /// does must read the handle at each mutation rather than at mount, and
+    /// must leave timestamps untouched whenever the clock reports no time.
+    fn set_wall_clock(&mut self, _clock: Rc<dyn WallClock>) {}
 }
 
 #[derive(Clone, Debug)]
@@ -430,6 +452,7 @@ pub struct Namespace {
     ramfs_nodes: usize,
     ramfs_high_water: usize,
     system_config_generation: u64,
+    wall_clock: Option<Rc<dyn WallClock>>,
 }
 
 impl Namespace {
@@ -451,7 +474,20 @@ impl Namespace {
             ramfs_nodes: 0,
             ramfs_high_water: 0,
             system_config_generation: 0,
+            wall_clock: None,
         }
+    }
+
+    /// Install the clock every mounted and later-mounted provider stamps with.
+    ///
+    /// The handle is shared, not sampled, so a provider mounted before the
+    /// clock existed starts stamping from here on and a long-lived mount never
+    /// writes its mount time onto a later mutation.
+    pub fn set_wall_clock(&mut self, clock: Rc<dyn WallClock>) {
+        for mount in &mut self.mounts {
+            mount.provider.set_wall_clock(Rc::clone(&clock));
+        }
+        self.wall_clock = Some(clock);
     }
 
     /// Atomically replace the read-only active-generation configuration view.
@@ -925,6 +961,9 @@ impl Namespace {
         }
         if provider.metadata("/")?.kind != NodeKind::Directory {
             return Err(FsError::WrongType);
+        }
+        if let Some(clock) = self.wall_clock.as_ref() {
+            provider.set_wall_clock(Rc::clone(clock));
         }
         if !target_exists {
             self.nodes.insert(path.clone(), Node::Directory);
