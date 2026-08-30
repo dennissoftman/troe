@@ -106,8 +106,10 @@ read-only `e2fsck`. Note that `e2fsck -fn` does not replay a pending journal, so
 it cannot by itself prove replay correctness; byte-level assertions carry that
 evidence.
 
-Journal size is not yet pinned by the build tooling, and the independent
-verifier asserts only that the journal superblock agrees with inode 8's length
-rather than an absolute size. Pinning `-J size=` and asserting an absolute
-`s_maxlen` remain follow-on work tracked in
-[GitHub issue #56](https://github.com/dennissoftman/troe/issues/56).
+The image recipe pins the journal length with an explicit `-J size=4`, and the
+independent verifier asserts the pinned block count absolutely against inode 8's
+allocation, the journal superblock's `s_maxlen`, and its `s_first`, so a build
+that took a different length is refused rather than accepted. A test derives the
+worst-case transaction footprint from `MAX_TRANSACTION_BLOCKS` plus the
+descriptor and commit blocks and checks it against that pinned capacity, so
+changing either side alone fails.
