@@ -65,6 +65,12 @@ mod firmware {
     };
     use troe_fs_ext4::Ext4Limits;
     use troe_fs_fat::Fat32Limits;
+    use troe_fs_kefs::Kefs;
+
+    /// Directories the embedded image supplies but does not own, because
+    /// manifest-selected volumes mount beneath them.
+    const EMBEDDED_MOUNT_ROOTS: &[&str] = &["/vol"];
+    use troe_fs_ramfs::{RamFs, RamFsQuota};
     #[cfg(feature = "acceptance-probes")]
     use troe_fs_statefs::STATE_PATH;
     use troe_fs_statefs::StateFs;
@@ -74,6 +80,7 @@ mod firmware {
         Mapping, MappingLifetime, MappingMemoryType, MappingOwner, MappingPermissions, MappingPlan,
         MemoryMapStats, MemoryRegion, NormalizedMemoryMap, PhysicalRange, RegionKind, VirtualRange,
     };
+    use troe_namespace::Namespace;
     use troe_net::{
         ArpCache, DhcpMessageType, DhcpPacket, Ipv4Address, MAX_UDP_PAYLOAD_BYTES, MacAddress,
         NetError, NetworkDevice, NetworkServiceStats, TcpConnection, TcpEndpoint, TcpError,
@@ -106,7 +113,6 @@ mod firmware {
         TextConsoleConfig,
     };
     use troe_txslot::{DualSlotStore, TRANSACTION_BLOCKS};
-    use troe_vfs::{Namespace, RamFsQuota};
     use troe_volume::{
         ActivationLimits, MAX_STORAGE_REPORT_BYTES, PreparedMount, STORAGE_REPORT_EXTENSION_BYTES,
         prepare_mounts, read_selected_file, validate_root_activation,
@@ -10358,9 +10364,31 @@ mod firmware {
         accounting: &OwnedAccounting,
         console: &mut dyn Output,
     ) -> (Namespace, NativeRootMode) {
-        let mut namespace = Namespace::new(RamFsQuota::default());
-        if namespace.mount_embedded(ROOTFS).is_err() {
+        let mut namespace = Namespace::new();
+        if namespace
+            .mount_writable("/tmp", Box::new(RamFs::new(RamFsQuota::default())))
+            .is_err()
+        {
+            fatal(b"fatal: cannot mount the writable filesystem\n");
+        }
+        let Ok(embedded) = Kefs::parse(ROOTFS) else {
             fatal(b"fatal: cannot mount embedded root\n");
+        };
+        let embedded = embedded.into_mounts(EMBEDDED_MOUNT_ROOTS);
+        for path in embedded.directories {
+            if namespace.add_read_only_dir(&path).is_err() {
+                fatal(b"fatal: cannot mount embedded root\n");
+            }
+        }
+        for (path, bytes) in embedded.files {
+            if namespace.add_read_only_file(&path, &bytes).is_err() {
+                fatal(b"fatal: cannot mount embedded root\n");
+            }
+        }
+        for (path, view) in embedded.mounts {
+            if namespace.mount_read_only(&path, Box::new(view)).is_err() {
+                fatal(b"fatal: cannot mount embedded root\n");
+            }
         }
         let root_mode = activate_native_storage(accounting, &mut namespace, console);
         (namespace, root_mode)

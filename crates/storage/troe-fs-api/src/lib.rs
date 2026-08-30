@@ -108,6 +108,17 @@ pub struct ProviderListing {
     pub next_cursor: Option<u64>,
 }
 
+/// Bounded payload accounting reported by a provider that owns a budget.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ProviderUsage {
+    /// Retained payload bytes.
+    pub used_bytes: u64,
+    /// Configured payload ceiling.
+    pub limit_bytes: u64,
+    /// Greatest retained payload observed since construction.
+    pub high_water_bytes: u64,
+}
+
 /// Source of Unix UTC seconds for the timestamps providers write.
 ///
 /// The namespace owns one clock and hands the same handle to every provider,
@@ -136,6 +147,14 @@ pub trait FileSystemProvider: fmt::Debug {
     /// media, transport failures, and provider resource exhaustion.
     fn metadata(&mut self, path: &str) -> Result<FileMetadata, FsError>;
 
+    /// Report bounded payload accounting, when this provider owns a budget.
+    ///
+    /// Providers backed by external media retain the default and report
+    /// nothing; a provider that charges its own quota returns it here so the
+    /// namespace never needs to know which implementation it mounted.
+    fn usage(&self) -> Option<ProviderUsage> {
+        None
+    }
     /// Adopt the namespace's wall clock.
     ///
     /// Providers that write no timestamps retain this default. A provider that

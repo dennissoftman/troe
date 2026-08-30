@@ -16,4 +16,5 @@ troe-txslot = { path = "../troe-txslot" }
 workspace = true
 
 [dev-dependencies]
-troe-vfs = { path = "../troe-vfs" }
+troe-fs-ramfs = { path = "../troe-fs-ramfs" }
+troe-namespace = { path = "../troe-namespace" }

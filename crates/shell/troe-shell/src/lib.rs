@@ -29,7 +29,7 @@ use troe_core::{
 };
 use troe_driver::InputQueueStats;
 use troe_fs_api::{FILE_IO_BUFFER_BYTES, FsError, MAX_FILE_IO_BUFFER_BYTES, NodeKind};
-use troe_vfs::Namespace;
+use troe_namespace::Namespace;
 
 /// Shared namespace ownership used by stream endpoints and KEX services.
 pub type SharedNamespace = Rc<RefCell<Namespace>>;
@@ -2716,7 +2716,19 @@ mod tests {
         FILE_IO_BUFFER_BYTES, FileMetadata, FileSystemProvider, FsError, MAX_FILE_IO_BUFFER_BYTES,
         NodeKind, ProviderListing,
     };
-    use troe_vfs::{Namespace, RamFsQuota};
+    use troe_fs_ramfs::{RamFs, RamFsQuota};
+
+    /// Compose a namespace the way a composition root does: a skeleton plus one
+    /// writable filesystem mounted at `/tmp`.
+    fn writable_namespace() -> Namespace {
+        let mut namespace = Namespace::new();
+        assert_eq!(
+            namespace.mount_writable("/tmp", Box::new(RamFs::new(RamFsQuota::default()))),
+            Ok(())
+        );
+        namespace
+    }
+    use troe_namespace::Namespace;
 
     #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
     struct StreamState {
@@ -2807,7 +2819,7 @@ mod tests {
     }
 
     fn shell() -> Shell {
-        let mut namespace = Namespace::new(RamFsQuota::default());
+        let mut namespace = writable_namespace();
         assert_eq!(namespace.add_read_only_dir("/help"), Ok(()));
         assert_eq!(namespace.add_read_only_dir("/bin"), Ok(()));
         for (command, completion) in [
@@ -3158,7 +3170,7 @@ mod tests {
 
     /// One namespace holding a small tree plus a hidden and a nested entry.
     fn expansion_shell() -> Shell {
-        let mut namespace = Namespace::new(RamFsQuota::default());
+        let mut namespace = writable_namespace();
         for directory in ["/work", "/work/sub"] {
             assert_eq!(namespace.add_read_only_dir(directory), Ok(()));
         }
@@ -3348,7 +3360,7 @@ mod tests {
 
     #[test]
     fn an_over_budget_expansion_refuses_the_whole_stage_before_dispatch() {
-        let mut namespace = Namespace::new(RamFsQuota::default());
+        let mut namespace = writable_namespace();
         assert_eq!(namespace.add_read_only_dir("/wide"), Ok(()));
         // Aggregate entry-name bytes past the 64 KiB scan budget.
         let filler = "n".repeat(200);
@@ -4212,7 +4224,7 @@ mod tests {
 
     #[test]
     fn large_catalog_retains_one_thousand_discovered_applications() {
-        let mut namespace = Namespace::new(RamFsQuota::default());
+        let mut namespace = writable_namespace();
         assert_eq!(namespace.add_read_only_dir("/bin"), Ok(()));
         for index in 0..1000 {
             assert_eq!(
@@ -4253,7 +4265,7 @@ mod tests {
     #[test]
     fn exact_capacity_pipeline_succeeds_and_one_extra_byte_is_atomic() {
         assert_eq!(PIPE_CAPACITY, 1024 * 1024);
-        let mut namespace = Namespace::new(RamFsQuota::default());
+        let mut namespace = writable_namespace();
         let exact = alloc::vec![b'x'; PIPE_CAPACITY];
         let oversized = alloc::vec![b'y'; PIPE_CAPACITY + 1];
         assert_eq!(namespace.add_read_only_file("/exact", &exact), Ok(()));
@@ -4329,7 +4341,7 @@ mod tests {
             "snapshot-test",
             MachineMemorySnapshot::firmware(123_456, 78_900),
             None,
-            Namespace::new(RamFsQuota::default()).memory_stats(),
+            writable_namespace().memory_stats(),
         );
         assert!(report.contains("memory owner: firmware\n"));
         assert!(report.contains("memory map: firmware snapshot (advisory)\n"));
@@ -4351,7 +4363,7 @@ mod tests {
                 idle_waits: 8,
                 wakeups: 7,
             }),
-            Namespace::new(RamFsQuota::default()).memory_stats(),
+            writable_namespace().memory_stats(),
         );
         assert!(report.contains("memory owner: kernel\n"));
         assert!(report.contains("memory map: final map (owned)\n"));

@@ -7,8 +7,14 @@ use std::io::{self, Read, Write};
 use std::process::ExitCode;
 
 use troe_core::{Input, MAX_LINE_BYTES, MachineMemorySnapshot, Output, StreamError};
+use troe_fs_kefs::Kefs;
+
+/// Directories the embedded image supplies but does not own, because
+/// manifest-selected volumes mount beneath them.
+const EMBEDDED_MOUNT_ROOTS: &[&str] = &["/vol"];
+use troe_fs_ramfs::{RamFs, RamFsQuota};
+use troe_namespace::Namespace;
 use troe_shell::Shell;
-use troe_vfs::{Namespace, RamFsQuota};
 
 #[cfg(target_arch = "x86_64")]
 const ROOTFS: &[u8] = include_bytes!("../../assets/root-x86_64.kefs");
@@ -53,10 +59,28 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<u8, String> {
-    let mut namespace = Namespace::new(RamFsQuota::default());
+    let mut namespace = Namespace::new();
     namespace
-        .mount_embedded(ROOTFS)
-        .map_err(|error| format!("cannot mount embedded root: {error}"))?;
+        .mount_writable("/tmp", Box::new(RamFs::new(RamFsQuota::default())))
+        .map_err(|error| format!("cannot mount the writable filesystem: {error}"))?;
+    let embedded =
+        Kefs::parse(ROOTFS).map_err(|error| format!("cannot mount embedded root: {error}"))?;
+    let embedded = embedded.into_mounts(EMBEDDED_MOUNT_ROOTS);
+    for path in embedded.directories {
+        namespace
+            .add_read_only_dir(&path)
+            .map_err(|error| format!("cannot mount embedded root: {error}"))?;
+    }
+    for (path, bytes) in embedded.files {
+        namespace
+            .add_read_only_file(&path, &bytes)
+            .map_err(|error| format!("cannot mount embedded root: {error}"))?;
+    }
+    for (path, view) in embedded.mounts {
+        namespace
+            .mount_read_only(&path, Box::new(view))
+            .map_err(|error| format!("cannot mount embedded root: {error}"))?;
+    }
     let mut shell = Shell::new(
         namespace,
         env::consts::ARCH,

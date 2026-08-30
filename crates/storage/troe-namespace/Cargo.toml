@@ -1,0 +1,18 @@
+[package]
+name = "troe-namespace"
+description = "Bounded mount namespace, directory capabilities, and generated nodes for TROE"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+troe-core = { path = "../../common/troe-core" }
+troe-fs-api = { path = "../troe-fs-api" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+troe-fs-kefs = { path = "../troe-fs-kefs" }
+troe-fs-ramfs = { path = "../troe-fs-ramfs" }
