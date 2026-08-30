@@ -83,8 +83,8 @@ mod firmware {
     use troe_shell::{
         CompletionConfig, CompletionEnvironment, CompletionVisitor, DynamicCompletionDomain,
         ExecutionPlacement, ExternalCommand, ExternalCommandReference, JobControl, MachineAction,
-        ServiceControl, SharedNamespace, Shell, external_command_reference, format_memory_report,
-        parse_command_list,
+        ServiceControl, SharedNamespace, Shell, Word, external_command_reference,
+        format_memory_report, parse_command_list,
     };
     #[cfg(feature = "acceptance-probes")]
     use troe_statefs::STATE_PATH;
@@ -15696,7 +15696,7 @@ mod firmware {
             .into_iter()
             .flat_map(|entry| entry.pipeline.stages)
         {
-            let Some(command) = stage.words.first() else {
+            let Some(command) = stage.words.first().map(Word::text) else {
                 continue;
             };
             if !matches!(

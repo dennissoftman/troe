@@ -7,8 +7,8 @@ mod common;
 use core::fmt::{self, Write as _};
 use troe_kex_runtime::units::HumanBytes;
 use troe_kex_sdk::{
-    CommandContext, ENVIRONMENT_BUFFER_BYTES, Error, FILESYSTEM_LIST_BUFFER_BYTES,
-    INVOCATION_BUFFER_BYTES, ReadOnlyFilesystem, StandardOutput, command, entry, exit, filesystem,
+    ArgumentReader, CommandContext, ENVIRONMENT_BUFFER_BYTES, Error, FILESYSTEM_LIST_BUFFER_BYTES,
+    ReadOnlyFilesystem, StandardOutput, entry, exit, filesystem,
 };
 
 const DEFAULT_COLUMNS: usize = 80;
@@ -51,12 +51,12 @@ enum LongError {
     Output,
 }
 
-fn parse_options(invocation: command::Invocation<'_>) -> Option<(Flags, usize)> {
+fn parse_options(arguments: &mut ArgumentReader, total: usize) -> Option<(Flags, usize)> {
     let mut flags = Flags::default();
     let mut options = true;
-    let mut operand_start = invocation.len();
-    for index in 1..invocation.len() {
-        let argument = invocation.argument(index)?;
+    let mut operand_start = total;
+    for index in 1..total {
+        let argument = arguments.get(index).ok()??;
         if options && argument == "--" {
             options = false;
             operand_start = index + 1;
@@ -79,7 +79,7 @@ fn parse_options(invocation: command::Invocation<'_>) -> Option<(Flags, usize)> 
             }
             continue;
         }
-        if operand_start == invocation.len() {
+        if operand_start == total {
             operand_start = index;
         }
         options = false;
@@ -377,11 +377,13 @@ fn list_directory(
 }
 
 fn main(command: &mut CommandContext) -> u32 {
-    let mut invocation_bytes = [0_u8; INVOCATION_BUFFER_BYTES];
-    let Ok(invocation) = command.invocation(&mut invocation_bytes) else {
+    let Ok(mut arguments) = command.arguments() else {
         return exit::FAILURE;
     };
-    let Some((flags, operand_start)) = parse_options(invocation) else {
+    let Ok(total) = arguments.total() else {
+        return exit::FAILURE;
+    };
+    let Some((flags, operand_start)) = parse_options(&mut arguments, total) else {
         return common::usage(&mut command.stderr(), "ls", b"ls [-1ACFadhlp] [PATH...]");
     };
     let columns = terminal_columns(command);
@@ -389,15 +391,19 @@ fn main(command: &mut CommandContext) -> u32 {
         return exit::DENIED;
     };
     let mut output = command.stdout();
-    let operand_count = invocation.len().saturating_sub(operand_start).max(1);
+    let operand_count = total.saturating_sub(operand_start).max(1);
+    if arguments.seek(operand_start).is_err() {
+        return exit::FAILURE;
+    }
     for operand_index in 0..operand_count {
-        let path = if operand_start == invocation.len() {
+        let path = if operand_start == total {
             "."
         } else {
-            let Some(path) = invocation.argument(operand_start + operand_index) else {
-                return exit::FAILURE;
-            };
-            path
+            match arguments.next_argument() {
+                Ok(Some(path)) => path,
+                Ok(None) => return exit::FAILURE,
+                Err(_) => return exit::FAILURE,
+            }
         };
         let metadata = match filesystem.metadata_no_follow(path) {
             Ok(metadata) => metadata,

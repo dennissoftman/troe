@@ -1,9 +1,21 @@
 NAME
-    rmdir - remove an empty directory
+    rmdir - remove empty directories
 
 SYNOPSIS
-    rmdir DIRECTORY
+    rmdir DIRECTORY...
 
 DESCRIPTION
-    Removes one empty writable directory. Nonempty directories, roots,
+    Removes each empty writable directory operand. Nonempty directories, roots,
     mountpoints, read-only objects, files, and symbolic links are rejected.
+
+    Every operand is attempted. A nonempty directory is reported and the
+    remaining operands are still removed; the exit status reflects the first
+    failure.
+
+    rmdir is not a restricted spelling of rm -r. It refuses a nonempty
+    directory, which is the reason to reach for it when a directory is only
+    expected to be empty.
+
+EXAMPLES
+    rmdir /vol/shared/empty
+    rmdir stage-*

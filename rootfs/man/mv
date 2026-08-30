@@ -1,11 +1,26 @@
 NAME
-    mv - atomically rename a filesystem object
+    mv - atomically rename filesystem objects
 
 SYNOPSIS
     mv SOURCE DEST
+    mv SOURCE... DIRECTORY
 
 DESCRIPTION
-    Renames one file, symbolic link, or directory through the owning provider's
-    atomic rename primitive. Cross-provider moves fail explicitly as
+    Renames each file, symbolic link, or directory through the owning
+    provider's atomic rename primitive. Cross-provider moves fail explicitly as
     cross-device operations; mv does not emulate them with a partial copy and
     delete sequence.
+
+    The final operand is the destination. It is classified once, before any
+    move begins. With more than one source the destination must already be an
+    existing directory; otherwise the command fails having moved nothing. With
+    exactly one source, an existing directory receives the source under its own
+    base name and any other destination names the result itself.
+
+    A source whose base name is empty, . or .. is rejected. Sources sharing a
+    base name resolve last writer wins. Every source is attempted; the exit
+    status reflects the first failure.
+
+EXAMPLES
+    mv draft.txt notes.txt
+    mv *.log /vol/shared/logs

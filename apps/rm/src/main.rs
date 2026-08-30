@@ -6,10 +6,12 @@ mod common;
 
 use troe_kex_alloc::GlobalAllocator;
 use troe_kex_runtime::Error as RuntimeError;
-use troe_kex_sdk::{CommandContext, INVOCATION_BUFFER_BYTES, entry, exit};
+use troe_kex_sdk::{ArgumentReader, CommandContext, entry, exit};
 
 #[global_allocator]
 static ALLOCATOR: GlobalAllocator = GlobalAllocator::new();
+
+const SYNOPSIS: &[u8] = b"rm [-r|-R] PATH...";
 
 fn failure(command: &mut CommandContext, path: &str, error: RuntimeError) -> u32 {
     match error.service_error() {
@@ -28,18 +30,37 @@ fn failure(command: &mut CommandContext, path: &str, error: RuntimeError) -> u32
     }
 }
 
+/// Locate the first operand, accepting `-r`/`-R` and `--` before it.
+///
+/// Returns the operand index and whether recursive removal was requested.
+fn parse_flags(arguments: &mut ArgumentReader) -> Result<(usize, bool), ()> {
+    let mut recursive = false;
+    let mut index = 1_usize;
+    loop {
+        let Ok(Some(argument)) = arguments.get(index) else {
+            return Ok((index, recursive));
+        };
+        match argument {
+            "-r" | "-R" => recursive = true,
+            "--" => return Ok((index + 1, recursive)),
+            value if value.starts_with('-') && value.len() > 1 => return Err(()),
+            _ => return Ok((index, recursive)),
+        }
+        index += 1;
+    }
+}
+
 fn main(command: &mut CommandContext) -> u32 {
-    let mut invocation_bytes = [0_u8; INVOCATION_BUFFER_BYTES];
-    let Ok(invocation) = command.invocation(&mut invocation_bytes) else {
+    let Ok(mut arguments) = command.arguments() else {
         return exit::FAILURE;
     };
-    let recursive = matches!(invocation.argument(1), Some("-r" | "-R"));
-    let path_index = if recursive { 2 } else { 1 };
-    let Some(path) = invocation.argument(path_index) else {
-        return common::usage(&mut command.stderr(), "rm", b"rm [-r|-R] PATH");
+    let (Ok(total), Ok((operand_start, recursive))) =
+        (arguments.total(), parse_flags(&mut arguments))
+    else {
+        return common::usage(&mut command.stderr(), "rm", SYNOPSIS);
     };
-    if invocation.len() != path_index + 1 {
-        return common::usage(&mut command.stderr(), "rm", b"rm [-r|-R] PATH");
+    if operand_start >= total {
+        return common::usage(&mut command.stderr(), "rm", SYNOPSIS);
     }
     if recursive {
         let Some(heap) = command.take_heap() else {
@@ -52,18 +73,39 @@ fn main(command: &mut CommandContext) -> u32 {
     let Ok(mut mutation) = command.filesystem_mutation() else {
         return exit::DENIED;
     };
-    let result = if recursive {
-        let Ok(mut filesystem) = command.filesystem() else {
+    let mut filesystem = if recursive {
+        let Ok(filesystem) = command.filesystem() else {
             return exit::DENIED;
         };
-        troe_kex_runtime::remove_recursive(&mut filesystem, &mut mutation, path)
+        Some(filesystem)
     } else {
-        mutation.remove(path).map_err(RuntimeError::from)
+        None
     };
-    match result {
-        Ok(()) => exit::SUCCESS,
-        Err(error) => failure(command, path, error),
+
+    // Every operand is attempted so that one missing name in an expansion does
+    // not hide the removals the operator asked for.
+    let mut status = exit::SUCCESS;
+    if arguments.seek(operand_start).is_err() {
+        return exit::FAILURE;
     }
+    loop {
+        let path = match arguments.next_argument() {
+            Ok(Some(path)) => path,
+            Ok(None) => break,
+            Err(_) => return exit::FAILURE,
+        };
+        let result = match filesystem.as_mut() {
+            Some(filesystem) => troe_kex_runtime::remove_recursive(filesystem, &mut mutation, path),
+            None => mutation.remove(path).map_err(RuntimeError::from),
+        };
+        if let Err(error) = result {
+            let path_status = failure(command, path, error);
+            if status == exit::SUCCESS {
+                status = path_status;
+            }
+        }
+    }
+    status
 }
 
 entry!(main);

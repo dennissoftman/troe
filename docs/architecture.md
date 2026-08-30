@@ -43,9 +43,15 @@ firmware fails before device publication or volatile I/O.
    and decoded key events; ANSI serial input and x86 set-1 PS/2 input feed the
    same event type outside interrupt context.
 2. The shell crate tokenizes iteratively. Single and double quotes group literal
-   bytes; no expansion, recursion, substitution, environment lookup, or
-   globbing occurs. Unquoted `&&` and `||` form left-associative short-circuit
-   lists; `<`, `>`, and `>>` select bounded-memory file streams.
+   bytes and record, per character, that quoting made them literal; no
+   recursion, substitution, or environment lookup occurs. Bounded pathname
+   expansion matches an argument word holding an unquoted `*`, `?`, or `[`
+   against the namespace one path component at a time, leaves the command word
+   and redirection targets alone, passes a pattern that matches nothing through
+   as written, and fails the whole stage before dispatch when it exceeds its
+   word, byte, or directory-scan bound (ADR 0057). Unquoted `&&` and `||` form
+   left-associative short-circuit lists; `<`, `>`, and `>>` select
+   bounded-memory file streams.
 3. The pipeline executor protects shell intrinsics, then resolves the exact KEX
    command path. Absence reports an unavailable application and never selects
    privileged utility behavior. KEX receives bounded stdin/stdout/stderr streams
