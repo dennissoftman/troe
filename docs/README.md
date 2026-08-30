@@ -39,6 +39,7 @@ history rather than in current documentation.
 | Launch environment composition | [ADR 0054](adr/0054-launch-environment-composition.md) |
 | Journaled ext4 mutation and bounded recovery | [ADR 0055](adr/0055-journaled-ext4-mutation-and-recovery.md) |
 | General ext4 compatibility profile | [ADR 0056](adr/0056-general-ext4-compatibility-profile.md) |
+| Bounded shell pathname expansion and paged operands | [ADR 0057](adr/0057-bounded-shell-pathname-expansion.md) |
 
 The current serialized contracts are versioned independently under
 [`formats/`](formats):

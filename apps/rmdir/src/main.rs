@@ -4,26 +4,44 @@
 #[path = "../../common.rs"]
 mod common;
 
-use troe_kex_sdk::{CommandContext, INVOCATION_BUFFER_BYTES, entry, exit};
+use troe_kex_sdk::{CommandContext, entry, exit};
+
+const SYNOPSIS: &[u8] = b"rmdir DIRECTORY...";
 
 fn main(command: &mut CommandContext) -> u32 {
-    let mut invocation_bytes = [0_u8; INVOCATION_BUFFER_BYTES];
-    let Ok(invocation) = command.invocation(&mut invocation_bytes) else {
+    let Ok(mut arguments) = command.arguments() else {
         return exit::FAILURE;
     };
-    let Some(path) = invocation.argument(1) else {
-        return common::usage(&mut command.stderr(), "rmdir", b"rmdir DIRECTORY");
+    let Ok(total) = arguments.total() else {
+        return exit::FAILURE;
     };
-    if invocation.len() != 2 {
-        return common::usage(&mut command.stderr(), "rmdir", b"rmdir DIRECTORY");
+    if total < 2 {
+        return common::usage(&mut command.stderr(), "rmdir", SYNOPSIS);
     }
     let Ok(mut mutation) = command.filesystem_mutation() else {
         return exit::DENIED;
     };
-    match mutation.remove_directory(path) {
-        Ok(()) => exit::SUCCESS,
-        Err(error) => common::filesystem_failure(&mut command.stderr(), "rmdir", path, error),
+    if arguments.seek(1).is_err() {
+        return exit::FAILURE;
     }
+    // Every operand is attempted; a nonempty directory in an expansion is
+    // reported and skipped rather than stopping the empty ones.
+    let mut status = exit::SUCCESS;
+    loop {
+        let path = match arguments.next_argument() {
+            Ok(Some(path)) => path,
+            Ok(None) => break,
+            Err(_) => return exit::FAILURE,
+        };
+        if let Err(error) = mutation.remove_directory(path) {
+            let path_status =
+                common::filesystem_failure(&mut command.stderr(), "rmdir", path, error);
+            if status == exit::SUCCESS {
+                status = path_status;
+            }
+        }
+    }
+    status
 }
 
 entry!(main);

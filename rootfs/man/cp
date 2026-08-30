@@ -3,11 +3,27 @@ NAME
 
 SYNOPSIS
     cp SOURCE DEST
-    cp -r SOURCE DEST
-    cp -R SOURCE DEST
+    cp [-r|-R] SOURCE DEST
+    cp [-r|-R] SOURCE... DIRECTORY
 
 DESCRIPTION
     Copies regular files with bounded streamed I/O. With -r or -R, traverses
     directory trees iteratively. Symbolic links encountered during traversal
     are reproduced without following them. Traversal metadata grows fallibly
     to documented runtime ceilings; file payload size is not staged in memory.
+
+    The final operand is the destination. It is classified once, before any
+    copy begins. With more than one source the destination must already be an
+    existing directory; otherwise the command fails having copied nothing,
+    which is what stops several sources from overwriting each other in one
+    file. With exactly one source, an existing directory receives the source
+    under its own base name and any other destination names the copy itself.
+
+    A source whose base name is empty, . or .. is rejected. Sources sharing a
+    base name resolve last writer wins. Every source is attempted; the exit
+    status reflects the first failure.
+
+EXAMPLES
+    cp notes.txt /vol/shared/notes.txt
+    cp *.txt /vol/shared
+    cp -r /vol/shared/build /vol/shared/build-backup

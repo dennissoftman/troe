@@ -6,8 +6,7 @@ mod common;
 
 use core::fmt::{self, Write as _};
 use troe_kex_sdk::{
-    CommandContext, Error, INVOCATION_BUFFER_BYTES, ReadOnlyFilesystem, StandardOutput, command,
-    entry, exit,
+    ArgumentReader, CommandContext, Error, ReadOnlyFilesystem, StandardOutput, entry, exit,
 };
 
 #[derive(Clone, Copy, Default)]
@@ -151,11 +150,11 @@ fn write_visible(output: &mut BufferedOutput, byte: u8) -> Result<(), ()> {
     }
 }
 
-fn parse_options(invocation: command::Invocation<'_>) -> Option<(Options, usize)> {
+fn parse_options(arguments: &mut ArgumentReader, total: usize) -> Option<(Options, usize)> {
     let mut options = Options::default();
-    let mut operand_start = invocation.len();
-    for index in 1..invocation.len() {
-        let argument = invocation.argument(index)?;
+    let mut operand_start = total;
+    for index in 1..total {
+        let argument = arguments.get(index).ok()??;
         if argument == "--" {
             operand_start = index + 1;
             break;
@@ -248,15 +247,17 @@ fn copy_file(
 }
 
 fn main(command: &mut CommandContext) -> u32 {
-    let mut invocation_bytes = [0_u8; INVOCATION_BUFFER_BYTES];
-    let Ok(invocation) = command.invocation(&mut invocation_bytes) else {
+    let Ok(mut arguments) = command.arguments() else {
         return exit::FAILURE;
     };
-    let Some((options, operand_start)) = parse_options(invocation) else {
+    let Ok(total) = arguments.total() else {
+        return exit::FAILURE;
+    };
+    let Some((options, operand_start)) = parse_options(&mut arguments, total) else {
         return common::usage(&mut command.stderr(), "cat", b"cat [-AbEnstTuv] [FILE...]");
     };
     let mut transformer = Transformer::new(options, command.stdout());
-    if operand_start == invocation.len() {
+    if operand_start == total {
         if let Err(error) = copy_input(command, &mut transformer) {
             return common::stream_read_failure(&mut command.stderr(), "cat", error);
         }
@@ -266,39 +267,40 @@ fn main(command: &mut CommandContext) -> u32 {
         return exit::SUCCESS;
     }
 
-    let requires_filesystem = (operand_start..invocation.len()).any(|index| {
-        invocation
-            .argument(index)
-            .is_some_and(|argument| argument != "-")
-    });
-    let mut filesystem = if requires_filesystem {
-        match command.filesystem() {
-            Ok(filesystem) => Some(filesystem),
-            Err(_) => return exit::DENIED,
-        }
-    } else {
-        None
-    };
-    for index in operand_start..invocation.len() {
-        let Some(path) = invocation.argument(index) else {
-            return exit::FAILURE;
+    // The read capability is acquired on the first named operand rather than
+    // pre-scanned, so an operand list of any length costs one pass.
+    let mut filesystem: Option<ReadOnlyFilesystem> = None;
+    if arguments.seek(operand_start).is_err() {
+        return exit::FAILURE;
+    }
+    loop {
+        let path = match arguments.next_argument() {
+            Ok(Some(path)) => path,
+            Ok(None) => break,
+            Err(_) => return exit::FAILURE,
         };
         if path == "-" {
             if let Err(error) = copy_input(command, &mut transformer) {
                 return common::stream_read_failure(&mut command.stderr(), "cat", error);
             }
-        } else {
-            let Some(filesystem) = filesystem.as_mut() else {
-                return exit::DENIED;
-            };
-            if let Err(error) = copy_file(filesystem, path, &mut transformer) {
-                return match error {
-                    CopyError::Filesystem(error) => {
-                        common::filesystem_failure(&mut command.stderr(), "cat", path, error)
-                    }
-                    CopyError::Output => common::stream_failure(&mut command.stderr(), "cat"),
-                };
+            continue;
+        }
+        if filesystem.is_none() {
+            match command.filesystem() {
+                Ok(opened) => filesystem = Some(opened),
+                Err(_) => return exit::DENIED,
             }
+        }
+        let Some(filesystem) = filesystem.as_mut() else {
+            return exit::DENIED;
+        };
+        if let Err(error) = copy_file(filesystem, path, &mut transformer) {
+            return match error {
+                CopyError::Filesystem(error) => {
+                    common::filesystem_failure(&mut command.stderr(), "cat", path, error)
+                }
+                CopyError::Output => common::stream_failure(&mut command.stderr(), "cat"),
+            };
         }
     }
     if transformer.finish().is_err() {

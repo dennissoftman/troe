@@ -6,9 +6,7 @@ mod common;
 
 use core::fmt::Write as _;
 use troe_app_wc::Counts;
-use troe_kex_sdk::{
-    CommandContext, Error, INVOCATION_BUFFER_BYTES, ReadOnlyFilesystem, entry, exit,
-};
+use troe_kex_sdk::{CommandContext, Error, ReadOnlyFilesystem, entry, exit};
 
 #[derive(Clone, Copy, Default)]
 struct Selection {
@@ -95,15 +93,17 @@ fn write_counts(
 }
 
 fn main(command: &mut CommandContext) -> u32 {
-    let mut invocation_bytes = [0_u8; INVOCATION_BUFFER_BYTES];
-    let Ok(invocation) = command.invocation(&mut invocation_bytes) else {
+    let Ok(mut arguments) = command.arguments() else {
+        return exit::FAILURE;
+    };
+    let Ok(argument_count) = arguments.total() else {
         return exit::FAILURE;
     };
     let mut selection = Selection::default();
-    let mut operand_start = invocation.len();
+    let mut operand_start = argument_count;
     let mut options_seen = false;
-    for index in 1..invocation.len() {
-        let Some(argument) = invocation.argument(index) else {
+    for index in 1..argument_count {
+        let Ok(Some(argument)) = arguments.get(index) else {
             return exit::FAILURE;
         };
         if argument == "--" {
@@ -118,22 +118,24 @@ fn main(command: &mut CommandContext) -> u32 {
             operand_start = index;
             break;
         }
+        let mut invalid = false;
         for option in argument.as_bytes().iter().skip(1) {
             match option {
                 b'l' => selection.lines = true,
                 b'w' => selection.words = true,
                 b'c' => selection.bytes = true,
-                _ => {
-                    return common::usage(&mut command.stderr(), "wc", b"wc [-lwc] [FILE...]");
-                }
+                _ => invalid = true,
             }
             options_seen = true;
+        }
+        if invalid {
+            return common::usage(&mut command.stderr(), "wc", b"wc [-lwc] [FILE...]");
         }
     }
     if !options_seen {
         selection = Selection::all();
     }
-    if operand_start == invocation.len() {
+    if operand_start == argument_count {
         let counts = match count_stdin(command) {
             Ok(counts) => counts,
             Err(error) => {
@@ -147,24 +149,19 @@ fn main(command: &mut CommandContext) -> u32 {
         };
     }
 
-    let operand_count = invocation.len() - operand_start;
-    let requires_filesystem = (operand_start..invocation.len()).any(|index| {
-        invocation
-            .argument(index)
-            .is_some_and(|argument| argument != "-")
-    });
-    let mut filesystem = if requires_filesystem {
-        match command.filesystem() {
-            Ok(filesystem) => Some(filesystem),
-            Err(_) => return exit::DENIED,
-        }
-    } else {
-        None
-    };
+    let operand_count = argument_count - operand_start;
+    // The read capability is acquired on the first named operand rather than
+    // pre-scanned, so an operand list of any length costs one pass.
+    let mut filesystem: Option<ReadOnlyFilesystem> = None;
     let mut total = Counts::default();
-    for index in operand_start..invocation.len() {
-        let Some(path) = invocation.argument(index) else {
-            return exit::FAILURE;
+    if arguments.seek(operand_start).is_err() {
+        return exit::FAILURE;
+    }
+    loop {
+        let path = match arguments.next_argument() {
+            Ok(Some(path)) => path,
+            Ok(None) => break,
+            Err(_) => return exit::FAILURE,
         };
         let counts = if path == "-" {
             match count_stdin(command) {
@@ -174,6 +171,12 @@ fn main(command: &mut CommandContext) -> u32 {
                 }
             }
         } else {
+            if filesystem.is_none() {
+                match command.filesystem() {
+                    Ok(opened) => filesystem = Some(opened),
+                    Err(_) => return exit::DENIED,
+                }
+            }
             let Some(filesystem) = filesystem.as_mut() else {
                 return exit::DENIED;
             };

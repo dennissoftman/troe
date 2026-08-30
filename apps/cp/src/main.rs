@@ -4,12 +4,15 @@
 #[path = "../../common.rs"]
 mod common;
 
+use common::ArgumentBuffer;
 use troe_kex_alloc::GlobalAllocator;
 use troe_kex_runtime::Error as RuntimeError;
-use troe_kex_sdk::{CommandContext, INVOCATION_BUFFER_BYTES, entry, exit};
+use troe_kex_sdk::{ArgumentReader, CommandContext, Error, entry, exit, filesystem::NodeKind};
 
 #[global_allocator]
 static ALLOCATOR: GlobalAllocator = GlobalAllocator::new();
+
+const SYNOPSIS: &[u8] = b"cp [-r|-R] SOURCE DEST | cp [-r|-R] SOURCE... DIRECTORY";
 
 fn failure(command: &mut CommandContext, path: &str, error: RuntimeError) -> u32 {
     match error.service_error() {
@@ -28,22 +31,46 @@ fn failure(command: &mut CommandContext, path: &str, error: RuntimeError) -> u32
     }
 }
 
+/// Locate the first operand, accepting `-r`/`-R` and `--` before it.
+fn parse_flags(arguments: &mut ArgumentReader) -> Result<(usize, bool), ()> {
+    let mut recursive = false;
+    let mut index = 1_usize;
+    loop {
+        let Ok(Some(argument)) = arguments.get(index) else {
+            return Ok((index, recursive));
+        };
+        match argument {
+            "-r" | "-R" => recursive = true,
+            "--" => return Ok((index + 1, recursive)),
+            value if value.starts_with('-') && value.len() > 1 => return Err(()),
+            _ => return Ok((index, recursive)),
+        }
+        index += 1;
+    }
+}
+
 fn main(command: &mut CommandContext) -> u32 {
-    let mut invocation_bytes = [0_u8; INVOCATION_BUFFER_BYTES];
-    let Ok(invocation) = command.invocation(&mut invocation_bytes) else {
+    let Ok(mut arguments) = command.arguments() else {
         return exit::FAILURE;
     };
-    let recursive = matches!(invocation.argument(1), Some("-r" | "-R"));
-    let source_index = if recursive { 2 } else { 1 };
-    let (Some(source), Some(destination)) = (
-        invocation.argument(source_index),
-        invocation.argument(source_index + 1),
-    ) else {
-        return common::usage(&mut command.stderr(), "cp", b"cp [-r|-R] SOURCE DEST");
+    let (Ok(total), Ok((operand_start, recursive))) =
+        (arguments.total(), parse_flags(&mut arguments))
+    else {
+        return common::usage(&mut command.stderr(), "cp", SYNOPSIS);
     };
-    if invocation.len() != source_index + 2 {
-        return common::usage(&mut command.stderr(), "cp", b"cp [-r|-R] SOURCE DEST");
+    // One destination plus at least one source.
+    if total < operand_start + 2 {
+        return common::usage(&mut command.stderr(), "cp", SYNOPSIS);
     }
+    let destination_index = total - 1;
+    let mut destination = ArgumentBuffer::new();
+    let Ok(Some(value)) = arguments.get(destination_index) else {
+        return exit::FAILURE;
+    };
+    if destination.set(value).is_err() {
+        return common::usage(&mut command.stderr(), "cp", SYNOPSIS);
+    }
+
     let Some(heap) = command.take_heap() else {
         return exit::DENIED;
     };
@@ -55,15 +82,95 @@ fn main(command: &mut CommandContext) -> u32 {
     else {
         return exit::DENIED;
     };
-    let result = if recursive {
-        troe_kex_runtime::copy_recursive(&mut filesystem, &mut mutation, source, destination)
-    } else {
-        troe_kex_runtime::copy(&mut filesystem, &mut mutation, source, destination)
+
+    // The destination is classified once, before any mutation. More than one
+    // source requires an existing directory, which is what stops several
+    // sources from being copied over each other into one file.
+    let into_directory = match filesystem.metadata(destination.as_str()) {
+        Ok(metadata) => metadata.kind == NodeKind::Directory,
+        Err(Error::NotFound) => false,
+        Err(error) => {
+            return common::filesystem_failure(
+                &mut command.stderr(),
+                "cp",
+                destination.as_str(),
+                error,
+            );
+        }
     };
-    match result {
-        Ok(()) => exit::SUCCESS,
-        Err(error) => failure(command, source, error),
+    let sources = destination_index - operand_start;
+    if sources > 1 && !into_directory {
+        common::report_path(
+            &mut command.stderr(),
+            "cp",
+            destination.as_str(),
+            b"destination for several sources must be an existing directory",
+        );
+        return exit::USAGE;
     }
+
+    if arguments.seek(operand_start).is_err() {
+        return exit::FAILURE;
+    }
+    let mut status = exit::SUCCESS;
+    let mut target = ArgumentBuffer::new();
+    for _ in 0..sources {
+        let source = match arguments.next_argument() {
+            Ok(Some(source)) => source,
+            Ok(None) => break,
+            Err(_) => return exit::FAILURE,
+        };
+        let mut source_path = ArgumentBuffer::new();
+        if source_path.set(source).is_err() {
+            return exit::FAILURE;
+        }
+        if into_directory {
+            let Some(name) = common::base_name(source_path.as_str()) else {
+                common::report_path(
+                    &mut command.stderr(),
+                    "cp",
+                    source_path.as_str(),
+                    b"source has no copyable name",
+                );
+                status = exit::USAGE;
+                continue;
+            };
+            if common::join_into(&mut target, destination.as_str(), name).is_err() {
+                common::report_path(
+                    &mut command.stderr(),
+                    "cp",
+                    source_path.as_str(),
+                    b"destination path exceeds the path limit",
+                );
+                status = exit::FAILURE;
+                continue;
+            }
+        } else if target.set(destination.as_str()).is_err() {
+            return exit::FAILURE;
+        }
+        let result = if recursive {
+            troe_kex_runtime::copy_recursive(
+                &mut filesystem,
+                &mut mutation,
+                source_path.as_str(),
+                target.as_str(),
+            )
+        } else {
+            troe_kex_runtime::copy(
+                &mut filesystem,
+                &mut mutation,
+                source_path.as_str(),
+                target.as_str(),
+            )
+        };
+        if let Err(error) = result {
+            let source_status = failure(command, source_path.as_str(), error);
+            if status == exit::SUCCESS {
+                status = source_status;
+            }
+        }
+    }
+    status
 }
 
 entry!(main);

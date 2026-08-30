@@ -2,13 +2,25 @@ NAME
     rm - remove writable filesystem objects
 
 SYNOPSIS
-    rm FILE
-    rm -r DIRECTORY
-    rm -R DIRECTORY
+    rm FILE...
+    rm -r DIRECTORY...
+    rm -R DIRECTORY...
 
 DESCRIPTION
-    Removes one regular file or symbolic link from a writable provider.
-    Removing one ext4 hard-link name preserves the inode and its other names.
-    With -r or -R, traverses directories iteratively in post-order and never
-    follows symbolic links. Roots, mountpoints, immutable content, and mounted
-    read-only content are rejected.
+    Removes each operand in turn from a writable provider. Removing one ext4
+    hard-link name preserves the inode and its other names. With -r or -R,
+    traverses directories iteratively in post-order and never follows symbolic
+    links. Roots, mountpoints, immutable content, and mounted read-only content
+    are rejected.
+
+    Every operand is attempted. A failed operand is reported and the remaining
+    operands are still removed; the exit status reflects the first failure. An
+    optional -- ends option parsing, so a name beginning with - can be removed.
+
+    The shell expands patterns before rm runs, so rm never sees a pattern. See
+    sh for the expansion rules and their bounds.
+
+EXAMPLES
+    rm notes.txt
+    rm *.txt
+    rm -r /vol/shared/build
