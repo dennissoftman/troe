@@ -12,9 +12,12 @@ troe-application = { path = "../../runtime/troe-application" }
 troe-completion = { path = "../../common/troe-completion" }
 troe-core = { path = "../../common/troe-core" }
 troe-fs-api = { path = "../../storage/troe-fs-api" }
+troe-fs-client = { path = "../../storage/troe-fs-client" }
 troe-fs-ramfs = { path = "../../storage/troe-fs-ramfs" }
 troe-driver = { path = "../../device/troe-driver" }
-troe-namespace = { path = "../../storage/troe-namespace" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+troe-namespace = { path = "../../storage/troe-namespace" }

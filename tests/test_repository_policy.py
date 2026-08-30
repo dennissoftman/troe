@@ -301,6 +301,11 @@ class RepositoryPolicyTests(unittest.TestCase):
             {"common", "storage", "net", "device", "runtime", "shell"},
         )
 
+        # Two troe-fs-* crates are contracts rather than filesystems: the
+        # provider contract and the client contract. Everything else carrying
+        # that prefix is an implementation.
+        contracts = {"troe-fs-api", "troe-fs-client"}
+
         def shipped_dependencies(manifest: dict) -> set[str]:
             """Dependencies that reach a built image.
 
@@ -337,7 +342,7 @@ class RepositoryPolicyTests(unittest.TestCase):
                         " troe-block, but no format may reach a provider,"
                         " namespace, or policy crate.",
                     )
-            if crate.startswith("troe-fs-") and crate != "troe-fs-api":
+            if crate.startswith("troe-fs-") and crate not in contracts:
                 self.assertLessEqual(
                     dependencies,
                     {"troe-fs-api", "troe-block", "troe-txslot", "troe-core", "troe-checksum"},
@@ -346,7 +351,15 @@ class RepositoryPolicyTests(unittest.TestCase):
                 )
             if crate == "troe-fs-api":
                 self.assertEqual(
-                    dependencies, set(), "the filesystem contract must stay dependency-free"
+                    dependencies, set(), "the provider contract must stay dependency-free"
+                )
+            if crate == "troe-fs-client":
+                self.assertLessEqual(
+                    dependencies,
+                    {"troe-fs-api", "troe-core"},
+                    "the client contract may name vocabulary only, never an"
+                    " implementation, so a client can be served across a"
+                    " protection boundary",
                 )
             if crate == "troe-namespace":
                 self.assertNotIn(
@@ -355,9 +368,25 @@ class RepositoryPolicyTests(unittest.TestCase):
                 for dependency in dependencies:
                     self.assertFalse(
                         dependency.startswith(("troe-fs-", "troe-fmt-"))
-                        and dependency != "troe-fs-api",
+                        and dependency not in contracts,
                         f"the namespace may not link the {dependency} implementation",
                     )
+
+    def test_the_session_holds_no_filesystem_implementation(self) -> None:
+        """The shell is a namespace client, not a namespace owner. ADR 0035
+        Phase E requires this before the namespace can move into a server: a
+        session that names a concrete namespace cannot be served across a
+        protection boundary."""
+        manifest = tomllib.loads(
+            (REPO_ROOT / "crates/shell/troe-shell/Cargo.toml").read_text("utf-8")
+        )
+        shipped = {
+            name for name in manifest.get("dependencies", {}) if name.startswith("troe-")
+        }
+        self.assertIn("troe-fs-client", shipped)
+        self.assertNotIn("troe-namespace", shipped)
+        source = (REPO_ROOT / "crates/shell/troe-shell/src/lib.rs").read_text("utf-8")
+        self.assertIn("pub type SharedNamespace = Rc<RefCell<dyn NamespaceClient>>;", source)
 
     def test_kernel_storage_dependencies_are_recorded_for_phase_e(self) -> None:
         """The kernel still links every filesystem format and the network stack.

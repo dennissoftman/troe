@@ -29,10 +29,10 @@ use troe_core::{
 };
 use troe_driver::InputQueueStats;
 use troe_fs_api::{FILE_IO_BUFFER_BYTES, FsError, MAX_FILE_IO_BUFFER_BYTES, NodeKind};
-use troe_namespace::Namespace;
+use troe_fs_client::NamespaceClient;
 
 /// Shared namespace ownership used by stream endpoints and KEX services.
-pub type SharedNamespace = Rc<RefCell<Namespace>>;
+pub type SharedNamespace = Rc<RefCell<dyn NamespaceClient>>;
 
 /// Trusted dynamic state domains available to shell-owned completion.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -650,7 +650,7 @@ impl CommandCatalog {
         })
     }
 
-    fn refresh(&mut self, namespace: &mut Namespace) {
+    fn refresh(&mut self, namespace: &mut dyn NamespaceClient) {
         let revision = namespace.command_revision();
         if self.revision == Some(revision) {
             return;
@@ -663,7 +663,9 @@ impl CommandCatalog {
     }
 }
 
-fn load_command_catalog(namespace: &mut Namespace) -> Result<(Vec<String>, bool), FsError> {
+fn load_command_catalog(
+    namespace: &mut dyn NamespaceClient,
+) -> Result<(Vec<String>, bool), FsError> {
     let mut names = Vec::new();
     names
         .try_reserve_exact(INTRINSICS.len())
@@ -1218,24 +1220,20 @@ impl Shell {
     ///
     /// # Errors
     ///
-    /// Fails if the supplied namespace cannot accept the required `/sys` nodes.
-    pub fn new(
-        mut namespace: Namespace,
-        architecture: &str,
-        machine_memory: MachineMemorySnapshot,
-        machine_control: bool,
-    ) -> Result<Self, FsError> {
-        namespace.set_system_file("/sys/arch", format!("{architecture}\n").as_bytes())?;
-        namespace.set_system_file("/sys/version", b"0.1.0\n")?;
-        let memory_report =
-            format_memory_report(architecture, machine_memory, None, namespace.memory_stats());
-        namespace.set_system_file("/sys/memory", memory_report.as_bytes())?;
+    /// Fails if the session's own bounded tables cannot be reserved.
+    ///
+    /// The caller composes the namespace, including the generated `/sys`
+    /// nodes, because attaching state is composition authority that a client
+    /// must not hold. The architecture and machine-memory values the session
+    /// used to write are now the caller's to record, so they are no longer
+    /// parameters here.
+    pub fn new(namespace: SharedNamespace, machine_control: bool) -> Result<Self, FsError> {
         let command_catalog = CommandCatalog::new()?;
         let package_completions = PackageCompletionRegistry::new();
         let intrinsic_completions =
             IntrinsicCompletionRegistry::new().map_err(|_| FsError::Corrupt)?;
         Ok(Self {
-            namespace: Rc::new(RefCell::new(namespace)),
+            namespace,
             command_catalog,
             package_completions,
             intrinsic_completions,
@@ -1307,7 +1305,7 @@ impl Shell {
                 return self.complete_paths(context, PathKind::File, config);
             }
             self.command_catalog
-                .refresh(&mut self.namespace.borrow_mut());
+                .refresh(&mut *self.namespace.borrow_mut());
             return complete_commands(
                 context,
                 &self.command_catalog.names,
@@ -1338,7 +1336,7 @@ impl Shell {
             );
         }
         self.package_completions
-            .refresh(&mut self.namespace.borrow_mut());
+            .refresh(&mut *self.namespace.borrow_mut());
         let Some(resolver) = self.package_completions.resolve(command, request) else {
             return Completion::default();
         };
@@ -1415,7 +1413,7 @@ impl Shell {
         config: CompletionConfig,
     ) -> Completion {
         self.command_catalog
-            .refresh(&mut self.namespace.borrow_mut());
+            .refresh(&mut *self.namespace.borrow_mut());
         complete_commands(
             context,
             &self.command_catalog.names,
@@ -2718,8 +2716,31 @@ mod tests {
     };
     use troe_fs_ramfs::{RamFs, RamFsQuota};
 
-    /// Compose a namespace the way a composition root does: a skeleton plus one
-    /// writable filesystem mounted at `/tmp`.
+    /// Compose the generated `/sys` nodes the way a composition root does and
+    /// return the concrete namespace, so a caller can still compose while the
+    /// session receives only the client contract.
+    fn session_namespace(mut namespace: Namespace, architecture: &str) -> Rc<RefCell<Namespace>> {
+        assert_eq!(
+            namespace.set_system_file("/sys/arch", format!("{architecture}\n").as_bytes()),
+            Ok(())
+        );
+        assert_eq!(
+            namespace.set_system_file("/sys/version", b"0.1.0\n"),
+            Ok(())
+        );
+        let report = format_memory_report(
+            architecture,
+            MachineMemorySnapshot::hosted(),
+            None,
+            namespace.memory_stats(),
+        );
+        assert_eq!(
+            namespace.set_system_file("/sys/memory", report.as_bytes()),
+            Ok(())
+        );
+        Rc::new(RefCell::new(namespace))
+    }
+
     fn writable_namespace() -> Namespace {
         let mut namespace = Namespace::new();
         assert_eq!(
@@ -2819,6 +2840,13 @@ mod tests {
     }
 
     fn shell() -> Shell {
+        shell_with_namespace().0
+    }
+
+    /// Build a session and retain the concrete namespace. Composition is not
+    /// reachable through the session any more, which is the point of the
+    /// client contract, so a test that composes needs its own handle.
+    fn shell_with_namespace() -> (Shell, Rc<RefCell<Namespace>>) {
         let mut namespace = writable_namespace();
         assert_eq!(namespace.add_read_only_dir("/help"), Ok(()));
         assert_eq!(namespace.add_read_only_dir("/bin"), Ok(()));
@@ -2911,10 +2939,13 @@ mod tests {
             namespace.add_read_only_file("/help/readme", b"alpha\nbeta alpha\n"),
             Ok(())
         );
-        match Shell::new(namespace, "test", MachineMemorySnapshot::hosted(), true) {
+        let namespace = session_namespace(namespace, "test");
+        let shared: SharedNamespace = Rc::clone(&namespace) as SharedNamespace;
+        let shell = match Shell::new(shared, true) {
             Ok(value) => value,
             Err(_error) => std::process::abort(),
-        }
+        };
+        (shell, namespace)
     }
 
     #[derive(Default)]
@@ -3184,7 +3215,7 @@ mod tests {
         ] {
             assert_eq!(namespace.add_read_only_file(path, b"x"), Ok(()));
         }
-        match Shell::new(namespace, "test", MachineMemorySnapshot::hosted(), true) {
+        match Shell::new(session_namespace(namespace, "test"), true) {
             Ok(value) => value,
             Err(_error) => std::process::abort(),
         }
@@ -3370,7 +3401,7 @@ mod tests {
                 Ok(())
             );
         }
-        let mut shell = match Shell::new(namespace, "test", MachineMemorySnapshot::hosted(), true) {
+        let mut shell = match Shell::new(session_namespace(namespace, "test"), true) {
             Ok(value) => value,
             Err(_error) => std::process::abort(),
         };
@@ -3737,10 +3768,10 @@ mod tests {
     #[test]
     fn redirection_streams_past_old_limit_and_honors_archive_chunk_hint() {
         const TOTAL_BYTES: u64 = 2 * 1024 * 1024;
-        let mut shell = shell();
+        let (mut shell, namespace) = shell_with_namespace();
         let state = Rc::new(RefCell::new(StreamState::default()));
         assert_eq!(
-            shell.namespace.borrow_mut().mount_writable(
+            namespace.borrow_mut().mount_writable(
                 "/media",
                 Box::new(StreamProvider {
                     state: Rc::clone(&state),
@@ -4191,7 +4222,7 @@ mod tests {
 
     #[test]
     fn lazy_catalog_is_cached_and_revision_invalidated() {
-        let mut shell = shell();
+        let (mut shell, namespace) = shell_with_namespace();
         assert_eq!(shell.command_catalog.revision, None);
 
         let first = shell.complete("he", 2, CompletionConfig::standard());
@@ -4206,8 +4237,7 @@ mod tests {
         assert_eq!(cached.common_replacement(), Some("cached-only "));
 
         assert_eq!(
-            shell
-                .namespace
+            namespace
                 .borrow_mut()
                 .add_read_only_file("/bin/beta.kex", b"package"),
             Ok(())
@@ -4232,7 +4262,7 @@ mod tests {
                 Ok(())
             );
         }
-        let mut shell = Shell::new(namespace, "test", MachineMemorySnapshot::hosted(), true)
+        let mut shell = Shell::new(session_namespace(namespace, "test"), true)
             .unwrap_or_else(|_| std::process::abort());
         let completion = shell.complete("app0999", 7, CompletionConfig::standard());
         assert_eq!(completion.common_replacement(), Some("app0999 "));
@@ -4273,7 +4303,7 @@ mod tests {
             namespace.add_read_only_file("/oversized", &oversized),
             Ok(())
         );
-        let mut shell = Shell::new(namespace, "test", MachineMemorySnapshot::hosted(), true)
+        let mut shell = Shell::new(session_namespace(namespace, "test"), true)
             .unwrap_or_else(|_| std::process::abort());
         let mut external = FakeExternal::default();
         let mut input = SliceInput::new(b"");

@@ -688,6 +688,10 @@ mod firmware {
         runtime: SharedRuntime,
         session_terminal: Option<SharedSessionTerminal>,
         pending_script_lines: Option<Vec<String>>,
+        /// Composition authority. External execution attaches application
+        /// filesystem and volume services, which is more than the client
+        /// contract the session itself holds.
+        composed_namespace: OwnedNamespace,
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -713,6 +717,17 @@ mod firmware {
     type SharedResidentLog = Rc<RefCell<BoundedLog>>;
     type SharedProcessTable = Rc<RefCell<ProcessTable>>;
     type SharedTaskIdentity = Rc<Cell<Option<TaskId>>>;
+    /// The composition root retains the concrete namespace, because mounting
+    /// providers and projecting generated state are authorities a client of
+    /// the namespace must not hold.
+    type OwnedNamespace = Rc<RefCell<Namespace>>;
+
+    /// The architecture name with its trailing newline, for `/sys/arch`.
+    fn architecture_line() -> String {
+        let mut line = String::from(architecture());
+        line.push('\n');
+        line
+    }
     type SharedChildTable = Rc<RefCell<ChildTable>>;
     type SharedPipeTable = Rc<RefCell<PipeTable>>;
     type SharedRandom = Rc<RefCell<RandomGenerator>>;
@@ -766,7 +781,7 @@ mod firmware {
 
     #[derive(Clone)]
     struct NestedLaunchContext<'stream> {
-        namespace: SharedNamespace,
+        namespace: OwnedNamespace,
         runtime: SharedRuntime,
         processes: SharedProcessTable,
         mounts: SharedRuntimeMounts,
@@ -1423,7 +1438,9 @@ mod firmware {
     }
 
     struct ApplicationVolumeControlService {
-        namespace: SharedNamespace,
+        /// Activating a manifest volume attaches a provider, which is
+        /// composition authority rather than client access.
+        namespace: OwnedNamespace,
         mounts: SharedRuntimeMounts,
     }
 
@@ -13422,7 +13439,7 @@ mod firmware {
             command: &str,
             words: &[String],
             cwd: &str,
-            namespace: &SharedNamespace,
+            namespace: &OwnedNamespace,
             artifact_path: &str,
             package: &StreamedKexPackage,
             requirements: BackgroundRequirements,
@@ -13937,6 +13954,7 @@ mod firmware {
     #[allow(clippy::too_many_arguments)]
     fn launch_service_process(
         service: &troe_fmt_scfg::ServiceConfig,
+        namespace: &OwnedNamespace,
         shell: &mut Shell,
         residents: &mut ResidentProcessTable,
         processes: &SharedProcessTable,
@@ -13964,6 +13982,7 @@ mod firmware {
             runtime: runtime.clone(),
             session_terminal: None,
             pending_script_lines: None,
+            composed_namespace: Rc::clone(namespace),
         };
         shell.execute_with_external(&line, &mut input, &mut output, &mut error, &mut runner)
     }
@@ -13977,6 +13996,7 @@ mod firmware {
         #[allow(clippy::too_many_arguments)]
         fn drive(
             &mut self,
+            namespace: &OwnedNamespace,
             shell: &mut Shell,
             residents: &mut ResidentProcessTable,
             processes: &SharedProcessTable,
@@ -14042,6 +14062,7 @@ mod firmware {
                         }
                         let status = launch_service_process(
                             service,
+                            namespace,
                             shell,
                             residents,
                             processes,
@@ -14086,12 +14107,16 @@ mod firmware {
             command: &str,
             words: &[String],
             cwd: &str,
-            namespace: &SharedNamespace,
+            _namespace: &SharedNamespace,
             placement: ExecutionPlacement,
             stdin: &'stream mut dyn Input,
             stdout: &'stream mut dyn Output,
             stderr: &'stream mut dyn Output,
         ) -> Option<CommandStatus> {
+            // The session hands over the client contract, but this runner also
+            // attaches application filesystem and volume services, so it works
+            // through the composition handle it was constructed with.
+            let namespace = &Rc::clone(&self.composed_namespace);
             self.pending_script_lines = None;
             let reference = external_command_reference(command)?;
             let explicit_path = matches!(reference, ExternalCommandReference::Path(_));
@@ -14338,7 +14363,8 @@ mod firmware {
                 machine_input,
                 namespace_memory,
             );
-            if namespace
+            if self
+                .composed_namespace
                 .borrow_mut()
                 .set_system_file("/sys/memory", memory_report.as_bytes())
                 .is_err()
@@ -15486,9 +15512,33 @@ mod firmware {
             .unwrap_or_else(|_| fatal(b"fatal: cannot read /recovery/motd\n"));
         let initial_snapshot = machine_snapshot(task.accounting);
         let machine_control = task.capabilities.contains(Capabilities::MACHINE_CONTROL);
-        let Ok(mut shell) =
-            Shell::new(namespace, architecture(), initial_snapshot, machine_control)
-        else {
+        // Generated /sys state is composition authority, so it is written here
+        // rather than by the session, which holds only the client contract.
+        let mut namespace = namespace;
+        if namespace
+            .set_system_file("/sys/arch", architecture_line().as_bytes())
+            .is_err()
+            || namespace
+                .set_system_file("/sys/version", b"0.1.0\n")
+                .is_err()
+        {
+            fatal(b"fatal: cannot compose namespace\n");
+        }
+        let memory_report = format_memory_report(
+            architecture(),
+            initial_snapshot,
+            None,
+            namespace.memory_stats(),
+        );
+        if namespace
+            .set_system_file("/sys/memory", memory_report.as_bytes())
+            .is_err()
+        {
+            fatal(b"fatal: cannot compose namespace\n");
+        }
+        let namespace: OwnedNamespace = Rc::new(RefCell::new(namespace));
+        let session: SharedNamespace = Rc::clone(&namespace) as SharedNamespace;
+        let Ok(mut shell) = Shell::new(session, machine_control) else {
             fatal(b"fatal: cannot compose namespace\n");
         };
         let runtime = finish_shell_startup(
@@ -15499,8 +15549,9 @@ mod firmware {
         );
         // Providers were mounted before the runtime existed, so the clock is
         // installed here and reaches both those mounts and every later one.
-        shell
-            .namespace()
+        // It goes through the composition handle rather than the session,
+        // because installing a clock into every provider is composition.
+        namespace
             .borrow_mut()
             .set_wall_clock(Rc::new(RuntimeWallClock {
                 runtime: runtime.clone(),
@@ -15541,6 +15592,7 @@ mod firmware {
         if let Some(services) = services.as_mut() {
             services
                 .drive(
+                    &namespace,
                     &mut shell,
                     &mut residents,
                     &processes,
@@ -15569,6 +15621,7 @@ mod firmware {
             let Ok(line) = read_edited_line(
                 &mut editor,
                 &terminal,
+                &namespace,
                 &mut shell,
                 &runtime,
                 &mut residents,
@@ -15625,6 +15678,7 @@ mod firmware {
                 &line,
                 &confirmation_cwd,
                 &terminal,
+                &namespace,
                 &mut shell,
                 &runtime,
                 &mut residents,
@@ -15644,6 +15698,7 @@ mod firmware {
             let mut input = SessionTerminalInput::new(Rc::clone(&terminal));
             let mut error = NativeConsole;
             let mut external = KexCommandRunner {
+                composed_namespace: Rc::clone(&namespace),
                 accounting: task.accounting,
                 scheduler: task.scheduler,
                 residents: &mut residents,
@@ -15685,6 +15740,7 @@ mod firmware {
             if let Some(services) = services.as_mut() {
                 services
                     .drive(
+                        &namespace,
                         &mut shell,
                         &mut residents,
                         &processes,
@@ -15736,6 +15792,7 @@ mod firmware {
         line: &str,
         cwd: &str,
         terminal: &SharedSessionTerminal,
+        namespace: &OwnedNamespace,
         shell: &mut Shell,
         runtime: &SharedRuntime,
         residents: &mut ResidentProcessTable,
@@ -15778,6 +15835,7 @@ mod firmware {
             let answer = read_edited_line(
                 &mut confirmation_editor,
                 terminal,
+                namespace,
                 shell,
                 runtime,
                 residents,
@@ -15803,6 +15861,7 @@ mod firmware {
     fn read_edited_line(
         editor: &mut LineEditor,
         terminal: &SharedSessionTerminal,
+        namespace: &OwnedNamespace,
         shell: &mut Shell,
         runtime: &SharedRuntime,
         residents: &mut ResidentProcessTable,
@@ -15825,6 +15884,7 @@ mod firmware {
                     residents.pump(scheduler, accounting, shell_id, shell_capabilities)?;
                     if let Some(services) = services.as_mut() {
                         services.drive(
+                            namespace,
                             shell,
                             residents,
                             processes,

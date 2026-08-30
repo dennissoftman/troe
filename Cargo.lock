@@ -205,6 +205,14 @@ name = "troe-fs-api"
 version = "0.1.0"
 
 [[package]]
+name = "troe-fs-client"
+version = "0.1.0"
+dependencies = [
+ "troe-core",
+ "troe-fs-api",
+]
+
+[[package]]
 name = "troe-fs-ext4"
 version = "0.1.0"
 dependencies = [
@@ -368,6 +376,7 @@ version = "0.1.0"
 dependencies = [
  "troe-core",
  "troe-fs-api",
+ "troe-fs-client",
  "troe-fs-kefs",
  "troe-fs-ramfs",
 ]
@@ -401,6 +410,7 @@ dependencies = [
  "troe-core",
  "troe-driver",
  "troe-fs-api",
+ "troe-fs-client",
  "troe-fs-ramfs",
  "troe-namespace",
 ]

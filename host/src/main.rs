@@ -1,10 +1,12 @@
 //! Host executable for portable development and acceptance testing.
 #![forbid(unsafe_code)]
 
+use std::cell::RefCell;
 use std::env;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
+use std::rc::Rc;
 
 use troe_core::{Input, MAX_LINE_BYTES, MachineMemorySnapshot, Output, StreamError};
 use troe_fs_kefs::Kefs;
@@ -14,7 +16,7 @@ use troe_fs_kefs::Kefs;
 const EMBEDDED_MOUNT_ROOTS: &[&str] = &["/vol"];
 use troe_fs_ramfs::{RamFs, RamFsQuota};
 use troe_namespace::Namespace;
-use troe_shell::Shell;
+use troe_shell::{SharedNamespace, Shell, format_memory_report};
 
 #[cfg(target_arch = "x86_64")]
 const ROOTFS: &[u8] = include_bytes!("../../assets/root-x86_64.kefs");
@@ -81,13 +83,24 @@ fn run() -> Result<u8, String> {
             .mount_read_only(&path, Box::new(view))
             .map_err(|error| format!("cannot mount embedded root: {error}"))?;
     }
-    let mut shell = Shell::new(
-        namespace,
-        env::consts::ARCH,
-        MachineMemorySnapshot::hosted(),
-        true,
-    )
-    .map_err(|error| format!("cannot compose namespace: {error}"))?;
+    // Generated /sys state is composition, so it is written here rather than by
+    // the session, which now holds only the namespace client contract.
+    let architecture = env::consts::ARCH;
+    let machine_memory = MachineMemorySnapshot::hosted();
+    namespace
+        .set_system_file("/sys/arch", format!("{architecture}\n").as_bytes())
+        .map_err(|error| format!("cannot compose namespace: {error}"))?;
+    namespace
+        .set_system_file("/sys/version", b"0.1.0\n")
+        .map_err(|error| format!("cannot compose namespace: {error}"))?;
+    let memory_report =
+        format_memory_report(architecture, machine_memory, None, namespace.memory_stats());
+    namespace
+        .set_system_file("/sys/memory", memory_report.as_bytes())
+        .map_err(|error| format!("cannot compose namespace: {error}"))?;
+    let namespace: SharedNamespace = Rc::new(RefCell::new(namespace));
+    let mut shell = Shell::new(namespace, true)
+        .map_err(|error| format!("cannot compose namespace: {error}"))?;
 
     let arguments: Vec<String> = env::args().skip(1).collect();
     if arguments.first().is_some_and(|value| value == "--command") {
