@@ -41,6 +41,7 @@ class SetupTroeTests(unittest.TestCase):
         cls.boot = {
             kind: cls.build_boot(kind) for kind in mkcloud.BUNDLE_KINDS
         }
+        cls._assembled = {}
 
     @classmethod
     def build_boot(cls, bundle_kind: str) -> bytes:
@@ -66,6 +67,26 @@ class SetupTroeTests(unittest.TestCase):
         self.addCleanup(self._temporary.cleanup)
         self.root = Path(self._temporary.name)
 
+    @classmethod
+    def assembled(cls, kind: str) -> tuple[dict[str, bytes], dict[str, object]]:
+        """Return the one immutable 56 MiB image set that defines one kind.
+
+        Assembly is deterministic for a fixed platform, environment, boot image,
+        and kind, and `test_cloud_artifacts` owns that reproducibility contract.
+        Every test republishes these images into its own destination and then
+        edits only the published files, so assembling once per class removes
+        repeated work without weakening an assertion.
+        """
+        if kind not in cls._assembled:
+            cls._assembled[kind] = mkcloud.assemble_bundle(
+                platform=cls.platform,
+                environment=cls.environment,
+                boot_fat=cls.boot[kind],
+                root_source=cls.root_source,
+                bundle_kind=kind,
+            )
+        return cls._assembled[kind]
+
     def write_bundle(self, kind: str = mkcloud.BUNDLE_KIND_DEVELOPMENT, name: str = "bundle") -> Path:
         """Publish one synthetic bundle of the requested kind."""
         self.cspk = (
@@ -73,13 +94,7 @@ class SetupTroeTests(unittest.TestCase):
             if kind == mkcloud.BUNDLE_KIND_PRODUCTION
             else self.fixture_cspk
         )
-        images, manifest = mkcloud.assemble_bundle(
-            platform=self.platform,
-            environment=self.environment,
-            boot_fat=self.boot[kind],
-            root_source=self.root_source,
-            bundle_kind=kind,
-        )
+        images, manifest = self.assembled(kind)
         directory = self.root / name
         directory.mkdir()
         for role, filename in mkcloud.BUNDLE_FILENAMES.items():

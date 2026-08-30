@@ -155,24 +155,43 @@ class ProductionBuildPolicyTests(unittest.TestCase):
             )
             for profile in build.PLATFORM_PROFILES.values()
         ]
-        self.assertEqual(verification.target_clippy_commands(), expected)
+        gates = verification.target_clippy_commands()
+        self.assertEqual([gate.command for gate in gates], expected)
+        self.assertEqual(
+            [gate.label for gate in gates],
+            [
+                f"clippy troe-kernel ({profile.identifier})"
+                for profile in build.PLATFORM_PROFILES.values()
+            ],
+        )
 
     def test_full_gate_has_only_one_owner_for_both_image_variants(self) -> None:
         without_qemu = verification.image_and_qemu_commands(skip_qemu=True)
-        with_qemu = verification.image_and_qemu_commands(skip_qemu=False)
         self.assertEqual(len(without_qemu), 1)
-        self.assertIn("--all-variants", without_qemu[0])
-        self.assertEqual(len(with_qemu), 1)
-        self.assertIn("test-qemu.py", str(with_qemu[0][1]))
-        self.assertNotIn("build.py", str(with_qemu[0][1]))
+        self.assertIn("--all-variants", without_qemu[0].command)
         strict_without_qemu = verification.image_and_qemu_commands(
             skip_qemu=True, strict_tool_versions=True
         )
+        self.assertIn("--strict-tool-versions", strict_without_qemu[0].command)
+
+    def test_boot_acceptance_runs_exactly_one_platform_per_invocation(self) -> None:
+        with_qemu = verification.image_and_qemu_commands(skip_qemu=False)
+        self.assertEqual(len(with_qemu), len(build.PLATFORM_IDS))
+        selected = []
+        for gate, platform_id in zip(with_qemu, build.PLATFORM_IDS, strict=True):
+            self.assertIn("test-qemu.py", str(gate.command[1]))
+            self.assertNotIn("build.py", str(gate.command[1]))
+            self.assertNotIn("all", gate.command)
+            index = gate.command.index("--platform")
+            self.assertEqual(gate.command[index + 1], platform_id)
+            self.assertIn(platform_id, gate.label)
+            selected.append(platform_id)
+        self.assertEqual(sorted(selected), sorted(build.PLATFORM_IDS))
         strict_with_qemu = verification.image_and_qemu_commands(
             skip_qemu=False, strict_tool_versions=True
         )
-        self.assertIn("--strict-tool-versions", strict_without_qemu[0])
-        self.assertIn("--strict-tool-versions", strict_with_qemu[0])
+        for gate in strict_with_qemu:
+            self.assertIn("--strict-tool-versions", gate.command)
 
     def test_rootfs_image_is_selected_only_by_architecture(self) -> None:
         for architecture in ("x86_64", "aarch64"):
