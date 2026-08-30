@@ -48,6 +48,11 @@ ARCHITECTURES = {
     "aarch64": "aarch64-unknown-linux-musl",
 }
 DEFAULT_VERSION = "3.14.7"
+# Bundled dependency archives that the reviewed static modules link.
+VENDORED_ARCHIVES = (
+    "Modules/_decimal/libmpdec/libmpdec.a",
+    "Modules/expat/libexpat.a",
+)
 HACL_ARCHIVES = (
     "Modules/_hacl/libHacl_Hash_MD5.a",
     "Modules/_hacl/libHacl_Hash_SHA1.a",
@@ -505,6 +510,7 @@ def build_library(
             f"-j{jobs}",
             f"libpython{release.series}.a",
             *hacl_archives(release),
+            *VENDORED_ARCHIVES,
         ],
         cwd=build,
         env=environment,

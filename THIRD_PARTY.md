@@ -35,10 +35,15 @@ time/process-identifier seeding fallback so withheld entropy authority fails
 instead of degrading. The statically linked C module allowlist and the shipped
 pure-Python profile are declared in `apps/python/config/Setup.local` and
 `apps/python/stdlib-policy.json`, and every built package records its own
-included and excluded module manifests with reasons. Interpreter builds compile
-the HACL* hash implementations distributed inside the CPython source tree under
-Apache-2.0 OR MIT; the excluded modules do not build CPython's vendored
-mpdecimal, Expat, or zlib copies.
+included and excluded module manifests with reasons.
+
+Interpreter builds compile three dependency sets distributed inside that same
+authenticated CPython source release, so none of them is a separate download or
+a separate digest to pin: the HACL* hash implementations under Apache-2.0 OR
+MIT, libmpdec under the 2-clause BSD license for `_decimal`, and Expat under
+MIT for `pyexpat`. Their exact versions are whatever the pinned CPython release
+carries, which the recorded source digest already fixes. The excluded modules do
+not build CPython's vendored zlib, bzip2, or xz bindings.
 
 Lua number formatting uses nanoprintf 0.6.1 under Unlicense OR 0BSD. The source,
 license, archive hash, and configuration are vendored once under

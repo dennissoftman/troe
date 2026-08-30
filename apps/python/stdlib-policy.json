@@ -60,12 +60,6 @@
     },
     {
       "paths": [
-        "cProfile.py"
-      ],
-      "reason": "the native _lsprof accelerator is intentionally unavailable"
-    },
-    {
-      "paths": [
         "ctypes"
       ],
       "reason": "dynamic native library and ctypes loading is intentionally unavailable"
@@ -82,12 +76,11 @@
         "doctest.py",
         "mailbox.py",
         "pdb.py",
-        "plistlib.py",
         "pydoc.py",
         "pydoc_data",
         "unittest"
       ],
-      "reason": "requires the signal, fcntl, or pyexpat extension modules that this milestone excludes, so the module cannot be imported at all"
+      "reason": "requires the signal or fcntl extension modules that this milestone excludes, so the module cannot be imported at all"
     },
     {
       "paths": [
@@ -151,12 +144,6 @@
         "webbrowser.py"
       ],
       "reason": "external GUI and subprocess launching are intentionally unavailable"
-    },
-    {
-      "paths": [
-        "xml"
-      ],
-      "reason": "the native expat parser is intentionally unavailable"
     },
     {
       "paths": [
