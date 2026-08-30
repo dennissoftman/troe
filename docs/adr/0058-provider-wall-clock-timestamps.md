@@ -54,6 +54,11 @@ A created inode carries the instant in its access, change, modification and
 creation times. A later write advances the change time, and advances the
 modification time when the payload changed; the access time is left alone.
 
+A directory's own inode is stamped when it is written, which is when it gains
+or loses a block, not on every entry added to or removed from a block it
+already has. Advancing a directory's times on every name change would mean an
+extra inode write per create, and nothing in this profile reads them.
+
 Each time is written as its 32-bit field together with the two epoch bits of the
 record's extra word, which spans 1970 to 2446. When a record declares no room
 for that word the instant is clamped to 2038-01-19 instead, because the bare
@@ -75,9 +80,14 @@ media from a correct one.
 The fields are what FAT defines. The write time counts two-second units; the
 creation entry carries the odd second in its separate tenths field; last access
 is a date with no time part at all. Creation is stamped when the entry is
-created, the write time on every content mutation, and the `.` and `..` entries
-of a new directory carry that directory's own stamp. A rename moves a name and
-not its contents, so the destination record inherits the source's stamps.
+created and the write time on every mutation of a file's contents, and the `.`
+and `..` entries of a new directory carry that directory's own stamp. A rename
+moves a name and not its contents, so the destination record inherits the
+source's stamps.
+
+As on ext4, a directory's own entry is not restamped when names are added to or
+removed from it; only the `.` and `..` records it was created with carry a time.
+The root directory has no entry at all, so it never carries one.
 
 The representable range is 1980-01-01 through 2107-12-31. A clock outside it is
 clamped to the nearer end rather than refused, because refusing would leave the
