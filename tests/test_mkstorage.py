@@ -233,7 +233,7 @@ class Ext4JournalCapacityTests(unittest.TestCase):
     """Check the pinned log against the provider's transaction ceiling."""
 
     def test_pinned_journal_outsizes_the_worst_admissible_transaction(self) -> None:
-        source = (REPO_ROOT / "crates" / "troe-ext4" / "src" / "journal.rs").read_text(
+        source = (REPO_ROOT / "crates" / "storage" / "troe-fs-ext4" / "src" / "journal.rs").read_text(
             encoding="utf-8"
         )
         declaration = re.search(

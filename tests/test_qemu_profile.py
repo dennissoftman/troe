@@ -148,7 +148,7 @@ class FirmwareProfileTests(unittest.TestCase):
         encoded = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
         self.assertEqual(PLATFORM_MANIFEST_PATH.read_text(encoding="utf-8"), encoded)
 
-        source = (REPO_ROOT / "crates" / "troe-platform" / "src" / "lib.rs").read_text(
+        source = (REPO_ROOT / "crates" / "device" / "troe-platform" / "src" / "lib.rs").read_text(
             encoding="utf-8"
         )
         numeric_ids = {

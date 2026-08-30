@@ -1,0 +1,14 @@
+[package]
+name = "troe-supervisor"
+description = "Bounded resident-service supervision policy for TROE"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+troe-fmt-scfg = { path = "../../storage/troe-fmt-scfg" }
+troe-task = { path = "../troe-task" }
+
+[lints]
+workspace = true

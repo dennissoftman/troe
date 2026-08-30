@@ -7,9 +7,9 @@ license.workspace = true
 publish = false
 
 [dependencies]
-troe-abi = { path = "../../crates/troe-abi" }
-troe-application = { path = "../../crates/troe-application" }
-troe-completion = { path = "../../crates/troe-completion" }
+troe-abi = { path = "../../crates/common/troe-abi" }
+troe-application = { path = "../../crates/runtime/troe-application" }
+troe-completion = { path = "../../crates/common/troe-completion" }
 
 [lints]
 workspace = true

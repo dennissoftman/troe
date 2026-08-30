@@ -22,12 +22,12 @@ def package(
 
 PACKAGES = {
     "troe-completion": package(
-        "troe-completion", "crates/troe-completion", "troe-shell"
+        "troe-completion", "crates/common/troe-completion", "troe-shell"
     ),
-    "troe-shell": package("troe-shell", "crates/troe-shell", "troe-host", "troe-kernel"),
+    "troe-shell": package("troe-shell", "crates/shell/troe-shell", "troe-host", "troe-kernel"),
     "troe-host": package("troe-host", "host"),
-    "troe-net": package("troe-net", "crates/troe-net", "troe-machine", "troe-kernel"),
-    "troe-machine": package("troe-machine", "crates/troe-machine", "troe-kernel"),
+    "troe-net": package("troe-net", "crates/net/troe-net", "troe-machine", "troe-kernel"),
+    "troe-machine": package("troe-machine", "crates/runtime/troe-machine", "troe-kernel"),
     "troe-kernel": package("troe-kernel", "kernel"),
     "troe-kex": package("troe-kex", "sdk/rust/troe-kex"),
     "troe-kex-alloc": package("troe-kex-alloc", "sdk/rust/troe-kex-alloc"),
@@ -42,7 +42,7 @@ class ChangedTestSelectionTests(unittest.TestCase):
     """Selection widens through dependencies and fails closed for uncertainty."""
 
     def test_rust_change_selects_reverse_dependency_closure_and_scenarios(self) -> None:
-        path = PurePosixPath("crates/troe-net/src/lib.rs")
+        path = PurePosixPath("crates/net/troe-net/src/lib.rs")
         plan = test_changed.build_plan((path,), PACKAGES)
         self.assertFalse(plan.full_reasons)
         self.assertEqual(
@@ -52,7 +52,7 @@ class ChangedTestSelectionTests(unittest.TestCase):
         self.assertFalse(plan.qemu_all_platforms)
 
     def test_completion_policy_change_selects_shell_consumers_and_behavior(self) -> None:
-        path = PurePosixPath("crates/troe-completion/src/lib.rs")
+        path = PurePosixPath("crates/common/troe-completion/src/lib.rs")
         plan = test_changed.build_plan((path,), PACKAGES)
         self.assertFalse(plan.full_reasons)
         self.assertEqual(
@@ -82,7 +82,7 @@ class ChangedTestSelectionTests(unittest.TestCase):
 
     def test_low_level_change_expands_qemu_to_every_platform(self) -> None:
         plan = test_changed.build_plan(
-            (PurePosixPath("crates/troe-machine/src/mechanism.rs"),), PACKAGES
+            (PurePosixPath("crates/runtime/troe-machine/src/mechanism.rs"),), PACKAGES
         )
         self.assertTrue(plan.qemu_all_platforms)
         self.assertIn("fault-isolation", plan.qemu_scenarios)
@@ -261,7 +261,7 @@ class ChangedTestSelectionTests(unittest.TestCase):
                 self.assertTrue(plan.full_reasons)
 
     def test_qemu_command_repeats_selected_groups_and_honors_scope(self) -> None:
-        plan = test_changed.TestPlan((PurePosixPath("crates/troe-net/src/lib.rs"),))
+        plan = test_changed.TestPlan((PurePosixPath("crates/net/troe-net/src/lib.rs"),))
         plan.qemu_scenarios.update(("network", "boot"))
         commands = test_changed.commands_for_plan(
             plan, skip_qemu=False, require_filesystem_tools=False

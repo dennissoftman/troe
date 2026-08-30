@@ -1,0 +1,10 @@
+[package]
+name = "troe-fs-api"
+description = "Implementation-independent filesystem contract, path rules, and provider trait for TROE"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

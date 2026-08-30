@@ -40,11 +40,6 @@ mod firmware {
     use troe_application::{ParseError, parse_kex};
     use troe_block::{BlockAccess, BlockRegion};
     use troe_block::{BlockDevice, BlockLimits};
-    use troe_config::{
-        ActivationPointer, ActivationRecovery, MemoryPolicy, SystemConfig,
-        normalize_memory_policy_toml, parse_config, recover_activation,
-    };
-    use troe_content::{ContentPack, MAX_PACK_BYTES, ObjectKind};
     use troe_core::{
         CommandStatus, Input, MAX_LINE_BYTES, MachineMemoryOwner, MachineMemorySnapshot,
         MemoryStats, Output, StreamError,
@@ -54,18 +49,30 @@ mod firmware {
         HandleOwner, ReplyStatus, Request, Rights, Service, ServiceReply, ServiceReplyInfo,
     };
     use troe_driver::{InputEvent, InputQueueConfig, InputQueueStats, InputSource};
-    use troe_ext4::Ext4Limits;
-    use troe_fat::Fat32Limits;
-    use troe_gpt::{GptGuid, GptLimits, discover};
+    use troe_fmt_bmnt::{
+        AccessMode, ActivationMode, BootMountManifest, FilesystemProfile, MAX_MANIFEST_BYTES,
+        parse_manifest,
+    };
+    use troe_fmt_cspk::{ContentPack, MAX_PACK_BYTES, ObjectKind};
+    use troe_fmt_gpt::{GptGuid, GptLimits, discover};
+    use troe_fmt_prgn::RegionSelector;
+    use troe_fmt_scfg::{
+        ActivationPointer, ActivationRecovery, MemoryPolicy, SystemConfig,
+        normalize_memory_policy_toml, parse_config, recover_activation,
+    };
+    use troe_fs_api::{
+        FILE_IO_BUFFER_BYTES, FileSystemProvider, FsError, NodeKind, WallClock, canonicalize,
+    };
+    use troe_fs_ext4::Ext4Limits;
+    use troe_fs_fat::Fat32Limits;
+    #[cfg(feature = "acceptance-probes")]
+    use troe_fs_statefs::STATE_PATH;
+    use troe_fs_statefs::StateFs;
     use troe_identity::IdentityLimits;
     use troe_memory::{
         BASE_PAGE_SIZE, BootAllocator, FrameAllocationError, FrameAllocator, MAX_FIRMWARE_REGIONS,
         Mapping, MappingLifetime, MappingMemoryType, MappingOwner, MappingPermissions, MappingPlan,
         MemoryMapStats, MemoryRegion, NormalizedMemoryMap, PhysicalRange, RegionKind, VirtualRange,
-    };
-    use troe_mount::{
-        AccessMode, ActivationMode, BootMountManifest, FilesystemProfile, MAX_MANIFEST_BYTES,
-        parse_manifest,
     };
     use troe_net::{
         ArpCache, DhcpMessageType, DhcpPacket, Ipv4Address, MAX_UDP_PAYLOAD_BYTES, MacAddress,
@@ -74,7 +81,6 @@ mod firmware {
         build_dhcp_discover, build_dhcp_request, build_icmp_echo, build_tcp, build_udp, parse_arp,
         parse_dhcp, parse_icmp_echo, parse_tcp, parse_udp,
     };
-    use troe_persist::{DualSlotStore, RegionSelector, TRANSACTION_BLOCKS};
     use troe_process::{
         ChildLifecycle, ChildTable, MAX_CHILDREN_PER_OWNER, MAX_PIPES_PER_OWNER, OwnerId,
         PipeDirection, PipeEndpoint, PipeTable, ProcessError as ChildProcessError,
@@ -85,13 +91,6 @@ mod firmware {
         ExecutionPlacement, ExternalCommand, ExternalCommandReference, JobControl, MachineAction,
         ServiceControl, SharedNamespace, Shell, Word, external_command_reference,
         format_memory_report, parse_command_list,
-    };
-    #[cfg(feature = "acceptance-probes")]
-    use troe_statefs::STATE_PATH;
-    use troe_statefs::StateFs;
-    use troe_storage::{
-        ActivationLimits, MAX_STORAGE_REPORT_BYTES, PreparedMount, STORAGE_REPORT_EXTENSION_BYTES,
-        prepare_mounts, read_selected_file, validate_root_activation,
     };
     use troe_supervisor::{BoundedLog, ServiceState, Supervisor, SupervisorAction};
     use troe_task::{
@@ -106,9 +105,11 @@ mod firmware {
         InputDecoder, KeyEvent, KeyboardConfig, LineEditor, Ps2Set1Decoder, TextConsole,
         TextConsoleConfig,
     };
-    use troe_vfs::{
-        FILE_IO_BUFFER_BYTES, FsError, Namespace, NodeKind, RamFsQuota, ReadOnlyFileSystem,
-        WallClock, canonicalize,
+    use troe_txslot::{DualSlotStore, TRANSACTION_BLOCKS};
+    use troe_vfs::{Namespace, RamFsQuota};
+    use troe_volume::{
+        ActivationLimits, MAX_STORAGE_REPORT_BYTES, PreparedMount, STORAGE_REPORT_EXTENSION_BYTES,
+        prepare_mounts, read_selected_file, validate_root_activation,
     };
     use uefi::boot;
     use uefi::mem::memory_map::{MemoryMap, MemoryMapOwned};
@@ -592,7 +593,7 @@ mod firmware {
         kernel_runtime: PhysicalRange,
         kernel_plan: MappingPlan,
         native_blocks: RefCell<Vec<troe_machine::NativeVirtioBlock>>,
-        native_statefs: RefCell<Option<Box<dyn ReadOnlyFileSystem>>>,
+        native_statefs: RefCell<Option<Box<dyn FileSystemProvider>>>,
         native_generation: NativeGenerationState,
         selected_config: Option<SystemConfig>,
         memory_policy: MemoryPolicy,
@@ -606,7 +607,7 @@ mod firmware {
 
     struct NativeBlockInitialization {
         blocks: Vec<troe_machine::NativeVirtioBlock>,
-        statefs: Option<Box<dyn ReadOnlyFileSystem>>,
+        statefs: Option<Box<dyn FileSystemProvider>>,
         generation: NativeGenerationState,
         config: Option<SystemConfig>,
     }
@@ -2265,7 +2266,7 @@ mod firmware {
     #[cfg(feature = "acceptance-probes")]
     fn recover_native_statefs(
         devices: &mut Vec<troe_machine::NativeVirtioBlock>,
-    ) -> Result<Option<Box<dyn ReadOnlyFileSystem>>, ()> {
+    ) -> Result<Option<Box<dyn FileSystemProvider>>, ()> {
         let statefs = mount_native_statefs(devices)?;
         let mut statefs = statefs;
         probe_native_statefs_mutation(&mut statefs)?;
@@ -2275,10 +2276,10 @@ mod firmware {
     #[cfg(not(feature = "acceptance-probes"))]
     fn recover_native_statefs(
         devices: &mut Vec<troe_machine::NativeVirtioBlock>,
-    ) -> Option<Box<dyn ReadOnlyFileSystem>> {
+    ) -> Option<Box<dyn FileSystemProvider>> {
         mount_native_statefs(devices)
             .ok()
-            .map(|statefs| Box::new(statefs) as Box<dyn ReadOnlyFileSystem>)
+            .map(|statefs| Box::new(statefs) as Box<dyn FileSystemProvider>)
     }
 
     #[cfg(feature = "acceptance-probes")]
@@ -2288,7 +2289,7 @@ mod firmware {
         let mut prior = [0_u8; 8];
         let next = match statefs.read_file(STATE_PATH, 0, &mut prior) {
             Ok(8) => u64::from_le_bytes(prior).checked_add(1).ok_or(())?,
-            Err(troe_vfs::FsError::NotFound) => 1,
+            Err(troe_fs_api::FsError::NotFound) => 1,
             _ => return Err(()),
         };
         statefs
@@ -5940,7 +5941,7 @@ mod firmware {
                 .borrow_mut()
                 .metadata(cwd, path)
                 .map_err(|error| match error {
-                    troe_vfs::FsError::NotFound => ReplyStatus::NotFound,
+                    troe_fs_api::FsError::NotFound => ReplyStatus::NotFound,
                     _ => ReplyStatus::Failure,
                 })?;
             if metadata.kind != NodeKind::File {
@@ -13907,7 +13908,7 @@ mod firmware {
     /// always empty, so a supervised process cannot consume prompt input.
     #[allow(clippy::too_many_arguments)]
     fn launch_service_process(
-        service: &troe_config::ServiceConfig,
+        service: &troe_fmt_scfg::ServiceConfig,
         shell: &mut Shell,
         residents: &mut ResidentProcessTable,
         processes: &SharedProcessTable,
@@ -14075,8 +14076,8 @@ mod firmware {
             let path = catalog_path.as_deref().unwrap_or(command);
             let metadata = match namespace.borrow_mut().metadata(cwd, path) {
                 Ok(metadata) => metadata,
-                Err(troe_vfs::FsError::NotFound) if !explicit_path => return None,
-                Err(troe_vfs::FsError::NotFound) => {
+                Err(troe_fs_api::FsError::NotFound) if !explicit_path => return None,
+                Err(troe_fs_api::FsError::NotFound) => {
                     return Some(command_application_status_error(
                         stderr,
                         command,
@@ -14238,16 +14239,16 @@ mod firmware {
             }
             let mut service_capability_bits = 0;
             if datagram_required {
-                service_capability_bits |= troe_config::SERVICE_CAPABILITY_DATAGRAM;
+                service_capability_bits |= troe_fmt_scfg::SERVICE_CAPABILITY_DATAGRAM;
             }
             if timer_required {
-                service_capability_bits |= troe_config::SERVICE_CAPABILITY_TIMER;
+                service_capability_bits |= troe_fmt_scfg::SERVICE_CAPABILITY_TIMER;
             }
             if clock_control_required {
-                service_capability_bits |= troe_config::SERVICE_CAPABILITY_CLOCK_CONTROL;
+                service_capability_bits |= troe_fmt_scfg::SERVICE_CAPABILITY_CLOCK_CONTROL;
             }
             if wall_clock_required {
-                service_capability_bits |= troe_config::SERVICE_CAPABILITY_WALL_CLOCK;
+                service_capability_bits |= troe_fmt_scfg::SERVICE_CAPABILITY_WALL_CLOCK;
             }
             if let (Some(initial_handles), Some(authorized)) =
                 (self.service_initial_handles, self.service_capability_bits)
@@ -15250,7 +15251,7 @@ mod firmware {
             .services()
             .iter()
             .find(|service| service.name() == name)
-            .map(troe_config::ServiceConfig::id)
+            .map(troe_fmt_scfg::ServiceConfig::id)
     }
 
     const fn service_state_label(state: ServiceState) -> &'static str {

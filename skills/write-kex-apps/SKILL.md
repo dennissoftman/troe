@@ -6,7 +6,7 @@ description: Write, review, build, or debug secure TROE KEX command applications
 # Write TROE KEX apps
 
 Work from the repository root. Read `apps/echo` (streams), `apps/udp`
-(datagrams), `sdk/rust/troe-kex/src/lib.rs`, and `crates/troe-abi/src/lib.rs`
+(datagrams), `sdk/rust/troe-kex/src/lib.rs`, and `crates/common/troe-abi/src/lib.rs`
 only as needed. Do not infer POSIX behavior.
 
 ## App contract

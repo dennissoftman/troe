@@ -1,0 +1,14 @@
+[package]
+name = "troe-application"
+description = "Bounded KEX package, executable, and application load-plan policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+troe-abi = { path = "../../common/troe-abi" }
+troe-completion = { path = "../../common/troe-completion" }
+
+[lints]
+workspace = true

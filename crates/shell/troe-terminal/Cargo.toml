@@ -1,0 +1,14 @@
+[package]
+name = "troe-terminal"
+description = "Configurable bounded terminal input and line editing for TROE"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+troe-core = { path = "../../common/troe-core" }
+
+[lints]
+workspace = true
+

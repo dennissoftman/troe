@@ -7,7 +7,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-MMU_SOURCE = (REPO_ROOT / "crates/troe-machine/src/mmu.rs").read_text(
+MMU_SOURCE = (REPO_ROOT / "crates/runtime/troe-machine/src/mmu.rs").read_text(
     encoding="utf-8"
 )
 KERNEL_SOURCE = (REPO_ROOT / "kernel/src/main.rs").read_text(encoding="utf-8")

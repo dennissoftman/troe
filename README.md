@@ -464,7 +464,7 @@ provisioning workflow.
 | Path | Purpose |
 | --- | --- |
 | [`kernel/`](kernel) | UEFI entry point and native kernel composition |
-| [`crates/`](crates) | Portable shell, VFS, storage, networking, task, and driver components |
+| [`crates/`](crates) | Portable components grouped by domain: `common/`, `storage/`, `net/`, `device/`, `runtime/`, and `shell/` |
 | [`apps/`](apps) | Isolated KEX command applications |
 | [`sdk/`](sdk) | Rust and freestanding C application SDKs, runtimes, and linker support |
 | [`rootfs/`](rootfs) | Root filesystem and packaged applications |

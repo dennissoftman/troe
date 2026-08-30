@@ -1,0 +1,13 @@
+[package]
+name = "troe-fmt-cspk"
+description = "Bounded immutable content packs and SHA-256 identities for TROE"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+troe-checksum = { path = "../../common/troe-checksum" }
+
+[lints]
+workspace = true

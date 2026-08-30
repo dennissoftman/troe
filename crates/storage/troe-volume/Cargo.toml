@@ -1,0 +1,25 @@
+[package]
+name = "troe-volume"
+description = "Deterministic native-volume discovery and authorized mount activation for TROE"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+troe-block = { path = "../../device/troe-block" }
+troe-fmt-scfg = { path = "../troe-fmt-scfg" }
+troe-fmt-cspk = { path = "../troe-fmt-cspk" }
+troe-fs-ext4 = { path = "../troe-fs-ext4" }
+troe-fs-fat = { path = "../troe-fs-fat" }
+troe-fs-api = { path = "../troe-fs-api" }
+troe-fmt-gpt = { path = "../troe-fmt-gpt" }
+troe-identity = { path = "../troe-identity" }
+troe-fmt-bmnt = { path = "../troe-fmt-bmnt" }
+troe-vfs = { path = "../troe-vfs" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+troe-checksum = { path = "../../common/troe-checksum" }

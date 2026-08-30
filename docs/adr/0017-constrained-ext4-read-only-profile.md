@@ -24,7 +24,7 @@ immutable content; it does not require every ext4 layout optimization.
 
 ## Decision
 
-The `troe-ext4` v1 profile is a strict, clean ext4 subset. Read-only mounts
+The `troe-fs-ext4` v1 profile is a strict, clean ext4 subset. Read-only mounts
 retain the original parser contract, while a read-write block capability may
 perform bounded-memory streamed mutation:
 

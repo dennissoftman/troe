@@ -14,34 +14,36 @@ platform-x86_64-q35-uefi = ["troe-machine/platform-x86_64-q35-uefi"]
 platform-x86_64-uefi-virtio-pci = ["troe-machine/platform-x86_64-uefi-virtio-pci"]
 
 [dependencies]
-troe-abi = { path = "../crates/troe-abi" }
-troe-application = { path = "../crates/troe-application" }
-troe-block = { path = "../crates/troe-block" }
-troe-config = { path = "../crates/troe-config" }
-troe-content = { path = "../crates/troe-content" }
-troe-core = { path = "../crates/troe-core" }
-troe-dispatch = { path = "../crates/troe-dispatch" }
-troe-driver = { path = "../crates/troe-driver" }
-troe-memory = { path = "../crates/troe-memory" }
-troe-mount = { path = "../crates/troe-mount" }
-troe-net = { path = "../crates/troe-net" }
-troe-persist = { path = "../crates/troe-persist" }
-troe-process = { path = "../crates/troe-process" }
-troe-random = { path = "../crates/troe-random" }
-troe-shell = { path = "../crates/troe-shell" }
-troe-storage = { path = "../crates/troe-storage" }
-troe-supervisor = { path = "../crates/troe-supervisor" }
-troe-statefs = { path = "../crates/troe-statefs" }
-troe-task = { path = "../crates/troe-task" }
-troe-terminal = { path = "../crates/troe-terminal" }
-troe-vfs = { path = "../crates/troe-vfs" }
-troe-ext4 = { path = "../crates/troe-ext4" }
-troe-fat = { path = "../crates/troe-fat" }
-troe-gpt = { path = "../crates/troe-gpt" }
-troe-identity = { path = "../crates/troe-identity" }
+troe-abi = { path = "../crates/common/troe-abi" }
+troe-application = { path = "../crates/runtime/troe-application" }
+troe-block = { path = "../crates/device/troe-block" }
+troe-fmt-scfg = { path = "../crates/storage/troe-fmt-scfg" }
+troe-fmt-cspk = { path = "../crates/storage/troe-fmt-cspk" }
+troe-core = { path = "../crates/common/troe-core" }
+troe-dispatch = { path = "../crates/runtime/troe-dispatch" }
+troe-fs-api = { path = "../crates/storage/troe-fs-api" }
+troe-driver = { path = "../crates/device/troe-driver" }
+troe-memory = { path = "../crates/runtime/troe-memory" }
+troe-fmt-bmnt = { path = "../crates/storage/troe-fmt-bmnt" }
+troe-net = { path = "../crates/net/troe-net" }
+troe-fmt-prgn = { path = "../crates/storage/troe-fmt-prgn" }
+troe-txslot = { path = "../crates/storage/troe-txslot" }
+troe-process = { path = "../crates/runtime/troe-process" }
+troe-random = { path = "../crates/runtime/troe-random" }
+troe-shell = { path = "../crates/shell/troe-shell" }
+troe-volume = { path = "../crates/storage/troe-volume" }
+troe-supervisor = { path = "../crates/runtime/troe-supervisor" }
+troe-fs-statefs = { path = "../crates/storage/troe-fs-statefs" }
+troe-task = { path = "../crates/runtime/troe-task" }
+troe-terminal = { path = "../crates/shell/troe-terminal" }
+troe-vfs = { path = "../crates/storage/troe-vfs" }
+troe-fs-ext4 = { path = "../crates/storage/troe-fs-ext4" }
+troe-fs-fat = { path = "../crates/storage/troe-fs-fat" }
+troe-fmt-gpt = { path = "../crates/storage/troe-fmt-gpt" }
+troe-identity = { path = "../crates/storage/troe-identity" }
 
 [target.'cfg(target_os = "uefi")'.dependencies]
-troe-machine = { path = "../crates/troe-machine" }
+troe-machine = { path = "../crates/runtime/troe-machine" }
 uefi = { version = "=0.39.0", features = ["alloc"] }
 
 [lints]
