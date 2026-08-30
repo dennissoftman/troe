@@ -783,15 +783,12 @@ impl<D: BlockDevice> Ext4<D> {
         if info.access() != BlockAccess::ReadWrite {
             return Err(FsError::ReadOnly);
         }
-        if !info.supports_flush() && !info.supports_force_unit_access() {
+        // Every ordering guarantee this provider makes is enforced by an
+        // explicit flush, so a device without one cannot be mutated safely.
+        if !info.supports_flush() {
             return Err(FsError::Unsupported);
         }
         Ok(())
-    }
-
-    fn force_unit_access(&self) -> bool {
-        let info = self.region.info();
-        !info.supports_flush() && info.supports_force_unit_access()
     }
 
     fn write_fs_block(&mut self, block: u32, bytes: &[u8]) -> Result<(), FsError> {
@@ -812,21 +809,13 @@ impl<D: BlockDevice> Ext4<D> {
             .checked_mul(u64::from(self.layout.device_blocks_per_fs_block))
             .ok_or(FsError::Overflow)?;
         self.region
-            .write_blocks(
-                start,
-                self.layout.device_blocks_per_fs_block,
-                bytes,
-                self.force_unit_access(),
-            )
+            .write_blocks(start, self.layout.device_blocks_per_fs_block, bytes, false)
             .map_err(map_block_error)
     }
 
     fn durability_barrier(&mut self) -> Result<(), FsError> {
         self.ensure_writable()?;
-        if self.region.info().supports_flush() {
-            self.region.flush().map_err(map_block_error)?;
-        }
-        Ok(())
+        self.region.flush().map_err(map_block_error)
     }
 
     /// Stamp the clean marker and the recovery flag in one flushed block-0
@@ -5507,6 +5496,46 @@ mod tests {
         }
     }
 
+    /// A device that offers force unit access and no cache flush.
+    ///
+    /// Nothing in this system produces one: virtio-blk, the only block
+    /// transport, has no per-request force-unit-access flag to negotiate, so
+    /// the geometry exists only to prove the provider refuses it rather than
+    /// mutating a volume whose durability barriers would all be no-ops.
+    #[derive(Debug)]
+    struct ForceUnitAccessDevice(SparseDevice);
+
+    impl BlockDevice for ForceUnitAccessDevice {
+        fn geometry(&self) -> BlockGeometry {
+            BlockGeometry::new(DEVICE_BLOCK_BYTES_U32, DEVICE_BLOCKS, 1, false, true)
+                .unwrap_or_else(|_| unreachable!())
+        }
+
+        fn read_blocks(
+            &mut self,
+            start_block: u64,
+            block_count: u32,
+            destination: &mut [u8],
+        ) -> Result<(), BlockError> {
+            self.0.read_blocks(start_block, block_count, destination)
+        }
+
+        fn write_blocks(
+            &mut self,
+            start_block: u64,
+            block_count: u32,
+            source: &[u8],
+            force_unit_access: bool,
+        ) -> Result<(), BlockError> {
+            self.0
+                .write_blocks(start_block, block_count, source, force_unit_access)
+        }
+
+        fn flush(&mut self) -> Result<(), BlockError> {
+            Err(BlockError::Unsupported)
+        }
+    }
+
     struct TestDirectory(PathBuf);
 
     impl TestDirectory {
@@ -6210,6 +6239,33 @@ mod tests {
         );
         assert_eq!(ext4.remove_file("/hello"), Err(FsError::ReadOnly));
         assert_eq!(ext4.create_directory("/nope"), Err(FsError::ReadOnly));
+        Ok(())
+    }
+
+    #[test]
+    fn a_device_without_flush_is_refused_even_when_it_offers_force_unit_access()
+    -> Result<(), FsError> {
+        // Every ordering guarantee this provider makes is a flush. Admitting a
+        // flush-incapable device on a force-unit-access claim would turn each
+        // durability barrier into a no-op, so mutation is refused outright
+        // while the read path stays unaffected.
+        let block_limits = BlockLimits::new(8, EXT4_BLOCK_BYTES, 1).map_err(|_| FsError::Io)?;
+        let region = BlockRegion::whole_device(
+            ForceUnitAccessDevice(valid_device()),
+            BlockAccess::ReadWrite,
+            block_limits,
+        )
+        .map_err(|_| FsError::Io)?;
+        let mut ext4 = Ext4::mount(region, limits()?)?;
+        let mut bytes = [0_u8; 13];
+        assert_eq!(ext4.read_file("/hello", 0, &mut bytes)?, 13);
+        for outcome in [
+            ext4.write_file("/blocked.txt", b"nope"),
+            ext4.remove_file("/hello"),
+            ext4.create_directory("/nope"),
+        ] {
+            assert_eq!(outcome, Err(FsError::Unsupported));
+        }
         Ok(())
     }
 

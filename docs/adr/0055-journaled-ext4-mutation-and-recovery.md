@@ -63,6 +63,13 @@ together in one flushed block-0 update, so the cost is exactly the previous
 dirty marker. The ordinary mount refuses on either signal; a foreign Linux host
 is forced to recover rather than mount half-applied metadata.
 
+Force unit access is not accepted in place of those flushes. virtio-blk is the
+only block transport this system has, and its request header carries no
+per-request force-unit-access flag to negotiate, so no driver can report the
+capability. Admitting a flush-incapable device on a force-unit-access claim
+would reduce every barrier above to a no-op for a device nothing can produce,
+so volume activation and both writable providers require flush outright.
+
 Recovery is a separate, explicitly authorized entry point. It is the only path
 that may open a volume whose journal still needs replay, and it refuses a volume
 that is already clean, so recovery authority is explicit at the call site and

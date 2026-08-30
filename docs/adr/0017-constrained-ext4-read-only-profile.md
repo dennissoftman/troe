@@ -54,7 +54,7 @@ encryption, case folding, external journals, and extent trees deeper than one
 level are not in v1. The volume UUID is exposed so mount policy can select a
 filesystem by stable identity.
 
-Writable mounts require flush or force-unit-access durability and implement
+Writable mounts require an explicit cache flush and implement
 regular-file create/truncate/sequential append, non-directory unlink,
 empty-directory creation, symbolic-link creation, and regular-file hard-link
 creation. Data blocks and extent records grow incrementally from bounded caller

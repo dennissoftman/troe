@@ -853,7 +853,11 @@ fn selected_block_access(
         .iter()
         .any(|entry| entry.selector() == selector && entry.access() == AccessMode::ReadWrite);
     if writable {
-        if !geometry.supports_flush() && !geometry.supports_force_unit_access() {
+        // Providers order their writes with explicit flushes. Force unit
+        // access is not an accepted substitute: the only block transport this
+        // system has cannot express it per request, so a device that offered
+        // it and nothing else would silently reduce every barrier to a no-op.
+        if !geometry.supports_flush() {
             return Err(ActivationError::Resolution);
         }
         Ok(BlockAccess::ReadWrite)
@@ -1183,12 +1187,13 @@ mod tests {
     use super::{
         ActivationError, ActivationLimits, Candidate, MAX_DISCOVERY_REPORT_BYTES, SharedDevice,
         StorageReport, prepare_mounts, prepare_read_only, render_storage_report,
+        selected_block_access,
     };
-    use troe_block::{BlockDevice, BlockError, BlockGeometry, BlockLimits};
+    use troe_block::{BlockAccess, BlockDevice, BlockError, BlockGeometry, BlockLimits};
     use troe_ext4::Ext4Limits;
     use troe_fat::Fat32Limits;
     use troe_gpt::GptLimits;
-    use troe_mount::parse_manifest;
+    use troe_mount::{AccessMode, MountEntry, VolumeSelector, parse_manifest};
 
     const MANIFEST: &[u8] = include_bytes!("../../../assets/boot.bmnt");
 
@@ -1247,6 +1252,44 @@ mod tests {
             Fat32Limits::new(4096, 1024, 1024 * 1024, 4096, 64)
                 .unwrap_or_else(|_| std::process::abort()),
         )
+    }
+
+    #[test]
+    fn writable_activation_requires_flush_and_refuses_force_unit_access_alone() {
+        let manifest = parse_manifest(MANIFEST).unwrap_or_else(|_| std::process::abort());
+        let writable = manifest
+            .entries()
+            .iter()
+            .find(|entry| entry.access() == AccessMode::ReadWrite)
+            .map_or_else(|| std::process::abort(), MountEntry::selector);
+        let geometry = |flush, force_unit_access| {
+            BlockGeometry::new(512, 64, 1, flush, force_unit_access)
+                .unwrap_or_else(|_| std::process::abort())
+        };
+
+        assert_eq!(
+            selected_block_access(&manifest, writable, geometry(true, false)),
+            Ok(BlockAccess::ReadWrite)
+        );
+        // Force unit access is not a substitute for flush. A device offering it
+        // and nothing else is refused write authority exactly like a device
+        // that offers neither.
+        for force_unit_access in [false, true] {
+            assert_eq!(
+                selected_block_access(&manifest, writable, geometry(false, force_unit_access)),
+                Err(ActivationError::Resolution)
+            );
+        }
+
+        // A volume the manifest never names stays read-only whatever the
+        // device can do, so the durability rule gates writes alone.
+        let unnamed = VolumeSelector::whole_ext4([7; 16]).unwrap_or_else(|_| std::process::abort());
+        for force_unit_access in [false, true] {
+            assert_eq!(
+                selected_block_access(&manifest, unnamed, geometry(false, force_unit_access)),
+                Ok(BlockAccess::ReadOnly)
+            );
+        }
     }
 
     #[test]
