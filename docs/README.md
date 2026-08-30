@@ -40,6 +40,7 @@ history rather than in current documentation.
 | Journaled ext4 mutation and bounded recovery | [ADR 0055](adr/0055-journaled-ext4-mutation-and-recovery.md) |
 | General ext4 compatibility profile | [ADR 0056](adr/0056-general-ext4-compatibility-profile.md) |
 | Bounded shell pathname expansion and paged operands | [ADR 0057](adr/0057-bounded-shell-pathname-expansion.md) |
+| One namespace wall clock for provider timestamps | [ADR 0058](adr/0058-provider-wall-clock-timestamps.md) |
 
 The current serialized contracts are versioned independently under
 [`formats/`](formats):

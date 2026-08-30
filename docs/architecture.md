@@ -496,7 +496,11 @@ metadata-preserving ext4 with bounded symbolic/hard links, native virtio
 transport, dual-slot durability, and
 selected STFS mutation pieces preserve this dependency direction. Empty
 directory removal and same-provider rename are implemented for RAMFS, FAT32,
-and the ext4 provider. Its ext4 mutations are
+and the ext4 provider. The namespace holds one wall clock and shares it with
+every mounted provider, which reads it at each mutation, so both the ext4 and
+FAT32 providers stamp the instant a write happened; each converts the single
+Unix-seconds representation itself, and without a readable clock neither invents
+a time. Its ext4 mutations are
 journaled as physical block redo transactions in the profile's existing internal
 journal, and a separate explicitly authorized recovery path replays a committed
 transaction or discards an uncommitted one, so an interrupted mutation recovers

@@ -7,6 +7,7 @@ extern crate alloc;
 extern crate std;
 
 use alloc::format;
+use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::char::decode_utf16;
@@ -14,7 +15,7 @@ use core::fmt;
 use troe_block::{BlockAccess, BlockDevice, BlockError, BlockRegion};
 use troe_vfs::{
     DirEntry, FileMetadata, FsError, MAX_NAME_BYTES, NodeKind, ProviderListing, ReadOnlyFileSystem,
-    canonicalize,
+    WallClock, canonicalize,
 };
 
 const FAT32_MIN_CLUSTERS: u32 = 65_525;
@@ -24,6 +25,26 @@ const FAT32_EOC_MIN: u32 = 0x0fff_fff8;
 const FAT32_CLEAN_SHUTDOWN: u32 = 0x0800_0000;
 const FAT32_NO_HARD_ERROR: u32 = 0x0400_0000;
 const DIRECTORY_ENTRY_BYTES: usize = 32;
+/// Short-entry offset of the creation time's tenths-of-a-second remainder.
+const DIRECTORY_CREATE_TENTHS: usize = 13;
+/// Short-entry offset of the creation time and date pair.
+const DIRECTORY_CREATE_TIME: usize = 14;
+/// Short-entry offset of the last-access date, which has no time part.
+const DIRECTORY_ACCESS_DATE: usize = 18;
+/// Short-entry offset of the last-write time and date pair.
+const DIRECTORY_WRITE_TIME: usize = 22;
+/// Short-entry byte ranges holding timestamps. They are disjoint because the
+/// high half of the first cluster sits between the access date and the write
+/// time.
+const DIRECTORY_STAMP_RANGES: [core::ops::Range<usize>; 2] =
+    [DIRECTORY_CREATE_TENTHS..20, DIRECTORY_WRITE_TIME..26];
+/// First instant a FAT date encodes: its year field counts from 1980.
+const DOS_EPOCH_SECONDS: u64 = 315_532_800;
+/// Last instant a FAT date encodes, 2107-12-31T23:59:58, at the two-second
+/// granularity of the write time.
+const DOS_LAST_SECONDS: u64 = 4_354_819_198;
+/// Seconds in one day, the step between DOS date fields.
+const SECONDS_PER_DAY: u64 = 86_400;
 const LFN_UNITS_PER_ENTRY: usize = 13;
 const MAX_LFN_ENTRIES: usize = 20;
 const MAX_LFN_UNITS: usize = LFN_UNITS_PER_ENTRY * MAX_LFN_ENTRIES;
@@ -154,6 +175,11 @@ pub struct Fat32<D: BlockDevice> {
     layout: Layout,
     append_cursor: Option<FatAppendCursor>,
     read_cursor: Option<FatReadCursor>,
+    /// Clock this provider stamps into the entries it writes.
+    ///
+    /// `None`, or a clock that reports no time, leaves an entry's date and
+    /// time fields exactly as they were, which for a new entry means zero.
+    wall_clock: Option<Rc<dyn WallClock>>,
 }
 
 #[derive(Clone, Debug)]
@@ -223,6 +249,7 @@ impl<D: BlockDevice> Fat32<D> {
             layout,
             append_cursor: None,
             read_cursor: None,
+            wall_clock: None,
         };
         let media = mounted.read_fat_entry(0)?;
         let reserved = mounted.read_fat_entry(1)?;
@@ -242,6 +269,18 @@ impl<D: BlockDevice> Fat32<D> {
     #[must_use]
     pub const fn volume_id(&self) -> u32 {
         self.layout.volume_id
+    }
+
+    /// The instant to stamp into an entry, or `None` to leave its fields be.
+    ///
+    /// The clock is read here, at the mutation, so a mount never stamps the
+    /// instant it was attached onto a write that happened much later.
+    fn wall_stamp(&self) -> Result<Option<DosStamp>, FsError> {
+        self.wall_clock
+            .as_ref()
+            .and_then(|clock| clock.unix_seconds())
+            .map(DosStamp::from_unix_seconds)
+            .transpose()
     }
 
     fn resolve(&mut self, path: &str) -> Result<FatEntry, FsError> {
@@ -958,11 +997,17 @@ impl<D: BlockDevice> Fat32<D> {
         first_cluster: u32,
         byte_count: usize,
     ) -> Result<(), FsError> {
+        // Every caller reaches here because the file's payload changed, so the
+        // write time advances while the creation time is left alone.
+        let stamp = self.wall_stamp()?;
         let slot = *entry.directory_slots.last().ok_or(FsError::Corrupt)?;
         let mut bytes = self.read_cluster(slot.cluster)?;
         let raw = bytes
             .get_mut(slot.offset..slot.offset + DIRECTORY_ENTRY_BYTES)
             .ok_or(FsError::Corrupt)?;
+        if let Some(stamp) = stamp {
+            stamp.write_modification(raw)?;
+        }
         let cluster_bytes = first_cluster.to_le_bytes();
         raw[20..22].copy_from_slice(&cluster_bytes[2..4]);
         raw[26..28].copy_from_slice(&cluster_bytes[..2]);
@@ -1202,11 +1247,13 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Fat32<D> {
             return self.finish_mutation();
         }
 
-        let provisional = directory_records(&name, &entries, 0, 0)?;
+        let stamp = self.wall_stamp()?;
+        let provisional = directory_records(stamp, &name, &entries, 0, 0)?;
         self.begin_mutation()?;
         let slots = self.reserve_directory_slots(parent.first_cluster, provisional.len())?;
         let new_chain = self.allocate_file_chain(bytes)?;
         let records = directory_records(
+            stamp,
             &name,
             &entries,
             new_chain.first().copied().unwrap_or(0),
@@ -1246,20 +1293,28 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Fat32<D> {
             let _ignored = self.release_clusters(&clusters);
             return Err(FsError::Corrupt);
         };
+        let stamp = self.wall_stamp()?;
         let mut directory = zeroes;
+        // `.` and `..` describe this directory, so they carry its own stamp
+        // rather than one of their own.
         let initialize_entry = |raw: &mut [u8], name: &[u8; 11], target: u32| {
             raw.fill(0);
             raw[..11].copy_from_slice(name);
             raw[11] = 0x10;
+            if let Some(stamp) = stamp {
+                stamp.write_creation(raw)?;
+                stamp.write_modification(raw)?;
+            }
             let encoded = target.to_le_bytes();
             raw[20..22].copy_from_slice(&encoded[2..4]);
             raw[26..28].copy_from_slice(&encoded[..2]);
+            Ok::<(), FsError>(())
         };
         initialize_entry(
             &mut directory[..DIRECTORY_ENTRY_BYTES],
             b".          ",
             cluster,
-        );
+        )?;
         initialize_entry(
             &mut directory[DIRECTORY_ENTRY_BYTES..2 * DIRECTORY_ENTRY_BYTES],
             b"..         ",
@@ -1268,13 +1323,13 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Fat32<D> {
             } else {
                 parent.first_cluster
             },
-        );
+        )?;
         if let Err(error) = self.write_cluster(cluster, &directory) {
             let _ignored = self.release_clusters(&clusters);
             return Err(error);
         }
 
-        let mut records = directory_records(&name, &entries, cluster, 0)?;
+        let mut records = directory_records(stamp, &name, &entries, cluster, 0)?;
         let Some(short) = records.last_mut() else {
             let _ignored = self.release_clusters(&clusters);
             return Err(FsError::Corrupt);
@@ -1385,6 +1440,7 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Fat32<D> {
             return Err(FsError::Exists);
         }
         let mut records = directory_records(
+            None,
             &destination_name,
             &destination_entries,
             source_entry.first_cluster,
@@ -1393,6 +1449,17 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Fat32<D> {
         if source_entry.kind == NodeKind::Directory {
             records.last_mut().ok_or(FsError::Corrupt)?[11] = 0x10;
         }
+        // A rename moves a name, not its contents, so the destination record
+        // inherits the source's stamps instead of taking the current time.
+        let source_slot = *source_entry
+            .directory_slots
+            .last()
+            .ok_or(FsError::Corrupt)?;
+        let source_cluster = self.read_cluster(source_slot.cluster)?;
+        let source_raw = source_cluster
+            .get(source_slot.offset..source_slot.offset + DIRECTORY_ENTRY_BYTES)
+            .ok_or(FsError::Corrupt)?;
+        copy_timestamps(source_raw, records.last_mut().ok_or(FsError::Corrupt)?)?;
 
         self.begin_mutation()?;
         let slots =
@@ -1424,9 +1491,14 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Fat32<D> {
         self.ensure_writable()?;
         Err(FsError::Unsupported)
     }
+
+    fn set_wall_clock(&mut self, clock: Rc<dyn WallClock>) {
+        self.wall_clock = Some(clock);
+    }
 }
 
 fn directory_records(
+    stamp: Option<DosStamp>,
     name: &str,
     entries: &[FatEntry],
     first_cluster: u32,
@@ -1488,12 +1560,127 @@ fn directory_records(
     raw[..11].copy_from_slice(&short);
     raw[11] = 0x20;
     raw[12] = case_flags;
+    // A record is created and written in the same instant, so both stamps and
+    // the access date are the same reading of the clock.
+    if let Some(stamp) = stamp {
+        stamp.write_creation(&mut raw)?;
+        stamp.write_modification(&mut raw)?;
+    }
     let cluster = first_cluster.to_le_bytes();
     raw[20..22].copy_from_slice(&cluster[2..4]);
     raw[26..28].copy_from_slice(&cluster[..2]);
     raw[28..32].copy_from_slice(&byte_count.to_le_bytes());
     records.push(raw);
     Ok(records)
+}
+
+/// One instant already reduced to the fields a FAT directory entry stores.
+///
+/// FAT records local time with no timezone field. TROE has no timezone source,
+/// so the wall clock's UTC reading is written unconverted and a host reading
+/// the volume sees UTC. Inventing an offset would be a guess, and a wrong one
+/// would be indistinguishable from a correct one on the media.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DosStamp {
+    /// Year from 1980, month, and day, packed as FAT stores them.
+    date: u16,
+    /// Hour, minute, and seconds/2: the write time's granularity is 2 seconds.
+    time: u16,
+    /// The second the packed time cannot express, in tenths.
+    tenths: u8,
+}
+
+impl DosStamp {
+    /// Reduce a Unix UTC instant to the FAT fields, clamped to what FAT can
+    /// encode.
+    ///
+    /// The representable range is 1980-01-01 through 2107-12-31. A clock
+    /// outside it is clamped to the nearer end rather than refused, because a
+    /// refusal would leave the fields zero and a zero DOS date is not an old
+    /// date but an invalid one that `fsck.vfat` reports.
+    fn from_unix_seconds(seconds: u64) -> Result<Self, FsError> {
+        let seconds = seconds.clamp(DOS_EPOCH_SECONDS, DOS_LAST_SECONDS);
+        let (year, month, day) = civil_from_days(seconds / SECONDS_PER_DAY)?;
+        let day_seconds = seconds % SECONDS_PER_DAY;
+        let hour = u16::try_from(day_seconds / 3_600).map_err(|_| FsError::Overflow)?;
+        let minute = u16::try_from((day_seconds % 3_600) / 60).map_err(|_| FsError::Overflow)?;
+        let second = u16::try_from(day_seconds % 60).map_err(|_| FsError::Overflow)?;
+        let from_1980 = year.checked_sub(1980).ok_or(FsError::Overflow)?;
+        Ok(Self {
+            date: (from_1980 << 9) | (month << 5) | day,
+            time: (hour << 11) | (minute << 5) | (second / 2),
+            tenths: u8::try_from((second % 2) * 10).map_err(|_| FsError::Overflow)?,
+        })
+    }
+
+    /// Stamp this instant as an entry's creation time, and as the access date.
+    fn write_creation(self, raw: &mut [u8]) -> Result<(), FsError> {
+        *raw.get_mut(DIRECTORY_CREATE_TENTHS)
+            .ok_or(FsError::Corrupt)? = self.tenths;
+        put_u16_at(raw, DIRECTORY_CREATE_TIME, self.time)?;
+        put_u16_at(raw, DIRECTORY_CREATE_TIME + 2, self.date)?;
+        put_u16_at(raw, DIRECTORY_ACCESS_DATE, self.date)
+    }
+
+    /// Stamp this instant as an entry's last-write time, and as the access
+    /// date, which FAT records to the day only.
+    fn write_modification(self, raw: &mut [u8]) -> Result<(), FsError> {
+        put_u16_at(raw, DIRECTORY_WRITE_TIME, self.time)?;
+        put_u16_at(raw, DIRECTORY_WRITE_TIME + 2, self.date)?;
+        put_u16_at(raw, DIRECTORY_ACCESS_DATE, self.date)
+    }
+}
+
+/// Carry an entry's timestamps to the record that replaces it.
+///
+/// Renaming a name does not change when its contents were created or written,
+/// so the new record inherits both stamps instead of taking a fresh one.
+fn copy_timestamps(source: &[u8], destination: &mut [u8]) -> Result<(), FsError> {
+    for range in DIRECTORY_STAMP_RANGES {
+        let bytes = source.get(range.clone()).ok_or(FsError::Corrupt)?;
+        destination
+            .get_mut(range)
+            .ok_or(FsError::Corrupt)?
+            .copy_from_slice(bytes);
+    }
+    Ok(())
+}
+
+/// Split a day count since 1970-01-01 into its proleptic Gregorian date.
+///
+/// The era arithmetic is the standard shift of the year's origin to March, so
+/// that a leap day falls at the end of a cycle and every month before it has a
+/// fixed length.
+fn civil_from_days(days: u64) -> Result<(u16, u16, u16), FsError> {
+    let shifted = days.checked_add(719_468).ok_or(FsError::Overflow)?;
+    let era = shifted / 146_097;
+    let day_of_era = shifted % 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    // A March-based year rolls over at January, not at the shifted origin.
+    let year = if month <= 2 { year + 1 } else { year };
+    Ok((
+        u16::try_from(year).map_err(|_| FsError::Overflow)?,
+        u16::try_from(month).map_err(|_| FsError::Overflow)?,
+        u16::try_from(day).map_err(|_| FsError::Overflow)?,
+    ))
+}
+
+fn put_u16_at(bytes: &mut [u8], offset: usize, value: u16) -> Result<(), FsError> {
+    bytes
+        .get_mut(offset..offset.checked_add(2).ok_or(FsError::Overflow)?)
+        .ok_or(FsError::Corrupt)?
+        .copy_from_slice(&value.to_le_bytes());
+    Ok(())
 }
 
 fn validate_writable_name(name: &str) -> Result<(), FsError> {
@@ -1903,8 +2090,10 @@ mod tests {
     use troe_block::{BlockAccess, BlockGeometry, BlockLimits};
 
     use super::{
-        BlockDevice, BlockError, BlockRegion, Fat32, Fat32Limits, FsError, NodeKind,
-        ReadOnlyFileSystem, short_name_checksum,
+        BlockDevice, BlockError, BlockRegion, DIRECTORY_ACCESS_DATE, DIRECTORY_CREATE_TENTHS,
+        DIRECTORY_CREATE_TIME, DIRECTORY_ENTRY_BYTES, DIRECTORY_WRITE_TIME, DOS_EPOCH_SECONDS,
+        DOS_LAST_SECONDS, DosStamp, Fat32, Fat32Limits, FsError, NodeKind, Rc, ReadOnlyFileSystem,
+        WallClock, read_u16, short_name_checksum,
     };
 
     const BLOCK_BYTES: usize = 512;
@@ -2472,6 +2661,181 @@ mod tests {
         Ok(())
     }
 
+    /// A clock whose reading the test controls, including reporting none.
+    #[derive(Debug)]
+    struct TestClock(core::cell::Cell<Option<u64>>);
+
+    impl TestClock {
+        fn new(seconds: Option<u64>) -> Rc<Self> {
+            Rc::new(Self(core::cell::Cell::new(seconds)))
+        }
+
+        fn set(&self, seconds: Option<u64>) {
+            self.0.set(seconds);
+        }
+    }
+
+    impl WallClock for TestClock {
+        fn unix_seconds(&self) -> Option<u64> {
+            self.0.get()
+        }
+    }
+
+    /// Read one short entry's creation, access, and write fields.
+    fn entry_stamps<D: BlockDevice>(
+        fat: &mut Fat32<D>,
+        path: &str,
+    ) -> Result<(DosStamp, u16, DosStamp), FsError> {
+        let entry = fat.resolve(path)?;
+        let slot = *entry.directory_slots.last().ok_or(FsError::Corrupt)?;
+        let cluster = fat.read_cluster(slot.cluster)?;
+        let raw = cluster
+            .get(slot.offset..slot.offset + DIRECTORY_ENTRY_BYTES)
+            .ok_or(FsError::Corrupt)?;
+        Ok((
+            DosStamp {
+                date: read_u16(raw, DIRECTORY_CREATE_TIME + 2)?,
+                time: read_u16(raw, DIRECTORY_CREATE_TIME)?,
+                tenths: *raw.get(DIRECTORY_CREATE_TENTHS).ok_or(FsError::Corrupt)?,
+            },
+            read_u16(raw, DIRECTORY_ACCESS_DATE)?,
+            DosStamp {
+                date: read_u16(raw, DIRECTORY_WRITE_TIME + 2)?,
+                time: read_u16(raw, DIRECTORY_WRITE_TIME)?,
+                tenths: 0,
+            },
+        ))
+    }
+
+    #[test]
+    fn dos_stamps_encode_the_fat_range_and_clamp_outside_it() -> Result<(), FsError> {
+        // 1980-01-01T00:00:00, the first instant a FAT date can express.
+        assert_eq!(
+            DosStamp::from_unix_seconds(DOS_EPOCH_SECONDS)?,
+            DosStamp {
+                date: 33,
+                time: 0,
+                tenths: 0
+            }
+        );
+        // 2026-08-29T10:40:00, an ordinary instant well inside the range.
+        assert_eq!(
+            DosStamp::from_unix_seconds(1_788_000_000)?,
+            DosStamp {
+                date: 23_837,
+                time: 21_760,
+                tenths: 0
+            }
+        );
+        // The write time counts two-second units, so the odd second is carried
+        // by the creation entry's tenths field instead.
+        assert_eq!(
+            DosStamp::from_unix_seconds(1_788_000_001)?,
+            DosStamp {
+                date: 23_837,
+                time: 21_760,
+                tenths: 10
+            }
+        );
+        // 2107-12-31T23:59:58, the last instant a FAT date can express.
+        assert_eq!(
+            DosStamp::from_unix_seconds(DOS_LAST_SECONDS)?,
+            DosStamp {
+                date: 65_439,
+                time: 49_021,
+                tenths: 0
+            }
+        );
+        // Outside the range the stamp clamps rather than encoding a year the
+        // field cannot hold; a zero date would be invalid, not merely old.
+        assert_eq!(
+            DosStamp::from_unix_seconds(0)?,
+            DosStamp::from_unix_seconds(DOS_EPOCH_SECONDS)?
+        );
+        assert_eq!(
+            DosStamp::from_unix_seconds(u64::MAX)?,
+            DosStamp::from_unix_seconds(DOS_LAST_SECONDS)?
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn stamps_directory_entries_only_when_a_clock_is_supplied() -> Result<(), FsError> {
+        const CREATED: u64 = 1_788_000_000;
+        const WRITTEN: u64 = CREATED + 90_000;
+
+        // Without a clock every date and time field stays zero, which is the
+        // only honest encoding of an unknown instant.
+        let mut fat = mount_writable(valid_device().map_err(|_| FsError::Io)?)?;
+        fat.write_file("/unstamped.txt", b"no clock")?;
+        let zero = DosStamp {
+            date: 0,
+            time: 0,
+            tenths: 0,
+        };
+        assert_eq!(entry_stamps(&mut fat, "/unstamped.txt")?, (zero, 0, zero));
+
+        // A clock that reports no time is the same as having none at all.
+        fat.set_wall_clock(TestClock::new(None));
+        fat.write_file("/unavailable.txt", b"time unknown")?;
+        assert_eq!(entry_stamps(&mut fat, "/unavailable.txt")?, (zero, 0, zero));
+
+        let clock = TestClock::new(Some(CREATED));
+        fat.set_wall_clock(clock.clone());
+        fat.write_file("/stamped.txt", b"clocked")?;
+        let created = DosStamp::from_unix_seconds(CREATED)?;
+        assert_eq!(
+            entry_stamps(&mut fat, "/stamped.txt")?,
+            (created, created.date, created)
+        );
+
+        // Replacing the contents advances the write time and the access date
+        // while the creation time stays at the instant the name appeared.
+        clock.set(Some(WRITTEN));
+        fat.write_file("/stamped.txt", b"clocked again")?;
+        let written = DosStamp::from_unix_seconds(WRITTEN)?;
+        assert_eq!(
+            entry_stamps(&mut fat, "/stamped.txt")?,
+            (created, written.date, written)
+        );
+
+        // Appending is a content change too.
+        clock.set(Some(WRITTEN + 4));
+        fat.append_file("/stamped.txt", b" and appended")?;
+        let appended = DosStamp::from_unix_seconds(WRITTEN + 4)?;
+        assert_eq!(
+            entry_stamps(&mut fat, "/stamped.txt")?,
+            (created, appended.date, appended)
+        );
+
+        // A rename moves the name, not the contents, so both stamps survive it.
+        clock.set(Some(WRITTEN + 200_000));
+        fat.rename("/stamped.txt", "/renamed.txt")?;
+        assert_eq!(
+            entry_stamps(&mut fat, "/renamed.txt")?,
+            (created, appended.date, appended)
+        );
+
+        // `.` and `..` describe their directory, so they carry its stamp.
+        clock.set(Some(CREATED));
+        fat.create_directory("/stamped")?;
+        assert_eq!(
+            entry_stamps(&mut fat, "/stamped")?,
+            (created, created.date, created)
+        );
+        let directory = fat.resolve("/stamped")?;
+        let cluster = fat.read_cluster(directory.first_cluster)?;
+        for index in 0..2 {
+            let raw = cluster
+                .get(index * DIRECTORY_ENTRY_BYTES..(index + 1) * DIRECTORY_ENTRY_BYTES)
+                .ok_or(FsError::Corrupt)?;
+            assert_eq!(read_u16(raw, DIRECTORY_CREATE_TIME + 2)?, created.date);
+            assert_eq!(read_u16(raw, DIRECTORY_WRITE_TIME + 2)?, created.date);
+            assert_eq!(read_u16(raw, DIRECTORY_WRITE_TIME)?, created.time);
+        }
+        Ok(())
+    }
+
     #[test]
     fn mutation_dirty_marker_brackets_durable_changes() -> Result<(), FsError> {
         let mut fat = mount_writable(valid_device().map_err(|_| FsError::Io)?)?;
@@ -2564,6 +2928,69 @@ mod tests {
 
         drop(fat);
         verify_writer_interoperability(&image, &fsck_fat)
+    }
+
+    #[test]
+    fn stamps_real_fat32_entries_a_host_tool_renders() -> Result<(), String> {
+        // 2026-08-29T10:40:00Z. FAT stores local time with no timezone, and
+        // TROE has no timezone source, so this UTC reading is written
+        // unconverted and a host reads back exactly these digits.
+        const CREATED: u64 = 1_788_000_000;
+        const RENDERED: &str = "2026-08-29  10:40";
+        let Some(mkfs_fat) = fat_tool("mkfs.fat") else {
+            return unavailable_tool("mkfs.fat");
+        };
+        let Some(fsck_fat) = fat_tool("fsck.fat") else {
+            return unavailable_tool("fsck.fat");
+        };
+        let Some(mdir) = mtool("mdir") else {
+            return unavailable_tool("mdir");
+        };
+        let temporary = TestDirectory::create("fat32-stamps")?;
+        let image = temporary.path().join("filesystem.fat32");
+        File::create(&image)
+            .and_then(|file| file.set_len(64 * 1024 * 1024))
+            .map_err(|error| error.to_string())?;
+        let format = Command::new(mkfs_fat)
+            .args(["-F", "32", "-n", "TROESTAMP"])
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&format, "mkfs.fat for stamped entries")?;
+
+        {
+            let mut fat = mount_file_writable(&image)?;
+            fat.set_wall_clock(TestClock::new(Some(CREATED)));
+            fat.write_file("/Stamped Name.txt", b"written by troe\n")
+                .map_err(|error| error.to_string())?;
+            fat.create_directory("/stamped")
+                .map_err(|error| error.to_string())?;
+            fat.write_file("/stamped/member.txt", b"member\n")
+                .map_err(|error| error.to_string())?;
+        }
+
+        let check = Command::new(&fsck_fat)
+            .args(["-vn"])
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&check, "fsck.fat after stamped writes")?;
+
+        for directory in ["::/", "::/stamped"] {
+            let listing = Command::new(&mdir)
+                .args(["-i"])
+                .arg(&image)
+                .arg(directory)
+                .output()
+                .map_err(|error| error.to_string())?;
+            command_succeeded(&listing, "mdir")?;
+            let report = String::from_utf8_lossy(&listing.stdout).to_string();
+            assert!(
+                report.contains(RENDERED),
+                "{directory} must render {RENDERED}, got:\n{report}"
+            );
+        }
+        Ok(())
     }
 
     #[test]

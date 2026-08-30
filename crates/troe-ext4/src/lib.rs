@@ -9,13 +9,14 @@ extern crate std;
 mod htree;
 mod journal;
 
+use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::{fmt, str};
 use troe_block::{BlockAccess, BlockDevice, BlockError, BlockRegion};
 use troe_vfs::{
     DirEntry, FileMetadata, FsError, MAX_NAME_BYTES, MAX_PATH_BYTES, NodeKind, ProviderListing,
-    ReadOnlyFileSystem, canonicalize,
+    ReadOnlyFileSystem, WallClock, canonicalize,
 };
 
 const EXT4_MAGIC: u16 = 0xef53;
@@ -84,6 +85,25 @@ const EXT4_ROOT_INDEXES: usize = 4;
 const EXT4_MAX_EXTENT_DEPTH: u16 = 5;
 /// Hard ceiling on interior blocks one extent tree may occupy.
 const EXT4_MAX_EXTENT_TREE_BLOCKS: usize = 2048;
+/// Inode offsets of each timestamp: the 32-bit base field and the extra word
+/// whose low two bits extend it past 2038.
+const EXT4_ATIME: (usize, usize) = (8, 140);
+const EXT4_CTIME: (usize, usize) = (12, 132);
+const EXT4_MTIME: (usize, usize) = (16, 136);
+const EXT4_CRTIME: (usize, usize) = (144, 148);
+/// Inode offset of the extra-field size, which says how far the record's
+/// declared fields reach beyond the original 128-byte inode.
+const EXT4_EXTRA_ISIZE_OFFSET: usize = 128;
+/// Bytes of the inode record every ext4 revision defines.
+const EXT4_BASE_INODE_BYTES: usize = 128;
+/// Extra bytes this provider declares on an inode it creates, covering every
+/// timestamp field including the creation time and its epoch bits.
+const EXT4_EXTRA_ISIZE: u16 = 32;
+/// Latest instant a bare 32-bit timestamp field encodes, because ext4 reads it
+/// as signed when the record declares no epoch bits: 2038-01-19T03:14:07Z.
+const EXT4_MAX_BASE_SECONDS: u64 = i32::MAX as u64;
+/// Latest instant the 32-bit field plus two epoch bits encodes, 2446-05-10.
+const EXT4_MAX_EXTENDED_SECONDS: u64 = 0x3_ffff_ffff;
 const EXT4_FT_REG_FILE: u8 = 1;
 const EXT4_FT_DIR: u8 = 2;
 const EXT4_FT_SYMLINK: u8 = 7;
@@ -426,11 +446,11 @@ pub struct Ext4<D: BlockDevice> {
     write_defaults: Ext4WriteDefaults,
     journal: Option<JournalGeometry>,
     transaction: Option<Transaction>,
-    /// Seconds since the epoch stamped into mutated inodes.
+    /// Clock this provider stamps into the inodes it mutates.
     ///
-    /// Zero means the owner supplied no clock, in which case timestamps are
-    /// left exactly as they were rather than invented.
-    wall_clock_seconds: u32,
+    /// `None`, or a clock that reports no time, leaves every timestamp exactly
+    /// as it was rather than inventing one.
+    wall_clock: Option<Rc<dyn WallClock>>,
 }
 
 /// Which timestamps one inode write should advance.
@@ -603,7 +623,7 @@ impl<D: BlockDevice> Ext4<D> {
             write_defaults,
             journal: None,
             transaction: None,
-            wall_clock_seconds: 0,
+            wall_clock: None,
         };
         // A half-checkpointed volume may hold a torn root directory that
         // replay is about to restore, so recovery validates the root only
@@ -678,12 +698,12 @@ impl<D: BlockDevice> Ext4<D> {
         })
     }
 
-    /// Supply the wall clock this provider stamps into mutated inodes.
+    /// Wall time to stamp into an inode, or `None` to leave its times alone.
     ///
-    /// Timestamps are left untouched until an owner provides a time, so a
-    /// provider without a clock never invents one.
-    pub const fn set_wall_clock_seconds(&mut self, seconds: u32) {
-        self.wall_clock_seconds = seconds;
+    /// The clock is read here, at the mutation, so a mount never stamps the
+    /// instant it was attached onto a write that happened much later.
+    fn wall_seconds(&self) -> Option<u64> {
+        self.wall_clock.as_ref()?.unix_seconds()
     }
 
     /// Filesystem UUID validated at mount.
@@ -1608,15 +1628,18 @@ impl<D: BlockDevice> Ext4<D> {
             122,
             u16::try_from(gid >> 16).map_err(|_| FsError::Overflow)?,
         )?;
-        if self.wall_clock_seconds != 0 {
+        // The extra-field size must be declared before any timestamp is
+        // written, because it is what makes the epoch bits a defined field.
+        put_u16(raw, EXT4_EXTRA_ISIZE_OFFSET, EXT4_EXTRA_ISIZE)?;
+        if let Some(seconds) = self.wall_seconds() {
             // A newly allocated inode is born now, so every time it carries
             // starts at the same instant, including its creation time.
-            for offset in [8_usize, 12, 16, 144] {
-                put_u32(raw, offset, self.wall_clock_seconds)?;
+            for field in [EXT4_ATIME, EXT4_CTIME, EXT4_MTIME, EXT4_CRTIME] {
+                put_inode_time(raw, field, seconds)?;
             }
         }
         put_u32(raw, 100, self.layout.checksum_seed ^ number ^ 0xa5a5_5a5a)?;
-        put_u16(raw, 128, 32)
+        Ok(())
     }
 
     fn inode_sector_count(raw: &[u8]) -> Result<u64, FsError> {
@@ -1853,12 +1876,12 @@ impl<D: BlockDevice> Ext4<D> {
         number: u32,
         touch: InodeTouch,
     ) -> Result<(), FsError> {
-        if self.wall_clock_seconds != 0 {
+        if let Some(seconds) = self.wall_seconds() {
             // The change time advances on every inode write; the modification
             // time only when the file's contents actually changed.
-            put_u32(raw, 12, self.wall_clock_seconds)?;
+            put_inode_time(raw, EXT4_CTIME, seconds)?;
             if touch == InodeTouch::Content {
-                put_u32(raw, 16, self.wall_clock_seconds)?;
+                put_inode_time(raw, EXT4_MTIME, seconds)?;
             }
         }
         raw[124..126].fill(0);
@@ -3519,6 +3542,10 @@ impl<D: BlockDevice> ReadOnlyFileSystem for Ext4<D> {
         self.durability_barrier()?;
         self.finish_mutation()
     }
+
+    fn set_wall_clock(&mut self, clock: Rc<dyn WallClock>) {
+        self.wall_clock = Some(clock);
+    }
 }
 
 /// Decide whether this admission may open a volume in the recorded state.
@@ -4300,6 +4327,37 @@ fn put_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), FsError> {
     Ok(())
 }
 
+/// Write one inode timestamp as its 32-bit base field and its epoch bits.
+///
+/// ext4 reads the base field as signed, so a record that declares no room for
+/// the extra word cannot carry an instant past 2038 without reading as 1901.
+/// The clock is therefore clamped to whatever the record can actually encode,
+/// which keeps a far-future time implausible rather than wrong by a century.
+fn put_inode_time(raw: &mut [u8], field: (usize, usize), seconds: u64) -> Result<(), FsError> {
+    let (base, extra) = field;
+    let declared = EXT4_BASE_INODE_BYTES
+        .checked_add(usize::from(read_u16(raw, EXT4_EXTRA_ISIZE_OFFSET)?))
+        .ok_or(FsError::Overflow)?;
+    let extended = extra.checked_add(4).ok_or(FsError::Overflow)? <= declared;
+    let seconds = seconds.min(if extended {
+        EXT4_MAX_EXTENDED_SECONDS
+    } else {
+        EXT4_MAX_BASE_SECONDS
+    });
+    put_u32(
+        raw,
+        base,
+        u32::try_from(seconds & u64::from(u32::MAX)).map_err(|_| FsError::Overflow)?,
+    )?;
+    if !extended {
+        return Ok(());
+    }
+    let epoch = u32::try_from(seconds >> 32).map_err(|_| FsError::Overflow)?;
+    // The extra word also carries nanoseconds above its low two bits, so the
+    // epoch is merged in rather than overwriting the whole field.
+    put_u32(raw, extra, (read_u32(raw, extra)? & !0x3) | epoch)
+}
+
 fn crc32c(seed: u32, bytes: &[u8]) -> u32 {
     let mut checksum = seed;
     for byte in bytes {
@@ -4314,11 +4372,13 @@ fn crc32c(seed: u32, bytes: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use crate::{
-        EXT4_EXT_MAGIC, EXT4_EXTENT_HEADER_BYTES, EXT4_EXTENT_RECORD_BYTES, EXT4_EXTENT_TAIL_BYTES,
-        EXT4_MAX_EXTENT_DEPTH, htree, parse_directory_block, parse_extent_index_block,
+        EXT4_CRTIME, EXT4_EXT_MAGIC, EXT4_EXTENT_HEADER_BYTES, EXT4_EXTENT_RECORD_BYTES,
+        EXT4_EXTENT_TAIL_BYTES, EXT4_MAX_EXTENT_DEPTH, EXT4_MTIME, htree, parse_directory_block,
+        parse_extent_index_block,
     };
     use alloc::collections::BTreeMap;
     use alloc::format;
+    use alloc::rc::Rc;
     use alloc::string::{String, ToString};
     use alloc::vec;
     use alloc::vec::Vec;
@@ -4328,7 +4388,7 @@ mod tests {
     use std::process::{Command, Output};
     use std::time::{SystemTime, UNIX_EPOCH};
     use troe_block::{BlockAccess, BlockError, BlockGeometry, BlockLimits};
-    use troe_vfs::MAX_NAME_BYTES;
+    use troe_vfs::{MAX_NAME_BYTES, WallClock};
 
     use super::{
         BlockDevice, BlockRegion, CRC32C_POLYNOMIAL, EXT4_BLOCK_BYTES, EXT4_BLOCK_BYTES_U32,
@@ -6426,6 +6486,26 @@ mod tests {
         Ok(())
     }
 
+    /// A clock whose reading the test controls, including reporting none.
+    #[derive(Debug)]
+    struct TestClock(core::cell::Cell<Option<u64>>);
+
+    impl TestClock {
+        fn new(seconds: Option<u64>) -> Rc<Self> {
+            Rc::new(Self(core::cell::Cell::new(seconds)))
+        }
+
+        fn set(&self, seconds: Option<u64>) {
+            self.0.set(seconds);
+        }
+    }
+
+    impl WallClock for TestClock {
+        fn unix_seconds(&self) -> Option<u64> {
+            self.0.get()
+        }
+    }
+
     #[test]
     fn stamps_timestamps_only_when_a_clock_is_supplied() -> Result<(), String> {
         const NOW: u32 = 1_788_000_000;
@@ -6447,22 +6527,71 @@ mod tests {
             assert_eq!(times, (0, 0, 0), "no clock must invent no time");
         }
 
-        // With one, a created inode carries it and a later write advances the
-        // modification time.
+        // A clock that reports no time is the same as having none at all.
         {
             let mut ext4 = mount_file_writable_with_limits(&image, default_volume_limits()?)?;
-            ext4.set_wall_clock_seconds(NOW);
+            ext4.set_wall_clock(TestClock::new(None));
+            ext4.write_file("/unavailable.txt", b"clock present, time unknown\n")
+                .map_err(|error| format!("cannot create: {error:?}"))?;
+            let times = inode_times(&mut ext4, "/unavailable.txt")?;
+            assert_eq!(times, (0, 0, 0), "an unreadable clock must invent no time");
+        }
+
+        // With a readable one, a created inode carries it and a later write
+        // advances the modification time.
+        {
+            let mut ext4 = mount_file_writable_with_limits(&image, default_volume_limits()?)?;
+            let clock = TestClock::new(Some(u64::from(NOW)));
+            ext4.set_wall_clock(clock.clone());
             ext4.write_file("/stamped.txt", b"clocked\n")
                 .map_err(|error| format!("cannot create: {error:?}"))?;
             assert_eq!(inode_times(&mut ext4, "/stamped.txt")?, (NOW, NOW, NOW));
 
-            ext4.set_wall_clock_seconds(NOW + 60);
+            // The same mount reads the clock again, so it stamps the later
+            // instant rather than the one it was mounted at.
+            clock.set(Some(u64::from(NOW) + 60));
             ext4.write_file("/stamped.txt", b"clocked again\n")
                 .map_err(|error| format!("cannot replace: {error:?}"))?;
             let (atime, ctime, mtime) = inode_times(&mut ext4, "/stamped.txt")?;
             assert_eq!(atime, NOW, "a write does not advance the access time");
             assert_eq!(ctime, NOW + 60);
             assert_eq!(mtime, NOW + 60);
+
+            // A clock that moves backwards is recorded as it reads; the
+            // provider reports the time it was told, not one of its own.
+            clock.set(Some(u64::from(NOW) - 3_600));
+            ext4.write_file("/stamped.txt", b"clocked backwards\n")
+                .map_err(|error| format!("cannot rewrite: {error:?}"))?;
+            let (_, ctime, mtime) = inode_times(&mut ext4, "/stamped.txt")?;
+            assert_eq!(ctime, NOW - 3_600);
+            assert_eq!(mtime, NOW - 3_600);
+        }
+
+        // Past 2038 the base field alone would read as 1901, so the epoch bits
+        // in the extra word carry the instant instead.
+        {
+            const BEYOND_2038: u64 = 0x1_0000_0000 + 12_345;
+            let mut ext4 = mount_file_writable_with_limits(&image, default_volume_limits()?)?;
+            ext4.set_wall_clock(TestClock::new(Some(BEYOND_2038)));
+            ext4.write_file("/far-future.txt", b"after 2038\n")
+                .map_err(|error| format!("cannot create: {error:?}"))?;
+            let inode = ext4
+                .resolve("/far-future.txt")
+                .map_err(|error| format!("cannot resolve: {error:?}"))?;
+            let raw = ext4
+                .raw_inode_record(inode.number)
+                .map_err(|error| format!("cannot read inode: {error:?}"))?;
+            for (base, extra) in [EXT4_MTIME, EXT4_CRTIME] {
+                let seconds = u64::from(
+                    read_u32(&raw, base)
+                        .map_err(|error| format!("cannot read the time at {base}: {error:?}"))?,
+                ) | (u64::from(
+                    read_u32(&raw, extra)
+                        .map_err(|error| format!("cannot read the epoch at {extra}: {error:?}"))?
+                        & 0x3,
+                ) << 32);
+                assert_eq!(seconds, BEYOND_2038);
+            }
         }
 
         let check = Command::new(&e2fsck)
@@ -6471,6 +6600,34 @@ mod tests {
             .output()
             .map_err(|error| error.to_string())?;
         command_succeeded(&check, "e2fsck after stamped mutations")?;
+
+        // The e2fsprogs reader decodes what a Linux host would, including the
+        // epoch bits that carry an instant past 2038.
+        let Some(debugfs) = e2fs_tool("debugfs") else {
+            return unavailable_tool("debugfs");
+        };
+        for (path, seconds) in [
+            ("/stamped.txt", u64::from(NOW) - 3_600),
+            ("/far-future.txt", 0x1_0000_0000 + 12_345),
+        ] {
+            let stat = Command::new(&debugfs)
+                .arg("-R")
+                .arg(format!("stat {path}"))
+                .arg(&image)
+                .output()
+                .map_err(|error| error.to_string())?;
+            command_succeeded(&stat, "debugfs stat")?;
+            let report = String::from_utf8_lossy(&stat.stdout).to_string();
+            // e2fsprogs prints the base field and the extra word separately,
+            // and the extra word here holds only the epoch bits.
+            let base = seconds & u64::from(u32::MAX);
+            let epoch = seconds >> 32;
+            let expected = format!("mtime: {base:#010x}:{epoch:08x}");
+            assert!(
+                report.contains(&expected),
+                "{path} must report {expected}, got:\n{report}"
+            );
+        }
         Ok(())
     }
 

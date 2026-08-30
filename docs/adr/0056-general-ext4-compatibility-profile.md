@@ -79,11 +79,16 @@ interior node checksum-validated and the total tree bounded. Rewriting a file
 still produces a depth of at most one, so a file whose extents no longer fit
 that shape is refused explicitly rather than silently truncated.
 
-Timestamps advance when, and only when, an owner supplies a wall clock. A
-created inode carries that instant in its access, change, modification and
-creation times; a later write advances the change and modification times and
-leaves the access time alone. Without a clock the provider leaves every
-timestamp exactly as it found it rather than inventing one.
+Timestamps advance when, and only when, the namespace has a wall clock. The
+provider holds a shared handle and reads it at each mutation, so a volume
+mounted at boot stamps the instant of the write rather than the instant of the
+mount. A created inode carries that instant in its access, change, modification
+and creation times; a later write advances the change and modification times and
+leaves the access time alone. Without a clock, or when the clock reports no
+time, the provider leaves every timestamp exactly as it found it rather than
+inventing one. [ADR 0058](0058-provider-wall-clock-timestamps.md) records the
+shared-handle decision, the encoding range, and why the final unlink zeroes the
+inode record instead of setting `i_dtime`.
 
 Free-block search stops as soon as the retained runs can satisfy the request,
 so admitting large volumes does not make allocation scan a whole volume.
