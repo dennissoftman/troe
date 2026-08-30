@@ -88,6 +88,7 @@ PACKAGE_SCENARIOS = {
     "troe-dispatch": set(ALL_QEMU_SCENARIOS),
     "troe-driver": {"boot", "network", "filesystem"},
     "troe-fs-api": {"boot", "filesystem", "quota-memory"},
+    "troe-fs-client": {"boot", "filesystem", "shell-terminal"},
     "troe-fs-ext4": {"boot", "filesystem", "persistence"},
     "troe-fs-fat": {"boot", "filesystem"},
     "troe-fs-kefs": {"boot", "filesystem", "shell-terminal"},

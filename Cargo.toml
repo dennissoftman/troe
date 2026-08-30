@@ -37,6 +37,7 @@ default-members = [
     "crates/storage/troe-fmt-prgn",
     "crates/storage/troe-fmt-scfg",
     "crates/storage/troe-fs-api",
+    "crates/storage/troe-fs-client",
     "crates/storage/troe-fs-ext4",
     "crates/storage/troe-fs-fat",
     "crates/storage/troe-fs-kefs",

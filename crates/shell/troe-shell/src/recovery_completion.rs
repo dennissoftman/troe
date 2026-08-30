@@ -9,7 +9,7 @@ use troe_completion::{
     IntegerConstraints, PathConstraints, PathKind, PrefixPredicate, Resolver, ValidatedDescriptor,
 };
 use troe_fs_api::{FsError, NodeKind};
-use troe_namespace::Namespace;
+use troe_fs_client::NamespaceClient;
 
 const REGISTRY_MAX_ENTRIES: usize = 1024;
 const REGISTRY_MAX_BYTES: usize = 1024 * 1024;
@@ -49,7 +49,7 @@ impl PackageCompletionRegistry {
         }
     }
 
-    pub(crate) fn refresh(&mut self, namespace: &mut Namespace) {
+    pub(crate) fn refresh(&mut self, namespace: &mut dyn NamespaceClient) {
         let revision = namespace.command_revision();
         if self.revision == Some(revision) {
             return;
@@ -82,7 +82,9 @@ impl PackageCompletionRegistry {
     }
 }
 
-fn load_package_registry(namespace: &mut Namespace) -> Result<Vec<PackageEntry>, FsError> {
+fn load_package_registry(
+    namespace: &mut dyn NamespaceClient,
+) -> Result<Vec<PackageEntry>, FsError> {
     let mut entries = Vec::new();
     let mut cursor = 0_u64;
     let mut retained_bytes = 0_usize;

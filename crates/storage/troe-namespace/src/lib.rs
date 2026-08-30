@@ -16,6 +16,7 @@ use troe_fs_api::{
     MAX_NAME_BYTES, NodeKind, ProviderListing, ProviderUsage, WallClock, canonicalize,
     canonicalize_beneath,
 };
+use troe_fs_client::NamespaceClient;
 
 const PROVIDER_READ_CHUNK: usize = 4 * 1024;
 const MAX_PROVIDER_DIRECTORY_ENTRIES: usize = 1024;
@@ -1376,6 +1377,141 @@ fn is_active_configuration_path(path: &str) -> bool {
 
 fn is_reserved_configuration_content(path: &str) -> bool {
     path.starts_with("/config/") || is_active_configuration_path(path)
+}
+
+/// The in-process namespace is the direct implementation of the client
+/// contract. Every method forwards to the inherent one, which takes precedence
+/// over the trait, so this adds no behavior of its own.
+///
+/// A second implementation carrying the same calls over IPC is what moves the
+/// namespace into a server without changing a single client.
+impl NamespaceClient for Namespace {
+    fn metadata(&mut self, cwd: &str, path: &str) -> Result<FileMetadata, FsError> {
+        Self::metadata(self, cwd, path)
+    }
+
+    fn metadata_no_follow(&mut self, cwd: &str, path: &str) -> Result<FileMetadata, FsError> {
+        Self::metadata_no_follow(self, cwd, path)
+    }
+
+    fn read_file_at(
+        &mut self,
+        cwd: &str,
+        path: &str,
+        offset: u64,
+        destination: &mut [u8],
+    ) -> Result<usize, FsError> {
+        Self::read_file_at(self, cwd, path, offset, destination)
+    }
+
+    fn read_file_bounded(
+        &mut self,
+        cwd: &str,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, FsError> {
+        Self::read_file_bounded(self, cwd, path, max_bytes)
+    }
+
+    fn read_file(&mut self, cwd: &str, path: &str) -> Result<Vec<u8>, FsError> {
+        Self::read_file(self, cwd, path)
+    }
+
+    fn truncate_file(&mut self, cwd: &str, path: &str) -> Result<(), FsError> {
+        Self::truncate_file(self, cwd, path)
+    }
+
+    fn append_file(&mut self, cwd: &str, path: &str, bytes: &[u8]) -> Result<(), FsError> {
+        Self::append_file(self, cwd, path, bytes)
+    }
+
+    fn sync_file(&mut self, cwd: &str, path: &str) -> Result<(), FsError> {
+        Self::sync_file(self, cwd, path)
+    }
+
+    fn write_file(&mut self, cwd: &str, path: &str, bytes: &[u8]) -> Result<(), FsError> {
+        Self::write_file(self, cwd, path, bytes)
+    }
+
+    fn remove_file(&mut self, cwd: &str, path: &str) -> Result<(), FsError> {
+        Self::remove_file(self, cwd, path)
+    }
+
+    fn create_directory(&mut self, cwd: &str, path: &str) -> Result<(), FsError> {
+        Self::create_directory(self, cwd, path)
+    }
+
+    fn remove_directory(&mut self, cwd: &str, path: &str) -> Result<(), FsError> {
+        Self::remove_directory(self, cwd, path)
+    }
+
+    fn rename(&mut self, cwd: &str, source: &str, destination: &str) -> Result<(), FsError> {
+        Self::rename(self, cwd, source, destination)
+    }
+
+    fn read_link(&mut self, cwd: &str, path: &str) -> Result<String, FsError> {
+        Self::read_link(self, cwd, path)
+    }
+
+    fn create_symlink(&mut self, cwd: &str, target: &str, link_path: &str) -> Result<(), FsError> {
+        Self::create_symlink(self, cwd, target, link_path)
+    }
+
+    fn create_hard_link(
+        &mut self,
+        cwd: &str,
+        existing: &str,
+        new_path: &str,
+    ) -> Result<(), FsError> {
+        Self::create_hard_link(self, cwd, existing, new_path)
+    }
+
+    fn list(&mut self, cwd: &str, path: &str) -> Result<Vec<DirEntry>, FsError> {
+        Self::list(self, cwd, path)
+    }
+
+    fn list_bounded(
+        &mut self,
+        cwd: &str,
+        path: &str,
+        cursor: u64,
+        max_entries: usize,
+        max_name_bytes: usize,
+    ) -> Result<ProviderListing, FsError> {
+        Self::list_bounded(self, cwd, path, cursor, max_entries, max_name_bytes)
+    }
+
+    fn list_matching_bounded(
+        &mut self,
+        cwd: &str,
+        path: &str,
+        name_prefix: &str,
+        directories_only: bool,
+        max_entries: usize,
+        max_bytes: usize,
+    ) -> Result<DirectoryListing, FsError> {
+        Self::list_matching_bounded(
+            self,
+            cwd,
+            path,
+            name_prefix,
+            directories_only,
+            max_entries,
+            max_bytes,
+        )
+    }
+
+    fn resolve_dir(&mut self, cwd: &str, path: &str) -> Result<String, FsError> {
+        Self::resolve_dir(self, cwd, path)
+    }
+
+    fn memory_stats(&self) -> MemoryStats {
+        Self::memory_stats(self)
+    }
+
+    fn command_revision(&self) -> u64 {
+        Self::command_revision(self)
+    }
 }
 
 #[cfg(test)]
