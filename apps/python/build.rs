@@ -126,6 +126,17 @@ fn main() {
             println!("cargo:rerun-if-changed={}", archive.display());
         }
     }
+    // Bundled dependencies of the reviewed static modules.
+    for library in [
+        "Modules/_decimal/libmpdec/libmpdec.a",
+        "Modules/expat/libexpat.a",
+    ] {
+        let archive = build.join(library);
+        if archive.is_file() {
+            println!("cargo:rustc-link-arg={}", archive.display());
+            println!("cargo:rerun-if-changed={}", archive.display());
+        }
+    }
     println!(
         "cargo:rustc-link-arg={}",
         sysroot.join(architecture).join("lib/libtroe_c.a").display()
