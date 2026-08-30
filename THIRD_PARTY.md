@@ -58,6 +58,15 @@ lockfile is also checked by pinned
 `cargo-audit` against the committed RustSec database revision; no claim is made
 that this is a formal security audit.
 
+`tools/qemu-plugin/troe_count.c` is the one file in this repository that is not
+Apache-2.0. It includes QEMU's `qemu-plugin.h`, which is GPL-2.0-or-later, and
+so carries that license itself. It is a host-side measurement tool that QEMU
+loads with `dlopen` when comparing guests; it is not linked into the kernel,
+the KEX applications, the SDK, or any shipped image, and nothing in TROE
+depends on it. `tools/build_qemu_plugin.py` builds it against the QEMU
+development headers already installed on the host, and the result is written
+under the ignored `build/` directory rather than committed.
+
 The optional `cargo alpine` development command downloads the official Alpine
 Linux 3.24.1 virtual ISO for x86-64 or AArch64. Those images remain external
 development inputs under Alpine's constituent package licenses and are not
