@@ -5,6 +5,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #include <sys/times.h>
 #include <time.h>
 #include <unistd.h>
@@ -16,6 +17,20 @@ static char troe_utc[] = "UTC";
 char *tzname[2] = {troe_utc, troe_utc};
 
 void tzset(void) {}
+
+int gettimeofday(struct timeval *destination, void *timezone_unused) {
+  (void)timezone_unused;
+  if (destination == NULL) {
+    errno = EINVAL;
+    return -1;
+  }
+  struct timespec now;
+  if (clock_gettime(CLOCK_REALTIME, &now) != 0)
+    return -1;
+  destination->tv_sec = now.tv_sec;
+  destination->tv_usec = now.tv_nsec / 1000;
+  return 0;
+}
 
 int clock_getres(clockid_t clock_id, struct timespec *resolution) {
   if (resolution == NULL) {

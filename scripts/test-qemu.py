@@ -2580,7 +2580,7 @@ def run_cpython_group(session: SerialSession, command_timeout: float) -> None:
         f"{python} {packages}/stdlib_probe.py",
         cwd,
         timeout,
-        contains=("stdlib-probe 19 1 True\n",),
+        contains=("stdlib-probe 22 1 True\n",),
     )
     # Every module the profile ships must actually import; a shipped module
     # that raises ModuleNotFoundError is a manifest defect, not a limitation.

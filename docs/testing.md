@@ -127,6 +127,26 @@ Drop `--reset` to add runtimes to an existing medium, and repeat `--app` for
 each additional application. The CPython package is installed rather than
 rebuilt, because building it is the slow authenticated step above.
 
+`python` is not a valid `--app` name. `apps/python` links against a generated
+CPython tree, so it only builds when `tools/build_cpython.py` supplies
+`TROE_CPYTHON_BUILD`, `TROE_CPYTHON_SOURCE`, `TROE_CPYTHON_SYSROOT`,
+`TROE_CPYTHON_VERSION`, `TROE_CPYTHON_SERIES`, and
+`TROE_CPYTHON_ARCHITECTURE`. Passing `--app python` runs a bare
+`cargo kex build apps/python`, and its build script fails with
+`TROE_CPYTHON_BUILD must name a generated CPython path`. Build the
+authenticated package once with the command above and install it through
+`--cpython-package` instead:
+
+```console
+# Wrong: the interpreter has no CPython build environment here.
+python3 tools/mkruntime.py provision --image build/troe-shared-fat32.img \
+  --app python --cpython-package build/cpython-package
+
+# Right: the package supplies the interpreter; --app is for other runtimes.
+python3 tools/mkruntime.py provision --image build/troe-shared-fat32.img \
+  --cpython-package build/cpython-package
+```
+
 `--check` builds the package twice in independent directories and compares
 every output byte. Reuse the retained work directory for `variants`: the
 capability-negative interpreters relink the already-built library rather than

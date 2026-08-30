@@ -48,6 +48,11 @@ ARCHITECTURES = {
     "aarch64": "aarch64-unknown-linux-musl",
 }
 DEFAULT_VERSION = "3.14.7"
+# Bundled dependency archives that the reviewed static modules link.
+VENDORED_ARCHIVES = (
+    "Modules/_decimal/libmpdec/libmpdec.a",
+    "Modules/expat/libexpat.a",
+)
 HACL_ARCHIVES = (
     "Modules/_hacl/libHacl_Hash_MD5.a",
     "Modules/_hacl/libHacl_Hash_SHA1.a",
@@ -73,45 +78,57 @@ class Release:
         return f"Python-{self.version}.tar.xz"
 
 
+def absolute_path(value: str) -> Path:
+    """Anchor one command-line path to the caller's working directory.
+
+    Build steps run with their own working directories, so a relative path
+    would silently resolve against the wrong one; ``configure`` in particular
+    is invoked from the per-architecture build directory.
+    """
+    return Path(value).expanduser().absolute()
+
+
 def parse_args() -> argparse.Namespace:
     lock = load_json(SOURCE_LOCK)
     versions = tuple(item["version"] for item in lock["releases"])
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="action", required=True)
     verify = subparsers.add_parser("verify", help="verify one built package tree")
-    verify.add_argument("tree", type=Path)
+    verify.add_argument("tree", type=absolute_path)
     install_image_parser = subparsers.add_parser(
         "install-image", help="install one package below /cpython on shared media"
     )
-    install_image_parser.add_argument("tree", type=Path)
-    install_image_parser.add_argument("--image", type=Path, required=True)
+    install_image_parser.add_argument("tree", type=absolute_path)
+    install_image_parser.add_argument("--image", type=absolute_path, required=True)
     verify_image_parser = subparsers.add_parser(
         "verify-image", help="verify one installed package on shared media"
     )
-    verify_image_parser.add_argument("tree", type=Path)
-    verify_image_parser.add_argument("--image", type=Path, required=True)
+    verify_image_parser.add_argument("tree", type=absolute_path)
+    verify_image_parser.add_argument("--image", type=absolute_path, required=True)
     install_diagnostics_parser = subparsers.add_parser(
         "install-diagnostics", help="install capability-negative interpreters"
     )
-    install_diagnostics_parser.add_argument("tree", type=Path)
-    install_diagnostics_parser.add_argument("--image", type=Path, required=True)
+    install_diagnostics_parser.add_argument("tree", type=absolute_path)
+    install_diagnostics_parser.add_argument("--image", type=absolute_path, required=True)
     install_packages_parser = subparsers.add_parser(
         "install-packages", help="install pure-Python packages onto shared media"
     )
-    install_packages_parser.add_argument("source", type=Path)
-    install_packages_parser.add_argument("--image", type=Path, required=True)
+    install_packages_parser.add_argument("source", type=absolute_path)
+    install_packages_parser.add_argument("--image", type=absolute_path, required=True)
     variants = subparsers.add_parser(
         "variants", help="link capability-negative interpreters for acceptance"
     )
-    variants.add_argument("output", type=Path, help="empty diagnostics output directory")
-    variants.add_argument("--work-directory", type=Path, required=True)
+    variants.add_argument(
+        "output", type=absolute_path, help="empty diagnostics output directory"
+    )
+    variants.add_argument("--work-directory", type=absolute_path, required=True)
     variants.add_argument("--architecture", choices=("all", *ARCHITECTURES), default="all")
     variants.add_argument("--cc", help="LLVM clang executable")
     build = subparsers.add_parser("build", help="build one authenticated package")
-    build.add_argument("output", type=Path, help="empty package output directory")
+    build.add_argument("output", type=absolute_path, help="empty package output directory")
     build.add_argument(
         "--source-cache",
-        type=Path,
+        type=absolute_path,
         required=True,
         help="cache for pinned archives and Sigstore bundles",
     )
@@ -143,7 +160,7 @@ def parse_args() -> argparse.Namespace:
     )
     build.add_argument(
         "--work-directory",
-        type=Path,
+        type=absolute_path,
         help="empty persistent work directory (retained for inspection)",
     )
     build.add_argument(
@@ -505,6 +522,7 @@ def build_library(
             f"-j{jobs}",
             f"libpython{release.series}.a",
             *hacl_archives(release),
+            *VENDORED_ARCHIVES,
         ],
         cwd=build,
         env=environment,

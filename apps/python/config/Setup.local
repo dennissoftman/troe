@@ -26,14 +26,60 @@ _codecs_jp cjkcodecs/_codecs_jp.c
 _codecs_kr cjkcodecs/_codecs_kr.c
 _codecs_tw cjkcodecs/_codecs_tw.c
 unicodedata unicodedata.c
+_lsprof _lsprof.c rotatingtree.c
+_decimal _decimal/_decimal.c $(MODULE__DECIMAL_CFLAGS)
+pyexpat pyexpat.c $(MODULE_PYEXPAT_CFLAGS)
 
 *disabled*
-_asyncio _bz2 _ctypes _curses _curses_panel _dbm _decimal _elementtree
-_gdbm _hashlib _interpreters _interpchannels _interpqueues _lsprof _lzma
-_multiprocessing _posixshmem _posixsubprocess _remote_debugging _scproxy
-_socket _sqlite3 _ssl _tkinter _uuid _zoneinfo _zstd fcntl grp mmap pyexpat
-pwd readline resource select syslog termios zlib
-faulthandler _signal _tracemalloc
-_testbuffer _testcapi _testclinic _testclinic_limited _testimportmultiple
-_testinternalcapi _testlimitedcapi _testmultiphase _testsinglephase
-_ctypes_test _xxtestfuzz xxlimited xxlimited_35 xxsubtype
+_asyncio
+_bz2
+_ctypes
+_curses
+_curses_panel
+_dbm
+_elementtree
+_gdbm
+_hashlib
+_interpreters
+_interpchannels
+_interpqueues
+_lzma
+_multiprocessing
+_posixshmem
+_posixsubprocess
+_remote_debugging
+_scproxy
+_socket
+_sqlite3
+_ssl
+_tkinter
+_uuid
+_zoneinfo
+_zstd
+fcntl
+grp
+mmap
+pwd
+readline
+resource
+select
+syslog
+termios
+zlib
+faulthandler
+_signal
+_tracemalloc
+_testbuffer
+_testcapi
+_testclinic
+_testclinic_limited
+_testimportmultiple
+_testinternalcapi
+_testlimitedcapi
+_testmultiphase
+_testsinglephase
+_ctypes_test
+_xxtestfuzz
+xxlimited
+xxlimited_35
+xxsubtype

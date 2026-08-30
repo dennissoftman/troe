@@ -80,6 +80,13 @@ class RuntimeTreeTests(unittest.TestCase):
             self.assertEqual(destination, shared / "bin")
             mkruntime.verify_tree(destination)
 
+    def test_provisioning_refuses_to_build_the_cpython_interpreter(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="troe-runtime-") as temporary:
+            image = Path(temporary) / "shared.img"
+            with self.assertRaisesRegex(ValueError, "--cpython-package"):
+                mkruntime.provision_image(image, ["python"], None, False)
+            self.assertFalse(image.exists())
+
     def test_invalid_or_duplicate_artifact_specs_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory(prefix="troe-runtime-") as temporary:
             root = Path(temporary)
