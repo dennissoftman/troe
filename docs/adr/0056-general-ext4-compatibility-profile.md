@@ -90,10 +90,15 @@ Names are limited by ext4 rather than by this provider: a path component may be
 255 bytes and a path 1024, which the VFS and the KEX filesystem service both
 carry.
 
-Extent trees are walked to any depth ext4 builds, up to five, with every
-interior node checksum-validated and the total tree bounded. Rewriting a file
-still produces a depth of at most one, so a file whose extents no longer fit
-that shape is refused explicitly rather than silently truncated.
+Extent trees are walked and built to whatever depth the file needs, with every
+interior node checksum-validated and each level bounded. The write path plans
+the shallowest tree that describes the extents: leaves first, then a level of
+interior nodes for as long as the top one does not fit the inode's four
+records. The ceiling is not the depth ext4 permits but the per-level tree-block
+bound the read path enforces, so a tree that would be unreadable is refused
+before it is written rather than after. Releasing a file releases every level,
+not only its leaves, and a rewrite builds the new tree beside the old one so a
+failure leaves the file intact.
 
 Timestamps advance when, and only when, the namespace has a wall clock. The
 provider holds a shared handle and reads it at each mutation, so a volume

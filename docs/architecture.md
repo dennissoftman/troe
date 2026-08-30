@@ -511,7 +511,9 @@ compatible features are ignored. It reads 1 KiB, 2 KiB and 4 KiB blocks,
 32- and 64-byte group descriptors, stored checksum seeds, flexible block
 groups, uninitialized groups, hashed directory indexes, and extent trees to the
 depth ext4 builds them, so an ordinary Linux ext4 volume mounts and takes the
-full mutation surface. General ext4 repair and mutations outside the documented
+full mutation surface. A hashed directory grows by splitting a full leaf and
+rewriting its index, and a heavily fragmented file is rewritten through an
+extent tree as deep as its extents require. General ext4 repair and mutations outside the documented
 profile remain unsupported. A transport provides bounded block-region capabilities; partition
 discovery turns a whole device into non-overlapping regions; independently
 selected filesystem providers expose VFS objects.
