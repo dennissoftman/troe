@@ -45,6 +45,21 @@ KEFS, configuration, content, and storage inputs once before building both
 kernel variants. Focused groups that do not execute destructive fault probes
 build only production images.
 
+The exhaustive runner executes one gate at a time and emulates one named
+platform at a time. It invokes `scripts/test-qemu.py` once per named platform
+instead of once for all of them, so a single guest competes for host memory,
+cores, and local ports even when other checkouts run their own gate. Coverage
+is unchanged: every named platform and every scenario group still runs. The
+concurrent multi-platform path stays available by invoking
+`scripts/test-qemu.py --platform all` directly.
+
+The runner prints its numbered gate plan before the first command, then reports
+each gate's start time, exact argv, and duration. While a gate runs it repeats a
+liveness line every `--progress-interval` seconds, sixty by default, so a long
+silent platform is distinguishable from a stalled one. `--progress-interval 0`
+suppresses those lines. A failing gate is named on standard error with its
+elapsed time and the number of gates that already passed.
+
 `--skip-qemu` is only an environment escape hatch. It does not mean that QEMU
 coverage is unnecessary; the full pinned gate must still run on the merge
 runner. `--require-filesystem-tools` makes absence of the exact external FAT32
