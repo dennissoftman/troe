@@ -1,7 +1,9 @@
 # ADR 0036: Bounded KEX shell scripts without nested execution
 
 Status: accepted and implemented, 2026-08-27; nested-launch premise superseded
-by ADR 0046 while the current `sh.kex` sidecar behavior remains implemented.
+by ADR 0046 while the current `sh.kex` sidecar behavior remains implemented;
+the no-expansion premise amended by ADR 0057, which adds bounded pathname
+expansion.
 
 ## Context
 
@@ -59,9 +61,11 @@ filesystem mutation authority, process table, environment, or machine control.
 Child commands receive only their own manifests' capabilities after the
 interpreter has been reclaimed.
 
-The first language deliberately has no variables, expansion, control-flow
-blocks, loops, functions, command substitution, multiline constructs, traps,
-jobs, descriptor syntax, stderr redirection, or POSIX compatibility claim.
+The first language deliberately has no variables, control-flow blocks, loops,
+functions, command substitution, multiline constructs, traps, jobs, descriptor
+syntax, stderr redirection, or POSIX compatibility claim. It had no expansion of
+any kind until ADR 0057 added bounded pathname expansion; every other form of
+expansion remains absent.
 `&&` and `||` provide only same-line status-based short circuiting. Each broader
 feature requires a later grammar/version decision and dedicated bounds. The
 accepted example under `/share/sh/bench.sh` plus transactional rejection,

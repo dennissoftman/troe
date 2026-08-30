@@ -10,6 +10,7 @@
 
 extern crate alloc;
 
+use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
@@ -107,6 +108,20 @@ pub struct ProviderListing {
     pub next_cursor: Option<u64>,
 }
 
+/// Source of Unix UTC seconds for the timestamps providers write.
+///
+/// The namespace owns one clock and hands the same handle to every provider,
+/// so no mount captures an instant: a provider asks the clock again at each
+/// mutation and therefore never stamps its own mount time onto a later write.
+/// `None` means no wall time is known; a provider that reads it must leave the
+/// timestamps it would otherwise write exactly as they were rather than
+/// inventing one. A clock that moves backwards is recorded as it reads,
+/// because a provider reports the time it was told, not a time of its own.
+pub trait WallClock: fmt::Debug {
+    /// Current Unix UTC time in whole seconds, or `None` when it is unknown.
+    fn unix_seconds(&self) -> Option<u64>;
+}
+
 /// Narrow filesystem-provider interface consumed by the VFS.
 ///
 /// Paths are absolute within the provider root and must already satisfy the
@@ -120,6 +135,13 @@ pub trait FileSystemProvider: fmt::Debug {
     /// Rejects invalid or missing paths, wrong types, corrupt or unsupported
     /// media, transport failures, and provider resource exhaustion.
     fn metadata(&mut self, path: &str) -> Result<FileMetadata, FsError>;
+
+    /// Adopt the namespace's wall clock.
+    ///
+    /// Providers that write no timestamps retain this default. A provider that
+    /// does must read the handle at each mutation rather than at mount, and
+    /// must leave timestamps untouched whenever the clock reports no time.
+    fn set_wall_clock(&mut self, _clock: Rc<dyn WallClock>) {}
 
     /// Resolve one path without following its final symbolic link.
     ///

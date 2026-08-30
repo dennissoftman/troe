@@ -13,6 +13,8 @@ use troe_fs_api::FsError;
 
 /// Offset of the index metadata inside a root block, after `.` and `..`.
 const DX_ROOT_INFO_OFFSET: usize = 24;
+/// Offset of the level count inside the root's index metadata.
+const DX_ROOT_LEVELS_OFFSET: usize = DX_ROOT_INFO_OFFSET + 6;
 /// Offset of the count/limit pair inside a root block.
 pub(crate) const DX_ROOT_COUNT_OFFSET: usize = 32;
 /// Offset of the count/limit pair inside an interior node block.
@@ -45,6 +47,22 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, FsError> {
     Ok(u32::from_le_bytes(
         <[u8; 4]>::try_from(field).map_err(|_| FsError::Corrupt)?,
     ))
+}
+
+fn put_u16(bytes: &mut [u8], offset: usize, value: u16) -> Result<(), FsError> {
+    bytes
+        .get_mut(offset..offset.checked_add(2).ok_or(FsError::Overflow)?)
+        .ok_or(FsError::Corrupt)?
+        .copy_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+fn put_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), FsError> {
+    bytes
+        .get_mut(offset..offset.checked_add(4).ok_or(FsError::Overflow)?)
+        .ok_or(FsError::Corrupt)?
+        .copy_from_slice(&value.to_le_bytes());
+    Ok(())
 }
 
 /// One index entry: the lowest hash in a subtree and the logical block that
@@ -473,4 +491,126 @@ fn legacy_hash(name: &[u8], signed_bytes: bool) -> u32 {
         hash0 = hash;
     }
     hash0 << 1
+}
+
+/// Entries one index block of this size holds at the given array offset.
+///
+/// This profile requires metadata checksums, so the last entry slot always
+/// holds the trailing checksum record rather than an entry.
+pub(crate) fn entry_capacity(block_bytes: usize, count_offset: usize) -> Result<usize, FsError> {
+    validate_block_size_of(block_bytes)?;
+    block_bytes
+        .checked_sub(count_offset)
+        .map(|span| span / DX_ENTRY_BYTES)
+        .and_then(|slots| slots.checked_sub(1))
+        .filter(|capacity| *capacity != 0)
+        .ok_or(FsError::Corrupt)
+}
+
+fn validate_block_size_of(block_bytes: usize) -> Result<(), FsError> {
+    if !matches!(block_bytes, 1024 | 2048 | 4096) {
+        return Err(FsError::Corrupt);
+    }
+    Ok(())
+}
+
+/// Turn a freshly allocated block into an empty interior index node.
+///
+/// The node hides behind one empty record spanning the whole block, so a
+/// reader that does not know about the index sees no entries in it at all.
+///
+/// # Errors
+///
+/// Returns [`FsError::Corrupt`] for a block this profile does not use.
+pub(crate) fn initialize_node(block: &mut [u8]) -> Result<(), FsError> {
+    validate_block_size(block)?;
+    block.fill(0);
+    put_u16(
+        block,
+        4,
+        u16::try_from(block.len()).map_err(|_| FsError::Overflow)?,
+    )
+}
+
+/// Record how many interior levels the root's children stand above the leaves.
+///
+/// This byte is inside the range the root checksum covers, so it must be set
+/// before the entries are written.
+///
+/// # Errors
+///
+/// Returns [`FsError::Corrupt`] when the block is too short.
+pub(crate) fn set_indirect_levels(block: &mut [u8], levels: u8) -> Result<(), FsError> {
+    *block
+        .get_mut(DX_ROOT_LEVELS_OFFSET)
+        .ok_or(FsError::Corrupt)? = levels;
+    Ok(())
+}
+
+/// Replace the entry array of a root or interior node and refresh its checksum.
+///
+/// The first entry's hash field is where the count and limit live, so that
+/// entry implicitly covers every hash below the second one and its own hash
+/// must be zero. Callers that promote a subtree pass its real lowest hash to
+/// the parent instead.
+///
+/// # Errors
+///
+/// Returns [`FsError::NoSpace`] when the entries do not fit and
+/// [`FsError::Corrupt`] when they are unordered or the block is malformed.
+pub(crate) fn write_entries(
+    block: &mut [u8],
+    count_offset: usize,
+    entries: &[DxEntry],
+    inode_seed: u32,
+    crc: impl Fn(u32, &[u8]) -> u32,
+) -> Result<(), FsError> {
+    let limit = entry_capacity(block.len(), count_offset)?;
+    let first = entries.first().ok_or(FsError::Corrupt)?;
+    if entries.len() > limit {
+        return Err(FsError::NoSpace);
+    }
+    if first.hash != 0 || entries.windows(2).any(|pair| pair[1].hash <= pair[0].hash) {
+        return Err(FsError::Corrupt);
+    }
+    put_u16(
+        block,
+        count_offset,
+        u16::try_from(limit).map_err(|_| FsError::Overflow)?,
+    )?;
+    put_u16(
+        block,
+        count_offset + 2,
+        u16::try_from(entries.len()).map_err(|_| FsError::Overflow)?,
+    )?;
+    for (index, entry) in entries.iter().enumerate() {
+        let offset = count_offset
+            .checked_add(index.checked_mul(DX_ENTRY_BYTES).ok_or(FsError::Overflow)?)
+            .ok_or(FsError::Overflow)?;
+        if index != 0 {
+            put_u32(block, offset, entry.hash)?;
+        }
+        put_u32(block, offset + 4, entry.block)?;
+    }
+    let used = count_offset
+        .checked_add(
+            entries
+                .len()
+                .checked_mul(DX_ENTRY_BYTES)
+                .ok_or(FsError::Overflow)?,
+        )
+        .ok_or(FsError::Overflow)?;
+    let tail_offset = count_offset
+        .checked_add(limit.checked_mul(DX_ENTRY_BYTES).ok_or(FsError::Overflow)?)
+        .ok_or(FsError::Overflow)?;
+    // Retired slots keep no stale entry, and the trailing record's reserved
+    // word is zero because the checksum is computed over it.
+    block
+        .get_mut(used..tail_offset + 4)
+        .ok_or(FsError::Corrupt)?
+        .fill(0);
+    let mut checksum = crc(inode_seed, block.get(..used).ok_or(FsError::Corrupt)?);
+    checksum = crc(checksum, &[0_u8; 4]);
+    checksum = crc(checksum, &[0_u8; 4]);
+    put_u32(block, tail_offset + 4, checksum)
 }

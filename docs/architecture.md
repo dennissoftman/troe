@@ -43,9 +43,15 @@ firmware fails before device publication or volatile I/O.
    and decoded key events; ANSI serial input and x86 set-1 PS/2 input feed the
    same event type outside interrupt context.
 2. The shell crate tokenizes iteratively. Single and double quotes group literal
-   bytes; no expansion, recursion, substitution, environment lookup, or
-   globbing occurs. Unquoted `&&` and `||` form left-associative short-circuit
-   lists; `<`, `>`, and `>>` select bounded-memory file streams.
+   bytes and record, per character, that quoting made them literal; no
+   recursion, substitution, or environment lookup occurs. Bounded pathname
+   expansion matches an argument word holding an unquoted `*`, `?`, or `[`
+   against the namespace one path component at a time, leaves the command word
+   and redirection targets alone, passes a pattern that matches nothing through
+   as written, and fails the whole stage before dispatch when it exceeds its
+   word, byte, or directory-scan bound (ADR 0057). Unquoted `&&` and `||` form
+   left-associative short-circuit lists; `<`, `>`, and `>>` select
+   bounded-memory file streams.
 3. The pipeline executor protects shell intrinsics, then resolves the exact KEX
    command path. Absence reports an unavailable application and never selects
    privileged utility behavior. KEX receives bounded stdin/stdout/stderr streams
@@ -490,7 +496,11 @@ metadata-preserving ext4 with bounded symbolic/hard links, native virtio
 transport, dual-slot durability, and
 selected STFS mutation pieces preserve this dependency direction. Empty
 directory removal and same-provider rename are implemented for RAMFS, FAT32,
-and the ext4 provider. Its ext4 mutations are
+and the ext4 provider. The namespace holds one wall clock and shares it with
+every mounted provider, which reads it at each mutation, so both the ext4 and
+FAT32 providers stamp the instant a write happened; each converts the single
+Unix-seconds representation itself, and without a readable clock neither invents
+a time. Its ext4 mutations are
 journaled as physical block redo transactions in the profile's existing internal
 journal, and a separate explicitly authorized recovery path replays a committed
 transaction or discards an uncommitted one, so an interrupted mutation recovers
@@ -501,7 +511,9 @@ compatible features are ignored. It reads 1 KiB, 2 KiB and 4 KiB blocks,
 32- and 64-byte group descriptors, stored checksum seeds, flexible block
 groups, uninitialized groups, hashed directory indexes, and extent trees to the
 depth ext4 builds them, so an ordinary Linux ext4 volume mounts and takes the
-full mutation surface. General ext4 repair and mutations outside the documented
+full mutation surface. A hashed directory grows by splitting a full leaf and
+rewriting its index, and a heavily fragmented file is rewritten through an
+extent tree as deep as its extents require. General ext4 repair and mutations outside the documented
 profile remain unsupported. A transport provides bounded block-region capabilities; partition
 discovery turns a whole device into non-overlapping regions; independently
 selected filesystem providers expose VFS objects.

@@ -35,7 +35,8 @@ DESCRIPTION
     Enter or any answer other than y as cancellation. The prompt is an advisory
     provenance warning, not a filesystem permission or package-trust decision.
 
-    Single and double quotes group literal text; neither performs expansion.
+    Single and double quotes group literal text and suppress pattern matching
+    for the characters they enclose; neither performs any other expansion.
     Unquoted && and || have equal precedence, associate left to right, and run
     the next pipeline after success or non-success respectively. An unquoted |
     connects bounded byte streams. Unquoted < supplies the first stage from
@@ -57,11 +58,36 @@ DESCRIPTION
     File streams use a 16 KiB default working buffer and are not capped by the
     shell. A failing command may leave an empty file or written prefix. The
     1 MiB limit applies only between sequential pipeline stages. Redirection
-    paths do not enter command argv. Variables, expansion, command substitution,
+    paths do not enter command argv. Variables, command substitution,
     control-flow blocks, stderr redirection, heredocs, jobs, descriptor numbers,
     and multiline grammar are not supported by the current script grammar.
 
+PATHNAME EXPANSION
+    An argument word holding an unquoted *, ? or [ is matched against the
+    filesystem before the command runs, so a command never receives a pattern.
+    * matches any run of characters, ? matches exactly one, and [abc], [a-z],
+    [!abc] and [^abc] match one character from a set. An unterminated or empty
+    [ is literal text.
+
+    Matching is per path component: * never crosses /, and an unanchored * or ?
+    never matches a name beginning with . , so rm * cannot remove dotfiles.
+    Quoting suppresses matching for the characters it encloses, so rm "*.txt"
+    names one file while rm *.txt names a set, and "a"* still matches on its
+    unquoted *. A pattern matching nothing is passed through as written, so the
+    command reports it the way it reports any other missing name. Matches are
+    sorted in lexical order.
+
+    The command word and redirection targets are never expanded. One expansion
+    is limited to 4,096 words, 64 KiB of aggregate argument bytes, and 4,096
+    visited directory entries. Exceeding any limit fails the whole command
+    before it runs, so nothing is removed, copied, or moved in part. Tilde and
+    brace expansion, **, [[:alpha:]] classes, case-insensitive matching, and
+    the nullglob and failglob options are not supported.
+
 EXAMPLES
+    rm *.txt
+    cp logs/*.log /vol/shared
+    ls "*.txt"
     sh /share/sh/bench.sh
     printf 'echo from-stdin\n' | sh -
     cp /bin/echo.kex /vol/shared/echo-copy

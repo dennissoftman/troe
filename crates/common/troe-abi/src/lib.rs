@@ -1000,11 +1000,13 @@ pub mod command {
     /// Interface major version.
     pub const MAJOR: u16 = 1;
     /// Interface minor version.
-    pub const MINOR: u16 = 1;
+    pub const MINOR: u16 = 2;
     /// Return the immutable invocation record.
     pub const GET_INVOCATION: u16 = 1;
     /// Return the immutable launch environment.
     pub const GET_ENVIRONMENT: u16 = 2;
+    /// Return one bounded page of the immutable argument vector.
+    pub const GET_ARGUMENT_PAGE: u16 = 3;
     /// Maximum arguments including the command name.
     pub const MAX_ARGUMENTS: usize = 128;
     /// Maximum encoded current-directory bytes.
@@ -1016,6 +1018,28 @@ pub mod command {
     /// Maximum complete canonical invocation reply.
     pub const MAX_INVOCATION_BYTES: usize =
         HEADER_BYTES + MAX_ARGUMENTS * 2 + MAX_CWD_BYTES + MAX_ARGUMENT_BYTES;
+    /// Maximum arguments in one paged record, including the command name.
+    ///
+    /// A record larger than [`MAX_ARGUMENTS`] cannot be returned as one
+    /// message, so it is read page by page instead of being truncated.
+    pub const MAX_PAGED_ARGUMENTS: usize = 4096;
+    /// Maximum aggregate UTF-8 argument bytes in one paged record.
+    pub const MAX_PAGED_ARGUMENT_BYTES: usize = 64 * 1024;
+    /// Maximum UTF-8 bytes in any one argument.
+    ///
+    /// Bounded so that every argument always fits inside one page.
+    pub const MAX_SINGLE_ARGUMENT_BYTES: usize = 1024;
+    /// Maximum arguments returned by one page.
+    pub const MAX_ARGUMENT_PAGE: usize = 64;
+    /// Maximum aggregate argument bytes returned by one page.
+    pub const MAX_ARGUMENT_PAGE_BYTES: usize = MAX_SINGLE_ARGUMENT_BYTES;
+    /// Fixed argument-page reply header bytes.
+    pub const ARGUMENT_PAGE_HEADER_BYTES: usize = 10;
+    /// Maximum canonical argument-page reply.
+    pub const MAX_ARGUMENT_PAGE_REPLY_BYTES: usize =
+        ARGUMENT_PAGE_HEADER_BYTES + MAX_ARGUMENT_PAGE * 2 + MAX_ARGUMENT_PAGE_BYTES;
+    /// Exact canonical argument-page request bytes.
+    pub const ARGUMENT_PAGE_REQUEST_BYTES: usize = 2;
     /// Conventional values a trusted top-level launcher supplies.
     ///
     /// These belong to whichever component composes a launch. An application
@@ -1474,6 +1498,323 @@ pub mod command {
         destination[..total].copy_from_slice(&encoded[..total]);
         Ok(total)
     }
+
+    /// Encode the exact canonical request for one argument page.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a start index beyond the paged bound or insufficient space.
+    pub fn encode_argument_page_request(
+        start: usize,
+        destination: &mut [u8],
+    ) -> Result<usize, EncodeError> {
+        if start > MAX_PAGED_ARGUMENTS || destination.len() < ARGUMENT_PAGE_REQUEST_BYTES {
+            return Err(if start > MAX_PAGED_ARGUMENTS {
+                EncodeError::LimitExceeded
+            } else {
+                EncodeError::DestinationTooSmall
+            });
+        }
+        write_u16(
+            destination,
+            0,
+            u16::try_from(start).map_err(|_| EncodeError::LimitExceeded)?,
+        );
+        Ok(ARGUMENT_PAGE_REQUEST_BYTES)
+    }
+
+    /// Decode the exact canonical request for one argument page.
+    ///
+    /// # Errors
+    ///
+    /// Rejects any length other than the canonical request or an excessive index.
+    pub fn decode_argument_page_request(bytes: &[u8]) -> Result<usize, DecodeError> {
+        if bytes.len() != ARGUMENT_PAGE_REQUEST_BYTES {
+            return Err(DecodeError::InvalidEncoding);
+        }
+        let start = usize::from(read_u16(bytes, 0)?);
+        if start > MAX_PAGED_ARGUMENTS {
+            return Err(DecodeError::LimitExceeded);
+        }
+        Ok(start)
+    }
+
+    /// Encode one canonical argument page starting at `start`.
+    ///
+    /// The page carries as many consecutive arguments as fit within
+    /// [`MAX_ARGUMENT_PAGE`] and [`MAX_ARGUMENT_PAGE_BYTES`]. A start index
+    /// equal to `total` encodes the canonical empty final page, so a reader
+    /// always terminates.
+    ///
+    /// `value` returns one argument by its absolute index and is the only way
+    /// the record is read, so a flat owned string table needs no intermediate
+    /// slice of references.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a start index past `total`, a record exceeding the paged
+    /// bounds, an absent index below `total`, an argument exceeding
+    /// [`MAX_SINGLE_ARGUMENT_BYTES`], arithmetic overflow, or insufficient
+    /// output space.
+    pub fn encode_argument_page_with<'value, F>(
+        total: usize,
+        start: usize,
+        value: F,
+        destination: &mut [u8],
+    ) -> Result<usize, EncodeError>
+    where
+        F: Fn(usize) -> Option<&'value str>,
+    {
+        if !(1..=MAX_PAGED_ARGUMENTS).contains(&total) || start > total {
+            return Err(EncodeError::LimitExceeded);
+        }
+        let mut count = 0_usize;
+        let mut page_bytes = 0_usize;
+        while start + count < total {
+            let argument = value(start + count).ok_or(EncodeError::LimitExceeded)?;
+            let length = argument.len();
+            if length > MAX_SINGLE_ARGUMENT_BYTES || (start + count == 0 && length == 0) {
+                return Err(EncodeError::LimitExceeded);
+            }
+            let next_bytes = page_bytes
+                .checked_add(length)
+                .ok_or(EncodeError::LimitExceeded)?;
+            if count == MAX_ARGUMENT_PAGE || next_bytes > MAX_ARGUMENT_PAGE_BYTES {
+                break;
+            }
+            page_bytes = next_bytes;
+            count += 1;
+        }
+        let total_bytes = ARGUMENT_PAGE_HEADER_BYTES
+            .checked_add(count.checked_mul(2).ok_or(EncodeError::LimitExceeded)?)
+            .and_then(|value| value.checked_add(page_bytes))
+            .ok_or(EncodeError::LimitExceeded)?;
+        if total_bytes > MAX_ARGUMENT_PAGE_REPLY_BYTES || total_bytes > MAX_MESSAGE_BYTES {
+            return Err(EncodeError::LimitExceeded);
+        }
+        if destination.len() < total_bytes {
+            return Err(EncodeError::DestinationTooSmall);
+        }
+        write_u16(
+            destination,
+            0,
+            u16::try_from(total_bytes).map_err(|_| EncodeError::LimitExceeded)?,
+        );
+        destination[2] = u8::try_from(MAJOR).map_err(|_| EncodeError::LimitExceeded)?;
+        destination[3] = u8::try_from(MINOR).map_err(|_| EncodeError::LimitExceeded)?;
+        write_u16(
+            destination,
+            4,
+            u16::try_from(total).map_err(|_| EncodeError::LimitExceeded)?,
+        );
+        write_u16(
+            destination,
+            6,
+            u16::try_from(start).map_err(|_| EncodeError::LimitExceeded)?,
+        );
+        write_u16(
+            destination,
+            8,
+            u16::try_from(count).map_err(|_| EncodeError::LimitExceeded)?,
+        );
+        let mut cursor = ARGUMENT_PAGE_HEADER_BYTES + count * 2;
+        for index in 0..count {
+            let bytes = value(start + index)
+                .ok_or(EncodeError::LimitExceeded)?
+                .as_bytes();
+            write_u16(
+                destination,
+                ARGUMENT_PAGE_HEADER_BYTES + index * 2,
+                u16::try_from(bytes.len()).map_err(|_| EncodeError::LimitExceeded)?,
+            );
+            destination[cursor..cursor + bytes.len()].copy_from_slice(bytes);
+            cursor += bytes.len();
+        }
+        Ok(total_bytes)
+    }
+
+    /// Encode one canonical argument page from a contiguous argument slice.
+    ///
+    /// # Errors
+    ///
+    /// Reports every failure of [`encode_argument_page_with`].
+    pub fn encode_argument_page<T: AsRef<str>>(
+        arguments: &[T],
+        start: usize,
+        destination: &mut [u8],
+    ) -> Result<usize, EncodeError> {
+        encode_argument_page_with(
+            arguments.len(),
+            start,
+            |index| arguments.get(index).map(AsRef::as_ref),
+            destination,
+        )
+    }
+
+    /// One borrowed, validated page of an immutable argument vector.
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub struct ArgumentPage<'a> {
+        bytes: &'a [u8],
+        total: usize,
+        start: usize,
+        count: usize,
+        values_start: usize,
+    }
+
+    impl<'a> ArgumentPage<'a> {
+        /// Parse one exact canonical argument page.
+        ///
+        /// # Errors
+        ///
+        /// Rejects every malformed, excessive, non-UTF-8, or trailing byte.
+        pub fn parse(bytes: &'a [u8]) -> Result<Self, DecodeError> {
+            if bytes.len() < ARGUMENT_PAGE_HEADER_BYTES
+                || usize::from(read_u16(bytes, 0)?) != bytes.len()
+                || bytes[2] != u8::try_from(MAJOR).unwrap_or(u8::MAX)
+                || bytes[3] != u8::try_from(MINOR).unwrap_or(u8::MAX)
+            {
+                return Err(DecodeError::InvalidEncoding);
+            }
+            let total = usize::from(read_u16(bytes, 4)?);
+            let start = usize::from(read_u16(bytes, 6)?);
+            let count = usize::from(read_u16(bytes, 8)?);
+            if !(1..=MAX_PAGED_ARGUMENTS).contains(&total) || count > MAX_ARGUMENT_PAGE {
+                return Err(DecodeError::LimitExceeded);
+            }
+            let end = start
+                .checked_add(count)
+                .ok_or(DecodeError::InvalidEncoding)?;
+            if start > total || end > total {
+                return Err(DecodeError::InvalidEncoding);
+            }
+            let values_start = ARGUMENT_PAGE_HEADER_BYTES
+                .checked_add(count.checked_mul(2).ok_or(DecodeError::InvalidEncoding)?)
+                .ok_or(DecodeError::InvalidEncoding)?;
+            if values_start > bytes.len() {
+                return Err(DecodeError::InvalidEncoding);
+            }
+            let mut cursor = values_start;
+            let mut page_bytes = 0_usize;
+            for index in 0..count {
+                let length = usize::from(read_u16(bytes, ARGUMENT_PAGE_HEADER_BYTES + index * 2)?);
+                if length > MAX_SINGLE_ARGUMENT_BYTES {
+                    return Err(DecodeError::LimitExceeded);
+                }
+                page_bytes = page_bytes
+                    .checked_add(length)
+                    .ok_or(DecodeError::InvalidEncoding)?;
+                if page_bytes > MAX_ARGUMENT_PAGE_BYTES {
+                    return Err(DecodeError::LimitExceeded);
+                }
+                let value_end = cursor
+                    .checked_add(length)
+                    .ok_or(DecodeError::InvalidEncoding)?;
+                if value_end > bytes.len() {
+                    return Err(DecodeError::InvalidEncoding);
+                }
+                if str::from_utf8(&bytes[cursor..value_end]).is_err() {
+                    return Err(DecodeError::InvalidUtf8);
+                }
+                if start + index == 0 && length == 0 {
+                    return Err(DecodeError::InvalidEncoding);
+                }
+                cursor = value_end;
+            }
+            if cursor != bytes.len() {
+                return Err(DecodeError::InvalidEncoding);
+            }
+            Ok(Self {
+                bytes,
+                total,
+                start,
+                count,
+                values_start,
+            })
+        }
+
+        /// Total arguments in the whole record, including the command name.
+        #[must_use]
+        pub const fn total(self) -> usize {
+            self.total
+        }
+
+        /// Index of this page's first argument within the whole record.
+        #[must_use]
+        pub const fn start(self) -> usize {
+            self.start
+        }
+
+        /// Arguments carried by this page.
+        #[must_use]
+        pub const fn len(self) -> usize {
+            self.count
+        }
+
+        /// Whether this page carries no argument.
+        #[must_use]
+        pub const fn is_empty(self) -> bool {
+            self.count == 0
+        }
+
+        /// Index of the first argument after this page.
+        ///
+        /// Equals [`total`](Self::total) once the record has been read.
+        #[must_use]
+        pub const fn next_start(self) -> usize {
+            self.start + self.count
+        }
+
+        /// Return one argument by its index within this page.
+        #[must_use]
+        pub fn get(self, wanted: usize) -> Option<&'a str> {
+            if wanted >= self.count {
+                return None;
+            }
+            let mut cursor = self.values_start;
+            for index in 0..self.count {
+                let length =
+                    usize::from(read_u16(self.bytes, ARGUMENT_PAGE_HEADER_BYTES + index * 2).ok()?);
+                let end = cursor.checked_add(length)?;
+                if index == wanted {
+                    return str::from_utf8(&self.bytes[cursor..end]).ok();
+                }
+                cursor = end;
+            }
+            None
+        }
+
+        /// Iterate over every argument carried by this page.
+        #[must_use]
+        pub fn iter(self) -> PageArguments<'a> {
+            PageArguments {
+                page: self,
+                index: 0,
+            }
+        }
+    }
+
+    /// Iterator over one borrowed argument page.
+    pub struct PageArguments<'a> {
+        page: ArgumentPage<'a>,
+        index: usize,
+    }
+
+    impl<'a> Iterator for PageArguments<'a> {
+        type Item = &'a str;
+
+        fn next(&mut self) -> Option<Self::Item> {
+            let value = self.page.get(self.index)?;
+            self.index += 1;
+            Some(value)
+        }
+
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            let remaining = self.page.len().saturating_sub(self.index);
+            (remaining, Some(remaining))
+        }
+    }
+
+    impl ExactSizeIterator for PageArguments<'_> {}
 
     fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, DecodeError> {
         let raw = bytes
@@ -5808,6 +6149,83 @@ mod tests {
         let mut trailing = bytes[..count].to_vec();
         trailing.push(0);
         assert!(command::Invocation::parse(&trailing).is_err());
+    }
+
+    #[test]
+    fn argument_pages_cover_a_record_larger_than_one_message() {
+        // More operands than one single-message invocation record can carry.
+        let mut arguments = std::vec::Vec::new();
+        arguments.push(std::string::String::from("rm"));
+        for index in 0..1000 {
+            arguments.push(std::format!("operand-{index:04}.txt"));
+        }
+        let mut record = [0_u8; MAX_MESSAGE_BYTES];
+        assert!(command::encode("/work", &arguments, &mut record).is_err());
+
+        let mut seen = std::vec::Vec::new();
+        let mut start = 0_usize;
+        let mut pages = 0_usize;
+        loop {
+            let mut bytes = [0_u8; command::MAX_ARGUMENT_PAGE_REPLY_BYTES];
+            let count = command::encode_argument_page(&arguments, start, &mut bytes)
+                .unwrap_or_else(|_| std::process::abort());
+            let page = command::ArgumentPage::parse(&bytes[..count])
+                .unwrap_or_else(|_| std::process::abort());
+            assert_eq!(page.total(), arguments.len());
+            assert_eq!(page.start(), start);
+            assert!(count <= MAX_MESSAGE_BYTES);
+            if page.is_empty() {
+                assert_eq!(page.start(), arguments.len());
+                break;
+            }
+            seen.extend(page.iter().map(std::string::ToString::to_string));
+            start = page.next_start();
+            pages += 1;
+            assert!(pages <= arguments.len(), "page reader failed to advance");
+        }
+        assert_eq!(seen, arguments);
+
+        // A page request is exact, and its index is bounded.
+        let mut request = [0_u8; command::ARGUMENT_PAGE_REQUEST_BYTES];
+        let count = command::encode_argument_page_request(7, &mut request)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            command::decode_argument_page_request(&request[..count]),
+            Ok(7)
+        );
+        assert!(command::decode_argument_page_request(&[]).is_err());
+        assert!(command::decode_argument_page_request(&[0, 0, 0]).is_err());
+        assert!(
+            command::encode_argument_page_request(command::MAX_PAGED_ARGUMENTS + 1, &mut request)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn argument_pages_reject_every_truncation_and_trailing_byte() {
+        let arguments = ["cat", "alpha.txt", "beta.txt"];
+        let mut bytes = [0_u8; command::MAX_ARGUMENT_PAGE_REPLY_BYTES];
+        let count = command::encode_argument_page(&arguments, 0, &mut bytes)
+            .unwrap_or_else(|_| std::process::abort());
+        for end in 0..count {
+            assert!(command::ArgumentPage::parse(&bytes[..end]).is_err());
+        }
+        let mut trailing = bytes[..count].to_vec();
+        trailing.push(0);
+        assert!(command::ArgumentPage::parse(&trailing).is_err());
+
+        // A start past the record, and an empty record, are both refused.
+        assert!(command::encode_argument_page(&arguments, 4, &mut bytes).is_err());
+        let empty: [&str; 0] = [];
+        assert!(command::encode_argument_page(&empty, 0, &mut bytes).is_err());
+
+        // The final page is empty rather than absent, so a reader terminates.
+        let count = command::encode_argument_page(&arguments, arguments.len(), &mut bytes)
+            .unwrap_or_else(|_| std::process::abort());
+        let page =
+            command::ArgumentPage::parse(&bytes[..count]).unwrap_or_else(|_| std::process::abort());
+        assert!(page.is_empty());
+        assert_eq!(page.next_start(), arguments.len());
     }
 
     #[test]

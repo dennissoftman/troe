@@ -7,17 +7,20 @@ import argparse
 import os
 import subprocess
 import sys
+import threading
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
 if __package__:
-    from .platform_profile import PLATFORM_PROFILES
+    from .platform_profile import PLATFORM_IDS, PLATFORM_PROFILES
     from .qemu_profile import QEMU_ENVIRONMENT
     from .repository_policy import (
         require_supported_python,
         rootfs_application_directories,
     )
 else:
-    from platform_profile import PLATFORM_PROFILES
+    from platform_profile import PLATFORM_IDS, PLATFORM_PROFILES
     from qemu_profile import QEMU_ENVIRONMENT
     from repository_policy import (
         require_supported_python,
@@ -27,6 +30,7 @@ else:
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOLS_DIR = REPO_ROOT / "tools"
+DEFAULT_PROGRESS_INTERVAL = 60.0
 KEX_APPLICATIONS = rootfs_application_directories()
 KEX_SERVICES = (
     (REPO_ROOT / "services" / "diagnostics", "diagnostics-server", 8),
@@ -41,6 +45,14 @@ KEX_SERVICES = (
         8,
     ),
 )
+
+
+@dataclass(frozen=True)
+class Step:
+    """One labeled verification command owned by the exhaustive gate."""
+
+    label: str
+    command: tuple[str | Path, ...]
 
 
 def parse_args() -> argparse.Namespace:
@@ -60,29 +72,97 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="require release-pinned QEMU, UEFI firmware, and e2fsprogs versions",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--progress-interval",
+        type=float,
+        default=DEFAULT_PROGRESS_INTERVAL,
+        metavar="SECONDS",
+        help="seconds between liveness lines inside one gate; 0 disables them",
+    )
+    args = parser.parse_args()
+    if args.progress_interval < 0:
+        parser.error("--progress-interval must not be negative")
+    return args
 
 
-def run(*command: str | Path) -> None:
-    """Run a verification command from the repository root."""
-    subprocess.run([str(argument) for argument in command], cwd=REPO_ROOT, check=True)
+def format_duration(seconds: float) -> str:
+    """Render one elapsed interval in stable, scannable units."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    hours, remainder = divmod(int(seconds), 3600)
+    minutes, whole_seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{whole_seconds:02d}s"
+    return f"{minutes}m{whole_seconds:02d}s"
 
 
-def target_clippy_commands() -> list[tuple[str | Path, ...]]:
+def report(message: str) -> None:
+    """Print one progress line that stays ordered with child process output."""
+    print(message, flush=True)
+
+
+def display(command: tuple[str | Path, ...]) -> str:
+    """Render argv relative to the repository without implying shell semantics."""
+    prefix = f"{REPO_ROOT}{os.sep}"
+    arguments = []
+    for argument in command:
+        text = str(argument)
+        if text.startswith(prefix):
+            text = text[len(prefix) :]
+        arguments.append(repr(text) if any(c.isspace() for c in text) else text)
+    return " ".join(arguments)
+
+
+class LivenessReporter:
+    """Print periodic progress while one silent long-running gate executes."""
+
+    def __init__(self, prefix: str, started: float, interval: float) -> None:
+        self._prefix = prefix
+        self._started = started
+        self._interval = interval
+        self._finished = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def __enter__(self) -> LivenessReporter:
+        if self._interval > 0:
+            self._thread = threading.Thread(
+                target=self._announce, name="verification-progress", daemon=True
+            )
+            self._thread.start()
+        return self
+
+    def __exit__(self, *exception: object) -> None:
+        self._finished.set()
+        if self._thread is not None:
+            self._thread.join()
+
+    def _announce(self) -> None:
+        while not self._finished.wait(self._interval):
+            elapsed = format_duration(time.monotonic() - self._started)
+            report(
+                f"{self._prefix}: still running after {elapsed} "
+                f"({time.strftime('%H:%M:%S')})"
+            )
+
+
+def target_clippy_commands() -> list[Step]:
     """Return one exact target gate per named platform."""
     return [
-        (
-            "cargo",
-            "clippy",
-            "-p",
-            "troe-kernel",
-            "--target",
-            profile.target,
-            "--features",
-            f"{profile.kernel_feature},acceptance-probes",
-            "--",
-            "-D",
-            "warnings",
+        Step(
+            f"clippy troe-kernel ({profile.identifier})",
+            (
+                "cargo",
+                "clippy",
+                "-p",
+                "troe-kernel",
+                "--target",
+                profile.target,
+                "--features",
+                f"{profile.kernel_feature},acceptance-probes",
+                "--",
+                "-D",
+                "warnings",
+            ),
         )
         for profile in PLATFORM_PROFILES.values()
     ]
@@ -90,33 +170,210 @@ def target_clippy_commands() -> list[tuple[str | Path, ...]]:
 
 def image_and_qemu_commands(
     *, skip_qemu: bool, strict_tool_versions: bool = False
-) -> list[tuple[str | Path, ...]]:
-    """Return one owner for production/acceptance builds without duplication."""
+) -> list[Step]:
+    """Return one owner for production/acceptance builds without duplication.
+
+    Boot acceptance takes one named platform per invocation so that a single
+    emulated guest, not one guest per platform, competes for host memory, cores,
+    and local ports. The exhaustive gate still covers every named platform.
+    """
     if skip_qemu:
         return [
-            (
-                sys.executable,
-                REPO_ROOT / "scripts" / "build.py",
-                "--platform",
-                "all",
-                "--fixture-identities",
-                "--all-variants",
-                *(("--strict-tool-versions",) if strict_tool_versions else ()),
+            Step(
+                "build images (all platforms)",
+                (
+                    sys.executable,
+                    REPO_ROOT / "scripts" / "build.py",
+                    "--platform",
+                    "all",
+                    "--fixture-identities",
+                    "--all-variants",
+                    *(("--strict-tool-versions",) if strict_tool_versions else ()),
+                ),
             )
         ]
     return [
-        (
-            sys.executable,
-            REPO_ROOT / "scripts" / "test-qemu.py",
-            "--platform",
-            "all",
-            "--environment",
-            QEMU_ENVIRONMENT,
-            "--framebuffer-console",
-            "--native-keyboard",
-            *(("--strict-tool-versions",) if strict_tool_versions else ()),
+        Step(
+            f"qemu acceptance ({platform_id})",
+            (
+                sys.executable,
+                REPO_ROOT / "scripts" / "test-qemu.py",
+                "--platform",
+                platform_id,
+                "--environment",
+                QEMU_ENVIRONMENT,
+                "--framebuffer-console",
+                "--native-keyboard",
+                *(("--strict-tool-versions",) if strict_tool_versions else ()),
+            ),
         )
+        for platform_id in PLATFORM_IDS
     ]
+
+
+def verification_steps(args: argparse.Namespace) -> list[Step]:
+    """Return every gate in execution order with its short progress label."""
+    steps: list[Step] = [
+        Step("cargo fmt", ("cargo", "fmt", "--all", "--", "--check")),
+        Step(
+            "clippy workspace",
+            (
+                "cargo",
+                "clippy",
+                "--workspace",
+                "--all-targets",
+                "--",
+                "-D",
+                "warnings",
+            ),
+        ),
+        *target_clippy_commands(),
+        Step("cargo test workspace", ("cargo", "test", "--workspace")),
+        Step(
+            "python unit tests",
+            (
+                sys.executable,
+                "-m",
+                "unittest",
+                "discover",
+                "-s",
+                REPO_ROOT / "tests",
+                "-p",
+                "test_*.py",
+            ),
+        ),
+        Step("dependency audit", (sys.executable, REPO_ROOT / "scripts" / "audit.py")),
+        *(
+            Step(
+                f"kefs check ({architecture})",
+                (
+                    sys.executable,
+                    TOOLS_DIR / "mkefs.py",
+                    REPO_ROOT / "rootfs",
+                    REPO_ROOT / "assets" / f"root-{architecture}.kefs",
+                    "--architecture",
+                    architecture,
+                    "--check",
+                ),
+            )
+            for architecture in ("x86_64", "aarch64")
+        ),
+        *(
+            Step(
+                f"kex app ({application.name})",
+                (
+                    "cargo",
+                    "kex",
+                    "build",
+                    application,
+                    "--target",
+                    "all",
+                    "--check",
+                ),
+            )
+            for application in KEX_APPLICATIONS
+        ),
+        *(
+            Step(
+                f"kex service ({name})",
+                (
+                    "cargo",
+                    "kex",
+                    "build",
+                    service,
+                    "--name",
+                    name,
+                    "--target",
+                    "all",
+                    "--output",
+                    REPO_ROOT / "tests" / "kex-corpus",
+                    "--stack-pages",
+                    str(stack_pages),
+                    "--check",
+                ),
+            )
+            for service, name, stack_pages in KEX_SERVICES
+        ),
+        Step(
+            "kex runtime probe",
+            (
+                "cargo",
+                "kex",
+                "build",
+                REPO_ROOT / "tests" / "runtime-probe",
+                "--target",
+                "all",
+                "--output",
+                REPO_ROOT / "build" / "runtime-probe-packages",
+            ),
+        ),
+        Step(
+            "host smoke",
+            (
+                "cargo",
+                "run",
+                "--quiet",
+                "-p",
+                "troe-host",
+                "--",
+                "--script",
+                REPO_ROOT / "tests" / "smoke.sh",
+            ),
+        ),
+    ]
+    steps.extend(
+        image_and_qemu_commands(
+            skip_qemu=args.skip_qemu,
+            strict_tool_versions=args.strict_tool_versions,
+        )
+    )
+    return steps
+
+
+def announce_plan(steps: list[Step]) -> None:
+    """Print the ordered plan so a long run is legible before it starts."""
+    total = len(steps)
+    report(f"verification plan: {total} gates, one at a time")
+    for index, step in enumerate(steps, start=1):
+        report(f"  [{index:0{len(str(total))}d}/{total}] {step.label}")
+
+
+def run_steps(steps: list[Step], *, progress_interval: float) -> None:
+    """Run every gate in order, reporting start, liveness, and completion."""
+    total = len(steps)
+    announce_plan(steps)
+    started = time.monotonic()
+    for index, step in enumerate(steps, start=1):
+        prefix = f"verification [{index:0{len(str(total))}d}/{total}] {step.label}"
+        step_started = time.monotonic()
+        report(f"{prefix}: started {time.strftime('%H:%M:%S')}")
+        report(f"  {display(step.command)}")
+        try:
+            with LivenessReporter(prefix, step_started, progress_interval):
+                subprocess.run(
+                    [str(argument) for argument in step.command],
+                    cwd=REPO_ROOT,
+                    check=True,
+                )
+        except BaseException:
+            print(
+                f"{prefix}: failed after "
+                f"{format_duration(time.monotonic() - step_started)} "
+                f"({index - 1} of {total} gates passed in "
+                f"{format_duration(time.monotonic() - started)})",
+                file=sys.stderr,
+                flush=True,
+            )
+            raise
+        report(
+            f"{prefix}: passed in "
+            f"{format_duration(time.monotonic() - step_started)} "
+            f"(gate elapsed {format_duration(time.monotonic() - started)})"
+        )
+    report(
+        f"verification: {total} gates passed in "
+        f"{format_duration(time.monotonic() - started)}"
+    )
 
 
 def main() -> int:
@@ -128,103 +385,9 @@ def main() -> int:
     args = parse_args()
     if args.require_filesystem_tools:
         os.environ["TROE_REQUIRE_FS_TOOLS"] = "1"
-    commands: list[tuple[str | Path, ...]] = [
-        ("cargo", "fmt", "--all", "--", "--check"),
-        (
-            "cargo",
-            "clippy",
-            "--workspace",
-            "--all-targets",
-            "--",
-            "-D",
-            "warnings",
-        ),
-        *target_clippy_commands(),
-        ("cargo", "test", "--workspace"),
-        (
-            sys.executable,
-            "-m",
-            "unittest",
-            "discover",
-            "-s",
-            REPO_ROOT / "tests",
-            "-p",
-            "test_*.py",
-        ),
-        (sys.executable, REPO_ROOT / "scripts" / "audit.py"),
-        *(
-            (
-                sys.executable,
-                TOOLS_DIR / "mkefs.py",
-                REPO_ROOT / "rootfs",
-                REPO_ROOT / "assets" / f"root-{architecture}.kefs",
-                "--architecture",
-                architecture,
-                "--check",
-            )
-            for architecture in ("x86_64", "aarch64")
-        ),
-        *(
-            (
-                "cargo",
-                "kex",
-                "build",
-                application,
-                "--target",
-                "all",
-                "--check",
-            )
-            for application in KEX_APPLICATIONS
-        ),
-        *(
-            (
-                "cargo",
-                "kex",
-                "build",
-                service,
-                "--name",
-                name,
-                "--target",
-                "all",
-                "--output",
-                REPO_ROOT / "tests" / "kex-corpus",
-                "--stack-pages",
-                str(stack_pages),
-                "--check",
-            )
-            for service, name, stack_pages in KEX_SERVICES
-        ),
-        (
-            "cargo",
-            "kex",
-            "build",
-            REPO_ROOT / "tests" / "runtime-probe",
-            "--target",
-            "all",
-            "--output",
-            REPO_ROOT / "build" / "runtime-probe-packages",
-        ),
-        (
-            "cargo",
-            "run",
-            "--quiet",
-            "-p",
-            "troe-host",
-            "--",
-            "--script",
-            REPO_ROOT / "tests" / "smoke.sh",
-        ),
-    ]
-    commands.extend(
-        image_and_qemu_commands(
-            skip_qemu=args.skip_qemu,
-            strict_tool_versions=args.strict_tool_versions,
-        )
-    )
 
     try:
-        for command in commands:
-            run(*command)
+        run_steps(verification_steps(args), progress_interval=args.progress_interval)
     except FileNotFoundError as error:
         print(
             f"verification failed: command not found: {error.filename}", file=sys.stderr
@@ -239,6 +402,9 @@ def main() -> int:
             file=sys.stderr,
         )
         return error.returncode or 1
+    except KeyboardInterrupt:
+        print("verification failed: interrupted", file=sys.stderr)
+        return 130
 
     return 0
 

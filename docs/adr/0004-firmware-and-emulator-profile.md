@@ -19,7 +19,7 @@ selects the original QEMU 11.1.0 and exact-digest policy.
 Stage 1 targets Rust's `x86_64-unknown-uefi` and `aarch64-unknown-uefi` using
 UEFI Simple Text Input/Output and the firmware allocator. The repeatable test
 profile is QEMU 11.1.0 with rust-osdev ovmf-prebuilt
-`edk2-stable202605-r1`: `q35`, `max` TCG CPU, 64 MiB on x86-64; `virt`, GICv2, plus
+`edk2-stable202605-r1`: `q35`, `max` TCG CPU, 128 MiB on x86-64; `virt`, GICv2, plus
 `cortex-a72`, 128 MiB on AArch64. Firmware Simple Text I/O is attached to host standard I/O
 through the 16550-backed console on x86-64 and the PL011-backed console on
 AArch64, with the QEMU monitor disabled. This is firmware console routing, not

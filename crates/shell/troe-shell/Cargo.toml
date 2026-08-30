@@ -7,6 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+troe-abi = { path = "../../common/troe-abi" }
 troe-application = { path = "../../runtime/troe-application" }
 troe-completion = { path = "../../common/troe-completion" }
 troe-core = { path = "../../common/troe-core" }

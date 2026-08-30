@@ -9,13 +9,14 @@ extern crate std;
 mod htree;
 mod journal;
 
+use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::{fmt, str};
 use troe_block::{BlockAccess, BlockDevice, BlockError, BlockRegion};
 use troe_fs_api::{
     DirEntry, FileMetadata, FileSystemProvider, FsError, MAX_NAME_BYTES, MAX_PATH_BYTES, NodeKind,
-    ProviderListing, canonicalize,
+    ProviderListing, WallClock, canonicalize,
 };
 
 const EXT4_MAGIC: u16 = 0xef53;
@@ -26,6 +27,7 @@ const EXT4_ERROR_FS: u16 = 2;
 const EXT4_MAX_BLOCK_BYTES: usize = 4096;
 /// Smallest filesystem block ext4 defines.
 const EXT4_MIN_BLOCK_BYTES: usize = 1024;
+#[cfg(test)]
 const EXT4_BLOCK_BYTES: usize = 4096;
 #[cfg(test)]
 const EXT4_BLOCK_BYTES_U32: u32 = 4096;
@@ -71,12 +73,38 @@ const fn extent_tail_offset(block_bytes: usize) -> usize {
     EXT4_EXTENT_HEADER_BYTES + leaf_extents(block_bytes) * EXT4_EXTENT_RECORD_BYTES
 }
 
-/// Largest extent count a depth-one tree can describe at the given block size.
-const fn max_depth_one_extents(block_bytes: usize) -> usize {
-    leaf_extents(block_bytes) * EXT4_ROOT_INDEXES
+/// Index entries one interior node holds at the given block size.
+///
+/// An index record and an extent record are both twelve bytes behind the same
+/// header and checksum tail, so a node and a leaf hold the same number.
+const fn node_entries(block_bytes: usize) -> usize {
+    leaf_extents(block_bytes)
 }
 
+/// Largest extent count a tree this provider can both write and walk back.
+///
+/// Each level below the inode multiplies the block count by one node's
+/// capacity. The ceiling is not the depth ext4 permits but the per-level tree
+/// block bound the read path enforces, because a tree the reader would refuse
+/// must never be written.
+const fn max_tree_extents(block_bytes: usize) -> usize {
+    let per_node = node_entries(block_bytes);
+    let mut leaves = EXT4_ROOT_INDEXES;
+    let mut depth = 1_u16;
+    while depth < EXT4_MAX_EXTENT_DEPTH {
+        let deeper = leaves * per_node;
+        if deeper > EXT4_MAX_EXTENT_TREE_BLOCKS {
+            break;
+        }
+        leaves = deeper;
+        depth += 1;
+    }
+    leaves * leaf_extents(block_bytes)
+}
+
+#[cfg(test)]
 const EXT4_LEAF_EXTENTS: usize = leaf_extents(EXT4_BLOCK_BYTES);
+#[cfg(test)]
 const EXT4_EXTENT_TAIL_OFFSET: usize =
     EXT4_EXTENT_HEADER_BYTES + EXT4_LEAF_EXTENTS * EXT4_EXTENT_RECORD_BYTES;
 const EXT4_ROOT_INDEXES: usize = 4;
@@ -84,11 +112,33 @@ const EXT4_ROOT_INDEXES: usize = 4;
 const EXT4_MAX_EXTENT_DEPTH: u16 = 5;
 /// Hard ceiling on interior blocks one extent tree may occupy.
 const EXT4_MAX_EXTENT_TREE_BLOCKS: usize = 2048;
+/// Inode offsets of each timestamp: the 32-bit base field and the extra word
+/// whose low two bits extend it past 2038.
+const EXT4_ATIME: (usize, usize) = (8, 140);
+const EXT4_CTIME: (usize, usize) = (12, 132);
+const EXT4_MTIME: (usize, usize) = (16, 136);
+const EXT4_CRTIME: (usize, usize) = (144, 148);
+/// Inode offset of the extra-field size, which says how far the record's
+/// declared fields reach beyond the original 128-byte inode.
+const EXT4_EXTRA_ISIZE_OFFSET: usize = 128;
+/// Bytes of the inode record every ext4 revision defines.
+const EXT4_BASE_INODE_BYTES: usize = 128;
+/// Extra bytes this provider declares on an inode it creates, covering every
+/// timestamp field including the creation time and its epoch bits.
+const EXT4_EXTRA_ISIZE: u16 = 32;
+/// Latest instant a bare 32-bit timestamp field encodes, because ext4 reads it
+/// as signed when the record declares no epoch bits: 2038-01-19T03:14:07Z.
+const EXT4_MAX_BASE_SECONDS: u64 = i32::MAX as u64;
+/// Latest instant the 32-bit field plus two epoch bits encodes, 2446-05-10.
+const EXT4_MAX_EXTENDED_SECONDS: u64 = 0x3_ffff_ffff;
 const EXT4_FT_REG_FILE: u8 = 1;
 const EXT4_FT_DIR: u8 = 2;
 const EXT4_FT_SYMLINK: u8 = 7;
 const EXT4_FAST_SYMLINK_BYTES: usize = 60;
 const MAX_SYMLINK_EXPANSIONS: u8 = 8;
+/// Offset of the `..` record inside a hashed directory's root block, after the
+/// fixed 12-byte `.` record.
+const EXT4_DX_PARENT_OFFSET: usize = 12;
 const EXT4_DIR_TAIL_FT: u8 = 0xde;
 const EXT4_DIR_TAIL_BYTES: usize = 12;
 const EXT4_DIR_TAIL_BYTES_U16: u16 = 12;
@@ -426,11 +476,11 @@ pub struct Ext4<D: BlockDevice> {
     write_defaults: Ext4WriteDefaults,
     journal: Option<JournalGeometry>,
     transaction: Option<Transaction>,
-    /// Seconds since the epoch stamped into mutated inodes.
+    /// Clock this provider stamps into the inodes it mutates.
     ///
-    /// Zero means the owner supplied no clock, in which case timestamps are
-    /// left exactly as they were rather than invented.
-    wall_clock_seconds: u32,
+    /// `None`, or a clock that reports no time, leaves every timestamp exactly
+    /// as it was rather than inventing one.
+    wall_clock: Option<Rc<dyn WallClock>>,
 }
 
 /// Which timestamps one inode write should advance.
@@ -603,7 +653,7 @@ impl<D: BlockDevice> Ext4<D> {
             write_defaults,
             journal: None,
             transaction: None,
-            wall_clock_seconds: 0,
+            wall_clock: None,
         };
         // A half-checkpointed volume may hold a torn root directory that
         // replay is about to restore, so recovery validates the root only
@@ -678,12 +728,12 @@ impl<D: BlockDevice> Ext4<D> {
         })
     }
 
-    /// Supply the wall clock this provider stamps into mutated inodes.
+    /// Wall time to stamp into an inode, or `None` to leave its times alone.
     ///
-    /// Timestamps are left untouched until an owner provides a time, so a
-    /// provider without a clock never invents one.
-    pub const fn set_wall_clock_seconds(&mut self, seconds: u32) {
-        self.wall_clock_seconds = seconds;
+    /// The clock is read here, at the mutation, so a mount never stamps the
+    /// instant it was attached onto a write that happened much later.
+    fn wall_seconds(&self) -> Option<u64> {
+        self.wall_clock.as_ref()?.unix_seconds()
     }
 
     /// Filesystem UUID validated at mount.
@@ -1520,7 +1570,7 @@ impl<D: BlockDevice> Ext4<D> {
                     continue;
                 }
             }
-            if extents.len() >= max_depth_one_extents(block_bytes) {
+            if extents.len() >= max_tree_extents(block_bytes) {
                 return Err(FsError::NoSpace);
             }
             extents.push(Extent {
@@ -1608,15 +1658,18 @@ impl<D: BlockDevice> Ext4<D> {
             122,
             u16::try_from(gid >> 16).map_err(|_| FsError::Overflow)?,
         )?;
-        if self.wall_clock_seconds != 0 {
+        // The extra-field size must be declared before any timestamp is
+        // written, because it is what makes the epoch bits a defined field.
+        put_u16(raw, EXT4_EXTRA_ISIZE_OFFSET, EXT4_EXTRA_ISIZE)?;
+        if let Some(seconds) = self.wall_seconds() {
             // A newly allocated inode is born now, so every time it carries
             // starts at the same instant, including its creation time.
-            for offset in [8_usize, 12, 16, 144] {
-                put_u32(raw, offset, self.wall_clock_seconds)?;
+            for field in [EXT4_ATIME, EXT4_CTIME, EXT4_MTIME, EXT4_CRTIME] {
+                put_inode_time(raw, field, seconds)?;
             }
         }
         put_u32(raw, 100, self.layout.checksum_seed ^ number ^ 0xa5a5_5a5a)?;
-        put_u16(raw, 128, 32)
+        Ok(())
     }
 
     fn inode_sector_count(raw: &[u8]) -> Result<u64, FsError> {
@@ -1714,23 +1767,25 @@ impl<D: BlockDevice> Ext4<D> {
         put_u16(raw, 42, extent_count)
     }
 
+    /// Write the sixty-byte extent root inside one inode record.
+    ///
+    /// `root` is empty for a file whose extents fit in the inode, and is
+    /// otherwise the index entries naming the top level of the tree, each
+    /// paired with the lowest logical block its subtree covers.
     fn encode_inode_extent_records(
         raw: &mut [u8],
         size: u64,
         extents: &[Extent],
-        tree_blocks: &[u32],
+        root: &[(u32, u32)],
+        tree: &ExtentTreePlan,
         metadata_sectors: u64,
         block_bytes: usize,
     ) -> Result<(), FsError> {
         let block_bytes_u64 = u64::try_from(block_bytes).map_err(|_| FsError::Overflow)?;
-        let required_tree_blocks = if extents.len() <= EXT4_INLINE_EXTENTS {
-            0
-        } else {
-            extents.len().div_ceil(leaf_extents(block_bytes))
-        };
-        if extents.len() > max_depth_one_extents(block_bytes)
+        if extents.len() > max_tree_extents(block_bytes)
             || extents.iter().any(|extent| extent.unwritten)
-            || tree_blocks.len() != required_tree_blocks
+            || root.len() != tree.levels.last().copied().unwrap_or(0)
+            || root.len() > EXT4_ROOT_INDEXES
         {
             return Err(FsError::NoSpace);
         }
@@ -1751,7 +1806,7 @@ impl<D: BlockDevice> Ext4<D> {
                 .ok_or(FsError::Overflow)
         })?;
         let sectors = data_blocks
-            .checked_add(u64::try_from(tree_blocks.len()).map_err(|_| FsError::Overflow)?)
+            .checked_add(u64::try_from(tree.total_blocks()).map_err(|_| FsError::Overflow)?)
             .ok_or(FsError::Overflow)?
             .checked_mul(block_bytes_u64 / 512)
             .and_then(|data| data.checked_add(metadata_sectors))
@@ -1770,7 +1825,7 @@ impl<D: BlockDevice> Ext4<D> {
         raw[40..100].fill(0);
         put_u16(raw, 40, EXT4_EXT_MAGIC)?;
         put_u16(raw, 44, 4)?;
-        if tree_blocks.is_empty() {
+        if root.is_empty() {
             put_u16(
                 raw,
                 42,
@@ -1789,23 +1844,67 @@ impl<D: BlockDevice> Ext4<D> {
             put_u16(
                 raw,
                 42,
-                u16::try_from(tree_blocks.len()).map_err(|_| FsError::Overflow)?,
+                u16::try_from(root.len()).map_err(|_| FsError::Overflow)?,
             )?;
-            put_u16(raw, 46, 1)?;
-            for (index, block) in tree_blocks.iter().copied().enumerate() {
-                let first_extent = extents
-                    .get(index * leaf_extents(block_bytes))
-                    .ok_or(FsError::Corrupt)?;
+            put_u16(raw, 46, tree.depth()?)?;
+            for (index, (logical, block)) in root.iter().copied().enumerate() {
                 let offset = 52_usize
                     .checked_add(index.checked_mul(12).ok_or(FsError::Overflow)?)
                     .ok_or(FsError::Overflow)?;
-                put_u32(raw, offset, first_extent.logical)?;
+                put_u32(raw, offset, logical)?;
                 put_u32(raw, offset + 4, block)?;
                 put_u16(raw, offset + 8, 0)?;
                 put_u16(raw, offset + 10, 0)?;
             }
         }
         Ok(())
+    }
+
+    /// Write one interior node of an extent tree.
+    fn encode_extent_index_block(
+        raw: &mut [u8],
+        depth: u16,
+        children: &[(u32, u32)],
+        checksum_seed: u32,
+        inode_number: u32,
+        inode_generation: u32,
+    ) -> Result<(), FsError> {
+        if children.is_empty() || children.len() > node_entries(raw.len()) || depth == 0 {
+            return Err(FsError::Invalid);
+        }
+        raw.fill(0);
+        put_u16(raw, 0, EXT4_EXT_MAGIC)?;
+        put_u16(
+            raw,
+            2,
+            u16::try_from(children.len()).map_err(|_| FsError::Overflow)?,
+        )?;
+        put_u16(
+            raw,
+            4,
+            u16::try_from(node_entries(raw.len())).map_err(|_| FsError::Overflow)?,
+        )?;
+        put_u16(raw, 6, depth)?;
+        for (index, (logical, block)) in children.iter().copied().enumerate() {
+            let offset = EXT4_EXTENT_HEADER_BYTES
+                .checked_add(
+                    index
+                        .checked_mul(EXT4_EXTENT_RECORD_BYTES)
+                        .ok_or(FsError::Overflow)?,
+                )
+                .ok_or(FsError::Overflow)?;
+            put_u32(raw, offset, logical)?;
+            put_u32(raw, offset + 4, block)?;
+            put_u16(raw, offset + 8, 0)?;
+            put_u16(raw, offset + 10, 0)?;
+        }
+        let inode_seed = crc32c(
+            crc32c(checksum_seed, &inode_number.to_le_bytes()),
+            &inode_generation.to_le_bytes(),
+        );
+        let tail_offset = extent_tail_offset(raw.len());
+        let checksum = crc32c(inode_seed, raw.get(..tail_offset).ok_or(FsError::Corrupt)?);
+        put_u32(raw, tail_offset, checksum)
     }
 
     fn encode_extent_leaf(
@@ -1853,12 +1952,12 @@ impl<D: BlockDevice> Ext4<D> {
         number: u32,
         touch: InodeTouch,
     ) -> Result<(), FsError> {
-        if self.wall_clock_seconds != 0 {
+        if let Some(seconds) = self.wall_seconds() {
             // The change time advances on every inode write; the modification
             // time only when the file's contents actually changed.
-            put_u32(raw, 12, self.wall_clock_seconds)?;
+            put_inode_time(raw, EXT4_CTIME, seconds)?;
             if touch == InodeTouch::Content {
-                put_u32(raw, 16, self.wall_clock_seconds)?;
+                put_inode_time(raw, EXT4_MTIME, seconds)?;
             }
         }
         raw[124..126].fill(0);
@@ -1939,41 +2038,30 @@ impl<D: BlockDevice> Ext4<D> {
         if existing.number != number || existing.kind != kind {
             return Err(FsError::Corrupt);
         }
-        let tree_count = if extents.len() <= EXT4_INLINE_EXTENTS {
-            0
-        } else {
-            extents
-                .len()
-                .div_ceil(leaf_extents(self.layout.block_bytes))
-        };
-        if tree_count > EXT4_ROOT_INDEXES {
-            return Err(FsError::NoSpace);
-        }
-        let reuse_tree = tree_count != 0 && tree_count == existing.extent_tree_blocks.len();
-        let tree_blocks = if reuse_tree {
+        let tree = ExtentTreePlan::new(extents.len(), self.layout.block_bytes)?;
+        // A tree of the same shape is rewritten in place. Any other shape is
+        // built beside the old one and the old one released only after the
+        // inode names the new tree, so a failure leaves the file intact.
+        let previous = ExtentTreePlan::new(existing.extents.len(), self.layout.block_bytes).ok();
+        let reuse = tree.depth()? == 1
+            && previous.as_ref() == Some(&tree)
+            && existing.extent_depth == 1
+            && existing.extent_tree_blocks.len() == tree.total_blocks();
+        let blocks = if reuse {
             existing.extent_tree_blocks.clone()
         } else {
-            let tree_zeroes = alloc::vec![0_u8; tree_count * self.layout.block_bytes];
-            self.allocate_file_blocks(&tree_zeroes)?
+            self.allocate_metadata_blocks(tree.total_blocks())?
         };
-        for (index, block) in tree_blocks.iter().copied().enumerate() {
-            let start = index * leaf_extents(self.layout.block_bytes);
-            let end = (start + leaf_extents(self.layout.block_bytes)).min(extents.len());
-            let mut leaf = alloc::vec![0_u8; self.layout.block_bytes];
-            Self::encode_extent_leaf(
-                &mut leaf,
-                &extents[start..end],
-                self.layout.checksum_seed,
-                number,
-                existing.generation,
-            )?;
-            if let Err(error) = self.write_fs_block(block, &leaf) {
-                if !reuse_tree {
-                    let _ignored = self.release_blocks(&tree_blocks);
+        let outcome = self.write_extent_tree(number, existing.generation, extents, &tree, &blocks);
+        let root = match outcome {
+            Ok(root) => root,
+            Err(error) => {
+                if !reuse {
+                    let _ignored = self.release_blocks(&blocks);
                 }
                 return Err(error);
             }
-        }
+        };
         let (table_block, offset) = self.inode_record_location(number)?;
         let mut table = self.read_fs_block(table_block)?;
         let raw = table
@@ -1984,34 +2072,37 @@ impl<D: BlockDevice> Ext4<D> {
                 .checked_add(u64::from(extent.blocks))
                 .ok_or(FsError::Overflow)
         })?;
+        let existing_tree_blocks = existing
+            .extent_tree_blocks
+            .len()
+            .checked_add(existing.interior_extent_blocks.len())
+            .ok_or(FsError::Overflow)?;
         let allocated_sectors = data_blocks
-            .checked_add(
-                u64::try_from(existing.extent_tree_blocks.len()).map_err(|_| FsError::Overflow)?,
-            )
+            .checked_add(u64::try_from(existing_tree_blocks).map_err(|_| FsError::Overflow)?)
             .and_then(|blocks| blocks.checked_mul(self.layout.block_bytes_u64 / 512))
             .ok_or(FsError::Overflow)?;
         let metadata_sectors = Self::inode_sector_count(raw)?
             .checked_sub(allocated_sectors)
             .ok_or(FsError::Corrupt)?;
-        Self::encode_inode_extent_records(
+        let encoded = Self::encode_inode_extent_records(
             raw,
             size,
             extents,
-            &tree_blocks,
+            &root,
+            &tree,
             metadata_sectors,
             self.layout.block_bytes,
-        )?;
-        self.refresh_inode_checksum(raw, number, InodeTouch::Content)?;
-        if let Err(error) = self
-            .write_fs_block(table_block, &table)
-            .and_then(|()| self.durability_barrier())
-        {
-            if !reuse_tree {
-                let _ignored = self.release_blocks(&tree_blocks);
+        )
+        .and_then(|()| self.refresh_inode_checksum(raw, number, InodeTouch::Content))
+        .and_then(|()| self.write_fs_block(table_block, &table))
+        .and_then(|()| self.durability_barrier());
+        if let Err(error) = encoded {
+            if !reuse {
+                let _ignored = self.release_blocks(&blocks);
             }
             return Err(error);
         }
-        if reuse_tree {
+        if reuse {
             Ok(())
         } else {
             // Release every level, not just the leaves, so a deeper tree
@@ -2019,6 +2110,105 @@ impl<D: BlockDevice> Ext4<D> {
             self.release_blocks(&existing.interior_extent_blocks)?;
             self.release_blocks(&existing.extent_tree_blocks)
         }
+    }
+
+    /// Fill a planned extent tree and return the entries the inode root names.
+    ///
+    /// `blocks` is the planned block count taken level by level, leaves first.
+    /// Each level is written from the level below it, so an interior node
+    /// records the lowest logical block of every subtree it covers.
+    fn write_extent_tree(
+        &mut self,
+        number: u32,
+        generation: u32,
+        extents: &[Extent],
+        tree: &ExtentTreePlan,
+        blocks: &[u32],
+    ) -> Result<Vec<(u32, u32)>, FsError> {
+        let mut root = Vec::new();
+        if tree.levels.is_empty() {
+            return Ok(root);
+        }
+        let per_node = node_entries(self.layout.block_bytes);
+        let mut taken = 0_usize;
+        let mut children: Vec<(u32, u32)> = Vec::new();
+        for (level, count) in tree.levels.iter().copied().enumerate() {
+            let level_blocks = blocks
+                .get(taken..taken.checked_add(count).ok_or(FsError::Overflow)?)
+                .ok_or(FsError::Corrupt)?;
+            taken = taken.checked_add(count).ok_or(FsError::Overflow)?;
+            let mut parents = Vec::new();
+            parents
+                .try_reserve_exact(count)
+                .map_err(|_| FsError::NoSpace)?;
+            let mut raw = alloc::vec![0_u8; self.layout.block_bytes];
+            for (index, block) in level_blocks.iter().copied().enumerate() {
+                let start = index.checked_mul(per_node).ok_or(FsError::Overflow)?;
+                let lowest = if level == 0 {
+                    let end = start
+                        .checked_add(per_node)
+                        .ok_or(FsError::Overflow)?
+                        .min(extents.len());
+                    let leaf = extents.get(start..end).ok_or(FsError::Corrupt)?;
+                    Self::encode_extent_leaf(
+                        &mut raw,
+                        leaf,
+                        self.layout.checksum_seed,
+                        number,
+                        generation,
+                    )?;
+                    leaf.first().ok_or(FsError::Corrupt)?.logical
+                } else {
+                    let end = start
+                        .checked_add(per_node)
+                        .ok_or(FsError::Overflow)?
+                        .min(children.len());
+                    let node = children.get(start..end).ok_or(FsError::Corrupt)?;
+                    Self::encode_extent_index_block(
+                        &mut raw,
+                        u16::try_from(level).map_err(|_| FsError::Overflow)?,
+                        node,
+                        self.layout.checksum_seed,
+                        number,
+                        generation,
+                    )?;
+                    node.first().ok_or(FsError::Corrupt)?.0
+                };
+                self.write_fs_block(block, &raw)?;
+                parents.push((lowest, block));
+            }
+            children = parents;
+        }
+        if taken != blocks.len() {
+            return Err(FsError::Corrupt);
+        }
+        root.try_reserve_exact(children.len())
+            .map_err(|_| FsError::NoSpace)?;
+        root.extend_from_slice(&children);
+        Ok(root)
+    }
+
+    /// Reserve blocks for metadata without materializing their contents.
+    ///
+    /// A deep extent tree can run to thousands of blocks, so the caller writes
+    /// each one's real bytes rather than staging that many zeroes first.
+    fn allocate_metadata_blocks(&mut self, count: usize) -> Result<Vec<u32>, FsError> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let blocks = self.find_free_blocks(count)?;
+        let mut allocated = 0_usize;
+        while allocated < blocks.len() {
+            if let Err(error) = self.set_block_allocated(blocks[allocated], true) {
+                for block in &blocks[..allocated] {
+                    let _ignored = self.set_block_allocated(*block, false);
+                }
+                return Err(error);
+            }
+            allocated += 1;
+        }
+        self.durability_barrier()?;
+        Ok(blocks)
     }
 
     fn append_regular_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), FsError> {
@@ -2500,29 +2690,365 @@ impl<D: BlockDevice> Ext4<D> {
     /// Placing a record anywhere else would leave the index describing the
     /// wrong leaf, so a name whose hash cannot be reproduced is refused.
     fn hashed_target_leaf(&mut self, directory: &Inode, name: &str) -> Result<u32, FsError> {
+        Ok(self.hashed_path(directory, name)?.leaf)
+    }
+
+    /// Walk the index to a name's leaf, keeping the entry followed at each
+    /// level so a split can insert its separator exactly beside it.
+    fn hashed_path(&mut self, directory: &Inode, name: &str) -> Result<HashedPath, FsError> {
         let hashing = self.directory_hash()?;
         let seed = self.inode_checksum_seed(directory);
         let root_block = self.directory_block(directory, 0)?;
         let root = htree::parse_root(&root_block, seed, crc32c)?;
-        let value = hashing.hash(name.as_bytes(), root.hash_version)?;
-        let select = |entries: &[htree::DxEntry]| -> Result<u32, FsError> {
-            let mut chosen = entries.first().ok_or(FsError::Corrupt)?.block;
-            for entry in entries {
-                if entry.hash <= value {
-                    chosen = entry.block;
-                } else {
-                    break;
-                }
-            }
-            Ok(chosen)
-        };
-        let first = select(&root.entries)?;
+        let hash = hashing.hash(name.as_bytes(), root.hash_version)?;
+        let root_index = covering_entry(&root.entries, hash)?;
+        let followed = *root.entries.get(root_index).ok_or(FsError::Corrupt)?;
         if root.indirect_levels == 0 {
-            return Ok(first);
+            return Ok(HashedPath {
+                root: root.entries,
+                root_index,
+                node: None,
+                leaf: followed.block,
+            });
         }
-        let node_block = self.directory_block(directory, first)?;
-        let node = htree::parse_node(&node_block, seed, crc32c)?;
-        select(&node)
+        let node_block = self.directory_block(directory, followed.block)?;
+        let entries = htree::parse_node(&node_block, seed, crc32c)?;
+        let index = covering_entry(&entries, hash)?;
+        let leaf = entries.get(index).ok_or(FsError::Corrupt)?.block;
+        Ok(HashedPath {
+            root: root.entries,
+            root_index,
+            node: Some(HashedNode {
+                logical: followed.block,
+                entries,
+                index,
+            }),
+            leaf,
+        })
+    }
+
+    /// Split the full leaf a name maps to and rewrite the index over both
+    /// halves.
+    ///
+    /// Records are redistributed by hash so that every name still lands in the
+    /// leaf its own hash selects, and the separator is inserted beside the
+    /// entry the walk followed. A parent with no room splits in turn: a root
+    /// still addressing leaves directly grows one level of interior nodes, and
+    /// a full interior node splits under a root that still has room.
+    fn split_hashed_leaf(&mut self, directory: &Inode, name: &str) -> Result<(), FsError> {
+        let seed = self.inode_checksum_seed(directory);
+        let path = self.hashed_path(directory, name)?;
+        let hashing = self.directory_hash()?;
+        let root_block = self.directory_block(directory, 0)?;
+        let hash_version = htree::parse_root(&root_block, seed, crc32c)?.hash_version;
+
+        let leaf_block = self.directory_block(directory, path.leaf)?;
+        verify_directory_checksum(self.layout.checksum_seed, directory, &leaf_block)?;
+        let mut records = Vec::new();
+        for record in read_directory_records(&leaf_block)? {
+            let hash = hashing.hash(&record.name, hash_version)?;
+            records.try_reserve(1).map_err(|_| FsError::NoSpace)?;
+            records.push((hash, record));
+        }
+        // A hash decides a record's leaf, so redistribution is by hash and the
+        // order within one hash does not matter.
+        records.sort_by_key(|(hash, _)| *hash);
+        let boundary = balanced_hash_boundary(&records)?;
+        let separator = records.get(boundary).ok_or(FsError::Corrupt)?.0;
+
+        // Refuse before allocating anything when the index cannot describe the
+        // extra leaf however the parents are rearranged.
+        let plan = self.plan_index_growth(&path)?;
+        let base_logical = u32::try_from(directory.size / self.layout.block_bytes_u64)
+            .map_err(|_| FsError::Overflow)?;
+        let zeroes = alloc::vec![0_u8; plan.blocks * self.layout.block_bytes];
+        let physical = self.allocate_file_blocks(&zeroes)?;
+        if physical.len() != plan.blocks {
+            let _ignored = self.release_blocks(&physical);
+            return Err(FsError::Corrupt);
+        }
+        let new_leaf = base_logical;
+        let new_index_block = base_logical.checked_add(1).ok_or(FsError::Overflow)?;
+
+        let outcome = self.write_hashed_split(
+            directory,
+            &path,
+            &records,
+            boundary,
+            separator,
+            plan,
+            (new_leaf, new_index_block),
+            &physical,
+            base_logical,
+        );
+        if outcome.is_err() {
+            let _ignored = self.release_blocks(&physical);
+        }
+        outcome
+    }
+
+    /// Decide how the index must change to describe one more leaf.
+    fn plan_index_growth(&mut self, path: &HashedPath) -> Result<IndexGrowth, FsError> {
+        let root_capacity =
+            htree::entry_capacity(self.layout.block_bytes, htree::DX_ROOT_COUNT_OFFSET)?;
+        let node_capacity =
+            htree::entry_capacity(self.layout.block_bytes, htree::DX_NODE_COUNT_OFFSET)?;
+        match path.node.as_ref() {
+            None if path.root.len() < root_capacity => Ok(IndexGrowth {
+                shape: IndexShape::RootHasRoom,
+                blocks: 1,
+            }),
+            // A root addressing leaves directly cannot hold another separator,
+            // so its entries move down into one interior node. They always fit:
+            // a node's array starts earlier in the block than a root's.
+            None => Ok(IndexGrowth {
+                shape: IndexShape::DeepenRoot,
+                blocks: 2,
+            }),
+            Some(node) if node.entries.len() < node_capacity => Ok(IndexGrowth {
+                shape: IndexShape::NodeHasRoom,
+                blocks: 1,
+            }),
+            Some(_) if path.root.len() < root_capacity => Ok(IndexGrowth {
+                shape: IndexShape::SplitNode,
+                blocks: 2,
+            }),
+            // Both levels are full, and ext4 defines no third one here.
+            Some(_) => Err(FsError::NoSpace),
+        }
+    }
+
+    /// Write both halves of the split leaf and the index that describes them.
+    #[allow(clippy::too_many_arguments)]
+    fn write_hashed_split(
+        &mut self,
+        directory: &Inode,
+        path: &HashedPath,
+        records: &[(u32, DirectoryRecord)],
+        boundary: usize,
+        separator: u32,
+        plan: IndexGrowth,
+        logicals: (u32, u32),
+        physical: &[u32],
+        base_logical: u32,
+    ) -> Result<(), FsError> {
+        let (new_leaf, new_index_block) = logicals;
+        let (lower, upper) = records.split_at(boundary);
+        for (blocks, target) in [(lower, path.leaf), (upper, new_leaf)] {
+            let mut block = alloc::vec![0_u8; self.layout.block_bytes];
+            self.pack_directory_leaf(&mut block, blocks)?;
+            refresh_directory_checksum(self.layout.checksum_seed, directory, &mut block)?;
+            let physical_target = if target == new_leaf {
+                *physical.first().ok_or(FsError::Corrupt)?
+            } else {
+                let (found, false) = map_block(directory, target)?.ok_or(FsError::Corrupt)? else {
+                    return Err(FsError::Corrupt);
+                };
+                found
+            };
+            self.write_fs_block(physical_target, &block)?;
+        }
+
+        self.apply_index_growth(
+            directory,
+            path,
+            plan.shape,
+            (new_leaf, new_index_block),
+            separator,
+            physical,
+        )?;
+
+        let mut extents = directory.extents.clone();
+        Self::append_physical_blocks(
+            &mut extents,
+            base_logical,
+            physical,
+            self.layout.block_bytes,
+        )?;
+        let size = directory
+            .size
+            .checked_add(
+                u64::try_from(plan.blocks)
+                    .ok()
+                    .and_then(|blocks| blocks.checked_mul(self.layout.block_bytes_u64))
+                    .ok_or(FsError::Overflow)?,
+            )
+            .ok_or(FsError::Overflow)?;
+        self.write_inode_extent_records(
+            directory.number,
+            NodeKind::Directory,
+            size,
+            &extents,
+            directory,
+        )?;
+        self.durability_barrier()
+    }
+
+    /// Rearrange the index levels so they describe the new leaf.
+    ///
+    /// The separator goes directly beside the entry the walk followed, and a
+    /// parent with no room for it is reshaped first.
+    fn apply_index_growth(
+        &mut self,
+        directory: &Inode,
+        path: &HashedPath,
+        shape: IndexShape,
+        logicals: (u32, u32),
+        separator: u32,
+        physical: &[u32],
+    ) -> Result<(), FsError> {
+        let (new_leaf, new_index_block) = logicals;
+        let entry = htree::DxEntry {
+            hash: separator,
+            block: new_leaf,
+        };
+        match shape {
+            IndexShape::RootHasRoom => {
+                let mut entries = path.root.clone();
+                insert_index_entry(&mut entries, path.root_index, entry)?;
+                self.write_index_root(directory, &entries, 0)?;
+            }
+            IndexShape::DeepenRoot => {
+                let mut entries = path.root.clone();
+                insert_index_entry(&mut entries, path.root_index, entry)?;
+                let node = *physical.get(1).ok_or(FsError::Corrupt)?;
+                self.write_index_node(directory, node, &entries)?;
+                self.write_index_root(
+                    directory,
+                    &[htree::DxEntry {
+                        hash: 0,
+                        block: new_index_block,
+                    }],
+                    1,
+                )?;
+            }
+            IndexShape::NodeHasRoom => {
+                let node = path.node.as_ref().ok_or(FsError::Corrupt)?;
+                let mut entries = node.entries.clone();
+                insert_index_entry(&mut entries, node.index, entry)?;
+                let (found, false) = map_block(directory, node.logical)?.ok_or(FsError::Corrupt)?
+                else {
+                    return Err(FsError::Corrupt);
+                };
+                self.write_index_node(directory, found, &entries)?;
+            }
+            IndexShape::SplitNode => {
+                let node = path.node.as_ref().ok_or(FsError::Corrupt)?;
+                let mut entries = node.entries.clone();
+                insert_index_entry(&mut entries, node.index, entry)?;
+                let middle = entries.len() / 2;
+                let promoted = entries.get(middle).ok_or(FsError::Corrupt)?.hash;
+                let mut upper = Vec::new();
+                upper
+                    .try_reserve_exact(entries.len() - middle)
+                    .map_err(|_| FsError::NoSpace)?;
+                upper.extend_from_slice(entries.get(middle..).ok_or(FsError::Corrupt)?);
+                entries.truncate(middle);
+                // The first entry of a node covers everything below the second,
+                // so the hash it was carrying is what the parent records.
+                upper.first_mut().ok_or(FsError::Corrupt)?.hash = 0;
+                let (found, false) = map_block(directory, node.logical)?.ok_or(FsError::Corrupt)?
+                else {
+                    return Err(FsError::Corrupt);
+                };
+                self.write_index_node(directory, found, &entries)?;
+                self.write_index_node(
+                    directory,
+                    *physical.get(1).ok_or(FsError::Corrupt)?,
+                    &upper,
+                )?;
+                let mut root = path.root.clone();
+                insert_index_entry(
+                    &mut root,
+                    path.root_index,
+                    htree::DxEntry {
+                        hash: promoted,
+                        block: new_index_block,
+                    },
+                )?;
+                self.write_index_root(directory, &root, 1)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Lay a set of records out from the start of one empty leaf block.
+    fn pack_directory_leaf(
+        &self,
+        block: &mut [u8],
+        records: &[(u32, DirectoryRecord)],
+    ) -> Result<(), FsError> {
+        let tail_offset = self.layout.block_bytes - EXT4_DIR_TAIL_BYTES;
+        let mut offset = 0_usize;
+        for (index, (_, record)) in records.iter().enumerate() {
+            let minimum = directory_record_bytes(record.name.len())?;
+            // The last record's length runs to the tail so that the block is
+            // one unbroken chain of records.
+            let bytes = if index + 1 == records.len() {
+                tail_offset.checked_sub(offset).ok_or(FsError::NoSpace)?
+            } else {
+                minimum
+            };
+            if bytes < minimum {
+                return Err(FsError::NoSpace);
+            }
+            write_directory_record(
+                block,
+                offset,
+                bytes,
+                record.inode,
+                &record.name,
+                record.file_type,
+            )?;
+            offset = offset.checked_add(bytes).ok_or(FsError::Overflow)?;
+        }
+        if records.is_empty() {
+            write_directory_record(block, 0, tail_offset, 0, &[], 0)?;
+        }
+        initialize_directory_tail(block)
+    }
+
+    /// Rewrite the index root over a new entry array.
+    fn write_index_root(
+        &mut self,
+        directory: &Inode,
+        entries: &[htree::DxEntry],
+        indirect_levels: u8,
+    ) -> Result<(), FsError> {
+        let seed = self.inode_checksum_seed(directory);
+        let (physical, false) = map_block(directory, 0)?.ok_or(FsError::Corrupt)? else {
+            return Err(FsError::Corrupt);
+        };
+        let mut block = self.read_fs_block(physical)?;
+        htree::set_indirect_levels(&mut block, indirect_levels)?;
+        htree::write_entries(
+            &mut block,
+            htree::DX_ROOT_COUNT_OFFSET,
+            entries,
+            seed,
+            crc32c,
+        )?;
+        self.write_fs_block(physical, &block)
+    }
+
+    /// Write one interior index node over a physical block.
+    fn write_index_node(
+        &mut self,
+        directory: &Inode,
+        physical: u32,
+        entries: &[htree::DxEntry],
+    ) -> Result<(), FsError> {
+        let seed = self.inode_checksum_seed(directory);
+        let mut block = alloc::vec![0_u8; self.layout.block_bytes];
+        htree::initialize_node(&mut block)?;
+        htree::write_entries(
+            &mut block,
+            htree::DX_NODE_COUNT_OFFSET,
+            entries,
+            seed,
+            crc32c,
+        )?;
+        self.write_fs_block(physical, &block)
     }
 
     /// Read the filesystem-wide inputs to a directory name hash.
@@ -2818,9 +3344,27 @@ impl<D: BlockDevice> Ext4<D> {
             }
         }
         if directory.indexed {
-            // The target leaf is full. Splitting it means rewriting the index,
-            // which this provider does not do, so the insert is refused rather
-            // than placed where the index cannot find it.
+            // The target leaf is full, so it splits and the index is rewritten
+            // to describe both halves. The name is then placed by the same walk
+            // as before, into whichever half now covers its hash.
+            self.split_hashed_leaf(directory, name)?;
+            let grown = self.read_inode(directory.number)?;
+            let leaf = self.hashed_target_leaf(&grown, name)?;
+            let (physical, false) = map_block(&grown, leaf)?.ok_or(FsError::Corrupt)? else {
+                return Err(FsError::Corrupt);
+            };
+            if self.try_add_directory_entry_to_block(
+                &grown,
+                physical,
+                name,
+                inode_number,
+                required,
+                file_type,
+            )? {
+                return Ok(());
+            }
+            // The split ran but left no room in the half this name belongs to,
+            // which takes an uneven division forced by records sharing a hash.
             return Err(FsError::NoSpace);
         }
 
@@ -2927,13 +3471,14 @@ impl<D: BlockDevice> Ext4<D> {
         directory: &Inode,
         parent_number: u32,
     ) -> Result<(), FsError> {
-        // Records live in leaf blocks the index maps by name hash, so a linear
-        // insert or removal would leave the index describing the wrong leaf.
-        if directory.indexed {
-            return Err(FsError::Unsupported);
-        }
         if directory.kind != NodeKind::Directory {
             return Err(FsError::WrongType);
+        }
+        // An indexed directory keeps `..` in its root block, where the record
+        // that holds it spans the index and the block carries the index
+        // checksum rather than a linear directory tail.
+        if directory.indexed {
+            return self.update_indexed_directory_parent(directory, parent_number);
         }
         let (physical, false) = map_block(directory, 0)?.ok_or(FsError::Corrupt)? else {
             return Err(FsError::Corrupt);
@@ -2966,6 +3511,37 @@ impl<D: BlockDevice> Ext4<D> {
             offset = offset.checked_add(record_bytes).ok_or(FsError::Overflow)?;
         }
         Err(FsError::Corrupt)
+    }
+
+    /// Repoint `..` inside the root block of a hashed directory.
+    ///
+    /// The root's `..` record spans the rest of the block so an unaware reader
+    /// sees nothing past it, so the record is located by the layout the index
+    /// fixes rather than by walking record lengths. The inode field sits inside
+    /// the range the index checksum covers, so the entries are rewritten
+    /// unchanged to refresh it.
+    fn update_indexed_directory_parent(
+        &mut self,
+        directory: &Inode,
+        parent_number: u32,
+    ) -> Result<(), FsError> {
+        let seed = self.inode_checksum_seed(directory);
+        let (physical, false) = map_block(directory, 0)?.ok_or(FsError::Corrupt)? else {
+            return Err(FsError::Corrupt);
+        };
+        let mut block = self.read_fs_block(physical)?;
+        let root = htree::parse_root(&block, seed, crc32c)?;
+        put_u32(&mut block, EXT4_DX_PARENT_OFFSET, parent_number)?;
+        htree::set_indirect_levels(&mut block, root.indirect_levels)?;
+        htree::write_entries(
+            &mut block,
+            htree::DX_ROOT_COUNT_OFFSET,
+            &root.entries,
+            seed,
+            crc32c,
+        )?;
+        self.write_fs_block(physical, &block)?;
+        self.durability_barrier()
     }
 }
 
@@ -3111,24 +3687,28 @@ impl<D: BlockDevice> FileSystemProvider for Ext4<D> {
                 return Err(FsError::WrongType);
             }
             let old_extents = inode.extents.clone();
-            let old_tree_blocks = inode.extent_tree_blocks.clone();
             self.begin_mutation()?;
             let new_blocks = self.allocate_file_blocks(bytes)?;
-            if let Err(error) = self
-                .write_inode_extents(
-                    inode.number,
-                    NodeKind::File,
-                    u64::try_from(bytes.len()).map_err(|_| FsError::Overflow)?,
-                    &new_blocks,
-                    false,
-                )
-                .and_then(|()| self.durability_barrier())
+            // The replacement goes through the tree writer rather than the
+            // inline encoder, because the file being replaced may itself be
+            // described by a tree whose every level has to be released.
+            let mut extents = Vec::new();
+            if let Err(error) =
+                Self::append_physical_blocks(&mut extents, 0, &new_blocks, self.layout.block_bytes)
+                    .and_then(|()| {
+                        self.write_inode_extent_records(
+                            inode.number,
+                            NodeKind::File,
+                            u64::try_from(bytes.len()).map_err(|_| FsError::Overflow)?,
+                            &extents,
+                            &inode,
+                        )
+                    })
             {
                 let _ignored = self.release_blocks(&new_blocks);
                 return Err(error);
             }
             self.release_extents(&old_extents)?;
-            self.release_blocks(&old_tree_blocks)?;
             return self.finish_mutation();
         }
 
@@ -3297,6 +3877,10 @@ impl<D: BlockDevice> FileSystemProvider for Ext4<D> {
         }
         self.release_extents(&inode.extents)?;
         self.release_blocks(&inode.extent_tree_blocks)?;
+        self.release_blocks(&inode.interior_extent_blocks)?;
+        // The inode record is zeroed rather than left with `i_dtime` set:
+        // nothing in this profile reads a freed record, so a deletion time in
+        // one whose mode and link count are already zero records nothing.
         self.clear_inode_record(inode.number)?;
         self.set_inode_allocated(inode.number, false)?;
         self.durability_barrier()?;
@@ -3343,6 +3927,7 @@ impl<D: BlockDevice> FileSystemProvider for Ext4<D> {
         self.update_inode_links(parent.number, parent_links, next_parent_links)?;
         self.release_extents(&directory.extents)?;
         self.release_blocks(&directory.extent_tree_blocks)?;
+        self.release_blocks(&directory.interior_extent_blocks)?;
         self.clear_inode_record(directory.number)?;
         self.set_directory_allocated(directory.number, false)?;
         self.set_inode_allocated(directory.number, false)?;
@@ -3518,6 +4103,10 @@ impl<D: BlockDevice> FileSystemProvider for Ext4<D> {
         self.update_inode_links(inode.number, links, replacement)?;
         self.durability_barrier()?;
         self.finish_mutation()
+    }
+
+    fn set_wall_clock(&mut self, clock: Rc<dyn WallClock>) {
+        self.wall_clock = Some(clock);
     }
 }
 
@@ -3987,15 +4576,18 @@ fn parse_extent_leaf(
         return Err(FsError::Unsupported);
     }
     let count = usize::from(read_u16(raw, 2)?);
-    if count == 0 || count > EXT4_LEAF_EXTENTS {
+    if count == 0 || count > leaf_extents(raw.len()) {
         return Err(FsError::Corrupt);
     }
-    let stored_checksum = read_u32(raw, EXT4_EXTENT_TAIL_OFFSET)?;
+    // The tail sits after as many records as this block size holds, which is
+    // not the same place at every block size the profile reads.
+    let tail_offset = extent_tail_offset(raw.len());
+    let stored_checksum = read_u32(raw, tail_offset)?;
     let inode_seed = crc32c(
         crc32c(checksum_seed, &inode_number.to_le_bytes()),
         &inode_generation.to_le_bytes(),
     );
-    if stored_checksum != crc32c(inode_seed, &raw[..EXT4_EXTENT_TAIL_OFFSET]) {
+    if stored_checksum != crc32c(inode_seed, raw.get(..tail_offset).ok_or(FsError::Corrupt)?) {
         return Err(FsError::Corrupt);
     }
     let mut extents = Vec::new();
@@ -4143,6 +4735,222 @@ fn parse_directory_block(
         return Err(FsError::Corrupt);
     }
     Ok(())
+}
+
+/// The shape of one extent tree: how many blocks each level holds.
+///
+/// Levels run leaves first, so the last entry is the level the inode's own
+/// sixty-byte root names directly. An empty plan means the extents fit in the
+/// inode with no tree at all.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExtentTreePlan {
+    levels: Vec<usize>,
+}
+
+impl ExtentTreePlan {
+    /// Plan the shallowest tree that describes this many extents.
+    ///
+    /// Levels are added until the top one fits in the inode's four records.
+    /// A level wider than the read path's tree-block bound, or a tree deeper
+    /// than ext4 defines, is refused here rather than written and then found
+    /// unreadable.
+    fn new(extents: usize, block_bytes: usize) -> Result<Self, FsError> {
+        let mut levels = Vec::new();
+        if extents <= EXT4_INLINE_EXTENTS {
+            return Ok(Self { levels });
+        }
+        let mut count = extents.div_ceil(leaf_extents(block_bytes));
+        loop {
+            if count > EXT4_MAX_EXTENT_TREE_BLOCKS
+                || levels.len() >= usize::from(EXT4_MAX_EXTENT_DEPTH)
+            {
+                return Err(FsError::NoSpace);
+            }
+            levels.try_reserve(1).map_err(|_| FsError::NoSpace)?;
+            levels.push(count);
+            if count <= EXT4_ROOT_INDEXES {
+                return Ok(Self { levels });
+            }
+            count = count.div_ceil(node_entries(block_bytes));
+        }
+    }
+
+    /// Depth recorded in the inode's extent header.
+    fn depth(&self) -> Result<u16, FsError> {
+        u16::try_from(self.levels.len()).map_err(|_| FsError::Overflow)
+    }
+
+    /// Blocks the whole tree occupies, across every level.
+    fn total_blocks(&self) -> usize {
+        self.levels.iter().sum()
+    }
+}
+
+/// One live directory record, detached from the block it was read out of.
+struct DirectoryRecord {
+    inode: u32,
+    file_type: u8,
+    name: Vec<u8>,
+}
+
+/// The path the index took to one leaf.
+///
+/// A split needs more than the leaf: it must place the new separator beside
+/// the entry the walk actually followed at each level.
+struct HashedPath {
+    /// Entries of the index root, in ascending hash order.
+    root: Vec<htree::DxEntry>,
+    /// Root entry whose subtree covers the hash.
+    root_index: usize,
+    /// Interior node the walk followed, when the tree has a level of them.
+    node: Option<HashedNode>,
+    /// Logical block of the leaf the hash maps to.
+    leaf: u32,
+}
+
+/// One interior index node the walk descended through.
+struct HashedNode {
+    /// Logical block of the node within the directory.
+    logical: u32,
+    /// Entries of the node, in ascending hash order.
+    entries: Vec<htree::DxEntry>,
+    /// Node entry whose leaf covers the hash.
+    index: usize,
+}
+
+/// How the index must change to describe one more leaf.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IndexGrowth {
+    shape: IndexShape,
+    /// Directory blocks the change allocates, the new leaf included.
+    blocks: usize,
+}
+
+/// The rearrangement one leaf split forces on the levels above it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum IndexShape {
+    /// The root addresses leaves directly and has a free slot.
+    RootHasRoom,
+    /// The root addresses leaves directly and is full, so it gains a level.
+    DeepenRoot,
+    /// An interior node holds the leaf and has a free slot.
+    NodeHasRoom,
+    /// An interior node is full, so it splits under a root that has room.
+    SplitNode,
+}
+
+/// Index of the entry whose subtree covers this hash.
+///
+/// The first entry covers everything below the second, so a hash lower than
+/// every recorded one still resolves rather than falling off the front.
+fn covering_entry(entries: &[htree::DxEntry], hash: u32) -> Result<usize, FsError> {
+    if entries.is_empty() {
+        return Err(FsError::Corrupt);
+    }
+    let mut chosen = 0_usize;
+    for (index, entry) in entries.iter().enumerate() {
+        if entry.hash > hash {
+            break;
+        }
+        chosen = index;
+    }
+    Ok(chosen)
+}
+
+/// Insert one separator directly after the entry its subtree was split from.
+fn insert_index_entry(
+    entries: &mut Vec<htree::DxEntry>,
+    after: usize,
+    entry: htree::DxEntry,
+) -> Result<(), FsError> {
+    let position = after.checked_add(1).ok_or(FsError::Overflow)?;
+    if entries
+        .get(after)
+        .is_none_or(|left| left.hash >= entry.hash)
+        || entries
+            .get(position)
+            .is_some_and(|right| right.hash <= entry.hash)
+    {
+        return Err(FsError::Corrupt);
+    }
+    entries.try_reserve(1).map_err(|_| FsError::NoSpace)?;
+    entries.insert(position, entry);
+    Ok(())
+}
+
+/// Split point that divides a leaf's records most evenly by bytes.
+///
+/// Two records with the same hash must stay in the same leaf, because the
+/// index can only send one hash to one place, so only a strict hash change is
+/// a candidate. A leaf whose records all share one hash has no split point at
+/// all and says so rather than producing a leaf the index cannot address.
+fn balanced_hash_boundary(records: &[(u32, DirectoryRecord)]) -> Result<usize, FsError> {
+    let mut total = 0_usize;
+    for (_, record) in records {
+        total = total
+            .checked_add(directory_record_bytes(record.name.len())?)
+            .ok_or(FsError::Overflow)?;
+    }
+    let target = total / 2;
+    let mut used = 0_usize;
+    let mut best: Option<(usize, usize)> = None;
+    for (index, (hash, record)) in records.iter().enumerate() {
+        if index != 0 && *hash != records.get(index - 1).ok_or(FsError::Corrupt)?.0 {
+            let distance = used.abs_diff(target);
+            if best.is_none_or(|(_, closest)| distance < closest) {
+                best = Some((index, distance));
+            }
+        }
+        used = used
+            .checked_add(directory_record_bytes(record.name.len())?)
+            .ok_or(FsError::Overflow)?;
+    }
+    best.map(|(index, _)| index).ok_or(FsError::NoSpace)
+}
+
+/// Collect the live records of one directory block.
+fn read_directory_records(block: &[u8]) -> Result<Vec<DirectoryRecord>, FsError> {
+    let tail_offset = block
+        .len()
+        .checked_sub(EXT4_DIR_TAIL_BYTES)
+        .ok_or(FsError::Corrupt)?;
+    let mut records = Vec::new();
+    let mut offset = 0_usize;
+    while offset < tail_offset {
+        let inode = read_u32(block, offset)?;
+        let record_bytes = usize::from(read_u16(block, offset + 4)?);
+        let name_bytes = usize::from(*block.get(offset + 6).ok_or(FsError::Corrupt)?);
+        let file_type = *block.get(offset + 7).ok_or(FsError::Corrupt)?;
+        if record_bytes < 8
+            || !record_bytes.is_multiple_of(4)
+            || offset
+                .checked_add(record_bytes)
+                .is_none_or(|end| end > tail_offset)
+            || name_bytes > record_bytes - 8
+        {
+            return Err(FsError::Corrupt);
+        }
+        if inode != 0 {
+            let raw = block
+                .get(offset + 8..offset + 8 + name_bytes)
+                .ok_or(FsError::Corrupt)?;
+            let mut name = Vec::new();
+            name.try_reserve_exact(raw.len())
+                .map_err(|_| FsError::NoSpace)?;
+            name.extend_from_slice(raw);
+            records.try_reserve(1).map_err(|_| FsError::NoSpace)?;
+            records.push(DirectoryRecord {
+                inode,
+                file_type,
+                name,
+            });
+        }
+        offset = offset.checked_add(record_bytes).ok_or(FsError::Overflow)?;
+    }
+    if offset != tail_offset {
+        return Err(FsError::Corrupt);
+    }
+    Ok(records)
 }
 
 fn directory_record_bytes(name_bytes: usize) -> Result<usize, FsError> {
@@ -4300,6 +5108,37 @@ fn put_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), FsError> {
     Ok(())
 }
 
+/// Write one inode timestamp as its 32-bit base field and its epoch bits.
+///
+/// ext4 reads the base field as signed, so a record that declares no room for
+/// the extra word cannot carry an instant past 2038 without reading as 1901.
+/// The clock is therefore clamped to whatever the record can actually encode,
+/// which keeps a far-future time implausible rather than wrong by a century.
+fn put_inode_time(raw: &mut [u8], field: (usize, usize), seconds: u64) -> Result<(), FsError> {
+    let (base, extra) = field;
+    let declared = EXT4_BASE_INODE_BYTES
+        .checked_add(usize::from(read_u16(raw, EXT4_EXTRA_ISIZE_OFFSET)?))
+        .ok_or(FsError::Overflow)?;
+    let extended = extra.checked_add(4).ok_or(FsError::Overflow)? <= declared;
+    let seconds = seconds.min(if extended {
+        EXT4_MAX_EXTENDED_SECONDS
+    } else {
+        EXT4_MAX_BASE_SECONDS
+    });
+    put_u32(
+        raw,
+        base,
+        u32::try_from(seconds & u64::from(u32::MAX)).map_err(|_| FsError::Overflow)?,
+    )?;
+    if !extended {
+        return Ok(());
+    }
+    let epoch = u32::try_from(seconds >> 32).map_err(|_| FsError::Overflow)?;
+    // The extra word also carries nanoseconds above its low two bits, so the
+    // epoch is merged in rather than overwriting the whole field.
+    put_u32(raw, extra, (read_u32(raw, extra)? & !0x3) | epoch)
+}
+
 fn crc32c(seed: u32, bytes: &[u8]) -> u32 {
     let mut checksum = seed;
     for byte in bytes {
@@ -4314,21 +5153,24 @@ fn crc32c(seed: u32, bytes: &[u8]) -> u32 {
 #[cfg(test)]
 mod tests {
     use crate::{
-        EXT4_EXT_MAGIC, EXT4_EXTENT_HEADER_BYTES, EXT4_EXTENT_RECORD_BYTES, EXT4_EXTENT_TAIL_BYTES,
-        EXT4_MAX_EXTENT_DEPTH, htree, parse_directory_block, parse_extent_index_block,
+        EXT4_CRTIME, EXT4_DX_PARENT_OFFSET, EXT4_EXT_MAGIC, EXT4_EXTENT_HEADER_BYTES,
+        EXT4_EXTENT_RECORD_BYTES, EXT4_EXTENT_TAIL_BYTES, EXT4_MAX_EXTENT_DEPTH, EXT4_MTIME,
+        ExtentTreePlan, htree, parse_directory_block, parse_extent_index_block,
     };
     use alloc::collections::BTreeMap;
     use alloc::format;
+    use alloc::rc::Rc;
     use alloc::string::{String, ToString};
     use alloc::vec;
     use alloc::vec::Vec;
+    use std::fmt::Write as _;
     use std::fs::{self, File, OpenOptions};
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::path::{Path, PathBuf};
     use std::process::{Command, Output};
     use std::time::{SystemTime, UNIX_EPOCH};
     use troe_block::{BlockAccess, BlockError, BlockGeometry, BlockLimits};
-    use troe_fs_api::MAX_NAME_BYTES;
+    use troe_fs_api::{MAX_NAME_BYTES, WallClock};
 
     use super::{
         BlockDevice, BlockRegion, CRC32C_POLYNOMIAL, EXT4_BLOCK_BYTES, EXT4_BLOCK_BYTES_U32,
@@ -4761,11 +5603,14 @@ mod tests {
             });
         }
         let mut raw = [0_u8; EXT4_INODE_BYTES];
+        let tree = ExtentTreePlan::new(extents.len(), EXT4_BLOCK_BYTES)?;
+        assert_eq!(tree.levels, [1]);
         Ext4::<SparseDevice>::encode_inode_extent_records(
             &mut raw,
             2 * 1024 * 1024 * 1024,
             &extents,
-            &[600_000],
+            &[(0, 600_000)],
+            &tree,
             0,
             EXT4_BLOCK_BYTES,
         )?;
@@ -6244,6 +7089,261 @@ mod tests {
         Ok(())
     }
 
+    /// Build a volume whose 1 KiB-block directory carries a shallow index.
+    ///
+    /// Long names fill a small leaf quickly, so a few hundred of them give a
+    /// root that still addresses leaves directly and is close to full. That is
+    /// the shape a split has to grow out of.
+    fn shallow_index_image(
+        directory: &Path,
+        mke2fs: &Path,
+        e2fsck: &Path,
+        names: usize,
+        name_bytes: usize,
+    ) -> Result<PathBuf, String> {
+        let image = directory.join("shallow.ext4");
+        File::create(&image)
+            // `mke2fs` selects 1 KiB blocks for a volume this small, and a
+            // small block gives a small leaf.
+            .and_then(|file| file.set_len(64 * 1024 * 1024))
+            .map_err(|error| error.to_string())?;
+        let source = directory.join("tree");
+        let many = source.join("many");
+        fs::create_dir_all(&many).map_err(|error| error.to_string())?;
+        for index in 0..names {
+            fs::write(many.join(long_name("seed", index, name_bytes)), b"x")
+                .map_err(|error| error.to_string())?;
+        }
+        let format = Command::new(mke2fs)
+            .args(["-q", "-F", "-t", "ext4", "-d"])
+            .arg(&source)
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&format, "mke2fs shallow index")?;
+        let reindex = Command::new(e2fsck)
+            .args(["-fD", "-y"])
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !matches!(reindex.status.code(), Some(0 | 1)) {
+            return Err(format!("e2fsck -D failed: {:?}", reindex.status));
+        }
+        Ok(image)
+    }
+
+    /// One distinct name of an exact byte length.
+    fn long_name(prefix: &str, index: usize, bytes: usize) -> String {
+        let mut name = format!("{prefix}-{index:05}-");
+        while name.len() < bytes {
+            name.push('n');
+        }
+        name.truncate(bytes);
+        name
+    }
+
+    /// The levels, root entry count, and leaf count of one hashed directory.
+    fn index_shape<D: BlockDevice>(
+        ext4: &mut Ext4<D>,
+        path: &str,
+    ) -> Result<(u8, usize, usize), String> {
+        let inode = ext4
+            .resolve(path)
+            .map_err(|error| format!("cannot resolve {path}: {error:?}"))?;
+        if !inode.indexed {
+            return Err(format!("{path} is not indexed"));
+        }
+        let seed = ext4.inode_checksum_seed(&inode);
+        let root_block = ext4
+            .directory_block(&inode, 0)
+            .map_err(|error| format!("cannot read the index root: {error:?}"))?;
+        let root = htree::parse_root(&root_block, seed, crc32c)
+            .map_err(|error| format!("cannot parse the index root: {error:?}"))?;
+        let leaves = ext4
+            .hashed_leaf_blocks(&inode)
+            .map_err(|error| format!("cannot collect leaves: {error:?}"))?;
+        Ok((root.indirect_levels, root.entries.len(), leaves.len()))
+    }
+
+    #[test]
+    fn splits_full_hashed_leaves_and_deepens_a_full_index_root() -> Result<(), String> {
+        const SEEDED: usize = 300;
+        const NAME_BYTES: usize = 255;
+        const ATTEMPTS: usize = 250;
+        let Some(mke2fs) = e2fs_tool("mke2fs") else {
+            return unavailable_tool("mke2fs");
+        };
+        let Some(e2fsck) = e2fs_tool("e2fsck") else {
+            return unavailable_tool("e2fsck");
+        };
+        let temporary = TestDirectory::create("ext4-hashed-split")?;
+        let image = shallow_index_image(temporary.path(), &mke2fs, &e2fsck, SEEDED, NAME_BYTES)?;
+        let limits = default_volume_limits()?;
+
+        let mut inserted = Vec::new();
+        {
+            let mut ext4 = mount_file_writable_with_limits(&image, limits)?;
+            let (levels, _, seeded_leaves) = index_shape(&mut ext4, "/many")?;
+            assert_eq!(levels, 0, "the seeded index must address leaves directly");
+            assert!(
+                seeded_leaves > 1,
+                "the seeded index must have leaves to fill"
+            );
+
+            // Every name lands in the one leaf its hash selects, so a full leaf
+            // has to split before the name fits. Enough of those fill the root,
+            // which then grows a level of interior nodes; enough more fill that
+            // node, which then splits and puts a second entry in the root.
+            let mut split_leaves = false;
+            let mut deepened = false;
+            let mut split_node = false;
+            for index in 0..ATTEMPTS {
+                let name = long_name("troe", index, NAME_BYTES);
+                ext4.write_file(&format!("/many/{name}"), b"inserted by troe\n")
+                    .map_err(|error| format!("cannot insert {name}: {error:?}"))?;
+                inserted.push(name);
+                let (levels, root_entries, leaves) = index_shape(&mut ext4, "/many")?;
+                split_leaves |= leaves > seeded_leaves;
+                deepened |= levels == 1;
+                split_node |= levels == 1 && root_entries > 1;
+                if split_node {
+                    break;
+                }
+            }
+            assert!(split_leaves, "no leaf split in {ATTEMPTS} inserts");
+            assert!(
+                deepened,
+                "the full root never grew a level in {ATTEMPTS} inserts"
+            );
+            assert!(
+                split_node,
+                "the full interior node never split in {ATTEMPTS} inserts"
+            );
+        }
+
+        // e2fsck validates hashed-directory ordering and every index checksum,
+        // so a record placed in the wrong leaf, or a stale separator, fails
+        // here rather than silently.
+        let check = Command::new(&e2fsck)
+            .args(["-f", "-n"])
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&check, "e2fsck after hashed-directory splits")?;
+
+        let mut ext4 = mount_file_with_limits(&image, limits)?;
+        let mut listed = BTreeMap::new();
+        let mut cursor = 0_u64;
+        loop {
+            let page = ext4
+                .list("/many", cursor, 64, MAX_NAME_BYTES)
+                .map_err(|error| format!("cannot list: {error:?}"))?;
+            for entry in page.entries {
+                listed.insert(entry.name, entry.kind);
+            }
+            match page.next_cursor {
+                Some(next) => cursor = next,
+                None => break,
+            }
+        }
+        for index in 0..SEEDED {
+            let name = long_name("seed", index, NAME_BYTES);
+            assert!(listed.contains_key(&name), "{name} was lost by a split");
+        }
+        for name in &inserted {
+            assert!(listed.contains_key(name), "{name} was lost by a split");
+            let mut bytes = [0_u8; 32];
+            let read = ext4
+                .read_file(&format!("/many/{name}"), 0, &mut bytes)
+                .map_err(|error| format!("cannot read {name}: {error:?}"))?;
+            assert_eq!(&bytes[..read], b"inserted by troe\n");
+        }
+        Ok(())
+    }
+
+    /// The inode `..` names inside one directory's first block.
+    fn recorded_parent<D: BlockDevice>(ext4: &mut Ext4<D>, path: &str) -> Result<u32, String> {
+        let inode = ext4
+            .resolve(path)
+            .map_err(|error| format!("cannot resolve {path}: {error:?}"))?;
+        let block = ext4
+            .directory_block(&inode, 0)
+            .map_err(|error| format!("cannot read the first block of {path}: {error:?}"))?;
+        read_u32(&block, EXT4_DX_PARENT_OFFSET)
+            .map_err(|error| format!("cannot read the parent record: {error:?}"))
+    }
+
+    #[test]
+    fn renames_a_hashed_directory_between_parents() -> Result<(), String> {
+        const SEEDED: usize = 300;
+        const NAME_BYTES: usize = 255;
+        let Some(mke2fs) = e2fs_tool("mke2fs") else {
+            return unavailable_tool("mke2fs");
+        };
+        let Some(e2fsck) = e2fs_tool("e2fsck") else {
+            return unavailable_tool("e2fsck");
+        };
+        let temporary = TestDirectory::create("ext4-hashed-rename")?;
+        let image = shallow_index_image(temporary.path(), &mke2fs, &e2fsck, SEEDED, NAME_BYTES)?;
+        let limits = default_volume_limits()?;
+
+        let sample = long_name("seed", 7, NAME_BYTES);
+        {
+            let mut ext4 = mount_file_writable_with_limits(&image, limits)?;
+            assert!(
+                ext4.resolve("/many")
+                    .map_err(|error| format!("cannot resolve: {error:?}"))?
+                    .indexed
+            );
+            ext4.create_directory("/holder")
+                .map_err(|error| format!("cannot create the destination: {error:?}"))?;
+            let holder = ext4
+                .resolve("/holder")
+                .map_err(|error| format!("cannot resolve the destination: {error:?}"))?
+                .number;
+            let root = ext4
+                .resolve("/")
+                .map_err(|error| format!("cannot resolve the root: {error:?}"))?
+                .number;
+            assert_eq!(recorded_parent(&mut ext4, "/many")?, root);
+
+            // Moving an indexed directory rewrites the `..` record that shares
+            // its root block with the index.
+            ext4.rename("/many", "/holder/many")
+                .map_err(|error| format!("cannot move a hashed directory in: {error:?}"))?;
+            assert_eq!(recorded_parent(&mut ext4, "/holder/many")?, holder);
+            assert_eq!(
+                ext4.metadata(&format!("/holder/many/{sample}"))
+                    .map_err(|error| format!("cannot reach a moved name: {error:?}"))?
+                    .byte_count,
+                1
+            );
+
+            // And moving it back out restores the original parent.
+            ext4.rename("/holder/many", "/many")
+                .map_err(|error| format!("cannot move a hashed directory out: {error:?}"))?;
+            assert_eq!(recorded_parent(&mut ext4, "/many")?, root);
+        }
+
+        // e2fsck checks every `..` against the parent that actually holds the
+        // directory, so a stale record or a broken index checksum fails here.
+        let check = Command::new(&e2fsck)
+            .args(["-f", "-n"])
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&check, "e2fsck after moving a hashed directory")?;
+
+        let mut ext4 = mount_file_with_limits(&image, limits)?;
+        assert_eq!(
+            ext4.metadata(&format!("/many/{sample}"))
+                .map_err(|error| format!("cannot reach a restored name: {error:?}"))?
+                .byte_count,
+            1
+        );
+        Ok(())
+    }
+
     #[test]
     fn accepts_the_longest_name_ext4_allows() -> Result<(), String> {
         const LENGTH: usize = 255;
@@ -6292,6 +7392,273 @@ mod tests {
         }
         assert!(found, "the long name must be enumerable");
         Ok(())
+    }
+
+    /// Build a volume holding one file whose extent tree is deeper than one
+    /// level.
+    ///
+    /// `mke2fs` and this provider both allocate whole runs, so neither can
+    /// produce the shape under test. Deleting alternate small files with
+    /// `debugfs` leaves a comb of single-block holes, and `debugfs write`
+    /// fills them one block at a time, which is the fragmentation an ordinary
+    /// Linux host produces over a long life.
+    fn fragmented_file_image(
+        directory: &Path,
+        mke2fs: &Path,
+        e2fsck: &Path,
+        debugfs: &Path,
+        payload: &[u8],
+    ) -> Result<PathBuf, String> {
+        const SEEDS: usize = 3000;
+        let image = directory.join("fragmented.ext4");
+        File::create(&image)
+            // `mke2fs` selects 1 KiB blocks for a volume this small, so one
+            // leaf holds few extents and the tree needs a level sooner.
+            .and_then(|file| file.set_len(64 * 1024 * 1024))
+            .map_err(|error| error.to_string())?;
+        let source = directory.join("tree");
+        let many = source.join("many");
+        fs::create_dir_all(&many).map_err(|error| error.to_string())?;
+        for index in 0..SEEDS {
+            fs::write(many.join(format!("f{index:05}")), b"x")
+                .map_err(|error| error.to_string())?;
+        }
+        let format = Command::new(mke2fs)
+            .args(["-q", "-F", "-t", "ext4", "-d"])
+            .arg(&source)
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&format, "mke2fs fragmented")?;
+
+        let mut script = String::new();
+        for index in (1..SEEDS).step_by(2) {
+            writeln!(script, "kill_file /many/f{index:05}\nrm /many/f{index:05}")
+                .map_err(|error| error.to_string())?;
+        }
+        let script_path = directory.join("holes.debugfs");
+        fs::write(&script_path, script.as_bytes()).map_err(|error| error.to_string())?;
+        let punch = Command::new(debugfs)
+            .arg("-w")
+            .arg("-f")
+            .arg(&script_path)
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&punch, "debugfs punching holes")?;
+
+        let payload_path = directory.join("payload.bin");
+        fs::write(&payload_path, payload).map_err(|error| error.to_string())?;
+        let write = Command::new(debugfs)
+            .arg("-w")
+            .arg("-R")
+            .arg(format!("write {} big.bin", payload_path.display()))
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&write, "debugfs writing a fragmented file")?;
+
+        // Deleting through `debugfs` leaves the group counters stale, so the
+        // volume is repaired once and then required to be clean.
+        let repair = Command::new(e2fsck)
+            .args(["-fy"])
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        if !matches!(repair.status.code(), Some(0..=2)) {
+            return Err(format!("e2fsck repair failed: {:?}", repair.status));
+        }
+        let check = Command::new(e2fsck)
+            .args(["-f", "-n"])
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&check, "e2fsck on the fragmented volume")?;
+        Ok(image)
+    }
+
+    /// Levels `debugfs` reports in one file's extent tree.
+    fn host_extent_depth(debugfs: &Path, image: &Path, path: &str) -> Result<u16, String> {
+        let listing = Command::new(debugfs)
+            .arg("-R")
+            .arg(format!("ex {path}"))
+            .arg(image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&listing, "debugfs ex")?;
+        let report = String::from_utf8_lossy(&listing.stdout).to_string();
+        // Each row starts with `level/ depth`, so the depth is the same on
+        // every row and the root row is enough.
+        let depth = report
+            .lines()
+            .filter_map(|line| line.trim().split('/').nth(1))
+            .filter_map(|field| field.split_whitespace().next())
+            .find_map(|field| field.parse::<u16>().ok())
+            .ok_or_else(|| format!("no extent rows in:\n{report}"))?;
+        Ok(depth)
+    }
+
+    /// Read one file out of an image with the host's own reader.
+    fn host_file_bytes(
+        debugfs: &Path,
+        image: &Path,
+        path: &str,
+        destination: &Path,
+    ) -> Result<Vec<u8>, String> {
+        let dump = Command::new(debugfs)
+            .arg("-R")
+            .arg(format!("dump {path} {}", destination.display()))
+            .arg(image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&dump, "debugfs dump")?;
+        fs::read(destination).map_err(|error| error.to_string())
+    }
+
+    /// Read one whole file through the provider in bounded chunks.
+    fn provider_file_bytes<D: BlockDevice>(
+        ext4: &mut Ext4<D>,
+        path: &str,
+    ) -> Result<Vec<u8>, String> {
+        let byte_count = ext4
+            .metadata(path)
+            .map_err(|error| format!("cannot stat {path}: {error:?}"))?
+            .byte_count;
+        let mut bytes = Vec::new();
+        let mut chunk = vec![0_u8; 64 * 1024];
+        while u64::try_from(bytes.len()).map_err(|error| error.to_string())? < byte_count {
+            let offset = u64::try_from(bytes.len()).map_err(|error| error.to_string())?;
+            let read = ext4
+                .read_file(path, offset, &mut chunk)
+                .map_err(|error| format!("cannot read {path}: {error:?}"))?;
+            if read == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&chunk[..read]);
+        }
+        Ok(bytes)
+    }
+
+    #[test]
+    fn rewrites_a_file_whose_extent_tree_is_deeper_than_one_level() -> Result<(), String> {
+        const BLOCKS: usize = 1000;
+        const BLOCK: usize = 1024;
+        let Some(mke2fs) = e2fs_tool("mke2fs") else {
+            return unavailable_tool("mke2fs");
+        };
+        let Some(e2fsck) = e2fs_tool("e2fsck") else {
+            return unavailable_tool("e2fsck");
+        };
+        let Some(debugfs) = e2fs_tool("debugfs") else {
+            return unavailable_tool("debugfs");
+        };
+        let temporary = TestDirectory::create("ext4-deep-extents")?;
+        let payload: Vec<u8> = (0..BLOCKS * BLOCK)
+            .map(|index| u8::try_from(index % 251).unwrap_or_default())
+            .collect();
+        let image = fragmented_file_image(temporary.path(), &mke2fs, &e2fsck, &debugfs, &payload)?;
+        assert_eq!(
+            host_extent_depth(&debugfs, &image, "/big.bin")?,
+            2,
+            "the seeded file must already need two levels"
+        );
+
+        let limits = default_volume_limits()?;
+        let appended = b"appended by troe\n";
+        {
+            let mut ext4 = mount_file_writable_with_limits(&image, limits)?;
+            let inode = ext4
+                .resolve("/big.bin")
+                .map_err(|error| format!("cannot resolve: {error:?}"))?;
+            assert_eq!(inode.extent_depth, 2);
+            assert!(
+                inode.extents.len() > max_depth_one_extent_ceiling(BLOCK),
+                "the file must need more extents than one level holds: {}",
+                inode.extents.len()
+            );
+            assert_eq!(provider_file_bytes(&mut ext4, "/big.bin")?, payload);
+
+            // Appending rewrites the whole tree, which is the operation that
+            // used to be refused once the extents no longer fit one level.
+            ext4.append_file("/big.bin", appended)
+                .map_err(|error| format!("cannot append to a deep tree: {error:?}"))?;
+            // And again, so the tree TROE wrote is itself read back, rebuilt,
+            // and released.
+            ext4.append_file("/big.bin", appended)
+                .map_err(|error| format!("cannot append twice: {error:?}"))?;
+
+            // Replacing the file releases the whole deep tree rather than only
+            // its leaves, and leaves a shallow one behind.
+            ext4.write_file("/replaced.bin", b"seed\n")
+                .map_err(|error| format!("cannot create beside a deep tree: {error:?}"))?;
+            let deep = ext4
+                .resolve("/big.bin")
+                .map_err(|error| format!("cannot resolve: {error:?}"))?;
+            assert_eq!(deep.extent_depth, 2, "the appended tree must be deep");
+        }
+
+        // A leaked or doubly-claimed tree block is a block-bitmap difference,
+        // which this reports as an error rather than repairing.
+        let check = Command::new(&e2fsck)
+            .args(["-f", "-n"])
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&check, "e2fsck after rewriting a deep extent tree")?;
+        assert_eq!(
+            host_extent_depth(&debugfs, &image, "/big.bin")?,
+            2,
+            "the tree TROE wrote must still have two levels"
+        );
+
+        let mut expected = payload.clone();
+        expected.extend_from_slice(appended);
+        expected.extend_from_slice(appended);
+        let dumped = host_file_bytes(
+            &debugfs,
+            &image,
+            "/big.bin",
+            &temporary.path().join("dumped.bin"),
+        )?;
+        assert_eq!(dumped.len(), expected.len(), "host-visible length");
+        assert!(
+            dumped == expected,
+            "the host must read back what TROE wrote"
+        );
+
+        {
+            let mut ext4 = mount_file_with_limits(&image, limits)?;
+            assert_eq!(provider_file_bytes(&mut ext4, "/big.bin")?, expected);
+        }
+
+        // Replacing the deep file entirely must release every level it held.
+        {
+            let mut ext4 = mount_file_writable_with_limits(&image, limits)?;
+            ext4.write_file("/big.bin", b"replaced by troe\n")
+                .map_err(|error| format!("cannot replace a deep tree: {error:?}"))?;
+            let replaced = ext4
+                .resolve("/big.bin")
+                .map_err(|error| format!("cannot resolve: {error:?}"))?;
+            assert_eq!(replaced.extent_depth, 0, "the replacement needs no tree");
+        }
+        let after_replace = Command::new(&e2fsck)
+            .args(["-f", "-n"])
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&after_replace, "e2fsck after replacing a deep extent tree")?;
+
+        let mut ext4 = mount_file_with_limits(&image, limits)?;
+        assert_eq!(
+            provider_file_bytes(&mut ext4, "/big.bin")?,
+            b"replaced by troe\n"
+        );
+        Ok(())
+    }
+
+    /// Extents a one-level tree holds at this block size, for test assertions.
+    fn max_depth_one_extent_ceiling(block_bytes: usize) -> usize {
+        crate::leaf_extents(block_bytes) * crate::EXT4_ROOT_INDEXES
     }
 
     /// Build one interior extent node with the given children.
@@ -6426,6 +7793,26 @@ mod tests {
         Ok(())
     }
 
+    /// A clock whose reading the test controls, including reporting none.
+    #[derive(Debug)]
+    struct TestClock(core::cell::Cell<Option<u64>>);
+
+    impl TestClock {
+        fn new(seconds: Option<u64>) -> Rc<Self> {
+            Rc::new(Self(core::cell::Cell::new(seconds)))
+        }
+
+        fn set(&self, seconds: Option<u64>) {
+            self.0.set(seconds);
+        }
+    }
+
+    impl WallClock for TestClock {
+        fn unix_seconds(&self) -> Option<u64> {
+            self.0.get()
+        }
+    }
+
     #[test]
     fn stamps_timestamps_only_when_a_clock_is_supplied() -> Result<(), String> {
         const NOW: u32 = 1_788_000_000;
@@ -6447,22 +7834,71 @@ mod tests {
             assert_eq!(times, (0, 0, 0), "no clock must invent no time");
         }
 
-        // With one, a created inode carries it and a later write advances the
-        // modification time.
+        // A clock that reports no time is the same as having none at all.
         {
             let mut ext4 = mount_file_writable_with_limits(&image, default_volume_limits()?)?;
-            ext4.set_wall_clock_seconds(NOW);
+            ext4.set_wall_clock(TestClock::new(None));
+            ext4.write_file("/unavailable.txt", b"clock present, time unknown\n")
+                .map_err(|error| format!("cannot create: {error:?}"))?;
+            let times = inode_times(&mut ext4, "/unavailable.txt")?;
+            assert_eq!(times, (0, 0, 0), "an unreadable clock must invent no time");
+        }
+
+        // With a readable one, a created inode carries it and a later write
+        // advances the modification time.
+        {
+            let mut ext4 = mount_file_writable_with_limits(&image, default_volume_limits()?)?;
+            let clock = TestClock::new(Some(u64::from(NOW)));
+            ext4.set_wall_clock(clock.clone());
             ext4.write_file("/stamped.txt", b"clocked\n")
                 .map_err(|error| format!("cannot create: {error:?}"))?;
             assert_eq!(inode_times(&mut ext4, "/stamped.txt")?, (NOW, NOW, NOW));
 
-            ext4.set_wall_clock_seconds(NOW + 60);
+            // The same mount reads the clock again, so it stamps the later
+            // instant rather than the one it was mounted at.
+            clock.set(Some(u64::from(NOW) + 60));
             ext4.write_file("/stamped.txt", b"clocked again\n")
                 .map_err(|error| format!("cannot replace: {error:?}"))?;
             let (atime, ctime, mtime) = inode_times(&mut ext4, "/stamped.txt")?;
             assert_eq!(atime, NOW, "a write does not advance the access time");
             assert_eq!(ctime, NOW + 60);
             assert_eq!(mtime, NOW + 60);
+
+            // A clock that moves backwards is recorded as it reads; the
+            // provider reports the time it was told, not one of its own.
+            clock.set(Some(u64::from(NOW) - 3_600));
+            ext4.write_file("/stamped.txt", b"clocked backwards\n")
+                .map_err(|error| format!("cannot rewrite: {error:?}"))?;
+            let (_, ctime, mtime) = inode_times(&mut ext4, "/stamped.txt")?;
+            assert_eq!(ctime, NOW - 3_600);
+            assert_eq!(mtime, NOW - 3_600);
+        }
+
+        // Past 2038 the base field alone would read as 1901, so the epoch bits
+        // in the extra word carry the instant instead.
+        {
+            const BEYOND_2038: u64 = 0x1_0000_0000 + 12_345;
+            let mut ext4 = mount_file_writable_with_limits(&image, default_volume_limits()?)?;
+            ext4.set_wall_clock(TestClock::new(Some(BEYOND_2038)));
+            ext4.write_file("/far-future.txt", b"after 2038\n")
+                .map_err(|error| format!("cannot create: {error:?}"))?;
+            let inode = ext4
+                .resolve("/far-future.txt")
+                .map_err(|error| format!("cannot resolve: {error:?}"))?;
+            let raw = ext4
+                .raw_inode_record(inode.number)
+                .map_err(|error| format!("cannot read inode: {error:?}"))?;
+            for (base, extra) in [EXT4_MTIME, EXT4_CRTIME] {
+                let seconds = u64::from(
+                    read_u32(&raw, base)
+                        .map_err(|error| format!("cannot read the time at {base}: {error:?}"))?,
+                ) | (u64::from(
+                    read_u32(&raw, extra)
+                        .map_err(|error| format!("cannot read the epoch at {extra}: {error:?}"))?
+                        & 0x3,
+                ) << 32);
+                assert_eq!(seconds, BEYOND_2038);
+            }
         }
 
         let check = Command::new(&e2fsck)
@@ -6471,6 +7907,34 @@ mod tests {
             .output()
             .map_err(|error| error.to_string())?;
         command_succeeded(&check, "e2fsck after stamped mutations")?;
+
+        // The e2fsprogs reader decodes what a Linux host would, including the
+        // epoch bits that carry an instant past 2038.
+        let Some(debugfs) = e2fs_tool("debugfs") else {
+            return unavailable_tool("debugfs");
+        };
+        for (path, seconds) in [
+            ("/stamped.txt", u64::from(NOW) - 3_600),
+            ("/far-future.txt", 0x1_0000_0000 + 12_345),
+        ] {
+            let stat = Command::new(&debugfs)
+                .arg("-R")
+                .arg(format!("stat {path}"))
+                .arg(&image)
+                .output()
+                .map_err(|error| error.to_string())?;
+            command_succeeded(&stat, "debugfs stat")?;
+            let report = String::from_utf8_lossy(&stat.stdout).to_string();
+            // e2fsprogs prints the base field and the extra word separately,
+            // and the extra word here holds only the epoch bits.
+            let base = seconds & u64::from(u32::MAX);
+            let epoch = seconds >> 32;
+            let expected = format!("mtime: {base:#010x}:{epoch:08x}");
+            assert!(
+                report.contains(&expected),
+                "{path} must report {expected}, got:\n{report}"
+            );
+        }
         Ok(())
     }
 

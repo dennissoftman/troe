@@ -61,29 +61,55 @@ rather than reading and rewriting an uninitialized bitmap. This is why an
 ordinary volume, whose groups are mostly uninitialized after `mke2fs`, can be
 written without first initializing it.
 
-A hashed directory index is walked rather than refused. Enumeration reads the
-root and any interior node, collects the leaf blocks, and parses those leaves
-linearly, so a name resolves without computing any hash. Removal edits the leaf
-that holds the record and leaves the index describing that same leaf, so no
-index rewrite is needed. Insertion computes the name's hash with ext4's own
-function and admits the record only into the leaf the index maps that hash to;
-if that leaf is full the insert is refused, because splitting it would mean
-rewriting the index. A record is never placed where the index cannot find it.
+A hashed directory index is walked and maintained rather than refused.
+Enumeration reads the root and any interior node, collects the leaf blocks, and
+parses those leaves linearly, so a name resolves without computing any hash.
+Removal edits the leaf that holds the record and leaves the index describing
+that same leaf, so no index rewrite is needed. Insertion computes the name's
+hash with ext4's own function and admits the record only into the leaf the index
+maps that hash to. A record is never placed where the index cannot find it.
+
+A full leaf splits instead of refusing the name. Its records are redistributed
+by hash into two leaves, and the separator is inserted beside the entry the walk
+followed, which is what keeps every name in the leaf its own hash selects. Two
+records that share a hash cannot be separated, so the split point is always a
+strict hash change nearest the byte midpoint; a leaf whose records all share one
+hash has no split point and the insert is refused rather than producing a leaf
+the index cannot address. A parent with no room is reshaped first: a root that
+still addresses leaves directly moves its entries down into one interior node
+and gains a level, and a full interior node splits under a root that still has
+room. Both levels full is the end of what ext4 defines here, and is refused.
+
+Moving a directory rewrites the `..` record of the directory that moved. In an
+indexed one that record shares the root block with the index, so it is located
+by the layout the index fixes rather than by walking record lengths, and the
+index checksum that covers it is refreshed. An indexed directory therefore
+renames between parents like any other.
 
 Names are limited by ext4 rather than by this provider: a path component may be
 255 bytes and a path 1024, which the VFS and the KEX filesystem service both
 carry.
 
-Extent trees are walked to any depth ext4 builds, up to five, with every
-interior node checksum-validated and the total tree bounded. Rewriting a file
-still produces a depth of at most one, so a file whose extents no longer fit
-that shape is refused explicitly rather than silently truncated.
+Extent trees are walked and built to whatever depth the file needs, with every
+interior node checksum-validated and each level bounded. The write path plans
+the shallowest tree that describes the extents: leaves first, then a level of
+interior nodes for as long as the top one does not fit the inode's four
+records. The ceiling is not the depth ext4 permits but the per-level tree-block
+bound the read path enforces, so a tree that would be unreadable is refused
+before it is written rather than after. Releasing a file releases every level,
+not only its leaves, and a rewrite builds the new tree beside the old one so a
+failure leaves the file intact.
 
-Timestamps advance when, and only when, an owner supplies a wall clock. A
-created inode carries that instant in its access, change, modification and
-creation times; a later write advances the change and modification times and
-leaves the access time alone. Without a clock the provider leaves every
-timestamp exactly as it found it rather than inventing one.
+Timestamps advance when, and only when, the namespace has a wall clock. The
+provider holds a shared handle and reads it at each mutation, so a volume
+mounted at boot stamps the instant of the write rather than the instant of the
+mount. A created inode carries that instant in its access, change, modification
+and creation times; a later write advances the change and modification times and
+leaves the access time alone. Without a clock, or when the clock reports no
+time, the provider leaves every timestamp exactly as it found it rather than
+inventing one. [ADR 0058](0058-provider-wall-clock-timestamps.md) records the
+shared-handle decision, the encoding range, and why the final unlink zeroes the
+inode record instead of setting `i_dtime`.
 
 Free-block search stops as soon as the retained runs can satisfy the request,
 so admitting large volumes does not make allocation scan a whole volume.

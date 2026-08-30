@@ -366,6 +366,7 @@ version = "0.1.0"
 name = "troe-shell"
 version = "0.1.0"
 dependencies = [
+ "troe-abi",
  "troe-application",
  "troe-completion",
  "troe-core",

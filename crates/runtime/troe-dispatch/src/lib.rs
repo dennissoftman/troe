@@ -9,6 +9,7 @@ use alloc::rc::Rc;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 use core::fmt;
+use core::str;
 use troe_abi::{MAX_SERVICE_PAYLOAD_BYTES, command, stream};
 use troe_core::{BoundedOutput, Output, StreamError, write_all};
 
@@ -1091,9 +1092,16 @@ impl<'service> Dispatcher<'service> {
 }
 
 /// Immutable command-invocation service for one application launch.
+///
+/// Arguments are retained once as a flat UTF-8 table with a parallel length
+/// table. That representation serves both the single-message record of
+/// interface 1.1 and the paged reads of 1.2 without a second copy, and without
+/// one owned `String` allocation per argument.
 pub struct CommandInvocationService {
-    invocation: Vec<u8>,
+    invocation: Option<Vec<u8>>,
     environment: Vec<u8>,
+    argument_bytes: Vec<u8>,
+    argument_lengths: Vec<u16>,
 }
 
 impl CommandInvocationService {
@@ -1108,6 +1116,10 @@ impl CommandInvocationService {
 
     /// Encode one invocation and its immutable `NAME=VALUE` environment.
     ///
+    /// An argument vector that exceeds the single-message bounds of interface
+    /// 1.1 is still accepted and is readable only page by page. `GET_INVOCATION`
+    /// then fails closed rather than returning a prefix of the operands.
+    ///
     /// # Errors
     ///
     /// Rejects invocation/environment policy excess or bounded allocation failure.
@@ -1116,14 +1128,56 @@ impl CommandInvocationService {
         arguments: &[T],
         environment: &[&str],
     ) -> Result<Self, DispatchError> {
-        let mut encoded = [0_u8; command::MAX_INVOCATION_BYTES];
-        let count = command::encode(cwd, arguments, &mut encoded)
-            .map_err(|_| DispatchError::MessageTooLarge)?;
-        let mut invocation = Vec::new();
-        invocation
-            .try_reserve_exact(count)
+        if !(1..=command::MAX_PAGED_ARGUMENTS).contains(&arguments.len()) {
+            return Err(DispatchError::MessageTooLarge);
+        }
+        let mut argument_bytes = Vec::new();
+        let mut argument_lengths = Vec::new();
+        argument_lengths
+            .try_reserve_exact(arguments.len())
             .map_err(|_| DispatchError::MetadataExhausted)?;
-        invocation.extend_from_slice(&encoded[..count]);
+        let mut aggregate = 0_usize;
+        for (index, argument) in arguments.iter().enumerate() {
+            let value = argument.as_ref();
+            if value.len() > command::MAX_SINGLE_ARGUMENT_BYTES || (index == 0 && value.is_empty())
+            {
+                return Err(DispatchError::MessageTooLarge);
+            }
+            aggregate = aggregate
+                .checked_add(value.len())
+                .ok_or(DispatchError::MessageTooLarge)?;
+            if aggregate > command::MAX_PAGED_ARGUMENT_BYTES {
+                return Err(DispatchError::MessageTooLarge);
+            }
+            argument_bytes
+                .try_reserve(value.len())
+                .map_err(|_| DispatchError::MetadataExhausted)?;
+            argument_bytes.extend_from_slice(value.as_bytes());
+            argument_lengths
+                .push(u16::try_from(value.len()).map_err(|_| DispatchError::MessageTooLarge)?);
+        }
+
+        let mut encoded = [0_u8; command::MAX_INVOCATION_BYTES];
+        let invocation = match command::encode(cwd, arguments, &mut encoded) {
+            Ok(count) => {
+                let mut owned = Vec::new();
+                owned
+                    .try_reserve_exact(count)
+                    .map_err(|_| DispatchError::MetadataExhausted)?;
+                owned.extend_from_slice(&encoded[..count]);
+                Some(owned)
+            }
+            Err(command::EncodeError::LimitExceeded)
+                if arguments.len() > command::MAX_ARGUMENTS =>
+            {
+                None
+            }
+            Err(command::EncodeError::LimitExceeded) if aggregate > command::MAX_ARGUMENT_BYTES => {
+                None
+            }
+            Err(_) => return Err(DispatchError::MessageTooLarge),
+        };
+
         let mut encoded_environment = [0_u8; command::MAX_ENCODED_ENVIRONMENT_BYTES];
         let environment_count = command::encode_environment(environment, &mut encoded_environment)
             .map_err(|_| DispatchError::MessageTooLarge)?;
@@ -1135,21 +1189,51 @@ impl CommandInvocationService {
         Ok(Self {
             invocation,
             environment: owned_environment,
+            argument_bytes,
+            argument_lengths,
         })
+    }
+
+    /// Borrow one retained argument by its absolute index.
+    fn argument(&self, wanted: usize) -> Option<&str> {
+        let mut cursor = 0_usize;
+        for (index, length) in self.argument_lengths.iter().enumerate() {
+            let end = cursor.checked_add(usize::from(*length))?;
+            if index == wanted {
+                return str::from_utf8(self.argument_bytes.get(cursor..end)?).ok();
+            }
+            cursor = end;
+        }
+        None
     }
 }
 
 impl Service for CommandInvocationService {
     fn call(&mut self, request: Request<'_>) -> Result<ServiceReply, DispatchError> {
-        if !request.payload().is_empty() {
-            return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
-        }
         match request.opcode() {
-            command::GET_INVOCATION => {
-                ServiceReply::with_payload(ReplyStatus::Success, &self.invocation)
-            }
-            command::GET_ENVIRONMENT => {
+            command::GET_INVOCATION if request.payload().is_empty() => match &self.invocation {
+                Some(invocation) => ServiceReply::with_payload(ReplyStatus::Success, invocation),
+                None => Ok(ServiceReply::empty(ReplyStatus::TooLarge)),
+            },
+            command::GET_ENVIRONMENT if request.payload().is_empty() => {
                 ServiceReply::with_payload(ReplyStatus::Success, &self.environment)
+            }
+            command::GET_ARGUMENT_PAGE => {
+                let Ok(start) = command::decode_argument_page_request(request.payload()) else {
+                    return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                };
+                if start > self.argument_lengths.len() {
+                    return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                }
+                let mut page = [0_u8; command::MAX_ARGUMENT_PAGE_REPLY_BYTES];
+                let count = command::encode_argument_page_with(
+                    self.argument_lengths.len(),
+                    start,
+                    |index| self.argument(index),
+                    &mut page,
+                )
+                .map_err(|_| DispatchError::MessageTooLarge)?;
+                ServiceReply::with_payload(ReplyStatus::Success, &page[..count])
             }
             _ => Ok(ServiceReply::empty(ReplyStatus::InvalidRequest)),
         }
@@ -1376,6 +1460,105 @@ mod tests {
                 request.payload().len(),
             ))
         }
+    }
+
+    #[test]
+    fn an_oversized_argument_record_is_paged_and_never_returned_in_part() {
+        // An operand list far larger than one single-message record.
+        let mut arguments = alloc::vec::Vec::new();
+        arguments.push(alloc::string::String::from("rm"));
+        for index in 0..1000 {
+            arguments.push(alloc::format!("operand-{index:04}.txt"));
+        }
+        let mut dispatcher = Dispatcher::new(4, 4).unwrap_or_else(|_| std::process::abort());
+        let (_port, handle) = dispatcher
+            .register(
+                Box::new(
+                    CommandInvocationService::new("/work", &arguments)
+                        .unwrap_or_else(|_| std::process::abort()),
+                ),
+                Rights::CALL,
+            )
+            .unwrap_or_else(|_| std::process::abort());
+
+        // The single-message operation fails closed rather than truncating.
+        assert_eq!(
+            dispatcher
+                .call(handle, command::GET_INVOCATION, &[])
+                .unwrap_or_else(|_| std::process::abort())
+                .status(),
+            ReplyStatus::TooLarge
+        );
+
+        let mut seen = Vec::new();
+        let mut start = 0_usize;
+        loop {
+            let mut request = [0_u8; command::ARGUMENT_PAGE_REQUEST_BYTES];
+            let count = command::encode_argument_page_request(start, &mut request)
+                .unwrap_or_else(|_| std::process::abort());
+            let reply = dispatcher
+                .call(handle, command::GET_ARGUMENT_PAGE, &request[..count])
+                .unwrap_or_else(|_| std::process::abort());
+            assert_eq!(reply.status(), ReplyStatus::Success);
+            let page = command::ArgumentPage::parse(reply.payload())
+                .unwrap_or_else(|_| std::process::abort());
+            assert_eq!(page.total(), arguments.len());
+            if page.is_empty() {
+                break;
+            }
+            seen.extend(page.iter().map(alloc::string::ToString::to_string));
+            start = page.next_start();
+        }
+        assert_eq!(seen, arguments);
+
+        // A malformed or out-of-range page request is refused, not clamped.
+        assert_eq!(
+            dispatcher
+                .call(handle, command::GET_ARGUMENT_PAGE, &[0])
+                .unwrap_or_else(|_| std::process::abort())
+                .status(),
+            ReplyStatus::InvalidRequest
+        );
+        let mut past = [0_u8; command::ARGUMENT_PAGE_REQUEST_BYTES];
+        let count = command::encode_argument_page_request(arguments.len() + 1, &mut past)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            dispatcher
+                .call(handle, command::GET_ARGUMENT_PAGE, &past[..count])
+                .unwrap_or_else(|_| std::process::abort())
+                .status(),
+            ReplyStatus::InvalidRequest
+        );
+    }
+
+    #[test]
+    fn a_record_within_the_single_message_bounds_serves_both_operations() {
+        let mut dispatcher = Dispatcher::new(4, 4).unwrap_or_else(|_| std::process::abort());
+        let (_port, handle) = dispatcher
+            .register(
+                Box::new(
+                    CommandInvocationService::new("/work", &["cat", "alpha.txt"])
+                        .unwrap_or_else(|_| std::process::abort()),
+                ),
+                Rights::CALL,
+            )
+            .unwrap_or_else(|_| std::process::abort());
+        let reply = dispatcher
+            .call(handle, command::GET_INVOCATION, &[])
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(reply.status(), ReplyStatus::Success);
+        let mut request = [0_u8; command::ARGUMENT_PAGE_REQUEST_BYTES];
+        let count = command::encode_argument_page_request(0, &mut request)
+            .unwrap_or_else(|_| std::process::abort());
+        let reply = dispatcher
+            .call(handle, command::GET_ARGUMENT_PAGE, &request[..count])
+            .unwrap_or_else(|_| std::process::abort());
+        let page =
+            command::ArgumentPage::parse(reply.payload()).unwrap_or_else(|_| std::process::abort());
+        assert_eq!(
+            page.iter().collect::<Vec<_>>(),
+            alloc::vec!["cat", "alpha.txt"]
+        );
     }
 
     #[test]

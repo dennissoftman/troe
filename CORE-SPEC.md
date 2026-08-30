@@ -946,7 +946,7 @@ troe/
 │   │   ├── troe-completion/  bounded package-owned CMPL descriptors
 │   │   └── troe-core/        portable types and bounded streams
 │   ├── storage/          filesystem contract, providers, formats, and policy
-│   │   ├── troe-fs-api/      error, metadata, path, and provider contract
+│   │   ├── troe-fs-api/      error, metadata, path, clock, and provider contract
 │   │   ├── troe-fs-*/        ext4, FAT32, and StateFS providers
 │   │   ├── troe-fmt-*/       GPT, BMNT, CSPK, SCFG, and PRGN codecs
 │   │   ├── troe-txslot/      dual-slot crash-consistent transactions

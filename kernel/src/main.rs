@@ -60,7 +60,9 @@ mod firmware {
         ActivationPointer, ActivationRecovery, MemoryPolicy, SystemConfig,
         normalize_memory_policy_toml, parse_config, recover_activation,
     };
-    use troe_fs_api::{FILE_IO_BUFFER_BYTES, FileSystemProvider, FsError, NodeKind, canonicalize};
+    use troe_fs_api::{
+        FILE_IO_BUFFER_BYTES, FileSystemProvider, FsError, NodeKind, WallClock, canonicalize,
+    };
     use troe_fs_ext4::Ext4Limits;
     use troe_fs_fat::Fat32Limits;
     #[cfg(feature = "acceptance-probes")]
@@ -87,8 +89,8 @@ mod firmware {
     use troe_shell::{
         CompletionConfig, CompletionEnvironment, CompletionVisitor, DynamicCompletionDomain,
         ExecutionPlacement, ExternalCommand, ExternalCommandReference, JobControl, MachineAction,
-        ServiceControl, SharedNamespace, Shell, external_command_reference, format_memory_report,
-        parse_command_list,
+        ServiceControl, SharedNamespace, Shell, Word, external_command_reference,
+        format_memory_report, parse_command_list,
     };
     use troe_supervisor::{BoundedLog, ServiceState, Supervisor, SupervisorAction};
     use troe_task::{
@@ -1358,6 +1360,29 @@ mod firmware {
     struct WallClockAnchor {
         unix_seconds: u64,
         monotonic_milliseconds: u64,
+    }
+
+    /// The runtime's wall clock, as filesystem providers read it.
+    ///
+    /// Providers hold this handle and ask it at each mutation, so a volume
+    /// mounted at boot stamps the current time rather than its mount time.
+    struct RuntimeWallClock {
+        runtime: SharedRuntime,
+    }
+
+    impl core::fmt::Debug for RuntimeWallClock {
+        fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            formatter.debug_struct("RuntimeWallClock").finish()
+        }
+    }
+
+    impl WallClock for RuntimeWallClock {
+        fn unix_seconds(&self) -> Option<u64> {
+            // A mutation reached from inside a runtime borrow reports no time
+            // rather than panicking; the provider then leaves its timestamps
+            // untouched, which is the same contract as having no clock.
+            self.runtime.try_borrow().ok()?.wall_seconds()
+        }
     }
 
     struct ApplicationDatagramService {
@@ -15444,6 +15469,14 @@ mod firmware {
             root_mode,
             task.accounting.firmware_wall_seconds,
         );
+        // Providers were mounted before the runtime existed, so the clock is
+        // installed here and reaches both those mounts and every later one.
+        shell
+            .namespace()
+            .borrow_mut()
+            .set_wall_clock(Rc::new(RuntimeWallClock {
+                runtime: runtime.clone(),
+            }));
         let editor_config = EditorConfig::standard();
         if editor_config.max_line_bytes() > MAX_LINE_BYTES {
             fatal(b"fatal: editor line policy exceeds shell parser policy\n");
@@ -15695,7 +15728,7 @@ mod firmware {
             .into_iter()
             .flat_map(|entry| entry.pipeline.stages)
         {
-            let Some(command) = stage.words.first() else {
+            let Some(command) = stage.words.first().map(Word::text) else {
                 continue;
             };
             if !matches!(

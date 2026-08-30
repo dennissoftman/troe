@@ -5,14 +5,15 @@
 mod common;
 
 use core::fmt::Write as _;
+use core::str;
 use troe_app_grep::{Program, RegexError, Syntax};
 use troe_kex_sdk::{
-    CommandContext, Error, INVOCATION_BUFFER_BYTES, ReadOnlyFilesystem, StandardOutput, command,
-    entry, exit,
+    ArgumentReader, CommandContext, Error, ReadOnlyFilesystem, StandardOutput, entry, exit,
 };
 
 const LINE_BYTES: usize = 64 * 1024;
 const MAX_PATTERNS: usize = 16;
+const PATTERN_ARENA_BYTES: usize = 4096;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ListMode {
@@ -59,11 +60,52 @@ impl Default for Options {
     }
 }
 
-struct Parsed<'argument> {
+struct Parsed {
     options: Options,
-    patterns: [Option<&'argument str>; MAX_PATTERNS],
-    pattern_count: usize,
     operand_start: usize,
+}
+
+/// Owned copies of every pattern written on the command line.
+///
+/// Patterns are read through the paged argument reader, whose single page
+/// buffer stops borrowing as soon as another page loads, so each pattern is
+/// copied out before parsing continues.
+struct PatternArena {
+    bytes: [u8; PATTERN_ARENA_BYTES],
+    spans: [(usize, usize); MAX_PATTERNS],
+    count: usize,
+    used: usize,
+}
+
+impl PatternArena {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; PATTERN_ARENA_BYTES],
+            spans: [(0, 0); MAX_PATTERNS],
+            count: 0,
+            used: 0,
+        }
+    }
+
+    /// Retain one pattern, rejecting excess count or aggregate bytes.
+    fn push(&mut self, value: &str) -> Option<()> {
+        let end = self.used.checked_add(value.len())?;
+        if self.count == MAX_PATTERNS || end > self.bytes.len() {
+            return None;
+        }
+        self.bytes[self.used..end].copy_from_slice(value.as_bytes());
+        self.spans[self.count] = (self.used, end);
+        self.count += 1;
+        self.used = end;
+        Some(())
+    }
+
+    /// Visit every retained pattern in the order it was written.
+    fn iter(&self) -> impl Iterator<Item = &str> {
+        self.spans[..self.count]
+            .iter()
+            .filter_map(|(start, end)| str::from_utf8(&self.bytes[*start..*end]).ok())
+    }
 }
 
 enum GrepError {
@@ -288,13 +330,19 @@ fn write_prefix(
     Ok(())
 }
 
-fn parse(invocation: command::Invocation<'_>) -> Option<Parsed<'_>> {
+fn parse(
+    arguments: &mut ArgumentReader,
+    total: usize,
+    patterns: &mut PatternArena,
+) -> Option<Parsed> {
     let mut options = Options::default();
-    let mut patterns = [None; MAX_PATTERNS];
-    let mut pattern_count = 0_usize;
     let mut index = 1_usize;
-    while index < invocation.len() {
-        let argument = invocation.argument(index)?;
+    // The current argument is copied out before it is scanned, so a `-e` or
+    // `-m` value that lives in a later page can be fetched mid-scan.
+    let mut current = common::ArgumentBuffer::new();
+    while index < total {
+        current.set(arguments.get(index).ok()??).ok()?;
+        let argument = current.as_str();
         if argument == "--" {
             index += 1;
             break;
@@ -302,10 +350,10 @@ fn parse(invocation: command::Invocation<'_>) -> Option<Parsed<'_>> {
         if argument == "-" || !argument.starts_with('-') {
             break;
         }
-        let bytes = argument.as_bytes();
         let mut cursor = 1_usize;
-        while cursor < bytes.len() {
-            match bytes[cursor] {
+        while cursor < argument.len() {
+            let byte = *argument.as_bytes().get(cursor)?;
+            match byte {
                 b'E' => options.syntax = Syntax::Extended,
                 b'F' => options.syntax = Syntax::Fixed,
                 b'G' => options.syntax = Syntax::Basic,
@@ -324,23 +372,28 @@ fn parse(invocation: command::Invocation<'_>) -> Option<Parsed<'_>> {
                 b'l' => options.list = Some(ListMode::Matching),
                 b'L' => options.list = Some(ListMode::NonMatching),
                 b'e' | b'm' => {
+                    // The attached form is a slice of the same argument, so the
+                    // value is taken before any further page may be loaded.
                     let attached = argument.get(cursor + 1..).filter(|value| !value.is_empty());
-                    let value = if let Some(value) = attached {
-                        value
-                    } else {
-                        index += 1;
-                        invocation.argument(index)?
-                    };
-                    if bytes[cursor] == b'e' {
-                        if pattern_count == patterns.len() {
-                            return None;
+                    match attached {
+                        Some(value) => {
+                            if byte == b'e' {
+                                patterns.push(value)?;
+                            } else {
+                                options.max_count = Some(value.parse().ok()?);
+                            }
                         }
-                        patterns[pattern_count] = Some(value);
-                        pattern_count += 1;
-                    } else {
-                        options.max_count = Some(value.parse().ok()?);
+                        None => {
+                            index += 1;
+                            let value = arguments.get(index).ok()??;
+                            if byte == b'e' {
+                                patterns.push(value)?;
+                            } else {
+                                options.max_count = Some(value.parse().ok()?);
+                            }
+                        }
                     }
-                    cursor = bytes.len();
+                    cursor = argument.len();
                     continue;
                 }
                 _ => return None,
@@ -349,15 +402,13 @@ fn parse(invocation: command::Invocation<'_>) -> Option<Parsed<'_>> {
         }
         index += 1;
     }
-    if pattern_count == 0 {
-        patterns[0] = Some(invocation.argument(index)?);
-        pattern_count = 1;
+    if patterns.count == 0 {
+        let value = arguments.get(index).ok()??;
+        patterns.push(value)?;
         index += 1;
     }
     Some(Parsed {
         options,
-        patterns,
-        pattern_count,
         operand_start: index,
     })
 }
@@ -497,11 +548,14 @@ fn status_selected(options: Options, matched: bool) -> bool {
 }
 
 fn main(command: &mut CommandContext) -> u32 {
-    let mut invocation_bytes = [0_u8; INVOCATION_BUFFER_BYTES];
-    let Ok(invocation) = command.invocation(&mut invocation_bytes) else {
+    let Ok(mut arguments) = command.arguments() else {
         return exit::FAILURE;
     };
-    let Some(parsed) = parse(invocation) else {
+    let Ok(argument_count) = arguments.total() else {
+        return exit::FAILURE;
+    };
+    let mut patterns = PatternArena::new();
+    let Some(parsed) = parse(&mut arguments, argument_count, &mut patterns) else {
         return common::usage(
             &mut command.stderr(),
             "grep",
@@ -509,7 +563,7 @@ fn main(command: &mut CommandContext) -> u32 {
         );
     };
     let mut program = Program::new();
-    for pattern in parsed.patterns[..parsed.pattern_count].iter().flatten() {
+    for pattern in patterns.iter() {
         if let Err(error) = program.add(pattern, parsed.options.syntax) {
             return matcher_failure(command, GrepError::Regex(error));
         }
@@ -518,7 +572,7 @@ fn main(command: &mut CommandContext) -> u32 {
         return matcher_failure(command, GrepError::Regex(error));
     }
 
-    if parsed.operand_start == invocation.len() {
+    if parsed.operand_start == argument_count {
         let result = grep_input(
             command,
             &program,
@@ -547,31 +601,32 @@ fn main(command: &mut CommandContext) -> u32 {
         };
     }
 
-    let operand_count = invocation.len() - parsed.operand_start;
-    let requires_filesystem = (parsed.operand_start..invocation.len()).any(|index| {
-        invocation
-            .argument(index)
-            .is_some_and(|argument| argument != "-")
-    });
-    let mut filesystem = if requires_filesystem {
-        match command.filesystem() {
-            Ok(filesystem) => Some(filesystem),
-            Err(_) => return exit::DENIED,
-        }
-    } else {
-        None
-    };
+    let operand_count = argument_count - parsed.operand_start;
+    // The read capability is acquired on the first named operand rather than
+    // pre-scanned, so an operand list of any length costs one pass.
+    let mut filesystem: Option<ReadOnlyFilesystem> = None;
     let mut selected_any = false;
     let mut failure_status = None;
-    for index in parsed.operand_start..invocation.len() {
-        let Some(path) = invocation.argument(index) else {
-            return exit::FAILURE;
+    if arguments.seek(parsed.operand_start).is_err() {
+        return exit::FAILURE;
+    }
+    loop {
+        let path = match arguments.next_argument() {
+            Ok(Some(path)) => path,
+            Ok(None) => break,
+            Err(_) => return exit::FAILURE,
         };
         let show_filename = parsed.options.show_filename.unwrap_or(operand_count > 1);
         let label = show_filename.then_some(path);
         let result = if path == "-" {
             grep_input(command, &program, parsed.options, label).map_err(FileGrepError::Matcher)
         } else {
+            if filesystem.is_none() {
+                match command.filesystem() {
+                    Ok(opened) => filesystem = Some(opened),
+                    Err(_) => return exit::DENIED,
+                }
+            }
             let Some(filesystem) = filesystem.as_mut() else {
                 return exit::DENIED;
             };

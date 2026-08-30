@@ -32,6 +32,10 @@ const KEX_STACK_TOP: u64 = KEX_USER_END - STARTUP_PAGE_BYTES as u64;
 
 /// Maximum stack buffer needed to receive one command invocation.
 pub const INVOCATION_BUFFER_BYTES: usize = command::MAX_INVOCATION_BYTES;
+/// Maximum UTF-8 bytes in any one command argument.
+pub const MAX_ARGUMENT_BYTES: usize = command::MAX_SINGLE_ARGUMENT_BYTES;
+/// Maximum stack buffer needed to receive one page of command arguments.
+pub const ARGUMENT_PAGE_BUFFER_BYTES: usize = command::MAX_ARGUMENT_PAGE_REPLY_BYTES;
 /// Maximum stack buffer needed to receive the immutable launch environment.
 pub const ENVIRONMENT_BUFFER_BYTES: usize = command::MAX_ENCODED_ENVIRONMENT_BYTES;
 /// Maximum stack buffer needed to receive one datagram.
@@ -342,6 +346,27 @@ impl CommandContext {
     ) -> Result<command::Invocation<'buffer>, Error> {
         let count = call(self.invocation, command::GET_INVOCATION, &[], buffer)?;
         command::Invocation::parse(&buffer[..count]).map_err(|_| Error::InvalidInvocation)
+    }
+
+    /// Open a bounded page-by-page reader over the immutable argument vector.
+    ///
+    /// Use this instead of [`invocation`](Self::invocation) for a command that
+    /// accepts an operand list. The record is read one bounded page at a time
+    /// and needs no heap, so an expansion far larger than one message is
+    /// consumed without ever being materialized.
+    ///
+    /// # Errors
+    ///
+    /// Reports call, service, authority, or canonical decoding failure.
+    pub fn arguments(&self) -> Result<ArgumentReader, Error> {
+        let mut reader = ArgumentReader {
+            handle: self.invocation,
+            bytes: [0_u8; ARGUMENT_PAGE_BUFFER_BYTES],
+            len: 0,
+            position: 0,
+        };
+        reader.load(0)?;
+        Ok(reader)
     }
 
     /// Fetch and validate the immutable `NAME=VALUE` launch environment.
@@ -715,6 +740,113 @@ pub unsafe fn grow_heap(minimum_additional_pages: usize) -> Result<usize, Error>
         }
         heap_growth::EXHAUSTED if mapped_bytes == 0 => Err(Error::Exhausted),
         _ => Err(Error::InvalidCall),
+    }
+}
+
+/// Bounded page-by-page reader over one immutable command argument vector.
+///
+/// The reader owns exactly one page-sized buffer. An argument vector produced
+/// by shell pathname expansion may hold thousands of operands, far more than
+/// one service message can carry, so operands are consumed a page at a time
+/// rather than materialized. The record is immutable, so seeking backwards and
+/// re-reading is well defined: a flag pre-pass followed by an operand pass
+/// costs one extra page load.
+pub struct ArgumentReader {
+    handle: Handle,
+    bytes: [u8; ARGUMENT_PAGE_BUFFER_BYTES],
+    len: usize,
+    position: usize,
+}
+
+impl ArgumentReader {
+    /// Load the page beginning at one absolute argument index.
+    fn load(&mut self, start: usize) -> Result<(), Error> {
+        let mut request = [0_u8; command::ARGUMENT_PAGE_REQUEST_BYTES];
+        let count = command::encode_argument_page_request(start, &mut request)
+            .map_err(|_| Error::InvalidCall)?;
+        let mut reply = [0_u8; ARGUMENT_PAGE_BUFFER_BYTES];
+        let received = call(
+            self.handle,
+            command::GET_ARGUMENT_PAGE,
+            &request[..count],
+            &mut reply,
+        )?;
+        let page = command::ArgumentPage::parse(&reply[..received])
+            .map_err(|_| Error::InvalidInvocation)?;
+        if page.start() != start {
+            return Err(Error::InvalidInvocation);
+        }
+        self.bytes[..received].copy_from_slice(&reply[..received]);
+        self.len = received;
+        Ok(())
+    }
+
+    /// Borrow the currently loaded page.
+    fn page(&self) -> Result<command::ArgumentPage<'_>, Error> {
+        command::ArgumentPage::parse(&self.bytes[..self.len]).map_err(|_| Error::InvalidInvocation)
+    }
+
+    /// Total arguments in the record, including the command name at index zero.
+    ///
+    /// # Errors
+    ///
+    /// Reports canonical decoding failure of the loaded page.
+    pub fn total(&self) -> Result<usize, Error> {
+        Ok(self.page()?.total())
+    }
+
+    /// Position the reader at one absolute argument index.
+    ///
+    /// # Errors
+    ///
+    /// Reports an index past the record, or canonical decoding failure.
+    pub fn seek(&mut self, index: usize) -> Result<(), Error> {
+        if index > self.page()?.total() {
+            return Err(Error::InvalidCall);
+        }
+        self.position = index;
+        Ok(())
+    }
+
+    /// Return one argument by its absolute index without moving the reader.
+    ///
+    /// # Errors
+    ///
+    /// Reports call, service, or canonical decoding failure.
+    pub fn get(&mut self, index: usize) -> Result<Option<&str>, Error> {
+        let page = self.page()?;
+        if index >= page.total() {
+            return Ok(None);
+        }
+        if index < page.start() || index >= page.next_start() {
+            self.load(index)?;
+        }
+        let page = self.page()?;
+        Ok(page.get(index - page.start()))
+    }
+
+    /// Return the argument at the reader's position and advance past it.
+    ///
+    /// Returns `Ok(None)` exactly once the record is exhausted.
+    ///
+    /// # Errors
+    ///
+    /// Reports call, service, or canonical decoding failure.
+    pub fn next_argument(&mut self) -> Result<Option<&str>, Error> {
+        let index = self.position;
+        let (total, start, next_start) = {
+            let page = self.page()?;
+            (page.total(), page.start(), page.next_start())
+        };
+        if index >= total {
+            return Ok(None);
+        }
+        if index < start || index >= next_start {
+            self.load(index)?;
+        }
+        self.position = index.saturating_add(1);
+        let page = self.page()?;
+        Ok(page.get(index - page.start()))
     }
 }
 

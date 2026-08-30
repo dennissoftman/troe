@@ -6,6 +6,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod glob;
 mod recovery_completion;
 
 use alloc::format;
@@ -16,6 +17,7 @@ use core::cell::RefCell;
 use core::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use core::str::FromStr;
 use recovery_completion::{ActiveResolver, IntrinsicCompletionRegistry, PackageCompletionRegistry};
+use troe_abi::command;
 use troe_completion::{
     AddressConstraints, AddressFamily, CompletionLimits, CompletionRequest, IntegerConstraints,
     IntegerRadix, PathKind, PortRequirement, Resolver,
@@ -105,11 +107,79 @@ impl OutputRedirection {
     }
 }
 
+/// One parsed shell word and the quoting needed to expand it.
+///
+/// The parser is the only place that still knows which characters were written
+/// inside quotes, so the mask is captured there rather than rediscovered later.
+/// It is per character rather than per word so that a partially quoted word
+/// such as `"a"*` still expands on its unquoted `*`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Word {
+    text: String,
+    literal: Vec<bool>,
+}
+
+impl Word {
+    /// Build one word whose every character is literal.
+    #[must_use]
+    pub fn quoted(text: &str) -> Self {
+        Self {
+            literal: text.chars().map(|_| true).collect(),
+            text: text.to_string(),
+        }
+    }
+
+    /// Build one word whose every character was written unquoted.
+    #[must_use]
+    pub fn bare(text: &str) -> Self {
+        Self {
+            literal: text.chars().map(|_| false).collect(),
+            text: text.to_string(),
+        }
+    }
+
+    /// Exact text after quote removal.
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    /// Character/quoting pairs used by pathname expansion.
+    fn units(&self) -> Vec<glob::Unit> {
+        self.text
+            .chars()
+            .zip(self.literal.iter().copied())
+            .collect()
+    }
+
+    /// Whether this word holds at least one unquoted metacharacter.
+    ///
+    /// Checked directly against the mask because every dispatched word is
+    /// tested, and only the few that are patterns are worth materializing.
+    #[must_use]
+    pub fn is_pattern(&self) -> bool {
+        self.text
+            .chars()
+            .zip(self.literal.iter().copied())
+            .any(|(character, literal)| !literal && matches!(character, '*' | '?' | '['))
+    }
+}
+
+/// Compare one word to plain text, ignoring where quotes were written.
+///
+/// Word-to-word equality still compares the quoting mask, so this is a
+/// convenience for callers that care only about the resulting text.
+impl PartialEq<&str> for Word {
+    fn eq(&self, other: &&str) -> bool {
+        self.text == *other
+    }
+}
+
 /// One parsed command invocation.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Stage {
-    /// Command name followed by its arguments.
-    pub words: Vec<String>,
+    /// Command name followed by its arguments, before pathname expansion.
+    pub words: Vec<Word>,
     /// Optional file used as this stage's standard input.
     pub input: Option<String>,
     /// Optional streamed file destination used as this stage's standard output.
@@ -275,6 +345,55 @@ pub trait ExternalCommand {
 
 const MAX_SCRIPT_DEPTH: u8 = 4;
 const MAX_SCRIPT_COMMANDS: usize = 1024;
+
+/// Maximum words one stage may hold after pathname expansion.
+///
+/// Matched to the paged command-invocation bound so that any expansion the
+/// shell accepts can actually be delivered to the launched application.
+const MAX_EXPANDED_WORDS: usize = command::MAX_PAGED_ARGUMENTS;
+/// Maximum aggregate argument bytes one stage may hold after expansion.
+const MAX_EXPANDED_BYTES: usize = command::MAX_PAGED_ARGUMENT_BYTES;
+/// Maximum directory entries visited while expanding one whole word.
+const MAX_EXPANSION_SCAN: usize = 4096;
+/// Maximum entry-name bytes visited while expanding one pattern component.
+const MAX_EXPANSION_SCAN_BYTES: usize = 64 * 1024;
+
+/// Pathname-expansion failure attributable to one written word.
+///
+/// Every variant fails the whole stage before dispatch, so no command observes
+/// a truncated operand list and no partial removal, copy, or move can occur.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExpansionError {
+    /// The expansion exceeded the argument-count bound.
+    TooManyWords,
+    /// The expansion exceeded the aggregate argument-byte bound.
+    TooManyBytes,
+    /// One pattern required visiting too many directory entries.
+    ScanExhausted,
+    /// Bounded allocation failed while retaining the expansion.
+    Exhausted,
+}
+
+/// Stable operator-facing text for one expansion failure.
+const fn expansion_error_text(error: ExpansionError) -> &'static str {
+    match error {
+        ExpansionError::TooManyWords => "expansion exceeds the argument limit",
+        ExpansionError::TooManyBytes => "expansion exceeds the argument byte limit",
+        ExpansionError::ScanExhausted => "expansion exceeds the directory scan limit",
+        ExpansionError::Exhausted => "expansion metadata exhausted",
+    }
+}
+
+/// Join one already-expanded prefix to one further path component.
+fn join_expanded(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else if prefix == "/" {
+        format!("/{name}")
+    } else {
+        format!("{prefix}/{name}")
+    }
+}
 
 struct EmptyScriptInput;
 
@@ -788,6 +907,7 @@ pub fn parse_line(line: &str) -> Result<Pipeline, ParseError> {
     let mut stages = Vec::new();
     let mut words = Vec::new();
     let mut word = String::new();
+    let mut word_literal = Vec::new();
     let mut word_started = false;
     let mut quote = Quote::None;
     let mut input = None;
@@ -803,6 +923,7 @@ pub fn parse_line(line: &str) -> Result<Pipeline, ParseError> {
                     quote = Quote::None;
                 } else {
                     word.push(character);
+                    word_literal.push(true);
                 }
             }
             Quote::Double => {
@@ -810,6 +931,7 @@ pub fn parse_line(line: &str) -> Result<Pipeline, ParseError> {
                     quote = Quote::None;
                 } else {
                     word.push(character);
+                    word_literal.push(true);
                 }
             }
             Quote::None => match character {
@@ -828,6 +950,7 @@ pub fn parse_line(line: &str) -> Result<Pipeline, ParseError> {
                         &mut output,
                         &mut pending,
                         &mut word,
+                        &mut word_literal,
                         &mut word_started,
                     )?;
                     if pending.is_some() {
@@ -855,6 +978,7 @@ pub fn parse_line(line: &str) -> Result<Pipeline, ParseError> {
                         &mut output,
                         &mut pending,
                         &mut word,
+                        &mut word_literal,
                         &mut word_started,
                     )?;
                     if pending.is_some()
@@ -873,6 +997,7 @@ pub fn parse_line(line: &str) -> Result<Pipeline, ParseError> {
                         &mut output,
                         &mut pending,
                         &mut word,
+                        &mut word_literal,
                         &mut word_started,
                     )?;
                     if pending.is_some() {
@@ -893,11 +1018,13 @@ pub fn parse_line(line: &str) -> Result<Pipeline, ParseError> {
                         &mut output,
                         &mut pending,
                         &mut word,
+                        &mut word_literal,
                         &mut word_started,
                     )?;
                 }
                 value => {
                     word.push(value);
+                    word_literal.push(false);
                     word_started = true;
                 }
             },
@@ -912,6 +1039,7 @@ pub fn parse_line(line: &str) -> Result<Pipeline, ParseError> {
         &mut output,
         &mut pending,
         &mut word,
+        &mut word_literal,
         &mut word_started,
     )?;
     if pending.is_some() {
@@ -1020,15 +1148,17 @@ pub fn parse_command_list(line: &str) -> Result<CommandList, ParseError> {
 }
 
 fn push_token(
-    words: &mut Vec<String>,
+    words: &mut Vec<Word>,
     input: &mut Option<String>,
     output: &mut Option<OutputRedirection>,
     pending: &mut Option<PendingRedirection>,
     word: &mut String,
+    literal: &mut Vec<bool>,
     started: &mut bool,
 ) -> Result<(), ParseError> {
     if *started {
         let token = core::mem::take(word);
+        let mask = core::mem::take(literal);
         match pending.take() {
             Some(PendingRedirection::Input) => {
                 if input.replace(token).is_some() {
@@ -1049,7 +1179,10 @@ fn push_token(
                 if words.len() >= MAX_ARGS {
                     return Err(ParseError::TooManyArguments);
                 }
-                words.push(token);
+                words.push(Word {
+                    text: token,
+                    literal: mask,
+                });
             }
         }
         *started = false;
@@ -1112,6 +1245,15 @@ impl Shell {
             script_depth: 0,
             script_commands_remaining: 0,
         })
+    }
+
+    /// Namespace this session owns, shared with its stream endpoints.
+    ///
+    /// The owner needs it to install session-wide namespace state, such as the
+    /// wall clock its mounted providers stamp with.
+    #[must_use]
+    pub const fn namespace(&self) -> &SharedNamespace {
+        &self.namespace
     }
 
     /// Terminal platform transition requested by an authorized command.
@@ -1365,6 +1507,17 @@ impl Shell {
         let mut previous = Vec::new();
         for (index, stage) in pipeline.stages.iter().enumerate() {
             let last = index + 1 == pipeline.stages.len();
+            let words = match self.expand_words(&stage.words) {
+                Ok(words) => words,
+                Err((pattern, error)) => {
+                    let _ignored = write_error(
+                        stderr,
+                        "sh",
+                        &format!("{pattern}: {}", expansion_error_text(error)),
+                    );
+                    return CommandStatus::Usage;
+                }
+            };
             let redirected_input = match stage.input.as_deref() {
                 Some(path) => match NamespaceFileInput::new(&self.namespace, &self.cwd, path) {
                     Ok(input) => Some(input),
@@ -1383,7 +1536,7 @@ impl Shell {
                             }
                         };
                     let status = self.dispatch_stage(
-                        &stage.words,
+                        &words,
                         index == 0,
                         redirected_input
                             .as_mut()
@@ -1401,7 +1554,7 @@ impl Shell {
                     };
                 }
                 return self.dispatch_stage(
-                    &stage.words,
+                    &words,
                     index == 0,
                     redirected_input
                         .as_mut()
@@ -1417,7 +1570,7 @@ impl Shell {
 
             let mut next = BoundedOutput::new(PIPE_CAPACITY);
             let status = self.dispatch_stage(
-                &stage.words,
+                &words,
                 index == 0,
                 redirected_input
                     .as_mut()
@@ -1610,6 +1763,137 @@ impl Shell {
             self.script_commands_remaining = 0;
         }
         status
+    }
+
+    /// Expand every argument word of one stage into concrete operands.
+    ///
+    /// The command word is left literal so that exact KEX path resolution and
+    /// the untrusted-path confirmation see what was written. A pattern that
+    /// matches nothing is passed through unchanged, so a failed match surfaces
+    /// as the command's own diagnostic rather than as a silently empty
+    /// invocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the offending word and the bound it exceeded. Nothing has been
+    /// dispatched when this fails.
+    fn expand_words(&mut self, words: &[Word]) -> Result<Vec<String>, (String, ExpansionError)> {
+        let mut expanded = Vec::new();
+        let mut bytes = 0_usize;
+        for (index, word) in words.iter().enumerate() {
+            if index == 0 || !word.is_pattern() {
+                retain_expanded(&mut expanded, &mut bytes, word.text())
+                    .map_err(|error| (word.text().to_string(), error))?;
+                continue;
+            }
+            let matched = self
+                .expand_pattern(word)
+                .map_err(|error| (word.text().to_string(), error))?;
+            if matched.is_empty() {
+                retain_expanded(&mut expanded, &mut bytes, word.text())
+                    .map_err(|error| (word.text().to_string(), error))?;
+                continue;
+            }
+            for value in matched {
+                retain_expanded(&mut expanded, &mut bytes, &value)
+                    .map_err(|error| (word.text().to_string(), error))?;
+            }
+        }
+        Ok(expanded)
+    }
+
+    /// Expand one pattern word component by component against the namespace.
+    ///
+    /// An empty result means the pattern matched nothing.
+    fn expand_pattern(&mut self, word: &Word) -> Result<Vec<String>, ExpansionError> {
+        let units = word.units();
+        let parts = glob::components(&units);
+        let absolute = parts.len() > 1 && parts[0].is_empty();
+        let segments = if absolute { &parts[1..] } else { &parts[..] };
+        let mut current = Vec::new();
+        current.push(if absolute {
+            "/".to_string()
+        } else {
+            String::new()
+        });
+        let mut scanned = 0_usize;
+        let mut expanded_any = false;
+        for (index, segment) in segments.iter().enumerate() {
+            let last = index + 1 == segments.len();
+            let mut next = Vec::new();
+            if glob::is_pattern(segment) {
+                let name_prefix = glob::literal_prefix(segment);
+                for prefix in &current {
+                    let directory = if prefix.is_empty() {
+                        "."
+                    } else {
+                        prefix.as_str()
+                    };
+                    let listing = match self.namespace.borrow_mut().list_matching_bounded(
+                        &self.cwd,
+                        directory,
+                        &name_prefix,
+                        !last,
+                        MAX_EXPANSION_SCAN,
+                        MAX_EXPANSION_SCAN_BYTES,
+                    ) {
+                        Ok(listing) => listing,
+                        Err(FsError::NoSpace | FsError::Overflow) => {
+                            return Err(ExpansionError::ScanExhausted);
+                        }
+                        Err(_) => continue,
+                    };
+                    if listing.truncated {
+                        return Err(ExpansionError::ScanExhausted);
+                    }
+                    for entry in listing.entries {
+                        scanned = scanned
+                            .checked_add(1)
+                            .ok_or(ExpansionError::ScanExhausted)?;
+                        if scanned > MAX_EXPANSION_SCAN {
+                            return Err(ExpansionError::ScanExhausted);
+                        }
+                        if !glob::matches(segment, &entry.name) {
+                            continue;
+                        }
+                        if next.len() >= MAX_EXPANDED_WORDS {
+                            return Err(ExpansionError::TooManyWords);
+                        }
+                        next.try_reserve(1).map_err(|_| ExpansionError::Exhausted)?;
+                        next.push(join_expanded(prefix, &entry.name));
+                    }
+                }
+                next.sort();
+                expanded_any = true;
+            } else {
+                let text: String = segment.iter().map(|(character, _)| *character).collect();
+                for prefix in &current {
+                    let candidate = join_expanded(prefix, &text);
+                    // Once a component has matched, every path this word
+                    // produces must exist, or `*/missing` would name one file
+                    // per matched directory instead of matching nothing. Before
+                    // the first match the accumulated prefix is plain literal
+                    // text, which the next listing validates anyway.
+                    if expanded_any && !text.is_empty() {
+                        let Ok(metadata) =
+                            self.namespace.borrow_mut().metadata(&self.cwd, &candidate)
+                        else {
+                            continue;
+                        };
+                        if !last && metadata.kind != NodeKind::Directory {
+                            continue;
+                        }
+                    }
+                    next.try_reserve(1).map_err(|_| ExpansionError::Exhausted)?;
+                    next.push(candidate);
+                }
+            }
+            if next.is_empty() {
+                return Ok(Vec::new());
+            }
+            current = next;
+        }
+        Ok(current)
     }
 
     fn complete_paths(
@@ -2291,6 +2575,29 @@ fn optional_byte_ratio(numerator: Option<u64>, denominator: Option<u64>, suffix:
     }
 }
 
+/// Retain one expanded operand within the stage's argument budget.
+fn retain_expanded(
+    expanded: &mut Vec<String>,
+    bytes: &mut usize,
+    value: &str,
+) -> Result<(), ExpansionError> {
+    if expanded.len() >= MAX_EXPANDED_WORDS {
+        return Err(ExpansionError::TooManyWords);
+    }
+    let next_bytes = bytes
+        .checked_add(value.len())
+        .ok_or(ExpansionError::TooManyBytes)?;
+    if next_bytes > MAX_EXPANDED_BYTES {
+        return Err(ExpansionError::TooManyBytes);
+    }
+    expanded
+        .try_reserve(1)
+        .map_err(|_| ExpansionError::Exhausted)?;
+    expanded.push(value.to_string());
+    *bytes = next_bytes;
+    Ok(())
+}
+
 fn usage(stderr: &mut dyn Output, command: &str, synopsis: &str) -> CommandStatus {
     let _ignored = write_error(stderr, command, synopsis);
     CommandStatus::Usage
@@ -2392,6 +2699,7 @@ mod tests {
         command_synopsis, external_command_reference, format_memory_report, parse_command_list,
         parse_line,
     };
+    use super::{MAX_EXPANDED_WORDS, Word};
     use alloc::boxed::Box;
     use alloc::format;
     use alloc::rc::Rc;
@@ -2825,8 +3133,271 @@ mod tests {
         assert_eq!(stderr.as_slice(), b"sh: script command limit exceeded\n");
     }
 
+    /// Records the exact operand list every launched application received.
+    #[derive(Default)]
+    struct ArgumentRecorder {
+        invocations: Vec<Vec<String>>,
+    }
+
+    impl ExternalCommand for ArgumentRecorder {
+        fn execute<'stream>(
+            &mut self,
+            _command: &str,
+            words: &[String],
+            _cwd: &str,
+            _namespace: &SharedNamespace,
+            _placement: ExecutionPlacement,
+            _stdin: &'stream mut dyn Input,
+            _stdout: &'stream mut dyn Output,
+            _stderr: &'stream mut dyn Output,
+        ) -> Option<CommandStatus> {
+            self.invocations.push(words.to_vec());
+            Some(CommandStatus::Success)
+        }
+    }
+
+    /// One namespace holding a small tree plus a hidden and a nested entry.
+    fn expansion_shell() -> Shell {
+        let mut namespace = Namespace::new(RamFsQuota::default());
+        for directory in ["/work", "/work/sub"] {
+            assert_eq!(namespace.add_read_only_dir(directory), Ok(()));
+        }
+        for path in [
+            "/work/alpha.txt",
+            "/work/beta.txt",
+            "/work/notes.md",
+            "/work/.hidden.txt",
+            "/work/*literal.txt",
+            "/work/sub/gamma.txt",
+        ] {
+            assert_eq!(namespace.add_read_only_file(path, b"x"), Ok(()));
+        }
+        match Shell::new(namespace, "test", MachineMemorySnapshot::hosted(), true) {
+            Ok(value) => value,
+            Err(_error) => std::process::abort(),
+        }
+    }
+
+    /// Run one line and return the operand list the application observed.
+    fn expanded(shell: &mut Shell, line: &str) -> Vec<String> {
+        let mut recorder = ArgumentRecorder::default();
+        let mut input = SliceInput::new(b"");
+        let mut output = BoundedOutput::new(4096);
+        let mut error = BoundedOutput::new(4096);
+        assert_eq!(
+            shell.execute_with_external(line, &mut input, &mut output, &mut error, &mut recorder,),
+            CommandStatus::Success,
+            "{line}"
+        );
+        match recorder.invocations.into_iter().next() {
+            Some(words) => words,
+            None => std::process::abort(),
+        }
+    }
+
     #[test]
-    fn quotes_and_pipelines_parse_without_expansion() {
+    fn patterns_expand_to_sorted_operands_and_never_select_hidden_entries() {
+        let mut shell = expansion_shell();
+        assert_eq!(shell.cwd(), "/");
+        let mut input = SliceInput::new(b"");
+        let mut output = BoundedOutput::new(256);
+        let mut error = BoundedOutput::new(256);
+        assert_eq!(
+            shell.execute("cd /work", &mut input, &mut output, &mut error),
+            CommandStatus::Success
+        );
+
+        assert_eq!(
+            expanded(&mut shell, "record *.txt"),
+            ["record", "*literal.txt", "alpha.txt", "beta.txt"]
+        );
+        assert_eq!(
+            expanded(&mut shell, "record ?eta.txt"),
+            ["record", "beta.txt"]
+        );
+        assert_eq!(
+            expanded(&mut shell, "record [ab]*.txt"),
+            ["record", "alpha.txt", "beta.txt"]
+        );
+        assert_eq!(
+            expanded(&mut shell, "record [!ab]*.txt"),
+            ["record", "*literal.txt"]
+        );
+        // An unanchored pattern never reaches a dotfile; an anchored one does.
+        assert_eq!(
+            expanded(&mut shell, "record .*.txt"),
+            ["record", ".hidden.txt"]
+        );
+    }
+
+    #[test]
+    fn quoting_suppresses_matching_for_exactly_the_quoted_characters() {
+        let mut shell = expansion_shell();
+        let mut input = SliceInput::new(b"");
+        let mut output = BoundedOutput::new(256);
+        let mut error = BoundedOutput::new(256);
+        assert_eq!(
+            shell.execute("cd /work", &mut input, &mut output, &mut error),
+            CommandStatus::Success
+        );
+
+        // Fully quoted: one literal operand naming the file that exists.
+        assert_eq!(
+            expanded(&mut shell, "record \"*literal.txt\""),
+            ["record", "*literal.txt"]
+        );
+        assert_eq!(expanded(&mut shell, "record '*.txt'"), ["record", "*.txt"]);
+        // Partially quoted: the quoted * is literal, the bare one still matches.
+        assert_eq!(
+            expanded(&mut shell, "record \"*\"lit*"),
+            ["record", "*literal.txt"]
+        );
+        // Bare: the same word matches every .txt entry instead.
+        assert_eq!(
+            expanded(&mut shell, "record \"a\"*.txt"),
+            ["record", "alpha.txt"]
+        );
+    }
+
+    #[test]
+    fn patterns_matching_nothing_reach_the_command_as_written() {
+        let mut shell = expansion_shell();
+        let mut input = SliceInput::new(b"");
+        let mut output = BoundedOutput::new(256);
+        let mut error = BoundedOutput::new(256);
+        assert_eq!(
+            shell.execute("cd /work", &mut input, &mut output, &mut error),
+            CommandStatus::Success
+        );
+        assert_eq!(expanded(&mut shell, "record *.zzz"), ["record", "*.zzz"]);
+        assert_eq!(
+            expanded(&mut shell, "record missing/*.txt"),
+            ["record", "missing/*.txt"]
+        );
+    }
+
+    #[test]
+    fn expansion_walks_components_and_a_star_never_crosses_a_separator() {
+        let mut shell = expansion_shell();
+        assert_eq!(
+            expanded(&mut shell, "record /work/*.md"),
+            ["record", "/work/notes.md"]
+        );
+        assert_eq!(
+            expanded(&mut shell, "record /work/*/gamma.txt"),
+            ["record", "/work/sub/gamma.txt"]
+        );
+        assert_eq!(
+            expanded(&mut shell, "record /work/sub/*"),
+            ["record", "/work/sub/gamma.txt"]
+        );
+        // `*` stops at the separator, so a nested file is not reachable from
+        // one component and the unmatched word is passed through as written.
+        assert_eq!(
+            expanded(&mut shell, "record /work/*gamma.txt"),
+            ["record", "/work/*gamma.txt"]
+        );
+    }
+
+    #[test]
+    fn a_literal_component_after_a_match_must_still_exist() {
+        let mut shell = expansion_shell();
+        // `/work/*` matches `sub`, but nothing named `absent.txt` lives under
+        // it, so the whole word matches nothing and reaches the command as
+        // written rather than naming one path per matched directory.
+        assert_eq!(
+            expanded(&mut shell, "record /work/*/absent.txt"),
+            ["record", "/work/*/absent.txt"]
+        );
+        // A literal component that does exist is still produced.
+        assert_eq!(
+            expanded(&mut shell, "record /work/*/gamma.txt"),
+            ["record", "/work/sub/gamma.txt"]
+        );
+        // A literal non-final component must additionally be a directory.
+        assert_eq!(
+            expanded(&mut shell, "record /work/*/gamma.txt/deeper"),
+            ["record", "/work/*/gamma.txt/deeper"]
+        );
+    }
+
+    #[test]
+    fn the_command_word_and_redirection_targets_are_never_expanded() {
+        let mut shell = expansion_shell();
+        let mut input = SliceInput::new(b"");
+        let mut output = BoundedOutput::new(256);
+        let mut error = BoundedOutput::new(256);
+        assert_eq!(
+            shell.execute("cd /work", &mut input, &mut output, &mut error),
+            CommandStatus::Success
+        );
+        // The command word keeps its metacharacters even though a file matches.
+        assert_eq!(
+            expanded(&mut shell, "*literal.txt operand"),
+            ["*literal.txt", "operand"]
+        );
+        let parsed = match parse_line("record *.txt > *.out") {
+            Ok(value) => value,
+            Err(_error) => std::process::abort(),
+        };
+        assert_eq!(
+            parsed.stages[0].output,
+            Some(OutputRedirection::Replace("*.out".to_string()))
+        );
+    }
+
+    #[test]
+    fn an_over_budget_expansion_refuses_the_whole_stage_before_dispatch() {
+        let mut namespace = Namespace::new(RamFsQuota::default());
+        assert_eq!(namespace.add_read_only_dir("/wide"), Ok(()));
+        // Aggregate entry-name bytes past the 64 KiB scan budget.
+        let filler = "n".repeat(200);
+        for index in 0..400 {
+            assert_eq!(
+                namespace.add_read_only_file(&format!("/wide/{filler}{index:04}.txt"), b"x"),
+                Ok(())
+            );
+        }
+        let mut shell = match Shell::new(namespace, "test", MachineMemorySnapshot::hosted(), true) {
+            Ok(value) => value,
+            Err(_error) => std::process::abort(),
+        };
+        let mut recorder = ArgumentRecorder::default();
+        let mut input = SliceInput::new(b"");
+        let mut output = BoundedOutput::new(256);
+        let mut error = BoundedOutput::new(4096);
+        assert_eq!(
+            shell.execute_with_external(
+                "record /wide/*.txt",
+                &mut input,
+                &mut output,
+                &mut error,
+                &mut recorder,
+            ),
+            CommandStatus::Usage
+        );
+        // Nothing was dispatched, so no command observed a truncated list.
+        assert!(recorder.invocations.is_empty());
+        let reported = String::from_utf8_lossy(error.as_slice()).to_string();
+        assert!(reported.contains("/wide/*.txt"), "{reported}");
+        assert!(reported.contains("scan limit"), "{reported}");
+    }
+
+    #[test]
+    fn the_expansion_word_bound_matches_the_paged_invocation_bound() {
+        assert_eq!(MAX_EXPANDED_WORDS, troe_abi::command::MAX_PAGED_ARGUMENTS);
+        // Quoting is retained per character, not per word.
+        let word = match parse_line("record \"a\"*") {
+            Ok(value) => value,
+            Err(_error) => std::process::abort(),
+        };
+        assert!(word.stages[0].words[1].is_pattern());
+        assert!(!Word::quoted("a*").is_pattern());
+        assert!(Word::bare("a*").is_pattern());
+    }
+
+    #[test]
+    fn quotes_and_pipelines_parse_into_words_and_stages() {
         let parsed = parse_line("echo 'a b' \"c|d\" | grep b").unwrap_or_default();
         assert_eq!(parsed.stages.len(), 2);
         assert_eq!(parsed.stages[0].words, ["echo", "a b", "c|d"]);
