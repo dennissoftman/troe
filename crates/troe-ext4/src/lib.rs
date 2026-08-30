@@ -3363,8 +3363,8 @@ impl<D: BlockDevice> Ext4<D> {
             )? {
                 return Ok(());
             }
-            // Every record in the leaf shares the new name's hash, so no split
-            // could have separated them.
+            // The split ran but left no room in the half this name belongs to,
+            // which takes an uneven division forced by records sharing a hash.
             return Err(FsError::NoSpace);
         }
 
