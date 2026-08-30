@@ -7,5 +7,8 @@ SYNOPSIS
 DESCRIPTION
     Prints the bounded kernel process registry, including stable process IDs,
     launcher origin, lifecycle state, charged user CPU time, retained pages,
-    live handles, and executable name. Observation is read-only and does not
-    expose command arguments or process-control authority.
+    live handles, timer-driven preemptions, voluntary yields, and executable
+    name. PREEMPTS counts resumable timeslice expiries and YIELDS counts
+    voluntary returns to the scheduler; together they show how often a process
+    left unprivileged execution. Observation is read-only and does not expose
+    command arguments or process-control authority.

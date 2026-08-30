@@ -43,20 +43,19 @@ fn ticks_to_millis(ticks: u64, frequency: u64) -> u64 {
         .saturating_add(remainder.saturating_mul(1_000) / frequency)
 }
 
-fn report_page(
-    output: &mut impl fmt::Write,
-    page: &process_observation::Page,
-) -> fmt::Result {
+fn report_page(output: &mut impl fmt::Write, page: &process_observation::Page) -> fmt::Result {
     for process in page.processes() {
         writeln!(
             output,
-            "{} {:<6} {:<8} {} {} {} {}",
+            "{} {:<6} {:<8} {} {} {} {} {} {}",
             process.id,
             origin_label(process.origin),
             state_label(process.state),
             ticks_to_millis(process.cpu_ticks, page.counter_frequency_hz()),
             process.resident_pages,
             process.handles,
+            process.preemptions,
+            process.yields,
             process.name.as_str(),
         )?;
     }
@@ -89,8 +88,11 @@ fn main(command: &mut CommandContext) -> u32 {
             let mut stdout = command.stdout();
             let mut output = OutputWriter(&mut stdout);
             if first {
-                writeln!(output, "PID ORIGIN STATE    CPU-MS PAGES HANDLES NAME")
-                    .and_then(|()| report_page(&mut output, &page))
+                writeln!(
+                    output,
+                    "PID ORIGIN STATE    CPU-MS PAGES HANDLES PREEMPTS YIELDS NAME"
+                )
+                .and_then(|()| report_page(&mut output, &page))
             } else {
                 report_page(&mut output, &page)
             }
