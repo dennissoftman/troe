@@ -108,9 +108,27 @@ Fault injection covers this contract directly. A test device models a volatile
 write-back cache in which unflushed writes are unordered and lost on power loss,
 and the suite interrupts every write boundary of a create and of an append,
 proving each one recovers to exactly one valid state and that recovery is
-idempotent. Writer interoperability is still checked against real `mke2fs` and
-read-only `e2fsck`. Note that `e2fsck -fn` does not replay a pending journal, so
-it cannot by itself prove replay correctness; byte-level assertions carry that
+idempotent.
+
+The suite also tears writes, modelling one that was landing on the platter when
+power was lost: the sectors that made it are durable, the rest never happen, and
+no flush reconciles the two halves. It tears the journal descriptor, the commit
+record, an in-place checkpoint write, and one of recovery's own replay writes,
+and compares whole media images afterwards. A torn descriptor is discarded and
+leaves every filesystem block byte-identical to its pre-mutation image. A torn
+commit record lands on one whole state or the other, never between: the log
+payload is already durable when it is issued, so a record whose identifying
+header reached media commits the transaction the log fully describes, and one
+whose header did not is discarded. A torn checkpoint write leaves media holding
+neither state — the assertions pin the exact prefix and suffix — and replay
+restores the volume byte-for-byte to what the same mutation produces
+uninterrupted. A recovery torn part-way through reaches those same bytes when it
+is re-run, because nothing it does consumes the log until the whole checkpoint
+is durable.
+
+Writer interoperability is still checked against real `mke2fs` and read-only
+`e2fsck`. Note that `e2fsck -fn` does not replay a pending journal, so it cannot
+by itself prove replay correctness; the byte-level assertions above carry that
 evidence.
 
 The image recipe pins the journal length with an explicit `-J size=4`, and the

@@ -5141,6 +5141,7 @@ fn crc32c(seed: u32, bytes: &[u8]) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    use crate::journal::{JBD2_COMMIT_BLOCK, JBD2_DESCRIPTOR_BLOCK, JBD2_MAGIC};
     use crate::{
         EXT4_CRTIME, EXT4_DX_PARENT_OFFSET, EXT4_EXT_MAGIC, EXT4_EXTENT_HEADER_BYTES,
         EXT4_EXTENT_RECORD_BYTES, EXT4_EXTENT_TAIL_BYTES, EXT4_MAX_EXTENT_DEPTH, EXT4_MTIME,
@@ -5301,7 +5302,13 @@ mod tests {
     /// unbarriered writes have no ordering, exactly like a real disk. A power
     /// loss discards whatever has not been flushed. Faults can fail the Nth
     /// write or flush, or tear one write so that only a prefix of its sectors
-    /// reaches the cache.
+    /// reaches media.
+    ///
+    /// A torn write models one that was landing on the platter when power was
+    /// lost rather than one sitting in the cache: the sectors that made it are
+    /// durable immediately, the rest never happen, and no flush ever
+    /// reconciles the two halves. A tear whose prefix would cover the whole
+    /// request is an ordinary cached write.
     #[derive(Debug, Clone)]
     struct PowerLossDevice {
         geometry: BlockGeometry,
@@ -5313,6 +5320,10 @@ mod tests {
         fail_write_at: Option<usize>,
         fail_flush_at: Option<usize>,
         tear_write_at: Option<(usize, u32)>,
+        /// Start block and leading eight bytes of every write in issue order,
+        /// so a test names a boundary by what the provider was writing rather
+        /// than by a hardcoded index.
+        issued: Vec<(u64, [u8; 8])>,
     }
 
     impl PowerLossDevice {
@@ -5327,6 +5338,7 @@ mod tests {
                 fail_write_at: None,
                 fail_flush_at: None,
                 tear_write_at: None,
+                issued: Vec::new(),
             })
         }
 
@@ -5344,6 +5356,25 @@ mod tests {
         fn reset_counts(&mut self) {
             self.writes = 0;
             self.flushes = 0;
+            self.issued.clear();
+        }
+
+        /// Every durable sector in device-block order, unwritten blocks zero.
+        fn durable_image(&self) -> Vec<u8> {
+            let blocks = usize::try_from(DEVICE_BLOCKS).unwrap_or_else(|_| unreachable!());
+            let mut image = vec![0_u8; blocks * DEVICE_BLOCK_BYTES_USIZE];
+            for (block, sector) in &self.durable {
+                let start = usize::try_from(*block).unwrap_or_else(|_| unreachable!())
+                    * DEVICE_BLOCK_BYTES_USIZE;
+                image[start..start + DEVICE_BLOCK_BYTES_USIZE].copy_from_slice(sector);
+            }
+            image
+        }
+
+        /// The durable bytes of one filesystem block.
+        fn durable_fs_block(&self, block: u32) -> Vec<u8> {
+            let start = block as usize * EXT4_BLOCK_BYTES;
+            self.durable_image()[start..start + EXT4_BLOCK_BYTES].to_vec()
         }
 
         fn sector(&self, block: u64) -> [u8; DEVICE_BLOCK_BYTES_USIZE] {
@@ -5411,6 +5442,9 @@ mod tests {
                 return Err(BlockError::Device);
             }
             self.writes += 1;
+            let mut head = [0_u8; 8];
+            head.copy_from_slice(source.get(..8).ok_or(BlockError::Device)?);
+            self.issued.push((start_block, head));
             if self.fail_write_at == Some(self.writes) {
                 return Err(BlockError::Device);
             }
@@ -5418,6 +5452,7 @@ mod tests {
                 Some((index, sectors)) if index == self.writes => sectors.min(block_count),
                 _ => block_count,
             };
+            let torn = persisted != block_count;
             for index in 0..u64::from(persisted) {
                 let offset = usize::try_from(index)
                     .ok()
@@ -5429,9 +5464,13 @@ mod tests {
                         .get(offset..offset + DEVICE_BLOCK_BYTES_USIZE)
                         .ok_or(BlockError::Device)?,
                 );
-                self.pending.insert(start_block + index, sector);
+                if torn {
+                    self.durable.insert(start_block + index, sector);
+                } else {
+                    self.pending.insert(start_block + index, sector);
+                }
             }
-            if persisted != block_count {
+            if torn {
                 return Err(BlockError::Device);
             }
             Ok(())
@@ -6543,6 +6582,312 @@ mod tests {
         let region = BlockRegion::whole_device(device, BlockAccess::ReadWrite, block_limits)
             .map_err(|_| FsError::Io)?;
         Ext4::recover(region, limits()?)
+    }
+
+    /// One durable image with the log blanked, so two images compare on
+    /// filesystem state alone rather than on log scratch space.
+    fn outside_log(image: &[u8]) -> Vec<u8> {
+        let mut copy = image.to_vec();
+        let start = JOURNAL_FIRST_BLOCK as usize * EXT4_BLOCK_BYTES;
+        copy[start..start + JOURNAL_BLOCKS as usize * EXT4_BLOCK_BYTES].fill(0);
+        copy
+    }
+
+    /// Assert two durable images agree, naming the blocks that differ.
+    fn assert_same_blocks(actual: &[u8], expected: &[u8], label: &str) {
+        let differing = (0..actual.len() / EXT4_BLOCK_BYTES)
+            .filter(|block| {
+                let start = block * EXT4_BLOCK_BYTES;
+                actual[start..start + EXT4_BLOCK_BYTES] != expected[start..start + EXT4_BLOCK_BYTES]
+            })
+            .collect::<Vec<_>>();
+        assert!(differing.is_empty(), "{label}: blocks {differing:?} differ");
+    }
+
+    /// One journal block header: the magic followed by its block type.
+    fn journal_head(block_type: u32) -> [u8; 8] {
+        let mut head = [0_u8; 8];
+        head[..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+        head[4..].copy_from_slice(&block_type.to_be_bytes());
+        head
+    }
+
+    const fn device_block_of(fs_block: u32) -> u64 {
+        fs_block as u64 * DEVICE_BLOCKS_PER_FS_BLOCK as u64
+    }
+
+    /// A create and the two byte-exact media states it moves between.
+    struct TornWriteFixture {
+        /// Every durable byte before the mutation.
+        before: Vec<u8>,
+        /// Every durable byte after the same mutation completes uninterrupted.
+        after: Vec<u8>,
+        /// Start block and leading eight bytes of each write it issued.
+        issued: Vec<(u64, [u8; 8])>,
+    }
+
+    impl TornWriteFixture {
+        /// The one-based index of the first write matching `predicate`.
+        fn first_write<P>(&self, predicate: P) -> Option<usize>
+        where
+            P: Fn(u64, &[u8; 8]) -> bool,
+        {
+            self.issued
+                .iter()
+                .position(|(block, head)| predicate(*block, head))
+                .map(|index| index + 1)
+        }
+
+        /// Blocks the mutation checkpointed in place, which is exactly what a
+        /// replay of its log must restore: every write after the commit record
+        /// except the log retire and the clean marker that close the mutation.
+        fn checkpointed_blocks(&self) -> Result<u32, FsError> {
+            let commit = self
+                .first_write(|_, head| *head == journal_head(JBD2_COMMIT_BLOCK))
+                .ok_or(FsError::Corrupt)?;
+            let blocks = self
+                .issued
+                .len()
+                .checked_sub(commit + 2)
+                .ok_or(FsError::Corrupt)?;
+            u32::try_from(blocks).map_err(|_| FsError::Overflow)
+        }
+    }
+
+    const TORN_PATH: &str = "/created.txt";
+    const TORN_CONTENT: &[u8] = b"created by troe\n";
+    /// Sectors of a torn 4 KiB write that reach media; the rest never land.
+    const TORN_SECTORS: u32 = 4;
+
+    fn torn_write_fixture() -> Result<TornWriteFixture, FsError> {
+        let baseline = power_loss_device()?;
+        let before = baseline.device().durable_image();
+        {
+            let mut ext4 = mount_device_writable(baseline.clone())?;
+            ext4.write_file(TORN_PATH, TORN_CONTENT)?;
+        }
+        let device = baseline.device();
+        Ok(TornWriteFixture {
+            before,
+            after: device.durable_image(),
+            issued: device.issued.clone(),
+        })
+    }
+
+    /// Run the create again, tearing write `boundary` after `TORN_SECTORS`.
+    fn tear_create_at(boundary: usize) -> Result<SharedDevice, FsError> {
+        tear_create_at_with(boundary, TORN_SECTORS)
+    }
+
+    /// Run the create again, tearing write `boundary` after `sectors`.
+    fn tear_create_at_with(boundary: usize, sectors: u32) -> Result<SharedDevice, FsError> {
+        let device = power_loss_device()?;
+        device.device().tear_write_at = Some((boundary, sectors));
+        {
+            let mut ext4 = mount_device_writable(device.clone())?;
+            assert_eq!(
+                ext4.write_file(TORN_PATH, TORN_CONTENT),
+                Err(FsError::Io),
+                "a torn write must fail the mutation that issued it"
+            );
+        }
+        device.device().power_loss();
+        Ok(device)
+    }
+
+    /// Recover a volume the ordinary mount refuses, then prove that one pass
+    /// was enough: a second recovery finds nothing to do and the ordinary
+    /// mount opens the volume.
+    fn recover_once(device: &SharedDevice) -> Result<RecoveryOutcome, FsError> {
+        assert!(
+            mount_device_writable(device.clone()).is_err(),
+            "an interrupted volume must stay fail-closed to the ordinary mount"
+        );
+        let (_recovered, outcome) = recover_device(device.clone())?;
+        assert_eq!(
+            recover_device(device.clone()).err(),
+            Some(FsError::Invalid),
+            "recovery must be idempotent"
+        );
+        mount_device_writable(device.clone())?;
+        Ok(outcome)
+    }
+
+    #[test]
+    fn a_torn_journal_descriptor_is_discarded_and_leaves_media_untouched() -> Result<(), FsError> {
+        // The descriptor is written before the log head is armed, so a tear
+        // there can only discard: nothing the mutation staged ever reached an
+        // in-place block, and no replay can find the half-written record.
+        let fixture = torn_write_fixture()?;
+        let boundary = fixture
+            .first_write(|_, head| *head == journal_head(JBD2_DESCRIPTOR_BLOCK))
+            .ok_or(FsError::Corrupt)?;
+        let device = tear_create_at(boundary)?;
+
+        // Half a descriptor really is on media, so the tear was injected.
+        let torn = device.device().durable_fs_block(JOURNAL_FIRST_BLOCK + 1);
+        assert_eq!(&torn[..8], &journal_head(JBD2_DESCRIPTOR_BLOCK));
+        assert!(
+            torn[TORN_SECTORS as usize * DEVICE_BLOCK_BYTES_USIZE..]
+                .iter()
+                .all(|byte| *byte == 0),
+            "only the torn prefix may reach media"
+        );
+
+        assert_eq!(recover_once(&device)?, RecoveryOutcome::AlreadyClean);
+        // Byte for byte, every filesystem block is exactly as it was.
+        assert_same_blocks(
+            &outside_log(&device.device().durable_image()),
+            &outside_log(&fixture.before),
+            "a discarded transaction must leave media untouched",
+        );
+        let mut ext4 = mount_device_writable(device.clone())?;
+        assert_eq!(
+            ext4.metadata(TORN_PATH).err(),
+            Some(FsError::NotFound),
+            "a discarded transaction leaves nothing behind"
+        );
+        // The stale half-descriptor is inert: the next mutation still lands.
+        ext4.write_file(TORN_PATH, TORN_CONTENT)?;
+        let mut bytes = [0_u8; TORN_CONTENT.len()];
+        assert_eq!(
+            ext4.read_file(TORN_PATH, 0, &mut bytes)?,
+            TORN_CONTENT.len()
+        );
+        assert_eq!(&bytes, TORN_CONTENT);
+        Ok(())
+    }
+
+    #[test]
+    fn a_torn_commit_record_recovers_to_exactly_one_of_two_states() -> Result<(), FsError> {
+        // Every log payload block is already durable when the commit record is
+        // issued, so both fates are whole states: a commit record whose
+        // identifying header reached media replays the transaction the log
+        // fully describes, and one that did not is discarded.
+        let fixture = torn_write_fixture()?;
+        let boundary = fixture
+            .first_write(|_, head| *head == journal_head(JBD2_COMMIT_BLOCK))
+            .ok_or(FsError::Corrupt)?;
+
+        let landed = tear_create_at(boundary)?;
+        assert_eq!(
+            recover_once(&landed)?,
+            RecoveryOutcome::Replayed {
+                blocks: fixture.checkpointed_blocks()?
+            },
+            "a commit record whose header is durable commits the transaction"
+        );
+        assert_same_blocks(
+            &outside_log(&landed.device().durable_image()),
+            &outside_log(&fixture.after),
+            "a replayed transaction must reach the post-state",
+        );
+
+        let lost = tear_create_at_with(boundary, 0)?;
+        assert_eq!(recover_once(&lost)?, RecoveryOutcome::Discarded);
+        assert_same_blocks(
+            &outside_log(&lost.device().durable_image()),
+            &outside_log(&fixture.before),
+            "a discarded transaction must reach the pre-state",
+        );
+
+        let mut replayed = mount_device_writable(landed)?;
+        let mut bytes = [0_u8; TORN_CONTENT.len()];
+        assert_eq!(
+            replayed.read_file(TORN_PATH, 0, &mut bytes)?,
+            TORN_CONTENT.len()
+        );
+        assert_eq!(&bytes, TORN_CONTENT);
+        assert_eq!(
+            mount_device_writable(lost)?.metadata(TORN_PATH).err(),
+            Some(FsError::NotFound)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_torn_checkpoint_write_is_healed_by_replay() -> Result<(), FsError> {
+        // The root directory block changes at both ends when an entry is
+        // added: the record near its start and the checksum tail at its end.
+        // Tearing its in-place rewrite therefore leaves media a real mixture
+        // of the two states, which the whole-block replay images restore.
+        let fixture = torn_write_fixture()?;
+        let boundary = fixture
+            .first_write(|block, _| block == device_block_of(ROOT_DIRECTORY_BLOCK))
+            .ok_or(FsError::Corrupt)?;
+        let device = tear_create_at(boundary)?;
+
+        let split = TORN_SECTORS as usize * DEVICE_BLOCK_BYTES_USIZE;
+        let start = ROOT_DIRECTORY_BLOCK as usize * EXT4_BLOCK_BYTES;
+        let before = &fixture.before[start..start + EXT4_BLOCK_BYTES];
+        let after = &fixture.after[start..start + EXT4_BLOCK_BYTES];
+        let torn = device.device().durable_fs_block(ROOT_DIRECTORY_BLOCK);
+        assert_ne!(before, after, "the checkpoint must change this block");
+        assert_eq!(&torn[..split], &after[..split]);
+        assert_eq!(&torn[split..], &before[split..]);
+        assert_ne!(
+            torn.as_slice(),
+            before,
+            "media must hold neither whole state"
+        );
+        assert_ne!(torn.as_slice(), after);
+
+        assert_eq!(
+            recover_once(&device)?,
+            RecoveryOutcome::Replayed {
+                blocks: fixture.checkpointed_blocks()?
+            }
+        );
+        // Replay re-blits whole images, so the volume is byte-identical to the
+        // one the same mutation produces when nothing interrupts it.
+        assert_same_blocks(
+            &device.device().durable_image(),
+            &fixture.after,
+            "replay must reproduce the uninterrupted volume",
+        );
+        let mut ext4 = mount_device_writable(device)?;
+        let mut bytes = [0_u8; TORN_CONTENT.len()];
+        assert_eq!(
+            ext4.read_file(TORN_PATH, 0, &mut bytes)?,
+            TORN_CONTENT.len()
+        );
+        assert_eq!(&bytes, TORN_CONTENT);
+        Ok(())
+    }
+
+    #[test]
+    fn a_recovery_torn_part_way_through_replays_again_to_the_same_bytes() -> Result<(), FsError> {
+        // Recovery writes to the same media it is repairing, so it can be torn
+        // exactly like the mutation was. Nothing it does consumes the log: the
+        // commit record still stands until the whole checkpoint is durable, so
+        // a second pass re-blits the same whole images.
+        let fixture = torn_write_fixture()?;
+        let boundary = fixture
+            .first_write(|block, _| block == device_block_of(ROOT_DIRECTORY_BLOCK))
+            .ok_or(FsError::Corrupt)?;
+        let device = tear_create_at(boundary)?;
+
+        device.device().reset_counts();
+        device.device().tear_write_at = Some((1, TORN_SECTORS));
+        assert!(
+            recover_device(device.clone()).is_err(),
+            "a torn replay write must fail the recovery that issued it"
+        );
+        device.device().power_loss();
+        device.device().tear_write_at = None;
+
+        assert_eq!(
+            recover_once(&device)?,
+            RecoveryOutcome::Replayed {
+                blocks: fixture.checkpointed_blocks()?
+            }
+        );
+        assert_same_blocks(
+            &device.device().durable_image(),
+            &fixture.after,
+            "a re-run recovery must reach the same bytes",
+        );
+        Ok(())
     }
 
     #[test]
