@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import struct
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -115,6 +116,22 @@ class CpythonIntegrationTests(unittest.TestCase):
         self.assertIn("ac_sys_system=TROE", patch)
         builder = (REPO_ROOT / "tools" / "build_cpython.py").read_text(encoding="utf-8")
         self.assertIn('"MACHDEP": "troe"', builder)
+
+    def test_command_line_paths_are_anchored_to_the_caller(self) -> None:
+        argv = [
+            "build_cpython.py",
+            "build",
+            "build/cpython-package",
+            "--source-cache",
+            "build/cpython-cache",
+            "--work-directory",
+            "build/cpython-work",
+        ]
+        with mock.patch.object(sys, "argv", argv):
+            args = build_cpython.parse_args()
+        self.assertEqual(args.output, Path.cwd() / "build" / "cpython-package")
+        self.assertEqual(args.source_cache, Path.cwd() / "build" / "cpython-cache")
+        self.assertEqual(args.work_directory, Path.cwd() / "build" / "cpython-work")
 
     def test_seeding_never_falls_back_from_capability_backed_entropy(self) -> None:
         self.assertEqual(build_cpython.PATCH, APP_ROOT / "patches" / "troe.patch")
