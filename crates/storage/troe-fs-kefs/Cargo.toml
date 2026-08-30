@@ -1,15 +1,13 @@
 [package]
-name = "troe-vfs"
-description = "Bounded namespace, embedded filesystem, and RAMFS for TROE"
+name = "troe-fs-kefs"
+description = "Immutable embedded KEFS v1 image reader and filesystem provider for TROE"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-troe-core = { path = "../../common/troe-core" }
 troe-fs-api = { path = "../troe-fs-api" }
 
 [lints]
 workspace = true
-

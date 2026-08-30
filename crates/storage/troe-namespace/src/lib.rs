@@ -1,4 +1,4 @@
-//! Portable virtual namespace with immutable and quota-bound writable nodes.
+//! Portable virtual namespace over mounted filesystem providers.
 #![no_std]
 #![forbid(unsafe_code)]
 
@@ -13,13 +13,10 @@ use core::str;
 use troe_core::MemoryStats;
 use troe_fs_api::{
     DirEntry, DirectoryListing, FILE_IO_BUFFER_BYTES, FileMetadata, FileSystemProvider, FsError,
-    MAX_NAME_BYTES, MAX_PATH_BYTES, NodeKind, ProviderListing, WallClock, canonicalize,
+    MAX_NAME_BYTES, NodeKind, ProviderListing, ProviderUsage, WallClock, canonicalize,
     canonicalize_beneath,
 };
 
-/// Product-name-independent KEFS v1 format identifier.
-pub const KEFS_V1_MAGIC: [u8; 8] = *b"KEFSv1\0\0";
-const KEFS_HEADER_LEN: usize = 16;
 const PROVIDER_READ_CHUNK: usize = 4 * 1024;
 const MAX_PROVIDER_DIRECTORY_ENTRIES: usize = 1024;
 const MAX_PROVIDER_DIRECTORY_BYTES: usize = 64 * 1024;
@@ -33,7 +30,7 @@ pub const MAX_SYSTEM_CONFIG_FILE_BYTES: usize = 8 * 1024;
 #[derive(Clone, Debug)]
 enum Node {
     Directory,
-    File { bytes: Vec<u8>, writable: bool },
+    File { bytes: Vec<u8> },
 }
 
 impl Node {
@@ -43,17 +40,6 @@ impl Node {
             Self::File { .. } => NodeKind::File,
         }
     }
-}
-
-/// Explicit limits for the writable `/tmp` filesystem.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RamFsQuota {
-    /// Maximum total file payload bytes.
-    pub max_bytes: usize,
-    /// Maximum writable file count.
-    pub max_nodes: usize,
-    /// Maximum payload bytes in one file.
-    pub max_file_bytes: usize,
 }
 
 /// Closed rights attached to one package-resolved directory capability.
@@ -106,17 +92,7 @@ impl DirectoryCapability {
     }
 }
 
-impl Default for RamFsQuota {
-    fn default() -> Self {
-        Self {
-            max_bytes: 1024 * 1024,
-            max_nodes: 128,
-            max_file_bytes: 1024 * 1024,
-        }
-    }
-}
-
-/// Unified immutable-root and writable-RAM namespace.
+/// One provider attached at an exact namespace path.
 #[derive(Debug)]
 struct ProviderMount {
     path: String,
@@ -124,24 +100,30 @@ struct ProviderMount {
     writable: bool,
 }
 
-/// Unified immutable-root, writable-RAM, and mounted-provider namespace.
+/// Immutable composed nodes plus the mounted providers layered over them.
 #[derive(Debug)]
 pub struct Namespace {
     nodes: BTreeMap<String, Node>,
     mounts: Vec<ProviderMount>,
     command_revision: u64,
-    quota: RamFsQuota,
-    ramfs_bytes: usize,
-    ramfs_nodes: usize,
-    ramfs_high_water: usize,
     system_config_generation: u64,
     wall_clock: Option<Rc<dyn WallClock>>,
 }
 
+impl Default for Namespace {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Namespace {
-    /// Create the fixed root skeleton.
+    /// Create the fixed root skeleton with no provider attached.
+    ///
+    /// The caller composes the namespace by mounting providers, including the
+    /// writable filesystem for `/tmp`. The namespace deliberately knows no
+    /// filesystem implementation.
     #[must_use]
-    pub fn new(quota: RamFsQuota) -> Self {
+    pub fn new() -> Self {
         let mut nodes = BTreeMap::new();
         nodes.insert("/".to_string(), Node::Directory);
         nodes.insert("/tmp".to_string(), Node::Directory);
@@ -152,10 +134,6 @@ impl Namespace {
             nodes,
             mounts: Vec::new(),
             command_revision: 0,
-            quota,
-            ramfs_bytes: 0,
-            ramfs_nodes: 0,
-            ramfs_high_water: 0,
             system_config_generation: 0,
             wall_clock: None,
         }
@@ -238,7 +216,6 @@ impl Namespace {
                 resolved,
                 Node::File {
                     bytes: bytes.to_vec(),
-                    writable: false,
                 },
             );
         }
@@ -280,7 +257,6 @@ impl Namespace {
             path,
             Node::File {
                 bytes: bytes.to_vec(),
-                writable: false,
             },
         )
     }
@@ -306,7 +282,6 @@ impl Namespace {
             path,
             Node::File {
                 bytes: bytes.to_vec(),
-                writable: false,
             },
         );
         Ok(())
@@ -325,38 +300,6 @@ impl Namespace {
         }
         let changes_commands = is_command_path(&path);
         self.nodes.insert(path, node);
-        if changes_commands {
-            self.bump_command_revision();
-        }
-        Ok(())
-    }
-
-    /// Validate and mount a deterministic KEFS v1 image.
-    ///
-    /// # Errors
-    ///
-    /// Fails atomically if metadata, bounds, ordering, paths, or parents are invalid.
-    pub fn mount_embedded(&mut self, image: &[u8]) -> Result<(), FsError> {
-        let parsed = parse_embedded(image)?;
-        let changes_commands = parsed.iter().any(|entry| is_command_path(&entry.path));
-        let mut staged = self.nodes.clone();
-        for entry in parsed {
-            if is_reserved_configuration_content(&entry.path)
-                || self.mount_for_path(&entry.path).is_some()
-            {
-                return Err(FsError::ReadOnly);
-            }
-            let node = match entry.kind {
-                NodeKind::Directory => Node::Directory,
-                NodeKind::File => Node::File {
-                    bytes: entry.data,
-                    writable: false,
-                },
-                NodeKind::Symlink => return Err(FsError::Unsupported),
-            };
-            insert_node(&mut staged, entry.path, node)?;
-        }
-        self.nodes = staged;
         if changes_commands {
             self.bump_command_revision();
         }
@@ -815,46 +758,7 @@ impl Namespace {
             }
             return Ok(());
         }
-        if !is_under_tmp(&path) {
-            return Err(FsError::ReadOnly);
-        }
-        let parent = parent_path(&path).ok_or(FsError::Invalid)?;
-        if !matches!(self.nodes.get(parent), Some(Node::Directory)) {
-            return Err(FsError::NotFound);
-        }
-
-        let old_len = match self.nodes.get(&path) {
-            Some(Node::File {
-                bytes,
-                writable: true,
-            }) => bytes.len(),
-            Some(Node::File { .. }) => return Err(FsError::ReadOnly),
-            Some(Node::Directory) => return Err(FsError::WrongType),
-            None => 0,
-        };
-        let is_new = !self.nodes.contains_key(&path);
-        if is_new && self.ramfs_nodes >= self.quota.max_nodes {
-            return Err(FsError::NoSpace);
-        }
-        let without_old = self
-            .ramfs_bytes
-            .checked_sub(old_len)
-            .ok_or(FsError::Overflow)?;
-        self.nodes.insert(
-            path,
-            Node::File {
-                bytes: Vec::new(),
-                writable: true,
-            },
-        );
-        self.ramfs_bytes = without_old;
-        if is_new {
-            self.ramfs_nodes += 1;
-        }
-        if changes_commands {
-            self.bump_command_revision();
-        }
-        Ok(())
+        Err(FsError::ReadOnly)
     }
 
     /// Append one chunk without retaining a second complete-file copy.
@@ -882,48 +786,7 @@ impl Namespace {
             }
             return Ok(());
         }
-        if !is_under_tmp(&path) {
-            return Err(FsError::ReadOnly);
-        }
-        let current_len = match self.nodes.get(&path) {
-            Some(Node::File {
-                bytes,
-                writable: true,
-            }) => bytes.len(),
-            Some(Node::File { .. }) => return Err(FsError::ReadOnly),
-            Some(Node::Directory) => return Err(FsError::WrongType),
-            None => return Err(FsError::NotFound),
-        };
-        let next_len = current_len
-            .checked_add(bytes.len())
-            .ok_or(FsError::Overflow)?;
-        if next_len > self.quota.max_file_bytes {
-            return Err(FsError::NoSpace);
-        }
-        let next_total = self
-            .ramfs_bytes
-            .checked_add(bytes.len())
-            .ok_or(FsError::Overflow)?;
-        if next_total > self.quota.max_bytes {
-            return Err(FsError::NoSpace);
-        }
-        let Some(Node::File {
-            bytes: destination,
-            writable: true,
-        }) = self.nodes.get_mut(&path)
-        else {
-            return Err(FsError::Corrupt);
-        };
-        destination
-            .try_reserve_exact(bytes.len())
-            .map_err(|_| FsError::NoSpace)?;
-        destination.extend_from_slice(bytes);
-        self.ramfs_bytes = next_total;
-        self.ramfs_high_water = self.ramfs_high_water.max(next_total);
-        if changes_commands {
-            self.bump_command_revision();
-        }
-        Ok(())
+        Err(FsError::ReadOnly)
     }
 
     /// Complete a streamed write and request provider durability.
@@ -942,7 +805,6 @@ impl Namespace {
             return self.mounts[index].provider.sync_file(&relative);
         }
         match self.nodes.get(&path) {
-            Some(Node::File { writable: true, .. }) => Ok(()),
             Some(Node::File { .. }) => Err(FsError::ReadOnly),
             Some(Node::Directory) => Err(FsError::WrongType),
             None => Err(FsError::NotFound),
@@ -984,25 +846,10 @@ impl Namespace {
             return Ok(());
         }
         match self.nodes.get(&path) {
-            Some(Node::File {
-                bytes,
-                writable: true,
-            }) => {
-                self.ramfs_bytes = self
-                    .ramfs_bytes
-                    .checked_sub(bytes.len())
-                    .ok_or(FsError::Overflow)?;
-                self.ramfs_nodes = self.ramfs_nodes.checked_sub(1).ok_or(FsError::Overflow)?;
-            }
-            Some(Node::File { .. }) => return Err(FsError::ReadOnly),
-            Some(Node::Directory) => return Err(FsError::WrongType),
-            None => return Err(FsError::NotFound),
+            Some(Node::File { .. }) => Err(FsError::ReadOnly),
+            Some(Node::Directory) => Err(FsError::WrongType),
+            None => Err(FsError::NotFound),
         }
-        self.nodes.remove(&path);
-        if changes_commands {
-            self.bump_command_revision();
-        }
-        Ok(())
     }
 
     /// Create one empty writable directory.
@@ -1024,25 +871,7 @@ impl Namespace {
             }
             return Ok(());
         }
-        if !is_under_tmp(&path) {
-            return Err(FsError::ReadOnly);
-        }
-        if self.nodes.contains_key(&path) {
-            return Err(FsError::Exists);
-        }
-        if self.ramfs_nodes >= self.quota.max_nodes {
-            return Err(FsError::NoSpace);
-        }
-        let parent = parent_path(&path).ok_or(FsError::Invalid)?;
-        if !matches!(self.nodes.get(parent), Some(Node::Directory)) {
-            return Err(FsError::NotFound);
-        }
-        self.nodes.insert(path, Node::Directory);
-        self.ramfs_nodes = self.ramfs_nodes.checked_add(1).ok_or(FsError::Overflow)?;
-        if changes_commands {
-            self.bump_command_revision();
-        }
-        Ok(())
+        Err(FsError::ReadOnly)
     }
 
     /// Remove one empty writable directory without crossing a mount boundary.
@@ -1067,30 +896,7 @@ impl Namespace {
             }
             return Ok(());
         }
-        if !is_under_tmp(&path) || path == "/tmp" {
-            return Err(FsError::ReadOnly);
-        }
-        match self.nodes.get(&path) {
-            Some(Node::Directory) => {}
-            Some(Node::File { .. }) => return Err(FsError::WrongType),
-            None => return Err(FsError::NotFound),
-        }
-        let mut prefix = path.clone();
-        prefix.push('/');
-        if self
-            .nodes
-            .range(prefix.clone()..)
-            .next()
-            .is_some_and(|(candidate, _)| candidate.starts_with(&prefix))
-        {
-            return Err(FsError::NotEmpty);
-        }
-        self.nodes.remove(&path);
-        self.ramfs_nodes = self.ramfs_nodes.checked_sub(1).ok_or(FsError::Overflow)?;
-        if changes_commands {
-            self.bump_command_revision();
-        }
-        Ok(())
+        Err(FsError::ReadOnly)
     }
 
     /// Atomically rename one object within one writable provider.
@@ -1135,86 +941,11 @@ impl Namespace {
                     .provider
                     .rename(&source_relative, &destination_relative)?;
             }
-            (None, None) => self.rename_ramfs(&source, &destination)?,
+            (None, None) => return Err(FsError::ReadOnly),
             _ => return Err(FsError::CrossDevice),
         }
         if is_command_path(&source) || is_command_path(&destination) {
             self.bump_command_revision();
-        }
-        Ok(())
-    }
-
-    fn rename_ramfs(&mut self, source: &str, destination: &str) -> Result<(), FsError> {
-        if !is_under_tmp(source) || !is_under_tmp(destination) || source == "/tmp" {
-            return Err(FsError::ReadOnly);
-        }
-        let source_is_directory = match self.nodes.get(source) {
-            Some(Node::Directory) => true,
-            Some(Node::File { writable: true, .. }) => false,
-            Some(Node::File { .. }) => return Err(FsError::ReadOnly),
-            None => return Err(FsError::NotFound),
-        };
-        if self.nodes.contains_key(destination) {
-            return Err(FsError::Exists);
-        }
-        let parent = parent_path(destination).ok_or(FsError::Invalid)?;
-        if !matches!(self.nodes.get(parent), Some(Node::Directory)) {
-            return Err(FsError::NotFound);
-        }
-        let mut prefix = source.to_string();
-        prefix.push('/');
-        if source_is_directory && destination.starts_with(&prefix) {
-            return Err(FsError::Invalid);
-        }
-        if self.mounts.iter().any(|mount| {
-            mount.path.starts_with(&prefix)
-                || mount
-                    .path
-                    .strip_prefix(destination)
-                    .is_some_and(|suffix| suffix.starts_with('/'))
-        }) {
-            return Err(FsError::ReadOnly);
-        }
-
-        let mut moves = Vec::new();
-        for candidate in self.nodes.keys() {
-            if candidate == source || candidate.starts_with(&prefix) {
-                let suffix = &candidate[source.len()..];
-                let capacity = destination
-                    .len()
-                    .checked_add(suffix.len())
-                    .ok_or(FsError::Overflow)?;
-                if capacity > MAX_PATH_BYTES {
-                    return Err(FsError::NoSpace);
-                }
-                let mut renamed = String::new();
-                renamed
-                    .try_reserve_exact(capacity)
-                    .map_err(|_| FsError::NoSpace)?;
-                renamed.push_str(destination);
-                renamed.push_str(suffix);
-                moves.try_reserve(1).map_err(|_| FsError::NoSpace)?;
-                moves.push((candidate.clone(), renamed));
-            }
-        }
-        if moves.is_empty() {
-            return Err(FsError::NotFound);
-        }
-        if moves.iter().any(|(_, renamed)| {
-            self.nodes.contains_key(renamed)
-                && !moves.iter().any(|(original, _)| original == renamed)
-        }) {
-            return Err(FsError::Exists);
-        }
-        let mut removed = Vec::new();
-        removed
-            .try_reserve_exact(moves.len())
-            .map_err(|_| FsError::NoSpace)?;
-        for (original, _) in &moves {
-            removed.push(self.nodes.remove(original).ok_or(FsError::Corrupt)?);
-        }
-        for ((_, renamed), node) in moves.into_iter().zip(removed) {
-            self.nodes.insert(renamed, node);
         }
         Ok(())
     }
@@ -1554,10 +1285,21 @@ impl Namespace {
     /// Current RAMFS accounting for system reporting.
     #[must_use]
     pub fn memory_stats(&self) -> MemoryStats {
+        let usage = self
+            .mounts
+            .iter()
+            .filter_map(|mount| mount.provider.usage())
+            .fold(ProviderUsage::default(), |total, mount| ProviderUsage {
+                used_bytes: total.used_bytes.saturating_add(mount.used_bytes),
+                limit_bytes: total.limit_bytes.saturating_add(mount.limit_bytes),
+                high_water_bytes: total
+                    .high_water_bytes
+                    .saturating_add(mount.high_water_bytes),
+            });
         MemoryStats {
-            ramfs_used: self.ramfs_bytes as u64,
-            ramfs_limit: self.quota.max_bytes as u64,
-            ramfs_high_water: self.ramfs_high_water as u64,
+            ramfs_used: usage.used_bytes,
+            ramfs_limit: usage.limit_bytes,
+            ramfs_high_water: usage.high_water_bytes,
             ..MemoryStats::default()
         }
     }
@@ -1623,29 +1365,9 @@ fn validate_listing(
     Ok(())
 }
 
-fn insert_node(
-    nodes: &mut BTreeMap<String, Node>,
-    path: String,
-    node: Node,
-) -> Result<(), FsError> {
-    if path == "/" || nodes.contains_key(&path) {
-        return Err(FsError::Exists);
-    }
-    let parent = parent_path(&path).ok_or(FsError::Invalid)?;
-    if !matches!(nodes.get(parent), Some(Node::Directory)) {
-        return Err(FsError::NotFound);
-    }
-    nodes.insert(path, node);
-    Ok(())
-}
-
 fn parent_path(path: &str) -> Option<&str> {
     let index = path.rfind('/')?;
     Some(if index == 0 { "/" } else { &path[..index] })
-}
-
-fn is_under_tmp(path: &str) -> bool {
-    path.starts_with("/tmp/") && path.len() > "/tmp/".len()
 }
 
 fn is_active_configuration_path(path: &str) -> bool {
@@ -1656,94 +1378,29 @@ fn is_reserved_configuration_content(path: &str) -> bool {
     path.starts_with("/config/") || is_active_configuration_path(path)
 }
 
-#[derive(Debug)]
-struct EmbeddedEntry {
-    path: String,
-    kind: NodeKind,
-    data: Vec<u8>,
-}
-
-fn parse_embedded(image: &[u8]) -> Result<Vec<EmbeddedEntry>, FsError> {
-    if image.len() < KEFS_HEADER_LEN
-        || image[..8] != KEFS_V1_MAGIC
-        || image.get(10..12) != Some(&[0, 0])
-    {
-        return Err(FsError::Invalid);
-    }
-    let count = usize::from(read_u16(image, 8)?);
-    let declared_len = usize::try_from(read_u32(image, 12)?).map_err(|_| FsError::Overflow)?;
-    if declared_len != image.len() {
-        return Err(FsError::Invalid);
-    }
-    let mut offset = KEFS_HEADER_LEN;
-    let mut previous: Option<String> = None;
-    let mut entries = Vec::with_capacity(count);
-    for _ in 0..count {
-        let kind = match *image.get(offset).ok_or(FsError::Invalid)? {
-            1 => NodeKind::File,
-            2 => NodeKind::Directory,
-            _ => return Err(FsError::Invalid),
-        };
-        offset = offset.checked_add(1).ok_or(FsError::Overflow)?;
-        let path_len = usize::from(read_u16(image, offset)?);
-        offset = offset.checked_add(2).ok_or(FsError::Overflow)?;
-        let data_len = usize::try_from(read_u32(image, offset)?).map_err(|_| FsError::Overflow)?;
-        offset = offset.checked_add(4).ok_or(FsError::Overflow)?;
-        let path_end = offset.checked_add(path_len).ok_or(FsError::Overflow)?;
-        let path_bytes = image.get(offset..path_end).ok_or(FsError::Invalid)?;
-        let raw_path = str::from_utf8(path_bytes).map_err(|_| FsError::Invalid)?;
-        let path = canonicalize("/", raw_path)?;
-        if path != raw_path || path == "/" {
-            return Err(FsError::Invalid);
-        }
-        if previous.as_ref().is_some_and(|value| value >= &path) {
-            return Err(FsError::Invalid);
-        }
-        previous = Some(path.clone());
-        offset = path_end;
-        let data_end = offset.checked_add(data_len).ok_or(FsError::Overflow)?;
-        let data = image.get(offset..data_end).ok_or(FsError::Invalid)?;
-        if kind == NodeKind::Directory && !data.is_empty() {
-            return Err(FsError::Invalid);
-        }
-        entries.push(EmbeddedEntry {
-            path,
-            kind,
-            data: data.to_vec(),
-        });
-        offset = data_end;
-    }
-    if offset != image.len() {
-        return Err(FsError::Invalid);
-    }
-    Ok(entries)
-}
-
-fn read_u16(image: &[u8], offset: usize) -> Result<u16, FsError> {
-    let end = offset.checked_add(2).ok_or(FsError::Overflow)?;
-    let bytes: [u8; 2] = image
-        .get(offset..end)
-        .ok_or(FsError::Invalid)?
-        .try_into()
-        .map_err(|_| FsError::Invalid)?;
-    Ok(u16::from_le_bytes(bytes))
-}
-
-fn read_u32(image: &[u8], offset: usize) -> Result<u32, FsError> {
-    let end = offset.checked_add(4).ok_or(FsError::Overflow)?;
-    let bytes: [u8; 4] = image
-        .get(offset..end)
-        .ok_or(FsError::Invalid)?
-        .try_into()
-        .map_err(|_| FsError::Invalid)?;
-    Ok(u32::from_le_bytes(bytes))
-}
-
 #[cfg(test)]
 mod tests {
+    use troe_fs_kefs::Kefs;
+    use troe_fs_ramfs::{RamFs, RamFsQuota};
+
+    /// Compose the namespace the way a composition root does: a skeleton plus
+    /// one writable filesystem mounted at `/tmp`.
+    fn writable_namespace() -> Namespace {
+        namespace_with_quota(RamFsQuota::default())
+    }
+
+    fn namespace_with_quota(quota: RamFsQuota) -> Namespace {
+        let mut namespace = Namespace::new();
+        assert_eq!(
+            namespace.mount_writable("/tmp", Box::new(RamFs::new(quota))),
+            Ok(())
+        );
+        namespace
+    }
+
     use super::{
-        DirEntry, DirectoryRights, FileMetadata, FileSystemProvider, FsError, KEFS_V1_MAGIC,
-        Namespace, NodeKind, ProviderListing, RamFsQuota, canonicalize, canonicalize_beneath,
+        DirEntry, DirectoryRights, FileMetadata, FileSystemProvider, FsError, Namespace, NodeKind,
+        ProviderListing, canonicalize, canonicalize_beneath,
     };
     use alloc::{boxed::Box, rc::Rc, string::String, vec, vec::Vec};
     use core::cell::RefCell;
@@ -2040,7 +1697,7 @@ mod tests {
 
     #[test]
     fn directory_capabilities_bind_generation_rights_mounts_and_links() -> Result<(), FsError> {
-        let mut namespace = Namespace::new(RamFsQuota::default());
+        let mut namespace = writable_namespace();
         namespace.mount_read_only("/vol", Box::new(ScopedProvider))?;
         let read = namespace.grant_directory("/vol/scope", 7, DirectoryRights::READ)?;
         assert_eq!(read.root(), "/vol/scope");
@@ -2088,7 +1745,7 @@ mod tests {
 
     #[test]
     fn mutation_capability_validates_existing_parents_before_creation() -> Result<(), FsError> {
-        let mut namespace = Namespace::new(RamFsQuota::default());
+        let mut namespace = writable_namespace();
         let mutation = namespace.grant_directory("/tmp", 9, DirectoryRights::READ_MUTATE)?;
         assert_eq!(
             namespace.resolve_directory_mutation(&mutation, 9, "new", true),
@@ -2108,7 +1765,7 @@ mod tests {
 
     #[test]
     fn ramfs_quota_and_deletion_accounting() {
-        let mut fs = Namespace::new(RamFsQuota {
+        let mut fs = namespace_with_quota(RamFsQuota {
             max_bytes: 4,
             max_nodes: 1,
             max_file_bytes: 4,
@@ -2129,7 +1786,7 @@ mod tests {
         let provider = CountingProvider {
             state: Rc::clone(&state),
         };
-        let mut fs = Namespace::new(RamFsQuota::default());
+        let mut fs = writable_namespace();
         assert_eq!(fs.mount_writable("/media", Box::new(provider)), Ok(()));
         assert_eq!(fs.truncate_file("/", "/media/large"), Ok(()));
         let chunk = vec![0x5a; CHUNK_BYTES];
@@ -2149,7 +1806,7 @@ mod tests {
 
     #[test]
     fn ramfs_directory_creation_is_bounded_and_requires_existing_parents() {
-        let mut fs = Namespace::new(RamFsQuota {
+        let mut fs = namespace_with_quota(RamFsQuota {
             max_bytes: 4,
             max_nodes: 2,
             max_file_bytes: 4,
@@ -2168,7 +1825,7 @@ mod tests {
 
     #[test]
     fn ramfs_rename_and_directory_removal_are_atomic_and_precise() {
-        let mut fs = Namespace::new(RamFsQuota {
+        let mut fs = namespace_with_quota(RamFsQuota {
             max_bytes: 64,
             max_nodes: 16,
             max_file_bytes: 64,
@@ -2209,7 +1866,7 @@ mod tests {
 
     #[test]
     fn rename_rejects_provider_crossings_and_mountpoint_names() -> Result<(), FsError> {
-        let mut fs = Namespace::new(RamFsQuota::default());
+        let mut fs = writable_namespace();
         fs.add_read_only_dir("/first")?;
         fs.add_read_only_dir("/second")?;
         fs.mount_writable("/first", Box::new(TestProvider))?;
@@ -2228,7 +1885,7 @@ mod tests {
 
     #[test]
     fn command_revision_changes_only_for_successful_bin_updates() {
-        let mut fs = Namespace::new(RamFsQuota::default());
+        let mut fs = writable_namespace();
         assert_eq!(fs.command_revision(), 0);
         assert_eq!(fs.write_file("/", "/tmp/data", b"x"), Ok(()));
         assert_eq!(fs.set_system_file("/sys/status", b"ready"), Ok(()));
@@ -2247,7 +1904,7 @@ mod tests {
 
     #[test]
     fn metadata_range_reads_and_caller_whole_file_limits_are_distinct() {
-        let mut fs = Namespace::new(RamFsQuota::default());
+        let mut fs = writable_namespace();
         assert_eq!(fs.write_file("/", "/tmp/app.kex", b"0123456789"), Ok(()));
         assert_eq!(
             fs.metadata("/", "/tmp/app.kex"),
@@ -2271,7 +1928,7 @@ mod tests {
 
     #[test]
     fn mounted_link_operations_require_one_writable_provider() {
-        let mut fs = Namespace::new(RamFsQuota::default());
+        let mut fs = writable_namespace();
         assert_eq!(fs.mount_writable("/media", Box::new(TestProvider)), Ok(()));
         assert_eq!(fs.create_symlink("/", "/data", "/media/link"), Ok(()));
         assert_eq!(fs.read_link("/", "/media/link"), Ok("/data".into()));
@@ -2279,15 +1936,26 @@ mod tests {
             fs.create_hard_link("/", "/media/data", "/media/hard"),
             Ok(())
         );
+        // /tmp is an ordinary writable provider, so linking into it crosses a
+        // filesystem boundary like any other provider pair.
         assert_eq!(
             fs.create_hard_link("/", "/media/data", "/tmp/hard"),
+            Err(FsError::CrossDevice)
+        );
+        // A path served by no provider at all still has no link support.
+        assert_eq!(
+            fs.create_hard_link("/", "/media/data", "/sys/hard"),
+            Err(FsError::Unsupported)
+        );
+        assert_eq!(
+            fs.create_symlink("/", "/data", "/sys/link"),
             Err(FsError::Unsupported)
         );
     }
 
     #[test]
     fn listing_is_lexical_and_shallow() {
-        let mut fs = Namespace::new(RamFsQuota::default());
+        let mut fs = writable_namespace();
         assert_eq!(fs.write_file("/", "/tmp/z", b""), Ok(()));
         assert_eq!(fs.write_file("/", "/tmp/a", b""), Ok(()));
         let list = fs.list("/", "/tmp").unwrap_or_default();
@@ -2299,7 +1967,7 @@ mod tests {
 
     #[test]
     fn bounded_listing_cursor_is_opaque_progress_without_duplication() {
-        let mut fs = Namespace::new(RamFsQuota::default());
+        let mut fs = writable_namespace();
         for name in ["alpha", "beta", "gamma"] {
             assert_eq!(
                 fs.write_file("/", &alloc::format!("/tmp/{name}"), b""),
@@ -2336,7 +2004,7 @@ mod tests {
 
     #[test]
     fn matching_listing_obeys_injected_entry_and_byte_budgets() {
-        let mut fs = Namespace::new(RamFsQuota::default());
+        let mut fs = writable_namespace();
         assert_eq!(fs.write_file("/", "/tmp/alpha", b""), Ok(()));
         assert_eq!(fs.write_file("/", "/tmp/alpine", b""), Ok(()));
         assert_eq!(fs.write_file("/", "/tmp/beta", b""), Ok(()));
@@ -2361,24 +2029,8 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_embedded_image_is_rejected_without_partial_mount() {
-        let mut image = vec![0_u8; 16];
-        image[..8].copy_from_slice(&KEFS_V1_MAGIC);
-        image[8..10].copy_from_slice(&1_u16.to_le_bytes());
-        image[12..16].copy_from_slice(&16_u32.to_le_bytes());
-        let mut fs = Namespace::new(RamFsQuota::default());
-        assert_eq!(fs.mount_embedded(&image), Err(FsError::Invalid));
-        assert!(fs.list("/", "/").is_ok());
-    }
-
-    #[test]
-    fn format_identifier_is_product_name_independent() {
-        assert_eq!(KEFS_V1_MAGIC, *b"KEFSv1\0\0");
-    }
-
-    #[test]
     fn mounted_providers_are_routed_and_remain_read_only() {
-        let mut fs = Namespace::new(RamFsQuota::default());
+        let mut fs = writable_namespace();
         assert_eq!(fs.mount_read_only("/media", Box::new(TestProvider)), Ok(()));
         assert_eq!(fs.read_file("/", "/media/data"), Ok(b"mounted".to_vec()));
         assert_eq!(fs.resolve_dir("/", "/media"), Ok("/media".into()));
@@ -2402,7 +2054,7 @@ mod tests {
 
     #[test]
     fn provider_can_overlay_only_an_empty_recovery_mountpoint() {
-        let mut fs = Namespace::new(RamFsQuota::default());
+        let mut fs = writable_namespace();
         assert_eq!(fs.add_read_only_dir("/vol"), Ok(()));
         assert_eq!(fs.add_read_only_dir("/vol/root"), Ok(()));
         assert_eq!(
@@ -2411,7 +2063,7 @@ mod tests {
         );
         assert_eq!(fs.read_file("/", "/vol/root/data"), Ok(b"mounted".to_vec()));
 
-        let mut occupied = Namespace::new(RamFsQuota::default());
+        let mut occupied = writable_namespace();
         assert_eq!(occupied.add_read_only_dir("/vol"), Ok(()));
         assert_eq!(occupied.add_read_only_dir("/vol/root"), Ok(()));
         assert_eq!(
@@ -2426,7 +2078,7 @@ mod tests {
 
     #[test]
     fn desired_and_active_configuration_namespaces_are_distinct_and_atomic() {
-        let mut fs = Namespace::new(RamFsQuota::default());
+        let mut fs = writable_namespace();
         assert_eq!(
             fs.mount_read_only("/config", Box::new(TestProvider)),
             Err(FsError::ReadOnly)
@@ -2504,8 +2156,50 @@ mod tests {
     }
 
     #[test]
+    fn volumes_mount_beneath_a_reserved_embedded_directory() {
+        // The boot manifest mounts volumes under /vol, which the embedded image
+        // also populates. Reserving that root keeps it namespace-owned so the
+        // volume mounts are ordinary mounts rather than rejected nested ones.
+        let mut image = vec![0_u8; 16];
+        image[..8].copy_from_slice(b"KEFSv1\0\0");
+        image[8..10].copy_from_slice(&3_u16.to_le_bytes());
+        for (kind, path) in [(2_u8, "/bin"), (2, "/vol"), (2, "/vol/root")] {
+            image.push(kind);
+            image.extend_from_slice(&u16::try_from(path.len()).unwrap_or(0).to_le_bytes());
+            image.extend_from_slice(&0_u32.to_le_bytes());
+            image.extend_from_slice(path.as_bytes());
+        }
+        let length = u32::try_from(image.len()).unwrap_or(0);
+        image[12..16].copy_from_slice(&length.to_le_bytes());
+
+        let mut fs = writable_namespace();
+        let Ok(parsed) = Kefs::parse(&image) else {
+            unreachable!("the image is well formed")
+        };
+        let embedded = parsed.into_mounts(&["/vol"]);
+        for path in embedded.directories {
+            assert_eq!(fs.add_read_only_dir(&path), Ok(()));
+        }
+        for (path, view) in embedded.mounts {
+            assert_eq!(fs.mount_read_only(&path, Box::new(view)), Ok(()));
+        }
+        assert_eq!(
+            fs.mount_writable("/vol/root", Box::new(TestProvider)),
+            Ok(())
+        );
+        assert_eq!(
+            fs.metadata("/", "/vol/root").map(|entry| entry.kind),
+            Ok(NodeKind::Directory)
+        );
+        assert_eq!(
+            fs.metadata("/", "/bin").map(|entry| entry.kind),
+            Ok(NodeKind::Directory)
+        );
+    }
+
+    #[test]
     fn embedded_and_composed_files_cannot_populate_configuration_roots() {
-        let mut fs = Namespace::new(RamFsQuota::default());
+        let mut fs = writable_namespace();
         assert_eq!(
             fs.add_read_only_file("/config/default", b"ambient"),
             Err(FsError::ReadOnly)
@@ -2515,9 +2209,12 @@ mod tests {
             Err(FsError::ReadOnly)
         );
 
+        // An embedded image naming /config produces a mount at that root, and
+        // the namespace must refuse it rather than let the image supply
+        // configuration content.
         let path = b"/config/default";
         let mut image = vec![0_u8; 16];
-        image[..8].copy_from_slice(&KEFS_V1_MAGIC);
+        image[..8].copy_from_slice(b"KEFSv1\0\0");
         image[8..10].copy_from_slice(&1_u16.to_le_bytes());
         image.push(1);
         image.extend_from_slice(&u16::try_from(path.len()).unwrap_or(0).to_le_bytes());
@@ -2525,7 +2222,13 @@ mod tests {
         image.extend_from_slice(path);
         let image_len = u32::try_from(image.len()).unwrap_or(0);
         image[12..16].copy_from_slice(&image_len.to_le_bytes());
-        assert_eq!(fs.mount_embedded(&image), Err(FsError::ReadOnly));
+        let mut outcomes = Vec::new();
+        if let Ok(embedded) = Kefs::parse(&image) {
+            for (mount, view) in embedded.into_mounts(&[]).mounts {
+                outcomes.push(fs.mount_read_only(&mount, Box::new(view)));
+            }
+        }
+        assert_eq!(outcomes, vec![Err(FsError::ReadOnly)]);
         assert_eq!(fs.read_file("/", "/config/default"), Err(FsError::NotFound));
     }
 }

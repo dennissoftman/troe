@@ -318,8 +318,20 @@ mod tests {
         BlockAccess, BlockDevice, BlockError, BlockGeometry, BlockLimits, BlockRegion,
     };
     use troe_fs_api::{FileSystemProvider, FsError};
+    use troe_fs_ramfs::{RamFs, RamFsQuota};
+
+    /// Compose a namespace the way a composition root does: a skeleton plus one
+    /// writable filesystem mounted at `/tmp`.
+    fn writable_namespace() -> Namespace {
+        let mut namespace = Namespace::new();
+        assert_eq!(
+            namespace.mount_writable("/tmp", Box::new(RamFs::new(RamFsQuota::default()))),
+            Ok(())
+        );
+        namespace
+    }
+    use troe_namespace::Namespace;
     use troe_txslot::DualSlotStore;
-    use troe_vfs::{Namespace, RamFsQuota};
 
     #[derive(Clone)]
     struct MemoryDevice(Rc<RefCell<Vec<u8>>>);
@@ -394,7 +406,7 @@ mod tests {
     fn vfs_mutation_reopens_and_removes_durably() -> Result<(), FsError> {
         let device = MemoryDevice::new();
         let statefs = StateFs::mount(region(device.clone()).map_err(|_| FsError::Io)?)?;
-        let mut namespace = Namespace::new(RamFsQuota::default());
+        let mut namespace = writable_namespace();
         namespace.mount_writable("/state", Box::new(statefs))?;
         namespace.write_file("/", "/state/state.bin", b"persistent")?;
         assert_eq!(namespace.read_file("/", "/state/state.bin")?, b"persistent");

@@ -22,6 +22,8 @@ troe-fmt-cspk = { path = "../crates/storage/troe-fmt-cspk" }
 troe-core = { path = "../crates/common/troe-core" }
 troe-dispatch = { path = "../crates/runtime/troe-dispatch" }
 troe-fs-api = { path = "../crates/storage/troe-fs-api" }
+troe-fs-kefs = { path = "../crates/storage/troe-fs-kefs" }
+troe-fs-ramfs = { path = "../crates/storage/troe-fs-ramfs" }
 troe-driver = { path = "../crates/device/troe-driver" }
 troe-memory = { path = "../crates/runtime/troe-memory" }
 troe-fmt-bmnt = { path = "../crates/storage/troe-fmt-bmnt" }
@@ -36,7 +38,7 @@ troe-supervisor = { path = "../crates/runtime/troe-supervisor" }
 troe-fs-statefs = { path = "../crates/storage/troe-fs-statefs" }
 troe-task = { path = "../crates/runtime/troe-task" }
 troe-terminal = { path = "../crates/shell/troe-terminal" }
-troe-vfs = { path = "../crates/storage/troe-vfs" }
+troe-namespace = { path = "../crates/storage/troe-namespace" }
 troe-fs-ext4 = { path = "../crates/storage/troe-fs-ext4" }
 troe-fs-fat = { path = "../crates/storage/troe-fs-fat" }
 troe-fmt-gpt = { path = "../crates/storage/troe-fmt-gpt" }

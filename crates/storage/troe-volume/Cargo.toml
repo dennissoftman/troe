@@ -16,7 +16,7 @@ troe-fs-api = { path = "../troe-fs-api" }
 troe-fmt-gpt = { path = "../troe-fmt-gpt" }
 troe-identity = { path = "../troe-identity" }
 troe-fmt-bmnt = { path = "../troe-fmt-bmnt" }
-troe-vfs = { path = "../troe-vfs" }
+troe-namespace = { path = "../troe-namespace" }
 
 [lints]
 workspace = true

@@ -9,7 +9,7 @@ use troe_completion::{
     IntegerConstraints, PathConstraints, PathKind, PrefixPredicate, Resolver, ValidatedDescriptor,
 };
 use troe_fs_api::{FsError, NodeKind};
-use troe_vfs::Namespace;
+use troe_namespace::Namespace;
 
 const REGISTRY_MAX_ENTRIES: usize = 1024;
 const REGISTRY_MAX_BYTES: usize = 1024 * 1024;

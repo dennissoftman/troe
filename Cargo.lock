@@ -221,14 +221,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "troe-fs-kefs"
+version = "0.1.0"
+dependencies = [
+ "troe-fs-api",
+]
+
+[[package]]
+name = "troe-fs-ramfs"
+version = "0.1.0"
+dependencies = [
+ "troe-fs-api",
+]
+
+[[package]]
 name = "troe-fs-statefs"
 version = "0.1.0"
 dependencies = [
  "troe-block",
  "troe-checksum",
  "troe-fs-api",
+ "troe-fs-ramfs",
+ "troe-namespace",
  "troe-txslot",
- "troe-vfs",
 ]
 
 [[package]]
@@ -236,8 +251,10 @@ name = "troe-host"
 version = "0.1.0"
 dependencies = [
  "troe-core",
+ "troe-fs-kefs",
+ "troe-fs-ramfs",
+ "troe-namespace",
  "troe-shell",
- "troe-vfs",
 ]
 
 [[package]]
@@ -265,10 +282,13 @@ dependencies = [
  "troe-fs-api",
  "troe-fs-ext4",
  "troe-fs-fat",
+ "troe-fs-kefs",
+ "troe-fs-ramfs",
  "troe-fs-statefs",
  "troe-identity",
  "troe-machine",
  "troe-memory",
+ "troe-namespace",
  "troe-net",
  "troe-process",
  "troe-random",
@@ -277,7 +297,6 @@ dependencies = [
  "troe-task",
  "troe-terminal",
  "troe-txslot",
- "troe-vfs",
  "troe-volume",
  "uefi",
 ]
@@ -344,6 +363,16 @@ name = "troe-memory"
 version = "0.1.0"
 
 [[package]]
+name = "troe-namespace"
+version = "0.1.0"
+dependencies = [
+ "troe-core",
+ "troe-fs-api",
+ "troe-fs-kefs",
+ "troe-fs-ramfs",
+]
+
+[[package]]
 name = "troe-net"
 version = "0.1.0"
 
@@ -372,7 +401,8 @@ dependencies = [
  "troe-core",
  "troe-driver",
  "troe-fs-api",
- "troe-vfs",
+ "troe-fs-ramfs",
+ "troe-namespace",
 ]
 
 [[package]]
@@ -403,14 +433,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "troe-vfs"
-version = "0.1.0"
-dependencies = [
- "troe-core",
- "troe-fs-api",
-]
-
-[[package]]
 name = "troe-virtio"
 version = "0.1.0"
 dependencies = [
@@ -431,7 +453,7 @@ dependencies = [
  "troe-fs-ext4",
  "troe-fs-fat",
  "troe-identity",
- "troe-vfs",
+ "troe-namespace",
 ]
 
 [[package]]

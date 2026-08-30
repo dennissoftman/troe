@@ -9,7 +9,9 @@ license.workspace = true
 [dependencies]
 troe-core = { path = "../crates/common/troe-core" }
 troe-shell = { path = "../crates/shell/troe-shell" }
-troe-vfs = { path = "../crates/storage/troe-vfs" }
+troe-namespace = { path = "../crates/storage/troe-namespace" }
+troe-fs-ramfs = { path = "../crates/storage/troe-fs-ramfs" }
+troe-fs-kefs = { path = "../crates/storage/troe-fs-kefs" }
 
 [lints]
 workspace = true

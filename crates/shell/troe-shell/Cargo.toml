@@ -12,8 +12,9 @@ troe-application = { path = "../../runtime/troe-application" }
 troe-completion = { path = "../../common/troe-completion" }
 troe-core = { path = "../../common/troe-core" }
 troe-fs-api = { path = "../../storage/troe-fs-api" }
+troe-fs-ramfs = { path = "../../storage/troe-fs-ramfs" }
 troe-driver = { path = "../../device/troe-driver" }
-troe-vfs = { path = "../../storage/troe-vfs" }
+troe-namespace = { path = "../../storage/troe-namespace" }
 
 [lints]
 workspace = true

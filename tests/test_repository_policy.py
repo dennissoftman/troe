@@ -301,17 +301,23 @@ class RepositoryPolicyTests(unittest.TestCase):
             {"common", "storage", "net", "device", "runtime", "shell"},
         )
 
-        def troe_dependencies(manifest: dict) -> set[str]:
+        def shipped_dependencies(manifest: dict) -> set[str]:
+            """Dependencies that reach a built image.
+
+            Tests must be free to compose a namespace out of real providers, so
+            dev-dependencies are deliberately excluded: the layering claim is
+            about what the kernel and the future storage server link, not about
+            what a unit test constructs.
+            """
             names: set[str] = set()
-            for section in ("dependencies", "dev-dependencies", "build-dependencies"):
+            for section in ("dependencies", "build-dependencies"):
                 names.update(
                     name for name in manifest.get(section, {}) if name.startswith("troe-")
                 )
             for target in manifest.get("target", {}).values():
-                for section in ("dependencies", "dev-dependencies"):
-                    names.update(
-                        name for name in target.get(section, {}) if name.startswith("troe-")
-                    )
+                names.update(
+                    name for name in target.get("dependencies", {}) if name.startswith("troe-")
+                )
             return names
 
         for crate, (domain, manifest) in manifests.items():
@@ -320,7 +326,7 @@ class RepositoryPolicyTests(unittest.TestCase):
                 crate,
                 f"{crate} directory and package name must match",
             )
-            dependencies = troe_dependencies(manifest)
+            dependencies = shipped_dependencies(manifest)
             if crate.startswith("troe-fmt-"):
                 for dependency in dependencies:
                     self.assertTrue(
@@ -333,20 +339,16 @@ class RepositoryPolicyTests(unittest.TestCase):
                     )
             if crate.startswith("troe-fs-") and crate != "troe-fs-api":
                 self.assertLessEqual(
-                    dependencies - {"troe-vfs"},
+                    dependencies,
                     {"troe-fs-api", "troe-block", "troe-txslot", "troe-core", "troe-checksum"},
-                    f"{crate} is a provider: it may not reach past the filesystem contract",
-                )
-                self.assertNotIn(
-                    "troe-vfs",
-                    manifest.get("dependencies", {}),
-                    f"{crate} must not link the namespace outside its own tests",
+                    f"{crate} is a provider: it may not reach past the filesystem"
+                    " contract, and must never link the namespace",
                 )
             if crate == "troe-fs-api":
                 self.assertEqual(
                     dependencies, set(), "the filesystem contract must stay dependency-free"
                 )
-            if crate == "troe-vfs":
+            if crate == "troe-namespace":
                 self.assertNotIn(
                     "troe-volume", dependencies, "the namespace may not depend on volume policy"
                 )
@@ -367,12 +369,12 @@ class RepositoryPolicyTests(unittest.TestCase):
             linked & {
                 "troe-fmt-bmnt", "troe-fmt-cspk", "troe-fmt-gpt", "troe-fmt-prgn",
                 "troe-fmt-scfg", "troe-fs-ext4", "troe-fs-fat", "troe-fs-statefs",
-                "troe-identity", "troe-net", "troe-txslot", "troe-vfs", "troe-volume",
+                "troe-identity", "troe-net", "troe-txslot", "troe-namespace", "troe-volume",
             },
             {
                 "troe-fmt-bmnt", "troe-fmt-cspk", "troe-fmt-gpt", "troe-fmt-prgn",
                 "troe-fmt-scfg", "troe-fs-ext4", "troe-fs-fat", "troe-fs-statefs",
-                "troe-identity", "troe-net", "troe-txslot", "troe-vfs", "troe-volume",
+                "troe-identity", "troe-net", "troe-txslot", "troe-namespace", "troe-volume",
             },
             "kernel storage/network linkage changed: update this gate with the migration",
         )

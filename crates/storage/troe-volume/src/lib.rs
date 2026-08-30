@@ -28,7 +28,7 @@ use troe_fmt_gpt::{GptError, GptGuid, GptLimits, GptPartition, discover};
 use troe_fs_api::{FileSystemProvider, FsError, NodeKind};
 use troe_fs_ext4::{Ext4, Ext4Limits};
 use troe_fs_fat::{Fat32, Fat32Limits};
-use troe_vfs::Namespace;
+use troe_namespace::Namespace;
 
 /// Hard ceiling for one early-activation file read.
 pub const MAX_SELECTED_FILE_BYTES: usize = 4 * 1024 * 1024;
