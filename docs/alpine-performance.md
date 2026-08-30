@@ -173,3 +173,59 @@ of a phase, `peak_kib` is an observed Lua-heap high-water delta, and
 interpreter executable, native allocator overhead, kernel memory, and guest
 page accounting. Use guest-level memory telemetry as a separate measurement
 when comparing total footprint.
+
+## Separate application cost from environment cost
+
+Elapsed time alone cannot distinguish an application that executes more
+instructions from an environment that makes the same instructions cost more.
+Both guests run under QEMU TCG, so a TCG plugin can count the work directly.
+Build it once against the QEMU headers already installed on the host:
+
+```console
+python3 tools/build_qemu_plugin.py
+```
+
+Add the resulting object to the QEMU command produced by `--dry-run`, naming
+the address window that holds application code. TROE maps command applications
+at its user code base, and Linux places user space in the low canonical half:
+
+```console
+# TROE
+-plugin build/qemu-plugin/troe_count.so,user_lo=0x400000000000,user_hi=0x400100000000 -d plugin
+
+# Alpine
+-plugin build/qemu-plugin/troe_count.so,user_lo=0,user_hi=0x800000000000 -d plugin
+```
+
+Each run reports executed instructions, translation blocks, and memory reads
+and writes for the application window and for everything else:
+
+```
+guest-work user_instructions=… user_blocks=… user_reads=… user_writes=…
+  other_instructions=… other_blocks=… other_reads=… other_writes=…
+```
+
+The counters cover the complete run, including firmware and boot. Run each
+workload at one size and at twice that size and use the difference between the
+two runs; every fixed cost then cancels exactly, without measuring boot
+separately. From the differences, form two ratios:
+
+- work: TROE application instructions divided by Alpine's;
+- rate: TROE time per application instruction divided by Alpine's.
+
+Their product is the observed slowdown, and their split is the diagnosis. A
+work ratio above one with a rate ratio near one is a code-generation
+difference in the application. A work ratio near one with a rate ratio above
+one is an environment difference, and the `other_instructions` ratio then says
+whether the kernel is the part doing more. Matching instruction counts with
+higher `user_reads` or `user_writes` indicate more memory traffic rather than
+more computation.
+
+`-icount shift=N` makes guest time proportional to instructions executed and
+removes host-load noise, which is useful for regression comparisons. Confirm
+that it does not disturb timeslice preemption before relying on it.
+
+Inside TROE, `ps` and `top` report `PREEMPTS` and `YIELDS` per process. These
+are lifetime counters, so their growth across two `top` snapshots is the rate
+at which a process left unprivileged execution. Read them alongside
+`other_instructions` when the ratios point at the environment.
