@@ -178,6 +178,10 @@ PYTHON_IMPACTS = {
     "tools/size_report.py": ("test_build_policy.py",),
     "tools/build_c_sysroot.py": ("test_c_sysroot.py",),
     "tools/build_cpython.py": ("test_cpython_integration.py",),
+    # Host-side measurement tool. It is loaded by QEMU and is not part of any
+    # guest artifact, so it selects no runtime scenario.
+    "tools/build_qemu_plugin.py": ("test_qemu_plugin.py",),
+    "tools/qemu-plugin/troe_count.c": ("test_qemu_plugin.py",),
 }
 RUNTIME_TOOL_SCENARIOS = {
     "config/volumes.toml": ("boot", "filesystem"),

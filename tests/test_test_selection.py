@@ -190,6 +190,17 @@ class ChangedTestSelectionTests(unittest.TestCase):
                 self.assertEqual(plan.qemu_scenarios, {"filesystem"})
                 self.assertTrue(plan.qemu_all_platforms)
 
+    def test_qemu_plugin_paths_select_only_their_host_contract_test(self) -> None:
+        for path in (
+            "tools/build_qemu_plugin.py",
+            "tools/qemu-plugin/troe_count.c",
+        ):
+            with self.subTest(path=path):
+                plan = test_changed.build_plan((PurePosixPath(path),), PACKAGES)
+                self.assertFalse(plan.full_reasons)
+                self.assertEqual(plan.python_tests, {"test_qemu_plugin.py"})
+                self.assertEqual(plan.qemu_scenarios, set())
+
     def test_package_model_and_cli_select_only_their_host_contract_tests(self) -> None:
         cases = {
             "tools/package_model.py": "test_package_model.py",

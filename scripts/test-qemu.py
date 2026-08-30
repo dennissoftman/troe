@@ -1386,7 +1386,10 @@ def run_shell_terminal_group(session: SerialSession, command_timeout: float) -> 
         "ps",
         cwd,
         command_timeout,
-        contains=("PID ORIGIN STATE    CPU-MS PAGES HANDLES NAME", " ps\n"),
+        contains=(
+            "PID ORIGIN STATE    CPU-MS PAGES HANDLES PREEMPTS YIELDS NAME",
+            " ps\n",
+        ),
     )
     session.command(
         "top 1",

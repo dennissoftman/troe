@@ -2901,6 +2901,8 @@ const PL011_INTERRUPT_CLEAR: usize = 0x044;
 const PL011_RECEIVE_INTERRUPT: u32 = 1 << 4;
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 const PL011_RECEIVE_TIMEOUT_INTERRUPT: u32 = 1 << 6;
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+const PL011_TRANSMIT_FIFO_EMPTY: u32 = 1 << 7;
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 fn architecture_initialize_console() {
@@ -2952,10 +2954,16 @@ fn write_byte(byte: u8) -> bool {
     let Ok(base) = usize::try_from(resource.base_address()) else {
         return false;
     };
+    // Wait for an empty transmit FIFO rather than merely a free slot. The
+    // enabled FIFO holds sixteen bytes, so a caller that stops writing and
+    // parks could otherwise leave a complete short line, such as a shell
+    // prompt, resident and unobserved. The 16550 path waits on the same
+    // condition, which its status register reports as a transmitter holding
+    // register empty.
     for _ in 0..UART_SPIN_LIMIT {
         // SAFETY: The validated descriptor owns the PL011 flag register.
-        if unsafe { pl011_read(base, PL011_FLAGS) } & (1 << 5) == 0 {
-            // SAFETY: The transmitter FIFO has capacity for one byte.
+        if unsafe { pl011_read(base, PL011_FLAGS) } & PL011_TRANSMIT_FIFO_EMPTY != 0 {
+            // SAFETY: The transmitter FIFO is empty and accepts one byte.
             unsafe { pl011_write(base, PL011_DATA, u32::from(byte)) };
             return true;
         }

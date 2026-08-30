@@ -63,6 +63,13 @@ together in one flushed block-0 update, so the cost is exactly the previous
 dirty marker. The ordinary mount refuses on either signal; a foreign Linux host
 is forced to recover rather than mount half-applied metadata.
 
+Force unit access is not accepted in place of those flushes. virtio-blk is the
+only block transport this system has, and its request header carries no
+per-request force-unit-access flag to negotiate, so no driver can report the
+capability. Admitting a flush-incapable device on a force-unit-access claim
+would reduce every barrier above to a no-op for a device nothing can produce,
+so volume activation and both writable providers require flush outright.
+
 Recovery is a separate, explicitly authorized entry point. It is the only path
 that may open a volume whose journal still needs replay, and it refuses a volume
 that is already clean, so recovery authority is explicit at the call site and
@@ -101,13 +108,33 @@ Fault injection covers this contract directly. A test device models a volatile
 write-back cache in which unflushed writes are unordered and lost on power loss,
 and the suite interrupts every write boundary of a create and of an append,
 proving each one recovers to exactly one valid state and that recovery is
-idempotent. Writer interoperability is still checked against real `mke2fs` and
-read-only `e2fsck`. Note that `e2fsck -fn` does not replay a pending journal, so
-it cannot by itself prove replay correctness; byte-level assertions carry that
+idempotent.
+
+The suite also tears writes, modelling one that was landing on the platter when
+power was lost: the sectors that made it are durable, the rest never happen, and
+no flush reconciles the two halves. It tears the journal descriptor, the commit
+record, an in-place checkpoint write, and one of recovery's own replay writes,
+and compares whole media images afterwards. A torn descriptor is discarded and
+leaves every filesystem block byte-identical to its pre-mutation image. A torn
+commit record lands on one whole state or the other, never between: the log
+payload is already durable when it is issued, so a record whose identifying
+header reached media commits the transaction the log fully describes, and one
+whose header did not is discarded. A torn checkpoint write leaves media holding
+neither state — the assertions pin the exact prefix and suffix — and replay
+restores the volume byte-for-byte to what the same mutation produces
+uninterrupted. A recovery torn part-way through reaches those same bytes when it
+is re-run, because nothing it does consumes the log until the whole checkpoint
+is durable.
+
+Writer interoperability is still checked against real `mke2fs` and read-only
+`e2fsck`. Note that `e2fsck -fn` does not replay a pending journal, so it cannot
+by itself prove replay correctness; the byte-level assertions above carry that
 evidence.
 
-Journal size is not yet pinned by the build tooling, and the independent
-verifier asserts only that the journal superblock agrees with inode 8's length
-rather than an absolute size. Pinning `-J size=` and asserting an absolute
-`s_maxlen` remain follow-on work tracked in
-[GitHub issue #56](https://github.com/dennissoftman/troe/issues/56).
+The image recipe pins the journal length with an explicit `-J size=4`, and the
+independent verifier asserts the pinned block count absolutely against inode 8's
+allocation, the journal superblock's `s_maxlen`, and its `s_first`, so a build
+that took a different length is refused rather than accepted. A test derives the
+worst-case transaction footprint from `MAX_TRANSACTION_BLOCKS` plus the
+descriptor and commit blocks and checks it against that pinned capacity, so
+changing either side alone fails.

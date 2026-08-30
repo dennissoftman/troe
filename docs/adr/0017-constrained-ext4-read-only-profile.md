@@ -54,7 +54,7 @@ encryption, case folding, external journals, and extent trees deeper than one
 level are not in v1. The volume UUID is exposed so mount policy can select a
 filesystem by stable identity.
 
-Writable mounts require flush or force-unit-access durability and implement
+Writable mounts require an explicit cache flush and implement
 regular-file create/truncate/sequential append, non-directory unlink,
 empty-directory creation, symbolic-link creation, and regular-file hard-link
 creation. Data blocks and extent records grow incrementally from bounded caller
@@ -92,8 +92,11 @@ A host image for this exact profile can be created by selecting only these
 features rather than relying on defaults, for example with `mke2fs -t ext4 -b
 4096 -I 256 -O
 none,has_journal,ext_attr,extent,filetype,sparse_super,large_file,extra_isize,metadata_csum
--E lazy_itable_init=0,lazy_journal_init=0`. The build/installer tooling must
-still inspect the result and validate the produced feature bitmap exactly.
+-E lazy_itable_init=0,lazy_journal_init=0 -J size=4`. The internal journal's
+length is selected rather than defaulted for the same reason the features are:
+the writer's transaction ceiling is stated against it. The build/installer
+tooling must still inspect the result and validate the produced feature bitmap
+and journal length exactly.
 
 Strict release evidence formats and checks the production fixture with exactly
 e2fsprogs `1.47.4` (`6-Mar-2025`). `tools/mkstorage.py` checks the complete

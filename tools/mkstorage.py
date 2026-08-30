@@ -75,6 +75,15 @@ EXT4_INODES_PER_GROUP = 4096
 EXT4_FIRST_NON_RESERVED_INODE = 11
 EXT4_ROOT_INODE = 2
 EXT4_JOURNAL_INODE = 8
+# The internal journal length is a pinned decision, not an mke2fs default. It
+# is the smallest journal mke2fs accepts at this block size and still holds
+# several times the provider's worst-case transaction, which
+# tests/test_mkstorage.py checks against it.
+EXT4_JOURNAL_MEBIBYTES = 4
+EXT4_JOURNAL_BLOCKS = EXT4_JOURNAL_MEBIBYTES * 1024 * 1024 // EXT4_BLOCK_BYTES
+# Journal block zero holds the journal superblock, so the log itself starts at
+# block one and the usable capacity is the difference of the two.
+EXT4_JOURNAL_FIRST_BLOCK = 1
 EXT4_EXTENTS_FLAG = 0x0008_0000
 EXT4_EXTENT_MAGIC = 0xF30A
 EXT4_COMPAT_FEATURES = 0x0000_0004 | 0x0000_0008
@@ -1132,11 +1141,20 @@ class _Ext4ProfileVerifier:
         if mapped is None:
             raise ValueError("ext4 internal journal has no superblock")
         journal_superblock = self._block(mapped[0])
+        # Both the allocation and the log's own declared length are checked
+        # against the pinned size, not merely against each other, so a build
+        # that took a different journal size is refused rather than accepted.
+        if (
+            journal_blocks != EXT4_JOURNAL_BLOCKS
+            or int.from_bytes(journal_superblock[16:20], "big") != EXT4_JOURNAL_BLOCKS
+            or int.from_bytes(journal_superblock[20:24], "big")
+            != EXT4_JOURNAL_FIRST_BLOCK
+        ):
+            raise ValueError("ext4 internal journal is not the pinned length")
         if (
             int.from_bytes(journal_superblock[0:4], "big") != 0xC03B_3998
             or int.from_bytes(journal_superblock[4:8], "big") != 4
             or int.from_bytes(journal_superblock[12:16], "big") != EXT4_BLOCK_BYTES
-            or int.from_bytes(journal_superblock[16:20], "big") != journal_blocks
             or journal_superblock[48:64].tobytes() != FILESYSTEM_UUID
         ):
             raise ValueError("ext4 internal journal superblock is inconsistent")
@@ -1357,6 +1375,8 @@ def create_ext4(
                 "none,has_journal,ext_attr,extent,filetype,sparse_super,large_file,extra_isize,metadata_csum",
                 "-E",
                 f"lazy_itable_init=0,lazy_journal_init=0,hash_seed={FILESYSTEM_UUID_TEXT}",
+                "-J",
+                f"size={EXT4_JOURNAL_MEBIBYTES}",
                 "-d",
                 str(source),
                 str(filesystem),

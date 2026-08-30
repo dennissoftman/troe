@@ -546,7 +546,9 @@ impl<D: BlockDevice> Fat32<D> {
         if info.access() != BlockAccess::ReadWrite {
             return Err(FsError::ReadOnly);
         }
-        if !info.supports_flush() && !info.supports_force_unit_access() {
+        // Every ordering guarantee this provider makes is enforced by an
+        // explicit flush, so a device without one cannot be mutated safely.
+        if !info.supports_flush() {
             return Err(FsError::Unsupported);
         }
         Ok(())
@@ -644,26 +646,18 @@ impl<D: BlockDevice> Fat32<D> {
         Ok(())
     }
 
-    fn force_unit_access(&self) -> bool {
-        let info = self.region.info();
-        !info.supports_flush() && info.supports_force_unit_access()
-    }
-
     fn write_sector(&mut self, lba: u64, bytes: &[u8]) -> Result<(), FsError> {
         if bytes.len() != self.layout.block_bytes {
             return Err(FsError::Invalid);
         }
         self.region
-            .write_blocks(lba, 1, bytes, self.force_unit_access())
+            .write_blocks(lba, 1, bytes, false)
             .map_err(map_block)
     }
 
     fn durability_barrier(&mut self) -> Result<(), FsError> {
         self.ensure_writable()?;
-        if self.region.info().supports_flush() {
-            self.region.flush().map_err(map_block)?;
-        }
-        Ok(())
+        self.region.flush().map_err(map_block)
     }
 
     fn begin_mutation(&mut self) -> Result<(), FsError> {
@@ -2631,6 +2625,30 @@ mod tests {
         fat.remove_file("/moved/member")?;
         fat.remove_directory("/moved")?;
         assert_eq!(fat.metadata("/moved"), Err(FsError::NotFound));
+        Ok(())
+    }
+
+    #[test]
+    fn a_device_without_flush_is_refused_even_when_it_offers_force_unit_access()
+    -> Result<(), FsError> {
+        // Every ordering guarantee this provider makes is a flush. Nothing in
+        // this system produces a flush-incapable, force-unit-access-capable
+        // device — virtio-blk has no per-request flag to negotiate — and
+        // admitting one would turn each durability barrier into a no-op, so
+        // mutation is refused outright while the read path stays unaffected.
+        let mut device = valid_device().map_err(|_| FsError::Io)?;
+        device.geometry =
+            BlockGeometry::new(512, BLOCK_COUNT, 1, false, true).map_err(|_| FsError::Io)?;
+        let mut fat = mount_writable(device)?;
+        let mut bytes = [0_u8; 5];
+        assert_eq!(fat.read_file("/HELLO.TXT", 0, &mut bytes)?, 5);
+        for outcome in [
+            fat.write_file("/new.txt", b"data"),
+            fat.remove_file("/HELLO.TXT"),
+            fat.create_directory("/nope"),
+        ] {
+            assert_eq!(outcome, Err(FsError::Unsupported));
+        }
         Ok(())
     }
 

@@ -462,6 +462,11 @@ def configure_options(release: Release, architecture: str, build_python: str) ->
         "--disable-test-modules",
         "--without-readline",
         "--with-tzpath=",
+        # CPython probes computed gotos by running a test program, so a cross
+        # build cannot answer it and configure falls back to "no" unless the
+        # option is explicit. Requesting it keeps the threaded interpreter
+        # dispatch that the hosted builds select for themselves.
+        "--with-computed-gotos",
     ]
     if release.series in {"3.14", "3.13"}:
         options.append("--without-mimalloc")

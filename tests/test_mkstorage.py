@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import re
 import shutil
 import struct
 import tempfile
 import textwrap
 import unittest
+import unittest.mock
 import zlib
 from pathlib import Path
 
 from tools import mkstorage
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class MountManifestTests(unittest.TestCase):
@@ -225,6 +229,37 @@ class E2fsprogsPolicyTests(unittest.TestCase):
             )
 
 
+class Ext4JournalCapacityTests(unittest.TestCase):
+    """Check the pinned log against the provider's transaction ceiling."""
+
+    def test_pinned_journal_outsizes_the_worst_admissible_transaction(self) -> None:
+        source = (REPO_ROOT / "crates" / "storage" / "troe-fs-ext4" / "src" / "journal.rs").read_text(
+            encoding="utf-8"
+        )
+        declaration = re.search(
+            r"pub\(crate\) const MAX_TRANSACTION_BLOCKS: usize = ([0-9_]+);", source
+        )
+        self.assertIsNotNone(
+            declaration, "troe-ext4 must declare a transaction ceiling"
+        )
+        assert declaration is not None
+        ceiling = int(declaration.group(1).replace("_", ""))
+
+        # `encode_transaction` writes one descriptor block, one image per staged
+        # block, and one commit record, and refuses the transaction unless every
+        # one of them fits between the journal superblock and the log's end.
+        footprint = ceiling + 2
+        usable = mkstorage.EXT4_JOURNAL_BLOCKS - mkstorage.EXT4_JOURNAL_FIRST_BLOCK
+        self.assertGreaterEqual(
+            usable,
+            footprint,
+            f"the pinned {mkstorage.EXT4_JOURNAL_BLOCKS}-block journal leaves "
+            f"{usable} usable blocks, below the {footprint} a worst-case "
+            f"transaction needs; raise EXT4_JOURNAL_MEBIBYTES or lower "
+            f"MAX_TRANSACTION_BLOCKS",
+        )
+
+
 class Ext4StorageBuilderTests(unittest.TestCase):
     """Exercise deterministic formatting and independent post-format parsing."""
 
@@ -328,12 +363,64 @@ class Ext4StorageBuilderTests(unittest.TestCase):
         struct.pack_into("<H", image, offset + 124, checksum & 0xFFFF)
         struct.pack_into("<H", image, offset + 130, checksum >> 16)
 
+    @classmethod
+    def journal_superblock_offset(cls, image: bytearray) -> int:
+        """Locate the journal superblock through inode 8's first extent."""
+        inode = cls.inode_offset(image, mkstorage.EXT4_JOURNAL_INODE)
+        return (
+            struct.unpack_from("<I", image, inode + 60)[0] * mkstorage.EXT4_BLOCK_BYTES
+        )
+
     def test_double_build_is_identical_and_independently_validated(self) -> None:
         self.assertEqual(self.first, self.second)
         self.assertEqual(
             len(self.first), mkstorage.PARTITION_SECTORS * mkstorage.SECTOR_BYTES
         )
         mkstorage.verify_ext4(self.first, self.CONTENT)
+
+    def test_journal_is_the_pinned_length_and_starts_where_expected(self) -> None:
+        image = bytearray(self.first)
+        offset = self.journal_superblock_offset(image)
+        self.assertEqual(
+            struct.unpack_from(">I", image, offset + 16)[0],
+            mkstorage.EXT4_JOURNAL_BLOCKS,
+        )
+        self.assertEqual(
+            struct.unpack_from(">I", image, offset + 20)[0],
+            mkstorage.EXT4_JOURNAL_FIRST_BLOCK,
+        )
+        self.assertEqual(
+            struct.unpack_from(
+                "<I", image, self.inode_offset(image, mkstorage.EXT4_JOURNAL_INODE) + 4
+            )[0],
+            mkstorage.EXT4_JOURNAL_BLOCKS * mkstorage.EXT4_BLOCK_BYTES,
+        )
+
+        # This profile emits no journal checksums, so the declared length is
+        # editable in place: an image that claims any other log size is refused
+        # even though it stays self-consistent everywhere else.
+        for field, value in ((16, mkstorage.EXT4_JOURNAL_BLOCKS * 2), (20, 2)):
+            with self.subTest(field=field):
+                altered = bytearray(self.first)
+                struct.pack_into(">I", altered, offset + field, value)
+                with self.assertRaisesRegex(
+                    ValueError, "journal is not the pinned length"
+                ):
+                    mkstorage.verify_ext4(bytes(altered), self.CONTENT)
+
+    def test_a_differently_sized_journal_fails_the_verifier(self) -> None:
+        # A recipe that asks mke2fs for another journal size still formats and
+        # passes `e2fsck`; the independent verifier is what refuses it, so the
+        # build fails instead of producing an accepted image.
+        with (
+            unittest.mock.patch.object(
+                mkstorage,
+                "EXT4_JOURNAL_MEBIBYTES",
+                mkstorage.EXT4_JOURNAL_MEBIBYTES + 1,
+            ),
+            self.assertRaisesRegex(ValueError, "journal is not the pinned length"),
+        ):
+            mkstorage.create_ext4(self.CONTENT)
 
     def test_truncation_dirty_state_and_unknown_features_are_rejected(self) -> None:
         for truncated in (b"", self.first[:2048], self.first[:-1]):
