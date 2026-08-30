@@ -36,6 +36,9 @@ MAX_ARTIFACT_BYTES = (
     + CMPL_MAX_BYTES
 )
 MAX_ARTIFACTS = 128
+# The interpreter links against a generated CPython tree, so only
+# tools/build_cpython.py can build it; provisioning installs its package.
+CPYTHON_APPLICATIONS = ("python",)
 
 
 @dataclass(frozen=True, order=True)
@@ -326,6 +329,12 @@ def provision_image(
             source = repository / "apps" / application
             if not (source / "Cargo.toml").is_file():
                 raise ValueError(f"application does not exist: {application}")
+            if application in CPYTHON_APPLICATIONS:
+                raise ValueError(
+                    "the CPython interpreter is not built here: build it with "
+                    "tools/build_cpython.py and install it with "
+                    "--cpython-package"
+                )
             run(
                 [
                     "cargo",
