@@ -61,14 +61,30 @@ rather than reading and rewriting an uninitialized bitmap. This is why an
 ordinary volume, whose groups are mostly uninitialized after `mke2fs`, can be
 written without first initializing it.
 
-A hashed directory index is walked rather than refused. Enumeration reads the
-root and any interior node, collects the leaf blocks, and parses those leaves
-linearly, so a name resolves without computing any hash. Removal edits the leaf
-that holds the record and leaves the index describing that same leaf, so no
-index rewrite is needed. Insertion computes the name's hash with ext4's own
-function and admits the record only into the leaf the index maps that hash to;
-if that leaf is full the insert is refused, because splitting it would mean
-rewriting the index. A record is never placed where the index cannot find it.
+A hashed directory index is walked and maintained rather than refused.
+Enumeration reads the root and any interior node, collects the leaf blocks, and
+parses those leaves linearly, so a name resolves without computing any hash.
+Removal edits the leaf that holds the record and leaves the index describing
+that same leaf, so no index rewrite is needed. Insertion computes the name's
+hash with ext4's own function and admits the record only into the leaf the index
+maps that hash to. A record is never placed where the index cannot find it.
+
+A full leaf splits instead of refusing the name. Its records are redistributed
+by hash into two leaves, and the separator is inserted beside the entry the walk
+followed, which is what keeps every name in the leaf its own hash selects. Two
+records that share a hash cannot be separated, so the split point is always a
+strict hash change nearest the byte midpoint; a leaf whose records all share one
+hash has no split point and the insert is refused rather than producing a leaf
+the index cannot address. A parent with no room is reshaped first: a root that
+still addresses leaves directly moves its entries down into one interior node
+and gains a level, and a full interior node splits under a root that still has
+room. Both levels full is the end of what ext4 defines here, and is refused.
+
+Moving a directory rewrites the `..` record of the directory that moved. In an
+indexed one that record shares the root block with the index, so it is located
+by the layout the index fixes rather than by walking record lengths, and the
+index checksum that covers it is refreshed. An indexed directory therefore
+renames between parents like any other.
 
 Names are limited by ext4 rather than by this provider: a path component may be
 255 bytes and a path 1024, which the VFS and the KEX filesystem service both
