@@ -78,7 +78,8 @@ mod firmware {
     use troe_memory::{
         BASE_PAGE_SIZE, BootAllocator, FrameAllocationError, FrameAllocator, MAX_FIRMWARE_REGIONS,
         Mapping, MappingLifetime, MappingMemoryType, MappingOwner, MappingPermissions, MappingPlan,
-        MemoryMapStats, MemoryRegion, NormalizedMemoryMap, PhysicalRange, RegionKind, VirtualRange,
+        MemoryMapStats, MemoryRegion, NormalizedMemoryMap, PhysicalExtents, PhysicalRange,
+        RegionKind, VirtualRange,
     };
     use troe_namespace::Namespace;
     use troe_net::{
@@ -167,7 +168,6 @@ mod firmware {
     const ISOLATED_RESOURCE_PAGES: u64 = ISOLATED_TABLE_PAGES + ISOLATED_PRIVATE_PAGES;
     const STAGE6_USER_REGION_LIMIT: usize = 8;
     const STAGE6_USER_REGIONS: usize = 3;
-    const APPLICATION_FIXED_USER_REGIONS: usize = 3;
     const APPLICATION_INTERFACE_ECHO: u32 = 1;
     const APPLICATION_TIMESLICE_MILLISECONDS: u32 = 50;
     const APPLICATION_DATAGRAM_WAIT_MILLISECONDS: u64 = 4_000;
@@ -1643,15 +1643,48 @@ mod firmware {
     }
 
     struct ApplicationAllocation {
-        complete: PhysicalRange,
+        extents: PhysicalExtents,
         tables: PhysicalRange,
-        image: PhysicalRange,
+        image_pages: u64,
         startup: PhysicalRange,
-        heap: Option<PhysicalRange>,
+        heap_pages: u64,
         growth_ranges: Vec<PhysicalRange>,
         growth_table_frames: Vec<u64>,
         private_memory: ApplicationPrivateMemory,
     }
+
+    /// Largest number of physical extents one launch reservation may use.
+    ///
+    /// Every extent contributes at least one bounded mapping-plan record, and
+    /// one plan holds at most `troe_memory::MAX_MAPPINGS` records across kernel
+    /// and application mappings together. Refusing a more fragmented
+    /// reservation up front keeps the allocation loop bounded and turns "too
+    /// fragmented to describe" into the same fail-closed refusal as "not enough
+    /// frames", rather than a failure discovered while building the plan.
+    const MAX_APPLICATION_EXTENTS: usize = 256;
+
+    /// Pages the startup page occupies between the image and the heap.
+    const APPLICATION_STARTUP_PAGES: u64 = 1;
+
+    /// Whether a launch reservation coalesces physically adjacent quanta.
+    ///
+    /// Production always coalesces, so an unfragmented machine reserves exactly
+    /// one extent and builds exactly the mapping records the former contiguous
+    /// reservation built. The acceptance image deliberately does not, so every
+    /// command launch exercises the multi-extent mapping, payload-copy, and
+    /// straddling-relocation paths that real fragmentation would otherwise
+    /// reach only rarely and nondeterministically.
+    const COALESCE_LAUNCH_EXTENTS: bool = !cfg!(feature = "acceptance-probes");
+
+    /// Pages reserved per launch step in the acceptance image.
+    ///
+    /// Production reserves the configured operation quantum and coalesces, so an
+    /// unfragmented machine takes exactly one extent. The acceptance image takes
+    /// tiny non-coalescing steps instead, so every command launch is backed by
+    /// several extents and exercises the split mapping, payload-copy,
+    /// straddling-relocation, and buffer-validation paths on every run rather
+    /// than only when memory happens to be fragmented.
+    const ACCEPTANCE_LAUNCH_QUANTUM_PAGES: u64 = 4;
 
     struct ApplicationPrivateMemory {
         mappings: Vec<ApplicationPrivateMapping>,
@@ -1720,11 +1753,11 @@ mod firmware {
     }
 
     struct ApplicationPrivateAllocation {
-        complete: PhysicalRange,
-        image: PhysicalRange,
+        extents: PhysicalExtents,
+        image_pages: u64,
         startup: PhysicalRange,
-        heap: Option<PhysicalRange>,
-        stack: PhysicalRange,
+        heap_pages: u64,
+        stack_pages: u64,
     }
 
     enum ApplicationGrowth {
@@ -3481,16 +3514,6 @@ mod firmware {
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
-        let fixed_user_regions = if plan.heap_pages() == 0 {
-            APPLICATION_FIXED_USER_REGIONS - 1
-        } else {
-            APPLICATION_FIXED_USER_REGIONS
-        };
-        let application_user_regions = plan
-            .segments()
-            .count()
-            .checked_add(fixed_user_regions)
-            .ok_or(())?;
         let private_pages = plan.charges().private_pages();
         let stack_pages = plan.stack_pages();
 
@@ -3520,10 +3543,13 @@ mod firmware {
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         }
+        let (planned_user_regions, planned_user_pages) =
+            troe_machine::planned_user_regions(&mapping_plan).map_err(|_| ())?;
         let table_pages = address_space.stats().table_pages;
         if table_pages == 0
             || table_pages != allocation.tables.page_count()
-            || address_space.user_region_count() != application_user_regions
+            || address_space.user_region_count() != planned_user_regions
+            || planned_user_pages != private_pages
         {
             reclaim_application(accounting, allocation)?;
             clear_provisional_loader_ownership(&mut transaction);
@@ -3557,7 +3583,7 @@ mod firmware {
         }
         let entry = plan.entry_address();
         let layout = plan.layout();
-        let allocation_start = allocation.complete.start();
+        let allocation_start = allocation.extents.first_start().map_err(|_| ())?;
         let mut live_owner = None;
         let setup = (|| -> Result<(_, _), ()> {
             let owner = HandleOwner::isolated(task_id.get()).map_err(|_| ())?;
@@ -5051,15 +5077,6 @@ mod firmware {
         transaction
             .acquire(LoaderResource::Staging)
             .map_err(|_| ())?;
-        let fixed_user_regions = if plan.heap_pages() == 0 {
-            APPLICATION_FIXED_USER_REGIONS - 1
-        } else {
-            APPLICATION_FIXED_USER_REGIONS
-        };
-        let application_user_regions = plan
-            .segment_count()
-            .checked_add(fixed_user_regions)
-            .ok_or(())?;
         let heap_start = plan.layout().heap_address();
         let maximum_heap_pages = plan
             .layout()
@@ -5096,10 +5113,18 @@ mod firmware {
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         }
+        let Ok((planned_user_regions, planned_user_pages)) =
+            troe_machine::planned_user_regions(&mapping_plan)
+        else {
+            reclaim_command_application(accounting, allocation);
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        };
         let table_pages = address_space.stats().table_pages;
         if table_pages == 0
             || table_pages != allocation.tables.page_count()
-            || address_space.user_region_count() != application_user_regions
+            || address_space.user_region_count() != planned_user_regions
+            || planned_user_pages != private_pages
         {
             reclaim_command_application(accounting, allocation);
             clear_provisional_loader_ownership(&mut transaction);
@@ -5293,16 +5318,6 @@ mod firmware {
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         };
-        let fixed_user_regions = if plan.heap_pages() == 0 {
-            APPLICATION_FIXED_USER_REGIONS - 1
-        } else {
-            APPLICATION_FIXED_USER_REGIONS
-        };
-        let application_user_regions = plan
-            .segments()
-            .count()
-            .checked_add(fixed_user_regions)
-            .ok_or(())?;
         let heap_start = plan.layout().heap_address();
         let maximum_heap_pages = plan
             .layout()
@@ -5339,10 +5354,18 @@ mod firmware {
             clear_provisional_loader_ownership(&mut transaction);
             return Err(());
         }
+        let Ok((planned_user_regions, planned_user_pages)) =
+            troe_machine::planned_user_regions(&mapping_plan)
+        else {
+            reclaim_command_application(accounting, allocation);
+            clear_provisional_loader_ownership(&mut transaction);
+            return Err(());
+        };
         let table_pages = address_space.stats().table_pages;
         if table_pages == 0
             || table_pages != allocation.tables.page_count()
-            || address_space.user_region_count() != application_user_regions
+            || address_space.user_region_count() != planned_user_regions
+            || planned_user_pages != private_pages
         {
             reclaim_command_application(accounting, allocation);
             clear_provisional_loader_ownership(&mut transaction);
@@ -7878,8 +7901,7 @@ mod firmware {
         heap_start: u64,
     ) -> Result<u64, PrivateMemoryError> {
         let pages = allocation
-            .heap
-            .map_or(0, PhysicalRange::page_count)
+            .heap_pages
             .checked_add(
                 application_growth_pages(allocation).map_err(|()| PrivateMemoryError::Terminal)?,
             )
@@ -8158,7 +8180,7 @@ mod firmware {
     ) -> Result<(), PrivateMemoryError> {
         let state = &allocation.private_memory;
         let process_commit = allocation
-            .complete
+            .extents
             .page_count()
             .checked_add(
                 application_growth_pages(allocation).map_err(|()| PrivateMemoryError::Terminal)?,
@@ -9026,7 +9048,7 @@ mod firmware {
         maximum_heap_pages: u64,
         minimum_pages: u64,
     ) -> Result<ApplicationGrowth, ()> {
-        let initial_pages = allocation.heap.map_or(0, PhysicalRange::page_count);
+        let initial_pages = allocation.heap_pages;
         let current_pages = initial_pages
             .checked_add(application_growth_pages(allocation)?)
             .ok_or(())?;
@@ -9074,7 +9096,7 @@ mod firmware {
             .checked_add(minimum_pages)
             .ok_or(())?;
         let process_commit = allocation
-            .complete
+            .extents
             .page_count()
             .checked_add(application_growth_pages(allocation)?)
             .and_then(|pages| pages.checked_add(allocation.private_memory.committed_pages))
@@ -9258,6 +9280,161 @@ mod firmware {
             .ok_or(())
     }
 
+    /// Reserve one launch's private frames and zero them in bounded substeps.
+    ///
+    /// The reservation is a sequence of extents rather than one contiguous run,
+    /// so a large application launches on a fragmented machine instead of being
+    /// refused for want of one long free span. Each quantum is zeroed as it is
+    /// taken, so no substep scales with the total request and no derived range
+    /// is ever published over frames that still hold a previous owner's bytes.
+    fn reserve_zeroed_private_extents(
+        accounting: &mut OwnedAccounting,
+        resource_pages: u64,
+    ) -> Result<PhysicalExtents, ()> {
+        let quantum = if cfg!(feature = "acceptance-probes") {
+            ACCEPTANCE_LAUNCH_QUANTUM_PAGES
+        } else {
+            accounting.memory_policy.operation_quantum_pages()
+        };
+        if quantum == 0 || resource_pages == 0 {
+            return Err(());
+        }
+        let mut extents = PhysicalExtents::new();
+        let mut remaining = resource_pages;
+        let mut failed = false;
+        while remaining != 0 {
+            // Halve the request rather than give up when no run of this size
+            // is free. A launch then needs only as much contiguity as the
+            // machine still has, down to single pages, instead of being refused
+            // while enough total frames remain.
+            let mut request = remaining.min(quantum);
+            let reserved = loop {
+                match accounting.frames.allocate_contiguous(request, 1) {
+                    Ok(range) => break Some(range),
+                    Err(_) if request > 1 => request /= 2,
+                    Err(_) => break None,
+                }
+            };
+            let Some(range) = reserved else {
+                failed = true;
+                break;
+            };
+            let taken = range.page_count();
+            if troe_machine::zero_physical_range(range).is_err()
+                || extents
+                    .push(range, MAX_APPLICATION_EXTENTS, COALESCE_LAUNCH_EXTENTS)
+                    .is_err()
+            {
+                accounting.frames.free_range(range).map_err(|_| ())?;
+                failed = true;
+                break;
+            }
+            remaining = remaining.checked_sub(taken).ok_or(())?;
+        }
+        if failed {
+            release_launch_extents(accounting, &extents)?;
+            return Err(());
+        }
+        if extents.page_count() != resource_pages {
+            release_launch_extents(accounting, &extents)?;
+            return Err(());
+        }
+        Ok(extents)
+    }
+
+    /// Release every extent of one provisional launch reservation.
+    fn release_launch_extents(
+        accounting: &mut OwnedAccounting,
+        extents: &PhysicalExtents,
+    ) -> Result<(), ()> {
+        for range in extents.extents() {
+            accounting.frames.free_range(*range).map_err(|_| ())?;
+        }
+        Ok(())
+    }
+
+    /// Copy `bytes` to one logical offset in a reservation, crossing extents.
+    ///
+    /// A relocation target or a streamed payload chunk may straddle an extent
+    /// boundary, so the copy is split at whatever boundaries it crosses rather
+    /// than requiring one contiguous destination.
+    fn write_launch_bytes(
+        extents: &PhysicalExtents,
+        byte_offset: u64,
+        bytes: &[u8],
+    ) -> Result<(), ()> {
+        let mut written = 0_usize;
+        while written < bytes.len() {
+            let remaining = bytes.len().checked_sub(written).ok_or(())?;
+            let offset = u64::try_from(written)
+                .ok()
+                .and_then(|written| byte_offset.checked_add(written))
+                .ok_or(())?;
+            let (extent, within, count) = extents
+                .byte_run_at(offset, u64::try_from(remaining).map_err(|_| ())?)
+                .map_err(|_| ())?;
+            let chunk = bytes
+                .get(written..written.checked_add(count).ok_or(())?)
+                .ok_or(())?;
+            troe_machine::copy_to_physical(extent, within, chunk).map_err(|_| ())?;
+            written = written.checked_add(count).ok_or(())?;
+        }
+        Ok(())
+    }
+
+    /// Copy one segment's payload bytes at an offset inside that segment.
+    ///
+    /// The contiguous reservation bounded every payload write to the segment's
+    /// own physical range, so an offset past the segment's end was refused.
+    /// Extents address the whole reservation, so that bound is reimposed here
+    /// rather than letting an overrun spill into the next segment, the startup
+    /// page, or the heap.
+    fn write_segment_bytes<P: NativeApplicationPlan>(
+        extents: &PhysicalExtents,
+        plan: &P,
+        segment_index: usize,
+        offset_in_segment: u64,
+        bytes: &[u8],
+    ) -> Result<(), ()> {
+        let segment = plan.segment(segment_index).ok_or(())?;
+        let end = u64::try_from(bytes.len())
+            .ok()
+            .and_then(|length| offset_in_segment.checked_add(length))
+            .ok_or(())?;
+        if end > segment.memory_bytes() {
+            return Err(());
+        }
+        let logical = segment_logical_offset(plan, segment_index)?
+            .checked_add(offset_in_segment)
+            .ok_or(())?;
+        write_launch_bytes(extents, logical, bytes)
+    }
+
+    /// Map one virtually contiguous region across however many extents back it.
+    fn map_launch_region(
+        plan: &mut MappingPlan,
+        extents: &PhysicalExtents,
+        start_page: u64,
+        page_count: u64,
+        virtual_start: u64,
+        permissions: MappingPermissions,
+    ) -> Result<(), ()> {
+        let mut mapped = 0_u64;
+        while mapped < page_count {
+            let remaining = page_count.checked_sub(mapped).ok_or(())?;
+            let run = extents
+                .run_at(start_page.checked_add(mapped).ok_or(())?, remaining)
+                .map_err(|_| ())?;
+            let address = mapped
+                .checked_mul(BASE_PAGE_SIZE)
+                .and_then(|bytes| virtual_start.checked_add(bytes))
+                .ok_or(())?;
+            insert_application_mapping(plan, address, run, permissions)?;
+            mapped = mapped.checked_add(run.page_count()).ok_or(())?;
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     fn allocate_application<P: NativeApplicationPlan>(
         accounting: &mut OwnedAccounting,
@@ -9286,54 +9463,41 @@ mod firmware {
         {
             return Err(());
         }
-        let complete = accounting
-            .frames
-            .allocate_contiguous(resource_pages, 1)
-            .map_err(|_| ())?;
-        let derived = (|| {
-            let image = PhysicalRange::from_pages(complete.start(), plan.charges().image_pages())
-                .map_err(|_| ())?;
-            let startup = PhysicalRange::from_pages(image.end(), 1).map_err(|_| ())?;
-            let heap = if plan.heap_pages() == 0 {
-                None
-            } else {
-                Some(PhysicalRange::from_pages(startup.end(), plan.heap_pages()).map_err(|_| ())?)
-            };
-            let stack_start = heap.map_or(startup.end(), PhysicalRange::end);
-            let stack =
-                PhysicalRange::from_pages(stack_start, plan.stack_pages()).map_err(|_| ())?;
-            if stack.end() != complete.end() {
-                return Err(());
-            }
-            Ok(ApplicationPrivateAllocation {
-                complete,
-                image,
-                startup,
-                heap,
-                stack,
-            })
-        })();
-        if derived.is_err() {
-            accounting.frames.free_range(complete).map_err(|_| ())?;
-        }
-        let private = derived?;
+        let extents = reserve_zeroed_private_extents(accounting, resource_pages)?;
+        let image_pages = plan.charges().image_pages();
+        let heap_pages = plan.heap_pages();
+        let stack_pages = plan.stack_pages();
+        // The reservation must describe exactly the logical sequence the plan
+        // charged: image, startup page, heap, stack.
+        let derived = image_pages
+            .checked_add(APPLICATION_STARTUP_PAGES)
+            .and_then(|pages| pages.checked_add(heap_pages))
+            .and_then(|pages| pages.checked_add(stack_pages))
+            .filter(|total| *total == extents.page_count())
+            .ok_or(())
+            .and_then(|_| extents.run_at(image_pages, 1).map_err(|_| ()));
+        let Ok(startup) = derived else {
+            release_launch_extents(accounting, &extents)?;
+            return Err(());
+        };
+        let private = ApplicationPrivateAllocation {
+            extents,
+            image_pages,
+            startup,
+            heap_pages,
+            stack_pages,
+        };
         let Ok(mapping_plan) = build_application_plan(
             &accounting.kernel_plan,
             accounting.kernel_runtime,
             &private,
             plan,
         ) else {
-            accounting
-                .frames
-                .free_range(private.complete)
-                .map_err(|_| ())?;
+            release_launch_extents(accounting, &private.extents)?;
             return Err(());
         };
         let Ok(table_pages) = troe_machine::required_page_table_pages(&mapping_plan) else {
-            accounting
-                .frames
-                .free_range(private.complete)
-                .map_err(|_| ())?;
+            release_launch_extents(accounting, &private.extents)?;
             return Err(());
         };
         if table_pages == 0
@@ -9343,27 +9507,21 @@ mod firmware {
                     .free_frames()
                     .saturating_sub(accounting.memory_policy.minimum_free_pages())
         {
-            accounting
-                .frames
-                .free_range(private.complete)
-                .map_err(|_| ())?;
+            release_launch_extents(accounting, &private.extents)?;
             return Err(());
         }
         let Ok(tables) = accounting.frames.allocate_contiguous(table_pages, 1) else {
-            accounting
-                .frames
-                .free_range(private.complete)
-                .map_err(|_| ())?;
+            release_launch_extents(accounting, &private.extents)?;
             return Err(());
         };
         accounting.application_committed_pages = committed_pages;
         Ok((
             ApplicationAllocation {
-                complete: private.complete,
+                extents: private.extents,
                 tables,
-                image: private.image,
+                image_pages: private.image_pages,
                 startup: private.startup,
-                heap: private.heap,
+                heap_pages: private.heap_pages,
                 growth_ranges: Vec::new(),
                 growth_table_frames: Vec::new(),
                 private_memory: ApplicationPrivateMemory::new(
@@ -9379,16 +9537,17 @@ mod firmware {
         allocation: &ApplicationAllocation,
         plan: &LoadPlan<'_>,
     ) -> Result<(), ()> {
-        troe_machine::zero_physical_range(allocation.complete).map_err(|_| ())?;
-        let mut physical_start = allocation.image.start();
-        for segment in plan.segments() {
-            let physical =
-                PhysicalRange::from_pages(physical_start, segment.memory_bytes() / BASE_PAGE_SIZE)
-                    .map_err(|_| ())?;
-            troe_machine::copy_to_physical(physical, 0, segment.file_bytes()).map_err(|_| ())?;
-            physical_start = physical.end();
+        let mut logical = 0_u64;
+        for (index, segment) in plan.segments().enumerate() {
+            write_segment_bytes(&allocation.extents, plan, index, 0, segment.file_bytes())?;
+            logical = logical.checked_add(segment.memory_bytes()).ok_or(())?;
         }
-        if physical_start != allocation.image.end() {
+        if logical
+            != allocation
+                .image_pages
+                .checked_mul(BASE_PAGE_SIZE)
+                .ok_or(())?
+        {
             return Err(());
         }
         for relocation in plan.relocations() {
@@ -9402,15 +9561,17 @@ mod firmware {
         package: &StreamedKexPackage,
         read_at: &mut impl FnMut(u64, &mut [u8]) -> Result<usize, ()>,
     ) -> Result<(), ()> {
-        troe_machine::zero_physical_range(allocation.complete).map_err(|_| ())?;
         stream_verified_segments(
             package,
             |offset, destination| read_at(offset, destination),
             |segment_index, segment_offset, bytes| {
-                let (physical, _segment) =
-                    application_segment_physical(allocation, package.executable(), segment_index)?;
-                let byte_offset = usize::try_from(segment_offset).map_err(|_| ())?;
-                troe_machine::copy_to_physical(physical, byte_offset, bytes).map_err(|_| ())
+                write_segment_bytes(
+                    &allocation.extents,
+                    package.executable(),
+                    segment_index,
+                    segment_offset,
+                    bytes,
+                )
             },
         )
         .map_err(|_| ())?;
@@ -9422,21 +9583,22 @@ mod firmware {
         .map_err(|_| ())
     }
 
-    fn application_segment_physical<P: NativeApplicationPlan>(
-        allocation: &ApplicationAllocation,
+    /// Logical byte offset of one segment within the launch reservation.
+    ///
+    /// Segments occupy the reservation in plan order starting at logical zero,
+    /// exactly as they did when the reservation was one contiguous run, so a
+    /// segment-relative offset composes with this to address any image byte.
+    fn segment_logical_offset<P: NativeApplicationPlan>(
         plan: &P,
         wanted_index: usize,
-    ) -> Result<(PhysicalRange, LoadSegmentLayout), ()> {
-        let mut physical_start = allocation.image.start();
+    ) -> Result<u64, ()> {
+        let mut offset = 0_u64;
         for index in 0..plan.segment_count() {
             let segment = plan.segment(index).ok_or(())?;
-            let physical =
-                PhysicalRange::from_pages(physical_start, segment.memory_bytes() / BASE_PAGE_SIZE)
-                    .map_err(|_| ())?;
             if index == wanted_index {
-                return Ok((physical, segment));
+                return Ok(offset);
             }
-            physical_start = physical.end();
+            offset = offset.checked_add(segment.memory_bytes()).ok_or(())?;
         }
         Err(())
     }
@@ -9449,27 +9611,32 @@ mod firmware {
         let target_end = relocation.target_offset().checked_add(8).ok_or(())?;
         let mut target = None;
         for index in 0..plan.segment_count() {
-            let (physical, segment) = application_segment_physical(allocation, plan, index)?;
+            let segment = plan.segment(index).ok_or(())?;
             let segment_end = segment
                 .image_offset()
                 .checked_add(segment.memory_bytes())
                 .ok_or(())?;
             if segment.image_offset() <= relocation.target_offset() && target_end <= segment_end {
-                let byte_offset = relocation
+                let within = relocation
                     .target_offset()
                     .checked_sub(segment.image_offset())
-                    .and_then(|offset| usize::try_from(offset).ok())
                     .ok_or(())?;
-                target = Some((physical, byte_offset));
+                target = Some(
+                    segment_logical_offset(plan, index)?
+                        .checked_add(within)
+                        .ok_or(())?,
+                );
                 break;
             }
         }
-        let (physical, byte_offset) = target.ok_or(())?;
+        let logical = target.ok_or(())?;
         let value = plan
             .image_base()
             .checked_add(relocation.value_offset())
             .ok_or(())?;
-        troe_machine::copy_to_physical(physical, byte_offset, &value.to_le_bytes()).map_err(|_| ())
+        // An eight-byte target may straddle an extent boundary, so the write is
+        // split rather than requiring one contiguous destination.
+        write_launch_bytes(&allocation.extents, logical, &value.to_le_bytes())
     }
 
     fn build_application_plan<P: NativeApplicationPlan>(
@@ -9489,27 +9656,24 @@ mod firmware {
             }
         }
 
-        let mut physical_start = allocation.image.start();
+        // Each region is virtually contiguous but may be backed by several
+        // extents, so one region contributes one mapping record per physically
+        // contiguous run rather than exactly one record.
         for index in 0..application.segment_count() {
             let segment = application.segment(index).ok_or(())?;
-            let physical =
-                PhysicalRange::from_pages(physical_start, segment.memory_bytes() / BASE_PAGE_SIZE)
-                    .map_err(|_| ())?;
             let permissions = match segment.permissions() {
                 SegmentPermissions::ReadOnly => MappingPermissions::READ_ONLY,
                 SegmentPermissions::ReadExecute => MappingPermissions::READ_EXECUTE,
                 SegmentPermissions::ReadWrite => MappingPermissions::READ_WRITE,
             };
-            insert_application_mapping(
+            map_launch_region(
                 &mut plan,
+                &allocation.extents,
+                segment_logical_offset(application, index)? / BASE_PAGE_SIZE,
+                segment.memory_bytes() / BASE_PAGE_SIZE,
                 segment.virtual_address(),
-                physical,
                 permissions,
             )?;
-            physical_start = physical.end();
-        }
-        if physical_start != allocation.image.end() {
-            return Err(());
         }
         insert_application_mapping(
             &mut plan,
@@ -9517,18 +9681,28 @@ mod firmware {
             allocation.startup,
             MappingPermissions::READ_ONLY,
         )?;
-        if let Some(heap) = allocation.heap {
-            insert_application_mapping(
+        let heap_start_page = allocation
+            .image_pages
+            .checked_add(APPLICATION_STARTUP_PAGES)
+            .ok_or(())?;
+        if allocation.heap_pages != 0 {
+            map_launch_region(
                 &mut plan,
+                &allocation.extents,
+                heap_start_page,
+                allocation.heap_pages,
                 application.layout().heap_address(),
-                heap,
                 MappingPermissions::READ_WRITE,
             )?;
         }
-        insert_application_mapping(
+        map_launch_region(
             &mut plan,
+            &allocation.extents,
+            heap_start_page
+                .checked_add(allocation.heap_pages)
+                .ok_or(())?,
+            allocation.stack_pages,
             application.layout().stack_bottom(),
-            allocation.stack,
             MappingPermissions::READ_WRITE,
         )?;
         if !plan.enforces_global_w_xor_x() {
@@ -9627,7 +9801,7 @@ mod firmware {
         allocation: ApplicationAllocation,
     ) -> Result<(), ()> {
         let committed_pages = allocation
-            .complete
+            .extents
             .page_count()
             .checked_add(application_growth_pages(&allocation)?)
             .and_then(|pages| pages.checked_add(allocation.private_memory.committed_pages))
@@ -9660,11 +9834,11 @@ mod firmware {
             .frames
             .free_range(allocation.tables)
             .map_err(|_| ())?;
-        troe_machine::zero_physical_range(allocation.complete).map_err(|_| ())?;
-        accounting
-            .frames
-            .free_range(allocation.complete)
-            .map_err(|_| ())
+        for range in allocation.extents.extents() {
+            troe_machine::zero_physical_range(*range).map_err(|_| ())?;
+            accounting.frames.free_range(*range).map_err(|_| ())?;
+        }
+        Ok(())
     }
 
     const fn native_application_target() -> Target {

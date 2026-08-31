@@ -226,7 +226,37 @@ def _rejections(target: str, base: bytes) -> dict[str, tuple[bytes, str]]:
     invalid[22] = 1
     add("header-flags", bytes(invalid), "NonzeroReserved")
     add("header-reserved16", _put_u16(bytearray(base), 34, 1), "NonzeroReserved")
-    add("header-reserved32", _put_u32(bytearray(base), 36, 1), "NonzeroReserved")
+    span_pages = struct.unpack_from("<I", base, 36)[0]
+    add("image-span-zero", _put_u32(bytearray(base), 36, 0), "InvalidImageSpan")
+    add(
+        "image-span-unaligned",
+        _put_u32(bytearray(base), 36, span_pages + 1),
+        "InvalidImageSpan",
+    )
+    add(
+        "image-span-above-maximum",
+        _put_u32(
+            bytearray(base),
+            36,
+            elf2kex.MAX_IMAGE_SPAN_PAGES + elf2kex.KEX_IMAGE_ALIGNMENT
+            // elf2kex.KEX_PAGE_BYTES,
+        ),
+        "InvalidImageSpan",
+    )
+    add(
+        "image-span-noncanonical",
+        _put_u32(
+            bytearray(base),
+            36,
+            span_pages + elf2kex.KEX_IMAGE_ALIGNMENT // elf2kex.KEX_PAGE_BYTES,
+        ),
+        "InvalidImageSpan",
+    )
+    add(
+        "image-span-legacy-nonzero",
+        _put_u16(bytearray(_put_u32(bytearray(base), 36, 1)), 20, 1),
+        "NonzeroReserved",
+    )
     add(
         "record-reserved",
         _put_u32(bytearray(base), elf2kex.KEX_HEADER_BYTES + 36, 1),
@@ -307,17 +337,12 @@ def _rejections(target: str, base: bytes) -> dict[str, tuple[bytes, str]]:
     add("payload-trailing", bytes(trailing), "NoncanonicalPayload")
     add(
         "image-span-exceeded",
-        _put_u64(bytearray(base), elf2kex.KEX_HEADER_BYTES, 128 * 1024 * 1024),
-        "ImageSpanExceeded",
-    )
-    add(
-        "image-pages-exceeded",
         _put_u64(
             bytearray(base),
-            elf2kex.KEX_HEADER_BYTES + 24,
-            8193 * elf2kex.KEX_PAGE_BYTES,
+            elf2kex.KEX_HEADER_BYTES,
+            span_pages * elf2kex.KEX_PAGE_BYTES,
         ),
-        "ImagePagesExceeded",
+        "ImageSpanExceeded",
     )
     add("stack-below-minimum", _put_u64(bytearray(base), 40, 3), "StackBudgetExceeded")
     add(
@@ -398,13 +423,11 @@ def generate_corpus() -> dict[str, bytes]:
                 target,
                 NATIVE_CODE[target]["calls"],
                 first_virtual=elf2kex.KEX_IMAGE_BASE
-                + 128 * 1024 * 1024
+                + elf2kex.MAX_IMAGE_SPAN_BYTES
                 - elf2kex.KEX_PAGE_BYTES,
             ),
-            "standard-max-pages": _canonical(
-                target,
-                NATIVE_CODE[target]["calls"],
-                first_memory_bytes=8192 * elf2kex.KEX_PAGE_BYTES,
+            "standard-minimum-span": _canonical(
+                target, NATIVE_CODE[target]["calls"]
             ),
             "standard-max-stack-heap": elf2kex.convert_elf(
                 build_static_elf(target, NATIVE_CODE[target]["calls"]),
@@ -412,13 +435,16 @@ def generate_corpus() -> dict[str, bytes]:
                 stack_pages=1 << 32,
                 heap_pages=1 << 32,
             ),
-            "standard-max-encoded": _canonical(
+            # The encoded ceiling is now two spans, far past anything worth
+            # committing. This case instead exercises a multi-megabyte image
+            # whose payload fills its declared span exactly.
+            "standard-large-image": _canonical(
                 target,
                 NATIVE_CODE[target]["calls"],
-                first_file_bytes=32 * 1024 * 1024
+                first_file_bytes=4 * 1024 * 1024
                 - elf2kex.KEX_HEADER_BYTES
                 - elf2kex.KEX_RECORD_BYTES,
-                first_memory_bytes=32 * 1024 * 1024,
+                first_memory_bytes=4 * 1024 * 1024,
             ),
         }
         for label, artifact in boundary_artifacts.items():

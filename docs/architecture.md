@@ -155,7 +155,7 @@ cannot intercept intrinsic names. A token containing `/` bypasses discovery
 and selects one exact relative or absolute VFS file; it adds neither a `PATH`
 search nor implicit current-directory execution. The interactive shell asks a
 default-negative confirmation before direct execution outside `/bin`; nested
-typed process launch remains noninteractive. ABI 1.1 exposes no platform-transition operation.
+typed process launch remains noninteractive. ABI 1.2 exposes no platform-transition operation.
 
 Native KEX interfaces follow ADR 0034: opaque handles share generation,
 ownership, accounting, cancellation, waiting, and teardown machinery, while
@@ -187,7 +187,9 @@ allocations, if any, are retained rather than passed to dead boot services.
 The architecture-independent memory-map model in `troe-memory` validates
 checked 4 KiB ranges, normalizes unordered firmware
 descriptors, overlays bounded explicit reservations, and reports usable and
-reserved bytes. It also models checked, aligned monotonic allocation over one
+reserved bytes. It also models an ordered sequence of physical extents addressed
+as one logical page sequence, so a reservation that is not physically contiguous
+is still addressed by logical page or byte offset. It also models checked, aligned monotonic allocation over one
 explicitly reserved boot arena, including padding, exhaustion, and sealing
 accounting. The UEFI adapter consumes these models at its pointer boundary;
 firmware types do not enter the portable crate.
@@ -367,12 +369,15 @@ complete non-overlapping ranges, copies a two-byte opcode-prefixed request,
 checks task handle ownership, and copies a successful bounded reply before a
 fresh leased resume. Unknown calls and an attempted `_start` return are
 contained and reclaimed as invalid-call and translation faults.
-ABI 1.1 also suspends on `grow_heap`; the kernel atomically commits owned,
+ABI 1.2 also suspends on `grow_heap`; the kernel atomically commits owned,
 zeroed physical extents at the end of the virtual heap prefix, falling back to
 discontiguous frames when necessary, adds page-table frames as mappings
 require, updates scheduler ownership accounting, and resumes with the new
 mapped length. Expected physical-memory exhaustion leaves the mapping
-unchanged. Initial mappings, heap growth, and dynamic private mappings share
+unchanged. The initial launch reservation is itself a sequence of coalesced physical
+extents rather than one contiguous run, so a large application starts on a
+fragmented machine; an unfragmented one still reserves exactly one extent.
+Initial mappings, heap growth, and dynamic private mappings share
 full-width per-process and system commitment accounting under the active SCFG
 memory policy; the kernel protects a configured minimum-free reserve without
 preallocating any policy ceiling.

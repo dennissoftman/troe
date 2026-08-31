@@ -261,7 +261,10 @@ feature so embedders can retain their own allocator policy.
 KEX container 1.1 is position-independent. The kernel fails closed unless UEFI
 supplies an approved RNG seed, retains a ChaCha20 CSPRNG, gives applications
 random bytes only through an explicit read capability, and independently
-randomizes every image, stack, and anonymous private mapping. Initial and
+randomizes every image, stack, and anonymous private mapping. Each application
+declares the image span it needs, so a small command reserves 2 MiB of image
+address space rather than a fixed window sized for the largest artifact the
+format permits. Initial and
 runtime commitment use full-width accounting under the active
 `/config/system/resources/memory.toml` policy; valid large requests consume
 resources on demand rather than reserving their ceiling at boot.

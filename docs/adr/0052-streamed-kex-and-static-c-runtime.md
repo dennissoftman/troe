@@ -2,6 +2,11 @@
 
 Status: accepted and implemented, 2026-08-29.
 
+Supersession note, 2026-08-31: [ADR 0059](0059-declared-image-span-and-scaled-launch-admission.md)
+replaces the fixed encoded ceiling this ADR raised to 32 MiB with one derived
+from the per-application declared image span. The streaming decision and its
+fixed working set are unchanged and are what make the derived ceiling safe.
+
 ## Context
 
 The KEX format permits a 32 MiB executable, while the owned kernel heap is

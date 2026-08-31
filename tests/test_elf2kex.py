@@ -350,22 +350,23 @@ class Elf2KexTests(unittest.TestCase):
                     elf2kex.convert_elf(elf, stack_pages=stack)
         with self.assertRaises(ValueError):
             elf2kex.convert_elf(elf, heap_pages=(1 << 32) + 1)
+        # A sparse image below the maximum span is admitted and declares the
+        # span that covers it exactly.
         sparse = self.make_elf(
             virtual_address=elf2kex.KEX_IMAGE_BASE + 128 * 1024 * 1024
         )
-        with self.assertRaises(ValueError):
-            elf2kex.convert_elf(sparse)
-        oversized = gen_kex_corpus.build_static_elf(
-            "x86_64",
-            b"\x90\xc3",
-            first_file_bytes=elf2kex.STANDARD_LIMITS["encoded_bytes"]
-            - elf2kex.KEX_HEADER_BYTES
-            - elf2kex.KEX_RECORD_BYTES
-            + 1,
-            first_memory_bytes=32 * 1024 * 1024,
+        artifact = elf2kex.convert_elf(sparse)
+        span_pages = struct.unpack_from("<I", artifact, 36)[0]
+        self.assertEqual(
+            span_pages * elf2kex.KEX_PAGE_BYTES,
+            128 * 1024 * 1024 + elf2kex.KEX_IMAGE_ALIGNMENT,
+        )
+        # One page past the maximum span is refused.
+        beyond = self.make_elf(
+            virtual_address=elf2kex.KEX_IMAGE_BASE + elf2kex.MAX_IMAGE_SPAN_BYTES
         )
         with self.assertRaises(ValueError):
-            elf2kex.convert_elf(oversized)
+            elf2kex.convert_elf(beyond)
 
     def test_kex_self_validation_rejects_corruption(self) -> None:
         artifact = elf2kex.convert_elf(self.make_elf())

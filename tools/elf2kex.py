@@ -65,7 +65,8 @@ KEX_RELOCATION_BYTES = 16
 KEX_IMAGE_BASE = 0x0000_4000_0000_0000
 KEX_PAGE_BYTES = 4096
 KEX_ABI_MAJOR = 1
-KEX_ABI_MINOR = 1
+KEX_ABI_MINOR = 2
+KEX_IMAGE_ALIGNMENT = 2 * 1024 * 1024
 KEX_TARGETS = {"x86_64": 1, "aarch64": 2}
 ELF_MACHINES = {ELF_EM_X86_64: "x86_64", ELF_EM_AARCH64: "aarch64"}
 KEX_PERMISSIONS = {
@@ -73,17 +74,42 @@ KEX_PERMISSIONS = {
     ELF_PF_R | ELF_PF_X: 2,
     ELF_PF_R | ELF_PF_W: 3,
 }
+MAX_IMAGE_SPAN_BYTES = 1024 * 1024 * 1024
+MAX_IMAGE_SPAN_PAGES = MAX_IMAGE_SPAN_BYTES // KEX_PAGE_BYTES
+# Contiguous virtual regions in one launch layout: image, startup, heap, stack.
+LAUNCH_REGIONS = 4
+TABLE_ENTRIES = 512
+TABLE_LEVELS_BELOW_ROOT = 3
 STANDARD_LIMITS = {
-    "encoded_bytes": 32 * 1024 * 1024,
+    "encoded_bytes": 2 * MAX_IMAGE_SPAN_BYTES,
     "records": 16,
-    "image_span": 128 * 1024 * 1024,
-    "image_pages": 8192,
+    "maximum_image_span": MAX_IMAGE_SPAN_BYTES,
     "stack_min": 4,
     "stack_max": 1 << 32,
     "heap_pages": 1 << 32,
-    "table_pages": 512,
-    "resident_pages": 2 * (1 << 32) + 8192 + 1 + 512,
+    "resident_pages": 0,
 }
+MAX_PRIVATE_PAGES = MAX_IMAGE_SPAN_PAGES + 1 + (1 << 32) + (1 << 32)
+
+
+def maximum_table_pages(mapped_pages: int) -> int:
+    """Mirror the kernel's pre-admission page-table bound for `mapped_pages`."""
+    total = 1
+    coverage = TABLE_ENTRIES
+    for _ in range(TABLE_LEVELS_BELOW_ROOT):
+        total += -(-mapped_pages // coverage) + LAUNCH_REGIONS
+        coverage *= TABLE_ENTRIES
+    return total
+
+
+STANDARD_LIMITS["resident_pages"] = MAX_PRIVATE_PAGES + maximum_table_pages(
+    MAX_PRIVATE_PAGES
+)
+
+
+def image_span_bytes(image_end: int) -> int:
+    """Round one image end up to the declared-span alignment."""
+    return -(-image_end // KEX_IMAGE_ALIGNMENT) * KEX_IMAGE_ALIGNMENT
 
 
 @dataclass(frozen=True)
@@ -550,7 +576,8 @@ def verify_kex(
         raise ValueError("KEX output fixed header fields are noncanonical")
     encoded_entry = struct.unpack_from("<Q", artifact, 24)[0]
     count, reserved = struct.unpack_from("<HH", artifact, 32)
-    reserved32 = struct.unpack_from("<I", artifact, 36)[0]
+    encoded_span_pages = struct.unpack_from("<I", artifact, 36)[0]
+    encoded_span = encoded_span_pages * KEX_PAGE_BYTES
     encoded_stack, encoded_heap = struct.unpack_from("<QQ", artifact, 40)
     table_offset, payload_offset = struct.unpack_from("<II", artifact, 56)
     artifact_bytes = struct.unpack_from("<Q", artifact, 80)[0]
@@ -561,7 +588,9 @@ def verify_kex(
         count == 0
         or count > limits["records"]
         or reserved != 0
-        or reserved32 != 0
+        or encoded_span == 0
+        or encoded_span > limits["maximum_image_span"]
+        or encoded_span % KEX_IMAGE_ALIGNMENT
         or table_offset != KEX_HEADER_BYTES
         or relocation_offset != KEX_HEADER_BYTES + count * KEX_RECORD_BYTES
         or relocation_count != 0
@@ -621,13 +650,12 @@ def verify_kex(
             executable_entry = True
     if next_payload != len(artifact) or not executable_entry:
         raise ValueError("KEX output payload or executable entry is noncanonical")
-    if previous_end > limits["image_span"]:
-        raise ValueError("KEX output image span exceeds the standard policy")
-    if image_pages > limits["image_pages"]:
-        raise ValueError("KEX output image pages exceed the standard policy")
-    resident_pages = (
-        image_pages + 1 + encoded_stack + encoded_heap + limits["table_pages"]
-    )
+    if previous_end > encoded_span:
+        raise ValueError("KEX output segment ends beyond the declared image span")
+    if encoded_span != image_span_bytes(previous_end):
+        raise ValueError("KEX output declared image span is not the canonical span")
+    private_pages = image_pages + 1 + encoded_stack + encoded_heap
+    resident_pages = private_pages + maximum_table_pages(private_pages)
     if resident_pages > limits["resident_pages"]:
         raise ValueError("KEX output resident charge exceeds the standard policy")
     if records is not None and tuple(decoded) != records:
@@ -649,17 +677,17 @@ def convert_elf(
     image_end = max(record.image_offset + record.memory_bytes for record in records)
     payload_bytes = sum(len(record.file_bytes) for record in records)
     artifact_bytes = KEX_HEADER_BYTES + len(records) * KEX_RECORD_BYTES + payload_bytes
+    span_bytes = image_span_bytes(image_end)
     if len(records) > limits["records"]:
         raise ValueError("ELF load-record count exceeds the standard KEX policy")
-    if image_end > limits["image_span"]:
+    if span_bytes > limits["maximum_image_span"]:
         raise ValueError("ELF image span exceeds the standard KEX policy")
-    if image_pages > limits["image_pages"]:
-        raise ValueError("ELF mapped pages exceed the standard KEX policy")
     if not limits["stack_min"] <= stack_pages <= limits["stack_max"]:
         raise ValueError("requested KEX stack pages exceed the standard KEX policy")
     if not 0 <= heap_pages <= limits["heap_pages"]:
         raise ValueError("requested KEX heap pages exceed the standard KEX policy")
-    resident = image_pages + 1 + stack_pages + heap_pages + limits["table_pages"]
+    private = image_pages + 1 + stack_pages + heap_pages
+    resident = private + maximum_table_pages(private)
     if resident > limits["resident_pages"]:
         raise ValueError(
             "KEX aggregate resident charge exceeds the standard KEX policy"
@@ -684,7 +712,7 @@ def convert_elf(
         parsed.entry - KEX_IMAGE_BASE,
         len(records),
         0,
-        0,
+        span_bytes // KEX_PAGE_BYTES,
         stack_pages,
         heap_pages,
         KEX_HEADER_BYTES,

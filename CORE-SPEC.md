@@ -148,7 +148,7 @@ There is:
 Ordinary commands are target-native immutable KEX files, not privileged shell
 functions. The shell registry retains only names/synopses and the nine
 session-, supervisor-, or machine-owned intrinsics. The kernel resolver
-validates and maps each application through ABI 1.1; resident ownership survives
+validates and maps each application through ABI 1.2; resident ownership survives
 individual execution slices and is revoked, zeroized, and reclaimed only at its
 terminal fate.
 
@@ -464,7 +464,7 @@ KEX application. They mutate shell-session, resident-job, service-supervisor,
 or machine lifecycle state and therefore execute in the invoking shell. The two
 terminal actions remain behind the shell's explicit machine-control capability;
 ordinary KEX applications cannot acquire that authority or invoke an intrinsic
-through application ABI 1.1. No ordinary command has a privileged fallback.
+through application ABI 1.2. No ordinary command has a privileged fallback.
 
 ### 11.5 Resident jobs and services
 

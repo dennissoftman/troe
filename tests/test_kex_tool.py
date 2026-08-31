@@ -59,7 +59,11 @@ class KexToolTests(unittest.TestCase):
                     report = json.loads(inspected.stdout)
                     self.assertEqual(report["format"], "KEX package v1")
                     self.assertEqual(report["executable_format"], "KEX v1")
-                    self.assertEqual(report["abi"], "1.1")
+                    self.assertEqual(report["abi"], "1.2")
+                    # Every application declares the span its image needs
+                    # rather than one fixed window.
+                    self.assertEqual(report["image_span_bytes"] % (2 * 1024 * 1024), 0)
+                    self.assertGreater(report["image_span_bytes"], 0)
                     self.assertEqual(report["target"], target)
                     expected_stack_pages = (
                         64

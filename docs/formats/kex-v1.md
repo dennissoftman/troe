@@ -26,12 +26,12 @@ The container-1.1 header is exactly 88 bytes.
 | 14 | 2 | header bytes | 88 |
 | 16 | 2 | load-record bytes | 40 |
 | 18 | 2 | ABI major | 1 |
-| 20 | 2 | minimum ABI minor | at most the kernel-supported minor; currently 1 |
+| 20 | 2 | minimum ABI minor | at most the kernel-supported minor; currently 2 |
 | 22 | 2 | flags | zero |
 | 24 | 8 | entry offset | image-relative byte inside an RX segment |
 | 32 | 2 | load-record count | bounded, nonzero |
 | 34 | 2 | reserved | zero |
-| 36 | 4 | reserved | zero |
+| 36 | 4 | image span pages | ABI minor 2 and above; reserved zero below |
 | 40 | 8 | initial stack pages | within the standard range |
 | 48 | 8 | zeroed heap pages | within the standard ceiling |
 | 56 | 4 | load-record offset | 88 |
@@ -62,8 +62,8 @@ Each 40-byte record has this layout:
 | 36 | 4 | reserved | zero |
 
 Records are strictly ordered by image offset and their mapped page ranges do
-not overlap. Gaps in virtual space are permitted only within the standard
-image-span ceiling; they remain unmapped. Writable-executable and
+not overlap. Gaps in virtual space are permitted only within the declared image
+span; they remain unmapped. Writable-executable and
 execute-only encodings do not exist.
 
 The load-record table is followed by sorted 16-byte relative-relocation records.
@@ -92,22 +92,30 @@ and standard-policy arithmetic before allocating or mapping application memory.
 
 | Limit | Standard |
 | --- | ---: |
-| Encoded bytes | 32 MiB |
+| Encoded bytes | 2 GiB |
 | Load records | 16 |
-| Image span | 128 MiB |
-| Mapped image pages | 8,192 |
+| Declared image span | 2 MiB–1 GiB, exactly the rounded image end |
+| Mapped image pages | bounded by the declared span |
 | Stack pages | 4–4,294,967,296 (16 TiB) |
 | Heap pages | 0–4,294,967,296 (16 TiB) |
-| Conservative format table charge | 512 pages |
-| Initial resident admission | 8,589,943,297 pages |
+| Conservative format table charge | derived from the mapped layout |
+| Initial resident admission | maximum private pages plus their table bound |
+
+An ABI-minor-2 artifact declares its own image span as a page count. The span
+is nonzero, 2 MiB-aligned, within the standard maximum, and exactly the image
+end rounded up to that alignment, so it bounds the mapped image without a
+separate page ceiling and reserves no address space the artifact never maps.
+ABI minor 0 and 1 artifacts leave the field zero and take the fixed 128 MiB
+implied span.
 
 The preliminary portable plan charges exact image, startup, initial heap, and
-stack pages plus a conservative table amount for format admission. Native
-launch computes and retains the exact tables implied by the complete mapping
-plan. Physical availability, the active 64-bit memory policy, and the protected
+stack pages plus a table amount derived from that layout. Native launch
+computes and retains the exact tables implied by the complete mapping plan.
+Physical availability, the active 64-bit memory policy, and the protected
 free-frame reserve decide whether a valid large request is admitted; no maximum
-table is preallocated. ABI 1.1 heap growth and private mappings use the same
-system/process commitment accounting.
+table is preallocated. Launch zeroing is bounded by the configured operation
+quantum. ABI 1.2 heap growth and private mappings use the same system/process
+commitment accounting.
 
 ## Hosted ELF input contract
 
@@ -146,14 +154,14 @@ the build entrypoint.
 The shared generated corpus lives under `tests/kex-corpus`; its exact file set
 and bytes are checked with `python3 tools/gen_kex_corpus.py --check`.
 
-## ABI 1.1 randomized virtual layout and startup page
+## ABI 1.2 randomized virtual layout and startup page
 
 The kernel draws an independently randomized 2 MiB-aligned image base from the
 4 GiB–64 TiB window and a 2 MiB-aligned stack placement from the 96–128 TiB
 window. Placement uses the kernel CSPRNG and fails closed if firmware entropy
 was unavailable at boot. The startup page begins at `selected image base +
-standard image-span ceiling`. For an application requiring ABI
-minor 1, the heap follows it and may grow through the otherwise unused user
+declared image span`. For an application requiring ABI
+minor 1 or above, the heap follows it and may grow through the otherwise unused user
 virtual-address gap. A lower guard and the fixed maximum stack slot are placed
 at the top of the user half; the requested stack pages are mapped at the top of
 that slot so they end immediately before an unmapped upper guard. All

@@ -22,6 +22,14 @@ and the 16 MiB ceiling preserve the original decision; the current loader
 charges only its fixed peak buffers and retains the same transaction, mapping,
 and teardown requirements.
 
+Supersession note, 2026-08-31: [ADR 0059](0059-declared-image-span-and-scaled-launch-admission.md)
+raises the artifact ABI to 1.2, replaces the fixed 128 MiB image span and the
+8,192-page mapped-image ceiling with a per-application declared span, derives
+the page-table and resident charges from the layout instead of flat constants,
+and bounds launch zeroing by the ADR 0048 operation quantum. The memory and
+retained-resource table below states the current values; the surrounding prose
+about a single fixed image window preserves the original decision.
+
 Implementation note, 2026-08-23: the portable parser, canonical virtual layout,
 startup-page encoder, and native owned-staging/validate/map/reclaim transaction
 are implemented. The native root maps only the supervisor image, devices, and
@@ -264,15 +272,15 @@ separately bounded and is released before entry.
 | Limit | Standard |
 | --- | ---: |
 | Loadable isolated applications | enabled |
-| Encoded KEX bytes | 16 MiB |
+| Encoded KEX bytes | 2 GiB (two maximum image spans) |
 | Load records | 16 |
-| Image virtual span | 128 MiB |
-| Mapped image pages | 8,192 |
+| Declared image span | exactly the image end rounded to 2 MiB, at most 1 GiB |
+| Mapped image pages | bounded by the declared span |
 | Initial stack pages | 4–4,294,967,296 (16 TiB) |
 | Initially mapped heap pages | 0–4,294,967,296 (16 TiB) |
 | Runtime heap/private commit | active 64-bit policy, minimum-free reserve, and available frames |
-| Format page-table charge | 512 pages; native launch retains the exact fallibly allocated amount |
-| Initial resident-page admission | 8,589,943,297 pages |
+| Format page-table charge | derived from the mapped layout; native launch retains the exact fallibly allocated amount |
+| Initial resident-page admission | maximum private pages plus their derived table bound |
 | Initial handles | 32 |
 
 There is one initial application resource policy. These values are launch

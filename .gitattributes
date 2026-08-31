@@ -8,4 +8,4 @@ apps/python/patches/** -whitespace
 
 # Store large opaque generated/test artifacts outside ordinary Git object history.
 assets/*.kefs filter=lfs diff=lfs merge=lfs -text
-tests/kex-corpus/valid-standard-max-encoded-*.kex filter=lfs diff=lfs merge=lfs -text
+tests/kex-corpus/valid-standard-large-image-*.kex filter=lfs diff=lfs merge=lfs -text

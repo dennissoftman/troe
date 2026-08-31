@@ -141,6 +141,7 @@ struct InspectReport {
     entry_offset: u64,
     stack_pages: u64,
     heap_pages: u64,
+    image_span_bytes: u64,
 }
 
 struct Arguments {
@@ -922,6 +923,11 @@ fn inspect(path: &Path) -> ToolResult<InspectReport> {
         entry_offset,
         stack_pages: plan.stack_pages(),
         heap_pages: plan.heap_pages(),
+        image_span_bytes: plan
+            .layout()
+            .startup_address()
+            .checked_sub(plan.image_base())
+            .ok_or_else(|| ToolError::new("KEX startup page is below the image base"))?,
     })
 }
 
@@ -948,12 +954,13 @@ fn execute_inspect(arguments: &mut Arguments) -> ToolResult<()> {
     };
     if json {
         println!(
-            "{{\"abi\":\"{ABI_MAJOR}.{}\",\"bytes\":{},\"entry_offset\":{},\"executable_bytes\":{},\"executable_format\":\"KEX v1\",\"format\":\"{format}\",\"heap_pages\":{},\"records\":{},\"requirements\":{},\"stack_pages\":{},\"target\":\"{}\"}}",
+            "{{\"abi\":\"{ABI_MAJOR}.{}\",\"bytes\":{},\"entry_offset\":{},\"executable_bytes\":{},\"executable_format\":\"KEX v1\",\"format\":\"{format}\",\"heap_pages\":{},\"image_span_bytes\":{},\"records\":{},\"requirements\":{},\"stack_pages\":{},\"target\":\"{}\"}}",
             report.abi_minor,
             report.bytes,
             report.entry_offset,
             report.executable_bytes,
             report.heap_pages,
+            report.image_span_bytes,
             report.records,
             report.requirements,
             report.stack_pages,
@@ -961,7 +968,7 @@ fn execute_inspect(arguments: &mut Arguments) -> ToolResult<()> {
         );
     } else {
         println!(
-            "{format}; target={}; ABI={ABI_MAJOR}.{}; bytes={}; executable={} bytes; requirements={}; records={}; entry={:#x}; stack={} pages; heap={} pages",
+            "{format}; target={}; ABI={ABI_MAJOR}.{}; bytes={}; executable={} bytes; requirements={}; records={}; entry={:#x}; image span={} bytes; stack={} pages; heap={} pages",
             target_name(report.target),
             report.abi_minor,
             report.bytes,
@@ -969,6 +976,7 @@ fn execute_inspect(arguments: &mut Arguments) -> ToolResult<()> {
             report.requirements,
             report.records,
             report.entry_offset,
+            report.image_span_bytes,
             report.stack_pages,
             report.heap_pages,
         );

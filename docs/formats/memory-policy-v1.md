@@ -61,8 +61,11 @@ virtual-memory state.
 - `global_metadata_bytes`: a mandatory nonzero boot-wide budget for charged
   dynamic virtual-memory metadata; and
 - `operation_quantum_pages`: a mandatory nonzero maximum extent used by one
-  private-backing allocation/zeroing substep. It bounds contiguous allocator
-  work and is not a limit on the total request.
+  private-backing or launch-reservation allocation/zeroing substep. It bounds
+  contiguous allocator work and is not a limit on the total request. A
+  reservation that cannot find a free run of this size halves the request rather
+  than failing, so the value is a ceiling on one substep and not a contiguity
+  requirement.
 
 All page counts refer to TROE's 4 KiB page. Multiplication by page size and
 conversion to target address types use checked arithmetic.
