@@ -2091,7 +2091,7 @@ pub mod filesystem {
     /// Interface major version.
     pub const MAJOR: u16 = 1;
     /// Interface minor version.
-    pub const MINOR: u16 = 3;
+    pub const MINOR: u16 = 4;
     /// Resolve and open one regular file.
     pub const OPEN: u16 = 1;
     /// Read one bounded range through an open-file token.
@@ -2132,7 +2132,7 @@ pub mod filesystem {
     pub const MAX_LIST_REPLY_BYTES: usize =
         LIST_REPLY_HEADER_BYTES + MAX_LIST_ENTRIES * LIST_ENTRY_HEADER_BYTES + MAX_LIST_NAME_BYTES;
     /// Fixed metadata reply bytes.
-    pub const METADATA_REPLY_BYTES: usize = 16;
+    pub const METADATA_REPLY_BYTES: usize = 24;
     /// Maximum encoded bytes in one symbolic-link target.
     pub const MAX_LINK_BYTES: usize = MAX_PATH_BYTES;
 
@@ -2170,6 +2170,13 @@ pub mod filesystem {
         pub kind: NodeKind,
         /// Exact regular-file bytes, or zero for a directory.
         pub byte_count: u64,
+        /// Whole Unix UTC seconds of the last payload modification, when the
+        /// provider recorded one.
+        ///
+        /// `None` where the provider stores no timestamp, and where it stores
+        /// one that was never stamped. A zero is therefore an absent time
+        /// rather than 1970.
+        pub modified_unix_seconds: Option<u64>,
     }
 
     /// Opaque open-file token plus immutable size observed at open time.
@@ -2578,7 +2585,11 @@ pub mod filesystem {
     pub fn encode_metadata_reply(metadata: Metadata) -> [u8; METADATA_REPLY_BYTES] {
         let mut bytes = [0_u8; METADATA_REPLY_BYTES];
         bytes[0] = metadata.kind as u8;
+        // An absent time is one flag byte and an all-zero value, so a decoder
+        // never has to treat a valid instant as a sentinel.
+        bytes[1] = u8::from(metadata.modified_unix_seconds.is_some());
         bytes[8..16].copy_from_slice(&metadata.byte_count.to_le_bytes());
+        bytes[16..24].copy_from_slice(&metadata.modified_unix_seconds.unwrap_or(0).to_le_bytes());
         bytes
     }
 
@@ -2588,7 +2599,7 @@ pub mod filesystem {
     ///
     /// Rejects wrong length, padding, kind, or nonzero directory size.
     pub fn decode_metadata_reply(bytes: &[u8]) -> Result<Metadata, EncodingError> {
-        if bytes.len() != METADATA_REPLY_BYTES || bytes[1..8].iter().any(|byte| *byte != 0) {
+        if bytes.len() != METADATA_REPLY_BYTES || bytes[2..8].iter().any(|byte| *byte != 0) {
             return Err(EncodingError);
         }
         let kind = NodeKind::parse(bytes[0])?;
@@ -2596,7 +2607,19 @@ pub mod filesystem {
         if kind == NodeKind::Directory && byte_count != 0 {
             return Err(EncodingError);
         }
-        Ok(Metadata { kind, byte_count })
+        let seconds = read_u64(bytes, 16)?;
+        let modified_unix_seconds = match bytes[1] {
+            0 if seconds == 0 => None,
+            1 => Some(seconds),
+            // A present flag with no value, or a value with no flag, is a
+            // producer that did not encode this reply.
+            _ => return Err(EncodingError),
+        };
+        Ok(Metadata {
+            kind,
+            byte_count,
+            modified_unix_seconds,
+        })
     }
 
     /// Encode one exact UTF-8 symbolic-link target.
@@ -2706,7 +2729,7 @@ pub mod filesystem_mutation {
     /// Interface major version.
     pub const MAJOR: u16 = 1;
     /// Interface minor version.
-    pub const MINOR: u16 = 4;
+    pub const MINOR: u16 = 5;
     /// Truncate or create one file and begin a sequential streamed replacement.
     pub const BEGIN_REPLACE: u16 = 1;
     /// Append one sequential chunk to the pending replacement.
@@ -2733,6 +2756,10 @@ pub mod filesystem_mutation {
     pub const BEGIN_APPEND: u16 = 12;
     /// Read already-staged bytes back from one pending streamed replacement.
     pub const READ_REPLACEMENT: u16 = 13;
+    /// Set one object's modification time, or stamp it from the wall clock.
+    pub const SET_MODIFIED_TIME: u16 = 14;
+    /// Fixed bytes of one set-modified-time request ahead of its path.
+    pub const SET_MODIFIED_TIME_HEADER_BYTES: usize = 16;
     /// Fixed bytes preceding an append payload.
     pub const APPEND_HEADER_BYTES: usize = 12;
     /// Maximum bytes carried by one append call.
@@ -2804,6 +2831,79 @@ pub mod filesystem_mutation {
     /// Rejects noncanonical filesystem paths.
     pub fn decode_path_request(bytes: &[u8]) -> Result<&str, EncodingError> {
         filesystem::decode_path_request(bytes).map_err(|_| EncodingError)
+    }
+
+    /// Encode one set-modified-time request.
+    ///
+    /// The instant is carried as a present flag plus a value so an absent time
+    /// asks for the wall clock rather than encoding 1970 as a sentinel.
+    ///
+    /// # Errors
+    ///
+    /// Rejects noncanonical paths and insufficient output.
+    pub fn encode_set_modified_time_request(
+        path: &str,
+        unix_seconds: Option<u64>,
+        output: &mut [u8],
+    ) -> Result<usize, EncodingError> {
+        let count = SET_MODIFIED_TIME_HEADER_BYTES
+            .checked_add(path.len())
+            .ok_or(EncodingError)?;
+        if output.len() < count {
+            return Err(EncodingError);
+        }
+        let mut header = [0_u8; SET_MODIFIED_TIME_HEADER_BYTES];
+        header[0] = u8::from(unix_seconds.is_some());
+        header[8..16].copy_from_slice(&unix_seconds.unwrap_or(0).to_le_bytes());
+        let mut encoded = [0_u8; filesystem::MAX_PATH_BYTES];
+        let path_count =
+            filesystem::encode_path_request(path, &mut encoded).map_err(|_| EncodingError)?;
+        let total = SET_MODIFIED_TIME_HEADER_BYTES
+            .checked_add(path_count)
+            .ok_or(EncodingError)?;
+        if output.len() < total {
+            return Err(EncodingError);
+        }
+        output[..SET_MODIFIED_TIME_HEADER_BYTES].copy_from_slice(&header);
+        output[SET_MODIFIED_TIME_HEADER_BYTES..total]
+            .copy_from_slice(encoded.get(..path_count).ok_or(EncodingError)?);
+        Ok(total)
+    }
+
+    /// Decode one set-modified-time request.
+    ///
+    /// # Errors
+    ///
+    /// Rejects short requests, padding, a flag outside its closed domain, a
+    /// value without its flag, and noncanonical paths.
+    pub fn decode_set_modified_time_request(
+        bytes: &[u8],
+    ) -> Result<(&str, Option<u64>), EncodingError> {
+        let header = bytes
+            .get(..SET_MODIFIED_TIME_HEADER_BYTES)
+            .ok_or(EncodingError)?;
+        if header[1..8].iter().any(|byte| *byte != 0) {
+            return Err(EncodingError);
+        }
+        let seconds = u64::from_le_bytes(
+            header
+                .get(8..16)
+                .ok_or(EncodingError)?
+                .try_into()
+                .map_err(|_| EncodingError)?,
+        );
+        let unix_seconds = match header[0] {
+            0 if seconds == 0 => None,
+            1 => Some(seconds),
+            _ => return Err(EncodingError),
+        };
+        let path = filesystem::decode_path_request(
+            bytes
+                .get(SET_MODIFIED_TIME_HEADER_BYTES..)
+                .ok_or(EncodingError)?,
+        )
+        .map_err(|_| EncodingError)?;
+        Ok((path, unix_seconds))
     }
 
     /// Encode one symbolic- or hard-link request.
@@ -6318,9 +6418,50 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn filesystem_mutation_is_sequential_streamed_and_exact() {
         assert_eq!(filesystem_mutation::MAJOR, 1);
-        assert_eq!(filesystem_mutation::MINOR, 4);
+        assert_eq!(filesystem_mutation::MINOR, 5);
+
+        // A set-modified-time request round-trips both an exact instant and the
+        // request for the wall clock's own.
+        let mut request = [0_u8;
+            filesystem_mutation::SET_MODIFIED_TIME_HEADER_BYTES + filesystem::MAX_PATH_BYTES];
+        for instant in [None, Some(1_788_000_000_u64)] {
+            let count = filesystem_mutation::encode_set_modified_time_request(
+                "/vol/root/note",
+                instant,
+                &mut request,
+            )
+            .unwrap_or_else(|_| unreachable!());
+            assert_eq!(
+                filesystem_mutation::decode_set_modified_time_request(&request[..count]),
+                Ok(("/vol/root/note", instant))
+            );
+        }
+        let count = filesystem_mutation::encode_set_modified_time_request(
+            "/vol/root/note",
+            Some(7),
+            &mut request,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        // A value without its flag, and a flag outside its closed domain, are
+        // both producers that did not encode this request.
+        let mut cleared = request;
+        cleared[0] = 0;
+        assert!(filesystem_mutation::decode_set_modified_time_request(&cleared[..count]).is_err());
+        let mut invalid = request;
+        invalid[0] = 2;
+        assert!(filesystem_mutation::decode_set_modified_time_request(&invalid[..count]).is_err());
+        let mut padded = request;
+        padded[3] = 1;
+        assert!(filesystem_mutation::decode_set_modified_time_request(&padded[..count]).is_err());
+        assert!(
+            filesystem_mutation::decode_set_modified_time_request(
+                &request[..filesystem_mutation::SET_MODIFIED_TIME_HEADER_BYTES - 1]
+            )
+            .is_err()
+        );
         let mut read_request = [0_u8; filesystem_mutation::READ_REQUEST_BYTES];
         assert_eq!(
             filesystem_mutation::encode_read_request(3, 17, 64, &mut read_request),
@@ -6343,7 +6484,28 @@ mod tests {
         );
         assert!(filesystem_mutation::decode_read_request(&read_request[..15]).is_err());
         assert_eq!(filesystem::MAJOR, 1);
-        assert_eq!(filesystem::MINOR, 3);
+        assert_eq!(filesystem::MINOR, 4);
+
+        // An absent modification time is a zero flag and an all-zero value, so
+        // it never collides with the epoch as a real instant.
+        for instant in [None, Some(1_788_000_000_u64)] {
+            let metadata = filesystem::Metadata {
+                kind: filesystem::NodeKind::File,
+                byte_count: 9,
+                modified_unix_seconds: instant,
+            };
+            let encoded = filesystem::encode_metadata_reply(metadata);
+            assert_eq!(filesystem::decode_metadata_reply(&encoded), Ok(metadata));
+        }
+        let mut mismatched = filesystem::encode_metadata_reply(filesystem::Metadata {
+            kind: filesystem::NodeKind::File,
+            byte_count: 9,
+            modified_unix_seconds: Some(5),
+        });
+        mismatched[1] = 0;
+        assert!(filesystem::decode_metadata_reply(&mismatched).is_err());
+        mismatched[1] = 2;
+        assert!(filesystem::decode_metadata_reply(&mismatched).is_err());
         let token = filesystem_mutation::encode_token(7).unwrap_or_else(|_| std::process::abort());
         assert_eq!(filesystem_mutation::decode_token(&token), Ok(7));
         assert!(filesystem_mutation::decode_token(&[7, 0, 0, 0, 0]).is_err());

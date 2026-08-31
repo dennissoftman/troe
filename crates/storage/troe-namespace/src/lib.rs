@@ -543,10 +543,12 @@ impl Namespace {
             Some(Node::Directory) => Ok(FileMetadata {
                 kind: NodeKind::Directory,
                 byte_count: 0,
+                modified_unix_seconds: None,
             }),
             Some(Node::File { bytes, .. }) => Ok(FileMetadata {
                 kind: NodeKind::File,
                 byte_count: u64::try_from(bytes.len()).map_err(|_| FsError::Overflow)?,
+                modified_unix_seconds: None,
             }),
             None => Err(FsError::NotFound),
         }
@@ -628,10 +630,12 @@ impl Namespace {
             Some(Node::Directory) => Ok(FileMetadata {
                 kind: NodeKind::Directory,
                 byte_count: 0,
+                modified_unix_seconds: None,
             }),
             Some(Node::File { bytes, .. }) => Ok(FileMetadata {
                 kind: NodeKind::File,
                 byte_count: u64::try_from(bytes.len()).map_err(|_| FsError::Overflow)?,
+                modified_unix_seconds: None,
             }),
             None => Err(FsError::NotFound),
         }
@@ -871,6 +875,35 @@ impl Namespace {
                 self.bump_command_revision();
             }
             return Ok(());
+        }
+        Err(FsError::ReadOnly)
+    }
+
+    /// Set one object's modification time, or stamp it from the wall clock.
+    ///
+    /// The time is a property of the object rather than of the directory that
+    /// names it, so this does not bump the command revision the way creating or
+    /// removing a name does.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid or missing paths, immutable mounts, providers that store
+    /// no timestamp, and a request for the clock's instant while no wall time
+    /// is known.
+    pub fn set_modified_time(
+        &mut self,
+        cwd: &str,
+        path: &str,
+        unix_seconds: Option<u64>,
+    ) -> Result<(), FsError> {
+        let path = canonicalize(cwd, path)?;
+        if let Some((index, relative)) = self.mount_for_path(&path) {
+            if !self.mounts[index].writable {
+                return Err(FsError::ReadOnly);
+            }
+            return self.mounts[index]
+                .provider
+                .set_modified_time(&relative, unix_seconds);
         }
         Err(FsError::ReadOnly)
     }
@@ -1441,6 +1474,15 @@ impl NamespaceClient for Namespace {
         Self::create_directory(self, cwd, path)
     }
 
+    fn set_modified_time(
+        &mut self,
+        cwd: &str,
+        path: &str,
+        unix_seconds: Option<u64>,
+    ) -> Result<(), FsError> {
+        Self::set_modified_time(self, cwd, path, unix_seconds)
+    }
+
     fn remove_directory(&mut self, cwd: &str, path: &str) -> Result<(), FsError> {
         Self::remove_directory(self, cwd, path)
     }
@@ -1565,10 +1607,12 @@ mod tests {
                 "/" => Ok(FileMetadata {
                     kind: NodeKind::Directory,
                     byte_count: 0,
+                    modified_unix_seconds: None,
                 }),
                 "/large" => Ok(FileMetadata {
                     kind: NodeKind::File,
                     byte_count: self.state.borrow().bytes,
+                    modified_unix_seconds: None,
                 }),
                 _ => Err(FsError::NotFound),
             }
@@ -1641,10 +1685,12 @@ mod tests {
                 "/" => Ok(FileMetadata {
                     kind: NodeKind::Directory,
                     byte_count: 0,
+                    modified_unix_seconds: None,
                 }),
                 "/data" => Ok(FileMetadata {
                     kind: NodeKind::File,
                     byte_count: 7,
+                    modified_unix_seconds: None,
                 }),
                 _ => Err(FsError::NotFound),
             }
@@ -1737,10 +1783,12 @@ mod tests {
                 "/" | "/scope" | "/outside" => Ok(FileMetadata {
                     kind: NodeKind::Directory,
                     byte_count: 0,
+                    modified_unix_seconds: None,
                 }),
                 "/scope/file" | "/scope/link" | "/outside/secret" => Ok(FileMetadata {
                     kind: NodeKind::File,
                     byte_count: 6,
+                    modified_unix_seconds: None,
                 }),
                 _ => Err(FsError::NotFound),
             }
@@ -1751,6 +1799,7 @@ mod tests {
                 return Ok(FileMetadata {
                     kind: NodeKind::Symlink,
                     byte_count: 0,
+                    modified_unix_seconds: None,
                 });
             }
             self.metadata(path)
@@ -2047,6 +2096,7 @@ mod tests {
             Ok(FileMetadata {
                 kind: NodeKind::File,
                 byte_count: 10,
+                modified_unix_seconds: None,
             })
         );
         let mut range = [0_u8; 4];

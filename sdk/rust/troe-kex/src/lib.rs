@@ -1463,6 +1463,40 @@ impl FilesystemMutation {
         }
     }
 
+    /// Set one object's modification time, or stamp it from the wall clock.
+    ///
+    /// `None` requests the namespace clock's current instant, which is what
+    /// `touch` with no explicit time asks for; `Some` requests an exact one.
+    ///
+    /// # Errors
+    ///
+    /// Reports invalid or missing paths, immutable mounts, providers that store
+    /// no timestamp, a request for the clock's instant while no wall time is
+    /// known, persistence failures, or call-gate failure.
+    pub fn set_modified_time(
+        &mut self,
+        path: &str,
+        unix_seconds: Option<u64>,
+    ) -> Result<(), Error> {
+        let mut request = [0_u8;
+            filesystem_mutation::SET_MODIFIED_TIME_HEADER_BYTES + filesystem::MAX_PATH_BYTES];
+        let count =
+            filesystem_mutation::encode_set_modified_time_request(path, unix_seconds, &mut request)
+                .map_err(|_| Error::InvalidCall)?;
+        let mut reply = [];
+        let count = call(
+            self.handle,
+            filesystem_mutation::SET_MODIFIED_TIME,
+            &request[..count],
+            &mut reply,
+        )?;
+        if count == 0 {
+            Ok(())
+        } else {
+            Err(Error::InvalidCall)
+        }
+    }
+
     /// Create one empty directory without replacing an existing entry.
     ///
     /// # Errors

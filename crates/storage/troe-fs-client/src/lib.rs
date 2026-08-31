@@ -121,6 +121,22 @@ pub trait NamespaceClient: fmt::Debug {
     /// Rejects immutable paths, missing parents, collisions, and exhaustion.
     fn create_directory(&mut self, cwd: &str, path: &str) -> Result<(), FsError>;
 
+    /// Set one object's modification time, or stamp it from the wall clock.
+    ///
+    /// `None` requests the namespace clock's current instant.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid or missing paths, immutable mounts, providers that store
+    /// no timestamp, and a request for the clock's instant while no wall time
+    /// is known.
+    fn set_modified_time(
+        &mut self,
+        cwd: &str,
+        path: &str,
+        unix_seconds: Option<u64>,
+    ) -> Result<(), FsError>;
+
     /// Remove one empty writable directory without crossing a mount boundary.
     ///
     /// # Errors

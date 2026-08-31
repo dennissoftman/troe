@@ -432,6 +432,8 @@ struct Inode {
     /// release the entire tree.
     interior_extent_blocks: Vec<u32>,
     extent_tree_logicals: Vec<u32>,
+    /// Last payload modification in whole Unix UTC seconds, when stamped.
+    modified_unix_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -3545,6 +3547,7 @@ impl<D: BlockDevice> FileSystemProvider for Ext4<D> {
             } else {
                 0
             },
+            modified_unix_seconds: inode.modified_unix_seconds,
         })
     }
 
@@ -3558,6 +3561,7 @@ impl<D: BlockDevice> FileSystemProvider for Ext4<D> {
             } else {
                 0
             },
+            modified_unix_seconds: inode.modified_unix_seconds,
         })
     }
 
@@ -3728,6 +3732,28 @@ impl<D: BlockDevice> FileSystemProvider for Ext4<D> {
             return Err(error);
         }
         self.finish_mutation()
+    }
+
+    fn set_modified_time(&mut self, path: &str, unix_seconds: Option<u64>) -> Result<(), FsError> {
+        self.abort_mutation();
+        self.ensure_writable()?;
+        // `None` asks for the clock's instant. Refusing when no wall time is
+        // known keeps ADR 0058's rule that a provider never invents one.
+        let seconds = match unix_seconds {
+            Some(seconds) => seconds,
+            None => self.wall_seconds().ok_or(FsError::Unsupported)?,
+        };
+        let inode = self.resolve(path)?;
+        let (block, offset) = self.inode_record_location(inode.number)?;
+        let mut table = self.read_fs_block(block)?;
+        let raw = table
+            .get_mut(offset..offset + EXT4_INODE_BYTES)
+            .ok_or(FsError::Corrupt)?;
+        put_inode_time(raw, EXT4_MTIME, seconds)?;
+        // The change time advances because the inode itself changed, which
+        // `refresh_inode_checksum` does from the clock for any metadata write.
+        self.refresh_inode_checksum(raw, inode.number, InodeTouch::Metadata)?;
+        self.write_fs_block(block, &table)
     }
 
     fn create_directory(&mut self, path: &str) -> Result<(), FsError> {
@@ -4387,6 +4413,7 @@ fn parse_inode(
         extent_depth: parsed_extents.depth,
         interior_extent_blocks: Vec::new(),
         extent_tree_logicals: parsed_extents.tree_logicals,
+        modified_unix_seconds: get_inode_time(raw, EXT4_MTIME)?,
     })
 }
 
@@ -5103,6 +5130,26 @@ fn put_u32(bytes: &mut [u8], offset: usize, value: u32) -> Result<(), FsError> {
 /// the extra word cannot carry an instant past 2038 without reading as 1901.
 /// The clock is therefore clamped to whatever the record can actually encode,
 /// which keeps a far-future time implausible rather than wrong by a century.
+/// Read one inode timestamp, or `None` when it was never stamped.
+///
+/// The 32-bit base field is extended past 2038 by the low two bits of the
+/// record's extra word, so a record that declares room for that word is read
+/// with them and one that does not is read without. A zero is an absent time
+/// rather than 1970: ADR 0058 leaves the fields it would write untouched
+/// whenever no wall time is known, so zero is exactly what "never stamped"
+/// looks like.
+fn get_inode_time(raw: &[u8], field: (usize, usize)) -> Result<Option<u64>, FsError> {
+    let (base, extra) = field;
+    let declared = EXT4_BASE_INODE_BYTES
+        .checked_add(usize::from(read_u16(raw, EXT4_EXTRA_ISIZE_OFFSET)?))
+        .ok_or(FsError::Overflow)?;
+    let mut seconds = u64::from(read_u32(raw, base)?);
+    if extra.checked_add(4).ok_or(FsError::Overflow)? <= declared {
+        seconds |= u64::from(read_u32(raw, extra)? & 0x3) << 32;
+    }
+    Ok(if seconds == 0 { None } else { Some(seconds) })
+}
+
 fn put_inode_time(raw: &mut [u8], field: (usize, usize), seconds: u64) -> Result<(), FsError> {
     let (base, extra) = field;
     let declared = EXT4_BASE_INODE_BYTES

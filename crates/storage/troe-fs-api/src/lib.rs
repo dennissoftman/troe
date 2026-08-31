@@ -97,6 +97,14 @@ pub struct FileMetadata {
     pub kind: NodeKind,
     /// Exact file payload bytes, or zero for a directory.
     pub byte_count: u64,
+    /// Whole Unix UTC seconds of the last payload modification, when recorded.
+    ///
+    /// `None` where the provider stores no timestamp at all, and also where it
+    /// stores one that was never stamped: ADR 0058 leaves the fields it would
+    /// write exactly as it found them whenever no wall time is known, which for
+    /// a new FAT32 entry means zero. A zero is therefore an absent time rather
+    /// than 1970, so it is reported as `None` and never as an instant.
+    pub modified_unix_seconds: Option<u64>,
 }
 
 /// One bounded page of a provider directory traversal.
@@ -155,6 +163,28 @@ pub trait FileSystemProvider: fmt::Debug {
     fn usage(&self) -> Option<ProviderUsage> {
         None
     }
+    /// Set one object's modification time, or stamp it from the wall clock.
+    ///
+    /// `None` requests the namespace clock's current instant, which is what
+    /// `touch` with no explicit time asks for. `Some` requests an exact instant.
+    ///
+    /// Providers that store no timestamp retain this default and refuse, so a
+    /// caller learns the time was not recorded instead of receiving success for
+    /// a write that could not happen.
+    ///
+    /// # Errors
+    ///
+    /// Rejects invalid or missing paths, immutable or unsupported providers, a
+    /// request for the clock's instant while no wall time is known, and
+    /// persistence failures.
+    fn set_modified_time(
+        &mut self,
+        _path: &str,
+        _unix_seconds: Option<u64>,
+    ) -> Result<(), FsError> {
+        Err(FsError::Unsupported)
+    }
+
     /// Adopt the namespace's wall clock.
     ///
     /// Providers that write no timestamps retain this default. A provider that

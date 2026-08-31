@@ -5,6 +5,7 @@
 mod common;
 
 use core::fmt::{self, Write as _};
+use troe_kex_runtime::time as calendar;
 use troe_kex_runtime::units::HumanBytes;
 use troe_kex_sdk::{
     ArgumentReader, CommandContext, ENVIRONMENT_BUFFER_BYTES, Error, FILESYSTEM_LIST_BUFFER_BYTES,
@@ -283,12 +284,67 @@ fn list_columns(
     Ok(())
 }
 
+/// Bytes one modification-time column occupies when a listing has one.
+///
+/// The width is fixed within a listing so the name column stays aligned when
+/// some entries carry a time and others do not. The column itself is omitted
+/// entirely when no visible entry has one, so listing a provider that stores no
+/// timestamps -- the read-only root, or a quota-bound /tmp -- reads exactly as
+/// it did before times existed rather than gaining a blank field.
+const TIME_COLUMN_BYTES: usize = 16;
+
+/// Write one `YYYY-MM-DD HH:MM` column, or spaces when no time was recorded.
+///
+/// A provider that stores no timestamp reports `None`, and so does one whose
+/// entry was never stamped, so an absent time is rendered as blank rather than
+/// as the epoch.
+fn write_modified(
+    output: &mut StandardOutput,
+    modified_unix_seconds: Option<u64>,
+) -> Result<(), ()> {
+    let Some(seconds) = modified_unix_seconds else {
+        return output
+            .write_all(&[b' '; TIME_COLUMN_BYTES])
+            .map_err(|_| ());
+    };
+    let Ok(seconds) = i64::try_from(seconds) else {
+        return output
+            .write_all(&[b' '; TIME_COLUMN_BYTES])
+            .map_err(|_| ());
+    };
+    let time = calendar::from_unix_seconds(seconds);
+    // `YYYY-MM-DD HH:MM` is exactly the column width, so the field is filled
+    // positionally rather than formatted and padded.
+    let mut column = [b'-'; TIME_COLUMN_BYTES];
+    let Ok(year) = u16::try_from(time.year) else {
+        return output
+            .write_all(&[b' '; TIME_COLUMN_BYTES])
+            .map_err(|_| ());
+    };
+    let pairs = [
+        (0, year / 100),
+        (2, year % 100),
+        (5, u16::try_from(time.month).unwrap_or(0)),
+        (8, u16::try_from(time.day).unwrap_or(0)),
+        (11, u16::try_from(time.hour).unwrap_or(0)),
+        (14, u16::try_from(time.minute).unwrap_or(0)),
+    ];
+    for (offset, value) in pairs {
+        column[offset] = b'0' + u8::try_from(value / 10 % 10).unwrap_or(0);
+        column[offset + 1] = b'0' + u8::try_from(value % 10).unwrap_or(0);
+    }
+    column[10] = b' ';
+    column[13] = b':';
+    output.write_all(&column).map_err(|_| ())
+}
+
 fn list_long(
     filesystem: &mut ReadOnlyFilesystem,
     output: &mut StandardOutput,
     options: Options<'_>,
 ) -> Result<(), VisitError<LongError>> {
     let mut maximum_size_width = 1_usize;
+    let mut any_modified = false;
     visit_entries(filesystem, options.path, |filesystem, entry| {
         if !visible(options.flags, entry) {
             return Ok(());
@@ -298,6 +354,7 @@ fn list_long(
             metadata.byte_count,
             options.flags.human_readable,
         ));
+        any_modified |= metadata.modified_unix_seconds.is_some();
         Ok::<(), Error>(())
     })
     .map_err(|error| match error {
@@ -325,6 +382,11 @@ fn list_long(
         write_size(output, metadata.byte_count, options.flags.human_readable)
             .map_err(|_| LongError::Output)?;
         output.write_all(b" ").map_err(|_| LongError::Output)?;
+        if any_modified {
+            write_modified(output, metadata.modified_unix_seconds)
+                .map_err(|_| LongError::Output)?;
+            output.write_all(b" ").map_err(|_| LongError::Output)?;
+        }
         write_name(output, entry, options.flags).map_err(|_| LongError::Output)?;
         output.write_all(b"\n").map_err(|_| LongError::Output)
     })
@@ -346,6 +408,10 @@ fn write_operand(
         output.write_all(b" ").map_err(|_| ())?;
         write_size(output, metadata.byte_count, flags.human_readable).map_err(|_| ())?;
         output.write_all(b" ").map_err(|_| ())?;
+        if metadata.modified_unix_seconds.is_some() {
+            write_modified(output, metadata.modified_unix_seconds)?;
+            output.write_all(b" ").map_err(|_| ())?;
+        }
     }
     let mut writer = OutputWriter(output);
     writer.write_str(path).map_err(|_| ())?;

@@ -41,6 +41,7 @@ history rather than in current documentation.
 | General ext4 compatibility profile | [ADR 0056](adr/0056-general-ext4-compatibility-profile.md) |
 | Bounded shell pathname expansion and paged operands | [ADR 0057](adr/0057-bounded-shell-pathname-expansion.md) |
 | One namespace wall clock for provider timestamps | [ADR 0058](adr/0058-provider-wall-clock-timestamps.md) |
+| Readable and settable modification time | [ADR 0061](adr/0061-readable-and-settable-modification-time.md) |
 | Declared image span and scaled launch admission | [ADR 0059](adr/0059-declared-image-span-and-scaled-launch-admission.md) |
 | Extent-backed launch reservation | [ADR 0060](adr/0060-extent-backed-launch-reservation.md) |
 

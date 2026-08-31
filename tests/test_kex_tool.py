@@ -136,9 +136,9 @@ class KexToolTests(unittest.TestCase):
                     if command == "udp":
                         expected = [(5, 1, 0)]
                     elif command == "tar":
-                        expected = [(6, 1, 3), (7, 1, 4)]
+                        expected = [(6, 1, 4), (7, 1, 5)]
                     elif command in {"cp", "mv", "rm"}:
-                        expected = [(6, 1, 3), (7, 1, 4)]
+                        expected = [(6, 1, 4), (7, 1, 5)]
                     elif command in {
                         "awk",
                         "cat",
@@ -149,11 +149,11 @@ class KexToolTests(unittest.TestCase):
                         "sed",
                         "wc",
                     }:
-                        expected = [(6, 1, 3)]
+                        expected = [(6, 1, 4)]
                     elif command == "lua":
                         expected = [
-                            (6, 1, 3),
-                            (7, 1, 4),
+                            (6, 1, 4),
+                            (7, 1, 5),
                             (8, 1, 0),
                             (17, 1, 0),
                             (20, 1, 0),
@@ -162,7 +162,7 @@ class KexToolTests(unittest.TestCase):
                             (23, 1, 0),
                         ]
                     elif command in {"ln", "rmdir"}:
-                        expected = [(7, 1, 4)]
+                        expected = [(7, 1, 5)]
                     elif command == "sleep":
                         expected = [(8, 1, 0)]
                     elif command == "timesync":
@@ -184,9 +184,9 @@ class KexToolTests(unittest.TestCase):
                     elif command == "mount":
                         expected = [(14, 1, 0)]
                     elif command == "sh":
-                        expected = [(6, 1, 3), (16, 1, 0)]
+                        expected = [(6, 1, 4), (16, 1, 0)]
                     elif command == "spawn":
-                        expected = [(6, 1, 3), (20, 1, 0), (21, 1, 0)]
+                        expected = [(6, 1, 4), (20, 1, 0), (21, 1, 0)]
                     else:
                         expected = []
                     self.assertEqual(records, expected)

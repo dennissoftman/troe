@@ -4,6 +4,13 @@ Status: accepted and implemented, 2026-08-30. Refines the timestamp paragraph
 of ADR 0056 and adds the first filesystem consumer of the wall clock in
 ADR 0039.
 
+Amendment, 2026-08-31: this decision writes timestamps and deliberately reads
+none. [ADR 0061](0061-readable-and-settable-modification-time.md) carries the
+modification time up through the VFS and the KEX ABI and adds one bounded
+operation that sets it. The statements below that nothing in this profile reads
+the stamped fields describe the original decision; the exclusion of
+access-time updates on read still holds.
+
 ## Context
 
 The kernel has held Unix wall time since ADR 0039, and the ext4 provider has
