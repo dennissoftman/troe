@@ -446,6 +446,8 @@ pub use mechanism::{
     wait_for_runtime_event_timeout, write, zero_physical_range,
 };
 
+#[cfg(any(test, target_os = "uefi"))]
+pub use mmu::planned_user_regions;
 #[cfg(target_os = "uefi")]
 pub use mmu::{
     ApplicationCall, ApplicationResume, ApplicationSession, build_user_address_space,

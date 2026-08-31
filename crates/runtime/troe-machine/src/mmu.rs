@@ -1109,6 +1109,44 @@ pub fn install_mmu(plan: &MappingPlan, table_arena: PhysicalRange) -> Result<Mmu
     Ok(stats)
 }
 
+/// Coalesced user regions implied by one application mapping plan.
+///
+/// Physical extents split a virtually contiguous region into one mapping record
+/// per contiguous run. Region descriptors exist to validate application buffers
+/// against the address space the application sees, where that split is not
+/// meaningful, so adjacent records with identical permissions describe one
+/// region. Without merging, a buffer straddling a split would be refused even
+/// though it lies wholly inside one mapped, uniformly permitted range.
+///
+/// Returns the coalesced region count and the total user pages the plan maps.
+///
+/// # Errors
+///
+/// Rejects checked arithmetic overflow.
+#[cfg(any(test, target_os = "uefi"))]
+pub fn planned_user_regions(plan: &MappingPlan) -> Result<(usize, u64), MmuError> {
+    let mut regions = 0_usize;
+    let mut pages = 0_u64;
+    let mut previous: Option<(u64, MappingPermissions)> = None;
+    for mapping in plan.mappings() {
+        if mapping.privilege() != MappingPrivilege::User {
+            continue;
+        }
+        let range = mapping.virtual_range();
+        pages = pages
+            .checked_add(range.page_count())
+            .ok_or(MmuError::AddressUnsupported)?;
+        let merges = previous.is_some_and(|(end, permissions)| {
+            end == range.start() && permissions == mapping.permissions()
+        });
+        if !merges {
+            regions = regions.checked_add(1).ok_or(MmuError::AddressUnsupported)?;
+        }
+        previous = Some((range.end(), mapping.permissions()));
+    }
+    Ok((regions, pages))
+}
+
 /// Build, but do not activate, one task address space containing validated
 /// supervisor mappings and at least one explicit user mapping.
 ///
@@ -1126,7 +1164,7 @@ pub fn build_user_address_space(
         .iter()
         .filter(|mapping| mapping.privilege() == MappingPrivilege::User)
         .count();
-    let mut regions = Vec::new();
+    let mut regions: Vec<UserRegion> = Vec::new();
     regions
         .try_reserve_exact(user_count)
         .map_err(|_| MmuError::InvalidUserContext)?;
@@ -1142,10 +1180,23 @@ pub fn build_user_address_space(
         let permissions = mapping.permissions();
         executable |= permissions.execute;
         writable |= permissions.write;
-        regions.push(UserRegion {
-            range: mapping.virtual_range(),
-            permissions,
-        });
+        let range = mapping.virtual_range();
+        // See `planned_user_regions`: extents fragment the records, not the
+        // address space the application sees.
+        if let Some(previous) = regions.last_mut()
+            && previous.range.end() == range.start()
+            && previous.permissions == permissions
+        {
+            let merged = previous
+                .range
+                .page_count()
+                .checked_add(range.page_count())
+                .ok_or(MmuError::AddressUnsupported)?;
+            previous.range = VirtualRange::from_pages(previous.range.start(), merged)
+                .map_err(|_| MmuError::AddressUnsupported)?;
+            continue;
+        }
+        regions.push(UserRegion { range, permissions });
     }
     if !executable || !writable {
         return Err(MmuError::InvalidUserContext);

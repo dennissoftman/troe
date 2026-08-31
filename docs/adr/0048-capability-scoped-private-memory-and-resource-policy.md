@@ -2,6 +2,11 @@
 
 Status: accepted and implemented, 2026-08-28.
 
+Amendment, 2026-08-31: [ADR 0060](0060-extent-backed-launch-reservation.md)
+applies this decision's `operation_quantum_pages` substep bound and extent-based
+backing to the initial launch reservation as well, so the quantum is no longer
+specific to dynamic private mappings. Its meaning here is unchanged.
+
 ## Context
 
 KEX ABI 1.1 gives each application an initially bounded heap whose mapped

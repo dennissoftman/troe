@@ -187,7 +187,9 @@ allocations, if any, are retained rather than passed to dead boot services.
 The architecture-independent memory-map model in `troe-memory` validates
 checked 4 KiB ranges, normalizes unordered firmware
 descriptors, overlays bounded explicit reservations, and reports usable and
-reserved bytes. It also models checked, aligned monotonic allocation over one
+reserved bytes. It also models an ordered sequence of physical extents addressed
+as one logical page sequence, so a reservation that is not physically contiguous
+is still addressed by logical page or byte offset. It also models checked, aligned monotonic allocation over one
 explicitly reserved boot arena, including padding, exhaustion, and sealing
 accounting. The UEFI adapter consumes these models at its pointer boundary;
 firmware types do not enter the portable crate.
@@ -372,7 +374,10 @@ zeroed physical extents at the end of the virtual heap prefix, falling back to
 discontiguous frames when necessary, adds page-table frames as mappings
 require, updates scheduler ownership accounting, and resumes with the new
 mapped length. Expected physical-memory exhaustion leaves the mapping
-unchanged. Initial mappings, heap growth, and dynamic private mappings share
+unchanged. The initial launch reservation is itself a sequence of coalesced physical
+extents rather than one contiguous run, so a large application starts on a
+fragmented machine; an unfragmented one still reserves exactly one extent.
+Initial mappings, heap growth, and dynamic private mappings share
 full-width per-process and system commitment accounting under the active SCFG
 memory policy; the kernel protects a configured minimum-free reserve without
 preallocating any policy ceiling.

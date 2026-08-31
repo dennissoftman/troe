@@ -104,10 +104,10 @@ ceiling no longer exists. Dropping the two 32 MiB boundary artifacts takes the
 corpus from 64 MB to 8.5 MB and moves its only Git LFS entry beyond the `.kefs`
 assets onto the smaller `standard-large-image` pair.
 
-One scaling limit is deliberately left in place. A launch still reserves its
-image, startup page, heap, and stack as one physically contiguous run, so a
-large application needs a large contiguous extent and can be refused under
-fragmentation even when enough total frames are free. Heap growth and ADR 0048
-private mappings are already extent-based; making the initial reservation
-extent-based is a separate change that must also resolve how many of the 512
-mapping-plan records one image may consume.
+One scaling limit was deliberately left in place by this decision and resolved
+separately. A launch reserved its image, startup page, heap, and stack as one
+physically contiguous run, so a large application needed a large contiguous
+extent and could be refused under fragmentation even when enough total frames
+were free. [ADR 0060](0060-extent-backed-launch-reservation.md) replaces that
+reservation with coalesced physical extents and settles how many mapping-plan
+records one launch may consume.
