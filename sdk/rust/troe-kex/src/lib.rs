@@ -19,12 +19,15 @@ const CALL_RIGHT: u32 = 1;
 const KEX_IMAGE_BASE: u64 = 0x0000_4000_0000_0000;
 const KEX_MIN_IMAGE_BASE: u64 = 0x0000_0001_0000_0000;
 const KEX_IMAGE_ALIGNMENT: u64 = 2 * 1024 * 1024;
-const KEX_IMAGE_SPAN_BYTES: u64 = 128 * 1024 * 1024;
+const KEX_MAX_IMAGE_SPAN_BYTES: u64 = 1024 * 1024 * 1024;
 const KEX_USER_END: u64 = 0x0000_8000_0000_0000;
 const KEX_MAXIMUM_STACK_BYTES: u64 = 256 * STARTUP_PAGE_BYTES as u64;
 const KEX_MINIMUM_STACK_BYTES: u64 = 4 * STARTUP_PAGE_BYTES as u64;
+/// Image span used by hosted tests, which build a minimal single-page image.
 #[cfg(test)]
-const KEX_STARTUP_ADDRESS: u64 = KEX_IMAGE_BASE + KEX_IMAGE_SPAN_BYTES;
+const KEX_TEST_IMAGE_SPAN_BYTES: u64 = KEX_IMAGE_ALIGNMENT;
+#[cfg(test)]
+const KEX_STARTUP_ADDRESS: u64 = KEX_IMAGE_BASE + KEX_TEST_IMAGE_SPAN_BYTES;
 #[cfg(test)]
 const KEX_HEAP_ADDRESS: u64 = KEX_STARTUP_ADDRESS + STARTUP_PAGE_BYTES as u64;
 #[cfg(test)]
@@ -2357,11 +2360,13 @@ impl<'a> Startup<'a> {
         let heap_bytes = read_u64(bytes, 32)?;
         let stack_bottom = read_u64(bytes, 40)?;
         let stack_top = read_u64(bytes, 48)?;
-        let image_end = image_base
-            .checked_add(KEX_IMAGE_SPAN_BYTES)
-            .ok_or(StartupError::InvalidPage)?;
-        let expected_heap_address = image_end
-            .checked_add(STARTUP_PAGE_BYTES as u64)
+        // The kernel places the startup page directly above the image, so the
+        // span the artifact declared is recoverable from the heap address. The
+        // guest cannot know that span independently, so it checks the canonical
+        // relationship and the policy bound rather than one fixed offset.
+        let declared_span = heap_address
+            .checked_sub(STARTUP_PAGE_BYTES as u64)
+            .and_then(|startup| startup.checked_sub(image_base))
             .ok_or(StartupError::InvalidPage)?;
         let lower_guard = stack_top
             .checked_sub(KEX_MAXIMUM_STACK_BYTES)
@@ -2375,7 +2380,9 @@ impl<'a> Startup<'a> {
             || bytes[encoded_bytes..].iter().any(|byte| *byte != 0)
             || image_base < KEX_MIN_IMAGE_BASE
             || !image_base.is_multiple_of(KEX_IMAGE_ALIGNMENT)
-            || heap_address != expected_heap_address
+            || declared_span == 0
+            || declared_span > KEX_MAX_IMAGE_SPAN_BYTES
+            || !declared_span.is_multiple_of(KEX_IMAGE_ALIGNMENT)
             || heap_end > lower_guard
             || !heap_bytes.is_multiple_of(STARTUP_PAGE_BYTES as u64)
             || read_u64(bytes, 56)? == 0

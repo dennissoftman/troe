@@ -155,7 +155,7 @@ cannot intercept intrinsic names. A token containing `/` bypasses discovery
 and selects one exact relative or absolute VFS file; it adds neither a `PATH`
 search nor implicit current-directory execution. The interactive shell asks a
 default-negative confirmation before direct execution outside `/bin`; nested
-typed process launch remains noninteractive. ABI 1.1 exposes no platform-transition operation.
+typed process launch remains noninteractive. ABI 1.2 exposes no platform-transition operation.
 
 Native KEX interfaces follow ADR 0034: opaque handles share generation,
 ownership, accounting, cancellation, waiting, and teardown machinery, while
@@ -367,7 +367,7 @@ complete non-overlapping ranges, copies a two-byte opcode-prefixed request,
 checks task handle ownership, and copies a successful bounded reply before a
 fresh leased resume. Unknown calls and an attempted `_start` return are
 contained and reclaimed as invalid-call and translation faults.
-ABI 1.1 also suspends on `grow_heap`; the kernel atomically commits owned,
+ABI 1.2 also suspends on `grow_heap`; the kernel atomically commits owned,
 zeroed physical extents at the end of the virtual heap prefix, falling back to
 discontiguous frames when necessary, adds page-table frames as mappings
 require, updates scheduler ownership accounting, and resumes with the new

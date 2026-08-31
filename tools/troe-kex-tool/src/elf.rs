@@ -3,9 +3,9 @@
 use std::ops::Range;
 
 use troe_application::{
-    ABI_MAJOR, ABI_MINOR, ApplicationLimits, KEX_V1_HEADER_BYTES, KEX_V1_LOAD_RECORD_BYTES,
-    KEX_V1_MAGIC, KEX_V1_RELOCATION_RECORD_BYTES, MAX_LOAD_RECORDS, PAGE_SIZE, SegmentPermissions,
-    Target, parse_kex,
+    ABI_MAJOR, ABI_MINOR, ApplicationLimits, KEX_V1_HEADER_BYTES, KEX_V1_IMAGE_ALIGNMENT,
+    KEX_V1_LOAD_RECORD_BYTES, KEX_V1_MAGIC, KEX_V1_RELOCATION_RECORD_BYTES, MAX_LOAD_RECORDS,
+    PAGE_SIZE, SegmentPermissions, Target, maximum_table_pages, parse_kex,
 };
 
 use crate::{ToolError, ToolResult};
@@ -976,12 +976,20 @@ fn records<'image>(parsed: &ParsedElf, image: &'image [u8]) -> ToolResult<Vec<Ke
         .collect()
 }
 
+/// Round one image end up to the declared-span alignment.
+fn image_span_bytes(image_end: u64) -> ToolResult<u64> {
+    image_end
+        .checked_add(KEX_V1_IMAGE_ALIGNMENT - 1)
+        .map(|value| value / KEX_V1_IMAGE_ALIGNMENT * KEX_V1_IMAGE_ALIGNMENT)
+        .ok_or_else(|| invalid("ELF image span overflows"))
+}
+
 fn validate_policy(
     records: &[KexRecord<'_>],
     relocations: &[ElfRelativeRelocation],
     stack_pages: u64,
     heap_pages: u64,
-) -> ToolResult<usize> {
+) -> ToolResult<(usize, u64)> {
     let limits = ApplicationLimits::standard();
     let image_pages = records.iter().try_fold(0_u64, |pages, record| {
         pages
@@ -1018,11 +1026,9 @@ fn validate_policy(
             "ELF load-record count exceeds the standard KEX policy",
         ));
     }
-    if image_end > limits.image_span_bytes() {
+    let span_bytes = image_span_bytes(image_end)?;
+    if span_bytes > limits.maximum_image_span_bytes() {
         return Err(invalid("ELF image span exceeds the standard KEX policy"));
-    }
-    if image_pages > limits.image_pages() {
-        return Err(invalid("ELF mapped pages exceed the standard KEX policy"));
     }
     let (minimum_stack, maximum_stack) = limits.stack_pages();
     if !(minimum_stack..=maximum_stack).contains(&stack_pages) {
@@ -1035,11 +1041,13 @@ fn validate_policy(
             "requested KEX heap pages exceed the standard KEX policy",
         ));
     }
-    let resident = image_pages
+    let private = image_pages
         .checked_add(1)
         .and_then(|pages| pages.checked_add(stack_pages))
         .and_then(|pages| pages.checked_add(heap_pages))
-        .and_then(|pages| pages.checked_add(limits.table_pages()))
+        .ok_or_else(|| invalid("KEX aggregate resident charge overflows"))?;
+    let resident = maximum_table_pages(private)
+        .and_then(|tables| private.checked_add(tables))
         .ok_or_else(|| invalid("KEX aggregate resident charge overflows"))?;
     if resident > limits.resident_pages() {
         return Err(invalid(
@@ -1049,7 +1057,7 @@ fn validate_policy(
     if artifact_bytes > limits.encoded_bytes() {
         return Err(invalid("KEX encoded bytes exceed the standard KEX policy"));
     }
-    Ok(artifact_bytes)
+    Ok((artifact_bytes, span_bytes))
 }
 
 fn verify_generated(
@@ -1115,7 +1123,8 @@ pub fn convert_elf(
 ) -> ToolResult<Vec<u8>> {
     let parsed = parse_elf(image, expected_target)?;
     let records = records(&parsed, image)?;
-    let artifact_bytes = validate_policy(&records, &parsed.relocations, stack_pages, heap_pages)?;
+    let (artifact_bytes, span_bytes) =
+        validate_policy(&records, &parsed.relocations, stack_pages, heap_pages)?;
     let record_count = u16::try_from(records.len())
         .map_err(|_| invalid("KEX load-record count is not representable"))?;
     let relocations_offset = KEX_V1_HEADER_BYTES
@@ -1149,7 +1158,12 @@ pub fn convert_elf(
     write_u64(&mut output, 24, entry_offset);
     write_u16(&mut output, 32, record_count);
     write_u16(&mut output, 34, 0);
-    write_u32(&mut output, 36, 0);
+    write_u32(
+        &mut output,
+        36,
+        u32::try_from(span_bytes / PAGE_SIZE)
+            .map_err(|_| invalid("KEX image span is not representable"))?,
+    );
     write_u64(&mut output, 40, stack_pages);
     write_u64(&mut output, 48, heap_pages);
     write_u32(

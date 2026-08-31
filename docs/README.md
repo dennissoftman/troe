@@ -41,6 +41,7 @@ history rather than in current documentation.
 | General ext4 compatibility profile | [ADR 0056](adr/0056-general-ext4-compatibility-profile.md) |
 | Bounded shell pathname expansion and paged operands | [ADR 0057](adr/0057-bounded-shell-pathname-expansion.md) |
 | One namespace wall clock for provider timestamps | [ADR 0058](adr/0058-provider-wall-clock-timestamps.md) |
+| Declared image span and scaled launch admission | [ADR 0059](adr/0059-declared-image-span-and-scaled-launch-admission.md) |
 
 The current serialized contracts are versioned independently under
 [`formats/`](formats):

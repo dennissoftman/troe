@@ -21,6 +21,13 @@ pub const KEX_V1_MIN_IMAGE_BASE: u64 = 0x0000_0001_0000_0000;
 pub const KEX_V1_IMAGE_ALIGNMENT: u64 = 2 * 1024 * 1024;
 /// Exclusive upper bound of the application half of the initial 48-bit roots.
 pub const KEX_V1_USER_END: u64 = 0x0000_8000_0000_0000;
+/// Image span assumed for ABI 1.0 and 1.1 artifacts, which do not declare one.
+///
+/// Those artifacts place the startup page at a fixed offset from the image
+/// base, so their span is part of the ABI rather than the header.
+pub const KEX_V1_LEGACY_IMAGE_SPAN_BYTES: u64 = 128 * 1024 * 1024;
+/// Lowest application ABI minor whose artifacts declare their own image span.
+pub const KEX_V1_DECLARED_SPAN_ABI_MINOR: u16 = 2;
 /// KEX v1 header length in bytes.
 pub const KEX_V1_HEADER_BYTES: usize = 88;
 /// KEX v1 load-record length in bytes.
@@ -54,7 +61,7 @@ const HEADER_FLAGS: usize = 22;
 const HEADER_ENTRY_OFFSET: usize = 24;
 const HEADER_RECORD_COUNT: usize = 32;
 const HEADER_RESERVED16: usize = 34;
-const HEADER_RESERVED32: usize = 36;
+const HEADER_IMAGE_SPAN_PAGES: usize = 36;
 const HEADER_STACK_PAGES: usize = 40;
 const HEADER_HEAP_PAGES: usize = 48;
 const HEADER_RECORDS_OFFSET: usize = 56;
@@ -271,32 +278,127 @@ impl SegmentPermissions {
     }
 }
 
+/// Largest image span one artifact may declare.
+///
+/// The declared span bounds every mapped image page, so it replaces the former
+/// fixed image-page ceiling: an artifact is held to the span it asks for, and
+/// no artifact maps more than this. The binding launch constraint is available
+/// frames, which the kernel charges against the configured minimum-free
+/// reserve once the mapping plan exists.
+pub const MAX_IMAGE_SPAN_BYTES: u64 = 1024 * 1024 * 1024;
+/// [`MAX_IMAGE_SPAN_BYTES`] as a page count.
+pub const MAX_IMAGE_SPAN_PAGES: u64 = MAX_IMAGE_SPAN_BYTES / PAGE_SIZE;
+/// [`MAX_IMAGE_SPAN_BYTES`] as a host slice length.
+///
+/// The KEX ABI is LP64, so the span is representable; a build whose pointers
+/// are narrower than the format requires fails here rather than silently
+/// truncating an admission ceiling.
+const MAX_IMAGE_SPAN_USIZE: usize = {
+    const {
+        assert!(
+            usize::BITS >= u64::BITS,
+            "KEX requires 64-bit host pointers"
+        );
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        MAX_IMAGE_SPAN_BYTES as usize
+    }
+};
+
+/// Page-table entries described by one page-table page.
+const TABLE_ENTRIES: u64 = 512;
+/// Page-table levels below the shared root on both supported architectures.
+const TABLE_LEVELS_BELOW_ROOT: u32 = 3;
+/// Contiguous virtual regions in one launch layout: image, startup, heap, stack.
+const LAUNCH_REGIONS: u64 = 4;
+/// Largest private page count one launch may charge before its page tables.
+const MAX_PRIVATE_PAGES: u64 =
+    MAX_IMAGE_SPAN_PAGES + STARTUP_PAGES + MAX_INITIAL_STACK_PAGES + MAX_INITIAL_HEAP_PAGES;
+
+/// Canonical declared span for one image that ends at `image_end`.
+///
+/// The span is the image end rounded up to [`KEX_V1_IMAGE_ALIGNMENT`]. It is
+/// exact rather than an upper bound, so an artifact cannot reserve image
+/// address space it never maps, and the startup page always sits directly
+/// above the image.
+///
+/// Returns [`None`] when the rounded span is not representable.
+#[must_use]
+pub const fn canonical_image_span_bytes(image_end: u64) -> Option<u64> {
+    let Some(rounded) = image_end.checked_add(KEX_V1_IMAGE_ALIGNMENT - 1) else {
+        return None;
+    };
+    Some(rounded / KEX_V1_IMAGE_ALIGNMENT * KEX_V1_IMAGE_ALIGNMENT)
+}
+
+/// Upper bound on the page-table pages needed to map `mapped_pages`.
+///
+/// One page-table page describes [`TABLE_ENTRIES`] entries, so each of the
+/// three levels below the root costs at most one page per that level's
+/// coverage, rounded up, plus one page per launch region for a run that does
+/// not begin on that level's boundary. The root is shared.
+///
+/// The kernel charges the exact requirement computed from the built mapping
+/// plan, so this bound only has to hold beforehand, while admission is still
+/// deciding whether to reserve anything at all. It must nonetheless be a true
+/// upper bound: an optimistic estimate would admit a launch that then fails at
+/// the exact reservation.
+///
+/// Returns [`None`] when the count is not representable.
+#[must_use]
+pub const fn maximum_table_pages(mapped_pages: u64) -> Option<u64> {
+    let mut total = 1_u64;
+    let mut coverage = TABLE_ENTRIES;
+    let mut level = 0_u32;
+    while level < TABLE_LEVELS_BELOW_ROOT {
+        let Some(rounded) = mapped_pages.checked_add(coverage - 1) else {
+            return None;
+        };
+        let Some(with_level) = total.checked_add(rounded / coverage) else {
+            return None;
+        };
+        let Some(with_regions) = with_level.checked_add(LAUNCH_REGIONS) else {
+            return None;
+        };
+        total = with_regions;
+        let Some(wider) = coverage.checked_mul(TABLE_ENTRIES) else {
+            return None;
+        };
+        coverage = wider;
+        level += 1;
+    }
+    Some(total)
+}
+
 /// Absolute application limits enforced by the standard policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ApplicationLimits {
     encoded_bytes: usize,
     load_records: usize,
-    image_span_bytes: u64,
-    image_pages: u64,
+    maximum_image_span_bytes: u64,
     minimum_stack_pages: u64,
     maximum_stack_pages: u64,
     heap_pages: u64,
-    table_pages: u64,
     resident_pages: u64,
     initial_handles: u16,
 }
 
 impl ApplicationLimits {
     const STANDARD: Self = Self {
-        encoded_bytes: 32 * 1024 * 1024,
+        // Payload bytes cannot exceed the mapped span, which the segment
+        // parser enforces exactly. The remaining allowance bounds the
+        // canonical header, load records, and relative-relocation table.
+        encoded_bytes: 2 * MAX_IMAGE_SPAN_USIZE,
         load_records: 16,
-        image_span_bytes: 128 * 1024 * 1024,
-        image_pages: 8192,
+        maximum_image_span_bytes: MAX_IMAGE_SPAN_BYTES,
         minimum_stack_pages: 4,
         maximum_stack_pages: MAX_INITIAL_STACK_PAGES,
         heap_pages: MAX_INITIAL_HEAP_PAGES,
-        table_pages: 512,
-        resident_pages: 2 * (1 << 32) + 8192 + 1 + 512,
+        resident_pages: match maximum_table_pages(MAX_PRIVATE_PAGES) {
+            Some(tables) => MAX_PRIVATE_PAGES + tables,
+            None => panic!("maximum private pages must have a table bound"),
+        },
         initial_handles: 32,
     };
 
@@ -318,16 +420,10 @@ impl ApplicationLimits {
         self.load_records
     }
 
-    /// Maximum image-relative end address.
+    /// Largest image span one artifact may declare.
     #[must_use]
-    pub const fn image_span_bytes(self) -> u64 {
-        self.image_span_bytes
-    }
-
-    /// Maximum mapped image pages.
-    #[must_use]
-    pub const fn image_pages(self) -> u64 {
-        self.image_pages
+    pub const fn maximum_image_span_bytes(self) -> u64 {
+        self.maximum_image_span_bytes
     }
 
     /// Inclusive permitted stack-page range.
@@ -340,12 +436,6 @@ impl ApplicationLimits {
     #[must_use]
     pub const fn heap_pages(self) -> u64 {
         self.heap_pages
-    }
-
-    /// Maximum application page-table pages.
-    #[must_use]
-    pub const fn table_pages(self) -> u64 {
-        self.table_pages
     }
 
     /// Maximum total resident pages including page tables.
@@ -1001,10 +1091,10 @@ pub enum ParseError {
     OverlappingSegments,
     /// File payload ranges are not exact, ordered, and canonical.
     NoncanonicalPayload,
-    /// The image-relative address span exceeds the standard policy.
+    /// A segment ends beyond the image span the artifact declared.
     ImageSpanExceeded,
-    /// Mapped image pages exceed the standard policy.
-    ImagePagesExceeded,
+    /// The declared image span is zero, misaligned, or above the standard policy.
+    InvalidImageSpan,
     /// Requested stack pages are outside the standard range.
     StackBudgetExceeded,
     /// Requested heap pages exceed the standard policy.
@@ -1039,8 +1129,8 @@ impl fmt::Display for ParseError {
             Self::InvalidSegmentRange => "KEX segment range is invalid",
             Self::OverlappingSegments => "KEX segments overlap or are out of order",
             Self::NoncanonicalPayload => "KEX segment payload layout is noncanonical",
-            Self::ImageSpanExceeded => "KEX image span exceeds the standard policy",
-            Self::ImagePagesExceeded => "KEX image pages exceed the standard policy",
+            Self::ImageSpanExceeded => "KEX segment ends beyond the declared image span",
+            Self::InvalidImageSpan => "KEX declared image span is invalid",
             Self::StackBudgetExceeded => "KEX stack request exceeds the standard policy",
             Self::HeapBudgetExceeded => "KEX heap request exceeds the standard policy",
             Self::ResidentBudgetExceeded => "KEX resident-page charge exceeds the standard policy",
@@ -1865,7 +1955,6 @@ fn parse_stream_prefix(
         executable_prefix,
         executable_bytes,
         header,
-        ApplicationLimits::standard(),
         placement.image_base,
     )
     .map_err(StreamError::Executable)?;
@@ -1873,6 +1962,7 @@ fn parse_stream_prefix(
         header.stack_pages,
         header.heap_pages,
         header.abi_minor,
+        header.image_span_bytes,
         ApplicationLimits::standard(),
         placement,
     )
@@ -1883,8 +1973,8 @@ fn parse_stream_prefix(
         .and_then(|pages| pages.checked_add(header.heap_pages))
         .and_then(|pages| pages.checked_add(STARTUP_PAGES))
         .ok_or(StreamError::Executable(ParseError::ArithmeticOverflow))?;
-    let reserved_resident_pages = private_pages
-        .checked_add(ApplicationLimits::standard().table_pages)
+    let reserved_resident_pages = maximum_table_pages(private_pages)
+        .and_then(|tables| private_pages.checked_add(tables))
         .ok_or(StreamError::Executable(ParseError::ArithmeticOverflow))?;
     if reserved_resident_pages > ApplicationLimits::standard().resident_pages {
         return Err(StreamError::Executable(ParseError::ResidentBudgetExceeded));
@@ -1927,11 +2017,11 @@ struct ParsedStreamSegments {
     image_pages: u64,
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_stream_segments(
     prefix: &[u8],
     executable_bytes: usize,
     header: ParsedHeader,
-    limits: ApplicationLimits,
     image_base: u64,
 ) -> Result<ParsedStreamSegments, ParseError> {
     let mut segments = [None; MAX_LOAD_RECORDS];
@@ -1983,7 +2073,7 @@ fn parse_stream_segments(
         if index != 0 && image_offset < previous_image_end {
             return Err(ParseError::OverlappingSegments);
         }
-        if image_end > limits.image_span_bytes {
+        if image_end > header.image_span_bytes {
             return Err(ParseError::ImageSpanExceeded);
         }
         if file_offset != expected_file_offset {
@@ -1998,9 +2088,6 @@ fn parse_stream_segments(
         image_pages = image_pages
             .checked_add(memory_bytes / PAGE_SIZE)
             .ok_or(ParseError::ArithmeticOverflow)?;
-        if image_pages > limits.image_pages {
-            return Err(ParseError::ImagePagesExceeded);
-        }
         if permissions.executable() {
             executable = true;
             let entry_end = header
@@ -2028,6 +2115,14 @@ fn parse_stream_segments(
     }
     if !entry_is_executable {
         return Err(ParseError::InvalidEntryPoint);
+    }
+    // Artifacts that declare their own span must declare the exact one. ABI
+    // 1.0 and 1.1 artifacts have a fixed implied span and are held only to the
+    // segment bound already checked above.
+    if header.abi_minor >= KEX_V1_DECLARED_SPAN_ABI_MINOR
+        && canonical_image_span_bytes(previous_image_end) != Some(header.image_span_bytes)
+    {
+        return Err(ParseError::InvalidImageSpan);
     }
     Ok(ParsedStreamSegments {
         segments,
@@ -2193,7 +2288,7 @@ fn parse_with_limits(
         return Err(ParseError::ArtifactTooLarge);
     }
     let header = parse_header(artifact, expected_target, supported_abi_minor, limits)?;
-    let parsed = parse_segments(artifact, header, limits, placement.image_base)?;
+    let parsed = parse_segments(artifact, header, placement.image_base)?;
     let relocations = parse_relocations(artifact, header, &parsed)?;
     let private_pages = parsed
         .image_pages
@@ -2201,8 +2296,8 @@ fn parse_with_limits(
         .and_then(|pages| pages.checked_add(header.heap_pages))
         .and_then(|pages| pages.checked_add(STARTUP_PAGES))
         .ok_or(ParseError::ArithmeticOverflow)?;
-    let reserved_resident_pages = private_pages
-        .checked_add(limits.table_pages)
+    let reserved_resident_pages = maximum_table_pages(private_pages)
+        .and_then(|tables| private_pages.checked_add(tables))
         .ok_or(ParseError::ArithmeticOverflow)?;
     if reserved_resident_pages > limits.resident_pages {
         return Err(ParseError::ResidentBudgetExceeded);
@@ -2211,6 +2306,7 @@ fn parse_with_limits(
         header.stack_pages,
         header.heap_pages,
         header.abi_minor,
+        header.image_span_bytes,
         limits,
         placement,
     )?;
@@ -2242,6 +2338,7 @@ fn application_layout(
     stack_pages: u64,
     heap_pages: u64,
     abi_minor: u16,
+    image_span_bytes: u64,
     limits: ApplicationLimits,
     placement: LoadPlacement,
 ) -> Result<ApplicationLayout, ParseError> {
@@ -2254,7 +2351,7 @@ fn application_layout(
     }
     let startup_address = placement
         .image_base
-        .checked_add(limits.image_span_bytes)
+        .checked_add(image_span_bytes)
         .ok_or(ParseError::ArithmeticOverflow)?;
     let heap_address = startup_address
         .checked_add(PAGE_SIZE)
@@ -2317,6 +2414,7 @@ fn application_layout(
 struct ParsedHeader {
     target: Target,
     abi_minor: u16,
+    image_span_bytes: u64,
     entry_offset: u64,
     record_count: usize,
     records_offset: usize,
@@ -2340,6 +2438,37 @@ fn parse_header(
         supported_abi_minor,
         limits,
     )
+}
+
+/// Resolve one artifact's image span from its header.
+///
+/// ABI 1.2 and above declare the span as a page count in the field ABI 1.0 and
+/// 1.1 reserve; those older artifacts leave it zero and take the fixed implied
+/// span. The span must be nonzero, aligned, and within the standard maximum.
+/// The segment parser separately requires it to be the exact canonical span.
+fn parse_image_span(
+    header: &[u8],
+    abi_minor: u16,
+    limits: ApplicationLimits,
+) -> Result<u64, ParseError> {
+    let declared_span_pages = read_u32(header, HEADER_IMAGE_SPAN_PAGES)?;
+    let image_span_bytes = if abi_minor < KEX_V1_DECLARED_SPAN_ABI_MINOR {
+        if declared_span_pages != 0 {
+            return Err(ParseError::NonzeroReserved);
+        }
+        KEX_V1_LEGACY_IMAGE_SPAN_BYTES
+    } else {
+        u64::from(declared_span_pages)
+            .checked_mul(PAGE_SIZE)
+            .ok_or(ParseError::ArithmeticOverflow)?
+    };
+    if image_span_bytes == 0
+        || image_span_bytes > limits.maximum_image_span_bytes
+        || !image_span_bytes.is_multiple_of(KEX_V1_IMAGE_ALIGNMENT)
+    {
+        return Err(ParseError::InvalidImageSpan);
+    }
+    Ok(image_span_bytes)
 }
 
 fn parse_header_with_len(
@@ -2377,12 +2506,12 @@ fn parse_header_with_len(
     }
     if read_u16(header, HEADER_FLAGS)? != 0
         || read_u16(header, HEADER_RESERVED16)? != 0
-        || read_u32(header, HEADER_RESERVED32)? != 0
         || read_u16(header, HEADER_RESERVED_RELOCATION16)? != 0
         || read_u32(header, HEADER_RESERVED_RELOCATION32)? != 0
     {
         return Err(ParseError::NonzeroReserved);
     }
+    let image_span_bytes = parse_image_span(header, abi_minor, limits)?;
     let declared_bytes = usize::try_from(read_u64(header, HEADER_ARTIFACT_BYTES)?)
         .map_err(|_| ParseError::ArithmeticOverflow)?;
     if declared_bytes != artifact_len {
@@ -2437,6 +2566,7 @@ fn parse_header_with_len(
     Ok(ParsedHeader {
         target,
         abi_minor,
+        image_span_bytes,
         entry_offset,
         record_count,
         records_offset,
@@ -2505,7 +2635,6 @@ fn parse_relocations<'artifact>(
 fn parse_segments(
     artifact: &[u8],
     header: ParsedHeader,
-    limits: ApplicationLimits,
     image_base: u64,
 ) -> Result<ParsedSegments<'_>, ParseError> {
     let mut segments = [None; MAX_LOAD_RECORDS];
@@ -2536,7 +2665,7 @@ fn parse_segments(
             expected_file_offset,
             previous_image_end,
             index != 0,
-            limits,
+            header.image_span_bytes,
             image_base,
         )?;
         previous_image_end = parsed.image_end;
@@ -2545,9 +2674,6 @@ fn parse_segments(
         image_pages = image_pages
             .checked_add(parsed.segment.memory_bytes / PAGE_SIZE)
             .ok_or(ParseError::ArithmeticOverflow)?;
-        if image_pages > limits.image_pages {
-            return Err(ParseError::ImagePagesExceeded);
-        }
         if parsed.segment.permissions.executable() {
             executable = true;
             let entry_end = header
@@ -2569,6 +2695,14 @@ fn parse_segments(
     if !entry_is_executable {
         return Err(ParseError::InvalidEntryPoint);
     }
+    // Artifacts that declare their own span must declare the exact one. ABI
+    // 1.0 and 1.1 artifacts have a fixed implied span and are held only to the
+    // segment bound already checked above.
+    if header.abi_minor >= KEX_V1_DECLARED_SPAN_ABI_MINOR
+        && canonical_image_span_bytes(previous_image_end) != Some(header.image_span_bytes)
+    {
+        return Err(ParseError::InvalidImageSpan);
+    }
 
     Ok(ParsedSegments {
         segments,
@@ -2588,7 +2722,7 @@ fn parse_record<'artifact>(
     expected_file_offset: usize,
     previous_image_end: u64,
     has_predecessor: bool,
-    limits: ApplicationLimits,
+    image_span_bytes: u64,
     image_base: u64,
 ) -> Result<ParsedRecord<'artifact>, ParseError> {
     let image_offset = read_u64(record, RECORD_IMAGE_OFFSET)?;
@@ -2619,7 +2753,7 @@ fn parse_record<'artifact>(
     if has_predecessor && image_offset < previous_image_end {
         return Err(ParseError::OverlappingSegments);
     }
-    if image_end > limits.image_span_bytes {
+    if image_end > image_span_bytes {
         return Err(ParseError::ImageSpanExceeded);
     }
     if file_offset != expected_file_offset {
@@ -2859,6 +2993,7 @@ mod tests {
         u64::try_from(value).unwrap_or_else(|_| unreachable!())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn artifact_with_relocations(
         target: Target,
         segments: &[TestSegment<'_>],
@@ -2885,6 +3020,20 @@ mod tests {
         );
         put_u16(&mut bytes, HEADER_ABI_MAJOR, ABI_MAJOR);
         put_u16(&mut bytes, HEADER_ABI_MINOR, ABI_MINOR);
+        let image_end = segments
+            .iter()
+            .map(|segment| segment.image_offset + segment.memory_bytes)
+            .max()
+            .unwrap_or(0);
+        // Degenerate geometries under test can end at zero; keep the header
+        // itself well formed so the property under test is what fails.
+        let span_bytes =
+            canonical_image_span_bytes(image_end.max(1)).unwrap_or_else(|| unreachable!());
+        put_u32(
+            &mut bytes,
+            HEADER_IMAGE_SPAN_PAGES,
+            u32::try_from(span_bytes / PAGE_SIZE).unwrap_or_else(|_| unreachable!()),
+        );
         put_u64(&mut bytes, HEADER_ENTRY_OFFSET, 0);
         put_u16(&mut bytes, HEADER_RECORD_COUNT, usize_u16(segments.len()));
         put_u64(&mut bytes, HEADER_STACK_PAGES, 4);
@@ -3361,11 +3510,14 @@ mod tests {
             assert_eq!(plan.charges().staging_bytes(), bytes.len());
             assert_eq!(plan.charges().image_pages(), 2);
             assert_eq!(plan.charges().private_pages(), 7);
-            assert_eq!(plan.charges().reserved_resident_pages(), 519);
+            assert_eq!(
+                plan.charges().reserved_resident_pages(),
+                7 + maximum_table_pages(7).unwrap_or_else(|| unreachable!())
+            );
             let layout = plan.layout();
             assert_eq!(
                 layout.startup_address(),
-                KEX_V1_IMAGE_BASE + 128 * 1024 * 1024
+                KEX_V1_IMAGE_BASE + KEX_V1_IMAGE_ALIGNMENT
             );
             assert_eq!(layout.heap_bytes(), 0);
             assert_eq!(layout.stack_top() - layout.stack_bottom(), 4 * PAGE_SIZE);
@@ -3549,6 +3701,7 @@ mod tests {
             parse_standard(&current_bytes, Target::X86_64).unwrap_or_else(|_| unreachable!());
         let mut legacy_bytes = current_bytes.clone();
         put_u16(&mut legacy_bytes, HEADER_ABI_MINOR, 0);
+        put_u32(&mut legacy_bytes, HEADER_IMAGE_SPAN_PAGES, 0);
         let legacy =
             parse_standard(&legacy_bytes, Target::X86_64).unwrap_or_else(|_| unreachable!());
         let mut legacy_page = [0_u8; PAGE_BYTES];
@@ -3574,14 +3727,17 @@ mod tests {
     fn standard_limits_match_current_policy() {
         let standard = ApplicationLimits::standard();
 
-        assert_eq!(standard.encoded_bytes(), 32 * 1024 * 1024);
+        assert_eq!(standard.encoded_bytes(), 2 * 1024 * 1024 * 1024);
         assert_eq!(standard.load_records(), 16);
-        assert_eq!(standard.image_span_bytes(), 128 * 1024 * 1024);
-        assert_eq!(standard.image_pages(), 8192);
+        assert_eq!(standard.maximum_image_span_bytes(), 1024 * 1024 * 1024);
         assert_eq!(standard.stack_pages(), (4, 1 << 32));
         assert_eq!(standard.heap_pages(), 1 << 32);
-        assert_eq!(standard.table_pages(), 512);
-        assert_eq!(standard.resident_pages(), 2 * (1 << 32) + 8192 + 1 + 512);
+        let maximum_private = 2 * (1 << 32) + MAX_IMAGE_SPAN_PAGES + 1;
+        assert_eq!(
+            standard.resident_pages(),
+            maximum_private
+                + maximum_table_pages(maximum_private).unwrap_or_else(|| unreachable!())
+        );
         assert_eq!(standard.initial_handles(), 32);
     }
 
@@ -3591,12 +3747,44 @@ mod tests {
     }
 
     #[test]
-    fn rejects_staging_overflow() {
-        let oversized = vec![0_u8; ApplicationLimits::STANDARD.encoded_bytes + 1];
-        assert_eq!(
-            parse_standard(&oversized, Target::X86_64),
-            Err(ParseError::ArtifactTooLarge)
+    fn rejects_executable_above_the_encoded_ceiling_without_staging_it() {
+        // The ceiling is far larger than any artifact worth materializing, so
+        // this drives the streamed path, which decides from declared lengths
+        // inside a fixed working set rather than from a staged copy.
+        let executable = artifact(
+            Target::X86_64,
+            &[TestSegment {
+                image_offset: 0,
+                memory_bytes: PAGE_SIZE,
+                permissions: SegmentPermissions::ReadExecute as u32,
+                payload: &[0x90, 0xc3],
+            }],
         );
+        let mut package =
+            encode_kex_package(&executable, &[]).unwrap_or_else(|_| std::process::abort());
+        let oversize = u64::try_from(ApplicationLimits::STANDARD.encoded_bytes)
+            .unwrap_or_else(|_| unreachable!())
+            + 1;
+        write_u64(&mut package, PACKAGE_HEADER_EXECUTABLE_BYTES, oversize);
+        let mut reads = 0;
+        assert_eq!(
+            parse_streamed_kex_package(
+                package.len() as u64,
+                |offset, destination| {
+                    reads += 1;
+                    let start = usize::try_from(offset).map_err(|_| ())?;
+                    let count = destination.len().min(package.len() - start);
+                    destination[..count].copy_from_slice(&package[start..start + count]);
+                    Ok(count)
+                },
+                Target::X86_64,
+                ABI_MINOR,
+                LoadPlacement::STANDARD,
+            )
+            .err(),
+            Some(StreamError::Package(PackageError::InvalidLayout))
+        );
+        assert!(reads <= 2);
     }
 
     #[test]
@@ -3646,7 +3834,7 @@ mod tests {
                 Err(ParseError::InvalidLayout)
             );
         }
-        for offset in [HEADER_FLAGS, HEADER_RESERVED16, HEADER_RESERVED32] {
+        for offset in [HEADER_FLAGS, HEADER_RESERVED16] {
             let mut bytes = valid.clone();
             bytes[offset] = 1;
             assert_eq!(
@@ -3752,32 +3940,65 @@ mod tests {
             Err(ParseError::OverlappingSegments)
         );
 
-        let sparse = artifact(
+        // A sparse image is admitted, and its declared span covers it exactly.
+        let mut sparse = artifact(
             Target::X86_64,
             &[TestSegment {
-                image_offset: ApplicationLimits::STANDARD.image_span_bytes,
+                image_offset: 64 * KEX_V1_IMAGE_ALIGNMENT,
                 memory_bytes: PAGE_SIZE,
                 permissions: SegmentPermissions::ReadExecute as u32,
                 payload: &[1],
             }],
         );
+        put_u64(
+            &mut sparse,
+            HEADER_ENTRY_OFFSET,
+            64 * KEX_V1_IMAGE_ALIGNMENT,
+        );
+        let sparse_plan =
+            parse_standard(&sparse, Target::X86_64).unwrap_or_else(|_| unreachable!());
         assert_eq!(
-            parse_standard(&sparse, Target::X86_64),
+            sparse_plan.layout().startup_address(),
+            LoadPlacement::STANDARD.image_base + 65 * KEX_V1_IMAGE_ALIGNMENT
+        );
+
+        // Shrinking the declared span below the image rejects the segment.
+        let mut shrunk = sparse.clone();
+        put_u32(
+            &mut shrunk,
+            HEADER_IMAGE_SPAN_PAGES,
+            u32::try_from(64 * KEX_V1_IMAGE_ALIGNMENT / PAGE_SIZE)
+                .unwrap_or_else(|_| unreachable!()),
+        );
+        assert_eq!(
+            parse_standard(&shrunk, Target::X86_64),
             Err(ParseError::ImageSpanExceeded)
         );
 
-        let too_many_pages = artifact(
-            Target::X86_64,
-            &[TestSegment {
-                image_offset: 0,
-                memory_bytes: (ApplicationLimits::STANDARD.image_pages + 1) * PAGE_SIZE,
-                permissions: SegmentPermissions::ReadExecute as u32,
-                payload: &[1],
-            }],
+        // Growing it past the canonical span reserves unmapped address space.
+        let mut padded = sparse.clone();
+        put_u32(
+            &mut padded,
+            HEADER_IMAGE_SPAN_PAGES,
+            u32::try_from(66 * KEX_V1_IMAGE_ALIGNMENT / PAGE_SIZE)
+                .unwrap_or_else(|_| unreachable!()),
         );
         assert_eq!(
-            parse_standard(&too_many_pages, Target::X86_64),
-            Err(ParseError::ImagePagesExceeded)
+            parse_standard(&padded, Target::X86_64),
+            Err(ParseError::InvalidImageSpan)
+        );
+
+        // A span above the standard policy is refused before any segment work.
+        let mut oversize = sparse.clone();
+        put_u32(
+            &mut oversize,
+            HEADER_IMAGE_SPAN_PAGES,
+            u32::try_from(MAX_IMAGE_SPAN_PAGES + KEX_V1_IMAGE_ALIGNMENT / PAGE_SIZE)
+                .unwrap_or_else(|_| unreachable!()),
+        );
+        assert_eq!(
+            parse_standard(&oversize, Target::X86_64),
+            Err(ParseError::InvalidImageSpan)
         );
 
         let mut overflowing = valid_artifact(Target::X86_64);
@@ -3842,7 +4063,7 @@ mod tests {
         );
 
         let limits = ApplicationLimits {
-            resident_pages: 70,
+            resident_pages: 16,
             ..ApplicationLimits::STANDARD
         };
         assert_eq!(
@@ -3908,7 +4129,9 @@ mod tests {
             );
             assert_eq!(
                 plan.charges().reserved_resident_pages(),
-                plan.charges().private_pages() + limits.table_pages(),
+                plan.charges().private_pages()
+                    + maximum_table_pages(plan.charges().private_pages())
+                        .unwrap_or_else(|| unreachable!()),
                 "{name}"
             );
             for pair in segments.windows(2) {
@@ -3920,9 +4143,6 @@ mod tests {
             assert!(segments.iter().all(|segment| {
                 !(segment.permissions().writable() && segment.permissions().executable())
             }));
-            if name.contains("max-encoded") {
-                assert_eq!(bytes.len(), limits.encoded_bytes(), "{name}");
-            }
             if name.contains("max-records") {
                 assert_eq!(segments.len(), limits.load_records(), "{name}");
             }
@@ -3930,12 +4150,16 @@ mod tests {
                 let last = segments.last().unwrap_or_else(|| unreachable!());
                 assert_eq!(
                     last.image_offset() + last.memory_bytes(),
-                    limits.image_span_bytes(),
+                    limits.maximum_image_span_bytes(),
                     "{name}"
                 );
             }
-            if name.contains("max-pages") {
-                assert_eq!(image_pages, limits.image_pages(), "{name}");
+            if name.contains("minimum-span") {
+                let last = segments.last().unwrap_or_else(|| unreachable!());
+                assert!(
+                    last.image_offset() + last.memory_bytes() <= KEX_V1_IMAGE_ALIGNMENT,
+                    "{name}"
+                );
             }
             if name.contains("max-stack-heap") {
                 assert_eq!(plan.stack_pages(), limits.stack_pages().1, "{name}");
@@ -4027,7 +4251,9 @@ mod tests {
             );
             assert_eq!(
                 plan.charges().reserved_resident_pages(),
-                plan.charges().private_pages() + ApplicationLimits::STANDARD.table_pages
+                plan.charges().private_pages()
+                    + maximum_table_pages(plan.charges().private_pages())
+                        .unwrap_or_else(|| unreachable!())
             );
         }
     }

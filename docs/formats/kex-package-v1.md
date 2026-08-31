@@ -22,7 +22,7 @@ All integers are unsigned little-endian. The header is exactly 48 bytes:
 | 20 | 4 | manifest bytes | exact canonical KCAP v1 length |
 | 24 | 4 | executable offset | `48 + manifest_bytes` |
 | 28 | 4 | completion offset | zero without bit 0; otherwise exact executable end |
-| 32 | 8 | executable bytes | nonzero and at most 32 MiB |
+| 32 | 8 | executable bytes | nonzero and at most the KEX v1 encoded ceiling |
 | 40 | 8 | package bytes | exact input length |
 
 The KCAP bytes immediately follow the header. The KEX executable immediately
@@ -30,8 +30,10 @@ follows KCAP. When flag bit 0 is set, one nonempty canonical CMPL v1 artifact
 immediately follows the executable and consumes the remainder of the package.
 Gaps, padding, reordered members, unbound trailing bytes, unknown flags, and
 unsupported versions are noncanonical. A complete package is at most
-33,571,904 bytes: a 48-byte header, the 1,040-byte maximum manifest, the 32 MiB
-maximum executable, and the 16 KiB maximum completion artifact.
+2,147,501,120 bytes: a 48-byte header, the 1,040-byte maximum manifest, the
+2 GiB maximum executable, and the 16 KiB maximum completion artifact. The
+executable ceiling follows the KEX v1 image span; see
+[kex-v1](kex-v1.md).
 
 KCAP and CMPL remain independently versioned encodings, but neither is
 installed as a separate file. KCAP inclusion proves that an empty

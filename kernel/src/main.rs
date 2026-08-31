@@ -9258,6 +9258,59 @@ mod firmware {
             .ok_or(())
     }
 
+    /// Zero one freshly reserved private range in bounded substeps.
+    ///
+    /// A launch may now reserve far more pages than the former fixed image
+    /// ceiling allowed, so the zeroing substep is bounded by the same
+    /// configured quantum that ADR 0048 applies to private mappings rather
+    /// than scaling with the total request.
+    fn zero_private_range_in_quanta(
+        range: PhysicalRange,
+        operation_quantum_pages: u64,
+    ) -> Result<(), ()> {
+        if operation_quantum_pages == 0 {
+            return Err(());
+        }
+        let mut start = range.start();
+        let mut remaining = range.page_count();
+        while remaining != 0 {
+            let quantum = remaining.min(operation_quantum_pages);
+            let chunk = PhysicalRange::from_pages(start, quantum).map_err(|_| ())?;
+            troe_machine::zero_physical_range(chunk).map_err(|_| ())?;
+            start = chunk.end();
+            remaining -= quantum;
+        }
+        if start != range.end() {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    /// Reserve one launch's private frames and zero them in bounded substeps.
+    ///
+    /// Zeroing happens here rather than during preparation so no derived range
+    /// is published over frames that still hold a previous owner's bytes, and
+    /// so the substep bound applies to every caller.
+    fn reserve_zeroed_private_range(
+        accounting: &mut OwnedAccounting,
+        resource_pages: u64,
+    ) -> Result<PhysicalRange, ()> {
+        let complete = accounting
+            .frames
+            .allocate_contiguous(resource_pages, 1)
+            .map_err(|_| ())?;
+        if zero_private_range_in_quanta(
+            complete,
+            accounting.memory_policy.operation_quantum_pages(),
+        )
+        .is_err()
+        {
+            accounting.frames.free_range(complete).map_err(|_| ())?;
+            return Err(());
+        }
+        Ok(complete)
+    }
+
     #[allow(clippy::too_many_lines)]
     fn allocate_application<P: NativeApplicationPlan>(
         accounting: &mut OwnedAccounting,
@@ -9286,10 +9339,7 @@ mod firmware {
         {
             return Err(());
         }
-        let complete = accounting
-            .frames
-            .allocate_contiguous(resource_pages, 1)
-            .map_err(|_| ())?;
+        let complete = reserve_zeroed_private_range(accounting, resource_pages)?;
         let derived = (|| {
             let image = PhysicalRange::from_pages(complete.start(), plan.charges().image_pages())
                 .map_err(|_| ())?;
@@ -9379,7 +9429,6 @@ mod firmware {
         allocation: &ApplicationAllocation,
         plan: &LoadPlan<'_>,
     ) -> Result<(), ()> {
-        troe_machine::zero_physical_range(allocation.complete).map_err(|_| ())?;
         let mut physical_start = allocation.image.start();
         for segment in plan.segments() {
             let physical =
@@ -9402,7 +9451,6 @@ mod firmware {
         package: &StreamedKexPackage,
         read_at: &mut impl FnMut(u64, &mut [u8]) -> Result<usize, ()>,
     ) -> Result<(), ()> {
-        troe_machine::zero_physical_range(allocation.complete).map_err(|_| ())?;
         stream_verified_segments(
             package,
             |offset, destination| read_at(offset, destination),

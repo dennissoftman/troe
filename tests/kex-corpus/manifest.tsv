@@ -6,9 +6,9 @@ native-invalid-call-x86_64.kex	x86_64	ok
 native-unexpected-return-x86_64.kex	x86_64	ok
 valid-standard-max-records-x86_64.kex	x86_64	ok
 valid-standard-max-span-x86_64.kex	x86_64	ok
-valid-standard-max-pages-x86_64.kex	x86_64	ok
+valid-standard-minimum-span-x86_64.kex	x86_64	ok
 valid-standard-max-stack-heap-x86_64.kex	x86_64	ok
-valid-standard-max-encoded-x86_64.kex	x86_64	ok
+valid-standard-large-image-x86_64.kex	x86_64	ok
 reject-truncated-header-x86_64.kex	x86_64	TruncatedHeader
 reject-invalid-magic-x86_64.kex	x86_64	InvalidMagic
 reject-container-major-x86_64.kex	x86_64	UnsupportedContainerVersion
@@ -20,7 +20,11 @@ reject-records-offset-x86_64.kex	x86_64	InvalidLayout
 reject-payload-offset-x86_64.kex	x86_64	InvalidLayout
 reject-header-flags-x86_64.kex	x86_64	NonzeroReserved
 reject-header-reserved16-x86_64.kex	x86_64	NonzeroReserved
-reject-header-reserved32-x86_64.kex	x86_64	NonzeroReserved
+reject-image-span-zero-x86_64.kex	x86_64	InvalidImageSpan
+reject-image-span-unaligned-x86_64.kex	x86_64	InvalidImageSpan
+reject-image-span-above-maximum-x86_64.kex	x86_64	InvalidImageSpan
+reject-image-span-noncanonical-x86_64.kex	x86_64	InvalidImageSpan
+reject-image-span-legacy-nonzero-x86_64.kex	x86_64	NonzeroReserved
 reject-record-reserved-x86_64.kex	x86_64	NonzeroReserved
 reject-abi-major-x86_64.kex	x86_64	UnsupportedAbi
 reject-abi-minor-x86_64.kex	x86_64	UnsupportedAbi
@@ -38,7 +42,6 @@ reject-segments-overlap-x86_64.kex	x86_64	OverlappingSegments
 reject-payload-gap-x86_64.kex	x86_64	NoncanonicalPayload
 reject-payload-trailing-x86_64.kex	x86_64	NoncanonicalPayload
 reject-image-span-exceeded-x86_64.kex	x86_64	ImageSpanExceeded
-reject-image-pages-exceeded-x86_64.kex	x86_64	ImagePagesExceeded
 reject-stack-below-minimum-x86_64.kex	x86_64	StackBudgetExceeded
 reject-stack-above-maximum-x86_64.kex	x86_64	StackBudgetExceeded
 reject-heap-above-maximum-x86_64.kex	x86_64	HeapBudgetExceeded
@@ -52,9 +55,9 @@ native-unexpected-return-aarch64.kex	aarch64	ok
 native-thread-pointer-aarch64.kex	aarch64	ok
 valid-standard-max-records-aarch64.kex	aarch64	ok
 valid-standard-max-span-aarch64.kex	aarch64	ok
-valid-standard-max-pages-aarch64.kex	aarch64	ok
+valid-standard-minimum-span-aarch64.kex	aarch64	ok
 valid-standard-max-stack-heap-aarch64.kex	aarch64	ok
-valid-standard-max-encoded-aarch64.kex	aarch64	ok
+valid-standard-large-image-aarch64.kex	aarch64	ok
 reject-truncated-header-aarch64.kex	aarch64	TruncatedHeader
 reject-invalid-magic-aarch64.kex	aarch64	InvalidMagic
 reject-container-major-aarch64.kex	aarch64	UnsupportedContainerVersion
@@ -66,7 +69,11 @@ reject-records-offset-aarch64.kex	aarch64	InvalidLayout
 reject-payload-offset-aarch64.kex	aarch64	InvalidLayout
 reject-header-flags-aarch64.kex	aarch64	NonzeroReserved
 reject-header-reserved16-aarch64.kex	aarch64	NonzeroReserved
-reject-header-reserved32-aarch64.kex	aarch64	NonzeroReserved
+reject-image-span-zero-aarch64.kex	aarch64	InvalidImageSpan
+reject-image-span-unaligned-aarch64.kex	aarch64	InvalidImageSpan
+reject-image-span-above-maximum-aarch64.kex	aarch64	InvalidImageSpan
+reject-image-span-noncanonical-aarch64.kex	aarch64	InvalidImageSpan
+reject-image-span-legacy-nonzero-aarch64.kex	aarch64	NonzeroReserved
 reject-record-reserved-aarch64.kex	aarch64	NonzeroReserved
 reject-abi-major-aarch64.kex	aarch64	UnsupportedAbi
 reject-abi-minor-aarch64.kex	aarch64	UnsupportedAbi
@@ -84,7 +91,6 @@ reject-segments-overlap-aarch64.kex	aarch64	OverlappingSegments
 reject-payload-gap-aarch64.kex	aarch64	NoncanonicalPayload
 reject-payload-trailing-aarch64.kex	aarch64	NoncanonicalPayload
 reject-image-span-exceeded-aarch64.kex	aarch64	ImageSpanExceeded
-reject-image-pages-exceeded-aarch64.kex	aarch64	ImagePagesExceeded
 reject-stack-below-minimum-aarch64.kex	aarch64	StackBudgetExceeded
 reject-stack-above-maximum-aarch64.kex	aarch64	StackBudgetExceeded
 reject-heap-above-maximum-aarch64.kex	aarch64	HeapBudgetExceeded
