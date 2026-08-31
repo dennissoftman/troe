@@ -947,6 +947,7 @@ troe/
 │   │   └── troe-core/        portable types and bounded streams
 │   ├── storage/          filesystem contract, providers, formats, and policy
 │   │   ├── troe-fs-api/      error, metadata, path, clock, and provider contract
+│   │   ├── troe-fs-client/   namespace client surface without composition authority
 │   │   ├── troe-fs-*/        KEFS, RAMFS, ext4, FAT32, and StateFS providers
 │   │   ├── troe-fmt-*/       GPT, BMNT, CSPK, SCFG, and PRGN codecs
 │   │   ├── troe-txslot/      dual-slot crash-consistent transactions
