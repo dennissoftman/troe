@@ -123,6 +123,11 @@ class RepositoryPolicyTests(unittest.TestCase):
         files = sorted(path.relative_to(root).as_posix() for path in root.rglob("*"))
         self.assertEqual(files, ["SKILL.md"])
         source = (root / "SKILL.md").read_text(encoding="utf-8")
+        # Agents that discover skills under `.claude/skills` read their own copy,
+        # so the two must not drift into different authoring guidance.
+        mirror = REPO_ROOT / ".claude" / "skills" / "write-kex-apps" / "SKILL.md"
+        self.assertTrue(mirror.is_file(), f"{mirror} is missing")
+        self.assertEqual(mirror.read_text(encoding="utf-8"), source)
         self.assertLessEqual(len(source.splitlines()), 120)
         self.assertTrue(source.startswith("---\nname: write-kex-apps\ndescription: "))
         self.assertIn("cargo kex build", source)
