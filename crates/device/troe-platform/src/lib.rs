@@ -66,6 +66,10 @@ pub enum MmioRole {
     GicV2Distributor,
     /// Arm `GICv2` CPU-interface aperture.
     GicV2CpuInterface,
+    /// Arm `GICv3` distributor aperture.
+    GicV3Distributor,
+    /// Arm `GICv3` redistributor region, one strided frame pair per CPU.
+    GicV3Redistributor,
     /// Arm PL011 UART page.
     Pl011,
     /// Modern virtio-MMIO slot aperture.
@@ -316,6 +320,16 @@ pub enum InterruptControllerKind {
         /// Distributor CPU-target mask for statically routed shared interrupts.
         cpu_target_mask: u8,
     },
+    /// GIC version 3 distributor plus per-CPU redistributors.
+    ///
+    /// The CPU interface is reached through `ICC_*` system registers rather
+    /// than an MMIO aperture, so only the distributor and the redistributor
+    /// region are described here. Shared interrupts are routed by affinity
+    /// instead of the version 2 target mask.
+    GicV3 {
+        /// Bytes between consecutive per-CPU redistributor frame pairs.
+        redistributor_stride: u64,
+    },
 }
 
 /// Monotonic/execution-lease timer composition.
@@ -536,7 +550,7 @@ impl<'a> PlatformDescriptor<'a> {
             (
                 Architecture::Aarch64,
                 ConsoleKind::Pl011 { clock_hz },
-                InterruptControllerKind::GicV2 { cpu_target_mask },
+                InterruptControllerKind::GicV2 { .. } | InterruptControllerKind::GicV3 { .. },
                 TimerKind::Aarch64Generic,
                 PowerKind::PsciHvc,
                 KeyboardKind::None,
@@ -551,7 +565,7 @@ impl<'a> PlatformDescriptor<'a> {
             ) => validate_aarch64_composition(
                 self,
                 clock_hz,
-                cpu_target_mask,
+                self.controller,
                 slot_bytes,
                 slot_count,
                 first_interrupt,
@@ -807,7 +821,7 @@ fn validate_x86_common_composition(
 fn validate_aarch64_composition(
     descriptor: PlatformDescriptor<'_>,
     clock_hz: u32,
-    cpu_target_mask: u8,
+    controller: InterruptControllerKind,
     slot_bytes: u32,
     slot_count: u16,
     first_interrupt: u32,
@@ -815,9 +829,23 @@ fn validate_aarch64_composition(
     network_trigger: TriggerMode,
     network_polarity: Polarity,
 ) -> Result<(), PlatformError> {
+    // The two GIC generations describe different apertures: version 2 has an
+    // MMIO CPU interface, version 3 reaches it through `ICC_*` system registers
+    // and instead needs one strided redistributor frame pair per CPU.
+    let (distributor_role, second_role) = match controller {
+        InterruptControllerKind::GicV2 { .. } => {
+            (MmioRole::GicV2Distributor, MmioRole::GicV2CpuInterface)
+        }
+        InterruptControllerKind::GicV3 { .. } => {
+            (MmioRole::GicV3Distributor, MmioRole::GicV3Redistributor)
+        }
+        InterruptControllerKind::X86Apic => {
+            return Err(PlatformError::IncompatibleComposition);
+        }
+    };
     for role in [
-        MmioRole::GicV2Distributor,
-        MmioRole::GicV2CpuInterface,
+        distributor_role,
+        second_role,
         MmioRole::Pl011,
         MmioRole::VirtioMmio,
     ] {
@@ -825,9 +853,22 @@ fn validate_aarch64_composition(
     }
     let serial_interrupt = require_interrupt(descriptor.interrupts, InterruptRole::Serial)?;
     let timer_interrupt = require_interrupt(descriptor.interrupts, InterruptRole::Timer)?;
-    let distributor = require_mmio(descriptor.mmio, MmioRole::GicV2Distributor)?;
-    let cpu_interface = require_mmio(descriptor.mmio, MmioRole::GicV2CpuInterface)?;
+    let distributor = require_mmio(descriptor.mmio, distributor_role)?;
+    let cpu_interface = require_mmio(descriptor.mmio, second_role)?;
     let aperture = require_mmio(descriptor.mmio, MmioRole::VirtioMmio)?;
+    // A version 2 target mask must name exactly one CPU; a version 3 stride
+    // must hold both the RD and SGI frames of one redistributor.
+    let controller_ok = match controller {
+        InterruptControllerKind::GicV2 { cpu_target_mask } => cpu_target_mask.count_ones() == 1,
+        InterruptControllerKind::GicV3 {
+            redistributor_stride,
+        } => {
+            redistributor_stride >= GICV3_REDISTRIBUTOR_MINIMUM_STRIDE
+                && redistributor_stride.is_power_of_two()
+                && cpu_interface.byte_len >= redistributor_stride
+        }
+        InterruptControllerKind::X86Apic => false,
+    };
     let described = u64::from(slot_bytes)
         .checked_mul(u64::from(slot_count))
         .ok_or(PlatformError::InvalidRange)?;
@@ -839,7 +880,7 @@ fn validate_aarch64_composition(
         || descriptor.interrupts.len() != 2
         || distributor.byte_len < 0x1000
         || cpu_interface.byte_len < 0x1000
-        || cpu_target_mask.count_ones() != 1
+        || !controller_ok
         || clock_hz < 16 * 115_200
         || slot_bytes < 0x118
         || !slot_bytes.is_multiple_of(4)
@@ -1208,6 +1249,16 @@ pub const VALIDATED_X86_64_UEFI_VIRTIO_PCI: ValidatedPlatform<'static> = Validat
     descriptor: &X86_64_UEFI_VIRTIO_PCI,
 };
 
+/// Smallest `GICv3` redistributor stride: one 64 KiB RD frame plus one SGI
+/// frame. Implementations with virtual LPIs use a larger stride, never smaller.
+pub const GICV3_REDISTRIBUTOR_MINIMUM_STRIDE: u64 = 0x2_0000;
+
+const VIRT_GICV3_MMIO: [MmioRegion; 4] = [
+    MmioRegion::new(MmioRole::GicV3Distributor, 0x0800_0000, 0x0001_0000),
+    MmioRegion::new(MmioRole::GicV3Redistributor, 0x080a_0000, 0x00f6_0000),
+    MmioRegion::new(MmioRole::Pl011, 0x0900_0000, 0x1000),
+    MmioRegion::new(MmioRole::VirtioMmio, 0x0a00_0000, 0x4000),
+];
 const VIRT_MMIO: [MmioRegion; 4] = [
     MmioRegion::new(MmioRole::GicV2Distributor, 0x0800_0000, 0x0001_0000),
     MmioRegion::new(MmioRole::GicV2CpuInterface, 0x0801_0000, 0x0001_0000),
@@ -1233,19 +1284,23 @@ const VIRT_INTERRUPTS: [InterruptRoute; 2] = [
     ),
 ];
 
-/// Exact pinned `AArch64` QEMU `virt` `GICv2` UEFI platform descriptor.
+/// Exact pinned `AArch64` QEMU `virt` `GICv3` UEFI platform descriptor.
+///
+/// Version 3 rather than version 2 because every shipping `AArch64` system
+/// implements `GICv3` or later, and the SBSA reference platform offers no
+/// choice at all.
 pub const AARCH64_VIRT_UEFI: PlatformDescriptor<'static> = PlatformDescriptor::new(
     PlatformId::AARCH64_VIRT_UEFI,
     "aarch64-virt-uefi",
     Architecture::Aarch64,
-    &VIRT_MMIO,
+    &VIRT_GICV3_MMIO,
     &[],
     &VIRT_INTERRUPTS,
     ConsoleKind::Pl011 {
         clock_hz: 24_000_000,
     },
-    InterruptControllerKind::GicV2 {
-        cpu_target_mask: 0x01,
+    InterruptControllerKind::GicV3 {
+        redistributor_stride: GICV3_REDISTRIBUTOR_MINIMUM_STRIDE,
     },
     TimerKind::Aarch64Generic,
     PowerKind::PsciHvc,
@@ -1276,14 +1331,14 @@ pub const AARCH64_UEFI_VIRTIO_MMIO: PlatformDescriptor<'static> = PlatformDescri
     PlatformId::AARCH64_UEFI_VIRTIO_MMIO,
     "aarch64-uefi-virtio-mmio",
     Architecture::Aarch64,
-    &VIRT_MMIO,
+    &VIRT_GICV3_MMIO,
     &[],
     &VIRT_INTERRUPTS,
     ConsoleKind::Pl011 {
         clock_hz: 24_000_000,
     },
-    InterruptControllerKind::GicV2 {
-        cpu_target_mask: 0x01,
+    InterruptControllerKind::GicV3 {
+        redistributor_stride: GICV3_REDISTRIBUTOR_MINIMUM_STRIDE,
     },
     TimerKind::Aarch64Generic,
     PowerKind::PsciHvc,
@@ -1371,17 +1426,22 @@ mod tests {
             Some(0x0a00_0000)
         );
         assert_eq!(
-            virt.mmio(MmioRole::GicV2Distributor).map(MmioRegion::base),
+            virt.mmio(MmioRole::GicV3Distributor).map(MmioRegion::base),
             Some(0x0800_0000)
         );
-        assert_eq!(
-            virt.mmio(MmioRole::GicV2CpuInterface).map(MmioRegion::base),
-            Some(0x0801_0000)
-        );
+        // The redistributor region replaces the version 2 CPU interface, and
+        // must hold one strided frame pair per CPU the machine can start.
+        let redistributors = virt
+            .mmio(MmioRole::GicV3Redistributor)
+            .unwrap_or_else(|| unreachable!());
+        assert_eq!(redistributors.base(), 0x080a_0000);
+        assert_eq!(redistributors.byte_len(), 0x00f6_0000);
+        assert!(redistributors.byte_len() >= GICV3_REDISTRIBUTOR_MINIMUM_STRIDE);
+        assert_eq!(virt.mmio(MmioRole::GicV2CpuInterface), None);
         assert_eq!(
             virt.interrupt_controller(),
-            InterruptControllerKind::GicV2 {
-                cpu_target_mask: 0x01
+            InterruptControllerKind::GicV3 {
+                redistributor_stride: GICV3_REDISTRIBUTOR_MINIMUM_STRIDE
             }
         );
         let discovered_x86 = X86_64_UEFI_VIRTIO_PCI

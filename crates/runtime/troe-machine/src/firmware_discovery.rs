@@ -480,17 +480,19 @@ fn validate_aarch64(
         .map_err(|_| DiscoveryError::PlatformDescriptor)?;
     let gic = discovered.gic().ok_or(DiscoveryError::ArmGic)?;
     let distributor = platform
-        .mmio(MmioRole::GicV2Distributor)
+        .mmio(MmioRole::GicV3Distributor)
         .ok_or(DiscoveryError::ArmGic)?;
-    let cpu = platform
-        .mmio(MmioRole::GicV2CpuInterface)
+    let redistributors = platform
+        .mmio(MmioRole::GicV3Redistributor)
         .ok_or(DiscoveryError::ArmGic)?;
-    if gic.version() != GicVersion::V2
+    // The second region is the redistributor block rather than a CPU
+    // interface, which version 3 reaches through system registers instead.
+    if gic.version() != GicVersion::V3
         || gic.regions().count() != 2
         || gic.distributor().base() != distributor.base()
         || gic.distributor().byte_len() != distributor.byte_len()
-        || gic.cpu_or_redistributor().base() != cpu.base()
-        || gic.cpu_or_redistributor().byte_len() != cpu.byte_len()
+        || gic.cpu_or_redistributor().base() != redistributors.base()
+        || gic.cpu_or_redistributor().byte_len() != redistributors.byte_len()
     {
         return Err(DiscoveryError::ArmGic);
     }

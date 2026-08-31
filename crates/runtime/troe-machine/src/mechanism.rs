@@ -2350,24 +2350,149 @@ fn aarch64_mmio(role: troe_platform::MmioRole) -> Result<MmioResource, InputInte
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
-fn aarch64_gicv2_cpu_target_mask() -> Result<u8, InputInterruptError> {
+mod gicv3 {
+    //! `GICv3` register geometry.
+    //!
+    //! The CPU interface is reached through `ICC_*` system registers rather
+    //! than an MMIO aperture, so only the distributor and the per-CPU
+    //! redistributor frames appear here.
+
+    /// Redistributor wake register, in the first frame of a redistributor.
+    pub const GICR_WAKER: usize = 0x0014;
+    /// Processor-sleep request bit written to leave the sleep state.
+    pub const GICR_WAKER_PROCESSOR_SLEEP: u32 = 1 << 1;
+    /// Children-asleep acknowledgement, polled until the wake completes.
+    pub const GICR_WAKER_CHILDREN_ASLEEP: u32 = 1 << 2;
+    /// Second 64 KiB frame, holding the SGI and PPI registers.
+    pub const GICR_SGI_FRAME: usize = 0x1_0000;
+    /// Group select for the 32 SGIs and PPIs of one redistributor.
+    pub const GICR_IGROUPR0: usize = 0x0080;
+    /// Set-enable for the 32 SGIs and PPIs of one redistributor.
+    pub const GICR_ISENABLER0: usize = 0x0100;
+    /// Clear-enable for the 32 SGIs and PPIs of one redistributor.
+    pub const GICR_ICENABLER0: usize = 0x0180;
+    /// Clear-pending for the 32 SGIs and PPIs of one redistributor.
+    pub const GICR_ICPENDR0: usize = 0x0280;
+    /// Byte-per-interrupt priorities for one redistributor.
+    pub const GICR_IPRIORITYR: usize = 0x0400;
+    /// Trigger configuration for the 16 private peripheral interrupts.
+    pub const GICR_ICFGR1: usize = 0x0c04;
+    /// One 64-bit affinity route per shared interrupt.
+    pub const GICD_IROUTER: usize = 0x6000;
+    /// Enable affinity routing, without which the version 3 model is inactive.
+    pub const GICD_CTLR_ARE_NS: u32 = 1 << 4;
+    /// Enable non-secure group 1, the group every interrupt here belongs to.
+    pub const GICD_CTLR_ENABLE_GRP1NS: u32 = 1 << 1;
+    /// Bounded wait for a redistributor to acknowledge a wake request.
+    pub const WAKE_POLL_LIMIT: u32 = 1_000_000;
+}
+
+/// Redistributor frame base for the running CPU.
+///
+/// The supported profiles are single-vCPU, so the first frame is this CPU's.
+/// A multi-CPU port would index by the affinity read from `MPIDR_EL1`.
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn aarch64_gicv3_redistributor() -> Result<usize, InputInterruptError> {
     let controller = crate::selected_platform()
         .map_err(|_| InputInterruptError::InvalidResource)?
         .interrupt_controller();
-    let troe_platform::InterruptControllerKind::GicV2 { cpu_target_mask } = controller else {
+    let troe_platform::InterruptControllerKind::GicV3 {
+        redistributor_stride,
+    } = controller
+    else {
         return Err(InputInterruptError::InvalidResource);
     };
-    Ok(cpu_target_mask)
+    let region = aarch64_mmio(troe_platform::MmioRole::GicV3Redistributor)?;
+    if region.byte_len() < redistributor_stride {
+        return Err(InputInterruptError::InvalidResource);
+    }
+    usize::try_from(region.base_address()).map_err(|_| InputInterruptError::InvalidResource)
+}
+
+/// Affinity route naming the running CPU, for `GICD_IROUTER`.
+///
+/// Version 3 routes a shared interrupt by affinity rather than by the version 2
+/// target bitmask, so the value is assembled from `MPIDR_EL1` with the
+/// interrupt-routing mode left at "this affinity only".
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn aarch64_gicv3_affinity_route() -> u64 {
+    let mpidr: u64;
+    // SAFETY: MPIDR_EL1 is a read-only identification register at EL1.
+    unsafe {
+        core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack));
+    }
+    // Aff3 sits at bits 39..32 of MPIDR and moves to bits 39..32 of IROUTER,
+    // while Aff2..Aff0 keep their positions in the low word.
+    (mpidr & 0x00ff_ffff) | ((mpidr >> 32) & 0xff) << 32
+}
+
+/// Bring this CPU's redistributor out of sleep so it can deliver interrupts.
+///
+/// # Safety
+///
+/// The redistributor aperture must be mapped and owned by the caller.
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+unsafe fn gicv3_wake_redistributor(redistributor: usize) -> Result<(), InputInterruptError> {
+    // SAFETY: GICR_WAKER is within the owned redistributor frame.
+    unsafe {
+        let waker = mmio_read32(redistributor + gicv3::GICR_WAKER);
+        mmio_write32(
+            redistributor + gicv3::GICR_WAKER,
+            waker & !gicv3::GICR_WAKER_PROCESSOR_SLEEP,
+        );
+        // The wake is asynchronous, so the acknowledgement is polled rather
+        // than assumed. A bounded wait keeps a dead redistributor from
+        // hanging the boot with no diagnostic.
+        for _ in 0..gicv3::WAKE_POLL_LIMIT {
+            if mmio_read32(redistributor + gicv3::GICR_WAKER) & gicv3::GICR_WAKER_CHILDREN_ASLEEP
+                == 0
+            {
+                return Ok(());
+            }
+            core::hint::spin_loop();
+        }
+    }
+    Err(InputInterruptError::InvalidResource)
+}
+
+/// Enable the system-register CPU interface for non-secure group 1.
+///
+/// # Safety
+///
+/// Must run with interrupt delivery masked, before any interrupt is enabled.
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+unsafe fn gicv3_enable_cpu_interface() {
+    // SAFETY: These are the architected GIC CPU-interface system registers.
+    // SRE is enabled first because the remaining writes are only defined once
+    // the system-register interface is active.
+    unsafe {
+        let sre: u64;
+        core::arch::asm!("mrs {}, icc_sre_el1", out(reg) sre, options(nomem, nostack));
+        core::arch::asm!(
+            "msr icc_sre_el1, {}",
+            "isb",
+            in(reg) sre | 1,
+            options(nomem, nostack)
+        );
+        core::arch::asm!("msr icc_pmr_el1, {}", in(reg) 0xff_u64, options(nomem, nostack));
+        core::arch::asm!("msr icc_bpr1_el1, {}", in(reg) 0_u64, options(nomem, nostack));
+        core::arch::asm!(
+            "msr icc_igrpen1_el1, {}",
+            "isb",
+            in(reg) 1_u64,
+            options(nomem, nostack)
+        );
+    }
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 fn architecture_input_device_ranges() -> Result<[Option<PhysicalRange>; 3], InputInterruptError> {
-    let distributor = aarch64_mmio(troe_platform::MmioRole::GicV2Distributor)?;
-    let cpu_interface = aarch64_mmio(troe_platform::MmioRole::GicV2CpuInterface)?;
+    let distributor = aarch64_mmio(troe_platform::MmioRole::GicV3Distributor)?;
+    let redistributors = aarch64_mmio(troe_platform::MmioRole::GicV3Redistributor)?;
     let pl011 = aarch64_mmio(troe_platform::MmioRole::Pl011)?;
     Ok([
         Some(resource_page_range(distributor)?),
-        Some(resource_page_range(cpu_interface)?),
+        Some(resource_page_range(redistributors)?),
         Some(resource_page_range(pl011)?),
     ])
 }
@@ -2383,15 +2508,10 @@ fn architecture_initialize_input_interrupts(
     const GICD_ICENABLER: usize = 0x180;
     const GICD_ICPENDR: usize = 0x280;
     const GICD_IPRIORITYR: usize = 0x400;
-    const GICD_ITARGETSR: usize = 0x800;
     const GICD_ICFGR: usize = 0xc00;
-    const GICC_CTLR: usize = 0x000;
-    const GICC_PMR: usize = 0x004;
-    const GICC_BPR: usize = 0x008;
-
-    let gic_distributor = aarch64_mmio(troe_platform::MmioRole::GicV2Distributor)?;
-    let gic_cpu_interface = aarch64_mmio(troe_platform::MmioRole::GicV2CpuInterface)?;
-    let cpu_target_mask = aarch64_gicv2_cpu_target_mask()?;
+    let gic_distributor = aarch64_mmio(troe_platform::MmioRole::GicV3Distributor)?;
+    let redistributor = aarch64_gicv3_redistributor()?;
+    let affinity = aarch64_gicv3_affinity_route();
     let serial_route = crate::selected_platform()
         .map_err(|_| InputInterruptError::InvalidResource)?
         .interrupt(troe_platform::InterruptRole::Serial)
@@ -2403,8 +2523,6 @@ fn architecture_initialize_input_interrupts(
         usize::try_from(pl011.base_address()).map_err(|_| InputInterruptError::InvalidResource)?;
     let distributor = usize::try_from(gic_distributor.base_address())
         .map_err(|_| InputInterruptError::InvalidResource)?;
-    let cpu = usize::try_from(gic_cpu_interface.base_address())
-        .map_err(|_| InputInterruptError::InvalidResource)?;
     let intid = usize::try_from(serial_interrupt.line())
         .map_err(|_| InputInterruptError::InvalidResource)?;
     // SAFETY: GICD_TYPER is a read-only register inside the owned aperture.
@@ -2414,16 +2532,31 @@ fn architecture_initialize_input_interrupts(
     let interrupt_count = register_count
         .checked_mul(32)
         .ok_or(InputInterruptError::InvalidResource)?;
-    if intid >= interrupt_count {
+    // The serial line is a shared interrupt, so it lives in the distributor
+    // rather than in this CPU's redistributor.
+    if intid < 32 || intid >= interrupt_count {
         return Err(InputInterruptError::InterruptLineUnavailable);
     }
 
-    // SAFETY: All fallible profile validation is complete. The full GICv2
-    // aperture is mapped RW/NX and IRQ delivery remains masked while ownership
-    // is committed, so no failure can expose a partially initialized controller.
+    // SAFETY: All fallible profile validation is complete. The distributor and
+    // redistributor apertures are mapped RW/NX and IRQ delivery remains masked
+    // while ownership is committed, so no failure can expose a partially
+    // initialized controller.
     unsafe {
-        mmio_write32(cpu + GICC_CTLR, 0);
         mmio_write32(distributor + GICD_CTLR, 0);
+    }
+    // A redistributor delivers nothing until it is woken, and the wake is
+    // acknowledged asynchronously, so this must complete before any enable.
+    // SAFETY: the redistributor aperture is mapped and owned here.
+    unsafe { gicv3_wake_redistributor(redistributor)? };
+    // The private interrupts are banked in the redistributor rather than the
+    // distributor, so clearing the distributor alone would leave whatever the
+    // firmware enabled still live.
+    // SAFETY: the SGI frame is the second frame of the owned redistributor.
+    unsafe {
+        let sgi = redistributor + gicv3::GICR_SGI_FRAME;
+        mmio_write32(sgi + gicv3::GICR_ICENABLER0, u32::MAX);
+        mmio_write32(sgi + gicv3::GICR_ICPENDR0, u32::MAX);
     }
     for register in 0..register_count {
         let offset = register * 4;
@@ -2438,14 +2571,17 @@ fn architecture_initialize_input_interrupts(
     let bit = 1_u32 << (intid % 32);
     // SAFETY: The selected INTID was checked against GICD_TYPER.
     unsafe {
+        // Non-secure group 1, which is the only group this profile enables:
+        // the bit is set here where the version 2 model cleared it for group 0.
         let group = mmio_read32(distributor + GICD_IGROUPR + word * 4);
-        mmio_write32(distributor + GICD_IGROUPR + word * 4, group & !bit);
+        mmio_write32(distributor + GICD_IGROUPR + word * 4, group | bit);
         gicv2_update_byte(
             distributor + GICD_IPRIORITYR,
             intid,
             serial_route.priority(),
         );
-        gicv2_update_byte(distributor + GICD_ITARGETSR, intid, cpu_target_mask);
+        // Affinity routing replaces the version 2 target bitmask.
+        mmio_write64(distributor + gicv3::GICD_IROUTER + intid * 8, affinity);
         let config_address = distributor + GICD_ICFGR + (intid / 16) * 4;
         let config_shift = (intid % 16) * 2;
         let edge = match serial_route.trigger() {
@@ -2455,11 +2591,14 @@ fn architecture_initialize_input_interrupts(
         let config =
             (mmio_read32(config_address) & !(0b10 << config_shift)) | (edge << config_shift);
         mmio_write32(config_address, config);
+        // Affinity routing must be live before the interrupt is enabled,
+        // otherwise the route just written is not the one consulted.
+        mmio_write32(
+            distributor + GICD_CTLR,
+            gicv3::GICD_CTLR_ARE_NS | gicv3::GICD_CTLR_ENABLE_GRP1NS,
+        );
         mmio_write32(distributor + GICD_ISENABLER + word * 4, bit);
-        mmio_write32(cpu + GICC_PMR, 0xff);
-        mmio_write32(cpu + GICC_BPR, 0);
-        mmio_write32(cpu + GICC_CTLR, 1);
-        mmio_write32(distributor + GICD_CTLR, 1);
+        gicv3_enable_cpu_interface();
     }
 
     // SAFETY: Initialization still runs with IRQ delivery masked.
@@ -2482,11 +2621,6 @@ fn architecture_initialize_input_interrupts(
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 fn architecture_handle_input_interrupt(queue: &mut BoundedInputQueue) -> bool {
-    const GICC_IAR: usize = 0x00c;
-    const GICC_EOIR: usize = 0x010;
-    let Ok(gic_cpu_interface) = aarch64_mmio(troe_platform::MmioRole::GicV2CpuInterface) else {
-        return false;
-    };
     let Ok(serial_interrupt) = platform_interrupt(troe_platform::InterruptRole::Serial) else {
         return false;
     };
@@ -2499,12 +2633,19 @@ fn architecture_handle_input_interrupt(queue: &mut BoundedInputQueue) -> bool {
     let Ok(pl011_base) = usize::try_from(pl011.base_address()) else {
         return false;
     };
-    let Ok(cpu) = usize::try_from(gic_cpu_interface.base_address()) else {
-        return false;
-    };
-    // SAFETY: GICC_IAR acknowledges the highest-priority pending interrupt.
-    let acknowledge = unsafe { mmio_read32(cpu + GICC_IAR) };
-    let intid = acknowledge & 0x03ff;
+    // SAFETY: ICC_IAR1_EL1 acknowledges the highest-priority pending group 1
+    // interrupt. The read is the acknowledgement, so its value must reach
+    // ICC_EOIR1_EL1 verbatim on every path that consumes it.
+    let acknowledge: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {}, icc_iar1_el1",
+            out(reg) acknowledge,
+            options(nomem, nostack)
+        );
+    }
+    // Version 3 widens the INTID field; the spurious values stay 1020..1023.
+    let intid = u32::try_from(acknowledge & 0x00ff_ffff).unwrap_or(u32::MAX);
     let execution_timer = intid == timer_interrupt.line();
     if execution_timer {
         architecture_disarm_execution_timer();
@@ -2528,8 +2669,14 @@ fn architecture_handle_input_interrupt(queue: &mut BoundedInputQueue) -> bool {
         aarch64_drain_serial(queue);
     }
     if intid < 1020 {
-        // SAFETY: A non-spurious IAR value must be returned verbatim to EOIR.
-        unsafe { mmio_write32(cpu + GICC_EOIR, acknowledge) };
+        // SAFETY: A non-spurious acknowledgement must be returned verbatim.
+        unsafe {
+            core::arch::asm!(
+                "msr icc_eoir1_el1, {}",
+                in(reg) acknowledge,
+                options(nomem, nostack)
+            );
+        }
     }
     execution_timer
 }
@@ -2543,7 +2690,6 @@ fn architecture_prepare_network_interrupt(
     const GICD_ICENABLER: usize = 0x180;
     const GICD_ICPENDR: usize = 0x280;
     const GICD_IPRIORITYR: usize = 0x400;
-    const GICD_ITARGETSR: usize = 0x800;
     const GICD_ICFGR: usize = 0xc00;
     let NetworkInterruptSource::VirtioMmio { slot } = route.source() else {
         return Err(InputInterruptError::InvalidResource);
@@ -2559,8 +2705,8 @@ fn architecture_prepare_network_interrupt(
     if route.polarity() != troe_platform::Polarity::ActiveHigh || route.priority() == 0 {
         return Err(InputInterruptError::InvalidResource);
     }
-    let gic = aarch64_mmio(troe_platform::MmioRole::GicV2Distributor)?;
-    let cpu_target_mask = aarch64_gicv2_cpu_target_mask()?;
+    let gic = aarch64_mmio(troe_platform::MmioRole::GicV3Distributor)?;
+    let affinity = aarch64_gicv3_affinity_route();
     architecture_mask_input_interrupts();
     let result = (|| {
         let distributor = usize::try_from(gic.base_address())
@@ -2582,9 +2728,12 @@ fn architecture_prepare_network_interrupt(
             mmio_write32(distributor + GICD_ICENABLER + word * 4, bit);
             mmio_write32(distributor + GICD_ICPENDR + word * 4, bit);
             let group = mmio_read32(distributor + GICD_IGROUPR + word * 4);
-            mmio_write32(distributor + GICD_IGROUPR + word * 4, group & !bit);
+            mmio_write32(distributor + GICD_IGROUPR + word * 4, group | bit);
             gicv2_update_byte(distributor + GICD_IPRIORITYR, intid_index, route.priority());
-            gicv2_update_byte(distributor + GICD_ITARGETSR, intid_index, cpu_target_mask);
+            mmio_write64(
+                distributor + gicv3::GICD_IROUTER + intid_index * 8,
+                affinity,
+            );
             let address = distributor + GICD_ICFGR + (intid_index / 16) * 4;
             let shift = (intid_index % 16) * 2;
             let edge = match route.trigger() {
@@ -2604,7 +2753,7 @@ fn architecture_prepare_network_interrupt(
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 fn architecture_activate_network_interrupt(route: &NetworkInterruptRoute) {
     const GICD_ISENABLER: usize = 0x100;
-    let Ok(gic) = aarch64_mmio(troe_platform::MmioRole::GicV2Distributor) else {
+    let Ok(gic) = aarch64_mmio(troe_platform::MmioRole::GicV3Distributor) else {
         park();
     };
     let Ok(distributor) = usize::try_from(gic.base_address()) else {
@@ -2635,7 +2784,7 @@ fn architecture_activate_network_interrupt(route: &NetworkInterruptRoute) {
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 fn architecture_deactivate_network_interrupt(route: &NetworkInterruptRoute) {
     const GICD_ICENABLER: usize = 0x180;
-    let Ok(gic) = aarch64_mmio(troe_platform::MmioRole::GicV2Distributor) else {
+    let Ok(gic) = aarch64_mmio(troe_platform::MmioRole::GicV3Distributor) else {
         park();
     };
     let Ok(distributor) = usize::try_from(gic.base_address()) else {
@@ -2668,7 +2817,7 @@ fn architecture_deactivate_network_interrupt(route: &NetworkInterruptRoute) {
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 fn architecture_cancel_prepared_network_interrupt(route: &NetworkInterruptRoute) {
     const GICD_ICENABLER: usize = 0x180;
-    let Ok(gic) = aarch64_mmio(troe_platform::MmioRole::GicV2Distributor) else {
+    let Ok(gic) = aarch64_mmio(troe_platform::MmioRole::GicV3Distributor) else {
         park();
     };
     let Ok(distributor) = usize::try_from(gic.base_address()) else {
@@ -2751,12 +2900,8 @@ fn architecture_initialize_monotonic_clock() -> bool {
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 fn architecture_arm_execution_timer(milliseconds: u32) -> Result<(), ExecutionTimerError> {
-    const GICD_IGROUPR: usize = 0x080;
-    const GICD_ISENABLER: usize = 0x100;
-    const GICD_IPRIORITYR: usize = 0x400;
-    const GICD_ICFGR: usize = 0xc00;
-    let gic = aarch64_mmio(troe_platform::MmioRole::GicV2Distributor)
-        .map_err(|_| ExecutionTimerError::InterruptUnavailable)?;
+    let redistributor =
+        aarch64_gicv3_redistributor().map_err(|_| ExecutionTimerError::InterruptUnavailable)?;
     let timer_route = crate::selected_platform()
         .map_err(|_| ExecutionTimerError::InterruptUnavailable)?
         .interrupt(troe_platform::InterruptRole::Timer)
@@ -2764,29 +2909,34 @@ fn architecture_arm_execution_timer(milliseconds: u32) -> Result<(), ExecutionTi
     if timer_route.polarity() != troe_platform::Polarity::ActiveHigh {
         return Err(ExecutionTimerError::InterruptUnavailable);
     }
-    let distributor = usize::try_from(gic.base_address())
-        .map_err(|_| ExecutionTimerError::InterruptUnavailable)?;
     let intid = usize::try_from(timer_route.line())
         .map_err(|_| ExecutionTimerError::InterruptUnavailable)?;
-    let word = intid / 32;
+    // Private peripheral interrupts occupy 16..32. Anything else would not be
+    // reachable through the redistributor's SGI frame.
+    if !(16..32).contains(&intid) {
+        return Err(ExecutionTimerError::InterruptUnavailable);
+    }
+    let sgi = redistributor + gicv3::GICR_SGI_FRAME;
     let bit = 1_u32 << (intid % 32);
     if !AARCH64_EXECUTION_TIMER_CONFIGURED.load(Ordering::Acquire) {
         // SAFETY: PPI 30 is the architected non-secure physical timer interrupt;
         // the caller masked IRQ delivery before this one-time configuration.
+        // These are the redistributor's own banked registers, which is where a
+        // version 3 controller keeps the private interrupts.
         unsafe {
-            let group = mmio_read32(distributor + GICD_IGROUPR + word * 4);
-            mmio_write32(distributor + GICD_IGROUPR + word * 4, group & !bit);
-            gicv2_update_byte(distributor + GICD_IPRIORITYR, intid, timer_route.priority());
-            let config_address = distributor + GICD_ICFGR + (intid / 16) * 4;
-            let config_shift = (intid % 16) * 2;
+            let group = mmio_read32(sgi + gicv3::GICR_IGROUPR0);
+            mmio_write32(sgi + gicv3::GICR_IGROUPR0, group | bit);
+            gicv2_update_byte(sgi + gicv3::GICR_IPRIORITYR, intid, timer_route.priority());
+            // GICR_ICFGR1 configures 16..32, two bits per interrupt.
+            let config_shift = (intid - 16) * 2;
             let edge = match timer_route.trigger() {
                 troe_platform::TriggerMode::Edge => 0b10,
                 troe_platform::TriggerMode::Level => 0,
             };
-            let config =
-                (mmio_read32(config_address) & !(0b10 << config_shift)) | (edge << config_shift);
-            mmio_write32(distributor + GICD_ICFGR + (intid / 16) * 4, config);
-            mmio_write32(distributor + GICD_ISENABLER + word * 4, bit);
+            let config = (mmio_read32(sgi + gicv3::GICR_ICFGR1) & !(0b10 << config_shift))
+                | (edge << config_shift);
+            mmio_write32(sgi + gicv3::GICR_ICFGR1, config);
+            mmio_write32(sgi + gicv3::GICR_ISENABLER0, bit);
         }
         AARCH64_EXECUTION_TIMER_CONFIGURED.store(true, Ordering::Release);
     }
@@ -3119,6 +3269,18 @@ unsafe fn mmio_write32(address: usize, value: u32) {
     // SAFETY: The caller proves that the address names an aligned writable MMIO
     // register and owns the corresponding device operation.
     unsafe { ptr::write_volatile(address as *mut u32, value) };
+}
+
+/// Write one 64-bit MMIO register.
+///
+/// `GICD_IROUTER` is architecturally 64 bits wide and is the only register in
+/// this profile that is not 32 bits, so it gets its own accessor rather than a
+/// pair of halves whose ordering would matter.
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+unsafe fn mmio_write64(address: usize, value: u64) {
+    // SAFETY: The caller proves that the address names an aligned writable MMIO
+    // register and owns the corresponding device operation.
+    unsafe { ptr::write_volatile(address as *mut u64, value) };
 }
 
 #[cfg(test)]
