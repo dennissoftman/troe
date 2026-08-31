@@ -15,9 +15,23 @@ use troe_kex_sdk::{
 const DEFAULT_COLUMNS: usize = 80;
 const MAX_ENTRIES: usize = 1024;
 
+/// Which of an object's recorded times the long listing shows.
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum TimeField {
+    /// When the payload last changed.
+    #[default]
+    Modified,
+    /// When the record last changed, which a rename advances and a
+    /// modification time does not.
+    Changed,
+    /// When the object was created.
+    Created,
+}
+
 #[derive(Clone, Copy, Default)]
 struct Flags {
     long: bool,
+    time: TimeField,
     human_readable: bool,
     one_per_line: bool,
     show_all: bool,
@@ -75,6 +89,8 @@ fn parse_options(arguments: &mut ArgumentReader, total: usize) -> Option<(Flags,
                     b'F' => flags.classify = true,
                     b'p' => flags.slash_directories = true,
                     b'd' => flags.directory = true,
+                    b'c' => flags.time = TimeField::Changed,
+                    b'U' => flags.time = TimeField::Created,
                     _ => return None,
                 }
             }
@@ -293,16 +309,25 @@ fn list_columns(
 /// it did before times existed rather than gaining a blank field.
 const TIME_COLUMN_BYTES: usize = 16;
 
+/// Pick the time the flags asked for, which the provider may not record.
+fn selected_time(metadata: filesystem::Metadata, field: TimeField) -> Option<u64> {
+    match field {
+        TimeField::Modified => metadata.modified_unix_seconds,
+        TimeField::Changed => metadata.changed_unix_seconds,
+        TimeField::Created => metadata.created_unix_seconds,
+    }
+}
+
 /// Write one `YYYY-MM-DD HH:MM` column, or spaces when no time was recorded.
 ///
 /// A provider that stores no timestamp reports `None`, and so does one whose
 /// entry was never stamped, so an absent time is rendered as blank rather than
 /// as the epoch.
-fn write_modified(
+fn write_time(
     output: &mut StandardOutput,
-    modified_unix_seconds: Option<u64>,
+    unix_seconds: Option<u64>,
 ) -> Result<(), ()> {
-    let Some(seconds) = modified_unix_seconds else {
+    let Some(seconds) = unix_seconds else {
         return output
             .write_all(&[b' '; TIME_COLUMN_BYTES])
             .map_err(|_| ());
@@ -354,7 +379,7 @@ fn list_long(
             metadata.byte_count,
             options.flags.human_readable,
         ));
-        any_modified |= metadata.modified_unix_seconds.is_some();
+        any_modified |= selected_time(metadata, options.flags.time).is_some();
         Ok::<(), Error>(())
     })
     .map_err(|error| match error {
@@ -383,7 +408,7 @@ fn list_long(
             .map_err(|_| LongError::Output)?;
         output.write_all(b" ").map_err(|_| LongError::Output)?;
         if any_modified {
-            write_modified(output, metadata.modified_unix_seconds)
+            write_time(output, selected_time(metadata, options.flags.time))
                 .map_err(|_| LongError::Output)?;
             output.write_all(b" ").map_err(|_| LongError::Output)?;
         }
@@ -408,8 +433,8 @@ fn write_operand(
         output.write_all(b" ").map_err(|_| ())?;
         write_size(output, metadata.byte_count, flags.human_readable).map_err(|_| ())?;
         output.write_all(b" ").map_err(|_| ())?;
-        if metadata.modified_unix_seconds.is_some() {
-            write_modified(output, metadata.modified_unix_seconds)?;
+        if selected_time(metadata, flags.time).is_some() {
+            write_time(output, selected_time(metadata, flags.time))?;
             output.write_all(b" ").map_err(|_| ())?;
         }
     }

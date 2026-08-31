@@ -2,7 +2,7 @@ NAME
     ls - list files and directories
 
 SYNOPSIS
-    ls [-1ACFadhlp] [PATH...]
+    ls [-1ACFUadchlp] [PATH...]
 
 DESCRIPTION
     Lists each file operand or the immediate children of each directory in
@@ -20,12 +20,23 @@ OPTIONS
     -F  Append / to directories and @ to symbolic links. The filesystem ABI
         does not expose executable-mode or special-file classifiers.
     -p  Append / to directories.
-    -l  Print one entry per line with a node-type marker, byte size, and the
-        UTC modification time as YYYY-MM-DD HH:MM. The time column appears only
-        when at least one listed entry has one: a provider that stores no
-        timestamp, such as the read-only root or a quota-bound /tmp, reports
-        none and the column is omitted rather than left blank. TROE's
-        filesystem ABI does not expose POSIX ownership or modes.
+    -l  Print one entry per line with a node-type marker, byte size, and a UTC
+        time as YYYY-MM-DD HH:MM. The time shown is the modification time
+        unless -c or -U selects another. The column appears only when at least
+        one listed entry has the selected time: a provider that stores none,
+        such as the read-only root or a quota-bound /tmp, reports absent and
+        the column is omitted rather than left blank. TROE's filesystem ABI
+        does not expose POSIX ownership or modes.
+
+        There is no -u. No provider records an access time, so the option
+        would have nothing to show; see ADR 0062.
+    -c  With -l, show the change time instead of the modification time. It
+        advances whenever an object's record is rewritten, including renames
+        that leave the payload untouched. Only ext4 records one; FAT32 has no
+        such field and reports none.
+    -U  With -l, show the creation time instead of the modification time. It
+        never advances once the object exists. ext4 and FAT32 both record one;
+        the read-only root and /tmp do not.
     -h  With -l, round sizes using 1024-based IEC units such as KiB and GiB.
 
     Options may be combined. -- ends option parsing. Recursive listing and

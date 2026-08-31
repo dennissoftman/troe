@@ -111,6 +111,20 @@ pub struct FileMetadata {
     /// a new FAT32 entry means zero. A zero is therefore an absent time rather
     /// than 1970, so it is reported as `None` and never as an instant.
     pub modified_unix_seconds: Option<u64>,
+    /// Whole Unix UTC seconds of the last metadata change, when recorded.
+    ///
+    /// Advances whenever the object's record is rewritten, including changes a
+    /// modification time does not see, such as a rename. `None` where the
+    /// format has no such field: FAT32 has no change time at all, so this is
+    /// reported absent rather than substituted from a field that means
+    /// something else.
+    pub changed_unix_seconds: Option<u64>,
+    /// Whole Unix UTC seconds of the object's creation, when recorded.
+    ///
+    /// Never advances after the object is created. `None` under the same rule
+    /// as the other two: a provider that stamps no creation time reports
+    /// absence rather than the closest instant it happens to hold.
+    pub created_unix_seconds: Option<u64>,
 }
 
 /// One bounded page of a provider directory traversal.

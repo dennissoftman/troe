@@ -434,6 +434,8 @@ struct Inode {
     extent_tree_logicals: Vec<u32>,
     /// Last payload modification in whole Unix UTC seconds, when stamped.
     modified_unix_seconds: Option<u64>,
+    changed_unix_seconds: Option<u64>,
+    created_unix_seconds: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -2318,6 +2320,22 @@ impl<D: BlockDevice> Ext4<D> {
         self.write_fs_block(block, &table)
     }
 
+    /// Advance one inode's change time without altering any of its fields.
+    ///
+    /// A rename rewrites directory entries and never the inode it moves, so
+    /// nothing would record that the object changed. POSIX advances the change
+    /// time on rename, and a change time that a rename does not move is a field
+    /// a caller cannot use for the one case a modification time cannot see.
+    fn touch_inode_metadata(&mut self, number: u32) -> Result<(), FsError> {
+        let (block, offset) = self.inode_record_location(number)?;
+        let mut table = self.read_fs_block(block)?;
+        let raw = table
+            .get_mut(offset..offset + EXT4_INODE_BYTES)
+            .ok_or(FsError::Corrupt)?;
+        self.refresh_inode_checksum(raw, number, InodeTouch::Metadata)?;
+        self.write_fs_block(block, &table)
+    }
+
     fn clear_inode_record(&mut self, number: u32) -> Result<(), FsError> {
         let (block, offset) = self.inode_record_location(number)?;
         let mut table = self.read_fs_block(block)?;
@@ -3548,6 +3566,8 @@ impl<D: BlockDevice> FileSystemProvider for Ext4<D> {
                 0
             },
             modified_unix_seconds: inode.modified_unix_seconds,
+            changed_unix_seconds: inode.changed_unix_seconds,
+            created_unix_seconds: inode.created_unix_seconds,
         })
     }
 
@@ -3562,6 +3582,8 @@ impl<D: BlockDevice> FileSystemProvider for Ext4<D> {
                 0
             },
             modified_unix_seconds: inode.modified_unix_seconds,
+            changed_unix_seconds: inode.changed_unix_seconds,
+            created_unix_seconds: inode.created_unix_seconds,
         })
     }
 
@@ -4039,6 +4061,9 @@ impl<D: BlockDevice> FileSystemProvider for Ext4<D> {
         {
             return Err(FsError::Corrupt);
         }
+        // The moved object itself changed, even though none of its own fields
+        // did, so its change time advances with the rest of the mutation.
+        self.touch_inode_metadata(source_entry.inode)?;
         self.finish_mutation()
     }
 
@@ -4414,6 +4439,8 @@ fn parse_inode(
         interior_extent_blocks: Vec::new(),
         extent_tree_logicals: parsed_extents.tree_logicals,
         modified_unix_seconds: get_inode_time(raw, EXT4_MTIME)?,
+        changed_unix_seconds: get_inode_time(raw, EXT4_CTIME)?,
+        created_unix_seconds: get_inode_time(raw, EXT4_CRTIME)?,
     })
 }
 
@@ -8383,6 +8410,67 @@ mod tests {
                 "{path} must report {expected}, got:\n{report}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_reports_change_and_creation_times() -> Result<(), String> {
+        const NOW: u64 = 1_788_000_000;
+        let Some(mke2fs) = e2fs_tool("mke2fs") else {
+            return unavailable_tool("mke2fs");
+        };
+        let temporary = TestDirectory::create("ext4-change-creation")?;
+        let image = default_mke2fs_image(temporary.path(), &mke2fs, 1024 * 1024 * 1024)?;
+
+        let mut ext4 = mount_file_writable_with_limits(&image, default_volume_limits()?)?;
+        let clock = TestClock::new(Some(NOW));
+        ext4.set_wall_clock(clock.clone());
+        ext4.write_file("/tracked.txt", b"first\n")
+            .map_err(|error| format!("cannot create: {error:?}"))?;
+
+        // An inode is born with all three at the same instant.
+        let born = ext4
+            .metadata("/tracked.txt")
+            .map_err(|error| format!("cannot stat: {error:?}"))?;
+        assert_eq!(born.modified_unix_seconds, Some(NOW));
+        assert_eq!(born.changed_unix_seconds, Some(NOW));
+        assert_eq!(born.created_unix_seconds, Some(NOW));
+
+        // A rename changes the record without touching the payload, which is
+        // exactly the case a modification time cannot see. This is the whole
+        // reason the change time is worth exposing.
+        clock.set(Some(NOW + 60));
+        ext4.rename("/tracked.txt", "/renamed.txt")
+            .map_err(|error| format!("cannot rename: {error:?}"))?;
+        let renamed = ext4
+            .metadata("/renamed.txt")
+            .map_err(|error| format!("cannot stat: {error:?}"))?;
+        assert_eq!(
+            renamed.modified_unix_seconds,
+            Some(NOW),
+            "a rename leaves the payload, so the modification time stands"
+        );
+        assert_eq!(
+            renamed.changed_unix_seconds,
+            Some(NOW + 60),
+            "a rename rewrites the record, so the change time advances"
+        );
+        assert_eq!(
+            renamed.created_unix_seconds,
+            Some(NOW),
+            "creation never advances"
+        );
+
+        // A payload write advances both, and still leaves creation alone.
+        clock.set(Some(NOW + 120));
+        ext4.write_file("/renamed.txt", b"second\n")
+            .map_err(|error| format!("cannot rewrite: {error:?}"))?;
+        let rewritten = ext4
+            .metadata("/renamed.txt")
+            .map_err(|error| format!("cannot stat: {error:?}"))?;
+        assert_eq!(rewritten.modified_unix_seconds, Some(NOW + 120));
+        assert_eq!(rewritten.changed_unix_seconds, Some(NOW + 120));
+        assert_eq!(rewritten.created_unix_seconds, Some(NOW));
         Ok(())
     }
 

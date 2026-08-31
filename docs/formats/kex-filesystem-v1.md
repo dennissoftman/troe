@@ -4,7 +4,7 @@ The read and mutation interfaces are independent typed KEX capabilities. All
 paths are nonempty bounded UTF-8 byte strings without NUL; namespace
 normalization and provider routing occur in the service.
 
-## Filesystem read 1.4
+## Filesystem read 1.5
 
 Interface 6 retains the 1.2 open/read/close, paginated list, metadata, and
 read-link operations. Minor 1.3 adds `METADATA_NO_FOLLOW` (opcode 7), which has
@@ -12,22 +12,34 @@ the same path request and metadata reply as `METADATA` but reports the final
 symbolic link itself. This lets recursive user-space algorithms avoid link
 cycles without exposing provider internals.
 
-Minor 1.4 grows the metadata reply from 16 to 24 bytes to carry the last
-payload modification in whole Unix UTC seconds:
+Minor 1.4 grew the metadata reply from 16 to 24 bytes to carry the last payload
+modification in whole Unix UTC seconds. Minor 1.5 grows it to 40 bytes for the
+change and creation times, each with its own presence flag because the three
+are independently absent:
 
 | Offset | Bytes | Field |
 | ---: | ---: | --- |
 | 0 | 1 | node kind |
 | 1 | 1 | modification time present, 0 or 1 |
-| 2 | 6 | reserved, zero |
+| 2 | 1 | change time present, 0 or 1 |
+| 3 | 1 | creation time present, 0 or 1 |
+| 4 | 4 | reserved, zero |
 | 8 | 8 | exact file bytes, zero for a directory |
 | 16 | 8 | modification time, zero when absent |
+| 24 | 8 | change time, zero when absent |
+| 32 | 8 | creation time, zero when absent |
 
 An absent time is a zero flag together with an all-zero value, so the epoch is
 never a sentinel. A value without its flag, a flag outside its closed domain,
 and nonzero reserved bytes are all rejected. A provider that stores no
 timestamp reports absent, and so does one whose record was never stamped: a
 zero on the media is what "never stamped" looks like, not 1970.
+
+There is no access time. Neither provider records one: ext4's `atime` field is
+stamped when the inode is born and never advanced, and FAT32's access date
+tracks the last write to the day. Reporting either as an access time would give
+one field two meanings, so [ADR 0062](../adr/0062-change-and-creation-times.md)
+excludes it rather than exposing a field that never means what it says.
 
 ## Filesystem mutation 1.5
 
