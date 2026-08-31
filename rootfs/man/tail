@@ -1,0 +1,30 @@
+NAME
+    tail - print the trailing part of files
+
+SYNOPSIS
+    tail [-c COUNT] [-n COUNT] [-qv] [FILE...]
+    tail -COUNT [FILE...]
+
+DESCRIPTION
+    Prints the last 10 lines of each FILE. With no file, reads standard input.
+    A FILE of - also selects standard input. At an interactive prompt that
+    reads typed lines until Ctrl-D; see man sh.
+
+    -c COUNT  Print the last COUNT bytes instead of lines.
+    -n COUNT  Print the last COUNT lines. -COUNT is the same request.
+    -n +COUNT Start at line COUNT, counting from one.
+    -c +COUNT Start at byte COUNT, counting from one.
+    -q        Never print the ==> FILE <== header.
+    -v        Always print the header, even for a single operand.
+
+    A named file is read backwards from its end, so the trailing lines of a
+    large file cost their own size rather than the file's. A pipe or the
+    session terminal cannot be read backwards, so at most 8 KiB is retained;
+    a request beyond that is reported rather than silently truncated. Counting
+    from the start with +COUNT streams and retains nothing.
+
+    There is no -f: the namespace has no change-notification interface, so a
+    follow mode could only poll.
+
+    Every operand is attempted; a failure is reported and the remaining
+    operands still run. A missing file exits 3, other failures exit 1.

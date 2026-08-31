@@ -1427,6 +1427,254 @@ def shared_lua(session: SerialSession) -> str:
     return f"{SHARED_BIN}/{session.architecture}/lua.kex"
 
 
+def exercise_head_tail_and_mkdir(
+    session: SerialSession, cwd: str, command_timeout: float
+) -> None:
+    """Cover directory creation and the leading/trailing line selectors."""
+    # `mkdir -p` creates every missing component and is idempotent. Each step
+    # asserts an observable outcome, because a command with no expectation
+    # verifies nothing at all.
+    session.command(
+        "mkdir -v /vol/root/troe-md",
+        cwd,
+        command_timeout,
+        contains=("mkdir: created directory '/vol/root/troe-md'\n",),
+    )
+    # Walking prefixes must tolerate /vol, which lies above any writable mount
+    # and can never itself be created.
+    session.command(
+        "mkdir -pv /vol/root/troe-md/a/b/c",
+        cwd,
+        command_timeout,
+        contains=(
+            "mkdir: created directory '/vol/root/troe-md/a'\n",
+            "mkdir: created directory '/vol/root/troe-md/a/b'\n",
+            "mkdir: created directory '/vol/root/troe-md/a/b/c'\n",
+        ),
+        absent=("read-only",),
+    )
+    # Repeating it creates nothing and reports no failure.
+    session.command(
+        "mkdir -pv /vol/root/troe-md/a/b/c",
+        cwd,
+        command_timeout,
+        absent=("created directory", "read-only", "already exists"),
+    )
+    # A refusal names the component that failed, not the leaf that followed.
+    session.command(
+        "mkdir -p /vol/rooot/data/logs",
+        cwd,
+        command_timeout,
+        contains=("mkdir: /vol/rooot: read-only filesystem\n",),
+        absent=("/vol/rooot/data",),
+    )
+    # An existing file cannot become a directory, and it is named too.
+    session.command("printf x > /vol/root/troe-md/afile", cwd, command_timeout)
+    session.command(
+        "mkdir -p /vol/root/troe-md/afile/below",
+        cwd,
+        command_timeout,
+        contains=("mkdir: /vol/root/troe-md/afile: wrong node type\n",),
+    )
+    # The leaf really is a directory a file can be written into.
+    session.command(
+        "printf deep > /vol/root/troe-md/a/b/c/file",
+        cwd,
+        command_timeout,
+    )
+    session.command(
+        "cat /vol/root/troe-md/a/b/c/file",
+        cwd,
+        command_timeout,
+        contains=("deep",),
+    )
+    session.command(
+        "mkdir /vol/root/troe-md",
+        cwd,
+        command_timeout,
+        contains=("mkdir: /vol/root/troe-md: already exists\n",),
+    )
+    session.command(
+        "printf 'l1\\nl2\\nl3\\nl4\\nl5\\n' > /vol/root/troe-md/lines",
+        cwd,
+        command_timeout,
+    )
+    # Line and byte selection from each end, including the obsolete -N form.
+    session.command(
+        "head -n 2 /vol/root/troe-md/lines",
+        cwd,
+        command_timeout,
+        contains=("l1\nl2\n",),
+    )
+    session.command(
+        "head -2 /vol/root/troe-md/lines",
+        cwd,
+        command_timeout,
+        contains=("l1\nl2\n",),
+    )
+    session.command(
+        "tail -n 2 /vol/root/troe-md/lines",
+        cwd,
+        command_timeout,
+        contains=("l4\nl5\n",),
+    )
+    session.command(
+        "tail -n +4 /vol/root/troe-md/lines",
+        cwd,
+        command_timeout,
+        contains=("l4\nl5\n",),
+    )
+    session.command(
+        "head -c 3 /vol/root/troe-md/lines",
+        cwd,
+        command_timeout,
+        contains=("l1\n",),
+    )
+    session.command(
+        "tail -c 3 /vol/root/troe-md/lines",
+        cwd,
+        command_timeout,
+        contains=("l5\n",),
+    )
+    # A count beyond the input yields the whole input rather than an error.
+    session.command(
+        "head -n 99 /vol/root/troe-md/lines",
+        cwd,
+        command_timeout,
+        contains=("l1\nl2\nl3\nl4\nl5\n",),
+    )
+    # A pipe cannot be read backwards, so this takes the retained-window path.
+    session.command(
+        "cat /vol/root/troe-md/lines | tail -n 1",
+        cwd,
+        command_timeout,
+        contains=("l5\n",),
+    )
+    session.command(
+        "cat /vol/root/troe-md/lines | head -n 1",
+        cwd,
+        command_timeout,
+        contains=("l1\n",),
+    )
+    # Multiple operands print separating headers; -q suppresses them.
+    session.command(
+        "head -n 1 /vol/root/troe-md/lines /vol/root/troe-md/lines",
+        cwd,
+        command_timeout,
+        contains=("==> /vol/root/troe-md/lines <==\nl1\n",),
+    )
+    session.command(
+        "head -q -n 1 /vol/root/troe-md/lines /vol/root/troe-md/lines",
+        cwd,
+        command_timeout,
+        contains=("l1\nl1\n",),
+    )
+    session.command(
+        "head /vol/root/troe-md/missing",
+        cwd,
+        command_timeout,
+        contains=("head: /vol/root/troe-md/missing: not found\n",),
+    )
+    session.command("rm -r /vol/root/troe-md", cwd, command_timeout)
+
+
+def exercise_touch(session: SerialSession, cwd: str, command_timeout: float) -> None:
+    """Cover creation, in-place stamping, and the providers that refuse."""
+    session.command(
+        "mkdir -p /vol/root/troe-touch",
+        cwd,
+        command_timeout,
+        absent=("read-only", "not found"),
+    )
+    # Creating an absent file leaves it empty and stamped. The listing is matched
+    # on its size and date columns, so `ls`'s own error cannot satisfy it.
+    session.command("touch /vol/root/troe-touch/new", cwd, command_timeout)
+    listing = session.command("ls -l /vol/root/troe-touch/new", cwd, command_timeout)
+    if not re.search(r"- +0 \d{4}-\d{2}-\d{2} \d{2}:\d{2} /vol/root/troe-touch/new", listing):
+        raise AcceptanceError(
+            f"touch did not create a stamped empty file; output was {listing!r}"
+        )
+    session.command(
+        "wc -c /vol/root/troe-touch/new",
+        cwd,
+        command_timeout,
+        contains=("0 /vol/root/troe-touch/new\n",),
+    )
+    # An explicit instant is applied exactly, and 2026-08-29T10:40:00Z is well
+    # inside every provider's range.
+    session.command(
+        "touch -d 1788000000 /vol/root/troe-touch/new",
+        cwd,
+        command_timeout,
+        absent=("touch:",),
+    )
+    session.command(
+        "ls -l /vol/root/troe-touch/new",
+        cwd,
+        command_timeout,
+        contains=("2026-08-29 10:40 /vol/root/troe-touch/new",),
+    )
+    # Stamping an existing file must not truncate it: a replacement would.
+    session.command(
+        "printf keepme > /vol/root/troe-touch/kept", cwd, command_timeout
+    )
+    session.command(
+        "touch -d 1788000000 /vol/root/troe-touch/kept",
+        cwd,
+        command_timeout,
+        absent=("touch:",),
+    )
+    session.command(
+        "cat /vol/root/troe-touch/kept",
+        cwd,
+        command_timeout,
+        contains=("keepme",),
+    )
+    # -c leaves an absent file absent, without reporting a failure.
+    session.command(
+        "touch -c /vol/root/troe-touch/absent",
+        cwd,
+        command_timeout,
+        absent=("touch:",),
+    )
+    session.command(
+        "ls /vol/root/troe-touch/absent",
+        cwd,
+        command_timeout,
+        contains=("/vol/root/troe-touch/absent: not found\n",),
+    )
+    # A provider that records no time still creates the file and reports
+    # success, both for a new name and for one that already exists.
+    session.command(
+        "touch /tmp/troe-touch-tmp",
+        cwd,
+        command_timeout,
+        absent=("touch:",),
+    )
+    session.command(
+        "touch /tmp/troe-touch-tmp",
+        cwd,
+        command_timeout,
+        absent=("touch:",),
+    )
+    # It exists and is empty, so the second call neither failed nor truncated.
+    session.command(
+        "wc -c /tmp/troe-touch-tmp",
+        cwd,
+        command_timeout,
+        contains=("0 /tmp/troe-touch-tmp\n",),
+    )
+    session.command("rm /tmp/troe-touch-tmp", cwd, command_timeout)
+    # The read-only root refuses the mutation itself.
+    session.command(
+        "touch /bin/echo.kex",
+        cwd,
+        command_timeout,
+        contains=("touch: /bin/echo.kex: read-only filesystem\n",),
+    )
+    session.command("rm -r /vol/root/troe-touch", cwd, command_timeout)
+
+
 def run_filesystem_group(session: SerialSession, command_timeout: float) -> None:
     """Exercise mounted reads, pipelines, paths, and bounded file mutation."""
     cwd = "/"
@@ -1711,6 +1959,8 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
             f"output was {root_listing!r}"
         )
     session.command("rm /vol/root/troe-timed", cwd, command_timeout)
+    exercise_head_tail_and_mkdir(session, cwd, command_timeout)
+    exercise_touch(session, cwd, command_timeout)
     session.confirmed_command(
         lua + " -e 'local ok,kind,status=os.execute(\"mv "
         "/vol/root/troe-moved.txt /vol/shared/cross-device.txt\"); "

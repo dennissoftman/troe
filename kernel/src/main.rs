@@ -12772,6 +12772,7 @@ mod firmware {
             FsError::Corrupt => ReplyStatus::Corrupt,
             FsError::Io => ReplyStatus::Io,
             FsError::Unsupported => ReplyStatus::Unsupported,
+            FsError::NotConfigured => ReplyStatus::NotConfigured,
             FsError::NotEmpty => ReplyStatus::NotEmpty,
             FsError::CrossDevice => ReplyStatus::CrossDevice,
         }

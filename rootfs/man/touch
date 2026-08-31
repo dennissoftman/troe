@@ -1,0 +1,33 @@
+NAME
+    touch - set a file's modification time, creating it when absent
+
+SYNOPSIS
+    touch [-c] [-d SECONDS] [-m] FILE...
+
+DESCRIPTION
+    Sets each FILE's modification time to the current wall-clock instant,
+    creating an empty file when it does not exist.
+
+    -c          Do not create a missing file; leave it absent without error.
+    -d SECONDS  Use this exact instant, in whole Unix UTC seconds, instead of
+                the clock's. There is no date-string parser and no timezone
+                source, so the instant is given as seconds.
+    -m          Select the modification time. This is the only time TROE's
+                filesystem ABI records, so the option is accepted and
+                redundant.
+
+    Requires filesystem-read to test existence and filesystem-mutate to create
+    or stamp, so it works on a writable volume such as /vol/root and is refused
+    on the read-only root.
+
+    A provider that records no modification time, such as the quota-bound /tmp,
+    reports success without recording one: the file exists, which is what touch
+    was asked for, and no filesystem refuses touch for this reason. See man ls
+    for which listings show a time.
+
+    A wall clock that is not yet set is a different, transient condition and is
+    reported, because it would otherwise silently drop a time the filesystem
+    could have recorded. Run timesync, or give -d an explicit instant.
+
+    Every operand is attempted; a failure is reported and the remaining
+    operands still run. A missing file with -c is not a failure.

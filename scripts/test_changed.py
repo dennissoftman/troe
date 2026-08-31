@@ -45,23 +45,29 @@ FILESYSTEM_APPS = frozenset(
         "cat",
         "cp",
         "grep",
+        "head",
         "hexdump",
         "ln",
         "ls",
+        "mkdir",
         "mv",
         "printf",
         "rm",
         "rmdir",
         "sed",
         "sh",
+        "tail",
         "tar",
+        "touch",
         "wc",
     )
 )
 TERMINAL_APPS = frozenset(("clear", "echo", "man", "pwd"))
 # Commands that read standard input also exercise the foreground session
 # terminal loan, not only their filesystem or network operands.
-STDIN_APPS = frozenset(("awk", "cat", "grep", "hexdump", "sed", "sh", "udp", "wc"))
+STDIN_APPS = frozenset((
+    "awk", "cat", "grep", "head", "hexdump", "sed", "sh", "tail", "udp", "wc",
+))
 LOW_LEVEL_PACKAGES = frozenset(
     (
         "troe-block",

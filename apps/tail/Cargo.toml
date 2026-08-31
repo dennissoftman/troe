@@ -1,0 +1,31 @@
+[package]
+name = "troe-app-tail"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata.troe-kex]
+capabilities = ["filesystem-read"]
+# `tail` retains the trailing window of a non-seekable stream in a fixed ring;
+# a seekable file is read backwards instead and needs no window.
+stack-pages = 8
+
+[dependencies]
+troe-kex-sdk = { path = "../../sdk/rust/troe-kex" }
+
+[[bin]]
+name = "troe-app-tail"
+path = "src/main.rs"
+test = false
+bench = false
+
+[profile.release]
+codegen-units = 1
+lto = false
+opt-level = "z"
+panic = "abort"
+strip = "none"
+
+[workspace]

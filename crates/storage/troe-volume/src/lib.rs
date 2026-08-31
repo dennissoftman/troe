@@ -893,7 +893,11 @@ fn push_candidate(
 
 const fn probe_state(error: FsError) -> ProbeState {
     match error {
-        FsError::Unsupported => ProbeState::Unsupported,
+        // A probe never asks for the wall clock's instant, so `NotConfigured`
+        // cannot arise here. It is grouped with the unsupported media rather
+        // than the corrupt media because declining a mount is the safer
+        // misclassification if that ever changes.
+        FsError::Unsupported | FsError::NotConfigured => ProbeState::Unsupported,
         FsError::Io => ProbeState::Io,
         FsError::NoSpace => ProbeState::Exhausted,
         FsError::Invalid

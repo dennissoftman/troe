@@ -224,6 +224,7 @@ pub const fn filesystem_message(error: Error) -> &'static [u8] {
         Error::Corrupt => b"filesystem metadata is corrupt",
         Error::Io => b"filesystem transport failed",
         Error::Unsupported => b"filesystem feature is unsupported",
+        Error::NotConfigured => b"wall clock is not set; run timesync",
         Error::Exhausted => b"bounded filesystem resources exhausted",
         Error::NotEmpty => b"directory not empty",
         Error::CrossDevice => b"cross-device operation",

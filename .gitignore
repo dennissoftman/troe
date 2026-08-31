@@ -3,6 +3,7 @@
 /services/*/target/
 /tests/runtime-probe/target/
 /build/
+/.claude/worktrees/
 .DS_Store
 ._*
 .coverage

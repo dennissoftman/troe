@@ -1,0 +1,23 @@
+NAME
+    head - print the leading part of files
+
+SYNOPSIS
+    head [-c COUNT] [-n COUNT] [-qv] [FILE...]
+    head -COUNT [FILE...]
+
+DESCRIPTION
+    Prints the first 10 lines of each FILE. With no file, reads standard input.
+    A FILE of - also selects standard input. At an interactive prompt that
+    reads typed lines until Ctrl-D; see man sh.
+
+    -c COUNT  Print the first COUNT bytes instead of lines.
+    -n COUNT  Print the first COUNT lines. -COUNT is the same request.
+    -q        Never print the ==> FILE <== header.
+    -v        Always print the header, even for a single operand.
+
+    Headers appear when more than one operand is named, separated by a blank
+    line. Reading stops as soon as the requested count is met, so a bounded
+    prefix of a large file costs only the bytes it prints.
+
+    Every operand is attempted; a failure is reported and the remaining
+    operands still run. A missing file exits 3, other failures exit 1.
