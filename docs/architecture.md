@@ -70,8 +70,9 @@ firmware fails before device publication or volatile I/O.
    range-reads or incrementally writes the namespace with a 16 KiB default
    buffer. Applications may request power-of-two chunks from 4 KiB to 1 MiB;
    file length is governed by the provider format, media, and configured quota.
-5. Filesystem commands ask `Namespace` to canonicalize from the logical cwd.
-   Immutable KEFS nodes and writable `/tmp` nodes share one object model.
+5. Filesystem commands ask the session's `NamespaceClient` to canonicalize from
+   the logical cwd. Immutable KEFS content and the writable `/tmp` RAMFS are
+   separate providers behind one contract, not one shared node model.
    The current recovery root keeps executables in `/bin`, recovery-only
    bootstrap files in `/recovery`, architecture-independent package data in
    producer-owned `/share/<name>` directories, and persistent or mounted data

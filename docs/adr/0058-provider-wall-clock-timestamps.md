@@ -16,7 +16,7 @@ contents, such as `make`, `rsync` and incremental backup, cannot work against
 either result.
 
 Two shapes were available. A per-mutation argument would put the instant next to
-the write that uses it, but `ReadOnlyFileSystem` has more than a dozen mutating
+the write that uses it, but `FileSystemProvider` has more than a dozen mutating
 methods and every provider — including those that store no time at all — would
 carry the parameter. A clock handed to a provider at `mount_writable` would cost
 nothing at the trait boundary, but a value sampled at mount is the mount's own
@@ -30,7 +30,7 @@ The namespace owns one clock and shares it as a handle, not as a value.
 `WallClock` returns whole Unix UTC seconds, or `None` when no time is known.
 `Namespace::set_wall_clock` stores one handle, hands it to every provider
 already mounted, and hands it to every provider mounted afterwards.
-`ReadOnlyFileSystem::set_wall_clock` defaults to doing nothing, so a provider
+`FileSystemProvider::set_wall_clock` defaults to doing nothing, so a provider
 that stores no timestamps is unchanged and no mutation signature moves.
 
 A provider reads the handle at the mutation, never at the mount. That keeps the
