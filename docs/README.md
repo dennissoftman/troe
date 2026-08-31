@@ -44,6 +44,7 @@ history rather than in current documentation.
 | Readable and settable modification time | [ADR 0061](adr/0061-readable-and-settable-modification-time.md) |
 | Declared image span and scaled launch admission | [ADR 0059](adr/0059-declared-image-span-and-scaled-launch-admission.md) |
 | Extent-backed launch reservation | [ADR 0060](adr/0060-extent-backed-launch-reservation.md) |
+| Change and creation times, and no access time | [ADR 0062](adr/0062-change-and-creation-times.md) |
 
 The current serialized contracts are versioned independently under
 [`formats/`](formats):

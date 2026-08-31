@@ -544,11 +544,15 @@ impl Namespace {
                 kind: NodeKind::Directory,
                 byte_count: 0,
                 modified_unix_seconds: None,
+                changed_unix_seconds: None,
+                created_unix_seconds: None,
             }),
             Some(Node::File { bytes, .. }) => Ok(FileMetadata {
                 kind: NodeKind::File,
                 byte_count: u64::try_from(bytes.len()).map_err(|_| FsError::Overflow)?,
                 modified_unix_seconds: None,
+                changed_unix_seconds: None,
+                created_unix_seconds: None,
             }),
             None => Err(FsError::NotFound),
         }
@@ -631,11 +635,15 @@ impl Namespace {
                 kind: NodeKind::Directory,
                 byte_count: 0,
                 modified_unix_seconds: None,
+                changed_unix_seconds: None,
+                created_unix_seconds: None,
             }),
             Some(Node::File { bytes, .. }) => Ok(FileMetadata {
                 kind: NodeKind::File,
                 byte_count: u64::try_from(bytes.len()).map_err(|_| FsError::Overflow)?,
                 modified_unix_seconds: None,
+                changed_unix_seconds: None,
+                created_unix_seconds: None,
             }),
             None => Err(FsError::NotFound),
         }
@@ -1608,11 +1616,15 @@ mod tests {
                     kind: NodeKind::Directory,
                     byte_count: 0,
                     modified_unix_seconds: None,
+                    changed_unix_seconds: None,
+                    created_unix_seconds: None,
                 }),
                 "/large" => Ok(FileMetadata {
                     kind: NodeKind::File,
                     byte_count: self.state.borrow().bytes,
                     modified_unix_seconds: None,
+                    changed_unix_seconds: None,
+                    created_unix_seconds: None,
                 }),
                 _ => Err(FsError::NotFound),
             }
@@ -1686,11 +1698,15 @@ mod tests {
                     kind: NodeKind::Directory,
                     byte_count: 0,
                     modified_unix_seconds: None,
+                    changed_unix_seconds: None,
+                    created_unix_seconds: None,
                 }),
                 "/data" => Ok(FileMetadata {
                     kind: NodeKind::File,
                     byte_count: 7,
                     modified_unix_seconds: None,
+                    changed_unix_seconds: None,
+                    created_unix_seconds: None,
                 }),
                 _ => Err(FsError::NotFound),
             }
@@ -1784,11 +1800,15 @@ mod tests {
                     kind: NodeKind::Directory,
                     byte_count: 0,
                     modified_unix_seconds: None,
+                    changed_unix_seconds: None,
+                    created_unix_seconds: None,
                 }),
                 "/scope/file" | "/scope/link" | "/outside/secret" => Ok(FileMetadata {
                     kind: NodeKind::File,
                     byte_count: 6,
                     modified_unix_seconds: None,
+                    changed_unix_seconds: None,
+                    created_unix_seconds: None,
                 }),
                 _ => Err(FsError::NotFound),
             }
@@ -1800,6 +1820,8 @@ mod tests {
                     kind: NodeKind::Symlink,
                     byte_count: 0,
                     modified_unix_seconds: None,
+                    changed_unix_seconds: None,
+                    created_unix_seconds: None,
                 });
             }
             self.metadata(path)
@@ -2097,6 +2119,8 @@ mod tests {
                 kind: NodeKind::File,
                 byte_count: 10,
                 modified_unix_seconds: None,
+                changed_unix_seconds: None,
+                created_unix_seconds: None,
             })
         );
         let mut range = [0_u8; 4];

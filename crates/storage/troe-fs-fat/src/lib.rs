@@ -162,6 +162,7 @@ struct FatEntry {
     directory_slots: Vec<DirectorySlot>,
     /// Write time recorded in this entry, when it was ever stamped.
     modified_unix_seconds: Option<u64>,
+    created_unix_seconds: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -299,6 +300,7 @@ impl<D: BlockDevice> Fat32<D> {
             directory_slots: Vec::new(),
             // The volume root has no directory entry, so it carries no time.
             modified_unix_seconds: None,
+            created_unix_seconds: None,
         };
         if normalized == "/" {
             return Ok(current);
@@ -540,6 +542,7 @@ impl<D: BlockDevice> Fat32<D> {
                     short_name: raw[..11].try_into().map_err(|_| FsError::Corrupt)?,
                     directory_slots,
                     modified_unix_seconds: DosStamp::read_modification(raw)?,
+                    created_unix_seconds: DosStamp::read_creation(raw)?,
                 });
             }
         }
@@ -1066,6 +1069,10 @@ impl<D: BlockDevice> FileSystemProvider for Fat32<D> {
             kind: entry.kind,
             byte_count: entry.byte_count,
             modified_unix_seconds: entry.modified_unix_seconds,
+            // FAT32 records no change time, so it is absent rather than
+            // substituted from the write or creation stamp.
+            changed_unix_seconds: None,
+            created_unix_seconds: entry.created_unix_seconds,
         })
     }
 
@@ -1674,6 +1681,24 @@ impl DosStamp {
             tenths: 0,
         }
         .to_unix_seconds()
+    }
+
+    /// Read one directory entry's creation time.
+    ///
+    /// The tenths byte carries the odd second the two-second time field cannot,
+    /// so it is folded in rather than dropped.
+    fn read_creation(raw: &[u8]) -> Result<Option<u64>, FsError> {
+        let tenths = *raw.get(DIRECTORY_CREATE_TENTHS).ok_or(FsError::Corrupt)?;
+        let Some(seconds) = (Self {
+            date: read_u16(raw, DIRECTORY_CREATE_TIME + 2)?,
+            time: read_u16(raw, DIRECTORY_CREATE_TIME)?,
+            tenths,
+        })
+        .to_unix_seconds()?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(seconds + u64::from(tenths) / 100))
     }
 
     /// Stamp this instant as an entry's creation time, and as the access date.
@@ -2970,6 +2995,44 @@ mod tests {
         // The volume root has no directory entry of its own to stamp.
         assert_eq!(fat.metadata("/")?.modified_unix_seconds, None);
         assert_eq!(fat.set_modified_time("/", None), Err(FsError::Unsupported));
+        Ok(())
+    }
+
+    #[test]
+    fn reports_a_creation_time_and_never_a_change_time() -> Result<(), FsError> {
+        const CREATED: u64 = 1_788_000_000;
+
+        let mut fat = mount_writable(valid_device().map_err(|_| FsError::Io)?)?;
+
+        // With no clock the creation stamp is zero, which is absent, not 1980.
+        fat.write_file("/unstamped.txt", b"no clock")?;
+        assert_eq!(fat.metadata("/unstamped.txt")?.created_unix_seconds, None);
+
+        let clock = TestClock::new(Some(CREATED));
+        fat.set_wall_clock(clock.clone());
+        fat.write_file("/stamped.txt", b"clocked")?;
+        // The creation stamp keeps its own two-second granularity, so it is
+        // read back rounded down rather than exactly.
+        let created = fat.metadata("/stamped.txt")?.created_unix_seconds;
+        assert_eq!(created, Some(CREATED - CREATED % 2));
+
+        // FAT32 has no change time. It is reported absent rather than filled
+        // in from the write or creation stamp, both of which are present here,
+        // so the absence is the format's and not a missing clock's.
+        let metadata = fat.metadata("/stamped.txt")?;
+        assert_eq!(metadata.changed_unix_seconds, None);
+        assert!(metadata.modified_unix_seconds.is_some());
+        assert!(metadata.created_unix_seconds.is_some());
+
+        // Writing again advances the write time and leaves creation alone.
+        clock.set(Some(CREATED + 86_400));
+        fat.write_file("/stamped.txt", b"rewritten")?;
+        let after = fat.metadata("/stamped.txt")?;
+        assert_eq!(after.created_unix_seconds, created, "creation is immutable");
+        assert_eq!(
+            after.modified_unix_seconds,
+            Some(CREATED + 86_400 - (CREATED + 86_400) % 2)
+        );
         Ok(())
     }
 

@@ -11505,6 +11505,8 @@ mod firmware {
                         },
                         byte_count: metadata.byte_count,
                         modified_unix_seconds: metadata.modified_unix_seconds,
+                        changed_unix_seconds: metadata.changed_unix_seconds,
+                        created_unix_seconds: metadata.created_unix_seconds,
                     };
                     ServiceReply::with_payload(
                         ReplyStatus::Success,

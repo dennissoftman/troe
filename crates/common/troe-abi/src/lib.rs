@@ -2091,7 +2091,7 @@ pub mod filesystem {
     /// Interface major version.
     pub const MAJOR: u16 = 1;
     /// Interface minor version.
-    pub const MINOR: u16 = 4;
+    pub const MINOR: u16 = 5;
     /// Resolve and open one regular file.
     pub const OPEN: u16 = 1;
     /// Read one bounded range through an open-file token.
@@ -2132,7 +2132,7 @@ pub mod filesystem {
     pub const MAX_LIST_REPLY_BYTES: usize =
         LIST_REPLY_HEADER_BYTES + MAX_LIST_ENTRIES * LIST_ENTRY_HEADER_BYTES + MAX_LIST_NAME_BYTES;
     /// Fixed metadata reply bytes.
-    pub const METADATA_REPLY_BYTES: usize = 24;
+    pub const METADATA_REPLY_BYTES: usize = 40;
     /// Maximum encoded bytes in one symbolic-link target.
     pub const MAX_LINK_BYTES: usize = MAX_PATH_BYTES;
 
@@ -2177,6 +2177,16 @@ pub mod filesystem {
         /// one that was never stamped. A zero is therefore an absent time
         /// rather than 1970.
         pub modified_unix_seconds: Option<u64>,
+        /// Whole Unix UTC seconds of the last metadata change, when recorded.
+        ///
+        /// Advances on changes a modification time does not see, such as a
+        /// rename. `None` where the format has no such field.
+        pub changed_unix_seconds: Option<u64>,
+        /// Whole Unix UTC seconds of the object's creation, when recorded.
+        ///
+        /// `None` where the format stamps none. Absence is never filled in
+        /// from a field that means something else.
+        pub created_unix_seconds: Option<u64>,
     }
 
     /// Opaque open-file token plus immutable size observed at open time.
@@ -2586,11 +2596,28 @@ pub mod filesystem {
         let mut bytes = [0_u8; METADATA_REPLY_BYTES];
         bytes[0] = metadata.kind as u8;
         // An absent time is one flag byte and an all-zero value, so a decoder
-        // never has to treat a valid instant as a sentinel.
+        // never has to treat a valid instant as a sentinel. Each time carries
+        // its own flag because the three are independently absent.
         bytes[1] = u8::from(metadata.modified_unix_seconds.is_some());
+        bytes[2] = u8::from(metadata.changed_unix_seconds.is_some());
+        bytes[3] = u8::from(metadata.created_unix_seconds.is_some());
         bytes[8..16].copy_from_slice(&metadata.byte_count.to_le_bytes());
         bytes[16..24].copy_from_slice(&metadata.modified_unix_seconds.unwrap_or(0).to_le_bytes());
+        bytes[24..32].copy_from_slice(&metadata.changed_unix_seconds.unwrap_or(0).to_le_bytes());
+        bytes[32..40].copy_from_slice(&metadata.created_unix_seconds.unwrap_or(0).to_le_bytes());
         bytes
+    }
+
+    /// Pair one time's presence flag with its value.
+    ///
+    /// A present flag with no value, or a value with no flag, is a producer
+    /// that did not encode this reply.
+    fn decode_optional_time(flag: u8, seconds: u64) -> Result<Option<u64>, EncodingError> {
+        match flag {
+            0 if seconds == 0 => Ok(None),
+            1 => Ok(Some(seconds)),
+            _ => Err(EncodingError),
+        }
     }
 
     /// Decode one exact metadata reply.
@@ -2599,7 +2626,7 @@ pub mod filesystem {
     ///
     /// Rejects wrong length, padding, kind, or nonzero directory size.
     pub fn decode_metadata_reply(bytes: &[u8]) -> Result<Metadata, EncodingError> {
-        if bytes.len() != METADATA_REPLY_BYTES || bytes[2..8].iter().any(|byte| *byte != 0) {
+        if bytes.len() != METADATA_REPLY_BYTES || bytes[4..8].iter().any(|byte| *byte != 0) {
             return Err(EncodingError);
         }
         let kind = NodeKind::parse(bytes[0])?;
@@ -2607,18 +2634,12 @@ pub mod filesystem {
         if kind == NodeKind::Directory && byte_count != 0 {
             return Err(EncodingError);
         }
-        let seconds = read_u64(bytes, 16)?;
-        let modified_unix_seconds = match bytes[1] {
-            0 if seconds == 0 => None,
-            1 => Some(seconds),
-            // A present flag with no value, or a value with no flag, is a
-            // producer that did not encode this reply.
-            _ => return Err(EncodingError),
-        };
         Ok(Metadata {
             kind,
             byte_count,
-            modified_unix_seconds,
+            modified_unix_seconds: decode_optional_time(bytes[1], read_u64(bytes, 16)?)?,
+            changed_unix_seconds: decode_optional_time(bytes[2], read_u64(bytes, 24)?)?,
+            created_unix_seconds: decode_optional_time(bytes[3], read_u64(bytes, 32)?)?,
         })
     }
 
@@ -6484,28 +6505,54 @@ mod tests {
         );
         assert!(filesystem_mutation::decode_read_request(&read_request[..15]).is_err());
         assert_eq!(filesystem::MAJOR, 1);
-        assert_eq!(filesystem::MINOR, 4);
+        assert_eq!(filesystem::MINOR, 5);
 
-        // An absent modification time is a zero flag and an all-zero value, so
-        // it never collides with the epoch as a real instant.
-        for instant in [None, Some(1_788_000_000_u64)] {
-            let metadata = filesystem::Metadata {
+        // An absent time is a zero flag and an all-zero value, so it never
+        // collides with the epoch as a real instant. The three times are
+        // independently absent, so every combination has to survive a round
+        // trip rather than only all-present and all-absent.
+        for modified in [None, Some(1_788_000_000_u64)] {
+            for changed in [None, Some(1_788_000_001_u64)] {
+                for created in [None, Some(1_788_000_002_u64)] {
+                    let metadata = filesystem::Metadata {
+                        kind: filesystem::NodeKind::File,
+                        byte_count: 9,
+                        modified_unix_seconds: modified,
+                        changed_unix_seconds: changed,
+                        created_unix_seconds: created,
+                    };
+                    let encoded = filesystem::encode_metadata_reply(metadata);
+                    assert_eq!(filesystem::decode_metadata_reply(&encoded), Ok(metadata));
+                }
+            }
+        }
+        // Each time's flag is validated against its own value, so a producer
+        // that sets one without the other is rejected for whichever it was.
+        for flag in [1_usize, 2, 3] {
+            let mut mismatched = filesystem::encode_metadata_reply(filesystem::Metadata {
                 kind: filesystem::NodeKind::File,
                 byte_count: 9,
-                modified_unix_seconds: instant,
-            };
-            let encoded = filesystem::encode_metadata_reply(metadata);
-            assert_eq!(filesystem::decode_metadata_reply(&encoded), Ok(metadata));
+                modified_unix_seconds: Some(5),
+                changed_unix_seconds: Some(6),
+                created_unix_seconds: Some(7),
+            });
+            mismatched[flag] = 0;
+            assert!(filesystem::decode_metadata_reply(&mismatched).is_err());
+            mismatched[flag] = 2;
+            assert!(filesystem::decode_metadata_reply(&mismatched).is_err());
         }
-        let mut mismatched = filesystem::encode_metadata_reply(filesystem::Metadata {
+        // The reserved span shrank to make room for the two extra flags, so a
+        // stale producer writing the old six-byte reserved field is rejected.
+        let mut reserved = filesystem::encode_metadata_reply(filesystem::Metadata {
             kind: filesystem::NodeKind::File,
             byte_count: 9,
-            modified_unix_seconds: Some(5),
+            modified_unix_seconds: None,
+            changed_unix_seconds: None,
+            created_unix_seconds: None,
         });
-        mismatched[1] = 0;
-        assert!(filesystem::decode_metadata_reply(&mismatched).is_err());
-        mismatched[1] = 2;
-        assert!(filesystem::decode_metadata_reply(&mismatched).is_err());
+        reserved[4] = 1;
+        assert!(filesystem::decode_metadata_reply(&reserved).is_err());
+        assert_eq!(filesystem::METADATA_REPLY_BYTES, 40);
         let token = filesystem_mutation::encode_token(7).unwrap_or_else(|_| std::process::abort());
         assert_eq!(filesystem_mutation::decode_token(&token), Ok(7));
         assert!(filesystem_mutation::decode_token(&[7, 0, 0, 0, 0]).is_err());

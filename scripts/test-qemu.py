@@ -1578,6 +1578,61 @@ def exercise_head_tail_and_mkdir(
     session.command("rm -r /vol/root/troe-md", cwd, command_timeout)
 
 
+def exercise_change_and_creation_times(
+    session: SerialSession, cwd: str, command_timeout: float
+) -> None:
+    """Cover `ls -lc` and `ls -lU`, and the change time a rename advances."""
+    stamp = r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}"
+    session.command("printf one > /vol/root/troe-ctime", cwd, command_timeout)
+    # Every column is matched with the size beside it, so `ls`'s own error
+    # cannot satisfy the assertion the way a bare path match would.
+    for flag, label in (("-l", "modification"), ("-lc", "change"), ("-lU", "creation")):
+        listing = session.command(
+            f"ls {flag} /vol/root/troe-ctime", cwd, command_timeout
+        )
+        if not re.search(rf"- +3 {stamp} /vol/root/troe-ctime", listing):
+            raise AcceptanceError(
+                f"ls {flag} did not report a {label} time; output was {listing!r}"
+            )
+
+    # A rename rewrites no byte of the payload, so the modification time must
+    # stand while the change time moves. This is the case `-c` exists for.
+    before = session.command("ls -l /vol/root/troe-ctime", cwd, command_timeout)
+    session.command(
+        "mv /vol/root/troe-ctime /vol/root/troe-ctime-moved", cwd, command_timeout
+    )
+    after = session.command("ls -l /vol/root/troe-ctime-moved", cwd, command_timeout)
+    modified_before = re.search(stamp, before)
+    modified_after = re.search(stamp, after)
+    if not modified_before or not modified_after:
+        raise AcceptanceError(f"no time before/after rename: {before!r} {after!r}")
+    if modified_before.group() != modified_after.group():
+        raise AcceptanceError(
+            "a rename must not advance the modification time; "
+            f"{modified_before.group()!r} became {modified_after.group()!r}"
+        )
+    changed = session.command("ls -lc /vol/root/troe-ctime-moved", cwd, command_timeout)
+    if not re.search(rf"- +3 {stamp} /vol/root/troe-ctime-moved", changed):
+        raise AcceptanceError(f"ls -lc lost the change time; output was {changed!r}")
+    session.command("rm /vol/root/troe-ctime-moved", cwd, command_timeout)
+
+    # FAT32 records no change time at all, so the column is omitted rather than
+    # blank -- while its creation time is present.
+    session.command("printf fat > /vol/shared/troe-ctime", cwd, command_timeout)
+    fat_changed = session.command("ls -lc /vol/shared/troe-ctime", cwd, command_timeout)
+    if re.search(stamp, fat_changed):
+        raise AcceptanceError(
+            "FAT32 has no change time yet ls -lc reported one; "
+            f"output was {fat_changed!r}"
+        )
+    fat_created = session.command("ls -lU /vol/shared/troe-ctime", cwd, command_timeout)
+    if not re.search(rf"- +3 {stamp} /vol/shared/troe-ctime", fat_created):
+        raise AcceptanceError(
+            f"FAT32 records a creation time yet ls -lU omitted it: {fat_created!r}"
+        )
+    session.command("rm /vol/shared/troe-ctime", cwd, command_timeout)
+
+
 def exercise_touch(session: SerialSession, cwd: str, command_timeout: float) -> None:
     """Cover creation, in-place stamping, and the providers that refuse."""
     session.command(
@@ -1959,6 +2014,7 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
             f"output was {root_listing!r}"
         )
     session.command("rm /vol/root/troe-timed", cwd, command_timeout)
+    exercise_change_and_creation_times(session, cwd, command_timeout)
     exercise_head_tail_and_mkdir(session, cwd, command_timeout)
     exercise_touch(session, cwd, command_timeout)
     session.confirmed_command(

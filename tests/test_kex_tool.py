@@ -136,9 +136,9 @@ class KexToolTests(unittest.TestCase):
                     if command == "udp":
                         expected = [(5, 1, 0)]
                     elif command == "tar":
-                        expected = [(6, 1, 4), (7, 1, 5)]
+                        expected = [(6, 1, 5), (7, 1, 5)]
                     elif command in {"cp", "mkdir", "mv", "rm", "touch"}:
-                        expected = [(6, 1, 4), (7, 1, 5)]
+                        expected = [(6, 1, 5), (7, 1, 5)]
                     elif command in {
                         "awk",
                         "cat",
@@ -151,10 +151,10 @@ class KexToolTests(unittest.TestCase):
                         "tail",
                         "wc",
                     }:
-                        expected = [(6, 1, 4)]
+                        expected = [(6, 1, 5)]
                     elif command == "lua":
                         expected = [
-                            (6, 1, 4),
+                            (6, 1, 5),
                             (7, 1, 5),
                             (8, 1, 0),
                             (17, 1, 0),
@@ -186,9 +186,9 @@ class KexToolTests(unittest.TestCase):
                     elif command == "mount":
                         expected = [(14, 1, 0)]
                     elif command == "sh":
-                        expected = [(6, 1, 4), (16, 1, 0)]
+                        expected = [(6, 1, 5), (16, 1, 0)]
                     elif command == "spawn":
-                        expected = [(6, 1, 4), (20, 1, 0), (21, 1, 0)]
+                        expected = [(6, 1, 5), (20, 1, 0), (21, 1, 0)]
                     else:
                         expected = []
                     self.assertEqual(records, expected)
