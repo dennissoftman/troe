@@ -83,11 +83,13 @@ impl<D: BlockDevice> FileSystemProvider for StateFs<D> {
             "/" => Ok(FileMetadata {
                 kind: NodeKind::Directory,
                 byte_count: 0,
+                modified_unix_seconds: None,
             }),
             STATE_PATH => self.bytes.as_ref().map_or(Err(FsError::NotFound), |bytes| {
                 Ok(FileMetadata {
                     kind: NodeKind::File,
                     byte_count: u64::try_from(bytes.len()).map_err(|_| FsError::Overflow)?,
+                    modified_unix_seconds: None,
                 })
             }),
             _ => Err(FsError::NotFound),

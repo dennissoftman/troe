@@ -2769,10 +2769,12 @@ mod tests {
                 "/" => Ok(FileMetadata {
                     kind: NodeKind::Directory,
                     byte_count: 0,
+                    modified_unix_seconds: None,
                 }),
                 "/large" => Ok(FileMetadata {
                     kind: NodeKind::File,
                     byte_count: self.state.borrow().bytes,
+                    modified_unix_seconds: None,
                 }),
                 _ => Err(FsError::NotFound),
             }

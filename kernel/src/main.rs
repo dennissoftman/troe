@@ -11504,6 +11504,7 @@ mod firmware {
                             NodeKind::Symlink => filesystem::NodeKind::Symlink,
                         },
                         byte_count: metadata.byte_count,
+                        modified_unix_seconds: metadata.modified_unix_seconds,
                     };
                     ServiceReply::with_payload(
                         ReplyStatus::Success,
@@ -11742,6 +11743,20 @@ mod firmware {
                 .map_err(application_filesystem_status)
         }
 
+        fn set_modified_time(
+            &mut self,
+            path: &str,
+            unix_seconds: Option<u64>,
+        ) -> Result<(), ReplyStatus> {
+            if self.pending.is_some() {
+                return Err(ReplyStatus::Conflict);
+            }
+            self.namespace
+                .borrow_mut()
+                .set_modified_time(&self.cwd, path, unix_seconds)
+                .map_err(application_filesystem_status)
+        }
+
         fn rename(&mut self, source: &str, destination: &str) -> Result<(), ReplyStatus> {
             if self.pending.is_some() {
                 return Err(ReplyStatus::Conflict);
@@ -11872,6 +11887,16 @@ mod firmware {
                         return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
                     };
                     Ok(application_mutation_reply(self.remove_directory(path)))
+                }
+                filesystem_mutation::SET_MODIFIED_TIME => {
+                    let Ok((path, unix_seconds)) =
+                        filesystem_mutation::decode_set_modified_time_request(request.payload())
+                    else {
+                        return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                    };
+                    Ok(application_mutation_reply(
+                        self.set_modified_time(path, unix_seconds),
+                    ))
                 }
                 filesystem_mutation::RENAME => {
                     let Ok(paths) = filesystem_mutation::decode_two_path_request(request.payload())

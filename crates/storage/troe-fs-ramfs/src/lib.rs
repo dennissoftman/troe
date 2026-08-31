@@ -115,10 +115,12 @@ impl FileSystemProvider for RamFs {
             Some(Node::Directory) => Ok(FileMetadata {
                 kind: NodeKind::Directory,
                 byte_count: 0,
+                modified_unix_seconds: None,
             }),
             Some(Node::File(bytes)) => Ok(FileMetadata {
                 kind: NodeKind::File,
                 byte_count: bytes.len() as u64,
+                modified_unix_seconds: None,
             }),
             None => Err(FsError::NotFound),
         }

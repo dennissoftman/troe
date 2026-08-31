@@ -20,10 +20,14 @@ OPTIONS
     -F  Append / to directories and @ to symbolic links. The filesystem ABI
         does not expose executable-mode or special-file classifiers.
     -p  Append / to directories.
-    -l  Print one entry per line with a node-type marker and byte size. TROE's
-        filesystem ABI does not expose POSIX ownership, modes, or timestamps.
+    -l  Print one entry per line with a node-type marker, byte size, and the
+        UTC modification time as YYYY-MM-DD HH:MM. The time column appears only
+        when at least one listed entry has one: a provider that stores no
+        timestamp, such as the read-only root or a quota-bound /tmp, reports
+        none and the column is omitted rather than left blank. TROE's
+        filesystem ABI does not expose POSIX ownership or modes.
     -h  With -l, round sizes using 1024-based IEC units such as KiB and GiB.
 
     Options may be combined. -- ends option parsing. Recursive listing and
     sorting by size or time are not provided because directory enumeration is
-    intentionally bounded and the filesystem ABI exposes no timestamps.
+    intentionally bounded and returns one lexical page at a time.

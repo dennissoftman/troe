@@ -160,6 +160,8 @@ struct FatEntry {
     byte_count: u64,
     short_name: [u8; 11],
     directory_slots: Vec<DirectorySlot>,
+    /// Write time recorded in this entry, when it was ever stamped.
+    modified_unix_seconds: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -295,6 +297,8 @@ impl<D: BlockDevice> Fat32<D> {
             byte_count: 0,
             short_name: [0; 11],
             directory_slots: Vec::new(),
+            // The volume root has no directory entry, so it carries no time.
+            modified_unix_seconds: None,
         };
         if normalized == "/" {
             return Ok(current);
@@ -535,6 +539,7 @@ impl<D: BlockDevice> Fat32<D> {
                     byte_count,
                     short_name: raw[..11].try_into().map_err(|_| FsError::Corrupt)?,
                     directory_slots,
+                    modified_unix_seconds: DosStamp::read_modification(raw)?,
                 });
             }
         }
@@ -1060,7 +1065,33 @@ impl<D: BlockDevice> FileSystemProvider for Fat32<D> {
         Ok(FileMetadata {
             kind: entry.kind,
             byte_count: entry.byte_count,
+            modified_unix_seconds: entry.modified_unix_seconds,
         })
+    }
+
+    fn set_modified_time(&mut self, path: &str, unix_seconds: Option<u64>) -> Result<(), FsError> {
+        self.ensure_writable()?;
+        // `None` asks for the clock's instant. Refusing when no wall time is
+        // known keeps ADR 0058's rule that a provider never invents one.
+        let seconds = match unix_seconds {
+            Some(seconds) => seconds,
+            None => self
+                .wall_clock
+                .as_ref()
+                .and_then(|clock| clock.unix_seconds())
+                .ok_or(FsError::Unsupported)?,
+        };
+        let stamp = DosStamp::from_unix_seconds(seconds)?;
+        let entry = self.resolve(path)?;
+        // The volume root has no directory entry of its own to stamp.
+        let slot = *entry.directory_slots.last().ok_or(FsError::Unsupported)?;
+        let mut bytes = self.read_cluster(slot.cluster)?;
+        let raw = bytes
+            .get_mut(slot.offset..slot.offset + DIRECTORY_ENTRY_BYTES)
+            .ok_or(FsError::Corrupt)?;
+        stamp.write_modification(raw)?;
+        self.write_cluster(slot.cluster, &bytes)?;
+        self.durability_barrier()
     }
 
     fn read_file(
@@ -1607,6 +1638,44 @@ impl DosStamp {
         })
     }
 
+    /// Recover the Unix UTC instant this stamp encodes.
+    ///
+    /// A zero date is an absent time rather than 1980: a FAT entry that was
+    /// never stamped keeps the zeroes it was created with, and ADR 0058 leaves
+    /// them exactly so whenever no wall time is known. FAT records the write
+    /// time to two seconds, so the tenths field is not consulted.
+    fn to_unix_seconds(self) -> Result<Option<u64>, FsError> {
+        if self.date == 0 {
+            return Ok(None);
+        }
+        let year = (self.date >> 9) + 1980;
+        let month = (self.date >> 5) & 0xf;
+        let day = self.date & 0x1f;
+        let hour = u64::from(self.time >> 11);
+        let minute = u64::from((self.time >> 5) & 0x3f);
+        let second = u64::from((self.time & 0x1f) * 2);
+        if hour > 23 || minute > 59 || second > 59 {
+            return Err(FsError::Corrupt);
+        }
+        let days = days_from_civil(year, month, day)?;
+        days.checked_mul(SECONDS_PER_DAY)
+            .and_then(|seconds| seconds.checked_add(hour * 3_600))
+            .and_then(|seconds| seconds.checked_add(minute * 60))
+            .and_then(|seconds| seconds.checked_add(second))
+            .map(Some)
+            .ok_or(FsError::Overflow)
+    }
+
+    /// Read one directory entry's write time.
+    fn read_modification(raw: &[u8]) -> Result<Option<u64>, FsError> {
+        Self {
+            date: read_u16(raw, DIRECTORY_WRITE_TIME + 2)?,
+            time: read_u16(raw, DIRECTORY_WRITE_TIME)?,
+            tenths: 0,
+        }
+        .to_unix_seconds()
+    }
+
     /// Stamp this instant as an entry's creation time, and as the access date.
     fn write_creation(self, raw: &mut [u8]) -> Result<(), FsError> {
         *raw.get_mut(DIRECTORY_CREATE_TENTHS)
@@ -1645,6 +1714,28 @@ fn copy_timestamps(source: &[u8], destination: &mut [u8]) -> Result<(), FsError>
 /// The era arithmetic is the standard shift of the year's origin to March, so
 /// that a leap day falls at the end of a cycle and every month before it has a
 /// fixed length.
+/// Days since the Unix epoch for one proleptic Gregorian date.
+///
+/// The exact inverse of [`civil_from_days`], so a stamp written from an instant
+/// and read back reports the same instant to FAT's two-second granularity.
+fn days_from_civil(year: u16, month: u16, day: u16) -> Result<u64, FsError> {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return Err(FsError::Corrupt);
+    }
+    // The algorithm counts from March so a leap day lands at the end of a year.
+    let year = u64::from(year) - u64::from(month <= 2);
+    let era = year / 400;
+    let year_of_era = year - era * 400;
+    let month = u64::from(month);
+    let shifted_month = if month > 2 { month - 3 } else { month + 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + u64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era.checked_mul(146_097)
+        .and_then(|days| days.checked_add(day_of_era))
+        .and_then(|days| days.checked_sub(719_468))
+        .ok_or(FsError::Overflow)
+}
+
 fn civil_from_days(days: u64) -> Result<(u16, u16, u16), FsError> {
     let shifted = days.checked_add(719_468).ok_or(FsError::Overflow)?;
     let era = shifted / 146_097;
@@ -2087,7 +2178,7 @@ mod tests {
         BlockDevice, BlockError, BlockRegion, DIRECTORY_ACCESS_DATE, DIRECTORY_CREATE_TENTHS,
         DIRECTORY_CREATE_TIME, DIRECTORY_ENTRY_BYTES, DIRECTORY_WRITE_TIME, DOS_EPOCH_SECONDS,
         DOS_LAST_SECONDS, DosStamp, Fat32, Fat32Limits, FileSystemProvider, FsError, NodeKind, Rc,
-        WallClock, read_u16, short_name_checksum,
+        WallClock, civil_from_days, days_from_civil, read_u16, short_name_checksum,
     };
 
     const BLOCK_BYTES: usize = 512;
@@ -2726,6 +2817,53 @@ mod tests {
     }
 
     #[test]
+    fn dos_stamps_round_trip_and_report_an_unstamped_entry_as_absent() -> Result<(), FsError> {
+        // Every instant FAT can express reads back as the same instant, to the
+        // two-second granularity the write time records.
+        for seconds in [
+            DOS_EPOCH_SECONDS,
+            DOS_EPOCH_SECONDS + 59,
+            1_788_000_000,
+            1_788_000_001,
+            DOS_LAST_SECONDS,
+        ] {
+            let stamp = DosStamp::from_unix_seconds(seconds)?;
+            let expected = seconds - seconds % 2;
+            assert_eq!(
+                stamp.to_unix_seconds()?,
+                Some(expected),
+                "round trip at {seconds}"
+            );
+        }
+        // A zero date is an entry that was never stamped, not 1980.
+        assert_eq!(
+            DosStamp {
+                date: 0,
+                time: 0,
+                tenths: 0
+            }
+            .to_unix_seconds()?,
+            None
+        );
+        // A month or day outside its field is corrupt rather than clamped.
+        assert!(
+            DosStamp {
+                date: 0x21 | (0xd << 5),
+                time: 0,
+                tenths: 0
+            }
+            .to_unix_seconds()
+            .is_err()
+        );
+        // The civil conversion is the exact inverse of the forward one.
+        for day in [0_u64, 1, 3_652, 20_000, 50_000] {
+            let (year, month, date) = civil_from_days(day)?;
+            assert_eq!(days_from_civil(year, month, date)?, day, "day {day}");
+        }
+        Ok(())
+    }
+
+    #[test]
     fn dos_stamps_encode_the_fat_range_and_clamp_outside_it() -> Result<(), FsError> {
         // 1980-01-01T00:00:00, the first instant a FAT date can express.
         assert_eq!(
@@ -2774,6 +2912,57 @@ mod tests {
             DosStamp::from_unix_seconds(u64::MAX)?,
             DosStamp::from_unix_seconds(DOS_LAST_SECONDS)?
         );
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_reports_the_write_time_and_an_explicit_set_replaces_it() -> Result<(), FsError> {
+        const CREATED: u64 = 1_788_000_000;
+        const REQUESTED: u64 = 1_600_000_000;
+
+        let mut fat = mount_writable(valid_device().map_err(|_| FsError::Io)?)?;
+
+        // An entry written with no clock has no time to report.
+        fat.write_file("/unstamped.txt", b"no clock")?;
+        assert_eq!(
+            fat.metadata("/unstamped.txt")?.modified_unix_seconds,
+            None,
+            "an unstamped entry reports no time rather than 1980"
+        );
+        // Asking for the clock's instant while none is known is refused rather
+        // than inventing one.
+        assert_eq!(
+            fat.set_modified_time("/unstamped.txt", None),
+            Err(FsError::Unsupported)
+        );
+
+        let clock = TestClock::new(Some(CREATED));
+        fat.set_wall_clock(clock.clone());
+        fat.write_file("/stamped.txt", b"clocked")?;
+        assert_eq!(
+            fat.metadata("/stamped.txt")?.modified_unix_seconds,
+            Some(CREATED),
+            "the stamped write time reads back"
+        );
+
+        // An explicit instant replaces it, including one earlier than the clock.
+        fat.set_modified_time("/stamped.txt", Some(REQUESTED))?;
+        assert_eq!(
+            fat.metadata("/stamped.txt")?.modified_unix_seconds,
+            Some(REQUESTED)
+        );
+
+        // `None` with a clock installed stamps the clock's own instant.
+        clock.set(Some(CREATED + 60));
+        fat.set_modified_time("/stamped.txt", None)?;
+        assert_eq!(
+            fat.metadata("/stamped.txt")?.modified_unix_seconds,
+            Some(CREATED + 60)
+        );
+
+        // The volume root has no directory entry of its own to stamp.
+        assert_eq!(fat.metadata("/")?.modified_unix_seconds, None);
+        assert_eq!(fat.set_modified_time("/", None), Err(FsError::Unsupported));
         Ok(())
     }
 

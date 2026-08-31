@@ -1692,6 +1692,25 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
     )
     session.command("rm /vol/root/troe-empty-test/state.txt", cwd, command_timeout)
     session.command("rmdir /vol/root/troe-empty-test", cwd, command_timeout)
+    # A writable ext4 volume records a modification time, so `ls -l` gains the
+    # UTC column; the read-only root stores none and omits it entirely.
+    session.command(
+        "printf timed > /vol/root/troe-timed",
+        cwd,
+        command_timeout,
+    )
+    listing = session.command("ls -l /vol/root/troe-timed", cwd, command_timeout)
+    if not re.search(r"- +5 \d{4}-\d{2}-\d{2} \d{2}:\d{2} /vol/root/troe-timed", listing):
+        raise AcceptanceError(
+            f"ls -l did not report a modification time; output was {listing!r}"
+        )
+    root_listing = session.command("ls -l /bin/echo.kex", cwd, command_timeout)
+    if re.search(r"\d{4}-\d{2}-\d{2}", root_listing):
+        raise AcceptanceError(
+            "the read-only root stores no time yet ls -l reported one; "
+            f"output was {root_listing!r}"
+        )
+    session.command("rm /vol/root/troe-timed", cwd, command_timeout)
     session.confirmed_command(
         lua + " -e 'local ok,kind,status=os.execute(\"mv "
         "/vol/root/troe-moved.txt /vol/shared/cross-device.txt\"); "
