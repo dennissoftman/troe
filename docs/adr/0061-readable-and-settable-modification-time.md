@@ -56,12 +56,18 @@ opcode. `None` requests the namespace clock's current instant, which is what
 `touch` with no explicit time asks for; `Some` requests an exact one, which is
 what `touch -d` asks for. Two refusals are deliberate:
 
-- A provider that stores no timestamp keeps the trait default and refuses, so a
-  caller learns the time was not recorded rather than receiving success for a
-  write that could not happen.
-- A request for the clock's instant while no wall time is known is refused
-  rather than satisfied with a substitute, which is ADR 0058's rule that a
-  provider never invents an instant, applied to an explicit caller.
+- A provider that stores no timestamp keeps the trait default and refuses with
+  `Unsupported`, so the operation reports what it did rather than claiming a
+  write that could not happen. A command may still choose to treat that as
+  success where the user's request was satisfied by other means: `touch`
+  creates the file, which is what was asked for, and no filesystem refuses
+  `touch` for this reason.
+- A request for the clock's instant while no wall time is known is refused with
+  `NotConfigured` rather than satisfied with a substitute, which is ADR 0058's
+  rule that a provider never invents an instant, applied to an explicit caller.
+  The two are separate errors precisely so a caller can forgive the permanent
+  condition without also silently dropping a time the provider could have
+  recorded once a clock arrives.
 
 `ls -l` renders `YYYY-MM-DD HH:MM` in UTC. The column appears only when at
 least one listed entry has a time, so listing a provider that stores none — the

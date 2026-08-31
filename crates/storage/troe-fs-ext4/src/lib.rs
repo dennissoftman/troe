@@ -3741,7 +3741,7 @@ impl<D: BlockDevice> FileSystemProvider for Ext4<D> {
         // known keeps ADR 0058's rule that a provider never invents one.
         let seconds = match unix_seconds {
             Some(seconds) => seconds,
-            None => self.wall_seconds().ok_or(FsError::Unsupported)?,
+            None => self.wall_seconds().ok_or(FsError::NotConfigured)?,
         };
         let inode = self.resolve(path)?;
         let (block, offset) = self.inode_record_location(inode.number)?;

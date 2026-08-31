@@ -73,7 +73,7 @@ class KexToolTests(unittest.TestCase):
                         else 12
                         if command in {"cp", "mv", "rm", "spawn", "tar"}
                         else 8
-                        if command in {"arp", "ps", "top"}
+                        if command in {"arp", "ps", "tail", "top"}
                         else 20
                         if command in {"awk", "sed"}
                         else 4
@@ -137,16 +137,18 @@ class KexToolTests(unittest.TestCase):
                         expected = [(5, 1, 0)]
                     elif command == "tar":
                         expected = [(6, 1, 4), (7, 1, 5)]
-                    elif command in {"cp", "mv", "rm"}:
+                    elif command in {"cp", "mkdir", "mv", "rm", "touch"}:
                         expected = [(6, 1, 4), (7, 1, 5)]
                     elif command in {
                         "awk",
                         "cat",
                         "grep",
+                        "head",
                         "hexdump",
                         "ls",
                         "man",
                         "sed",
+                        "tail",
                         "wc",
                     }:
                         expected = [(6, 1, 4)]

@@ -65,6 +65,11 @@ pub enum FsError {
     Io,
     /// The media uses a feature outside the selected provider profile.
     Unsupported,
+    /// The operation needs the wall clock's instant and no wall time is known.
+    ///
+    /// Distinct from `Unsupported`, which says the provider records nothing at
+    /// all: this is a transient condition an installed clock resolves.
+    NotConfigured,
     /// A directory removal targeted a directory that still has children.
     NotEmpty,
     /// A name operation crossed filesystem-provider boundaries.
@@ -84,6 +89,7 @@ impl fmt::Display for FsError {
             Self::Corrupt => f.write_str("filesystem metadata is corrupt"),
             Self::Io => f.write_str("filesystem transport failed"),
             Self::Unsupported => f.write_str("filesystem feature is unsupported"),
+            Self::NotConfigured => f.write_str("wall clock is not set"),
             Self::NotEmpty => f.write_str("directory not empty"),
             Self::CrossDevice => f.write_str("cross-device operation"),
         }

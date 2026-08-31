@@ -1,0 +1,27 @@
+NAME
+    mkdir - create directories
+
+SYNOPSIS
+    mkdir [-pv] DIRECTORY...
+
+DESCRIPTION
+    Creates each named DIRECTORY. The parent must already exist and the name
+    must be free, unless -p is given.
+
+    -p  Create missing parent directories, and succeed when the directory
+        already exists.
+    -v  Print a line for each directory created.
+
+    With -p a refusal names the component that caused it rather than the leaf
+    that followed, so a mistyped volume reports the mistyped component. That
+    needs the filesystem-read capability to tell an ancestor that already
+    exists from one that cannot be created, because both refuse alike: /vol
+    sits above every writable mount and is no more creatable than a volume
+    that does not exist.
+
+    Requires filesystem-mutate to create, and filesystem-read for -p, so it
+    works on a writable volume such as /vol/root and is refused on the
+    read-only root.
+
+    Every operand is attempted; a failure is reported and the remaining
+    operands still run.

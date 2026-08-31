@@ -1079,7 +1079,7 @@ impl<D: BlockDevice> FileSystemProvider for Fat32<D> {
                 .wall_clock
                 .as_ref()
                 .and_then(|clock| clock.unix_seconds())
-                .ok_or(FsError::Unsupported)?,
+                .ok_or(FsError::NotConfigured)?,
         };
         let stamp = DosStamp::from_unix_seconds(seconds)?;
         let entry = self.resolve(path)?;
@@ -2930,10 +2930,17 @@ mod tests {
             "an unstamped entry reports no time rather than 1980"
         );
         // Asking for the clock's instant while none is known is refused rather
-        // than inventing one.
+        // than inventing one, and reported as the transient condition it is
+        // rather than as a provider that records nothing.
         assert_eq!(
             fat.set_modified_time("/unstamped.txt", None),
-            Err(FsError::Unsupported)
+            Err(FsError::NotConfigured)
+        );
+        // An explicit instant needs no clock, so it is accepted.
+        fat.set_modified_time("/unstamped.txt", Some(1_788_000_000))?;
+        assert_eq!(
+            fat.metadata("/unstamped.txt")?.modified_unix_seconds,
+            Some(1_788_000_000)
         );
 
         let clock = TestClock::new(Some(CREATED));

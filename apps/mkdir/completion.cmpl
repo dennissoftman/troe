@@ -1,0 +1,3 @@
+CMPL	1	mkdir
+R	1	1	^-	values:--,-p,-v
+R	1	*	*	path:directory

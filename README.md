@@ -56,9 +56,10 @@ measurement.
   `/tmp`, live `/sys`, and crash-consistent state under `/vol/state`.
 - Ethernet, ARP, DHCP, IPv4, ICMP, UDP, and outbound TCP over virtio-net.
 - KEX applications for `arp`, `awk`, `cat`, `clear`, `cp`, `dhcp`, `echo`,
-  `grep`, `hexdump`, `ln`, `ls`, `lua`, `man`, `mem`, `mount`, `mv`, `net`,
-  `ping`, `printf`, `ps`, `pwd`, `rm`, `rmdir`, `sed`, `sh`, `sleep`, `spawn`,
-  `tar`, `tcp`, `timesync`, `top`, `udp`, and `wc`.
+  `grep`, `head`, `hexdump`, `ln`, `ls`, `lua`, `man`, `mem`, `mkdir`, `mount`,
+  `mv`, `net`, `ping`, `printf`, `ps`, `pwd`, `rm`, `rmdir`, `sed`, `sh`,
+  `sleep`, `spawn`, `tail`, `tar`, `tcp`, `timesync`, `top`, `touch`, `udp`, and
+  `wc`.
 
 `cd`, session job control, `svc`, `poweroff`, and `reboot` are non-shadowable
 shell intrinsics because they mutate shell- or supervisor-owned state. Ordinary
