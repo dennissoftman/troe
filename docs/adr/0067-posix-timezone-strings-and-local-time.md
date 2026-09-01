@@ -1,7 +1,8 @@
 # ADR 0067: POSIX timezone strings and local time without a database
 
-Status: accepted, 2026-09-01. Amends the "no timezone source" premise of
-ADR 0039 and the FAT32 reasoning in ADR 0058, and narrows the remaining scope of
+Status: accepted and implemented, 2026-09-01. Amends the "no timezone source"
+premise of ADR 0039 and the FAT32 reasoning in ADR 0058, and narrows the
+remaining scope of
 [issue #34](https://github.com/dennissoftman/troe/issues/34) to dataset work.
 
 ## Context
@@ -194,7 +195,9 @@ is the compiled `UTC0`. This is a consequence of the capability model rather
 than of this decision, but it means the one command an operator would reach for
 cannot yet show a local time, and it will stay that way until either a
 configured session zone lands or `spawn` is given the authority to delegate.
-Acceptance pins the refusal so the boundary is stated rather than discovered.
+Acceptance pins the refusal so the boundary is stated rather than discovered,
+and [issue #148](https://github.com/dennissoftman/troe/issues/148) tracks
+closing it.
 
 The limitation this tier keeps is that a POSIX string applies today's rules to
 every instant, so a timestamp before the zone's last rule change renders with
