@@ -2849,6 +2849,93 @@ mod tests {
         shell_with_namespace().0
     }
 
+    /// Package-owned completions the fixture installs under `/bin`.
+    ///
+    /// The real registry is each package's own `completion.cmpl`; this is a
+    /// representative sample, not the command set.
+    const FIXTURE_COMPLETIONS: &[(&str, &[u8])] = &[
+        (
+            "awk",
+            include_bytes!("../../../../apps/awk/completion.cmpl").as_slice(),
+        ),
+        (
+            "cat",
+            include_bytes!("../../../../apps/cat/completion.cmpl").as_slice(),
+        ),
+        (
+            "date",
+            include_bytes!("../../../../apps/date/completion.cmpl").as_slice(),
+        ),
+        (
+            "echo",
+            include_bytes!("../../../../apps/echo/completion.cmpl").as_slice(),
+        ),
+        (
+            "grep",
+            include_bytes!("../../../../apps/grep/completion.cmpl").as_slice(),
+        ),
+        (
+            "hexdump",
+            include_bytes!("../../../../apps/hexdump/completion.cmpl").as_slice(),
+        ),
+        (
+            "ln",
+            include_bytes!("../../../../apps/ln/completion.cmpl").as_slice(),
+        ),
+        (
+            "lua",
+            include_bytes!("../../../../apps/lua/completion.cmpl").as_slice(),
+        ),
+        (
+            "ls",
+            include_bytes!("../../../../apps/ls/completion.cmpl").as_slice(),
+        ),
+        (
+            "man",
+            include_bytes!("../../../../apps/man/completion.cmpl").as_slice(),
+        ),
+        (
+            "mem",
+            include_bytes!("../../../../apps/mem/completion.cmpl").as_slice(),
+        ),
+        (
+            "mount",
+            include_bytes!("../../../../apps/mount/completion.cmpl").as_slice(),
+        ),
+        (
+            "net",
+            include_bytes!("../../../../apps/net/completion.cmpl").as_slice(),
+        ),
+        (
+            "ping",
+            include_bytes!("../../../../apps/ping/completion.cmpl").as_slice(),
+        ),
+        (
+            "pwd",
+            include_bytes!("../../../../apps/pwd/completion.cmpl").as_slice(),
+        ),
+        (
+            "sed",
+            include_bytes!("../../../../apps/sed/completion.cmpl").as_slice(),
+        ),
+        (
+            "sleep",
+            include_bytes!("../../../../apps/sleep/completion.cmpl").as_slice(),
+        ),
+        (
+            "tar",
+            include_bytes!("../../../../apps/tar/completion.cmpl").as_slice(),
+        ),
+        (
+            "udp",
+            include_bytes!("../../../../apps/udp/completion.cmpl").as_slice(),
+        ),
+        (
+            "wc",
+            include_bytes!("../../../../apps/wc/completion.cmpl").as_slice(),
+        ),
+    ];
+
     /// Build a session and retain the concrete namespace. Composition is not
     /// reachable through the session any more, which is the point of the
     /// client contract, so a test that composes needs its own handle.
@@ -2856,84 +2943,7 @@ mod tests {
         let mut namespace = writable_namespace();
         assert_eq!(namespace.add_read_only_dir("/help"), Ok(()));
         assert_eq!(namespace.add_read_only_dir("/bin"), Ok(()));
-        for (command, completion) in [
-            (
-                "awk",
-                include_bytes!("../../../../apps/awk/completion.cmpl").as_slice(),
-            ),
-            (
-                "cat",
-                include_bytes!("../../../../apps/cat/completion.cmpl").as_slice(),
-            ),
-            (
-                "echo",
-                include_bytes!("../../../../apps/echo/completion.cmpl").as_slice(),
-            ),
-            (
-                "grep",
-                include_bytes!("../../../../apps/grep/completion.cmpl").as_slice(),
-            ),
-            (
-                "hexdump",
-                include_bytes!("../../../../apps/hexdump/completion.cmpl").as_slice(),
-            ),
-            (
-                "ln",
-                include_bytes!("../../../../apps/ln/completion.cmpl").as_slice(),
-            ),
-            (
-                "lua",
-                include_bytes!("../../../../apps/lua/completion.cmpl").as_slice(),
-            ),
-            (
-                "ls",
-                include_bytes!("../../../../apps/ls/completion.cmpl").as_slice(),
-            ),
-            (
-                "man",
-                include_bytes!("../../../../apps/man/completion.cmpl").as_slice(),
-            ),
-            (
-                "mem",
-                include_bytes!("../../../../apps/mem/completion.cmpl").as_slice(),
-            ),
-            (
-                "mount",
-                include_bytes!("../../../../apps/mount/completion.cmpl").as_slice(),
-            ),
-            (
-                "net",
-                include_bytes!("../../../../apps/net/completion.cmpl").as_slice(),
-            ),
-            (
-                "ping",
-                include_bytes!("../../../../apps/ping/completion.cmpl").as_slice(),
-            ),
-            (
-                "pwd",
-                include_bytes!("../../../../apps/pwd/completion.cmpl").as_slice(),
-            ),
-            (
-                "sed",
-                include_bytes!("../../../../apps/sed/completion.cmpl").as_slice(),
-            ),
-            (
-                "sleep",
-                include_bytes!("../../../../apps/sleep/completion.cmpl").as_slice(),
-            ),
-            (
-                "tar",
-                include_bytes!("../../../../apps/tar/completion.cmpl").as_slice(),
-            ),
-            (
-                "udp",
-                include_bytes!("../../../../apps/udp/completion.cmpl").as_slice(),
-            ),
-            (
-                "wc",
-                include_bytes!("../../../../apps/wc/completion.cmpl").as_slice(),
-            ),
-        ] {
+        for (command, completion) in FIXTURE_COMPLETIONS {
             let package = encode_kex_package_with_completion(b"x", &[], Some(completion))
                 .unwrap_or_else(|_| std::process::abort());
             assert_eq!(

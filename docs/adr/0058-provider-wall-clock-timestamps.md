@@ -11,6 +11,12 @@ operation that sets it. The statements below that nothing in this profile reads
 the stamped fields describe the original decision; the exclusion of
 access-time updates on read still holds.
 
+Amendment, 2026-09-01: [ADR 0067](0067-posix-timezone-strings-and-local-time.md)
+adds a timezone source, so the FAT32 section's premise that TROE has none is no
+longer true. The behavior it justified is retained on a different ground: the
+provider stamps writes on behalf of any process, so there is no single launch
+whose zone it could apply, and UTC remains the only defensible reading.
+
 ## Context
 
 The kernel has held Unix wall time since ADR 0039, and the ext4 provider has

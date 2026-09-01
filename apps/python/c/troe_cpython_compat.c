@@ -11,12 +11,10 @@
 #include <unistd.h>
 #include <wchar.h>
 
-long timezone = 0;
-int daylight = 0;
-static char troe_utc[] = "UTC";
-char *tzname[2] = {troe_utc, troe_utc};
-
-void tzset(void) {}
+/* `timezone`, `daylight`, `tzname` and `tzset` used to be hardcoded here as
+ * UTC-only stand-ins because the C sysroot had no zone at all. The sysroot owns
+ * them since ADR 0067, and they now answer from the launch `TZ`, so defining
+ * them again here would be a duplicate symbol as well as a wrong answer. */
 
 int gettimeofday(struct timeval *destination, void *timezone_unused) {
   (void)timezone_unused;

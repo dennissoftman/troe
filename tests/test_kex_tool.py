@@ -167,6 +167,8 @@ class KexToolTests(unittest.TestCase):
                         expected = [(7, 1, 5)]
                     elif command == "sleep":
                         expected = [(8, 1, 0)]
+                    elif command == "date":
+                        expected = [(17, 1, 0)]
                     elif command == "timesync":
                         expected = [(5, 1, 0), (8, 1, 0), (18, 1, 0)]
                     elif command == "mem":

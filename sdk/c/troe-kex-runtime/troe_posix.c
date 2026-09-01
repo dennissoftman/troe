@@ -18,6 +18,49 @@
 
 extern void troe_runtime_run_tss_destructors(void);
 
+/* The timezone rules live once, in the Rust KEX runtime, so libc, Lua, and
+   CPython cannot disagree about a transition. See ADR 0067. */
+#define TROE_ZONE_ABBREVIATION_BYTES 16
+
+typedef struct TroeRuntimeCalendar {
+  int64_t year;
+  int month;
+  int day;
+  int hour;
+  int minute;
+  int second;
+  int week_day;
+  int year_day;
+  int gmt_offset;
+  int daylight;
+  unsigned char zone[TROE_ZONE_ABBREVIATION_BYTES];
+  unsigned char zone_length;
+} TroeRuntimeCalendar;
+
+typedef struct TroeRuntimeCalendarResult {
+  int status;
+  int64_t seconds;
+  TroeRuntimeCalendar calendar;
+} TroeRuntimeCalendarResult;
+
+typedef struct TroeRuntimeZoneSummary {
+  int standard_offset;
+  int daylight_offset;
+  int observes_daylight;
+  unsigned char standard[TROE_ZONE_ABBREVIATION_BYTES];
+  unsigned char standard_length;
+  unsigned char daylight[TROE_ZONE_ABBREVIATION_BYTES];
+  unsigned char daylight_length;
+} TroeRuntimeZoneSummary;
+
+extern TroeRuntimeCalendar troe_runtime_local_calendar_from_seconds(
+    const unsigned char *timezone_text, size_t timezone_length, int64_t seconds);
+extern TroeRuntimeCalendarResult troe_runtime_normalize_local_calendar(
+    const unsigned char *timezone_text, size_t timezone_length,
+    TroeRuntimeCalendar calendar);
+extern TroeRuntimeZoneSummary troe_runtime_zone_summary(
+    const unsigned char *timezone_text, size_t timezone_length);
+
 #define TROE_FILE_SLOTS 16U
 #define TROE_PATH_BUFFER TROE_C_MAX_PATH_BYTES
 #define TROE_FILE_BUFFER 4096U
@@ -80,10 +123,21 @@ static char troe_cwd[TROE_PATH_BUFFER];
 static void (*troe_atexit[TROE_C_MAX_ATEXIT])(void);
 static size_t troe_atexit_count;
 static int troe_initialized;
+/* `TZ` is fixed for the life of a launch: `setenv` is unsupported and ADR 0054
+   makes the launch environment immutable. The cache is therefore written once
+   and only read afterwards, so `tm_zone` may point into it safely. */
+static char troe_tz_standard[TROE_ZONE_ABBREVIATION_BYTES + 1];
+static char troe_tz_daylight[TROE_ZONE_ABBREVIATION_BYTES + 1];
+static const char *troe_tz_text;
+static size_t troe_tz_length;
+static int troe_tz_ready;
 
 int __troe_argc;
 char **__troe_argv;
 char **environ;
+char *tzname[2] = {troe_tz_standard, troe_tz_daylight};
+long timezone;
+int daylight;
 FILE *stdin;
 FILE *stdout;
 FILE *stderr;
@@ -1614,6 +1668,8 @@ struct tm *gmtime_r(const time_t *seconds, struct tm *destination) {
   destination->tm_yday =
       (int)(days - troe_days_from_civil(year, 1, 1));
   destination->tm_isdst = 0;
+  destination->tm_gmtoff = 0;
+  destination->tm_zone = "UTC";
   return destination;
 }
 
@@ -1621,12 +1677,93 @@ struct tm *gmtime(const time_t *seconds) {
   static struct tm calendar;
   return gmtime_r(seconds, &calendar);
 }
-struct tm *localtime_r(const time_t *seconds, struct tm *destination) {
-  return gmtime_r(seconds, destination);
+static void troe_copy_abbreviation(char *destination,
+                                   const unsigned char *source,
+                                   unsigned char length) {
+  size_t count = length > TROE_ZONE_ABBREVIATION_BYTES
+                     ? (size_t)TROE_ZONE_ABBREVIATION_BYTES
+                     : (size_t)length;
+  memcpy(destination, source, count);
+  destination[count] = '\0';
 }
-struct tm *localtime(const time_t *seconds) { return gmtime(seconds); }
+
+void tzset(void) {
+  if (troe_tz_ready)
+    return;
+  /* An absent or refused `TZ` reads as UTC. A launcher validates the value it
+     composes, so a process only ever observes a string that already parsed. */
+  troe_tz_text = getenv("TZ");
+  troe_tz_length = troe_tz_text == NULL ? 0 : strlen(troe_tz_text);
+  TroeRuntimeZoneSummary summary = troe_runtime_zone_summary(
+      (const unsigned char *)troe_tz_text, troe_tz_length);
+  troe_copy_abbreviation(troe_tz_standard, summary.standard,
+                         summary.standard_length);
+  troe_copy_abbreviation(troe_tz_daylight, summary.daylight,
+                         summary.daylight_length);
+  /* POSIX writes `timezone` west-positive; the runtime reports it east. */
+  timezone = -(long)summary.standard_offset;
+  daylight = summary.observes_daylight;
+  troe_tz_ready = 1;
+}
+
+static struct tm *troe_fill_calendar(struct tm *destination,
+                                     const TroeRuntimeCalendar *calendar) {
+  destination->tm_sec = calendar->second;
+  destination->tm_min = calendar->minute;
+  destination->tm_hour = calendar->hour;
+  destination->tm_mday = calendar->day;
+  destination->tm_mon = calendar->month - 1;
+  destination->tm_year = (int)(calendar->year - 1900);
+  destination->tm_wday = calendar->week_day;
+  destination->tm_yday = calendar->year_day;
+  destination->tm_isdst = calendar->daylight;
+  destination->tm_gmtoff = calendar->gmt_offset;
+  destination->tm_zone = calendar->daylight ? tzname[1] : tzname[0];
+  return destination;
+}
+
+struct tm *localtime_r(const time_t *seconds, struct tm *destination) {
+  if (seconds == NULL || destination == NULL) {
+    errno = EFAULT;
+    return NULL;
+  }
+  tzset();
+  TroeRuntimeCalendar calendar = troe_runtime_local_calendar_from_seconds(
+      (const unsigned char *)troe_tz_text, troe_tz_length, (int64_t)*seconds);
+  return troe_fill_calendar(destination, &calendar);
+}
+
+struct tm *localtime(const time_t *seconds) {
+  static struct tm calendar;
+  return localtime_r(seconds, &calendar);
+}
 
 time_t mktime(struct tm *calendar) {
+  if (calendar == NULL) {
+    errno = EFAULT;
+    return (time_t)-1;
+  }
+  tzset();
+  TroeRuntimeCalendar fields;
+  memset(&fields, 0, sizeof(fields));
+  fields.year = (int64_t)calendar->tm_year + 1900;
+  fields.month = calendar->tm_mon + 1;
+  fields.day = calendar->tm_mday;
+  fields.hour = calendar->tm_hour;
+  fields.minute = calendar->tm_min;
+  fields.second = calendar->tm_sec;
+  fields.daylight = calendar->tm_isdst;
+  TroeRuntimeCalendarResult result = troe_runtime_normalize_local_calendar(
+      (const unsigned char *)troe_tz_text, troe_tz_length, fields);
+  if (result.status != 0) {
+    errno = EOVERFLOW;
+    return (time_t)-1;
+  }
+  troe_fill_calendar(calendar, &result.calendar);
+  return (time_t)result.seconds;
+}
+
+time_t timegm(struct tm *calendar) {
   if (calendar == NULL) {
     errno = EFAULT;
     return (time_t)-1;
@@ -1699,7 +1836,19 @@ size_t strftime(char *destination, size_t capacity, const char *format,
     case 'w': failed = troe_strftime_number(destination, capacity, &length, calendar->tm_wday, 1); break;
     case 'a': failed = calendar->tm_wday >= 0 && calendar->tm_wday < 7 ? troe_strftime_append(destination, capacity, &length, weekdays[calendar->tm_wday]) : -1; break;
     case 'b': failed = calendar->tm_mon >= 0 && calendar->tm_mon < 12 ? troe_strftime_append(destination, capacity, &length, months[calendar->tm_mon]) : -1; break;
-    case 'Z': failed = troe_strftime_append(destination, capacity, &length, "UTC"); break;
+    case 'z': {
+      long offset = calendar->tm_gmtoff;
+      long magnitude = offset < 0 ? -offset : offset;
+      char buffer[16];
+      int count = snprintf(buffer, sizeof(buffer), "%c%02ld%02ld",
+                           offset < 0 ? '-' : '+', magnitude / 3600,
+                           magnitude % 3600 / 60);
+      failed = count < 0
+                   ? -1
+                   : troe_strftime_append(destination, capacity, &length, buffer);
+      break;
+    }
+    case 'Z': failed = troe_strftime_append(destination, capacity, &length, calendar->tm_zone == NULL ? "" : calendar->tm_zone); break;
     default: return 0;
     }
     if (failed != 0)

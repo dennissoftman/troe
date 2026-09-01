@@ -7,7 +7,7 @@ pub use troe_abi::{
     ABI_MAJOR, ABI_MINOR, clock_control, command, datagram, diagnostics, exit, filesystem,
     filesystem_mutation, icmp_echo, interface, network_configuration, network_observation, pipe,
     private_memory, process_launch, process_observation, random, reply, server, shell_script,
-    tcp_connect, timer, volume_control, wall_clock,
+    tcp_connect, timer, timezone, volume_control, wall_clock,
 };
 use troe_abi::{MAX_MESSAGE_BYTES, MAX_SERVICE_PAYLOAD_BYTES, heap_growth, stream};
 

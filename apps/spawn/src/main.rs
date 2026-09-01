@@ -3,7 +3,7 @@
 
 use troe_kex_sdk::{
     CommandContext, ENVIRONMENT_BUFFER_BYTES, INVOCATION_BUFFER_BYTES, command, entry, exit, pipe,
-    process_launch,
+    process_launch, timezone,
 };
 
 /// Iterate the `--env` values among the leading options before `end`.
@@ -25,6 +25,33 @@ fn overrides<'a>(
 fn split_entry(entry: &str) -> Option<(&str, &str)> {
     let (name, value) = entry.split_once('=')?;
     (!name.is_empty()).then_some((name, value))
+}
+
+/// Why one `TZ` override is refused, or `None` when the name is not `TZ`.
+///
+/// Conversion in the child has no error channel — `localtime` returns a
+/// calendar, not a status — so a bad zone is refused here, before the child
+/// exists, rather than silently becoming UTC inside it. See ADR 0067.
+fn timezone_refusal(name: &str, value: &str) -> Option<&'static [u8]> {
+    if name != "TZ" {
+        return None;
+    }
+    match timezone::parse_str(value) {
+        Ok(_) => None,
+        Err(timezone::ParseError::DatabaseForm) => {
+            Some(b"--env TZ names a database TROE does not carry")
+        }
+        Err(timezone::ParseError::MissingRules) => {
+            Some(b"--env TZ gives a daylight name without its rules")
+        }
+        Err(timezone::ParseError::Abbreviation) => {
+            Some(b"--env TZ has an invalid zone abbreviation")
+        }
+        Err(timezone::ParseError::Offset) => Some(b"--env TZ has an invalid offset"),
+        Err(timezone::ParseError::Rule) => Some(b"--env TZ has an invalid transition rule"),
+        Err(timezone::ParseError::Trailing) => Some(b"--env TZ has trailing bytes"),
+        Err(timezone::ParseError::Malformed) => Some(b"--env TZ is not a POSIX zone"),
+    }
 }
 
 fn failure(command: &mut CommandContext, message: &[u8], status: u32) -> u32 {
@@ -78,9 +105,12 @@ fn main(command: &mut CommandContext) -> u32 {
                 let Some(entry) = invocation.argument(first_child_argument + 1) else {
                     return failure(command, b"--env requires NAME=VALUE", exit::USAGE);
                 };
-                let Some((name, _)) = split_entry(entry) else {
+                let Some((name, value)) = split_entry(entry) else {
                     return failure(command, b"--env requires NAME=VALUE", exit::USAGE);
                 };
+                if let Some(message) = timezone_refusal(name, value) {
+                    return failure(command, message, exit::USAGE);
+                }
                 if overrides(&invocation, first_child_argument)
                     .any(|earlier| split_entry(earlier).is_some_and(|(other, _)| other == name))
                 {

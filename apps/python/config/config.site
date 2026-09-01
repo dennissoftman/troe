@@ -45,4 +45,5 @@ ac_cv_header_sys_times_h=yes
 ac_cv_header_sys_utsname_h=no
 ac_cv_header_sys_wait_h=no
 ac_cv_header_termios_h=no
+ac_cv_working_tzset=no
 ax_cv_c_float_words_bigendian=no

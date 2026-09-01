@@ -143,6 +143,7 @@ class RepositoryPolicyTests(unittest.TestCase):
             "cat",
             "clear",
             "cp",
+            "date",
             "dhcp",
             "echo",
             "grep",
@@ -222,7 +223,7 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn("kex_package_completion_range", registry)
 
         apps = list(application_directories())
-        self.assertEqual(len(apps), 38)
+        self.assertEqual(len(apps), 39)
         for app in apps:
             descriptor = app / "completion.cmpl"
             self.assertTrue(descriptor.is_file(), app.name)

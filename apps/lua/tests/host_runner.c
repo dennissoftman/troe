@@ -4,6 +4,8 @@
 #include <string.h>
 #include <time.h>
 
+#define TROE_ZONE_ABBREVIATION_BYTES 16
+
 typedef struct TroeCalendarTime {
   int64_t year;
   int month;
@@ -13,6 +15,10 @@ typedef struct TroeCalendarTime {
   int second;
   int week_day;
   int year_day;
+  int gmt_offset;
+  int daylight;
+  unsigned char zone[TROE_ZONE_ABBREVIATION_BYTES];
+  unsigned char zone_length;
 } TroeCalendarTime;
 
 typedef struct TroeCalendarResult {
@@ -29,12 +35,10 @@ typedef struct TroeFormatResult {
 
 extern time_t timegm(struct tm *calendar);
 
-TroeCalendarTime troe_runtime_calendar_from_seconds(int64_t seconds) {
-  time_t value = (time_t)seconds;
-  struct tm *calendar = gmtime(&value);
-  if (calendar == NULL)
-    return (TroeCalendarTime){0};
-  return (TroeCalendarTime){
+static TroeCalendarTime host_calendar_from_tm(const struct tm *calendar,
+                                              int gmt_offset, int daylight,
+                                              const char *zone) {
+  TroeCalendarTime result = {
       .year = (int64_t)calendar->tm_year + 1900,
       .month = calendar->tm_mon + 1,
       .day = calendar->tm_mday,
@@ -43,6 +47,72 @@ TroeCalendarTime troe_runtime_calendar_from_seconds(int64_t seconds) {
       .second = calendar->tm_sec,
       .week_day = calendar->tm_wday,
       .year_day = calendar->tm_yday,
+      .gmt_offset = gmt_offset,
+      .daylight = daylight,
+  };
+  size_t length = zone == NULL ? 0 : strlen(zone);
+  if (length > TROE_ZONE_ABBREVIATION_BYTES)
+    length = TROE_ZONE_ABBREVIATION_BYTES;
+  memcpy(result.zone, zone == NULL ? "" : zone, length);
+  result.zone_length = (unsigned char)length;
+  return result;
+}
+
+/* The host libc parses POSIX `TZ` strings itself, so these stubs answer from
+   an implementation independent of the one under test. */
+static void host_apply_timezone(const uint8_t *text, size_t length) {
+  char value[256];
+  if (length >= sizeof(value))
+    length = sizeof(value) - 1;
+  memcpy(value, text, length);
+  value[length] = '\0';
+  setenv("TZ", length == 0 ? "UTC0" : value, 1);
+  tzset();
+}
+
+TroeCalendarTime troe_runtime_calendar_from_seconds(int64_t seconds) {
+  time_t value = (time_t)seconds;
+  struct tm *calendar = gmtime(&value);
+  if (calendar == NULL)
+    return (TroeCalendarTime){0};
+  return host_calendar_from_tm(calendar, 0, 0, "UTC");
+}
+
+TroeCalendarTime troe_runtime_local_calendar_from_seconds(
+    const uint8_t *timezone_text, size_t timezone_length, int64_t seconds) {
+  time_t value = (time_t)seconds;
+  struct tm calendar;
+  host_apply_timezone(timezone_text, timezone_length);
+  if (localtime_r(&value, &calendar) == NULL)
+    return (TroeCalendarTime){0};
+  return host_calendar_from_tm(&calendar, (int)calendar.tm_gmtoff,
+                               calendar.tm_isdst > 0 ? 1 : 0,
+                               calendar.tm_zone);
+}
+
+TroeCalendarResult troe_runtime_normalize_local_calendar(
+    const uint8_t *timezone_text, size_t timezone_length,
+    TroeCalendarTime fields) {
+  struct tm calendar = {
+      .tm_year = (int)(fields.year - 1900),
+      .tm_mon = fields.month - 1,
+      .tm_mday = fields.day,
+      .tm_hour = fields.hour,
+      .tm_min = fields.minute,
+      .tm_sec = fields.second,
+      .tm_isdst = fields.daylight,
+  };
+  time_t seconds;
+  host_apply_timezone(timezone_text, timezone_length);
+  seconds = mktime(&calendar);
+  if (seconds == (time_t)-1)
+    return (TroeCalendarResult){.status = -1};
+  return (TroeCalendarResult){
+      .status = 0,
+      .seconds = (int64_t)seconds,
+      .calendar = host_calendar_from_tm(&calendar, (int)calendar.tm_gmtoff,
+                                        calendar.tm_isdst > 0 ? 1 : 0,
+                                        calendar.tm_zone),
   };
 }
 
@@ -65,10 +135,57 @@ TroeCalendarResult troe_runtime_normalize_calendar(
   };
 }
 
+/* The host's `%z` and `%Z` read its own global zone state rather than the
+   `struct tm` handed to it, so this stub expands them from the calendar before
+   delegating. Otherwise the reference would answer a different question than
+   the runtime under test, whose conversions are functions of their argument. */
+static size_t host_expand_zone(char *pattern, size_t capacity,
+                               const uint8_t *format, size_t format_length,
+                               int gmt_offset, const char *zone) {
+  size_t length = 0;
+  for (size_t index = 0; index < format_length; ++index) {
+    char replacement[16];
+    const char *text = replacement;
+    size_t count;
+    if (format[index] != '%' || index + 1 == format_length) {
+      if (length + 1 >= capacity)
+        return capacity;
+      pattern[length++] = (char)format[index];
+      continue;
+    }
+    if (format[index + 1] == 'z') {
+      int magnitude = gmt_offset < 0 ? -gmt_offset : gmt_offset;
+      snprintf(replacement, sizeof(replacement), "%c%02d%02d",
+               gmt_offset < 0 ? '-' : '+', magnitude / 3600,
+               magnitude % 3600 / 60);
+    } else if (format[index + 1] == 'Z') {
+      text = zone;
+    } else {
+      if (length + 2 >= capacity)
+        return capacity;
+      pattern[length++] = (char)format[index];
+      pattern[length++] = (char)format[index + 1];
+      ++index;
+      continue;
+    }
+    count = strlen(text);
+    if (length + count >= capacity)
+      return capacity;
+    memcpy(pattern + length, text, count);
+    length += count;
+    ++index;
+  }
+  pattern[length] = '\0';
+  return length;
+}
+
 TroeFormatResult troe_runtime_format_calendar(
     TroeCalendarTime calendar, const uint8_t *format, size_t format_length,
     uint8_t *destination, size_t capacity) {
   char pattern[4097];
+  char zone[TROE_ZONE_ABBREVIATION_BYTES + 1];
+  memcpy(zone, calendar.zone, calendar.zone_length);
+  zone[calendar.zone_length] = '\0';
   struct tm value = {
       .tm_year = (int)(calendar.year - 1900),
       .tm_mon = calendar.month - 1,
@@ -78,13 +195,16 @@ TroeFormatResult troe_runtime_format_calendar(
       .tm_sec = calendar.second,
       .tm_wday = calendar.week_day,
       .tm_yday = calendar.year_day,
+      .tm_gmtoff = calendar.gmt_offset,
+      .tm_zone = zone,
   };
   if (format_length == 0)
     return (TroeFormatResult){.count = 0, .status = 0, .option = 0};
   if (format_length >= sizeof(pattern))
     return (TroeFormatResult){.status = 3};
-  memcpy(pattern, format, format_length);
-  pattern[format_length] = '\0';
+  if (host_expand_zone(pattern, sizeof(pattern), format, format_length,
+                       calendar.gmt_offset, zone) >= sizeof(pattern))
+    return (TroeFormatResult){.status = 3};
   size_t count = strftime((char *)destination, capacity, pattern, &value);
   return (TroeFormatResult){
       .count = count,
@@ -257,8 +377,8 @@ static intptr_t host_environment_get(void *context, const uint8_t *name,
                                      size_t name_length,
                                      uint8_t *destination, size_t capacity) {
   static const char *const entries[] = {
-      "HOME=/",       "PATH=/bin",   "TMPDIR=/tmp", "SHELL=/bin/sh",
-      "USER=root",    "LOGNAME=root", "PWD=/",
+      "HOME=/",       "PATH=/bin",    "TMPDIR=/tmp", "SHELL=/bin/sh",
+      "USER=root",    "LOGNAME=root", "TZ=UTC0",     "PWD=/",
   };
   static const char prefix[] = "TROE_TEST_ENV_";
   const size_t prefix_length = sizeof(prefix) - 1;

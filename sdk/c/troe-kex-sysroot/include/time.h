@@ -21,7 +21,18 @@ struct tm {
   int tm_wday;
   int tm_yday;
   int tm_isdst;
+  /* Seconds east of UTC, opposite in sign to the `timezone` global. */
+  long tm_gmtoff;
+  /* Abbreviation naming this reading's offset; stable for the process. */
+  const char *tm_zone;
 };
+
+/* Standard and daylight abbreviations of the zone `TZ` selects. */
+extern char *tzname[2];
+/* Seconds *west* of UTC in the zone's standard state. */
+extern long timezone;
+/* Nonzero when the zone declares daylight rules at all. */
+extern int daylight;
 
 time_t time(time_t *destination);
 clock_t clock(void);
@@ -33,7 +44,11 @@ struct tm *gmtime_r(const time_t *seconds, struct tm *destination);
 struct tm *localtime(const time_t *seconds);
 struct tm *localtime_r(const time_t *seconds, struct tm *destination);
 time_t mktime(struct tm *calendar);
+time_t timegm(struct tm *calendar);
 size_t strftime(char *destination, size_t capacity, const char *format,
                 const struct tm *calendar);
+/* Publish `tzname`, `timezone`, and `daylight` from the launch `TZ` value.
+   The launch environment is immutable, so this is idempotent. */
+void tzset(void);
 
 #endif

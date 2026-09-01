@@ -34,6 +34,8 @@ inside the growable TLSF heap and reports normal allocation failure at its
 limit. Unsupported access modes,
 random writes, process creation, signals, executable mappings, networking,
 dynamic linking, additional locales, and timezone databases fail explicitly.
+Local time comes from the launch `TZ` value, parsed once per process and
+evaluated by the shared rule engine in the Rust KEX runtime.
 
 Nanoprintf 0.6.1 is vendored once below `vendor/` and shared by this runtime and
 Lua. Lua also consumes these headers, compatibility symbols, and setjmp source;

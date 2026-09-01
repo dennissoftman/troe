@@ -404,7 +404,11 @@ one past a decoder.
 The **launcher** composes an environment; the application only reads one. A
 trusted top-level component supplies deployment and session values explicitly,
 and the interactive session supplies `HOME`, `PATH`, `TMPDIR`, `SHELL`, `USER`,
-and `LOGNAME`. `PWD` is not stored: it resolves from the invocation's current
+`LOGNAME`, and `TZ`. `TZ` carries a POSIX zone string so that no conversion has
+to treat an absent zone as a special case; a launcher MUST refuse a `TZ` value
+that does not parse, because conversion in the child has no error channel. See
+[ADR 0067](docs/adr/0067-posix-timezone-strings-and-local-time.md).
+`PWD` is not stored: it resolves from the invocation's current
 directory, so it is always the launch directory. An application MUST NOT
 synthesize a value the launcher did not supply; an absent name is absent.
 
@@ -456,7 +460,9 @@ libc. Every filesystem and process service MUST remain scoped to typed KEX
 capabilities; missing authority and unsupported operations MUST fail
 explicitly. Thread creation, signals, fork/exec, executable private mappings,
 networking, dynamic linking, additional locales, and timezone databases are not
-part of this C target.
+part of this C target. Local time comes from a POSIX `TZ` string supplied in the
+launch environment, never from a database or any ambient source; see
+[ADR 0067](docs/adr/0067-posix-timezone-strings-and-local-time.md).
 
 `cd`, `fg`, `jobs`, `kill`, `log`, `poweroff`, `reboot`, `svc`, and `wait` are
 permanent shell intrinsics and their names MUST NOT be shadowed or replaced by a

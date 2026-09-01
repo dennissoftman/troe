@@ -62,7 +62,7 @@ FILESYSTEM_APPS = frozenset(
         "wc",
     )
 )
-TERMINAL_APPS = frozenset(("clear", "echo", "man", "pwd"))
+TERMINAL_APPS = frozenset(("clear", "date", "echo", "man", "pwd"))
 # Commands that read standard input also exercise the foreground session
 # terminal loan, not only their filesystem or network operands.
 STDIN_APPS = frozenset((

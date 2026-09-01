@@ -1608,10 +1608,12 @@ fn directory_records(
 
 /// One instant already reduced to the fields a FAT directory entry stores.
 ///
-/// FAT records local time with no timezone field. TROE has no timezone source,
-/// so the wall clock's UTC reading is written unconverted and a host reading
-/// the volume sees UTC. Inventing an offset would be a guess, and a wrong one
-/// would be indistinguishable from a correct one on the media.
+/// FAT records local time with no timezone field. A zone belongs to a launch
+/// rather than to a mount, and this provider stamps writes on behalf of any
+/// process, so there is no single offset it could apply. The wall clock's UTC
+/// reading is written unconverted and a host reading the volume sees UTC.
+/// Inventing an offset would be a guess, and a wrong one would be
+/// indistinguishable from a correct one on the media.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DosStamp {
     /// Year from 1980, month, and day, packed as FAT stores them.
@@ -3210,8 +3212,9 @@ mod tests {
     #[test]
     fn stamps_real_fat32_entries_a_host_tool_renders() -> Result<(), String> {
         // 2026-08-29T10:40:00Z. FAT stores local time with no timezone, and
-        // TROE has no timezone source, so this UTC reading is written
-        // unconverted and a host reads back exactly these digits.
+        // this provider has no single launch whose zone it could apply, so the
+        // UTC reading is written unconverted and a host reads back exactly
+        // these digits.
         const CREATED: u64 = 1_788_000_000;
         const RENDERED: &str = "2026-08-29  10:40";
         let Some(mkfs_fat) = fat_tool("mkfs.fat") else {
