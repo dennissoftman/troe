@@ -73,6 +73,15 @@ def parse_args() -> argparse.Namespace:
         help="require release-pinned QEMU, UEFI firmware, and e2fsprogs versions",
     )
     parser.add_argument(
+        "--build-sbsa-firmware",
+        action="store_true",
+        help=(
+            "build the pinned Arm SBSA reference firmware before acceptance; "
+            "it is fetched and compiled from source, so this is opt-in and "
+            "only needed once per machine"
+        ),
+    )
+    parser.add_argument(
         "--progress-interval",
         type=float,
         default=DEFAULT_PROGRESS_INTERVAL,
@@ -321,6 +330,16 @@ def verification_steps(args: argparse.Namespace) -> list[Step]:
             ),
         ),
     ]
+    if args.build_sbsa_firmware:
+        # Placed immediately before the image and acceptance gates: it is an
+        # input to them, and building it after the fast checks means an
+        # ordinary mistake still fails in seconds rather than after a compile.
+        steps.append(
+            Step(
+                "sbsa firmware",
+                (sys.executable, str(TOOLS_DIR / "build_sbsa_firmware.py")),
+            )
+        )
     steps.extend(
         image_and_qemu_commands(
             skip_qemu=args.skip_qemu,
