@@ -116,6 +116,51 @@ print("lua-feature-unit", _VERSION)
         self.assertEqual(metadata[0], 0)
         self.assertIn(b"lua-feature-unit\tLua 5.5", completed.stdout)
 
+    def test_local_time_follows_the_launch_timezone(self) -> None:
+        # `os.date` without `!` is local time, so the launch `TZ` decides it.
+        # United States Eastern in 2026 enters daylight time at
+        # 2026-03-08T07:00:00Z and leaves it at 2026-11-01T06:00:00Z.
+        source = r"""
+assert(os.getenv("TZ") == "EST5EDT,M3.2.0,M11.1.0")
+assert(os.date("!%Y-%m-%d %H:%M:%S %Z", 1784116800) == "2026-07-15 12:00:00 UTC")
+assert(os.date("%Y-%m-%d %H:%M:%S %Z %z", 1784116800) == "2026-07-15 08:00:00 EDT -0400")
+assert(os.date("%Y-%m-%d %H:%M:%S %Z %z", 1768478400) == "2026-01-15 07:00:00 EST -0500")
+-- The exact transition second and the one before it.
+assert(os.date("%H:%M:%S %Z", 1772953199) == "01:59:59 EST")
+assert(os.date("%H:%M:%S %Z", 1772953200) == "03:00:00 EDT")
+local summer = os.date("*t", 1784116800)
+assert(summer.hour == 8 and summer.isdst == true)
+local winter = os.date("*t", 1768478400)
+assert(winter.hour == 7 and winter.isdst == false)
+-- `os.time` reads a table as local wall time, which is what mktime means.
+assert(os.time{year=2026, month=7, day=15, hour=8, min=0, sec=0} == 1784116800)
+assert(os.time{year=2026, month=1, day=15, hour=7, min=0, sec=0} == 1768478400)
+print("lua-timezone", os.date("%Z", 1784116800))
+"""
+        completed, metadata = self.run_lua(
+            source,
+            environment={"TROE_TEST_ENV_TZ": "EST5EDT,M3.2.0,M11.1.0"},
+        )
+        self.assertEqual(metadata[0], 0)
+        self.assertIn(b"lua-timezone\tEDT", completed.stdout)
+
+    def test_a_southern_zone_wraps_the_year_in_lua(self) -> None:
+        # Australian Eastern runs daylight time October through April, so a
+        # January instant is inside the period rather than outside it.
+        source = r"""
+assert(os.date("%Y-%m-%d %H:%M %Z %z", 1768478400) == "2026-01-15 23:00 AEDT +1100")
+assert(os.date("%Y-%m-%d %H:%M %Z %z", 1784116800) == "2026-07-15 22:00 AEST +1000")
+assert(os.date("*t", 1768478400).isdst == true)
+assert(os.date("*t", 1784116800).isdst == false)
+print("lua-southern", os.date("%Z", 1768478400))
+"""
+        completed, metadata = self.run_lua(
+            source,
+            environment={"TROE_TEST_ENV_TZ": "AEST-10AEDT,M10.1.0,M4.1.0/3"},
+        )
+        self.assertEqual(metadata[0], 0)
+        self.assertIn(b"lua-southern\tAEDT", completed.stdout)
+
     def test_freestanding_binary64_formatter_matches_host_libc(self) -> None:
         completed = subprocess.run(
             (self.printf_runner,),

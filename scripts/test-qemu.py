@@ -1382,6 +1382,51 @@ def run_shell_terminal_group(session: SerialSession, command_timeout: float) -> 
         max(command_timeout, 30.0),
         contains=("bounded command scripts", "16 KiB default working buffer"),
     )
+    # `date` reads the live clock, so nothing here may assert an instant. Every
+    # check below is a property of the zone rather than of the current time:
+    # the session default is UTC, a fixed-offset zone always renders the same
+    # abbreviation and offset, and `-u` overrides whatever TZ says.
+    session.command(
+        "date +%Z",
+        cwd,
+        command_timeout,
+        contains=("UTC\n",),
+    )
+    session.command(
+        "date -u +%z",
+        cwd,
+        command_timeout,
+        contains=("+0000\n",),
+    )
+    # `date` cannot be reached through `spawn --env`: a child's capabilities
+    # must attenuate its launcher's, and `spawn` holds no `wall-clock`. The
+    # zone `date` reports is therefore the session's, and the launcher-narrowed
+    # zone is proven through `lua`, which does hold it, in the lua group.
+    session.command(
+        "spawn --env TZ=XYZ-7 date +%Z",
+        cwd,
+        command_timeout,
+        contains=("spawn: child launch failed",),
+        absent=("XYZ",),
+    )
+    session.command(
+        "date +%Q",
+        cwd,
+        command_timeout,
+        contains=("date: unsupported conversion in FORMAT",),
+    )
+    session.command(
+        "date --bogus",
+        cwd,
+        command_timeout,
+        contains=("date: date [-u] [+FORMAT]",),
+    )
+    session.command(
+        "man date",
+        cwd,
+        max(command_timeout, 30.0),
+        contains=("date - print the wall-clock time", "There is no timezone"),
+    )
     session.command(
         "ps",
         cwd,
@@ -2453,6 +2498,41 @@ def run_launch_environment_checks(
         contains=("spawn: --env requires NAME=VALUE",),
         absent=("unreachable",),
     )
+    # Every launch carries an explicit zone, and the default is UTC.
+    session.confirmed_command(
+        lua + " -e 'print(\"env-zone\", os.getenv(\"TZ\"), "
+        "os.date(\"!%Y-%m-%d %H:%M %Z\", 1784116800))'",
+        cwd,
+        command_timeout,
+        contains=("env-zone\tUTC0\t2026-07-15 12:00 UTC\n",),
+    )
+    # A launcher narrowing TZ changes what local conversion means in the child.
+    # 2026-07-15T12:00:00Z is 08:00 EDT and 2026-01-15T12:00:00Z is 07:00 EST,
+    # so one zone proves the offset, the abbreviation, and the transition.
+    session.confirmed_command(
+        "spawn --env TZ=EST5EDT,M3.2.0,M11.1.0 " + lua
+        + " -e 'print(\"env-local\", os.date(\"%H:%M %Z %z\", 1784116800), "
+        "os.date(\"%H:%M %Z %z\", 1768478400))'",
+        cwd,
+        command_timeout,
+        contains=("env-local\t08:00 EDT -0400\t07:00 EST -0500\n",),
+    )
+    # A zone that does not parse is refused before the child exists, because
+    # conversion inside it could only fall back to UTC silently.
+    session.command(
+        "spawn --env TZ=:America/New_York echo unreachable",
+        cwd,
+        command_timeout,
+        contains=("spawn: --env TZ names a database TROE does not carry",),
+        absent=("unreachable",),
+    )
+    session.command(
+        "spawn --env TZ=EST5EDT echo unreachable",
+        cwd,
+        command_timeout,
+        contains=("spawn: --env TZ gives a daylight name without its rules",),
+        absent=("unreachable",),
+    )
     # Observation surfaces expose no environment name or value.
     session.command(
         "ps",
@@ -2870,6 +2950,40 @@ def run_cpython_group(session: SerialSession, command_timeout: float) -> None:
         cwd,
         timeout,
         contains=("cpy-argv ['--', '-x']\n",),
+    )
+
+    # CPython reaches the timezone rules through the C runtime's `localtime_r`,
+    # `mktime`, and `strftime`, which nothing else in this suite executes. Both
+    # instants sit far from a transition so the readings are exact, and the
+    # zone is narrowed by the launcher rather than read from any ambient state.
+    # 2026-07-15T12:00:00Z is 08:00 EDT and 2026-01-15T12:00:00Z is 07:00 EST.
+    session.confirmed_command(
+        "spawn --env TZ=EST5EDT,M3.2.0,M11.1.0 " + python
+        + """ -c 'import time; s=1784116800; w=1768478400; """
+        + """print("cpy-zone", time.strftime("%H:%M %Z %z", time.localtime(s)), """
+        + """time.strftime("%H:%M %Z %z", time.localtime(w)))'""",
+        cwd,
+        timeout,
+        contains=("cpy-zone 08:00 EDT -0400 07:00 EST -0500\n",),
+    )
+    # `mktime` reads a broken-down time as local, so it inverts `localtime`,
+    # while `gmtime` stays UTC and does not move with the zone.
+    session.confirmed_command(
+        "spawn --env TZ=EST5EDT,M3.2.0,M11.1.0 " + python
+        + """ -c 'import time; s=1784116800; """
+        + """print("cpy-mktime", int(time.mktime(time.localtime(s))), """
+        + """time.gmtime(s).tm_hour, time.localtime(s).tm_gmtoff)'""",
+        cwd,
+        timeout,
+        contains=("cpy-mktime 1784116800 12 -14400\n",),
+    )
+    # An unconfigured zone is UTC, and `-u`-style UTC reads never move.
+    session.confirmed_command(
+        f"""{python} -c 'import time; print("cpy-utc", """
+        + """time.strftime("%H:%M %Z %z", time.localtime(1784116800)))'""",
+        cwd,
+        timeout,
+        contains=("cpy-utc 12:00 UTC +0000\n",),
     )
     session.confirmed_command(
         f"{python} {packages}/script_probe.py one two",

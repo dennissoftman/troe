@@ -10,7 +10,9 @@ UTC/C-locale behavior, descriptor and stream layouts, setjmp state, single-
 execution-thread pthread stubs, and the versioned `troe/runtime.h` host bridge.
 The linked implementation owns the corresponding symbols. Thread creation,
 signals beyond fail-closed `raise`, executable mappings, networking, dynamic
-linking, additional locales, and timezone databases are unsupported.
+linking, additional locales, and timezone databases are unsupported. `struct
+tm` carries `tm_gmtoff` and `tm_zone`, and `tzset`, `localtime`, `mktime`,
+`timegm`, and `strftime` resolve the POSIX `TZ` string the launch supplies.
 
 Build both architecture sysroots into an empty output directory and verify
 byte-for-byte deterministic output with:

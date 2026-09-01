@@ -57,6 +57,8 @@ only typed capabilities present in the package manifest. Missing authority
 returns `EACCES`; unsupported flags and facilities return explicit errors.
 Thread creation, signals, fork/exec, executable private mappings, networking,
 dynamic linking, additional locales, and timezone databases are absent.
+[ADR 0067](0067-posix-timezone-strings-and-local-time.md) later added local time
+from a POSIX `TZ` string, which needs no database and does not change this.
 
 ## Consequences
 

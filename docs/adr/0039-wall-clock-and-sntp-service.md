@@ -3,6 +3,12 @@
 Status: accepted; whole-second wall-clock and SNTP increment implemented,
 2026-08-27.
 
+Amendment, 2026-09-01: [ADR 0067](0067-posix-timezone-strings-and-local-time.md)
+gives applications local time from a POSIX `TZ` string supplied by their
+launcher. The wall clock and `clock-control` interface described here stay
+UTC-only and unchanged; no timezone crosses that boundary, and this decision's
+refusal of a timezone database still stands.
+
 ## Context
 
 TROE exposes only a boot-relative nondecreasing monotonic millisecond clock.

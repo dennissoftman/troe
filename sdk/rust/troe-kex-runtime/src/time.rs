@@ -1,7 +1,14 @@
-//! UTC Unix-time and normalized civil-calendar conversion.
+//! Unix-time and normalized civil-calendar conversion.
+//!
+//! Every conversion is available in UTC and in one zone described by a parsed
+//! POSIX `TZ` string. A calendar carries the offset and abbreviation of the
+//! instant it names, so formatting stays a function of its argument rather
+//! than of any retained state.
 #![allow(unsafe_code)]
 
-/// Broken-down UTC calendar value.
+use crate::timezone::{Abbreviation, MAX_ABBREVIATION_BYTES, TimeZone, ZoneOffset};
+
+/// Broken-down calendar value in one zone.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(C)]
 pub struct CalendarTime {
@@ -21,6 +28,39 @@ pub struct CalendarTime {
     pub week_day: i32,
     /// Day of year where January 1 is zero.
     pub year_day: i32,
+    /// Seconds east of UTC for the zone this calendar was read in.
+    pub gmt_offset: i32,
+    /// One while the zone is in its daylight state, zero otherwise.
+    pub daylight: i32,
+    /// Zone abbreviation bytes; only `zone_length` of them are significant.
+    pub zone: [u8; MAX_ABBREVIATION_BYTES],
+    /// Significant bytes in `zone`.
+    pub zone_length: u8,
+}
+
+impl CalendarTime {
+    /// The zone abbreviation naming this calendar's offset.
+    #[must_use]
+    pub fn zone_bytes(&self) -> &[u8] {
+        let length = usize::from(self.zone_length);
+        self.zone.get(..length).unwrap_or(&[])
+    }
+
+    fn with_zone(mut self, state: ZoneOffset) -> Self {
+        self.gmt_offset = state.seconds_east;
+        self.daylight = i32::from(state.is_daylight);
+        self = self.with_abbreviation(state.abbreviation);
+        self
+    }
+
+    fn with_abbreviation(mut self, abbreviation: Abbreviation) -> Self {
+        let bytes = abbreviation.as_bytes();
+        if let Some(destination) = self.zone.get_mut(..bytes.len()) {
+            destination.copy_from_slice(bytes);
+            self.zone_length = u8::try_from(bytes.len()).unwrap_or(0);
+        }
+        self
+    }
 }
 
 /// Normalized calendar result plus its Unix timestamp.
@@ -164,6 +204,7 @@ fn calendar_indexes(calendar: CalendarTime) -> Result<(usize, usize), FormatErro
         || !(0..=59).contains(&calendar.second)
         || !(0..=6).contains(&calendar.week_day)
         || !(0..=365).contains(&calendar.year_day)
+        || usize::from(calendar.zone_length) > MAX_ABBREVIATION_BYTES
     {
         return Err(FormatError::InvalidCalendar);
     }
@@ -258,7 +299,13 @@ pub fn format_calendar(
             }
             b'y' => output.number(calendar.year % 100, 2, b'0')?,
             b'Y' => output.number(calendar.year, 0, b'0')?,
-            b'Z' => output.bytes(b"UTC")?,
+            b'z' => {
+                let magnitude = calendar.gmt_offset.unsigned_abs();
+                output.byte(if calendar.gmt_offset < 0 { b'-' } else { b'+' })?;
+                output.number(i64::from(magnitude / 3600), 2, b'0')?;
+                output.number(i64::from(magnitude % 3600 / 60), 2, b'0')?;
+            }
+            b'Z' => output.bytes(calendar.zone_bytes())?,
             b'%' => output.byte(b'%')?,
             _ => return Err(FormatError::InvalidSpecifier(option)),
         }
@@ -267,7 +314,7 @@ pub fn format_calendar(
     Ok(output.count)
 }
 
-fn floor_divide(value: i64, divisor: i64) -> i64 {
+pub(crate) fn floor_divide(value: i64, divisor: i64) -> i64 {
     let quotient = value / divisor;
     let remainder = value % divisor;
     if remainder < 0 {
@@ -277,7 +324,7 @@ fn floor_divide(value: i64, divisor: i64) -> i64 {
     }
 }
 
-fn days_from_civil(mut year: i64, month: i32, day: i32) -> Option<i64> {
+pub(crate) fn days_from_civil(mut year: i64, month: i32, day: i32) -> Option<i64> {
     year = year.checked_sub(i64::from(month <= 2))?;
     let era = floor_divide(year, 400);
     let year_of_era = u32::try_from(year.checked_sub(era.checked_mul(400)?)?).ok()?;
@@ -291,7 +338,7 @@ fn days_from_civil(mut year: i64, month: i32, day: i32) -> Option<i64> {
         .checked_sub(719_468)
 }
 
-fn civil_from_days(mut days: i64) -> (i64, i32, i32) {
+pub(crate) fn civil_from_days(mut days: i64) -> (i64, i32, i32) {
     days += 719_468;
     let era = floor_divide(days, 146_097);
     let day_of_era = u32::try_from(days - era * 146_097).unwrap_or(0);
@@ -308,6 +355,22 @@ fn civil_from_days(mut days: i64) -> (i64, i32, i32) {
 /// Convert every representable Unix timestamp to a broken-down UTC calendar.
 #[must_use]
 pub fn from_unix_seconds(seconds: i64) -> CalendarTime {
+    fields_from_seconds(seconds).with_abbreviation(Abbreviation::utc())
+}
+
+/// Convert one Unix timestamp to a broken-down calendar in `zone`.
+///
+/// The result carries the offset, daylight state, and abbreviation in effect
+/// at that instant, so formatting it needs no other input.
+#[must_use]
+pub fn local_from_unix_seconds(zone: &TimeZone, seconds: i64) -> CalendarTime {
+    let state = crate::timezone::offset_at(zone, seconds);
+    let local = seconds.saturating_add(i64::from(state.seconds_east));
+    fields_from_seconds(local).with_zone(state)
+}
+
+/// Break one epoch-second count into calendar fields, carrying no zone.
+fn fields_from_seconds(seconds: i64) -> CalendarTime {
     let days = floor_divide(seconds, 86_400);
     let day_seconds = seconds - days * 86_400;
     let (year, month, day) = civil_from_days(days);
@@ -327,6 +390,10 @@ pub fn from_unix_seconds(seconds: i64) -> CalendarTime {
         second: i32::try_from(day_seconds % 60).unwrap_or(0),
         week_day,
         year_day,
+        gmt_offset: 0,
+        daylight: 0,
+        zone: [0_u8; MAX_ABBREVIATION_BYTES],
+        zone_length: 0,
     }
 }
 
@@ -337,13 +404,61 @@ pub fn from_unix_seconds(seconds: i64) -> CalendarTime {
 /// Returns `None` when checked Gregorian arithmetic cannot be represented.
 #[must_use]
 pub fn normalize(
-    mut year: i64,
+    year: i64,
     month: i64,
     day: i64,
     hour: i64,
     minute: i64,
     second: i64,
 ) -> Option<NormalizedTime> {
+    let seconds = naive_seconds(year, month, day, hour, minute, second)?;
+    Some(NormalizedTime {
+        seconds,
+        calendar: from_unix_seconds(seconds),
+    })
+}
+
+/// Normalize a broken-down time read as local wall time in `zone`.
+///
+/// Only the date and time fields and `daylight` are read, exactly as POSIX
+/// `mktime` reads a `struct tm`; the weekday, year day, offset, and zone of the
+/// argument are outputs and are ignored here. `daylight` follows the POSIX
+/// `tm_isdst` convention: above zero selects the daylight offset, zero selects
+/// standard, and below zero determines the state from the zone's rules.
+///
+/// The returned calendar is the normalized local reading of the resolved
+/// instant, so for a nonexistent local time it differs from what was supplied.
+///
+/// # Errors
+///
+/// Returns `None` when checked Gregorian arithmetic cannot be represented.
+#[must_use]
+pub fn normalize_local(zone: &TimeZone, calendar: CalendarTime) -> Option<NormalizedTime> {
+    let naive = naive_seconds(
+        calendar.year,
+        i64::from(calendar.month),
+        i64::from(calendar.day),
+        i64::from(calendar.hour),
+        i64::from(calendar.minute),
+        i64::from(calendar.second),
+    )?;
+    let (seconds, state) = crate::timezone::unix_from_local(zone, naive, calendar.daylight);
+    let local = seconds.checked_add(i64::from(state.seconds_east))?;
+    Some(NormalizedTime {
+        seconds,
+        calendar: fields_from_seconds(local).with_zone(state),
+    })
+}
+
+/// Fold out-of-range calendar fields into one epoch-second count.
+fn naive_seconds(
+    mut year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    minute: i64,
+    second: i64,
+) -> Option<i64> {
     let month_zero = month.checked_sub(1)?;
     let month_years = floor_divide(month_zero, 12);
     let normalized_month = i32::try_from(
@@ -357,11 +472,7 @@ pub fn normalize(
     let mut value = days.checked_mul(86_400)?;
     value = value.checked_add(hour.checked_mul(3600)?)?;
     value = value.checked_add(minute.checked_mul(60)?)?;
-    value = value.checked_add(second)?;
-    Some(NormalizedTime {
-        seconds: value,
-        calendar: from_unix_seconds(value),
-    })
+    value.checked_add(second)
 }
 
 /// C ABI bridge for [`from_unix_seconds`].
@@ -381,6 +492,166 @@ pub extern "C" fn troe_runtime_normalize_calendar(
     second: i64,
 ) -> CalendarResult {
     match normalize(year, month, day, hour, minute, second) {
+        Some(value) => CalendarResult {
+            status: 0,
+            seconds: value.seconds,
+            calendar: value.calendar,
+        },
+        None => CalendarResult {
+            status: -1,
+            seconds: 0,
+            calendar: from_unix_seconds(0),
+        },
+    }
+}
+
+/// Borrow a caller-supplied `TZ` string for the duration of one call.
+///
+/// # Safety
+///
+/// A nonzero length must describe readable bytes that remain live for the call.
+unsafe fn borrow_timezone<'a>(text: *const u8, length: usize) -> Option<&'a [u8]> {
+    if length != 0 && text.is_null() {
+        return None;
+    }
+    // SAFETY: The contract above requires readable `length` bytes; a dangling
+    // nonnull pointer is valid for an empty slice.
+    Some(unsafe {
+        core::slice::from_raw_parts(
+            if length == 0 {
+                core::ptr::NonNull::<u8>::dangling().as_ptr().cast_const()
+            } else {
+                text
+            },
+            length,
+        )
+    })
+}
+
+/// C ABI bridge reporting whether one `TZ` string is accepted.
+///
+/// Launchers call this to refuse a bad value before a child exists. It reports
+/// only whether the string parses; a Rust caller reads
+/// [`timezone::parse`](crate::timezone::parse) for the typed reason instead.
+///
+/// # Safety
+///
+/// A nonzero length must describe readable bytes that remain live for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn troe_runtime_validate_timezone(text: *const u8, length: usize) -> i32 {
+    // SAFETY: The pointer contract is forwarded to the caller unchanged.
+    let Some(text) = (unsafe { borrow_timezone(text, length) }) else {
+        return 1;
+    };
+    i32::from(crate::timezone::parse(text).is_err())
+}
+
+/// Pointer-free summary of one zone's two states.
+///
+/// This is what a libc needs to publish `tzname`, `timezone`, and `daylight`
+/// once, rather than inferring them from sample instants, which no single
+/// hemisphere's sampling can do correctly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
+pub struct ZoneSummary {
+    /// Seconds east of UTC in the standard state.
+    pub standard_offset: i32,
+    /// Seconds east of UTC in the daylight state, equal to the standard offset
+    /// when the zone declares no daylight rules.
+    pub daylight_offset: i32,
+    /// One when the zone declares daylight rules, zero otherwise.
+    pub observes_daylight: i32,
+    /// Standard-state abbreviation bytes.
+    pub standard: [u8; MAX_ABBREVIATION_BYTES],
+    /// Significant bytes in `standard`.
+    pub standard_length: u8,
+    /// Daylight-state abbreviation bytes, empty when there are no rules.
+    pub daylight: [u8; MAX_ABBREVIATION_BYTES],
+    /// Significant bytes in `daylight`.
+    pub daylight_length: u8,
+}
+
+fn copy_abbreviation(source: Abbreviation) -> ([u8; MAX_ABBREVIATION_BYTES], u8) {
+    let mut bytes = [0_u8; MAX_ABBREVIATION_BYTES];
+    let source = source.as_bytes();
+    if let Some(destination) = bytes.get_mut(..source.len()) {
+        destination.copy_from_slice(source);
+    }
+    (bytes, u8::try_from(source.len()).unwrap_or(0))
+}
+
+/// Summarize one zone's states.
+#[must_use]
+pub fn summarize(zone: &TimeZone) -> ZoneSummary {
+    let (standard, standard_length) = copy_abbreviation(zone.standard_abbreviation());
+    let (daylight, daylight_length) = zone
+        .daylight_abbreviation()
+        .map_or(([0_u8; MAX_ABBREVIATION_BYTES], 0), copy_abbreviation);
+    ZoneSummary {
+        standard_offset: zone.standard_offset(),
+        daylight_offset: zone.daylight_offset().unwrap_or(zone.standard_offset()),
+        observes_daylight: i32::from(zone.observes_daylight()),
+        standard,
+        standard_length,
+        daylight,
+        daylight_length,
+    }
+}
+
+/// C ABI bridge for [`summarize`].
+///
+/// # Safety
+///
+/// A nonzero length must describe readable bytes that remain live for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn troe_runtime_zone_summary(text: *const u8, length: usize) -> ZoneSummary {
+    // SAFETY: The pointer contract is forwarded to the caller unchanged.
+    let zone = match unsafe { borrow_timezone(text, length) } {
+        Some(text) => TimeZone::parse_or_utc(text),
+        None => TimeZone::utc(),
+    };
+    summarize(&zone)
+}
+
+/// C ABI bridge for [`local_from_unix_seconds`].
+///
+/// An unparsable `TZ` yields the UTC calendar, because conversion has no error
+/// channel; launchers refuse such a value before a process can observe it.
+///
+/// # Safety
+///
+/// A nonzero length must describe readable bytes that remain live for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn troe_runtime_local_calendar_from_seconds(
+    text: *const u8,
+    length: usize,
+    seconds: i64,
+) -> CalendarTime {
+    // SAFETY: The pointer contract is forwarded to the caller unchanged.
+    let zone = match unsafe { borrow_timezone(text, length) } {
+        Some(text) => TimeZone::parse_or_utc(text),
+        None => TimeZone::utc(),
+    };
+    local_from_unix_seconds(&zone, seconds)
+}
+
+/// C ABI bridge for [`normalize_local`].
+///
+/// # Safety
+///
+/// A nonzero length must describe readable bytes that remain live for the call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn troe_runtime_normalize_local_calendar(
+    text: *const u8,
+    length: usize,
+    calendar: CalendarTime,
+) -> CalendarResult {
+    // SAFETY: The pointer contract is forwarded to the caller unchanged.
+    let zone = match unsafe { borrow_timezone(text, length) } {
+        Some(text) => TimeZone::parse_or_utc(text),
+        None => TimeZone::utc(),
+    };
+    match normalize_local(&zone, calendar) {
         Some(value) => CalendarResult {
             status: 0,
             seconds: value.seconds,
@@ -464,7 +735,18 @@ pub unsafe extern "C" fn troe_runtime_format_calendar(
 mod tests {
     extern crate std;
 
-    use super::{FormatError, format_calendar, from_unix_seconds, normalize};
+    use super::{
+        CalendarResult, CalendarTime, FormatError, ZoneSummary, format_calendar, from_unix_seconds,
+        local_from_unix_seconds, normalize, normalize_local,
+    };
+    use crate::timezone::{TimeZone, parse_str};
+
+    /// United States Eastern, matching the timezone module's own fixtures.
+    const EASTERN: &str = "EST5EDT,M3.2.0,M11.1.0";
+
+    fn eastern() -> TimeZone {
+        parse_str(EASTERN).unwrap_or_else(|_| std::process::abort())
+    }
 
     #[test]
     fn leap_day_and_field_normalization_match_posix_calendar_rules() {
@@ -495,6 +777,116 @@ mod tests {
             ),
             (2024, 2, 29)
         );
+    }
+
+    /// The C runtime and the Lua shim mirror these structures field for field.
+    /// A layout change here is an ABI break for every compiled `.kex`, so the
+    /// exact sizes and offsets are pinned rather than merely assumed.
+    #[test]
+    fn the_c_abi_layout_matches_what_the_mirrors_declare() {
+        use core::mem::{align_of, offset_of, size_of};
+        assert_eq!(
+            (size_of::<CalendarTime>(), align_of::<CalendarTime>()),
+            (64, 8)
+        );
+        assert_eq!(offset_of!(CalendarTime, year), 0);
+        assert_eq!(offset_of!(CalendarTime, month), 8);
+        assert_eq!(offset_of!(CalendarTime, gmt_offset), 36);
+        assert_eq!(offset_of!(CalendarTime, daylight), 40);
+        assert_eq!(offset_of!(CalendarTime, zone), 44);
+        assert_eq!(offset_of!(CalendarTime, zone_length), 60);
+        assert_eq!(
+            (size_of::<CalendarResult>(), align_of::<CalendarResult>()),
+            (80, 8)
+        );
+        assert_eq!(offset_of!(CalendarResult, status), 0);
+        assert_eq!(offset_of!(CalendarResult, seconds), 8);
+        assert_eq!(offset_of!(CalendarResult, calendar), 16);
+        assert_eq!(
+            (size_of::<ZoneSummary>(), align_of::<ZoneSummary>()),
+            (48, 4)
+        );
+        assert_eq!(offset_of!(ZoneSummary, standard_offset), 0);
+        assert_eq!(offset_of!(ZoneSummary, standard), 12);
+        assert_eq!(offset_of!(ZoneSummary, standard_length), 28);
+        assert_eq!(offset_of!(ZoneSummary, daylight), 29);
+        assert_eq!(offset_of!(ZoneSummary, daylight_length), 45);
+    }
+
+    #[test]
+    fn a_local_calendar_carries_the_offset_it_was_read_through() {
+        let zone = eastern();
+        // 2026-01-15T12:00:00Z is 07:00 EST, and 2026-07-15T12:00:00Z is
+        // 08:00 EDT.
+        let winter = local_from_unix_seconds(&zone, 1_768_478_400);
+        assert_eq!((winter.hour, winter.minute), (7, 0));
+        assert_eq!((winter.year, winter.month, winter.day), (2026, 1, 15));
+        assert_eq!(winter.gmt_offset, -5 * 3600);
+        assert_eq!(winter.daylight, 0);
+        assert_eq!(winter.zone_bytes(), b"EST");
+        let summer = local_from_unix_seconds(&zone, 1_784_116_800);
+        assert_eq!(summer.hour, 8);
+        assert_eq!(summer.gmt_offset, -4 * 3600);
+        assert_eq!(summer.daylight, 1);
+        assert_eq!(summer.zone_bytes(), b"EDT");
+
+        // The UTC conversion is unchanged and names itself.
+        let utc = from_unix_seconds(1_784_116_800);
+        assert_eq!(utc.hour, 12);
+        assert_eq!(utc.gmt_offset, 0);
+        assert_eq!(utc.zone_bytes(), b"UTC");
+    }
+
+    #[test]
+    fn normalizing_local_fields_resolves_through_the_zone() {
+        let zone = eastern();
+        let mut fields = from_unix_seconds(0);
+        fields.year = 2026;
+        fields.month = 7;
+        fields.day = 15;
+        fields.hour = 8;
+        fields.minute = 0;
+        fields.second = 0;
+        fields.daylight = -1;
+        let Some(normalized) = normalize_local(&zone, fields) else {
+            std::process::abort();
+        };
+        assert_eq!(normalized.seconds, 1_784_116_800);
+        assert_eq!(normalized.calendar.zone_bytes(), b"EDT");
+        assert_eq!(normalized.calendar.gmt_offset, -4 * 3600);
+        // The same wall-clock fields read as UTC are a different instant.
+        let Some(as_utc) = normalize(2026, 7, 15, 8, 0, 0) else {
+            std::process::abort();
+        };
+        assert_eq!(as_utc.seconds, 1_784_116_800 - 4 * 3600);
+    }
+
+    #[test]
+    fn zone_conversions_render_from_the_calendar_alone() {
+        let zone = eastern();
+        let mut output = [0_u8; 64];
+        let summer = local_from_unix_seconds(&zone, 1_784_116_800);
+        let count = format_calendar(summer, b"%Y-%m-%d %H:%M:%S %z %Z", &mut output)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(&output[..count], b"2026-07-15 08:00:00 -0400 EDT");
+        let winter = local_from_unix_seconds(&zone, 1_768_478_400);
+        let count = format_calendar(winter, b"%z %Z", &mut output)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(&output[..count], b"-0500 EST");
+        // A half-hour zone keeps its minutes, and UTC renders as `+0000`.
+        let Ok(india) = parse_str("<+0530>-5:30") else {
+            std::process::abort();
+        };
+        let count = format_calendar(
+            local_from_unix_seconds(&india, 1_784_116_800),
+            b"%H:%M %z %Z",
+            &mut output,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(&output[..count], b"17:30 +0530 +0530");
+        let count = format_calendar(from_unix_seconds(0), b"%z %Z", &mut output)
+            .unwrap_or_else(|_| std::process::abort());
+        assert_eq!(&output[..count], b"+0000 UTC");
     }
 
     #[test]

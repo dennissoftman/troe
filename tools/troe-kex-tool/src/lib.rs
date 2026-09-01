@@ -1068,7 +1068,7 @@ mod tests {
             .map(|entry| entry.file_name())
             .collect::<Vec<_>>();
         names.sort_unstable();
-        assert_eq!(names.len(), 38);
+        assert_eq!(names.len(), 39);
         for name in names {
             let directory = apps.join(&name);
             let manifest =

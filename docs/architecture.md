@@ -175,7 +175,9 @@ to the application. It returns `EACCES` at a missing-authority boundary and
 `ENOTSUP` for unsupported operations; it cannot manufacture ambient filesystem
 or process authority. Thread creation, signals, dynamic linking, executable
 private mappings, networking, additional locales, and timezone databases are
-not part of this facade.
+not part of this facade. `localtime`, `mktime`, and `strftime` resolve a POSIX
+`TZ` string from the launch environment through the one rule evaluator in the
+KEX runtime; see [ADR 0067](adr/0067-posix-timezone-strings-and-local-time.md).
 
 ## Allocation
 

@@ -1,5 +1,8 @@
 /* Capability-aware Lua 5.5 operating-system library for TROE. */
 
+#define TROE_ZONE_ABBREVIATION_BYTES 16
+#define TROE_ZONE_TEXT_BYTES 128
+
 typedef struct TroeCalendarTime {
   int64_t year;
   int month;
@@ -9,6 +12,10 @@ typedef struct TroeCalendarTime {
   int second;
   int week_day;
   int year_day;
+  int gmt_offset;
+  int daylight;
+  unsigned char zone[TROE_ZONE_ABBREVIATION_BYTES];
+  unsigned char zone_length;
 } TroeCalendarTime;
 
 typedef struct TroeCalendarResult {
@@ -30,6 +37,24 @@ extern TroeCalendarResult troe_runtime_normalize_calendar(
 extern TroeFormatResult troe_runtime_format_calendar(
     TroeCalendarTime calendar, const uint8_t *format, size_t format_length,
     uint8_t *destination, size_t capacity);
+extern TroeCalendarTime troe_runtime_local_calendar_from_seconds(
+    const uint8_t *timezone_text, size_t timezone_length, int64_t seconds);
+extern TroeCalendarResult troe_runtime_normalize_local_calendar(
+    const uint8_t *timezone_text, size_t timezone_length,
+    TroeCalendarTime calendar);
+
+/* Lua reads local time by default and UTC only for a `!`-prefixed format, so
+   the shim needs the launch `TZ` value the same way `os.getenv` reads any
+   other name. There is no ambient zone to fall back on. */
+static size_t troe_zone_text(uint8_t *destination, size_t capacity) {
+  intptr_t length;
+  if (troe_active_host == NULL)
+    return 0;
+  length = troe_active_host->environment_get(troe_active_host->context,
+                                             (const uint8_t *)"TZ", 2,
+                                             destination, capacity);
+  return length < 0 ? 0 : (size_t)length;
+}
 
 static int troe_current_time(lua_State *state, int64_t *seconds) {
   uint64_t wall_seconds;
@@ -59,7 +84,7 @@ static void troe_set_calendar_fields(lua_State *state,
   troe_set_integer_field(state, "sec", calendar->second);
   troe_set_integer_field(state, "wday", calendar->week_day + 1);
   troe_set_integer_field(state, "yday", calendar->year_day + 1);
-  lua_pushboolean(state, 0);
+  lua_pushboolean(state, calendar->daylight != 0);
   lua_setfield(state, -2, "isdst");
 }
 
@@ -81,16 +106,38 @@ static lua_Integer troe_get_time_field(lua_State *state, const char *name,
   return result;
 }
 
+static int troe_calendar_field(lua_State *state, const char *name,
+                               lua_Integer default_value, int required) {
+  lua_Integer value = troe_get_time_field(state, name, default_value, required);
+  if (value < INT_MIN || value > INT_MAX)
+    luaL_error(state, "field '%s' is out of range", name);
+  return (int)value;
+}
+
+/* An absent `isdst` asks the zone's rules to decide, which is the POSIX
+   `tm_isdst` convention a present boolean overrides. */
+static int troe_daylight_field(lua_State *state) {
+  int field_type = lua_getfield(state, 1, "isdst");
+  int result = field_type == LUA_TNIL ? -1 : (lua_toboolean(state, -1) ? 1 : 0);
+  lua_pop(state, 1);
+  return result;
+}
+
 static void troe_seconds_from_table(lua_State *state, int64_t *seconds,
                                     TroeCalendarTime *normalized) {
-  int64_t year = (int64_t)troe_get_time_field(state, "year", 0, 1);
-  int64_t month = (int64_t)troe_get_time_field(state, "month", 0, 1);
-  int64_t day = (int64_t)troe_get_time_field(state, "day", 0, 1);
-  int64_t hour = (int64_t)troe_get_time_field(state, "hour", 12, 0);
-  int64_t minute = (int64_t)troe_get_time_field(state, "min", 0, 0);
-  int64_t second = (int64_t)troe_get_time_field(state, "sec", 0, 0);
-  TroeCalendarResult result = troe_runtime_normalize_calendar(
-      year, month, day, hour, minute, second);
+  uint8_t zone[TROE_ZONE_TEXT_BYTES];
+  size_t zone_length = troe_zone_text(zone, sizeof(zone));
+  TroeCalendarTime fields;
+  TroeCalendarResult result;
+  memset(&fields, 0, sizeof(fields));
+  fields.year = (int64_t)troe_get_time_field(state, "year", 0, 1);
+  fields.month = troe_calendar_field(state, "month", 0, 1);
+  fields.day = troe_calendar_field(state, "day", 0, 1);
+  fields.hour = troe_calendar_field(state, "hour", 12, 0);
+  fields.minute = troe_calendar_field(state, "min", 0, 0);
+  fields.second = troe_calendar_field(state, "sec", 0, 0);
+  fields.daylight = troe_daylight_field(state);
+  result = troe_runtime_normalize_local_calendar(zone, zone_length, fields);
   if (result.status != 0) {
     luaL_error(state, "time result cannot be represented");
     return;
@@ -124,8 +171,13 @@ static int troe_os_date(lua_State *state) {
   if (format_length != 0 && format[0] == '!') {
     ++format;
     --format_length;
+    calendar = troe_runtime_calendar_from_seconds(seconds);
+  } else {
+    uint8_t zone[TROE_ZONE_TEXT_BYTES];
+    size_t zone_length = troe_zone_text(zone, sizeof(zone));
+    calendar =
+        troe_runtime_local_calendar_from_seconds(zone, zone_length, seconds);
   }
-  calendar = troe_runtime_calendar_from_seconds(seconds);
   if (format_length == 2 && format[0] == '*' && format[1] == 't') {
     lua_createtable(state, 0, 9);
     troe_set_calendar_fields(state, &calendar);

@@ -1,0 +1,41 @@
+NAME
+    date - print the wall-clock time
+
+SYNOPSIS
+    date [-u] [+FORMAT]
+
+DESCRIPTION
+    Reads the kernel wall clock and writes one formatted line.
+
+    With no FORMAT the output is ISO 8601 with an explicit offset, so a line is
+    unambiguous without knowing which zone the machine runs in:
+
+        2026-07-15T08:00:00-0400
+
+    The zone comes from the TZ value the launcher supplied, which is a POSIX
+    zone string such as UTC0 or EST5EDT,M3.2.0,M11.1.0. There is no timezone
+    database, so a name like America/New_York is refused rather than looked up,
+    and historical transitions before the zone's current rules are not
+    represented. -u reports UTC regardless of TZ.
+
+    The zone is the one the session supplies. It cannot be narrowed per command
+    through spawn: a child's capabilities must attenuate its launcher's, and
+    spawn holds no wall-clock authority to pass on, so spawn refuses the launch
+    rather than starting date without a clock.
+
+    +FORMAT selects the C-locale conversions the runtime supports, including
+    %Y %m %d %H %M %S %a %A %b %B %j %Z %z and %%. %Z writes the zone
+    abbreviation and %z the numeric offset.
+
+    Setting the clock is not part of this command. The timesync service owns
+    correction through the privileged clock-control capability.
+
+EXIT STATUS
+    0   the time was written
+    2   the invocation or FORMAT was rejected
+    1   the wall clock is unconfigured or unavailable
+
+EXAMPLES
+    date
+    date -u +%Y-%m-%dT%H:%M:%SZ
+    date '+%H:%M %Z'

@@ -21,6 +21,7 @@ pub mod memory;
 pub mod process;
 pub mod random;
 pub mod time;
+pub mod timezone;
 pub mod units;
 
 #[cfg(feature = "alloc")]
