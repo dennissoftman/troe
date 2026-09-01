@@ -27,8 +27,6 @@ use uefi::table::cfg::ConfigTableEntry;
 use crate::PlatformDiscoveryFailure as DiscoveryError;
 
 const UEFI_PAGE_BYTES: u64 = 4_096;
-#[cfg(all(target_os = "uefi", feature = "platform-x86_64-uefi-virtio-pci"))]
-const ECAM_BUS_BYTES: u64 = 1 << 20;
 
 #[cfg(all(target_os = "uefi", feature = "platform-x86_64-uefi-virtio-pci"))]
 static X86_ECAM_BASE: AtomicU64 = AtomicU64::new(0);
@@ -37,67 +35,8 @@ static X86_ECAM_BUSES: AtomicU16 = AtomicU16::new(0);
 #[cfg(all(target_os = "uefi", feature = "platform-x86_64-uefi-virtio-pci"))]
 static X86_ECAM_READY: AtomicBool = AtomicBool::new(false);
 
-/// Validated, selected segment-zero ECAM aperture for the bounded PCI scan.
 #[cfg(all(target_os = "uefi", feature = "platform-x86_64-uefi-virtio-pci"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct X86EcamWindow {
-    base_address: u64,
-    first_bus: u8,
-    last_bus: u8,
-}
-
-#[cfg(all(target_os = "uefi", feature = "platform-x86_64-uefi-virtio-pci"))]
-impl X86EcamWindow {
-    const fn new(base_address: u64, first_bus: u8, last_bus: u8) -> Option<Self> {
-        if base_address == 0 || !base_address.is_multiple_of(ECAM_BUS_BYTES) || first_bus > last_bus
-        {
-            return None;
-        }
-        Some(Self {
-            base_address,
-            first_bus,
-            last_bus,
-        })
-    }
-
-    pub(crate) const fn first_bus(self) -> u8 {
-        self.first_bus
-    }
-
-    pub(crate) const fn last_bus(self) -> u8 {
-        self.last_bus
-    }
-
-    pub(crate) fn physical_range(self) -> Option<(u64, u64)> {
-        let bus_count = u64::from(self.last_bus)
-            .checked_sub(u64::from(self.first_bus))?
-            .checked_add(1)?;
-        let start = self
-            .base_address
-            .checked_add(u64::from(self.first_bus).checked_mul(ECAM_BUS_BYTES)?)?;
-        Some((start, bus_count.checked_mul(ECAM_BUS_BYTES)?))
-    }
-
-    pub(crate) fn configuration_address(
-        self,
-        bus: u8,
-        device: u8,
-        function: u8,
-        register_offset: u8,
-    ) -> Option<u64> {
-        if !(self.first_bus..=self.last_bus).contains(&bus) || device >= 32 || function >= 8 {
-            return None;
-        }
-        self.base_address
-            .checked_add(u64::from(bus).checked_mul(ECAM_BUS_BYTES)?)?
-            .checked_add(u64::from(device).checked_mul(1 << 15)?)?
-            .checked_add(u64::from(function).checked_mul(1 << 12)?)?
-            .checked_add(u64::from(register_offset))
-    }
-}
-
-#[cfg(all(target_os = "uefi", feature = "platform-x86_64-uefi-virtio-pci"))]
-fn publish_x86_ecam(window: X86EcamWindow) {
+fn publish_x86_ecam(window: crate::ecam::EcamWindow) {
     let buses = u16::from(window.first_bus) | (u16::from(window.last_bus) << 8);
     X86_ECAM_BASE.store(window.base_address, Ordering::Relaxed);
     X86_ECAM_BUSES.store(buses, Ordering::Relaxed);
@@ -105,12 +44,12 @@ fn publish_x86_ecam(window: X86EcamWindow) {
 }
 
 #[cfg(all(target_os = "uefi", feature = "platform-x86_64-uefi-virtio-pci"))]
-pub(crate) fn x86_ecam_window() -> Option<X86EcamWindow> {
+pub(crate) fn x86_ecam_window() -> Option<crate::ecam::EcamWindow> {
     if !X86_ECAM_READY.load(Ordering::Acquire) {
         return None;
     }
     let buses = X86_ECAM_BUSES.load(Ordering::Relaxed);
-    X86EcamWindow::new(
+    crate::ecam::EcamWindow::new(
         X86_ECAM_BASE.load(Ordering::Relaxed),
         buses.to_le_bytes()[0],
         buses.to_le_bytes()[1],
@@ -217,7 +156,7 @@ fn unique_config_address(guid: uefi::Guid) -> Result<Option<u64>, DiscoveryError
     feature = "platform-x86_64-uefi-virtio-pci",
     not(any(
         feature = "platform-x86_64-q35-uefi",
-        feature = "platform-aarch64-virt-uefi",
+        feature = "platform-aarch64-sbsa-ref",
         feature = "platform-aarch64-uefi-virtio-mmio"
     ))
 ))]
@@ -262,7 +201,7 @@ pub(super) fn validate() -> Result<(), DiscoveryError> {
 #[cfg(all(target_os = "uefi", feature = "platform-x86_64-uefi-virtio-pci"))]
 fn validate_x86<M: AcpiMemory + ?Sized>(
     discovered: &X86VirtioAcpi<'_, M>,
-) -> Result<X86EcamWindow, DiscoveryError> {
+) -> Result<crate::ecam::EcamWindow, DiscoveryError> {
     use troe_platform::{
         InterruptRole, MmioRole, PciConfigurationKind, TriggerMode, VirtioTransportKind,
     };
@@ -290,7 +229,7 @@ fn validate_x86<M: AcpiMemory + ?Sized>(
     if matching_segments.next().is_some() {
         return Err(DiscoveryError::X86Ecam);
     }
-    let ecam = X86EcamWindow::new(segment.base_address(), first_bus, last_bus)
+    let ecam = crate::ecam::EcamWindow::new(segment.base_address(), first_bus, last_bus)
         .ok_or(DiscoveryError::X86Ecam)?;
 
     let local_apic = platform
@@ -441,7 +380,7 @@ fn validate_x86_serial_and_power<M: AcpiMemory + ?Sized>(
     feature = "platform-aarch64-uefi-virtio-mmio",
     not(any(
         feature = "platform-x86_64-q35-uefi",
-        feature = "platform-aarch64-virt-uefi",
+        feature = "platform-aarch64-sbsa-ref",
         feature = "platform-x86_64-uefi-virtio-pci"
     ))
 ))]

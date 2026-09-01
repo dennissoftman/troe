@@ -37,25 +37,28 @@
       "acceptance_evidence": [],
       "architecture": "aarch64",
       "artifact_status": "host-verified",
-      "block_device": "virtio-blk-mmio-modern",
-      "boot_contract": "uefi-removable-fallback-gpt-esp",
+      "block_device": "virtio-blk-pci-modern",
+      "boot_contract": "uefi-removable-fallback-gpt-esp-on-ahci",
       "environment": "qemu",
-      "firmware": "pinned-edk2-uefi",
+      "firmware": "built-trusted-firmware-and-edk2-sbsa",
       "gaps": [
-        "combined system.raw layout is host-verified but the current QEMU runtime gate still attaches boot and root as separate media"
+        "combined system.raw layout is host-verified but the current QEMU runtime gate still attaches boot and root as separate media",
+        "the secure-world and UEFI firmware banks are built from source rather than taken from a distribution package"
       ],
-      "id": "qemu-virt-aarch64",
+      "id": "qemu-sbsa-ref-aarch64",
       "image_format": "raw-gpt",
-      "interrupt_model": "gicv2",
-      "machine_contract": "qemu-virt-gicv2",
+      "interrupt_model": "gicv3",
+      "machine_contract": "qemu-sbsa-ref-gicv3-pcie",
       "missing_drivers": [],
-      "network_device": "virtio-net-mmio-modern",
-      "platform": "aarch64-virt-uefi",
+      "network_device": "virtio-net-pci-modern",
+      "platform": "aarch64-sbsa-ref",
       "provider": "qemu",
       "required_cpu_features": [
         "aarch64-el1",
+        "aarch64-el2-firmware-handoff",
         "four-kib-translation-granule",
-        "physical-address-width-32-to-48"
+        "physical-address-width-32-to-48",
+        "gicv3-system-register-interface"
       ],
       "required_disks": [
         "system",
@@ -63,7 +66,7 @@
         "state"
       ],
       "runtime_status": "compatible-unverified",
-      "virtio_transport": "mmio"
+      "virtio_transport": "pci"
     },
     {
       "acceptance_evidence": [
@@ -204,26 +207,30 @@
       "acceptance_evidence": [],
       "architecture": "aarch64",
       "artifact_status": "host-verified",
-      "block_device": "virtio-blk-mmio-modern",
-      "boot_contract": "uefi-removable-fallback-gpt-esp",
+      "block_device": "virtio-blk-pci-modern",
+      "boot_contract": "uefi-removable-fallback-gpt-esp-on-ahci",
       "environment": "qemu-kvm",
-      "firmware": "edk2-uefi",
+      "firmware": "built-trusted-firmware-and-edk2-sbsa",
       "gaps": [
         "no pinned AArch64 KVM runtime acceptance result",
-        "combined system.raw layout has no runtime boot result"
+        "combined system.raw layout has no runtime boot result",
+        "the secure-world and UEFI firmware banks are built from source rather than taken from a distribution package"
       ],
-      "id": "qemu-kvm-virt-aarch64",
+      "id": "qemu-kvm-sbsa-ref-aarch64",
       "image_format": "raw-gpt",
-      "interrupt_model": "gicv2",
-      "machine_contract": "qemu-virt-gicv2-with-kvm-acceleration",
+      "interrupt_model": "gicv3",
+      "machine_contract": "qemu-sbsa-ref-gicv3-pcie-with-kvm-acceleration",
       "missing_drivers": [],
-      "network_device": "virtio-net-mmio-modern",
-      "platform": "aarch64-virt-uefi",
+      "network_device": "virtio-net-pci-modern",
+      "platform": "aarch64-sbsa-ref",
       "provider": "qemu-kvm",
       "required_cpu_features": [
         "aarch64-el1",
+        "aarch64-el2-firmware-handoff",
         "four-kib-translation-granule",
-        "physical-address-width-32-to-48"
+        "physical-address-width-32-to-48",
+        "gicv3-system-register-interface",
+        "kvm-api"
       ],
       "required_disks": [
         "system",
@@ -231,7 +238,7 @@
         "state"
       ],
       "runtime_status": "compatible-unverified",
-      "virtio_transport": "mmio"
+      "virtio_transport": "pci"
     },
     {
       "acceptance_evidence": [],

@@ -173,9 +173,22 @@ pub(crate) struct NetworkInterruptRoute {
 #[derive(Debug, Eq, PartialEq)]
 #[cfg(any(test, target_os = "uefi"))]
 enum NetworkInterruptSource {
-    #[cfg_attr(all(target_os = "uefi", target_arch = "aarch64"), allow(dead_code))]
+    #[cfg_attr(
+        all(
+            target_os = "uefi",
+            target_arch = "aarch64",
+            not(feature = "platform-aarch64-sbsa-ref")
+        ),
+        allow(dead_code)
+    )]
     PciIntx { pin: u8 },
-    #[cfg_attr(all(target_os = "uefi", target_arch = "x86_64"), allow(dead_code))]
+    #[cfg_attr(
+        all(
+            target_os = "uefi",
+            any(target_arch = "x86_64", feature = "platform-aarch64-sbsa-ref")
+        ),
+        allow(dead_code)
+    )]
     VirtioMmio { slot: u32 },
 }
 
@@ -223,6 +236,73 @@ impl NetworkInterruptRoute {
         })
     }
 
+    /// Derive and validate one Arm PCI `INTx` swizzle to a shared interrupt.
+    ///
+    /// A PCI function's platform interrupt is not named in configuration
+    /// space on Arm. The host bridge instead folds the pin and the device
+    /// number onto four consecutive SPIs, so the route is computed from the
+    /// descriptor's first INTID rather than read from the device.
+    #[cfg(any(
+        test,
+        all(
+            target_os = "uefi",
+            target_arch = "aarch64",
+            feature = "platform-aarch64-sbsa-ref"
+        )
+    ))]
+    pub(crate) fn gic_pci_intx(device: u8, pin: u8) -> Result<Self, InputInterruptError> {
+        #[cfg(test)]
+        let platform = troe_platform::AARCH64_SBSA_REF
+            .validate()
+            .map_err(|_| InputInterruptError::InvalidResource)?;
+        #[cfg(not(test))]
+        let platform =
+            crate::selected_platform().map_err(|_| InputInterruptError::InvalidResource)?;
+        let troe_platform::VirtioTransportKind::PciGic {
+            first_interrupt,
+            network_priority,
+            network_trigger,
+            network_polarity,
+            ..
+        } = platform.virtio()
+        else {
+            return Err(InputInterruptError::InvalidResource);
+        };
+        if !(1..=4).contains(&pin) || device >= 32 {
+            return Err(InputInterruptError::InvalidResource);
+        }
+        // The standard swizzle: INTA on device zero takes the first line, and
+        // each further device rotates the four pins by one.
+        let offset = u32::from(device.wrapping_add(pin - 1) % 4);
+        let intid = first_interrupt
+            .checked_add(offset)
+            .ok_or(InputInterruptError::InvalidResource)?;
+        if !(32..=1019).contains(&intid)
+            || [
+                troe_platform::InterruptRole::Serial,
+                troe_platform::InterruptRole::Timer,
+            ]
+            .into_iter()
+            .filter_map(|role| platform.interrupt(role))
+            .any(|route| route.line() == intid)
+        {
+            return Err(InputInterruptError::InvalidResource);
+        }
+        let vector = platform
+            .interrupt(troe_platform::InterruptRole::Serial)
+            .ok_or(InputInterruptError::InvalidResource)?
+            .vector();
+        let interrupt = InterruptResource::new(intid, vector)
+            .map_err(|_| InputInterruptError::InvalidResource)?;
+        Ok(Self {
+            interrupt,
+            source: NetworkInterruptSource::PciIntx { pin },
+            priority: network_priority,
+            trigger: network_trigger,
+            polarity: network_polarity,
+        })
+    }
+
     /// Derive and validate one QEMU `virt` MMIO slot-to-SPI route.
     #[cfg(any(test, target_os = "uefi"))]
     pub(crate) fn virtio_mmio(
@@ -231,7 +311,7 @@ impl NetworkInterruptRoute {
         first_intid: u32,
     ) -> Result<Self, InputInterruptError> {
         #[cfg(test)]
-        let platform = troe_platform::AARCH64_VIRT_UEFI
+        let platform = troe_platform::AARCH64_UEFI_VIRTIO_MMIO
             .validate()
             .map_err(|_| InputInterruptError::InvalidResource)?;
         #[cfg(not(test))]
@@ -899,6 +979,34 @@ pub fn copy_to_physical(
     // safe Rust owns `bytes`, while `range` names externally owned physical RAM.
     unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), destination as *mut u8, bytes.len()) };
     Ok(())
+}
+
+/// Refuse to run the kernel at an execution level it was not built for.
+#[cfg(target_os = "uefi")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ExecutionLevelError {
+    /// The firmware entered the kernel at a level no descent path handles.
+    Unsupported,
+    /// The firmware left the Virtualization Host Extensions active.
+    VirtualizationHost,
+}
+
+/// Descend to the execution level the kernel's system-register use assumes.
+///
+/// A `virt`-style machine hands an EFI application EL1 and this does nothing.
+/// A `SystemReady` machine boots through Trusted Firmware, which hands the boot
+/// loader EL2 instead, so every `*_EL1` register the kernel programs would
+/// otherwise be the wrong one. The descent keeps translation enabled the whole
+/// way across: turning the MMU off between two cacheable mappings would strand
+/// dirty lines that the following non-cacheable accesses could not see.
+///
+/// # Errors
+///
+/// Rejects an execution level with no descent path and a host-extension
+/// configuration whose register layout this descent does not translate.
+#[cfg(target_os = "uefi")]
+pub fn descend_to_kernel_execution_level() -> Result<(), ExecutionLevelError> {
+    architecture_descend_to_kernel_execution_level()
 }
 
 /// Mask architecture interrupts before replacing firmware exception state.
@@ -2227,11 +2335,19 @@ fn architecture_reboot() {
             reset_control_port,
             reset_value,
         } => (reset_control_port, reset_value),
-        troe_platform::PowerKind::PsciHvc => return,
+        troe_platform::PowerKind::PsciHvc | troe_platform::PowerKind::PsciSmc => return,
     };
     // SAFETY: The validated descriptor assigns the reset-control port; requesting
     // a full system reset is terminal and the caller parks if it returns.
     unsafe { port_write(reset_control_port, reset_value) };
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+#[allow(clippy::unnecessary_wraps)]
+fn architecture_descend_to_kernel_execution_level() -> Result<(), ExecutionLevelError> {
+    // x86-64 firmware has only one privilege level to hand a boot loader, so
+    // there is nothing to descend from. The result type is the shared one.
+    Ok(())
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
@@ -2505,7 +2621,7 @@ fn architecture_initialize_input_interrupts(
     const GICD_TYPER: usize = 0x004;
     const GICD_IGROUPR: usize = 0x080;
     const GICD_ISENABLER: usize = 0x100;
-    const GICD_ICENABLER: usize = 0x180;
+    const GICD_ICENABLER: usize = 0x160;
     const GICD_ICPENDR: usize = 0x280;
     const GICD_IPRIORITYR: usize = 0x400;
     const GICD_ICFGR: usize = 0xc00;
@@ -2575,7 +2691,7 @@ fn architecture_initialize_input_interrupts(
         // the bit is set here where the version 2 model cleared it for group 0.
         let group = mmio_read32(distributor + GICD_IGROUPR + word * 4);
         mmio_write32(distributor + GICD_IGROUPR + word * 4, group | bit);
-        gicv2_update_byte(
+        gic_update_byte(
             distributor + GICD_IPRIORITYR,
             intid,
             serial_route.priority(),
@@ -2687,19 +2803,23 @@ fn architecture_prepare_network_interrupt(
 ) -> Result<(), InputInterruptError> {
     const GICD_TYPER: usize = 0x004;
     const GICD_IGROUPR: usize = 0x080;
-    const GICD_ICENABLER: usize = 0x180;
+    const GICD_ICENABLER: usize = 0x160;
     const GICD_ICPENDR: usize = 0x280;
     const GICD_IPRIORITYR: usize = 0x400;
     const GICD_ICFGR: usize = 0xc00;
-    let NetworkInterruptSource::VirtioMmio { slot } = route.source() else {
-        return Err(InputInterruptError::InvalidResource);
-    };
     let platform = crate::selected_platform().map_err(|_| InputInterruptError::InvalidResource)?;
-    let troe_platform::VirtioTransportKind::Mmio { slot_count, .. } = platform.virtio() else {
-        return Err(InputInterruptError::InvalidResource);
-    };
-    if *slot >= u32::from(slot_count) {
-        return Err(InputInterruptError::InvalidResource);
+    // The SPI is already fixed by the route; this re-checks that the source
+    // the route names is the one the selected transport can actually raise.
+    match (route.source(), platform.virtio()) {
+        (
+            NetworkInterruptSource::VirtioMmio { slot },
+            troe_platform::VirtioTransportKind::Mmio { slot_count, .. },
+        ) if *slot < u32::from(slot_count) => {}
+        (
+            NetworkInterruptSource::PciIntx { pin },
+            troe_platform::VirtioTransportKind::PciGic { .. },
+        ) if (1..=4).contains(pin) => {}
+        _ => return Err(InputInterruptError::InvalidResource),
     }
     let intid = route.interrupt().line();
     if route.polarity() != troe_platform::Polarity::ActiveHigh || route.priority() == 0 {
@@ -2729,7 +2849,7 @@ fn architecture_prepare_network_interrupt(
             mmio_write32(distributor + GICD_ICPENDR + word * 4, bit);
             let group = mmio_read32(distributor + GICD_IGROUPR + word * 4);
             mmio_write32(distributor + GICD_IGROUPR + word * 4, group | bit);
-            gicv2_update_byte(distributor + GICD_IPRIORITYR, intid_index, route.priority());
+            gic_update_byte(distributor + GICD_IPRIORITYR, intid_index, route.priority());
             mmio_write64(
                 distributor + gicv3::GICD_IROUTER + intid_index * 8,
                 affinity,
@@ -2783,7 +2903,7 @@ fn architecture_activate_network_interrupt(route: &NetworkInterruptRoute) {
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 fn architecture_deactivate_network_interrupt(route: &NetworkInterruptRoute) {
-    const GICD_ICENABLER: usize = 0x180;
+    const GICD_ICENABLER: usize = 0x160;
     let Ok(gic) = aarch64_mmio(troe_platform::MmioRole::GicV3Distributor) else {
         park();
     };
@@ -2816,7 +2936,7 @@ fn architecture_deactivate_network_interrupt(route: &NetworkInterruptRoute) {
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 fn architecture_cancel_prepared_network_interrupt(route: &NetworkInterruptRoute) {
-    const GICD_ICENABLER: usize = 0x180;
+    const GICD_ICENABLER: usize = 0x160;
     let Ok(gic) = aarch64_mmio(troe_platform::MmioRole::GicV3Distributor) else {
         park();
     };
@@ -2926,7 +3046,7 @@ fn architecture_arm_execution_timer(milliseconds: u32) -> Result<(), ExecutionTi
         unsafe {
             let group = mmio_read32(sgi + gicv3::GICR_IGROUPR0);
             mmio_write32(sgi + gicv3::GICR_IGROUPR0, group | bit);
-            gicv2_update_byte(sgi + gicv3::GICR_IPRIORITYR, intid, timer_route.priority());
+            gic_update_byte(sgi + gicv3::GICR_IPRIORITYR, intid, timer_route.priority());
             // GICR_ICFGR1 configures 16..32, two bits per interrupt.
             let config_shift = (intid - 16) * 2;
             let edge = match timer_route.trigger() {
@@ -2988,7 +3108,7 @@ fn aarch64_drain_serial(queue: &mut BoundedInputQueue) {
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
-unsafe fn gicv2_update_byte(base: usize, index: usize, value: u8) {
+unsafe fn gic_update_byte(base: usize, index: usize, value: u8) {
     let address = base + (index / 4) * 4;
     let shift = (index % 4) * 8;
     // SAFETY: The caller bounds the register through GICD_TYPER and owns the
@@ -3148,10 +3268,11 @@ fn architecture_poweroff() {
     let Ok(platform) = crate::selected_platform() else {
         return;
     };
-    if platform.power() != troe_platform::PowerKind::PsciHvc {
-        return;
-    }
-    let _unexpected_return = psci_hvc(PSCI_SYSTEM_OFF);
+    let _unexpected_return = match platform.power() {
+        troe_platform::PowerKind::PsciHvc => psci_hypervisor_call(PSCI_SYSTEM_OFF),
+        troe_platform::PowerKind::PsciSmc => psci_secure_monitor_call(PSCI_SYSTEM_OFF),
+        troe_platform::PowerKind::Q35 { .. } | troe_platform::PowerKind::X86Reset { .. } => return,
+    };
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
@@ -3160,18 +3281,19 @@ fn architecture_reboot() {
     let Ok(platform) = crate::selected_platform() else {
         return;
     };
-    if platform.power() != troe_platform::PowerKind::PsciHvc {
-        return;
-    }
-    let _unexpected_return = psci_hvc(PSCI_SYSTEM_RESET);
+    let _unexpected_return = match platform.power() {
+        troe_platform::PowerKind::PsciHvc => psci_hypervisor_call(PSCI_SYSTEM_RESET),
+        troe_platform::PowerKind::PsciSmc => psci_secure_monitor_call(PSCI_SYSTEM_RESET),
+        troe_platform::PowerKind::Q35 { .. } | troe_platform::PowerKind::X86Reset { .. } => return,
+    };
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
-fn psci_hvc(function_id: u64) -> u64 {
+fn psci_hypervisor_call(function_id: u64) -> u64 {
     let mut result = function_id;
-    // SAFETY: The pinned QEMU virt profile advertises PSCI 1.0 with the HVC
-    // conduit. SYSTEM_OFF and SYSTEM_RESET take no arguments and are terminal
-    // on success; x0 carries a stable PSCI error if firmware rejects the call.
+    // SAFETY: The descriptor selects this conduit only where PSCI answers at
+    // EL2. SYSTEM_OFF and SYSTEM_RESET take no arguments and are terminal on
+    // success; x0 carries a stable PSCI error if firmware rejects the call.
     unsafe {
         core::arch::asm!(
             "hvc #0",
@@ -3185,6 +3307,195 @@ fn psci_hvc(function_id: u64) -> u64 {
     result
 }
 
+#[cfg(any(test, all(target_os = "uefi", target_arch = "aarch64")))]
+mod el2 {
+    //! EL2 controls that must be settled before the kernel runs at EL1.
+
+    // A host test build compiles this module for the translation helper alone,
+    // so the registers only the descent itself writes are unused there.
+    #![cfg_attr(test, allow(dead_code))]
+
+    /// `HCR_EL2.E2H`, which redirects the EL2 registers to the EL1 layout.
+    pub const HCR_E2H: u64 = 1 << 34;
+    /// `HCR_EL2.RW`, without which EL1 would be entered as `AArch32`.
+    pub const HCR_RW: u64 = 1 << 31;
+    /// `HCR_EL2.APK`, so EL1 use of the pointer-authentication keys is untrapped.
+    pub const HCR_APK: u64 = 1 << 40;
+    /// `HCR_EL2.API`, so pointer-authentication instructions are untrapped.
+    pub const HCR_API: u64 = 1 << 41;
+    /// `CPTR_EL2` with every RES1 bit set and no SIMD, FP, or trace trap.
+    pub const CPTR_NO_TRAPS: u64 = 0x33ff;
+    /// `CNTHCTL_EL2` bits letting EL1 read the counter and own the timer.
+    pub const CNTHCTL_EL1_TIMERS: u64 = 0b11;
+    /// `ICC_SRE_EL2.SRE`, selecting the system-register GIC interface.
+    pub const ICC_SRE_SRE: u64 = 1 << 0;
+    /// `ICC_SRE_EL2.Enable`, without which EL1 traps on every `ICC_*` access.
+    pub const ICC_SRE_ENABLE: u64 = 1 << 3;
+    /// `SCTLR_EL1` RES1 bits, the architectural baseline for the level.
+    pub const SCTLR_RESERVED: u64 = 0x30d0_0800;
+    /// `CPACR_EL1.FPEN`, without which EL1's first SIMD instruction traps.
+    pub const CPACR_FLOATING_POINT: u64 = 0b11 << 20;
+    /// `SCTLR_EL1.M`, keeping translation enabled across the descent.
+    pub const SCTLR_MMU: u64 = 1 << 0;
+    /// `SCTLR_EL1.C`, keeping data accesses cacheable across the descent.
+    pub const SCTLR_DATA_CACHE: u64 = 1 << 2;
+    /// `SCTLR_EL1.I`, keeping instruction fetches cacheable.
+    pub const SCTLR_INSTRUCTION_CACHE: u64 = 1 << 12;
+    /// `TCR_EL1.EPD1`, disabling the upper half the descended tables lack.
+    pub const TCR_DISABLE_UPPER: u64 = 1 << 23;
+    /// `TCR_EL2.DS`, selecting the 52-bit output the small `T0SZ` requires.
+    pub const TCR_EL2_LARGE_ADDRESSES: u64 = 1 << 32;
+    /// `TCR_EL1.DS`, the same selection at its own bit position.
+    pub const TCR_EL1_LARGE_ADDRESSES: u64 = 1 << 59;
+    /// `SPSR_EL2` selecting `EL1h` with debug, `SError`, IRQ, and FIQ masked.
+    pub const SPSR_EL1H_MASKED: u64 = 0x3c5;
+}
+
+/// Translate the non-VHE `TCR_EL2` layout into the `TCR_EL1` one.
+///
+/// The low half is identical, so only the physical-address size, the
+/// top-byte-ignore bit, and the large-address selection move. The upper
+/// translation range is then disabled, because the descended tables describe
+/// the lower one only. Dropping the large-address bit would leave a `T0SZ`
+/// below the classic 48-bit floor with nothing to justify it, which firmware
+/// using a 52-bit map does produce.
+#[cfg(any(test, all(target_os = "uefi", target_arch = "aarch64")))]
+const fn aarch64_tcr_el1_from_el2(tcr_el2: u64) -> u64 {
+    let shared = tcr_el2 & 0xffff;
+    let physical_size = ((tcr_el2 >> 16) & 0b111) << 32;
+    let top_byte_ignored = ((tcr_el2 >> 20) & 1) << 37;
+    let large_addresses = if tcr_el2 & el2::TCR_EL2_LARGE_ADDRESSES == 0 {
+        0
+    } else {
+        el2::TCR_EL1_LARGE_ADDRESSES
+    };
+    shared
+        | physical_size
+        | top_byte_ignored
+        | large_addresses
+        | aarch64_upper_granule_from_lower(tcr_el2)
+        | el2::TCR_DISABLE_UPPER
+}
+
+/// Mirror the lower granule into the differently encoded upper `TG1` field.
+///
+/// No walk uses it while `EPD1` is set, but the field has no reserved-value
+/// behaviour worth relying on, so it is given the matching size.
+#[cfg(any(test, all(target_os = "uefi", target_arch = "aarch64")))]
+const fn aarch64_upper_granule_from_lower(tcr_el2: u64) -> u64 {
+    match (tcr_el2 >> 14) & 0b11 {
+        0b01 => 0b11 << 30, // 64 KiB
+        0b10 => 0b01 << 30, // 16 KiB
+        _ => 0b10 << 30,    // 4 KiB
+    }
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn architecture_descend_to_kernel_execution_level() -> Result<(), ExecutionLevelError> {
+    let current_level: u64;
+    let host_configuration: u64;
+    // SAFETY: Both reads are side-effect free and legal at EL1 and above.
+    unsafe {
+        core::arch::asm!("mrs {}, CurrentEL", out(reg) current_level, options(nomem, nostack));
+    }
+    match current_level >> 2 {
+        1 => return Ok(()),
+        2 => {}
+        _ => return Err(ExecutionLevelError::Unsupported),
+    }
+    // SAFETY: EL2 was just confirmed, so HCR_EL2 is readable here.
+    unsafe {
+        core::arch::asm!("mrs {}, hcr_el2", out(reg) host_configuration, options(nomem, nostack));
+    }
+    if host_configuration & el2::HCR_E2H != 0 {
+        return Err(ExecutionLevelError::VirtualizationHost);
+    }
+    // SAFETY: The kernel owns the machine after boot services exited. Every
+    // register below is EL2-only and this is the sole descent, performed once
+    // on the boot CPU with interrupts masked. Translation stays enabled: the
+    // EL1 registers receive the firmware's own live mapping, so the `eret`
+    // lands on the same identity-mapped stack and code it left.
+    // SAFETY: The kernel owns the machine after boot services exited. Every
+    // register below is EL2-only and this is the sole descent, performed once
+    // on the boot CPU with interrupts masked. Translation stays enabled: the
+    // EL1 registers receive the firmware's own live mapping, so the `eret`
+    // lands on the same identity-mapped stack and code it left.
+    unsafe {
+        core::arch::asm!(
+            // An absolute write, not a merge. Firmware that never intends to
+            // run an EL1 sets TGE, which routes every exception to EL2 and
+            // makes the exception return below illegal; it also sets FMO, IMO,
+            // and AMO, which would hold interrupts at EL2 after the kernel had
+            // taken ownership of them.
+            "msr hcr_el2, {host_configuration}",
+            "isb",
+            // Neither SIMD nor debug may trap into an EL2 the kernel is leaving.
+            "msr cptr_el2, {no_traps}",
+            "msr mdcr_el2, xzr",
+            // EL1 reads these two identity registers through their EL2 copies.
+            "mrs {scratch}, midr_el1",
+            "msr vpidr_el2, {scratch}",
+            "mrs {scratch}, mpidr_el1",
+            "msr vmpidr_el2, {scratch}",
+            // The generic counter and timer must be usable from EL1 unshifted.
+            "mrs {scratch}, cnthctl_el2",
+            "orr {scratch}, {scratch}, {el1_timers}",
+            "msr cnthctl_el2, {scratch}",
+            "msr cntvoff_el2, xzr",
+            // Without this every EL1 access to an `ICC_*` register traps.
+            "mrs {scratch}, icc_sre_el2",
+            "orr {scratch}, {scratch}, {gic_system_registers}",
+            "msr icc_sre_el2, {scratch}",
+            // Hand EL1 the translation regime that is live at EL2 right now.
+            "mrs {scratch}, mair_el2",
+            "msr mair_el1, {scratch}",
+            "msr tcr_el1, {tcr}",
+            "mrs {scratch}, ttbr0_el2",
+            "msr ttbr0_el1, {scratch}",
+            "msr sctlr_el1, {sctlr}",
+            // The compiler is free to emit SIMD in the very first instruction
+            // that runs at EL1, and CPACR_EL1 still holds its trapping reset
+            // value, because no code has ever run at that level.
+            "msr cpacr_el1, {floating_point}",
+            "dsb sy",
+            "tlbi vmalle1",
+            "dsb sy",
+            "isb",
+            // Continue on the same stack, at the instruction after the `eret`.
+            "mov {scratch}, sp",
+            "msr sp_el1, {scratch}",
+            "adr {scratch}, 99f",
+            "msr elr_el2, {scratch}",
+            "msr spsr_el2, {resumed_state}",
+            "eret",
+            "99:",
+            scratch = out(reg) _,
+            host_configuration = in(reg) el2::HCR_RW | el2::HCR_APK | el2::HCR_API,
+            no_traps = in(reg) el2::CPTR_NO_TRAPS,
+            el1_timers = in(reg) el2::CNTHCTL_EL1_TIMERS,
+            gic_system_registers = in(reg) el2::ICC_SRE_SRE | el2::ICC_SRE_ENABLE,
+            tcr = in(reg) aarch64_tcr_el1_from_el2(aarch64_read_tcr_el2()),
+            floating_point = in(reg) el2::CPACR_FLOATING_POINT,
+            sctlr = in(reg) el2::SCTLR_RESERVED
+                | el2::SCTLR_MMU
+                | el2::SCTLR_DATA_CACHE
+                | el2::SCTLR_INSTRUCTION_CACHE,
+            resumed_state = in(reg) el2::SPSR_EL1H_MASKED,
+        );
+    }
+    Ok(())
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn aarch64_read_tcr_el2() -> u64 {
+    let tcr: u64;
+    // SAFETY: TCR_EL2 is readable at EL2, which the caller confirmed.
+    unsafe {
+        core::arch::asm!("mrs {}, tcr_el2", out(reg) tcr, options(nomem, nostack));
+    }
+    tcr
+}
+
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 fn architecture_take_interrupt_ownership() {
     // SAFETY: Boot services have ended and the kernel intentionally masks debug,
@@ -3192,6 +3503,24 @@ fn architecture_take_interrupt_ownership() {
     unsafe {
         core::arch::asm!("msr daifset, #0xf", "isb", options(nomem, nostack));
     }
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn psci_secure_monitor_call(function_id: u64) -> u64 {
+    let mut result = function_id;
+    // SAFETY: The descriptor selects this conduit only where PSCI answers in
+    // an EL3 runtime. The call is otherwise identical to the EL2 one.
+    unsafe {
+        core::arch::asm!(
+            "smc #0",
+            inout("x0") result,
+            out("x1") _,
+            out("x2") _,
+            out("x3") _,
+            options(nostack)
+        );
+    }
+    result
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
@@ -3289,8 +3618,9 @@ mod tests {
         ActiveNetworkInterrupt, DeactivatedNetworkInterrupt, DmaInitializationPhase,
         DmaInitializationState, HeapState, InputInterruptError, NetworkInterruptRoute,
         NetworkInterruptSource, PreparedNetworkInterrupt, TaskStackError, UsedIndexTransition,
-        cached_nonzero, claim_network_interrupt_publication, classify_used_index, counter_millis,
-        revoke_network_interrupt_publication, validate_task_stack,
+        aarch64_tcr_el1_from_el2, cached_nonzero, claim_network_interrupt_publication,
+        classify_used_index, counter_millis, el2, revoke_network_interrupt_publication,
+        validate_task_stack,
     };
     use core::alloc::Layout;
     use core::cell::Cell;
@@ -3388,6 +3718,74 @@ mod tests {
 
         let accepted = PhysicalRange::from_pages(0x20_0000, 8).unwrap_or(too_small);
         assert_eq!(validate_task_stack(accepted), Ok(0x20_8000));
+    }
+
+    #[test]
+    fn gic_pci_routes_swizzle_each_pin_onto_its_own_shared_interrupt() {
+        // `INTA` on device zero takes the first line, and each further device
+        // rotates the four pins by one, so two adjacent devices on the same
+        // pin land on different shared interrupts.
+        for (device, pin, expected) in [
+            (0, 1, 35),
+            (0, 2, 36),
+            (0, 3, 37),
+            (0, 4, 38),
+            (1, 1, 36),
+            (2, 1, 37),
+            (3, 2, 35),
+            (4, 1, 35),
+            (31, 1, 38),
+        ] {
+            let Ok(route) = NetworkInterruptRoute::gic_pci_intx(device, pin) else {
+                unreachable!("device {device} pin {pin} has a route")
+            };
+            assert_eq!(route.interrupt().line(), expected);
+            assert!(matches!(
+                route.source(),
+                NetworkInterruptSource::PciIntx { pin: routed } if *routed == pin
+            ));
+            assert_eq!(route.trigger(), troe_platform::TriggerMode::Level);
+            assert_eq!(route.polarity(), troe_platform::Polarity::ActiveHigh);
+            assert_ne!(route.priority(), 0);
+        }
+        for (device, pin) in [(0, 0), (0, 5), (32, 1), (u8::MAX, 1), (0, u8::MAX)] {
+            assert_eq!(
+                NetworkInterruptRoute::gic_pci_intx(device, pin),
+                Err(InputInterruptError::InvalidResource)
+            );
+        }
+    }
+
+    #[test]
+    fn descended_translation_control_keeps_every_field_the_regime_needs() {
+        // A firmware value observed on the reference machine: a 52-bit map
+        // with a 4 KiB granule, which is only legal while the large-address
+        // bit travels with it.
+        let translated = aarch64_tcr_el1_from_el2(0x0001_8086_350c);
+        assert_eq!(translated & 0xffff, 0x350c, "lower half is copied verbatim");
+        assert_eq!((translated >> 32) & 0b111, 6, "physical size moves to IPS");
+        assert_ne!(
+            translated & el2::TCR_EL1_LARGE_ADDRESSES,
+            0,
+            "a 52-bit map without its large-address bit is not a legal regime"
+        );
+        assert_ne!(
+            translated & el2::TCR_DISABLE_UPPER,
+            0,
+            "the descended tables describe the lower range only"
+        );
+        assert_eq!((translated >> 30) & 0b11, 0b10, "4 KiB granule upper field");
+        assert_eq!((translated >> 37) & 1, 0, "top-byte-ignore is off here");
+
+        // Firmware that stays inside 48 bits must not acquire the bit.
+        let classic = aarch64_tcr_el1_from_el2(0x8090_0010);
+        assert_eq!(classic & el2::TCR_EL1_LARGE_ADDRESSES, 0);
+        assert_eq!(classic & 0x3f, 16, "T0SZ is copied verbatim");
+        assert_eq!((classic >> 37) & 1, 1, "top-byte-ignore moves to TBI0");
+
+        // The two granule encodings differ between the lower and upper fields.
+        assert_eq!((aarch64_tcr_el1_from_el2(0b01 << 14) >> 30) & 0b11, 0b11);
+        assert_eq!((aarch64_tcr_el1_from_el2(0b10 << 14) >> 30) & 0b11, 0b01);
     }
 
     #[test]

@@ -13,10 +13,10 @@
       "architecture": "aarch64",
       "firmware_discovery": "fixed",
       "id": 2,
-      "kernel_feature": "platform-aarch64-virt-uefi",
-      "name": "aarch64-virt-uefi",
+      "kernel_feature": "platform-aarch64-sbsa-ref",
+      "name": "aarch64-sbsa-ref",
       "target": "aarch64-unknown-uefi",
-      "virtio_transport": "mmio"
+      "virtio_transport": "pci"
     },
     {
       "architecture": "x86_64",

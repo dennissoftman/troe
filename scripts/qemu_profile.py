@@ -16,7 +16,7 @@ from pathlib import Path
 
 if __package__:
     from .platform_profile import (
-        AARCH64_VIRT_UEFI,
+        AARCH64_SBSA_REF,
         AARCH64_UEFI_VIRTIO_MMIO,
         X86_64_Q35_UEFI,
         X86_64_UEFI_VIRTIO_PCI,
@@ -29,7 +29,7 @@ if __package__:
     )
 else:
     from platform_profile import (
-        AARCH64_VIRT_UEFI,
+        AARCH64_SBSA_REF,
         AARCH64_UEFI_VIRTIO_MMIO,
         X86_64_Q35_UEFI,
         X86_64_UEFI_VIRTIO_PCI,
@@ -43,6 +43,10 @@ else:
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+# Table-of-contents magic beginning a Trusted Firmware package.
+TRUSTED_FIRMWARE_PACKAGE_MAGIC = b"\x01\x00\x64\xaa"
+# How far into a secure-world bank that package is searched for.
+TRUSTED_FIRMWARE_SEARCH_BYTES = 1024 * 1024
 EXPECTED_QEMU_VERSION = "11.1.0"
 MINIMUM_QEMU_VERSION = (8, 0, 0)
 MAXIMUM_QEMU_VERSION = (12, 0, 0)
@@ -75,6 +79,8 @@ class RunnerProfile:
     disk_layout: str = "split"
     framebuffer_device: str | None = None
     extra_arguments: tuple[str, ...] = ()
+    boot_media_device: str | None = None
+    firmware_code_is_volume: bool = True
 
 
 QEMU_ENVIRONMENT = "qemu"
@@ -105,28 +111,34 @@ RUNNER_PROFILES = {
             "OVMF_VARS_4M.fd",
         ),
     ),
-    (AARCH64_VIRT_UEFI, QEMU_ENVIRONMENT): RunnerProfile(
-        platform_id=AARCH64_VIRT_UEFI,
+    (AARCH64_SBSA_REF, QEMU_ENVIRONMENT): RunnerProfile(
+        platform_id=AARCH64_SBSA_REF,
         environment=QEMU_ENVIRONMENT,
         executable="qemu-system-aarch64",
-        machine="virt,gic-version=3",
-        cpu="cortex-a72",
+        machine="sbsa-ref",
+        # The reference firmware draws its entropy from FEAT_RNG, which the
+        # older cores QEMU offers on this machine do not implement.
+        cpu="max",
         memory="128M",
         virtual_cpus=1,
-        virtio_block_device="virtio-blk-device",
-        virtio_network_device="virtio-net-device",
-        virtio_rng_device="virtio-rng-device",
+        virtio_block_device="virtio-blk-pci,disable-legacy=on",
+        virtio_network_device="virtio-net-pci,disable-legacy=on",
+        virtio_rng_device="virtio-rng-pci,disable-legacy=on",
         network_mac="52:54:00:12:34:57",
         acceptance_udp_port=40124,
         firmware_architecture="aarch64",
-        firmware_code_filenames=(
-            "edk2-aarch64-code.fd",
-            "AAVMF_CODE.fd",
-            "QEMU_EFI.fd",
-        ),
-        firmware_vars_filenames=("edk2-arm-vars.fd", "AAVMF_VARS.fd"),
-        framebuffer_device="ramfb",
-        extra_arguments=("-global", "virtio-mmio.force-legacy=false"),
+        # Two 256 MiB flash banks: Trusted Firmware in the first, the UEFI
+        # volume and its variable store in the second.
+        firmware_code_filenames=("SBSA_FLASH0.fd",),
+        firmware_vars_filenames=("SBSA_FLASH1.fd",),
+        firmware_code_is_volume=False,
+        # The reference firmware carries no virtio driver, so the boot volume
+        # arrives on the machine's own AHCI controller. Everything the kernel
+        # then drives itself stays on virtio, as it does everywhere else.
+        boot_media_device="ide-hd,bus=ide.0",
+        # No `ramfb`: that needs the `fw_cfg` interface the reference machine
+        # deliberately omits. The firmware's QEMU video driver binds this.
+        framebuffer_device="bochs-display",
     ),
     (X86_64_UEFI_VIRTIO_PCI, QEMU_ENVIRONMENT): RunnerProfile(
         platform_id=X86_64_UEFI_VIRTIO_PCI,
@@ -247,6 +259,7 @@ def validate_runner_catalog(
             or runner.disk_layout not in {"split", "cloud-bundle-v1"}
             or any(not filename for filename in runner.firmware_code_filenames)
             or any(not filename for filename in runner.firmware_vars_filenames)
+            or runner.boot_media_device == ""
         ):
             raise RuntimeError(f"invalid runner record for {key!r}")
         if runner.acceptance_udp_port in ports:
@@ -396,8 +409,10 @@ def verify_file_digest(path: Path, expected_bytes: int, expected_sha256: str) ->
         )
 
 
-def verify_compatible_firmware(path: Path, architecture: str, kind: str) -> None:
-    """Require a regular, flash-aligned UEFI firmware volume image."""
+def verify_compatible_firmware(
+    path: Path, architecture: str, kind: str, *, volume: bool = True
+) -> None:
+    """Require a regular, flash-aligned firmware image of the expected shape."""
     if architecture not in FIRMWARE_ARCHITECTURES or kind not in ("code", "vars"):
         raise RuntimeError(f"invalid firmware selection: {architecture} {kind}")
     if not path.is_file():
@@ -409,14 +424,33 @@ def verify_compatible_firmware(path: Path, architecture: str, kind: str) -> None
         raise RuntimeError(
             f"firmware image must be at least 256 KiB and 4-KiB aligned: {path}"
         )
+    if volume:
+        with path.open("rb") as source:
+            header = source.read(64 * 1024)
+        if b"_FVH" not in header:
+            raise RuntimeError(
+                f"firmware image has no UEFI firmware-volume header: {path}"
+            )
+        return
+    # A secure-world bank holds Trusted Firmware and its package rather than a
+    # UEFI volume, so the package table of contents is what identifies it. Its
+    # offset follows the first-stage loader's length and is not fixed, so the
+    # search covers the whole region a loader could occupy.
     with path.open("rb") as source:
-        header = source.read(64 * 1024)
-    if b"_FVH" not in header:
-        raise RuntimeError(f"firmware image has no UEFI firmware-volume header: {path}")
+        header = source.read(TRUSTED_FIRMWARE_SEARCH_BYTES)
+    if TRUSTED_FIRMWARE_PACKAGE_MAGIC not in header:
+        raise RuntimeError(
+            f"firmware image has no Trusted Firmware package header: {path}"
+        )
 
 
 def verify_firmware(
-    path: Path, architecture: str, kind: str, *, strict: bool = False
+    path: Path,
+    architecture: str,
+    kind: str,
+    *,
+    strict: bool = False,
+    volume: bool = True,
 ) -> None:
     """Verify selected firmware structurally or against the release profile."""
     stat = path.stat()
@@ -424,7 +458,7 @@ def verify_firmware(
     if cache_key in _VERIFIED_FIRMWARE:
         return
     if not strict:
-        verify_compatible_firmware(path, architecture, kind)
+        verify_compatible_firmware(path, architecture, kind, volume=volume)
         _VERIFIED_FIRMWARE.add(cache_key)
         return
     profile = firmware_profile()
@@ -504,6 +538,9 @@ def firmware_search_roots(executable: str) -> tuple[Path, ...]:
     """Return QEMU-adjacent and conventional system firmware directories."""
     executable_dir = Path(executable).resolve().parent
     roots = (
+        # Firmware no distribution packages, built into the tree by
+        # `tools/build_sbsa_firmware.py`, is found before any system copy.
+        REPO_ROOT / "build" / "sbsa-firmware",
         executable_dir / "share",
         executable_dir.parent / "share" / "qemu",
         Path("/usr/share/qemu"),
@@ -552,7 +589,13 @@ def resolve_firmware(
         selected = supplied.expanduser().resolve(strict=True)
     else:
         selected = discover_firmware(executable, runner, kind)
-    verify_firmware(selected, runner.firmware_architecture, kind, strict=strict)
+    verify_firmware(
+        selected,
+        runner.firmware_architecture,
+        kind,
+        strict=strict,
+        volume=kind != "code" or runner.firmware_code_is_volume,
+    )
     return selected
 
 
@@ -606,11 +649,26 @@ def _qemu_arguments(
                 f"{runner.virtio_block_device},drive=troe-system,bootindex=1",
             )
         )
-    else:
+    elif runner.boot_media_device is None:
         command.extend(
             (
                 "-drive",
                 f"if=virtio,format=raw,file={image}",
+                "-drive",
+                f"if=none,format=raw,cache=writeback,id=troe-root,file={storage}",
+                "-device",
+                f"{runner.virtio_block_device},drive=troe-root",
+            )
+        )
+    else:
+        # Firmware that carries no virtio driver still has to read the boot
+        # volume, so it arrives on the bus the machine gives the firmware.
+        command.extend(
+            (
+                "-drive",
+                f"if=none,format=raw,id=troe-boot,file={image}",
+                "-device",
+                f"{runner.boot_media_device},drive=troe-boot,bootindex=1",
                 "-drive",
                 f"if=none,format=raw,cache=writeback,id=troe-root,file={storage}",
                 "-device",

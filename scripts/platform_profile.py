@@ -111,7 +111,7 @@ def _load_platform_profiles() -> dict[str, PlatformProfile]:
 PLATFORM_PROFILES = _load_platform_profiles()
 PLATFORM_IDS = tuple(PLATFORM_PROFILES)
 X86_64_Q35_UEFI = "x86_64-q35-uefi"
-AARCH64_VIRT_UEFI = "aarch64-virt-uefi"
+AARCH64_SBSA_REF = "aarch64-sbsa-ref"
 X86_64_UEFI_VIRTIO_PCI = "x86_64-uefi-virtio-pci"
 AARCH64_UEFI_VIRTIO_MMIO = "aarch64-uefi-virtio-mmio"
 

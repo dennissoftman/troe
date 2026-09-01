@@ -42,7 +42,7 @@ class AlpineProfileTests(unittest.TestCase):
                 sys.executable,
                 str(alpine_profile.REPO_ROOT / "scripts" / "run-alpine.py"),
                 "--platform",
-                "aarch64-virt-uefi",
+                "aarch64-sbsa-ref",
                 "--environment",
                 "qemu",
                 "--gui",
@@ -164,7 +164,7 @@ class AlpineProfileTests(unittest.TestCase):
             self.assertEqual(destination.read_bytes(), b"template")
 
     def test_qemu_arguments_match_troe_resources_and_attach_shared_disk(self) -> None:
-        runner = RUNNER_PROFILES[("aarch64-virt-uefi", "qemu")]
+        runner = RUNNER_PROFILES[("aarch64-sbsa-ref", "qemu")]
         command = alpine_profile._alpine_qemu_arguments(
             runner,
             "/usr/bin/qemu-system-aarch64",

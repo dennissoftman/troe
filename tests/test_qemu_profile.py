@@ -20,7 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from platform_profile import (  # noqa: E402
-    AARCH64_VIRT_UEFI,
+    AARCH64_SBSA_REF,
     AARCH64_UEFI_VIRTIO_MMIO,
     PLATFORM_IDS,
     PLATFORM_MANIFEST_PATH,
@@ -169,7 +169,7 @@ class FirmwareProfileTests(unittest.TestCase):
             identity = re.search(r"PlatformId::([A-Z0-9_]+),", body)
             name = re.search(r'\n\s*"([a-z0-9_-]+)",', body)
             architecture = re.search(r"Architecture::([A-Za-z0-9_]+),", body)
-            transport = re.search(r"VirtioTransportKind::(Pci|Mmio)\s*\{", body)
+            transport = re.search(r"VirtioTransportKind::(PciGic|Pci|Mmio)\s*\{", body)
             self.assertIsNotNone(identity)
             self.assertIsNotNone(name)
             self.assertIsNotNone(architecture)
@@ -184,7 +184,9 @@ class FirmwareProfileTests(unittest.TestCase):
                     numeric_ids[constant],
                     name.group(1),
                     architecture_names[architecture.group(1)],
-                    transport.group(1).lower(),
+                    # A GIC-routed PCI transport is still a PCI transport as
+                    # far as the manifest's device model is concerned.
+                    "pci" if transport.group(1) == "PciGic" else transport.group(1).lower(),
                 )
             )
         manifest_platforms = {
@@ -203,7 +205,7 @@ class FirmwareProfileTests(unittest.TestCase):
             PLATFORM_IDS,
             (
                 X86_64_Q35_UEFI,
-                AARCH64_VIRT_UEFI,
+                AARCH64_SBSA_REF,
                 X86_64_UEFI_VIRTIO_PCI,
                 AARCH64_UEFI_VIRTIO_MMIO,
             ),
@@ -221,7 +223,7 @@ class FirmwareProfileTests(unittest.TestCase):
             },
         )
         x86 = resolve_platform(X86_64_Q35_UEFI)
-        arm = resolve_platform(AARCH64_VIRT_UEFI)
+        arm = resolve_platform(AARCH64_SBSA_REF)
         self.assertEqual(
             (
                 x86.numeric_id,
@@ -292,8 +294,8 @@ class FirmwareProfileTests(unittest.TestCase):
                 "aarch64",
                 "fixed",
                 "aarch64-unknown-uefi",
-                "platform-aarch64-virt-uefi",
-                "mmio",
+                "platform-aarch64-sbsa-ref",
+                "pci",
             ),
         )
         discovered_x86 = resolve_runner(X86_64_UEFI_VIRTIO_PCI, QEMU_ENVIRONMENT)
@@ -325,7 +327,7 @@ class FirmwareProfileTests(unittest.TestCase):
                 discovered_arm.acceptance_udp_port,
             ),
             (
-                "virt,gic-version=2,acpi=off",
+                "virt,gic-version=3,acpi=off",
                 "virtio-blk-device",
                 "virtio-net-device",
                 "virtio-rng-device",
@@ -336,7 +338,7 @@ class FirmwareProfileTests(unittest.TestCase):
     def test_qemu_runner_records_are_complete_and_exact(self) -> None:
         self.assertEqual(ENVIRONMENT_IDS, (QEMU_ENVIRONMENT,))
         x86 = resolve_runner(X86_64_Q35_UEFI, QEMU_ENVIRONMENT)
-        arm = resolve_runner(AARCH64_VIRT_UEFI, QEMU_ENVIRONMENT)
+        arm = resolve_runner(AARCH64_SBSA_REF, QEMU_ENVIRONMENT)
         self.assertEqual(
             (
                 x86.executable,
@@ -379,16 +381,16 @@ class FirmwareProfileTests(unittest.TestCase):
             ),
             (
                 "qemu-system-aarch64",
-                "virt,gic-version=2",
-                "cortex-a72",
+                "sbsa-ref",
+                "max",
                 "128M",
                 1,
-                "virtio-blk-device",
-                "virtio-net-device",
-                "virtio-rng-device",
+                "virtio-blk-pci,disable-legacy=on",
+                "virtio-net-pci,disable-legacy=on",
+                "virtio-rng-pci,disable-legacy=on",
                 "aarch64",
                 40124,
-                ("-global", "virtio-mmio.force-legacy=false"),
+                (),
             ),
         )
 
@@ -569,7 +571,7 @@ class FirmwareProfileTests(unittest.TestCase):
             ],
         )
         arm = _qemu_arguments(
-            RUNNER_PROFILES[(AARCH64_VIRT_UEFI, QEMU_ENVIRONMENT)],
+            RUNNER_PROFILES[(AARCH64_SBSA_REF, QEMU_ENVIRONMENT)],
             "/qemu-aarch64",
             **paths,
             graphical=False,
@@ -580,7 +582,7 @@ class FirmwareProfileTests(unittest.TestCase):
             [
                 "/qemu-aarch64",
                 "-machine",
-                "virt,gic-version=2",
+                "sbsa-ref",
                 "-monitor",
                 "none",
                 "-serial",
@@ -588,34 +590,44 @@ class FirmwareProfileTests(unittest.TestCase):
                 "-display",
                 "none",
                 "-device",
-                "ramfb",
+                "bochs-display",
                 "-cpu",
-                "cortex-a72",
+                "max",
                 "-smp",
                 "1",
-                "-global",
-                "virtio-mmio.force-legacy=false",
                 "-m",
                 "128M",
-                *common_tail,
+                "-drive",
+                "if=pflash,format=raw,unit=0,readonly=on,file=/firmware.fd",
+                "-drive",
+                "if=pflash,format=raw,unit=1,file=/variables.fd",
+                # The reference firmware has no virtio driver, so the boot
+                # volume arrives on the machine's own AHCI controller.
+                "-drive",
+                "if=none,format=raw,id=troe-boot,file=/boot.img",
                 "-device",
-                "virtio-blk-device,drive=troe-root",
+                "ide-hd,bus=ide.0,drive=troe-boot,bootindex=1",
+                "-drive",
+                "if=none,format=raw,cache=writeback,id=troe-root,file=/root.img",
+                "-device",
+                "virtio-blk-pci,disable-legacy=on,drive=troe-root",
                 "-drive",
                 "if=none,format=raw,cache=writeback,id=troe-txslot,file=/txslot.img",
                 "-device",
-                "virtio-blk-device,drive=troe-txslot",
+                "virtio-blk-pci,disable-legacy=on,drive=troe-txslot",
                 "-drive",
                 "if=none,format=raw,cache=writeback,id=troe-statefs,file=/statefs.img",
                 "-device",
-                "virtio-blk-device,drive=troe-statefs",
+                "virtio-blk-pci,disable-legacy=on,drive=troe-statefs",
                 "-netdev",
                 "user,id=troe-net",
                 "-device",
-                "virtio-net-device,netdev=troe-net,mac=52:54:00:12:34:57",
+                "virtio-net-pci,disable-legacy=on,netdev=troe-net,"
+                "mac=52:54:00:12:34:57",
                 "-object",
                 "rng-random,id=troe-rng,filename=/dev/urandom",
                 "-device",
-                "virtio-rng-device,rng=troe-rng",
+                "virtio-rng-pci,disable-legacy=on,rng=troe-rng",
                 "-no-reboot",
             ],
         )

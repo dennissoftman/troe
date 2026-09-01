@@ -1,4 +1,8 @@
-//! x86-64 q35 modern virtio PCI block transport.
+//! Modern virtio PCI block and network transport.
+//!
+//! Two platform families reach it: x86-64, where a function's `INTx` line is
+//! named in configuration space, and the Arm SBSA reference contract, where
+//! the pin is swizzled onto a shared peripheral interrupt instead.
 
 extern crate alloc;
 
@@ -17,7 +21,12 @@ use troe_net::{
     NetworkDevice, RECEIVE_QUEUE_INDEX, TRANSMIT_QUEUE_INDEX, VIRTIO_NET_HEADER_BYTES,
     VirtioNetworkProfile,
 };
-use troe_platform::{IoPortRole, PciConfigurationKind, VirtioTransportKind};
+#[cfg(any(
+    feature = "platform-x86_64-q35-uefi",
+    feature = "platform-x86_64-uefi-virtio-pci"
+))]
+use troe_platform::IoPortRole;
+use troe_platform::{PciConfigurationKind, VirtioTransportKind};
 use troe_virtio::{
     REQUEST_HEADER_BYTES, REQUEST_QUEUE_INDEX, REQUEST_QUEUE_SIZE, RequestKind, RequestPlan,
     SplitQueueLayout, VirtioBlock, VirtioBlockProfile, VirtioBlockTransport,
@@ -75,6 +84,10 @@ const NO_VECTOR: u16 = u16::MAX;
 const DESCRIPTOR_NEXT: u16 = 1;
 const DESCRIPTOR_WRITE: u16 = 2;
 const NO_INTERRUPT: u16 = 1;
+#[cfg(any(
+    feature = "platform-x86_64-q35-uefi",
+    feature = "platform-x86_64-uefi-virtio-pci"
+))]
 const PCI_INTERRUPT_LINE: u8 = 0x3c;
 const PCI_INTERRUPT_PIN: u8 = 0x3d;
 
@@ -82,22 +95,50 @@ static NETWORK_ISR_ADDRESS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PciConfigurationAccess {
-    Mechanism1 {
-        address_port: u16,
-        data_port: u16,
-    },
-    #[cfg(feature = "platform-x86_64-uefi-virtio-pci")]
-    Ecam(crate::firmware_discovery::X86EcamWindow),
+    #[cfg(any(
+        feature = "platform-x86_64-q35-uefi",
+        feature = "platform-x86_64-uefi-virtio-pci"
+    ))]
+    Mechanism1 { address_port: u16, data_port: u16 },
+    #[cfg(any(
+        feature = "platform-x86_64-uefi-virtio-pci",
+        feature = "platform-aarch64-sbsa-ref"
+    ))]
+    Ecam(crate::ecam::EcamWindow),
 }
 
 impl PciConfigurationAccess {
     fn physical_range(self) -> Option<(u64, u64)> {
         match self {
+            #[cfg(any(
+                feature = "platform-x86_64-q35-uefi",
+                feature = "platform-x86_64-uefi-virtio-pci"
+            ))]
             Self::Mechanism1 { .. } => None,
-            #[cfg(feature = "platform-x86_64-uefi-virtio-pci")]
+            #[cfg(any(
+                feature = "platform-x86_64-uefi-virtio-pci",
+                feature = "platform-aarch64-sbsa-ref"
+            ))]
             Self::Ecam(window) => window.physical_range(),
         }
     }
+}
+
+/// How a PCI function's `INTx` pin reaches the platform interrupt controller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PciInterruptModel {
+    /// The configuration Interrupt Line byte names the controller input.
+    #[cfg(any(
+        feature = "platform-x86_64-q35-uefi",
+        feature = "platform-x86_64-uefi-virtio-pci"
+    ))]
+    ConfigurationLine {
+        /// Largest controller input the platform can route.
+        maximum_interrupt_line: u8,
+    },
+    /// Four consecutive shared interrupts reached through the standard swizzle.
+    #[cfg(feature = "platform-aarch64-sbsa-ref")]
+    Swizzled,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,27 +146,83 @@ struct PciPlatformResources {
     configuration: PciConfigurationAccess,
     first_bus: u8,
     last_bus: u8,
-    maximum_interrupt_line: u8,
+    interrupts: PciInterruptModel,
 }
 
 impl PciPlatformResources {
     fn selected() -> Result<Self, VirtioPciError> {
         let platform = crate::selected_platform().map_err(|_| VirtioPciError::InvalidResource)?;
-        let VirtioTransportKind::Pci {
-            configuration: configuration_kind,
-            first_bus,
-            last_bus,
-            maximum_interrupt_line,
-            network_vector,
-            ..
-        } = platform.virtio()
-        else {
-            return Err(VirtioPciError::InvalidResource);
-        };
-        if first_bus > last_bus || network_vector < 32 {
-            return Err(VirtioPciError::InvalidResource);
+        match platform.virtio() {
+            #[cfg(any(
+                feature = "platform-x86_64-q35-uefi",
+                feature = "platform-x86_64-uefi-virtio-pci"
+            ))]
+            VirtioTransportKind::Pci {
+                configuration,
+                first_bus,
+                last_bus,
+                maximum_interrupt_line,
+                network_vector,
+                ..
+            } => {
+                if first_bus > last_bus || network_vector < 32 {
+                    return Err(VirtioPciError::InvalidResource);
+                }
+                Ok(Self {
+                    configuration: Self::x86_access(platform, configuration, first_bus, last_bus)?,
+                    first_bus,
+                    last_bus,
+                    interrupts: PciInterruptModel::ConfigurationLine {
+                        maximum_interrupt_line,
+                    },
+                })
+            }
+            #[cfg(feature = "platform-aarch64-sbsa-ref")]
+            VirtioTransportKind::PciGic {
+                configuration,
+                first_bus,
+                last_bus,
+                ..
+            } => {
+                if first_bus > last_bus || configuration != PciConfigurationKind::Ecam {
+                    return Err(VirtioPciError::InvalidResource);
+                }
+                // The SBSA aperture is pinned by the descriptor rather than
+                // discovered, so the window comes straight from its role.
+                let aperture = platform
+                    .mmio(troe_platform::MmioRole::PciEcam)
+                    .ok_or(VirtioPciError::InvalidResource)?;
+                let window = crate::ecam::EcamWindow::new(aperture.base(), first_bus, last_bus)
+                    .ok_or(VirtioPciError::InvalidResource)?;
+                let (_, span) = window
+                    .physical_range()
+                    .ok_or(VirtioPciError::InvalidResource)?;
+                if span > aperture.byte_len() {
+                    return Err(VirtioPciError::InvalidResource);
+                }
+                Ok(Self {
+                    configuration: PciConfigurationAccess::Ecam(window),
+                    first_bus,
+                    last_bus,
+                    interrupts: PciInterruptModel::Swizzled,
+                })
+            }
+            _ => Err(VirtioPciError::InvalidResource),
         }
-        let configuration = match configuration_kind {
+    }
+
+    /// Resolve the configuration transport for the x86-64 platform families.
+    #[cfg(any(
+        feature = "platform-x86_64-q35-uefi",
+        feature = "platform-x86_64-uefi-virtio-pci"
+    ))]
+    fn x86_access(
+        platform: troe_platform::ValidatedPlatform<'static>,
+        configuration: PciConfigurationKind,
+        first_bus: u8,
+        last_bus: u8,
+    ) -> Result<PciConfigurationAccess, VirtioPciError> {
+        match configuration {
             PciConfigurationKind::Mechanism1 => {
                 let ports = platform
                     .io_ports(IoPortRole::PciConfiguration)
@@ -141,33 +238,28 @@ impl PciPlatformResources {
                     .base()
                     .checked_add(ports.count() - 1)
                     .ok_or(VirtioPciError::InvalidResource)?;
-                PciConfigurationAccess::Mechanism1 {
+                Ok(PciConfigurationAccess::Mechanism1 {
                     address_port: ports.base(),
                     data_port,
-                }
+                })
             }
             PciConfigurationKind::Ecam => {
                 #[cfg(feature = "platform-x86_64-uefi-virtio-pci")]
                 {
                     let window = crate::firmware_discovery::x86_ecam_window()
                         .ok_or(VirtioPciError::InvalidResource)?;
-                    if window.first_bus() != first_bus || window.last_bus() != last_bus {
+                    if window.first_bus != first_bus || window.last_bus != last_bus {
                         return Err(VirtioPciError::InvalidResource);
                     }
-                    PciConfigurationAccess::Ecam(window)
+                    Ok(PciConfigurationAccess::Ecam(window))
                 }
                 #[cfg(not(feature = "platform-x86_64-uefi-virtio-pci"))]
                 {
-                    return Err(VirtioPciError::InvalidResource);
+                    let _ = (first_bus, last_bus);
+                    Err(VirtioPciError::InvalidResource)
                 }
             }
-        };
-        Ok(Self {
-            configuration,
-            first_bus,
-            last_bus,
-            maximum_interrupt_line,
-        })
+        }
     }
 }
 
@@ -1154,12 +1246,28 @@ pub(crate) fn acknowledge_network_interrupt_from_isr() -> bool {
 }
 
 fn pci_interrupt_route(address: PciAddress) -> Result<NetworkInterruptRoute, VirtioPciError> {
-    let line = pci_read8(address, PCI_INTERRUPT_LINE);
     let pin = pci_read8(address, PCI_INTERRUPT_PIN);
-    if line > address.platform.maximum_interrupt_line {
-        return Err(VirtioPciError::InvalidResource);
+    match address.platform.interrupts {
+        #[cfg(any(
+            feature = "platform-x86_64-q35-uefi",
+            feature = "platform-x86_64-uefi-virtio-pci"
+        ))]
+        PciInterruptModel::ConfigurationLine {
+            maximum_interrupt_line,
+        } => {
+            let line = pci_read8(address, PCI_INTERRUPT_LINE);
+            if line > maximum_interrupt_line {
+                return Err(VirtioPciError::InvalidResource);
+            }
+            NetworkInterruptRoute::q35_pci_intx(line, pin)
+                .map_err(|_| VirtioPciError::InvalidResource)
+        }
+        // Arm firmware leaves the Interrupt Line byte meaningless, so the
+        // device number and the pin decide the SPI instead.
+        #[cfg(feature = "platform-aarch64-sbsa-ref")]
+        PciInterruptModel::Swizzled => NetworkInterruptRoute::gic_pci_intx(address.device, pin)
+            .map_err(|_| VirtioPciError::InvalidResource),
     }
-    NetworkInterruptRoute::q35_pci_intx(line, pin).map_err(|_| VirtioPciError::InvalidResource)
 }
 
 impl Drop for NativeVirtioNetwork {
@@ -1460,6 +1568,10 @@ fn pci_write16(address: PciAddress, offset: u8, value: u16) {
     if !offset.is_multiple_of(2) {
         return;
     }
+    #[cfg(any(
+        feature = "platform-x86_64-q35-uefi",
+        feature = "platform-x86_64-uefi-virtio-pci"
+    ))]
     let selector = pci_mechanism1_selector(address, offset);
     // SAFETY: Mechanism #1 ports are descriptor-owned. An ECAM pointer is
     // within the firmware-validated selected-bus aperture, which is identity
@@ -1467,6 +1579,10 @@ fn pci_write16(address: PciAddress, offset: u8, value: u16) {
     // The width-specific write avoids adjacent write-one-to-clear status bits.
     unsafe {
         match address.platform.configuration {
+            #[cfg(any(
+                feature = "platform-x86_64-q35-uefi",
+                feature = "platform-x86_64-uefi-virtio-pci"
+            ))]
             PciConfigurationAccess::Mechanism1 {
                 address_port,
                 data_port,
@@ -1484,7 +1600,10 @@ fn pci_write16(address: PciAddress, offset: u8, value: u16) {
                     options(nostack, preserves_flags)
                 );
             }
-            #[cfg(feature = "platform-x86_64-uefi-virtio-pci")]
+            #[cfg(any(
+                feature = "platform-x86_64-uefi-virtio-pci",
+                feature = "platform-aarch64-sbsa-ref"
+            ))]
             PciConfigurationAccess::Ecam(window) => {
                 let Some(raw) = window.configuration_address(
                     address.bus,
@@ -1505,12 +1624,20 @@ fn pci_write16(address: PciAddress, offset: u8, value: u16) {
 
 fn pci_read32(address: PciAddress, offset: u8) -> u32 {
     let aligned_offset = offset & !3;
+    #[cfg(any(
+        feature = "platform-x86_64-q35-uefi",
+        feature = "platform-x86_64-uefi-virtio-pci"
+    ))]
     let selector = pci_mechanism1_selector(address, aligned_offset);
     // SAFETY: Mechanism #1 ports are descriptor-owned. An ECAM pointer is a
     // naturally aligned dword within the validated and mapped selected-bus
     // aperture. Reads name only bounded buses, devices, functions, and fields.
     unsafe {
         match address.platform.configuration {
+            #[cfg(any(
+                feature = "platform-x86_64-q35-uefi",
+                feature = "platform-x86_64-uefi-virtio-pci"
+            ))]
             PciConfigurationAccess::Mechanism1 {
                 address_port,
                 data_port,
@@ -1530,7 +1657,10 @@ fn pci_read32(address: PciAddress, offset: u8) -> u32 {
                 );
                 value
             }
-            #[cfg(feature = "platform-x86_64-uefi-virtio-pci")]
+            #[cfg(any(
+                feature = "platform-x86_64-uefi-virtio-pci",
+                feature = "platform-aarch64-sbsa-ref"
+            ))]
             PciConfigurationAccess::Ecam(window) => {
                 let Some(raw) = window.configuration_address(
                     address.bus,
@@ -1553,12 +1683,20 @@ fn pci_write32(address: PciAddress, offset: u8, value: u32) {
     if !offset.is_multiple_of(4) {
         return;
     }
+    #[cfg(any(
+        feature = "platform-x86_64-q35-uefi",
+        feature = "platform-x86_64-uefi-virtio-pci"
+    ))]
     let selector = pci_mechanism1_selector(address, offset);
     // SAFETY: Mechanism #1 ports are descriptor-owned. An ECAM pointer is a
     // naturally aligned dword in the validated and mapped selected-bus
     // aperture. BAR probing disables decode and restores all changed state.
     unsafe {
         match address.platform.configuration {
+            #[cfg(any(
+                feature = "platform-x86_64-q35-uefi",
+                feature = "platform-x86_64-uefi-virtio-pci"
+            ))]
             PciConfigurationAccess::Mechanism1 {
                 address_port,
                 data_port,
@@ -1576,7 +1714,10 @@ fn pci_write32(address: PciAddress, offset: u8, value: u32) {
                     options(nostack, preserves_flags)
                 );
             }
-            #[cfg(feature = "platform-x86_64-uefi-virtio-pci")]
+            #[cfg(any(
+                feature = "platform-x86_64-uefi-virtio-pci",
+                feature = "platform-aarch64-sbsa-ref"
+            ))]
             PciConfigurationAccess::Ecam(window) => {
                 let Some(raw) = window.configuration_address(
                     address.bus,
@@ -1595,6 +1736,10 @@ fn pci_write32(address: PciAddress, offset: u8, value: u32) {
     }
 }
 
+#[cfg(any(
+    feature = "platform-x86_64-q35-uefi",
+    feature = "platform-x86_64-uefi-virtio-pci"
+))]
 fn pci_mechanism1_selector(address: PciAddress, offset: u8) -> u32 {
     0x8000_0000_u32
         | (u32::from(address.bus) << 16)
@@ -1669,9 +1814,8 @@ fn dma_observe() {
 }
 
 fn terminal_park() -> ! {
-    loop {
-        // SAFETY: Failed reset may leave DMA live. Interrupt-masked parking is
-        // the only safe outcome because returning could free borrowed buffers.
-        unsafe { core::arch::asm!("cli", "hlt", options(nomem, nostack)) };
-    }
+    // The machine mechanism owns the architecture-specific interrupt mask and
+    // terminal idle instruction. Failed reset may leave DMA live, so returning
+    // to a scope that could free borrowed buffers is never an option.
+    crate::mechanism::park()
 }

@@ -735,7 +735,7 @@ class CloudBundleTests(unittest.TestCase):
 
     def test_selected_platform_and_boot_manifest_bind_the_root(self) -> None:
         wrong_platform_efi = fake_efi(
-            "x86_64", b"aarch64-virt-uefi\0" + mkstorage.build_manifest()
+            "x86_64", b"aarch64-sbsa-ref\0" + mkstorage.build_manifest()
         )
         wrong_platform_boot = mkfat.build(
             wrong_platform_efi,

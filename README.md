@@ -401,7 +401,7 @@ Choose a target explicitly when needed:
 
 ```console
 cargo qemu --platform x86_64-q35-uefi --environment qemu
-cargo qemu --platform aarch64-virt-uefi --environment qemu
+cargo qemu --platform aarch64-sbsa-ref --environment qemu
 ```
 
 Boot the pinned Alpine virtual image under the same QEMU machine resources for
@@ -411,7 +411,7 @@ system image, while the independent shared FAT32 disk is attached as
 
 ```console
 cargo alpine --platform x86_64-q35-uefi --environment qemu
-cargo alpine --platform aarch64-virt-uefi --environment qemu
+cargo alpine --platform aarch64-sbsa-ref --environment qemu
 ```
 
 Alpine defaults to 256 MiB because its current ISO cannot boot with TROE's
