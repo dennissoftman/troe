@@ -81,6 +81,7 @@ class RunnerProfile:
     extra_arguments: tuple[str, ...] = ()
     boot_media_device: str | None = None
     firmware_code_is_volume: bool = True
+    firmware_build_command: str | None = None
 
 
 QEMU_ENVIRONMENT = "qemu"
@@ -132,6 +133,8 @@ RUNNER_PROFILES = {
         firmware_code_filenames=("SBSA_FLASH0.fd",),
         firmware_vars_filenames=("SBSA_FLASH1.fd",),
         firmware_code_is_volume=False,
+        # No distribution packages this pair, so the tree builds both banks.
+        firmware_build_command="python3 tools/build_sbsa_firmware.py",
         # The reference firmware carries no virtio driver, so the boot volume
         # arrives on the machine's own AHCI controller. Everything the kernel
         # then drives itself stays on virtio, as it does everywhere else.
@@ -260,6 +263,7 @@ def validate_runner_catalog(
             or any(not filename for filename in runner.firmware_code_filenames)
             or any(not filename for filename in runner.firmware_vars_filenames)
             or runner.boot_media_device == ""
+            or runner.firmware_build_command == ""
         ):
             raise RuntimeError(f"invalid runner record for {key!r}")
         if runner.acceptance_udp_port in ports:
@@ -377,9 +381,24 @@ def firmware_profile() -> dict[str, object]:
             )
         for kind in ("code", "vars"):
             entry = entries[kind]
+            if not isinstance(entry, dict):
+                raise RuntimeError(
+                    f"QEMU firmware profile has invalid {architecture} {kind} metadata"
+                )
+            # Firmware taken from a distribution is pinned by digest. Firmware
+            # no distribution packages is built here instead, and an edk2 image
+            # records its own build time, so its provenance is the pinned
+            # source rather than a byte-for-byte identity.
+            if set(entry) == {"built_from"}:
+                if not isinstance(entry["built_from"], str) or not (
+                    REPO_ROOT / entry["built_from"]
+                ).is_file():
+                    raise RuntimeError(
+                        f"QEMU firmware profile names no {architecture} {kind} source"
+                    )
+                continue
             if (
-                not isinstance(entry, dict)
-                or set(entry) != {"bytes", "sha256"}
+                set(entry) != {"bytes", "sha256"}
                 or not isinstance(entry["bytes"], int)
                 or entry["bytes"] <= 0
                 or not isinstance(entry["sha256"], str)
@@ -444,6 +463,32 @@ def verify_compatible_firmware(
         )
 
 
+def verify_built_firmware(path: Path, architecture: str, kind: str, source: str) -> None:
+    """Verify one locally built bank against the manifest its builder wrote.
+
+    A distribution artifact is evidence because its digest is committed here.
+    A bank built from source cannot be, because the image records when it was
+    built, so the evidence is instead that these bytes are the ones the pinned
+    sources produced and have not changed since.
+    """
+    if not (REPO_ROOT / source).is_file():
+        raise RuntimeError(f"the pinned {architecture} firmware source {source} is absent")
+    manifest = path.parent / "MANIFEST.sha256"
+    if not manifest.is_file():
+        raise RuntimeError(
+            f"{path.name} has no build manifest beside it; rebuild it from {source}"
+        )
+    recorded = {}
+    for line in manifest.read_text(encoding="utf-8").splitlines():
+        digest, _, name = line.partition("  ")
+        if re.fullmatch(r"[0-9a-f]{64}", digest) is None or not name:
+            raise RuntimeError(f"malformed firmware manifest entry: {line}")
+        recorded[name] = digest
+    if path.name not in recorded:
+        raise RuntimeError(f"{path.name} is not recorded in {manifest}")
+    verify_file_digest(path, path.stat().st_size, recorded[path.name])
+
+
 def verify_firmware(
     path: Path,
     architecture: str,
@@ -465,6 +510,15 @@ def verify_firmware(
     artifacts = profile["artifacts"]
     try:
         entry = artifacts[architecture][kind]
+    except (KeyError, TypeError) as error:
+        raise RuntimeError(
+            f"firmware profile has no {architecture} {kind} artifact"
+        ) from error
+    if "built_from" in entry:
+        verify_built_firmware(path, architecture, kind, entry["built_from"])
+        _VERIFIED_FIRMWARE.add(cache_key)
+        return
+    try:
         expected_bytes = entry["bytes"]
         expected_sha256 = entry["sha256"]
     except (KeyError, TypeError) as error:
@@ -570,9 +624,14 @@ def discover_firmware(executable: str, runner: RunnerProfile, kind: str) -> Path
 
     flag = "--firmware-code" if kind == "code" else "--firmware-vars"
     searched = ", ".join(str(root) for root in roots)
+    remedy = (
+        f"build it with `{runner.firmware_build_command}`, or pass {flag} explicitly"
+        if runner.firmware_build_command
+        else f"pass {flag} explicitly"
+    )
     raise FileNotFoundError(
         f"could not auto-detect {runner.firmware_architecture} UEFI firmware {kind}; "
-        f"pass {flag} explicitly (searched: {searched})"
+        f"{remedy} (searched: {searched})"
     )
 
 

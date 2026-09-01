@@ -376,9 +376,20 @@ for a completed one. See
 - Git LFS; run `git lfs install` once before checking out repository artifacts.
 - Python `3.13` or newer.
 - e2fsprogs `1.47.x` (`mke2fs` and `e2fsck`).
-- QEMU `8.x` through `11.x` with matching x86-64 or AArch64 distribution UEFI
-  firmware. QEMU `11.1.0` and the committed firmware digests remain the strict
+- QEMU `8.x` through `11.x`. The x86-64 platforms use distribution UEFI
+  firmware; QEMU `11.1.0` and the committed firmware digests remain the strict
   release-evidence profile.
+- For `aarch64-sbsa-ref` only, firmware for the SBSA reference machine, which
+  no distribution packages. Build both flash banks once from pinned sources:
+
+  ```console
+  python3 tools/build_sbsa_firmware.py
+  ```
+
+  That needs LLVM with `lld`, GNU make `3.82` or newer, OpenSSL 3 development
+  headers, and ACPICA's `iasl`. On macOS: `brew install llvm lld make openssl@3
+  acpica`. The result lands in `build/sbsa-firmware/` and is found from there
+  automatically; `--verify-only` rechecks it against its manifest.
 
 From a repository checkout, build and boot the platform matching your host:
 

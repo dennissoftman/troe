@@ -1,0 +1,35 @@
+{
+  "bank_bytes": 268435456,
+  "machine": "sbsa-ref",
+  "repositories": [
+    {
+      "commit": "2970e5699ba6267f3384ffab20f96647578aebc8",
+      "name": "edk2",
+      "release": "edk2-stable202608",
+      "submodules": [
+        "BaseTools/Source/C/BrotliCompress/brotli",
+        "CryptoPkg/Library/MbedTlsLib/mbedtls",
+        "CryptoPkg/Library/OpensslLib/openssl",
+        "MdeModulePkg/Library/BrotliCustomDecompressLib/brotli",
+        "MdePkg/Library/MipiSysTLib/mipisyst",
+        "SecurityPkg/DeviceSecurity/SpdmLib/libspdm"
+      ],
+      "url": "https://github.com/tianocore/edk2.git"
+    },
+    {
+      "commit": "c8295e076affae5cf04fd4234db13a0e025f44e1",
+      "name": "edk2-platforms",
+      "release": null,
+      "submodules": [],
+      "url": "https://github.com/tianocore/edk2-platforms.git"
+    },
+    {
+      "commit": "da738d5eae93af342fdc4995dd3c05acb4c9d757",
+      "name": "trusted-firmware-a",
+      "release": "v2.15.0",
+      "submodules": [],
+      "url": "https://github.com/ARM-software/arm-trusted-firmware.git"
+    }
+  ],
+  "schema": 1
+}

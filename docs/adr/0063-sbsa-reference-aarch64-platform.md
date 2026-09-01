@@ -88,8 +88,16 @@ The gate now exercises a machine whose contract is published and certified
 against, so a green AArch64 run means something about hardware outside QEMU.
 
 The firmware is the cost. No distribution packages a Trusted Firmware and edk2
-pair for this machine, so both banks are built from pinned sources into the
-tree. That is a heavier dependency than the `AAVMF` package `virt` needed.
+pair for this machine, so `tools/build_sbsa_firmware.py` builds both banks from
+commits pinned in `tools/sbsa-firmware-sources.lock.json`. That is a heavier
+dependency than the `AAVMF` package `virt` needed: LLVM with `lld`, a GNU make
+newer than the one macOS ships, OpenSSL headers, and ACPICA.
+
+Only the submodules the platform actually needs are fetched, which is six of
+edk2's thirteen and about half the checkout. The set is not only what gets
+compiled: a package description declares its include directories and the build
+rejects one that is absent, so a tree nothing includes from still has to be on
+disk. That is why `libspdm` is fetched for a platform that never links it.
 
 The machine must be given a CPU implementing `FEAT_RNG`: the reference firmware
 draws its entropy from it, and the kernel reads the UEFI protocol that depends
