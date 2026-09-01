@@ -7,9 +7,19 @@ ADR 0039.
 Amendment, 2026-08-31: this decision writes timestamps and deliberately reads
 none. [ADR 0061](0061-readable-and-settable-modification-time.md) carries the
 modification time up through the VFS and the KEX ABI and adds one bounded
-operation that sets it. The statements below that nothing in this profile reads
-the stamped fields describe the original decision; the exclusion of
-access-time updates on read still holds.
+operation that sets it, and
+[ADR 0062](0062-change-and-creation-times.md) adds the change and creation
+times. The statements below that nothing in this profile reads the stamped
+fields describe the original decision; the exclusion of access-time updates on
+read still holds.
+
+Amendment, 2026-08-31: the two paragraphs below saying a directory's times are
+not advanced when names inside it change are **superseded**. They rested on
+"nothing in this profile reads them", which stopped being true once ADR 0061
+exposed the fields, and a host that mounts the volume always did read them.
+Both providers now stamp a directory whenever a name inside it is created,
+removed or renamed. The paragraphs are kept because they record why the
+original call was made, not because it still holds.
 
 Amendment, 2026-09-01: [ADR 0067](0067-posix-timezone-strings-and-local-time.md)
 adds a timezone source, so the FAT32 section's premise that TROE has none is no
@@ -72,6 +82,14 @@ or loses a block, not on every entry added to or removed from a block it
 already has. Advancing a directory's times on every name change would mean an
 extra inode write per create, and nothing in this profile reads them.
 
+*Superseded.* The extra write is now made. It joins the open journal
+transaction rather than adding a durability barrier of its own, so the cost is
+one more staged block per name mutation and no extra flush, and it is skipped
+entirely when no wall clock is set. Both the modification and change times
+advance; the access time is still left alone, which
+[ADR 0062](0062-change-and-creation-times.md) makes permanent by not exposing
+it at all.
+
 Each time is written as its 32-bit field together with the two epoch bits of the
 record's extra word, which spans 1970 to 2446. When a record declares no room
 for that word the instant is clamped to 2038-01-19 instead, because the bare
@@ -101,6 +119,13 @@ source's stamps.
 As on ext4, a directory's own entry is not restamped when names are added to or
 removed from it; only the `.` and `..` records it was created with carry a time.
 The root directory has no entry at all, so it never carries one.
+
+*Superseded, except for the root.* A directory's entry in its parent is now
+restamped when a name inside it is created, removed or renamed. The root
+genuinely has nowhere to record this — it has no entry in any parent — so it
+still reports no time, which is the same absence rule the rest of the timestamp
+work uses rather than a special case. Replacing a file's contents is not a
+change to its parent and does not restamp it.
 
 The representable range is 1980-01-01 through 2107-12-31. A clock outside it is
 clamped to the nearer end rather than refused, because refusing would leave the

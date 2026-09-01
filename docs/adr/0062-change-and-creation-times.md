@@ -70,8 +70,9 @@ is no `-u`, and `man ls` says why.
 Three of the four fields ext4 writes are now reachable, and the fourth is
 documented as deliberately unreachable rather than merely missing. A caller
 that needs to detect a rename can compare change times on ext4, which a
-modification time cannot see; issue #102 tracks the separate defect that a
-directory's own times do not advance when names inside it change.
+modification time cannot see. The companion defect — a directory's own times
+not advancing when names inside it change — was fixed separately; ADR 0058
+carries the amendment.
 
 The uneven per-provider picture is now visible to callers instead of hidden.
 `ls -lc` is useful on `/vol/root` and shows nothing on a FAT32 volume, which is
