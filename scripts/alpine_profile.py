@@ -11,9 +11,10 @@ import subprocess
 import tempfile
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Callable
+from typing import BinaryIO
 
 if __package__:
     from .qemu_profile import (
@@ -263,7 +264,9 @@ def ensure_alpine_root_image(path: Path, *, reset: bool = False) -> bool:
             staging.flush()
         staging_path.replace(selected)
     except OSError as error:
-        raise RuntimeError(f"cannot create Alpine root image {selected}: {error}") from error
+        raise RuntimeError(
+            f"cannot create Alpine root image {selected}: {error}"
+        ) from error
     finally:
         if staging_path is not None:
             staging_path.unlink(missing_ok=True)
@@ -276,7 +279,9 @@ def alpine_root_needs_install(path: Path) -> bool:
         with path.open("rb") as root:
             return not any(root.read(4096))
     except OSError as error:
-        raise RuntimeError(f"cannot inspect Alpine root image {path}: {error}") from error
+        raise RuntimeError(
+            f"cannot inspect Alpine root image {path}: {error}"
+        ) from error
 
 
 def ensure_alpine_variables(
@@ -284,7 +289,9 @@ def ensure_alpine_variables(
 ) -> None:
     """Preserve installed UEFI state or atomically initialize it from a template."""
     if destination.is_symlink():
-        raise RuntimeError("Alpine UEFI variable-store path must not be a symbolic link")
+        raise RuntimeError(
+            "Alpine UEFI variable-store path must not be a symbolic link"
+        )
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists() and not reset:
         if not destination.is_file():
@@ -414,7 +421,9 @@ def prepare_alpine_command(
     runner = resolve_runner(platform_id, environment)
     executable = shutil.which(runner.executable)
     if executable is None:
-        raise FileNotFoundError(f"QEMU executable not found on PATH: {runner.executable}")
+        raise FileNotFoundError(
+            f"QEMU executable not found on PATH: {runner.executable}"
+        )
     if skip_version_check and strict_tool_versions:
         raise RuntimeError(
             "--skip-version-check and --strict-tool-versions are mutually exclusive"

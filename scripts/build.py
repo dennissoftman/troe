@@ -101,7 +101,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     variants.add_argument(
         "--all-variants",
         action="store_true",
-        help="build production and acceptance images after generating shared inputs once",
+        help=(
+            "build production and acceptance images after generating shared inputs once"
+        ),
     )
     identity_source = parser.add_mutually_exclusive_group(required=True)
     identity_source.add_argument(

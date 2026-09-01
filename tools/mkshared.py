@@ -10,9 +10,9 @@ import sys
 import tempfile
 import uuid
 import zlib
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 try:
     from tools import mkstorage
@@ -35,9 +35,7 @@ DISK_GUID_TEXT = mkstorage.SHARED_DISK_GUID_TEXT
 PARTITION_GUID_TEXT = mkstorage.SHARED_PARTITION_GUID_TEXT
 DISK_GUID = uuid.UUID(DISK_GUID_TEXT).bytes_le
 PARTITION_GUID = uuid.UUID(PARTITION_GUID_TEXT).bytes_le
-MICROSOFT_BASIC_DATA_GUID = uuid.UUID(
-    "ebd0a0a2-b9e5-4433-87c0-68b6b72699c7"
-).bytes_le
+MICROSOFT_BASIC_DATA_GUID = uuid.UUID("ebd0a0a2-b9e5-4433-87c0-68b6b72699c7").bytes_le
 
 FAT32_SECTORS_PER_CLUSTER = 8
 FAT32_RESERVED_SECTORS = 32
@@ -60,7 +58,7 @@ FAT32_MAX_CLUSTERS = 0x0FFF_FFF5
 DEFAULT_OUTPUT = Path("build/troe-shared-fat32.img")
 
 
-class SharedImageNeedsRepair(ValueError):
+class SharedImageRepairError(ValueError):
     """Report a validated image carrying only an unclean-unmount marker."""
 
 
@@ -82,23 +80,18 @@ def fat32_layout() -> Fat32Layout:
     fat_sectors = 1
     for _ in range(32):
         data_sectors = (
-            PARTITION_SECTORS
-            - FAT32_RESERVED_SECTORS
-            - FAT32_FAT_COUNT * fat_sectors
+            PARTITION_SECTORS - FAT32_RESERVED_SECTORS - FAT32_FAT_COUNT * fat_sectors
         )
         if data_sectors <= 0:
             raise ValueError("shared FAT32 partition has no data region")
         cluster_count = data_sectors // FAT32_SECTORS_PER_CLUSTER
-        required = (
-            (cluster_count + 2) * 4 + SECTOR_BYTES - 1
-        ) // SECTOR_BYTES
+        required = ((cluster_count + 2) * 4 + SECTOR_BYTES - 1) // SECTOR_BYTES
         if required == fat_sectors:
             if not FAT32_MIN_CLUSTERS <= cluster_count < FAT32_MAX_CLUSTERS:
                 raise ValueError("shared partition does not classify as FAT32")
             return Fat32Layout(
                 fat_sectors=fat_sectors,
-                data_start=FAT32_RESERVED_SECTORS
-                + FAT32_FAT_COUNT * fat_sectors,
+                data_start=FAT32_RESERVED_SECTORS + FAT32_FAT_COUNT * fat_sectors,
                 cluster_count=cluster_count,
             )
         fat_sectors = required
@@ -281,9 +274,7 @@ def _validate_image(path: Path) -> bool:
     entry_crc = zlib.crc32(entries)
     partition_offset = PARTITION_START * SECTOR_BYTES
     with path.open("rb") as source:
-        if _read_at(source, 0, SECTOR_BYTES) != mkstorage.protective_mbr(
-            TOTAL_SECTORS
-        ):
+        if _read_at(source, 0, SECTOR_BYTES) != mkstorage.protective_mbr(TOTAL_SECTORS):
             raise ValueError("shared image protective MBR is invalid")
         if _read_at(source, SECTOR_BYTES, SECTOR_BYTES) != mkstorage.gpt_header(
             1,
@@ -352,14 +343,16 @@ def _validate_image(path: Path) -> bool:
             != FAT32_CLEAN_SHUTDOWN | FAT32_NO_HARD_ERROR
             or root < 0x0FFF_FFF8
         ):
-            raise ValueError("shared FAT32 core allocation entries are invalid or dirty")
+            raise ValueError(
+                "shared FAT32 core allocation entries are invalid or dirty"
+            )
     return needs_repair
 
 
 def verify_image(path: Path) -> None:
     """Verify immutable geometry and clean mutable FAT32 metadata in bounded reads."""
     if _validate_image(path):
-        raise SharedImageNeedsRepair("shared FAT32 was not cleanly unmounted")
+        raise SharedImageRepairError("shared FAT32 was not cleanly unmounted")
 
 
 def repair_image(path: Path) -> bool:
@@ -383,7 +376,10 @@ def repair_image(path: Path) -> bool:
 
 
 def ensure_image(path: Path, *, reset: bool = False) -> bool:
-    """Preserve one valid image or atomically create/reset it; return whether created."""
+    """Preserve one valid image or atomically create/reset it.
+
+    Return whether the image was created.
+    """
     if path.is_symlink():
         raise ValueError("shared image path must not be a symbolic link")
     path = path.resolve(strict=False)
@@ -437,10 +433,10 @@ def ensure_image_with_repair_prompt(
     """Ensure one image, optionally repairing its marker; return created, repaired."""
     try:
         return ensure_image(path, reset=reset), False
-    except SharedImageNeedsRepair:
+    except SharedImageRepairError:
         selected_confirmation = confirm_repair if confirmation is None else confirmation
         if not selected_confirmation(path):
-            raise SharedImageNeedsRepair(
+            raise SharedImageRepairError(
                 "shared FAT32 repair declined; image was not changed"
             ) from None
         repair_image(path)

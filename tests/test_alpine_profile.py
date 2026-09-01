@@ -145,9 +145,7 @@ class AlpineProfileTests(unittest.TestCase):
             self.assertFalse(alpine_profile.alpine_root_needs_install(root))
             with self.assertRaisesRegex(RuntimeError, "--reset-root-disk"):
                 alpine_profile.ensure_alpine_root_image(root)
-            self.assertTrue(
-                alpine_profile.ensure_alpine_root_image(root, reset=True)
-            )
+            self.assertTrue(alpine_profile.ensure_alpine_root_image(root, reset=True))
             self.assertEqual(root.stat().st_size, alpine_profile.ALPINE_ROOT_DISK_BYTES)
 
     def test_uefi_variables_are_preserved_until_reset(self) -> None:
@@ -184,10 +182,16 @@ class AlpineProfileTests(unittest.TestCase):
         self.assertIn("id=alpine-root", " ".join(command))
         self.assertIn("id=alpine-shared", " ".join(command))
         self.assertTrue(
-            any("drive=alpine-root" in argument and "bootindex=1" in argument for argument in command)
+            any(
+                "drive=alpine-root" in argument and "bootindex=1" in argument
+                for argument in command
+            )
         )
         self.assertTrue(
-            any(argument.endswith("drive=alpine-boot,bootindex=2") for argument in command)
+            any(
+                argument.endswith("drive=alpine-boot,bootindex=2")
+                for argument in command
+            )
         )
         self.assertIn("serial=ALPINE_ROOT", " ".join(command))
         self.assertIn("serial=TROE_SHARED", " ".join(command))
@@ -210,7 +214,10 @@ class AlpineProfileTests(unittest.TestCase):
         self.assertNotIn("id=alpine-root", " ".join(command))
         self.assertNotIn("id=alpine-shared", " ".join(command))
         self.assertTrue(
-            any(argument.endswith("drive=alpine-boot,bootindex=1") for argument in command)
+            any(
+                argument.endswith("drive=alpine-boot,bootindex=1")
+                for argument in command
+            )
         )
 
 

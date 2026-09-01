@@ -11,7 +11,7 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
-from mkcontent import IdentityIds, RESERVED_FIXTURE_IDS
+from mkcontent import RESERVED_FIXTURE_IDS, IdentityIds
 
 
 def generate_identities(

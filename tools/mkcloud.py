@@ -717,18 +717,15 @@ def validate_environment_matrix(
                     "cloud matrix contains a duplicate platform/environment"
                 )
             supported_pairs.add(pair)
-        else:
-            if (
-                platform is not None
-                or transport is not None
-                or entry["image_format"] != "unavailable"
-                or required_disks
-                or runtime_status != "incompatible"
-                or not missing
-            ):
-                raise ValueError(
-                    f"unavailable matrix entry {identifier!r} is inconsistent"
-                )
+        elif (
+            platform is not None
+            or transport is not None
+            or entry["image_format"] != "unavailable"
+            or required_disks
+            or runtime_status != "incompatible"
+            or not missing
+        ):
+            raise ValueError(f"unavailable matrix entry {identifier!r} is inconsistent")
 
         if runtime_status == "accepted":
             if artifact_status != "host-verified" or not evidence:
@@ -737,7 +734,8 @@ def validate_environment_matrix(
                 raise ValueError(f"accepted matrix entry {identifier!r} still has gaps")
         elif evidence:
             raise ValueError(
-                f"unaccepted matrix entry {identifier!r} cannot claim acceptance evidence"
+                f"unaccepted matrix entry {identifier!r} "
+                "cannot claim acceptance evidence"
             )
         if runtime_status != "accepted" and not gaps:
             raise ValueError(

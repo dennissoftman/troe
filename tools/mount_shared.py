@@ -13,10 +13,11 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from types import TracebackType
-from typing import BinaryIO, Callable, Sequence
+from typing import BinaryIO
 
 try:
     from tools import mkshared
@@ -152,11 +153,15 @@ def load_state(path: Path = DEFAULT_STATE) -> MountState | None:
     except FileNotFoundError:
         return None
     except (OSError, UnicodeError) as error:
-        raise MountError(f"cannot read shared-media mount state {path}: {error}") from error
+        raise MountError(
+            f"cannot read shared-media mount state {path}: {error}"
+        ) from error
     try:
         return MountState.decode(json.loads(payload))
     except json.JSONDecodeError as error:
-        raise MountError(f"shared-media mount state is not valid JSON: {error}") from error
+        raise MountError(
+            f"shared-media mount state is not valid JSON: {error}"
+        ) from error
 
 
 def write_state(state: MountState, path: Path = DEFAULT_STATE) -> None:
@@ -189,7 +194,9 @@ def remove_state(path: Path = DEFAULT_STATE) -> None:
     except FileNotFoundError:
         pass
     except OSError as error:
-        raise MountError(f"cannot remove shared-media mount state {path}: {error}") from error
+        raise MountError(
+            f"cannot remove shared-media mount state {path}: {error}"
+        ) from error
 
 
 def attachment_is_live(state: MountState) -> bool:
@@ -212,8 +219,7 @@ def _run(
             command,
             check=False,
             text=not binary,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
         )
     except (FileNotFoundError, OSError) as error:
         raise MountError(f"cannot {purpose}: {error}") from error
@@ -228,9 +234,7 @@ def _run(
     return completed
 
 
-def parse_macos_attach(
-    payload: bytes, image: Path, *, read_only: bool
-) -> MountState:
+def parse_macos_attach(payload: bytes, image: Path, *, read_only: bool) -> MountState:
     """Parse hdiutil's stable plist response without localized text."""
     try:
         document = plistlib.loads(payload)
@@ -288,7 +292,10 @@ def _macos_attachment(image: Path) -> str | None:
         if not isinstance(attached, dict):
             continue
         attached_path = attached.get("image-path")
-        if isinstance(attached_path, str) and _resolved(Path(attached_path)) == expected:
+        if (
+            isinstance(attached_path, str)
+            and _resolved(Path(attached_path)) == expected
+        ):
             return attached_path
     return None
 
@@ -332,7 +339,9 @@ def require_detached(
     state = load_state(state_path)
     if state is not None:
         if state.image != _resolved(image):
-            raise MountError("shared-media state names a different image; inspect it manually")
+            raise MountError(
+                "shared-media state names a different image; inspect it manually"
+            )
         if attachment_is_live(state):
             raise MountError(
                 f"shared FAT32 media is mounted at {state.mount_point}; "
@@ -342,7 +351,8 @@ def require_detached(
     attachment = discover_attachment(image, platform)
     if attachment is not None:
         raise MountError(
-            f"shared FAT32 media is already attached by the host ({attachment}); detach it first"
+            "shared FAT32 media is already attached by the host "
+            f"({attachment}); detach it first"
         )
 
 
@@ -369,7 +379,9 @@ def mount_macos(image: Path, *, read_only: bool) -> MountState:
             device = ""
             if isinstance(entities, list):
                 for entity in entities:
-                    entry = entity.get("dev-entry") if isinstance(entity, dict) else None
+                    entry = (
+                        entity.get("dev-entry") if isinstance(entity, dict) else None
+                    )
                     if isinstance(entry, str):
                         device = entry
                         break
@@ -640,9 +652,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="open the mounted directory in the host file manager",
     )
     args = parser.parse_args(argv)
-    if (args.unmount or args.status or args.repair) and (
-        args.read_only or args.open
-    ):
+    if (args.unmount or args.status or args.repair) and (args.read_only or args.open):
         parser.error("--read-only and --open apply only when mounting")
     return args
 
@@ -667,7 +677,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     if external is None:
                         print("shared FAT32: detached")
                     else:
-                        print(f"shared FAT32: attached outside cargo mount ({external})")
+                        print(
+                            f"shared FAT32: attached outside cargo mount ({external})"
+                        )
                 return 0
 
             if args.unmount:
@@ -675,7 +687,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     external = discover_attachment(DEFAULT_IMAGE)
                     if external is not None:
                         raise MountError(
-                            f"image is attached outside cargo mount ({external}); detach it with the host tool"
+                            "image is attached outside cargo mount "
+                            f"({external}); detach it with the host tool"
                         )
                     print("shared FAT32: already detached")
                     return 0
@@ -694,7 +707,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             if state is not None:
                 if args.read_only and not state.read_only:
                     raise MountError(
-                        "shared FAT32 is already mounted read-write; detach it before changing mode"
+                        "shared FAT32 is already mounted read-write; "
+                        "detach it before changing mode"
                     )
             else:
                 require_detached()

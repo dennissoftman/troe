@@ -27,7 +27,6 @@ from cloud_hypervisor_profile import (
 )
 from platform_profile import REPO_ROOT
 
-
 BOOT_TIMEOUT_SECONDS = 45.0
 COMMAND_TIMEOUT_SECONDS = 15.0
 STATE_PARTITION_OFFSET = 2_048 * 512
@@ -129,8 +128,7 @@ def _wait_for_control(
             completed = subprocess.run(
                 [str(control), f"--api-socket={api_socket}", "ping"],
                 check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                capture_output=True,
                 timeout=5,
             )
             if completed.returncode == 0:

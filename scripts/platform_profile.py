@@ -9,7 +9,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PLATFORM_MANIFEST_PATH = REPO_ROOT / "tools" / "platforms.json"
 

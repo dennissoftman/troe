@@ -7,7 +7,6 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
@@ -24,7 +23,9 @@ class AuditPolicyTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "expected cargo-audit 0.22.1"):
                 audit.verify_tool_version()
 
-    def test_audit_command_is_no_fetch_deny_warnings_and_documented_ignores(self) -> None:
+    def test_audit_command_is_no_fetch_deny_warnings_and_documented_ignores(
+        self,
+    ) -> None:
         command = audit.audit_command(("RUSTSEC-2026-0001",))
         self.assertIn("--no-fetch", command)
         self.assertEqual(command[command.index("--deny") + 1], "warnings")

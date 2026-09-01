@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import struct
 import sys
 from pathlib import Path
@@ -65,7 +66,7 @@ def select_architecture(entries: list[Entry], architecture: str) -> list[Entry]:
         elif owning_prefix == selected_prefix and path != selected_prefix:
             projected.append((kind, "/bin" + path[len(selected_prefix) :], payload))
     projected.sort(key=lambda entry: entry[1].encode("utf-8"))
-    for previous, current in zip(projected, projected[1:], strict=False):
+    for previous, current in itertools.pairwise(projected):
         if previous[1] == current[1]:
             raise ValueError(f"architecture projection collides at {current[1]}")
     return projected
@@ -97,7 +98,9 @@ def build(root: Path, architecture: str | None = None) -> bytes:
     return encode(entries)
 
 
-def checked_slice(image: bytes, offset: int, length: int, label: str) -> tuple[bytes, int]:
+def checked_slice(
+    image: bytes, offset: int, length: int, label: str
+) -> tuple[bytes, int]:
     """Return one checked image slice and its exclusive end offset."""
     end = offset + length
     if length < 0 or offset < 0 or end > len(image):
@@ -180,17 +183,12 @@ def main() -> int:
         expected = collect(args.root.resolve())
         if args.architecture is not None:
             expected = select_architecture(expected, args.architecture)
-        if args.check:
-            image = args.output.read_bytes()
-        else:
-            image = encode(expected)
+        image = args.output.read_bytes() if args.check else encode(expected)
         verify_tree(image, expected)
         if not args.check:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_bytes(image)
-        selection = (
-            f" {args.architecture}" if args.architecture is not None else ""
-        )
+        selection = f" {args.architecture}" if args.architecture is not None else ""
         print(f"KEFS v1{selection}: {len(image)} bytes -> {args.output}")
         return 0
     except (OSError, ValueError) as error:

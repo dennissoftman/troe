@@ -10,7 +10,6 @@ import os
 import re
 import shlex
 import shutil
-import stat
 import struct
 import subprocess
 import sys
@@ -109,7 +108,9 @@ def parse_args() -> argparse.Namespace:
         "install-diagnostics", help="install capability-negative interpreters"
     )
     install_diagnostics_parser.add_argument("tree", type=absolute_path)
-    install_diagnostics_parser.add_argument("--image", type=absolute_path, required=True)
+    install_diagnostics_parser.add_argument(
+        "--image", type=absolute_path, required=True
+    )
     install_packages_parser = subparsers.add_parser(
         "install-packages", help="install pure-Python packages onto shared media"
     )
@@ -122,10 +123,14 @@ def parse_args() -> argparse.Namespace:
         "output", type=absolute_path, help="empty diagnostics output directory"
     )
     variants.add_argument("--work-directory", type=absolute_path, required=True)
-    variants.add_argument("--architecture", choices=("all", *ARCHITECTURES), default="all")
+    variants.add_argument(
+        "--architecture", choices=("all", *ARCHITECTURES), default="all"
+    )
     variants.add_argument("--cc", help="LLVM clang executable")
     build = subparsers.add_parser("build", help="build one authenticated package")
-    build.add_argument("output", type=absolute_path, help="empty package output directory")
+    build.add_argument(
+        "output", type=absolute_path, help="empty package output directory"
+    )
     build.add_argument(
         "--source-cache",
         type=absolute_path,
@@ -238,7 +243,9 @@ def releases() -> list[Release]:
     return result
 
 
-def find_tool(explicit: str | None, names: tuple[str, ...], candidates: tuple[str, ...]) -> str:
+def find_tool(
+    explicit: str | None, names: tuple[str, ...], candidates: tuple[str, ...]
+) -> str:
     if explicit:
         resolved = shutil.which(explicit) if "/" not in explicit else explicit
         if resolved and Path(resolved).is_file():
@@ -260,7 +267,11 @@ def find_rust_lld() -> str:
         raise RuntimeError("required tool not found: rustc")
     details = run([rustc, "-vV"], capture=True)
     host = next(
-        (line.split(":", 1)[1].strip() for line in details.splitlines() if line.startswith("host:")),
+        (
+            line.split(":", 1)[1].strip()
+            for line in details.splitlines()
+            if line.startswith("host:")
+        ),
         None,
     )
     if host is None:
@@ -303,7 +314,11 @@ def find_build_python(series: str, overrides: dict[str, str]) -> str:
         if not path.is_file():
             continue
         actual = run(
-            [str(path), "-c", "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')"],
+            [
+                str(path),
+                "-c",
+                "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}')",
+            ],
             capture=True,
         )
         if actual == series:
@@ -321,21 +336,26 @@ def download(url: str, destination: Path, offline: bool) -> None:
         raise RuntimeError(f"offline source cache entry is missing: {destination}")
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(destination.suffix + ".partial")
-    request = urllib.request.Request(url, headers={"User-Agent": "TROE reproducible builder"})
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "TROE reproducible builder"}
+    )
     with urllib.request.urlopen(request) as response, temporary.open("wb") as output:
         shutil.copyfileobj(response, output)
     temporary.replace(destination)
     normalize_file(destination)
 
 
-def authenticate_source(release: Release, cache: Path, sigstore: str, offline: bool) -> Path:
+def authenticate_source(
+    release: Release, cache: Path, sigstore: str, offline: bool
+) -> Path:
     archive = cache / release.archive_name
     bundle = cache / f"{release.archive_name}.sigstore"
     download(release.url, archive, offline)
     actual = sha256(archive)
     if actual != release.sha256:
         raise RuntimeError(
-            f"digest mismatch for {archive.name}: expected {release.sha256}, got {actual}"
+            f"digest mismatch for {archive.name}: "
+            f"expected {release.sha256}, got {actual}"
         )
     download(release.sigstore_url, bundle, offline)
     run(
@@ -360,9 +380,13 @@ def extract_source(archive: Path, destination: Path, release: Release) -> Path:
     destination.mkdir(parents=True)
     expected_root = f"Python-{release.version}"
     with tarfile.open(archive, "r:xz") as bundle:
-        names = {Path(member.name).parts[0] for member in bundle.getmembers() if member.name}
+        names = {
+            Path(member.name).parts[0] for member in bundle.getmembers() if member.name
+        }
         if names != {expected_root}:
-            raise RuntimeError(f"unexpected archive roots in {archive}: {sorted(names)}")
+            raise RuntimeError(
+                f"unexpected archive roots in {archive}: {sorted(names)}"
+            )
         bundle.extractall(destination, filter="data")
     source = destination / expected_root
     run(["patch", "--batch", "--forward", "-p1", "-i", str(PATCH)], cwd=source)
@@ -428,7 +452,9 @@ def make_compiler_wrapper(
         str(sysroot / architecture / "include"),
     ]
     path.write_text(
-        "#!/bin/sh\nexec " + " ".join(shlex.quote(value) for value in arguments) + ' "$@"\n',
+        "#!/bin/sh\nexec "
+        + " ".join(shlex.quote(value) for value in arguments)
+        + ' "$@"\n',
         encoding="utf-8",
     )
     normalize_file(path, executable=True)
@@ -450,7 +476,9 @@ def build_configure_stub(
     )
 
 
-def configure_options(release: Release, architecture: str, build_python: str) -> list[str]:
+def configure_options(
+    release: Release, architecture: str, build_python: str
+) -> list[str]:
     options = [
         f"--host={architecture}-unknown-none",
         f"--with-build-python={build_python}",
@@ -669,7 +697,9 @@ def install_stdlib(
     return {
         "included_modules": len(included),
         "excluded_modules": len(excluded),
-        "stdlib_bytes": sum(path.stat().st_size for path in destination.rglob("*") if path.is_file()),
+        "stdlib_bytes": sum(
+            path.stat().st_size for path in destination.rglob("*") if path.is_file()
+        ),
     }
 
 
@@ -731,9 +761,16 @@ def install_release(
         names.extend(["python3.kex", "python.kex"])
     for name in names:
         copy_artifact(artifact, bin_root / name, executable=True)
-    inspect = json.loads(run(["cargo", "kex", "inspect", str(artifact), "--json"], capture=True))
-    if inspect.get("target") != architecture or inspect.get("format") != "KEX package v1":
-        raise RuntimeError(f"CPython KEX inspection did not match {architecture}: {artifact}")
+    inspect = json.loads(
+        run(["cargo", "kex", "inspect", str(artifact), "--json"], capture=True)
+    )
+    if (
+        inspect.get("target") != architecture
+        or inspect.get("format") != "KEX package v1"
+    ):
+        raise RuntimeError(
+            f"CPython KEX inspection did not match {architecture}: {artifact}"
+        )
     write_json(bin_root / f"python{release.version}.inspect.json", inspect)
     stdlib = architecture_root / f"python{release.version}" / f"python{release.series}"
     metrics = install_stdlib(release, source, build, stdlib, policy)
@@ -769,9 +806,12 @@ def install_release(
 
 def write_package_manifest(root: Path) -> None:
     manifest = root / MANIFEST_NAME
-    lines = []
-    for path in sorted(item for item in root.rglob("*") if item.is_file() and item != manifest):
-        lines.append(f"{sha256(path)}  {path.relative_to(root).as_posix()}")
+    lines = [
+        f"{sha256(path)}  {path.relative_to(root).as_posix()}"
+        for path in sorted(
+            item for item in root.rglob("*") if item.is_file() and item != manifest
+        )
+    ]
     manifest.write_text("\n".join(lines) + "\n", encoding="utf-8")
     normalize_file(manifest)
 
@@ -784,7 +824,9 @@ def read_package_manifest(root: Path) -> list[tuple[PurePosixPath, str]]:
             raise RuntimeError(f"package manifest entry is malformed: {line}")
         relative = PurePosixPath(name)
         if relative.is_absolute() or ".." in relative.parts:
-            raise RuntimeError(f"package manifest entry is not repository-relative: {name}")
+            raise RuntimeError(
+                f"package manifest entry is not repository-relative: {name}"
+            )
         entries.append((relative, digest))
     return entries
 
@@ -820,8 +862,7 @@ def mtools(
         [executable, "-i", f"{image.resolve(strict=True)}@@{offset}", *arguments],
         check=check,
         text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
     )
 
 
@@ -860,7 +901,10 @@ def install_package_image(root: Path, image: Path) -> None:
     entries = verify_package(root)
     mkshared.verify_image(image)
     for relative, _digest in entries:
-        if mtools("mdir", image, f"::/{relative.as_posix()}", check=False).returncode == 0:
+        if (
+            mtools("mdir", image, f"::/{relative.as_posix()}", check=False).returncode
+            == 0
+        ):
             raise RuntimeError(f"shared media already contains /{relative.as_posix()}")
     for directory in MEDIA_DIRECTORIES:
         source = root / directory.as_posix()
@@ -870,7 +914,9 @@ def install_package_image(root: Path, image: Path) -> None:
         for child in sorted(item for item in source.iterdir() if item.is_dir()):
             mtools("mcopy", image, "-s", str(child), f"::/{directory.as_posix()}/")
         for child in sorted(item for item in source.iterdir() if item.is_file()):
-            mtools("mcopy", image, str(child), f"::/{directory.as_posix()}/{child.name}")
+            mtools(
+                "mcopy", image, str(child), f"::/{directory.as_posix()}/{child.name}"
+            )
     verify_package_image(root, image)
 
 
@@ -883,7 +929,9 @@ def verify_package_image(root: Path, image: Path) -> None:
         extraction.mkdir()
         for directory in MEDIA_DIRECTORIES:
             if (root / directory.as_posix()).is_dir():
-                mtools("mcopy", image, "-s", f"::/{directory.as_posix()}", str(extraction))
+                mtools(
+                    "mcopy", image, "-s", f"::/{directory.as_posix()}", str(extraction)
+                )
         for relative, digest in entries:
             path = extraction / Path(*relative.parts)
             if not path.is_file() or sha256(path) != digest:
@@ -922,7 +970,9 @@ def install_packages_image(source: Path, image: Path) -> None:
         if mtools("mdir", image, f"::/lib/{name}", check=False).returncode == 0
     ]
     if not architectures:
-        raise RuntimeError(f"shared media has no installed interpreter library: {image}")
+        raise RuntimeError(
+            f"shared media has no installed interpreter library: {image}"
+        )
     for architecture in architectures:
         packages = PurePosixPath("lib") / architecture / "packages"
         directories = sorted(
@@ -985,7 +1035,9 @@ def build_variant_kex(
         {
             "CC": cc,
             "CARGO_NET_OFFLINE": "true",
-            "CARGO_TARGET_DIR": str(workspace / "cargo-variants" / variant / architecture),
+            "CARGO_TARGET_DIR": str(
+                workspace / "cargo-variants" / variant / architecture
+            ),
             "SOURCE_DATE_EPOCH": EPOCH,
             "TROE_CPYTHON_APP_ROOT": str(APP_ROOT),
             "TROE_CPYTHON_BUILD": str(build),
@@ -1016,7 +1068,9 @@ def build_variant_kex(
     return artifact
 
 
-def build_variants(output: Path, workspace: Path, architectures: tuple[str, ...], cc: str) -> None:
+def build_variants(
+    output: Path, workspace: Path, architectures: tuple[str, ...], cc: str
+) -> None:
     """Emit the capability-negative interpreters used by acceptance only."""
     if output.exists() and any(output.iterdir()):
         raise RuntimeError(f"output directory is not empty: {output}")
@@ -1026,7 +1080,9 @@ def build_variants(output: Path, workspace: Path, architectures: tuple[str, ...]
         for variant in NEGATIVE_VARIANTS:
             artifact = build_variant_kex(variant, release, workspace, architecture, cc)
             copy_artifact(
-                artifact, root / architecture / "bin" / f"{variant}.kex", executable=True
+                artifact,
+                root / architecture / "bin" / f"{variant}.kex",
+                executable=True,
             )
     write_package_manifest(root)
 
@@ -1054,7 +1110,11 @@ def build_package(
     lld_driver.parent.mkdir(parents=True, exist_ok=True)
     lld_driver.symlink_to(lld)
     sysroot = workspace / "sysroot"
-    sysroot_command = [sys.executable, str(REPO_ROOT / "tools" / "build_c_sysroot.py"), str(sysroot)]
+    sysroot_command = [
+        sys.executable,
+        str(REPO_ROOT / "tools" / "build_c_sysroot.py"),
+        str(sysroot),
+    ]
     if len(architectures) == 1:
         sysroot_command.extend(["--architecture", architectures[0]])
     sysroot_command.extend(["--cc", cc, "--ar", archiver])
@@ -1064,7 +1124,9 @@ def build_package(
     authenticated: list[dict[str, str]] = []
     for release in selected:
         archive = authenticate_source(release, cache, sigstore, offline)
-        source = extract_source(archive, workspace / "source" / release.version, release)
+        source = extract_source(
+            archive, workspace / "source" / release.version, release
+        )
         build_python = find_build_python(release.series, python_overrides)
         authenticated.append(
             {
@@ -1098,7 +1160,10 @@ def build_package(
                 artifact,
                 policy,
             )
-    write_json(package_root / "lib" / "TROE-SOURCES.json", {"schema": 1, "releases": authenticated})
+    write_json(
+        package_root / "lib" / "TROE-SOURCES.json",
+        {"schema": 1, "releases": authenticated},
+    )
     write_json(
         package_root / "lib" / "TROE-PACKAGES.json",
         {
@@ -1142,7 +1207,10 @@ def main() -> int:
                 find_tool(
                     args.cc,
                     ("clang",),
-                    ("/opt/homebrew/opt/llvm/bin/clang", "/usr/local/opt/llvm/bin/clang"),
+                    (
+                        "/opt/homebrew/opt/llvm/bin/clang",
+                        "/usr/local/opt/llvm/bin/clang",
+                    ),
                 ),
             )
             print(f"TROE CPython diagnostics ready: {args.output}")
@@ -1221,7 +1289,12 @@ def main() -> int:
                 )
                 if tree_digest(args.output) != tree_digest(second_output):
                     raise RuntimeError("CPython package output is not reproducible")
-    except (OSError, RuntimeError, subprocess.CalledProcessError, tarfile.TarError) as error:
+    except (
+        OSError,
+        RuntimeError,
+        subprocess.CalledProcessError,
+        tarfile.TarError,
+    ) as error:
         print(f"CPython build failed: {error}", file=sys.stderr)
         return 1
     print(f"TROE CPython package ready: {args.output}")

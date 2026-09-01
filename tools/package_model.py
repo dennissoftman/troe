@@ -7,10 +7,9 @@ import base64
 import hashlib
 import json
 import re
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Mapping, Sequence
-
 
 MAX_DOCUMENT_BYTES = 256 * 1024
 MAX_PACKAGE_BYTES = 8 * 1024 * 1024
@@ -56,7 +55,9 @@ class Version:
         if (
             not isinstance(value, list)
             or len(value) != 3
-            or any(not isinstance(part, int) or isinstance(part, bool) for part in value)
+            or any(
+                not isinstance(part, int) or isinstance(part, bool) for part in value
+            )
             or any(part < 0 or part > 65_535 for part in value)
         ):
             raise ModelError("invalid-version", path, "expected [major, minor, patch]")
@@ -320,7 +321,9 @@ def decode_json(data: bytes, label: str, maximum: int = MAX_DOCUMENT_BYTES) -> o
             data,
             object_pairs_hook=_unique_object,
             parse_float=lambda _value: (_ for _ in ()).throw(
-                ModelError("invalid-number", label, "floating-point values are forbidden")
+                ModelError(
+                    "invalid-number", label, "floating-point values are forbidden"
+                )
             ),
             parse_constant=lambda _value: (_ for _ in ()).throw(
                 ModelError("invalid-number", label, "non-finite values are forbidden")
@@ -367,10 +370,14 @@ def _bounded_int(value: object, path: str, minimum: int, maximum: int) -> int:
     return value
 
 
-def _strictly_sorted(values: Sequence[object], key: Callable[[object], object], path: str) -> None:
+def _strictly_sorted(
+    values: Sequence[object], key: Callable[[object], object], path: str
+) -> None:
     keys = [key(value) for value in values]
     if keys != sorted(keys) or len(keys) != len(set(keys)):
-        raise ModelError("noncanonical-order", path, "entries must be unique and sorted")
+        raise ModelError(
+            "noncanonical-order", path, "entries must be unique and sorted"
+        )
 
 
 def parse_manifest(data: bytes, label: str = "manifest") -> Manifest:
@@ -403,7 +410,9 @@ def parse_manifest(data: bytes, label: str = "manifest") -> Manifest:
         path = f"{label}.dependencies[{index}]"
         entry = _object(raw, {"name", "requirement"}, path)
         requirement = _object(
-            entry["requirement"], {"maximum_exclusive", "minimum"}, f"{path}.requirement"
+            entry["requirement"],
+            {"maximum_exclusive", "minimum"},
+            f"{path}.requirement",
         )
         minimum = Version.parse(requirement["minimum"], f"{path}.requirement.minimum")
         maximum = Version.parse(
@@ -413,15 +422,21 @@ def parse_manifest(data: bytes, label: str = "manifest") -> Manifest:
         if minimum >= maximum:
             raise ModelError("invalid-range", f"{path}.requirement", "range is empty")
         dependencies.append(
-            Dependency(_name(entry["name"], f"{path}.name"), VersionRange(minimum, maximum))
+            Dependency(
+                _name(entry["name"], f"{path}.name"), VersionRange(minimum, maximum)
+            )
         )
-    _strictly_sorted(dependencies, lambda dependency: dependency.name, f"{label}.dependencies")
+    _strictly_sorted(
+        dependencies, lambda dependency: dependency.name, f"{label}.dependencies"
+    )
     if any(dependency.name == name for dependency in dependencies):
         raise ModelError("self-dependency", f"{label}.dependencies", name)
 
     raw_targets = _array(document["targets"], f"{label}.targets", MAX_TARGETS)
     if not raw_targets:
-        raise ModelError("invalid-array", f"{label}.targets", "at least one target is required")
+        raise ModelError(
+            "invalid-array", f"{label}.targets", "at least one target is required"
+        )
     targets: list[TargetArtifact] = []
     target_fields = {
         "abi",
@@ -440,7 +455,9 @@ def parse_manifest(data: bytes, label: str = "manifest") -> Manifest:
             raise ModelError("unsupported-target", f"{path}.target", str(target))
         architecture = entry["architecture"]
         if architecture != SUPPORTED_TARGETS[target]:
-            raise ModelError("target-mismatch", f"{path}.architecture", str(architecture))
+            raise ModelError(
+                "target-mismatch", f"{path}.architecture", str(architecture)
+            )
         abi = entry["abi"]
         if (
             not isinstance(abi, list)
@@ -448,14 +465,21 @@ def parse_manifest(data: bytes, label: str = "manifest") -> Manifest:
             or abi[0] != 1
             or abi[1] not in {0, 1}
         ):
-            raise ModelError("unsupported-abi", f"{path}.abi", "expected [1,0] or [1,1]")
+            raise ModelError(
+                "unsupported-abi", f"{path}.abi", "expected [1,0] or [1,1]"
+            )
         targets.append(
             TargetArtifact(
                 target,
                 architecture,
                 (abi[0], abi[1]),
                 _digest(entry["artifact_sha256"], f"{path}.artifact_sha256"),
-                _bounded_int(entry["artifact_bytes"], f"{path}.artifact_bytes", 1, 4 * 1024 * 1024),
+                _bounded_int(
+                    entry["artifact_bytes"],
+                    f"{path}.artifact_bytes",
+                    1,
+                    4 * 1024 * 1024,
+                ),
                 _digest(entry["sdk_sha256"], f"{path}.sdk_sha256"),
                 _digest(entry["toolchain_sha256"], f"{path}.toolchain_sha256"),
             )
@@ -475,7 +499,9 @@ def parse_manifest(data: bytes, label: str = "manifest") -> Manifest:
             "unknown-capability", f"{label}.capabilities", ",".join(sorted(unknown))
         )
 
-    raw_directories = _array(document["directories"], f"{label}.directories", MAX_DIRECTORIES)
+    raw_directories = _array(
+        document["directories"], f"{label}.directories", MAX_DIRECTORIES
+    )
     directories: list[DirectoryGrant] = []
     for index, raw in enumerate(raw_directories):
         path = f"{label}.directories[{index}]"
@@ -484,12 +510,16 @@ def parse_manifest(data: bytes, label: str = "manifest") -> Manifest:
         rights = entry["rights"]
         if role not in DIRECTORY_ROLES:
             raise ModelError("unknown-directory-role", f"{path}.role", str(role))
-        if rights not in DIRECTORY_RIGHTS or (role in {"assets", "config"} and rights != "read"):
+        if rights not in DIRECTORY_RIGHTS or (
+            role in {"assets", "config"} and rights != "read"
+        ):
             raise ModelError("invalid-directory-rights", f"{path}.rights", str(rights))
         directories.append(
             DirectoryGrant(_name(entry["name"], f"{path}.name"), role, rights)
         )
-    _strictly_sorted(directories, lambda directory: directory.name, f"{label}.directories")
+    _strictly_sorted(
+        directories, lambda directory: directory.name, f"{label}.directories"
+    )
 
     resource = _object(
         document["resources"],
@@ -497,10 +527,16 @@ def parse_manifest(data: bytes, label: str = "manifest") -> Manifest:
         f"{label}.resources",
     )
     resources = ResourceLimits(
-        _bounded_int(resource["execution_ms"], f"{label}.resources.execution_ms", 1, 50),
+        _bounded_int(
+            resource["execution_ms"], f"{label}.resources.execution_ms", 1, 50
+        ),
         _bounded_int(resource["handles"], f"{label}.resources.handles", 1, 8),
-        _bounded_int(resource["heap_bytes"], f"{label}.resources.heap_bytes", 4096, U64_MAX),
-        _bounded_int(resource["stack_bytes"], f"{label}.resources.stack_bytes", 4096, U64_MAX),
+        _bounded_int(
+            resource["heap_bytes"], f"{label}.resources.heap_bytes", 4096, U64_MAX
+        ),
+        _bounded_int(
+            resource["stack_bytes"], f"{label}.resources.stack_bytes", 4096, U64_MAX
+        ),
     )
 
     raw_services = _array(document["services"], f"{label}.services", MAX_SERVICES)
@@ -509,7 +545,9 @@ def parse_manifest(data: bytes, label: str = "manifest") -> Manifest:
         path = f"{label}.services[{index}]"
         entry = _object(raw, {"command", "name"}, path)
         command = _name(entry["command"], f"{path}.command")
-        services.append(Service(_name(entry["name"], f"{path}.name", _SERVICE), command))
+        services.append(
+            Service(_name(entry["name"], f"{path}.name", _SERVICE), command)
+        )
     _strictly_sorted(services, lambda service: service.name, f"{label}.services")
     return Manifest(
         name,
@@ -533,7 +571,8 @@ def parse_manifest_file(path: Path) -> Manifest:
 
 
 def resolve(root: str, target: str, manifests: Iterable[Manifest]) -> TargetLock:
-    """Resolve the highest compatible versions deterministically and reject conflicts."""
+    """Resolve the highest compatible versions deterministically and reject
+    conflicts."""
     if target not in SUPPORTED_TARGETS:
         raise ModelError("unsupported-target", "target", target)
     catalog: dict[str, list[Manifest]] = {}
@@ -541,12 +580,18 @@ def resolve(root: str, target: str, manifests: Iterable[Manifest]) -> TargetLock
     for manifest in manifests:
         identity = (manifest.name, manifest.version)
         if identity in identities:
-            raise ModelError("duplicate-package", "catalog", f"{manifest.name}@{manifest.version.text()}")
+            raise ModelError(
+                "duplicate-package",
+                "catalog",
+                f"{manifest.name}@{manifest.version.text()}",
+            )
         identities.add(identity)
         manifest.target(target)
         catalog.setdefault(manifest.name, []).append(manifest)
     if len(identities) > MAX_PACKAGES:
-        raise ModelError("package-capacity", "catalog", f"more than {MAX_PACKAGES} versions")
+        raise ModelError(
+            "package-capacity", "catalog", f"more than {MAX_PACKAGES} versions"
+        )
     for versions in catalog.values():
         versions.sort(key=lambda manifest: manifest.version, reverse=True)
     if root not in catalog:
@@ -576,10 +621,16 @@ def resolve(root: str, target: str, manifests: Iterable[Manifest]) -> TargetLock
                 if dependency.name not in reachable:
                     reachable.add(dependency.name)
                     pending.append(dependency.name)
-        selected = {name: manifest for name, manifest in supplied.items() if name in reachable}
-        state = tuple(sorted((name, manifest.version) for name, manifest in selected.items()))
+        selected = {
+            name: manifest for name, manifest in supplied.items() if name in reachable
+        }
+        state = tuple(
+            sorted((name, manifest.version) for name, manifest in selected.items())
+        )
         if state in visited_states:
-            return None, ModelError("version-conflict", "catalog", "repeated resolver state")
+            return None, ModelError(
+                "version-conflict", "catalog", "repeated resolver state"
+            )
         visited_states.add(state)
 
         requirements: dict[str, list[tuple[str, VersionRange]]] = {}
@@ -594,7 +645,9 @@ def resolve(root: str, target: str, manifests: Iterable[Manifest]) -> TargetLock
             if name not in catalog:
                 owners = sorted(owner for owner, _range in requirements.get(name, []))
                 return None, ModelError(
-                    "missing-dependency", f"package:{owners[0] if owners else root}", name
+                    "missing-dependency",
+                    f"package:{owners[0] if owners else root}",
+                    name,
                 )
             selected_manifest = selected.get(name)
             if selected_manifest is None or any(
@@ -614,7 +667,10 @@ def resolve(root: str, target: str, manifests: Iterable[Manifest]) -> TargetLock
         candidates = [
             manifest
             for manifest in catalog[name]
-            if all(requirement.contains(manifest.version) for _owner, requirement in constraints)
+            if all(
+                requirement.contains(manifest.version)
+                for _owner, requirement in constraints
+            )
         ]
         if not candidates:
             owners = ",".join(sorted(owner for owner, _requirement in constraints))
@@ -718,14 +774,21 @@ def parse_lock(data: bytes, label: str = "lock") -> TargetLock:
                     Version.parse(dependency["version"], f"{dependency_path}.version"),
                 )
             )
-        _strictly_sorted(dependencies, lambda dependency: dependency[0], f"{path}.dependencies")
+        _strictly_sorted(
+            dependencies, lambda dependency: dependency[0], f"{path}.dependencies"
+        )
         packages.append(
             LockedPackage(
                 _name(entry["name"], f"{path}.name"),
                 Version.parse(entry["version"], f"{path}.version"),
                 _digest(entry["manifest_sha256"], f"{path}.manifest_sha256"),
                 _digest(entry["artifact_sha256"], f"{path}.artifact_sha256"),
-                _bounded_int(entry["artifact_bytes"], f"{path}.artifact_bytes", 1, 4 * 1024 * 1024),
+                _bounded_int(
+                    entry["artifact_bytes"],
+                    f"{path}.artifact_bytes",
+                    1,
+                    4 * 1024 * 1024,
+                ),
                 _digest(entry["sdk_sha256"], f"{path}.sdk_sha256"),
                 _digest(entry["toolchain_sha256"], f"{path}.toolchain_sha256"),
                 tuple(dependencies),
@@ -756,7 +819,9 @@ def parse_lock(data: bytes, label: str = "lock") -> TargetLock:
     visit(root)
     if reachable != set(by_name):
         raise ModelError(
-            "unreachable-package", f"{label}.packages", ",".join(sorted(set(by_name) - reachable))
+            "unreachable-package",
+            f"{label}.packages",
+            ",".join(sorted(set(by_name) - reachable)),
         )
     lock = TargetLock(root, target, tuple(packages))
     if canonical_json(document) != data:
@@ -766,12 +831,17 @@ def parse_lock(data: bytes, label: str = "lock") -> TargetLock:
 
 def build_package(manifest: Manifest, lock: TargetLock, artifact: bytes) -> bytes:
     """Construct one canonical TPKG v1 artifact for a member of the target lock."""
-    locked = next((package for package in lock.packages if package.name == manifest.name), None)
+    locked = next(
+        (package for package in lock.packages if package.name == manifest.name), None
+    )
     if locked is None or locked.manifest_sha256 != manifest.digest():
         raise ModelError("manifest-mismatch", "package", manifest.name)
     _validate_locked_manifest(lock, manifest, locked)
     target = manifest.target(lock.target)
-    if len(artifact) != target.artifact_bytes or sha256(artifact) != target.artifact_sha256:
+    if (
+        len(artifact) != target.artifact_bytes
+        or sha256(artifact) != target.artifact_sha256
+    ):
         raise ModelError("artifact-mismatch", "package.artifact", manifest.name)
     document = {
         "artifact": base64.b64encode(artifact).decode("ascii"),
@@ -782,11 +852,15 @@ def build_package(manifest: Manifest, lock: TargetLock, artifact: bytes) -> byte
     }
     encoded = canonical_json(document)
     if len(encoded) > MAX_PACKAGE_BYTES:
-        raise ModelError("package-size", "package", f"more than {MAX_PACKAGE_BYTES} bytes")
+        raise ModelError(
+            "package-size", "package", f"more than {MAX_PACKAGE_BYTES} bytes"
+        )
     return encoded
 
 
-def parse_package(data: bytes, label: str = "package") -> tuple[Manifest, TargetLock, bytes]:
+def parse_package(
+    data: bytes, label: str = "package"
+) -> tuple[Manifest, TargetLock, bytes]:
     """Independently parse and cross-check one canonical TPKG v1 artifact."""
     document = _object(
         decode_json(data, label, MAX_PACKAGE_BYTES),
@@ -803,26 +877,36 @@ def parse_package(data: bytes, label: str = "package") -> tuple[Manifest, Target
         raise ModelError("target-mismatch", f"{label}.target", str(document["target"]))
     artifact_value = document["artifact"]
     if not isinstance(artifact_value, str):
-        raise ModelError("invalid-artifact", f"{label}.artifact", "expected base64 string")
+        raise ModelError(
+            "invalid-artifact", f"{label}.artifact", "expected base64 string"
+        )
     try:
         artifact = base64.b64decode(artifact_value, validate=True)
     except ValueError as error:
-        raise ModelError("invalid-artifact", f"{label}.artifact", "invalid base64") from error
+        raise ModelError(
+            "invalid-artifact", f"{label}.artifact", "invalid base64"
+        ) from error
     if base64.b64encode(artifact).decode("ascii") != artifact_value:
-        raise ModelError("noncanonical-artifact", f"{label}.artifact", "base64 is not canonical")
+        raise ModelError(
+            "noncanonical-artifact", f"{label}.artifact", "base64 is not canonical"
+        )
     if build_package(manifest, lock, artifact) != data:
         raise ModelError("package-mismatch", label, "cross-check failed")
     return manifest, lock, artifact
 
 
-def plan(lock: TargetLock, manifests: Mapping[tuple[str, Version], Manifest]) -> dict[str, object]:
+def plan(
+    lock: TargetLock, manifests: Mapping[tuple[str, Version], Manifest]
+) -> dict[str, object]:
     """Derive a stable, non-mutating activation plan from one complete lock."""
     packages: list[dict[str, object]] = []
     totals = {"artifact_bytes": 0, "handles": 0, "heap_bytes": 0, "stack_bytes": 0}
     for locked in lock.packages:
         manifest = manifests.get((locked.name, locked.version))
         if manifest is None or manifest.digest() != locked.manifest_sha256:
-            raise ModelError("manifest-mismatch", f"plan:{locked.name}", locked.version.text())
+            raise ModelError(
+                "manifest-mismatch", f"plan:{locked.name}", locked.version.text()
+            )
         _validate_locked_manifest(lock, manifest, locked)
         artifact = manifest.target(lock.target)
         if artifact.artifact_sha256 != locked.artifact_sha256:
@@ -841,13 +925,17 @@ def plan(lock: TargetLock, manifests: Mapping[tuple[str, Version], Manifest]) ->
             }
         )
     if totals["artifact_bytes"] > 64 * 1024 * 1024:
-        raise ModelError("plan-capacity", "plan.artifact_bytes", str(totals["artifact_bytes"]))
+        raise ModelError(
+            "plan-capacity", "plan.artifact_bytes", str(totals["artifact_bytes"])
+        )
     if totals["handles"] > 256:
         raise ModelError("plan-capacity", "plan.handles", str(totals["handles"]))
     if totals["heap_bytes"] > U64_MAX:
         raise ModelError("plan-capacity", "plan.heap_bytes", str(totals["heap_bytes"]))
     if totals["stack_bytes"] > U64_MAX:
-        raise ModelError("plan-capacity", "plan.stack_bytes", str(totals["stack_bytes"]))
+        raise ModelError(
+            "plan-capacity", "plan.stack_bytes", str(totals["stack_bytes"])
+        )
     return {
         "lock_sha256": lock.digest(),
         "packages": packages,
@@ -862,17 +950,24 @@ def _validate_locked_manifest(
     lock: TargetLock, manifest: Manifest, locked: LockedPackage
 ) -> None:
     """Require one lock record to reproduce its manifest's dependency contract."""
-    locked_dependencies = {name: version for name, version in locked.dependencies}
-    if tuple(locked_dependencies) != tuple(dependency.name for dependency in manifest.dependencies):
-        raise ModelError("lock-mismatch", f"package:{manifest.name}", "dependency names differ")
+    locked_dependencies = dict(locked.dependencies)
+    if tuple(locked_dependencies) != tuple(
+        dependency.name for dependency in manifest.dependencies
+    ):
+        raise ModelError(
+            "lock-mismatch", f"package:{manifest.name}", "dependency names differ"
+        )
     for dependency in manifest.dependencies:
         version = locked_dependencies[dependency.name]
         selected = next(
-            (package for package in lock.packages if package.name == dependency.name), None
+            (package for package in lock.packages if package.name == dependency.name),
+            None,
         )
         if (
             selected is None
             or selected.version != version
             or not dependency.requirement.contains(version)
         ):
-            raise ModelError("lock-mismatch", f"package:{manifest.name}", dependency.name)
+            raise ModelError(
+                "lock-mismatch", f"package:{manifest.name}", dependency.name
+            )

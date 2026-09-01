@@ -51,7 +51,9 @@ class SourceLockTests(unittest.TestCase):
         self.assertEqual(len(set(submodules)), len(submodules))
 
     def test_a_lock_of_another_schema_or_shape_is_refused(self) -> None:
-        document = json.loads(build_sbsa_firmware.SOURCE_LOCK.read_text(encoding="utf-8"))
+        document = json.loads(
+            build_sbsa_firmware.SOURCE_LOCK.read_text(encoding="utf-8")
+        )
         for mutate in (
             lambda value: value.update({"schema": 2}),
             lambda value: value.update({"bank_bytes": 0}),
@@ -95,7 +97,9 @@ class PublishAndVerifyTests(unittest.TestCase):
                 bank = output / name
                 self.assertEqual(bank.stat().st_size, self.BANK_BYTES)
                 # Padding must extend the image, never replace it.
-                self.assertEqual(bank.read_bytes()[512:], b"\x00" * (self.BANK_BYTES - 512))
+                self.assertEqual(
+                    bank.read_bytes()[512:], b"\x00" * (self.BANK_BYTES - 512)
+                )
             build_sbsa_firmware.verify(output, self.BANK_BYTES)
 
     def test_publishing_refuses_an_image_larger_than_one_bank(self) -> None:
@@ -105,7 +109,9 @@ class PublishAndVerifyTests(unittest.TestCase):
             oversized = built / build_sbsa_firmware.FLASH_BANKS[0]
             oversized.write_bytes(b"\xff" * (self.BANK_BYTES + 1))
             with self.assertRaises(RuntimeError):
-                build_sbsa_firmware.publish([oversized], Path(directory) / "out", self.BANK_BYTES)
+                build_sbsa_firmware.publish(
+                    [oversized], Path(directory) / "out", self.BANK_BYTES
+                )
 
     def test_verification_rejects_every_way_a_bank_can_be_wrong(self) -> None:
         first, second = build_sbsa_firmware.FLASH_BANKS
@@ -114,7 +120,9 @@ class PublishAndVerifyTests(unittest.TestCase):
             ("absent manifest", lambda out: (out / manifest_name).unlink()),
             (
                 "malformed entry",
-                lambda out: (out / manifest_name).write_text("nonsense\n", encoding="utf-8"),
+                lambda out: (out / manifest_name).write_text(
+                    "nonsense\n", encoding="utf-8"
+                ),
             ),
             (
                 "unrecorded bank",
@@ -144,7 +152,9 @@ class HostToolTests(unittest.TestCase):
             ("bmake 20240108", False),
         ):
             with self.subTest(version):
-                build_sbsa_firmware.run = lambda *_args, **_kwargs: version
+                build_sbsa_firmware.run = lambda *_args, reported=version, **_kwargs: (
+                    reported
+                )
                 try:
                     if acceptable:
                         self.assertTrue(build_sbsa_firmware.gnu_make(sys.executable))
@@ -154,15 +164,21 @@ class HostToolTests(unittest.TestCase):
                 finally:
                     build_sbsa_firmware.run = original
 
-    def test_the_prefixed_toolchain_directory_must_hold_every_prefixed_tool(self) -> None:
+    def test_the_prefixed_toolchain_directory_must_hold_every_prefixed_tool(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             candidate = Path(directory)
             for tool in build_sbsa_firmware.PREFIXED_TOOLS[:-1]:
                 (candidate / tool).write_text("", encoding="utf-8")
             with self.assertRaises(RuntimeError):
                 build_sbsa_firmware.find_llvm_bin(candidate)
-            (candidate / build_sbsa_firmware.PREFIXED_TOOLS[-1]).write_text("", encoding="utf-8")
-            self.assertEqual(build_sbsa_firmware.find_llvm_bin(candidate), candidate.resolve())
+            (candidate / build_sbsa_firmware.PREFIXED_TOOLS[-1]).write_text(
+                "", encoding="utf-8"
+            )
+            self.assertEqual(
+                build_sbsa_firmware.find_llvm_bin(candidate), candidate.resolve()
+            )
 
     def test_the_linker_may_live_apart_from_the_rest_of_the_toolchain(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -179,7 +195,9 @@ class HostToolTests(unittest.TestCase):
 
 class RunnerAgreementTests(unittest.TestCase):
     def test_the_runner_looks_for_exactly_the_banks_the_builder_publishes(self) -> None:
-        runner = qemu_profile.RUNNER_PROFILES[(AARCH64_SBSA_REF, qemu_profile.QEMU_ENVIRONMENT)]
+        runner = qemu_profile.RUNNER_PROFILES[
+            (AARCH64_SBSA_REF, qemu_profile.QEMU_ENVIRONMENT)
+        ]
         published = build_sbsa_firmware.FLASH_BANKS
         self.assertEqual(
             (runner.firmware_code_filenames[0], runner.firmware_vars_filenames[0]),
@@ -222,13 +240,14 @@ class StrictEvidenceTests(unittest.TestCase):
             build_sbsa_firmware.SOURCE_LOCK.resolve(),
         )
 
-    def test_strict_verification_accepts_a_bank_matching_its_build_manifest(self) -> None:
+    def test_strict_verification_accepts_a_bank_matching_its_build_manifest(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as directory:
             output = self._staged(Path(directory))
             qemu_profile.verify_built_firmware(
                 output / build_sbsa_firmware.FLASH_BANKS[0],
                 "aarch64",
-                "code",
                 "tools/sbsa-firmware-sources.lock.json",
             )
 
@@ -257,7 +276,7 @@ class StrictEvidenceTests(unittest.TestCase):
                     corrupt(output)
                     with self.assertRaises(RuntimeError):
                         qemu_profile.verify_built_firmware(
-                            output / first, "aarch64", "code", source
+                            output / first, "aarch64", source
                         )
 
 

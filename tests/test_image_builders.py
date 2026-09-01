@@ -218,8 +218,7 @@ class FatBuilderTests(unittest.TestCase):
 
         file_clusters = max(
             1,
-            (len(self.PAYLOAD) + mkfat.CLUSTER_BYTES - 1)
-            // mkfat.CLUSTER_BYTES,
+            (len(self.PAYLOAD) + mkfat.CLUSTER_BYTES - 1) // mkfat.CLUSTER_BYTES,
         )
         unused_data = bytearray(image)
         unused_data[mkfat.cluster_offset(4 + file_clusters)] = 1

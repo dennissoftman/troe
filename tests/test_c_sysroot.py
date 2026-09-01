@@ -11,14 +11,15 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
 class CSysrootTests(unittest.TestCase):
     """Require deterministic, architecture-correct SDK output."""
 
-    @unittest.skipUnless(shutil.which("clang") and shutil.which("rustc"), "cross compiler unavailable")
+    @unittest.skipUnless(
+        shutil.which("clang") and shutil.which("rustc"), "cross compiler unavailable"
+    )
     def test_both_targets_build_deterministically_without_host_headers(self) -> None:
         with tempfile.TemporaryDirectory(prefix="troe-c-sysroot-") as temporary:
             output = Path(temporary) / "sysroot"

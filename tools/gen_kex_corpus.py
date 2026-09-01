@@ -238,8 +238,8 @@ def _rejections(target: str, base: bytes) -> dict[str, tuple[bytes, str]]:
         _put_u32(
             bytearray(base),
             36,
-            elf2kex.MAX_IMAGE_SPAN_PAGES + elf2kex.KEX_IMAGE_ALIGNMENT
-            // elf2kex.KEX_PAGE_BYTES,
+            elf2kex.MAX_IMAGE_SPAN_PAGES
+            + elf2kex.KEX_IMAGE_ALIGNMENT // elf2kex.KEX_PAGE_BYTES,
         ),
         "InvalidImageSpan",
     )
@@ -281,9 +281,7 @@ def _rejections(target: str, base: bytes) -> dict[str, tuple[bytes, str]]:
     )
     add(
         "arithmetic-overflow",
-        _put_u64(
-            bytearray(base), elf2kex.KEX_HEADER_BYTES, 0xFFFF_FFFF_FFFF_F000
-        ),
+        _put_u64(bytearray(base), elf2kex.KEX_HEADER_BYTES, 0xFFFF_FFFF_FFFF_F000),
         "ArithmeticOverflow",
     )
     add(
@@ -314,15 +312,15 @@ def _rejections(target: str, base: bytes) -> dict[str, tuple[bytes, str]]:
     file_bytes = struct.unpack_from("<Q", base, elf2kex.KEX_HEADER_BYTES + 16)[0]
     add(
         "file-exceeds-memory",
-        _put_u64(
-            bytearray(base), elf2kex.KEX_HEADER_BYTES + 24, file_bytes - 1
-        ),
+        _put_u64(bytearray(base), elf2kex.KEX_HEADER_BYTES + 24, file_bytes - 1),
         "InvalidSegmentRange",
     )
     two = _canonical(target, NATIVE_CODE[target]["calls"], segment_count=2)
     add(
         "segments-overlap",
-        _put_u64(bytearray(two), elf2kex.KEX_HEADER_BYTES + elf2kex.KEX_RECORD_BYTES, 0),
+        _put_u64(
+            bytearray(two), elf2kex.KEX_HEADER_BYTES + elf2kex.KEX_RECORD_BYTES, 0
+        ),
         "OverlappingSegments",
     )
     first_payload = struct.unpack_from("<Q", base, elf2kex.KEX_HEADER_BYTES + 8)[0]
@@ -411,8 +409,7 @@ def generate_corpus() -> dict[str, bytes]:
             files[name] = artifact
             manifest.append(f"{name}\t{target}\tok")
             valid_rows.append(
-                f'    ("{name}", include_bytes!("{name}") as &[u8], '
-                "Target::Aarch64),"
+                f'    ("{name}", include_bytes!("{name}") as &[u8], Target::Aarch64),'
             )
 
         boundary_artifacts = {
@@ -426,9 +423,7 @@ def generate_corpus() -> dict[str, bytes]:
                 + elf2kex.MAX_IMAGE_SPAN_BYTES
                 - elf2kex.KEX_PAGE_BYTES,
             ),
-            "standard-minimum-span": _canonical(
-                target, NATIVE_CODE[target]["calls"]
-            ),
+            "standard-minimum-span": _canonical(target, NATIVE_CODE[target]["calls"]),
             "standard-max-stack-heap": elf2kex.convert_elf(
                 build_static_elf(target, NATIVE_CODE[target]["calls"]),
                 expected_target=target,

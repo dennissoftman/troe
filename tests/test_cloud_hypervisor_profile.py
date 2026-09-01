@@ -10,7 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-
+from types import ModuleType
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = REPO_ROOT / "scripts"
@@ -28,7 +28,7 @@ from cloud_hypervisor_profile import (  # noqa: E402
 )
 
 
-def load_acceptance_module():
+def load_acceptance_module() -> ModuleType:
     """Load the hyphenated live runner without executing its CLI."""
     path = SCRIPTS / "test-cloud-hypervisor.py"
     spec = importlib.util.spec_from_file_location("test_cloud_hypervisor_live", path)

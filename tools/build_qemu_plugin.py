@@ -15,7 +15,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SOURCE = REPO_ROOT / "tools" / "qemu-plugin" / "troe_count.c"
 HEADER = "qemu-plugin.h"
@@ -65,8 +64,7 @@ def glib_flags() -> list[str]:
         ["pkg-config", "--cflags", "glib-2.0"],
         check=False,
         text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
     )
     if completed.returncode != 0:
         raise RuntimeError("pkg-config could not describe glib-2.0")

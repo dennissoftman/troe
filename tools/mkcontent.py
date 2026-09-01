@@ -13,7 +13,6 @@ import zlib
 from dataclasses import dataclass
 from pathlib import Path
 
-
 USER_ID = bytes([1]) * 16
 GROUP_ID = bytes([2]) * 16
 DOMAIN_ID = bytes([3]) * 16
@@ -37,9 +36,15 @@ def load_deployment_identities(path: Path) -> IdentityIds:
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise ValueError(f"cannot read deployment identities {path}: {error}") from error
+        raise ValueError(
+            f"cannot read deployment identities {path}: {error}"
+        ) from error
     expected = {"schema", "user_id", "group_id", "domain_id"}
-    if not isinstance(document, dict) or set(document) != expected or document["schema"] != 1:
+    if (
+        not isinstance(document, dict)
+        or set(document) != expected
+        or document["schema"] != 1
+    ):
         raise ValueError("deployment identity file has an invalid schema")
 
     values: list[bytes] = []
@@ -49,7 +54,9 @@ def load_deployment_identities(path: Path) -> IdentityIds:
             not isinstance(encoded, str)
             or re.fullmatch(r"[0-9a-f]{32}", encoded) is None
         ):
-            raise ValueError(f"deployment {field} must be 32 lowercase hexadecimal digits")
+            raise ValueError(
+                f"deployment {field} must be 32 lowercase hexadecimal digits"
+            )
         try:
             value = bytes.fromhex(encoded)
         except ValueError as error:
@@ -64,7 +71,7 @@ def load_deployment_identities(path: Path) -> IdentityIds:
 
 def checked(image: bytearray, offset: int) -> bytes:
     """Publish one CRC32 field after treating it as zero."""
-    image[offset:offset + 4] = b"\0" * 4
+    image[offset : offset + 4] = b"\0" * 4
     struct.pack_into("<I", image, offset, zlib.crc32(image))
     return bytes(image)
 
@@ -90,9 +97,7 @@ def build_registry(
     return checked(image, 20)
 
 
-def build_mapping(
-    version: int, identities: IdentityIds = FIXTURE_IDENTITIES
-) -> bytes:
+def build_mapping(version: int, identities: IdentityIds = FIXTURE_IDENTITIES) -> bytes:
     """Encode a UID-0/GID-0 IMAP v1 snapshot for one domain."""
     image = bytearray(64 + 2 * 128)
     image[:8] = b"IMAPv1\0\0"
@@ -103,7 +108,7 @@ def build_mapping(
     for index, (kind, target) in enumerate(
         ((1, identities.user), (2, identities.group))
     ):
-        record = memoryview(image)[64 + index * 128:192 + index * 128]
+        record = memoryview(image)[64 + index * 128 : 192 + index * 128]
         struct.pack_into("<I", record, 0, 1)
         record[4:6] = bytes((kind, 4))
         record[8:24] = target
@@ -129,7 +134,7 @@ def build_acl() -> bytes:
     struct.pack_into("<HHHHI", image, 8, 1, 0, 64, 32, len(image))
     struct.pack_into("<I", image, 24, 3)
     for index, tag in enumerate((1, 3, 6)):
-        image[64 + index * 32:66 + index * 32] = bytes((tag, 4))
+        image[64 + index * 32 : 66 + index * 32] = bytes((tag, 4))
     return checked(image, 20)
 
 
@@ -139,7 +144,7 @@ def build_security_manifest(generation: int, objects: list[tuple[int, bytes]]) -
     image[:8] = b"ISECv1\0\0"
     struct.pack_into("<HHHHQ", image, 8, 1, 0, 192, 0, generation)
     for offset, (_, data) in zip((24, 56, 88, 120), objects, strict=True):
-        image[offset:offset + 32] = hashlib.sha256(data).digest()
+        image[offset : offset + 32] = hashlib.sha256(data).digest()
     return checked(image, 152)
 
 
@@ -217,11 +222,11 @@ def build_pack(
     struct.pack_into("<H", image, 24, len(addressed))
     offset = table_end
     for index, (digest, kind, data) in enumerate(addressed):
-        record = memoryview(image)[64 + index * 64:128 + index * 64]
+        record = memoryview(image)[64 + index * 64 : 128 + index * 64]
         record[:32] = digest
         record[32] = kind
         struct.pack_into("<II", record, 40, offset, len(data))
-        image[offset:offset + len(data)] = data
+        image[offset : offset + len(data)] = data
         offset += len(data)
     checked = bytearray(image)
     checked[20:24] = b"\0" * 4
@@ -234,7 +239,7 @@ def write_reference(image: bytearray, offset: int, config: bytes) -> None:
     generation = struct.unpack_from("<Q", config, 24)[0]
     config_crc = struct.unpack_from("<I", config, 20)[0]
     struct.pack_into("<QII", image, offset, generation, len(config), config_crc)
-    image[offset + 16:offset + 48] = hashlib.sha256(config).digest()
+    image[offset + 16 : offset + 48] = hashlib.sha256(config).digest()
 
 
 def build_activation(config: bytes, previous_config: bytes | None) -> bytes:
@@ -276,7 +281,9 @@ def main() -> int:
     try:
         config = args.config.read_bytes()
         previous_config = (
-            args.previous_config.read_bytes() if args.previous_config is not None else None
+            args.previous_config.read_bytes()
+            if args.previous_config is not None
+            else None
         )
         identities = (
             FIXTURE_IDENTITIES

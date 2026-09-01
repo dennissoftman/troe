@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import itertools
 import os
 import re
 import shutil
@@ -16,7 +17,6 @@ import uuid
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
-
 
 SECTOR_BYTES = 512
 TOTAL_SECTORS = 36_864
@@ -238,7 +238,8 @@ def _validated_mount_specs(entries: object) -> tuple[MountSpec, ...]:
                     or re.fullmatch(r"[0-9a-fA-F]{8}", volume_id) is None
                 ):
                     raise ValueError(
-                        f"volume {name!r} FAT32 volume_id must contain exactly eight hex digits"
+                        f"volume {name!r} FAT32 volume_id must contain "
+                        "exactly eight hex digits"
                     )
                 numeric_volume_id = int(volume_id, 16)
                 if numeric_volume_id == 0:
@@ -254,7 +255,8 @@ def _validated_mount_specs(entries: object) -> tuple[MountSpec, ...]:
                 missing = sorted(expected - set(raw))
                 extra = sorted(set(raw) - expected)
                 raise ValueError(
-                    f"volume {name!r} fields do not match its profile; missing={missing} extra={extra}"
+                    f"volume {name!r} fields do not match its profile; "
+                    f"missing={missing} extra={extra}"
                 )
             spec = MountSpec(
                 name=name,
@@ -276,7 +278,8 @@ def _validated_mount_specs(entries: object) -> tuple[MountSpec, ...]:
             or re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", spec.name) is None
         ):
             raise ValueError(
-                f"volume name {spec.name!r} must use 1-{BMNT_MAX_NAME_BYTES} lowercase ASCII name bytes"
+                f"volume name {spec.name!r} must use "
+                f"1-{BMNT_MAX_NAME_BYTES} lowercase ASCII name bytes"
             )
         if spec.filesystem not in {"ext4-v1", "fat32"}:
             raise ValueError(f"volume {spec.name!r} has an unsupported filesystem")
@@ -322,7 +325,7 @@ def _validated_mount_specs(entries: object) -> tuple[MountSpec, ...]:
         retained.append(spec)
 
     retained.sort(key=lambda entry: entry.name)
-    for previous, current in zip(retained, retained[1:], strict=False):
+    for previous, current in itertools.pairwise(retained):
         if previous.name == current.name:
             raise ValueError(f"duplicate volume name {current.name!r}")
     selectors: set[tuple[object, ...]] = set()
@@ -1510,7 +1513,10 @@ def main() -> int:
     parser.add_argument(
         "--volume-table",
         type=Path,
-        help="compile this strict TOML volume table instead of the built-in fixture policy",
+        help=(
+            "compile this strict TOML volume table instead of the built-in "
+            "fixture policy"
+        ),
     )
     parser.add_argument(
         "--output", type=Path, help="also create the GPT/ext4 disk image"

@@ -12,16 +12,15 @@ from pathlib import Path
 
 from tools import package_model, package_trust
 
-
 TARGET = "x86_64-unknown-uefi"
 NOW = 1_000_000
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TRUST_CLI = REPO_ROOT / "tools" / "troe_trust.py"
 
 
-def package_fixture(name: str = "hello", version: tuple[int, int, int] = (1, 0, 0)) -> tuple[
-    package_model.Manifest, package_model.TargetLock, bytes
-]:
+def package_fixture(
+    name: str = "hello", version: tuple[int, int, int] = (1, 0, 0)
+) -> tuple[package_model.Manifest, package_model.TargetLock, bytes]:
     """Construct one canonical target package without trust metadata."""
     artifact = b"native-kex-artifact"
     digest = package_model.sha256
@@ -80,8 +79,7 @@ class TrustFixtures:
         subprocess.run(
             ("openssl", "genpkey", "-algorithm", "Ed25519", "-out", str(path)),
             check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
         )
         return path
 
@@ -126,7 +124,9 @@ class TrustFixtures:
             "publishers": [
                 {"key_ids": [publisher_id], "package": "hello", "threshold": 1}
             ],
-            "recovery_packages": [package_model.sha256(self.package)] if recovery else [],
+            "recovery_packages": [package_model.sha256(self.package)]
+            if recovery
+            else [],
             "revocations": [] if revocations is None else revocations,
             "roles": {
                 "provenance": {"key_ids": builder_ids, "threshold": 2},
@@ -137,7 +137,9 @@ class TrustFixtures:
             "type": "root",
         }
 
-    def verified_root(self, **kwargs: object) -> tuple[package_trust.Envelope, dict[str, object]]:
+    def verified_root(
+        self, **kwargs: object
+    ) -> tuple[package_trust.Envelope, dict[str, object]]:
         document = self.root_document(**kwargs)
         root_key = kwargs.get("root_key", self.root_key)
         envelope = package_trust.sign_payload(document, [root_key])
@@ -222,7 +224,9 @@ class RootAndCryptoTests(TrustFixtures, unittest.TestCase):
 
         skipped = dict(document)
         skipped["generation"] = 3
-        skipped_envelope = package_trust.sign_payload(skipped, [self.root_key, new_root_key])
+        skipped_envelope = package_trust.sign_payload(
+            skipped, [self.root_key, new_root_key]
+        )
         with self.assertRaisesRegex(package_model.ModelError, "invalid-rotation"):
             package_trust.verify_root_rotation(old_root, skipped_envelope.bytes(), NOW)
 
@@ -246,7 +250,8 @@ class RootAndCryptoTests(TrustFixtures, unittest.TestCase):
 
 
 class ReleasePolicyTests(TrustFixtures, unittest.TestCase):
-    """Exercise release identity, provenance, freshness, replay, target, and recovery."""
+    """Exercise release identity, provenance, freshness, replay, target, and
+    recovery."""
 
     def test_active_release_binds_every_package_and_provenance_identity(self) -> None:
         _root_envelope, root = self.verified_root()
@@ -255,12 +260,18 @@ class ReleasePolicyTests(TrustFixtures, unittest.TestCase):
             root, release.bytes(), self.package, now=NOW
         )
         self.assertEqual(verified.status, "active")
-        self.assertEqual(verified.payload["package_sha256"], package_model.sha256(self.package))
+        self.assertEqual(
+            verified.payload["package_sha256"], package_model.sha256(self.package)
+        )
 
         corrupted = bytearray(self.package)
         corrupted[-2] ^= 1
-        with self.assertRaisesRegex(package_model.ModelError, "invalid-json|release-mismatch"):
-            package_trust.verify_release(root, release.bytes(), bytes(corrupted), now=NOW)
+        with self.assertRaisesRegex(
+            package_model.ModelError, "invalid-json|release-mismatch"
+        ):
+            package_trust.verify_release(
+                root, release.bytes(), bytes(corrupted), now=NOW
+            )
 
     def test_expiry_offline_freshness_replay_and_cross_target_fail_closed(self) -> None:
         _root_envelope, root = self.verified_root()
@@ -310,7 +321,9 @@ class ReleasePolicyTests(TrustFixtures, unittest.TestCase):
         _root_envelope, revoked = self.verified_root(revocations=revocations)
         release = self.release_envelope()
         with self.assertRaisesRegex(package_model.ModelError, "signature-threshold"):
-            package_trust.verify_release(revoked, release.bytes(), self.package, now=NOW)
+            package_trust.verify_release(
+                revoked, release.bytes(), self.package, now=NOW
+            )
 
         _root_envelope, recovery = self.verified_root(
             revocations=revocations, recovery=True
@@ -328,7 +341,9 @@ class ReleasePolicyTests(TrustFixtures, unittest.TestCase):
                 recovery, forged.bytes(), self.package, now=NOW
             )
 
-    def test_wrong_publisher_partial_provenance_and_replayed_signature_fail(self) -> None:
+    def test_wrong_publisher_partial_provenance_and_replayed_signature_fail(
+        self,
+    ) -> None:
         _root_envelope, root = self.verified_root()
         wrong = package_trust.sign_payload(
             self.release_document(),
@@ -378,7 +393,9 @@ class SnapshotAndPublicationTests(TrustFixtures, unittest.TestCase):
         with self.assertRaisesRegex(package_model.ModelError, "signature-threshold"):
             package_trust.verify_snapshot(root, wrong.bytes(), now=NOW)
 
-    def test_publication_is_complete_before_pointer_and_independently_verified(self) -> None:
+    def test_publication_is_complete_before_pointer_and_independently_verified(
+        self,
+    ) -> None:
         _root_envelope, root = self.verified_root()
         release = self.release_envelope()
         registry = self.root / "registry"
@@ -412,7 +429,9 @@ class SnapshotAndPublicationTests(TrustFixtures, unittest.TestCase):
             package_trust.verify_registry_generation(root, directory, now=NOW)
         release_file.write_bytes(original)
 
-    def test_second_publication_preserves_old_generation_and_moves_pointer_once(self) -> None:
+    def test_second_publication_preserves_old_generation_and_moves_pointer_once(
+        self,
+    ) -> None:
         _root_envelope, root = self.verified_root()
         registry = self.root / "registry"
         first = self.release_envelope()
@@ -451,8 +470,7 @@ class TrustCliTests(TrustFixtures, unittest.TestCase):
             cwd=REPO_ROOT,
             check=False,
             text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
         )
 
     def test_key_release_publication_and_registry_commands(self) -> None:

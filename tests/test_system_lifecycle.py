@@ -12,7 +12,6 @@ from pathlib import Path
 
 from tools import package_model, package_trust, system_lifecycle
 
-
 TARGET = "x86_64-unknown-uefi"
 NOW = 2_000_000
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -46,8 +45,7 @@ class LifecycleFixtures:
         subprocess.run(
             ("openssl", "genpkey", "-algorithm", "Ed25519", "-out", str(path)),
             check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
         )
         return path
 
@@ -381,7 +379,7 @@ class ActivationTests(LifecycleFixtures, unittest.TestCase):
             )
             releases = [
                 self.signed_release(manifest, lock, package, 1)
-                for manifest, package in zip((hello, library), packages)
+                for manifest, package in zip((hello, library), packages, strict=True)
             ]
             generation = store.deploy(
                 package_model.canonical_json(lock.json()),
@@ -529,7 +527,8 @@ class MigrationAndRollbackTests(LifecycleFixtures, unittest.TestCase):
 
 
 class PowerLossTests(LifecycleFixtures, unittest.TestCase):
-    """Reopen after every durable publish, migration, activation, and cleanup boundary."""
+    """Reopen after every durable publish, migration, activation, and cleanup
+    boundary."""
 
     def baseline(self, root: Path) -> None:
         store = system_lifecycle.LifecycleStore(root)
@@ -812,8 +811,7 @@ class LifecycleCliTests(LifecycleFixtures, unittest.TestCase):
             cwd=REPO_ROOT,
             check=False,
             text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
         )
 
     def test_config_deploy_health_verify_and_status_commands(self) -> None:

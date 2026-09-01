@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import os
+import itertools
 import shutil
 import subprocess
 import sys
@@ -55,10 +55,14 @@ class Artifact:
 
 
 def _valid_name(name: str) -> bool:
-    return bool(name) and len(name.encode("utf-8")) <= 64 and all(
-        character.isascii()
-        and (character.isalnum() or character in ("-", "_", "."))
-        for character in name
+    return (
+        bool(name)
+        and len(name.encode("utf-8")) <= 64
+        and all(
+            character.isascii()
+            and (character.isalnum() or character in ("-", "_", "."))
+            for character in name
+        )
     )
 
 
@@ -91,7 +95,7 @@ def collect_artifacts(specifications: list[str]) -> list[Artifact]:
     if not specifications or len(specifications) > MAX_ARTIFACTS:
         raise ValueError("runtime tree requires 1 through 128 artifacts")
     artifacts = sorted(parse_artifact(value) for value in specifications)
-    for previous, current in zip(artifacts, artifacts[1:], strict=False):
+    for previous, current in itertools.pairwise(artifacts):
         if previous.relative_path == current.relative_path:
             raise ValueError(f"duplicate runtime artifact: {current.relative_path}")
     return artifacts
@@ -124,7 +128,9 @@ def build_tree(output: Path, artifacts: list[Artifact]) -> None:
     ) as temporary:
         staging = Path(temporary) / output.name
         entries: list[tuple[PurePosixPath, int, str]] = []
-        for artifact in sorted(artifacts, key=lambda item: item.relative_path.as_posix()):
+        for artifact in sorted(
+            artifacts, key=lambda item: item.relative_path.as_posix()
+        ):
             destination = staging / Path(*artifact.relative_path.parts)
             destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(artifact.source, destination)
@@ -136,7 +142,7 @@ def build_tree(output: Path, artifacts: list[Artifact]) -> None:
             if output.is_symlink() or not output.is_dir():
                 raise ValueError(f"runtime output is not a directory: {output}")
             shutil.rmtree(output)
-        os.replace(staging, output)
+        staging.replace(output)
 
 
 def _parse_manifest(path: Path) -> list[tuple[PurePosixPath, int, str]]:
@@ -197,10 +203,7 @@ def verify_tree(root: Path) -> None:
         while parent != PurePosixPath("."):
             expected.add(parent.as_posix())
             parent = parent.parent
-    actual = {
-        candidate.relative_to(root).as_posix()
-        for candidate in root.rglob("*")
-    }
+    actual = {candidate.relative_to(root).as_posix() for candidate in root.rglob("*")}
     if actual != expected:
         raise ValueError("runtime tree contains unmanifested or missing files")
 
@@ -230,10 +233,13 @@ def install_tree(tree: Path, shared_root: Path) -> Path:
 
 
 def _mtools_image(image: Path) -> str:
-    return f"{image.resolve(strict=True)}@@{mkshared.PARTITION_START * mkshared.SECTOR_BYTES}"
+    offset = mkshared.PARTITION_START * mkshared.SECTOR_BYTES
+    return f"{image.resolve(strict=True)}@@{offset}"
 
 
-def _mtools(command: str, image: Path, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+def _mtools(
+    command: str, image: Path, *arguments: str, check: bool = True
+) -> subprocess.CompletedProcess[str]:
     executable = shutil.which(command)
     if executable is None:
         raise ValueError(f"{command} is required to populate shared runtime media")
@@ -241,8 +247,7 @@ def _mtools(command: str, image: Path, *arguments: str, check: bool = True) -> s
         [executable, "-i", _mtools_image(image), *arguments],
         check=check,
         text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
     )
 
 
@@ -278,13 +283,18 @@ def install_image(tree: Path, image: Path) -> None:
     directories = {PurePosixPath(RUNTIME_DIRECTORY.as_posix())}
     for relative, _byte_count, _digest_value in entries:
         target = PurePosixPath(RUNTIME_DIRECTORY.as_posix()) / relative
-        if _mtools("mdir", image, f"::/{target.as_posix()}", check=False).returncode == 0:
+        if (
+            _mtools("mdir", image, f"::/{target.as_posix()}", check=False).returncode
+            == 0
+        ):
             raise ValueError(f"shared media already contains /{target.as_posix()}")
         parent = target.parent
         while parent != PurePosixPath("."):
             directories.add(parent)
             parent = parent.parent
-    for directory in sorted(directories, key=lambda item: (len(item.parts), item.as_posix())):
+    for directory in sorted(
+        directories, key=lambda item: (len(item.parts), item.as_posix())
+    ):
         _mtools("mmd", image, f"::/{directory.as_posix()}", check=False)
     for relative, _byte_count, _digest_value in entries:
         _mtools(
@@ -349,11 +359,11 @@ def provision_image(
                 f"build {application}",
                 cwd=repository,
             )
-            for architecture in ARCHITECTURES:
-                specifications.append(
-                    f"{architecture}:{application}="
-                    f"{packages / architecture / f'{application}.kex'}"
-                )
+            specifications.extend(
+                f"{architecture}:{application}="
+                f"{packages / architecture / f'{application}.kex'}"
+                for architecture in ARCHITECTURES
+            )
         if specifications:
             build_tree(tree, collect_artifacts(specifications))
             install_image(tree, image)
@@ -439,9 +449,7 @@ def main(argv: list[str] | None = None) -> int:
             install_image(args.tree, args.image)
             result = args.image.resolve(strict=True)
         elif args.action == "provision":
-            provision_image(
-                args.image, args.app, args.cpython_package, args.reset
-            )
+            provision_image(args.image, args.app, args.cpython_package, args.reset)
             result = args.image.resolve(strict=True)
         else:
             verify_image(args.tree, args.image)

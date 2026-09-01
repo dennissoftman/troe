@@ -11,7 +11,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
@@ -135,9 +134,13 @@ class KexToolTests(unittest.TestCase):
                     ]
                     if command == "udp":
                         expected = [(5, 1, 0)]
-                    elif command == "tar":
-                        expected = [(6, 1, 5), (7, 1, 5)]
-                    elif command in {"cp", "mkdir", "mv", "rm", "touch"}:
+                    elif command == "tar" or command in {
+                        "cp",
+                        "mkdir",
+                        "mv",
+                        "rm",
+                        "touch",
+                    }:
                         expected = [(6, 1, 5), (7, 1, 5)]
                     elif command in {
                         "awk",

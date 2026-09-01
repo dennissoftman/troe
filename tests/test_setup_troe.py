@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -36,11 +35,11 @@ class SetupTroeTests(unittest.TestCase):
             cls.entries, "x86_64-q35-uefi", "qemu"
         )
         cls.root_source = mkstorage.build_gpt(_synthetic_root())
-        cls.fixture_cspk = b"CSPKv1\0\0" + b"".join(sorted(mkcontent.RESERVED_FIXTURE_IDS))
+        cls.fixture_cspk = b"CSPKv1\0\0" + b"".join(
+            sorted(mkcontent.RESERVED_FIXTURE_IDS)
+        )
         cls.deployment_cspk = b"CSPKv1\0\0deployment-identities"
-        cls.boot = {
-            kind: cls.build_boot(kind) for kind in mkcloud.BUNDLE_KINDS
-        }
+        cls.boot = {kind: cls.build_boot(kind) for kind in mkcloud.BUNDLE_KINDS}
         cls._assembled = {}
 
     @classmethod
@@ -59,7 +58,7 @@ class SetupTroeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.cspk = self.fixture_cspk
         self._patch = mock.patch.object(
-            mkcloud, "verify_root_payload", side_effect=lambda payload: self.cspk
+            mkcloud, "verify_root_payload", side_effect=lambda _payload: self.cspk
         )
         self._patch.start()
         self.addCleanup(self._patch.stop)
@@ -87,7 +86,9 @@ class SetupTroeTests(unittest.TestCase):
             )
         return cls._assembled[kind]
 
-    def write_bundle(self, kind: str = mkcloud.BUNDLE_KIND_DEVELOPMENT, name: str = "bundle") -> Path:
+    def write_bundle(
+        self, kind: str = mkcloud.BUNDLE_KIND_DEVELOPMENT, name: str = "bundle"
+    ) -> Path:
         """Publish one synthetic bundle of the requested kind."""
         self.cspk = (
             self.deployment_cspk
@@ -100,7 +101,7 @@ class SetupTroeTests(unittest.TestCase):
         for role, filename in mkcloud.BUNDLE_FILENAMES.items():
             (directory / filename).write_bytes(images[role])
         (directory / mkcloud.BUNDLE_MANIFEST).write_bytes(
-            mkcloud._canonical_json(manifest)  # noqa: SLF001 - format fixture
+            mkcloud._canonical_json(manifest)
         )
         return directory
 
@@ -137,9 +138,7 @@ class SetupTroeTests(unittest.TestCase):
 
     def test_published_seed_bundle_is_never_mutated(self) -> None:
         bundle = self.write_bundle()
-        before = {
-            path.name: path.read_bytes() for path in sorted(bundle.iterdir())
-        }
+        before = {path.name: path.read_bytes() for path in sorted(bundle.iterdir())}
         setup_troe.install(
             bundle=bundle, runtime_dir=self.root / "machine", allow_test_artifacts=True
         )
@@ -218,12 +217,17 @@ class SetupTroeTests(unittest.TestCase):
         self.assertEqual(destination.stat().st_mode & 0o777, 0o700)
 
     def test_device_roles_require_explicit_assignment(self) -> None:
-        for entries in (["/dev/one"], ["system=/dev/a", "system=/dev/b"], ["bogus=/dev/a"], ["system="]):
+        for entries in (
+            ["/dev/one"],
+            ["system=/dev/a", "system=/dev/b"],
+            ["bogus=/dev/a"],
+            ["system="],
+        ):
             with self.subTest(entries=entries):
                 with self.assertRaises(setup_troe.SetupError):
-                    setup_troe._parse_devices(entries)  # noqa: SLF001 - closed surface
+                    setup_troe._parse_devices(entries)
         self.assertEqual(
-            setup_troe._parse_devices(  # noqa: SLF001 - closed surface
+            setup_troe._parse_devices(
                 ["system=/dev/a", "activation=/dev/b", "state=/dev/c"]
             ),
             {"system": "/dev/a", "activation": "/dev/b", "state": "/dev/c"},
@@ -263,7 +267,11 @@ class SetupTroeTests(unittest.TestCase):
             setup_troe.install(
                 bundle=bundle,
                 runtime_dir=self.root / "machine",
-                device_targets={"system": "/dev/a", "activation": "/dev/b", "state": "/dev/c"},
+                device_targets={
+                    "system": "/dev/a",
+                    "activation": "/dev/b",
+                    "state": "/dev/c",
+                },
                 allow_test_artifacts=True,
             )
         self.assertEqual(raised.exception.code, "target-selection")

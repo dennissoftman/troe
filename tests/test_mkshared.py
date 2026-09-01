@@ -18,9 +18,7 @@ class SharedFat32ImageTests(unittest.TestCase):
 
     def test_identifiers_match_the_default_mount_policy(self) -> None:
         shared = [
-            entry
-            for entry in mkstorage.default_mount_specs()
-            if entry.name == "shared"
+            entry for entry in mkstorage.default_mount_specs() if entry.name == "shared"
         ]
         self.assertEqual(len(shared), 1)
         self.assertEqual(shared[0].disk_guid, mkshared.DISK_GUID)
@@ -39,8 +37,9 @@ class SharedFat32ImageTests(unittest.TestCase):
 
             layout = mkshared.fat32_layout()
             retained_offset = (
-                mkshared.PARTITION_START + layout.data_start
-            ) * mkshared.SECTOR_BYTES + mkshared.FAT32_SECTORS_PER_CLUSTER * mkshared.SECTOR_BYTES
+                (mkshared.PARTITION_START + layout.data_start) * mkshared.SECTOR_BYTES
+                + mkshared.FAT32_SECTORS_PER_CLUSTER * mkshared.SECTOR_BYTES
+            )
             with image.open("r+b") as output:
                 output.seek(retained_offset)
                 output.write(b"persistent-unused-cluster-bytes")
@@ -109,7 +108,7 @@ class SharedFat32ImageTests(unittest.TestCase):
                 output.write(b"retained-data")
 
             with self.assertRaisesRegex(
-                mkshared.SharedImageNeedsRepair, "not cleanly unmounted"
+                mkshared.SharedImageRepairError, "not cleanly unmounted"
             ):
                 mkshared.verify_image(image)
 
@@ -125,9 +124,7 @@ class SharedFat32ImageTests(unittest.TestCase):
             self.assertIn("repair declined", output.getvalue())
             with image.open("rb") as source:
                 source.seek(marker)
-                self.assertEqual(
-                    source.read(1), bytes((mkshared.FAT32_STATE_DIRTY,))
-                )
+                self.assertEqual(source.read(1), bytes((mkshared.FAT32_STATE_DIRTY,)))
 
             output = StringIO()
             with redirect_stdout(output), redirect_stderr(output):
@@ -166,9 +163,7 @@ class SharedFat32ImageTests(unittest.TestCase):
                 mock.patch.object(mkshared.sys, "stdin", TerminalInput(response)),
                 mock.patch.object(mkshared.sys, "stderr", prompt),
             ):
-                self.assertEqual(
-                    mkshared.confirm_repair(Path("shared.img")), expected
-                )
+                self.assertEqual(mkshared.confirm_repair(Path("shared.img")), expected)
             self.assertIn("[y/N]", prompt.getvalue())
 
         prompt = StringIO()

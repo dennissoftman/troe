@@ -13,7 +13,6 @@ from unittest import mock
 
 from tools import build_cpython
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 APP_ROOT = REPO_ROOT / "apps" / "python"
 
@@ -21,7 +20,9 @@ APP_ROOT = REPO_ROOT / "apps" / "python"
 class CpythonIntegrationTests(unittest.TestCase):
     """Keep the authenticated build, static policy, and package layout explicit."""
 
-    def test_release_lock_preserves_stabilization_order_and_authenticated_inputs(self) -> None:
+    def test_release_lock_preserves_stabilization_order_and_authenticated_inputs(
+        self,
+    ) -> None:
         releases = build_cpython.releases()
         self.assertEqual(
             [release.version for release in releases],
@@ -50,7 +51,9 @@ class CpythonIntegrationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "digest mismatch"):
                 build_cpython.authenticate_source(release, cache, "sigstore", True)
             archive.unlink()
-            with self.assertRaisesRegex(RuntimeError, "offline source cache entry is missing"):
+            with self.assertRaisesRegex(
+                RuntimeError, "offline source cache entry is missing"
+            ):
                 build_cpython.authenticate_source(release, cache, "sigstore", True)
 
     def test_configure_and_builtin_policies_disable_forbidden_facilities(self) -> None:
@@ -67,7 +70,9 @@ class CpythonIntegrationTests(unittest.TestCase):
             "_signal",
         }
         for release in build_cpython.releases():
-            options = build_cpython.configure_options(release, "x86_64", "/build/python")
+            options = build_cpython.configure_options(
+                release, "x86_64", "/build/python"
+            )
             self.assertIn("--disable-shared", options)
             self.assertIn("--without-ensurepip", options)
             self.assertIn("--disable-ipv6", options)
@@ -80,7 +85,8 @@ class CpythonIntegrationTests(unittest.TestCase):
             self.assertTrue(forbidden.issubset(set(disabled.split())))
         manifest = (APP_ROOT / "Cargo.toml").read_text(encoding="utf-8")
         self.assertIn(
-            'capabilities = ["filesystem-read", "filesystem-mutate", "timer", "wall-clock", "private-memory", "random"]',
+            'capabilities = ["filesystem-read", "filesystem-mutate", "timer", '
+            '"wall-clock", "private-memory", "random"]',
             manifest,
         )
         for capability in ("tcp-connect", "datagram", "process-launch", "pipe"):
@@ -145,7 +151,12 @@ class CpythonIntegrationTests(unittest.TestCase):
             for line in sections["Modules/_randommodule.c"].splitlines()
             if line.startswith((" ", "+")) and not line.startswith("+++")
         )
-        for token in ("#ifdef __TROE__", "return random_seed_urandom(self);", "#else", "#endif"):
+        for token in (
+            "#ifdef __TROE__",
+            "return random_seed_urandom(self);",
+            "#else",
+            "#endif",
+        ):
             self.assertIn(token, patched)
         guard = patched.index("#ifdef __TROE__")
         direct = patched.index("return random_seed_urandom(self);")
@@ -164,7 +175,9 @@ class CpythonIntegrationTests(unittest.TestCase):
         self.assertEqual(set(build_cpython.NEGATIVE_VARIANTS), set(withheld))
         declaration = next(
             line
-            for line in (APP_ROOT / "Cargo.toml").read_text(encoding="utf-8").splitlines()
+            for line in (APP_ROOT / "Cargo.toml")
+            .read_text(encoding="utf-8")
+            .splitlines()
             if line.startswith("capabilities = ")
         )
         granted = json.loads(declaration.split("=", 1)[1].strip())
@@ -179,7 +192,9 @@ class CpythonIntegrationTests(unittest.TestCase):
                 if retained != capability:
                     self.assertIn(f'"{retained}"', variant)
 
-    def test_stdlib_install_emits_machine_readable_included_and_excluded_manifests(self) -> None:
+    def test_stdlib_install_emits_machine_readable_included_and_excluded_manifests(
+        self,
+    ) -> None:
         release = build_cpython.releases()[0]
         policy = build_cpython.load_json(build_cpython.STDLIB_POLICY)
         with tempfile.TemporaryDirectory(prefix="troe-cpython-stdlib-") as temporary:
@@ -276,9 +291,10 @@ class CpythonIntegrationTests(unittest.TestCase):
             )
             narrowed = dict(policy)
             narrowed["limits"] = dict(policy["limits"], image_mapped_pages=6)
-            with mock.patch.object(
-                build_cpython, "run", return_value=inspect
-            ), mock.patch.object(build_cpython, "kex_image_pages", return_value=7):
+            with (
+                mock.patch.object(build_cpython, "run", return_value=inspect),
+                mock.patch.object(build_cpython, "kex_image_pages", return_value=7),
+            ):
                 with self.assertRaisesRegex(RuntimeError, "above the accepted ceiling"):
                     build_cpython.install_release(
                         root / "package",
@@ -322,8 +338,7 @@ class CpythonIntegrationTests(unittest.TestCase):
             (source / "Lib").mkdir(parents=True)
             (build / "Modules").mkdir(parents=True)
             (build / "Modules" / "config.c").write_text(
-                "struct _inittab _PyImport_Inittab[] = {\n"
-                "    /* Sentinel */\n};\n",
+                "struct _inittab _PyImport_Inittab[] = {\n    /* Sentinel */\n};\n",
                 encoding="utf-8",
             )
             artifact.write_bytes(b"test artifact")
@@ -335,8 +350,9 @@ class CpythonIntegrationTests(unittest.TestCase):
                     "heap_pages": 8192,
                 }
             )
-            with mock.patch.object(build_cpython, "run", return_value=inspect), mock.patch.object(
-                build_cpython, "kex_image_pages", return_value=7
+            with (
+                mock.patch.object(build_cpython, "run", return_value=inspect),
+                mock.patch.object(build_cpython, "kex_image_pages", return_value=7),
             ):
                 for release in build_cpython.releases():
                     build_cpython.install_release(
@@ -348,7 +364,10 @@ class CpythonIntegrationTests(unittest.TestCase):
                         artifact,
                         policy,
                     )
-            binaries = {path.name for path in (root / "package" / "bin" / "x86_64").glob("*.kex")}
+            binaries = {
+                path.name
+                for path in (root / "package" / "bin" / "x86_64").glob("*.kex")
+            }
             self.assertEqual(
                 binaries,
                 {

@@ -6,22 +6,25 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Iterable
 
 if __package__:
     from .platform_profile import X86_64_Q35_UEFI
     from .qemu_profile import QEMU_ENVIRONMENT
     from .repository_policy import (
         KEX_TARGETS,
+        RUFF_EXECUTABLE,
         SHARED_VOLUME_APPLICATIONS,
         UNLINTABLE_APPLICATIONS,
         application_directories,
         buildable_shared_volume_directories,
         lintable_application_directories,
+        python_lint_commands,
         require_supported_python,
         rootfs_application_directories,
     )
@@ -32,11 +35,13 @@ else:
     from qemu_profile import QEMU_ENVIRONMENT
     from repository_policy import (
         KEX_TARGETS,
+        RUFF_EXECUTABLE,
         SHARED_VOLUME_APPLICATIONS,
         UNLINTABLE_APPLICATIONS,
         application_directories,
         buildable_shared_volume_directories,
         lintable_application_directories,
+        python_lint_commands,
         require_supported_python,
         rootfs_application_directories,
     )
@@ -73,9 +78,20 @@ FILESYSTEM_APPS = frozenset(
 TERMINAL_APPS = frozenset(("clear", "date", "echo", "man", "pwd"))
 # Commands that read standard input also exercise the foreground session
 # terminal loan, not only their filesystem or network operands.
-STDIN_APPS = frozenset((
-    "awk", "cat", "grep", "head", "hexdump", "sed", "sh", "tail", "udp", "wc",
-))
+STDIN_APPS = frozenset(
+    (
+        "awk",
+        "cat",
+        "grep",
+        "head",
+        "hexdump",
+        "sed",
+        "sh",
+        "tail",
+        "udp",
+        "wc",
+    )
+)
 LOW_LEVEL_PACKAGES = frozenset(
     (
         "troe-block",
@@ -234,6 +250,7 @@ FULL_GATE_PATHS = frozenset(
         "Cargo.toml",
         "apps/Cargo.lock",
         "apps/Cargo.toml",
+        "pyproject.toml",
         "rust-toolchain.toml",
         "services/Cargo.lock",
         "services/Cargo.toml",
@@ -262,6 +279,7 @@ class TestPlan:
     full_reasons: list[str] = field(default_factory=list)
     rust_packages: set[str] = field(default_factory=set)
     python_tests: set[str] = field(default_factory=set)
+    python_lint_paths: set[str] = field(default_factory=set)
     applications: set[str] = field(default_factory=set)
     all_applications: bool = False
     run_fmt: bool = False
@@ -307,6 +325,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--require-filesystem-tools",
         action="store_true",
         help="make missing filesystem interoperability tools a failure",
+    )
+    parser.add_argument(
+        "--require-python-tools",
+        action="store_true",
+        help="make a missing ruff Python format and lint gate a failure",
     )
     return parser.parse_args(argv)
 
@@ -426,7 +449,10 @@ def _classify_app(plan: TestPlan, path: PurePosixPath) -> bool:
     # policy suite's textual `unwrap`/`expect`/`panic` scan is the only
     # compiler-like check any change to its sources receives. Select it for
     # every path under such an application, not only for its manifest.
-    if path.name in {"Cargo.toml", "Cargo.lock"} or application in UNLINTABLE_APPLICATIONS:
+    if (
+        path.name in {"Cargo.toml", "Cargo.lock"}
+        or application in UNLINTABLE_APPLICATIONS
+    ):
         _add_python(plan, path, "test_repository_policy.py")
     if application in STDIN_APPS:
         _add_qemu(plan, path, "shell-terminal")
@@ -466,6 +492,14 @@ def build_plan(
         if path_text in FULL_GATE_PATHS or path_text.startswith(".github/workflows/"):
             plan.require_full(path, "global verification or dependency policy changed")
             continue
+
+        # `changed_paths` reports deletions and, under `--no-renames`, the old
+        # side of every rename. These gates are handed file names rather than a
+        # tree, and `ruff` fails on a name that is not on disk, so only the
+        # files that survive the change are selected.
+        if path.suffix == ".py" and (REPO_ROOT / path_text).is_file():
+            plan.python_lint_paths.add(path_text)
+            plan.note("python-lint", path)
 
         package = package_for_path(path, packages)
         if package is not None:
@@ -526,9 +560,7 @@ def build_plan(
             _add_qemu(plan, path, *ALL_QEMU_SCENARIOS)
             plan.qemu_all_platforms = True
             continue
-        if path_text.startswith("tests/fixtures/cpython/") or path_text.startswith(
-            "tests/python-no-"
-        ):
+        if path_text.startswith(("tests/fixtures/cpython/", "tests/python-no-")):
             _add_qemu(plan, path, "cpython")
             continue
         if path_text == "tests/smoke.sh":
@@ -564,11 +596,7 @@ def build_plan(
             plan.note("audit", path)
             _add_python(plan, path, "test_audit_policy.py", "test_repository_policy.py")
             continue
-        if (
-            path.suffix == ".md"
-            or path_text.startswith("docs/")
-            or path_text.startswith("skills/")
-        ):
+        if path.suffix == ".md" or path_text.startswith(("docs/", "skills/")):
             _add_python(plan, path, "test_repository_policy.py")
             continue
         plan.require_full(path, "no reviewed impact rule")
@@ -587,6 +615,7 @@ def commands_for_plan(
     *,
     skip_qemu: bool,
     require_filesystem_tools: bool,
+    require_python_tools: bool = False,
 ) -> list[tuple[str, ...]]:
     """Render one stable command sequence from a selected plan."""
     if plan.full_reasons:
@@ -595,9 +624,13 @@ def commands_for_plan(
             command.append("--skip-qemu")
         if require_filesystem_tools:
             command.append("--require-filesystem-tools")
+        if require_python_tools:
+            command.append("--require-python-tools")
         return [tuple(command)]
 
     commands: list[tuple[str, ...]] = []
+    if plan.python_lint_paths:
+        commands.extend(python_lint_commands(paths=sorted(plan.python_lint_paths)))
     if plan.run_fmt:
         commands.append(("cargo", "fmt", "--all", "--", "--check"))
         format_applications = (
@@ -605,11 +638,17 @@ def commands_for_plan(
             if plan.all_applications
             else sorted(plan.applications)
         )
-        for application in format_applications:
-            manifest = REPO_ROOT / "apps" / application / "Cargo.toml"
-            commands.append(
-                ("cargo", "fmt", "--manifest-path", str(manifest), "--", "--check")
+        commands.extend(
+            (
+                "cargo",
+                "fmt",
+                "--manifest-path",
+                str(REPO_ROOT / "apps" / application / "Cargo.toml"),
+                "--",
+                "--check",
             )
+            for application in format_applications
+        )
     lint_applications = (
         sorted(path.name for path in lintable_application_directories())
         if plan.all_applications
@@ -621,38 +660,57 @@ def commands_for_plan(
     for application in lint_applications:
         manifest = str(REPO_ROOT / "apps" / application / "Cargo.toml")
         commands.append(
-            ("cargo", "clippy", "--manifest-path", manifest, *kex_targets, "--", "-D", "warnings")
+            (
+                "cargo",
+                "clippy",
+                "--manifest-path",
+                manifest,
+                *kex_targets,
+                "--",
+                "-D",
+                "warnings",
+            )
         )
         if not (REPO_ROOT / "apps" / application / "src" / "lib.rs").is_file():
             continue
         commands.append(
-            ("cargo", "clippy", "--manifest-path", manifest, "--tests", "--", "-D", "warnings")
-        )
-        commands.append(("cargo", "test", "--manifest-path", manifest, "--lib"))
-    for package in sorted(plan.rust_packages):
-        commands.append(
-            ("cargo", "clippy", "-p", package, "--all-targets", "--", "-D", "warnings")
-        )
-    if "troe-kernel" in plan.rust_packages:
-        commands.extend(
-            tuple(str(argument) for argument in command)
-            for command in target_clippy_commands()
-        )
-    for package in sorted(plan.rust_packages):
-        commands.append(("cargo", "test", "-p", package))
-    for test in sorted(plan.python_tests):
-        commands.append(
             (
-                sys.executable,
-                "-m",
-                "unittest",
-                "discover",
-                "-s",
-                str(REPO_ROOT / "tests"),
-                "-p",
-                test,
+                "cargo",
+                "clippy",
+                "--manifest-path",
+                manifest,
+                "--tests",
+                "--",
+                "-D",
+                "warnings",
             )
         )
+        commands.append(("cargo", "test", "--manifest-path", manifest, "--lib"))
+    commands.extend(
+        ("cargo", "clippy", "-p", package, "--all-targets", "--", "-D", "warnings")
+        for package in sorted(plan.rust_packages)
+    )
+    if "troe-kernel" in plan.rust_packages:
+        commands.extend(
+            tuple(str(argument) for argument in step.command)
+            for step in target_clippy_commands()
+        )
+    commands.extend(
+        ("cargo", "test", "-p", package) for package in sorted(plan.rust_packages)
+    )
+    commands.extend(
+        (
+            sys.executable,
+            "-m",
+            "unittest",
+            "discover",
+            "-s",
+            str(REPO_ROOT / "tests"),
+            "-p",
+            test,
+        )
+        for test in sorted(plan.python_tests)
+    )
     if plan.run_audit:
         commands.append((sys.executable, str(REPO_ROOT / "scripts" / "audit.py")))
     applications = (
@@ -660,18 +718,18 @@ def commands_for_plan(
         if plan.all_applications
         else sorted(plan.applications - SHARED_VOLUME_APPLICATIONS)
     )
-    for application in applications:
-        commands.append(
-            (
-                "cargo",
-                "kex",
-                "build",
-                str(REPO_ROOT / "apps" / application),
-                "--target",
-                "all",
-                "--check",
-            )
+    commands.extend(
+        (
+            "cargo",
+            "kex",
+            "build",
+            str(REPO_ROOT / "apps" / application),
+            "--target",
+            "all",
+            "--check",
         )
+        for application in applications
+    )
     # A shared-volume deliverable has no committed artifact to compare against,
     # so it is built rather than checked, exactly as the full gate does it.
     shared_volume = (
@@ -682,19 +740,19 @@ def commands_for_plan(
             & plan.applications
         )
     )
-    for application in shared_volume:
-        commands.append(
-            (
-                "cargo",
-                "kex",
-                "build",
-                str(REPO_ROOT / "apps" / application),
-                "--target",
-                "all",
-                "--output",
-                str(REPO_ROOT / "build" / "shared-volume-packages"),
-            )
+    commands.extend(
+        (
+            "cargo",
+            "kex",
+            "build",
+            str(REPO_ROOT / "apps" / application),
+            "--target",
+            "all",
+            "--output",
+            str(REPO_ROOT / "build" / "shared-volume-packages"),
         )
+        for application in shared_volume
+    )
     if plan.run_host_smoke:
         commands.append(
             (
@@ -725,6 +783,26 @@ def commands_for_plan(
     return commands
 
 
+def _drop_absent_python_tools(
+    commands: list[tuple[str, ...]], *, require_python_tools: bool
+) -> list[tuple[str, ...]]:
+    """Skip or demand the Python gates exactly as the full gate does."""
+    if not any(command[:1] == (RUFF_EXECUTABLE,) for command in commands):
+        return commands
+    if shutil.which(RUFF_EXECUTABLE) is not None:
+        return commands
+    if require_python_tools:
+        raise RuntimeError(
+            f"{RUFF_EXECUTABLE} is required for the Python format and lint gates"
+        )
+    print(
+        f"python format and lint skipped: {RUFF_EXECUTABLE} is unavailable. "
+        "Use --require-python-tools to make this a failure.",
+        file=sys.stderr,
+    )
+    return [command for command in commands if command[:1] != (RUFF_EXECUTABLE,)]
+
+
 def _display(command: tuple[str, ...]) -> str:
     """Render argv without implying shell evaluation semantics."""
     return " ".join(
@@ -745,13 +823,17 @@ def main() -> int:
     try:
         paths = () if args.full else changed_paths(args.base)
         packages = workspace_packages()
-        plan = TestPlan(tuple()) if args.full else build_plan(paths, packages)
+        plan = TestPlan(()) if args.full else build_plan(paths, packages)
         if args.full:
             plan.full_reasons.append("--full requested")
         commands = commands_for_plan(
             plan,
             skip_qemu=args.skip_qemu,
             require_filesystem_tools=args.require_filesystem_tools,
+            require_python_tools=args.require_python_tools,
+        )
+        commands = _drop_absent_python_tools(
+            commands, require_python_tools=args.require_python_tools
         )
         if not commands:
             print(f"focused verification: no changes relative to {args.base}")
@@ -782,7 +864,8 @@ def main() -> int:
         return 1
     except subprocess.CalledProcessError as error:
         print(
-            f"focused verification failed: command exited with status {error.returncode}",
+            "focused verification failed: command exited with status "
+            f"{error.returncode}",
             file=sys.stderr,
         )
         return error.returncode or 1

@@ -12,7 +12,6 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SDK_ROOT = REPO_ROOT / "sdk" / "c"
 INCLUDE_ROOT = SDK_ROOT / "troe-kex-sysroot" / "include"
@@ -54,8 +53,7 @@ def run(command: list[str]) -> str:
         command,
         check=True,
         text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
     )
     return completed.stdout.strip()
 
@@ -85,9 +83,7 @@ def find_archiver(explicit: str | None) -> str:
     for candidate in candidates:
         if candidate.is_file():
             return str(candidate)
-    raise RuntimeError(
-        "llvm-ar is required to build the cross-target static C library"
-    )
+    raise RuntimeError("llvm-ar is required to build the cross-target static C library")
 
 
 def build_one(output: Path, architecture: str, cc: str, archiver: str) -> None:
@@ -172,7 +168,9 @@ def build(output: Path, architectures: tuple[str, ...], cc: str, archiver: str) 
 
 def main() -> int:
     args = parse_args()
-    architectures = tuple(TARGETS) if args.architecture == "all" else (args.architecture,)
+    architectures = (
+        tuple(TARGETS) if args.architecture == "all" else (args.architecture,)
+    )
     try:
         archiver = find_archiver(args.ar)
         build(args.output, architectures, args.cc, archiver)

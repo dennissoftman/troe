@@ -43,13 +43,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     root.add_argument("--trusted-payload-sha256", required=True)
     root.add_argument("--now", type=int, required=True)
 
-    rotate = subparsers.add_parser("verify-rotation", help="verify one consecutive root")
+    rotate = subparsers.add_parser(
+        "verify-rotation", help="verify one consecutive root"
+    )
     rotate.add_argument("--trusted-root", type=Path, required=True)
     rotate.add_argument("--trusted-payload-sha256", required=True)
     rotate.add_argument("--new-root", type=Path, required=True)
     rotate.add_argument("--now", type=int, required=True)
 
-    release = subparsers.add_parser("verify-release", help="verify one signed package release")
+    release = subparsers.add_parser(
+        "verify-release", help="verify one signed package release"
+    )
     _root_arguments(release)
     release.add_argument("--release", type=Path, required=True)
     release.add_argument("--package", type=Path, required=True)
@@ -58,7 +62,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     release.add_argument("--offline", action="store_true")
     release.add_argument("--offline-grace", type=int, default=0)
 
-    publish = subparsers.add_parser("publish", help="atomically publish one registry release")
+    publish = subparsers.add_parser(
+        "publish", help="atomically publish one registry release"
+    )
     _root_arguments(publish)
     publish.add_argument("--release", type=Path, required=True)
     publish.add_argument("--package", type=Path, required=True)
@@ -67,7 +73,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     publish.add_argument("--now", type=int, required=True)
     publish.add_argument("--snapshot-expires", type=int, required=True)
 
-    registry = subparsers.add_parser("verify-registry", help="verify the current generation")
+    registry = subparsers.add_parser(
+        "verify-registry", help="verify the current generation"
+    )
     _root_arguments(registry)
     registry.add_argument("--registry", type=Path, required=True)
     registry.add_argument("--now", type=int, required=True)
@@ -133,9 +141,7 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
         )
         return {"envelope_sha256": envelope.digest(), "generation": root["generation"]}
     if args.command == "verify-rotation":
-        old = trusted_root(
-            args.trusted_root, args.trusted_payload_sha256, args.now
-        )
+        old = trusted_root(args.trusted_root, args.trusted_payload_sha256, args.now)
         envelope, root = verify_root_rotation(
             old, read(args.new_root, MAX_ENVELOPE_BYTES), args.now
         )
@@ -183,7 +189,10 @@ def execute(args: argparse.Namespace) -> dict[str, object]:
             offline=args.offline,
             offline_grace=args.offline_grace,
         )
-        return {"generation": snapshot["generation"], "releases": len(snapshot["releases"])}
+        return {
+            "generation": snapshot["generation"],
+            "releases": len(snapshot["releases"]),
+        }
     raise ModelError("unknown-command", "command", args.command)
 
 
@@ -192,7 +201,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
         data = execute(args)
-        result = {"command": args.command, "data": data, "diagnostics": [], "ok": True, "schema": 1}
+        result = {
+            "command": args.command,
+            "data": data,
+            "diagnostics": [],
+            "ok": True,
+            "schema": 1,
+        }
         sys.stdout.buffer.write(canonical_json(result))
         return 0
     except ModelError as error:

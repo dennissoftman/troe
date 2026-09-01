@@ -8,15 +8,35 @@ import json
 import re
 import sys
 import tomllib
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 AUDIT_EXCEPTIONS_FILE = REPO_ROOT / "tools" / "rustsec-exceptions.json"
+PYTHON_TOOLING_FILE = REPO_ROOT / "pyproject.toml"
 MINIMUM_PYTHON = (3, 13)
 _ADVISORY_PATTERN = re.compile(r"RUSTSEC-[0-9]{4}-[0-9]{4}")
 _EXCEPTION_FIELDS = {"advisory", "owner", "rationale", "expires"}
+
+
+# One tool formats and lints every repository-owned Python file. It is resolved
+# from `PATH` by name, exactly like the host image utilities: absence skips the
+# Python format and lint gates with a notice unless the caller demands them.
+RUFF_EXECUTABLE = "ruff"
+
+# The gates walk the repository root and let the committed configuration decide
+# what is in scope, so a new Python file anywhere is covered without edits here.
+PYTHON_LINT_ROOT = "."
+
+# Vendored and generated trees, the only paths `ruff` may skip. `apps/lua/vendor`
+# and `apps/python/patches` carry upstream sources; `build` and `**/target` are
+# generated. Everything else is repository-owned and gated.
+RUFF_EXCLUDED_PATHS = (
+    "apps/lua/vendor",
+    "apps/python/patches",
+    "build",
+    "**/target",
+)
 
 
 SHARED_VOLUME_APPLICATIONS = frozenset({"lua", "python"})
@@ -110,6 +130,32 @@ def buildable_shared_volume_directories(root: Path = REPO_ROOT) -> tuple[Path, .
     )
 
 
+def load_python_tooling_policy(
+    path: Path = PYTHON_TOOLING_FILE,
+) -> dict[str, object]:
+    """Return the committed ``[tool.ruff]`` table that governs Python tooling."""
+    try:
+        document = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, tomllib.TOMLDecodeError) as error:
+        raise RuntimeError(
+            f"cannot read Python tooling policy {path}: {error}"
+        ) from error
+    tools = document.get("tool")
+    if not isinstance(tools, dict) or not isinstance(tools.get("ruff"), dict):
+        raise RuntimeError(f"{path} must configure [tool.ruff]")
+    return tools["ruff"]
+
+
+def python_lint_commands(
+    *, executable: str = RUFF_EXECUTABLE, paths: Sequence[str] = (PYTHON_LINT_ROOT,)
+) -> tuple[tuple[str, ...], ...]:
+    """Return the Python format and lint argument vectors, in gate order."""
+    return (
+        (executable, "format", "--check", *paths),
+        (executable, "check", *paths),
+    )
+
+
 def require_supported_python(version: Sequence[int] = sys.version_info) -> None:
     """Reject repository-tool execution on an unsupported Python runtime."""
     actual = tuple(version[:2])
@@ -130,25 +176,36 @@ def load_audit_exceptions(
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise RuntimeError(f"cannot read RustSec exception policy {path}: {error}") from error
+        raise RuntimeError(
+            f"cannot read RustSec exception policy {path}: {error}"
+        ) from error
 
     if not isinstance(document, dict) or set(document) != {"schema", "exceptions"}:
-        raise RuntimeError("RustSec exception policy must contain schema and exceptions")
+        raise RuntimeError(
+            "RustSec exception policy must contain schema and exceptions"
+        )
     if document["schema"] != 1 or not isinstance(document["exceptions"], list):
         raise RuntimeError("unsupported RustSec exception policy schema")
 
-    current_date = datetime.date.today() if today is None else today
+    current_date = (
+        datetime.datetime.now(tz=datetime.UTC).date() if today is None else today
+    )
     advisories: list[str] = []
     for index, entry in enumerate(document["exceptions"]):
         label = f"RustSec exception {index}"
         if not isinstance(entry, dict) or set(entry) != _EXCEPTION_FIELDS:
-            raise RuntimeError(f"{label} must contain exactly {sorted(_EXCEPTION_FIELDS)}")
+            raise RuntimeError(
+                f"{label} must contain exactly {sorted(_EXCEPTION_FIELDS)}"
+            )
 
         advisory = entry["advisory"]
         owner = entry["owner"]
         rationale = entry["rationale"]
         expires = entry["expires"]
-        if not isinstance(advisory, str) or _ADVISORY_PATTERN.fullmatch(advisory) is None:
+        if (
+            not isinstance(advisory, str)
+            or _ADVISORY_PATTERN.fullmatch(advisory) is None
+        ):
             raise RuntimeError(f"{label} has an invalid advisory identifier")
         if advisory in advisories:
             raise RuntimeError(f"duplicate RustSec exception for {advisory}")
@@ -387,7 +444,9 @@ def rust_code_without_comments_or_literals(source: str) -> str:
             index += 1
             continue
         kept.append(
-            "".join("\n" if character == "\n" else " " for character in source[index:skip])
+            "".join(
+                "\n" if character == "\n" else " " for character in source[index:skip]
+            )
         )
         index = skip
     return "".join(kept)
@@ -402,7 +461,9 @@ def shipped_troe_dependencies(manifest: dict) -> set[str]:
     """
     names: set[str] = set()
     for section in ("dependencies", "build-dependencies"):
-        names.update(name for name in manifest.get(section, {}) if name.startswith("troe-"))
+        names.update(
+            name for name in manifest.get(section, {}) if name.startswith("troe-")
+        )
     for target in manifest.get("target", {}).values():
         names.update(
             name for name in target.get("dependencies", {}) if name.startswith("troe-")
