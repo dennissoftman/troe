@@ -1578,6 +1578,66 @@ def exercise_head_tail_and_mkdir(
     session.command("rm -r /vol/root/troe-md", cwd, command_timeout)
 
 
+def exercise_directory_times(
+    session: SerialSession, cwd: str, command_timeout: float
+) -> None:
+    """A directory's own time advances when a name inside it changes."""
+    # 2026-08-29T10:40:00Z. `ls -l` renders minutes, so two commands seconds
+    # apart would render the same string; stamping a distinctly old instant
+    # first makes "did it move" unambiguous rather than a race with the clock.
+    old = "2026-08-29 10:40"
+    root = "/vol/root/troe-dirtime"
+
+    def rebase() -> None:
+        session.command(
+            f"touch -d 1788000000 {root}", cwd, command_timeout, absent=("touch:",)
+        )
+        listing = session.command(f"ls -ld {root}", cwd, command_timeout)
+        if old not in listing:
+            raise AcceptanceError(
+                f"could not stamp the directory to a known instant: {listing!r}"
+            )
+
+    def assert_moved(action: str) -> None:
+        listing = session.command(f"ls -ld {root}", cwd, command_timeout)
+        if not re.search(r"d +0 \d{4}-\d{2}-\d{2} \d{2}:\d{2} " + root, listing):
+            raise AcceptanceError(f"no directory time after {action}: {listing!r}")
+        if old in listing:
+            raise AcceptanceError(
+                f"{action} inside a directory must advance its time, "
+                f"but it still reads {old}: {listing!r}"
+            )
+
+    session.command(f"mkdir -p {root}", cwd, command_timeout, absent=("mkdir:",))
+
+    rebase()
+    session.command(f"printf x > {root}/child", cwd, command_timeout)
+    assert_moved("creating a name")
+
+    rebase()
+    session.command(f"mv {root}/child {root}/renamed", cwd, command_timeout)
+    assert_moved("renaming a name")
+
+    rebase()
+    session.command(f"rm {root}/renamed", cwd, command_timeout)
+    assert_moved("removing a name")
+
+    # The negative case: replacing a file's contents changes the file, not the
+    # set of names in its parent, so the directory's time must stand. Without
+    # this a blanket "stamp on every write" would pass everything above.
+    session.command(f"printf first > {root}/stable", cwd, command_timeout)
+    rebase()
+    session.command(f"printf second > {root}/stable", cwd, command_timeout)
+    unchanged = session.command(f"ls -ld {root}", cwd, command_timeout)
+    if old not in unchanged:
+        raise AcceptanceError(
+            "replacing a file's contents must not advance its parent, "
+            f"but the directory moved off {old}: {unchanged!r}"
+        )
+    session.command(f"cat {root}/stable", cwd, command_timeout, contains=("second",))
+    session.command(f"rm -r {root}", cwd, command_timeout)
+
+
 def exercise_change_and_creation_times(
     session: SerialSession, cwd: str, command_timeout: float
 ) -> None:
@@ -2015,6 +2075,7 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
         )
     session.command("rm /vol/root/troe-timed", cwd, command_timeout)
     exercise_change_and_creation_times(session, cwd, command_timeout)
+    exercise_directory_times(session, cwd, command_timeout)
     exercise_head_tail_and_mkdir(session, cwd, command_timeout)
     exercise_touch(session, cwd, command_timeout)
     session.confirmed_command(

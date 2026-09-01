@@ -2320,19 +2320,26 @@ impl<D: BlockDevice> Ext4<D> {
         self.write_fs_block(block, &table)
     }
 
-    /// Advance one inode's change time without altering any of its fields.
+    /// Advance one inode's times without altering any of its fields.
     ///
-    /// A rename rewrites directory entries and never the inode it moves, so
-    /// nothing would record that the object changed. POSIX advances the change
-    /// time on rename, and a change time that a rename does not move is a field
-    /// a caller cannot use for the one case a modification time cannot see.
-    fn touch_inode_metadata(&mut self, number: u32) -> Result<(), FsError> {
+    /// `InodeTouch::Metadata` advances only the change time, which is what a
+    /// rename needs: it rewrites directory entries and never the inode it
+    /// moves, so nothing else would record that the object changed.
+    /// `InodeTouch::Content` advances the modification time too, which is what
+    /// a directory needs when a name inside it is created, removed or renamed.
+    ///
+    /// Without a wall clock there is nothing to record, so the write is skipped
+    /// rather than spent rewriting an unchanged record.
+    fn touch_inode(&mut self, number: u32, touch: InodeTouch) -> Result<(), FsError> {
+        if self.wall_seconds().is_none() {
+            return Ok(());
+        }
         let (block, offset) = self.inode_record_location(number)?;
         let mut table = self.read_fs_block(block)?;
         let raw = table
             .get_mut(offset..offset + EXT4_INODE_BYTES)
             .ok_or(FsError::Corrupt)?;
-        self.refresh_inode_checksum(raw, number, InodeTouch::Metadata)?;
+        self.refresh_inode_checksum(raw, number, touch)?;
         self.write_fs_block(block, &table)
     }
 
@@ -3313,7 +3320,26 @@ impl<D: BlockDevice> Ext4<D> {
         Ok(false)
     }
 
+    /// Link one name into a directory and record that the directory changed.
+    ///
+    /// POSIX advances a directory's modification and change times whenever a
+    /// name inside it is created, removed or renamed. The record itself is
+    /// rewritten only when the directory gains or loses a block, so the stamp
+    /// is applied here rather than left to that incidental write. It joins the
+    /// open transaction, so it costs one more staged block and no extra
+    /// durability barrier.
     fn add_directory_entry(
+        &mut self,
+        directory: &Inode,
+        name: &str,
+        inode_number: u32,
+        kind: NodeKind,
+    ) -> Result<(), FsError> {
+        self.insert_directory_record(directory, name, inode_number, kind)?;
+        self.touch_inode(directory.number, InodeTouch::Content)
+    }
+
+    fn insert_directory_record(
         &mut self,
         directory: &Inode,
         name: &str,
@@ -3422,7 +3448,21 @@ impl<D: BlockDevice> Ext4<D> {
         Ok(())
     }
 
+    /// Unlink one name from a directory and record that the directory changed.
+    ///
+    /// The stamp follows the same rule as `add_directory_entry`: losing a name
+    /// changes the directory whether or not its own record was rewritten.
     fn remove_directory_entry(
+        &mut self,
+        directory: &Inode,
+        name: &str,
+    ) -> Result<DirectoryEntry, FsError> {
+        let removed = self.take_directory_record(directory, name)?;
+        self.touch_inode(directory.number, InodeTouch::Content)?;
+        Ok(removed)
+    }
+
+    fn take_directory_record(
         &mut self,
         directory: &Inode,
         name: &str,
@@ -4063,7 +4103,7 @@ impl<D: BlockDevice> FileSystemProvider for Ext4<D> {
         }
         // The moved object itself changed, even though none of its own fields
         // did, so its change time advances with the rest of the mutation.
-        self.touch_inode_metadata(source_entry.inode)?;
+        self.touch_inode(source_entry.inode, InodeTouch::Metadata)?;
         self.finish_mutation()
     }
 
@@ -8410,6 +8450,101 @@ mod tests {
                 "{path} must report {expected}, got:\n{report}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn directory_times_advance_when_names_inside_change() -> Result<(), String> {
+        const START: u64 = 1_788_000_000;
+        let Some(mke2fs) = e2fs_tool("mke2fs") else {
+            return unavailable_tool("mke2fs");
+        };
+        let temporary = TestDirectory::create("ext4-directory-times")?;
+        let image = default_mke2fs_image(temporary.path(), &mke2fs, 1024 * 1024 * 1024)?;
+
+        let mut ext4 = mount_file_writable_with_limits(&image, default_volume_limits()?)?;
+        let clock = TestClock::new(Some(START));
+        ext4.set_wall_clock(clock.clone());
+        ext4.create_directory("/dir")
+            .map_err(|error| format!("cannot create directory: {error:?}"))?;
+
+        let stat = |ext4: &mut Ext4<_>| -> Result<(Option<u64>, Option<u64>), String> {
+            let metadata = ext4
+                .metadata("/dir")
+                .map_err(|error| format!("cannot stat: {error:?}"))?;
+            Ok((
+                metadata.modified_unix_seconds,
+                metadata.changed_unix_seconds,
+            ))
+        };
+
+        let born = stat(&mut ext4)?;
+        assert_eq!(born, (Some(START), Some(START)));
+
+        // Each of the three name mutations advances both times, even though
+        // none of them makes the directory gain or lose a block, which is the
+        // only thing that used to rewrite its record.
+        for (offset, action) in [(60_u64, "create"), (120, "rename"), (180, "remove")] {
+            clock.set(Some(START + offset));
+            match action {
+                "create" => ext4.write_file("/dir/child.txt", b"inside\n"),
+                "rename" => ext4.rename("/dir/child.txt", "/dir/renamed.txt"),
+                _ => ext4.remove_file("/dir/renamed.txt"),
+            }
+            .map_err(|error| format!("cannot {action}: {error:?}"))?;
+            assert_eq!(
+                stat(&mut ext4)?,
+                (Some(START + offset), Some(START + offset)),
+                "a {action} inside a directory must advance both of its times"
+            );
+        }
+
+        // Rewriting a file's contents changes the file, not its parent's set
+        // of names, so the directory's times stand.
+        clock.set(Some(START + 240));
+        ext4.write_file("/dir/stable.txt", b"first\n")
+            .map_err(|error| format!("cannot create: {error:?}"))?;
+        let after_add = stat(&mut ext4)?;
+        clock.set(Some(START + 300));
+        ext4.write_file("/dir/stable.txt", b"second\n")
+            .map_err(|error| format!("cannot rewrite: {error:?}"))?;
+        assert_eq!(
+            stat(&mut ext4)?,
+            after_add,
+            "replacing a file's contents must not advance its parent"
+        );
+
+        drop(ext4);
+        let Some(e2fsck) = e2fs_tool("e2fsck") else {
+            return unavailable_tool("e2fsck");
+        };
+        let check = Command::new(&e2fsck)
+            .args(["-f", "-n"])
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&check, "e2fsck after directory stamping")?;
+
+        // e2fsck proves the image is consistent, not that a host reads the
+        // time we meant. The last name mutation was creating stable.txt, so
+        // that is the instant the e2fsprogs reader must report for /dir.
+        let Some(debugfs) = e2fs_tool("debugfs") else {
+            return unavailable_tool("debugfs");
+        };
+        let stat_output = Command::new(&debugfs)
+            .arg("-R")
+            .arg("stat /dir")
+            .arg(&image)
+            .output()
+            .map_err(|error| error.to_string())?;
+        command_succeeded(&stat_output, "debugfs stat /dir")?;
+        let report = String::from_utf8_lossy(&stat_output.stdout).to_string();
+        let expected = format!("mtime: {:#010x}:00000000", START + 240);
+        assert!(
+            report.contains(&expected),
+            "/dir must report {expected} after a name was created inside it, \
+             got:\n{report}"
+        );
         Ok(())
     }
 

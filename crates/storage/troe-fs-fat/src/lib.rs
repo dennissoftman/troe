@@ -1022,6 +1022,31 @@ impl<D: BlockDevice> Fat32<D> {
         self.durability_barrier()
     }
 
+    /// Record that a directory's contents changed, on its own entry.
+    ///
+    /// FAT32 keeps a directory's timestamps in the entry that names it inside
+    /// its parent, so a name added to or removed from a directory is stamped
+    /// there rather than anywhere inside the directory itself.
+    ///
+    /// The volume root has no entry of its own -- `resolve` gives it an empty
+    /// slot list -- so there is nowhere to record this and it keeps reporting
+    /// no time. Without a clock there is likewise nothing to record.
+    fn touch_directory_entry(&mut self, directory: &FatEntry) -> Result<(), FsError> {
+        let Some(slot) = directory.directory_slots.last().copied() else {
+            return Ok(());
+        };
+        let Some(stamp) = self.wall_stamp()? else {
+            return Ok(());
+        };
+        let mut bytes = self.read_cluster(slot.cluster)?;
+        let raw = bytes
+            .get_mut(slot.offset..slot.offset + DIRECTORY_ENTRY_BYTES)
+            .ok_or(FsError::Corrupt)?;
+        stamp.write_modification(raw)?;
+        self.write_cluster(slot.cluster, &bytes)?;
+        self.durability_barrier()
+    }
+
     fn delete_directory_entry(&mut self, entry: &FatEntry) -> Result<(), FsError> {
         if entry.directory_slots.is_empty() {
             return Err(FsError::Corrupt);
@@ -1298,6 +1323,8 @@ impl<D: BlockDevice> FileSystemProvider for Fat32<D> {
             let _ignored = self.release_clusters(&new_chain);
             return Err(error);
         }
+        // The parent gained a name, which is a change to the parent itself.
+        self.touch_directory_entry(&parent)?;
         self.finish_mutation()
     }
 
@@ -1381,6 +1408,7 @@ impl<D: BlockDevice> FileSystemProvider for Fat32<D> {
             let _ignored = self.release_clusters(&clusters);
             return Err(error);
         }
+        self.touch_directory_entry(&parent)?;
         self.finish_mutation()
     }
 
@@ -1405,6 +1433,8 @@ impl<D: BlockDevice> FileSystemProvider for Fat32<D> {
         if entry.byte_count != 0 {
             self.release_chain_for_bytes(entry.first_cluster, entry.byte_count)?;
         }
+        // The parent lost a name, which is a change to the parent itself.
+        self.touch_directory_entry(&parent)?;
         self.finish_mutation()
     }
 
@@ -1431,6 +1461,7 @@ impl<D: BlockDevice> FileSystemProvider for Fat32<D> {
         self.begin_mutation()?;
         self.delete_directory_entry(&entry)?;
         self.release_clusters(&clusters)?;
+        self.touch_directory_entry(&parent)?;
         self.finish_mutation()
     }
 
@@ -1511,6 +1542,10 @@ impl<D: BlockDevice> FileSystemProvider for Fat32<D> {
             )?;
         }
         self.delete_directory_entry(&source_entry)?;
+        // Both ends changed: one lost the name and the other gained it. When
+        // they are the same directory the second stamp is simply idempotent.
+        self.touch_directory_entry(&destination_parent)?;
+        self.touch_directory_entry(&source_parent)?;
         self.finish_mutation()
     }
 
@@ -2999,6 +3034,73 @@ mod tests {
     }
 
     #[test]
+    fn directory_times_advance_when_names_inside_change() -> Result<(), FsError> {
+        const START: u64 = 1_788_000_000;
+        // Two days apart, because a FAT write date has day granularity and a
+        // smaller step could pass without the date field moving at all.
+        const LATER: u64 = START + 2 * 86_400;
+
+        let mut fat = mount_writable(valid_device().map_err(|_| FsError::Io)?)?;
+        let clock = TestClock::new(Some(START));
+        fat.set_wall_clock(clock.clone());
+        fat.create_directory("/dir")?;
+        let created = fat.metadata("/dir")?.modified_unix_seconds;
+        assert!(created.is_some(), "a stamped directory reports a time");
+
+        // Adding a name inside advances the directory's own stamp, which lives
+        // in its entry in the parent rather than anywhere inside it.
+        clock.set(Some(LATER));
+        fat.write_file("/dir/child.txt", b"inside")?;
+        let after_create = fat.metadata("/dir")?.modified_unix_seconds;
+        assert!(
+            after_create > created,
+            "adding a name must advance the directory: {created:?} -> {after_create:?}"
+        );
+
+        // Renaming inside it advances it again.
+        clock.set(Some(LATER + 2 * 86_400));
+        fat.rename("/dir/child.txt", "/dir/renamed.txt")?;
+        let after_rename = fat.metadata("/dir")?.modified_unix_seconds;
+        assert!(
+            after_rename > after_create,
+            "renaming a name must advance the directory: \
+             {after_create:?} -> {after_rename:?}"
+        );
+
+        // Removing the name advances it once more.
+        clock.set(Some(LATER + 4 * 86_400));
+        fat.remove_file("/dir/renamed.txt")?;
+        let after_remove = fat.metadata("/dir")?.modified_unix_seconds;
+        assert!(
+            after_remove > after_rename,
+            "removing a name must advance the directory: \
+             {after_rename:?} -> {after_remove:?}"
+        );
+
+        // The volume root has no entry of its own, so there is nowhere to
+        // record this and it still reports nothing rather than inventing one.
+        clock.set(Some(LATER + 6 * 86_400));
+        fat.write_file("/at-root.txt", b"root")?;
+        assert_eq!(fat.metadata("/")?.modified_unix_seconds, None);
+
+        // Rewriting a file's contents is not a change to its parent: the name
+        // set is untouched, so the directory's stamp stands.
+        let before_rewrite = fat.metadata("/dir")?.modified_unix_seconds;
+        clock.set(Some(LATER + 8 * 86_400));
+        fat.write_file("/dir/stable.txt", b"first")?;
+        let after_add = fat.metadata("/dir")?.modified_unix_seconds;
+        clock.set(Some(LATER + 10 * 86_400));
+        fat.write_file("/dir/stable.txt", b"second")?;
+        assert_eq!(
+            fat.metadata("/dir")?.modified_unix_seconds,
+            after_add,
+            "replacing a file's contents must not advance its parent"
+        );
+        assert!(after_add > before_rewrite, "but adding the name did");
+        Ok(())
+    }
+
+    #[test]
     fn reports_a_creation_time_and_never_a_change_time() -> Result<(), FsError> {
         const CREATED: u64 = 1_788_000_000;
 
@@ -3214,6 +3316,10 @@ mod tests {
         // unconverted and a host reads back exactly these digits.
         const CREATED: u64 = 1_788_000_000;
         const RENDERED: &str = "2026-08-29  10:40";
+        // Two days later, so the FAT date field itself moves and not merely
+        // the time-of-day within the same day.
+        const MEMBER_ADDED: u64 = CREATED + 2 * 86_400;
+        const RENDERED_LATER: &str = "2026-08-31  10:40";
         let Some(mkfs_fat) = fat_tool("mkfs.fat") else {
             return unavailable_tool("mkfs.fat");
         };
@@ -3237,12 +3343,18 @@ mod tests {
 
         {
             let mut fat = mount_file_writable(&image)?;
-            fat.set_wall_clock(TestClock::new(Some(CREATED)));
+            let clock = TestClock::new(Some(CREATED));
+            fat.set_wall_clock(clock.clone());
             fat.write_file("/Stamped Name.txt", b"written by troe\n")
                 .map_err(|error| error.to_string())?;
             fat.create_directory("/stamped")
                 .map_err(|error| error.to_string())?;
             fat.write_file("/stamped/member.txt", b"member\n")
+                .map_err(|error| error.to_string())?;
+            // Adding a name inside /stamped later must move the directory's
+            // own stamp forward, and a host tool has to see the newer date.
+            clock.set(Some(MEMBER_ADDED));
+            fat.write_file("/stamped/later.txt", b"later\n")
                 .map_err(|error| error.to_string())?;
         }
 
@@ -3266,6 +3378,19 @@ mod tests {
                 report.contains(RENDERED),
                 "{directory} must render {RENDERED}, got:\n{report}"
             );
+            if directory == "::/" {
+                // The `stamped` directory's own row carries the later date,
+                // because a name was added inside it after it was created.
+                let row = report
+                    .lines()
+                    .find(|line| line.contains("stamped") && line.contains("<DIR>"))
+                    .ok_or_else(|| format!("no directory row for stamped:\n{report}"))?;
+                assert!(
+                    row.contains(RENDERED_LATER),
+                    "the directory row must render {RENDERED_LATER} after a name \
+                     was added inside it, got: {row}"
+                );
+            }
         }
         Ok(())
     }
