@@ -45,6 +45,9 @@ history rather than in current documentation.
 | Declared image span and scaled launch admission | [ADR 0059](adr/0059-declared-image-span-and-scaled-launch-admission.md) |
 | Extent-backed launch reservation | [ADR 0060](adr/0060-extent-backed-launch-reservation.md) |
 | Change and creation times, and no access time | [ADR 0062](adr/0062-change-and-creation-times.md) |
+| Proposed cell-grid display surfaces and display protocol | [ADR 0064](adr/0064-bounded-cell-grid-display-surfaces.md) |
+| Proposed layered input events and editor-intent split | [ADR 0065](adr/0065-layered-input-events-and-editor-intent.md) |
+| Proposed pointer and AArch64 keyboard transports | [ADR 0066](adr/0066-pointer-and-aarch64-keyboard-transports.md) |
 
 The current serialized contracts are versioned independently under
 [`formats/`](formats):
