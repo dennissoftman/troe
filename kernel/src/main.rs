@@ -609,6 +609,13 @@ mod firmware {
         firmware_wall_seconds: Option<u64>,
         boot_mount_manifest: BootMountManifest,
         runtime_mounts: SharedRuntimeMounts,
+        /// Complete `TZ=VALUE` entry resolved from desired state at boot.
+        ///
+        /// ADR 0068 resolves the zone once, so an edit to `/config` takes
+        /// effect at the next session rather than changing a running one,
+        /// which is what ADR 0043 requires of desired state. `None` keeps the
+        /// conventional `UTC0` the ABI compiles in.
+        session_timezone: RefCell<Option<String>>,
     }
 
     struct NativeBlockInitialization {
@@ -2054,6 +2061,7 @@ mod firmware {
             firmware_wall_seconds: prepared.firmware_wall_seconds,
             boot_mount_manifest,
             runtime_mounts: Rc::new(RefCell::new(RuntimeMountRegistry::empty())),
+            session_timezone: RefCell::new(None),
         })
     }
 
@@ -10587,7 +10595,92 @@ mod firmware {
             }
         }
         let root_mode = activate_native_storage(accounting, &mut namespace, console);
+        attach_configuration(&mut namespace, root_mode, console);
+        *accounting.session_timezone.borrow_mut() =
+            resolve_session_timezone(&mut namespace, console);
         (namespace, root_mode)
+    }
+
+    /// Subtree of the persistent root holding configuration bytes.
+    const CONFIGURATION_STORE_PATH: &str = "/vol/root/config";
+
+    /// Present configuration at `/config`, backed by the persistent root.
+    ///
+    /// A path names an access point rather than a place bytes live, so
+    /// `/config` is where configuration is read and written while the bytes sit
+    /// on the journalled root volume that ADR 0055 already made durable. The
+    /// subtree is created on first boot when the root is writable.
+    ///
+    /// A recovery boot has no root to alias, and a read-only root presents
+    /// configuration without accepting edits. Both leave a configured value
+    /// reading as absent, which is the same ordinary case as a machine nobody
+    /// has configured.
+    fn attach_configuration(
+        namespace: &mut Namespace,
+        root_mode: NativeRootMode,
+        console: &mut dyn Output,
+    ) {
+        if matches!(root_mode, NativeRootMode::Recovery) {
+            return;
+        }
+        if matches!(root_mode, NativeRootMode::ReadWrite)
+            && namespace.metadata("/", CONFIGURATION_STORE_PATH).is_err()
+        {
+            let _ignored = namespace.create_directory("/", CONFIGURATION_STORE_PATH);
+        }
+        if namespace
+            .mount_alias("/config", "/vol/root", "/config")
+            .is_err()
+        {
+            // The root mounted but configuration did not attach, which is not
+            // the ordinary absent case and would otherwise look like a machine
+            // nobody configured.
+            let _ignored = write_all(console, b"/config: not attached; configuration is absent\n");
+        }
+    }
+
+    /// Path holding the operator's POSIX zone string, per ADR 0068.
+    const SESSION_TIMEZONE_PATH: &str = "/config/timezone";
+
+    /// Resolve the session's zone entry from desired state.
+    ///
+    /// Returns the complete `TZ=VALUE` entry to compose, or `None` to keep the
+    /// conventional `UTC0`. An absent file, an absent `/config` provider, and
+    /// recovery are the same ordinary case. A file that does not parse is
+    /// reported and refused: booting into a silently wrong zone would be worse
+    /// than booting into UTC, and refusing to boot over a typo worse still.
+    fn resolve_session_timezone(
+        namespace: &mut Namespace,
+        console: &mut dyn Output,
+    ) -> Option<String> {
+        // One trailing newline is allowed, so a file written by a shell
+        // redirection is accepted. The grammar and its refusals live in the
+        // ABI, where they are tested; the kernel binary has no test harness.
+        let bytes = namespace
+            .read_file_bounded(
+                "/",
+                SESSION_TIMEZONE_PATH,
+                troe_abi::timezone::MAX_TZ_BYTES + 2,
+            )
+            .ok()?;
+        let text = match troe_abi::timezone::parse_configuration(&bytes) {
+            Ok(text) => text,
+            Err(error) => {
+                let mut report = String::new();
+                if writeln!(&mut report, "{SESSION_TIMEZONE_PATH}: {error:?}; using UTC").is_ok() {
+                    let _ignored = write_all(console, report.as_bytes());
+                }
+                return None;
+            }
+        };
+        let mut entry = String::new();
+        entry
+            .try_reserve_exact(troe_abi::command::TIMEZONE_NAME.len() + 1 + text.len())
+            .ok()?;
+        entry.push_str(troe_abi::command::TIMEZONE_NAME);
+        entry.push('=');
+        entry.push_str(text);
+        Some(entry)
     }
 
     impl KernelNetworkService {
@@ -13762,6 +13855,29 @@ mod firmware {
                 None
             };
 
+            // The zone resolved at boot replaces the conventional `UTC0`. It is
+            // copied into bounded storage so no borrow of the accounting state
+            // is held across the launch, and so composing an environment needs
+            // no allocation that could fail here.
+            let mut timezone_storage =
+                [0_u8; command::TIMEZONE_NAME.len() + 1 + troe_abi::timezone::MAX_TZ_BYTES];
+            let timezone_bytes = {
+                let resolved = self.accounting.session_timezone.borrow();
+                match resolved.as_deref() {
+                    Some(entry) if entry.len() <= timezone_storage.len() => {
+                        timezone_storage[..entry.len()].copy_from_slice(entry.as_bytes());
+                        entry.len()
+                    }
+                    _ => 0,
+                }
+            };
+            let session_environment =
+                match core::str::from_utf8(&timezone_storage[..timezone_bytes]) {
+                    Ok(entry) if timezone_bytes != 0 => {
+                        command::conventional_environment_with_timezone(entry)
+                    }
+                    _ => command::CONVENTIONAL_ENVIRONMENT,
+                };
             let services = (|| -> Result<Vec<CommandStartupService>, ()> {
                 let mut services = Vec::new();
                 services.try_reserve_exact(service_count).map_err(|_| ())?;
@@ -13771,7 +13887,7 @@ mod firmware {
                         CommandInvocationService::new_with_environment(
                             cwd,
                             words,
-                            &command::CONVENTIONAL_ENVIRONMENT,
+                            &session_environment,
                         )
                         .map_err(|_| ())?,
                     )?,
@@ -14725,6 +14841,29 @@ mod firmware {
             let submitted_shell_script = shell_script_required
                 .then(|| Rc::new(RefCell::new(SubmittedShellScript::default())));
             let timer_task_id = timer_required.then(|| Rc::new(Cell::new(None)));
+            // The zone resolved at boot replaces the conventional `UTC0`. It is
+            // copied into bounded storage so no borrow of the accounting state
+            // is held across the launch, and so composing an environment needs
+            // no allocation that could fail here.
+            let mut timezone_storage =
+                [0_u8; command::TIMEZONE_NAME.len() + 1 + troe_abi::timezone::MAX_TZ_BYTES];
+            let timezone_bytes = {
+                let resolved = self.accounting.session_timezone.borrow();
+                match resolved.as_deref() {
+                    Some(entry) if entry.len() <= timezone_storage.len() => {
+                        timezone_storage[..entry.len()].copy_from_slice(entry.as_bytes());
+                        entry.len()
+                    }
+                    _ => 0,
+                }
+            };
+            let session_environment =
+                match core::str::from_utf8(&timezone_storage[..timezone_bytes]) {
+                    Ok(entry) if timezone_bytes != 0 => {
+                        command::conventional_environment_with_timezone(entry)
+                    }
+                    _ => command::CONVENTIONAL_ENVIRONMENT,
+                };
             let services = (|| -> Result<Vec<CommandStartupService>, ()> {
                 let mut services = Vec::new();
                 services.try_reserve_exact(service_count).map_err(|_| ())?;
@@ -14734,7 +14873,7 @@ mod firmware {
                         CommandInvocationService::new_with_environment(
                             cwd,
                             words,
-                            &command::CONVENTIONAL_ENVIRONMENT,
+                            &session_environment,
                         )
                         .map_err(|_| ())?,
                     )?,

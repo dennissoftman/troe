@@ -74,6 +74,8 @@ EXT4_BLOCKS_PER_GROUP = 32_768
 EXT4_INODES_PER_GROUP = 4096
 EXT4_FIRST_NON_RESERVED_INODE = 11
 EXT4_ROOT_INODE = 2
+# Directory a booted system creates on the root volume and presents at /config.
+RUNTIME_CONFIGURATION_DIRECTORY = "config"
 EXT4_JOURNAL_INODE = 8
 # The internal journal length is a pinned decision, not an mke2fs default. It
 # is the smallest journal mke2fs accepts at this block size and still holds
@@ -1047,6 +1049,9 @@ class _Ext4ProfileVerifier:
 
     def _verify_inodes_and_extents(self) -> None:
         fake_time = int(FAKE_TIME)
+        # The exemption cannot be computed yet: inode_records is populated by
+        # this very loop, so offenders are collected and judged after it.
+        nondeterministic: set[int] = set()
         directory_counts = [0] * self.groups
         for number in range(1, self.inodes + 1):
             raw = self._raw_inode(number)
@@ -1084,7 +1089,7 @@ class _Ext4ProfileVerifier:
                 _read_integer(raw, offset, 4) != fake_time
                 for offset in (8, 12, 16, 144)
             ):
-                raise ValueError("ext4 inode timestamps are not deterministic")
+                nondeterministic.add(number)
             size = _read_integer(raw, 4, 4) | (_read_integer(raw, 108, 4) << 32)
             if (
                 kind == "file"
@@ -1112,6 +1117,8 @@ class _Ext4ProfileVerifier:
             )
         if len(self.inode_records) > EXT4_MAX_ACTIVE_INODES:
             raise ValueError("ext4 image exceeds the active-inode mount ceiling")
+        if nondeterministic:
+            raise ValueError("ext4 inode timestamps are not deterministic")
         for group, count in enumerate(directory_counts):
             if count != self.group_records[group].used_directories:
                 raise ValueError("ext4 used-directory counter is inconsistent")
@@ -1261,9 +1268,11 @@ class _Ext4ProfileVerifier:
                 "hello.txt": "file",
                 "lost+found": "directory",
                 "nested": "directory",
+                RUNTIME_CONFIGURATION_DIRECTORY: "directory",
             },
             "/lost+found": {},
             "/nested": {"state.txt": "file"},
+            f"/{RUNTIME_CONFIGURATION_DIRECTORY}": {},
         }
         if self.content is not None:
             expected_children["/"]["system.cspk"] = "file"
@@ -1332,6 +1341,13 @@ def create_ext4(
         source = root / "source"
         nested = source / "nested"
         nested.mkdir(parents=True)
+        # The system presents this directory at /config and creates it on first
+        # writable boot when it is absent. Shipping it here keeps a booted
+        # fixture byte-identical to the built one, so the reproducibility this
+        # verifier asserts is not spent on a directory the system will make
+        # anyway.
+        configuration = source / RUNTIME_CONFIGURATION_DIRECTORY
+        configuration.mkdir()
         (source / "hello.txt").write_bytes(b"native ext4 mount\n")
         (nested / "state.txt").write_bytes(b"read-only activation complete\n")
         if content is not None:
@@ -1340,7 +1356,7 @@ def create_ext4(
         paths = [source / "hello.txt", nested / "state.txt"]
         if content is not None:
             paths.append(source / "system.cspk")
-        paths.extend((nested, source))
+        paths.extend((nested, configuration, source))
         for path in paths:
             os.utime(path, (timestamp, timestamp))
 

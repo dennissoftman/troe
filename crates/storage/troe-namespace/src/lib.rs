@@ -101,11 +101,26 @@ struct ProviderMount {
     writable: bool,
 }
 
+/// One path presenting a subtree of another mount's provider.
+///
+/// A path in this namespace names an access point rather than a place bytes
+/// live, so more than one path can lead to the same provider. An alias owns no
+/// storage: it rewrites a lookup onto its target and disappears, which is why
+/// resolution hands back the target's own index and every provider call site
+/// stays unaware that aliases exist.
+#[derive(Debug)]
+struct MountAlias {
+    path: String,
+    target: usize,
+    prefix: String,
+}
+
 /// Immutable composed nodes plus the mounted providers layered over them.
 #[derive(Debug)]
 pub struct Namespace {
     nodes: BTreeMap<String, Node>,
     mounts: Vec<ProviderMount>,
+    aliases: Vec<MountAlias>,
     command_revision: u64,
     system_config_generation: u64,
     wall_clock: Option<Rc<dyn WallClock>>,
@@ -134,6 +149,7 @@ impl Namespace {
         Self {
             nodes,
             mounts: Vec::new(),
+            aliases: Vec::new(),
             command_revision: 0,
             system_config_generation: 0,
             wall_clock: None,
@@ -556,6 +572,65 @@ impl Namespace {
             }),
             None => Err(FsError::NotFound),
         }
+    }
+
+    /// Present an existing mount's subtree at a second path.
+    ///
+    /// A path here names an access point, not a place bytes live, so one
+    /// provider can answer at more than one path. `target` names a mounted
+    /// provider and `prefix` selects the subtree of it this path exposes;
+    /// `/config` presenting the configuration subtree of the state store is
+    /// the first use, and a future `/bin` presenting the active package
+    /// generation is the same shape.
+    ///
+    /// An alias owns no storage and grants no authority of its own: a lookup
+    /// through it reaches the target's own mount record, so it can neither
+    /// widen the target's access nor outlive it.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a path that is already mounted or aliased, a target that is not
+    /// a mounted provider, an alias of an alias, a non-canonical path or
+    /// prefix, and the reserved active-configuration paths.
+    pub fn mount_alias(&mut self, path: &str, target: &str, prefix: &str) -> Result<(), FsError> {
+        let path = canonicalize("/", path)?;
+        let target = canonicalize("/", target)?;
+        // The prefix names a path inside the target provider, not in this
+        // namespace, so it is checked for shape rather than resolved here.
+        if !prefix.starts_with('/') || prefix.contains("//") || prefix.contains("/..") {
+            return Err(FsError::Invalid);
+        }
+        if is_active_configuration_path(&path) {
+            return Err(FsError::ReadOnly);
+        }
+        if path == "/" || self.mount_for_path(&path).is_some() {
+            return Err(FsError::Exists);
+        }
+        let Some(index) = self.mounts.iter().position(|mount| mount.path == target) else {
+            return Err(FsError::NotFound);
+        };
+        // The subtree the alias exposes is expressed relative to the target's
+        // own root, and a bare "/" would alias the whole provider, which is a
+        // second name for the same mount rather than a subtree of it.
+        let prefix = prefix.trim_end_matches('/').to_string();
+        if prefix.is_empty() {
+            return Err(FsError::Invalid);
+        }
+        let mut prefix = prefix;
+        prefix.shrink_to_fit();
+        let mut aliases = core::mem::take(&mut self.aliases);
+        if aliases.try_reserve_exact(1).is_err() {
+            self.aliases = aliases;
+            return Err(FsError::NoSpace);
+        }
+        aliases.push(MountAlias {
+            path,
+            target: index,
+            prefix,
+        });
+        self.aliases = aliases;
+        self.bump_command_revision();
+        Ok(())
     }
 
     fn mount_provider(
@@ -1361,7 +1436,7 @@ impl Namespace {
     }
 
     fn mount_for_path(&self, path: &str) -> Option<(usize, String)> {
-        self.mounts.iter().enumerate().find_map(|(index, mount)| {
+        let owned = self.mounts.iter().enumerate().find_map(|(index, mount)| {
             if path == mount.path {
                 Some((index, "/".to_string()))
             } else {
@@ -1369,6 +1444,28 @@ impl Namespace {
                     .filter(|suffix| suffix.starts_with('/'))
                     .map(|suffix| (index, suffix.to_string()))
             }
+        });
+        if owned.is_some() {
+            return owned;
+        }
+        // An alias resolves to its target's own index, so every caller reaches
+        // the provider exactly as it would through the target's own path and
+        // inherits that mount's access. One hop is enough because an alias may
+        // not name another alias.
+        self.aliases.iter().find_map(|alias| {
+            let relative = if path == alias.path {
+                String::new()
+            } else {
+                path.strip_prefix(&alias.path)
+                    .filter(|suffix| suffix.starts_with('/'))?
+                    .to_string()
+            };
+            let mut resolved = alias.prefix.clone();
+            resolved.push_str(&relative);
+            if resolved.is_empty() {
+                resolved.push('/');
+            }
+            Some((alias.target, resolved))
         })
     }
 }
@@ -1874,6 +1971,74 @@ mod tests {
         assert_eq!(canonicalize("/a/b", "../../../../c"), Ok("/c".into()));
         assert_eq!(canonicalize("/", "//a/./b/../c"), Ok("/a/c".into()));
         assert_eq!(canonicalize("/", "bad\0name"), Err(FsError::Invalid));
+    }
+
+    #[test]
+    fn an_alias_reaches_the_same_bytes_through_a_second_path() -> Result<(), FsError> {
+        let mut namespace = writable_namespace();
+        namespace.add_read_only_dir("/vol")?;
+        namespace.mount_writable("/vol/state", Box::new(RamFs::new(RamFsQuota::default())))?;
+        namespace.create_directory("/", "/vol/state/config")?;
+        namespace.mount_alias("/config", "/vol/state", "/config")?;
+
+        // A write through the alias is a write to the target's own storage.
+        namespace.write_file("/", "/config/timezone", b"XYZ-7")?;
+        assert_eq!(
+            namespace.read_file("/", "/vol/state/config/timezone")?,
+            b"XYZ-7".to_vec()
+        );
+        // And the same bytes read back through either path.
+        assert_eq!(
+            namespace.read_file("/", "/config/timezone")?,
+            b"XYZ-7".to_vec()
+        );
+
+        // The alias exposes only its subtree: the target's other entries are
+        // not reachable through it, so it names an access point rather than a
+        // second root.
+        namespace.write_file("/", "/vol/state/elsewhere", b"private")?;
+        assert_eq!(
+            namespace.read_file("/", "/config/elsewhere"),
+            Err(FsError::NotFound)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_alias_refuses_what_would_make_it_a_second_root_or_a_chain() {
+        let mut namespace = writable_namespace();
+        assert_eq!(namespace.add_read_only_dir("/vol"), Ok(()));
+        assert_eq!(
+            namespace.mount_writable("/vol/state", Box::new(RamFs::new(RamFsQuota::default()))),
+            Ok(())
+        );
+        // A target that is not mounted, and a prefix naming the whole provider
+        // rather than a subtree of it.
+        assert_eq!(
+            namespace.mount_alias("/config", "/vol/absent", "/config"),
+            Err(FsError::NotFound)
+        );
+        assert_eq!(
+            namespace.mount_alias("/config", "/vol/state", "/"),
+            Err(FsError::Invalid)
+        );
+        assert_eq!(
+            namespace.mount_alias("/config", "/vol/state", "/config"),
+            Ok(())
+        );
+        // A path already mounted or aliased, and an alias of an alias.
+        assert_eq!(
+            namespace.mount_alias("/config", "/vol/state", "/other"),
+            Err(FsError::Exists)
+        );
+        assert_eq!(
+            namespace.mount_alias("/second", "/config", "/config"),
+            Err(FsError::NotFound)
+        );
+        assert_eq!(
+            namespace.mount_alias("/vol/state", "/vol/state", "/config"),
+            Err(FsError::Exists)
+        );
     }
 
     #[test]

@@ -1057,6 +1057,38 @@ pub mod command {
         // an absent `TZ` as a special case. See ADR 0067.
         "TZ=UTC0",
     ];
+    /// Name of the conventional entry carrying the POSIX zone string.
+    pub const TIMEZONE_NAME: &str = "TZ";
+
+    /// The conventional entries with `TZ` replaced by one supplied entry.
+    ///
+    /// A launcher that resolves a zone from configuration substitutes it here
+    /// rather than restating the other conventional names, so the list keeps
+    /// the single definition ADR 0054 gave it. `entry` is a complete
+    /// `TZ=VALUE` string whose value the caller has already validated. An
+    /// entry that does not name `TZ` leaves the list unchanged, because
+    /// silently renaming a caller's entry would be worse than ignoring it.
+    #[must_use]
+    pub fn conventional_environment_with_timezone(
+        entry: &str,
+    ) -> [&str; CONVENTIONAL_ENVIRONMENT.len()] {
+        let mut composed = CONVENTIONAL_ENVIRONMENT;
+        if entry
+            .split_once('=')
+            .is_some_and(|(name, _)| name == TIMEZONE_NAME)
+        {
+            for slot in &mut composed {
+                if slot
+                    .split_once('=')
+                    .is_some_and(|(name, _)| name == TIMEZONE_NAME)
+                {
+                    *slot = entry;
+                }
+            }
+        }
+        composed
+    }
+
     /// Maximum launch-environment entries.
     pub const MAX_ENVIRONMENT: usize = 128;
     /// Maximum aggregate UTF-8 environment bytes.
@@ -2268,6 +2300,26 @@ pub mod timezone {
         parse(input.as_bytes())
     }
 
+    /// Validate the bytes of a configured zone file and return the zone string.
+    ///
+    /// A configuration file is written by an operator with a text editor or a
+    /// shell redirection, so one trailing newline is expected rather than an
+    /// error. Nothing else is trimmed: interior or leading whitespace is not a
+    /// zone, and accepting it would make two files that look different mean the
+    /// same thing. See ADR 0068.
+    ///
+    /// # Errors
+    ///
+    /// Reports the same refusals as [`parse`], plus [`ParseError::Malformed`]
+    /// for bytes that are not UTF-8.
+    pub fn parse_configuration(bytes: &[u8]) -> Result<&str, ParseError> {
+        let text = core::str::from_utf8(bytes).map_err(|_| ParseError::Malformed)?;
+        let text = text.strip_suffix('\n').unwrap_or(text);
+        let text = text.strip_suffix('\r').unwrap_or(text);
+        parse(text.as_bytes())?;
+        Ok(text)
+    }
+
     #[cfg(test)]
     mod tests {
         use super::{ParseError, RuleDay, parse, parse_str};
@@ -2348,6 +2400,39 @@ pub mod timezone {
             assert_eq!(
                 parse_str("XXX0YYY,M1.1.0/168,M2.1.0"),
                 Err(ParseError::Offset)
+            );
+        }
+
+        #[test]
+        fn a_configuration_file_accepts_one_trailing_newline_and_nothing_else() {
+            use super::parse_configuration;
+            let zone = "EST5EDT,M3.2.0,M11.1.0";
+            for text in [
+                "EST5EDT,M3.2.0,M11.1.0",
+                "EST5EDT,M3.2.0,M11.1.0\n",
+                "EST5EDT,M3.2.0,M11.1.0\r\n",
+            ] {
+                assert_eq!(parse_configuration(text.as_bytes()), Ok(zone), "{text:?}");
+            }
+            // Leading or interior whitespace is not part of a zone, and a file
+            // holding two lines is not one zone.
+            for text in [
+                " UTC0",
+                "UTC0 ",
+                "UTC0\n\n",
+                "UTC0\nEST5EDT,M3.2.0,M11.1.0\n",
+            ] {
+                assert!(parse_configuration(text.as_bytes()).is_err(), "{text:?}");
+            }
+            assert_eq!(parse_configuration(b""), Err(ParseError::Malformed));
+            assert_eq!(parse_configuration(b"\n"), Err(ParseError::Malformed));
+            assert_eq!(
+                parse_configuration(&[0xff, 0xfe]),
+                Err(ParseError::Malformed)
+            );
+            assert_eq!(
+                parse_configuration(b":America/New_York"),
+                Err(ParseError::DatabaseForm)
             );
         }
 
@@ -6597,6 +6682,46 @@ pub mod tcp_connect {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn substituting_the_zone_leaves_every_other_conventional_name() {
+        use super::command::{
+            CONVENTIONAL_ENVIRONMENT, TIMEZONE_NAME, conventional_environment_with_timezone,
+        };
+        let composed = conventional_environment_with_timezone("TZ=EST5EDT,M3.2.0,M11.1.0");
+        assert_eq!(composed.len(), CONVENTIONAL_ENVIRONMENT.len());
+        assert!(composed.contains(&"TZ=EST5EDT,M3.2.0,M11.1.0"));
+        // Exactly one entry names TZ, so the canonical encoding boundary, which
+        // refuses a duplicate name, still accepts the composed result.
+        assert_eq!(
+            composed
+                .iter()
+                .filter(|entry| entry.starts_with("TZ="))
+                .count(),
+            1
+        );
+        for conventional in CONVENTIONAL_ENVIRONMENT {
+            let named_tz = conventional.starts_with("TZ=");
+            assert_eq!(
+                composed.contains(&conventional),
+                !named_tz,
+                "{conventional}"
+            );
+        }
+        assert_eq!(TIMEZONE_NAME, "TZ");
+    }
+
+    #[test]
+    fn an_entry_that_does_not_name_the_zone_changes_nothing() {
+        use super::command::{CONVENTIONAL_ENVIRONMENT, conventional_environment_with_timezone};
+        for entry in ["HOME=/elsewhere", "TZX=UTC0", "no-equals", "", "=UTC0"] {
+            assert_eq!(
+                conventional_environment_with_timezone(entry),
+                CONVENTIONAL_ENVIRONMENT,
+                "{entry}"
+            );
+        }
+    }
+
     use super::{
         MAX_MESSAGE_BYTES, command, datagram, diagnostics, filesystem, filesystem_mutation,
         icmp_echo, interface, network_observation, pipe, private_memory, process_launch,
