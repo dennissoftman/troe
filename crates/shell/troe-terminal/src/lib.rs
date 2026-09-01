@@ -1128,6 +1128,9 @@ pub enum SurfaceError {
     Overflow,
 }
 
+/// Bytes occupied by one 32-bit framebuffer pixel.
+pub const FRAMEBUFFER_BYTES_PER_PIXEL: usize = 4;
+
 /// Supported 32-bit framebuffer channel order.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FramebufferPixelFormat {
@@ -1204,7 +1207,7 @@ impl FramebufferDescriptor {
         }
         let required = stride
             .checked_mul(height)
-            .and_then(|pixels| pixels.checked_mul(4))
+            .and_then(|pixels| pixels.checked_mul(FRAMEBUFFER_BYTES_PER_PIXEL))
             .ok_or(FramebufferDescriptorError::Overflow)?;
         if required > byte_len {
             return Err(FramebufferDescriptorError::TooSmall);
@@ -1303,6 +1306,34 @@ pub trait PixelSurface {
     ///
     /// Returns a typed surface failure without writing outside the surface.
     fn write_pixel(&mut self, x: usize, y: usize, color: Color) -> Result<(), SurfaceError>;
+
+    /// Move the top `height` pixel rows up by `distance` and clear the band the
+    /// move vacates, across the full surface width.
+    ///
+    /// A text console scrolls by one cell row for every line past the bottom of
+    /// the screen. Redrawing every glyph instead costs one `write_pixel` per
+    /// pixel of the whole grid, which on a framebuffer is four volatile byte
+    /// writes each; a surface that can move its own memory in bulk does the
+    /// same work in a handful of wide copies.
+    ///
+    /// A `distance` of zero leaves the surface untouched. A `distance` at least
+    /// as large as `height` erases the whole band rather than failing, because
+    /// scrolling everything off the top is a defined outcome and not an error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SurfaceError::Unsupported`] when the surface cannot move
+    /// pixels, which asks the caller to redraw the affected rows instead.
+    /// Returns a typed failure without addressing outside the surface.
+    fn scroll_up(
+        &mut self,
+        height: usize,
+        distance: usize,
+        background: Color,
+    ) -> Result<(), SurfaceError> {
+        let _ = (height, distance, background);
+        Err(SurfaceError::Unsupported)
+    }
 
     /// Fill a checked rectangle.
     ///
@@ -1641,7 +1672,17 @@ impl<S: PixelSurface> TextConsole<S> {
         let last_row = (self.rows - 1) * self.columns;
         self.cells[last_row..].fill(' ');
         self.row = self.rows - 1;
-        self.redraw_all()
+        // Only the cell grid moves. A surface taller than `rows * CELL_HEIGHT`
+        // keeps the remainder band untouched, exactly as a redraw would.
+        match self.surface.scroll_up(
+            self.rows * CELL_HEIGHT,
+            CELL_HEIGHT,
+            self.config.background(),
+        ) {
+            Ok(()) => Ok(()),
+            Err(SurfaceError::Unsupported) => self.redraw_all(),
+            Err(error) => Err(error),
+        }
     }
 
     fn clear(&mut self) -> Result<(), SurfaceError> {
@@ -1817,6 +1858,7 @@ mod tests {
         width: usize,
         height: usize,
         pixels: Vec<Color>,
+        writes: usize,
     }
 
     impl MemorySurface {
@@ -1825,6 +1867,7 @@ mod tests {
                 width,
                 height,
                 pixels: vec![Color::new(0, 0, 0); width * height],
+                writes: 0,
             }
         }
     }
@@ -1838,8 +1881,125 @@ mod tests {
             if x >= self.width || y >= self.height {
                 return Err(SurfaceError::Bounds);
             }
+            self.writes += 1;
             self.pixels[y * self.width + x] = color;
             Ok(())
+        }
+
+        fn scroll_up(
+            &mut self,
+            height: usize,
+            distance: usize,
+            background: Color,
+        ) -> Result<(), SurfaceError> {
+            if distance == 0 {
+                return Ok(());
+            }
+            if height > self.height {
+                return Err(SurfaceError::Bounds);
+            }
+            let moved_rows = height.saturating_sub(distance);
+            if moved_rows != 0 {
+                self.pixels
+                    .copy_within(distance * self.width..height * self.width, 0);
+            }
+            for row in moved_rows..height {
+                for column in 0..self.width {
+                    self.pixels[row * self.width + column] = background;
+                }
+            }
+            Ok(())
+        }
+    }
+
+    /// A surface that cannot move its own pixels, so the console must redraw.
+    struct RedrawOnlySurface(MemorySurface);
+
+    /// Feed identical text through both scroll paths and compare every pixel.
+    ///
+    /// The bulk move is only a valid optimization if it is indistinguishable
+    /// from redrawing the grid, so the test compares the rendered surfaces
+    /// rather than asserting the move happened.
+    #[test]
+    fn a_bulk_scroll_renders_exactly_what_a_redraw_would() {
+        const WIDTH: usize = 60;
+        const HEIGHT: usize = 40;
+        // Enough lines to scroll the grid several times over.
+        let text = b"the quick brown fox 0123\njumps over 456\nlazy dogs +-*=\n\n                     wrapping a much longer line than the grid is wide\n789\n";
+
+        let mut moved = TextConsole::new(
+            MemorySurface::new(WIDTH, HEIGHT),
+            TextConsoleConfig::standard(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        let mut redrawn = TextConsole::new(
+            RedrawOnlySurface(MemorySurface::new(WIDTH, HEIGHT)),
+            TextConsoleConfig::standard(),
+        )
+        .unwrap_or_else(|_| std::process::abort());
+        for _ in 0..6 {
+            for byte in text {
+                moved
+                    .push_byte(*byte)
+                    .unwrap_or_else(|_| std::process::abort());
+                redrawn
+                    .push_byte(*byte)
+                    .unwrap_or_else(|_| std::process::abort());
+            }
+        }
+
+        let moved_surface = moved.into_surface();
+        let redrawn_surface = redrawn.into_surface().0;
+        assert_eq!(
+            moved_surface.pixels, redrawn_surface.pixels,
+            "bulk scroll and redraw must be pixel-identical"
+        );
+        // The point of the move is cost. Redrawing writes at least one pixel
+        // per cell of the whole grid on every scrolled line; the move writes
+        // only the band it clears.
+        assert!(
+            moved_surface.writes * 4 < redrawn_surface.writes,
+            "expected the bulk move to cut pixel writes several-fold, got {} against {}",
+            moved_surface.writes,
+            redrawn_surface.writes
+        );
+    }
+
+    /// A move at least as tall as the band is an erase, not a failure, and a
+    /// zero move leaves the surface untouched.
+    #[test]
+    fn degenerate_scroll_distances_are_defined() {
+        let mut surface = MemorySurface::new(8, 4);
+        let ink = Color::new(9, 9, 9);
+        for y in 0..4 {
+            for x in 0..8 {
+                surface
+                    .write_pixel(x, y, ink)
+                    .unwrap_or_else(|_| std::process::abort());
+            }
+        }
+        let background = Color::new(0, 0, 0);
+        surface
+            .scroll_up(4, 0, background)
+            .unwrap_or_else(|_| std::process::abort());
+        assert!(surface.pixels.iter().all(|pixel| *pixel == ink));
+        surface
+            .scroll_up(4, 9, background)
+            .unwrap_or_else(|_| std::process::abort());
+        assert!(surface.pixels.iter().all(|pixel| *pixel == background));
+        assert_eq!(
+            surface.scroll_up(5, 1, background),
+            Err(SurfaceError::Bounds)
+        );
+    }
+
+    impl PixelSurface for RedrawOnlySurface {
+        fn dimensions(&self) -> (usize, usize) {
+            self.0.dimensions()
+        }
+
+        fn write_pixel(&mut self, x: usize, y: usize, color: Color) -> Result<(), SurfaceError> {
+            self.0.write_pixel(x, y, color)
         }
     }
 
