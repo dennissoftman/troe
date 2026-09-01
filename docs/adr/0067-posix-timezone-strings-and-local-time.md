@@ -195,9 +195,10 @@ is the compiled `UTC0`. This is a consequence of the capability model rather
 than of this decision, but it means the one command an operator would reach for
 cannot yet show a local time, and it will stay that way until either a
 configured session zone lands or `spawn` is given the authority to delegate.
-Acceptance pins the refusal so the boundary is stated rather than discovered,
-and [issue #148](https://github.com/dennissoftman/troe/issues/148) tracks
-closing it.
+Acceptance pins the refusal so the boundary is stated rather than discovered.
+[ADR 0068](0068-operator-configured-session-timezone.md) closed the gap by
+giving the session a configured zone, so `date` reports whatever an operator
+set rather than only UTC; the refusal through `spawn` is unchanged.
 
 The limitation this tier keeps is that a POSIX string applies today's rules to
 every instant, so a timestamp before the zone's last rule change renders with

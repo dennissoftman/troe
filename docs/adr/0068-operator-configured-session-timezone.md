@@ -1,9 +1,7 @@
 # ADR 0068: operator-configured session timezone
 
-Status: proposed implementation contract, 2026-09-01. Nothing in this ADR is
-implemented or accepted merely because the document exists. Acceptance requires
-every gate below. Completes the configuration source ADR 0067 deliberately left
-open, and resolves
+Status: accepted and implemented, 2026-09-01. Completes the configuration
+source ADR 0067 deliberately left open, and resolves
 [issue #148](https://github.com/dennissoftman/troe/issues/148).
 
 ## Context
@@ -77,8 +75,6 @@ generation control, the projection is the place for it, and `/config/timezone`
 remains the desired-state input that feeds it.
 
 ## Verification and acceptance
-
-This ADR is not accepted until all of the following hold.
 
 - Portable tests cover a valid file, a file with a trailing newline, an
   over-long file, a file that does not parse, an empty file, and an absent file,

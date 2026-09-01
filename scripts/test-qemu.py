@@ -65,6 +65,12 @@ CPYTHON_DIAGNOSTICS_TREE = (
     REPO_ROOT / "build" / "cpython-diagnostics" / "cpython-diagnostics" / "v1"
 )
 CPYTHON_FIXTURES = REPO_ROOT / "tests" / "fixtures" / "cpython"
+# A fixed-offset zone with no daylight rules, so its rendering is a property of
+# the zone rather than of the instant the acceptance happens to run at.
+SESSION_TIMEZONE_FILE = "/config/timezone"
+SESSION_TIMEZONE_VALUE = "XYZ-7"
+SESSION_TIMEZONE_ABBREVIATION = "XYZ"
+SESSION_TIMEZONE_OFFSET = "+0700"
 SHARED_BIN = "/vol/shared/bin"
 CPYTHON_SHARED_BIN = SHARED_BIN
 CPYTHON_SHARED_LIB = "/vol/shared/lib"
@@ -1426,6 +1432,29 @@ def run_shell_terminal_group(session: SerialSession, command_timeout: float) -> 
         cwd,
         max(command_timeout, 30.0),
         contains=("date - print the wall-clock time", "There is no timezone"),
+    )
+    # ADR 0068 resolves the zone once, when the session starts. Writing it here
+    # must therefore not change this session: an edit to desired state takes
+    # effect at the next boot, which is what ADR 0043 requires of `/config`.
+    # The reboot scenario reads it back, which is what proves it persisted.
+    session.command(
+        f"printf {SESSION_TIMEZONE_VALUE} > {SESSION_TIMEZONE_FILE}",
+        cwd,
+        command_timeout,
+        contains=("",),
+    )
+    session.command(
+        f"cat {SESSION_TIMEZONE_FILE}",
+        cwd,
+        command_timeout,
+        contains=(SESSION_TIMEZONE_VALUE,),
+    )
+    session.command(
+        "date +%Z",
+        cwd,
+        command_timeout,
+        contains=("UTC\n",),
+        absent=(SESSION_TIMEZONE_ABBREVIATION,),
     )
     session.command(
         "ps",
@@ -3366,6 +3395,16 @@ def run_reboot_scenario(
             contains=(MUTABLE_ROOT_CONTENT,),
         )
         session.command(f"rm {MUTABLE_ROOT_FILE}", "/", command_timeout)
+    if verify_mutable_root:
+        # The zone written before the reboot is now the session's, which proves
+        # both that it persisted and that it is resolved at session start.
+        session.command(
+            "date +%Z%z",
+            "/",
+            command_timeout,
+            contains=(f"{SESSION_TIMEZONE_ABBREVIATION}{SESSION_TIMEZONE_OFFSET}\n",),
+        )
+        session.command(f"rm {SESSION_TIMEZONE_FILE}", "/", command_timeout)
     if verify_shared_media:
         session.command(
             f"cat {SHARED_FILE}",

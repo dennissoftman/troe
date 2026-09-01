@@ -50,7 +50,7 @@ remain available in Git history rather than in current documentation.
 | Proposed layered input events and editor-intent split | [ADR 0065](adr/0065-layered-input-events-and-editor-intent.md) |
 | Proposed pointer and AArch64 keyboard transports | [ADR 0066](adr/0066-pointer-and-aarch64-keyboard-transports.md) |
 | POSIX timezone strings and local time | [ADR 0067](adr/0067-posix-timezone-strings-and-local-time.md) |
-| Proposed operator-configured session timezone | [ADR 0068](adr/0068-operator-configured-session-timezone.md) |
+| Operator-configured session timezone | [ADR 0068](adr/0068-operator-configured-session-timezone.md) |
 
 The current serialized contracts are versioned independently under
 [`formats/`](formats):

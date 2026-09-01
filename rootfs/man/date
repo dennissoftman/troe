@@ -18,10 +18,20 @@ DESCRIPTION
     and historical transitions before the zone's current rules are not
     represented. -u reports UTC regardless of TZ.
 
-    The zone is the one the session supplies. It cannot be narrowed per command
-    through spawn: a child's capabilities must attenuate its launcher's, and
-    spawn holds no wall-clock authority to pass on, so spawn refuses the launch
-    rather than starting date without a clock.
+    The zone is the one the session supplies. Set it by writing one POSIX zone
+    string to /config/timezone and rebooting:
+
+        printf 'CET-1CEST,M3.5.0,M10.5.0/3' > /config/timezone
+
+    The session reads that file once when it starts, so an edit takes effect at
+    the next boot rather than changing processes that are already running. A
+    file that does not parse is reported on the boot diagnostic and the session
+    falls back to UTC. With no file the zone is UTC.
+
+    The zone cannot be narrowed per command through spawn: a child's
+    capabilities must attenuate its launcher's, and spawn holds no wall-clock
+    authority to pass on, so spawn refuses the launch rather than starting date
+    without a clock.
 
     +FORMAT selects the C-locale conversions the runtime supports, including
     %Y %m %d %H %M %S %a %A %b %B %j %Z %z and %%. %Z writes the zone
