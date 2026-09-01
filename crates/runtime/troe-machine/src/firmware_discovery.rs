@@ -477,13 +477,17 @@ fn validate_aarch64(
         .timer()
         .and_then(|timer| timer.interrupts().nth(1))
         .ok_or(DiscoveryError::ArmTimer)?;
+    // The PPI CPU mask names the version 2 CPU interfaces a private interrupt
+    // reaches. Version 3 has no such interface and routes by affinity through
+    // the redistributor, so the field is unused there and firmware that filled
+    // it in would be describing a route this controller cannot take.
     if !gic_interrupt_matches(
         physical_timer,
         timer_route.line(),
         timer_route.trigger(),
         timer_route.polarity(),
         InterruptKind::Ppi,
-    ) || physical_timer.ppi_cpu_mask() & 1 == 0
+    ) || physical_timer.ppi_cpu_mask() != 0
     {
         return Err(DiscoveryError::ArmTimer);
     }
