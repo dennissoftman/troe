@@ -71,6 +71,7 @@ STDIN_APPS = frozenset((
 LOW_LEVEL_PACKAGES = frozenset(
     (
         "troe-block",
+        "troe-console",
         "troe-driver",
         "troe-machine",
         "troe-memory",
@@ -90,6 +91,7 @@ PACKAGE_SCENARIOS = {
     "troe-fmt-scfg": {"boot", "filesystem", "persistence"},
     "troe-fmt-cspk": {"boot", "filesystem", "persistence"},
     "troe-checksum": {"boot", "filesystem", "persistence"},
+    "troe-console": {"boot", "shell-terminal", "framebuffer-keyboard"},
     "troe-core": {"boot", "shell-terminal"},
     "troe-dispatch": set(ALL_QEMU_SCENARIOS),
     "troe-driver": {"boot", "network", "filesystem"},

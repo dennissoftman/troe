@@ -17,6 +17,7 @@ platform-x86_64-uefi-virtio-pci = ["troe-machine/platform-x86_64-uefi-virtio-pci
 troe-abi = { path = "../crates/common/troe-abi" }
 troe-application = { path = "../crates/runtime/troe-application" }
 troe-block = { path = "../crates/device/troe-block" }
+troe-console = { path = "../crates/device/troe-console" }
 troe-fmt-scfg = { path = "../crates/storage/troe-fmt-scfg" }
 troe-fmt-cspk = { path = "../crates/storage/troe-fmt-cspk" }
 troe-core = { path = "../crates/common/troe-core" }
@@ -37,7 +38,7 @@ troe-volume = { path = "../crates/storage/troe-volume" }
 troe-supervisor = { path = "../crates/runtime/troe-supervisor" }
 troe-fs-statefs = { path = "../crates/storage/troe-fs-statefs" }
 troe-task = { path = "../crates/runtime/troe-task" }
-troe-terminal = { path = "../crates/shell/troe-terminal" }
+troe-terminal = { path = "../crates/device/troe-terminal" }
 troe-namespace = { path = "../crates/storage/troe-namespace" }
 troe-fs-ext4 = { path = "../crates/storage/troe-fs-ext4" }
 troe-fs-fat = { path = "../crates/storage/troe-fs-fat" }

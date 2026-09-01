@@ -281,8 +281,11 @@ Persistent services are tracked in
 [GitHub issue #8](https://github.com/dennissoftman/troe/issues/8).
 
 `troe-terminal` keeps transport-independent input
-decoding, line editing, history, and fixed-glyph text rendering outside the
-machine mechanism. `troe-shell` owns completion orchestration because it has
+decoding, line editing, and history outside the machine mechanism, and
+`troe-console` keeps the framebuffer descriptor, pixel encoding, pixel surface,
+and fixed-glyph text rendering there as well. Both are device-domain crates.
+The machine mechanism links only `troe-console`; the composition root links
+both. `troe-shell` owns completion orchestration because it has
 the VFS namespace and its revision-aware `/bin` catalog; both command candidates
 and directory listings are returned under caller-selected count and byte
 budgets. `troe-completion` validates and evaluates bounded package-owned CMPL
