@@ -12,7 +12,9 @@ use core::cell::UnsafeCell;
 use core::fmt;
 use core::hint::spin_loop;
 use core::ptr;
-use core::sync::atomic::{AtomicUsize, Ordering, compiler_fence, fence};
+use core::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(target_arch = "x86_64")]
+use core::sync::atomic::{compiler_fence, fence};
 
 use troe_block::BlockError;
 use troe_memory::{BASE_PAGE_SIZE, PhysicalRange};
@@ -1803,11 +1805,29 @@ fn mmio_write_u64(address: usize, value: u64) {
     unsafe { ptr::write_volatile(address as *mut u64, value) };
 }
 
+#[cfg(target_arch = "aarch64")]
+fn dma_publish() {
+    // SAFETY: `dmb oshst` orders normal-memory queue and payload writes before
+    // the following device notification in the outer-shareable domain. A
+    // `SeqCst` fence would emit `dmb ish`, which orders nothing against a
+    // device outside the inner-shareable domain.
+    unsafe { core::arch::asm!("dmb oshst", options(nostack, preserves_flags)) };
+}
+
+#[cfg(target_arch = "aarch64")]
+fn dma_observe() {
+    // SAFETY: `dmb oshld` orders the observed used index before subsequent
+    // normal-memory reads of device-written ring, status, and payload bytes.
+    unsafe { core::arch::asm!("dmb oshld", options(nostack, preserves_flags)) };
+}
+
+#[cfg(target_arch = "x86_64")]
 fn dma_publish() {
     compiler_fence(Ordering::Release);
     fence(Ordering::SeqCst);
 }
 
+#[cfg(target_arch = "x86_64")]
 fn dma_observe() {
     fence(Ordering::SeqCst);
     compiler_fence(Ordering::Acquire);
