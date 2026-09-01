@@ -42,7 +42,9 @@ use troe_memory::PhysicalRange;
 #[cfg(target_os = "uefi")]
 use troe_task::TaskStep;
 #[cfg(target_os = "uefi")]
-use troe_terminal::{Color, FramebufferDescriptor, PixelSurface, SurfaceError};
+use troe_terminal::{
+    Color, FRAMEBUFFER_BYTES_PER_PIXEL, FramebufferDescriptor, PixelSurface, SurfaceError,
+};
 #[cfg(target_os = "uefi")]
 use uefi::mem::memory_map::MemoryMapOwned;
 
@@ -593,6 +595,56 @@ impl PixelSurface for OwnedFramebuffer {
             unsafe { ptr::write_volatile(address as *mut u8, byte) };
         }
         Ok(())
+    }
+
+    fn scroll_up(
+        &mut self,
+        height: usize,
+        distance: usize,
+        background: Color,
+    ) -> Result<(), SurfaceError> {
+        if distance == 0 {
+            return Ok(());
+        }
+        if height > self.descriptor.height() {
+            return Err(SurfaceError::Bounds);
+        }
+        let scanline = self
+            .descriptor
+            .stride()
+            .checked_mul(FRAMEBUFFER_BYTES_PER_PIXEL)
+            .ok_or(SurfaceError::Overflow)?;
+        // A move past the band is an erase of the whole band, not an error.
+        let moved_rows = height.saturating_sub(distance);
+        let moved_bytes = moved_rows
+            .checked_mul(scanline)
+            .ok_or(SurfaceError::Overflow)?;
+        let source_offset = distance
+            .checked_mul(scanline)
+            .ok_or(SurfaceError::Overflow)?;
+        let band_bytes = height.checked_mul(scanline).ok_or(SurfaceError::Overflow)?;
+        if band_bytes > self.descriptor.byte_len() {
+            return Err(SurfaceError::Bounds);
+        }
+        if moved_bytes != 0 {
+            let source = self
+                .base
+                .checked_add(source_offset)
+                .ok_or(SurfaceError::Overflow)?;
+            // SAFETY: `band_bytes` was proved to lie inside the validated
+            // framebuffer, so both the source at `distance` scanlines in and
+            // the destination at zero span `moved_bytes` within it. The regions
+            // overlap, which `copy` permits, and this owned surface is the sole
+            // writer. Bulk copy is what makes a scroll cheap: the same pixels
+            // moved one byte at a time would cost what a redraw already does.
+            unsafe {
+                ptr::copy(source as *const u8, self.base as *mut u8, moved_bytes);
+            }
+        }
+        // Clear the vacated band through the checked per-pixel path, so the
+        // encoding of `background` stays owned by the descriptor.
+        let cleared = height.saturating_sub(moved_rows);
+        self.fill_rect(0, moved_rows, self.descriptor.width(), cleared, background)
     }
 }
 
