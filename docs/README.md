@@ -3,8 +3,9 @@
 TROE keeps current behavior, normative contracts, accepted decisions, and
 current verification guidance in the repository. Work that is not implemented
 belongs in the GitHub issue tracker so proposed behavior cannot be mistaken for
-a current contract. Obsolete behavior and past evidence remain available in Git
-history rather than in current documentation.
+a current contract, with one exception: an ADR may carry a proposed contract
+when its status header says so explicitly. Obsolete behavior and past evidence
+remain available in Git history rather than in current documentation.
 
 ## Where to look
 
@@ -78,8 +79,13 @@ The current serialized contracts are versioned independently under
 ## Document status and precedence
 
 - Files under [`adr/`](adr) are the only documentation allowed to preserve
-  historical decisions and rationale. Each ADR's status header records
-  implementation or supersession state.
+  historical decisions and rationale, and the only documentation allowed to
+  state a decision that is not yet implemented. Each ADR's status header records
+  implementation, proposal, or supersession state, and a proposed ADR must say
+  in that header that nothing is implemented merely because the document exists.
+- A proposed ADR changes no other document. Until it is implemented, current
+  behavior documentation continues to describe the system as it is, and the
+  ADR's own consequences section records what will need updating at acceptance.
 - Other repository documentation describes the current implementation,
   contracts, and verification only. Point-in-time results, previous limits, and
   superseded behavior belong in Git history.
