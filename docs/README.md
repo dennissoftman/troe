@@ -3,8 +3,9 @@
 TROE keeps current behavior, normative contracts, accepted decisions, and
 current verification guidance in the repository. Work that is not implemented
 belongs in the GitHub issue tracker so proposed behavior cannot be mistaken for
-a current contract. Obsolete behavior and past evidence remain available in Git
-history rather than in current documentation.
+a current contract, with one exception: an ADR may carry a proposed contract
+when its status header says so explicitly. Obsolete behavior and past evidence
+remain available in Git history rather than in current documentation.
 
 ## Where to look
 
@@ -45,6 +46,9 @@ history rather than in current documentation.
 | Declared image span and scaled launch admission | [ADR 0059](adr/0059-declared-image-span-and-scaled-launch-admission.md) |
 | Extent-backed launch reservation | [ADR 0060](adr/0060-extent-backed-launch-reservation.md) |
 | Change and creation times, and no access time | [ADR 0062](adr/0062-change-and-creation-times.md) |
+| Proposed cell-grid display surfaces and display protocol | [ADR 0064](adr/0064-bounded-cell-grid-display-surfaces.md) |
+| Proposed layered input events and editor-intent split | [ADR 0065](adr/0065-layered-input-events-and-editor-intent.md) |
+| Proposed pointer and AArch64 keyboard transports | [ADR 0066](adr/0066-pointer-and-aarch64-keyboard-transports.md) |
 
 The current serialized contracts are versioned independently under
 [`formats/`](formats):
@@ -75,8 +79,13 @@ The current serialized contracts are versioned independently under
 ## Document status and precedence
 
 - Files under [`adr/`](adr) are the only documentation allowed to preserve
-  historical decisions and rationale. Each ADR's status header records
-  implementation or supersession state.
+  historical decisions and rationale, and the only documentation allowed to
+  state a decision that is not yet implemented. Each ADR's status header records
+  implementation, proposal, or supersession state, and a proposed ADR must say
+  in that header that nothing is implemented merely because the document exists.
+- A proposed ADR changes no other document. Until it is implemented, current
+  behavior documentation continues to describe the system as it is, and the
+  ADR's own consequences section records what will need updating at acceptance.
 - Other repository documentation describes the current implementation,
   contracts, and verification only. Point-in-time results, previous limits, and
   superseded behavior belong in Git history.
