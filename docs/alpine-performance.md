@@ -96,8 +96,8 @@ the workload bytes unchanged:
 cargo qemu --platform x86_64-q35-uefi --environment qemu --memory 256M
 cargo alpine --platform x86_64-q35-uefi --environment qemu
 
-cargo qemu --platform aarch64-virt-uefi --environment qemu --memory 256M
-cargo alpine --platform aarch64-virt-uefi --environment qemu
+cargo qemu --platform aarch64-sbsa-ref --environment qemu --memory 256M
+cargo alpine --platform aarch64-sbsa-ref --environment qemu
 ```
 
 Add `--gui` to either `cargo qemu` or `cargo alpine` to open the QEMU window.

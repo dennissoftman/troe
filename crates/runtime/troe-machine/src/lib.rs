@@ -6,7 +6,7 @@
     target_os = "uefi",
     not(any(
         feature = "platform-x86_64-q35-uefi",
-        feature = "platform-aarch64-virt-uefi",
+        feature = "platform-aarch64-sbsa-ref",
         feature = "platform-x86_64-uefi-virtio-pci",
         feature = "platform-aarch64-uefi-virtio-mmio"
     ))
@@ -16,7 +16,7 @@ compile_error!("UEFI builds require exactly one explicit platform feature");
     target_os = "uefi",
     feature = "platform-x86_64-q35-uefi",
     any(
-        feature = "platform-aarch64-virt-uefi",
+        feature = "platform-aarch64-sbsa-ref",
         feature = "platform-x86_64-uefi-virtio-pci",
         feature = "platform-aarch64-uefi-virtio-mmio"
     )
@@ -24,7 +24,7 @@ compile_error!("UEFI builds require exactly one explicit platform feature");
 compile_error!("UEFI builds cannot select more than one platform feature");
 #[cfg(all(
     target_os = "uefi",
-    feature = "platform-aarch64-virt-uefi",
+    feature = "platform-aarch64-sbsa-ref",
     any(
         feature = "platform-x86_64-uefi-virtio-pci",
         feature = "platform-aarch64-uefi-virtio-mmio"
@@ -49,7 +49,7 @@ compile_error!("the selected x86-64 platform requires the x86_64 target architec
 #[cfg(all(
     target_os = "uefi",
     any(
-        feature = "platform-aarch64-virt-uefi",
+        feature = "platform-aarch64-sbsa-ref",
         feature = "platform-aarch64-uefi-virtio-mmio"
     ),
     not(target_arch = "aarch64")
@@ -215,6 +215,14 @@ impl PlatformDiscoveryFailure {
     target_os = "uefi",
     any(
         feature = "platform-x86_64-uefi-virtio-pci",
+        feature = "platform-aarch64-sbsa-ref"
+    )
+))]
+mod ecam;
+#[cfg(all(
+    target_os = "uefi",
+    any(
+        feature = "platform-x86_64-uefi-virtio-pci",
         feature = "platform-aarch64-uefi-virtio-mmio"
     )
 ))]
@@ -230,7 +238,7 @@ mod mmu;
     target_os = "uefi",
     any(
         feature = "platform-x86_64-q35-uefi",
-        feature = "platform-aarch64-virt-uefi",
+        feature = "platform-aarch64-sbsa-ref",
         feature = "platform-x86_64-uefi-virtio-pci",
         feature = "platform-aarch64-uefi-virtio-mmio"
     )
@@ -241,7 +249,8 @@ mod virtio_mmio;
     target_os = "uefi",
     any(
         feature = "platform-x86_64-q35-uefi",
-        feature = "platform-x86_64-uefi-virtio-pci"
+        feature = "platform-x86_64-uefi-virtio-pci",
+        feature = "platform-aarch64-sbsa-ref"
     )
 ))]
 #[allow(unsafe_code)]
@@ -251,7 +260,7 @@ mod virtio_pci;
     target_os = "uefi",
     feature = "platform-x86_64-q35-uefi",
     not(any(
-        feature = "platform-aarch64-virt-uefi",
+        feature = "platform-aarch64-sbsa-ref",
         feature = "platform-x86_64-uefi-virtio-pci",
         feature = "platform-aarch64-uefi-virtio-mmio"
     ))
@@ -266,7 +275,7 @@ fn selected_platform()
 
 #[cfg(all(
     target_os = "uefi",
-    feature = "platform-aarch64-virt-uefi",
+    feature = "platform-aarch64-sbsa-ref",
     not(any(
         feature = "platform-x86_64-q35-uefi",
         feature = "platform-x86_64-uefi-virtio-pci",
@@ -276,8 +285,8 @@ fn selected_platform()
 fn selected_platform()
 -> Result<troe_platform::ValidatedPlatform<'static>, troe_platform::PlatformError> {
     selected_builtin_platform(
-        &troe_platform::AARCH64_VIRT_UEFI,
-        troe_platform::VALIDATED_AARCH64_VIRT_UEFI,
+        &troe_platform::AARCH64_SBSA_REF,
+        troe_platform::VALIDATED_AARCH64_SBSA_REF,
     )
 }
 
@@ -286,7 +295,7 @@ fn selected_platform()
     feature = "platform-x86_64-uefi-virtio-pci",
     not(any(
         feature = "platform-x86_64-q35-uefi",
-        feature = "platform-aarch64-virt-uefi",
+        feature = "platform-aarch64-sbsa-ref",
         feature = "platform-aarch64-uefi-virtio-mmio"
     ))
 ))]
@@ -303,7 +312,7 @@ fn selected_platform()
     feature = "platform-aarch64-uefi-virtio-mmio",
     not(any(
         feature = "platform-x86_64-q35-uefi",
-        feature = "platform-aarch64-virt-uefi",
+        feature = "platform-aarch64-sbsa-ref",
         feature = "platform-x86_64-uefi-virtio-pci"
     ))
 ))]
@@ -419,7 +428,7 @@ pub fn selected_platform_source() -> Result<PlatformSource, troe_platform::Platf
     selected_platform()?;
     #[cfg(any(
         feature = "platform-x86_64-q35-uefi",
-        feature = "platform-aarch64-virt-uefi"
+        feature = "platform-aarch64-sbsa-ref"
     ))]
     return Ok(PlatformSource::Fixed);
     #[cfg(feature = "platform-x86_64-uefi-virtio-pci")]
@@ -436,14 +445,15 @@ pub use mechanism::{
 #[cfg(target_os = "uefi")]
 pub use mechanism::{
     FramebufferError, HeapStats, InputInterruptError, OwnedFramebuffer, PhysicalMemoryError,
-    StackSwitchError, TaskStackError, copy_to_physical, current_stack_pointer, enter_owned_stack,
-    exit_boot_services_after_protocols, heap_stats, initialize_console, initialize_heap,
-    initialize_input_interrupts, initialize_monotonic_clock, input_device_ranges,
-    input_interrupt_stats, mark_firmware_exited, monotonic_millis, park, poweroff,
-    probe_allocation_failure, process_accounting_frequency_hz, process_accounting_ticks, read_byte,
-    reboot, run_task_step, take_interrupt_ownership, take_network_interrupt, try_input_event,
-    try_read_byte, try_read_keyboard_scancode, wait_for_input_event, wait_for_runtime_event,
-    wait_for_runtime_event_timeout, write, zero_physical_range,
+    StackSwitchError, TaskStackError, copy_to_physical, current_stack_pointer,
+    descend_to_kernel_execution_level, enter_owned_stack, exit_boot_services_after_protocols,
+    heap_stats, initialize_console, initialize_heap, initialize_input_interrupts,
+    initialize_monotonic_clock, input_device_ranges, input_interrupt_stats, mark_firmware_exited,
+    monotonic_millis, park, poweroff, probe_allocation_failure, process_accounting_frequency_hz,
+    process_accounting_ticks, read_byte, reboot, run_task_step, take_interrupt_ownership,
+    take_network_interrupt, try_input_event, try_read_byte, try_read_keyboard_scancode,
+    wait_for_input_event, wait_for_runtime_event, wait_for_runtime_event_timeout, write,
+    zero_physical_range,
 };
 
 #[cfg(any(test, target_os = "uefi"))]
@@ -474,7 +484,8 @@ pub use virtio_mmio::{
     target_os = "uefi",
     any(
         feature = "platform-x86_64-q35-uefi",
-        feature = "platform-x86_64-uefi-virtio-pci"
+        feature = "platform-x86_64-uefi-virtio-pci",
+        feature = "platform-aarch64-sbsa-ref"
     )
 ))]
 pub use virtio_pci::{
@@ -500,7 +511,8 @@ pub enum NativeVirtioBlock {
     /// Modern virtio PCI device.
     #[cfg(any(
         feature = "platform-x86_64-q35-uefi",
-        feature = "platform-x86_64-uefi-virtio-pci"
+        feature = "platform-x86_64-uefi-virtio-pci",
+        feature = "platform-aarch64-sbsa-ref"
     ))]
     Pci(PciNativeVirtioBlock),
     /// Modern virtio-MMIO device.
@@ -516,7 +528,8 @@ impl NativeVirtioBlock {
         match self {
             #[cfg(any(
                 feature = "platform-x86_64-q35-uefi",
-                feature = "platform-x86_64-uefi-virtio-pci"
+                feature = "platform-x86_64-uefi-virtio-pci",
+                feature = "platform-aarch64-sbsa-ref"
             ))]
             Self::Pci(device) => device.profile(),
             Self::Mmio(device) => device.profile(),
@@ -530,7 +543,8 @@ impl BlockDevice for NativeVirtioBlock {
         match self {
             #[cfg(any(
                 feature = "platform-x86_64-q35-uefi",
-                feature = "platform-x86_64-uefi-virtio-pci"
+                feature = "platform-x86_64-uefi-virtio-pci",
+                feature = "platform-aarch64-sbsa-ref"
             ))]
             Self::Pci(device) => device.geometry(),
             Self::Mmio(device) => device.geometry(),
@@ -546,7 +560,8 @@ impl BlockDevice for NativeVirtioBlock {
         match self {
             #[cfg(any(
                 feature = "platform-x86_64-q35-uefi",
-                feature = "platform-x86_64-uefi-virtio-pci"
+                feature = "platform-x86_64-uefi-virtio-pci",
+                feature = "platform-aarch64-sbsa-ref"
             ))]
             Self::Pci(device) => device.read_blocks(start_block, block_count, destination),
             Self::Mmio(device) => device.read_blocks(start_block, block_count, destination),
@@ -563,7 +578,8 @@ impl BlockDevice for NativeVirtioBlock {
         match self {
             #[cfg(any(
                 feature = "platform-x86_64-q35-uefi",
-                feature = "platform-x86_64-uefi-virtio-pci"
+                feature = "platform-x86_64-uefi-virtio-pci",
+                feature = "platform-aarch64-sbsa-ref"
             ))]
             Self::Pci(device) => {
                 device.write_blocks(start_block, block_count, source, force_unit_access)
@@ -578,7 +594,8 @@ impl BlockDevice for NativeVirtioBlock {
         match self {
             #[cfg(any(
                 feature = "platform-x86_64-q35-uefi",
-                feature = "platform-x86_64-uefi-virtio-pci"
+                feature = "platform-x86_64-uefi-virtio-pci",
+                feature = "platform-aarch64-sbsa-ref"
             ))]
             Self::Pci(device) => device.flush(),
             Self::Mmio(device) => device.flush(),
@@ -593,7 +610,8 @@ pub enum NativeVirtioNetwork {
     /// Modern virtio PCI network device.
     #[cfg(any(
         feature = "platform-x86_64-q35-uefi",
-        feature = "platform-x86_64-uefi-virtio-pci"
+        feature = "platform-x86_64-uefi-virtio-pci",
+        feature = "platform-aarch64-sbsa-ref"
     ))]
     Pci(PciNativeVirtioNetwork),
     /// Modern virtio-MMIO network device.
@@ -612,7 +630,8 @@ impl NativeVirtioNetwork {
         match self {
             #[cfg(any(
                 feature = "platform-x86_64-q35-uefi",
-                feature = "platform-x86_64-uefi-virtio-pci"
+                feature = "platform-x86_64-uefi-virtio-pci",
+                feature = "platform-aarch64-sbsa-ref"
             ))]
             Self::Pci(device) => device
                 .enable_interrupts()
@@ -630,7 +649,8 @@ impl NetworkDevice for NativeVirtioNetwork {
         match self {
             #[cfg(any(
                 feature = "platform-x86_64-q35-uefi",
-                feature = "platform-x86_64-uefi-virtio-pci"
+                feature = "platform-x86_64-uefi-virtio-pci",
+                feature = "platform-aarch64-sbsa-ref"
             ))]
             Self::Pci(device) => device.mac_address(),
             Self::Mmio(device) => device.mac_address(),
@@ -641,7 +661,8 @@ impl NetworkDevice for NativeVirtioNetwork {
         match self {
             #[cfg(any(
                 feature = "platform-x86_64-q35-uefi",
-                feature = "platform-x86_64-uefi-virtio-pci"
+                feature = "platform-x86_64-uefi-virtio-pci",
+                feature = "platform-aarch64-sbsa-ref"
             ))]
             Self::Pci(device) => device.transmit(frame),
             Self::Mmio(device) => device.transmit(frame),
@@ -652,7 +673,8 @@ impl NetworkDevice for NativeVirtioNetwork {
         match self {
             #[cfg(any(
                 feature = "platform-x86_64-q35-uefi",
-                feature = "platform-x86_64-uefi-virtio-pci"
+                feature = "platform-x86_64-uefi-virtio-pci",
+                feature = "platform-aarch64-sbsa-ref"
             ))]
             Self::Pci(device) => device.receive(),
             Self::Mmio(device) => device.receive(),
@@ -678,7 +700,8 @@ fn wrap_mmio_blocks(
     target_os = "uefi",
     any(
         feature = "platform-x86_64-q35-uefi",
-        feature = "platform-x86_64-uefi-virtio-pci"
+        feature = "platform-x86_64-uefi-virtio-pci",
+        feature = "platform-aarch64-sbsa-ref"
     )
 ))]
 fn wrap_pci_blocks(
@@ -726,6 +749,7 @@ pub fn virtio_device_ranges() -> Result<Vec<PhysicalRange>, NativeVirtioError> {
             virtio_pci::virtio_pci_device_ranges().map_err(|_| NativeVirtioError::Transport)
         }
         VirtioTransportKind::Mmio { .. } => mmio_device_ranges(),
+        VirtioTransportKind::PciGic { .. } => Err(NativeVirtioError::InvalidPlatform),
     }
 }
 
@@ -738,7 +762,7 @@ pub fn virtio_device_ranges() -> Result<Vec<PhysicalRange>, NativeVirtioError> {
 #[cfg(all(
     target_os = "uefi",
     any(
-        feature = "platform-aarch64-virt-uefi",
+        feature = "platform-aarch64-sbsa-ref",
         feature = "platform-aarch64-uefi-virtio-mmio"
     )
 ))]
@@ -746,6 +770,12 @@ pub fn virtio_device_ranges() -> Result<Vec<PhysicalRange>, NativeVirtioError> {
     let platform = selected_platform().map_err(|_| NativeVirtioError::InvalidPlatform)?;
     match platform.virtio() {
         VirtioTransportKind::Mmio { .. } => mmio_device_ranges(),
+        #[cfg(feature = "platform-aarch64-sbsa-ref")]
+        VirtioTransportKind::PciGic { .. } => {
+            virtio_pci::virtio_pci_device_ranges().map_err(|_| NativeVirtioError::Transport)
+        }
+        #[cfg(not(feature = "platform-aarch64-sbsa-ref"))]
+        VirtioTransportKind::PciGic { .. } => Err(NativeVirtioError::InvalidPlatform),
         VirtioTransportKind::Pci { .. } => Err(NativeVirtioError::InvalidPlatform),
     }
 }
@@ -773,6 +803,7 @@ pub fn discover_virtio_blocks() -> Result<Vec<NativeVirtioBlock>, NativeVirtioEr
         VirtioTransportKind::Mmio { .. } => wrap_mmio_blocks(
             virtio_mmio::discover_virtio_mmio_blocks().map_err(|_| NativeVirtioError::Transport)?,
         ),
+        VirtioTransportKind::PciGic { .. } => Err(NativeVirtioError::InvalidPlatform),
     }
 }
 
@@ -786,7 +817,7 @@ pub fn discover_virtio_blocks() -> Result<Vec<NativeVirtioBlock>, NativeVirtioEr
 #[cfg(all(
     target_os = "uefi",
     any(
-        feature = "platform-aarch64-virt-uefi",
+        feature = "platform-aarch64-sbsa-ref",
         feature = "platform-aarch64-uefi-virtio-mmio"
     )
 ))]
@@ -796,6 +827,12 @@ pub fn discover_virtio_blocks() -> Result<Vec<NativeVirtioBlock>, NativeVirtioEr
         VirtioTransportKind::Mmio { .. } => wrap_mmio_blocks(
             virtio_mmio::discover_virtio_mmio_blocks().map_err(|_| NativeVirtioError::Transport)?,
         ),
+        #[cfg(feature = "platform-aarch64-sbsa-ref")]
+        VirtioTransportKind::PciGic { .. } => wrap_pci_blocks(
+            virtio_pci::discover_virtio_pci_blocks().map_err(|_| NativeVirtioError::Transport)?,
+        ),
+        #[cfg(not(feature = "platform-aarch64-sbsa-ref"))]
+        VirtioTransportKind::PciGic { .. } => Err(NativeVirtioError::InvalidPlatform),
         VirtioTransportKind::Pci { .. } => Err(NativeVirtioError::InvalidPlatform),
     }
 }
@@ -823,6 +860,7 @@ pub fn discover_virtio_network() -> Result<Option<NativeVirtioNetwork>, NativeVi
         VirtioTransportKind::Mmio { .. } => virtio_mmio::discover_virtio_mmio_network()
             .map(|device| device.map(NativeVirtioNetwork::Mmio))
             .map_err(|_| NativeVirtioError::Transport),
+        VirtioTransportKind::PciGic { .. } => Err(NativeVirtioError::InvalidPlatform),
     }
 }
 
@@ -836,7 +874,7 @@ pub fn discover_virtio_network() -> Result<Option<NativeVirtioNetwork>, NativeVi
 #[cfg(all(
     target_os = "uefi",
     any(
-        feature = "platform-aarch64-virt-uefi",
+        feature = "platform-aarch64-sbsa-ref",
         feature = "platform-aarch64-uefi-virtio-mmio"
     )
 ))]
@@ -846,6 +884,12 @@ pub fn discover_virtio_network() -> Result<Option<NativeVirtioNetwork>, NativeVi
         VirtioTransportKind::Mmio { .. } => virtio_mmio::discover_virtio_mmio_network()
             .map(|device| device.map(NativeVirtioNetwork::Mmio))
             .map_err(|_| NativeVirtioError::Transport),
+        #[cfg(feature = "platform-aarch64-sbsa-ref")]
+        VirtioTransportKind::PciGic { .. } => virtio_pci::discover_virtio_pci_network()
+            .map(|device| device.map(NativeVirtioNetwork::Pci))
+            .map_err(|_| NativeVirtioError::Transport),
+        #[cfg(not(feature = "platform-aarch64-sbsa-ref"))]
+        VirtioTransportKind::PciGic { .. } => Err(NativeVirtioError::InvalidPlatform),
         VirtioTransportKind::Pci { .. } => Err(NativeVirtioError::InvalidPlatform),
     }
 }
@@ -867,9 +911,13 @@ fn acknowledge_network_interrupt_from_isr() -> bool {
         VirtioTransportKind::Pci { .. } => virtio_pci::acknowledge_network_interrupt_from_isr(),
         VirtioTransportKind::Mmio { .. } => virtio_mmio::acknowledge_network_interrupt_from_isr(),
         #[cfg(any(
-            feature = "platform-aarch64-virt-uefi",
+            feature = "platform-aarch64-sbsa-ref",
             feature = "platform-aarch64-uefi-virtio-mmio"
         ))]
         VirtioTransportKind::Pci { .. } => false,
+        #[cfg(feature = "platform-aarch64-sbsa-ref")]
+        VirtioTransportKind::PciGic { .. } => virtio_pci::acknowledge_network_interrupt_from_isr(),
+        #[cfg(not(feature = "platform-aarch64-sbsa-ref"))]
+        VirtioTransportKind::PciGic { .. } => false,
     }
 }

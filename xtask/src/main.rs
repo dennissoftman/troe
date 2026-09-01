@@ -5,7 +5,7 @@ use std::process::{Command, ExitCode};
 
 const DEFAULT_ENVIRONMENT: &str = "qemu";
 const X86_64_PLATFORM: &str = "x86_64-q35-uefi";
-const AARCH64_PLATFORM: &str = "aarch64-virt-uefi";
+const AARCH64_PLATFORM: &str = "aarch64-sbsa-ref";
 const ALPINE_COMMAND: &str = "alpine";
 const MOUNT_COMMAND: &str = "mount";
 
@@ -189,7 +189,7 @@ mod tests {
     #[test]
     fn explicit_selection_is_preserved_and_partial_selection_is_completed() {
         let explicit = vec![
-            OsString::from("--platform=aarch64-virt-uefi"),
+            OsString::from("--platform=aarch64-sbsa-ref"),
             OsString::from("--environment"),
             OsString::from("qemu"),
             OsString::from("--graphical"),
@@ -200,7 +200,7 @@ mod tests {
         assert_eq!(arguments, explicit);
 
         let (arguments, defaulted) = with_interactive_defaults(
-            vec![OsString::from("--platform=aarch64-virt-uefi")],
+            vec![OsString::from("--platform=aarch64-sbsa-ref")],
             "unsupported",
         )
         .unwrap();

@@ -76,7 +76,7 @@ platform split and do not belong in the architecture layer.
 
 ### Keep QEMU as the exhaustive deterministic backend
 
-`x86_64-q35-uefi` and `aarch64-virt-uefi` remain pinned acceptance platforms.
+`x86_64-q35-uefi` and `aarch64-sbsa-ref` remain pinned acceptance platforms.
 Host tests cover portable state spaces; QEMU covers complete boot, both virtio
 transports, and destructive fault injection. Support for another hypervisor or
 cloud is a separately named matrix entry even when it reuses the same drivers

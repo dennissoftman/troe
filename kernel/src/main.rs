@@ -1962,6 +1962,11 @@ mod firmware {
         let final_map = troe_machine::exit_boot_services_after_protocols();
         troe_machine::mark_firmware_exited();
         troe_machine::take_interrupt_ownership();
+        // Firmware built on Trusted Firmware hands a boot loader EL2, not the
+        // EL1 every system register below assumes.
+        if troe_machine::descend_to_kernel_execution_level().is_err() {
+            fatal(b"fatal: unsupported firmware execution level\n");
+        }
         let stack_pointer = usize_as_u64(troe_machine::current_stack_pointer());
         if !prepared.boot_memory.stack.contains(stack_pointer) {
             fatal(b"fatal: active stack is not kernel-owned\n");
@@ -2097,7 +2102,7 @@ mod firmware {
         }
         #[cfg(feature = "platform-x86_64-q35-uefi")]
         let host_port = 40_123;
-        #[cfg(feature = "platform-aarch64-virt-uefi")]
+        #[cfg(feature = "platform-aarch64-sbsa-ref")]
         let host_port = 40_124;
         #[cfg(feature = "platform-x86_64-uefi-virtio-pci")]
         let host_port = 40_125;

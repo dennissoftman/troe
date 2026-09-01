@@ -137,7 +137,11 @@ PYTHON_IMPACTS = {
         "test_setup_troe.py",
     ),
     "scripts/platform_profile.py": ("test_build_policy.py", "test_qemu_profile.py"),
-    "scripts/qemu_profile.py": ("test_cloud_artifacts.py", "test_qemu_profile.py"),
+    "scripts/qemu_profile.py": (
+        "test_cloud_artifacts.py",
+        "test_qemu_profile.py",
+        "test_sbsa_firmware.py",
+    ),
     "scripts/repository_policy.py": ("test_repository_policy.py",),
     "scripts/run-alpine.py": ("test_alpine_profile.py",),
     "scripts/run-qemu.py": ("test_mount_shared.py", "test_qemu_profile.py"),
@@ -191,6 +195,10 @@ PYTHON_IMPACTS = {
     # guest artifact, so it selects no runtime scenario.
     "tools/build_qemu_plugin.py": ("test_qemu_plugin.py",),
     "tools/qemu-plugin/troe_count.c": ("test_qemu_plugin.py",),
+    # Firmware for one platform only, so it selects that platform's runner
+    # contract alongside the builder's own tests.
+    "tools/build_sbsa_firmware.py": ("test_sbsa_firmware.py", "test_qemu_profile.py"),
+    "tools/sbsa-firmware-sources.lock.json": ("test_sbsa_firmware.py",),
 }
 RUNTIME_TOOL_SCENARIOS = {
     "config/volumes.toml": ("boot", "filesystem"),

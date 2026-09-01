@@ -237,7 +237,7 @@ MUST NOT silently imply q35, QEMU `virt`, or another virtual machine.
 | Platform | Role | Console | Boot | MMU page size |
 |---|---|---|---|---|
 | `x86_64-q35-uefi` | implemented QEMU acceptance | UEFI bootstrap; owned 16550 after handoff | UEFI/OVMF | 4 KiB |
-| `aarch64-virt-uefi` | implemented QEMU acceptance | UEFI bootstrap; owned PL011 after handoff | UEFI/AAVMF | 4 KiB |
+| `aarch64-sbsa-ref` | implemented QEMU acceptance | UEFI bootstrap; owned PL011 after handoff | Trusted Firmware EL3 runtime, then UEFI/edk2 | 4 KiB |
 
 Exact emulator invocations MUST be pinned in CI scripts. New cloud platforms
 MUST identify the architecture, firmware contract, discovery source,

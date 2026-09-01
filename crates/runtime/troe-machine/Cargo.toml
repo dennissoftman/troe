@@ -8,7 +8,7 @@ license.workspace = true
 
 [features]
 acceptance-probes = []
-platform-aarch64-virt-uefi = []
+platform-aarch64-sbsa-ref = []
 platform-aarch64-uefi-virtio-mmio = []
 platform-x86_64-q35-uefi = []
 platform-x86_64-uefi-virtio-pci = []

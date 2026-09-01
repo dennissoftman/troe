@@ -28,8 +28,8 @@ pub struct PlatformId(u16);
 impl PlatformId {
     /// Pinned QEMU q35 UEFI platform.
     pub const X86_64_Q35_UEFI: Self = Self(1);
-    /// Pinned QEMU `virt` `GICv2` UEFI platform.
-    pub const AARCH64_VIRT_UEFI: Self = Self(2);
+    /// Pinned Arm SBSA reference UEFI platform.
+    pub const AARCH64_SBSA_REF: Self = Self(2);
     /// Discoverable x86-64 UEFI cloud contract using modern virtio PCI.
     pub const X86_64_UEFI_VIRTIO_PCI: Self = Self(3);
     /// Discoverable `AArch64` UEFI cloud contract using modern virtio MMIO.
@@ -66,10 +66,16 @@ pub enum MmioRole {
     GicV2Distributor,
     /// Arm `GICv2` CPU-interface aperture.
     GicV2CpuInterface,
+    /// Arm `GICv3` distributor aperture.
+    GicV3Distributor,
+    /// Arm `GICv3` redistributor region, one strided frame pair per CPU.
+    GicV3Redistributor,
     /// Arm PL011 UART page.
     Pl011,
     /// Modern virtio-MMIO slot aperture.
     VirtioMmio,
+    /// PCI Enhanced Configuration Access Mechanism aperture.
+    PciEcam,
 }
 
 /// Closed role names for owned x86 I/O-port ranges.
@@ -316,6 +322,16 @@ pub enum InterruptControllerKind {
         /// Distributor CPU-target mask for statically routed shared interrupts.
         cpu_target_mask: u8,
     },
+    /// GIC version 3 distributor plus per-CPU redistributors.
+    ///
+    /// The CPU interface is reached through `ICC_*` system registers rather
+    /// than an MMIO aperture, so only the distributor and the redistributor
+    /// region are described here. Shared interrupts are routed by affinity
+    /// instead of the version 2 target mask.
+    GicV3 {
+        /// Bytes between consecutive per-CPU redistributor frame pairs.
+        redistributor_stride: u64,
+    },
 }
 
 /// Monotonic/execution-lease timer composition.
@@ -362,8 +378,14 @@ pub enum PowerKind {
         /// Firmware-validated full-reset command byte.
         reset_value: u8,
     },
-    /// PSCI 1.0 through the HVC conduit.
+    /// PSCI 1.0 through the HVC conduit, reaching an implementation at EL2.
     PsciHvc,
+    /// PSCI 1.0 through the SMC conduit, reaching an implementation at EL3.
+    ///
+    /// Firmware built on Trusted Firmware places PSCI in its EL3 runtime, so a
+    /// hypervisor call from EL1 would reach an EL2 that has nothing to answer
+    /// it. The conduit is a property of the platform, not of the architecture.
+    PsciSmc,
 }
 
 /// PCI configuration transport selected by the platform contract.
@@ -402,6 +424,29 @@ pub enum VirtioTransportKind {
         /// Trigger behavior for the platform `INTx` route.
         network_trigger: TriggerMode,
         /// Active polarity for the platform `INTx` route.
+        network_polarity: Polarity,
+    },
+    /// Modern virtio PCI functions whose `INTx` pins reach an Arm GIC.
+    ///
+    /// Arm platforms do not name a PCI function's interrupt in the
+    /// configuration Interrupt Line byte. The pin instead reaches one of four
+    /// consecutive shared peripheral interrupts through the standard swizzle,
+    /// so the descriptor pins the first of those four rather than a ceiling on
+    /// a configuration-space value.
+    PciGic {
+        /// Configuration transport used for every PCI config-space access.
+        configuration: PciConfigurationKind,
+        /// First PCI bus scanned.
+        first_bus: u8,
+        /// Last PCI bus scanned, inclusive.
+        last_bus: u8,
+        /// INTID reached by `INTA` on device zero.
+        first_interrupt: u32,
+        /// Controller priority for network completion.
+        network_priority: u8,
+        /// Trigger behavior for the four swizzled SPIs.
+        network_trigger: TriggerMode,
+        /// Active polarity for the four swizzled SPIs.
         network_polarity: Polarity,
     },
     /// Modern virtio-MMIO slots in [`MmioRole::VirtioMmio`].
@@ -495,13 +540,13 @@ impl<'a> PlatformDescriptor<'a> {
             | (PlatformId::X86_64_UEFI_VIRTIO_PCI, "x86_64-uefi-virtio-pci") => {
                 self.architecture == Architecture::X86_64
             }
-            (PlatformId::AARCH64_VIRT_UEFI, "aarch64-virt-uefi")
+            (PlatformId::AARCH64_SBSA_REF, "aarch64-sbsa-ref")
             | (PlatformId::AARCH64_UEFI_VIRTIO_MMIO, "aarch64-uefi-virtio-mmio") => {
                 self.architecture == Architecture::Aarch64
             }
             (
                 PlatformId::X86_64_Q35_UEFI
-                | PlatformId::AARCH64_VIRT_UEFI
+                | PlatformId::AARCH64_SBSA_REF
                 | PlatformId::X86_64_UEFI_VIRTIO_PCI
                 | PlatformId::AARCH64_UEFI_VIRTIO_MMIO,
                 _,
@@ -509,7 +554,7 @@ impl<'a> PlatformDescriptor<'a> {
             | (
                 _,
                 "x86_64-q35-uefi"
-                | "aarch64-virt-uefi"
+                | "aarch64-sbsa-ref"
                 | "x86_64-uefi-virtio-pci"
                 | "aarch64-uefi-virtio-mmio",
             ) => false,
@@ -536,9 +581,9 @@ impl<'a> PlatformDescriptor<'a> {
             (
                 Architecture::Aarch64,
                 ConsoleKind::Pl011 { clock_hz },
-                InterruptControllerKind::GicV2 { cpu_target_mask },
+                InterruptControllerKind::GicV2 { .. } | InterruptControllerKind::GicV3 { .. },
                 TimerKind::Aarch64Generic,
-                PowerKind::PsciHvc,
+                PowerKind::PsciHvc | PowerKind::PsciSmc,
                 KeyboardKind::None,
                 VirtioTransportKind::Mmio {
                     slot_bytes,
@@ -551,9 +596,37 @@ impl<'a> PlatformDescriptor<'a> {
             ) => validate_aarch64_composition(
                 self,
                 clock_hz,
-                cpu_target_mask,
+                self.controller,
                 slot_bytes,
                 slot_count,
+                first_interrupt,
+                network_priority,
+                network_trigger,
+                network_polarity,
+            )?,
+            (
+                Architecture::Aarch64,
+                ConsoleKind::Pl011 { clock_hz },
+                InterruptControllerKind::GicV3 { .. },
+                TimerKind::Aarch64Generic,
+                PowerKind::PsciHvc | PowerKind::PsciSmc,
+                KeyboardKind::None,
+                VirtioTransportKind::PciGic {
+                    configuration,
+                    first_bus,
+                    last_bus,
+                    first_interrupt,
+                    network_priority,
+                    network_trigger,
+                    network_polarity,
+                },
+            ) => validate_aarch64_pci_composition(
+                self,
+                clock_hz,
+                self.controller,
+                configuration,
+                first_bus,
+                last_bus,
                 first_interrupt,
                 network_priority,
                 network_trigger,
@@ -807,7 +880,7 @@ fn validate_x86_common_composition(
 fn validate_aarch64_composition(
     descriptor: PlatformDescriptor<'_>,
     clock_hz: u32,
-    cpu_target_mask: u8,
+    controller: InterruptControllerKind,
     slot_bytes: u32,
     slot_count: u16,
     first_interrupt: u32,
@@ -815,9 +888,23 @@ fn validate_aarch64_composition(
     network_trigger: TriggerMode,
     network_polarity: Polarity,
 ) -> Result<(), PlatformError> {
+    // The two GIC generations describe different apertures: version 2 has an
+    // MMIO CPU interface, version 3 reaches it through `ICC_*` system registers
+    // and instead needs one strided redistributor frame pair per CPU.
+    let (distributor_role, second_role) = match controller {
+        InterruptControllerKind::GicV2 { .. } => {
+            (MmioRole::GicV2Distributor, MmioRole::GicV2CpuInterface)
+        }
+        InterruptControllerKind::GicV3 { .. } => {
+            (MmioRole::GicV3Distributor, MmioRole::GicV3Redistributor)
+        }
+        InterruptControllerKind::X86Apic => {
+            return Err(PlatformError::IncompatibleComposition);
+        }
+    };
     for role in [
-        MmioRole::GicV2Distributor,
-        MmioRole::GicV2CpuInterface,
+        distributor_role,
+        second_role,
         MmioRole::Pl011,
         MmioRole::VirtioMmio,
     ] {
@@ -825,9 +912,22 @@ fn validate_aarch64_composition(
     }
     let serial_interrupt = require_interrupt(descriptor.interrupts, InterruptRole::Serial)?;
     let timer_interrupt = require_interrupt(descriptor.interrupts, InterruptRole::Timer)?;
-    let distributor = require_mmio(descriptor.mmio, MmioRole::GicV2Distributor)?;
-    let cpu_interface = require_mmio(descriptor.mmio, MmioRole::GicV2CpuInterface)?;
+    let distributor = require_mmio(descriptor.mmio, distributor_role)?;
+    let cpu_interface = require_mmio(descriptor.mmio, second_role)?;
     let aperture = require_mmio(descriptor.mmio, MmioRole::VirtioMmio)?;
+    // A version 2 target mask must name exactly one CPU; a version 3 stride
+    // must hold both the RD and SGI frames of one redistributor.
+    let controller_ok = match controller {
+        InterruptControllerKind::GicV2 { cpu_target_mask } => cpu_target_mask.is_power_of_two(),
+        InterruptControllerKind::GicV3 {
+            redistributor_stride,
+        } => {
+            redistributor_stride >= GICV3_REDISTRIBUTOR_MINIMUM_STRIDE
+                && redistributor_stride.is_power_of_two()
+                && cpu_interface.byte_len >= redistributor_stride
+        }
+        InterruptControllerKind::X86Apic => false,
+    };
     let described = u64::from(slot_bytes)
         .checked_mul(u64::from(slot_count))
         .ok_or(PlatformError::InvalidRange)?;
@@ -839,7 +939,7 @@ fn validate_aarch64_composition(
         || descriptor.interrupts.len() != 2
         || distributor.byte_len < 0x1000
         || cpu_interface.byte_len < 0x1000
-        || cpu_target_mask.count_ones() != 1
+        || !controller_ok
         || clock_hz < 16 * 115_200
         || slot_bytes < 0x118
         || !slot_bytes.is_multiple_of(4)
@@ -849,6 +949,91 @@ fn validate_aarch64_composition(
         || last_interrupt > 1_020
         || network_priority == 0
         || network_trigger != TriggerMode::Edge
+        || network_polarity != Polarity::ActiveHigh
+        || timer_interrupt.line != 30
+        || timer_interrupt.trigger != TriggerMode::Level
+        || timer_interrupt.polarity != Polarity::ActiveHigh
+        || serial_interrupt.line < 32
+        || serial_interrupt.polarity != Polarity::ActiveHigh
+        || descriptor
+            .interrupts
+            .iter()
+            .any(|route| (first_interrupt..last_interrupt).contains(&route.line))
+    {
+        return Err(PlatformError::IncompatibleComposition);
+    }
+    Ok(())
+}
+
+/// Validate one `AArch64` composition whose virtio functions live on PCI.
+///
+/// The SBSA reference contract differs from the virtio-MMIO one in three ways
+/// that matter here: the fourth aperture is a PCI Express configuration window
+/// rather than a slot array, `INTx` reaches four consecutive shared peripheral
+/// interrupts through the standard swizzle, and those four are level-triggered
+/// and active high rather than edge-triggered.
+#[allow(clippy::too_many_arguments)]
+fn validate_aarch64_pci_composition(
+    descriptor: PlatformDescriptor<'_>,
+    clock_hz: u32,
+    controller: InterruptControllerKind,
+    configuration: PciConfigurationKind,
+    first_bus: u8,
+    last_bus: u8,
+    first_interrupt: u32,
+    network_priority: u8,
+    network_trigger: TriggerMode,
+    network_polarity: Polarity,
+) -> Result<(), PlatformError> {
+    for role in [
+        MmioRole::GicV3Distributor,
+        MmioRole::GicV3Redistributor,
+        MmioRole::Pl011,
+        MmioRole::PciEcam,
+    ] {
+        require_mmio(descriptor.mmio, role)?;
+    }
+    let serial_interrupt = require_interrupt(descriptor.interrupts, InterruptRole::Serial)?;
+    let timer_interrupt = require_interrupt(descriptor.interrupts, InterruptRole::Timer)?;
+    let distributor = require_mmio(descriptor.mmio, MmioRole::GicV3Distributor)?;
+    let redistributor = require_mmio(descriptor.mmio, MmioRole::GicV3Redistributor)?;
+    let ecam = require_mmio(descriptor.mmio, MmioRole::PciEcam)?;
+    let InterruptControllerKind::GicV3 {
+        redistributor_stride,
+    } = controller
+    else {
+        return Err(PlatformError::IncompatibleComposition);
+    };
+    // ECAM addresses one 4 KiB function page per (bus, device, function), so
+    // the window must cover every bus the descriptor asks to be scanned.
+    let scanned_buses = u64::from(last_bus)
+        .checked_sub(u64::from(first_bus))
+        .ok_or(PlatformError::IncompatibleComposition)?
+        .checked_add(1)
+        .ok_or(PlatformError::InvalidRange)?;
+    let required_window = scanned_buses
+        .checked_mul(1 << 20)
+        .ok_or(PlatformError::InvalidRange)?;
+    // `INTA` through `INTD` occupy four consecutive INTIDs from the first.
+    let last_interrupt = first_interrupt
+        .checked_add(4)
+        .ok_or(PlatformError::InvalidInterrupt)?;
+    if descriptor.mmio.len() != 4
+        || !descriptor.io_ports.is_empty()
+        || descriptor.interrupts.len() != 2
+        || configuration != PciConfigurationKind::Ecam
+        || distributor.byte_len < 0x1000
+        || redistributor.byte_len < 0x1000
+        || redistributor_stride < GICV3_REDISTRIBUTOR_MINIMUM_STRIDE
+        || !redistributor_stride.is_power_of_two()
+        || redistributor.byte_len < redistributor_stride
+        || clock_hz < 16 * 115_200
+        || first_bus > last_bus
+        || ecam.byte_len < required_window
+        || first_interrupt < 32
+        || last_interrupt > 1_020
+        || network_priority == 0
+        || network_trigger != TriggerMode::Level
         || network_polarity != Polarity::ActiveHigh
         || timer_interrupt.line != 30
         || timer_interrupt.trigger != TriggerMode::Level
@@ -1208,6 +1393,55 @@ pub const VALIDATED_X86_64_UEFI_VIRTIO_PCI: ValidatedPlatform<'static> = Validat
     descriptor: &X86_64_UEFI_VIRTIO_PCI,
 };
 
+/// Smallest `GICv3` redistributor stride: one 64 KiB RD frame plus one SGI
+/// frame. Implementations with virtual LPIs use a larger stride, never smaller.
+pub const GICV3_REDISTRIBUTOR_MINIMUM_STRIDE: u64 = 0x2_0000;
+
+const VIRT_GICV3_MMIO: [MmioRegion; 4] = [
+    MmioRegion::new(MmioRole::GicV3Distributor, 0x0800_0000, 0x0001_0000),
+    MmioRegion::new(MmioRole::GicV3Redistributor, 0x080a_0000, 0x00f6_0000),
+    MmioRegion::new(MmioRole::Pl011, 0x0900_0000, 0x1000),
+    MmioRegion::new(MmioRole::VirtioMmio, 0x0a00_0000, 0x4000),
+];
+/// Arm SBSA reference platform apertures.
+///
+/// Fixed by the Server Base System Architecture reference design rather than
+/// by any one emulator: a `GICv3` distributor and redistributor region, one
+/// SBSA generic UART, and the PCI Express configuration aperture that carries
+/// every virtio function.
+const SBSA_REF_MMIO: [MmioRegion; 4] = [
+    MmioRegion::new(MmioRole::GicV3Distributor, 0x4006_0000, 0x0001_0000),
+    MmioRegion::new(MmioRole::GicV3Redistributor, 0x4008_0000, 0x0400_0000),
+    MmioRegion::new(MmioRole::Pl011, 0x6000_0000, 0x1000),
+    MmioRegion::new(MmioRole::PciEcam, 0xf000_0000, 0x1000_0000),
+];
+
+/// Arm SBSA reference interrupt routes.
+///
+/// The non-secure EL1 physical timer keeps its architectural PPI; the SBSA
+/// generic UART is the first shared peripheral interrupt.
+const SBSA_REF_INTERRUPTS: [InterruptRoute; 2] = [
+    InterruptRoute::new(
+        InterruptRole::Timer,
+        30,
+        32,
+        0x40,
+        TriggerMode::Level,
+        Polarity::ActiveHigh,
+    ),
+    InterruptRoute::new(
+        InterruptRole::Serial,
+        33,
+        32,
+        0xa0,
+        TriggerMode::Level,
+        Polarity::ActiveHigh,
+    ),
+];
+
+/// QEMU `virt` `GICv2` apertures, retained to exercise the version 2
+/// validation path that device-tree discovery can still reach.
+#[cfg(test)]
 const VIRT_MMIO: [MmioRegion; 4] = [
     MmioRegion::new(MmioRole::GicV2Distributor, 0x0800_0000, 0x0001_0000),
     MmioRegion::new(MmioRole::GicV2CpuInterface, 0x0801_0000, 0x0001_0000),
@@ -1233,39 +1467,50 @@ const VIRT_INTERRUPTS: [InterruptRoute; 2] = [
     ),
 ];
 
-/// Exact pinned `AArch64` QEMU `virt` `GICv2` UEFI platform descriptor.
-pub const AARCH64_VIRT_UEFI: PlatformDescriptor<'static> = PlatformDescriptor::new(
-    PlatformId::AARCH64_VIRT_UEFI,
-    "aarch64-virt-uefi",
+/// Exact pinned Arm SBSA reference UEFI platform descriptor.
+///
+/// The Server Base System Architecture is the closest thing `AArch64` has to
+/// the fixed contract x86-64 inherited from the PC: a `GICv3` or later, an
+/// architected generic timer, a PL011-compatible generic UART, PSCI, and PCI
+/// Express. Pinning that contract rather than one emulator's `virt` board is
+/// what lets the same image target a `SystemReady` machine.
+///
+/// Virtio remains the device model; on this platform it arrives as PCI
+/// functions rather than MMIO slots, because SBSA describes no MMIO
+/// transport aperture at all.
+pub const AARCH64_SBSA_REF: PlatformDescriptor<'static> = PlatformDescriptor::new(
+    PlatformId::AARCH64_SBSA_REF,
+    "aarch64-sbsa-ref",
     Architecture::Aarch64,
-    &VIRT_MMIO,
+    &SBSA_REF_MMIO,
     &[],
-    &VIRT_INTERRUPTS,
+    &SBSA_REF_INTERRUPTS,
     ConsoleKind::Pl011 {
         clock_hz: 24_000_000,
     },
-    InterruptControllerKind::GicV2 {
-        cpu_target_mask: 0x01,
+    InterruptControllerKind::GicV3 {
+        redistributor_stride: GICV3_REDISTRIBUTOR_MINIMUM_STRIDE,
     },
     TimerKind::Aarch64Generic,
-    PowerKind::PsciHvc,
+    PowerKind::PsciSmc,
     KeyboardKind::None,
-    VirtioTransportKind::Mmio {
-        slot_bytes: 0x200,
-        slot_count: 32,
-        first_interrupt: 48,
+    VirtioTransportKind::PciGic {
+        configuration: PciConfigurationKind::Ecam,
+        first_bus: 0,
+        last_bus: 0,
+        first_interrupt: 35,
         network_priority: 0x20,
-        network_trigger: TriggerMode::Edge,
+        network_trigger: TriggerMode::Level,
         network_polarity: Polarity::ActiveHigh,
     },
 );
 
-/// Borrowed token for the immutable built-in QEMU `virt` descriptor.
+/// Borrowed token for the immutable built-in SBSA reference descriptor.
 ///
 /// Consumers must first call [`PlatformDescriptor::validate`] in the current
 /// boot and may then retain this zero-allocation token.
-pub const VALIDATED_AARCH64_VIRT_UEFI: ValidatedPlatform<'static> = ValidatedPlatform {
-    descriptor: &AARCH64_VIRT_UEFI,
+pub const VALIDATED_AARCH64_SBSA_REF: ValidatedPlatform<'static> = ValidatedPlatform {
+    descriptor: &AARCH64_SBSA_REF,
 };
 
 /// Discoverable `AArch64` UEFI/device-tree virtio-MMIO cloud contract.
@@ -1276,14 +1521,14 @@ pub const AARCH64_UEFI_VIRTIO_MMIO: PlatformDescriptor<'static> = PlatformDescri
     PlatformId::AARCH64_UEFI_VIRTIO_MMIO,
     "aarch64-uefi-virtio-mmio",
     Architecture::Aarch64,
-    &VIRT_MMIO,
+    &VIRT_GICV3_MMIO,
     &[],
     &VIRT_INTERRUPTS,
     ConsoleKind::Pl011 {
         clock_hz: 24_000_000,
     },
-    InterruptControllerKind::GicV2 {
-        cpu_target_mask: 0x01,
+    InterruptControllerKind::GicV3 {
+        redistributor_stride: GICV3_REDISTRIBUTOR_MINIMUM_STRIDE,
     },
     TimerKind::Aarch64Generic,
     PowerKind::PsciHvc,
@@ -1360,30 +1605,53 @@ mod tests {
             q35.io_ports(IoPortRole::Serial).map(IoPortRegion::base),
             Some(0x3f8)
         );
-        let virt = AARCH64_VIRT_UEFI
+        let sbsa = AARCH64_SBSA_REF
             .validate()
             .unwrap_or_else(|_| unreachable!());
-        assert_eq!(virt, VALIDATED_AARCH64_VIRT_UEFI);
-        assert_eq!(virt.name(), "aarch64-virt-uefi");
-        assert_eq!(virt.architecture(), Architecture::Aarch64);
+        assert_eq!(sbsa, VALIDATED_AARCH64_SBSA_REF);
+        assert_eq!(sbsa.name(), "aarch64-sbsa-ref");
+        assert_eq!(sbsa.architecture(), Architecture::Aarch64);
+        // The reference contract describes no virtio-MMIO aperture at all;
+        // every virtio function arrives through PCI Express instead.
+        assert_eq!(sbsa.mmio(MmioRole::VirtioMmio), None);
         assert_eq!(
-            virt.mmio(MmioRole::VirtioMmio).map(MmioRegion::base),
-            Some(0x0a00_0000)
+            sbsa.mmio(MmioRole::PciEcam).map(MmioRegion::base),
+            Some(0xf000_0000)
         );
         assert_eq!(
-            virt.mmio(MmioRole::GicV2Distributor).map(MmioRegion::base),
-            Some(0x0800_0000)
+            sbsa.mmio(MmioRole::Pl011).map(MmioRegion::base),
+            Some(0x6000_0000)
         );
         assert_eq!(
-            virt.mmio(MmioRole::GicV2CpuInterface).map(MmioRegion::base),
-            Some(0x0801_0000)
+            sbsa.mmio(MmioRole::GicV3Distributor).map(MmioRegion::base),
+            Some(0x4006_0000)
         );
+        // The redistributor region replaces the version 2 CPU interface, and
+        // must hold one strided frame pair per CPU the machine can start.
+        let redistributors = sbsa
+            .mmio(MmioRole::GicV3Redistributor)
+            .unwrap_or_else(|| unreachable!());
+        assert_eq!(redistributors.base(), 0x4008_0000);
+        assert_eq!(redistributors.byte_len(), 0x0400_0000);
+        assert!(redistributors.byte_len() >= GICV3_REDISTRIBUTOR_MINIMUM_STRIDE);
+        assert_eq!(sbsa.mmio(MmioRole::GicV2CpuInterface), None);
         assert_eq!(
-            virt.interrupt_controller(),
-            InterruptControllerKind::GicV2 {
-                cpu_target_mask: 0x01
+            sbsa.interrupt_controller(),
+            InterruptControllerKind::GicV3 {
+                redistributor_stride: GICV3_REDISTRIBUTOR_MINIMUM_STRIDE
             }
         );
+        // `INTA` on device zero takes the first of the four swizzled SPIs.
+        assert!(matches!(
+            sbsa.virtio(),
+            VirtioTransportKind::PciGic {
+                configuration: PciConfigurationKind::Ecam,
+                first_interrupt: 35,
+                network_trigger: TriggerMode::Level,
+                network_polarity: Polarity::ActiveHigh,
+                ..
+            }
+        ));
         let discovered_x86 = X86_64_UEFI_VIRTIO_PCI
             .validate()
             .unwrap_or_else(|_| unreachable!());
@@ -1559,7 +1827,7 @@ mod tests {
             id: PlatformId::new(123).unwrap_or_else(|_| unreachable!()),
             name: "wide-address-arm",
             mmio: &outside_aarch64_physical_domain,
-            ..AARCH64_VIRT_UEFI
+            ..AARCH64_SBSA_REF
         };
         assert_eq!(profile.validate(), Err(PlatformError::InvalidRange));
 
@@ -1646,7 +1914,7 @@ mod tests {
             id: PlatformId::new(106).unwrap_or_else(|_| unreachable!()),
             name: "invalid-arm-priority",
             interrupts: &invalid_arm,
-            ..AARCH64_VIRT_UEFI
+            ..AARCH64_SBSA_REF
         };
         assert_eq!(profile.validate(), Err(PlatformError::InvalidInterrupt));
     }
@@ -1695,7 +1963,7 @@ mod tests {
                 network_trigger: TriggerMode::Edge,
                 network_polarity: Polarity::ActiveHigh,
             },
-            ..AARCH64_VIRT_UEFI
+            ..AARCH64_SBSA_REF
         };
         assert_eq!(
             wrong_aperture.validate(),
@@ -1749,7 +2017,7 @@ mod tests {
             id: PlatformId::new(115).unwrap_or_else(|_| unreachable!()),
             name: "wrong-timer-arm",
             interrupts: &wrong_timer_routes,
-            ..AARCH64_VIRT_UEFI
+            ..AARCH64_SBSA_REF
         };
         assert_eq!(
             wrong_timer.validate(),
@@ -1760,7 +2028,7 @@ mod tests {
             id: PlatformId::new(117).unwrap_or_else(|_| unreachable!()),
             name: "stray-port-arm",
             io_ports: &Q35_IO_PORTS[..1],
-            ..AARCH64_VIRT_UEFI
+            ..AARCH64_SBSA_REF
         };
         assert_eq!(
             stray_port.validate(),
@@ -1778,7 +2046,7 @@ mod tests {
                 network_trigger: TriggerMode::Edge,
                 network_polarity: Polarity::ActiveHigh,
             },
-            ..AARCH64_VIRT_UEFI
+            ..AARCH64_SBSA_REF
         };
         assert_eq!(
             undersized_slot.validate(),
@@ -1793,7 +2061,7 @@ mod tests {
             id: PlatformId::new(114).unwrap_or_else(|_| unreachable!()),
             name: "missing-gic-cpu-arm",
             mmio: &missing_cpu_interface,
-            ..AARCH64_VIRT_UEFI
+            ..AARCH64_SBSA_REF
         };
         assert_eq!(
             missing_cpu_interface.validate(),
@@ -1808,7 +2076,7 @@ mod tests {
                 id: PlatformId::new(id).unwrap_or_else(|_| unreachable!()),
                 name,
                 controller: InterruptControllerKind::GicV2 { cpu_target_mask },
-                ..AARCH64_VIRT_UEFI
+                ..AARCH64_SBSA_REF
             };
             assert_eq!(
                 invalid_target.validate(),

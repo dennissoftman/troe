@@ -2400,6 +2400,11 @@ mod tests {
     }
 
     fn base_tree_with_interrupt_parent(interrupt_parent: u32) -> Dtb {
+        // Version 3 machines leave the private-interrupt CPU mask empty.
+        base_tree_with(interrupt_parent, 4)
+    }
+
+    fn base_tree_with(interrupt_parent: u32, timer_flags: u32) -> Dtb {
         let mut dtb = Dtb::new();
         dtb.begin("");
         dtb.cell_prop("#address-cells", 2);
@@ -2459,7 +2464,20 @@ mod tests {
         dtb.prop("compatible", b"arm,armv8-timer\0");
         dtb.prop(
             "interrupts",
-            &cells(&[1, 13, 4, 1, 14, 4, 1, 11, 4, 1, 10, 4]),
+            &cells(&[
+                1,
+                13,
+                timer_flags,
+                1,
+                14,
+                timer_flags,
+                1,
+                11,
+                timer_flags,
+                1,
+                10,
+                timer_flags,
+            ]),
         );
         dtb.end_node();
 
@@ -2469,6 +2487,37 @@ mod tests {
         dtb.prop("interrupts", &cells(&[0, 16, 1]));
         dtb.end_node();
         dtb
+    }
+
+    #[test]
+    fn the_private_interrupt_cpu_mask_separates_the_two_gic_generations() {
+        // The third interrupt cell carries a CPU mask in bits 15:8. It names
+        // the version 2 CPU interfaces a private interrupt reaches, and
+        // version 3, which routes by affinity through the redistributor
+        // instead, leaves it empty. A consumer that requires the mask to name
+        // a CPU therefore rejects every version 3 machine, so the two shapes
+        // are pinned here against each other.
+        let mut version_three = base_tree();
+        version_three.end_node();
+        let blob = version_three.finish();
+        let inventory = ok(discover(&blob));
+        let timer = some(inventory.timer());
+        let physical = some(timer.interrupts().nth(1));
+        assert_eq!(physical.intid(), 30);
+        assert_eq!(physical.kind(), InterruptKind::Ppi);
+        assert_eq!(physical.ppi_cpu_mask(), 0);
+
+        // The same four routes as a version 2 machine describes them, with
+        // one CPU named in every mask.
+        let mut version_two = base_tree_with(1, 0x104);
+        version_two.end_node();
+        let blob = version_two.finish();
+        let inventory = ok(discover(&blob));
+        let timer = some(inventory.timer());
+        let physical = some(timer.interrupts().nth(1));
+        assert_eq!(physical.intid(), 30);
+        assert_eq!(physical.kind(), InterruptKind::Ppi);
+        assert_eq!(physical.ppi_cpu_mask(), 1);
     }
 
     #[test]
