@@ -264,7 +264,7 @@ class RepositoryPolicyTests(unittest.TestCase):
         self,
     ) -> None:
         machine_sources = tuple((REPO_ROOT / "crates/runtime/troe-machine/src").glob("*.rs"))
-        kernel_sources = tuple((REPO_ROOT / "kernel/src").glob("*.rs"))
+        kernel_sources = tuple((REPO_ROOT / "kernel/src").rglob("*.rs"))
         fixed_platform_literals = (
             "0xfee00000",
             "0xfec00000",
@@ -281,7 +281,9 @@ class RepositoryPolicyTests(unittest.TestCase):
                 with self.subTest(path=path.relative_to(REPO_ROOT), literal=literal):
                     self.assertNotIn(literal, normalized)
 
-        kernel = (REPO_ROOT / "kernel/src/main.rs").read_text(encoding="utf-8")
+        kernel = "\n".join(
+            path.read_text(encoding="utf-8") for path in sorted(kernel_sources)
+        )
         for transport_api in (
             "discover_virtio_mmio",
             "discover_virtio_pci",
