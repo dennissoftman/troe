@@ -10595,9 +10595,48 @@ mod firmware {
             }
         }
         let root_mode = activate_native_storage(accounting, &mut namespace, console);
+        attach_configuration(&mut namespace, root_mode, console);
         *accounting.session_timezone.borrow_mut() =
             resolve_session_timezone(&mut namespace, console);
         (namespace, root_mode)
+    }
+
+    /// Subtree of the persistent root holding configuration bytes.
+    const CONFIGURATION_STORE_PATH: &str = "/vol/root/config";
+
+    /// Present configuration at `/config`, backed by the persistent root.
+    ///
+    /// A path names an access point rather than a place bytes live, so
+    /// `/config` is where configuration is read and written while the bytes sit
+    /// on the journalled root volume that ADR 0055 already made durable. The
+    /// subtree is created on first boot when the root is writable.
+    ///
+    /// A recovery boot has no root to alias, and a read-only root presents
+    /// configuration without accepting edits. Both leave a configured value
+    /// reading as absent, which is the same ordinary case as a machine nobody
+    /// has configured.
+    fn attach_configuration(
+        namespace: &mut Namespace,
+        root_mode: NativeRootMode,
+        console: &mut dyn Output,
+    ) {
+        if matches!(root_mode, NativeRootMode::Recovery) {
+            return;
+        }
+        if matches!(root_mode, NativeRootMode::ReadWrite)
+            && namespace.metadata("/", CONFIGURATION_STORE_PATH).is_err()
+        {
+            let _ignored = namespace.create_directory("/", CONFIGURATION_STORE_PATH);
+        }
+        if namespace
+            .mount_alias("/config", "/vol/root", "/config")
+            .is_err()
+        {
+            // The root mounted but configuration did not attach, which is not
+            // the ordinary absent case and would otherwise look like a machine
+            // nobody configured.
+            let _ignored = write_all(console, b"/config: not attached; configuration is absent\n");
+        }
     }
 
     /// Path holding the operator's POSIX zone string, per ADR 0068.

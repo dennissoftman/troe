@@ -26,6 +26,31 @@ landed and the gap is the only thing left.
 
 ## Decision
 
+### `/config` is an access point, backed by the persistent root
+
+A path in this namespace names an access point rather than a place bytes live.
+`/sys/arch` and `/sys/mem` are behaviour, not files, and `/config` was reserved
+by ADR 0043 for desired state without anything ever being mounted there: it was
+a bare directory node, so a write to it failed with `not found`.
+
+`/config` is now an alias onto the `/config` subtree of `/vol/root`. The
+namespace gained the aliasing primitive that makes this expressible; an alias
+owns no storage and rewrites a lookup onto its target's own mount, so it can
+neither widen that mount's access nor outlive it. The bytes therefore sit on the
+journalled ext4 volume ADR 0055 already made durable and ADR 0009 makes required
+at boot.
+
+The persistent state filesystem was considered and rejected. ADR 0022 built it
+as an acceptance-only durability probe that production never mutates, and
+explicitly excluded "general directory mutation, rename, ACL, or multi-file
+transaction support". Adding named configuration entries would have contradicted
+the decision that created it, and would have meant a format revision to gain
+what the root volume already provides.
+
+A recovery boot has no root to alias and a read-only root accepts no edits.
+Both leave a configured value reading as absent, which is the same ordinary case
+as a machine nobody has configured.
+
 ### The session reads one zone file at start
 
 The interactive session resolves its `TZ` value once, when it starts, from
@@ -34,11 +59,8 @@ conventional default. The file holds one POSIX `TZ` string and nothing else:
 no key, no syntax, no comments, at most `timezone::MAX_TZ_BYTES` bytes, with an
 optional trailing newline.
 
-`/config` is where this belongs. ADR 0043 reserved it for "a stable, writable
-desired-state tree which survives generation replacement", on a persistent
-provider, which is exactly what a machine's timezone is. Setting it is
-`printf 'EST5EDT,M3.2.0,M11.1.0' > /config/timezone`, and it survives reboot
-because the provider does.
+Setting it is `printf 'EST5EDT,M3.2.0,M11.1.0' > /config/timezone`, and it
+survives reboot because the root volume does.
 
 Reading it at session start rather than per command is what keeps ADR 0043's
 separation intact. That ADR requires that "updating `/config` alone does not
@@ -74,6 +96,11 @@ rather than an ordinary edit. If a later decision needs the zone under
 generation control, the projection is the place for it, and `/config/timezone`
 remains the desired-state input that feeds it.
 
+This decision records one correction. An earlier draft asserted that `/config`
+was already writable persistent desired state because ADR 0043 reserved it. A
+reserved path is not an implemented one, and nothing had ever mounted a provider
+there. The aliasing primitive, not a new store, is what makes the path real.
+
 ## Verification and acceptance
 
 - Portable tests cover a valid file, a file with a trailing newline, an
@@ -86,7 +113,8 @@ remains the desired-state input that feeds it.
   assertion uses a fixed-offset zone so it states a property rather than an
   instant, as ADR 0067's acceptance does.
 - Acceptance proves the value survives a reboot, which is the whole point of
-  putting it on a persistent provider.
+  putting it on a persistent provider, and that a write does not change the
+  session that made it.
 - The existing assertion that `spawn --env TZ=... date` is refused stays, since
   this decision does not change the capability model.
 

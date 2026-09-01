@@ -1437,11 +1437,13 @@ def run_shell_terminal_group(session: SerialSession, command_timeout: float) -> 
     # must therefore not change this session: an edit to desired state takes
     # effect at the next boot, which is what ADR 0043 requires of `/config`.
     # The reboot scenario reads it back, which is what proves it persisted.
+    # `contains=("",)` would assert nothing and hide a failed redirection, so
+    # the write is proven by reading the file back rather than by its silence.
     session.command(
         f"printf {SESSION_TIMEZONE_VALUE} > {SESSION_TIMEZONE_FILE}",
         cwd,
         command_timeout,
-        contains=("",),
+        absent=("not found", "read-only", "failed"),
     )
     session.command(
         f"cat {SESSION_TIMEZONE_FILE}",

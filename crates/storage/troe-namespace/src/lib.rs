@@ -606,11 +606,7 @@ impl Namespace {
         if path == "/" || self.mount_for_path(&path).is_some() {
             return Err(FsError::Exists);
         }
-        let Some(index) = self
-            .mounts
-            .iter()
-            .position(|mount| mount.path == target)
-        else {
+        let Some(index) = self.mounts.iter().position(|mount| mount.path == target) else {
             return Err(FsError::NotFound);
         };
         // The subtree the alias exposes is expressed relative to the target's
@@ -2026,7 +2022,10 @@ mod tests {
             namespace.mount_alias("/config", "/vol/state", "/"),
             Err(FsError::Invalid)
         );
-        assert_eq!(namespace.mount_alias("/config", "/vol/state", "/config"), Ok(()));
+        assert_eq!(
+            namespace.mount_alias("/config", "/vol/state", "/config"),
+            Ok(())
+        );
         // A path already mounted or aliased, and an alias of an alias.
         assert_eq!(
             namespace.mount_alias("/config", "/vol/state", "/other"),
