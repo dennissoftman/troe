@@ -1,5 +1,12 @@
 #![no_std]
 #![no_main]
+// Bridges the vendored Lua C runtime, so every call across that boundary is an
+// FFI call. 12 of the 43 blocks name the invariant they rely on in a `SAFETY:`
+// comment; the other 31 -- the environment, file, and process callbacks the C
+// runtime calls back into -- do not. That gap is real and is tracked separately:
+// this change puts the file under the lint, it does not audit the bridge.
+// `tests/test_repository_policy.py` pins the undocumented count as a ceiling.
+#![allow(unsafe_code)]
 
 #[path = "../../common.rs"]
 mod common;
@@ -192,9 +199,7 @@ enum Selection<'invocation> {
     },
 }
 
-fn parse_invocation<'invocation>(
-    invocation: command::Invocation<'invocation>,
-) -> Result<ParsedInvocation<'invocation>, ()> {
+fn parse_invocation(invocation: command::Invocation<'_>) -> Result<ParsedInvocation<'_>, ()> {
     let mut parsed = ParsedInvocation {
         selection: None,
         actions: [EMPTY_ACTION; command::MAX_ARGUMENTS],
@@ -233,9 +238,7 @@ fn parse_invocation<'invocation>(
                 index += 1;
                 continue;
             }
-            "-W" => {
-                (LUA_ACTION_WARNING, "", 1)
-            }
+            "-W" => (LUA_ACTION_WARNING, "", 1),
             "-v" => {
                 parsed.show_version = true;
                 index += 1;
@@ -459,14 +462,14 @@ fn run(command: &mut CommandContext) -> u32 {
                 return exit::FAILURE;
             };
             source_name_storage[0] = b'@';
-            source_name_storage[1..1 + path.len()].copy_from_slice(path.as_bytes());
+            source_name_storage[1..=path.len()].copy_from_slice(path.as_bytes());
             (
                 Source::File {
                     filesystem,
                     file,
                     offset: 0,
                 },
-                &source_name_storage[..1 + path.len()],
+                &source_name_storage[..=path.len()],
                 script_index,
                 first_argument,
                 true,

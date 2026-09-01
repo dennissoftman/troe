@@ -1,5 +1,8 @@
 #![no_std]
 #![no_main]
+// Bridges the generated CPython C runtime, so every call across that boundary
+// is an FFI call. The interpreter's own entry points are declared here.
+#![allow(unsafe_code)]
 
 use core::{
     ffi::{c_char, c_void},

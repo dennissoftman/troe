@@ -80,4 +80,9 @@ replace the exhaustive gate.
 
 Dependencies must provide concrete value over a small local implementation,
 support `no_std` where required, have a compatible license, and be recorded in
-`THIRD_PARTY.md`. Commit `Cargo.lock` for reproducibility.
+`THIRD_PARTY.md`. Commit every `Cargo.lock` for reproducibility: the root
+workspace, `apps/`, `services/`, and `tests/runtime-probe`. A new command or
+service is a member of the `apps/` or `services/` workspace; it inherits
+`[workspace.package]` and `[workspace.lints]` and declares no workspace root,
+release profile, or lint levels of its own, so the format, lint, and test gates
+reach it. See [`docs/testing.md`](docs/testing.md) for those gates.

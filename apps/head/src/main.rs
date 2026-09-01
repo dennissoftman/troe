@@ -48,7 +48,9 @@ fn copy_head(
             let mut remaining = bytes;
             let mut buffer = [0_u8; CHUNK_BYTES];
             while remaining != 0 {
-                let wanted = usize::try_from(remaining).unwrap_or(CHUNK_BYTES).min(CHUNK_BYTES);
+                let wanted = usize::try_from(remaining)
+                    .unwrap_or(CHUNK_BYTES)
+                    .min(CHUNK_BYTES);
                 let count = read(&mut buffer[..wanted]).map_err(Failure::Source)?;
                 if count == 0 {
                     return Ok(());
@@ -150,7 +152,6 @@ fn report(command: &mut CommandContext, path: Option<&str>, failure: Failure) ->
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn main(command: &mut CommandContext) -> u32 {
     let Ok(mut arguments) = command.arguments() else {
         return exit::FAILURE;

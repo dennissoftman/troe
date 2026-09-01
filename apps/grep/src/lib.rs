@@ -1041,8 +1041,8 @@ mod tests {
             Ok(Some((0, 6)))
         );
         let mut program = Program::new();
-        program.add("[a-f]+", Syntax::Extended).unwrap();
-        program.finish().unwrap();
+        assert_eq!(program.add("[a-f]+", Syntax::Extended), Ok(()));
+        assert_eq!(program.finish(), Ok(()));
         assert_eq!(
             program.find(b"--BEEF--", 0, true, false, false),
             Ok(Some(2..6))
@@ -1052,8 +1052,8 @@ mod tests {
     #[test]
     fn fixed_whole_line_and_whole_word_modes_are_distinct() {
         let mut program = Program::new();
-        program.add("cat", Syntax::Fixed).unwrap();
-        program.finish().unwrap();
+        assert_eq!(program.add("cat", Syntax::Fixed), Ok(()));
+        assert_eq!(program.finish(), Ok(()));
         assert_eq!(
             program.find(b"catfish cat", 0, false, false, true),
             Ok(Some(8..11))
@@ -1065,15 +1065,13 @@ mod tests {
     #[test]
     fn multiple_patterns_are_combined() {
         let mut program = Program::new();
-        program.add("one", Syntax::Fixed).unwrap();
-        program.add("t.o", Syntax::Extended).unwrap();
-        program.finish().unwrap();
-        assert!(
-            program
-                .find(b"two", 0, false, false, false)
-                .unwrap()
-                .is_some()
-        );
+        assert_eq!(program.add("one", Syntax::Fixed), Ok(()));
+        assert_eq!(program.add("t.o", Syntax::Extended), Ok(()));
+        assert_eq!(program.finish(), Ok(()));
+        assert!(matches!(
+            program.find(b"two", 0, false, false, false),
+            Ok(Some(_))
+        ));
     }
 
     #[test]
@@ -1091,10 +1089,8 @@ mod tests {
     #[test]
     fn ambiguous_repetition_remains_linear_on_long_input() {
         let mut program = Program::new();
-        program
-            .add("a*a*a*a*z", Syntax::Extended)
-            .expect("bounded expression");
-        program.finish().expect("bounded program");
+        assert_eq!(program.add("a*a*a*a*z", Syntax::Extended), Ok(()));
+        assert_eq!(program.finish(), Ok(()));
         let subject = std::vec![b'a'; 64 * 1024];
         assert_eq!(program.find(&subject, 0, false, false, false), Ok(None));
     }

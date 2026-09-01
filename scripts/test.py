@@ -16,15 +16,25 @@ if __package__:
     from .platform_profile import PLATFORM_IDS, PLATFORM_PROFILES
     from .qemu_profile import QEMU_ENVIRONMENT
     from .repository_policy import (
+        KEX_TARGETS,
+        buildable_shared_volume_directories,
+        lintable_application_directories,
         require_supported_python,
         rootfs_application_directories,
+        service_directories,
+        unlintable_application_exclusions,
     )
 else:
     from platform_profile import PLATFORM_IDS, PLATFORM_PROFILES
     from qemu_profile import QEMU_ENVIRONMENT
     from repository_policy import (
+        KEX_TARGETS,
+        buildable_shared_volume_directories,
+        lintable_application_directories,
         require_supported_python,
         rootfs_application_directories,
+        service_directories,
+        unlintable_application_exclusions,
     )
 
 
@@ -32,6 +42,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 TOOLS_DIR = REPO_ROOT / "tools"
 DEFAULT_PROGRESS_INTERVAL = 60.0
 KEX_APPLICATIONS = rootfs_application_directories()
+SHARED_VOLUME_KEX_APPLICATIONS = buildable_shared_volume_directories()
+APPLICATIONS_MANIFEST = REPO_ROOT / "apps" / "Cargo.toml"
+UNLINTABLE_APPLICATION_EXCLUSIONS = unlintable_application_exclusions()
+SERVICES_MANIFEST = REPO_ROOT / "services" / "Cargo.toml"
 KEX_SERVICES = (
     (REPO_ROOT / "services" / "diagnostics", "diagnostics-server", 8),
     (
@@ -177,6 +191,40 @@ def target_clippy_commands() -> list[Step]:
     ]
 
 
+def package_clippy_commands() -> list[Step]:
+    """Return one bare-metal lint gate per shipped command and service.
+
+    One package at a time, not one workspace-wide invocation: Cargo unifies
+    features across everything it builds together, and `ls` and `mem` take
+    `troe-kex-runtime` without its `alloc` feature while `cp`, `mv`, and `rm`
+    take it with. A single workspace build would lint those commands against a
+    feature set they never ship with, and would not even compile.
+    """
+    targets: tuple[str, ...] = ()
+    for target in KEX_TARGETS:
+        targets = (*targets, "--target", target)
+    return [
+        Step(
+            f"clippy {kind} ({directory.name})",
+            (
+                "cargo",
+                "clippy",
+                "--manifest-path",
+                directory / "Cargo.toml",
+                *targets,
+                "--",
+                "-D",
+                "warnings",
+            ),
+        )
+        for kind, directories in (
+            ("app", lintable_application_directories()),
+            ("service", service_directories()),
+        )
+        for directory in directories
+    ]
+
+
 def image_and_qemu_commands(
     *, skip_qemu: bool, strict_tool_versions: bool = False
 ) -> list[Step]:
@@ -224,6 +272,16 @@ def verification_steps(args: argparse.Namespace) -> list[Step]:
     """Return every gate in execution order with its short progress label."""
     steps: list[Step] = [
         Step("cargo fmt", ("cargo", "fmt", "--all", "--", "--check")),
+        *(
+            Step(
+                f"cargo fmt ({label})",
+                ("cargo", "fmt", "--all", "--manifest-path", manifest, "--", "--check"),
+            )
+            for label, manifest in (
+                ("applications", APPLICATIONS_MANIFEST),
+                ("services", SERVICES_MANIFEST),
+            )
+        ),
         Step(
             "clippy workspace",
             (
@@ -237,7 +295,35 @@ def verification_steps(args: argparse.Namespace) -> list[Step]:
             ),
         ),
         *target_clippy_commands(),
+        *package_clippy_commands(),
+        Step(
+            "clippy applications (host unit tests)",
+            (
+                "cargo",
+                "clippy",
+                "--manifest-path",
+                APPLICATIONS_MANIFEST,
+                "--workspace",
+                *UNLINTABLE_APPLICATION_EXCLUSIONS,
+                "--tests",
+                "--",
+                "-D",
+                "warnings",
+            ),
+        ),
         Step("cargo test workspace", ("cargo", "test", "--workspace")),
+        Step(
+            "cargo test applications",
+            (
+                "cargo",
+                "test",
+                "--manifest-path",
+                APPLICATIONS_MANIFEST,
+                "--workspace",
+                *UNLINTABLE_APPLICATION_EXCLUSIONS,
+                "--lib",
+            ),
+        ),
         Step(
             "python unit tests",
             (
@@ -302,6 +388,27 @@ def verification_steps(args: argparse.Namespace) -> list[Step]:
                 ),
             )
             for service, name, stack_pages in KEX_SERVICES
+        ),
+        # A shared-volume deliverable ships no committed `.kex`, so there is no
+        # `--check` for it and only a QEMU acceptance run would otherwise build
+        # one. Build it here so the builder's workspace-member path handling is
+        # exercised for every member it can reach, not only the ones with a
+        # committed artifact to compare against.
+        *(
+            Step(
+                f"kex shared app ({application.name})",
+                (
+                    "cargo",
+                    "kex",
+                    "build",
+                    application,
+                    "--target",
+                    "all",
+                    "--output",
+                    REPO_ROOT / "build" / "shared-volume-packages",
+                ),
+            )
+            for application in SHARED_VOLUME_KEX_APPLICATIONS
         ),
         Step(
             "kex runtime probe",

@@ -69,11 +69,9 @@ mod tests {
         packet[1] = 2;
         packet[24..32].copy_from_slice(&token.to_be_bytes());
         packet[32..40].copy_from_slice(&[0, 0, 0, 1, 0, 0, 0, 1]);
-        packet[40..44].copy_from_slice(
-            &u32::try_from(NTP_TO_UNIX_SECONDS + 1_800_000_000)
-                .unwrap()
-                .to_be_bytes(),
-        );
+        let transmit = u32::try_from(NTP_TO_UNIX_SECONDS + 1_800_000_000);
+        assert!(transmit.is_ok(), "the fixture epoch fits an NTP timestamp");
+        packet[40..44].copy_from_slice(&transmit.unwrap_or_default().to_be_bytes());
         packet[47] = 1;
         packet
     }

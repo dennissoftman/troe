@@ -1,5 +1,9 @@
 #![no_std]
 #![no_main]
+// Reads and writes the three private pages this command maps for itself, to
+// prove that the mapping, protection change, and unmapping are all honored.
+// Every block carries a SAFETY note naming the ownership it relies on.
+#![allow(unsafe_code)]
 
 #[path = "../../common.rs"]
 mod common;

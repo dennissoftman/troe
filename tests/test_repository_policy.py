@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import argparse
 import datetime
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -17,12 +19,18 @@ sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
 from repository_policy import (  # noqa: E402
     AUDIT_EXCEPTIONS_FILE,
+    KEX_TARGETS,
     SHARED_VOLUME_APPLICATIONS,
+    UNLINTABLE_APPLICATIONS,
     application_directories,
+    buildable_shared_volume_directories,
+    lintable_application_directories,
     load_audit_exceptions,
     require_supported_python,
+    rootfs_application_directories,
     rust_code_without_comments_or_literals,
     rust_source_outside_test_configuration,
+    service_directories,
     shipped_troe_dependencies,
 )
 
@@ -655,6 +663,367 @@ fn shipped() -> u8 {
             "kernel storage/network linkage changed: update this gate with the migration",
         )
 
+    def test_shipped_packages_are_members_of_one_workspace_per_tree(self) -> None:
+        """`apps/` and `services/` are each one Cargo workspace, not 42 of them.
+        A per-package workspace root is invisible to `cargo fmt --all`,
+        `cargo clippy --workspace`, and `cargo test --workspace`, which is how
+        11,804 lines of shipped Rust and 31 unit tests stayed outside the gate.
+        Assert the exact member sets, the single lock per tree, and that no
+        member reintroduces a root, a profile, or its own lint levels."""
+        for tree, directories in (
+            ("apps", application_directories()),
+            ("services", service_directories()),
+        ):
+            root = REPO_ROOT / tree
+            workspace = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
+            self.assertNotIn("package", workspace, tree)
+            self.assertEqual(workspace["workspace"]["resolver"], "3", tree)
+            self.assertEqual(
+                sorted(workspace["workspace"]["members"]),
+                sorted(path.name for path in directories),
+                tree,
+            )
+            self.assertTrue((root / "Cargo.lock").is_file(), tree)
+            for directory in directories:
+                member = tomllib.loads(
+                    (directory / "Cargo.toml").read_text(encoding="utf-8")
+                )
+                with self.subTest(member=directory.name):
+                    self.assertNotIn("workspace", member)
+                    self.assertNotIn("profile", member)
+                    self.assertEqual(member["lints"], {"workspace": True})
+                    for field in ("version", "edition", "rust-version", "license", "publish"):
+                        self.assertEqual(
+                            member["package"][field], {"workspace": True}, field
+                        )
+                    # A `#![no_main]` command has no test harness, and Cargo's
+                    # default test target for it cannot build for either a bare
+                    # target or the host. Declaring it away is what lets the
+                    # gate reach the library test modules with `--tests`.
+                    self.assertEqual(len(member["bin"]), 1)
+                    self.assertIs(member["bin"][0]["test"], False)
+                    self.assertIs(member["bin"][0]["bench"], False)
+                    self.assertFalse((directory / "Cargo.lock").exists())
+
+    def test_application_lint_levels_track_the_root_workspace(self) -> None:
+        """Both trees start from the root workspace's lint levels. Two rust
+        deviations are deliberate and every clippy deviation is an `allow` for a
+        lint the shipped sources violate today, which cannot be fixed here
+        because a moved line rewrites the panic locations inside a committed
+        `.kex`. Pin the deviations so tightening them is a visible diff and
+        loosening them further is a failure."""
+        def lints(manifest: Path) -> dict[str, dict[str, object]]:
+            document = tomllib.loads(manifest.read_text(encoding="utf-8"))
+            return document["workspace"]["lints"]
+
+        root = lints(REPO_ROOT / "Cargo.toml")
+        self.assertEqual(
+            root["rust"], {"unsafe_code": "forbid", "missing_docs": "warn"}
+        )
+        strict_clippy = {
+            "all": {"level": "warn", "priority": -1},
+            "pedantic": {"level": "warn", "priority": -1},
+            "unwrap_used": "deny",
+            "expect_used": "deny",
+            "panic": "deny",
+        }
+        self.assertEqual(root["clippy"], strict_clippy)
+
+        deferred = {
+            "cast_possible_truncation",
+            "cast_sign_loss",
+            "collapsible_if",
+            "doc_markdown",
+            "if_not_else",
+            "ignored_unit_patterns",
+            "large_stack_arrays",
+            "large_types_passed_by_value",
+            "manual_let_else",
+            "match_same_arms",
+            "missing_errors_doc",
+            "needless_pass_by_value",
+            "semicolon_if_nothing_returned",
+            "single_match_else",
+            "struct_excessive_bools",
+            "too_many_arguments",
+            "too_many_lines",
+        }
+        for tree, allowed in (("apps", deferred), ("services", set())):
+            with self.subTest(tree=tree):
+                table = lints(REPO_ROOT / tree / "Cargo.toml")
+                # `deny` rather than `forbid`: `forbid` cannot be lifted, and
+                # four members genuinely need `unsafe`. They opt in per crate.
+                self.assertEqual(
+                    table["rust"], {"unsafe_code": "deny", "missing_docs": "allow"}
+                )
+                self.assertEqual(
+                    {name: table["clippy"][name] for name in strict_clippy},
+                    strict_clippy,
+                )
+                extra = set(table["clippy"]) - set(strict_clippy)
+                self.assertEqual(extra, allowed)
+                for name in extra:
+                    self.assertEqual(table["clippy"][name], "allow", name)
+
+    def test_one_release_profile_owns_every_shipped_package(self) -> None:
+        """One `[profile.release]` per tree replaces 42 identical copies. The two
+        interpreters keep `opt-level = 2`; that is the only value that differed,
+        and `opt-level` is the only one a per-package override may carry, so
+        `panic`, `lto`, and `strip` must stay uniform to be expressible here."""
+        shipped = {
+            "codegen-units": 1,
+            "lto": False,
+            "opt-level": "z",
+            "panic": "abort",
+            "strip": "none",
+        }
+        for tree, overrides in (
+            ("apps", {"troe-app-lua": 2, "troe-app-python": 2}),
+            ("services", {}),
+        ):
+            with self.subTest(tree=tree):
+                profile = tomllib.loads(
+                    (REPO_ROOT / tree / "Cargo.toml").read_text(encoding="utf-8")
+                )["profile"]["release"]
+                package = profile.pop("package", {})
+                self.assertEqual(profile, shipped)
+                self.assertEqual(
+                    {name: table["opt-level"] for name, table in package.items()},
+                    overrides,
+                )
+                for table in package.values():
+                    self.assertEqual(set(table), {"opt-level"})
+
+    def test_every_unsafe_opt_in_is_named_at_its_crate_root(self) -> None:
+        """`unsafe_code` is `deny`, so each of the four members that needs it
+        carries one crate-level `#![allow(unsafe_code)]` with the reason directly
+        above it. Pin that set, so a fifth opt-in has to be argued for in review
+        rather than added quietly.
+
+        Pin the `SAFETY:` coverage too, per block rather than per file.
+        CONTRIBUTING.md asks every `unsafe` block to name its invariant, and
+        two of the four opted-in files do. `apps/lua/src/main.rs` documents 12
+        of 43, and its header names that gap; `apps/python/src/main.rs`
+        documents 3 of 4. The allowance below is a ceiling on the undocumented
+        blocks, so the debt can only shrink and a new bare block fails here."""
+        undocumented_allowance = {
+            "apps/lua/src/main.rs": 31,
+            "apps/python/src/main.rs": 1,
+        }
+        opted_in = {}
+        for tree in ("apps", "services"):
+            for source in sorted((REPO_ROOT / tree).rglob("*.rs")):
+                relative = source.relative_to(REPO_ROOT).as_posix()
+                if relative.startswith(("apps/lua/vendor/", "apps/python/patches/")):
+                    continue
+                text = source.read_text(encoding="utf-8")
+                if "#![allow(unsafe_code)]" in text:
+                    opted_in[relative] = text
+        self.assertEqual(
+            sorted(opted_in),
+            [
+                "apps/lua/src/main.rs",
+                "apps/mem/src/main.rs",
+                "apps/python/src/main.rs",
+                "services/diagnostics-fault/src/main.rs",
+            ],
+        )
+        for relative, text in opted_in.items():
+            with self.subTest(source=relative):
+                lines = text.splitlines()
+                index = lines.index("#![allow(unsafe_code)]")
+                self.assertTrue(lines[index - 1].startswith("// "), relative)
+                self.assertGreaterEqual(text.count("SAFETY:"), 1, relative)
+                undocumented = [
+                    number
+                    for number, line in enumerate(lines, start=1)
+                    if "unsafe {" in line
+                    and not any(
+                        "SAFETY:" in preceding
+                        for preceding in lines[max(number - 5, 0) : number - 1]
+                    )
+                ]
+                self.assertLessEqual(
+                    len(undocumented),
+                    undocumented_allowance.get(relative, 0),
+                    f"{relative}: `unsafe` blocks with no `SAFETY:` note in the "
+                    f"four lines above them, at {undocumented}",
+                )
+
+    def test_panicking_allowance_stays_inside_build_scripts(self) -> None:
+        """`unwrap_used`, `expect_used`, and `panic` are `deny` for both trees.
+        A build script is the one place that has to be allowed to panic: it has
+        no caller to return an error to. Pin the exception to build scripts, so
+        the allowance cannot migrate into a shipped source file, where a panic
+        would abort a running command instead of a build."""
+        allowance = re.compile(
+            r"#!?\[allow\([^)]*clippy::(?:expect_used|panic|unwrap_used)"
+        )
+        allowed_in = []
+        for tree in ("apps", "services"):
+            for source in sorted((REPO_ROOT / tree).rglob("*.rs")):
+                relative = source.relative_to(REPO_ROOT).as_posix()
+                if relative.startswith(("apps/lua/vendor/", "apps/python/patches/")):
+                    continue
+                if allowance.search(source.read_text(encoding="utf-8")):
+                    self.assertEqual(source.name, "build.rs", relative)
+                    allowed_in.append(relative)
+        self.assertEqual(allowed_in, ["apps/lua/build.rs", "apps/python/build.rs"])
+
+    def test_shipped_locks_add_no_unaudited_external_crate(self) -> None:
+        """`scripts/audit.py` audits the root `Cargo.lock` only. That is sound
+        exactly while `apps/Cargo.lock` and `services/Cargo.lock` name no
+        registry crate the root lock does not already pin at the same version.
+        Assert it, so adding a boundary dependency to a command fails here
+        instead of silently leaving the RustSec gate."""
+        def registry_crates(lock: Path) -> dict[str, str]:
+            pinned: dict[str, str] = {}
+            for entry in lock.read_text(encoding="utf-8").split("[[package]]")[1:]:
+                if "source = " not in entry:
+                    continue
+                name = re.search(r'name = "([^"]+)"', entry)
+                version = re.search(r'version = "([^"]+)"', entry)
+                self.assertIsNotNone(name)
+                self.assertIsNotNone(version)
+                if name is not None and version is not None:
+                    pinned[name.group(1)] = version.group(1)
+            return pinned
+
+        audited = registry_crates(REPO_ROOT / "Cargo.lock")
+        for tree in ("apps", "services"):
+            with self.subTest(tree=tree):
+                shipped = registry_crates(REPO_ROOT / tree / "Cargo.lock")
+                self.assertEqual(
+                    {
+                        name: version
+                        for name, version in shipped.items()
+                        if audited.get(name) != version
+                    },
+                    {},
+                )
+
+    def test_the_lint_gate_reaches_every_shipped_package_it_can_compile(self) -> None:
+        """The full gate lints one package at a time on both bare-metal targets,
+        because Cargo unifies features across a workspace build and `ls` and
+        `mem` take `troe-kex-runtime` without the `alloc` feature that `cp`,
+        `mv`, and `rm` enable. `python` is the single exclusion: its build script
+        needs the CPython tree generated outside the repository."""
+        self.assertEqual(UNLINTABLE_APPLICATIONS, {"python"})
+        self.assertEqual(KEX_TARGETS, ("x86_64-unknown-none", "aarch64-unknown-none"))
+        lintable = {path.name for path in lintable_application_directories()}
+        self.assertEqual(
+            lintable, {path.name for path in application_directories()} - {"python"}
+        )
+        import test as full_gate  # noqa: PLC0415
+
+        labels = [
+            step.label
+            for step in full_gate.verification_steps(
+                argparse.Namespace(
+                    skip_qemu=True,
+                    strict_tool_versions=False,
+                    build_sbsa_firmware=False,
+                )
+            )
+        ]
+        expected = [f"clippy app ({name})" for name in sorted(lintable)]
+        expected += [
+            f"clippy service ({path.name})" for path in service_directories()
+        ]
+        expected += [
+            "cargo fmt (applications)",
+            "cargo fmt (services)",
+            "clippy applications (host unit tests)",
+            "cargo test applications",
+        ]
+        self.assertEqual(sorted(set(labels) & set(expected)), sorted(expected))
+
+    def test_the_gate_builds_the_member_it_cannot_byte_check(self) -> None:
+        """A shared-volume deliverable ships no committed `.kex`, so `--check`
+        has nothing to compare against and only a QEMU acceptance run would
+        otherwise build one. That left `cargo kex build` unexercised for the two
+        members whose sources are largest. `lua` is built by the full gate
+        instead; `python` cannot be, because its build script consumes the
+        out-of-tree CPython tree."""
+        shared = {path.name for path in buildable_shared_volume_directories()}
+        self.assertEqual(shared, SHARED_VOLUME_APPLICATIONS - UNLINTABLE_APPLICATIONS)
+        self.assertEqual(shared, {"lua"})
+        checked = {path.name for path in rootfs_application_directories()}
+        self.assertEqual(checked & SHARED_VOLUME_APPLICATIONS, set())
+        import test as full_gate  # noqa: PLC0415
+
+        labels = {
+            step.label
+            for step in full_gate.verification_steps(
+                argparse.Namespace(
+                    skip_qemu=True,
+                    strict_tool_versions=False,
+                    build_sbsa_firmware=False,
+                )
+            )
+        }
+        self.assertEqual(
+            {label for label in labels if label.startswith("kex shared app (")},
+            {f"kex shared app ({name})" for name in shared},
+        )
+
+    def test_the_unlinted_member_keeps_the_denied_constructs_out(self) -> None:
+        """`unwrap_used`, `expect_used`, and `panic` are `deny` for the whole
+        tree, but `python` is outside the lint gate, so nothing compiles those
+        denies against its shipped source. Substitute a textual check for the
+        one member clippy cannot reach, so the guarantee the workspace declares
+        is at least enforced for the constructs the denies name. `build.rs` is
+        exempt: a build script has no caller to return an error to, which is
+        what `test_panicking_allowance_stays_inside_build_scripts` pins."""
+        denied = re.compile(r"\.unwrap\(|\.expect\(|\b(?:panic|unreachable|todo|unimplemented)!")
+        checked = []
+        for name in sorted(UNLINTABLE_APPLICATIONS):
+            for source in sorted((REPO_ROOT / "apps" / name).rglob("*.rs")):
+                relative = source.relative_to(REPO_ROOT).as_posix()
+                if source.name == "build.rs" or relative.startswith(
+                    "apps/python/patches/"
+                ):
+                    continue
+                found = [
+                    number
+                    for number, line in enumerate(
+                        source.read_text(encoding="utf-8").splitlines(), start=1
+                    )
+                    if denied.search(line)
+                ]
+                self.assertEqual(found, [], f"{relative}: denied construct at {found}")
+                checked.append(relative)
+        self.assertEqual(checked, ["apps/python/src/main.rs"])
+
+    def test_the_shared_include_records_its_standalone_source_path(self) -> None:
+        """33 commands pull `apps/common.rs` in with
+        `#[path = "../../common.rs"]`, and rustc records that spelling relative
+        to the crate root rather than normalising it, so a shipped package names
+        the file `src/../../common.rs`. Six committed artifacts carry that
+        string. A workspace build shortens it to
+        `<member>/src/../../common.rs`, and the builder's member remapping
+        strips the member prefix back off, which is why the include needs no
+        remapping of its own and why membership did not regenerate those six
+        packages. Assert the committed bytes, so a remapping that stopped
+        covering the include is named here rather than only failing
+        `cargo kex build --check`."""
+        carriers = []
+        for architecture in ("x86_64", "aarch64"):
+            binaries = REPO_ROOT / "rootfs" / "bin" / architecture
+            for artifact in sorted(binaries.glob("*.kex")):
+                data = artifact.read_bytes()
+                if b"common.rs" not in data:
+                    continue
+                relative = artifact.relative_to(REPO_ROOT).as_posix()
+                self.assertIn(b"src/../../common.rs", data, relative)
+                self.assertNotIn(
+                    f"{artifact.stem}/src/../../common.rs".encode(), data, relative
+                )
+                self.assertNotIn(b"/troe/apps/common.rs", data, relative)
+                carriers.append(artifact.stem)
+        self.assertEqual(
+            sorted(set(carriers)), ["cp", "grep", "head", "mv", "tail", "touch"]
+        )
 
 
 if __name__ == "__main__":

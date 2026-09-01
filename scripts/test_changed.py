@@ -16,8 +16,12 @@ if __package__:
     from .platform_profile import X86_64_Q35_UEFI
     from .qemu_profile import QEMU_ENVIRONMENT
     from .repository_policy import (
+        KEX_TARGETS,
         SHARED_VOLUME_APPLICATIONS,
+        UNLINTABLE_APPLICATIONS,
         application_directories,
+        buildable_shared_volume_directories,
+        lintable_application_directories,
         require_supported_python,
         rootfs_application_directories,
     )
@@ -27,8 +31,12 @@ else:
     from platform_profile import X86_64_Q35_UEFI
     from qemu_profile import QEMU_ENVIRONMENT
     from repository_policy import (
+        KEX_TARGETS,
         SHARED_VOLUME_APPLICATIONS,
+        UNLINTABLE_APPLICATIONS,
         application_directories,
+        buildable_shared_volume_directories,
+        lintable_application_directories,
         require_supported_python,
         rootfs_application_directories,
     )
@@ -224,7 +232,11 @@ FULL_GATE_PATHS = frozenset(
         ".cargo/config.toml",
         "Cargo.lock",
         "Cargo.toml",
+        "apps/Cargo.lock",
+        "apps/Cargo.toml",
         "rust-toolchain.toml",
+        "services/Cargo.lock",
+        "services/Cargo.toml",
         "scripts/test.py",
         "scripts/test_changed.py",
         "scripts/test_scenarios.py",
@@ -410,7 +422,11 @@ def _classify_app(plan: TestPlan, path: PurePosixPath) -> bool:
     application = path.parts[1]
     plan.applications.add(application)
     plan.note(f"kex:{application}", path)
-    if path.name in {"Cargo.toml", "Cargo.lock"}:
+    # An unlintable application gets no clippy pass and no unit tests, so the
+    # policy suite's textual `unwrap`/`expect`/`panic` scan is the only
+    # compiler-like check any change to its sources receives. Select it for
+    # every path under such an application, not only for its manifest.
+    if path.name in {"Cargo.toml", "Cargo.lock"} or application in UNLINTABLE_APPLICATIONS:
         _add_python(plan, path, "test_repository_policy.py")
     if application in STDIN_APPS:
         _add_qemu(plan, path, "shell-terminal")
@@ -594,6 +610,25 @@ def commands_for_plan(
             commands.append(
                 ("cargo", "fmt", "--manifest-path", str(manifest), "--", "--check")
             )
+    lint_applications = (
+        sorted(path.name for path in lintable_application_directories())
+        if plan.all_applications
+        else sorted(plan.applications - UNLINTABLE_APPLICATIONS)
+    )
+    kex_targets: tuple[str, ...] = ()
+    for target in KEX_TARGETS:
+        kex_targets = (*kex_targets, "--target", target)
+    for application in lint_applications:
+        manifest = str(REPO_ROOT / "apps" / application / "Cargo.toml")
+        commands.append(
+            ("cargo", "clippy", "--manifest-path", manifest, *kex_targets, "--", "-D", "warnings")
+        )
+        if not (REPO_ROOT / "apps" / application / "src" / "lib.rs").is_file():
+            continue
+        commands.append(
+            ("cargo", "clippy", "--manifest-path", manifest, "--tests", "--", "-D", "warnings")
+        )
+        commands.append(("cargo", "test", "--manifest-path", manifest, "--lib"))
     for package in sorted(plan.rust_packages):
         commands.append(
             ("cargo", "clippy", "-p", package, "--all-targets", "--", "-D", "warnings")
@@ -635,6 +670,29 @@ def commands_for_plan(
                 "--target",
                 "all",
                 "--check",
+            )
+        )
+    # A shared-volume deliverable has no committed artifact to compare against,
+    # so it is built rather than checked, exactly as the full gate does it.
+    shared_volume = (
+        sorted(path.name for path in buildable_shared_volume_directories())
+        if plan.all_applications
+        else sorted(
+            {path.name for path in buildable_shared_volume_directories()}
+            & plan.applications
+        )
+    )
+    for application in shared_volume:
+        commands.append(
+            (
+                "cargo",
+                "kex",
+                "build",
+                str(REPO_ROOT / "apps" / application),
+                "--target",
+                "all",
+                "--output",
+                str(REPO_ROOT / "build" / "shared-volume-packages"),
             )
         )
     if plan.run_host_smoke:

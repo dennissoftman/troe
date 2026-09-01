@@ -54,21 +54,21 @@ raw Ethernet, routes, DNS, TLS, another network capability, or devices.
 
 ## Minimal crate
 
-Create a standalone crate under `apps/<command>` (include an empty `[workspace]`
-table), commit its `Cargo.lock` (`cargo kex` is locked), and depend on:
+Add `apps/<command>` to `members` in `apps/Cargo.toml` and refresh
+`apps/Cargo.lock` (`cargo kex` is locked). Inherit every `[package]` field but
+`name` with `field.workspace = true`; declare no workspace, profile, or lints:
 
 ```toml
+[[bin]]
+name = "troe-app-<command>"
+test = false
+bench = false
+
 [dependencies]
 troe-kex-sdk = { path = "../../sdk/rust/troe-kex" }
 
-[profile.release]
-codegen-units = 1
-lto = false
-opt-level = "z"
-panic = "abort"
-strip = "none"
-
-[workspace]
+[lints]
+workspace = true
 ```
 
 Use the adapter shape:

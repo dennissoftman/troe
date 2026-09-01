@@ -544,7 +544,6 @@ fn read_manifest(app: &Path, requested_command: Option<&str>) -> ToolResult<AppM
     let mut package = None;
     let mut binary = None;
     let mut bin_tables = 0_u8;
-    let mut workspace = false;
     let mut capabilities = None;
     let mut stack_pages = None;
     let mut heap_pages = None;
@@ -555,9 +554,7 @@ fn read_manifest(app: &Path, requested_command: Option<&str>) -> ToolResult<AppM
         }
         if line.starts_with('[') {
             section = line;
-            if line == "[workspace]" {
-                workspace = true;
-            } else if line == "[[bin]]" {
+            if line == "[[bin]]" {
                 bin_tables = bin_tables.saturating_add(1);
                 if bin_tables > 1 {
                     return Err(ToolError::new(
@@ -598,11 +595,6 @@ fn read_manifest(app: &Path, requested_command: Option<&str>) -> ToolResult<AppM
                 "manifest declares heap-pages more than once",
             ));
         }
-    }
-    if !workspace {
-        return Err(ToolError::new(
-            "application must be a standalone Cargo workspace",
-        ));
     }
     let package = package.ok_or_else(|| ToolError::new("manifest has no package name"))?;
     let binary = match (bin_tables, binary) {
@@ -654,25 +646,130 @@ fn read_manifest(app: &Path, requested_command: Option<&str>) -> ToolResult<AppM
     })
 }
 
-fn encoded_rust_flags() -> ToolResult<String> {
+/// Resolve the Cargo workspace that owns one package directory.
+///
+/// Cargo names a source file by its path relative to the workspace root, so the
+/// workspace root is what decides whether a package records `src/main.rs` or
+/// `<member>/src/main.rs`, and it is also the directory Cargo runs `rustc` from.
+/// Cargo's own rule is to walk upwards to the nearest manifest that carries a
+/// `[workspace]` table, and that walk is repeated here by reading at most a few
+/// manifests. Asking `cargo locate-project --workspace` would answer the same
+/// question by spawning a process on every build, for a layout this tool
+/// already constrains to the repository.
+fn workspace_root(package: &Path, root: &Path) -> ToolResult<PathBuf> {
+    let mut candidate = package;
+    loop {
+        let manifest = candidate.join("Cargo.toml");
+        if manifest.is_file() {
+            let source = fs::read_to_string(&manifest)
+                .map_err(|error| io_error("read", &manifest, &error))?;
+            if source.lines().any(|line| line.trim() == "[workspace]") {
+                return Ok(candidate.to_path_buf());
+            }
+        }
+        if candidate == root {
+            return Err(ToolError::new(
+                "no Cargo workspace owns the application directory",
+            ));
+        }
+        candidate = candidate
+            .parent()
+            .ok_or_else(|| ToolError::new("application directory has no parent"))?;
+    }
+}
+
+fn encoded_rust_flags(package: &Path) -> ToolResult<String> {
     let root = repo_root()
         .canonicalize()
         .map_err(|error| io_error("resolve", &repo_root(), &error))?;
+    let workspace = workspace_root(package, &root)?;
+    let relative_workspace = workspace
+        .strip_prefix(&root)
+        .map_err(|_| ToolError::new("workspace root must sit inside the repository"))?
+        .to_str()
+        .ok_or_else(|| ToolError::new("workspace path must be valid UTF-8"))?
+        .to_owned();
     let root = root
         .to_str()
         .ok_or_else(|| ToolError::new("repository path must be valid UTF-8"))?;
+    // Cargo runs `rustc` from the workspace root, which is `apps/` for a
+    // command, `services/` for a service, and the package directory itself for a
+    // standalone probe. The script is addressed relative to that root, one `..`
+    // per path component, so the flag names the same file at every depth without
+    // depending on where the checkout lives.
+    let ascent = if relative_workspace.is_empty() {
+        String::new()
+    } else {
+        "../".repeat(relative_workspace.split('/').count())
+    };
     let mut flags = RUST_FLAGS
         .iter()
         .map(|flag| {
             if *flag == "LINKER_SCRIPT" {
-                "link-arg=-T../../sdk/kex.ld".to_owned()
+                format!("link-arg=-T{ascent}sdk/kex.ld")
             } else {
                 (*flag).to_owned()
             }
         })
         .collect::<Vec<_>>();
     flags.push(format!("--remap-path-prefix={root}=/troe"));
+    flags.extend(member_path_remappings(
+        package,
+        &workspace,
+        &relative_workspace,
+    )?);
     Ok(flags.join("\x1f"))
+}
+
+/// Record every source path the way a standalone package build records it.
+///
+/// Cargo names a file inside the workspace by its path relative to the workspace
+/// root and a file outside it by its absolute path. A package therefore records
+/// `src/main.rs` when it is its own workspace root and `<member>/src/main.rs`
+/// when it is a member, and it names a sibling member relatively instead of
+/// absolutely. Both differences would rewrite the shipped artifact, so each
+/// member directory is remapped back to the standalone spelling: the built
+/// package loses its own prefix, and every sibling regains the absolute
+/// `/troe/...` form the repository-root remapping would have given it.
+///
+/// Stripping the member prefix is enough for a `#[path]` include as well, and
+/// nothing here needs to name one. `rustc` resolves such a path against the
+/// crate root's directory and records the join without normalising it, so the
+/// commands that pull in `apps/common.rs` record `src/../../common.rs`
+/// standalone and `<member>/src/../../common.rs` as a member. Six committed
+/// artifacts carry that string, and
+/// `test_the_shared_include_records_its_standalone_source_path` pins it.
+///
+/// A package that is its own workspace root needs no remapping and gets none.
+fn member_path_remappings(
+    package: &Path,
+    workspace: &Path,
+    relative_workspace: &str,
+) -> ToolResult<Vec<String>> {
+    if workspace == package {
+        return Ok(Vec::new());
+    }
+    let mut members = Vec::new();
+    for entry in fs::read_dir(workspace).map_err(|error| io_error("read", workspace, &error))? {
+        let entry = entry.map_err(|error| io_error("read", workspace, &error))?;
+        let directory = entry.path();
+        if !directory.join("Cargo.toml").is_file() {
+            continue;
+        }
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| ToolError::new("workspace member name must be valid UTF-8"))?;
+        if directory == package {
+            members.push(format!("--remap-path-prefix={name}/="));
+        } else {
+            members.push(format!(
+                "--remap-path-prefix={name}/=/troe/{relative_workspace}/{name}/"
+            ));
+        }
+    }
+    members.sort();
+    Ok(members)
 }
 
 fn run_cargo(manifest: &AppManifest, target: Target) -> ToolResult<PathBuf> {
@@ -691,7 +788,10 @@ fn run_cargo(manifest: &AppManifest, target: Target) -> ToolResult<PathBuf> {
         .current_dir(repo_root())
         .env("CARGO_INCREMENTAL", "0")
         .env("CARGO_TARGET_DIR", &target_dir)
-        .env("CARGO_ENCODED_RUSTFLAGS", encoded_rust_flags()?)
+        .env(
+            "CARGO_ENCODED_RUSTFLAGS",
+            encoded_rust_flags(&manifest.directory)?,
+        )
         .env("RUSTC_WRAPPER", wrapper)
         .env(RUSTC_WRAPPER_ENV, "1")
         .status()

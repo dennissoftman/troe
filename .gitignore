@@ -1,6 +1,6 @@
 /target/
-/apps/*/target/
-/services/*/target/
+/apps/target/
+/services/target/
 /tests/runtime-probe/target/
 /build/
 /.claude/worktrees/

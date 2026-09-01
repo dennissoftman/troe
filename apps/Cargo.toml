@@ -1,0 +1,123 @@
+[workspace]
+resolver = "3"
+members = [
+    "arp",
+    "awk",
+    "cat",
+    "clear",
+    "cp",
+    "date",
+    "dhcp",
+    "echo",
+    "grep",
+    "head",
+    "hexdump",
+    "ln",
+    "ls",
+    "lua",
+    "man",
+    "mem",
+    "mkdir",
+    "mount",
+    "mv",
+    "net",
+    "ping",
+    "printf",
+    "ps",
+    "pwd",
+    "python",
+    "rm",
+    "rmdir",
+    "sed",
+    "sh",
+    "sleep",
+    "spawn",
+    "tail",
+    "tar",
+    "tcp",
+    "timesync",
+    "top",
+    "touch",
+    "udp",
+    "wc",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "Apache-2.0"
+publish = false
+
+# Parity with the root workspace, with one deliberate divergence.
+#
+# `unsafe_code` is `deny` here rather than the root's `forbid`, because a few
+# packages in this tree genuinely need it: the Lua and CPython interpreters are
+# C FFI bridges, and `mem` reads a raw allocation it owns. `forbid` cannot be
+# lifted, so it would push those three packages back out of the lint gate
+# entirely. `deny` keeps every other package strict and turns each exception into
+# a crate-level `#![allow(unsafe_code)]` with a stated reason that a reviewer can
+# find.
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+# `missing_docs` is `allow` here, unlike the root workspace's `warn`.
+#
+# A command is a `#![no_std] #![no_main]` binary whose only public item is the
+# entry point the `entry!` macro generates, so the crate-level and entry-point
+# documentation the lint asks for has no reader. The seven library targets do
+# deserve it, but a doc comment shifts every line below it, and a shifted line
+# rewrites the `#[track_caller]` panic locations compiled into the shipped `.kex`
+# package. Documenting them therefore has to regenerate committed artifacts,
+# which this change deliberately does not do.
+missing_docs = "allow"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+# Every lint below is `allow` because the application tree violates it today and
+# the fix cannot land here.
+#
+# A panic location records the file and line of its call site, so the shipped
+# `.kex` packages embed the line numbers of `apps/*/src/*.rs`. Any edit that
+# moves a line rewrites a committed binary artifact, and regenerating those is a
+# separate change with its own review. Each entry is a measured, currently
+# violated lint rather than a precaution: every other lint in `all` and
+# `pedantic` stays on, so new code is held to the root workspace's standard.
+cast_possible_truncation = "allow"
+cast_sign_loss = "allow"
+collapsible_if = "allow"
+doc_markdown = "allow"
+if_not_else = "allow"
+ignored_unit_patterns = "allow"
+large_stack_arrays = "allow"
+large_types_passed_by_value = "allow"
+manual_let_else = "allow"
+match_same_arms = "allow"
+missing_errors_doc = "allow"
+needless_pass_by_value = "allow"
+semicolon_if_nothing_returned = "allow"
+single_match_else = "allow"
+struct_excessive_bools = "allow"
+too_many_arguments = "allow"
+too_many_lines = "allow"
+
+[profile.release]
+codegen-units = 1
+lto = false
+opt-level = "z"
+panic = "abort"
+strip = "none"
+
+# The two interpreters are throughput-bound and are the only members that trade
+# image size for speed. `opt-level` is the sole profile difference, and it is the
+# only one a per-package override is allowed to carry.
+[profile.release.package.troe-app-lua]
+opt-level = 2
+
+[profile.release.package.troe-app-python]
+opt-level = 2

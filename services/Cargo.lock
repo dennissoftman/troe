@@ -7,23 +7,29 @@ name = "troe-abi"
 version = "0.1.0"
 
 [[package]]
-name = "troe-app-date"
-version = "0.1.0"
-dependencies = [
- "troe-kex-runtime",
- "troe-kex-sdk",
-]
-
-[[package]]
-name = "troe-kex-runtime"
-version = "0.1.0"
-dependencies = [
- "troe-kex-sdk",
-]
-
-[[package]]
 name = "troe-kex-sdk"
 version = "0.1.0"
 dependencies = [
  "troe-abi",
+]
+
+[[package]]
+name = "troe-service-diagnostics"
+version = "0.1.0"
+dependencies = [
+ "troe-kex-sdk",
+]
+
+[[package]]
+name = "troe-service-diagnostics-benchmark"
+version = "0.1.0"
+dependencies = [
+ "troe-kex-sdk",
+]
+
+[[package]]
+name = "troe-service-diagnostics-fault"
+version = "0.1.0"
+dependencies = [
+ "troe-kex-sdk",
 ]

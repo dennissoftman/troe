@@ -92,7 +92,8 @@ fn offset_of_last_lines(
     let mut position = scan_end;
     let mut buffer = [0_u8; CHUNK_BYTES];
     while position != 0 {
-        let want = usize::try_from(position.min(CHUNK_BYTES as u64)).map_err(|_| Error::Overflow)?;
+        let want =
+            usize::try_from(position.min(CHUNK_BYTES as u64)).map_err(|_| Error::Overflow)?;
         let start = position.checked_sub(want as u64).ok_or(Error::Overflow)?;
         let slice = buffer.get_mut(..want).ok_or(Error::Overflow)?;
         read_exact(filesystem, file, start, slice)?;
@@ -359,7 +360,6 @@ fn report(command: &mut CommandContext, path: Option<&str>, failure: Failure) ->
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn main(command: &mut CommandContext) -> u32 {
     let Ok(mut arguments) = command.arguments() else {
         return exit::FAILURE;

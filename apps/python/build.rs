@@ -1,3 +1,8 @@
+// A build script fails the build by panicking: there is no caller to return an
+// error to, and a missing C toolchain or generated tree must stop the build
+// with a named reason rather than emit a half-configured artifact.
+#![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+
 use std::{env, path::PathBuf, process::Command};
 
 fn required_path(name: &str) -> PathBuf {

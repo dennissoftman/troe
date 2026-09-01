@@ -295,7 +295,14 @@ class ChangedTestSelectionTests(unittest.TestCase):
         )
         plan = test_changed.build_plan(paths, {})
         self.assertEqual(plan.full_reasons, [])
-        self.assertEqual(plan.python_tests, {"test_cpython_integration.py"})
+        # `python` is outside the clippy and test gates, so the policy suite's
+        # textual `unwrap`/`expect`/`panic` scan is the only compiler-like check
+        # a change to its sources gets. It is selected for every path under the
+        # application, not only for its manifest.
+        self.assertEqual(
+            plan.python_tests,
+            {"test_cpython_integration.py", "test_repository_policy.py"},
+        )
         self.assertEqual(plan.qemu_scenarios, {"cpython"})
         self.assertEqual(plan.applications, {"python"})
         commands = test_changed.commands_for_plan(
