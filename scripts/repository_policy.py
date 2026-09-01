@@ -102,3 +102,244 @@ def load_audit_exceptions(
         advisories.append(advisory)
 
     return tuple(advisories)
+
+
+_CFG_PREFIX = re.compile(r"#\[cfg\(")
+_RAW_STRING = re.compile(r"b?r(?P<hashes>#*)\"")
+_CHARACTER = re.compile(r"'(?:\\[^']*|[^'\\])'")
+
+
+def _literal_or_comment_end(source: str, index: int) -> int | None:
+    """Return the index just past a comment or literal starting at ``index``.
+
+    Returns ``None`` when ``index`` is ordinary code. Recognizing these spans is
+    what keeps a brace inside `"}"` or a doc comment from mis-scoping an item.
+    """
+    if source.startswith("//", index):
+        end = source.find("\n", index)
+        return len(source) if end < 0 else end
+    if source.startswith("/*", index):
+        depth = 0
+        end = index
+        while end < len(source):
+            if source.startswith("/*", end):
+                depth += 1
+                end += 2
+            elif source.startswith("*/", end):
+                depth -= 1
+                end += 2
+                if depth == 0:
+                    return end
+            else:
+                end += 1
+        return len(source)
+    raw = _RAW_STRING.match(source, index)
+    if raw is not None:
+        terminator = '"' + raw.group("hashes")
+        end = source.find(terminator, raw.end())
+        return len(source) if end < 0 else end + len(terminator)
+    if source[index] == '"':
+        end = index + 1
+        while end < len(source):
+            if source[end] == "\\":
+                end += 2
+                continue
+            if source[end] == '"':
+                return end + 1
+            end += 1
+        return len(source)
+    # A leading quote is a lifetime unless it closes as a character literal.
+    if source[index] == "'":
+        character = _CHARACTER.match(source, index)
+        return None if character is None else character.end()
+    return None
+
+
+def _cfg_attribute_at(source: str, index: int) -> tuple[str, int] | None:
+    """Return the ``#[cfg(..)]`` predicate and end index at ``index``.
+
+    Returns ``None`` when ``index`` does not begin such an attribute. The
+    predicate's parentheses are balanced by scanning rather than by pattern, so
+    nesting depth is not a limit.
+    """
+    prefix = _CFG_PREFIX.match(source, index)
+    if prefix is None:
+        return None
+    depth = 1
+    cursor = prefix.end()
+    while cursor < len(source):
+        skip = _literal_or_comment_end(source, cursor)
+        if skip is not None:
+            cursor = skip
+            continue
+        character = source[cursor]
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+            if depth == 0:
+                if not source.startswith("]", cursor + 1):
+                    return None
+                return source[prefix.end() : cursor], cursor + 2
+        cursor += 1
+    return None
+
+
+def _predicate_terms(predicate: str) -> list[str]:
+    """Split a ``cfg`` predicate list on its top-level commas."""
+    terms: list[str] = []
+    depth = 0
+    start = 0
+    index = 0
+    while index < len(predicate):
+        skip = _literal_or_comment_end(predicate, index)
+        if skip is not None:
+            index = skip
+            continue
+        character = predicate[index]
+        if character == "(":
+            depth += 1
+        elif character == ")":
+            depth -= 1
+        elif character == "," and depth == 0:
+            terms.append(predicate[start:index])
+            start = index + 1
+        index += 1
+    terms.append(predicate[start:])
+    return terms
+
+
+def _predicate_holds_only_under_test(predicate: str) -> bool:
+    """Report whether ``predicate`` can hold only when ``test`` is set.
+
+    Exactly two shapes qualify: a bare ``test``, and an ``all(..)`` naming a
+    bare ``test`` among its terms. A ``not(..)`` or an ``any(..)`` is satisfied
+    by a non-test build, so its item ships and must be retained; every other
+    shape is unrecognized and retained for the same reason.
+    """
+    predicate = predicate.strip()
+    if predicate == "test":
+        return True
+    if predicate.startswith("all(") and predicate.endswith(")"):
+        return any(
+            _predicate_holds_only_under_test(term)
+            for term in _predicate_terms(predicate[len("all(") : -1])
+        )
+    return False
+
+
+def _annotated_item_end(source: str, index: int) -> int:
+    """Return the index just past the item that begins at ``index``.
+
+    The item ends at the brace that closes its body, or at the semicolon that
+    terminates a declaration such as a ``use``. Bracket and parenthesis depth is
+    tracked so the semicolon in `[u8; 4]` does not end the item early.
+
+    An item shape this scan does not recognize -- an annotated statement, or a
+    struct field or enum variant, whose extent ends at neither -- reaches a
+    comma or a closing delimiter belonging to its enclosing block instead.
+    Every such boundary returns ``index``, which retains the remainder rather
+    than consuming it, so an unrecognized shape understates the removal instead
+    of deleting shipped code. A generic parameter list costs the same
+    understatement, since its comma is not nested in a tracked delimiter.
+    """
+    braces = 0
+    brackets = 0
+    while index < len(source):
+        skip = _literal_or_comment_end(source, index)
+        if skip is not None:
+            index = skip
+            continue
+        character = source[index]
+        if character == "{":
+            braces += 1
+        elif character == "}":
+            braces -= 1
+            if braces < 0:
+                return index
+            if braces == 0:
+                return index + 1
+        elif character in "([":
+            brackets += 1
+        elif character in ")]":
+            brackets -= 1
+            if brackets < 0:
+                return index
+        elif character == ";" and braces == 0 and brackets == 0:
+            return index + 1
+        elif character == "," and braces == 0 and brackets == 0:
+            return index
+        index += 1
+    return len(source)
+
+
+def rust_source_outside_test_configuration(source: str) -> str:
+    """Return ``source`` with every item annotated ``#[cfg(test)]`` removed.
+
+    What remains is the text a non-test build of the crate compiles, so a name
+    that survives here is named by shipped code. Only an item whose predicate
+    cannot hold outside a test build is removed: ``test`` itself and an
+    ``all(..)`` containing it. Every other predicate, and every item shape this
+    scan cannot delimit, is retained, so the result understates the removal
+    rather than overstating it and can never drop code a shipped build compiles.
+    """
+    kept: list[str] = []
+    index = 0
+    while index < len(source):
+        skip = _literal_or_comment_end(source, index)
+        if skip is not None:
+            kept.append(source[index:skip])
+            index = skip
+            continue
+        attribute = _cfg_attribute_at(source, index)
+        if attribute is None:
+            kept.append(source[index])
+            index += 1
+            continue
+        predicate, end = attribute
+        if not _predicate_holds_only_under_test(predicate):
+            kept.append(source[index:end])
+            index = end
+            continue
+        index = _annotated_item_end(source, end)
+    return "".join(kept)
+
+
+def rust_code_without_comments_or_literals(source: str) -> str:
+    """Return ``source`` with every comment and literal blanked out.
+
+    Each such span becomes spaces, with its newlines kept, so token boundaries
+    and line numbering survive. A textual search over the result therefore sees
+    code only: a doc-comment example or a string that merely mentions a
+    construct is not mistaken for the construct itself.
+    """
+    kept: list[str] = []
+    index = 0
+    while index < len(source):
+        skip = _literal_or_comment_end(source, index)
+        if skip is None:
+            kept.append(source[index])
+            index += 1
+            continue
+        kept.append(
+            "".join("\n" if character == "\n" else " " for character in source[index:skip])
+        )
+        index = skip
+    return "".join(kept)
+
+
+def shipped_troe_dependencies(manifest: dict) -> set[str]:
+    """Return the ``troe-`` dependencies of ``manifest`` that reach an image.
+
+    Normal, build, and per-target dependencies all link into something a build
+    produces. Dev-dependencies deliberately do not count: a test must stay free
+    to compose a real subsystem out of the crates a shipped build must not name.
+    """
+    names: set[str] = set()
+    for section in ("dependencies", "build-dependencies"):
+        names.update(name for name in manifest.get(section, {}) if name.startswith("troe-"))
+    for target in manifest.get("target", {}).values():
+        names.update(
+            name for name in target.get("dependencies", {}) if name.startswith("troe-")
+        )
+    return names

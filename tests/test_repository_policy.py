@@ -21,6 +21,9 @@ from repository_policy import (  # noqa: E402
     application_directories,
     load_audit_exceptions,
     require_supported_python,
+    rust_code_without_comments_or_literals,
+    rust_source_outside_test_configuration,
+    shipped_troe_dependencies,
 )
 
 
@@ -301,7 +304,15 @@ class RepositoryPolicyTests(unittest.TestCase):
         """Directories name the domain, crate names name the role, and neither
         may depend upward. This is the layering ADR 0035 Phase E relies on: a
         provider must be linkable without a namespace, and a format codec must
-        be linkable without either."""
+        be linkable without either.
+
+        The shipped graph is a total order: `common` is vocabulary, `device` is
+        hardware mechanism, `net` and `storage` are subsystems over a device,
+        `runtime` schedules them, and `shell` is the session above. Nothing
+        links `net` and `storage` in either direction, so their relative rank is
+        the one position this order chooses rather than records; `net` is placed
+        lower because it links no other crate at all, which leaves a
+        network-backed filesystem as the edge the order still permits."""
         manifests = {
             path.parent.name: (path.parent.parent.name, tomllib.loads(path.read_text("utf-8")))
             for path in (REPO_ROOT / "crates").rglob("Cargo.toml")
@@ -316,32 +327,40 @@ class RepositoryPolicyTests(unittest.TestCase):
         # that prefix is an implementation.
         contracts = {"troe-fs-api", "troe-fs-client"}
 
-        def shipped_dependencies(manifest: dict) -> set[str]:
-            """Dependencies that reach a built image.
+        # The shipped cross-domain edges, recomputed from the manifests below:
+        # device to common; storage to common and device; runtime to common,
+        # device, net, and storage; shell to common, device, storage, and
+        # runtime. net links nothing. Every edge points down this order.
+        order = ("common", "device", "net", "storage", "runtime", "shell")
 
-            Tests must be free to compose a namespace out of real providers, so
-            dev-dependencies are deliberately excluded: the layering claim is
-            about what the kernel and the future storage server link, not about
-            what a unit test constructs.
-            """
-            names: set[str] = set()
-            for section in ("dependencies", "build-dependencies"):
-                names.update(
-                    name for name in manifest.get(section, {}) if name.startswith("troe-")
-                )
-            for target in manifest.get("target", {}).values():
-                names.update(
-                    name for name in target.get("dependencies", {}) if name.startswith("troe-")
-                )
-            return names
-
+        # What reaches an image is `shipped_troe_dependencies`: normal, build,
+        # and per-target dependencies, never dev-dependencies. Every gate over
+        # linkage shares that one definition, so they cannot drift apart on what
+        # "shipped" means.
         for crate, (domain, manifest) in manifests.items():
             self.assertEqual(
                 manifest["package"]["name"],
                 crate,
                 f"{crate} directory and package name must match",
             )
-            dependencies = shipped_dependencies(manifest)
+            dependencies = shipped_troe_dependencies(manifest)
+            for dependency in dependencies:
+                self.assertTrue(
+                    dependency in manifests,
+                    f"{crate} ships {dependency}, which is not a crate under"
+                    " crates/: give this gate a domain for it before linking it.",
+                )
+                above = manifests[dependency][0]
+                self.assertLessEqual(
+                    order.index(above),
+                    order.index(domain),
+                    f"{crate} ({domain}) ships {dependency} ({above}), which is"
+                    " a higher layer. A crate may link its own domain or a lower"
+                    f" one only, in the order {' < '.join(order)}. Move the code"
+                    f" that needs {dependency} down, invert the edge behind a"
+                    " trait the lower crate owns, or, when only a test needs it,"
+                    " declare it under [dev-dependencies].",
+                )
             if crate.startswith("troe-fmt-"):
                 for dependency in dependencies:
                     self.assertTrue(
@@ -390,13 +409,229 @@ class RepositoryPolicyTests(unittest.TestCase):
         manifest = tomllib.loads(
             (REPO_ROOT / "crates/shell/troe-shell/Cargo.toml").read_text("utf-8")
         )
-        shipped = {
-            name for name in manifest.get("dependencies", {}) if name.startswith("troe-")
-        }
+        shipped = shipped_troe_dependencies(manifest)
         self.assertIn("troe-fs-client", shipped)
-        self.assertNotIn("troe-namespace", shipped)
+        storage = {
+            path.name
+            for path in (REPO_ROOT / "crates" / "storage").iterdir()
+            if path.is_dir()
+        }
+        self.assertLessEqual(
+            shipped & storage,
+            {"troe-fs-api", "troe-fs-client"},
+            "the session ships the two filesystem contracts and nothing else"
+            " from the storage domain: a namespace, a provider, or a format"
+            " codec under [dependencies] is linked into every image carrying the"
+            " shell, and a session naming a concrete implementation cannot be"
+            " served across a protection boundary. A test that needs a real"
+            " filesystem composes one through [dev-dependencies].",
+        )
         source = (REPO_ROOT / "crates/shell/troe-shell/src/lib.rs").read_text("utf-8")
         self.assertIn("pub type SharedNamespace = Rc<RefCell<dyn NamespaceClient>>;", source)
+
+    def test_no_crate_ships_a_dependency_only_its_tests_name(self) -> None:
+        """`[dependencies]` is what a built image links. A dependency named only
+        inside a `#[cfg(test)]` item is a test fixture, and shipping it claims
+        linkage the crate does not have.
+
+        The scan is textual, so it is sound only while a use cannot hide from
+        the text, and only while the removal never takes more than the annotated
+        item. Three properties hold that. No crate under `crates` defines a
+        macro, and every `troe-` dependency of those crates is itself one of
+        them, so no dependency can arrive through an expansion: both are
+        asserted here. And the removal is one-sided by construction -- it keeps
+        every predicate that a non-test build can satisfy and every item shape
+        it cannot delimit -- so a crate can only be missed, never reported
+        wrongly. A name absent from the crate's sources altogether is likewise
+        not reported, which leaves a link-only use silent rather than wrong."""
+        crates = {
+            path.parent.name: path.parent
+            for path in (REPO_ROOT / "crates").rglob("Cargo.toml")
+        }
+        for directory in sorted(crates.values()):
+            for path in sorted(directory.rglob("*.rs")):
+                with self.subTest(path=path.relative_to(REPO_ROOT)):
+                    # Code only: a doc-comment example or a diagnostic string
+                    # naming the construct is not a definition of it.
+                    code = rust_code_without_comments_or_literals(path.read_text("utf-8"))
+                    self.assertTrue(
+                        "macro_rules!" not in code,
+                        f"{path.relative_to(REPO_ROOT)} defines a macro, which"
+                        " can reach a dependency without naming it; this gate"
+                        " would read that dependency as unused. Give the gate a"
+                        " way to see the expansion before adding one.",
+                    )
+
+        for crate, directory in sorted(crates.items()):
+            manifest = tomllib.loads((directory / "Cargo.toml").read_text("utf-8"))
+            declared = shipped_troe_dependencies(manifest)
+
+            # Only the crate's own compiled sources count. An integration test
+            # under tests/ is a test target like any other.
+            paths = sorted((directory / "src").rglob("*.rs"))
+            if (directory / "build.rs").is_file():
+                paths.append(directory / "build.rs")
+            sources = [path.read_text("utf-8") for path in paths]
+            everywhere = "\n".join(sources)
+            outside_tests = "\n".join(
+                rust_source_outside_test_configuration(source) for source in sources
+            )
+            for dependency in sorted(declared):
+                self.assertTrue(
+                    dependency in crates,
+                    f"{crate} ships {dependency}, which is not a crate under"
+                    " crates/, so this scan cannot see how it is reached.",
+                )
+                identifier = dependency.replace("-", "_")
+                if identifier not in everywhere:
+                    continue
+                with self.subTest(crate=crate, dependency=dependency):
+                    self.assertTrue(
+                        identifier in outside_tests,
+                        f"{crate} ships {dependency} but names it only inside a"
+                        " #[cfg(test)] item, so no built image that links"
+                        f" {crate} reaches it. Declare {dependency} under"
+                        " [dev-dependencies] instead.",
+                    )
+
+    def test_test_configuration_stripping_ignores_braces_in_literals(self) -> None:
+        """The shipped-dependency scan above depends on removing exactly the
+        annotated item, so a brace inside a literal or a comment must not end it
+        early and a nested cfg predicate naming test must still be seen."""
+        source = """\
+use troe_shipped::Kept;
+#[cfg(test)]
+mod tests {
+    use troe_fixture::Made;
+    fn brace() -> &'static str { "}" /* } */ }
+}
+#[cfg(all(test, feature = "extra"))]
+use troe_extra::Also;
+#[cfg(target_arch = "aarch64")]
+use troe_platform::Retained;
+"""
+        outside = rust_source_outside_test_configuration(source)
+        self.assertIn("troe_shipped", outside)
+        self.assertIn("troe_platform", outside)
+        self.assertNotIn("troe_fixture", outside)
+        self.assertNotIn("troe_extra", outside)
+
+    def test_test_configuration_stripping_keeps_what_a_shipped_build_compiles(
+        self,
+    ) -> None:
+        """Only a predicate that cannot hold outside a test build may be
+        removed. `not(test)` and `any(test, ..)` are both satisfied by a shipped
+        build, so removing them would delete shipped code and then instruct the
+        author to move a live dependency to [dev-dependencies] -- the one
+        failure direction of this gate that is worse than silence.
+
+        The first three cases are idioms `crates/runtime/troe-machine` uses
+        today. The last two are not written anywhere in the tree; they are the
+        nesting shapes that would defeat a pattern-matched predicate, and pin
+        the scan's answer to their meaning rather than to how deep they go."""
+        for name, source in {
+            "not(test)": '#[cfg(not(test))]\nuse troe_real::Thing;\n',
+            "any(test, cfg)": (
+                '#[cfg(any(test, target_os = "uefi"))]\nuse troe_uefi::Thing;\n'
+            ),
+            "any(test, all(cfg, cfg))": (
+                '#[cfg(any(test, all(target_os = "uefi", target_arch = "x86_64")))]\n'
+                "use troe_uefi::Thing;\n"
+            ),
+            # Three levels of nesting: recognized, and retained on its merits
+            # rather than by failing to parse.
+            "all(not(test), cfg)": '#[cfg(all(not(test), unix))]\nuse troe_unix::Thing;\n',
+            "not(all(test, cfg))": (
+                '#[cfg(not(all(test, unix)))]\nuse troe_unix::Thing;\n'
+            ),
+        }.items():
+            with self.subTest(predicate=name):
+                self.assertEqual(
+                    rust_source_outside_test_configuration(source),
+                    source,
+                    f"a {name} item ships and must survive the removal",
+                )
+
+        # The real `mechanism.rs` shape: a test fixture and the platform the
+        # image actually selects, guarded as each other's complement. Stripping
+        # must take the fixture and leave the selection.
+        paired = """\
+pub(crate) fn route() -> Result<Self, Error> {
+    #[cfg(test)]
+    let platform = troe_platform::X86_64_Q35_UEFI.validate()?;
+    #[cfg(not(test))]
+    let platform = crate::selected_platform()?;
+    let troe_platform::VirtioTransportKind::Pci { .. } = platform.virtio() else {
+        return Err(Error);
+    };
+    Ok(Self { platform })
+}
+"""
+        outside = rust_source_outside_test_configuration(paired)
+        self.assertIn("troe_platform", outside)
+        self.assertIn("crate::selected_platform()", outside)
+        self.assertNotIn("X86_64_Q35_UEFI", outside)
+
+    def test_test_configuration_stripping_fails_closed_on_unknown_shapes(self) -> None:
+        """An item this scan cannot delimit must cost the removal, not the rest
+        of the file. A statement ends at neither a balanced body nor a top-level
+        semicolon, so the scan reaches a delimiter that belongs to the enclosing
+        block; it has to stop there and retain what follows."""
+        statement = """\
+fn f() {
+    #[cfg(test)]
+    do_it()
+}
+use troe_after::Thing;
+fn g() {}
+"""
+        outside = rust_source_outside_test_configuration(statement)
+        self.assertIn("troe_after", outside)
+        self.assertIn("fn g()", outside)
+        self.assertNotIn("do_it", outside)
+
+        field = """\
+struct S {
+    #[cfg(test)]
+    probe: troe_fixture::Probe,
+    shipped: troe_kept::Value,
+}
+use troe_after::Thing;
+"""
+        outside = rust_source_outside_test_configuration(field)
+        self.assertIn("troe_kept", outside)
+        self.assertIn("troe_after", outside)
+        self.assertNotIn("troe_fixture", outside)
+
+    def test_comment_and_literal_blanking_leaves_only_code(self) -> None:
+        """The macro-soundness assertion searches source text, so a construct
+        merely named in a doc comment or a diagnostic string must not read as a
+        definition of it."""
+        source = '''\
+/// Expands like `macro_rules! example { () => {} }` does.
+const MESSAGE: &str = "macro_rules! is not defined here";
+fn shipped() -> u8 {
+    /* macro_rules! neither */
+    4
+}
+'''
+        code = rust_code_without_comments_or_literals(source)
+        self.assertNotIn("macro_rules!", code)
+        self.assertIn("fn shipped()", code)
+        self.assertIn("const MESSAGE", code)
+        self.assertEqual(
+            code.count("\n"), source.count("\n"), "line numbering must survive"
+        )
+        self.assertNotIn(
+            "macro_rules!",
+            rust_code_without_comments_or_literals("macro/* split */_rules!"),
+            "a blanked span must keep the tokens it separated apart",
+        )
+        self.assertIn(
+            "macro_rules!",
+            rust_code_without_comments_or_literals("macro_rules! real { () => {} }"),
+            "a real definition must still be visible",
+        )
 
     def test_kernel_storage_dependencies_are_recorded_for_phase_e(self) -> None:
         """The kernel still links every filesystem format and the network stack.
