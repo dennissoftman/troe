@@ -28,6 +28,10 @@ use core::sync::atomic::AtomicU32;
 use core::sync::atomic::AtomicU64;
 #[cfg(any(test, target_os = "uefi"))]
 use core::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(target_os = "uefi")]
+use troe_console::{
+    Color, FRAMEBUFFER_BYTES_PER_PIXEL, FramebufferDescriptor, PixelSurface, SurfaceError,
+};
 #[cfg(any(test, target_os = "uefi"))]
 use troe_driver::InterruptResource;
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
@@ -41,10 +45,6 @@ use troe_driver::{
 use troe_memory::PhysicalRange;
 #[cfg(target_os = "uefi")]
 use troe_task::TaskStep;
-#[cfg(target_os = "uefi")]
-use troe_terminal::{
-    Color, FRAMEBUFFER_BYTES_PER_PIXEL, FramebufferDescriptor, PixelSurface, SurfaceError,
-};
 #[cfg(target_os = "uefi")]
 use uefi::mem::memory_map::MemoryMapOwned;
 

@@ -147,6 +147,13 @@ name = "troe-completion"
 version = "0.1.0"
 
 [[package]]
+name = "troe-console"
+version = "0.1.0"
+dependencies = [
+ "troe-core",
+]
+
+[[package]]
 name = "troe-core"
 version = "0.1.0"
 
@@ -279,6 +286,7 @@ dependencies = [
  "troe-abi",
  "troe-application",
  "troe-block",
+ "troe-console",
  "troe-core",
  "troe-dispatch",
  "troe-driver",
@@ -356,12 +364,12 @@ version = "0.1.0"
 dependencies = [
  "rlsf",
  "troe-block",
+ "troe-console",
  "troe-driver",
  "troe-memory",
  "troe-net",
  "troe-platform",
  "troe-task",
- "troe-terminal",
  "troe-virtio",
  "uefi",
 ]

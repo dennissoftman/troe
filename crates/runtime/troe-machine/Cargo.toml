@@ -15,12 +15,12 @@ platform-x86_64-uefi-virtio-pci = []
 
 [dependencies]
 troe-block = { path = "../../device/troe-block" }
+troe-console = { path = "../../device/troe-console" }
 troe-driver = { path = "../../device/troe-driver" }
 troe-memory = { path = "../troe-memory" }
 troe-net = { path = "../../net/troe-net" }
 troe-platform = { path = "../../device/troe-platform" }
 troe-task = { path = "../troe-task" }
-troe-terminal = { path = "../../shell/troe-terminal" }
 troe-virtio = { path = "../../device/troe-virtio" }
 rlsf = { version = "=0.2.3", default-features = false }
 

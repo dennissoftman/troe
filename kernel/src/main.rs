@@ -40,6 +40,9 @@ mod firmware {
     use troe_application::{ParseError, parse_kex};
     use troe_block::{BlockAccess, BlockRegion};
     use troe_block::{BlockDevice, BlockLimits};
+    use troe_console::{
+        FramebufferDescriptor, FramebufferPixelFormat, TextConsole, TextConsoleConfig,
+    };
     use troe_core::{
         CommandStatus, Input, MAX_LINE_BYTES, MachineMemoryOwner, MachineMemorySnapshot,
         MemoryStats, Output, StreamError,
@@ -109,9 +112,8 @@ mod firmware {
         WaitSpec, WaitTable, WakeInterest, WakeReason,
     };
     use troe_terminal::{
-        EditorConfig, EditorOutcome, FramebufferDescriptor, FramebufferPixelFormat, InputConfig,
-        InputDecoder, KeyEvent, KeyboardConfig, LineEditor, Ps2Set1Decoder, TextConsole,
-        TextConsoleConfig,
+        EditorConfig, EditorOutcome, InputConfig, InputDecoder, KeyEvent, KeyboardConfig,
+        LineEditor, Ps2Set1Decoder,
     };
     use troe_txslot::{DualSlotStore, TRANSACTION_BLOCKS};
     use troe_volume::{

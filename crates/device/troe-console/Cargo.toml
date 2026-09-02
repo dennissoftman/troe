@@ -1,6 +1,6 @@
 [package]
-name = "troe-terminal"
-description = "Configurable bounded terminal input and line editing for TROE"
+name = "troe-console"
+description = "Framebuffer text console and pixel surface for TROE"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,4 +11,3 @@ troe-core = { path = "../../common/troe-core" }
 
 [lints]
 workspace = true
-
