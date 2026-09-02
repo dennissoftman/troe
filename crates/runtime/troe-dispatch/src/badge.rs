@@ -51,6 +51,18 @@ impl ClientBadge {
         self.generation
     }
 
+    /// A badge naming no client, for a record that holds none.
+    ///
+    /// Slot zero at generation zero is never issued, because a live badge
+    /// always has a generation of at least one.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            slot: 0,
+            generation: 0,
+        }
+    }
+
     /// Stable nonzero opaque value carried in a call event.
     ///
     /// The low 32 bits encode a one-based slot and the high bits its
