@@ -10,7 +10,19 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 MMU_SOURCE = (REPO_ROOT / "crates/runtime/troe-machine/src/mmu.rs").read_text(
     encoding="utf-8"
 )
-KERNEL_SOURCE = (REPO_ROOT / "kernel/src/main.rs").read_text(encoding="utf-8")
+KERNEL_SRC = REPO_ROOT / "kernel/src"
+
+
+def kernel_module(relative: str) -> str:
+    """Read one kernel module and fail clearly if the module tree moves."""
+    return (KERNEL_SRC / relative).read_text(encoding="utf-8")
+
+
+ARTIFACTS_SOURCE = kernel_module("artifacts.rs")
+DEFERRED_SOURCE = kernel_module("deferred.rs")
+INVOCATION_SOURCE = kernel_module("invocation.rs")
+LAUNCH_MEMORY_SOURCE = kernel_module("memory/launch.rs")
+GROWTH_MEMORY_SOURCE = kernel_module("memory/growth.rs")
 CONTRACT_SOURCE = (REPO_ROOT / "docs/testing.md").read_text(
     encoding="utf-8"
 )
@@ -21,6 +33,11 @@ def source_between(source: str, start: str, end: str) -> str:
     start_offset = source.index(start)
     end_offset = source.index(end, start_offset + len(start))
     return source[start_offset:end_offset]
+
+
+def source_after(source: str, start: str) -> str:
+    """Return a named source region that runs to the end of its module."""
+    return source[source.index(start) :]
 
 
 def require_order(test: unittest.TestCase, source: str, *tokens: str) -> None:
@@ -191,7 +208,7 @@ class NativeExecutionContractTests(unittest.TestCase):
             '"msr tpidr_el0, x9"',
             '"eret"',
         )
-        self.assertIn("native-thread-pointer-aarch64.kex", KERNEL_SOURCE)
+        self.assertIn("native-thread-pointer-aarch64.kex", ARTIFACTS_SOURCE)
 
     def test_documented_matrix_enumerates_every_native_gate(self) -> None:
         for gate in (
@@ -251,9 +268,9 @@ class NativeExecutionContractTests(unittest.TestCase):
 
     def test_timeslices_and_local_service_budgets_do_not_cap_process_lifetime(self) -> None:
         runner = source_between(
-            KERNEL_SOURCE,
+            INVOCATION_SOURCE,
             "fn run_command_application(",
-            "const fn task_fault(",
+            "fn command_application_error(",
         )
         budget = source_between(runner, "let terminal = loop", "match outcome")
         self.assertIn("ApplicationOutcome::HandleCall", budget)
@@ -284,9 +301,9 @@ class NativeExecutionContractTests(unittest.TestCase):
 
     def test_deferred_calls_block_idle_wake_and_resume_in_owned_order(self) -> None:
         waiter = source_between(
-            KERNEL_SOURCE,
+            DEFERRED_SOURCE,
             "fn wait_for_deferred_call(",
-            "fn run_command_application(",
+            "fn complete_diagnostics_deferred_call(",
         )
         require_order(
             self,
@@ -300,10 +317,9 @@ class NativeExecutionContractTests(unittest.TestCase):
             "pending.finish(operation)",
         )
 
-        deferred_resume = source_between(
-            KERNEL_SOURCE,
+        deferred_resume = source_after(
+            DEFERRED_SOURCE,
             "fn resume_deferred_application_call(",
-            "fn run_command_application(",
         )
         require_order(
             self,
@@ -316,7 +332,7 @@ class NativeExecutionContractTests(unittest.TestCase):
         )
 
         deferred_state = source_between(
-            KERNEL_SOURCE,
+            DEFERRED_SOURCE,
             "impl CommandDeferredState {",
             "fn command_handle_interface(",
         )
@@ -324,29 +340,29 @@ class NativeExecutionContractTests(unittest.TestCase):
         self.assertIn("teardown_owner(owner, WakeReason::Revoked)", deferred_state)
 
         runner = source_between(
-            KERNEL_SOURCE,
+            INVOCATION_SOURCE,
             "fn run_command_application(",
-            "const fn task_fault(",
+            "fn command_application_error(",
         )
         self.assertIn("resume_deferred_application_call(", runner)
         self.assertIn("state.revoke_owner(task_id)", runner)
 
     def test_command_cleanup_failures_are_terminal(self) -> None:
         runner = source_between(
-            KERNEL_SOURCE,
+            INVOCATION_SOURCE,
             "fn run_command_application(",
-            "const fn task_fault(",
+            "fn command_application_error(",
         )
         self.assertIn("rollback_command_application_task(", runner)
         self.assertIn("reclaim_command_application(", runner)
 
         rollback = source_between(
-            KERNEL_SOURCE,
+            LAUNCH_MEMORY_SOURCE,
             "fn rollback_command_application_task(",
             "fn reclaim_command_application(",
         )
         reclaim = source_between(
-            KERNEL_SOURCE,
+            LAUNCH_MEMORY_SOURCE,
             "fn reclaim_command_application(",
             "fn clear_provisional_loader_ownership(",
         )
@@ -355,7 +371,7 @@ class NativeExecutionContractTests(unittest.TestCase):
 
     def test_growth_rollback_retains_metadata_until_release_succeeds(self) -> None:
         release = source_between(
-            KERNEL_SOURCE,
+            GROWTH_MEMORY_SOURCE,
             "fn release_application_growth_suffix(",
             "fn application_growth_pages(",
         )
