@@ -62,10 +62,6 @@ pub enum MmioRole {
     LocalApic,
     /// x86 I/O APIC page.
     IoApic,
-    /// Arm `GICv2` distributor aperture.
-    GicV2Distributor,
-    /// Arm `GICv2` CPU-interface aperture.
-    GicV2CpuInterface,
     /// Arm `GICv3` distributor aperture.
     GicV3Distributor,
     /// Arm `GICv3` redistributor region, one strided frame pair per CPU.
@@ -317,11 +313,6 @@ pub enum ConsoleKind {
 pub enum InterruptControllerKind {
     /// Local APIC plus I/O APIC and masked legacy PICs.
     X86Apic,
-    /// GIC version 2 distributor and CPU interface.
-    GicV2 {
-        /// Distributor CPU-target mask for statically routed shared interrupts.
-        cpu_target_mask: u8,
-    },
     /// GIC version 3 distributor plus per-CPU redistributors.
     ///
     /// The CPU interface is reached through `ICC_*` system registers rather
@@ -581,7 +572,7 @@ impl<'a> PlatformDescriptor<'a> {
             (
                 Architecture::Aarch64,
                 ConsoleKind::Pl011 { clock_hz },
-                InterruptControllerKind::GicV2 { .. } | InterruptControllerKind::GicV3 { .. },
+                InterruptControllerKind::GicV3 { .. },
                 TimerKind::Aarch64Generic,
                 PowerKind::PsciHvc | PowerKind::PsciSmc,
                 KeyboardKind::None,
@@ -888,23 +879,12 @@ fn validate_aarch64_composition(
     network_trigger: TriggerMode,
     network_polarity: Polarity,
 ) -> Result<(), PlatformError> {
-    // The two GIC generations describe different apertures: version 2 has an
-    // MMIO CPU interface, version 3 reaches it through `ICC_*` system registers
-    // and instead needs one strided redistributor frame pair per CPU.
-    let (distributor_role, second_role) = match controller {
-        InterruptControllerKind::GicV2 { .. } => {
-            (MmioRole::GicV2Distributor, MmioRole::GicV2CpuInterface)
-        }
-        InterruptControllerKind::GicV3 { .. } => {
-            (MmioRole::GicV3Distributor, MmioRole::GicV3Redistributor)
-        }
-        InterruptControllerKind::X86Apic => {
-            return Err(PlatformError::IncompatibleComposition);
-        }
-    };
+    // Version 3 reaches the CPU interface through `ICC_*` system registers
+    // rather than an MMIO aperture, so it needs one strided redistributor
+    // frame pair per CPU instead.
     for role in [
-        distributor_role,
-        second_role,
+        MmioRole::GicV3Distributor,
+        MmioRole::GicV3Redistributor,
         MmioRole::Pl011,
         MmioRole::VirtioMmio,
     ] {
@@ -912,22 +892,19 @@ fn validate_aarch64_composition(
     }
     let serial_interrupt = require_interrupt(descriptor.interrupts, InterruptRole::Serial)?;
     let timer_interrupt = require_interrupt(descriptor.interrupts, InterruptRole::Timer)?;
-    let distributor = require_mmio(descriptor.mmio, distributor_role)?;
-    let cpu_interface = require_mmio(descriptor.mmio, second_role)?;
+    let distributor = require_mmio(descriptor.mmio, MmioRole::GicV3Distributor)?;
+    let redistributor = require_mmio(descriptor.mmio, MmioRole::GicV3Redistributor)?;
     let aperture = require_mmio(descriptor.mmio, MmioRole::VirtioMmio)?;
-    // A version 2 target mask must name exactly one CPU; a version 3 stride
-    // must hold both the RD and SGI frames of one redistributor.
-    let controller_ok = match controller {
-        InterruptControllerKind::GicV2 { cpu_target_mask } => cpu_target_mask.is_power_of_two(),
-        InterruptControllerKind::GicV3 {
-            redistributor_stride,
-        } => {
-            redistributor_stride >= GICV3_REDISTRIBUTOR_MINIMUM_STRIDE
-                && redistributor_stride.is_power_of_two()
-                && cpu_interface.byte_len >= redistributor_stride
-        }
-        InterruptControllerKind::X86Apic => false,
+    let InterruptControllerKind::GicV3 {
+        redistributor_stride,
+    } = controller
+    else {
+        return Err(PlatformError::IncompatibleComposition);
     };
+    // The stride must hold both the RD and SGI frames of one redistributor.
+    let controller_ok = redistributor_stride >= GICV3_REDISTRIBUTOR_MINIMUM_STRIDE
+        && redistributor_stride.is_power_of_two()
+        && redistributor.byte_len >= redistributor_stride;
     let described = u64::from(slot_bytes)
         .checked_mul(u64::from(slot_count))
         .ok_or(PlatformError::InvalidRange)?;
@@ -938,7 +915,7 @@ fn validate_aarch64_composition(
         || !descriptor.io_ports.is_empty()
         || descriptor.interrupts.len() != 2
         || distributor.byte_len < 0x1000
-        || cpu_interface.byte_len < 0x1000
+        || redistributor.byte_len < 0x1000
         || !controller_ok
         || clock_hz < 16 * 115_200
         || slot_bytes < 0x118
@@ -1439,15 +1416,6 @@ const SBSA_REF_INTERRUPTS: [InterruptRoute; 2] = [
     ),
 ];
 
-/// QEMU `virt` `GICv2` apertures, retained to exercise the version 2
-/// validation path that device-tree discovery can still reach.
-#[cfg(test)]
-const VIRT_MMIO: [MmioRegion; 4] = [
-    MmioRegion::new(MmioRole::GicV2Distributor, 0x0800_0000, 0x0001_0000),
-    MmioRegion::new(MmioRole::GicV2CpuInterface, 0x0801_0000, 0x0001_0000),
-    MmioRegion::new(MmioRole::Pl011, 0x0900_0000, 0x1000),
-    MmioRegion::new(MmioRole::VirtioMmio, 0x0a00_0000, 0x4000),
-];
 const VIRT_INTERRUPTS: [InterruptRoute; 2] = [
     InterruptRoute::new(
         InterruptRole::Timer,
@@ -1634,7 +1602,6 @@ mod tests {
         assert_eq!(redistributors.base(), 0x4008_0000);
         assert_eq!(redistributors.byte_len(), 0x0400_0000);
         assert!(redistributors.byte_len() >= GICV3_REDISTRIBUTOR_MINIMUM_STRIDE);
-        assert_eq!(sbsa.mmio(MmioRole::GicV2CpuInterface), None);
         assert_eq!(
             sbsa.interrupt_controller(),
             InterruptControllerKind::GicV3 {
@@ -1820,7 +1787,7 @@ mod tests {
         );
         assert_eq!(profile.validate(), Err(PlatformError::InvalidRange));
 
-        let mut outside_aarch64_physical_domain = VIRT_MMIO;
+        let mut outside_aarch64_physical_domain = VIRT_GICV3_MMIO;
         outside_aarch64_physical_domain[2] =
             MmioRegion::new(MmioRole::Pl011, (1_u64 << 48) - 0x1000, 0x2000);
         let profile = PlatformDescriptor {
@@ -2055,31 +2022,40 @@ mod tests {
     }
 
     #[test]
-    fn gicv2_topology_is_complete_and_single_target() {
-        let missing_cpu_interface = [VIRT_MMIO[0], VIRT_MMIO[2], VIRT_MMIO[3]];
-        let missing_cpu_interface = PlatformDescriptor {
+    fn gicv3_topology_is_complete_and_strided_for_one_redistributor() {
+        let missing_redistributor = [VIRT_GICV3_MMIO[0], VIRT_GICV3_MMIO[2], VIRT_GICV3_MMIO[3]];
+        let missing_redistributor = PlatformDescriptor {
             id: PlatformId::new(114).unwrap_or_else(|_| unreachable!()),
-            name: "missing-gic-cpu-arm",
-            mmio: &missing_cpu_interface,
-            ..AARCH64_SBSA_REF
+            name: "missing-gic-redistributor-arm",
+            mmio: &missing_redistributor,
+            ..AARCH64_UEFI_VIRTIO_MMIO
         };
         assert_eq!(
-            missing_cpu_interface.validate(),
+            missing_redistributor.validate(),
             Err(PlatformError::IncompatibleComposition)
         );
 
-        for (id, name, cpu_target_mask) in [
-            (116, "zero-gic-target-arm", 0),
-            (124, "multi-gic-target-arm", 0b11),
+        // Below the minimum, not a power of two, and wider than the described
+        // redistributor region: one failed conjunct of the stride rule each.
+        for (id, name, redistributor_stride) in [
+            (
+                116,
+                "short-gic-stride-arm",
+                GICV3_REDISTRIBUTOR_MINIMUM_STRIDE / 2,
+            ),
+            (124, "unaligned-gic-stride-arm", 0x3_0000),
+            (125, "oversized-gic-stride-arm", 0x0100_0000),
         ] {
-            let invalid_target = PlatformDescriptor {
+            let invalid_stride = PlatformDescriptor {
                 id: PlatformId::new(id).unwrap_or_else(|_| unreachable!()),
                 name,
-                controller: InterruptControllerKind::GicV2 { cpu_target_mask },
-                ..AARCH64_SBSA_REF
+                controller: InterruptControllerKind::GicV3 {
+                    redistributor_stride,
+                },
+                ..AARCH64_UEFI_VIRTIO_MMIO
             };
             assert_eq!(
-                invalid_target.validate(),
+                invalid_stride.validate(),
                 Err(PlatformError::IncompatibleComposition)
             );
         }
