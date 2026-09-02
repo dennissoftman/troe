@@ -1,0 +1,10 @@
+[package]
+name = "troe-service"
+description = "Boot-service records, lifecycle, restart policy, and kernel continuations for TROE"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
