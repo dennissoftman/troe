@@ -482,13 +482,16 @@ pub(crate) const fn classify_used_index(current: u16, observed: u16) -> UsedInde
     }
 }
 
-/// Elapsed milliseconds one block completion may take before the transport
+/// Elapsed milliseconds one device completion may take before the transport
 /// declares its queue dead.
 ///
-/// Every synchronous transport shares the value so the two bus drivers cannot
-/// drift. It is deliberately far above any completion this profile observes and
-/// far below the acceptance harness's per-command ceiling, so an expiry stays a
-/// device verdict rather than becoming a harness timeout.
+/// Every synchronous transport shares the value, block requests and network
+/// transmits alike, so the two bus drivers cannot drift. It is deliberately far
+/// above any completion this profile observes and far below the acceptance
+/// harness's per-command ceiling, so an expiry stays a device verdict rather
+/// than becoming a harness timeout. A queue that expires latches itself dead,
+/// which is what holds one guest command to a single budget: a command that
+/// transmits several frames cannot accumulate one expiry per frame.
 #[cfg(any(test, target_os = "uefi"))]
 pub(crate) const COMPLETION_BUDGET_MILLIS: u64 = 1_000;
 
@@ -511,7 +514,7 @@ pub(crate) enum CompletionWaitState {
 /// slow is declared dead. The architected monotonic counter advances whether
 /// or not this vCPU is scheduled, so a bound read from it is a real interval.
 ///
-/// The counter is established before any block device is initialized, so the
+/// The counter is established before any device queue is initialized, so the
 /// poll count is only the fallback for a boot that reports none. It bounds the
 /// wait so it terminates, not because it measures anything.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
