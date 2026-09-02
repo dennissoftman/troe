@@ -12,6 +12,7 @@ physical-device, or cloud-provider support.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import errno
 import hashlib
 import json
@@ -21,7 +22,6 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 if __package__:
     from . import mkcloud
@@ -213,7 +213,7 @@ def _refuse_mounted(path: Path) -> None:
     os.close(descriptor)
 
 
-def _target_identity(path: Path, info: os.stat_result) -> str:
+def _target_identity(info: os.stat_result) -> str:
     """Return a stable identity that never depends on enumeration order."""
     if stat.S_ISBLK(info.st_mode) or stat.S_ISCHR(info.st_mode):
         return f"device:{os.major(info.st_rdev)}:{os.minor(info.st_rdev)}"
@@ -253,7 +253,7 @@ def _resolve_device_target(role: str, requested: str, image_bytes: int) -> Targe
         requested=requested,
         resolved=resolved,
         kind=TARGET_DEVICE,
-        identity=_target_identity(resolved, info),
+        identity=_target_identity(info),
         capacity_bytes=capacity,
         image_bytes=image_bytes,
         signatures=_detect_signatures(resolved, capacity),
@@ -277,7 +277,8 @@ def _refuse_aliases(targets: list[Target]) -> None:
             raise SetupError(
                 "target-alias",
                 path_key,
-                f"resolves to the same media as the {by_identity[target.identity]} role",
+                "resolves to the same media as the "
+                f"{by_identity[target.identity]} role",
             )
         by_identity[target.identity] = target.role
 
@@ -333,7 +334,9 @@ def _write_target(source: Path, target: Target) -> None:
     try:
         descriptor = os.open(target.resolved, flags, 0o600)
     except OSError as error:
-        raise SetupError("target-unwritable", str(target.resolved), str(error)) from error
+        raise SetupError(
+            "target-unwritable", str(target.resolved), str(error)
+        ) from error
     try:
         written = 0
         with source.open("rb") as handle:
@@ -404,7 +407,9 @@ def stage_bundle_directory(bundle: Path, destination: Path) -> dict[str, Path]:
         try:
             manifest_length = manifest_source.stat().st_size
         except OSError as error:
-            raise SetupError("source-missing", str(manifest_source), str(error)) from error
+            raise SetupError(
+                "source-missing", str(manifest_source), str(error)
+            ) from error
         manifest_target = Target(
             role="manifest",
             requested=str(created / mkcloud.BUNDLE_MANIFEST),
@@ -419,14 +424,10 @@ def stage_bundle_directory(bundle: Path, destination: Path) -> dict[str, Path]:
         _verify_target(manifest_target, _sha256_file(manifest_source, manifest_length))
     except Exception:
         for path in sorted(created.iterdir()):
-            try:
+            with contextlib.suppress(OSError):
                 path.unlink()
-            except OSError:
-                pass
-        try:
+        with contextlib.suppress(OSError):
             created.rmdir()
-        except OSError:
-            pass
         raise
     return staged
 
@@ -511,7 +512,9 @@ def _confirm(targets: list[Target], *, confirm_destroy: bool, assume_tty: bool) 
     )
     answer = input(f"Type {CONFIRMATION_PHRASE!r} to proceed: ")
     if answer.strip() != CONFIRMATION_PHRASE:
-        raise SetupError("confirmation-declined", "targets", "destructive install refused")
+        raise SetupError(
+            "confirmation-declined", "targets", "destructive install refused"
+        )
 
 
 def install(
@@ -545,7 +548,9 @@ def install(
             allow_test_artifacts=allow_test_artifacts,
         )
     except ValueError as error:
-        raise SetupError("bundle-rejected", str(bundle_directory), str(error)) from error
+        raise SetupError(
+            "bundle-rejected", str(bundle_directory), str(error)
+        ) from error
 
     disks = {str(disk["role"]): disk for disk in manifest["disks"]}  # type: ignore[index]
     if set(disks) != set(ROLES):
@@ -561,13 +566,15 @@ def install(
             raise SetupError(
                 "target-selection",
                 "targets",
-                "raw-device installation requires exactly one system, activation, and state target",
+                "raw-device installation requires exactly one system, "
+                "activation, and state target",
             )
         if record_path is None:
             raise SetupError(
                 "record-required",
                 "targets",
-                "raw-device installation requires --record so an interruption stays identifiable",
+                "raw-device installation requires --record so an "
+                "interruption stays identifiable",
             )
         targets = [
             _resolve_device_target(role, device_targets[role], image_bytes[role])
@@ -600,7 +607,8 @@ def install(
         source = bundle_directory / mkcloud.BUNDLE_FILENAMES[target.role]
         _write_target(source, target)
         installed[target.role] = _verify_target(
-            target, str(disks[target.role]["sha256"])  # type: ignore[index]
+            target,
+            str(disks[target.role]["sha256"]),  # type: ignore[index]
         )
 
     if created_directory is not None:
@@ -654,7 +662,8 @@ def verify_installation(record_path: Path) -> dict[str, object]:
             raise SetupError(
                 "installation-drift",
                 str(path),
-                f"installed bytes hash {actual}; record declares {entry['expected_sha256']}",
+                f"installed bytes hash {actual}; "
+                f"record declares {entry['expected_sha256']}",
             )
         checked.append({"path": str(path), "role": entry["role"], "sha256": actual})
     return {"state": STATE_VERIFIED, "targets": checked}
@@ -705,7 +714,9 @@ def _parse_devices(entries: list[str]) -> dict[str, str]:
         role, separator, path = entry.partition("=")
         if not separator or role not in ROLES or not path:
             raise SetupError(
-                "target-selection", entry, "expected system=PATH, activation=PATH, or state=PATH"
+                "target-selection",
+                entry,
+                "expected system=PATH, activation=PATH, or state=PATH",
             )
         if role in devices:
             raise SetupError("target-duplicate", entry, f"role {role} named twice")

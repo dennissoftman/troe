@@ -13,7 +13,7 @@ def pe_sections(image: bytes) -> list[tuple[str, int, int]]:
     if len(image) < 64 or image[:2] != b"MZ":
         raise ValueError("EFI executable has no DOS/PE header")
     pe_offset = struct.unpack_from("<I", image, 0x3C)[0]
-    if pe_offset + 24 > len(image) or image[pe_offset:pe_offset + 4] != b"PE\0\0":
+    if pe_offset + 24 > len(image) or image[pe_offset : pe_offset + 4] != b"PE\0\0":
         raise ValueError("EFI executable has no valid PE signature")
     section_count = struct.unpack_from("<H", image, pe_offset + 6)[0]
     optional_size = struct.unpack_from("<H", image, pe_offset + 20)[0]
@@ -24,7 +24,7 @@ def pe_sections(image: bytes) -> list[tuple[str, int, int]]:
     sections: list[tuple[str, int, int]] = []
     for index in range(section_count):
         offset = table + index * 40
-        raw_name = image[offset:offset + 8].split(b"\0", 1)[0]
+        raw_name = image[offset : offset + 8].split(b"\0", 1)[0]
         name = raw_name.decode("ascii", errors="replace")
         virtual_size = struct.unpack_from("<I", image, offset + 8)[0]
         raw_size = struct.unpack_from("<I", image, offset + 16)[0]
@@ -52,10 +52,21 @@ def main() -> int:
         print(f"  boot container:             {len(container):>8} bytes")
         print(f"  EFI executable:             {len(efi):>8} bytes")
         for name, raw_size, virtual_size in sections:
-            print(f"    PE {name:<8} raw:         {raw_size:>8} bytes (virtual {virtual_size})")
-        print(f"  embedded KEFS source:       {len(rootfs):>8} bytes (included in PE read-only data)")
-        print(f"  architecture boundary cap:  {len(efi):>8} bytes (conservative whole-EFI upper bound)")
-        print(f"  debug information:          {debug:>8} bytes in deployable PE sections")
+            print(
+                f"    PE {name:<8} raw:         {raw_size:>8} bytes "
+                f"(virtual {virtual_size})"
+            )
+        print(
+            f"  embedded KEFS source:       {len(rootfs):>8} bytes "
+            "(included in PE read-only data)"
+        )
+        print(
+            f"  architecture boundary cap:  {len(efi):>8} bytes "
+            "(conservative whole-EFI upper bound)"
+        )
+        print(
+            f"  debug information:          {debug:>8} bytes in deployable PE sections"
+        )
         print(f"  container overhead/padding: {len(container) - len(efi):>8} bytes")
         if len(container) > 16 * 1024 * 1024:
             raise ValueError("boot container exceeds the 16 MiB hard ceiling")

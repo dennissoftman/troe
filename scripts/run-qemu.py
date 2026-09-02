@@ -15,8 +15,7 @@ from qemu_profile import ENVIRONMENT_IDS, prepare_qemu_command, validate_memory_
 
 sys.path.insert(0, str(REPO_ROOT))
 
-from tools.mount_shared import SharedMediaLock, require_detached  # noqa: E402
-
+from tools.mount_shared import SharedMediaLock, require_detached
 
 SHARED_MEDIA_PATH = REPO_ROOT / "build" / "troe-shared-fat32.img"
 
@@ -43,7 +42,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--firmware-code",
         type=Path,
-        help="path to the read-only UEFI firmware code image (auto-detected by default)",
+        help=(
+            "path to the read-only UEFI firmware code image (auto-detected by default)"
+        ),
     )
     parser.add_argument(
         "--firmware-vars",

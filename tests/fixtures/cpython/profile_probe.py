@@ -5,7 +5,9 @@ import sys
 
 
 def shipped() -> list[str]:
-    root = pathlib.Path(sys.prefix) / f"python{sys.version_info[0]}.{sys.version_info[1]}"
+    root = (
+        pathlib.Path(sys.prefix) / f"python{sys.version_info[0]}.{sys.version_info[1]}"
+    )
     names = set()
     for entry in root.iterdir():
         if entry.name.startswith(("_", ".")) or entry.name == "site-packages":

@@ -69,7 +69,9 @@ def main() -> int:
     sum(range(100))
     profiler.disable()
 
-    print("stdlib-probe", len(REQUIRED), sys.flags.no_user_site, sys.dont_write_bytecode)
+    print(
+        "stdlib-probe", len(REQUIRED), sys.flags.no_user_site, sys.dont_write_bytecode
+    )
     return 0
 
 

@@ -12,7 +12,9 @@ from pathlib import Path
 
 HEADER_BYTES = 144
 RECORD_BYTES = 64
-POLICY_PATH = Path(__file__).resolve().parents[1] / "config/system/resources/memory.toml"
+POLICY_PATH = (
+    Path(__file__).resolve().parents[1] / "config/system/resources/memory.toml"
+)
 MAX_MAPPINGS = 1_048_576
 MAX_PROCESS_METADATA = 64 * 1024 * 1024
 MAX_GLOBAL_METADATA = 256 * 1024 * 1024
@@ -20,13 +22,20 @@ MAX_OPERATION_QUANTUM = 1_048_576
 
 
 def _u64(value: object, name: str, *, maximum: int = (1 << 64) - 1) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= maximum:
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or not 0 < value <= maximum
+    ):
         raise ValueError(f"invalid memory policy {name}")
     return value
 
 
 def _optional_limit(table: object, name: str) -> int | None:
-    if not isinstance(table, dict) or set(table) not in ({"limited"}, {"limited", "maximum"}):
+    if not isinstance(table, dict) or set(table) not in (
+        {"limited"},
+        {"limited", "maximum"},
+    ):
         raise ValueError(f"invalid memory policy {name}")
     limited = table.get("limited")
     if not isinstance(limited, bool):
@@ -63,9 +72,15 @@ def read_memory_policy(path: Path = POLICY_PATH) -> tuple[int, ...]:
     ):
         raise ValueError("unknown or missing memory policy field")
     defaults = process["default"]
-    system_limit = _optional_limit(system["application_commit"], "system.application_commit")
-    committed_limit = _optional_limit(defaults["committed_pages"], "process.default.committed_pages")
-    reserved_limit = _optional_limit(defaults["reserved_pages"], "process.default.reserved_pages")
+    system_limit = _optional_limit(
+        system["application_commit"], "system.application_commit"
+    )
+    committed_limit = _optional_limit(
+        defaults["committed_pages"], "process.default.committed_pages"
+    )
+    reserved_limit = _optional_limit(
+        defaults["reserved_pages"], "process.default.reserved_pages"
+    )
     mappings = defaults["mappings"]
     metadata = defaults["metadata_bytes"]
     if not isinstance(mappings, dict) or set(mappings) != {"maximum"}:
@@ -73,12 +88,28 @@ def read_memory_policy(path: Path = POLICY_PATH) -> tuple[int, ...]:
     if not isinstance(metadata, dict) or set(metadata) != {"maximum"}:
         raise ValueError("invalid process metadata policy")
     minimum_free = _u64(system["minimum_free_pages"], "system.minimum_free_pages")
-    maximum_mappings = _u64(mappings["maximum"], "process.default.mappings.maximum", maximum=MAX_MAPPINGS)
-    maximum_metadata = _u64(metadata["maximum"], "process.default.metadata_bytes.maximum", maximum=MAX_PROCESS_METADATA)
-    global_metadata = _u64(kernel["global_metadata_bytes"], "kernel.global_metadata_bytes", maximum=MAX_GLOBAL_METADATA)
-    quantum = _u64(kernel["operation_quantum_pages"], "kernel.operation_quantum_pages", maximum=MAX_OPERATION_QUANTUM)
+    maximum_mappings = _u64(
+        mappings["maximum"], "process.default.mappings.maximum", maximum=MAX_MAPPINGS
+    )
+    maximum_metadata = _u64(
+        metadata["maximum"],
+        "process.default.metadata_bytes.maximum",
+        maximum=MAX_PROCESS_METADATA,
+    )
+    global_metadata = _u64(
+        kernel["global_metadata_bytes"],
+        "kernel.global_metadata_bytes",
+        maximum=MAX_GLOBAL_METADATA,
+    )
+    quantum = _u64(
+        kernel["operation_quantum_pages"],
+        "kernel.operation_quantum_pages",
+        maximum=MAX_OPERATION_QUANTUM,
+    )
     if global_metadata < maximum_metadata or (
-        system_limit is not None and committed_limit is not None and committed_limit > system_limit
+        system_limit is not None
+        and committed_limit is not None
+        and committed_limit > system_limit
     ):
         raise ValueError("inconsistent memory policy")
     flags = (
@@ -99,16 +130,16 @@ def read_memory_policy(path: Path = POLICY_PATH) -> tuple[int, ...]:
     )
 
 
-def build_config(generation: int, previous: int, memory_policy: Path = POLICY_PATH) -> bytes:
+def build_config(
+    generation: int, previous: int, memory_policy: Path = POLICY_PATH
+) -> bytes:
     """Encode one generation with one boot-resident SNTP service."""
     if generation <= 0 or previous < 0 or previous >= generation:
         raise ValueError("invalid generation relationship")
     strings = b"timesync/bin/timesync.kex"
     image = bytearray(HEADER_BYTES + RECORD_BYTES + len(strings))
     image[:8] = b"SCFGv1\0\0"
-    struct.pack_into(
-        "<HHHHI", image, 8, 1, 1, HEADER_BYTES, RECORD_BYTES, len(image)
-    )
+    struct.pack_into("<HHHHI", image, 8, 1, 1, HEADER_BYTES, RECORD_BYTES, len(image))
     flags = 2 | (1 if previous else 0)
     struct.pack_into(
         "<QQHBBII", image, 24, generation, previous, 1, 3, flags, 30_000, len(strings)
@@ -148,7 +179,9 @@ def main() -> int:
             previous = build_config(1, 0, args.memory_policy)
             args.previous_output.parent.mkdir(parents=True, exist_ok=True)
             args.previous_output.write_bytes(previous)
-            print(f"SCFG v1 predecessor: {len(previous)} bytes -> {args.previous_output}")
+            print(
+                f"SCFG v1 predecessor: {len(previous)} bytes -> {args.previous_output}"
+            )
         return 0
     except (OSError, ValueError) as error:
         print(f"mkconfig: {error}", file=sys.stderr)

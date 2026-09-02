@@ -328,7 +328,7 @@ class CloudBundleTests(unittest.TestCase):
         for role, filename in mkcloud.BUNDLE_FILENAMES.items():
             (directory / filename).write_bytes(images[role])
         (directory / mkcloud.BUNDLE_MANIFEST).write_bytes(
-            mkcloud._canonical_json(manifest)  # noqa: SLF001 - format fixture
+            mkcloud._canonical_json(manifest)
         )
 
     def test_bundle_is_reproducible_and_has_exact_partition_geometry(self) -> None:

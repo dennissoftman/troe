@@ -53,13 +53,33 @@ all QEMU platforms and scenario groups, or require the repository's exhaustive
 merge check. QEMU `8.x` through `11.x` and matching distribution UEFI firmware
 are accepted. Use `--skip-qemu` only when a supported emulator and firmware are
 unavailable, and ensure the full gate runs before merge. Release evidence uses
-`python3 scripts/test.py --strict-tool-versions --require-filesystem-tools`. See
-[`docs/testing.md`](docs/testing.md) for impact rules and LLM instructions. New
-parsers require corrupt and boundary tests. New caches require
+
+```console
+python3 scripts/test.py --strict-tool-versions --require-filesystem-tools --require-python-tools
+```
+
+See [`docs/testing.md`](docs/testing.md) for impact rules and LLM instructions.
+New parsers require corrupt and boundary tests. New caches require
 an owner, hard cap, eviction policy, pressure behavior, and accounting. New
 unsafe code requires a `SAFETY:` comment at each operation, a narrowly scoped
 crate boundary, and the same change updating the unsafe boundary that
 [`SECURITY.md`](SECURITY.md) records.
+
+Repository Python is formatted and linted by `ruff`, configured in
+`pyproject.toml`, which is the only reason that file exists. Both runners
+execute `ruff format --check` and `ruff check`; the focused selector runs them
+over the Python files that changed. Install `ruff` before running either
+runner, or accept that both gates skip with a notice on standard error;
+`--require-python-tools` turns that skip into a failure. Disable a rule that is
+wrong for this repository in `pyproject.toml` with a rationale comment rather
+than adding a `noqa`. Reach for a `noqa` only in the opposite case, where the
+rule is right in general and wrong on the one line: `pyproject.toml` inventories
+the nineteen that survive, and `RUF100` fails the gate on a directive that has
+stopped suppressing anything. The CPython guest probes under
+`tests/fixtures/cpython` are formatted and linted like everything else, but the
+three rules whose fixes would rewrite what the guest interpreter executes are
+disabled for that tree; changes there are proved by the QEMU `cpython` group,
+not by the host gates.
 
 Storage-provider changes should also run
 `python3 scripts/test.py --skip-qemu --require-filesystem-tools` with

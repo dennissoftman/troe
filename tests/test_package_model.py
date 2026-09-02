@@ -12,7 +12,6 @@ from pathlib import Path
 
 from tools import package_model
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TROE = REPO_ROOT / "tools" / "troe.py"
 TARGET = "x86_64-unknown-uefi"
@@ -193,7 +192,9 @@ class ResolverTests(unittest.TestCase):
             [(package.name, package.version.text()) for package in lock.packages],
             [("app", "1.0.0"), ("library", "2.0.0")],
         )
-        self.assertEqual(package_model.parse_lock(package_model.canonical_json(lock.json())), lock)
+        self.assertEqual(
+            package_model.parse_lock(package_model.canonical_json(lock.json())), lock
+        )
 
     def test_cycles_conflicts_missing_dependencies_and_wrong_targets_fail(self) -> None:
         cyclic = [
@@ -266,16 +267,16 @@ class ResolverTests(unittest.TestCase):
         orphaned["packages"].append(
             package_model.resolve(
                 "orphan", TARGET, [parse_fixture("orphan", (1, 0, 0), b"orphan")]
-            ).packages[0].json()
+            )
+            .packages[0]
+            .json()
         )
         orphaned["packages"].sort(key=lambda package: package["name"])
         with self.assertRaisesRegex(package_model.ModelError, "unreachable-package"):
             package_model.parse_lock(package_model.canonical_json(orphaned))
 
         cyclic = lock.json()
-        cyclic["packages"][1]["dependencies"] = [
-            {"name": "app", "version": [1, 0, 0]}
-        ]
+        cyclic["packages"][1]["dependencies"] = [{"name": "app", "version": [1, 0, 0]}]
         with self.assertRaisesRegex(package_model.ModelError, "dependency-cycle"):
             package_model.parse_lock(package_model.canonical_json(cyclic))
 
@@ -330,7 +331,9 @@ class PackageAndPlanTests(unittest.TestCase):
         manifest = parse_fixture("hello", (1, 0, 0), artifact)
         lock = package_model.resolve("hello", TARGET, [manifest])
         package = package_model.build_package(manifest, lock, artifact)
-        self.assertEqual(package_model.parse_package(package), (manifest, lock, artifact))
+        self.assertEqual(
+            package_model.parse_package(package), (manifest, lock, artifact)
+        )
 
         document = json.loads(package)
         document["artifact"] = "bm90LXRoZS1hcnRpZmFjdA=="
@@ -342,7 +345,9 @@ class PackageAndPlanTests(unittest.TestCase):
         with self.assertRaisesRegex(package_model.ModelError, "artifact-mismatch"):
             package_model.build_package(other, other_lock, artifact)
 
-    def test_every_locked_dependency_can_be_packaged_against_the_same_plan(self) -> None:
+    def test_every_locked_dependency_can_be_packaged_against_the_same_plan(
+        self,
+    ) -> None:
         app = parse_fixture(
             "app",
             (1, 0, 0),
@@ -353,7 +358,9 @@ class PackageAndPlanTests(unittest.TestCase):
         lock = package_model.resolve("app", TARGET, [app, library])
         for manifest, artifact in ((app, b"app"), (library, b"library")):
             package = package_model.build_package(manifest, lock, artifact)
-            parsed, embedded_lock, parsed_artifact = package_model.parse_package(package)
+            parsed, embedded_lock, parsed_artifact = package_model.parse_package(
+                package
+            )
             self.assertEqual(parsed, manifest)
             self.assertEqual(embedded_lock, lock)
             self.assertEqual(parsed_artifact, artifact)
@@ -368,7 +375,9 @@ class PackageAndPlanTests(unittest.TestCase):
         result = package_model.plan(lock, {(manifest.name, manifest.version): manifest})
         self.assertEqual(result["root"], "hello")
         self.assertEqual(result["totals"]["handles"], 4)
-        self.assertEqual(result["packages"][0]["directories"][1]["rights"], "read-mutate")
+        self.assertEqual(
+            result["packages"][0]["directories"][1]["rights"], "read-mutate"
+        )
 
 
 class CliTests(unittest.TestCase):
@@ -380,8 +389,7 @@ class CliTests(unittest.TestCase):
             cwd=REPO_ROOT,
             check=False,
             text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
         )
 
     def test_check_resolve_build_inspect_explain_plan_and_diagnostics(self) -> None:

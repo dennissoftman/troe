@@ -21,8 +21,7 @@ from platform_profile import REPO_ROOT, resolve_platform
 
 sys.path.insert(0, str(REPO_ROOT))
 
-from tools import mkcloud, setup_troe  # noqa: E402
-
+from tools import mkcloud, setup_troe
 
 PROFILE_PATH = REPO_ROOT / "tools" / "cloud-hypervisor-profile.json"
 ARTIFACT_READ_CHUNK = 1024 * 1024
@@ -299,7 +298,8 @@ def verify_artifact(
     actual = digest.hexdigest()
     if actual != expected.sha256:
         raise ValueError(
-            f"{expected.name} SHA-256 mismatch: expected {expected.sha256}, got {actual}"
+            f"{expected.name} SHA-256 mismatch: "
+            f"expected {expected.sha256}, got {actual}"
         )
     if executable and not os.access(path, os.X_OK):
         raise ValueError(f"pinned executable is not executable: {path}")
@@ -458,7 +458,8 @@ def verify_host(
         profile.host.kvm_device, os.R_OK | os.W_OK
     ):
         raise ValueError(
-            f"KVM device is not a readable/writable character device: {profile.host.kvm_device}"
+            "KVM device is not a readable/writable character device: "
+            f"{profile.host.kvm_device}"
         )
     if _mem_available(meminfo) < profile.host.minimum_available_memory_bytes:
         raise ValueError("host does not meet the pinned available-memory floor")
@@ -472,8 +473,7 @@ def verify_host(
     completed = subprocess.run(
         ["ip", "-j", "address", "show", "dev", tap],
         check=False,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         text=True,
         timeout=10,
     )

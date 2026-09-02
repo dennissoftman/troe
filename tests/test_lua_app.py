@@ -10,7 +10,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 LUA_ROOT = REPO_ROOT / "apps" / "lua"
 RESULT_PATTERN = re.compile(
@@ -64,9 +63,7 @@ class LuaRuntimeTests(unittest.TestCase):
             "-o",
             str(cls.printf_runner),
         )
-        subprocess.run(
-            printf_command, cwd=REPO_ROOT, check=True, capture_output=True
-        )
+        subprocess.run(printf_command, cwd=REPO_ROOT, check=True, capture_output=True)
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -123,8 +120,10 @@ print("lua-feature-unit", _VERSION)
         source = r"""
 assert(os.getenv("TZ") == "EST5EDT,M3.2.0,M11.1.0")
 assert(os.date("!%Y-%m-%d %H:%M:%S %Z", 1784116800) == "2026-07-15 12:00:00 UTC")
-assert(os.date("%Y-%m-%d %H:%M:%S %Z %z", 1784116800) == "2026-07-15 08:00:00 EDT -0400")
-assert(os.date("%Y-%m-%d %H:%M:%S %Z %z", 1768478400) == "2026-01-15 07:00:00 EST -0500")
+assert(os.date("%Y-%m-%d %H:%M:%S %Z %z", 1784116800)
+    == "2026-07-15 08:00:00 EDT -0400")
+assert(os.date("%Y-%m-%d %H:%M:%S %Z %z", 1768478400)
+    == "2026-01-15 07:00:00 EST -0500")
 -- The exact transition second and the one before it.
 assert(os.date("%H:%M:%S %Z", 1772953199) == "01:59:59 EST")
 assert(os.date("%H:%M:%S %Z", 1772953200) == "03:00:00 EDT")
@@ -175,7 +174,8 @@ print("lua-southern", os.date("%Z", 1768478400))
         source = r"""
 assert(type(package) == "table" and type(require) == "function")
 assert(type(io) == "table" and type(debug) == "table")
-assert(type(load) == "function" and type(loadfile) == "function" and type(dofile) == "function")
+assert(type(load) == "function" and type(loadfile) == "function")
+assert(type(dofile) == "function")
 assert(load("return 6 * 7", "=(unit)", "t")() == 42)
 assert(os.difftime(7, 2) == 5)
 local before = os.clock()
@@ -302,7 +302,8 @@ print("lua-files-unit")
 
     def test_absent_names_have_no_ambient_value(self) -> None:
         completed, metadata = self.run_lua(
-            'assert(os.getenv("LUA_INIT_5_5") == nil and os.getenv("LUA_INIT") == nil); '
+            'assert(os.getenv("LUA_INIT_5_5") == nil '
+            'and os.getenv("LUA_INIT") == nil); '
             'assert(os.getenv("TOTALLY_ABSENT") == nil); print("lua-absent-env")'
         )
         self.assertEqual(metadata[0], 0, completed.stderr.decode(errors="replace"))
@@ -310,11 +311,11 @@ print("lua-files-unit")
 
     def test_arguments_and_controlled_exit_are_exact(self) -> None:
         completed, metadata = self.run_lua(
-            'local first, second = ...; '
+            "local first, second = ...; "
             'assert(arg[-1] == "lua" and arg[0] == "host.lua"); '
             'assert(arg[1] == "hello" and arg[2] == "world"); '
             'assert(select("#", ...) == 2 and first == "hello" and second == "world"); '
-            'os.exit(37, true)',
+            "os.exit(37, true)",
             "hello",
             "world",
         )
@@ -337,7 +338,9 @@ print("lua-allocation-unit", #values, total)
         self.assertEqual(metadata[0], 0, completed.stderr.decode(errors="replace"))
         self.assertEqual(completed.stdout, b"lua-allocation-unit\t6144\t6291456\n")
 
-    def test_clock_benchmark_completes_without_interpreter_scheduling_hooks(self) -> None:
+    def test_clock_benchmark_completes_without_interpreter_scheduling_hooks(
+        self,
+    ) -> None:
         source = r"""
 local function target()
     local x = 0

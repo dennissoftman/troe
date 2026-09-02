@@ -5,7 +5,6 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 MMU_SOURCE = (REPO_ROOT / "crates/runtime/troe-machine/src/mmu.rs").read_text(
     encoding="utf-8"
@@ -23,9 +22,7 @@ DEFERRED_SOURCE = kernel_module("deferred.rs")
 INVOCATION_SOURCE = kernel_module("invocation.rs")
 LAUNCH_MEMORY_SOURCE = kernel_module("memory/launch.rs")
 GROWTH_MEMORY_SOURCE = kernel_module("memory/growth.rs")
-CONTRACT_SOURCE = (REPO_ROOT / "docs/testing.md").read_text(
-    encoding="utf-8"
-)
+CONTRACT_SOURCE = (REPO_ROOT / "docs/testing.md").read_text(encoding="utf-8")
 
 
 def source_between(source: str, start: str, end: str) -> str:
@@ -149,7 +146,9 @@ class NativeExecutionContractTests(unittest.TestCase):
             '"eret"',
         )
 
-    def test_x86_timer_has_distinct_user_lease_and_kernel_deadline_returns(self) -> None:
+    def test_x86_timer_has_distinct_user_lease_and_kernel_deadline_returns(
+        self,
+    ) -> None:
         entry = source_between(
             MMU_SOURCE,
             'extern "C" fn x86_execution_timer_entry()',
@@ -198,8 +197,8 @@ class NativeExecutionContractTests(unittest.TestCase):
         )
         resume = source_between(
             MMU_SOURCE,
-            "unsafe extern \"C\" fn aarch64_resume_application(",
-            "extern \"C\" fn aarch64_isolated_complete()",
+            'unsafe extern "C" fn aarch64_resume_application(',
+            'extern "C" fn aarch64_isolated_complete()',
         )
         require_order(
             self,
@@ -266,7 +265,9 @@ class NativeExecutionContractTests(unittest.TestCase):
                     "finish_application_execution()",
                 )
 
-    def test_timeslices_and_local_service_budgets_do_not_cap_process_lifetime(self) -> None:
+    def test_timeslices_and_local_service_budgets_do_not_cap_process_lifetime(
+        self,
+    ) -> None:
         runner = source_between(
             INVOCATION_SOURCE,
             "fn run_command_application(",

@@ -12,9 +12,9 @@ from pathlib import Path
 
 from alpine_profile import (
     acquire_alpine_image,
+    alpine_profile,
     alpine_root_disk_path,
     alpine_root_needs_install,
-    alpine_profile,
     ensure_alpine_root_image,
     prepare_alpine_command,
 )
@@ -23,8 +23,7 @@ from qemu_profile import ENVIRONMENT_IDS, validate_memory_size
 
 sys.path.insert(0, str(REPO_ROOT))
 
-from tools.mount_shared import SharedMediaLock, require_detached  # noqa: E402
-
+from tools.mount_shared import SharedMediaLock, require_detached
 
 SHARED_MEDIA_PATH = REPO_ROOT / "build" / "troe-shared-fat32.img"
 SHARED_MOUNT_COMMAND = (

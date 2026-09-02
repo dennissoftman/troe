@@ -13,7 +13,6 @@ import tomllib
 import unittest
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
@@ -197,7 +196,9 @@ class RepositoryPolicyTests(unittest.TestCase):
             self.assertEqual(installed, ordinary)
             self.assertEqual(list(root.glob("*.kcap")), [])
 
-        shell = (REPO_ROOT / "crates/shell/troe-shell/src/lib.rs").read_text(encoding="utf-8")
+        shell = (REPO_ROOT / "crates/shell/troe-shell/src/lib.rs").read_text(
+            encoding="utf-8"
+        )
         self.assertEqual(shell.count("\n    fn command_"), 2)
         self.assertIn("fn command_cd", shell)
         self.assertIn("fn command_machine_action", shell)
@@ -210,7 +211,9 @@ class RepositoryPolicyTests(unittest.TestCase):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, shell)
 
-    def test_completion_policy_is_portable_and_kcap_remains_authority_only(self) -> None:
+    def test_completion_policy_is_portable_and_kcap_remains_authority_only(
+        self,
+    ) -> None:
         completion_root = REPO_ROOT / "crates" / "common" / "troe-completion"
         manifest = tomllib.loads(
             (completion_root / "Cargo.toml").read_text(encoding="utf-8")
@@ -222,12 +225,17 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertIn("Address(AddressConstraints)", source)
         self.assertIn("Integer(IntegerConstraints)", source)
 
-        shell = (REPO_ROOT / "crates" / "shell" / "troe-shell" / "src" / "lib.rs").read_text(
-            encoding="utf-8"
-        )
+        shell = (
+            REPO_ROOT / "crates" / "shell" / "troe-shell" / "src" / "lib.rs"
+        ).read_text(encoding="utf-8")
         self.assertNotIn("fn argument_completion", shell)
         registry = (
-            REPO_ROOT / "crates" / "shell" / "troe-shell" / "src" / "recovery_completion.rs"
+            REPO_ROOT
+            / "crates"
+            / "shell"
+            / "troe-shell"
+            / "src"
+            / "recovery_completion.rs"
         ).read_text(encoding="utf-8")
         self.assertIn("CompletionDescriptor", registry)
         self.assertIn("PackageCompletionRegistry", registry)
@@ -271,7 +279,9 @@ class RepositoryPolicyTests(unittest.TestCase):
     def test_platform_facts_and_virtio_transport_selection_stay_below_kernel(
         self,
     ) -> None:
-        machine_sources = tuple((REPO_ROOT / "crates/runtime/troe-machine/src").glob("*.rs"))
+        machine_sources = tuple(
+            (REPO_ROOT / "crates/runtime/troe-machine/src").glob("*.rs")
+        )
         kernel_sources = tuple((REPO_ROOT / "kernel/src").rglob("*.rs"))
         fixed_platform_literals = (
             "0xfee00000",
@@ -307,7 +317,8 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertEqual(
             machine.count("target_arch"),
             2,
-            "target_arch may only guard platform/CPU compatibility, not select transport",
+            "target_arch may only guard platform/CPU compatibility,"
+            " not select transport",
         )
 
     def test_crate_domains_and_roles_stay_layered(self) -> None:
@@ -324,7 +335,10 @@ class RepositoryPolicyTests(unittest.TestCase):
         lower because it links no other crate at all, which leaves a
         network-backed filesystem as the edge the order still permits."""
         manifests = {
-            path.parent.name: (path.parent.parent.name, tomllib.loads(path.read_text("utf-8")))
+            path.parent.name: (
+                path.parent.parent.name,
+                tomllib.loads(path.read_text("utf-8")),
+            )
             for path in (REPO_ROOT / "crates").rglob("Cargo.toml")
         }
         self.assertEqual(
@@ -384,13 +398,21 @@ class RepositoryPolicyTests(unittest.TestCase):
             if crate.startswith("troe-fs-") and crate not in contracts:
                 self.assertLessEqual(
                     dependencies,
-                    {"troe-fs-api", "troe-block", "troe-txslot", "troe-core", "troe-checksum"},
+                    {
+                        "troe-fs-api",
+                        "troe-block",
+                        "troe-txslot",
+                        "troe-core",
+                        "troe-checksum",
+                    },
                     f"{crate} is a provider: it may not reach past the filesystem"
                     " contract, and must never link the namespace",
                 )
             if crate == "troe-fs-api":
                 self.assertEqual(
-                    dependencies, set(), "the provider contract must stay dependency-free"
+                    dependencies,
+                    set(),
+                    "the provider contract must stay dependency-free",
                 )
             if crate == "troe-fs-client":
                 self.assertLessEqual(
@@ -402,7 +424,9 @@ class RepositoryPolicyTests(unittest.TestCase):
                 )
             if crate == "troe-namespace":
                 self.assertNotIn(
-                    "troe-volume", dependencies, "the namespace may not depend on volume policy"
+                    "troe-volume",
+                    dependencies,
+                    "the namespace may not depend on volume policy",
                 )
                 for dependency in dependencies:
                     self.assertFalse(
@@ -437,7 +461,9 @@ class RepositoryPolicyTests(unittest.TestCase):
             " filesystem composes one through [dev-dependencies].",
         )
         source = (REPO_ROOT / "crates/shell/troe-shell/src/lib.rs").read_text("utf-8")
-        self.assertIn("pub type SharedNamespace = Rc<RefCell<dyn NamespaceClient>>;", source)
+        self.assertIn(
+            "pub type SharedNamespace = Rc<RefCell<dyn NamespaceClient>>;", source
+        )
 
     def test_no_crate_ships_a_dependency_only_its_tests_name(self) -> None:
         """`[dependencies]` is what a built image links. A dependency named only
@@ -463,7 +489,9 @@ class RepositoryPolicyTests(unittest.TestCase):
                 with self.subTest(path=path.relative_to(REPO_ROOT)):
                     # Code only: a doc-comment example or a diagnostic string
                     # naming the construct is not a definition of it.
-                    code = rust_code_without_comments_or_literals(path.read_text("utf-8"))
+                    code = rust_code_without_comments_or_literals(
+                        path.read_text("utf-8")
+                    )
                     self.assertTrue(
                         "macro_rules!" not in code,
                         f"{path.relative_to(REPO_ROOT)} defines a macro, which"
@@ -540,7 +568,7 @@ use troe_platform::Retained;
         nesting shapes that would defeat a pattern-matched predicate, and pin
         the scan's answer to their meaning rather than to how deep they go."""
         for name, source in {
-            "not(test)": '#[cfg(not(test))]\nuse troe_real::Thing;\n',
+            "not(test)": "#[cfg(not(test))]\nuse troe_real::Thing;\n",
             "any(test, cfg)": (
                 '#[cfg(any(test, target_os = "uefi"))]\nuse troe_uefi::Thing;\n'
             ),
@@ -550,9 +578,11 @@ use troe_platform::Retained;
             ),
             # Three levels of nesting: recognized, and retained on its merits
             # rather than by failing to parse.
-            "all(not(test), cfg)": '#[cfg(all(not(test), unix))]\nuse troe_unix::Thing;\n',
+            "all(not(test), cfg)": (
+                "#[cfg(all(not(test), unix))]\nuse troe_unix::Thing;\n"
+            ),
             "not(all(test, cfg))": (
-                '#[cfg(not(all(test, unix)))]\nuse troe_unix::Thing;\n'
+                "#[cfg(not(all(test, unix)))]\nuse troe_unix::Thing;\n"
             ),
         }.items():
             with self.subTest(predicate=name):
@@ -617,14 +647,14 @@ use troe_after::Thing;
         """The macro-soundness assertion searches source text, so a construct
         merely named in a doc comment or a diagnostic string must not read as a
         definition of it."""
-        source = '''\
+        source = """\
 /// Expands like `macro_rules! example { () => {} }` does.
 const MESSAGE: &str = "macro_rules! is not defined here";
 fn shipped() -> u8 {
     /* macro_rules! neither */
     4
 }
-'''
+"""
         code = rust_code_without_comments_or_literals(source)
         self.assertNotIn("macro_rules!", code)
         self.assertIn("fn shipped()", code)
@@ -647,20 +677,44 @@ fn shipped() -> u8 {
         """The kernel still links every filesystem format and the network stack.
         Pin that list so ADR 0035 Phase D and E removals are a visible diff and
         cannot regress silently in the other direction."""
-        manifest = tomllib.loads((REPO_ROOT / "kernel" / "Cargo.toml").read_text("utf-8"))
+        manifest = tomllib.loads(
+            (REPO_ROOT / "kernel" / "Cargo.toml").read_text("utf-8")
+        )
         linked = {name for name in manifest["dependencies"] if name.startswith("troe-")}
         self.assertEqual(
-            linked & {
-                "troe-fmt-bmnt", "troe-fmt-cspk", "troe-fmt-gpt", "troe-fmt-prgn",
-                "troe-fmt-scfg", "troe-fs-ext4", "troe-fs-fat", "troe-fs-statefs",
-                "troe-identity", "troe-net", "troe-txslot", "troe-namespace", "troe-volume",
+            linked
+            & {
+                "troe-fmt-bmnt",
+                "troe-fmt-cspk",
+                "troe-fmt-gpt",
+                "troe-fmt-prgn",
+                "troe-fmt-scfg",
+                "troe-fs-ext4",
+                "troe-fs-fat",
+                "troe-fs-statefs",
+                "troe-identity",
+                "troe-net",
+                "troe-txslot",
+                "troe-namespace",
+                "troe-volume",
             },
             {
-                "troe-fmt-bmnt", "troe-fmt-cspk", "troe-fmt-gpt", "troe-fmt-prgn",
-                "troe-fmt-scfg", "troe-fs-ext4", "troe-fs-fat", "troe-fs-statefs",
-                "troe-identity", "troe-net", "troe-txslot", "troe-namespace", "troe-volume",
+                "troe-fmt-bmnt",
+                "troe-fmt-cspk",
+                "troe-fmt-gpt",
+                "troe-fmt-prgn",
+                "troe-fmt-scfg",
+                "troe-fs-ext4",
+                "troe-fs-fat",
+                "troe-fs-statefs",
+                "troe-identity",
+                "troe-net",
+                "troe-txslot",
+                "troe-namespace",
+                "troe-volume",
             },
-            "kernel storage/network linkage changed: update this gate with the migration",
+            "kernel storage/network linkage changed:"
+            " update this gate with the migration",
         )
 
     def test_shipped_packages_are_members_of_one_workspace_per_tree(self) -> None:
@@ -692,7 +746,13 @@ fn shipped() -> u8 {
                     self.assertNotIn("workspace", member)
                     self.assertNotIn("profile", member)
                     self.assertEqual(member["lints"], {"workspace": True})
-                    for field in ("version", "edition", "rust-version", "license", "publish"):
+                    for field in (
+                        "version",
+                        "edition",
+                        "rust-version",
+                        "license",
+                        "publish",
+                    ):
                         self.assertEqual(
                             member["package"][field], {"workspace": True}, field
                         )
@@ -712,6 +772,7 @@ fn shipped() -> u8 {
         because a moved line rewrites the panic locations inside a committed
         `.kex`. Pin the deviations so tightening them is a visible diff and
         loosening them further is a failure."""
+
         def lints(manifest: Path) -> dict[str, dict[str, object]]:
             document = tomllib.loads(manifest.read_text(encoding="utf-8"))
             return document["workspace"]["lints"]
@@ -876,6 +937,7 @@ fn shipped() -> u8 {
         registry crate the root lock does not already pin at the same version.
         Assert it, so adding a boundary dependency to a command fails here
         instead of silently leaving the RustSec gate."""
+
         def registry_crates(lock: Path) -> dict[str, str]:
             pinned: dict[str, str] = {}
             for entry in lock.read_text(encoding="utf-8").split("[[package]]")[1:]:
@@ -914,7 +976,7 @@ fn shipped() -> u8 {
         self.assertEqual(
             lintable, {path.name for path in application_directories()} - {"python"}
         )
-        import test as full_gate  # noqa: PLC0415
+        import test as full_gate
 
         labels = [
             step.label
@@ -923,13 +985,12 @@ fn shipped() -> u8 {
                     skip_qemu=True,
                     strict_tool_versions=False,
                     build_sbsa_firmware=False,
+                    require_python_tools=False,
                 )
             )
         ]
         expected = [f"clippy app ({name})" for name in sorted(lintable)]
-        expected += [
-            f"clippy service ({path.name})" for path in service_directories()
-        ]
+        expected += [f"clippy service ({path.name})" for path in service_directories()]
         expected += [
             "cargo fmt (applications)",
             "cargo fmt (services)",
@@ -950,7 +1011,7 @@ fn shipped() -> u8 {
         self.assertEqual(shared, {"lua"})
         checked = {path.name for path in rootfs_application_directories()}
         self.assertEqual(checked & SHARED_VOLUME_APPLICATIONS, set())
-        import test as full_gate  # noqa: PLC0415
+        import test as full_gate
 
         labels = {
             step.label
@@ -959,6 +1020,7 @@ fn shipped() -> u8 {
                     skip_qemu=True,
                     strict_tool_versions=False,
                     build_sbsa_firmware=False,
+                    require_python_tools=False,
                 )
             )
         }
@@ -975,7 +1037,9 @@ fn shipped() -> u8 {
         is at least enforced for the constructs the denies name. `build.rs` is
         exempt: a build script has no caller to return an error to, which is
         what `test_panicking_allowance_stays_inside_build_scripts` pins."""
-        denied = re.compile(r"\.unwrap\(|\.expect\(|\b(?:panic|unreachable|todo|unimplemented)!")
+        denied = re.compile(
+            r"\.unwrap\(|\.expect\(|\b(?:panic|unreachable|todo|unimplemented)!"
+        )
         checked = []
         for name in sorted(UNLINTABLE_APPLICATIONS):
             for source in sorted((REPO_ROOT / "apps" / name).rglob("*.rs")):

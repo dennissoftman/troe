@@ -9,7 +9,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 BUILDER = REPO_ROOT / "tools" / "build_qemu_plugin.py"
 SOURCE = REPO_ROOT / "tools" / "qemu-plugin" / "troe_count.c"
@@ -37,7 +36,9 @@ class QemuPluginTests(unittest.TestCase):
         self.assertIn("SPDX-License-Identifier: GPL-2.0-or-later", text)
 
     @unittest.skipUnless(
-        shutil.which("clang") and shutil.which("pkg-config") and qemu_headers_available(),
+        shutil.which("clang")
+        and shutil.which("pkg-config")
+        and qemu_headers_available(),
         "QEMU plugin headers or host compiler unavailable",
     )
     def test_builds_without_warnings_and_exports_the_plugin_contract(self) -> None:

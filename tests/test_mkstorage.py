@@ -173,18 +173,16 @@ class E2fsprogsPolicyTests(unittest.TestCase):
     def test_strict_version_banner_is_pinned(self) -> None:
         for name, expected in mkstorage.PINNED_E2FSPROGS_OUTPUT.items():
             with self.subTest(name=name):
-                mkstorage._verify_e2fsprogs_version_output(  # noqa: SLF001
+                mkstorage._verify_e2fsprogs_version_output(
                     name, "\n".join(expected) + "\n", strict=True
                 )
                 wrong = "\n".join(expected).replace(
                     mkstorage.PINNED_E2FSPROGS_VERSION, "1.47.5"
                 )
                 with self.assertRaises(ValueError):
-                    mkstorage._verify_e2fsprogs_version_output(  # noqa: SLF001
-                        name, wrong, strict=True
-                    )
+                    mkstorage._verify_e2fsprogs_version_output(name, wrong, strict=True)
                 with self.assertRaises(ValueError):
-                    mkstorage._verify_e2fsprogs_version_output(  # noqa: SLF001
+                    mkstorage._verify_e2fsprogs_version_output(
                         name,
                         "\n".join(expected) + "\nunreviewed wrapper\n",
                         strict=True,
@@ -198,9 +196,7 @@ class E2fsprogsPolicyTests(unittest.TestCase):
                     f"Using EXT2FS Library version {version}\n"
                 )
                 self.assertEqual(
-                    mkstorage._verify_e2fsprogs_version_output(  # noqa: SLF001
-                        "mke2fs", output
-                    )[:2],
+                    mkstorage._verify_e2fsprogs_version_output("mke2fs", output)[:2],
                     (1, 47),
                 )
         for version in ("1.46.6", "1.48.0", "2.0.0"):
@@ -210,18 +206,16 @@ class E2fsprogsPolicyTests(unittest.TestCase):
                     f"Using EXT2FS Library version {version}, distribution build\n"
                 )
                 with self.assertRaisesRegex(ValueError, "1.47.x"):
-                    mkstorage._verify_e2fsprogs_version_output(  # noqa: SLF001
-                        "e2fsck", output
-                    )
+                    mkstorage._verify_e2fsprogs_version_output("e2fsck", output)
 
     def test_compatible_policy_rejects_mixed_libraries_and_extra_output(self) -> None:
         with self.assertRaisesRegex(ValueError, "different versions"):
-            mkstorage._verify_e2fsprogs_version_output(  # noqa: SLF001
+            mkstorage._verify_e2fsprogs_version_output(
                 "mke2fs",
                 "mke2fs 1.47.0 (distribution)\nUsing EXT2FS Library version 1.47.1\n",
             )
         with self.assertRaisesRegex(ValueError, "invalid mke2fs version banner"):
-            mkstorage._verify_e2fsprogs_version_output(  # noqa: SLF001
+            mkstorage._verify_e2fsprogs_version_output(
                 "mke2fs",
                 "mke2fs 1.47.0 (distribution)\n"
                 "Using EXT2FS Library version 1.47.0\n"
@@ -233,9 +227,9 @@ class Ext4JournalCapacityTests(unittest.TestCase):
     """Check the pinned log against the provider's transaction ceiling."""
 
     def test_pinned_journal_outsizes_the_worst_admissible_transaction(self) -> None:
-        source = (REPO_ROOT / "crates" / "storage" / "troe-fs-ext4" / "src" / "journal.rs").read_text(
-            encoding="utf-8"
-        )
+        source = (
+            REPO_ROOT / "crates" / "storage" / "troe-fs-ext4" / "src" / "journal.rs"
+        ).read_text(encoding="utf-8")
         declaration = re.search(
             r"pub\(crate\) const MAX_TRANSACTION_BLOCKS: usize = ([0-9_]+);", source
         )
@@ -276,7 +270,7 @@ class Ext4StorageBuilderTests(unittest.TestCase):
     def refresh_superblock(image: bytearray) -> None:
         """Refresh the ext4 superblock checksum after one semantic mutation."""
         start = 1024
-        checksum = mkstorage._crc32c(  # noqa: SLF001 - focused format regression
+        checksum = mkstorage._crc32c(
             0xFFFF_FFFF, memoryview(image)[start : start + 1020]
         )
         struct.pack_into("<I", image, start + 1020, checksum)
@@ -284,7 +278,7 @@ class Ext4StorageBuilderTests(unittest.TestCase):
     @staticmethod
     def checksum_seed(image: bytearray) -> int:
         """Return the UUID-derived metadata_csum seed."""
-        return mkstorage._crc32c(  # noqa: SLF001 - focused format regression
+        return mkstorage._crc32c(
             0xFFFF_FFFF, memoryview(image)[1024 + 104 : 1024 + 120]
         )
 
@@ -296,10 +290,8 @@ class Ext4StorageBuilderTests(unittest.TestCase):
             image[offset : offset + mkstorage.EXT4_GROUP_DESCRIPTOR_BYTES]
         )
         descriptor[30:32] = b"\0\0"
-        checksum = mkstorage._crc32c(  # noqa: SLF001 - focused format regression
-            mkstorage._crc32c(  # noqa: SLF001 - focused format regression
-                cls.checksum_seed(image), (0).to_bytes(4, "little")
-            ),
+        checksum = mkstorage._crc32c(
+            mkstorage._crc32c(cls.checksum_seed(image), (0).to_bytes(4, "little")),
             descriptor,
         )
         struct.pack_into("<H", image, offset + 30, checksum & 0xFFFF)
@@ -310,7 +302,7 @@ class Ext4StorageBuilderTests(unittest.TestCase):
         descriptor_offset = mkstorage.EXT4_BLOCK_BYTES
         bitmap_block = struct.unpack_from("<I", image, descriptor_offset)[0]
         bitmap_offset = bitmap_block * mkstorage.EXT4_BLOCK_BYTES
-        checksum = mkstorage._crc32c(  # noqa: SLF001 - focused format regression
+        checksum = mkstorage._crc32c(
             cls.checksum_seed(image),
             memoryview(image)[
                 bitmap_offset : bitmap_offset + mkstorage.EXT4_BLOCK_BYTES
@@ -325,7 +317,7 @@ class Ext4StorageBuilderTests(unittest.TestCase):
         descriptor_offset = mkstorage.EXT4_BLOCK_BYTES
         bitmap_block = struct.unpack_from("<I", image, descriptor_offset + 4)[0]
         bitmap_offset = bitmap_block * mkstorage.EXT4_BLOCK_BYTES
-        checksum = mkstorage._crc32c(  # noqa: SLF001 - focused format regression
+        checksum = mkstorage._crc32c(
             cls.checksum_seed(image),
             memoryview(image)[
                 bitmap_offset : bitmap_offset + mkstorage.EXT4_INODES_PER_GROUP // 8
@@ -351,9 +343,9 @@ class Ext4StorageBuilderTests(unittest.TestCase):
         generation = struct.unpack_from("<I", raw, 100)[0]
         raw[124:126] = b"\0\0"
         raw[130:132] = b"\0\0"
-        checksum = mkstorage._crc32c(  # noqa: SLF001 - focused format regression
-            mkstorage._crc32c(  # noqa: SLF001 - focused format regression
-                mkstorage._crc32c(  # noqa: SLF001 - focused format regression
+        checksum = mkstorage._crc32c(
+            mkstorage._crc32c(
+                mkstorage._crc32c(
                     cls.checksum_seed(image), number.to_bytes(4, "little")
                 ),
                 generation.to_bytes(4, "little"),

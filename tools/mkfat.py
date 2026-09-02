@@ -187,9 +187,7 @@ def build(efi: bytes, boot_name: bytes, mount_manifest: bytes | None = None) -> 
         image[destination : destination + len(source)] = source
     if mount_manifest is not None:
         for index in range(manifest_clusters):
-            source = mount_manifest[
-                index * CLUSTER_BYTES : (index + 1) * CLUSTER_BYTES
-            ]
+            source = mount_manifest[index * CLUSTER_BYTES : (index + 1) * CLUSTER_BYTES]
             destination = cluster_offset(first_manifest_cluster + index)
             image[destination : destination + len(source)] = source
     return bytes(image)
@@ -319,8 +317,10 @@ def extract_files(image: bytes, boot_name: bytes) -> tuple[bytes, bytes | None]:
     )
     if (
         3 + file_clusters + manifest_clusters > MAX_DATA_CLUSTER
-        or manifest_entry is not None
-        and (manifest_size == 0 or manifest_cluster != 4 + file_clusters)
+        or (
+            manifest_entry is not None
+            and (manifest_size == 0 or manifest_cluster != 4 + file_clusters)
+        )
         or fat != expected_fat(file_clusters, manifest_clusters)
     ):
         raise ValueError("FAT allocation table is not canonical")
@@ -352,9 +352,10 @@ def extract_files(image: bytes, boot_name: bytes) -> tuple[bytes, bytes | None]:
         else None
     )
     first_unused_cluster = 4 + file_clusters + manifest_clusters
-    if first_unused_cluster <= MAX_DATA_CLUSTER:
-        if any(image[cluster_offset(first_unused_cluster) :]):
-            raise ValueError("unused FAT16 data clusters are not zero")
+    if first_unused_cluster <= MAX_DATA_CLUSTER and any(
+        image[cluster_offset(first_unused_cluster) :]
+    ):
+        raise ValueError("unused FAT16 data clusters are not zero")
     return efi, mount_manifest
 
 
@@ -402,7 +403,8 @@ def main() -> int:
             args.output.parent.mkdir(parents=True, exist_ok=True)
             args.output.write_bytes(image)
         print(
-            f"FAT16 {args.arch}: {len(efi)}-byte EFI, {len(image)}-byte image -> {args.output}"
+            f"FAT16 {args.arch}: {len(efi)}-byte EFI, "
+            f"{len(image)}-byte image -> {args.output}"
         )
         return 0
     except (OSError, ValueError) as error:

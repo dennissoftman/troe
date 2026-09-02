@@ -9,7 +9,6 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-
 ELF_HEADER_BYTES = 64
 ELF_PROGRAM_HEADER_BYTES = 56
 ELF_SECTION_HEADER_BYTES = 64
@@ -351,7 +350,7 @@ def parse_elf(image: bytes, expected_target: str | None = None) -> ParsedElf:
         section_string_index,
     ) = struct.unpack_from("<HHIQQQIHHHHHH", image, 16)
     target = ELF_MACHINES.get(machine)
-    if target is None or expected_target is not None and target != expected_target:
+    if target is None or (expected_target is not None and target != expected_target):
         raise ValueError("ELF machine does not match a supported requested KEX target")
     if target == "aarch64" and entry % 4:
         raise ValueError("AArch64 ELF entry is not instruction aligned")
@@ -581,9 +580,13 @@ def verify_kex(
     encoded_stack, encoded_heap = struct.unpack_from("<QQ", artifact, 40)
     table_offset, payload_offset = struct.unpack_from("<II", artifact, 56)
     artifact_bytes = struct.unpack_from("<Q", artifact, 80)[0]
-    relocation_offset, relocation_count, relocation_bytes, relocation_reserved16, relocation_reserved32 = struct.unpack_from(
-        "<IIHHI", artifact, 64
-    )
+    (
+        relocation_offset,
+        relocation_count,
+        relocation_bytes,
+        relocation_reserved16,
+        relocation_reserved32,
+    ) = struct.unpack_from("<IIHHI", artifact, 64)
     if (
         count == 0
         or count > limits["records"]

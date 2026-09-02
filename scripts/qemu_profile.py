@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import re
@@ -10,7 +11,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import fcntl
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -390,9 +390,10 @@ def firmware_profile() -> dict[str, object]:
             # records its own build time, so its provenance is the pinned
             # source rather than a byte-for-byte identity.
             if set(entry) == {"built_from"}:
-                if not isinstance(entry["built_from"], str) or not (
-                    REPO_ROOT / entry["built_from"]
-                ).is_file():
+                if (
+                    not isinstance(entry["built_from"], str)
+                    or not (REPO_ROOT / entry["built_from"]).is_file()
+                ):
                     raise RuntimeError(
                         f"QEMU firmware profile names no {architecture} {kind} source"
                     )
@@ -424,7 +425,8 @@ def verify_file_digest(path: Path, expected_bytes: int, expected_sha256: str) ->
     actual = digest.hexdigest()
     if actual != expected_sha256:
         raise RuntimeError(
-            f"firmware digest mismatch for {path}: expected {expected_sha256}, got {actual}"
+            f"firmware digest mismatch for {path}: "
+            f"expected {expected_sha256}, got {actual}"
         )
 
 
@@ -463,7 +465,7 @@ def verify_compatible_firmware(
         )
 
 
-def verify_built_firmware(path: Path, architecture: str, kind: str, source: str) -> None:
+def verify_built_firmware(path: Path, architecture: str, source: str) -> None:
     """Verify one locally built bank against the manifest its builder wrote.
 
     A distribution artifact is evidence because its digest is committed here.
@@ -472,7 +474,9 @@ def verify_built_firmware(path: Path, architecture: str, kind: str, source: str)
     sources produced and have not changed since.
     """
     if not (REPO_ROOT / source).is_file():
-        raise RuntimeError(f"the pinned {architecture} firmware source {source} is absent")
+        raise RuntimeError(
+            f"the pinned {architecture} firmware source {source} is absent"
+        )
     manifest = path.parent / "MANIFEST.sha256"
     if not manifest.is_file():
         raise RuntimeError(
@@ -515,7 +519,7 @@ def verify_firmware(
             f"firmware profile has no {architecture} {kind} artifact"
         ) from error
     if "built_from" in entry:
-        verify_built_firmware(path, architecture, kind, entry["built_from"])
+        verify_built_firmware(path, architecture, entry["built_from"])
         _VERIFIED_FIRMWARE.add(cache_key)
         return
     try:

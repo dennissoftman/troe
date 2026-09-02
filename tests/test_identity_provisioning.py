@@ -10,7 +10,6 @@ import tempfile
 import unittest
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "tools"))
 
@@ -38,7 +37,7 @@ class IdentityProvisioningTests(unittest.TestCase):
                 bytes.fromhex("30" * 16),
             )
         )
-        identities = generate_identities(lambda length: next(values))
+        identities = generate_identities(lambda _length: next(values))
         self.assertEqual(
             identities,
             IdentityIds(
@@ -92,8 +91,7 @@ class IdentityProvisioningTests(unittest.TestCase):
                 command,
                 cwd=REPO_ROOT,
                 check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                capture_output=True,
             )
             self.assertEqual(first.returncode, 0)
             self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
@@ -104,8 +102,7 @@ class IdentityProvisioningTests(unittest.TestCase):
                 command,
                 cwd=REPO_ROOT,
                 check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                capture_output=True,
             )
             self.assertEqual(second.returncode, 2)
             self.assertEqual(path.read_bytes(), original)

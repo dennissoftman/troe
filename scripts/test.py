@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import threading
@@ -17,8 +18,10 @@ if __package__:
     from .qemu_profile import QEMU_ENVIRONMENT
     from .repository_policy import (
         KEX_TARGETS,
+        RUFF_EXECUTABLE,
         buildable_shared_volume_directories,
         lintable_application_directories,
+        python_lint_commands,
         require_supported_python,
         rootfs_application_directories,
         service_directories,
@@ -29,8 +32,10 @@ else:
     from qemu_profile import QEMU_ENVIRONMENT
     from repository_policy import (
         KEX_TARGETS,
+        RUFF_EXECUTABLE,
         buildable_shared_volume_directories,
         lintable_application_directories,
+        python_lint_commands,
         require_supported_python,
         rootfs_application_directories,
         service_directories,
@@ -82,6 +87,11 @@ def parse_args() -> argparse.Namespace:
         help="require and run e2fsprogs, dosfstools, and mtools interoperability tests",
     )
     parser.add_argument(
+        "--require-python-tools",
+        action="store_true",
+        help="require and run the ruff Python format and lint gates",
+    )
+    parser.add_argument(
         "--strict-tool-versions",
         action="store_true",
         help="require release-pinned QEMU, UEFI firmware, and e2fsprogs versions",
@@ -130,8 +140,7 @@ def display(command: tuple[str | Path, ...]) -> str:
     arguments = []
     for argument in command:
         text = str(argument)
-        if text.startswith(prefix):
-            text = text[len(prefix) :]
+        text = text.removeprefix(prefix)
         arguments.append(repr(text) if any(c.isspace() for c in text) else text)
     return " ".join(arguments)
 
@@ -225,6 +234,32 @@ def package_clippy_commands() -> list[Step]:
     ]
 
 
+def python_lint_steps(*, require_python_tools: bool) -> list[Step]:
+    """Return the Python format and lint gates, or explain their absence.
+
+    This follows the external-tool idiom the filesystem interoperability gates
+    already use: an unavailable host tool skips its gate with a notice on
+    standard error, and one flag turns that skip into a failure. `ruff` is the
+    single tool that both formats and lints, so one absence decides both gates.
+    """
+    if shutil.which(RUFF_EXECUTABLE) is not None:
+        return [
+            Step(f"{RUFF_EXECUTABLE} {command[1]}", command)
+            for command in python_lint_commands()
+        ]
+    if require_python_tools:
+        raise RuntimeError(
+            f"{RUFF_EXECUTABLE} is required for the Python format and lint gates"
+        )
+    print(
+        f"python format and lint skipped: {RUFF_EXECUTABLE} is unavailable. "
+        "Use --require-python-tools to make this a failure.",
+        file=sys.stderr,
+        flush=True,
+    )
+    return []
+
+
 def image_and_qemu_commands(
     *, skip_qemu: bool, strict_tool_versions: bool = False
 ) -> list[Step]:
@@ -282,6 +317,7 @@ def verification_steps(args: argparse.Namespace) -> list[Step]:
                 ("services", SERVICES_MANIFEST),
             )
         ),
+        *python_lint_steps(require_python_tools=args.require_python_tools),
         Step(
             "clippy workspace",
             (
@@ -518,6 +554,9 @@ def main() -> int:
         print(
             f"verification failed: command not found: {error.filename}", file=sys.stderr
         )
+        return 1
+    except RuntimeError as error:
+        print(f"verification failed: {error}", file=sys.stderr)
         return 1
     except OSError as error:
         print(f"verification failed: {error}", file=sys.stderr)

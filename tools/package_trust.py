@@ -9,9 +9,9 @@ import re
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
 
 if __package__:
     from .package_model import (
@@ -116,7 +116,9 @@ def _digest(value: object, path: str) -> str:
     return value
 
 
-def _identifier(value: object, path: str, pattern: re.Pattern[str] = _IDENTIFIER) -> str:
+def _identifier(
+    value: object, path: str, pattern: re.Pattern[str] = _IDENTIFIER
+) -> str:
     if not isinstance(value, str) or pattern.fullmatch(value) is None:
         raise ModelError("invalid-name", path, "identifier is not canonical")
     return value
@@ -126,7 +128,9 @@ def _sorted_unique(values: Sequence[object], key: object, path: str) -> None:
     extractor = key
     keys = [extractor(value) for value in values]
     if keys != sorted(keys) or len(keys) != len(set(keys)):
-        raise ModelError("noncanonical-order", path, "entries must be unique and sorted")
+        raise ModelError(
+            "noncanonical-order", path, "entries must be unique and sorted"
+        )
 
 
 def require_openssl() -> str:
@@ -139,8 +143,7 @@ def require_openssl() -> str:
             (executable, "version"),
             check=True,
             text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
         ).stdout
     except (OSError, subprocess.CalledProcessError) as error:
         raise ModelError("openssl-unavailable", "openssl", str(error)) from error
@@ -156,8 +159,7 @@ def _run_openssl(arguments: Sequence[str], *, data: bytes | None = None) -> byte
             (executable, *arguments),
             input=data,
             check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
         ).stdout
     except (OSError, subprocess.CalledProcessError) as error:
         detail = (
@@ -221,7 +223,9 @@ def sign(private_key: Path, payload: bytes) -> tuple[str, bytes]:
         )
         value = signature.read_bytes()
     if len(value) != 64:
-        raise ModelError("invalid-signature", str(private_key), "Ed25519 signature is not 64 bytes")
+        raise ModelError(
+            "invalid-signature", str(private_key), "Ed25519 signature is not 64 bytes"
+        )
     return key_id(public_der), value
 
 
@@ -247,14 +251,20 @@ def parse_envelope(data: bytes, label: str = "envelope") -> Envelope:
         raise ModelError("unsupported-schema", f"{label}.schema", "expected 1")
     payload_value = document["payload"]
     if not isinstance(payload_value, str):
-        raise ModelError("invalid-payload", f"{label}.payload", "expected base64 string")
+        raise ModelError(
+            "invalid-payload", f"{label}.payload", "expected base64 string"
+        )
     try:
         payload = base64.b64decode(payload_value, validate=True)
     except ValueError as error:
-        raise ModelError("invalid-payload", f"{label}.payload", "invalid base64") from error
+        raise ModelError(
+            "invalid-payload", f"{label}.payload", "invalid base64"
+        ) from error
     if base64.b64encode(payload).decode("ascii") != payload_value:
         raise ModelError("noncanonical-payload", f"{label}.payload", "base64 differs")
-    raw_signatures = _array(document["signatures"], MAX_SIGNATURES, f"{label}.signatures")
+    raw_signatures = _array(
+        document["signatures"], MAX_SIGNATURES, f"{label}.signatures"
+    )
     if not raw_signatures:
         raise ModelError("signature-count", f"{label}.signatures", "no signatures")
     signatures: list[tuple[str, bytes]] = []
@@ -264,13 +274,19 @@ def parse_envelope(data: bytes, label: str = "envelope") -> Envelope:
         identity = _digest(entry["key_id"], f"{path}.key_id")
         value = entry["signature"]
         if not isinstance(value, str):
-            raise ModelError("invalid-signature", f"{path}.signature", "expected base64")
+            raise ModelError(
+                "invalid-signature", f"{path}.signature", "expected base64"
+            )
         try:
             decoded = base64.b64decode(value, validate=True)
         except ValueError as error:
-            raise ModelError("invalid-signature", f"{path}.signature", "invalid base64") from error
+            raise ModelError(
+                "invalid-signature", f"{path}.signature", "invalid base64"
+            ) from error
         if len(decoded) != 64 or base64.b64encode(decoded).decode("ascii") != value:
-            raise ModelError("invalid-signature", f"{path}.signature", "not canonical Ed25519")
+            raise ModelError(
+                "invalid-signature", f"{path}.signature", "not canonical Ed25519"
+            )
         signatures.append((identity, decoded))
     _sorted_unique(signatures, lambda signature: signature[0], f"{label}.signatures")
     envelope = Envelope(payload, tuple(signatures))
@@ -306,8 +322,7 @@ def _verify_signature(public_der: bytes, payload: bytes, signature: bytes) -> bo
                 str(signature_path),
             ),
             check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            capture_output=True,
         )
     return result.returncode == 0
 
@@ -366,7 +381,9 @@ def validate_root_payload(payload: bytes, label: str = "root") -> dict[str, obje
     previous = document["previous_root_sha256"]
     if generation == 1:
         if previous is not None:
-            raise ModelError("invalid-rotation", f"{label}.previous_root_sha256", "initial root")
+            raise ModelError(
+                "invalid-rotation", f"{label}.previous_root_sha256", "initial root"
+            )
     elif _digest(previous, f"{label}.previous_root_sha256") == "":
         raise AssertionError("unreachable")
 
@@ -383,19 +400,21 @@ def validate_root_payload(payload: bytes, label: str = "root") -> dict[str, obje
             raise ModelError("key-id-mismatch", path, identity)
         keys[identity] = public_der
     if len(keys) != len(raw_keys) or list(keys) != sorted(keys):
-        raise ModelError("noncanonical-order", f"{label}.keys", "keys must be unique and sorted")
+        raise ModelError(
+            "noncanonical-order", f"{label}.keys", "keys must be unique and sorted"
+        )
 
     roles = _object(
         document["roles"], {"provenance", "root", "snapshot"}, f"{label}.roles"
     )
     validated_roles = {
-        "provenance": _role(
-            roles["provenance"], keys, f"{label}.roles.provenance"
-        ),
+        "provenance": _role(roles["provenance"], keys, f"{label}.roles.provenance"),
         "root": _role(roles["root"], keys, f"{label}.roles.root"),
         "snapshot": _role(roles["snapshot"], keys, f"{label}.roles.snapshot"),
     }
-    raw_publishers = _array(document["publishers"], MAX_PUBLISHERS, f"{label}.publishers")
+    raw_publishers = _array(
+        document["publishers"], MAX_PUBLISHERS, f"{label}.publishers"
+    )
     publishers: list[dict[str, object]] = []
     for index, raw in enumerate(raw_publishers):
         path = f"{label}.publishers[{index}]"
@@ -405,7 +424,9 @@ def validate_root_payload(payload: bytes, label: str = "root") -> dict[str, obje
             {"key_ids": entry["key_ids"], "threshold": entry["threshold"]}, keys, path
         )
         publishers.append({"package": package, **validated})
-    _sorted_unique(publishers, lambda publisher: publisher["package"], f"{label}.publishers")
+    _sorted_unique(
+        publishers, lambda publisher: publisher["package"], f"{label}.publishers"
+    )
 
     raw_revocations = _array(
         document["revocations"], MAX_REVOCATIONS, f"{label}.revocations"
@@ -424,10 +445,14 @@ def validate_root_payload(payload: bytes, label: str = "root") -> dict[str, obje
             {
                 "key_id": identity,
                 "reason": reason,
-                "revoked_at": _integer(entry["revoked_at"], 0, 2**63 - 1, f"{path}.revoked_at"),
+                "revoked_at": _integer(
+                    entry["revoked_at"], 0, 2**63 - 1, f"{path}.revoked_at"
+                ),
             }
         )
-    _sorted_unique(revocations, lambda revocation: revocation["key_id"], f"{label}.revocations")
+    _sorted_unique(
+        revocations, lambda revocation: revocation["key_id"], f"{label}.revocations"
+    )
     recovery = tuple(
         _digest(value, f"{label}.recovery_packages")
         for value in _array(
@@ -500,7 +525,9 @@ def verify_initial_root(
     """Bootstrap one self-signed root through an out-of-band payload digest."""
     envelope = parse_envelope(envelope_bytes, "root-envelope")
     if sha256(envelope.payload) != _digest(trusted_payload_sha256, "trusted-root"):
-        raise ModelError("root-anchor-mismatch", "trusted-root", sha256(envelope.payload))
+        raise ModelError(
+            "root-anchor-mismatch", "trusted-root", sha256(envelope.payload)
+        )
     root = validate_root_payload(envelope.payload)
     if now < root["issued_at"] or now > root["expires"]:
         raise ModelError("root-expired", "root", str(now))
@@ -516,16 +543,23 @@ def verify_root_rotation(
     new_root = validate_root_payload(envelope.payload)
     if (
         new_root["generation"] != trusted_root["generation"] + 1
-        or new_root["previous_root_sha256"] != sha256(canonical_json(_root_json(trusted_root)))
+        or new_root["previous_root_sha256"]
+        != sha256(canonical_json(_root_json(trusted_root)))
         or new_root["issued_at"] < trusted_root["issued_at"]
         or now < new_root["issued_at"]
         or now > new_root["expires"]
     ):
         raise ModelError("invalid-rotation", "root", "generation, predecessor, or time")
     _require_role(
-        envelope, trusted_root, trusted_root["roles"]["root"], new_root["issued_at"], "old-root"
+        envelope,
+        trusted_root,
+        trusted_root["roles"]["root"],
+        new_root["issued_at"],
+        "old-root",
     )
-    _require_role(envelope, new_root, new_root["roles"]["root"], new_root["issued_at"], "new-root")
+    _require_role(
+        envelope, new_root, new_root["roles"]["root"], new_root["issued_at"], "new-root"
+    )
     return envelope, new_root
 
 
@@ -546,7 +580,8 @@ def _root_json(root: Mapping[str, object]) -> dict[str, object]:
         }
     } | {
         "keys": [
-            key_record(public_der) for _identity, public_der in sorted(root["keys"].items())
+            key_record(public_der)
+            for _identity, public_der in sorted(root["keys"].items())
         ],
         "publishers": [dict(publisher) for publisher in root["publishers"]],
         "revocations": [dict(revocation) for revocation in root["revocations"]],
@@ -554,7 +589,9 @@ def _root_json(root: Mapping[str, object]) -> dict[str, object]:
     }
 
 
-def validate_release_payload(payload: bytes, label: str = "release") -> dict[str, object]:
+def validate_release_payload(
+    payload: bytes, label: str = "release"
+) -> dict[str, object]:
     """Validate canonical TREL v1 metadata and provenance."""
     document = _object(
         decode_json(payload, label, MAX_ENVELOPE_BYTES),
@@ -586,10 +623,14 @@ def validate_release_payload(payload: bytes, label: str = "release") -> dict[str
     _integer(document["package_bytes"], 1, MAX_PACKAGE_BYTES, f"{label}.package_bytes")
     _digest(document["manifest_sha256"], f"{label}.manifest_sha256")
     _digest(document["lock_sha256"], f"{label}.lock_sha256")
-    published = _integer(document["published_at"], 0, 2**63 - 1, f"{label}.published_at")
+    published = _integer(
+        document["published_at"], 0, 2**63 - 1, f"{label}.published_at"
+    )
     expires = _integer(document["expires"], 1, 2**63 - 1, f"{label}.expires")
     if published >= expires:
-        raise ModelError("invalid-freshness", label, "release expires before publication")
+        raise ModelError(
+            "invalid-freshness", label, "release expires before publication"
+        )
     _integer(document["sequence"], 1, 2**63 - 1, f"{label}.sequence")
     provenance = _object(
         document["provenance"],
@@ -628,9 +669,13 @@ def validate_release_payload(payload: bytes, label: str = "release") -> dict[str
 
 def publisher_role(root: Mapping[str, object], package: str) -> Mapping[str, object]:
     """Resolve exactly one package publication role."""
-    matches = [publisher for publisher in root["publishers"] if publisher["package"] == package]
+    matches = [
+        publisher for publisher in root["publishers"] if publisher["package"] == package
+    ]
     if len(matches) != 1:
-        raise ModelError("publisher-unauthorized", f"package:{package}", "no unique role")
+        raise ModelError(
+            "publisher-unauthorized", f"package:{package}", "no unique role"
+        )
     return matches[0]
 
 
@@ -644,7 +689,8 @@ def verify_release(
     offline_grace: int = 0,
     minimum_sequence: int = 0,
 ) -> VerifiedRelease:
-    """Verify bytes, target, publisher, provenance, replay, revocation, and freshness."""
+    """Verify bytes, target, publisher, provenance, replay, revocation, and
+    freshness."""
     if offline_grace < 0 or offline_grace > MAX_OFFLINE_STALENESS_SECONDS:
         raise ModelError("offline-policy", "offline_grace", str(offline_grace))
     envelope = parse_envelope(envelope_bytes, "release-envelope")
@@ -661,7 +707,9 @@ def verify_release(
         or lock.digest() != release["lock_sha256"]
         or lock.target != release["target"]
     ):
-        raise ModelError("release-mismatch", "release", "package identity or target differs")
+        raise ModelError(
+            "release-mismatch", "release", "package identity or target differs"
+        )
     role = publisher_role(root, release["name"])
 
     def recovery_signatures_are_valid() -> bool:
@@ -735,7 +783,9 @@ def snapshot_payload(
     }
 
 
-def validate_snapshot_payload(payload: bytes, label: str = "snapshot") -> dict[str, object]:
+def validate_snapshot_payload(
+    payload: bytes, label: str = "snapshot"
+) -> dict[str, object]:
     """Validate canonical TSNP v1 metadata."""
     document = _object(
         decode_json(payload, label, MAX_ENVELOPE_BYTES),
@@ -745,10 +795,14 @@ def validate_snapshot_payload(payload: bytes, label: str = "snapshot") -> dict[s
     if document["schema"] != 1 or document["type"] != "snapshot":
         raise ModelError("unsupported-schema", label, "expected TSNP v1")
     _integer(document["generation"], 1, 2**63 - 1, f"{label}.generation")
-    published = _integer(document["published_at"], 0, 2**63 - 1, f"{label}.published_at")
+    published = _integer(
+        document["published_at"], 0, 2**63 - 1, f"{label}.published_at"
+    )
     expires = _integer(document["expires"], 1, 2**63 - 1, f"{label}.expires")
     if published >= expires:
-        raise ModelError("invalid-freshness", label, "snapshot expires before publication")
+        raise ModelError(
+            "invalid-freshness", label, "snapshot expires before publication"
+        )
     raw_releases = _array(document["releases"], MAX_RELEASES, f"{label}.releases")
     releases: list[dict[str, object]] = []
     for index, raw in enumerate(raw_releases):
@@ -764,15 +818,21 @@ def validate_snapshot_payload(payload: bytes, label: str = "snapshot") -> dict[s
         releases.append(
             {
                 "name": _identifier(entry["name"], f"{path}.name", _PACKAGE_NAME),
-                "package_sha256": _digest(entry["package_sha256"], f"{path}.package_sha256"),
-                "release_sha256": _digest(entry["release_sha256"], f"{path}.release_sha256"),
+                "package_sha256": _digest(
+                    entry["package_sha256"], f"{path}.package_sha256"
+                ),
+                "release_sha256": _digest(
+                    entry["release_sha256"], f"{path}.release_sha256"
+                ),
                 "target": target,
                 "version": Version.parse(entry["version"], f"{path}.version"),
             }
         )
     keys = [(entry["name"], entry["version"], entry["target"]) for entry in releases]
     if keys != sorted(keys) or len(keys) != len(set(keys)):
-        raise ModelError("noncanonical-order", f"{label}.releases", "duplicate or unsorted")
+        raise ModelError(
+            "noncanonical-order", f"{label}.releases", "duplicate or unsorted"
+        )
     if canonical_json(document) != payload:
         raise ModelError("noncanonical-json", label, "snapshot payload bytes differ")
     return {**document, "releases": releases}
@@ -793,7 +853,9 @@ def verify_snapshot(
     envelope = parse_envelope(envelope_bytes, "snapshot-envelope")
     snapshot = validate_snapshot_payload(envelope.payload)
     if snapshot["generation"] < minimum_generation:
-        raise ModelError("snapshot-replay", "snapshot.generation", str(snapshot["generation"]))
+        raise ModelError(
+            "snapshot-replay", "snapshot.generation", str(snapshot["generation"])
+        )
     if now < snapshot["published_at"] or now > snapshot["expires"] + (
         offline_grace if offline else 0
     ):
@@ -835,7 +897,8 @@ def publish_release(
     now: int,
     snapshot_expires: int,
 ) -> int:
-    """Stage a complete immutable registry generation, then atomically publish its pointer."""
+    """Stage a complete immutable registry generation, then atomically publish
+    its pointer."""
     verified = verify_release(root, release_envelope_bytes, package_bytes, now=now)
     if verified.status != "active":
         raise ModelError("recovery-only", "release", "cannot publish as active")
@@ -849,7 +912,9 @@ def publish_release(
         try:
             current = int(current_path.read_text(encoding="ascii"))
         except (OSError, UnicodeError, ValueError) as error:
-            raise ModelError("registry-corrupt", str(current_path), str(error)) from error
+            raise ModelError(
+                "registry-corrupt", str(current_path), str(error)
+            ) from error
         generation = current + 1
         previous_dir = registry / "generations" / f"{current:020d}"
         snapshot_bytes = (previous_dir / "snapshot.json").read_bytes()
@@ -857,11 +922,17 @@ def publish_release(
             root, snapshot_bytes, now=now, minimum_generation=current
         )
         for entry in snapshot["releases"]:
-            release_bytes = (previous_dir / "releases" / f"{entry['release_sha256']}.json").read_bytes()
-            package = (previous_dir / "packages" / f"{entry['package_sha256']}.tpkg").read_bytes()
+            release_bytes = (
+                previous_dir / "releases" / f"{entry['release_sha256']}.json"
+            ).read_bytes()
+            package = (
+                previous_dir / "packages" / f"{entry['package_sha256']}.tpkg"
+            ).read_bytes()
             previous_release = parse_envelope(release_bytes)
             previous_payload = validate_release_payload(previous_release.payload)
-            previous_entries.append((previous_payload, entry["release_sha256"], release_bytes, package))
+            previous_entries.append(
+                (previous_payload, entry["release_sha256"], release_bytes, package)
+            )
 
     release_identity = release_envelope.digest()
     replacement_key = (
@@ -875,7 +946,14 @@ def publish_release(
         if (entry[0]["name"], entry[0]["version"], entry[0]["target"])
         != replacement_key
     ]
-    retained.append((dict(verified.payload), release_identity, release_envelope_bytes, package_bytes))
+    retained.append(
+        (
+            dict(verified.payload),
+            release_identity,
+            release_envelope_bytes,
+            package_bytes,
+        )
+    )
     snapshot = snapshot_payload(
         generation,
         now,
@@ -908,7 +986,9 @@ def publish_release(
         _fsync_directory(staging / "releases")
         _fsync_directory(staging / "packages")
         _fsync_directory(staging)
-        verify_registry_generation(root, staging, now=now, minimum_generation=generation)
+        verify_registry_generation(
+            root, staging, now=now, minimum_generation=generation
+        )
         staging.rename(destination)
         _fsync_directory(generations)
         pointer = registry / f".current.{os.getpid()}.tmp"
@@ -932,7 +1012,9 @@ def verify_registry_generation(
 ) -> dict[str, object]:
     """Independently verify the exact files and every release in one generation."""
     if directory.is_symlink() or not directory.is_dir():
-        raise ModelError("registry-corrupt", str(directory), "generation is not a directory")
+        raise ModelError(
+            "registry-corrupt", str(directory), "generation is not a directory"
+        )
     snapshot_path = directory / "snapshot.json"
     _envelope, snapshot = verify_snapshot(
         root,
@@ -944,16 +1026,23 @@ def verify_registry_generation(
     )
     expected_files = {"snapshot.json", "releases", "packages"}
     if {path.name for path in directory.iterdir()} != expected_files:
-        raise ModelError("registry-corrupt", str(directory), "unexpected top-level files")
-    expected_releases = {f"{entry['release_sha256']}.json" for entry in snapshot["releases"]}
-    expected_packages = {f"{entry['package_sha256']}.tpkg" for entry in snapshot["releases"]}
+        raise ModelError(
+            "registry-corrupt", str(directory), "unexpected top-level files"
+        )
+    expected_releases = {
+        f"{entry['release_sha256']}.json" for entry in snapshot["releases"]
+    }
+    expected_packages = {
+        f"{entry['package_sha256']}.tpkg" for entry in snapshot["releases"]
+    }
     release_dir = directory / "releases"
     package_dir = directory / "packages"
-    if (
-        {path.name for path in release_dir.iterdir()} != expected_releases
-        or {path.name for path in package_dir.iterdir()} != expected_packages
-    ):
-        raise ModelError("registry-corrupt", str(directory), "generation file set differs")
+    if {path.name for path in release_dir.iterdir()} != expected_releases or {
+        path.name for path in package_dir.iterdir()
+    } != expected_packages:
+        raise ModelError(
+            "registry-corrupt", str(directory), "generation file set differs"
+        )
     for entry in snapshot["releases"]:
         release_bytes = (release_dir / f"{entry['release_sha256']}.json").read_bytes()
         package_bytes = (package_dir / f"{entry['package_sha256']}.tpkg").read_bytes()

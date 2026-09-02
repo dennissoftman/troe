@@ -1,0 +1,161 @@
+# Repository Python tooling configuration.
+#
+# TROE ships no Python package. This file exists solely so that `ruff` formats
+# and lints the repository's own tools, scripts, and tests with one committed
+# policy, the way `rustfmt` and `clippy` already govern the Rust surface.
+#
+# A rule that is wrong for this repository is disabled here, with a rationale,
+# rather than with a scattered `noqa`. Per-line directives survive only where
+# the opposite holds -- the rule is right in general and wrong on one line --
+# and they are exactly these nineteen: `E402` on the eleven imports in `tests/`
+# that must follow a `sys.path` insertion, `SLF001` on the seven calls in
+# `tools/mkcloud.py` that reuse the ext4 verifier's private steps, and
+# `PLW0603` on the one process-local notice flag in `scripts/qemu_profile.py`.
+# `RUF100` is enabled, so a directive that stops suppressing something fails
+# the gate rather than lingering.
+
+[tool.ruff]
+# Measured from the existing sources: line lengths fall off a cliff after 88
+# columns (131 lines end at exactly 88, 66 at 89, 29 at 91), so 88 is the width
+# the code was already written to.
+line-length = 88
+
+# The supported floor, `MINIMUM_PYTHON` in `scripts/repository_policy.py`.
+target-version = "py313"
+
+# Vendored and generated trees only. Every other Python file in the repository
+# is repository-owned and is formatted and linted.
+extend-exclude = [
+    "apps/lua/vendor",
+    "apps/python/patches",
+    "build",
+    "**/target",
+]
+
+# The exhaustive gate passes the repository root and the focused selector passes
+# the file names that changed. `ruff` honours the exclusions above only for the
+# former unless this is set, so without it the two runners would disagree about
+# a changed file inside a vendored tree.
+force-exclude = true
+
+[tool.ruff.format]
+# Docstrings in these tools quote exact developer commands and guest output;
+# reformatting code inside them would rewrite documentation.
+docstring-code-format = false
+
+[tool.ruff.lint]
+select = [
+    "A",    # flake8-builtins
+    "ANN",  # flake8-annotations
+    "ARG",  # flake8-unused-arguments
+    "B",    # flake8-bugbear
+    "BLE",  # flake8-blind-except
+    "C4",   # flake8-comprehensions
+    "DTZ",  # flake8-datetimez
+    "E",    # pycodestyle errors
+    "ERA",  # eradicate
+    "EXE",  # flake8-executable
+    "F",    # pyflakes
+    "FA",   # flake8-future-annotations
+    "FLY",  # flynt
+    "FURB", # refurb
+    "G",    # flake8-logging-format
+    "I",    # isort
+    "INT",  # flake8-gettext
+    "LOG",  # flake8-logging
+    "N",    # pep8-naming
+    "PERF", # perflint
+    "PGH",  # pygrep-hooks
+    "PIE",  # flake8-pie
+    "PL",   # pylint
+    "PTH",  # flake8-use-pathlib
+    "RET",  # flake8-return
+    "RSE",  # flake8-raise
+    "RUF",  # ruff-specific
+    "S",    # flake8-bandit
+    "SIM",  # flake8-simplify
+    "SLF",  # flake8-self
+    "SLOT", # flake8-slots
+    "TID",  # flake8-tidy-imports
+    "TRY",  # tryceratops
+    "UP",   # pyupgrade
+    "W",    # pycodestyle warnings
+    "YTT",  # flake8-2020
+]
+
+ignore = [
+    # `Any` is the honest annotation for a value decoded from JSON or TOML.
+    "ANN401",
+    # Every tool is documented and invoked as `python3 <path>`; the shebang
+    # names the interpreter rather than declaring an executable file.
+    "EXE001",
+    # Deferred imports here are deliberate: platform-conditional host locking in
+    # `mount_shared`, guest probes that import inside `main` to observe an import
+    # failure, and tests that load a script module by path.
+    "PLC0415",
+    # The QEMU acceptance driver and the image builders are long and branchy by
+    # construction; splitting them is a refactor, not a lint fix.
+    "PLR0911",
+    "PLR0912",
+    "PLR0913",
+    "PLR0915",
+    # Sector counts, byte offsets, and field widths are the literals these
+    # builders exist to assert against.
+    "PLR2004",
+    # `assert` is the assertion mechanism of the guest probes and of the
+    # dependency-free tool invariants.
+    "S101",
+    # The flagged paths are guest filesystem paths and fixture names, not host
+    # temporary files.
+    "S108",
+    # `tools/build_cpython.py` fetches pinned release tarballs over HTTPS and
+    # verifies each one against a committed SHA-256 digest.
+    "S310",
+    # Every tool drives host build and image utilities by argument vector, never
+    # through a shell, and resolves them from `PATH` by name; that is the
+    # documented developer environment contract.
+    "S603",
+    "S607",
+    # These tools raise `ValueError` and `RuntimeError` with one specific
+    # message per rejected input, and dozens of tests assert on those messages.
+    # An exception class per failure is not the design.
+    "TRY003",
+    # Every tool's `main` returns its success code as the last statement of the
+    # guarded block; an `else` clause separates that return from the work it
+    # reports on.
+    "TRY300",
+    "TRY301",
+    # Malformed repository input is rejected with `ValueError` uniformly, so
+    # that callers and tests have one contract; a `TypeError` for the subset of
+    # malformed input that is a wrong type would fragment it.
+    "TRY004",
+    # Nested context managers document setup order in the image, lifecycle, and
+    # profile tests.
+    "SIM117",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Unit tests exercise module-private helpers on purpose; that is what keeps the
+# format decoders testable without widening their public surface.
+"tests/**" = ["SLF001"]
+# The CPython guest probes exist to exercise the interpreter's own facilities:
+# `os.getcwd`, the non-cryptographic random generators, `xml.etree`, and a sweep
+# that must report every exception rather than abort.
+"tests/fixtures/cpython/**" = [
+    "BLE001",
+    "PTH109",
+    "S311",
+    "S314",
+    # These four files are not executed here. They are copied into the image and
+    # run by the shipped interpreter inside the TROE guest, so the host gates
+    # can prove a change to them formatted but never prove it correct. `ruff
+    # format` is safe there because it preserves the parsed tree exactly; the
+    # three rules below are not, because satisfying them rewrites what the guest
+    # executes -- a `collections.abc` import evaluated at definition time, the
+    # order the probe imports the standard library in, and the form its
+    # `xml.etree` import takes. The guest probes are formatted and linted, but
+    # not lint-fixed at the cost of their runtime behavior.
+    "ANN201",
+    "I001",
+    "N813",
+]

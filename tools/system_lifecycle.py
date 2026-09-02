@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Transactional hosted system generations, migration, rollback, and garbage collection."""
+"""Transactional hosted system generations, migration, rollback, and garbage
+collection."""
 
 from __future__ import annotations
 
@@ -9,10 +10,10 @@ import os
 import re
 import shutil
 import tempfile
-from contextlib import contextmanager
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, Mapping, Sequence
 
 if __package__:
     from .package_model import (
@@ -217,10 +218,8 @@ def _atomic_replace(path: Path, payload: bytes) -> None:
         temporary.replace(path)
         _fsync_directory(path.parent)
     except OSError as error:
-        try:
+        with suppress(OSError):
             temporary.unlink(missing_ok=True)
-        except OSError:
-            pass
         raise ModelError("write-failed", str(path), str(error)) from error
 
 
@@ -262,7 +261,7 @@ def parse_projection(
                 _CONFIG_COMPONENT.fullmatch(component) is None
                 for component in components
             )
-            or len(f"/sys/config/{relative}".encode("utf-8")) > 256
+            or len(f"/sys/config/{relative}".encode()) > 256
         ):
             raise ModelError("invalid-config-path", f"{path}.path", relative)
         encoded = entry["data"]
@@ -599,7 +598,7 @@ class LifecycleStore:
             generation = self._next_generation()
             self._store_object("roots", root_envelope.digest(), root_envelope_bytes)
             for record, release_input in zip(
-                records, sorted(releases, key=self._release_name)
+                records, sorted(releases, key=self._release_name), strict=True
             ):
                 self._store_object(
                     "packages", record["package_sha256"], release_input.package
@@ -753,10 +752,11 @@ class LifecycleStore:
         self._boundary(f"object.{kind}.{identity}")
 
     def _next_generation(self) -> int:
-        generations: list[int] = []
-        for path in (self.root / "generations").iterdir():
-            if path.name.isdigit() and len(path.name) == 20:
-                generations.append(int(path.name))
+        generations: list[int] = [
+            int(path.name)
+            for path in (self.root / "generations").iterdir()
+            if path.name.isdigit() and len(path.name) == 20
+        ]
         generation = max(generations, default=0) + 1
         if generation > MAX_GENERATIONS:
             raise ModelError("generation-capacity", "generations", str(generation))
@@ -1367,7 +1367,8 @@ class LifecycleStore:
             if any(migration.mode == "forward-only" for migration in migrations):
                 self._record_diagnostic_locked(
                     "rollback-forward-only",
-                    "healthy generation remains active because predecessor data is incompatible",
+                    "healthy generation remains active because predecessor "
+                    "data is incompatible",
                     active,
                 )
                 raise ModelError("rollback-forward-only", "migration", str(active))

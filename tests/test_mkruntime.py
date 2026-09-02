@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import tempfile
 import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -45,12 +45,8 @@ class RuntimeTreeTests(unittest.TestCase):
                 (second / mkruntime.MANIFEST_NAME).read_bytes(),
             )
             for architecture in mkruntime.ARCHITECTURES:
-                self.assertTrue(
-                    (first / architecture / "runtime-probe.kex").is_file()
-                )
-            self.assertEqual(
-                mkruntime.RUNTIME_DIRECTORY.as_posix(), "bin"
-            )
+                self.assertTrue((first / architecture / "runtime-probe.kex").is_file())
+            self.assertEqual(mkruntime.RUNTIME_DIRECTORY.as_posix(), "bin")
 
     def test_verifier_rejects_tampering_and_unmanifested_files(self) -> None:
         with tempfile.TemporaryDirectory(prefix="troe-runtime-") as temporary:

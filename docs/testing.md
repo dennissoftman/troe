@@ -63,7 +63,56 @@ elapsed time and the number of gates that already passed.
 `--skip-qemu` is only an environment escape hatch. It does not mean that QEMU
 coverage is unnecessary; the full pinned gate must still run on the merge
 runner. `--require-filesystem-tools` makes absence of the exact external FAT32
-and ext4 interoperability tools an error.
+and ext4 interoperability tools an error. `--require-python-tools` does the
+same for the Python format and lint gates.
+
+## Python tooling gates
+
+The repository's own Python is formatted and linted by one tool. `ruff` is both
+the formatter and the linter, configured in `pyproject.toml`, which exists for
+no other purpose: TROE ships no Python package. The exhaustive gate runs
+
+```console
+ruff format --check .
+ruff check .
+```
+
+immediately after the Rust format gates, and `scripts/test_changed.py` runs the
+same two commands over exactly the Python files that changed. A changed
+`pyproject.toml` widens the focused selector to the full gate, because a lint
+policy change has no bounded impact.
+
+`line-length` is 88 and `target-version` follows `MINIMUM_PYTHON` in
+`scripts/repository_policy.py`. `extend-exclude` names only vendored and
+generated trees: `apps/lua/vendor`, `apps/python/patches`, `build`, and
+`**/target`. Every other Python file in the repository is in scope, including
+the CPython guest probes under `tests/fixtures/cpython`. The selected rule set
+and each disabled rule's rationale live in `pyproject.toml`. A rule that is
+wrong for the repository is disabled there rather than with a scattered `noqa`;
+nineteen per-line directives survive where the reverse is true, and the same
+file inventories them. `RUF100` is enabled, so a directive that no longer
+suppresses anything fails the gate.
+
+The guest probes are the one tree these gates cannot prove correct: they are
+copied into the image and executed by the shipped interpreter inside the TROE
+guest, so only the QEMU `cpython` group runs them. `ruff format` is safe there
+because it preserves the parsed tree exactly. `ANN201`, `I001`, and `N813` are
+disabled for that tree because satisfying them would rewrite what the guest
+executes -- an annotation evaluated at definition time, the order the probe
+imports the standard library in, and the form its `xml.etree` import takes.
+Run the QEMU `cpython` group before merging any change to those files that
+`ruff format` did not make.
+
+`ruff` is resolved from `PATH` by name, exactly like the host image utilities.
+Absence skips both gates with a notice on standard error;
+`--require-python-tools` makes that absence a failure. Install it with
+`brew install ruff`, `cargo install ruff`, or the distribution package.
+`tests/test_repository_policy.py` asserts that the configuration exists, that
+the excluded paths are exactly the vendored and generated ones, that both
+runners execute the two commands, that both runners skip them when `ruff` is
+absent and fail under `--require-python-tools`, and that linting with
+suppressions ignored raises exactly the nineteen inventoried findings, so an
+uninventoried `noqa` fails the gate.
 
 ## Application and service gates
 
@@ -467,10 +516,14 @@ structurally valid matching distribution UEFI firmware, and e2fsprogs `1.47.x`;
 the ext4 byte verifier and all guest scenarios remain unchanged.
 
 Release-grade reproducibility evidence uses
-`python3 scripts/test.py --strict-tool-versions --require-filesystem-tools`.
+
+```console
+python3 scripts/test.py --strict-tool-versions --require-filesystem-tools --require-python-tools
+```
+
 That strict environment must provide Rust 1.97.1, QEMU 11.1.0, the committed
 `edk2-stable202605-r1` firmware bytes, `cargo-audit` 0.22.1, e2fsprogs 1.47.4,
-dosfstools, and mtools. The focused selector is a development aid and does not
+dosfstools, mtools, and `ruff`. The focused selector is a development aid and does not
 replace the maintainer-owned exhaustive gate.
 
 The non-QEMU production gate is separate because it requires a Linux x86-64

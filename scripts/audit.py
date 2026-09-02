@@ -10,7 +10,6 @@ from pathlib import Path
 
 from repository_policy import load_audit_exceptions, require_supported_python
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DATABASE_PATH = REPO_ROOT / "target" / "rustsec-advisory-db"
 DATABASE_REVISION_FILE = REPO_ROOT / "tools" / "rustsec-advisory-db.rev"
@@ -34,7 +33,9 @@ def pinned_revision() -> str:
     """Read and validate the committed RustSec database revision."""
     revision = DATABASE_REVISION_FILE.read_text(encoding="ascii").strip()
     if re.fullmatch(r"[0-9a-f]{40}", revision) is None:
-        raise RuntimeError("RustSec database revision must be a full lowercase Git hash")
+        raise RuntimeError(
+            "RustSec database revision must be a full lowercase Git hash"
+        )
     return revision
 
 
@@ -55,7 +56,14 @@ def prepare_database(revision: str) -> None:
     database_exists = (DATABASE_PATH / ".git").is_dir()
     if not database_exists:
         DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        run("git", "clone", "--filter=blob:none", "--no-checkout", DATABASE_URL, DATABASE_PATH)
+        run(
+            "git",
+            "clone",
+            "--filter=blob:none",
+            "--no-checkout",
+            DATABASE_URL,
+            DATABASE_PATH,
+        )
     elif run("git", "-C", DATABASE_PATH, "status", "--porcelain", capture=True):
         raise RuntimeError(f"RustSec database cache is modified: {DATABASE_PATH}")
     try:

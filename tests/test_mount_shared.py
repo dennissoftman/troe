@@ -56,9 +56,7 @@ class SharedMediaMountTests(unittest.TestCase):
             state_path = root / "state.json"
             image.touch()
             device.touch()
-            mount_shared.write_state(
-                self.state(image, device, mount_point), state_path
-            )
+            mount_shared.write_state(self.state(image, device, mount_point), state_path)
             with self.assertRaisesRegex(mount_shared.MountError, "before QEMU"):
                 mount_shared.require_detached(
                     image,
@@ -101,14 +99,14 @@ class SharedMediaMountTests(unittest.TestCase):
             )
 
     def test_macos_parse_failure_detaches_the_provisional_disk(self) -> None:
-        payload = plistlib.dumps(
-            {"system-entities": [{"dev-entry": "/dev/disk9"}]}
-        )
+        payload = plistlib.dumps({"system-entities": [{"dev-entry": "/dev/disk9"}]})
         attached = mount_shared.subprocess.CompletedProcess(
             args=(), returncode=0, stdout=payload, stderr=b""
         )
         with (
-            mock.patch.object(mount_shared.shutil, "which", return_value="/usr/bin/hdiutil"),
+            mock.patch.object(
+                mount_shared.shutil, "which", return_value="/usr/bin/hdiutil"
+            ),
             mock.patch.object(mount_shared, "_run", return_value=attached),
             mock.patch.object(mount_shared.subprocess, "run") as cleanup,
             self.assertRaisesRegex(mount_shared.MountError, "mounted FAT32"),

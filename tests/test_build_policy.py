@@ -9,7 +9,8 @@ import unittest
 from dataclasses import fields
 from pathlib import Path
 
-from scripts import build, test as verification
+from scripts import build
+from scripts import test as verification
 
 
 class ProductionBuildPolicyTests(unittest.TestCase):

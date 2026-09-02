@@ -123,7 +123,9 @@ def sources() -> tuple[int, list[Repository]]:
     if {item.name for item in repositories} != expected:
         raise RuntimeError(f"the source lock must pin exactly {sorted(expected)}")
     for item in repositories:
-        if len(item.commit) != 40 or not all(c in "0123456789abcdef" for c in item.commit):
+        if len(item.commit) != 40 or not all(
+            c in "0123456789abcdef" for c in item.commit
+        ):
             raise RuntimeError(f"{item.name} is not pinned to a full commit identity")
     return bank_bytes, repositories
 
@@ -168,8 +170,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--git", help="git executable")
     parser.add_argument("--make", help="GNU make executable, 3.82 or newer")
     parser.add_argument("--iasl", help="ACPICA ASL compiler")
-    parser.add_argument("--llvm-bin", type=absolute_path, help="directory holding clang and lld")
-    parser.add_argument("--openssl-dir", type=absolute_path, help="OpenSSL prefix with headers")
+    parser.add_argument(
+        "--llvm-bin", type=absolute_path, help="directory holding clang and lld"
+    )
+    parser.add_argument(
+        "--openssl-dir", type=absolute_path, help="OpenSSL prefix with headers"
+    )
     return parser.parse_args()
 
 
@@ -200,7 +206,9 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def find_tool(explicit: str | None, names: tuple[str, ...], candidates: tuple[Path, ...]) -> str:
+def find_tool(
+    explicit: str | None, names: tuple[str, ...], candidates: tuple[Path, ...]
+) -> str:
     if explicit:
         resolved = shutil.which(explicit) if "/" not in explicit else explicit
         if resolved and Path(resolved).is_file():
@@ -227,7 +235,7 @@ def gnu_make(explicit: str | None) -> str:
     version = run([resolved, "--version"], capture=True).splitlines()[0]
     if not version.startswith("GNU Make"):
         raise RuntimeError(f"{resolved} is not GNU make: {version}")
-    parts = (version.split()[2].split(".") + ["0"])[:2]
+    parts = ([*version.split()[2].split("."), "0"])[:2]
     release = tuple(int(part) for part in parts)
     if release < (3, 82):
         raise RuntimeError(
@@ -255,8 +263,7 @@ def find_llvm_bin(explicit: Path | None) -> Path:
             return candidate.resolve()
     required = ", ".join(PREFIXED_TOOLS)
     raise RuntimeError(
-        f"no directory holding {required} was found; install LLVM and pass "
-        "--llvm-bin"
+        f"no directory holding {required} was found; install LLVM and pass --llvm-bin"
     )
 
 
@@ -277,7 +284,10 @@ def find_lld_bin(llvm_bin: Path) -> Path:
 def find_openssl(explicit: Path | None) -> Path:
     """Find an OpenSSL prefix whose headers the firmware signer can include."""
     for candidate in (explicit,) if explicit is not None else OPENSSL_CANDIDATES:
-        if candidate is not None and (candidate / "include" / "openssl" / "sha.h").is_file():
+        if (
+            candidate is not None
+            and (candidate / "include" / "openssl" / "sha.h").is_file()
+        ):
             return candidate.resolve()
     raise RuntimeError(
         "no OpenSSL prefix with development headers was found; install "
@@ -306,7 +316,9 @@ def host_tools(args: argparse.Namespace) -> HostTools:
     )
 
 
-def checkout(repository: Repository, work: Path, tools: HostTools, offline: bool) -> Path:
+def checkout(
+    repository: Repository, work: Path, tools: HostTools, offline: bool
+) -> Path:
     """Place one pinned commit, and only the submodules it needs, on disk.
 
     A recursive clone of edk2 costs about 2.3 GiB, most of it trees this
@@ -372,7 +384,9 @@ def checkout(repository: Repository, work: Path, tools: HostTools, offline: bool
     return root
 
 
-def build_trusted_firmware(work: Path, tools: HostTools, jobs: int) -> tuple[Path, Path]:
+def build_trusted_firmware(
+    work: Path, tools: HostTools, jobs: int
+) -> tuple[Path, Path]:
     """Build the secure-world first stage and its package.
 
     No BL33 is packaged: the flash description preloads the UEFI volume into
@@ -424,7 +438,9 @@ def prepare_configuration(work: Path, edk2: Path) -> Path:
     return configuration
 
 
-def uefi_environment(work: Path, edk2: Path, platforms: Path, tools: HostTools) -> dict[str, str]:
+def uefi_environment(
+    work: Path, edk2: Path, platforms: Path, tools: HostTools
+) -> dict[str, str]:
     base_tools = edk2 / "BaseTools"
     configuration = prepare_configuration(work, edk2)
     environment = dict(os.environ)
@@ -510,7 +526,10 @@ def publish(banks: list[Path], output: Path, bank_bytes: int) -> None:
         destination.chmod(0o644)
         os.utime(destination, (EPOCH, EPOCH))
         lines.append(f"{sha256(destination)}  {destination.name}")
-        print(f"  {destination.name}: {bank.stat().st_size} bytes padded to {bank_bytes}", flush=True)
+        print(
+            f"  {destination.name}: {bank.stat().st_size} bytes padded to {bank_bytes}",
+            flush=True,
+        )
     manifest = output / MANIFEST_NAME
     manifest.write_text("\n".join(sorted(lines)) + "\n", encoding="utf-8")
     manifest.chmod(0o644)
@@ -538,11 +557,15 @@ def verify(output: Path, bank_bytes: int) -> None:
             raise RuntimeError(f"{name} is not one flash bank in size")
         actual = sha256(path)
         if actual != digest:
-            raise RuntimeError(f"digest mismatch for {name}: recorded {digest}, got {actual}")
+            raise RuntimeError(
+                f"digest mismatch for {name}: recorded {digest}, got {actual}"
+            )
         print(f"  {name}: {digest}", flush=True)
 
 
-def build(args: argparse.Namespace, bank_bytes: int, repositories: list[Repository]) -> None:
+def build(
+    args: argparse.Namespace, bank_bytes: int, repositories: list[Repository]
+) -> None:
     tools = host_tools(args)
     args.work.mkdir(parents=True, exist_ok=True)
     print(f"host toolchain: clang in {tools.llvm_bin}", flush=True)
@@ -552,7 +575,10 @@ def build(args: argparse.Namespace, bank_bytes: int, repositories: list[Reposito
     print("pinned sources:", flush=True)
     for repository in repositories:
         checkout(repository, args.work, tools, args.offline)
-        print(f"  {repository.name} {repository.release or repository.commit[:12]}", flush=True)
+        print(
+            f"  {repository.name} {repository.release or repository.commit[:12]}",
+            flush=True,
+        )
     print("building the secure-world firmware", flush=True)
     first_stage, package = build_trusted_firmware(args.work, tools, args.jobs)
     stage = args.work / TRUSTED_FIRMWARE_STAGE

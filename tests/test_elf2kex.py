@@ -12,7 +12,6 @@ from pathlib import Path
 
 from tools import elf2kex, gen_kex_corpus
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 KEX_TOOL = Path(os.environ.get("CARGO_TARGET_DIR", REPO_ROOT / "target"))
 if not KEX_TOOL.is_absolute():
@@ -272,9 +271,7 @@ class Elf2KexTests(unittest.TestCase):
             assert_rust_rejects(self.make_elf() + b"\0")
             assert_rust_rejects(self.make_elf(), "--target", "aarch64")
             assert_rust_rejects(self.make_elf(), "--stack-pages", "3")
-            assert_rust_rejects(
-                self.make_elf(), "--heap-pages", str((1 << 32) + 1)
-            )
+            assert_rust_rejects(self.make_elf(), "--heap-pages", str((1 << 32) + 1))
 
     def test_dynamic_interpreter_tls_notes_relro_and_relocations_are_rejected(
         self,

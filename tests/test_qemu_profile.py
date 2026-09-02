@@ -13,12 +13,13 @@ import tempfile
 import unittest
 from dataclasses import fields, replace
 from pathlib import Path
+from types import ModuleType
 from unittest import mock
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
+import qemu_profile  # noqa: E402
 from platform_profile import (  # noqa: E402
     AARCH64_SBSA_REF,
     AARCH64_UEFI_VIRTIO_MMIO,
@@ -52,10 +53,9 @@ from qemu_profile import (  # noqa: E402
     verify_file_digest,
     verify_qemu_version,
 )
-import qemu_profile  # noqa: E402
 
 
-def load_script_module(name: str, filename: str):
+def load_script_module(name: str, filename: str) -> ModuleType:
     """Load a hyphenated CLI script so its pure argument parser can be tested."""
     spec = importlib.util.spec_from_file_location(
         name, REPO_ROOT / "scripts" / filename
@@ -148,9 +148,9 @@ class FirmwareProfileTests(unittest.TestCase):
         encoded = json.dumps(manifest, indent=2, sort_keys=True) + "\n"
         self.assertEqual(PLATFORM_MANIFEST_PATH.read_text(encoding="utf-8"), encoded)
 
-        source = (REPO_ROOT / "crates" / "device" / "troe-platform" / "src" / "lib.rs").read_text(
-            encoding="utf-8"
-        )
+        source = (
+            REPO_ROOT / "crates" / "device" / "troe-platform" / "src" / "lib.rs"
+        ).read_text(encoding="utf-8")
         numeric_ids = {
             name: int(raw)
             for name, raw in re.findall(
@@ -186,7 +186,9 @@ class FirmwareProfileTests(unittest.TestCase):
                     architecture_names[architecture.group(1)],
                     # A GIC-routed PCI transport is still a PCI transport as
                     # far as the manifest's device model is concerned.
-                    "pci" if transport.group(1) == "PciGic" else transport.group(1).lower(),
+                    "pci"
+                    if transport.group(1) == "PciGic"
+                    else transport.group(1).lower(),
                 )
             )
         manifest_platforms = {
@@ -467,8 +469,7 @@ class FirmwareProfileTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="troe-shared-cleanup-") as temporary:
             root = Path(temporary)
             paths = {
-                platform_id: root / f"{platform_id}.img"
-                for platform_id in PLATFORM_IDS
+                platform_id: root / f"{platform_id}.img" for platform_id in PLATFORM_IDS
             }
             for path in paths.values():
                 path.write_bytes(b"acceptance-only")
