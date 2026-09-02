@@ -29,6 +29,7 @@ default-members = [
     "crates/runtime/troe-memory",
     "crates/runtime/troe-process",
     "crates/runtime/troe-random",
+    "crates/runtime/troe-service",
     "crates/runtime/troe-supervisor",
     "crates/runtime/troe-task",
     "crates/shell/troe-shell",

@@ -409,6 +409,10 @@ name = "troe-random"
 version = "0.1.0"
 
 [[package]]
+name = "troe-service"
+version = "0.1.0"
+
+[[package]]
 name = "troe-shell"
 version = "0.1.0"
 dependencies = [
