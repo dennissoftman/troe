@@ -10,6 +10,7 @@ mod badge;
 mod dispatcher;
 mod endpoint;
 mod message;
+mod pending;
 mod services;
 
 use core::fmt;
@@ -26,6 +27,10 @@ pub use endpoint::{
 pub use message::{
     CopiedMessage, Handle, HandleOwner, PortId, Reply, ReplyInfo, ReplyStatus, Request, Rights,
     ServiceReply, ServiceReplyInfo,
+};
+pub use pending::{
+    Admission, CallId, CallOutcome, CallState, Delivery, MAX_PENDING_CALLS,
+    MAX_QUEUED_PER_ENDPOINT, PendingCallStats, PendingCallTable, QueueSlotId,
 };
 pub use services::{
     ByteInputService, ByteOutputService, CONSOLE_WRITE, CommandInvocationService, ConsoleService,
@@ -73,6 +78,16 @@ pub enum DispatchError {
     BadgeCapacityExhausted,
     /// A stale, retired, closed, or unoccupied client badge was supplied.
     InvalidBadge,
+    /// A stale, retired, or already ended pending call was supplied.
+    InvalidCall,
+    /// A call deadline is zero, which no ordinary client may request.
+    InvalidDeadline,
+    /// No reusable pending-call record remains system-wide.
+    CallCapacityExhausted,
+    /// One endpoint's queue is full.
+    QueueFull,
+    /// Retaining the request would exceed the queued-byte ceiling.
+    RetainedBytesExhausted,
     /// A monotonic request or accounting counter overflowed.
     AccountingOverflow,
 }
@@ -99,6 +114,13 @@ impl fmt::Display for DispatchError {
             Self::InvalidInterface => formatter.write_str("service interface is invalid"),
             Self::BadgeCapacityExhausted => formatter.write_str("client badge capacity exhausted"),
             Self::InvalidBadge => formatter.write_str("client badge is invalid"),
+            Self::InvalidCall => formatter.write_str("pending call is invalid"),
+            Self::InvalidDeadline => formatter.write_str("call deadline is invalid"),
+            Self::CallCapacityExhausted => formatter.write_str("pending call capacity exhausted"),
+            Self::QueueFull => formatter.write_str("service endpoint queue is full"),
+            Self::RetainedBytesExhausted => {
+                formatter.write_str("queued request byte ceiling exhausted")
+            }
             Self::AccountingOverflow => formatter.write_str("dispatch accounting overflowed"),
         }
     }
