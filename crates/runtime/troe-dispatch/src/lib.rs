@@ -7,12 +7,18 @@ extern crate alloc;
 extern crate std;
 
 mod dispatcher;
+mod endpoint;
 mod message;
 mod services;
 
 use core::fmt;
 
 pub use dispatcher::{DispatchStats, Dispatcher, Service};
+pub use endpoint::{
+    EndpointBinding, EndpointId, EndpointLimits, EndpointStats, EndpointTable, InterfaceSet,
+    MAX_CALL_DEADLINE_MILLIS, MAX_ENDPOINT_INTERFACES, MAX_ENDPOINTS,
+    MAX_QUEUED_CALLS_PER_ENDPOINT, MAX_RETAINED_REQUEST_BYTES,
+};
 pub use message::{
     CopiedMessage, Handle, HandleOwner, PortId, Reply, ReplyInfo, ReplyStatus, Request, Rights,
     ServiceReply, ServiceReplyInfo,
@@ -50,6 +56,15 @@ pub enum DispatchError {
     InvalidPort,
     /// The handle lacks the requested operation right.
     PermissionDenied,
+    /// A rights set carries an unassigned bit, or one the interface has no
+    /// operation for.
+    InvalidRights,
+    /// No reusable endpoint slot remains.
+    EndpointCapacityExhausted,
+    /// A stale, closed, retired, or foreign endpoint was supplied.
+    InvalidEndpoint,
+    /// An interface is unassigned, duplicated, or outside an endpoint's set.
+    InvalidInterface,
     /// A monotonic request or accounting counter overflowed.
     AccountingOverflow,
 }
@@ -68,6 +83,12 @@ impl fmt::Display for DispatchError {
             Self::InvalidHandle => formatter.write_str("service handle is invalid"),
             Self::InvalidPort => formatter.write_str("service port is invalid"),
             Self::PermissionDenied => formatter.write_str("service handle right denied"),
+            Self::InvalidRights => formatter.write_str("service handle rights are invalid"),
+            Self::EndpointCapacityExhausted => {
+                formatter.write_str("service endpoint capacity exhausted")
+            }
+            Self::InvalidEndpoint => formatter.write_str("service endpoint is invalid"),
+            Self::InvalidInterface => formatter.write_str("service interface is invalid"),
             Self::AccountingOverflow => formatter.write_str("dispatch accounting overflowed"),
         }
     }
