@@ -5,6 +5,11 @@ implemented for the named QEMU contracts, 2026-08-25; exact Cloud Hypervisor
 v53 production candidate and live harness added without an acceptance claim,
 2026-08-27.
 
+Controller amendment, 2026-08-31: both named AArch64 platforms drive GICv3. The
+FDT contract validates a GICv3 distributor and redistributor and rejects any
+other version, rather than the GICv2 named below. See
+[ADR 0013](0013-interrupt-driven-input-and-driver-resources.md).
+
 ## Context
 
 TROE boots native x86-64 and AArch64 UEFI images under pinned QEMU q35 and

@@ -16,6 +16,11 @@ records and guest assertions but are behavioral compatibility evidence, not a
 reproduction of the pinned release environment. `--strict-tool-versions`
 selects the original QEMU 11.1.0 and exact-digest policy.
 
+Controller amendment, 2026-08-31: the AArch64 `virt` runner specifies
+`gic-version=3`, and both named AArch64 platforms drive GICv3 rather than the
+GICv2 named below. See
+[ADR 0013](0013-interrupt-driven-input-and-driver-resources.md).
+
 Stage 1 targets Rust's `x86_64-unknown-uefi` and `aarch64-unknown-uefi` using
 UEFI Simple Text Input/Output and the firmware allocator. The repeatable test
 profile is QEMU 11.1.0 with rust-osdev ovmf-prebuilt

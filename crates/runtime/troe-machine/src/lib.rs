@@ -123,7 +123,7 @@ pub enum PlatformDiscoveryFailure {
     X86Spcr,
     /// ACPI FADT did not prove the selected legacy, i8042, and reset contract.
     X86Fadt,
-    /// Devicetree evidence did not prove the selected `GICv2` contract.
+    /// Devicetree evidence did not prove the selected `GICv3` contract.
     ArmGic,
     /// Devicetree evidence did not prove the selected PSCI HVC conduit.
     ArmPsci,

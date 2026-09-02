@@ -30,6 +30,12 @@ and bounds launch zeroing by the ADR 0048 operation quantum. The memory and
 retained-resource table below states the current values; the surrounding prose
 about a single fixed image window preserves the original decision.
 
+Controller amendment, 2026-08-31: the AArch64 generic physical timer keeps
+PPI 30 but is configured through the GICv3 redistributor SGI frame, because a
+GICv3 distributor treats registers below INTID 32 as RES0. The GICv2 reference
+below preserves the original decision. See
+[ADR 0013](0013-interrupt-driven-input-and-driver-resources.md).
+
 Implementation note, 2026-08-23: the portable parser, canonical virtual layout,
 startup-page encoder, and native owned-staging/validate/map/reclaim transaction
 are implemented. The native root maps only the supervisor image, devices, and
