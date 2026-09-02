@@ -1115,12 +1115,24 @@ impl NetworkDevice for NativeVirtioNetwork {
             self.transmit_notify,
         )?;
         let expected = self.transmit_used.wrapping_add(1);
-        for _ in 0..REGISTER_SPIN_LIMIT {
+        // A completion this queue does not produce within the shared elapsed
+        // budget is a device verdict, so the queue is latched dead rather than
+        // retried: the timed-out descriptor is still device-owned, and the reset
+        // that reclaims its buffer also unconfigures the queue. The latch also
+        // caps one guest command at a single completion budget rather than one
+        // per transmitted frame, so an expiry cannot become a harness timeout.
+        let mut wait = CompletionWait::new(monotonic_millis(), REGISTER_SPIN_LIMIT);
+        loop {
             let observed = self
                 .transmit
                 .read_u16(self.transmit.layout.used_offset() + 2);
             match classify_used_index(self.transmit_used, observed) {
-                UsedIndexTransition::Empty => spin_loop(),
+                UsedIndexTransition::Empty => {
+                    if wait.poll(monotonic_millis()) == CompletionWaitState::Expired {
+                        return Err(self.fail_device(NetError::Timeout));
+                    }
+                    spin_loop();
+                }
                 UsedIndexTransition::Completed => {
                     dma_observe();
                     let Ok((head, bytes)) = self.transmit.used_element(self.transmit_used) else {
@@ -1138,7 +1150,6 @@ impl NetworkDevice for NativeVirtioNetwork {
                 }
             }
         }
-        Err(self.fail_device(NetError::Timeout))
     }
 
     fn receive(&mut self) -> Result<Option<Vec<u8>>, NetError> {
