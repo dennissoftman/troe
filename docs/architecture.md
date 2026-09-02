@@ -642,6 +642,43 @@ fact that belongs to one platform rather than to both.
   mappings before copying any byte. User privilege never receives a device
   mapping or writable/executable alias.
 
+### Timers and clocks
+
+- Two clocks exist and they are not interchangeable. The monotonic clock counts
+  boot-relative milliseconds and never moves backwards; the wall clock reports
+  whole Unix seconds and can be set at runtime through `clock_control`. Bound
+  every wait, deadline, and timeout on the monotonic clock.
+- `initialize_monotonic_clock` runs during handoff preparation, after console
+  initialization and before any device or service that bounds work by time. A
+  platform that cannot supply a counter fails the boot rather than continuing
+  without one.
+- Counter scaling divides before multiplying, splitting whole seconds from the
+  remainder. Multiplying ticks by 1,000 first overflows and silently truncates a
+  long uptime, so the split is load-bearing rather than stylistic.
+- The monotonic source is a platform fact, and the counter must keep advancing
+  while the vCPU is not scheduled — that property is what makes it a valid bound
+  for a completion serviced by a separate host thread. `x86_64-q35-uefi`
+  calibrates the TSC from PIT channel 2; `x86_64-uefi-virtio-pci` calibrates the
+  TSC and the local-APIC timer from the ACPI PM timer, whose counter is 24 or 32
+  bits wide; both AArch64 platforms read `CNTPCT_EL0` scaled by `CNTFRQ_EL0`.
+  Calibration is cached after the first nonzero result, so repeated reads cannot
+  re-time a running machine.
+- One millisecond is the resolution floor at every boundary: the timer interface
+  encodes milliseconds, the execution timer is armed in whole milliseconds, and
+  the C runtime therefore reports a 1,000 Hz frequency. A sub-millisecond
+  deadline is not expressible and returns immediately.
+- A sleep is a deadline, not a duration. The wait re-arms the one-shot timer in
+  slices no longer than the application timeslice and recomputes the remainder
+  from the counter on every pass, so a long wait cannot accumulate per-slice
+  error and cannot be capped by the hardware counter's exact range. A wake from
+  any other source re-arms on the recomputed remainder instead of restarting the
+  original interval.
+- The wall clock is anchored once. Firmware time is read through UEFI
+  `get_time`, normalized to UTC using the firmware's own offset, and advanced
+  from the monotonic counter afterwards; it is never re-read. A reading before
+  1970 leaves the clock unconfigured and its service says so rather than
+  inventing an epoch.
+
 ### x86-64 q35 profiles
 
 - Both legacy PICs stay masked. LAPIC/I/O APIC bounds come from the reported
