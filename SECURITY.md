@@ -105,10 +105,12 @@ never executes the ordinary application.
   exact retained pages, and CPU ticks are charged only around ring-3/EL0
   execution; the explicit read-only capability hides argv and grants no memory
   access or process control;
-- outbound TCP: one connection per declared handle, four system-wide, one
-  1,460-byte unacknowledged segment and 4 KiB receive FIFO per connection,
-  exact-tuple/sequence admission, four retransmissions, four-second cancellable
-  operations, and owner-teardown removal; no DNS, TLS, listen, or raw packets;
+- outbound TCP: one connection per declared handle, sixteen system-wide across
+  accepted connections, half-open passive opens, and tuples still retained
+  after close, one 1,460-byte unacknowledged segment and 4 KiB receive FIFO per
+  connection, exact-tuple/sequence admission, four retransmissions, four-second
+  cancellable operations, a four-second tuple retention on the active closer,
+  and owner-teardown removal; no DNS, TLS, listen, or raw packets;
 - dependencies: complete `Cargo.lock` checked by pinned `cargo-audit` against the
   exact RustSec database revision in `tools/rustsec-advisory-db.rev`.
 

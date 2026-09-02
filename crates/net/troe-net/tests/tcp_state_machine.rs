@@ -1,8 +1,9 @@
 //! Adversarial transition tests for the bounded TCP connection machine.
 
 use troe_net::{
-    Ipv4Address, MAX_TCP_RECEIVE_BYTES, NetError, TcpAdmission, TcpConnection, TcpEndpoint,
-    TcpError, TcpFlags, TcpSegment, TcpState,
+    Ipv4Address, MAX_TCP_BACKLOG, MAX_TCP_RECEIVE_BYTES, NetError, TCP_TIME_WAIT_MILLISECONDS,
+    TcpAdmission, TcpConnection, TcpEndpoint, TcpError, TcpFlags, TcpListener, TcpSegment,
+    TcpState,
 };
 
 const LOCAL: TcpEndpoint = match TcpEndpoint::new(Ipv4Address::new([10, 0, 2, 15]), 49_152) {
@@ -376,5 +377,498 @@ fn endpoints_reject_zero_ports() {
     assert_eq!(
         TcpEndpoint::new(Ipv4Address::new([192, 0, 2, 1]), 0),
         Err(NetError::Invalid)
+    );
+}
+
+const SERVER: TcpEndpoint = match TcpEndpoint::new(Ipv4Address::new([10, 0, 2, 15]), 8080) {
+    Ok(endpoint) => endpoint,
+    Err(_) => panic!("valid server test endpoint"),
+};
+const CLIENT: TcpEndpoint = match TcpEndpoint::new(Ipv4Address::new([10, 0, 2, 2]), 49_152) {
+    Ok(endpoint) => endpoint,
+    Err(_) => panic!("valid client test endpoint"),
+};
+const SERVER_SEQUENCE: u32 = 0x2030_4050;
+const CLIENT_SEQUENCE: u32 = 0x6070_8090;
+
+fn client(port: u16) -> Result<TcpEndpoint, TcpError> {
+    TcpEndpoint::new(Ipv4Address::new([10, 0, 2, 2]), port).map_err(|_| TcpError::Invalid)
+}
+
+/// Admit one client SYN and drain the answering SYN+ACK.
+fn admit_syn(
+    listener: &mut TcpListener,
+    peer: TcpEndpoint,
+    peer_sequence: u32,
+    initial_sequence: u32,
+) -> Result<(), TcpError> {
+    assert_eq!(
+        listener.on_segment(
+            segment(peer, SERVER, peer_sequence, 0, TcpFlags::SYN, 4096, &[]),
+            initial_sequence,
+        ),
+        TcpAdmission::Accepted
+    );
+    let syn_ack = listener.poll_emission(0).ok_or(TcpError::Invalid)?;
+    assert_eq!(syn_ack.flags, TcpFlags::SYN_ACK);
+    assert_eq!(syn_ack.sequence, initial_sequence);
+    assert_eq!(syn_ack.acknowledgement, peer_sequence.wrapping_add(1));
+    assert!(syn_ack.payload.is_empty());
+    Ok(())
+}
+
+/// Complete one passive handshake and return the accepted server connection.
+fn accepted() -> Result<TcpConnection, TcpError> {
+    let mut listener = TcpListener::bind(SERVER, MAX_TCP_BACKLOG)?;
+    admit_syn(&mut listener, CLIENT, CLIENT_SEQUENCE, SERVER_SEQUENCE)?;
+    assert_eq!(
+        listener.on_segment(
+            segment(
+                CLIENT,
+                SERVER,
+                CLIENT_SEQUENCE.wrapping_add(1),
+                SERVER_SEQUENCE.wrapping_add(1),
+                TcpFlags::ACK,
+                4096,
+                &[],
+            ),
+            SERVER_SEQUENCE,
+        ),
+        TcpAdmission::Accepted
+    );
+    let connection = listener.poll_accept().ok_or(TcpError::Invalid)?;
+    assert_eq!(connection.state(), TcpState::Established);
+    assert_eq!(listener.pending(), 0);
+    Ok(connection)
+}
+
+#[test]
+fn passive_open_completes_only_on_the_exact_final_acknowledgement() -> Result<(), TcpError> {
+    let mut listener = TcpListener::bind(SERVER, MAX_TCP_BACKLOG)?;
+    admit_syn(&mut listener, CLIENT, CLIENT_SEQUENCE, SERVER_SEQUENCE)?;
+
+    // A future acknowledgement, a stale acknowledgement, an out-of-sequence
+    // acknowledgement, and a segment without ACK all leave the half-open
+    // connection unaccepted.
+    for (sequence, acknowledgement, flags) in [
+        (
+            CLIENT_SEQUENCE.wrapping_add(1),
+            SERVER_SEQUENCE.wrapping_add(2),
+            TcpFlags::ACK,
+        ),
+        (
+            CLIENT_SEQUENCE.wrapping_add(1),
+            SERVER_SEQUENCE,
+            TcpFlags::ACK,
+        ),
+        (
+            CLIENT_SEQUENCE.wrapping_add(2),
+            SERVER_SEQUENCE.wrapping_add(1),
+            TcpFlags::ACK,
+        ),
+        (
+            CLIENT_SEQUENCE.wrapping_add(1),
+            SERVER_SEQUENCE.wrapping_add(1),
+            TcpFlags::FIN,
+        ),
+    ] {
+        assert_eq!(
+            listener.on_segment(
+                segment(CLIENT, SERVER, sequence, acknowledgement, flags, 4096, &[]),
+                SERVER_SEQUENCE,
+            ),
+            TcpAdmission::Ignored
+        );
+        assert!(listener.poll_accept().is_none());
+        assert_eq!(listener.pending(), 1);
+    }
+
+    assert_eq!(
+        listener.on_segment(
+            segment(
+                CLIENT,
+                SERVER,
+                CLIENT_SEQUENCE.wrapping_add(1),
+                SERVER_SEQUENCE.wrapping_add(1),
+                TcpFlags::ACK,
+                4096,
+                &[],
+            ),
+            SERVER_SEQUENCE,
+        ),
+        TcpAdmission::Accepted
+    );
+    let connection = listener.poll_accept().ok_or(TcpError::Invalid)?;
+    assert_eq!(connection.state(), TcpState::Established);
+    assert_eq!(connection.buffered_bytes(), 0);
+    Ok(())
+}
+
+#[test]
+fn passive_open_retains_bytes_and_fin_carried_by_the_final_acknowledgement() -> Result<(), TcpError>
+{
+    let mut listener = TcpListener::bind(SERVER, MAX_TCP_BACKLOG)?;
+    admit_syn(&mut listener, CLIENT, CLIENT_SEQUENCE, SERVER_SEQUENCE)?;
+
+    // A client may pipeline its complete request onto the handshake's final
+    // acknowledgement and close in the same segment.
+    let request = b"GET / HTTP/1.1\r\n\r\n";
+    assert_eq!(
+        listener.on_segment(
+            segment(
+                CLIENT,
+                SERVER,
+                CLIENT_SEQUENCE.wrapping_add(1),
+                SERVER_SEQUENCE.wrapping_add(1),
+                TcpFlags::FIN_ACK,
+                4096,
+                request,
+            ),
+            SERVER_SEQUENCE,
+        ),
+        TcpAdmission::Accepted
+    );
+    let mut connection = listener.poll_accept().ok_or(TcpError::Invalid)?;
+    assert_eq!(connection.state(), TcpState::CloseWait);
+    assert_eq!(connection.buffered_bytes(), request.len());
+    let mut received = [0_u8; 32];
+    assert_eq!(
+        connection.read(&mut received)?,
+        Some(request.len()),
+        "handshake-carried request bytes are retained"
+    );
+    assert_eq!(&received[..request.len()], request);
+    assert_eq!(connection.read(&mut received)?, Some(0), "orderly peer EOF");
+    Ok(())
+}
+
+#[test]
+fn listener_admits_only_a_bare_syn_for_its_own_endpoint() -> Result<(), TcpError> {
+    let mut listener = TcpListener::bind(SERVER, MAX_TCP_BACKLOG)?;
+    let other_port =
+        TcpEndpoint::new(Ipv4Address::new([10, 0, 2, 15]), 8081).map_err(|_| TcpError::Invalid)?;
+    let other_address =
+        TcpEndpoint::new(Ipv4Address::new([10, 0, 2, 99]), 8080).map_err(|_| TcpError::Invalid)?;
+
+    // A different local port, a different local address, a SYN carrying data,
+    // and a stray SYN+ACK never open a connection.
+    for (destination, flags, payload) in [
+        (other_port, TcpFlags::SYN, &b""[..]),
+        (other_address, TcpFlags::SYN, &b""[..]),
+        (SERVER, TcpFlags::SYN, &b"data"[..]),
+        (SERVER, TcpFlags::SYN_ACK, &b""[..]),
+        (SERVER, TcpFlags::ACK, &b""[..]),
+        (SERVER, TcpFlags::FIN_ACK, &b""[..]),
+        (SERVER, TcpFlags::RST, &b""[..]),
+    ] {
+        assert_eq!(
+            listener.on_segment(
+                segment(
+                    CLIENT,
+                    destination,
+                    CLIENT_SEQUENCE,
+                    0,
+                    flags,
+                    4096,
+                    payload
+                ),
+                SERVER_SEQUENCE,
+            ),
+            TcpAdmission::Ignored
+        );
+        assert_eq!(listener.pending(), 0);
+        assert!(listener.poll_emission(0).is_none());
+    }
+    Ok(())
+}
+
+#[test]
+fn retransmitted_inbound_syn_never_opens_a_second_connection() -> Result<(), TcpError> {
+    let mut listener = TcpListener::bind(SERVER, MAX_TCP_BACKLOG)?;
+    admit_syn(&mut listener, CLIENT, CLIENT_SEQUENCE, SERVER_SEQUENCE)?;
+
+    // The pending SYN+ACK schedule answers a retransmitted SYN; a second
+    // queue entry for the same tuple would duplicate the connection.
+    assert_eq!(
+        listener.on_segment(
+            segment(CLIENT, SERVER, CLIENT_SEQUENCE, 0, TcpFlags::SYN, 4096, &[]),
+            SERVER_SEQUENCE.wrapping_add(1),
+        ),
+        TcpAdmission::Duplicate
+    );
+    assert_eq!(listener.pending(), 1);
+
+    // A SYN reusing the tuple with a different sequence is not the same open
+    // and is refused rather than silently rebinding the connection.
+    assert_eq!(
+        listener.on_segment(
+            segment(
+                CLIENT,
+                SERVER,
+                CLIENT_SEQUENCE.wrapping_add(64),
+                0,
+                TcpFlags::SYN,
+                4096,
+                &[],
+            ),
+            SERVER_SEQUENCE.wrapping_add(1),
+        ),
+        TcpAdmission::Ignored
+    );
+    assert_eq!(listener.pending(), 1);
+    Ok(())
+}
+
+#[test]
+fn listener_backlog_is_bounded_and_drops_further_inbound_syns() -> Result<(), TcpError> {
+    let mut listener = TcpListener::bind(SERVER, MAX_TCP_BACKLOG)?;
+    assert_eq!(listener.capacity(), MAX_TCP_BACKLOG);
+    for index in 0..MAX_TCP_BACKLOG {
+        let port = 49_152_u16.saturating_add(u16::try_from(index).unwrap_or(u16::MAX));
+        admit_syn(
+            &mut listener,
+            client(port)?,
+            CLIENT_SEQUENCE,
+            SERVER_SEQUENCE,
+        )?;
+    }
+    assert_eq!(listener.pending(), MAX_TCP_BACKLOG);
+
+    // The backlog is the containment boundary: an excess SYN is dropped, no
+    // storage grows, and every retained connection is unaffected.
+    let excess = client(49_152_u16.saturating_add(u16::try_from(MAX_TCP_BACKLOG).unwrap_or(0)))?;
+    assert_eq!(
+        listener.on_segment(
+            segment(excess, SERVER, CLIENT_SEQUENCE, 0, TcpFlags::SYN, 4096, &[]),
+            SERVER_SEQUENCE,
+        ),
+        TcpAdmission::Ignored
+    );
+    assert_eq!(listener.pending(), MAX_TCP_BACKLOG);
+
+    // Accepting one connection reopens exactly one backlog slot.
+    assert_eq!(
+        listener.on_segment(
+            segment(
+                client(49_152)?,
+                SERVER,
+                CLIENT_SEQUENCE.wrapping_add(1),
+                SERVER_SEQUENCE.wrapping_add(1),
+                TcpFlags::ACK,
+                4096,
+                &[],
+            ),
+            SERVER_SEQUENCE,
+        ),
+        TcpAdmission::Accepted
+    );
+    let first = listener.poll_accept().ok_or(TcpError::Invalid)?;
+    assert_eq!(first.state(), TcpState::Established);
+    assert_eq!(listener.pending(), MAX_TCP_BACKLOG - 1);
+    assert_eq!(
+        listener.on_segment(
+            segment(excess, SERVER, CLIENT_SEQUENCE, 0, TcpFlags::SYN, 4096, &[]),
+            SERVER_SEQUENCE,
+        ),
+        TcpAdmission::Accepted
+    );
+    assert_eq!(listener.pending(), MAX_TCP_BACKLOG);
+    Ok(())
+}
+
+#[test]
+fn accept_never_returns_a_half_open_reset_or_timed_out_connection() -> Result<(), TcpError> {
+    let mut listener = TcpListener::bind(SERVER, MAX_TCP_BACKLOG)?;
+    admit_syn(&mut listener, CLIENT, CLIENT_SEQUENCE, SERVER_SEQUENCE)?;
+
+    // A half-open connection is never handed to an application.
+    assert!(listener.poll_accept().is_none());
+
+    // An exact in-window reset terminates only that client's connection.
+    assert_eq!(
+        listener.on_segment(
+            segment(
+                CLIENT,
+                SERVER,
+                CLIENT_SEQUENCE.wrapping_add(1),
+                0,
+                TcpFlags::RST,
+                4096,
+                &[],
+            ),
+            SERVER_SEQUENCE,
+        ),
+        TcpAdmission::Accepted
+    );
+    assert_eq!(listener.pending(), 0);
+    assert!(listener.poll_accept().is_none());
+
+    // A silent client expires its own bounded SYN+ACK schedule and is
+    // reclaimed without failing the listener.
+    admit_syn(&mut listener, CLIENT, CLIENT_SEQUENCE, SERVER_SEQUENCE)?;
+    for now in [250, 750, 1_750] {
+        let retransmission = listener.poll_emission(now).ok_or(TcpError::Invalid)?;
+        assert_eq!(retransmission.flags, TcpFlags::SYN_ACK);
+    }
+    assert!(
+        listener.poll_emission(2_750).is_none(),
+        "the fourth transmission's deadline ends the passive open"
+    );
+    assert!(listener.poll_accept().is_none());
+    listener.reap();
+    assert_eq!(listener.pending(), 0);
+    Ok(())
+}
+
+#[test]
+fn active_close_holds_the_tuple_in_time_wait_for_the_bounded_interval() -> Result<(), TcpError> {
+    let mut connection = accepted()?;
+    connection.begin_close()?;
+    assert_eq!(connection.state(), TcpState::FinWaitOne);
+    let fin = connection.poll_emission(0)?.ok_or(TcpError::Invalid)?;
+    assert_eq!(fin.flags, TcpFlags::FIN_ACK);
+    assert_eq!(fin.sequence, SERVER_SEQUENCE.wrapping_add(1));
+
+    assert_eq!(
+        connection.on_segment(segment(
+            CLIENT,
+            SERVER,
+            CLIENT_SEQUENCE.wrapping_add(1),
+            SERVER_SEQUENCE.wrapping_add(2),
+            TcpFlags::ACK,
+            4096,
+            &[],
+        ))?,
+        TcpAdmission::Accepted
+    );
+    assert_eq!(connection.state(), TcpState::FinWaitTwo);
+    assert_eq!(
+        connection.on_segment(segment(
+            CLIENT,
+            SERVER,
+            CLIENT_SEQUENCE.wrapping_add(1),
+            SERVER_SEQUENCE.wrapping_add(2),
+            TcpFlags::FIN_ACK,
+            4096,
+            &[],
+        ))?,
+        TcpAdmission::Accepted
+    );
+    assert_eq!(connection.state(), TcpState::TimeWait);
+
+    // The interval starts at the first emission poll, which also drains the
+    // final acknowledgement.
+    let start = 10;
+    let final_ack = connection.poll_emission(start)?.ok_or(TcpError::Invalid)?;
+    assert_eq!(final_ack.flags, TcpFlags::ACK);
+    assert_eq!(final_ack.acknowledgement, CLIENT_SEQUENCE.wrapping_add(2));
+
+    // The tuple is retained, admits no further application operation, and
+    // reports orderly end of stream.
+    let expiry = start.saturating_add(TCP_TIME_WAIT_MILLISECONDS);
+    assert!(connection.poll_emission(expiry - 1)?.is_none());
+    assert_eq!(connection.state(), TcpState::TimeWait);
+    assert!(!connection.is_closed(), "the tuple is not yet reclaimable");
+    assert_eq!(connection.begin_send(b"late"), Err(TcpError::Closed));
+    assert_eq!(connection.begin_close(), Err(TcpError::Closed));
+    let mut received = [0_u8; 4];
+    assert_eq!(connection.read(&mut received)?, Some(0));
+
+    assert!(connection.poll_emission(expiry)?.is_none());
+    assert_eq!(connection.state(), TcpState::Closed);
+    assert!(connection.is_closed(), "the tuple is reclaimable at expiry");
+    Ok(())
+}
+
+#[test]
+fn simultaneous_close_enters_time_wait_through_closing() -> Result<(), TcpError> {
+    let mut connection = accepted()?;
+    connection.begin_close()?;
+    let _fin = connection.poll_emission(0)?.ok_or(TcpError::Invalid)?;
+
+    // The peer's FIN crosses our own before acknowledging it.
+    assert_eq!(
+        connection.on_segment(segment(
+            CLIENT,
+            SERVER,
+            CLIENT_SEQUENCE.wrapping_add(1),
+            SERVER_SEQUENCE.wrapping_add(1),
+            TcpFlags::FIN_ACK,
+            4096,
+            &[],
+        ))?,
+        TcpAdmission::Accepted
+    );
+    assert_eq!(connection.state(), TcpState::Closing);
+
+    assert_eq!(
+        connection.on_segment(segment(
+            CLIENT,
+            SERVER,
+            CLIENT_SEQUENCE.wrapping_add(2),
+            SERVER_SEQUENCE.wrapping_add(2),
+            TcpFlags::ACK,
+            4096,
+            &[],
+        ))?,
+        TcpAdmission::Accepted
+    );
+    assert_eq!(connection.state(), TcpState::TimeWait);
+    assert_eq!(connection.begin_send(b"late"), Err(TcpError::Closed));
+    Ok(())
+}
+
+#[test]
+fn passive_close_reclaims_the_tuple_without_time_wait() -> Result<(), TcpError> {
+    let mut connection = accepted()?;
+
+    // The peer closes first, so this side is the passive closer and must not
+    // retain the tuple after its own FIN is acknowledged.
+    assert_eq!(
+        connection.on_segment(segment(
+            CLIENT,
+            SERVER,
+            CLIENT_SEQUENCE.wrapping_add(1),
+            SERVER_SEQUENCE.wrapping_add(1),
+            TcpFlags::FIN_ACK,
+            4096,
+            &[],
+        ))?,
+        TcpAdmission::Accepted
+    );
+    assert_eq!(connection.state(), TcpState::CloseWait);
+    connection.begin_close()?;
+    assert_eq!(connection.state(), TcpState::LastAck);
+    let _ack = connection.poll_emission(0)?.ok_or(TcpError::Invalid)?;
+    let fin = connection.poll_emission(0)?.ok_or(TcpError::Invalid)?;
+    assert_eq!(fin.flags, TcpFlags::FIN_ACK);
+    assert_eq!(
+        connection.on_segment(segment(
+            CLIENT,
+            SERVER,
+            CLIENT_SEQUENCE.wrapping_add(2),
+            SERVER_SEQUENCE.wrapping_add(2),
+            TcpFlags::ACK,
+            4096,
+            &[],
+        ))?,
+        TcpAdmission::Accepted
+    );
+    assert_eq!(connection.state(), TcpState::Closed);
+    assert!(connection.is_closed());
+    Ok(())
+}
+
+#[test]
+fn listener_rejects_invalid_endpoints_and_capacities() {
+    assert_eq!(
+        TcpListener::bind(SERVER, 0).err(),
+        Some(TcpError::Invalid),
+        "a zero backlog would admit an open it cannot retain"
+    );
+    assert_eq!(
+        TcpListener::bind(SERVER, MAX_TCP_BACKLOG + 1).err(),
+        Some(TcpError::Invalid),
+        "the backlog bound is part of the interface, not a hint"
     );
 }
