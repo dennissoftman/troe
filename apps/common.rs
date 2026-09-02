@@ -223,6 +223,10 @@ pub const fn filesystem_message(error: Error) -> &'static [u8] {
         Error::Exists => b"already exists",
         Error::Corrupt => b"filesystem metadata is corrupt",
         Error::Io => b"filesystem transport failed",
+        // A transport that never answered is not a transport that reported a
+        // failure. Naming the difference is what makes an intermittent
+        // completion-wait expiry diagnosable from a serial log alone.
+        Error::Timeout => b"filesystem transport timed out",
         Error::Unsupported => b"filesystem feature is unsupported",
         Error::NotConfigured => b"wall clock is not set; run timesync",
         Error::Exhausted => b"bounded filesystem resources exhausted",

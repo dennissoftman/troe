@@ -180,6 +180,13 @@ pub enum BlockError {
     Unsupported,
     /// The underlying device reported an I/O failure.
     Device,
+    /// The device did not report completion inside the driver's bounded wait.
+    ///
+    /// Distinct from [`BlockError::Device`], which is a completed request the
+    /// device or its completion record reported as failed. An expired wait
+    /// leaves the request's outcome unknown, so a caller that treats the two
+    /// alike cannot tell a dead device from a slow one.
+    Timeout,
 }
 
 /// Synchronous device mechanism consumed only through checked region wrappers.

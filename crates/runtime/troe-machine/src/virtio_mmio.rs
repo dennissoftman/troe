@@ -27,8 +27,9 @@ use troe_virtio::{
 };
 
 use crate::mechanism::{
-    ActiveNetworkInterrupt, DmaInitializationState, NetworkInterruptRoute, UsedIndexTransition,
-    claim_network_interrupt_publication, classify_used_index, revoke_network_interrupt_publication,
+    ActiveNetworkInterrupt, CompletionWait, CompletionWaitState, DmaInitializationState,
+    NetworkInterruptRoute, UsedIndexTransition, claim_network_interrupt_publication,
+    classify_used_index, monotonic_millis, revoke_network_interrupt_publication,
 };
 
 const MAX_NATIVE_BLOCK_DEVICES: usize = 8;
@@ -653,19 +654,18 @@ impl VirtioMmioTransport {
         mmio_write(self.base, MMIO_QUEUE_NOTIFY, u32::from(REQUEST_QUEUE_INDEX));
 
         let expected_used = self.used_index.wrapping_add(1);
-        let mut completed = false;
-        for _ in 0..REGISTER_SPIN_LIMIT {
+        let mut wait = CompletionWait::new(monotonic_millis(), REGISTER_SPIN_LIMIT);
+        loop {
             if self.queue.read_u16(self.queue.layout.used_offset() + 2) == expected_used {
-                completed = true;
                 break;
             }
-            spin_loop();
-        }
-        if !completed {
-            if reset_device(self.base).is_err() {
-                terminal_park();
+            if wait.poll(monotonic_millis()) == CompletionWaitState::Expired {
+                if reset_device(self.base).is_err() {
+                    terminal_park();
+                }
+                return Err(BlockError::Timeout);
             }
-            return Err(BlockError::Device);
+            spin_loop();
         }
         dma_observe();
         let used_slot = usize::from(self.used_index % REQUEST_QUEUE_SIZE);

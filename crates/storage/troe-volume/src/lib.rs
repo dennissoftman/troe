@@ -251,6 +251,7 @@ enum ProbeState {
     Corrupt,
     Unsupported,
     Io,
+    Timeout,
     Exhausted,
 }
 
@@ -899,6 +900,9 @@ const fn probe_state(error: FsError) -> ProbeState {
         // misclassification if that ever changes.
         FsError::Unsupported | FsError::NotConfigured => ProbeState::Unsupported,
         FsError::Io => ProbeState::Io,
+        // A probe that timed out learned nothing about the media, so the boot
+        // report has to say so rather than blaming the image.
+        FsError::Timeout => ProbeState::Timeout,
         FsError::NoSpace => ProbeState::Exhausted,
         FsError::Invalid
         | FsError::NotFound
@@ -1110,6 +1114,7 @@ const fn probe_name(state: ProbeState) -> &'static str {
         ProbeState::Corrupt => "corrupt",
         ProbeState::Unsupported => "unsupported",
         ProbeState::Io => "io-error",
+        ProbeState::Timeout => "transport-timeout",
         ProbeState::Exhausted => "profile-exhausted",
     }
 }
@@ -1180,6 +1185,7 @@ const fn block_error_name(error: BlockError) -> &'static str {
         BlockError::ReadOnly => "block-read-only",
         BlockError::Unsupported => "block-unsupported",
         BlockError::Device => "block-io-error",
+        BlockError::Timeout => "block-transport-timeout",
     }
 }
 

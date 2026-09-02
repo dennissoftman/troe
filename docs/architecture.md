@@ -527,7 +527,10 @@ rewriting its index, and a heavily fragmented file is rewritten through an
 extent tree as deep as its extents require. General ext4 repair and mutations outside the documented
 profile remain unsupported. A transport provides bounded block-region capabilities; partition
 discovery turns a whole device into non-overlapping regions; independently
-selected filesystem providers expose VFS objects.
+selected filesystem providers expose VFS objects. Every provider maps block
+conditions to filesystem errors exhaustively, so a transport whose completion
+wait expired reaches an application as a timeout rather than as the same
+transport failure a device-reported read error produces.
 Format-specific structures do not enter the machine backend, block transport,
 partition layer, or kernel composition root.
 
@@ -620,6 +623,11 @@ tests, and all four exhaustive QEMU platform suites together. q35 and QEMU
   confirms device reset before DMA storage can drop.
 - Map controller, UART, and transport apertures RW/NX as device memory before
   volatile access. Never retain a normal-memory alias to device pages.
+- Bound a device-completion wait by elapsed monotonic milliseconds, never by a
+  poll count. A count bounds guest instructions, so an emulated vCPU competing
+  for host CPU with the thread that services the completion can exhaust it while
+  the device is merely slow. Report an expiry as its own error, distinct from a
+  device-reported failure, because it leaves the request's outcome unknown.
 - Main-context queue access keeps the owned IRQ class masked. The proof is
   single-CPU and must be replaced before SMP. Polling is limited to bootstrap
   and terminal fatal output; the normal shell uses interrupt delivery.
