@@ -28,11 +28,12 @@ CLI or privileged system-control plane is implemented. That work is tracked in
 architecture and execution environment. Build and launch tooling selects the
 full platform ID explicitly; the machine crate consumes a validated token for
 MMIO/I/O ownership, interrupt topology, console, timer, lifecycle, keyboard,
-and virtio transport facts before owned device access. q35 and QEMU `virt`
-therefore remain two exact platforms rather than architecture defaults.
-Two additional QEMU contracts obtain those facts from bounded ACPI or FDT
-discovery and boot the deterministic three-disk cloud bundle; unsupported
-firmware fails before device publication or volatile I/O.
+and virtio transport facts before owned device access. Four platforms are
+named, never architecture defaults: `x86_64-q35-uefi` on q35 and
+`aarch64-sbsa-ref` on the SBSA reference machine pin their facts, while
+`x86_64-uefi-virtio-pci` and `aarch64-uefi-virtio-mmio` obtain the same facts
+from bounded ACPI or FDT discovery and boot the deterministic three-disk cloud
+bundle. Unsupported firmware fails before device publication or volatile I/O.
 
 ## Input-to-output trace
 
@@ -223,7 +224,7 @@ validated in fresh QEMU boots for both architectures.
 
 The post-handoff shell invokes no firmware protocol or allocator and cannot
 manipulate page tables or exception vectors. Authorized `poweroff` and `reboot`
-use the pinned platform profile's native ACPI/PSCI control mechanism; a request
+use the selected platform's native ACPI or PSCI control mechanism; a request
 that unexpectedly returns parks the CPU terminally.
 `troe-task` provides a bounded cooperative scheduler policy. Task IDs
 are monotonic, records have ready/running/exited lifecycles, capability sets are
@@ -301,10 +302,10 @@ native keyboard transport and uses serial input.
 The portable `troe-driver` crate defines the resource and event boundary. Queue
 capacity and maximum ISR drain come from the Standard portable policy;
 controller routes, vectors, trigger/polarity, and priority come from the
-validated VM platform descriptor. The pinned x86-64 platform
-masks the legacy PIC, owns LAPIC/I/O APIC, and routes COM1 and keyboard receive
-interrupts through explicit IDT gates. Both AArch64 platforms own GICv3 and
-route PL011 through the IRQ vector. Handlers preserve interrupted CPU
+validated VM platform descriptor. Both x86-64 platforms mask the legacy PIC,
+own LAPIC/I/O APIC, and route COM1 and keyboard receive interrupts through
+explicit IDT gates. Both AArch64 platforms own GICv3 and route PL011 through
+the IRQ vector. Handlers preserve interrupted CPU
 state, perform bounded non-allocating device work, and enqueue typed raw bytes;
 decoding and editing remain in main context. An empty queue executes a
 lost-wakeup-safe `sti; hlt` or IRQ-masked `dsb; wfi` transition followed by
@@ -609,8 +610,10 @@ These implementation details are recorded here because a portable refactor can
 erase them while leaving high-level interfaces apparently unchanged. Any change
 to interrupt entry, idle waiting, controller setup, isolated execution, or a
 named machine profile must review ADRs 0013, 0014, and 0016, the native contract
-tests, and all four exhaustive QEMU platform suites together. q35 and QEMU
-`virt` are exact profiles, not generic x86-64 or AArch64 contracts.
+tests, and all four exhaustive QEMU platform suites together. Each named
+platform is exact rather than a generic x86-64 or AArch64 contract, and the two
+that share an architecture still differ, so the subsections below mark every
+fact that belongs to one platform rather than to both.
 
 ### Shared ordering
 
@@ -639,7 +642,7 @@ tests, and all four exhaustive QEMU platform suites together. q35 and QEMU
   mappings before copying any byte. User privilege never receives a device
   mapping or writable/executable alias.
 
-### x86-64 q35 profile
+### x86-64 q35 profiles
 
 - Both legacy PICs stay masked. LAPIC/I/O APIC bounds come from the reported
   controller topology; q35 IRQ1 and IRQ4 route to explicit non-exception IDT
@@ -653,21 +656,28 @@ tests, and all four exhaustive QEMU platform suites together. q35 and QEMU
   and user descriptors precede ring-3 entry; SMEP and SMAP are enabled, while
   inherited LA57, CET, supervisor protection keys, `SYSCALL`, `SYSENTER`, and
   FSGSBASE state are rejected or disabled before userspace.
-- The bounded q35 scanner covers bus zero, validates/de-loops modern virtio PCI
+- The bounded PCI scanner covers bus zero, validates/de-loops modern virtio PCI
   capabilities, probes BAR sizes with decode disabled, restores configuration,
   and maps only the referenced page-rounded spans. Block and network queues use
-  fixed modern-v1 contracts and reset-before-DMA-drop teardown.
-- `poweroff` and `reboot` use q35 profile resources. Their I/O ports are not
-  architecture defaults and another platform must supply validated equivalents.
+  fixed modern-v1 contracts and reset-before-DMA-drop teardown. The scanner is
+  shared: `x86_64-q35-uefi` reaches configuration space through legacy
+  mechanism 1 I/O ports, while `x86_64-uefi-virtio-pci` and `aarch64-sbsa-ref`
+  use an ECAM aperture.
+- Lifecycle is a platform fact, not an architectural one. `x86_64-q35-uefi`
+  owns q35 ACPI PM1 S5 and reset-control ports and serves both `poweroff` and
+  `reboot`; `x86_64-uefi-virtio-pci` has a firmware-validated reset port only,
+  so soft-off is unsupported and `poweroff` parks the CPU instead. Neither set
+  of ports is an architecture default and another platform must supply
+  validated equivalents.
 
-### AArch64 QEMU `virt` profile
+### AArch64 `sbsa-ref` and `virt` profiles
 
 - Both named AArch64 platforms use GICv3, the only generation the platform
   descriptors describe. FDT discovery still parses a GICv2 device tree, but
   only to reject it, and no mechanism drives version 2. Distributor loops are
   bounded by `GICD_TYPER`; PL011 INTID 33 and each virtio SPI are validated
   against it before enable. A different firmware security state, or the ITS
-  and LPI support this profile omits, requires a distinct review.
+  and LPI support both platforms omit, requires a distinct review.
 - The CPU interface is the `ICC_*` system registers rather than an MMIO
   aperture, and `ICC_SRE_EL1` precedes the remaining interface writes.
   `GICR_WAKER` wakes the redistributor before any enable, because it delivers
@@ -686,11 +696,17 @@ tests, and all four exhaustive QEMU platform suites together. q35 and QEMU
 - EL0 mappings use distinct AP/PXN/UXN policy. Copied messages use unprivileged
   loads while PAN is active; return restores TTBR0_EL1 and completes the global
   invalidation before Rust resumes.
-- The profile maps only its documented virtio-MMIO aperture, accepts modern
-  devices, uses page-aligned live queue memory and outer-shareable DMA barriers,
-  and parks on an unconfirmed reset rather than allowing DMA to outlive storage.
-- PSCI 1.0 HVC supplies terminal poweroff and reboot. An unexpected PSCI return
-  falls back to the terminal CPU park path.
+- Virtio transport is a platform fact. `aarch64-uefi-virtio-mmio` maps only its
+  documented virtio-MMIO aperture, while `aarch64-sbsa-ref` carries virtio as
+  PCI functions through the shared scanner above, because SBSA describes no
+  MMIO transport aperture. Both accept modern devices only, use page-aligned
+  live queue memory and outer-shareable DMA barriers, and park on an
+  unconfirmed reset rather than allowing DMA to outlive storage.
+- PSCI 1.0 supplies terminal poweroff and reboot, but the conduit belongs to the
+  platform: `aarch64-uefi-virtio-mmio` calls HVC and reaches an implementation
+  at EL2, while `aarch64-sbsa-ref` calls SMC because Trusted Firmware places
+  PSCI in its EL3 runtime. An unexpected PSCI return falls back to the terminal
+  CPU park path.
 
 ### Platform separation and regression evidence
 
