@@ -63,6 +63,12 @@ pub enum FsError {
     Corrupt,
     /// The provider's bounded transport failed.
     Io,
+    /// The provider's bounded transport did not complete a request in time.
+    ///
+    /// Distinct from `Io`, which is a transport that answered with a failure:
+    /// this is a transport that did not answer inside the bound its driver
+    /// enforces, so the request's outcome is unknown rather than known-bad.
+    Timeout,
     /// The media uses a feature outside the selected provider profile.
     Unsupported,
     /// The operation needs the wall clock's instant and no wall time is known.
@@ -88,6 +94,7 @@ impl fmt::Display for FsError {
             Self::Exists => f.write_str("already exists"),
             Self::Corrupt => f.write_str("filesystem metadata is corrupt"),
             Self::Io => f.write_str("filesystem transport failed"),
+            Self::Timeout => f.write_str("filesystem transport timed out"),
             Self::Unsupported => f.write_str("filesystem feature is unsupported"),
             Self::NotConfigured => f.write_str("wall clock is not set"),
             Self::NotEmpty => f.write_str("directory not empty"),

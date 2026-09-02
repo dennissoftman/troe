@@ -1652,11 +1652,24 @@ fn validate_limits(limits: Fat32Limits) -> Result<(), FsError> {
     .map(|_| ())
 }
 
+/// Map one block-capability failure without collapsing distinct conditions.
+///
+/// Exhaustive for the same reason the ext4 provider's mapping is: a wildcard
+/// arm turns a bounded-wait expiry into an indistinguishable `Io`.
 const fn map_block(error: BlockError) -> FsError {
     match error {
         BlockError::ReadOnly => FsError::ReadOnly,
         BlockError::Unsupported => FsError::Unsupported,
-        _ => FsError::Io,
+        BlockError::Timeout => FsError::Timeout,
+        BlockError::InvalidGeometry
+        | BlockError::InvalidLimits
+        | BlockError::InvalidRegion
+        | BlockError::EmptyTransfer
+        | BlockError::Misaligned
+        | BlockError::OutOfBounds
+        | BlockError::TransferTooLarge
+        | BlockError::BufferLength
+        | BlockError::Device => FsError::Io,
     }
 }
 
@@ -1691,7 +1704,7 @@ mod tests {
 
     use super::{
         BlockDevice, BlockError, BlockRegion, DIRECTORY_ENTRY_BYTES, Fat32, Fat32Limits,
-        FileSystemProvider, FsError, NodeKind, Rc, WallClock, read_u16,
+        FileSystemProvider, FsError, NodeKind, Rc, WallClock, map_block, read_u16,
     };
     use crate::name::short_name_checksum;
     use crate::time::{
@@ -2124,6 +2137,18 @@ mod tests {
             7
         );
         Ok(())
+    }
+
+    /// Every block condition keeps its own filesystem error. A wildcard arm
+    /// here would turn a bounded-wait expiry, which leaves a request's outcome
+    /// unknown, into the same `Io` a device-reported read failure produces.
+    #[test]
+    fn every_block_condition_maps_to_its_own_filesystem_error() {
+        assert_eq!(map_block(BlockError::Timeout), FsError::Timeout);
+        assert_eq!(map_block(BlockError::Device), FsError::Io);
+        assert_eq!(map_block(BlockError::ReadOnly), FsError::ReadOnly);
+        assert_eq!(map_block(BlockError::Unsupported), FsError::Unsupported);
+        assert_eq!(map_block(BlockError::OutOfBounds), FsError::Io);
     }
 
     #[test]

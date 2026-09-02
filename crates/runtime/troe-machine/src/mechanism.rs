@@ -482,6 +482,91 @@ pub(crate) const fn classify_used_index(current: u16, observed: u16) -> UsedInde
     }
 }
 
+/// Elapsed milliseconds one block completion may take before the transport
+/// declares its queue dead.
+///
+/// Every synchronous transport shares the value so the two bus drivers cannot
+/// drift. It is deliberately far above any completion this profile observes and
+/// far below the acceptance harness's per-command ceiling, so an expiry stays a
+/// device verdict rather than becoming a harness timeout.
+#[cfg(any(test, target_os = "uefi"))]
+pub(crate) const COMPLETION_BUDGET_MILLIS: u64 = 1_000;
+
+/// Whether a bounded completion wait may continue.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(any(test, target_os = "uefi"))]
+pub(crate) enum CompletionWaitState {
+    /// The bound is not reached and the caller may poll the queue again.
+    Waiting,
+    /// The bound is reached and the caller must treat the queue as dead.
+    Expired,
+}
+
+/// Bound on how long a transport waits for one device completion.
+///
+/// A poll count bounds guest instructions, not elapsed time, and under
+/// emulation nothing ties the two together. The completion is produced by a
+/// separate host thread, so on a contended host this vCPU can burn its whole
+/// count before that thread is scheduled at all, and a device that was only
+/// slow is declared dead. The architected monotonic counter advances whether
+/// or not this vCPU is scheduled, so a bound read from it is a real interval.
+///
+/// The counter is established before any block device is initialized, so the
+/// poll count is only the fallback for a boot that reports none. It bounds the
+/// wait so it terminates, not because it measures anything.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(any(test, target_os = "uefi"))]
+pub(crate) enum CompletionWait {
+    /// Elapsed monotonic milliseconds since the request was published.
+    Deadline {
+        started_millis: u64,
+        budget_millis: u64,
+    },
+    /// Remaining polls when no monotonic counter reports.
+    Polls { remaining: usize },
+}
+
+#[cfg(any(test, target_os = "uefi"))]
+impl CompletionWait {
+    /// Begin a wait bounded by elapsed time, or by `poll_limit` without a clock.
+    pub(crate) const fn new(started_millis: Option<u64>, poll_limit: usize) -> Self {
+        match started_millis {
+            Some(started_millis) => Self::Deadline {
+                started_millis,
+                budget_millis: COMPLETION_BUDGET_MILLIS,
+            },
+            None => Self::Polls {
+                remaining: poll_limit,
+            },
+        }
+    }
+
+    /// Charge one unsuccessful poll and report whether the wait may continue.
+    ///
+    /// A deadline wait whose counter stops reporting expires rather than
+    /// continuing, because the bound it was constructed with no longer exists.
+    pub(crate) const fn poll(&mut self, now_millis: Option<u64>) -> CompletionWaitState {
+        match self {
+            Self::Deadline {
+                started_millis,
+                budget_millis,
+            } => match now_millis {
+                Some(now_millis) if now_millis.wrapping_sub(*started_millis) < *budget_millis => {
+                    CompletionWaitState::Waiting
+                }
+                _ => CompletionWaitState::Expired,
+            },
+            Self::Polls { remaining } => match remaining.checked_sub(1) {
+                Some(left) => {
+                    *remaining = left;
+                    CompletionWaitState::Waiting
+                }
+                None => CompletionWaitState::Expired,
+            },
+        }
+    }
+}
+
 /// Exclusively publish transport ISR state into an empty global slot.
 #[cfg(any(test, target_os = "uefi"))]
 pub(crate) fn claim_network_interrupt_publication(publication: &AtomicUsize, owned: usize) -> bool {
@@ -3667,12 +3752,12 @@ unsafe fn mmio_write64(address: usize, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ActiveNetworkInterrupt, DeactivatedNetworkInterrupt, DmaInitializationPhase,
-        DmaInitializationState, HeapState, InputInterruptError, NetworkInterruptRoute,
-        NetworkInterruptSource, PreparedNetworkInterrupt, TaskStackError, UsedIndexTransition,
-        aarch64_tcr_el1_from_el2, cached_nonzero, claim_network_interrupt_publication,
-        classify_used_index, counter_millis, el2, revoke_network_interrupt_publication,
-        validate_task_stack,
+        ActiveNetworkInterrupt, COMPLETION_BUDGET_MILLIS, CompletionWait, CompletionWaitState,
+        DeactivatedNetworkInterrupt, DmaInitializationPhase, DmaInitializationState, HeapState,
+        InputInterruptError, NetworkInterruptRoute, NetworkInterruptSource,
+        PreparedNetworkInterrupt, TaskStackError, UsedIndexTransition, aarch64_tcr_el1_from_el2,
+        cached_nonzero, claim_network_interrupt_publication, classify_used_index, counter_millis,
+        el2, revoke_network_interrupt_publication, validate_task_stack,
     };
     use core::alloc::Layout;
     use core::cell::Cell;
@@ -3950,6 +4035,54 @@ mod tests {
         state.transfer_ownership();
         assert_eq!(state.phase(), DmaInitializationPhase::OwnershipTransferred);
         assert!(!state.cleanup_requires_reset());
+    }
+
+    #[test]
+    fn completion_wait_bounds_elapsed_time_not_poll_count() {
+        let mut wait = CompletionWait::new(Some(1_000), 1);
+        // A poll count that would already have expired cannot end a wait the
+        // monotonic counter still says is inside its budget: the whole point of
+        // the elapsed bound is that a slow host cannot shorten it.
+        for elapsed in [0, 1, COMPLETION_BUDGET_MILLIS - 1] {
+            assert_eq!(
+                wait.poll(Some(1_000 + elapsed)),
+                CompletionWaitState::Waiting
+            );
+        }
+        assert_eq!(
+            wait.poll(Some(1_000 + COMPLETION_BUDGET_MILLIS)),
+            CompletionWaitState::Expired
+        );
+    }
+
+    #[test]
+    fn completion_wait_survives_a_counter_wrap_and_ends_without_a_counter() {
+        let started = u64::MAX - 2;
+        let mut wrapped = CompletionWait::new(Some(started), 1);
+        assert_eq!(wrapped.poll(Some(1)), CompletionWaitState::Waiting);
+        assert_eq!(
+            wrapped.poll(Some(started.wrapping_add(COMPLETION_BUDGET_MILLIS))),
+            CompletionWaitState::Expired
+        );
+        // A counter that stops reporting removes the bound the wait was built
+        // with, so the wait ends rather than spinning without one.
+        let mut lost = CompletionWait::new(Some(started), 1);
+        assert_eq!(lost.poll(None), CompletionWaitState::Expired);
+    }
+
+    #[test]
+    fn completion_wait_falls_back_to_a_poll_count_without_a_counter() {
+        let mut wait = CompletionWait::new(None, 2);
+        assert_eq!(wait.poll(None), CompletionWaitState::Waiting);
+        assert_eq!(wait.poll(None), CompletionWaitState::Waiting);
+        assert_eq!(wait.poll(None), CompletionWaitState::Expired);
+        // A counter reading that arrives later cannot extend a counter-less
+        // wait, because no start instant was ever recorded to measure from.
+        assert_eq!(wait.poll(Some(0)), CompletionWaitState::Expired);
+        assert_eq!(
+            CompletionWait::new(None, 0).poll(None),
+            CompletionWaitState::Expired
+        );
     }
 
     #[test]

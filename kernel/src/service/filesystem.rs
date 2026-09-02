@@ -713,6 +713,7 @@ pub(crate) const fn application_filesystem_status(error: FsError) -> ReplyStatus
         FsError::Exists => ReplyStatus::Exists,
         FsError::Corrupt => ReplyStatus::Corrupt,
         FsError::Io => ReplyStatus::Io,
+        FsError::Timeout => ReplyStatus::Timeout,
         FsError::Unsupported => ReplyStatus::Unsupported,
         FsError::NotConfigured => ReplyStatus::NotConfigured,
         FsError::NotEmpty => ReplyStatus::NotEmpty,

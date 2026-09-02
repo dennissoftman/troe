@@ -2,7 +2,9 @@
 
 Status: accepted and both QEMU transports implemented, 2026-08-24. The shared
 core, AArch64 `virtio-mmio`, and x86-64 q35 modern virtio PCI transports are
-active and feed the same storage-activation layer.
+active and feed the same storage-activation layer. The completion bound and the
+error an expiry reports are stated below as they are implemented today; an
+earlier poll-count bound reported an expiry as an ordinary device failure.
 
 ## Context
 
@@ -64,8 +66,24 @@ One page-aligned allocation retains each split queue, request header, and status
 for the complete initialized-device lifetime. Payloads are exclusively borrowed
 identity-mapped kernel buffers; an IOMMU or non-identity DMA profile will require
 an explicit mapping capability. Outer-shareable store/load barriers surround
-queue publication and completion observation. Completion polling is bounded.
-On timeout, the driver resets the device and confirms reset before returning.
+queue publication and completion observation.
+
+Completion polling is bounded by elapsed monotonic milliseconds, shared by both
+transports, and not by a poll count. A poll count bounds guest instructions
+rather than time, and under emulation nothing ties the two together: the
+completion is produced by a separate host thread, so on a contended host the
+vCPU can burn its whole count before that thread is scheduled at all, and a
+device that was only slow is declared dead. The architected counter advances
+whether or not the vCPU is scheduled, and it is established before any block
+device is initialized, so a poll count remains only the fallback bound for a
+boot that reports no counter.
+
+An expiry is its own block error, not the device-reported I/O failure. The two
+are different facts: a reported failure is a completed request the device says
+failed, while an expiry leaves the request's outcome unknown. Filesystem
+providers keep the distinction to their own callers, so an application and a
+serial log can tell a slow or dead transport from a media read that failed.
+On expiry, the driver resets the device and confirms reset before returning.
 If reset cannot be confirmed, the kernel parks permanently because no safe
 return can revoke the outstanding DMA pointer.
 
@@ -78,5 +96,9 @@ return can revoke the outstanding DMA pointer.
   selection and a read-only provider read.
 - The synchronous profile is simple enough to audit but does not yet offer
   interrupt-driven throughput.
+- The completion bound is a real interval, so an overloaded host slows a request
+  instead of failing it. An expiry now means the queue did not answer for the
+  whole budget, which is a device verdict rather than a statement about how much
+  CPU the guest received.
 - Enabling an IOMMU, packed queues, multiple in-flight requests, or untrusted
   device isolation requires a new DMA ownership and teardown review.

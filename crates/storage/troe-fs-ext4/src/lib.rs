@@ -5114,7 +5114,7 @@ fn read_raw_device_span<D: BlockDevice>(
     bytes.resize(bytes_wanted, 0);
     region
         .read_blocks(start_block, device_blocks, &mut bytes)
-        .map_err(|_| FsError::Io)?;
+        .map_err(map_block_error)?;
     Ok(bytes)
 }
 
@@ -5134,15 +5134,29 @@ fn read_raw_fs_block<D: BlockDevice>(
     bytes.resize(block_bytes, 0);
     region
         .read_blocks(start, device_blocks_per_fs_block, &mut bytes)
-        .map_err(|_| FsError::Io)?;
+        .map_err(map_block_error)?;
     Ok(bytes)
 }
 
+/// Map one block-capability failure without collapsing distinct conditions.
+///
+/// The match is exhaustive on purpose. A wildcard arm silently turns every
+/// block condition added later into `Io`, which is how a bounded-wait expiry
+/// became indistinguishable from a device-reported read failure.
 const fn map_block_error(error: BlockError) -> FsError {
     match error {
         BlockError::ReadOnly => FsError::ReadOnly,
         BlockError::Unsupported => FsError::Unsupported,
-        _ => FsError::Io,
+        BlockError::Timeout => FsError::Timeout,
+        BlockError::InvalidGeometry
+        | BlockError::InvalidLimits
+        | BlockError::InvalidRegion
+        | BlockError::EmptyTransfer
+        | BlockError::Misaligned
+        | BlockError::OutOfBounds
+        | BlockError::TransferTooLarge
+        | BlockError::BufferLength
+        | BlockError::Device => FsError::Io,
     }
 }
 
@@ -5434,6 +5448,9 @@ mod tests {
         fail_write_at: Option<usize>,
         fail_flush_at: Option<usize>,
         tear_write_at: Option<(usize, u32)>,
+        /// Block condition the next read reports instead of its sectors, so a
+        /// test can name the exact failure the transport would have raised.
+        fail_read_with: Option<BlockError>,
         /// Start block and leading eight bytes of every write in issue order,
         /// so a test names a boundary by what the provider was writing rather
         /// than by a hardcoded index.
@@ -5452,6 +5469,7 @@ mod tests {
                 fail_write_at: None,
                 fail_flush_at: None,
                 tear_write_at: None,
+                fail_read_with: None,
                 issued: Vec::new(),
             })
         }
@@ -5521,6 +5539,9 @@ mod tests {
                     .is_none_or(|end| end > self.blocks)
             {
                 return Err(BlockError::Device);
+            }
+            if let Some(error) = self.fail_read_with.take() {
+                return Err(error);
             }
             for index in 0..u64::from(block_count) {
                 let sector = self.sector(start_block + index);
@@ -6825,6 +6846,42 @@ mod tests {
         );
         mount_device_writable(device.clone())?;
         Ok(outcome)
+    }
+
+    /// A metadata read is the shortest path from an application to the block
+    /// transport, so every block condition it can raise has to arrive as its
+    /// own filesystem error. Collapsing them made an intermittent bounded-wait
+    /// expiry on `virtio-mmio` indistinguishable from a device that reported a
+    /// failed read, which is the whole diagnostic value of the distinction.
+    #[test]
+    fn a_metadata_read_reports_each_block_condition_distinctly() -> Result<(), FsError> {
+        for (raised, expected) in [
+            (BlockError::Timeout, FsError::Timeout),
+            (BlockError::Device, FsError::Io),
+            (BlockError::Unsupported, FsError::Unsupported),
+            (BlockError::ReadOnly, FsError::ReadOnly),
+            (BlockError::OutOfBounds, FsError::Io),
+        ] {
+            let device = power_loss_device()?;
+            let mut ext4 = mount_device_writable(device.clone())?;
+            assert_eq!(
+                ext4.metadata("/hello")?.byte_count,
+                4101,
+                "the mounted image must answer before a fault is injected"
+            );
+            device.device().fail_read_with = Some(raised);
+            assert_eq!(
+                ext4.metadata("/hello").err(),
+                Some(expected),
+                "a {raised:?} block read must reach the caller as {expected:?}"
+            );
+            // The injected condition is consumed by the read that observed it,
+            // so the very next metadata read of the same path succeeds. That is
+            // the observed acceptance shape: one failed read between two good
+            // ones, with the media never in doubt.
+            assert_eq!(ext4.metadata("/hello")?.byte_count, 4101);
+        }
+        Ok(())
     }
 
     #[test]

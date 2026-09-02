@@ -8,7 +8,7 @@ extern crate std;
 
 use alloc::string::String;
 use alloc::{vec, vec::Vec};
-use troe_block::{BlockDevice, BlockRegion};
+use troe_block::{BlockDevice, BlockError, BlockRegion};
 use troe_fs_api::{DirEntry, FileMetadata, FileSystemProvider, FsError, NodeKind, ProviderListing};
 use troe_txslot::{DualSlotStore, PersistError};
 
@@ -310,6 +310,7 @@ fn map_persist(error: PersistError) -> FsError {
         PersistError::PayloadTooLarge | PersistError::MetadataExhausted => FsError::NoSpace,
         PersistError::Corrupt => FsError::Corrupt,
         PersistError::UnsupportedRegion | PersistError::GenerationExhausted => FsError::Unsupported,
+        PersistError::Block(BlockError::Timeout) => FsError::Timeout,
         PersistError::Block(_) => FsError::Io,
     }
 }
