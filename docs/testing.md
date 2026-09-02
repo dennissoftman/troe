@@ -65,6 +65,85 @@ coverage is unnecessary; the full pinned gate must still run on the merge
 runner. `--require-filesystem-tools` makes absence of the exact external FAT32
 and ext4 interoperability tools an error.
 
+## Application and service gates
+
+`apps/` and `services/` are each one Cargo workspace with one committed
+`Cargo.lock`. Their members inherit `[workspace.package]` and
+`[workspace.lints]` and declare neither a workspace root nor a release profile
+of their own, so the shipped commands and services are inside the format, lint,
+and test gates rather than beside them.
+
+The exhaustive runner covers them with five kinds of gate:
+
+- `cargo fmt (applications)` and `cargo fmt (services)` check the whole tree.
+- `clippy app (<command>)` and `clippy service (<name>)` lint one package at a
+  time for `x86_64-unknown-none` and `aarch64-unknown-none` at `-D warnings`.
+  One package at a time is required, not tidier: Cargo unifies features across
+  everything it builds together, and `ls` and `mem` take `troe-kex-runtime`
+  without the `alloc` feature that `cp`, `mv`, and `rm` enable. A single
+  workspace-wide build would lint those two against a feature set they never
+  ship with, and would fail to compile for want of a global allocator.
+- `clippy applications (host unit tests)` lints the library test modules on the
+  host, which is where they run.
+- `cargo test applications` runs the 31 library unit tests in `awk`, `grep`,
+  `printf`, `sed`, `tar`, `timesync`, and `wc`. A command binary is
+  `#![no_main]` and declares `test = false`, so `--tests` and `--lib` reach the
+  library targets only; the binaries cannot host a test harness on either a bare
+  target or the host.
+- `kex shared app (lua)` builds the one shared-volume deliverable the gate can
+  build. A shared-volume application ships no committed `.kex`, so there is no
+  `kex app (<command>)` byte-for-byte `--check` for it and nothing short of a
+  QEMU acceptance run would otherwise compile it. Building it here keeps
+  `cargo kex build` covered for every member it can reach.
+
+`python` is excluded from the lint, test, and build gates. Its build script
+consumes the CPython tree that `tools/build_cpython.py` generates outside the
+repository, so reaching it would make an out-of-tree build a prerequisite of
+`cargo clippy`; its Rust bridge is covered by `test_cpython_integration.py`
+instead. `lua` is included: the Python suite already compiles its vendored C
+runtime.
+
+That exclusion is a real hole, not a technicality: `unsafe_code = "deny"` and
+the `unwrap_used`, `expect_used`, and `panic` denies are declared for the whole
+tree but never compiled against `apps/python/src/main.rs` or
+`apps/python/build.rs`, and the `#![allow(...)]` in that build script is
+therefore inert. Two policy tests substitute for the missing compiler pass:
+`test_the_unlinted_member_keeps_the_denied_constructs_out` fails if a shipped
+`python` source grows an `unwrap`, `expect`, or explicit panic, and
+`test_every_unsafe_opt_in_is_named_at_its_crate_root` holds its undocumented
+`unsafe` count to a shrink-only ceiling. Neither substitutes for
+`clippy::pedantic`; `python` alone is held to a lower standard than the other
+38 applications. That build script keeps its `#![allow(...)]` header even
+though nothing compiles it: the header states why a build script may panic, it
+is identical to the one in `apps/lua/build.rs` that clippy does enforce, and
+`test_panicking_allowance_stays_inside_build_scripts` names both files, so the
+day `python` re-enters the lint gate the exemption is already correct rather
+than a new finding.
+
+Both trees start from the root workspace's lint levels and deviate in two ways,
+each recorded in the workspace manifest next to the setting:
+
+- `unsafe_code` is `deny` rather than `forbid`. Four members genuinely need
+  `unsafe` -- the Lua and CPython FFI bridges, `mem` reading pages it mapped for
+  itself, and the fault-injection service trapping on purpose -- and `forbid`
+  cannot be lifted. Each of the four opts in with one crate-level
+  `#![allow(unsafe_code)]` and a stated reason.
+- `missing_docs` and seventeen named `clippy` lints are `allow`. Each is a lint
+  the shipped sources violate today. A panic location records the file and line
+  of its call site, so every `.kex` package embeds the line numbers of its own
+  sources: fixing any of these findings moves a line and rewrites a committed
+  binary artifact. Every other lint in `clippy::all` and `clippy::pedantic`
+  stays on, and `unwrap_used`, `expect_used`, and `panic` stay `deny`.
+
+`scripts/test_changed.py` selects the same gates for a changed application:
+formatting, both bare-metal clippy targets, and, when the package has a library,
+its host lint and unit tests. A changed command is checked byte-for-byte against
+its committed artifact; a changed shared-volume application is built instead,
+because it has no committed artifact to compare against. Changing
+`apps/Cargo.toml`, `apps/Cargo.lock`, or either services counterpart widens to
+the full gate, and changing `apps/common.rs`, which 33 commands include, widens
+to every application gate and every QEMU scenario.
+
 ## QEMU scenario groups
 
 `scripts/test-qemu.py` accepts a repeatable `--scenario` option. Omitting it is

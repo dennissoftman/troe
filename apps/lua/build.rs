@@ -1,3 +1,8 @@
+// A build script fails the build by panicking: there is no caller to return an
+// error to, and a missing C toolchain or generated tree must stop the build
+// with a named reason rather than emit a half-configured artifact.
+#![allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
+
 use std::{env, path::PathBuf, process::Command};
 
 fn main() {
@@ -14,9 +19,10 @@ fn main() {
         .arg("-print-resource-dir")
         .output()
         .unwrap_or_else(|error| panic!("failed to query clang resource directory: {error}"));
-    if !resource.status.success() {
-        panic!("clang could not report its resource directory");
-    }
+    assert!(
+        resource.status.success(),
+        "clang could not report its resource directory"
+    );
     let resource = String::from_utf8(resource.stdout)
         .unwrap_or_else(|error| panic!("clang resource directory was not UTF-8: {error}"));
     let resource_include = PathBuf::from(resource.trim()).join("include");
@@ -78,9 +84,10 @@ fn main() {
     let status = command
         .status()
         .unwrap_or_else(|error| panic!("failed to compile Lua runtime: {error}"));
-    if !status.success() {
-        panic!("failed to compile the freestanding Lua runtime");
-    }
+    assert!(
+        status.success(),
+        "failed to compile the freestanding Lua runtime"
+    );
 
     println!("cargo:rustc-link-arg={}", output.display());
     println!("cargo:rerun-if-changed={}", source.display());

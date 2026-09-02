@@ -1,0 +1,47 @@
+[workspace]
+resolver = "3"
+members = [
+    "diagnostics",
+    "diagnostics-benchmark",
+    "diagnostics-fault",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "Apache-2.0"
+publish = false
+
+# Parity with the root workspace, with one deliberate divergence.
+#
+# `unsafe_code` is `deny` here rather than the root's `forbid`, because the
+# fault-injection service exists to trap on purpose and needs a raw write.
+# `forbid` cannot be lifted, so it would push that package back out of the lint
+# gate entirely. `deny` keeps the other services strict and turns the exception
+# into a crate-level `#![allow(unsafe_code)]` with a stated reason that a
+# reviewer can find.
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+# `missing_docs` is `allow` here, unlike the root workspace's `warn`.
+#
+# A service is a `#![no_std] #![no_main]` binary whose only public item is the
+# entry point the `entry!` macro generates, so the crate-level and entry-point
+# documentation the lint asks for has no reader. All three members are such
+# binaries; this tree has no library target for the lint to speak to.
+missing_docs = "allow"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[profile.release]
+codegen-units = 1
+lto = false
+opt-level = "z"
+panic = "abort"
+strip = "none"

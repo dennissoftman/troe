@@ -323,28 +323,19 @@ fn selected_time(metadata: filesystem::Metadata, field: TimeField) -> Option<u64
 /// A provider that stores no timestamp reports `None`, and so does one whose
 /// entry was never stamped, so an absent time is rendered as blank rather than
 /// as the epoch.
-fn write_time(
-    output: &mut StandardOutput,
-    unix_seconds: Option<u64>,
-) -> Result<(), ()> {
+fn write_time(output: &mut StandardOutput, unix_seconds: Option<u64>) -> Result<(), ()> {
     let Some(seconds) = unix_seconds else {
-        return output
-            .write_all(&[b' '; TIME_COLUMN_BYTES])
-            .map_err(|_| ());
+        return output.write_all(&[b' '; TIME_COLUMN_BYTES]).map_err(|_| ());
     };
     let Ok(seconds) = i64::try_from(seconds) else {
-        return output
-            .write_all(&[b' '; TIME_COLUMN_BYTES])
-            .map_err(|_| ());
+        return output.write_all(&[b' '; TIME_COLUMN_BYTES]).map_err(|_| ());
     };
     let time = calendar::from_unix_seconds(seconds);
     // `YYYY-MM-DD HH:MM` is exactly the column width, so the field is filled
     // positionally rather than formatted and padded.
     let mut column = [b'-'; TIME_COLUMN_BYTES];
     let Ok(year) = u16::try_from(time.year) else {
-        return output
-            .write_all(&[b' '; TIME_COLUMN_BYTES])
-            .map_err(|_| ());
+        return output.write_all(&[b' '; TIME_COLUMN_BYTES]).map_err(|_| ());
     };
     let pairs = [
         (0, year / 100),

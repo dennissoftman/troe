@@ -4,9 +4,7 @@
 #[path = "../../common.rs"]
 mod common;
 
-use troe_kex_sdk::{
-    CommandContext, Error, FilesystemMutation, ReadOnlyFilesystem, entry, exit,
-};
+use troe_kex_sdk::{CommandContext, Error, FilesystemMutation, ReadOnlyFilesystem, entry, exit};
 
 const SYNOPSIS: &[u8] = b"touch [-c] [-d SECONDS] FILE...";
 

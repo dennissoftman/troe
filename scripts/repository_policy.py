@@ -7,6 +7,7 @@ import datetime
 import json
 import re
 import sys
+import tomllib
 from pathlib import Path
 from typing import Sequence
 
@@ -20,6 +21,16 @@ _EXCEPTION_FIELDS = {"advisory", "owner", "rationale", "expires"}
 
 SHARED_VOLUME_APPLICATIONS = frozenset({"lua", "python"})
 
+# The two bare-metal targets every command and service is compiled for.
+KEX_TARGETS = ("x86_64-unknown-none", "aarch64-unknown-none")
+
+# `python` is the one member the lint and test gates cannot reach from a clean
+# checkout: its build script consumes the CPython tree that
+# `tools/build_cpython.py` generates outside the repository, so linting it would
+# make an out-of-tree build a prerequisite of `cargo clippy`. Its Rust bridge is
+# covered by `test_cpython_integration.py` instead.
+UNLINTABLE_APPLICATIONS = frozenset({"python"})
+
 
 def application_directories(root: Path = REPO_ROOT) -> tuple[Path, ...]:
     """Return every application directory in deterministic order."""
@@ -29,6 +40,42 @@ def application_directories(root: Path = REPO_ROOT) -> tuple[Path, ...]:
             for path in (root / "apps").iterdir()
             if path.is_dir() and (path / "Cargo.toml").is_file()
         )
+    )
+
+
+def service_directories(root: Path = REPO_ROOT) -> tuple[Path, ...]:
+    """Return every isolated user-service directory in deterministic order."""
+    return tuple(
+        sorted(
+            path
+            for path in (root / "services").iterdir()
+            if path.is_dir() and (path / "Cargo.toml").is_file()
+        )
+    )
+
+
+def lintable_application_directories(root: Path = REPO_ROOT) -> tuple[Path, ...]:
+    """Return the applications the format, lint, and test gates can compile."""
+    return tuple(
+        path
+        for path in application_directories(root)
+        if path.name not in UNLINTABLE_APPLICATIONS
+    )
+
+
+def package_name(directory: Path) -> str:
+    """Return the Cargo package name one member manifest declares."""
+    manifest = tomllib.loads((directory / "Cargo.toml").read_text(encoding="utf-8"))
+    return str(manifest["package"]["name"])
+
+
+def unlintable_application_exclusions(root: Path = REPO_ROOT) -> tuple[str, ...]:
+    """Return the ``--exclude`` arguments that drop unlintable members."""
+    return tuple(
+        argument
+        for directory in application_directories(root)
+        if directory.name in UNLINTABLE_APPLICATIONS
+        for argument in ("--exclude", package_name(directory))
     )
 
 
@@ -42,6 +89,24 @@ def rootfs_application_directories(root: Path = REPO_ROOT) -> tuple[Path, ...]:
         path
         for path in application_directories(root)
         if path.name not in SHARED_VOLUME_APPLICATIONS
+    )
+
+
+def buildable_shared_volume_directories(root: Path = REPO_ROOT) -> tuple[Path, ...]:
+    """Return the shared-volume applications ``cargo kex build`` can build here.
+
+    A shared-volume deliverable ships no committed ``.kex``, so there is no
+    byte-for-byte ``--check`` to run for it and nothing outside a QEMU
+    acceptance run builds one. Building it is therefore the only thing that
+    proves the builder still reaches it. ``python`` is excluded for the same
+    reason it is unlintable: its build script consumes the CPython tree
+    ``tools/build_cpython.py`` generates outside the repository.
+    """
+    return tuple(
+        path
+        for path in application_directories(root)
+        if path.name in SHARED_VOLUME_APPLICATIONS
+        and path.name not in UNLINTABLE_APPLICATIONS
     )
 
 

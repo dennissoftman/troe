@@ -1,9 +1,11 @@
 #![no_std]
 #![no_main]
+// Executes one illegal instruction on purpose: this service exists to prove
+// that a faulting server is contained and reclaimed. Both blocks carry a
+// SAFETY note saying so.
+#![allow(unsafe_code)]
 
-use troe_kex_sdk::{
-    SERVER_REQUEST_BUFFER_BYTES, ServerContext, exit, server_entry,
-};
+use troe_kex_sdk::{SERVER_REQUEST_BUFFER_BYTES, ServerContext, exit, server_entry};
 
 fn main(server: &mut ServerContext) -> u32 {
     let mut request_bytes = [0_u8; SERVER_REQUEST_BUFFER_BYTES];

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-exclude = ["apps/*", "services/*"]
+exclude = ["apps", "services"]
 members = [
     "crates/*/*",
     "host",
