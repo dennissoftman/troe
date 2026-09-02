@@ -240,7 +240,7 @@ class Ext4JournalCapacityTests(unittest.TestCase):
             r"pub\(crate\) const MAX_TRANSACTION_BLOCKS: usize = ([0-9_]+);", source
         )
         self.assertIsNotNone(
-            declaration, "troe-ext4 must declare a transaction ceiling"
+            declaration, "troe-fs-ext4 must declare a transaction ceiling"
         )
         assert declaration is not None
         ceiling = int(declaration.group(1).replace("_", ""))
