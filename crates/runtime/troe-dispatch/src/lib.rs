@@ -6,6 +6,7 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+mod badge;
 mod dispatcher;
 mod endpoint;
 mod message;
@@ -13,6 +14,9 @@ mod services;
 
 use core::fmt;
 
+pub use badge::{
+    BadgeClosure, BadgeStats, BadgeTable, ClientBadge, MAX_BADGES_PER_ENDPOINT, MAX_CLIENT_BADGES,
+};
 pub use dispatcher::{DispatchStats, Dispatcher, Service};
 pub use endpoint::{
     EndpointBinding, EndpointId, EndpointLimits, EndpointStats, EndpointTable, InterfaceSet,
@@ -65,6 +69,10 @@ pub enum DispatchError {
     InvalidEndpoint,
     /// An interface is unassigned, duplicated, or outside an endpoint's set.
     InvalidInterface,
+    /// No reusable client-badge slot remains, system-wide or at one endpoint.
+    BadgeCapacityExhausted,
+    /// A stale, retired, closed, or unoccupied client badge was supplied.
+    InvalidBadge,
     /// A monotonic request or accounting counter overflowed.
     AccountingOverflow,
 }
@@ -89,6 +97,8 @@ impl fmt::Display for DispatchError {
             }
             Self::InvalidEndpoint => formatter.write_str("service endpoint is invalid"),
             Self::InvalidInterface => formatter.write_str("service interface is invalid"),
+            Self::BadgeCapacityExhausted => formatter.write_str("client badge capacity exhausted"),
+            Self::InvalidBadge => formatter.write_str("client badge is invalid"),
             Self::AccountingOverflow => formatter.write_str("dispatch accounting overflowed"),
         }
     }
