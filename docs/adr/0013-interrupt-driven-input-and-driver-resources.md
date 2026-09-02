@@ -2,6 +2,15 @@
 
 Status: accepted, 2026-08-23.
 
+Controller amendment, 2026-08-31: both AArch64 platforms drive GICv3, and the
+version 2 driver this ADR pinned was not retained. The CPU interface moved from
+an MMIO aperture to the `ICC_*` system registers, private interrupts are
+configured in the redistributor SGI frame rather than the distributor, and
+shared interrupts route by affinity through `GICD_IROUTER` rather than a target
+bitmask. ITS and LPI support is deliberately absent. The GICv2 statement below
+preserves the original Stage 5.2 decision; `docs/architecture.md` records the
+current invariants.
+
 Stage 5.2 replaces the owned shell's busy input polling with interrupt-driven
 delivery while retaining polling for bootstrap and fatal recovery. Interrupts
 are a hardware notification mechanism; the portable consumer interface is a

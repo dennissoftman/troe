@@ -3273,10 +3273,10 @@ fn architecture_enable_input_interrupts() {
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 fn architecture_wait_for_input_interrupt() {
-    // SAFETY: GICC_PMR leaves the owned IRQ eligible as a WFI wake source even
-    // while PSTATE.I prevents exception entry. Sleeping masked closes the race
-    // where a handler could run after unmask but before WFI. After wake, the
-    // brief unmask dispatches the pending handler; the final mask restores
+    // SAFETY: ICC_PMR_EL1 leaves the owned IRQ eligible as a WFI wake source
+    // even while PSTATE.I prevents exception entry. Sleeping masked closes the
+    // race where a handler could run after unmask but before WFI. After wake,
+    // the brief unmask dispatches the pending handler; the final mask restores
     // exclusive queue access before the caller rechecks it.
     unsafe {
         core::arch::asm!(

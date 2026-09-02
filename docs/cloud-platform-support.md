@@ -231,8 +231,8 @@ QEMU result.
 
 The accepted x86 QEMU contract uses q35 with a deterministic injected SPCR,
 ACPI-discovered ECAM/APIC topology, the FADT PM timer, and reset-only lifecycle
-control. The accepted AArch64 contract pins QEMU `virt,gic-version=2,acpi=off`
-and validates the edk2-published FDT for GICv2, PSCI-HVC, PL011, timer, RAM, and
+control. The accepted AArch64 contract pins QEMU `virt,gic-version=3,acpi=off`
+and validates the edk2-published FDT for GICv3, PSCI-HVC, PL011, timer, RAM, and
 virtio-MMIO. These are exact environment claims, not generic q35/`virt` or
 provider-cloud claims. Acceptance of the first production deployment is tracked
 in [GitHub issue #5](https://github.com/dennissoftman/troe/issues/5).

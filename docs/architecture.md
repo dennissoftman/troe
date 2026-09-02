@@ -303,8 +303,8 @@ capacity and maximum ISR drain come from the Standard portable policy;
 controller routes, vectors, trigger/polarity, and priority come from the
 validated VM platform descriptor. The pinned x86-64 platform
 masks the legacy PIC, owns LAPIC/I/O APIC, and routes COM1 and keyboard receive
-interrupts through explicit IDT gates. The pinned AArch64 platform owns GICv2
-and routes PL011 through its IRQ vector. Handlers preserve interrupted CPU
+interrupts through explicit IDT gates. Both AArch64 platforms own GICv3 and
+route PL011 through the IRQ vector. Handlers preserve interrupted CPU
 state, perform bounded non-allocating device work, and enqueue typed raw bytes;
 decoding and editing remain in main context. An empty queue executes a
 lost-wakeup-safe `sti; hlt` or IRQ-masked `dsb; wfi` transition followed by
@@ -662,9 +662,21 @@ tests, and all four exhaustive QEMU platform suites together. q35 and QEMU
 
 ### AArch64 QEMU `virt` profile
 
-- The pinned profile uses GICv2. Distributor loops are bounded by
-  `GICD_TYPER`; PL011 INTID 33 and each virtio SPI are validated before enable.
-  GICv3 or a different firmware security state requires a distinct review.
+- Both named AArch64 platforms use GICv3, the only generation the platform
+  descriptors describe. FDT discovery still parses a GICv2 device tree, but
+  only to reject it, and no mechanism drives version 2. Distributor loops are
+  bounded by `GICD_TYPER`; PL011 INTID 33 and each virtio SPI are validated
+  against it before enable. A different firmware security state, or the ITS
+  and LPI support this profile omits, requires a distinct review.
+- The CPU interface is the `ICC_*` system registers rather than an MMIO
+  aperture, and `ICC_SRE_EL1` precedes the remaining interface writes.
+  `GICR_WAKER` wakes the redistributor before any enable, because it delivers
+  nothing while asleep and acknowledges the wake asynchronously. Private
+  interrupts are configured in its SGI frame; the distributor's registers below
+  INTID 32 are RES0 once `GICD_CTLR.ARE_NS` routes by affinity, which must be
+  live before the enable write so the `GICD_IROUTER` route is the one
+  consulted. Owned interrupts are non-secure group 1, so their `GICD_IGROUPR`
+  bit is set where version 2 cleared it.
 - The IRQ vector preserves x0–x30, q0–q31, FPCR/FPSR, and the saved exception
   origin before Rust. Synchronous, FIQ, and SError paths that are not the lower
   application gate remain fatal.

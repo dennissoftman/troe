@@ -3,6 +3,10 @@
 Status: accepted and implemented for Stage 8; amended by the networking
 usability, transport-safety, and scalable-table increments, 2026-08-28.
 
+Controller amendment, 2026-08-31: virtio used-buffer interrupts reach AArch64
+through a GICv3 SPI rather than the GICv2 SPI named below. See
+[ADR 0013](0013-interrupt-driven-input-and-driver-resources.md).
+
 The first supported NIC is modern virtio-net on the existing AArch64 MMIO and
 x86-64 PCI buses. The initial device profile negotiates no checksum, segment,
 mergeable-buffer, control-queue, multiqueue, packed-ring, or guest-offload
