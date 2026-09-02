@@ -1,7 +1,4 @@
-/target/
-/apps/target/
-/services/target/
-/tests/runtime-probe/target/
+target/
 /build/
 /.claude/worktrees/
 .DS_Store
