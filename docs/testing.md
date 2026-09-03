@@ -509,11 +509,30 @@ part of the current contract.
 
 ## Maintainer merge and release gates
 
-The repository intentionally has no GitHub Actions workflow. The maintainer
-runs `python3 scripts/test.py --require-filesystem-tools` locally before a
-merge. This exhaustive behavioral gate accepts QEMU `8.x` through `11.x`,
-structurally valid matching distribution UEFI firmware, and e2fsprogs `1.47.x`;
-the ext4 byte verifier and all guest scenarios remain unchanged.
+The merge gate runs on GitHub Actions, in `.github/workflows/gate.yml`. It
+runs the same gates as a local invocation and accepts the same compatible tool
+policy: QEMU `8.x` through `11.x`, structurally valid matching distribution
+UEFI firmware, and e2fsprogs `1.47.x`. The ext4 byte verifier and all guest
+scenarios are unchanged.
+
+Two properties are specific to the hosted run. Each named platform gets its own
+runner, so the fixed acceptance UDP ports cannot collide the way two overlapping
+runs on one machine do. And the work is selected by `scripts/test_changed.py`
+from the changed paths rather than always running everything, so a
+documentation-only change runs one policy test instead of rebuilding the kernel
+and booting four VMs. The selector owns that mapping; the workflow does not
+restate it. A change under `.github/workflows/` escalates to the exhaustive
+gate, so the workflow cannot weaken its own coverage unobserved.
+
+`aarch64-sbsa-ref` has no distribution firmware, so its job builds the pinned
+edk2 and Trusted Firmware-A banks and caches them against
+`tools/sbsa-firmware-sources.lock.json`. A restored cache is still verified
+against the `MANIFEST.sha256` its builder wrote.
+
+Running the gate locally remains supported and is unchanged:
+`python3 scripts/test.py --require-filesystem-tools`. Prefer the hosted run for
+routine verification; a local run is the faster answer when iterating on a
+failure that reproduces on the developer's own machine.
 
 Release-grade reproducibility evidence uses
 

@@ -35,6 +35,12 @@
 
 ## QEMU verification on macOS
 
+- Prefer the hosted gate. `.github/workflows/gate.yml` runs the same gates on
+  GitHub Actions, one runner per platform, with the work selected from the
+  changed paths. It avoids the sandbox problem below entirely, and it avoids
+  the acceptance-port collision that two overlapping local runs produce. Run
+  the gate locally when iterating on a failure that reproduces on this machine,
+  or when producing release evidence, which requires pinned local tools.
 - QEMU acceptance requires process-control operations that the default Codex
   workspace sandbox denies on macOS. Running it in the sandbox can complete all
   earlier build and test stages before failing with
