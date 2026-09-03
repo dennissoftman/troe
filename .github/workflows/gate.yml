@@ -1,0 +1,322 @@
+name: gate
+
+# The merge gate is `scripts/test.py`: 105 gates, including exhaustive QEMU
+# acceptance on all four named platforms. Run serially on one machine it takes
+# 12-15 minutes, every session queues behind every other, and two overlapping
+# runs collide on the fixed acceptance UDP ports.
+#
+# This workflow runs the same gates with two properties the local run cannot
+# have. Each platform gets a dedicated runner, so a port collision is not
+# expressible. And the work is selected from the changed paths by
+# `scripts/test_changed.py` rather than always running everything, so a
+# documentation-only change does not rebuild the kernel or boot a VM.
+#
+# The selector owns that taxonomy, not this file. It already maps `.md`,
+# `docs/` and `skills/` paths to a single policy test, escalates build and
+# toolchain files to the exhaustive gate, and falls back to the exhaustive gate
+# for any path without a reviewed impact rule. Duplicating those rules in YAML
+# would let CI and the local run disagree.
+#
+# Tool policy is the compatible one, not `--strict-tool-versions`: strict mode
+# pins QEMU 11.1.0 and e2fsprogs 1.47.4 as release evidence, which a
+# distribution runner cannot supply. Release evidence stays a local, pinned
+# activity documented in docs/testing.md.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# A newer push supersedes an in-flight run for the same ref.
+concurrency:
+  group: gate-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  select:
+    name: select verification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      exhaustive: ${{ steps.plan.outputs.exhaustive }}
+      base: ${{ steps.plan.outputs.base }}
+    steps:
+      # The selector diffs a base revision against the worktree, so it needs
+      # real history rather than a single-commit clone.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Select verification from changed paths
+        id: plan
+        run: |
+          set -euo pipefail
+          if [ -n "${{ github.event.pull_request.base.sha }}" ]; then
+            base='${{ github.event.pull_request.base.sha }}'
+          elif [ -n "${{ github.event.before }}" ] \
+            && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ] \
+            && git cat-file -e '${{ github.event.before }}^{commit}' 2>/dev/null; then
+            base='${{ github.event.before }}'
+          else
+            base="$(git rev-parse HEAD~1)"
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "Comparing against $base"
+
+          python3 scripts/test_changed.py --base "$base" --dry-run --explain \
+            | tee plan.txt
+
+          # A plan that requires the exhaustive gate renders exactly one
+          # command, scripts/test.py. Anything else is a focused subset.
+          if grep -qE 'scripts/test\.py' plan.txt; then
+            echo 'exhaustive=true' >> "$GITHUB_OUTPUT"
+            echo '### Exhaustive gate selected' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'exhaustive=false' >> "$GITHUB_OUTPUT"
+            echo '### Focused verification selected' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          {
+            echo '```'
+            cat plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  focused:
+    name: focused verification
+    needs: select
+    if: needs.select.outputs.exhaustive == 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      # A focused plan can still select QEMU scenario groups, so this job
+      # installs the same tools the exhaustive jobs use.
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang lld llvm pkg-config libssl-dev \
+            qemu-system-x86 qemu-system-arm ovmf qemu-efi-aarch64 \
+            e2fsprogs dosfstools mtools
+          python3 -m pip install --disable-pip-version-check --quiet ruff
+
+      - name: Cache cargo and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-focused-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-focused-
+
+      - name: Run focused verification
+        run: |
+          python3 scripts/test_changed.py \
+            --base '${{ needs.select.outputs.base }}' \
+            --explain \
+            --require-filesystem-tools \
+            --require-python-tools
+
+  host:
+    name: host gates
+    needs: select
+    if: needs.select.outputs.exhaustive == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # The repository tools require Python 3.13 or newer; 24.04 ships 3.12.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install host tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang lld llvm pkg-config libssl-dev \
+            e2fsprogs dosfstools mtools
+          python3 -m pip install --disable-pip-version-check --quiet ruff
+
+      - name: Cache cargo and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-host-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-host-
+
+      # rustup reads rust-toolchain.toml, so the channel, profile, components
+      # and all four bare-metal targets install without being named here.
+      - name: Show toolchain
+        run: rustc --version && cargo --version
+
+      - name: Run host gates
+        run: |
+          python3 scripts/test.py \
+            --skip-qemu \
+            --require-filesystem-tools \
+            --require-python-tools \
+            --progress-interval 60
+
+  acceptance:
+    name: acceptance ${{ matrix.platform }}
+    needs: select
+    if: needs.select.outputs.exhaustive == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      # One platform's failure must not hide another's result.
+      fail-fast: false
+      matrix:
+        platform:
+          - x86_64-q35-uefi
+          - x86_64-uefi-virtio-pci
+          - aarch64-uefi-virtio-mmio
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      # `ovmf` installs /usr/share/OVMF and `qemu-efi-aarch64` installs
+      # /usr/share/AAVMF. Both directories and both filename spellings are
+      # already in the firmware search list in scripts/qemu_profile.py.
+      - name: Install QEMU, firmware, and filesystem tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang lld llvm pkg-config libssl-dev \
+            qemu-system-x86 qemu-system-arm ovmf qemu-efi-aarch64 \
+            e2fsprogs dosfstools mtools
+          qemu-system-x86_64 --version | head -1
+          qemu-system-aarch64 --version | head -1
+
+      - name: Cache cargo and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ matrix.platform }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ matrix.platform }}-
+
+      - name: Run QEMU acceptance
+        run: |
+          python3 scripts/test-qemu.py \
+            --platform ${{ matrix.platform }} \
+            --environment qemu
+
+  acceptance-sbsa:
+    name: acceptance aarch64-sbsa-ref
+    needs: select
+    if: needs.select.outputs.exhaustive == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install QEMU, firmware build tools, and filesystem tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang lld llvm pkg-config libssl-dev \
+            acpica-tools uuid-dev nasm python3-dev \
+            qemu-system-arm \
+            e2fsprogs dosfstools mtools
+          qemu-system-aarch64 --version | head -1
+
+      # This platform has no distribution firmware. Its banks are edk2 plus
+      # Trusted Firmware-A built from the revisions pinned in
+      # tools/sbsa-firmware-sources.lock.json, so the result is reproducible
+      # and worth caching. The key covers the lock file and the builder, the
+      # tree is restored to the directory the firmware search checks first, and
+      # the builder's own MANIFEST.sha256 is what acceptance verifies it
+      # against, so a restored cache is checked rather than trusted.
+      - name: Cache SBSA reference firmware
+        id: sbsa-firmware
+        uses: actions/cache@v4
+        with:
+          path: build/sbsa-firmware
+          key: sbsa-firmware-${{ hashFiles('tools/sbsa-firmware-sources.lock.json', 'tools/build_sbsa_firmware.py') }}
+
+      - name: Build SBSA reference firmware
+        if: steps.sbsa-firmware.outputs.cache-hit != 'true'
+        run: python3 tools/build_sbsa_firmware.py
+
+      - name: Cache cargo and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-sbsa-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-sbsa-
+
+      - name: Run QEMU acceptance
+        run: |
+          python3 scripts/test-qemu.py \
+            --platform aarch64-sbsa-ref \
+            --environment qemu
+
+  # One job to require in branch protection. It succeeds when every selected
+  # job succeeded and fails if any did, so protecting this single check works
+  # for a focused plan and an exhaustive one alike; a job skipped by selection
+  # is not a failure.
+  gate:
+    name: gate
+    needs: [select, focused, host, acceptance, acceptance-sbsa]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check selected results
+        run: |
+          set -euo pipefail
+          printf 'select          %s\n' '${{ needs.select.result }}'
+          printf 'focused         %s\n' '${{ needs.focused.result }}'
+          printf 'host            %s\n' '${{ needs.host.result }}'
+          printf 'acceptance      %s\n' '${{ needs.acceptance.result }}'
+          printf 'acceptance-sbsa %s\n' '${{ needs['acceptance-sbsa'].result }}'
+          for result in \
+            '${{ needs.select.result }}' \
+            '${{ needs.focused.result }}' \
+            '${{ needs.host.result }}' \
+            '${{ needs.acceptance.result }}' \
+            '${{ needs['acceptance-sbsa'].result }}'; do
+            case "$result" in
+              success|skipped) ;;
+              *) echo "a selected gate did not succeed"; exit 1 ;;
+            esac
+          done
+          echo 'every selected gate succeeded'
