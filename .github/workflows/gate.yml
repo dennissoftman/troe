@@ -121,7 +121,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             clang lld llvm pkg-config libssl-dev \
-            qemu-system-x86 qemu-system-arm ovmf qemu-efi-aarch64 \
+            qemu-system-x86 qemu-system-arm qemu-system-data \
+            ovmf qemu-efi-aarch64 \
             e2fsprogs dosfstools mtools
           # Pinned: an unpinned linter changes the gate's verdict whenever
           # upstream releases. A newer ruff enabled PLR0917 and failed 8 files
@@ -241,7 +242,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             clang lld llvm pkg-config libssl-dev \
-            qemu-system-x86 qemu-system-arm ovmf qemu-efi-aarch64 \
+            qemu-system-x86 qemu-system-arm qemu-system-data \
+            ovmf qemu-efi-aarch64 \
             e2fsprogs dosfstools mtools
           qemu-system-x86_64 --version | head -1
           qemu-system-aarch64 --version | head -1
@@ -290,7 +292,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential clang lld llvm pkg-config libssl-dev \
             acpica-tools uuid-dev nasm python3-dev \
-            qemu-system-arm \
+            qemu-system-arm qemu-system-data \
             e2fsprogs dosfstools mtools
           qemu-system-aarch64 --version | head -1
 

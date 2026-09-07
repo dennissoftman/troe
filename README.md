@@ -384,7 +384,10 @@ for a completed one. See
   `.github/actions/pinned-e2fsprogs` does.
 - QEMU `8.x` through `11.x`. The x86-64 platforms use distribution UEFI
   firmware; QEMU `11.1.0` and the committed firmware digests remain the strict
-  release-evidence profile.
+  release-evidence profile. QEMU's own ROM blobs must be installed too:
+  `aarch64-sbsa-ref` drives a `bochs-display` framebuffer, which loads
+  `vgabios-bochs-display.bin`. Homebrew ships those blobs inside the QEMU
+  formula, while Debian and Ubuntu split them into `qemu-system-data`.
 - For `aarch64-sbsa-ref` only, firmware for the SBSA reference machine, which
   no distribution packages. Build both flash banks once from pinned sources:
 
