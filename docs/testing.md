@@ -515,6 +515,20 @@ policy: QEMU `8.x` through `11.x`, structurally valid matching distribution
 UEFI firmware, and e2fsprogs `1.47.x`. The ext4 byte verifier and all guest
 scenarios are unchanged.
 
+The e2fsprogs range is narrower in practice than its version check states. The
+byte verifier requires every active inode's timestamps to equal the fixed epoch
+in `tools/mkstorage.py`, which only a `mke2fs` that honours
+`E2FSPROGS_FAKE_TIME` can produce. `1.47.4`, the pinned version, is verified.
+`1.47.0`, which Ubuntu 24.04 ships, passes the `1.47.x` check and then fails
+the verifier with `ext4 inode timestamps are not deterministic`. Which release
+between them gained the variable is not established here, so treat the pinned
+version as the requirement and build it from source when a distribution
+package is older — `.github/actions/pinned-e2fsprogs` does exactly that, and
+proves the variable is honoured before the gate runs rather than letting the
+failure surface minutes later. `MINIMUM_E2FSPROGS_VERSION` still admits
+`1.47.0`, so the version check alone does not reject a tool that cannot satisfy
+the verifier.
+
 Two properties are specific to the hosted run. Each named platform gets its own
 runner, so the fixed acceptance UDP ports cannot collide the way two overlapping
 runs on one machine do. And the work is selected by `scripts/test_changed.py`

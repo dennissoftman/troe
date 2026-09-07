@@ -375,7 +375,13 @@ for a completed one. See
   selects the required components and targets.
 - Git LFS; run `git lfs install` once before checking out repository artifacts.
 - Python `3.13` or newer.
-- e2fsprogs `1.47.x` (`mke2fs` and `e2fsck`).
+- e2fsprogs `1.47.x` (`mke2fs` and `e2fsck`), built so that `mke2fs` honours
+  `E2FSPROGS_FAKE_TIME`. That variable is what makes a generated ext4 image
+  reproducible, and the byte verifier rejects an image whose inode timestamps
+  are not the fixed epoch. `1.47.4` is verified; `1.47.0`, which Ubuntu 24.04
+  ships, satisfies the version range and then fails the verifier. Build the
+  pinned version from source if a distribution package is older, as
+  `.github/actions/pinned-e2fsprogs` does.
 - QEMU `8.x` through `11.x`. The x86-64 platforms use distribution UEFI
   firmware; QEMU `11.1.0` and the committed firmware digests remain the strict
   release-evidence profile.
