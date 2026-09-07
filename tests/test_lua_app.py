@@ -61,7 +61,14 @@ class LuaRuntimeTests(unittest.TestCase):
         compiler = os.environ.get("CC", "clang")
         command = (
             compiler,
-            "-std=c11",
+            # GNU rather than strict ISO, because this build compiles vendored
+            # Lua with LUA_USE_POSIX, whose `_longjmp` and `pclose` glibc only
+            # declares outside `__STRICT_ANSI__`. Under `-std=c11` a Linux
+            # clang rejects both as implicit declarations, while macOS headers
+            # expose them either way. Upstream Lua builds in GNU mode for the
+            # same reason. The printf runner below stays strict ISO: it uses no
+            # POSIX at all, and strict is what a freestanding formatter wants.
+            "-std=gnu11",
             "-O2",
             "-DTROE_LUA=1",
             "-DTROE_LUA_HOST_TEST=1",
