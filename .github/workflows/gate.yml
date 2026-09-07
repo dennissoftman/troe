@@ -292,9 +292,37 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             build-essential clang lld llvm pkg-config libssl-dev \
             acpica-tools uuid-dev nasm python3-dev \
-            qemu-system-arm qemu-system-data \
+            qemu-system-arm qemu-system-data seabios \
             e2fsprogs dosfstools mtools
           qemu-system-aarch64 --version | head -1
+
+      # This platform drives a `bochs-display` framebuffer, which loads
+      # vgabios-bochs-display.bin. qemu-system-data alone did not supply it on
+      # 24.04, so locate the blob and put a copy where QEMU looks. Failing here
+      # with the search printed beats failing later as "failed to find romfile".
+      - name: Ensure the bochs-display VGA BIOS is present
+        run: |
+          set -euo pipefail
+          rom=vgabios-bochs-display.bin
+          if [ -f "/usr/share/qemu/$rom" ]; then
+            echo "already present: /usr/share/qemu/$rom"
+            exit 0
+          fi
+          echo "not in /usr/share/qemu; searching the filesystem"
+          found="$(find /usr/share /usr/lib -name "$rom" -print -quit 2>/dev/null || true)"
+          if [ -z "$found" ]; then
+            echo "could not find $rom anywhere. Candidate directories:"
+            for dir in /usr/share/qemu /usr/share/seabios /usr/share/vgabios; do
+              echo "--- $dir"
+              ls -1 "$dir" 2>/dev/null | grep -iE 'vga|bochs' || echo "    (no vga/bochs entries)"
+            done
+            echo "packages owning any vgabios blob:"
+            dpkg -S vgabios 2>/dev/null || echo "    (none)"
+            exit 1
+          fi
+          echo "found: $found"
+          sudo install -Dm644 "$found" "/usr/share/qemu/$rom"
+          echo "installed to /usr/share/qemu/$rom"
 
       # This platform has no distribution firmware. Its banks are edk2 plus
       # Trusted Firmware-A built from the revisions pinned in
