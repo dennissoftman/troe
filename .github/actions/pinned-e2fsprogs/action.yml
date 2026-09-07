@@ -43,7 +43,15 @@ runs:
         version='${{ inputs.version }}'
         work="$(mktemp -d)"
         cd "$work"
-        curl -fsSL --retry 3 -o e2fsprogs.tar.xz \
+        # Every job in a run misses this cache, because a cache written by one
+        # job only becomes visible to later runs, so the fetch happens four or
+        # five times concurrently. One of those failed with
+        # "curl: (92) HTTP/2 stream 1 was not closed cleanly", so the transfer
+        # is pinned to HTTP/1.1 and retries cover errors curl treats as final.
+        curl -fsSL --http1.1 \
+          --retry 5 --retry-delay 2 --retry-all-errors \
+          --connect-timeout 30 --max-time 300 \
+          -o e2fsprogs.tar.xz \
           "https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v${version}/e2fsprogs-${version}.tar.xz"
         echo "sha256: $(sha256sum e2fsprogs.tar.xz | cut -d' ' -f1)"
         tar xf e2fsprogs.tar.xz
