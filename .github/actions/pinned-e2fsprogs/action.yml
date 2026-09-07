@@ -1,0 +1,100 @@
+name: pinned e2fsprogs
+description: >
+  Provide the e2fsprogs version this repository pins, because the distribution
+  one cannot build a reproducible ext4 image.
+
+# Ubuntu 24.04 ships e2fsprogs 1.47.0. That satisfies the compatible tool
+# policy's "1.47.x" version check and then fails the repository's own ext4 byte
+# verifier with "ext4 inode timestamps are not deterministic", because 1.47.0
+# does not honour E2FSPROGS_FAKE_TIME. The verifier requires every active
+# inode's four timestamps to equal the fixed epoch in tools/mkstorage.py.
+#
+# So the version this action builds is PINNED_E2FSPROGS_VERSION itself rather
+# than merely something newer. The build is cached; only a version bump or a
+# runner image change pays for it again.
+#
+# On supply chain: the tarball is fetched over HTTPS from kernel.org and the
+# built tools must report exactly the pinned banner before the action will use
+# them. The stronger guarantee is downstream, not here — mkstorage.py verifies
+# the produced ext4 bytes structurally on every run, so a formatter that
+# emitted wrong bytes would fail the gate rather than pass unnoticed.
+
+inputs:
+  version:
+    description: e2fsprogs version to build, matching PINNED_E2FSPROGS_VERSION.
+    required: false
+    default: 1.47.4
+
+runs:
+  using: composite
+  steps:
+    - name: Restore cached e2fsprogs
+      id: cache
+      uses: actions/cache@v4
+      with:
+        path: ~/.local/e2fsprogs
+        key: e2fsprogs-${{ inputs.version }}-${{ runner.os }}-${{ runner.arch }}
+
+    - name: Build e2fsprogs ${{ inputs.version }}
+      if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        version='${{ inputs.version }}'
+        work="$(mktemp -d)"
+        cd "$work"
+        curl -fsSL --retry 3 -o e2fsprogs.tar.xz \
+          "https://mirrors.edge.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v${version}/e2fsprogs-${version}.tar.xz"
+        echo "sha256: $(sha256sum e2fsprogs.tar.xz | cut -d' ' -f1)"
+        tar xf e2fsprogs.tar.xz
+        cd "e2fsprogs-${version}"
+        # Only mke2fs and e2fsck are used by the gate; the rest of the suite is
+        # disabled to keep the cold build short.
+        ./configure \
+          --prefix="$HOME/.local/e2fsprogs" \
+          --disable-nls \
+          --disable-uuidd \
+          --disable-fuse2fs \
+          --disable-e2initrd-helper \
+          > configure.log 2>&1 || { tail -40 configure.log; exit 1; }
+        make -j"$(nproc)" > build.log 2>&1 || { tail -60 build.log; exit 1; }
+        make install > install.log 2>&1 || { tail -40 install.log; exit 1; }
+
+    - name: Put pinned e2fsprogs first on PATH
+      shell: bash
+      run: echo "$HOME/.local/e2fsprogs/sbin" >> "$GITHUB_PATH"
+
+    - name: Verify the pinned tools are the ones selected
+      shell: bash
+      run: |
+        set -euo pipefail
+        version='${{ inputs.version }}'
+        for tool in mke2fs e2fsck; do
+          resolved="$(command -v "$tool")"
+          reported="$("$tool" -V 2>&1 | head -1)"
+          echo "$tool -> $resolved ($reported)"
+          case "$resolved" in
+            "$HOME/.local/e2fsprogs/sbin/$tool") ;;
+            *) echo "expected the pinned $tool to resolve first"; exit 1 ;;
+          esac
+          case "$reported" in
+            *"$version"*) ;;
+            *) echo "expected $tool $version; got $reported"; exit 1 ;;
+          esac
+        done
+
+        # Prove the property the byte verifier depends on, here rather than
+        # five minutes into a gate: with E2FSPROGS_FAKE_TIME set, a fresh image
+        # must carry that instant, not the wall clock.
+        image="$(mktemp -d)/probe.ext4"
+        truncate -s 16M "$image"
+        E2FSPROGS_FAKE_TIME=1704067200 LC_ALL=C TZ=UTC \
+          mke2fs -q -F -t ext4 -b 4096 -I 256 "$image"
+        stamp="$(dumpe2fs -h "$image" 2>/dev/null \
+          | sed -n 's/^Filesystem created: *//p')"
+        echo "filesystem created: $stamp"
+        expected="$(TZ=UTC date -u -d @1704067200 2>/dev/null || true)"
+        if [ -n "$expected" ] && [ "$stamp" != "$expected" ]; then
+          echo "mke2fs ignored E2FSPROGS_FAKE_TIME; expected $expected"
+          exit 1
+        fi

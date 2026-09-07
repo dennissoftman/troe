@@ -117,7 +117,15 @@ jobs:
             clang lld llvm pkg-config libssl-dev \
             qemu-system-x86 qemu-system-arm ovmf qemu-efi-aarch64 \
             e2fsprogs dosfstools mtools
-          python3 -m pip install --disable-pip-version-check --quiet ruff
+          # Pinned: an unpinned linter changes the gate's verdict whenever
+          # upstream releases. A newer ruff enabled PLR0917 and failed 8 files
+          # that the maintainer's 0.15.17 accepts.
+          python3 -m pip install --disable-pip-version-check --quiet 'ruff==0.15.17'
+
+      # 24.04's e2fsprogs 1.47.0 passes the version check and then fails the
+      # ext4 byte verifier, because it does not honour E2FSPROGS_FAKE_TIME.
+      - name: Use the pinned e2fsprogs
+        uses: ./.github/actions/pinned-e2fsprogs
 
       - name: Cache cargo and target
         uses: actions/cache@v4
@@ -157,7 +165,15 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             clang lld llvm pkg-config libssl-dev \
             e2fsprogs dosfstools mtools
-          python3 -m pip install --disable-pip-version-check --quiet ruff
+          # Pinned: an unpinned linter changes the gate's verdict whenever
+          # upstream releases. A newer ruff enabled PLR0917 and failed 8 files
+          # that the maintainer's 0.15.17 accepts.
+          python3 -m pip install --disable-pip-version-check --quiet 'ruff==0.15.17'
+
+      # The host job builds ext4 fixtures too, through the filesystem
+      # interoperability gates that --require-filesystem-tools turns on.
+      - name: Use the pinned e2fsprogs
+        uses: ./.github/actions/pinned-e2fsprogs
 
       - name: Cache cargo and target
         uses: actions/cache@v4
@@ -216,6 +232,11 @@ jobs:
           qemu-system-x86_64 --version | head -1
           qemu-system-aarch64 --version | head -1
 
+      # 24.04's e2fsprogs 1.47.0 passes the version check and then fails the
+      # ext4 byte verifier, because it does not honour E2FSPROGS_FAKE_TIME.
+      - name: Use the pinned e2fsprogs
+        uses: ./.github/actions/pinned-e2fsprogs
+
       - name: Cache cargo and target
         uses: actions/cache@v4
         with:
@@ -272,6 +293,11 @@ jobs:
       - name: Build SBSA reference firmware
         if: steps.sbsa-firmware.outputs.cache-hit != 'true'
         run: python3 tools/build_sbsa_firmware.py
+
+      # 24.04's e2fsprogs 1.47.0 passes the version check and then fails the
+      # ext4 byte verifier, because it does not honour E2FSPROGS_FAKE_TIME.
+      - name: Use the pinned e2fsprogs
+        uses: ./.github/actions/pinned-e2fsprogs
 
       - name: Cache cargo and target
         uses: actions/cache@v4
