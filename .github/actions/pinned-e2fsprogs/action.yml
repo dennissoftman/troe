@@ -99,11 +99,26 @@ runs:
         truncate -s 16M "$image"
         E2FSPROGS_FAKE_TIME=1704067200 LC_ALL=C TZ=UTC \
           mke2fs -q -F -t ext4 -b 4096 -I 256 "$image"
-        stamp="$(dumpe2fs -h "$image" 2>/dev/null \
+        # dumpe2fs renders the stamp in the ambient zone, so it is read back
+        # under TZ=UTC and parsed under TZ=UTC. Reading it in local time and
+        # parsing it as UTC agrees only on a machine already set to UTC, which
+        # a runner happens to be and a developer's machine happens not to be.
+        stamp="$(TZ=UTC LC_ALL=C dumpe2fs -h "$image" 2>/dev/null \
           | sed -n 's/^Filesystem created: *//p')"
-        echo "filesystem created: $stamp"
-        expected="$(TZ=UTC date -u -d @1704067200 2>/dev/null || true)"
-        if [ -n "$expected" ] && [ "$stamp" != "$expected" ]; then
-          echo "mke2fs ignored E2FSPROGS_FAKE_TIME; expected $expected"
+        echo "filesystem created: $stamp (UTC)"
+        # Compare instants, not strings: dumpe2fs prints a ctime-style stamp
+        # with no zone name, so formatting the expectation with `date` and
+        # matching text fails on the zone token alone even when the recorded
+        # instant is exactly right.
+        recorded="$(TZ=UTC date -d "$stamp" +%s 2>/dev/null || true)"
+        if [ -z "$recorded" ]; then
+          echo "could not parse the recorded creation time: $stamp"
           exit 1
         fi
+        if [ "$recorded" != "1704067200" ]; then
+          echo "mke2fs ignored E2FSPROGS_FAKE_TIME:"
+          echo "  recorded $stamp ($recorded)"
+          echo "  expected epoch 1704067200"
+          exit 1
+        fi
+        echo "E2FSPROGS_FAKE_TIME is honoured"
