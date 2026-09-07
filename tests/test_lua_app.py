@@ -17,6 +17,32 @@ RESULT_PATTERN = re.compile(
 )
 
 
+def compile_host_binary(command: tuple[str, ...]) -> None:
+    """Build one host test binary, reporting the compiler's own diagnosis.
+
+    `check=True` with captured output raises `CalledProcessError`, whose message
+    names the command and the exit status but discards the compiler's stderr.
+    That turns any portability failure into an opaque non-zero exit, which is
+    how a CI failure here first presented.
+    """
+    completed = subprocess.run(command, cwd=REPO_ROOT, check=False, capture_output=True)
+    if completed.returncode == 0:
+        return
+    raise AssertionError(
+        "\n".join(
+            (
+                f"compiling the Lua host runner failed with status "
+                f"{completed.returncode}",
+                f"command: {' '.join(command)}",
+                "stderr:",
+                completed.stderr.decode("utf-8", "replace").rstrip(),
+                "stdout:",
+                completed.stdout.decode("utf-8", "replace").rstrip(),
+            )
+        )
+    )
+
+
 class LuaRuntimeTests(unittest.TestCase):
     """Exercise the embedded interpreter without booting a guest."""
 
@@ -50,7 +76,7 @@ class LuaRuntimeTests(unittest.TestCase):
             "-o",
             str(cls.runner),
         )
-        subprocess.run(command, cwd=REPO_ROOT, check=True, capture_output=True)
+        compile_host_binary(command)
         printf_command = (
             compiler,
             "-std=c11",
@@ -63,7 +89,7 @@ class LuaRuntimeTests(unittest.TestCase):
             "-o",
             str(cls.printf_runner),
         )
-        subprocess.run(printf_command, cwd=REPO_ROOT, check=True, capture_output=True)
+        compile_host_binary(printf_command)
 
     @classmethod
     def tearDownClass(cls) -> None:
