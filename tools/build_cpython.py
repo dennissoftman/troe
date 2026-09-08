@@ -47,6 +47,8 @@ ARCHITECTURES = {
     "aarch64": "aarch64-unknown-linux-musl",
 }
 DEFAULT_VERSION = "3.14.7"
+DEFAULT_OUTPUT = REPO_ROOT / "build" / "cpython-package"
+DEFAULT_SOURCE_CACHE = REPO_ROOT / "build" / "cpython-cache"
 # Bundled dependency archives that the reviewed static modules link.
 VENDORED_ARCHIVES = (
     "Modules/_decimal/libmpdec/libmpdec.a",
@@ -93,16 +95,24 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     subparsers = parser.add_subparsers(dest="action", required=True)
     verify = subparsers.add_parser("verify", help="verify one built package tree")
-    verify.add_argument("tree", type=absolute_path)
+    verify.add_argument("tree", type=absolute_path, nargs="?", default=DEFAULT_OUTPUT)
     install_image_parser = subparsers.add_parser(
-        "install-image", help="install one package below /cpython on shared media"
+        "install-image", help="install one package into bin/ and lib/ on shared media"
     )
-    install_image_parser.add_argument("tree", type=absolute_path)
+    install_image_parser.add_argument(
+        "tree",
+        type=absolute_path,
+        nargs="?",
+        default=DEFAULT_OUTPUT,
+        help="package tree (default: repository build/cpython-package)",
+    )
     install_image_parser.add_argument("--image", type=absolute_path, required=True)
     verify_image_parser = subparsers.add_parser(
         "verify-image", help="verify one installed package on shared media"
     )
-    verify_image_parser.add_argument("tree", type=absolute_path)
+    verify_image_parser.add_argument(
+        "tree", type=absolute_path, nargs="?", default=DEFAULT_OUTPUT
+    )
     verify_image_parser.add_argument("--image", type=absolute_path, required=True)
     install_diagnostics_parser = subparsers.add_parser(
         "install-diagnostics", help="install capability-negative interpreters"
@@ -129,24 +139,29 @@ def parse_args() -> argparse.Namespace:
     variants.add_argument("--cc", help="LLVM clang executable")
     build = subparsers.add_parser("build", help="build one authenticated package")
     build.add_argument(
-        "output", type=absolute_path, help="empty package output directory"
+        "output",
+        type=absolute_path,
+        nargs="?",
+        default=DEFAULT_OUTPUT,
+        help="empty output directory (default: repository build/cpython-package)",
     )
     build.add_argument(
         "--source-cache",
         type=absolute_path,
-        required=True,
-        help="cache for pinned archives and Sigstore bundles",
+        default=DEFAULT_SOURCE_CACHE,
+        help="archive and signature cache (default: repository build/cpython-cache)",
     )
     build.add_argument(
         "--version",
         choices=("all", *versions),
-        default="all",
-        help="release to build; all preserves lock-file order",
+        default=DEFAULT_VERSION,
+        help=f"release (default: {DEFAULT_VERSION}); all preserves lock-file order",
     )
     build.add_argument(
         "--architecture",
         choices=("all", *ARCHITECTURES),
         default="all",
+        help="target architecture (default: all)",
     )
     build.add_argument("--cc", help="LLVM clang executable")
     build.add_argument("--ar", help="LLVM archiver executable")

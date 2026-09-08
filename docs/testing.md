@@ -248,7 +248,7 @@ Sigstore-verifies each pinned upstream release, so it needs the `sigstore` CLI
 and an exact build Python for every pinned series.
 
 ```console
-python3 tools/build_cpython.py build build/cpython-package \
+python3 tools/build_cpython.py build build/cpython-package --version all \
   --source-cache "$TROE_CPYTHON_CACHE" --work-directory "$TROE_CPYTHON_WORK"
 
 python3 tools/build_cpython.py variants build/cpython-diagnostics \

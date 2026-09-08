@@ -305,8 +305,22 @@ access.
 [`apps/python`](apps/python) is upstream CPython built as one statically linked
 KEX. It is the only application delivered on `/vol/shared` instead of rootfs:
 the interpreter and its library do not fit the rootfs and EFI budgets.
-`tools/build_cpython.py` authenticates and cross-builds the pinned 3.14.7,
-3.13.15, and 3.12.14 releases for both targets, and the package exposes
+`tools/build_cpython.py build` authenticates and cross-builds pinned 3.14.7
+for both targets into `build/cpython-package`, caching authenticated sources
+in `build/cpython-cache` (both paths are relative to the repository). It needs
+LLVM, Rust, the `sigstore` CLI, and a host Python 3.14. Build and copy it to a
+detached shared image with:
+
+```console
+python3 tools/build_cpython.py build
+python3 tools/build_cpython.py install-image --image build/troe-shared-fat32.img
+```
+
+For a mounted shared volume, copy the output's `bin/` and `lib/` directories
+into the volume root. The builder refuses a non-empty output directory; use
+another output path for a fresh build. `--source-cache`, `--architecture`, and
+`--version` override the defaults. `--version all` also builds pinned 3.13.15
+and 3.12.14 and requires a host Python for each series. That full package exposes
 version-addressable `python3.14.7.kex` through `python3.12.kex` names plus a
 `python.kex` default bound to the newest pinned release. Initialization is an
 explicit isolated `PyConfig`: fixed TROE paths, UTF-8 mode, no ambient
