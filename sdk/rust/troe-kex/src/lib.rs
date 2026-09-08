@@ -2717,8 +2717,8 @@ pub fn terminate(status: u32) -> ! {
 ///
 /// # Safety
 ///
-/// `startup_address` must identify the immutable mapped startup region supplied
-/// by the KEX loader for the complete duration of this non-returning call.
+/// `startup_address`/`startup_bytes` must name this task's live kernel startup
+/// mapping. Entry consumes its startup, heap, and IPC ownership exactly once.
 #[doc(hidden)]
 pub unsafe fn __run(
     startup_address: *const u8,
@@ -2744,8 +2744,8 @@ pub unsafe fn __run(
 ///
 /// # Safety
 ///
-/// `startup_address` must identify the immutable mapped startup region supplied
-/// by the KEX loader for the complete duration of this non-returning call.
+/// `startup_address`/`startup_bytes` must name this task's live kernel startup
+/// mapping. Entry consumes its startup, heap, and IPC ownership exactly once.
 #[doc(hidden)]
 pub unsafe fn __run_server(
     startup_address: *const u8,
