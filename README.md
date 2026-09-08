@@ -66,9 +66,10 @@ measurement.
 `cd`, session job control, `svc`, `poweroff`, and `reboot` are non-shadowable
 shell intrinsics because they mutate shell- or supervisor-owned state. Ordinary
 bare commands remain immutable KEX applications discovered from `/bin`.
-An explicit command token containing `/` instead resolves the exact KEX file
-through the caller's VFS working directory, so copied applications can be run
-as `./app` without adding writable volumes to an ambient search path.
+An explicit command token containing `/` resolves through the caller's VFS
+working directory, trying the exact filename first and then appending `.kex`
+if it is missing. Copied applications can be run as `./app` without adding
+writable volumes to an ambient search path.
 
 ## 🎬 Demos
 
@@ -232,9 +233,13 @@ Start exploring with [`apps/echo`](apps/echo) and the
 [`troe-kex` Rust SDK](sdk/rust/troe-kex).
 
 Bare names use the bounded `/bin/<name>.kex` catalog. Tokens containing `/`
-are exact relative or absolute VFS paths: no `.kex` suffix is inferred, and
-there is no `PATH` or implicit current-directory search. The selected regular
-file must pass the same complete package, manifest, target, and executable
+are relative or absolute VFS paths: lookup tries the exact path first, then
+appends `.kex` only on a not-found result if the filename does not already end
+in `.kex`. For example, `./python3.14` can launch `./python3.14.kex`.
+Existing files and directories take precedence, including invalid packages;
+other lookup errors do not trigger a retry. There is no `PATH` or implicit
+current-directory search. The selected regular file must pass the same
+complete package, manifest, target, and executable
 validation as an installed command. Symlinks may resolve to a regular KEX file;
 package requirements still cannot exceed the launcher's authority.
 The interactive shell asks for a default-negative confirmation before directly

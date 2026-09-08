@@ -76,9 +76,11 @@ never executes the ordinary application.
   x86 CPUs. Direct handoffs preserve the absolute 50 ms lease; expiry faults
   the active IPC participant and does not replay the call;
 - KEX resolution: bare names select only `/bin/<name>.kex`; a command containing
-  `/` selects one exact VFS path relative to its explicit cwd, with no suffix
-  inference, `PATH`, or implicit writable-directory search; every selected file
-  passes the same complete KEX/KCAP validation and capability attenuation, and
+  `/` tries its exact VFS path relative to its explicit cwd, then appends `.kex`
+  only if the path is missing and the filename does not already end in `.kex`;
+  existing nodes and other errors never trigger a retry, and there is no `PATH`
+  or implicit writable-directory search; every selected file passes the same
+  complete KEX/KCAP validation and capability attenuation, and
   direct interactive execution outside `/bin` requires a default-negative
   confirmation;
 - runtime media: optional large executables exist only in the exact

@@ -69,7 +69,7 @@ use troe_process::{
     ChildLifecycle, ChildTable, MAX_CHILDREN_PER_OWNER, MAX_PIPES_PER_OWNER, OwnerId, PipeTable,
     ProcessError as ChildProcessError,
 };
-use troe_shell::{ExternalCommandReference, external_command_reference};
+use troe_shell::external_command_reference;
 use troe_task::{
     Capabilities, IsolationResource, PendingCallState, PendingOperationId, ProcessOrigin,
     Scheduler, TaskFault, WaitKey, WaitObservation, WaitRegistration, WaitResource, WakeReason,
@@ -132,17 +132,9 @@ impl<'service> ResidentApplication<'service> {
             environment_refs.push(value.as_str());
         }
 
-        let catalog_path = match reference {
-            ExternalCommandReference::CatalogName(name) => Some(alloc::format!("/bin/{name}.kex")),
-            ExternalCommandReference::Path(_) => None,
-        };
-        let path = catalog_path.as_deref().unwrap_or(command_name);
         let cwd = invocation.cwd();
-        let metadata = control
-            .launch
-            .namespace
-            .borrow_mut()
-            .metadata(cwd, path)
+        let (path, metadata) = reference
+            .resolve(&mut *control.launch.namespace.borrow_mut(), cwd)
             .map_err(|error| match error {
                 troe_fs_api::FsError::NotFound => ReplyStatus::NotFound,
                 _ => ReplyStatus::Failure,
@@ -159,7 +151,7 @@ impl<'service> ResidentApplication<'service> {
                     .launch
                     .namespace
                     .borrow_mut()
-                    .read_file_at(cwd, path, offset, destination)
+                    .read_file_at(cwd, &path, offset, destination)
                     .map_err(|_| ())
             },
             native_application_target(),
@@ -585,7 +577,7 @@ impl<'service> ResidentApplication<'service> {
                     .launch
                     .namespace
                     .borrow_mut()
-                    .read_file_at(cwd, path, offset, destination)
+                    .read_file_at(cwd, &path, offset, destination)
                     .map_err(|_| ())
             },
             resource_slot,

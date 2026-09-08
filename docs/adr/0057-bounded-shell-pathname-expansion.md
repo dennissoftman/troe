@@ -46,7 +46,7 @@ a component does not match a name beginning with `.`, so `rm *` cannot remove
 dotfiles.
 
 Expansion applies to a stage's argument words. The command word is left
-literal, preserving exact KEX path resolution (ADR 0050) and the interactive
+literal, preserving explicit KEX path resolution (ADR 0050) and the interactive
 confirmation for applications outside `/bin`. Redirection targets are not
 expanded and remain outside argv. A pattern matching nothing is passed through
 unchanged, so a failed match surfaces as the tool's own `not found` diagnostic

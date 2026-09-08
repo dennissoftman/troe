@@ -2044,6 +2044,42 @@ def run_filesystem_group(session: SerialSession, command_timeout: float) -> None
         command_timeout,
         contains=("shared-child-kex\n", "path-kex-status\ttrue\texit\t0\n"),
     )
+    session.command("cp /bin/echo.kex ./echo-suffix.kex", cwd, command_timeout)
+    session.declined_command(
+        "./echo-suffix suffix-declined",
+        cwd,
+        command_timeout,
+        absent=("suffix-declined\n",),
+    )
+    for command in ("./echo-suffix", "/vol/shared/echo-suffix"):
+        session.confirmed_command(
+            f"{command} suffix-fallback",
+            cwd,
+            command_timeout,
+            contains=("suffix-fallback\n",),
+        )
+    session.command(
+        "spawn ./echo-suffix suffix-child",
+        cwd,
+        command_timeout,
+        contains=("suffix-child\n",),
+    )
+    session.command(
+        "echo-suffix should-not-execute",
+        cwd,
+        command_timeout,
+        contains=("echo-suffix: unknown command",),
+        absent=("should-not-execute\n",),
+    )
+    session.command("printf not-a-kex > ./echo-suffix", cwd, command_timeout)
+    session.confirmed_command(
+        "./echo-suffix should-not-execute",
+        cwd,
+        command_timeout,
+        contains=("./echo-suffix: application package rejected",),
+        absent=("should-not-execute\n",),
+    )
+    session.command("rm ./echo-suffix ./echo-suffix.kex", cwd, command_timeout)
     runtime_probe = f"{SHARED_BIN}/{session.architecture}/runtime-probe.kex"
     first_probe = session.confirmed_command(
         runtime_probe,
