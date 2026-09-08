@@ -18,13 +18,9 @@ use core::ptr::NonNull;
 use core::sync::atomic::AtomicBool;
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 use core::sync::atomic::AtomicU32;
-#[cfg(any(
-    test,
-    all(
-        target_os = "uefi",
-        any(target_arch = "x86_64", feature = "acceptance-probes")
-    )
-))]
+// Both architectures cache a counter frequency in one of these now, so the
+// narrower x86-or-probes gate this used to carry no longer describes it.
+#[cfg(any(test, target_os = "uefi"))]
 use core::sync::atomic::AtomicU64;
 #[cfg(any(test, target_os = "uefi"))]
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -1409,6 +1405,42 @@ pub fn monotonic_millis() -> Option<u64> {
     architecture_monotonic_millis()
 }
 
+/// Read the same boot-relative counter in nanoseconds.
+///
+/// Both counters this machine can offer are finer than a millisecond, so the
+/// millisecond reading above is a truncation rather than the resolution the
+/// hardware has. `u64` nanoseconds still spans 584 years of uptime.
+///
+/// This is a read. Deadlines and the execution timer remain millisecond-based,
+/// so a finer reading does not imply a finer sleep.
+#[must_use]
+#[cfg(target_os = "uefi")]
+pub fn monotonic_nanos() -> Option<u64> {
+    architecture_monotonic_nanos()
+}
+
+/// Scale one counter reading into nanoseconds without overflowing.
+///
+/// `ticks_per_unit` counts ticks in whatever unit `nanos_per_unit` measures, so
+/// a counter calibrated per millisecond and one calibrated per second both
+/// convert here. Whole units are separated from the remainder before either is
+/// multiplied: multiplying a full-width counter by the nanosecond scale first
+/// overflows and silently truncates a long uptime, which is the same reason
+/// `counter_millis` splits its own arithmetic.
+#[cfg(any(test, target_os = "uefi"))]
+fn counter_nanos(counter: u64, ticks_per_unit: u64, nanos_per_unit: u64) -> Option<u64> {
+    if ticks_per_unit == 0 {
+        return None;
+    }
+    let whole = counter.checked_div(ticks_per_unit)?;
+    let remainder = counter.checked_rem(ticks_per_unit)?;
+    whole.checked_mul(nanos_per_unit)?.checked_add(
+        remainder
+            .checked_mul(nanos_per_unit)?
+            .checked_div(ticks_per_unit)?,
+    )
+}
+
 /// Read the highest-resolution counter for kernel-owned process accounting.
 ///
 /// The raw current value is not exposed through the application ABI. Process
@@ -1826,6 +1858,25 @@ fn architecture_monotonic_millis() -> Option<u64> {
         cached
     };
     x86_read_tsc().checked_div(ticks_per_millisecond)
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn architecture_monotonic_nanos() -> Option<u64> {
+    // The calibration already cached for the millisecond reading is what this
+    // needs: one millisecond is exactly 1,000,000 nanoseconds, so no second
+    // calibration and no additional state is involved.
+    x86_timer_vectors(crate::selected_platform().ok()?.timer())?;
+    let cached = X86_TSC_TICKS_PER_MILLISECOND.load(Ordering::Relaxed);
+    let ticks_per_millisecond = if cached == 0 {
+        let detected = x86_cpuid_tsc_frequency()
+            .and_then(|frequency| frequency.checked_div(1_000))
+            .filter(|ticks| *ticks != 0)?;
+        X86_TSC_TICKS_PER_MILLISECOND.store(detected, Ordering::Relaxed);
+        detected
+    } else {
+        cached
+    };
+    counter_nanos(x86_read_tsc(), ticks_per_millisecond, 1_000_000)
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
@@ -3100,19 +3151,53 @@ fn architecture_cancel_prepared_network_interrupt(route: &NetworkInterruptRoute)
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+/// Cached `CNTFRQ_EL0`. The generic counter's frequency is fixed for the
+/// machine, so reading the system register on every sample is pure overhead.
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+static AARCH64_COUNTER_HZ: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn aarch64_counter_hz() -> u64 {
+    let cached = AARCH64_COUNTER_HZ.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    let frequency: u64;
+    // SAFETY: CNTFRQ_EL0 is read-only at EL1 and constant for the machine.
+    unsafe {
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frequency, options(nomem, nostack));
+    }
+    AARCH64_COUNTER_HZ.store(frequency, Ordering::Relaxed);
+    frequency
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn aarch64_counter_ticks() -> u64 {
+    let counter: u64;
+    // SAFETY: CNTPCT_EL0 is read-only at EL1 and the generic counter is
+    // monotonic across the pinned single-vCPU profile.
+    unsafe {
+        core::arch::asm!("mrs {}, cntpct_el0", out(reg) counter, options(nomem, nostack));
+    }
+    counter
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 fn architecture_monotonic_millis() -> Option<u64> {
     if crate::selected_platform().ok()?.timer() != troe_platform::TimerKind::Aarch64Generic {
         return None;
     }
-    let frequency: u64;
-    let counter: u64;
-    // SAFETY: CNTFRQ_EL0 and CNTPCT_EL0 are read-only at EL1 and the generic
-    // counter is monotonic across the pinned single-vCPU profile.
-    unsafe {
-        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) frequency, options(nomem, nostack));
-        core::arch::asm!("mrs {}, cntpct_el0", out(reg) counter, options(nomem, nostack));
+    counter_millis(aarch64_counter_ticks(), aarch64_counter_hz())
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn architecture_monotonic_nanos() -> Option<u64> {
+    if crate::selected_platform().ok()?.timer() != troe_platform::TimerKind::Aarch64Generic {
+        return None;
     }
-    counter_millis(counter, frequency)
+    // The architected counter runs well above a kilohertz, so nanoseconds are
+    // a finer reading of it rather than invented precision.
+    counter_nanos(aarch64_counter_ticks(), aarch64_counter_hz(), 1_000_000_000)
 }
 
 #[cfg(any(test, all(target_os = "uefi", target_arch = "aarch64")))]
@@ -3760,7 +3845,7 @@ mod tests {
         InputInterruptError, NetworkInterruptRoute, NetworkInterruptSource,
         PreparedNetworkInterrupt, TaskStackError, UsedIndexTransition, aarch64_tcr_el1_from_el2,
         cached_nonzero, claim_network_interrupt_publication, classify_used_index, counter_millis,
-        el2, revoke_network_interrupt_publication, validate_task_stack,
+        counter_nanos, el2, revoke_network_interrupt_publication, validate_task_stack,
     };
     use core::alloc::Layout;
     use core::cell::Cell;
@@ -3797,6 +3882,30 @@ mod tests {
         );
         assert_eq!(counter_millis(999, 1_000), Some(999));
         assert_eq!(counter_millis(1, 999), None);
+    }
+
+    #[test]
+    fn counter_nanosecond_scaling_preserves_long_uptime() {
+        // A 1 GHz counter at full width is 18.4 years, and the nanosecond
+        // reading of it must not wrap. Multiplying before dividing would.
+        assert_eq!(
+            counter_nanos(u64::MAX, 1_000_000_000, 1_000_000_000),
+            Some(u64::MAX)
+        );
+        // The x86 path scales a per-millisecond calibration, so one
+        // millisecond of ticks is exactly 1,000,000 nanoseconds.
+        assert_eq!(counter_nanos(1, 1, 1_000_000), Some(1_000_000));
+        assert_eq!(counter_nanos(3, 2, 1_000_000), Some(1_500_000));
+        // A 24 MHz architected counter resolves about 41.6 nanoseconds, so a
+        // single tick is a sub-microsecond reading rather than zero.
+        assert_eq!(counter_nanos(1, 24_000_000, 1_000_000_000), Some(41));
+        assert_eq!(
+            counter_nanos(24_000_000, 24_000_000, 1_000_000_000),
+            Some(1_000_000_000)
+        );
+        // A frequency of zero has no scale, and reports nothing rather than
+        // dividing by it.
+        assert_eq!(counter_nanos(1, 0, 1_000_000_000), None);
     }
 
     #[test]

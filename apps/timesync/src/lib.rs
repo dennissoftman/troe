@@ -35,6 +35,21 @@ pub fn request(token: u64) -> [u8; PACKET_BYTES] {
 /// covers Unix time through 2036-02-07. A later client can add era selection
 /// using a trusted wall-clock estimate without guessing at wraparound.
 pub fn unix_transmit_seconds(packet: &[u8], token: u64) -> Result<u64, ProtocolError> {
+    unix_transmit_instant(packet, token).map(|(seconds, _)| seconds)
+}
+
+/// Decode the transmit timestamp as whole seconds and a nanosecond remainder.
+///
+/// NTP carries a 32-bit binary fraction of a second, roughly 233 picoseconds
+/// per step, in the four bytes after the seconds. Reporting only the seconds
+/// discards a phase the server actually measured, which is the difference
+/// between a wall clock that is correct to the second and one that is correct.
+///
+/// # Errors
+///
+/// Rejects the same malformed, unauthenticated, and pre-epoch replies
+/// `unix_transmit_seconds` rejects.
+pub fn unix_transmit_instant(packet: &[u8], token: u64) -> Result<(u64, u32), ProtocolError> {
     if packet.len() < PACKET_BYTES {
         return Err(ProtocolError::Truncated);
     }
@@ -54,9 +69,18 @@ pub fn unix_transmit_seconds(packet: &[u8], token: u64) -> Result<u64, ProtocolE
     let seconds = u64::from(u32::from_be_bytes([
         packet[40], packet[41], packet[42], packet[43],
     ]));
-    seconds
+    let fraction = u64::from(u32::from_be_bytes([
+        packet[44], packet[45], packet[46], packet[47],
+    ]));
+    let seconds = seconds
         .checked_sub(NTP_TO_UNIX_SECONDS)
-        .ok_or(ProtocolError::Era)
+        .ok_or(ProtocolError::Era)?;
+    // The fraction is a binary fraction of one second, so scaling by 1e9 and
+    // shifting by 32 converts it. The product stays inside `u64` because the
+    // fraction is below 2^32.
+    let nanoseconds =
+        u32::try_from((fraction * 1_000_000_000) >> 32).map_err(|_| ProtocolError::Timestamp)?;
+    Ok((seconds, nanoseconds))
 }
 
 #[cfg(test)]

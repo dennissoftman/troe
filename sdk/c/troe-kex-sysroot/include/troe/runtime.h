@@ -64,6 +64,10 @@ struct troe_runtime_host {
   int (*process_cpu_time)(void *context, uint64_t *ticks,
                           uint64_t *frequency_hz);
   int (*wall_time)(void *context, uint64_t *seconds);
+  /* Unix seconds and their nanosecond remainder, which is below one
+     second. `wall_time` is kept because `time` needs only seconds. */
+  int (*wall_time_precise)(void *context, uint64_t *seconds,
+                           uint64_t *nanoseconds);
   int (*sleep_until)(void *context, uint64_t monotonic_milliseconds);
   int (*random_bytes)(void *context, uint8_t *destination, size_t length);
   void (*terminate)(void *context, uint32_t status) __attribute__((noreturn));

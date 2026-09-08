@@ -644,17 +644,18 @@ fact that belongs to one platform rather than to both.
 
 ### Timers and clocks
 
-- Two clocks exist and they are not interchangeable. The monotonic clock counts
-  boot-relative milliseconds and never moves backwards; the wall clock reports
-  whole Unix seconds and can be set at runtime through `clock_control`. Bound
-  every wait, deadline, and timeout on the monotonic clock.
+- Two clocks exist and they are not interchangeable. The monotonic clock is
+  boot-relative and never moves backwards; the wall clock reports Unix time and
+  can be set at runtime through `clock_control`. Bound every wait, deadline,
+  and timeout on the monotonic clock.
 - `initialize_monotonic_clock` runs during handoff preparation, after console
   initialization and before any device or service that bounds work by time. A
   platform that cannot supply a counter fails the boot rather than continuing
   without one.
-- Counter scaling divides before multiplying, splitting whole seconds from the
-  remainder. Multiplying ticks by 1,000 first overflows and silently truncates a
-  long uptime, so the split is load-bearing rather than stylistic.
+- Counter scaling divides before multiplying, splitting whole units from the
+  remainder, at both the millisecond and nanosecond scales. Multiplying a
+  full-width counter by the scale first overflows and silently truncates a long
+  uptime, so the split is load-bearing rather than stylistic.
 - The monotonic source is a platform fact, and the counter must keep advancing
   while the vCPU is not scheduled — that property is what makes it a valid bound
   for a completion serviced by a separate host thread. `x86_64-q35-uefi`
@@ -663,10 +664,21 @@ fact that belongs to one platform rather than to both.
   bits wide; both AArch64 platforms read `CNTPCT_EL0` scaled by `CNTFRQ_EL0`.
   Calibration is cached after the first nonzero result, so repeated reads cannot
   re-time a running machine.
-- One millisecond is the resolution floor for production scheduling: the timer
-  interface encodes milliseconds, the execution timer is armed in whole
-  milliseconds, and the C runtime therefore reports a 1,000 Hz frequency. A sub-millisecond
-  deadline is not expressible and returns immediately.
+- Reads and deadlines have different resolutions, deliberately. Both clocks are
+  read in nanoseconds: `timer::NOW_NANOS` scales the raw counter, and
+  `wall_clock::NOW_PRECISE` reports seconds with a nanosecond remainder shaped
+  like a `timespec`. The millisecond opcodes remain, because deadlines are
+  expressed in them. The execution timer is still armed in whole milliseconds,
+  so a sub-millisecond deadline is not expressible and returns immediately: a
+  finer reading is not a finer sleep.
+- The wall clock's remainder is only as true as its anchor's phase. Firmware
+  reports whole seconds, so the anchor starts on a second boundary and the
+  remainder is monotonic elapsed time from it, which makes differences exact
+  and the absolute phase arbitrary. `clock_control::SET_PRECISE` is what
+  establishes a real phase, and `timesync` supplies one from the NTP transmit
+  timestamp's fraction. The anchor keeps seconds and a remainder rather than
+  one nanosecond count because the accepted range reaches year 9999, which
+  `u64` nanoseconds since the epoch does not.
 - Acceptance storage probes sample the high-resolution architecture counter
   through an acceptance-only timer payload. The counter includes kernel and
   I/O time; it does not change production timer or execution-lease resolution.

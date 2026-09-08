@@ -1751,6 +1751,21 @@ impl Timer {
         timer::decode_milliseconds(&reply[..count]).map_err(|_| Error::InvalidCall)
     }
 
+    /// Read the same boot-relative instant in nanoseconds.
+    ///
+    /// `now` truncates to milliseconds; both counters the machine can offer
+    /// are finer than that. Deadlines stay millisecond-based, so this is a
+    /// finer reading rather than a finer sleep.
+    ///
+    /// # Errors
+    ///
+    /// Reports service, decoding, or call-gate failure.
+    pub fn now_nanos(&mut self) -> Result<u64, Error> {
+        let mut reply = [0_u8; timer::NANOSECONDS_BYTES];
+        let count = call(self.handle, timer::NOW_NANOS, &[], &mut reply)?;
+        timer::decode_nanoseconds(&reply[..count]).map_err(|_| Error::InvalidCall)
+    }
+
     /// Read CPU time charged to the calling process.
     ///
     /// The returned frequency converts `ticks` into seconds. Kernel service,
@@ -1793,6 +1808,21 @@ impl WallClock {
         let count = call(self.handle, wall_clock::NOW, &[], &mut reply)?;
         wall_clock::decode_seconds(&reply[..count]).map_err(|_| Error::InvalidCall)
     }
+
+    /// Read the same instant with its nanosecond remainder.
+    ///
+    /// The two fields map straight onto `tv_sec` and `tv_nsec`. The remainder
+    /// is advanced from the monotonic counter, so it is only as true as the
+    /// anchor's own phase, and firmware supplies whole seconds.
+    ///
+    /// # Errors
+    ///
+    /// Reports service, decoding, or call-gate failure.
+    pub fn now_precise(&mut self) -> Result<wall_clock::WallTime, Error> {
+        let mut reply = [0_u8; wall_clock::PRECISE_BYTES];
+        let count = call(self.handle, wall_clock::NOW_PRECISE, &[], &mut reply)?;
+        wall_clock::decode_precise(&reply[..count]).map_err(|_| Error::InvalidCall)
+    }
 }
 
 impl ClockControl {
@@ -1805,6 +1835,31 @@ impl ClockControl {
         let request = clock_control::encode_seconds(unix_seconds);
         let mut reply = [];
         let count = call(self.handle, clock_control::SET, &request, &mut reply)?;
+        if count == 0 {
+            Ok(())
+        } else {
+            Err(Error::InvalidCall)
+        }
+    }
+
+    /// Correct it with a source that knows the sub-second phase.
+    ///
+    /// `set` anchors on a second boundary, so the remainder a reading carried
+    /// is discarded and the clock's phase stays arbitrary. This preserves it.
+    ///
+    /// # Errors
+    ///
+    /// Reports a remainder of one second or more, an invalid timestamp, denied
+    /// service, or call-gate failure.
+    pub fn set_precise(&mut self, value: clock_control::WallTime) -> Result<(), Error> {
+        let request = clock_control::encode_precise(value).map_err(|_| Error::InvalidCall)?;
+        let mut reply = [];
+        let count = call(
+            self.handle,
+            clock_control::SET_PRECISE,
+            &request,
+            &mut reply,
+        )?;
         if count == 0 {
             Ok(())
         } else {
@@ -2910,6 +2965,10 @@ mod tests {
                 interface::PIPE => pipe::MINOR,
                 interface::PRIVATE_MEMORY => private_memory::MINOR,
                 interface::RANDOM => random::MINOR,
+                interface::WALL_CLOCK => crate::wall_clock::MINOR,
+                interface::CLOCK_CONTROL => crate::clock_control::MINOR,
+                // The catch-all assumes minor zero, which is true only until
+                // an interface is revised; name each one that is not.
                 _ => 0,
             };
             page[offset + 18..offset + 20].copy_from_slice(&minor.to_le_bytes());

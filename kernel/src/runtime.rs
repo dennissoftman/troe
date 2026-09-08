@@ -21,6 +21,7 @@ pub(crate) struct KernelRuntime {
     deferred_input: VecDeque<InputEvent>,
     control_down: bool,
     last_millis: Cell<u64>,
+    last_nanos: Cell<u64>,
 }
 
 pub(crate) struct KernelRuntimeCapability {
@@ -47,6 +48,7 @@ impl KernelRuntime {
         firmware_wall_seconds: Option<u64>,
     ) -> Result<Self, RuntimeInitError> {
         let initial = troe_machine::monotonic_millis().ok_or(RuntimeInitError::Clock)?;
+        let initial_nanos = troe_machine::monotonic_nanos().ok_or(RuntimeInitError::Clock)?;
         let mut deferred_input = VecDeque::new();
         deferred_input
             .try_reserve_exact(Self::DEFERRED_INPUT_CAPACITY)
@@ -55,12 +57,32 @@ impl KernelRuntime {
             network,
             wall_clock: firmware_wall_seconds.map(|unix_seconds| WallClockAnchor {
                 unix_seconds,
-                monotonic_milliseconds: initial,
+                // Firmware reports whole seconds, so the anchor starts on a
+                // second boundary and every finer reading is the monotonic
+                // delta from it. `clock_control::SET_PRECISE` is what can
+                // establish a true sub-second phase later.
+                unix_subsec_nanos: 0,
+                monotonic_nanos: initial_nanos,
             }),
             deferred_input,
             control_down: false,
             last_millis: Cell::new(initial),
+            last_nanos: Cell::new(initial_nanos),
         })
+    }
+
+    /// Read the monotonic clock in nanoseconds, never going backwards.
+    ///
+    /// The same latch `now` uses: a counter that reads lower than the previous
+    /// sample reports the previous one, so a caller never observes time
+    /// reversing.
+    pub(crate) fn now_nanos(&self) -> u64 {
+        let previous = self.last_nanos.get();
+        let current = troe_machine::monotonic_nanos()
+            .unwrap_or(previous)
+            .max(previous);
+        self.last_nanos.set(current);
+        current
     }
 
     pub(crate) fn now(&self) -> MonotonicMillis {
@@ -106,23 +128,52 @@ impl KernelRuntime {
         }
     }
 
+    /// Wall-clock seconds, derived from the precise reading so the two can
+    /// never disagree about which second it is.
     pub(crate) fn wall_seconds(&self) -> Option<u64> {
+        Some(self.wall_precise()?.seconds)
+    }
+
+    /// The wall clock with its sub-second remainder.
+    ///
+    /// The anchor is advanced by the monotonic delta rather than re-read, so
+    /// the remainder is as accurate as the anchor's own phase. Firmware
+    /// supplies whole seconds, so that phase is zero until something calls
+    /// `set_wall_precise` with a finer source.
+    pub(crate) fn wall_precise(&self) -> Option<troe_abi::wall_clock::WallTime> {
+        const NANOS_PER_SECOND: u64 = troe_abi::wall_clock::NANOS_PER_SECOND;
         let anchor = self.wall_clock?;
-        let elapsed = self
-            .now()
-            .as_millis()
-            .saturating_sub(anchor.monotonic_milliseconds)
-            / 1_000;
-        Some(anchor.unix_seconds.saturating_add(elapsed))
+        let elapsed = self.now_nanos().saturating_sub(anchor.monotonic_nanos);
+        let total = anchor.unix_subsec_nanos.saturating_add(elapsed);
+        Some(troe_abi::wall_clock::WallTime {
+            seconds: anchor.unix_seconds.saturating_add(total / NANOS_PER_SECOND),
+            nanoseconds: total % NANOS_PER_SECOND,
+        })
     }
 
     pub(crate) fn set_wall_seconds(&mut self, unix_seconds: u64) -> Result<(), ()> {
-        if unix_seconds > 253_402_300_799 {
+        self.set_wall_precise(troe_abi::wall_clock::WallTime {
+            seconds: unix_seconds,
+            nanoseconds: 0,
+        })
+    }
+
+    pub(crate) fn set_wall_precise(
+        &mut self,
+        value: troe_abi::wall_clock::WallTime,
+    ) -> Result<(), ()> {
+        // The seconds bound is year 9999, which is why the anchor keeps
+        // seconds and a remainder rather than one nanosecond count: that far
+        // out does not fit in `u64` nanoseconds.
+        if value.seconds > 253_402_300_799
+            || value.nanoseconds >= troe_abi::wall_clock::NANOS_PER_SECOND
+        {
             return Err(());
         }
         self.wall_clock = Some(WallClockAnchor {
-            unix_seconds,
-            monotonic_milliseconds: self.now().as_millis(),
+            unix_seconds: value.seconds,
+            unix_subsec_nanos: value.nanoseconds,
+            monotonic_nanos: self.now_nanos(),
         });
         Ok(())
     }
