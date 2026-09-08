@@ -541,7 +541,10 @@ AArch64 profiles require real ASID use in the emulated architecture. x86 TCG
 reports the full-flush fallback and cannot satisfy a tagged-profile claim. The
 two x86 hosted profiles also run `qemu-kvm` with `-cpu host -accel kvm`, require
 PCID plus INVPCID, and fail if hardware tagging is unavailable. There is no
-silent accelerator fallback. Local SBSA acceptance uses the pinned firmware:
+silent accelerator fallback.
+The KVM virtio-PCI runner uses the same QEMU cloud-bundle format and compiled
+guest probe port; its output directory and recorded command identify KVM.
+Local SBSA acceptance uses the pinned firmware:
 
 ```console
 python3 scripts/test-qemu.py --platform aarch64-sbsa-ref --environment qemu

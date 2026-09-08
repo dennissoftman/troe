@@ -336,7 +336,8 @@ def build_cloud_bundle(
                     "--platform",
                     profile.identifier,
                     "--environment",
-                    environment,
+                    # KVM changes CPU execution, not the QEMU disk contract.
+                    QEMU_ENVIRONMENT if environment == KVM_ENVIRONMENT else environment,
                     "--boot",
                     str(
                         boot_image_path(

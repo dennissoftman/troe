@@ -508,10 +508,15 @@ class FirmwareProfileTests(unittest.TestCase):
                     qemu_profile.subprocess,
                     "run",
                     side_effect=RuntimeError("synthetic build failure"),
-                ),
-                self.assertRaisesRegex(RuntimeError, "synthetic build failure"),
+                ) as run,
             ):
-                qemu_profile.build_cloud_bundle(profile, QEMU_ENVIRONMENT)
+                for environment in (QEMU_ENVIRONMENT, "qemu-kvm"):
+                    with self.assertRaisesRegex(RuntimeError, "synthetic build failure"):
+                        qemu_profile.build_cloud_bundle(profile, environment)
+                    command = run.call_args.args[0]
+                    self.assertEqual(
+                        command[command.index("--environment") + 1], QEMU_ENVIRONMENT
+                    )
             self.assertEqual(
                 (bundle / "sentinel").read_text(encoding="utf-8"),
                 "last-good",
