@@ -4,8 +4,8 @@
 #[path = "../../common.rs"]
 mod common;
 
-use troe_app_timesync::{request, unix_transmit_seconds};
-use troe_kex_sdk::{CommandContext, DATAGRAM_BUFFER_BYTES, Timer, entry, exit};
+use troe_app_timesync::{request, unix_transmit_instant};
+use troe_kex_sdk::{CommandContext, DATAGRAM_BUFFER_BYTES, Timer, clock_control, entry, exit};
 
 const NTP_SERVER: [u8; 4] = [10, 0, 2, 2];
 const NTP_PORT: u16 = 123;
@@ -67,8 +67,15 @@ fn synchronize(
     if received.source != NTP_SERVER || received.source_port != NTP_PORT {
         return Err(());
     }
-    let unix_seconds = unix_transmit_seconds(received.payload, token).map_err(|_| ())?;
-    clock.set(unix_seconds).map_err(|_| ())
+    // Carry the server's sub-second phase through rather than anchoring on a
+    // second boundary and leaving the remainder arbitrary.
+    let (seconds, nanoseconds) = unix_transmit_instant(received.payload, token).map_err(|_| ())?;
+    clock
+        .set_precise(clock_control::WallTime {
+            seconds,
+            nanoseconds: u64::from(nanoseconds),
+        })
+        .map_err(|_| ())
 }
 
 entry!(main);

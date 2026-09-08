@@ -67,6 +67,7 @@ pub struct Host {
     monotonic_time: unsafe extern "C" fn(*mut c_void, *mut u64, *mut u64) -> i32,
     process_cpu_time: unsafe extern "C" fn(*mut c_void, *mut u64, *mut u64) -> i32,
     wall_time: unsafe extern "C" fn(*mut c_void, *mut u64) -> i32,
+    wall_time_precise: unsafe extern "C" fn(*mut c_void, *mut u64, *mut u64) -> i32,
     sleep_until: unsafe extern "C" fn(*mut c_void, u64) -> i32,
     random_bytes: unsafe extern "C" fn(*mut c_void, *mut u8, usize) -> i32,
     terminate: unsafe extern "C" fn(*mut c_void, u32) -> !,
@@ -173,6 +174,7 @@ impl Runtime {
             monotonic_time: host_monotonic_time,
             process_cpu_time: host_process_cpu_time,
             wall_time: host_wall_time,
+            wall_time_precise: host_wall_time_precise,
             sleep_until: host_sleep_until,
             random_bytes: host_random_bytes,
             terminate: host_terminate,
@@ -729,14 +731,17 @@ unsafe extern "C" fn host_monotonic_time(
     let Some(timer) = runtime.timer.as_mut() else {
         return errno::EACCES;
     };
-    let value = match timer.now() {
+    // Nanoseconds rather than milliseconds: `clock_gettime` reports a
+    // `timespec`, so a nanosecond tick needs no scaling step and loses no
+    // resolution the counter actually has.
+    let value = match timer.now_nanos() {
         Ok(value) => value,
         Err(error) => return errno::from_kex(error),
     };
     // SAFETY: Nonnull scalar output pointers were checked above.
     unsafe {
         ticks.write(value);
-        frequency.write(1000);
+        frequency.write(1_000_000_000);
     }
     0
 }
@@ -785,6 +790,33 @@ unsafe extern "C" fn host_wall_time(context: *mut c_void, seconds: *mut u64) -> 
     };
     // SAFETY: Nonnull scalar output pointer was checked above.
     unsafe { seconds.write(value) };
+    0
+}
+
+unsafe extern "C" fn host_wall_time_precise(
+    context: *mut c_void,
+    seconds: *mut u64,
+    nanoseconds: *mut u64,
+) -> i32 {
+    // SAFETY: Scalar output pointers come from the C runtime.
+    let Some(runtime) = (unsafe { runtime(context) }) else {
+        return errno::EINVAL;
+    };
+    if seconds.is_null() || nanoseconds.is_null() {
+        return errno::EINVAL;
+    }
+    let Some(clock) = runtime.wall_clock.as_mut() else {
+        return errno::EACCES;
+    };
+    let value = match clock.now_precise() {
+        Ok(value) => value,
+        Err(error) => return errno::from_kex(error),
+    };
+    // SAFETY: Nonnull scalar output pointers were checked above.
+    unsafe {
+        seconds.write(value.seconds);
+        nanoseconds.write(value.nanoseconds);
+    }
     0
 }
 

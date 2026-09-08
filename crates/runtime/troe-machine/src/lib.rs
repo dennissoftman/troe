@@ -449,11 +449,11 @@ pub use mechanism::{
     descend_to_kernel_execution_level, enter_owned_stack, exit_boot_services_after_protocols,
     heap_stats, initialize_console, initialize_heap, initialize_input_interrupts,
     initialize_monotonic_clock, input_device_ranges, input_interrupt_stats, mark_firmware_exited,
-    monotonic_millis, park, poweroff, probe_allocation_failure, process_accounting_frequency_hz,
-    process_accounting_ticks, read_byte, reboot, run_task_step, take_interrupt_ownership,
-    take_network_interrupt, try_input_event, try_read_byte, try_read_keyboard_scancode,
-    wait_for_input_event, wait_for_runtime_event, wait_for_runtime_event_timeout, write,
-    zero_physical_range,
+    monotonic_millis, monotonic_nanos, park, poweroff, probe_allocation_failure,
+    process_accounting_frequency_hz, process_accounting_ticks, read_byte, reboot, run_task_step,
+    take_interrupt_ownership, take_network_interrupt, try_input_event, try_read_byte,
+    try_read_keyboard_scancode, wait_for_input_event, wait_for_runtime_event,
+    wait_for_runtime_event_timeout, write, zero_physical_range,
 };
 
 #[cfg(any(test, target_os = "uefi"))]

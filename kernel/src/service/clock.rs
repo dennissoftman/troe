@@ -15,7 +15,9 @@ use troe_task::MonotonicMillis;
 #[derive(Clone, Copy)]
 pub(crate) struct WallClockAnchor {
     pub(crate) unix_seconds: u64,
-    pub(crate) monotonic_milliseconds: u64,
+    /// Sub-second phase of the anchor, below one second.
+    pub(crate) unix_subsec_nanos: u64,
+    pub(crate) monotonic_nanos: u64,
 }
 
 /// The runtime's wall clock, as filesystem providers read it.
@@ -65,6 +67,13 @@ impl Service for ApplicationTimerService {
                     &timer::encode_milliseconds(milliseconds),
                 )
             }
+            timer::NOW_NANOS if request.payload().is_empty() => {
+                let nanoseconds = self.runtime.borrow().now_nanos();
+                ServiceReply::with_payload(
+                    ReplyStatus::Success,
+                    &timer::encode_nanoseconds(nanoseconds),
+                )
+            }
             timer::PROCESS_CPU_TIME if request.payload().is_empty() => {
                 let task_id = self
                     .task_id
@@ -107,25 +116,51 @@ impl Service for ApplicationTimerService {
 
 impl Service for ApplicationWallClockService {
     fn call(&mut self, request: Request<'_>) -> Result<ServiceReply, troe_dispatch::DispatchError> {
-        if request.opcode() != wall_clock::NOW || !request.payload().is_empty() {
+        if !request.payload().is_empty() {
             return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
         }
-        let Some(seconds) = self.runtime.borrow().wall_seconds() else {
-            return Ok(ServiceReply::empty(ReplyStatus::NotConfigured));
-        };
-        ServiceReply::with_payload(ReplyStatus::Success, &wall_clock::encode_seconds(seconds))
+        match request.opcode() {
+            wall_clock::NOW => {
+                let Some(seconds) = self.runtime.borrow().wall_seconds() else {
+                    return Ok(ServiceReply::empty(ReplyStatus::NotConfigured));
+                };
+                ServiceReply::with_payload(
+                    ReplyStatus::Success,
+                    &wall_clock::encode_seconds(seconds),
+                )
+            }
+            wall_clock::NOW_PRECISE => {
+                let Some(value) = self.runtime.borrow().wall_precise() else {
+                    return Ok(ServiceReply::empty(ReplyStatus::NotConfigured));
+                };
+                let Ok(reply) = wall_clock::encode_precise(value) else {
+                    return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                };
+                ServiceReply::with_payload(ReplyStatus::Success, &reply)
+            }
+            _ => Ok(ServiceReply::empty(ReplyStatus::InvalidRequest)),
+        }
     }
 }
 
 impl Service for ApplicationClockControlService {
     fn call(&mut self, request: Request<'_>) -> Result<ServiceReply, troe_dispatch::DispatchError> {
-        if request.opcode() != clock_control::SET {
-            return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
-        }
-        let Ok(seconds) = clock_control::decode_seconds(request.payload()) else {
-            return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+        let applied = match request.opcode() {
+            clock_control::SET => {
+                let Ok(seconds) = clock_control::decode_seconds(request.payload()) else {
+                    return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                };
+                self.runtime.borrow_mut().set_wall_seconds(seconds)
+            }
+            clock_control::SET_PRECISE => {
+                let Ok(value) = clock_control::decode_precise(request.payload()) else {
+                    return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest));
+                };
+                self.runtime.borrow_mut().set_wall_precise(value)
+            }
+            _ => return Ok(ServiceReply::empty(ReplyStatus::InvalidRequest)),
         };
-        let status = if self.runtime.borrow_mut().set_wall_seconds(seconds).is_ok() {
+        let status = if applied.is_ok() {
             ReplyStatus::Success
         } else {
             ReplyStatus::InvalidRequest
