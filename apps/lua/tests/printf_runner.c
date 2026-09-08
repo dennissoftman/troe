@@ -9,6 +9,48 @@
 
 #include "troe_printf_double.h"
 
+/* Whether the host's own `%#g` result dropped the trailing zeros that `#`
+   requires it to keep.
+
+   C says a `g` conversion removes trailing zeros "unless the `#` flag is
+   used". For 999999.5 at precision 6 the rounded exponent is 6, so `P > X` is
+   false and the style is `e` with precision 5: `1.00000e+06`. glibc renders
+   `1.e+06`, keeping the decimal point that `#` demands while removing the
+   digits that `#` equally demands. A decimal point with nothing between it and
+   the exponent is exactly that shape.
+
+   Where the host is non-conforming it stops being the oracle, and the standard
+   takes over: the rule is checked directly rather than the case being skipped,
+   so glibc keeps the coverage instead of losing it. */
+static int host_dropped_alternate_zeros(const char *text) {
+  const char *point = strchr(text, '.');
+  if (point == NULL)
+    return 0;
+  return point[1] == '\0' || point[1] == 'e' || point[1] == 'E';
+}
+
+/* Significant digits in one formatted mantissa, or -1 if it is not a number.
+   Leading zeros are not significant, so `0.00100000` and `1.00000e+06` both
+   carry six. The exponent is not part of the mantissa. */
+static int significant_digits(const char *text) {
+  const char *cursor = text;
+  int count = 0;
+  int started = 0;
+  if (*cursor == '-' || *cursor == '+')
+    cursor++;
+  for (; *cursor != '\0' && *cursor != 'e' && *cursor != 'E'; cursor++) {
+    if (*cursor == '.')
+      continue;
+    if (*cursor < '0' || *cursor > '9')
+      return -1;
+    if (!started && *cursor == '0')
+      continue;
+    started = 1;
+    count++;
+  }
+  return count;
+}
+
 static int compare(double value, char conversion, int precision,
                    int alternate) {
   char expected[TROE_DOUBLE_TEXT_BYTES];
@@ -25,6 +67,26 @@ static int compare(double value, char conversion, int precision,
     actual[actual_length] = '\0';
   if (expected_length != actual_length || actual_length < 0 ||
       memcmp(expected, actual, (size_t)expected_length + 1) != 0) {
+    /* Only a disagreement raises the question of which side is right, and only
+       then is the host's conformance worth testing. While the two agree the
+       host stays the oracle, which keeps `%#.0g` of zero -- legitimately `0.`
+       on both -- out of this branch entirely. */
+    if (alternate && (conversion == 'g' || conversion == 'G') &&
+        host_dropped_alternate_zeros(expected)) {
+      /* `#` keeps the trailing zeros, so a `g` result carries exactly
+         `precision` significant digits, and a precision of zero means one. */
+      int wanted = precision == 0 ? 1 : precision;
+      int digits = actual_length < 0 ? -1 : significant_digits(actual);
+      if (digits == wanted && strchr(actual, '.') != NULL)
+        return 0;
+      fprintf(stderr,
+              "alternate-form mismatch value=%a conversion=%c precision=%d "
+              "expected %d significant digits and a decimal point, got %s "
+              "with %d (host is non-conforming here and rendered %s)\n",
+              value, conversion, precision, wanted,
+              actual_length < 0 ? "(failure)" : actual, digits, expected);
+      return 1;
+    }
     fprintf(stderr,
             "format mismatch value=%a conversion=%c precision=%d alternate=%d "
             "expected=%s actual=%s\n",
