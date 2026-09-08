@@ -22,7 +22,7 @@ use crate::nested::{NestedInput, NestedLaunchContext, NestedOutput, NestedStdio}
 use crate::network::services::{
     ApplicationDatagramService, ApplicationDatagramState, ApplicationIcmpEchoService,
     ApplicationNetworkConfigurationService, ApplicationNetworkObservationService,
-    ApplicationTcpConnectService,
+    ApplicationTcpConnectService, ApplicationTcpListenService,
 };
 use crate::requirements::BackgroundRequirements;
 use crate::resident::launch::{
@@ -65,8 +65,8 @@ use core::cell::{Cell, RefCell};
 use troe_abi::{
     clock_control, command, datagram, diagnostics, filesystem, filesystem_mutation, icmp_echo,
     network_configuration, network_observation, pipe, private_memory, process_launch,
-    process_observation, random, shell_script, stream, tcp_connect, timer, volume_control,
-    wall_clock,
+    process_observation, random, shell_script, stream, tcp_connect, tcp_listen, timer,
+    volume_control, wall_clock,
 };
 use troe_application::{ABI_MINOR, StreamedKexPackage, parse_streamed_kex_package};
 use troe_core::{CommandStatus, Input, Output};
@@ -227,6 +227,7 @@ impl KexCommandRunner<'_> {
             + usize::from(requirements.network_configuration)
             + usize::from(requirements.icmp_echo)
             + usize::from(requirements.tcp_connect)
+            + usize::from(requirements.tcp_listen)
             + usize::from(requirements.volume_control)
             + usize::from(requirements.wall_clock)
             + usize::from(requirements.clock_control)
@@ -245,18 +246,19 @@ impl KexCommandRunner<'_> {
         };
         let log = Rc::new(RefCell::new(log));
         let application_network = self.runtime.borrow().network.clone();
-        let application_transport_network = if requirements.datagram || requirements.tcp_connect {
-            let Some(network) = application_network.clone() else {
-                return command_application_error(
-                    stderr,
-                    command,
-                    "required capability unavailable",
-                );
+        let application_transport_network =
+            if requirements.datagram || requirements.tcp_connect || requirements.tcp_listen {
+                let Some(network) = application_network.clone() else {
+                    return command_application_error(
+                        stderr,
+                        command,
+                        "required capability unavailable",
+                    );
+                };
+                Some(network)
+            } else {
+                None
             };
-            Some(network)
-        } else {
-            None
-        };
         let filesystem_namespace = if requirements.filesystem
             || requirements.filesystem_mutation
             || requirements.volume_control
@@ -535,6 +537,20 @@ impl KexCommandRunner<'_> {
                     minor: tcp_connect::MINOR,
                 });
             }
+            if requirements.tcp_listen {
+                services.push(CommandStartupService {
+                    port: register_command_service(
+                        &mut dispatcher,
+                        ApplicationTcpListenService::new(
+                            application_transport_network.as_ref().ok_or(())?.clone(),
+                            self.runtime.clone(),
+                        ),
+                    )?,
+                    interface: troe_abi::interface::TCP_LISTEN,
+                    major: tcp_listen::MAJOR,
+                    minor: tcp_listen::MINOR,
+                });
+            }
             if requirements.volume_control {
                 services.push(CommandStartupService {
                     port: register_command_service(
@@ -803,6 +819,7 @@ impl ExternalCommand for KexCommandRunner<'_> {
         let mut network_configuration_required = false;
         let mut icmp_echo_required = false;
         let mut tcp_connect_required = false;
+        let mut tcp_listen_required = false;
         let mut volume_control_required = false;
         let mut shell_script_required = false;
         let mut wall_clock_required = false;
@@ -870,6 +887,11 @@ impl ExternalCommand for KexCommandRunner<'_> {
                 && requirement.minor == tcp_connect::MINOR
             {
                 tcp_connect_required = true;
+            } else if requirement.interface == troe_abi::interface::TCP_LISTEN
+                && requirement.major == tcp_listen::MAJOR
+                && requirement.minor == tcp_listen::MINOR
+            {
+                tcp_listen_required = true;
             } else if requirement.interface == troe_abi::interface::VOLUME_CONTROL
                 && requirement.major == volume_control::MAJOR
                 && requirement.minor == volume_control::MINOR
@@ -936,6 +958,7 @@ impl ExternalCommand for KexCommandRunner<'_> {
                 || network_configuration_required
                 || icmp_echo_required
                 || tcp_connect_required
+                || tcp_listen_required
                 || volume_control_required
                 || shell_script_required;
             if unsupported_service_authority
@@ -1019,6 +1042,7 @@ impl ExternalCommand for KexCommandRunner<'_> {
                     network_configuration: network_configuration_required,
                     icmp_echo: icmp_echo_required,
                     tcp_connect: tcp_connect_required,
+                    tcp_listen: tcp_listen_required,
                     volume_control: volume_control_required,
                     wall_clock: wall_clock_required,
                     clock_control: clock_control_required,
@@ -1031,18 +1055,19 @@ impl ExternalCommand for KexCommandRunner<'_> {
             ));
         }
         let application_network = self.runtime.borrow().network.clone();
-        let application_transport_network = if datagram_required || tcp_connect_required {
-            let Some(network) = application_network.clone() else {
-                return Some(command_application_error(
-                    stderr,
-                    command,
-                    "required capability unavailable",
-                ));
+        let application_transport_network =
+            if datagram_required || tcp_connect_required || tcp_listen_required {
+                let Some(network) = application_network.clone() else {
+                    return Some(command_application_error(
+                        stderr,
+                        command,
+                        "required capability unavailable",
+                    ));
+                };
+                Some(network)
+            } else {
+                None
             };
-            Some(network)
-        } else {
-            None
-        };
         let service_count = 4
             + usize::from(datagram_required)
             + usize::from(filesystem_required)
@@ -1056,6 +1081,7 @@ impl ExternalCommand for KexCommandRunner<'_> {
             + usize::from(network_configuration_required)
             + usize::from(icmp_echo_required)
             + usize::from(tcp_connect_required)
+            + usize::from(tcp_listen_required)
             + usize::from(volume_control_required)
             + usize::from(shell_script_required)
             + usize::from(wall_clock_required)
@@ -1363,6 +1389,18 @@ impl ExternalCommand for KexCommandRunner<'_> {
                     minor: tcp_connect::MINOR,
                 });
             }
+            if tcp_listen_required {
+                let network = application_transport_network.as_ref().ok_or(())?.clone();
+                services.push(CommandStartupService {
+                    port: register_command_service(
+                        &mut dispatcher,
+                        ApplicationTcpListenService::new(network, self.runtime.clone()),
+                    )?,
+                    interface: troe_abi::interface::TCP_LISTEN,
+                    major: tcp_listen::MAJOR,
+                    minor: tcp_listen::MINOR,
+                });
+            }
             if volume_control_required {
                 let namespace = filesystem_namespace.as_ref().ok_or(())?.clone();
                 services.push(CommandStartupService {
@@ -1534,6 +1572,7 @@ impl ExternalCommand for KexCommandRunner<'_> {
                                 network_configuration: network_configuration_required,
                                 icmp_echo: icmp_echo_required,
                                 tcp_connect: tcp_connect_required,
+                                tcp_listen: tcp_listen_required,
                                 volume_control: volume_control_required,
                                 wall_clock: wall_clock_required,
                                 clock_control: clock_control_required,

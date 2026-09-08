@@ -1040,7 +1040,7 @@ Accordingly:
 - console input is untrusted and bounded;
 - KEFS, FAT32, ext4, StateFS, GPT, volume policy, configuration,
   generation, and activation inputs are parsed through exact bounded profiles;
-- Ethernet, ARP, DHCP, IPv4, ICMP, UDP, and outbound TCP input is untrusted and
+- Ethernet, ARP, DHCP, IPv4, ICMP, UDP, and inbound/outbound TCP input is untrusted and
   admitted only through the implemented bounded network profiles;
 - no command may access raw memory or devices unless explicitly given that capability;
 - release documentation MUST state whether hardware isolation exists.
@@ -1069,7 +1069,7 @@ are not implemented; their design gate is tracked in
 
 The implemented data plane includes the documented bounded VFS providers,
 persistent generations and configuration projection, virtio block/network,
-Ethernet/ARP/DHCP/IPv4/ICMP/UDP, and typed outbound TCP. Hosted tools implement
+Ethernet/ARP/DHCP/IPv4/ICMP/UDP, and separate typed outbound TCP and inbound TCP listener authorities. Hosted tools implement
 the current package-model, trust, publication, and transactional-lifecycle
 formats without claiming that host tooling is a native package manager.
 

@@ -1,6 +1,14 @@
 # ADR 0031: Bounded KEX TCP connect service
 
-Status: accepted and implemented for the first Stage 9 TCP slice, 2026-08-25.
+Extension: the independent [TCP listener v1](../formats/tcp-listen-v1.md)
+interface grants inbound authority. It does not widen `tcp-connect`.
+
+Status: accepted and implemented for the first Stage 9 TCP slice, 2026-08-25;
+the four-connection system-wide ceiling below is superseded by
+[ADR 0070](0070-bounded-tcp-passive-open-and-tuple-retention.md), which raises
+it to sixteen and adds the portable passive-open and tuple-retention states.
+Inbound listen authority is independently defined by the TCP listener v1
+contract linked above; the absence described below is historical.
 
 ## Decision
 
@@ -30,7 +38,8 @@ and treats an in-window reset as terminal.
 Resource bounds are part of interface 1.0:
 
 - at most four live TCP connections system-wide and one per `tcp-connect`
-  handle;
+  handle; the system-wide half is superseded by ADR 0070's sixteen, the
+  per-handle half is current;
 - one at-most-1,460-byte unacknowledged transmit segment per connection;
 - one 4 KiB receive FIFO per connection, with no out-of-order queue;
 - a four-attempt retransmission schedule of 250, 500, 1,000, and 1,000 ms;

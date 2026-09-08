@@ -54,7 +54,7 @@ measurement.
 - A bounded VFS with KEFS, a default read-write persistent ext4 volume at
   `/vol/root`, read/write FAT32, bounded ext4 symbolic/hard links, quota-bound
   `/tmp`, live `/sys`, and crash-consistent state under `/vol/state`.
-- Ethernet, ARP, DHCP, IPv4, ICMP, UDP, and outbound TCP over virtio-net.
+- Ethernet, ARP, DHCP, IPv4, ICMP, UDP, and bounded inbound/outbound TCP over virtio-net.
 - KEX applications for `arp`, `awk`, `cat`, `clear`, `cp`, `dhcp`, `echo`,
   `grep`, `head`, `hexdump`, `ln`, `ls`, `lua`, `man`, `mem`, `mkdir`, `mount`,
   `mv`, `net`, `ping`, `printf`, `ps`, `pwd`, `rm`, `rmdir`, `sed`, `sh`,
@@ -204,8 +204,10 @@ sh:/> udp send --source-port 40001 10.0.2.2 9 hello-from-troe
 sent 15 bytes from port 40001 to 10.0.2.2:9
 ```
 
-Networking is currently literal IPv4. DNS, IPv6, HTTP, TLS, and inbound TCP are
-outside the implemented scope.
+Networking is currently literal IPv4. DNS, IPv6, HTTP, and TLS are
+outside the implemented scope. Applications may declare the independent
+`tcp-listen` capability for one bounded inbound endpoint; see the
+[TCP listener contract](docs/formats/tcp-listen-v1.md).
 
 ### KEX applications
 

@@ -58,7 +58,7 @@ bundle. Unsupported firmware fails before device publication or volatile I/O.
    privileged utility behavior. KEX receives bounded stdin/stdout/stderr streams
    plus only declared optional datagram, read-only VFS, streamed file mutation,
    monotonic timer, wall-clock observation or correction, diagnostics,
-   process observation, network-observation, DHCP, ICMP, or outbound TCP-connect handles. Privileged
+   process observation, network-observation, DHCP, ICMP, outbound TCP-connect, or inbound TCP-listen handles. Privileged
    wall-clock correction is service-launcher-only. The `sh.kex` interpreter
    alone requests a bounded
    shell-script sidecar: it transactionally stages physical command lines, exits,
@@ -482,7 +482,9 @@ sequential streamed file mutation, a boot-relative monotonic timer with
 self-only process CPU time, one immutable typed diagnostics snapshot, current
 read-only process accounting, caller-private anonymous memory, fresh CSPRNG
 bytes, read-only typed network observation, one DHCP exchange, one ICMP
-   echo exchange, or one literal-IPv4 outbound TCP stream. Network observation,
+   echo exchange, one literal-IPv4 outbound TCP stream, or one bounded inbound
+   listener. The [listener contract](formats/tcp-listen-v1.md) specifies its
+   port ownership, backlog, connection identifiers, and shared limits. Network observation,
    configuration, echo, datagrams, and TCP are independent authorities; none
    exposes raw frames, routes, DNS, TLS, or devices. Datagram
 ports are exclusive to the launch; read-only
@@ -501,7 +503,9 @@ and cancellable; diagnostics retains fixed copied bytes rather than accounting
    borrows. TCP retains at most one unacknowledged 1,460-byte segment and one
    4 KiB receive FIFO per connection, retransmits four times on fixed timers,
    and admits only the exact tuple and next sequence. Dispatcher teardown
-   unbinds ports, removes connections, and invalidates every token. No
+   unbinds ports, removes live connections, and invalidates every token.
+   Gracefully closed tuples remain in the ambient network table until their
+   retention deadline; runtime checkpoints drive TCP emissions and expiry. No
 raw-network, route-control, provider, block, device, or machine handle is
 granted. The separate volume-control interface can list the boot policy and
 activate only a BMNT-authorized provider already prepared by stable-identity

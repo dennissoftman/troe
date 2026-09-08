@@ -8,7 +8,7 @@
 
 use crate::mounts::RuntimeMountRegistry;
 use crate::network::services::ApplicationDatagramState;
-use crate::network::{KernelNetworkService, KernelTcpConnection};
+use crate::network::{KernelNetworkService, KernelTcpConnection, KernelTcpListener};
 use crate::runtime::KernelRuntime;
 use alloc::rc::Rc;
 use alloc::vec::Vec;
@@ -43,6 +43,8 @@ pub(crate) type SharedProcessOwner = Rc<Cell<Option<OwnerId>>>;
 pub(crate) type SharedNetwork = Rc<RefCell<KernelNetworkService>>;
 
 pub(crate) type SharedTcpConnection = Rc<RefCell<KernelTcpConnection>>;
+
+pub(crate) type SharedTcpListener = Rc<RefCell<KernelTcpListener>>;
 
 pub(crate) type SharedRuntimeMounts = Rc<RefCell<RuntimeMountRegistry>>;
 

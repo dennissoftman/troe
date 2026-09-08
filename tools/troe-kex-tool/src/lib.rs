@@ -15,7 +15,8 @@ pub use elf::convert_elf;
 use troe_abi::{
     clock_control, datagram, diagnostics, filesystem, filesystem_mutation, icmp_echo, interface,
     network_configuration, network_observation, pipe, private_memory, process_launch,
-    process_observation, random, requirements, tcp_connect, timer, volume_control, wall_clock,
+    process_observation, random, requirements, tcp_connect, tcp_listen, timer, volume_control,
+    wall_clock,
 };
 use troe_application::{
     ABI_MAJOR, ABI_MINOR, KEX_PACKAGE_V1_MAGIC, KEX_V1_HEADER_BYTES, KEX_V1_MAGIC,
@@ -403,106 +404,90 @@ fn parse_simple_u64(line: &str, key: &str) -> ToolResult<Option<u64>> {
 }
 
 fn capability_requirement(name: &str) -> ToolResult<requirements::Requirement> {
-    match name {
-        "datagram" => Ok(requirements::Requirement {
-            interface: interface::DATAGRAM,
-            major: datagram::MAJOR,
-            minor: datagram::MINOR,
-        }),
-        "filesystem-read" => Ok(requirements::Requirement {
-            interface: interface::FILESYSTEM_READ,
-            major: filesystem::MAJOR,
-            minor: filesystem::MINOR,
-        }),
-        "filesystem-mutate" => Ok(requirements::Requirement {
-            interface: interface::FILESYSTEM_MUTATE,
-            major: filesystem_mutation::MAJOR,
-            minor: filesystem_mutation::MINOR,
-        }),
-        "timer" => Ok(requirements::Requirement {
-            interface: interface::TIMER,
-            major: timer::MAJOR,
-            minor: timer::MINOR,
-        }),
-        "diagnostics" => Ok(requirements::Requirement {
-            interface: interface::DIAGNOSTICS,
-            major: diagnostics::MAJOR,
-            minor: diagnostics::MINOR,
-        }),
-        "network-observe" => Ok(requirements::Requirement {
-            interface: interface::NETWORK_OBSERVE,
-            major: network_observation::MAJOR,
-            minor: network_observation::MINOR,
-        }),
-        "network-configure" => Ok(requirements::Requirement {
-            interface: interface::NETWORK_CONFIGURE,
-            major: network_configuration::MAJOR,
-            minor: network_configuration::MINOR,
-        }),
-        "icmp-echo" => Ok(requirements::Requirement {
-            interface: interface::ICMP_ECHO,
-            major: icmp_echo::MAJOR,
-            minor: icmp_echo::MINOR,
-        }),
-        "tcp-connect" => Ok(requirements::Requirement {
-            interface: interface::TCP_CONNECT,
-            major: tcp_connect::MAJOR,
-            minor: tcp_connect::MINOR,
-        }),
-        "volume-control" => Ok(requirements::Requirement {
-            interface: interface::VOLUME_CONTROL,
-            major: volume_control::MAJOR,
-            minor: volume_control::MINOR,
-        }),
-        "server-endpoint" => Ok(requirements::Requirement {
-            interface: interface::SERVER_ENDPOINT,
-            major: troe_abi::server::MAJOR,
-            minor: troe_abi::server::MINOR,
-        }),
-        "shell-script" => Ok(requirements::Requirement {
-            interface: interface::SHELL_SCRIPT,
-            major: troe_abi::shell_script::MAJOR,
-            minor: troe_abi::shell_script::MINOR,
-        }),
-        "wall-clock" => Ok(requirements::Requirement {
-            interface: interface::WALL_CLOCK,
-            major: wall_clock::MAJOR,
-            minor: wall_clock::MINOR,
-        }),
-        "clock-control" => Ok(requirements::Requirement {
-            interface: interface::CLOCK_CONTROL,
-            major: clock_control::MAJOR,
-            minor: clock_control::MINOR,
-        }),
-        "process-observe" => Ok(requirements::Requirement {
-            interface: interface::PROCESS_OBSERVE,
-            major: process_observation::MAJOR,
-            minor: process_observation::MINOR,
-        }),
-        "process-launch" => Ok(requirements::Requirement {
-            interface: interface::PROCESS_LAUNCH,
-            major: process_launch::MAJOR,
-            minor: process_launch::MINOR,
-        }),
-        "pipe" => Ok(requirements::Requirement {
-            interface: interface::PIPE,
-            major: pipe::MAJOR,
-            minor: pipe::MINOR,
-        }),
-        "private-memory" => Ok(requirements::Requirement {
-            interface: interface::PRIVATE_MEMORY,
-            major: private_memory::MAJOR,
-            minor: private_memory::MINOR,
-        }),
-        "random" => Ok(requirements::Requirement {
-            interface: interface::RANDOM,
-            major: random::MAJOR,
-            minor: random::MINOR,
-        }),
-        _ => Err(ToolError::new(format!(
-            "unknown TROE KEX capability '{name}'"
-        ))),
-    }
+    let (interface, major, minor) = match name {
+        "datagram" => (interface::DATAGRAM, datagram::MAJOR, datagram::MINOR),
+        "filesystem-read" => (
+            interface::FILESYSTEM_READ,
+            filesystem::MAJOR,
+            filesystem::MINOR,
+        ),
+        "filesystem-mutate" => (
+            interface::FILESYSTEM_MUTATE,
+            filesystem_mutation::MAJOR,
+            filesystem_mutation::MINOR,
+        ),
+        "timer" => (interface::TIMER, timer::MAJOR, timer::MINOR),
+        "diagnostics" => (
+            interface::DIAGNOSTICS,
+            diagnostics::MAJOR,
+            diagnostics::MINOR,
+        ),
+        "network-observe" => (
+            interface::NETWORK_OBSERVE,
+            network_observation::MAJOR,
+            network_observation::MINOR,
+        ),
+        "network-configure" => (
+            interface::NETWORK_CONFIGURE,
+            network_configuration::MAJOR,
+            network_configuration::MINOR,
+        ),
+        "icmp-echo" => (interface::ICMP_ECHO, icmp_echo::MAJOR, icmp_echo::MINOR),
+        "tcp-connect" => (
+            interface::TCP_CONNECT,
+            tcp_connect::MAJOR,
+            tcp_connect::MINOR,
+        ),
+        "tcp-listen" => (interface::TCP_LISTEN, tcp_listen::MAJOR, tcp_listen::MINOR),
+        "volume-control" => (
+            interface::VOLUME_CONTROL,
+            volume_control::MAJOR,
+            volume_control::MINOR,
+        ),
+        "server-endpoint" => (
+            interface::SERVER_ENDPOINT,
+            troe_abi::server::MAJOR,
+            troe_abi::server::MINOR,
+        ),
+        "shell-script" => (
+            interface::SHELL_SCRIPT,
+            troe_abi::shell_script::MAJOR,
+            troe_abi::shell_script::MINOR,
+        ),
+        "wall-clock" => (interface::WALL_CLOCK, wall_clock::MAJOR, wall_clock::MINOR),
+        "clock-control" => (
+            interface::CLOCK_CONTROL,
+            clock_control::MAJOR,
+            clock_control::MINOR,
+        ),
+        "process-observe" => (
+            interface::PROCESS_OBSERVE,
+            process_observation::MAJOR,
+            process_observation::MINOR,
+        ),
+        "process-launch" => (
+            interface::PROCESS_LAUNCH,
+            process_launch::MAJOR,
+            process_launch::MINOR,
+        ),
+        "pipe" => (interface::PIPE, pipe::MAJOR, pipe::MINOR),
+        "private-memory" => (
+            interface::PRIVATE_MEMORY,
+            private_memory::MAJOR,
+            private_memory::MINOR,
+        ),
+        "random" => (interface::RANDOM, random::MAJOR, random::MINOR),
+        _ => {
+            return Err(ToolError::new(format!(
+                "unknown TROE KEX capability '{name}'"
+            )));
+        }
+    };
+    Ok(requirements::Requirement {
+        interface,
+        major,
+        minor,
+    })
 }
 
 fn valid_command_name(name: &str) -> bool {
@@ -1126,6 +1111,18 @@ mod tests {
     use super::{filtered_rustc_arguments, read_manifest, repo_root};
     use std::ffi::OsString;
     use std::fs;
+
+    #[test]
+    fn listener_capability_is_separate_from_outbound_authority() -> Result<(), super::ToolError> {
+        let listener = super::capability_requirement("tcp-listen")?;
+        let outbound = super::capability_requirement("tcp-connect")?;
+        assert_eq!(listener.interface, troe_abi::interface::TCP_LISTEN);
+        assert_eq!((listener.major, listener.minor), (1, 0));
+        assert_ne!(listener.interface, outbound.interface);
+        assert!(!troe_abi::interface::is_boot_only(listener.interface));
+        assert!(super::capability_requirement("tcp").is_err());
+        Ok(())
+    }
 
     #[test]
     fn rustc_wrapper_removes_only_cargo_metadata() -> Result<(), super::ToolError> {

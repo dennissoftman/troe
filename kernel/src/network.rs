@@ -14,7 +14,7 @@
 pub(crate) mod bringup;
 pub(crate) mod services;
 
-use crate::handles::{SharedNetwork, SharedTcpConnection};
+use crate::handles::{SharedNetwork, SharedTcpConnection, SharedTcpListener};
 use alloc::collections::VecDeque;
 use alloc::rc::Rc;
 use alloc::string::String;
@@ -25,9 +25,10 @@ use troe_dispatch::ReplyStatus;
 use troe_net::NetworkDevice;
 use troe_net::{
     ArpCache, DhcpMessageType, DhcpPacket, Ipv4Address, MAX_UDP_PAYLOAD_BYTES, MacAddress,
-    NetError, NetworkServiceStats, TcpConnection, TcpError, UdpAdmission, UdpPortTable,
-    build_arp_reply, build_arp_request, build_dhcp_discover, build_dhcp_request, build_icmp_echo,
-    build_udp, parse_arp, parse_dhcp, parse_icmp_echo, parse_tcp, parse_udp,
+    NetError, NetworkServiceStats, TcpConnection, TcpEndpoint, TcpError, TcpListener, TcpSegment,
+    UdpAdmission, UdpPortTable, build_arp_reply, build_arp_request, build_dhcp_discover,
+    build_dhcp_request, build_icmp_echo, build_tcp, build_udp, parse_arp, parse_dhcp,
+    parse_icmp_echo, parse_tcp, parse_udp,
 };
 use troe_task::CooperativeRuntime;
 
@@ -49,6 +50,10 @@ pub(crate) enum NetworkError {
     Exhausted,
     Cancelled,
     Closed,
+    /// A local endpoint already has another owner.
+    Conflict,
+    /// The named connection or endpoint does not exist for this caller.
+    NotFound,
 }
 
 #[derive(Clone, Copy)]
@@ -87,6 +92,8 @@ pub(crate) struct KernelNetworkService {
     dhcp_inbox: VecDeque<DhcpPacket>,
     echo_inbox: VecDeque<EchoReply>,
     tcp: Vec<SharedTcpConnection>,
+    tcp_listeners: Vec<SharedTcpListener>,
+    next_tcp_listener_id: u64,
     stats: NetworkServiceStats,
 }
 
@@ -103,6 +110,19 @@ pub(crate) struct KernelTcpConnection {
     local_port: u16,
     peer_mac: MacAddress,
     machine: TcpConnection,
+}
+
+/// One owned listening endpoint retained in the ambient network state.
+///
+/// The portable listener owns every connection between an admitted SYN and its
+/// acceptance, so the ambient state holds the listener rather than its queue.
+/// Peer Ethernet addresses are not stored here: the frame path learns every
+/// inbound peer into the ARP cache before admission, so emission resolves them
+/// from that cache.
+pub(crate) struct KernelTcpListener {
+    id: u64,
+    local_port: u16,
+    listener: TcpListener,
 }
 
 pub(crate) struct KernelNetwork {
@@ -147,6 +167,7 @@ pub(crate) fn network_boot_label(status: NetworkStatus) -> String {
 impl KernelNetworkService {
     const POLL_BUDGET: usize = 8;
     const INBOX_CAPACITY: usize = 4;
+    const FLUSH_BUDGET: usize = 8;
 
     fn new(device: troe_machine::NativeVirtioNetwork) -> Result<Self, NetError> {
         let mut dhcp_inbox = VecDeque::new();
@@ -159,6 +180,10 @@ impl KernelNetworkService {
             .map_err(|_| NetError::Exhausted)?;
         let mut tcp = Vec::new();
         tcp.try_reserve_exact(troe_net::MAX_TCP_CONNECTIONS)
+            .map_err(|_| NetError::Exhausted)?;
+        let mut tcp_listeners = Vec::new();
+        tcp_listeners
+            .try_reserve_exact(troe_net::MAX_TCP_LISTENERS)
             .map_err(|_| NetError::Exhausted)?;
         Ok(Self {
             device,
@@ -174,6 +199,8 @@ impl KernelNetworkService {
             dhcp_inbox,
             echo_inbox,
             tcp,
+            tcp_listeners,
+            next_tcp_listener_id: 1,
             stats: NetworkServiceStats::default(),
         })
     }
@@ -207,6 +234,202 @@ impl KernelNetworkService {
                 Err(map_network_error(error))
             }
         }
+    }
+
+    /// Derive one initial sequence value for an active or passive open.
+    ///
+    /// ADR 0031's derivation, shared by both paths so there is exactly one:
+    /// boot-relative time, the device address, and a per-boot generation. It is not
+    /// cryptographic entropy.
+    pub(crate) fn next_tcp_initial_sequence(&mut self) -> u32 {
+        self.tcp_generation = self.tcp_generation.wrapping_add(1);
+        let mac = self.device.mac_address().bytes();
+        let mac_word = u32::from_be_bytes([mac[2], mac[3], mac[4], mac[5]]);
+        let now = troe_machine::monotonic_millis().unwrap_or(0);
+        u32::try_from(now & u64::from(u32::MAX)).unwrap_or(u32::MAX)
+            ^ u32::try_from(now >> 32).unwrap_or(u32::MAX).rotate_left(7)
+            ^ mac_word.rotate_left(13)
+            ^ self.tcp_generation.wrapping_mul(0x9e37_79b9)
+    }
+
+    /// Whether one local TCP port is already claimed by a listener or a live
+    /// connection.
+    pub(crate) fn tcp_port_claimed(&self, port: u16) -> bool {
+        self.tcp_listeners
+            .iter()
+            .any(|entry| entry.borrow().local_port == port)
+            || self
+                .tcp
+                .iter()
+                .any(|connection| connection.borrow().local_port == port)
+    }
+
+    /// Live connections plus every connection queued in a listener.
+    pub(crate) fn tcp_connection_count(&self) -> usize {
+        self.tcp.len().saturating_add(
+            self.tcp_listeners
+                .iter()
+                .map(|entry| entry.borrow().listener.pending())
+                .sum(),
+        )
+    }
+
+    /// Claim one listening endpoint and retain it in the ambient state.
+    pub(crate) fn bind_tcp_listener(
+        &mut self,
+        local: TcpEndpoint,
+        backlog: usize,
+    ) -> Result<SharedTcpListener, NetworkError> {
+        if self.tcp_port_claimed(local.port()) {
+            return Err(NetworkError::Conflict);
+        }
+        if self.tcp_listeners.len() == troe_net::MAX_TCP_LISTENERS {
+            return Err(NetworkError::Exhausted);
+        }
+        let listener = TcpListener::bind(local, backlog).map_err(map_tcp_error)?;
+        let id = self
+            .next_tcp_listener_id
+            .checked_add(1)
+            .ok_or(NetworkError::Exhausted)?;
+        let entry = Rc::new(RefCell::new(KernelTcpListener {
+            id: self.next_tcp_listener_id,
+            local_port: local.port(),
+            listener,
+        }));
+        self.next_tcp_listener_id = id;
+        self.tcp_listeners.push(entry.clone());
+        Ok(entry)
+    }
+
+    /// Release one listening endpoint and discard every connection still
+    /// queued in it.
+    pub(crate) fn release_tcp_listener(&mut self, id: u64) {
+        self.tcp_listeners.retain(|entry| entry.borrow().id != id);
+    }
+
+    /// Remove one connection from the frame path immediately.
+    ///
+    /// This is owner teardown and error recovery, not orderly close: a
+    /// gracefully closed connection stays in the table until its retained
+    /// tuple expires, so a delayed peer FIN cannot reach a reused tuple.
+    pub(crate) fn release_tcp_connection(&mut self, id: u64) {
+        self.tcp.retain(|candidate| candidate.borrow().id != id);
+    }
+
+    /// Select one unclaimed ephemeral local TCP port.
+    pub(crate) fn select_ephemeral_tcp_port(&mut self) -> Result<u16, NetworkError> {
+        for _ in 0..=troe_net::MAX_TCP_CONNECTIONS + troe_net::MAX_TCP_LISTENERS {
+            let port = self.next_tcp_port;
+            self.next_tcp_port = if port == u16::MAX { 49_152 } else { port + 1 };
+            if !self.tcp_port_claimed(port) {
+                return Ok(port);
+            }
+        }
+        Err(NetworkError::Exhausted)
+    }
+
+    /// Retain one accepted connection so the frame path routes to it directly.
+    pub(crate) fn retain_tcp_connection(
+        &mut self,
+        local_port: u16,
+        peer_mac: MacAddress,
+        machine: TcpConnection,
+    ) -> Result<SharedTcpConnection, NetworkError> {
+        if self.tcp_connection_count() >= troe_net::MAX_TCP_CONNECTIONS {
+            return Err(NetworkError::Exhausted);
+        }
+        let id = self
+            .next_tcp_id
+            .checked_add(1)
+            .ok_or(NetworkError::Exhausted)?;
+        let connection = Rc::new(RefCell::new(KernelTcpConnection {
+            id: self.next_tcp_id,
+            local_port,
+            peer_mac,
+            machine,
+        }));
+        self.next_tcp_id = id;
+        self.tcp.push(connection.clone());
+        Ok(connection)
+    }
+
+    /// Most recently observed Ethernet address for one peer.
+    pub(crate) fn peer_mac(&self, address: Ipv4Address) -> Option<MacAddress> {
+        self.arp.lookup(address)
+    }
+
+    /// Transmit every due segment retained by a listener or a connection.
+    ///
+    /// Emission is otherwise driven only by the application's own service call,
+    /// which is sufficient for an outbound stream: the application is inside
+    /// `connect`, `read`, or `write` exactly when it needs the wire. A listening
+    /// endpoint is not, so this runs from the ambient checkpoint and answers an
+    /// inbound SYN while the application is computing.
+    pub(crate) fn flush_pending(&mut self, now_milliseconds: u64) {
+        for _ in 0..Self::FLUSH_BUDGET {
+            if !self.flush_one(now_milliseconds) {
+                break;
+            }
+        }
+        // A connection reaches `Closed` only after a reset, a retransmission
+        // timeout, or the expiry of its retained tuple, so reclaiming here is
+        // what finally frees a gracefully closed connection's slot.
+        self.tcp
+            .retain(|connection| !connection.borrow().machine.is_closed());
+    }
+
+    /// Transmit at most one due segment, reporting whether one was produced.
+    fn flush_one(&mut self, now_milliseconds: u64) -> bool {
+        let source_mac = self.device.mac_address();
+        for index in 0..self.tcp_listeners.len() {
+            let Some(entry) = self.tcp_listeners.get(index).cloned() else {
+                continue;
+            };
+            let frame = {
+                let Ok(mut entry) = entry.try_borrow_mut() else {
+                    continue;
+                };
+                let Some(emission) = entry.listener.poll_emission(now_milliseconds) else {
+                    continue;
+                };
+                let Some(peer_mac) = self.arp.lookup(emission.destination.address()) else {
+                    // The peer is only reachable through an address the frame
+                    // path learned before admission, so an unresolvable peer
+                    // drops its segment rather than triggering ARP from here.
+                    continue;
+                };
+                match build_tcp(source_mac, peer_mac, emission_segment(&emission)) {
+                    Ok(frame) => frame,
+                    Err(_) => continue,
+                }
+            };
+            let _transmitted = self.transmit(&frame);
+            return true;
+        }
+        for index in 0..self.tcp.len() {
+            let Some(connection) = self.tcp.get(index).cloned() else {
+                continue;
+            };
+            let frame = {
+                let Ok(mut connection) = connection.try_borrow_mut() else {
+                    continue;
+                };
+                if !connection.machine.emission_due(now_milliseconds) {
+                    continue;
+                }
+                let peer_mac = connection.peer_mac;
+                let Ok(Some(emission)) = connection.machine.poll_emission(now_milliseconds) else {
+                    continue;
+                };
+                match build_tcp(source_mac, peer_mac, emission_segment(&emission)) {
+                    Ok(frame) => frame,
+                    Err(_) => continue,
+                }
+            };
+            let _transmitted = self.transmit(&frame);
+            return true;
+        }
+        false
     }
 
     pub(crate) fn poll(&mut self) -> Result<(), NetworkError> {
@@ -309,6 +532,38 @@ impl KernelNetworkService {
                 .find(|connection| connection.borrow().machine.accepts(segment))
             {
                 let _admission = connection.borrow_mut().machine.on_segment(segment);
+                return Ok(());
+            }
+            // A segment no live connection claims may still belong to an owned
+            // listening endpoint, which admits a bare SYN as one passive open
+            // and advances its own queued connections. The initial sequence is
+            // derived here, so both the active and the passive path share one
+            // derivation. Existing queued tuples retain their original value.
+            let listener = self
+                .tcp_listeners
+                .iter()
+                .position(|entry| entry.borrow().listener.owns(segment))
+                .and_then(|index| self.tcp_listeners.get(index).cloned());
+            if let Some(entry) = listener {
+                if troe_abi::tcp_listen::encode_accept_reply(
+                    1,
+                    segment.source.address().bytes(),
+                    segment.source.port(),
+                )
+                .is_err()
+                {
+                    return Ok(());
+                }
+                if self.tcp_connection_count() >= troe_net::MAX_TCP_CONNECTIONS
+                    && !entry.borrow().listener.has_connection(segment)
+                {
+                    return Ok(());
+                }
+                let initial_sequence = self.next_tcp_initial_sequence();
+                let _admission = entry
+                    .borrow_mut()
+                    .listener
+                    .on_segment(segment, initial_sequence);
             } else {
                 self.stats.ignored_frames = self.stats.ignored_frames.saturating_add(1);
             }
@@ -585,6 +840,23 @@ pub(crate) const fn application_network_status(error: NetworkError) -> ReplyStat
         NetworkError::Cancelled => ReplyStatus::Cancelled,
         NetworkError::Closed | NetworkError::Device => ReplyStatus::Failure,
         NetworkError::Protocol => ReplyStatus::NetworkProtocol,
+        NetworkError::Conflict => ReplyStatus::Conflict,
+        NetworkError::NotFound => ReplyStatus::NotFound,
+    }
+}
+
+/// Borrow one emission as the segment record the wire builder accepts.
+pub(crate) fn emission_segment<'segment>(
+    emission: &troe_net::TcpEmission<'segment>,
+) -> TcpSegment<'segment> {
+    TcpSegment {
+        source: emission.source,
+        destination: emission.destination,
+        sequence: emission.sequence,
+        acknowledgement: emission.acknowledgement,
+        flags: emission.flags,
+        window: emission.window,
+        payload: emission.payload,
     }
 }
 

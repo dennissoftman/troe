@@ -63,8 +63,16 @@ pub const BOOT_BLOB: u32 = 27;
 /// Supervisor-only initialize and shutdown for one persistent server.
 pub const SERVICE_LIFECYCLE: u32 = 28;
 
+// Application-facing interfaces assigned after ADR 0035's internal registry
+// took 24 through 28. The registry stays dense, so it is no longer true that
+// every identifier at or above `WAIT_SET` is boot-only; `is_boot_only` names
+// the closed internal set explicitly rather than comparing against a bound.
+
+/// One bounded inbound IPv4/TCP listening endpoint and its accepted streams.
+pub const TCP_LISTEN: u32 = 29;
+
 /// Highest assigned interface identifier.
-pub const HIGHEST: u32 = SERVICE_LIFECYCLE;
+pub const HIGHEST: u32 = TCP_LISTEN;
 
 /// Rights bit positions shared by every interface, fixed by ADR 0035.
 pub mod rights {
@@ -126,7 +134,9 @@ pub const fn allowed_rights(interface: u32) -> u16 {
         // The lifecycle interface and every application-facing interface are
         // reached only by calling them. Their operation-level authority is
         // carried by the interface identity itself, not by a rights bit.
-        SERVICE_LIFECYCLE | COMMAND..=SERVER_ENDPOINT | SHELL_SCRIPT..=RANDOM => rights::CALL,
+        SERVICE_LIFECYCLE | TCP_LISTEN | COMMAND..=SERVER_ENDPOINT | SHELL_SCRIPT..=RANDOM => {
+            rights::CALL
+        }
         _ => 0,
     }
 }
@@ -166,6 +176,7 @@ mod tests {
             interface::BLOCK_REGION,
             interface::BOOT_BLOB,
             interface::SERVICE_LIFECYCLE,
+            interface::TCP_LISTEN,
         ];
         assert!(interfaces.iter().all(|value| *value != 0));
         assert!(
@@ -188,10 +199,21 @@ mod tests {
 
     #[test]
     fn only_the_internal_registry_is_boot_only() {
+        // The internal registry is a closed set, not a tail. Identifiers above
+        // it are assigned to application-facing interfaces, so a comparison
+        // against `WAIT_SET` would silently classify every future interface as
+        // boot-only.
+        const BOOT_ONLY: [u32; 5] = [
+            interface::WAIT_SET,
+            interface::PACKET_DEVICE,
+            interface::BLOCK_REGION,
+            interface::BOOT_BLOB,
+            interface::SERVICE_LIFECYCLE,
+        ];
         for interface in 1..=interface::HIGHEST {
             assert_eq!(
                 interface::is_boot_only(interface),
-                interface >= interface::WAIT_SET,
+                BOOT_ONLY.contains(&interface),
                 "interface {interface} has the wrong boot-only classification"
             );
         }

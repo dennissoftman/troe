@@ -12,9 +12,9 @@ use alloc::vec::Vec;
 mod tcp;
 
 pub use tcp::{
-    MAX_TCP_CONNECTIONS, MAX_TCP_PAYLOAD_BYTES, MAX_TCP_RECEIVE_BYTES, TCP_TRANSMIT_ATTEMPTS,
-    TcpAdmission, TcpConnection, TcpEmission, TcpEndpoint, TcpError, TcpFlags, TcpSegment,
-    TcpState,
+    MAX_TCP_BACKLOG, MAX_TCP_CONNECTIONS, MAX_TCP_LISTENERS, MAX_TCP_PAYLOAD_BYTES,
+    MAX_TCP_RECEIVE_BYTES, TCP_TIME_WAIT_MILLISECONDS, TCP_TRANSMIT_ATTEMPTS, TcpAdmission,
+    TcpConnection, TcpEmission, TcpEndpoint, TcpError, TcpFlags, TcpListener, TcpSegment, TcpState,
 };
 
 /// Ethernet header bytes without VLAN tags.
