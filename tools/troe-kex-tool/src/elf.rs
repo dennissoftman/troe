@@ -3,9 +3,10 @@
 use std::ops::Range;
 
 use troe_application::{
-    ABI_MAJOR, ABI_MINOR, ApplicationLimits, KEX_V1_HEADER_BYTES, KEX_V1_IMAGE_ALIGNMENT,
-    KEX_V1_LOAD_RECORD_BYTES, KEX_V1_MAGIC, KEX_V1_RELOCATION_RECORD_BYTES, MAX_LOAD_RECORDS,
-    PAGE_SIZE, SegmentPermissions, Target, maximum_table_pages, parse_kex,
+    ABI_MAJOR, ABI_MINOR, ApplicationLimits, KEX_V1_CONTAINER_MAJOR, KEX_V1_CONTAINER_MINOR,
+    KEX_V1_HEADER_BYTES, KEX_V1_IMAGE_ALIGNMENT, KEX_V1_LOAD_RECORD_BYTES, KEX_V1_MAGIC,
+    KEX_V1_RELOCATION_RECORD_BYTES, MAX_LOAD_RECORDS, PAGE_SIZE, SegmentPermissions, Target,
+    maximum_table_pages, parse_kex,
 };
 
 use crate::{ToolError, ToolResult};
@@ -1137,8 +1138,8 @@ pub fn convert_elf(
 
     let mut output = vec![0_u8; artifact_bytes];
     output[..8].copy_from_slice(&KEX_V1_MAGIC);
-    write_u16(&mut output, 8, 1);
-    write_u16(&mut output, 10, 1);
+    write_u16(&mut output, 8, KEX_V1_CONTAINER_MAJOR);
+    write_u16(&mut output, 10, KEX_V1_CONTAINER_MINOR);
     write_u16(&mut output, 12, parsed.target as u16);
     write_u16(
         &mut output,

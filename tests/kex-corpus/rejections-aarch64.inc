@@ -3,6 +3,7 @@
     ("reject-invalid-magic-aarch64.kex", include_bytes!("reject-invalid-magic-aarch64.kex") as &[u8], ParseError::InvalidMagic),
     ("reject-container-major-aarch64.kex", include_bytes!("reject-container-major-aarch64.kex") as &[u8], ParseError::UnsupportedContainerVersion),
     ("reject-container-minor-aarch64.kex", include_bytes!("reject-container-minor-aarch64.kex") as &[u8], ParseError::UnsupportedContainerVersion),
+    ("reject-header-reserved64-aarch64.kex", include_bytes!("reject-header-reserved64-aarch64.kex") as &[u8], ParseError::NonzeroReserved),
     ("reject-wrong-target-aarch64.kex", include_bytes!("reject-wrong-target-aarch64.kex") as &[u8], ParseError::WrongTarget),
     ("reject-header-bytes-aarch64.kex", include_bytes!("reject-header-bytes-aarch64.kex") as &[u8], ParseError::InvalidLayout),
     ("reject-record-bytes-aarch64.kex", include_bytes!("reject-record-bytes-aarch64.kex") as &[u8], ParseError::InvalidLayout),

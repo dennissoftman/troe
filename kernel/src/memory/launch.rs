@@ -187,6 +187,10 @@ pub(crate) fn allocate_application<P: NativeApplicationPlan>(
     accounting: &mut OwnedAccounting,
     plan: &P,
 ) -> Result<(ApplicationAllocation, MappingPlan), ()> {
+    // This allocation and troe-machine's startup mapping each back one frame.
+    // Widening the ABI region must grow both before this assertion can change.
+    const _: () = assert!(troe_application::STARTUP_REGION_BYTES == troe_application::PAGE_BYTES);
+
     let resource_pages = plan.charges().private_pages();
     let committed_pages = accounting
         .application_committed_pages

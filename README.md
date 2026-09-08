@@ -259,7 +259,7 @@ C-locale formatting/classification, decimal/math, capability-backed CSPRNG
 reads, and POSIX-shaped private-memory helpers. Allocation-backed recursive filesystem operations are a separate
 feature so embedders can retain their own allocator policy.
 
-KEX container 1.1 is position-independent. The kernel fails closed unless UEFI
+KEX container 1.2 is position-independent. The kernel fails closed unless UEFI
 supplies an approved RNG seed, retains a ChaCha20 CSPRNG, gives applications
 random bytes only through an explicit read capability, and independently
 randomizes every image, stack, and anonymous private mapping. Each application

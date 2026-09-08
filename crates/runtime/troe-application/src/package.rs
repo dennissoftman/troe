@@ -3,10 +3,12 @@
 use crate::bytes::{write_u16, write_u32, write_u64};
 use crate::{
     ApplicationLimits, KEX_PACKAGE_V1_HEADER_BYTES, KEX_PACKAGE_V1_MAGIC, MAX_KEX_PACKAGE_BYTES,
-    PACKAGE_FLAG_COMPLETION, PACKAGE_HEADER_BYTES, PACKAGE_HEADER_COMPLETION_OFFSET,
-    PACKAGE_HEADER_EXECUTABLE_BYTES, PACKAGE_HEADER_EXECUTABLE_OFFSET, PACKAGE_HEADER_FLAGS,
-    PACKAGE_HEADER_MAJOR, PACKAGE_HEADER_MANIFEST_BYTES, PACKAGE_HEADER_MANIFEST_OFFSET,
-    PACKAGE_HEADER_MINOR, PACKAGE_HEADER_PACKAGE_BYTES, PACKAGE_MAJOR, PACKAGE_MINOR,
+    PACKAGE_FLAG_COMPLETION, PACKAGE_HEADER_BYTES, PACKAGE_HEADER_COMPLETION_BYTES,
+    PACKAGE_HEADER_COMPLETION_OFFSET, PACKAGE_HEADER_EXECUTABLE_BYTES,
+    PACKAGE_HEADER_EXECUTABLE_OFFSET, PACKAGE_HEADER_FLAGS, PACKAGE_HEADER_MAJOR,
+    PACKAGE_HEADER_MANIFEST_BYTES, PACKAGE_HEADER_MANIFEST_OFFSET, PACKAGE_HEADER_MINOR,
+    PACKAGE_HEADER_PACKAGE_BYTES, PACKAGE_HEADER_RESERVED, PACKAGE_HEADER_RESERVED_BYTES,
+    PACKAGE_MAJOR, PACKAGE_MINOR,
 };
 use alloc::vec::Vec;
 use core::fmt;
@@ -174,23 +176,28 @@ pub fn encode_kex_package_with_completion(
         PACKAGE_HEADER_MANIFEST_BYTES,
         u32::try_from(manifest_bytes).map_err(|_| PackageEncodeError::ArithmeticOverflow)?,
     );
-    write_u32(
+    write_u64(
         &mut package,
         PACKAGE_HEADER_EXECUTABLE_OFFSET,
-        u32::try_from(executable_offset).map_err(|_| PackageEncodeError::ArithmeticOverflow)?,
+        u64::try_from(executable_offset).map_err(|_| PackageEncodeError::ArithmeticOverflow)?,
     );
-    if completion.is_some() {
-        write_u32(
-            &mut package,
-            PACKAGE_HEADER_COMPLETION_OFFSET,
-            u32::try_from(executable_end).map_err(|_| PackageEncodeError::ArithmeticOverflow)?,
-        );
-    }
     write_u64(
         &mut package,
         PACKAGE_HEADER_EXECUTABLE_BYTES,
         u64::try_from(executable.len()).map_err(|_| PackageEncodeError::ArithmeticOverflow)?,
     );
+    if let Some(completion) = completion {
+        write_u64(
+            &mut package,
+            PACKAGE_HEADER_COMPLETION_OFFSET,
+            u64::try_from(executable_end).map_err(|_| PackageEncodeError::ArithmeticOverflow)?,
+        );
+        write_u64(
+            &mut package,
+            PACKAGE_HEADER_COMPLETION_BYTES,
+            u64::try_from(completion.len()).map_err(|_| PackageEncodeError::ArithmeticOverflow)?,
+        );
+    }
     write_u64(
         &mut package,
         PACKAGE_HEADER_PACKAGE_BYTES,
@@ -240,18 +247,24 @@ pub fn parse_kex_package(package: &[u8]) -> Result<KexPackage<'_>, PackageError>
     let manifest_bytes = usize::try_from(read_package_u32(package, PACKAGE_HEADER_MANIFEST_BYTES)?)
         .map_err(|_| PackageError::InvalidLayout)?;
     let executable_offset =
-        usize::try_from(read_package_u32(package, PACKAGE_HEADER_EXECUTABLE_OFFSET)?)
+        usize::try_from(read_package_u64(package, PACKAGE_HEADER_EXECUTABLE_OFFSET)?)
             .map_err(|_| PackageError::InvalidLayout)?;
     let executable_bytes =
         usize::try_from(read_package_u64(package, PACKAGE_HEADER_EXECUTABLE_BYTES)?)
             .map_err(|_| PackageError::InvalidLayout)?;
     let completion_offset =
-        usize::try_from(read_package_u32(package, PACKAGE_HEADER_COMPLETION_OFFSET)?)
+        usize::try_from(read_package_u64(package, PACKAGE_HEADER_COMPLETION_OFFSET)?)
+            .map_err(|_| PackageError::InvalidLayout)?;
+    let completion_bytes =
+        usize::try_from(read_package_u64(package, PACKAGE_HEADER_COMPLETION_BYTES)?)
             .map_err(|_| PackageError::InvalidLayout)?;
     let package_bytes = usize::try_from(read_package_u64(package, PACKAGE_HEADER_PACKAGE_BYTES)?)
         .map_err(|_| PackageError::LengthMismatch)?;
     if package_bytes != package.len() {
         return Err(PackageError::LengthMismatch);
+    }
+    if package_reserved_is_nonzero(package)? {
+        return Err(PackageError::NonzeroReserved);
     }
     let manifest_end = manifest_offset
         .checked_add(manifest_bytes)
@@ -265,11 +278,13 @@ pub fn parse_kex_package(package: &[u8]) -> Result<KexPackage<'_>, PackageError>
         || executable_offset != manifest_end
         || executable_bytes == 0
         || executable_bytes > ApplicationLimits::standard().encoded_bytes()
-        || (flags == 0 && (completion_offset != 0 || executable_end != package.len()))
+        || (flags == 0
+            && (completion_offset != 0 || completion_bytes != 0 || executable_end != package.len()))
         || (flags == PACKAGE_FLAG_COMPLETION
             && (completion_offset != executable_end
-                || completion_offset >= package.len()
-                || package.len() - completion_offset > troe_completion::MAX_ARTIFACT_BYTES))
+                || completion_bytes == 0
+                || completion_bytes > troe_completion::MAX_ARTIFACT_BYTES
+                || completion_offset.checked_add(completion_bytes) != Some(package.len())))
     {
         return Err(PackageError::InvalidLayout);
     }
@@ -284,7 +299,7 @@ pub fn parse_kex_package(package: &[u8]) -> Result<KexPackage<'_>, PackageError>
         .ok_or(PackageError::InvalidLayout)?;
     let completion = if flags == PACKAGE_FLAG_COMPLETION {
         let bytes = package
-            .get(completion_offset..)
+            .get(completion_offset..completion_offset + completion_bytes)
             .ok_or(PackageError::InvalidLayout)?;
         troe_completion::CompletionArtifact::parse(bytes)
             .map_err(|_| PackageError::InvalidCompletion)?;
@@ -302,9 +317,10 @@ pub fn parse_kex_package(package: &[u8]) -> Result<KexPackage<'_>, PackageError>
 /// Locate an embedded CMPL artifact using only the fixed package header and
 /// authoritative file length.
 ///
-/// This is the bounded activation-registry path: callers can read 48 header
-/// bytes and then only the small completion range instead of staging an entire
-/// executable. Full application launch still uses [`parse_kex_package`].
+/// This is the bounded activation-registry path: callers can read the fixed
+/// package header and then only the small completion range instead of staging
+/// an entire executable. Full application launch still uses
+/// [`parse_kex_package`].
 ///
 /// # Errors
 ///
@@ -329,7 +345,7 @@ pub fn kex_package_completion_range(
         return Err(PackageError::InvalidLayout);
     }
     let flags = read_package_u16(header, PACKAGE_HEADER_FLAGS)?;
-    if flags & !PACKAGE_FLAG_COMPLETION != 0 {
+    if flags & !PACKAGE_FLAG_COMPLETION != 0 || package_reserved_is_nonzero(header)? {
         return Err(PackageError::NonzeroReserved);
     }
     let declared = read_package_u64(header, PACKAGE_HEADER_PACKAGE_BYTES)?;
@@ -340,7 +356,7 @@ pub fn kex_package_completion_range(
     }
     let manifest_offset = u64::from(read_package_u32(header, PACKAGE_HEADER_MANIFEST_OFFSET)?);
     let manifest_bytes = u64::from(read_package_u32(header, PACKAGE_HEADER_MANIFEST_BYTES)?);
-    let executable_offset = u64::from(read_package_u32(header, PACKAGE_HEADER_EXECUTABLE_OFFSET)?);
+    let executable_offset = read_package_u64(header, PACKAGE_HEADER_EXECUTABLE_OFFSET)?;
     let executable_bytes = read_package_u64(header, PACKAGE_HEADER_EXECUTABLE_BYTES)?;
     if manifest_offset != u64::try_from(KEX_PACKAGE_V1_HEADER_BYTES).unwrap_or(u64::MAX)
         || manifest_bytes > u64::try_from(requirements::MAX_MANIFEST_BYTES).unwrap_or(u64::MAX)
@@ -354,25 +370,34 @@ pub fn kex_package_completion_range(
     let executable_end = executable_offset
         .checked_add(executable_bytes)
         .ok_or(PackageError::InvalidLayout)?;
-    let completion_offset = u64::from(read_package_u32(header, PACKAGE_HEADER_COMPLETION_OFFSET)?);
+    let completion_offset = read_package_u64(header, PACKAGE_HEADER_COMPLETION_OFFSET)?;
+    let declared_completion_bytes = read_package_u64(header, PACKAGE_HEADER_COMPLETION_BYTES)?;
     if flags == 0 {
-        if completion_offset != 0 || executable_end != file_bytes {
+        if completion_offset != 0 || declared_completion_bytes != 0 || executable_end != file_bytes
+        {
             return Err(PackageError::InvalidLayout);
         }
         return Ok(None);
     }
-    let completion_bytes = file_bytes
-        .checked_sub(completion_offset)
-        .and_then(|value| usize::try_from(value).ok())
-        .ok_or(PackageError::InvalidLayout)?;
+    let completion_bytes =
+        usize::try_from(declared_completion_bytes).map_err(|_| PackageError::InvalidLayout)?;
     if flags != PACKAGE_FLAG_COMPLETION
         || completion_offset != executable_end
         || completion_bytes == 0
         || completion_bytes > troe_completion::MAX_ARTIFACT_BYTES
+        || completion_offset.checked_add(declared_completion_bytes) != Some(file_bytes)
     {
         return Err(PackageError::InvalidLayout);
     }
     Ok(Some((completion_offset, completion_bytes)))
+}
+
+/// Whether any byte of the fixed header's reserved tail is set.
+pub(crate) fn package_reserved_is_nonzero(header: &[u8]) -> Result<bool, PackageError> {
+    let reserved = header
+        .get(PACKAGE_HEADER_RESERVED..PACKAGE_HEADER_RESERVED + PACKAGE_HEADER_RESERVED_BYTES)
+        .ok_or(PackageError::InvalidLayout)?;
+    Ok(reserved.iter().any(|byte| *byte != 0))
 }
 
 pub(crate) fn read_package_u16(bytes: &[u8], offset: usize) -> Result<u16, PackageError> {

@@ -40,7 +40,7 @@ Records are strictly increasing by path. The architecture is `aarch64` or
 components. Names are portable ASCII letters, digits, `_`, `-`, or `.`, occupy
 at most 64 UTF-8 bytes before the `.kex` suffix, and do not contain path
 separators. The tree contains 1 through 128 artifacts. Each artifact is nonempty
-and no larger than the KEX package v1 ceiling of 33,571,904 bytes.
+and no larger than the KEX package v1 ceiling of 2,147,502,184 bytes.
 
 The listed regular files and manifest are the complete file set. Symbolic
 links, duplicate paths, unmanifested files, missing files, noncanonical

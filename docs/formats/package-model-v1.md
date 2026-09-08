@@ -31,7 +31,7 @@ A manifest has exactly these fields:
 - `directories`: at most eight unique sorted package root declarations. Roles
   are `assets`, `config`, or `data`; assets and resolved configuration are
   read-only, while data may separately request `read-mutate`;
-- `resources`: 1–50 ms execution lease, 1–8 initial handles, and 4 KiB through
+- `resources`: 1–50 ms execution lease, 1–168 initial handles, and 4 KiB through
   unsigned-64-bit heap and stack requests; physical availability and the active
   deployment/kernel memory policy decide admission rather than this hosted
   interchange format; and
@@ -70,6 +70,10 @@ TPKG SHA-256 supplies content integrity and deterministic addressing only.
 Publisher authentication, freshness, revocation, provenance, and atomic
 publication are separate trust-policy inputs; a digest alone grants no trust or
 runtime capability.
+
+A deployment plan sums the locked packages' requested resources. Its handle
+ceiling is `MAX_PACKAGES * MAX_INITIAL_HANDLES`, currently `128 * 168 = 21,504`.
+The per-package handle capacity mirrors `troe_abi::startup::MAX_INITIAL_HANDLES`.
 
 ## Stable tool result
 

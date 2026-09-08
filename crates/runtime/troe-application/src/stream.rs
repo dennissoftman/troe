@@ -2,20 +2,23 @@
 
 use crate::bytes::{read_u32, read_u64};
 use crate::executable::{ParsedHeader, application_layout, parse_header_with_len};
-use crate::package::{read_package_u16, read_package_u32, read_package_u64};
+use crate::package::{
+    package_reserved_is_nonzero, read_package_u16, read_package_u32, read_package_u64,
+};
 use crate::sha256::Sha256;
 use crate::startup::encode_startup_page;
 use crate::{
     ApplicationLayout, ApplicationLimits, KEX_PACKAGE_V1_HEADER_BYTES, KEX_PACKAGE_V1_MAGIC,
     KEX_V1_DECLARED_SPAN_ABI_MINOR, KEX_V1_LOAD_RECORD_BYTES, KEX_V1_RELOCATION_RECORD_BYTES,
     LoadCharges, LoadPlacement, LoadSegmentLayout, MAX_KEX_PACKAGE_BYTES, MAX_LOAD_RECORDS,
-    PACKAGE_FLAG_COMPLETION, PACKAGE_HEADER_BYTES, PACKAGE_HEADER_COMPLETION_OFFSET,
-    PACKAGE_HEADER_EXECUTABLE_BYTES, PACKAGE_HEADER_EXECUTABLE_OFFSET, PACKAGE_HEADER_FLAGS,
-    PACKAGE_HEADER_MAJOR, PACKAGE_HEADER_MANIFEST_BYTES, PACKAGE_HEADER_MANIFEST_OFFSET,
-    PACKAGE_HEADER_MINOR, PACKAGE_HEADER_PACKAGE_BYTES, PACKAGE_MAJOR, PACKAGE_MINOR, PAGE_BYTES,
-    PAGE_SIZE, PackageError, ParseError, RECORD_FILE_BYTES, RECORD_FILE_OFFSET,
-    RECORD_IMAGE_OFFSET, RECORD_MEMORY_BYTES, RECORD_PERMISSIONS, RECORD_RESERVED,
-    RELOCATION_TARGET_OFFSET, RELOCATION_VALUE_OFFSET, RelativeRelocation, STARTUP_PAGES,
+    PACKAGE_FLAG_COMPLETION, PACKAGE_HEADER_BYTES, PACKAGE_HEADER_COMPLETION_BYTES,
+    PACKAGE_HEADER_COMPLETION_OFFSET, PACKAGE_HEADER_EXECUTABLE_BYTES,
+    PACKAGE_HEADER_EXECUTABLE_OFFSET, PACKAGE_HEADER_FLAGS, PACKAGE_HEADER_MAJOR,
+    PACKAGE_HEADER_MANIFEST_BYTES, PACKAGE_HEADER_MANIFEST_OFFSET, PACKAGE_HEADER_MINOR,
+    PACKAGE_HEADER_PACKAGE_BYTES, PACKAGE_MAJOR, PACKAGE_MINOR, PAGE_BYTES, PAGE_SIZE,
+    PackageError, ParseError, RECORD_FILE_BYTES, RECORD_FILE_OFFSET, RECORD_IMAGE_OFFSET,
+    RECORD_MEMORY_BYTES, RECORD_PERMISSIONS, RECORD_RESERVED, RELOCATION_TARGET_OFFSET,
+    RELOCATION_VALUE_OFFSET, RelativeRelocation, STARTUP_PAGES, STARTUP_REGION_BYTES,
     STREAM_PREFIX_BYTES, STREAM_WORKING_SET_BYTES, SegmentPermissions, StartupInfo,
     StartupPageError, Target, canonical_image_span_bytes, maximum_table_pages,
 };
@@ -125,7 +128,7 @@ impl StreamedLoadPlan {
     pub fn encode_startup_page(
         &self,
         info: StartupInfo<'_>,
-        destination: &mut [u8; PAGE_BYTES],
+        destination: &mut [u8; STARTUP_REGION_BYTES],
     ) -> Result<(), StartupPageError> {
         encode_startup_page(
             self.abi_minor,
@@ -433,7 +436,9 @@ fn parse_stream_prefix(
         return Err(StreamError::Package(PackageError::UnsupportedVersion));
     }
     let flags = read_package_u16(prefix, PACKAGE_HEADER_FLAGS).map_err(StreamError::Package)?;
-    if flags & !PACKAGE_FLAG_COMPLETION != 0 {
+    if flags & !PACKAGE_FLAG_COMPLETION != 0
+        || package_reserved_is_nonzero(prefix).map_err(StreamError::Package)?
+    {
         return Err(StreamError::Package(PackageError::NonzeroReserved));
     }
     let header_bytes =
@@ -447,11 +452,15 @@ fn parse_stream_prefix(
     )
     .map_err(|_| StreamError::Package(PackageError::InvalidLayout))?;
     let executable_offset = usize::try_from(
-        read_package_u32(prefix, PACKAGE_HEADER_EXECUTABLE_OFFSET).map_err(StreamError::Package)?,
+        read_package_u64(prefix, PACKAGE_HEADER_EXECUTABLE_OFFSET).map_err(StreamError::Package)?,
     )
     .map_err(|_| StreamError::Package(PackageError::InvalidLayout))?;
     let completion_offset = usize::try_from(
-        read_package_u32(prefix, PACKAGE_HEADER_COMPLETION_OFFSET).map_err(StreamError::Package)?,
+        read_package_u64(prefix, PACKAGE_HEADER_COMPLETION_OFFSET).map_err(StreamError::Package)?,
+    )
+    .map_err(|_| StreamError::Package(PackageError::InvalidLayout))?;
+    let completion_bytes = usize::try_from(
+        read_package_u64(prefix, PACKAGE_HEADER_COMPLETION_BYTES).map_err(StreamError::Package)?,
     )
     .map_err(|_| StreamError::Package(PackageError::InvalidLayout))?;
     let executable_bytes = usize::try_from(
@@ -481,17 +490,15 @@ fn parse_stream_prefix(
         return Err(StreamError::Package(PackageError::InvalidLayout));
     }
     let completion = if flags == 0 {
-        if completion_offset != 0 || executable_end != package_bytes {
+        if completion_offset != 0 || completion_bytes != 0 || executable_end != package_bytes {
             return Err(StreamError::Package(PackageError::InvalidLayout));
         }
         None
     } else {
-        let completion_bytes = package_bytes
-            .checked_sub(completion_offset)
-            .ok_or(StreamError::Package(PackageError::InvalidLayout))?;
         if completion_offset != executable_end
             || completion_bytes == 0
             || completion_bytes > troe_completion::MAX_ARTIFACT_BYTES
+            || completion_offset.checked_add(completion_bytes) != Some(package_bytes)
         {
             return Err(StreamError::Package(PackageError::InvalidLayout));
         }

@@ -213,9 +213,10 @@ def _rejections(target: str, base: bytes) -> dict[str, tuple[bytes, str]]:
     )
     add(
         "container-minor",
-        _put_u16(bytearray(base), 10, 2),
+        _put_u16(bytearray(base), 10, 3),
         "UnsupportedContainerVersion",
     )
+    add("header-reserved64", _put_u64(bytearray(base), 88, 1), "NonzeroReserved")
     other_target = 2 if target == "x86_64" else 1
     add("wrong-target", _put_u16(bytearray(base), 12, other_target), "WrongTarget")
     add("header-bytes", _put_u16(bytearray(base), 14, 65), "InvalidLayout")

@@ -202,6 +202,7 @@ dependencies = [
 name = "troe-fmt-scfg"
 version = "0.1.0"
 dependencies = [
+ "troe-abi",
  "troe-checksum",
  "troe-fmt-cspk",
  "troe-fs-api",

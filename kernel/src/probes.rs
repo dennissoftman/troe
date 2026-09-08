@@ -50,7 +50,8 @@ use core::fmt::Write as _;
 #[cfg(feature = "acceptance-probes")]
 use troe_application::ABI_MINOR;
 use troe_application::{
-    ApplicationLimits, InitialHandle, LoaderResource, LoaderTransaction, PAGE_BYTES, StartupInfo,
+    ApplicationLimits, InitialHandle, LoaderResource, LoaderTransaction, STARTUP_REGION_BYTES,
+    StartupInfo,
 };
 #[cfg(feature = "acceptance-probes")]
 use troe_application::{ParseError, parse_kex};
@@ -855,7 +856,7 @@ pub(crate) fn load_and_reclaim_application(
             major: 1,
             minor: 0,
         }];
-        let mut startup = [0_u8; PAGE_BYTES];
+        let mut startup = [0_u8; STARTUP_REGION_BYTES];
         plan.encode_startup_page(
             StartupInfo {
                 task_id: u64::from(task_id.get()),
@@ -897,7 +898,7 @@ pub(crate) fn load_and_reclaim_application(
             entry,
             layout.stack_top(),
             layout.startup_address(),
-            PAGE_BYTES,
+            STARTUP_REGION_BYTES,
             APPLICATION_TIMESLICE_MILLISECONDS,
         )
         .map_err(|_| ())?;
