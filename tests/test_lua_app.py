@@ -17,6 +17,32 @@ RESULT_PATTERN = re.compile(
 )
 
 
+def compile_host_binary(command: tuple[str, ...]) -> None:
+    """Build one host test binary, reporting the compiler's own diagnosis.
+
+    `check=True` with captured output raises `CalledProcessError`, whose message
+    names the command and the exit status but discards the compiler's stderr.
+    That turns any portability failure into an opaque non-zero exit, which is
+    how a CI failure here first presented.
+    """
+    completed = subprocess.run(command, cwd=REPO_ROOT, check=False, capture_output=True)
+    if completed.returncode == 0:
+        return
+    raise AssertionError(
+        "\n".join(
+            (
+                f"compiling the Lua host runner failed with status "
+                f"{completed.returncode}",
+                f"command: {' '.join(command)}",
+                "stderr:",
+                completed.stderr.decode("utf-8", "replace").rstrip(),
+                "stdout:",
+                completed.stdout.decode("utf-8", "replace").rstrip(),
+            )
+        )
+    )
+
+
 class LuaRuntimeTests(unittest.TestCase):
     """Exercise the embedded interpreter without booting a guest."""
 
@@ -35,7 +61,14 @@ class LuaRuntimeTests(unittest.TestCase):
         compiler = os.environ.get("CC", "clang")
         command = (
             compiler,
-            "-std=c11",
+            # GNU rather than strict ISO, because this build compiles vendored
+            # Lua with LUA_USE_POSIX, whose `_longjmp` and `pclose` glibc only
+            # declares outside `__STRICT_ANSI__`. Under `-std=c11` a Linux
+            # clang rejects both as implicit declarations, while macOS headers
+            # expose them either way. Upstream Lua builds in GNU mode for the
+            # same reason. The printf runner below stays strict ISO: it uses no
+            # POSIX at all, and strict is what a freestanding formatter wants.
+            "-std=gnu11",
             "-O2",
             "-DTROE_LUA=1",
             "-DTROE_LUA_HOST_TEST=1",
@@ -50,7 +83,7 @@ class LuaRuntimeTests(unittest.TestCase):
             "-o",
             str(cls.runner),
         )
-        subprocess.run(command, cwd=REPO_ROOT, check=True, capture_output=True)
+        compile_host_binary(command)
         printf_command = (
             compiler,
             "-std=c11",
@@ -63,7 +96,7 @@ class LuaRuntimeTests(unittest.TestCase):
             "-o",
             str(cls.printf_runner),
         )
-        subprocess.run(printf_command, cwd=REPO_ROOT, check=True, capture_output=True)
+        compile_host_binary(printf_command)
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -164,9 +197,23 @@ print("lua-southern", os.date("%Z", 1768478400))
         completed = subprocess.run(
             (self.printf_runner,),
             cwd=REPO_ROOT,
-            check=True,
+            check=False,
             capture_output=True,
             timeout=10,
+        )
+        # On a mismatch the runner writes the value, conversion, precision,
+        # expected text and actual text to stderr and then exits non-zero.
+        # `check=True` discards exactly that, leaving an exit status as the
+        # whole report, which says nothing about which value disagreed.
+        self.assertEqual(
+            completed.returncode,
+            0,
+            "\n".join(
+                (
+                    "the freestanding formatter disagreed with the host libc",
+                    completed.stderr.decode("utf-8", "replace").rstrip(),
+                )
+            ),
         )
         self.assertEqual(completed.stdout, b"troe-printf-double ok\n")
 
