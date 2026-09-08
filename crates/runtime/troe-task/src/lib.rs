@@ -7,7 +7,18 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::fmt;
 
+mod chain;
 mod wait;
+mod waitset;
+
+pub use chain::{
+    CallChainError, CallChainStats, CallChainTable, MAX_CALL_CHAIN_MEMBERS, MAX_CALL_CHAINS,
+};
+
+pub use waitset::{
+    MAX_WAIT_SET_SOURCES, SourceReadiness, WaitSelection, WaitSet, WaitSetError, WaitSource,
+    WaitSourceKind,
+};
 
 pub use wait::{
     MAX_PENDING_CALLS, MAX_PENDING_REQUEST_BYTES, MAX_WAIT_REGISTRATIONS, PendingCallError,

@@ -1,0 +1,337 @@
+name: gate
+
+# The merge gate is `scripts/test.py`: 105 gates, including exhaustive QEMU
+# acceptance on all four named platforms. Run serially on one machine it takes
+# 12-15 minutes, every session queues behind every other, and two overlapping
+# runs collide on the fixed acceptance UDP ports.
+#
+# This workflow runs the same gates with two properties the local run cannot
+# have. Each platform gets a dedicated runner, so a port collision is not
+# expressible. And the work is selected from the changed paths by
+# `scripts/test_changed.py` rather than always running everything, so a
+# documentation-only change does not rebuild the kernel or boot a VM.
+#
+# It covers three of the four platforms. `aarch64-sbsa-ref` is not here: on
+# 24.04's QEMU 8.2.2 its Trusted Firmware and UEFI both start and then no boot
+# device is found, and the profile already records that this firmware needs
+# FEAT_RNG, which `cpu=max` did not implement that far back. The machine model
+# itself also moved between 8.x and the pinned 11.1.0. That platform therefore
+# stays locally verified until a runner can supply a newer QEMU; adding it back
+# means building QEMU rather than installing the distribution one.
+#
+# The selector owns that taxonomy, not this file. It already maps `.md`,
+# `docs/` and `skills/` paths to a single policy test, escalates build and
+# toolchain files to the exhaustive gate, and falls back to the exhaustive gate
+# for any path without a reviewed impact rule. Duplicating those rules in YAML
+# would let CI and the local run disagree.
+#
+# Tool policy is the compatible one, not `--strict-tool-versions`: strict mode
+# pins QEMU 11.1.0 and e2fsprogs 1.47.4 as release evidence, which a
+# distribution runner cannot supply. Release evidence stays a local, pinned
+# activity documented in docs/testing.md.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# A newer push supersedes an in-flight run for the same ref.
+concurrency:
+  group: gate-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  select:
+    name: select verification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      exhaustive: ${{ steps.plan.outputs.exhaustive }}
+      base: ${{ steps.plan.outputs.base }}
+    steps:
+      # The selector diffs a base revision against the worktree, so it needs
+      # real history rather than a single-commit clone.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # assets/*.kefs and the large KEX corpus are Git LFS objects; without
+          # this they arrive as pointer text and a reader reports InvalidMagic.
+          lfs: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Select verification from changed paths
+        id: plan
+        run: |
+          set -euo pipefail
+          if [ -n "${{ github.event.pull_request.base.sha }}" ]; then
+            base='${{ github.event.pull_request.base.sha }}'
+          elif [ -n "${{ github.event.before }}" ] \
+            && [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ] \
+            && git cat-file -e '${{ github.event.before }}^{commit}' 2>/dev/null; then
+            base='${{ github.event.before }}'
+          else
+            base="$(git rev-parse HEAD~1)"
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "Comparing against $base"
+
+          python3 scripts/test_changed.py --base "$base" --dry-run --explain \
+            | tee plan.txt
+
+          # A plan that requires the exhaustive gate renders exactly one
+          # command, scripts/test.py. Anything else is a focused subset.
+          if grep -qE 'scripts/test\.py' plan.txt; then
+            echo 'exhaustive=true' >> "$GITHUB_OUTPUT"
+            echo '### Exhaustive gate selected' >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo 'exhaustive=false' >> "$GITHUB_OUTPUT"
+            echo '### Focused verification selected' >> "$GITHUB_STEP_SUMMARY"
+          fi
+          {
+            echo '```'
+            cat plan.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  focused:
+    name: focused verification
+    needs: select
+    if: needs.select.outputs.exhaustive == 'false'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # assets/*.kefs and the large KEX corpus are Git LFS objects; without
+          # this they arrive as pointer text and a reader reports InvalidMagic.
+          lfs: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      # A focused plan can still select QEMU scenario groups, so this job
+      # installs the same tools the exhaustive jobs use.
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang lld llvm pkg-config libssl-dev \
+            qemu-system-x86 qemu-system-arm qemu-system-data \
+            ovmf qemu-efi-aarch64 \
+            e2fsprogs dosfstools mtools
+          # Pinned: an unpinned linter changes the gate's verdict whenever
+          # upstream releases. A newer ruff enabled PLR0917 and failed 8 files
+          # that the maintainer's 0.15.17 accepts.
+          python3 -m pip install --disable-pip-version-check --quiet 'ruff==0.15.17'
+
+      # 24.04's e2fsprogs 1.47.0 passes the version check and then fails the
+      # ext4 byte verifier, because it does not honour E2FSPROGS_FAKE_TIME.
+      - name: Use the pinned e2fsprogs
+        uses: ./.github/actions/pinned-e2fsprogs
+
+      - name: Cache cargo and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            target
+          key: cargo-focused-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-focused-
+
+      # `dependency audit` runs `cargo audit`, which is not a runner default.
+      # docs/testing.md pins 0.22.1, so install exactly that; a restored cache
+      # already holds the binary and the version check skips the build.
+      - name: Install the pinned cargo-audit
+        run: |
+          set -euo pipefail
+          if cargo audit --version 2>/dev/null | grep -q '0\.22\.1'; then
+            echo "cached: $(cargo audit --version)"
+          else
+            cargo install cargo-audit --version 0.22.1 --locked
+          fi
+          cargo audit --version
+
+      - name: Run focused verification
+        run: |
+          python3 scripts/test_changed.py \
+            --base '${{ needs.select.outputs.base }}' \
+            --explain \
+            --require-filesystem-tools \
+            --require-python-tools
+
+  host:
+    name: host gates
+    needs: select
+    if: needs.select.outputs.exhaustive == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # assets/*.kefs and the large KEX corpus are Git LFS objects; without
+          # this they arrive as pointer text and a reader reports InvalidMagic.
+          lfs: true
+
+      # The repository tools require Python 3.13 or newer; 24.04 ships 3.12.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install host tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang lld llvm pkg-config libssl-dev \
+            e2fsprogs dosfstools mtools
+          # Pinned: an unpinned linter changes the gate's verdict whenever
+          # upstream releases. A newer ruff enabled PLR0917 and failed 8 files
+          # that the maintainer's 0.15.17 accepts.
+          python3 -m pip install --disable-pip-version-check --quiet 'ruff==0.15.17'
+
+      # The host job builds ext4 fixtures too, through the filesystem
+      # interoperability gates that --require-filesystem-tools turns on.
+      - name: Use the pinned e2fsprogs
+        uses: ./.github/actions/pinned-e2fsprogs
+
+      - name: Cache cargo and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            target
+          key: cargo-host-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-host-
+
+      # `dependency audit` runs `cargo audit`, which is not a runner default.
+      # docs/testing.md pins 0.22.1, so install exactly that; a restored cache
+      # already holds the binary and the version check skips the build.
+      - name: Install the pinned cargo-audit
+        run: |
+          set -euo pipefail
+          if cargo audit --version 2>/dev/null | grep -q '0\.22\.1'; then
+            echo "cached: $(cargo audit --version)"
+          else
+            cargo install cargo-audit --version 0.22.1 --locked
+          fi
+          cargo audit --version
+
+      # rustup reads rust-toolchain.toml, so the channel, profile, components
+      # and all four bare-metal targets install without being named here.
+      - name: Show toolchain
+        run: rustc --version && cargo --version
+
+      - name: Run host gates
+        run: |
+          python3 scripts/test.py \
+            --skip-qemu \
+            --require-filesystem-tools \
+            --require-python-tools \
+            --progress-interval 60
+
+  acceptance:
+    name: acceptance ${{ matrix.platform }}
+    needs: select
+    if: needs.select.outputs.exhaustive == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      # One platform's failure must not hide another's result.
+      fail-fast: false
+      matrix:
+        platform:
+          - x86_64-q35-uefi
+          - x86_64-uefi-virtio-pci
+          - aarch64-uefi-virtio-mmio
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # assets/*.kefs and the large KEX corpus are Git LFS objects; without
+          # this they arrive as pointer text and a reader reports InvalidMagic.
+          lfs: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      # `ovmf` installs /usr/share/OVMF and `qemu-efi-aarch64` installs
+      # /usr/share/AAVMF. Both directories and both filename spellings are
+      # already in the firmware search list in scripts/qemu_profile.py.
+      - name: Install QEMU, firmware, and filesystem tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            clang lld llvm pkg-config libssl-dev \
+            qemu-system-x86 qemu-system-arm qemu-system-data \
+            ovmf qemu-efi-aarch64 \
+            e2fsprogs dosfstools mtools
+          qemu-system-x86_64 --version | head -1
+          qemu-system-aarch64 --version | head -1
+
+      # 24.04's e2fsprogs 1.47.0 passes the version check and then fails the
+      # ext4 byte verifier, because it does not honour E2FSPROGS_FAKE_TIME.
+      - name: Use the pinned e2fsprogs
+        uses: ./.github/actions/pinned-e2fsprogs
+
+      - name: Cache cargo and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            target
+          key: cargo-${{ matrix.platform }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
+          restore-keys: cargo-${{ matrix.platform }}-
+
+      - name: Run QEMU acceptance
+        run: |
+          python3 scripts/test-qemu.py \
+            --platform ${{ matrix.platform }} \
+            --environment qemu
+
+  # One job to require in branch protection. It succeeds when every selected
+  # job succeeded and fails if any did, so protecting this single check works
+  # for a focused plan and an exhaustive one alike; a job skipped by selection
+  # is not a failure.
+  gate:
+    name: gate
+    needs: [select, focused, host, acceptance]
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Check selected results
+        run: |
+          set -euo pipefail
+          printf 'select          %s\n' '${{ needs.select.result }}'
+          printf 'focused         %s\n' '${{ needs.focused.result }}'
+          printf 'host            %s\n' '${{ needs.host.result }}'
+          printf 'acceptance      %s\n' '${{ needs.acceptance.result }}'
+          for result in \
+            '${{ needs.select.result }}' \
+            '${{ needs.focused.result }}' \
+            '${{ needs.host.result }}' \
+            '${{ needs.acceptance.result }}'; do
+            case "$result" in
+              success|skipped) ;;
+              *) echo "a selected gate did not succeed"; exit 1 ;;
+            esac
+          done
+          echo 'every selected gate succeeded'
