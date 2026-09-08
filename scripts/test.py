@@ -473,6 +473,32 @@ def verification_steps(args: argparse.Namespace) -> list[Step]:
             ),
         ),
         Step(
+            "fmt network baseline probe",
+            (
+                "cargo",
+                "fmt",
+                "--manifest-path",
+                REPO_ROOT / "tests" / "network-baseline" / "Cargo.toml",
+                "--check",
+            ),
+        ),
+        Step(
+            "clippy network baseline probe",
+            (
+                "cargo",
+                "clippy",
+                "--manifest-path",
+                REPO_ROOT / "tests" / "network-baseline" / "Cargo.toml",
+                "--target",
+                "x86_64-unknown-none",
+                "--target",
+                "aarch64-unknown-none",
+                "--",
+                "-D",
+                "warnings",
+            ),
+        ),
+        Step(
             "kex runtime probe",
             (
                 "cargo",

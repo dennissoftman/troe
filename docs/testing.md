@@ -206,6 +206,7 @@ where possible.
 | `network` | Link and IPv4 state, DHCP, ICMP, ARP, cancellation, UDP including a terminal-supplied datagram payload, bounded TCP streams |
 | `shell-terminal` | Editing, completion, history, manuals, parsing, CRLF, clear-screen behavior, and the foreground session terminal-input loan: typed lines, end of input, cancellation, background and nested end-of-input, resident-job and service coexistence, and unchanged redirection and pipelines |
 | `filesystem` | KEFS/ext4/FAT32 reads and writes, shared-media restart persistence, paths, logical lists, pipelines, bounded `sh.kex` scripts, RAMFS mutation, read-only and error behavior, plus repeated direct and nested launches of the large shared-media C runtime probe |
+| `system-baseline` | Compatibility IPC samples and structural counters, 1,472-byte UDP round trips, 16 KiB TCP transfers, and five internally timed boots from identical media |
 | `storage-baseline` | Fresh-media ext4/FAT32 4 KiB read and write-plus-sync timing, exact payload checks, and frozen fixture validation |
 | `lua` | Explicit-path execution of the optional shared-media runtime, Lua inline/stdin/file loading, the portable compute/allocation benchmark, consolidated language/numeric/system examples, script argument/`-l` compatibility, exact binary64 formatting, complete pipe reads, buffering modes, protected errors, shared-runtime math/calendar/environment/process/random behavior, typed filesystem errno failures, OS-shim clock and exit behavior, timer preemption, fragmentation, a 48 MiB private allocation beyond the former narrow TLSF geometry, and bounded OOM recovery. Not selected by default: it consumes the shared runtime tree, which the `filesystem` group also installs |
 | `cpython` | Version-addressable and default interpreters, explicit-path execution consent, `-c`, arguments after `--`, scripts, `-m`, redirected stdin, an interactive REPL that retains state and ends on end of input, upstream Unicode/GC/weakref/traceback semantics, the shipped library profile plus a full shipped-module import sweep, TROE-backed filesystem/temporary-file/clock/entropy behavior, excluded modules and explicit thread-creation failure, withheld random and mutation authority, and kernel-frame reclamation across repeated successful and failing launches. Not selected by default: it consumes the separately built interpreter package (see below) |
@@ -561,6 +562,60 @@ statistics from the raw samples, then writes fresh observations separately to
 `build/storage-baseline-results`. It does not treat another run's timing as an
 absolute pass threshold. The subsystem migration and same-image ratio gates
 are specified by [issue #8](https://github.com/dennissoftman/troe/issues/8).
+
+## IPC, network, and boot baseline capture
+
+The default `system-baseline` scenario freezes current-path
+measurements in `tests/fixtures/adr-0035/system-*.json`, one file per platform.
+It runs sequentially when multiple platforms are selected:
+
+```console
+python3 scripts/test-qemu.py --platform all --environment qemu --scenario system-baseline
+python3 scripts/test-qemu.py --platform all --environment qemu --scenario system-baseline --record-system-baseline /tmp/troe-system-capture
+```
+
+Explicit capture requires a fresh build and refuses existing destination files.
+Ordinary verification validates the frozen fixture, recomputes every statistic,
+and saves fresh observations in `build/system-baseline-results`. Timings from
+different runs are not absolute pass thresholds.
+
+Each IPC row preserves all 256 samples in measurement order, alongside the
+existing p50/p95/p99 and exact structural counters, for both current paths and
+all four payload sizes. The new `ipc-samples` diagnostic is emitted after the
+timed calls. A zero-tick individual IPC sample is valid counter quantization;
+negative samples and runs with no total elapsed ticks are rejected.
+
+The harness installs `tests/network-baseline` only on the disposable shared
+volume. Each transport runs 64 warmups and 256 samples against a loopback-bound
+host peer reached through QEMU's `10.0.2.2` gateway. UDP sends and receives one
+1,472-byte datagram per sample on one owned port. TCP uses one established
+connection, writing 16 KiB and reading its complete echo per sample through the
+SDK's bounded partial calls; connection setup and close are outside the timed
+interval. The peer enables `TCP_NODELAY`. Both sides check the exact payload:
+`0x5a` bytes with an eight-byte little-endian sample index. The fixture records
+the peer ports and policy. Network throughput counts the request and echoed
+payload bytes together; headers are excluded. Guest yields, payload comparison,
+and serial result formatting occur outside the intervals. Timer-call overhead
+is included, as in the storage measurements.
+
+Boot samples use five fresh QEMU processes with identical command, firmware
+state, and disk bytes. The harness snapshots mutable inputs once, restores them
+before each boot, and verifies their hashes again. Acceptance-only internal
+markers sample entry to `post_handoff` and readiness to print the first shell
+prompt. The dedicated IPC benchmark interval, including its diagnostic output,
+is subtracted; ordinary boot initialization remains inside the interval. The
+boot record is formatted and transmitted only after the ending counter sample,
+so host serial arrival time and measurement-record formatting are excluded.
+
+Each boot retains its start, end, excluded interval, and calibrated counter
+frequency. Its elapsed ticks are normalized to integer nanoseconds before
+computing the five-boot median; calibration can differ slightly between fresh
+x86 guests. These normalized ticks remain QEMU engineering evidence, not an
+absolute hardware latency claim. The first boot also supplies the IPC and
+network rows, which must agree on their counter frequency. The fixture includes
+QEMU/Rust identifiers and hashes of probe, source, firmware, and disk inputs.
+Production image builders reject both the boot and IPC-sample diagnostic
+markers.
 
 ## Maintainer merge and release gates
 

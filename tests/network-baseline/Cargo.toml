@@ -1,0 +1,40 @@
+[package]
+name = "troe-network-baseline"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "Apache-2.0"
+publish = false
+
+[package.metadata.troe-kex]
+capabilities = ["datagram", "tcp-connect", "timer"]
+stack-pages = 16
+heap-pages = 0
+
+[[bin]]
+name = "troe-network-baseline"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+troe-kex-sdk = { path = "../../sdk/rust/troe-kex", features = ["acceptance-probes"] }
+
+[profile.release]
+codegen-units = 1
+lto = false
+opt-level = 2
+panic = "abort"
+strip = "none"
+
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+
+[workspace]

@@ -19,6 +19,7 @@ import zlib
 from pathlib import Path
 
 import storage_baseline
+import system_baseline
 from platform_profile import (
     AARCH64_UEFI_VIRTIO_MMIO,
     PLATFORM_IDS,
@@ -493,6 +494,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         metavar="DIRECTORY",
         help="record frozen storage fixtures without overwriting existing files",
     )
+    parser.add_argument(
+        "--record-system-baseline",
+        type=Path,
+        metavar="DIRECTORY",
+        help="record frozen IPC/network/boot fixtures without overwriting",
+    )
     return parser.parse_args(argv)
 
 
@@ -505,6 +512,14 @@ def selected_scenarios(args: argparse.Namespace) -> frozenset[str]:
     ):
         raise ValueError(
             "--record-storage-baseline requires storage-baseline and a fresh build"
+        )
+    if args.record_system_baseline is not None and (
+        args.smoke
+        or args.skip_build
+        or (args.scenario and "system-baseline" not in args.scenario)
+    ):
+        raise ValueError(
+            "--record-system-baseline requires system-baseline and a fresh build"
         )
     if args.smoke:
         if args.scenario:
@@ -524,7 +539,11 @@ def apply_scenario_requirements(
 
 def requires_acceptance_images(scenario_groups: frozenset[str]) -> bool:
     """Return whether selected groups need acceptance-only instrumentation."""
-    return bool(scenario_groups.intersection(("fault-isolation", "storage-baseline")))
+    return bool(
+        scenario_groups.intersection(
+            ("fault-isolation", "storage-baseline", "system-baseline")
+        )
+    )
 
 
 def normalize(data: bytes) -> str:
@@ -3663,8 +3682,11 @@ def test_platform(
     args: argparse.Namespace,
 ) -> None:
     scenario_groups = selected_scenarios(args)
-    if scenario_groups == frozenset(("storage-baseline",)):
-        run_storage_acceptance(platform_id, args)
+    if scenario_groups and scenario_groups <= {"storage-baseline", "system-baseline"}:
+        if "storage-baseline" in scenario_groups:
+            run_storage_acceptance(platform_id, args)
+        if "system-baseline" in scenario_groups:
+            run_system_acceptance(platform_id, args)
         return
     command = prepare_qemu_command(
         platform_id,
@@ -3820,6 +3842,8 @@ def test_platform(
         run_native_keyboard_scenario(args)
     if "storage-baseline" in scenario_groups:
         run_storage_acceptance(platform_id, args)
+    if "system-baseline" in scenario_groups:
+        run_system_acceptance(platform_id, args)
     suite = "smoke" if args.smoke else "acceptance"
     groups = "smoke" if args.smoke else ",".join(sorted(scenario_groups))
     print(f"QEMU {suite} ({platform_id}; groups={groups}): passed")
@@ -3871,6 +3895,123 @@ def run_storage_acceptance(platform_id: str, args: argparse.Namespace) -> None:
         raise AcceptanceError(f"{platform_id} storage baseline boot peer failed")
     storage_baseline.settle(document, args.record_storage_baseline)
     print(f"QEMU storage baseline ({platform_id}): passed")
+
+
+def run_system_acceptance(platform_id: str, args: argparse.Namespace) -> None:
+    """Capture native IPC/network rows and five boots from identical media."""
+    reset_txslot(platform_id, args.environment)
+    reset_shared_media(platform_id, install_runtime=False)
+    profile = resolve_platform(platform_id)
+    system_baseline.install_probe(profile)
+    command = prepare_qemu_command(
+        platform_id,
+        args.environment,
+        args.firmware_code,
+        args.firmware_vars,
+        skip_version_check=args.skip_version_check,
+        strict_tool_versions=args.strict_tool_versions,
+        build=False,
+        acceptance_probes=True,
+        data_disks=(shared_test_image_path(profile),),
+    )
+    origin = storage_baseline.provenance(
+        platform_id,
+        args.environment,
+        command,
+        probe_name="network-baseline",
+        extra_sources=system_baseline.EXTRA_SOURCES,
+    )
+    boots = []
+    ipc = None
+    network = None
+    with tempfile.TemporaryDirectory(prefix="troe-baseline-boots-") as directory:
+        saved = system_baseline.snapshot_inputs(command, Path(directory))
+        for index in range(5):
+            for path, backup in saved:
+                shutil.copyfile(backup, path)
+            current = storage_baseline.provenance(
+                platform_id,
+                args.environment,
+                command,
+                probe_name="network-baseline",
+                extra_sources=system_baseline.EXTRA_SOURCES,
+            )
+            if current != {
+                key: value for key, value in origin.items() if key != "network_peer"
+            }:
+                raise AcceptanceError(
+                    "baseline boot inputs changed between fresh boots"
+                )
+            peer = UdpAcceptancePeer(platform_id, args.environment)
+            peer.start()
+            network_peer = None
+            session = None
+            try:
+                session = SerialSession(command, platform_id)
+                session.wait_for(b"sh:/> ", args.boot_timeout)
+                assert_owned_boot(session)
+                assert_ipc_baseline(session)
+                boots.append(system_baseline.boot_record(session.transcript()))
+                measured_ipc = system_baseline.ipc_rows(session.transcript())
+                if index == 0:
+                    ipc = measured_ipc
+                    network_peer = system_baseline.NetworkPeer()
+                    network_peer.start()
+                    udp_port = network_peer.udp.getsockname()[1]
+                    tcp_port = network_peer.tcp.getsockname()[1]
+                    origin["network_peer"] = {
+                        "host": "10.0.2.2",
+                        "udp_port": udp_port,
+                        "tcp_port": tcp_port,
+                        "tcp_nodelay": True,
+                    }
+                    output = session.confirmed_command(
+                        f"/vol/shared/network-baseline.kex {udp_port} {tcp_port}",
+                        "/",
+                        max(args.command_timeout, 300.0),
+                        contains=("NETWORK-BASELINE version=1", "END network-baseline"),
+                    )
+                    network = system_baseline.network_rows(output)
+                request_poweroff(session, args.command_timeout)
+            except Exception:
+                if session is not None:
+                    print(session.transcript(), file=sys.stderr)
+                raise
+            finally:
+                if session is not None:
+                    session.close()
+                peer.close()
+                if network_peer is not None:
+                    network_peer.close()
+            if peer.error is not None or peer.received == 0:
+                raise AcceptanceError("system baseline boot peer failed")
+            if network_peer is not None and (
+                network_peer.error is not None
+                or network_peer.received != {"udp": 320, "tcp": 320}
+            ):
+                raise AcceptanceError(
+                    f"network baseline peer failed: {network_peer.error}; "
+                    f"{network_peer.received}"
+                )
+            print(f"baseline boot {index + 1}/5 ({platform_id}): passed", flush=True)
+    document = {
+        "adr": 35,
+        "contract": system_baseline.CONTRACT,
+        "provenance": origin,
+        "ipc": ipc,
+        "network": network,
+        "boot": {
+            "records": boots,
+            "measurement": system_baseline.statistics(
+                [system_baseline.normalized_boot_ticks(row) for row in boots],
+                1_000_000_000,
+                5,
+                0,
+            ),
+        },
+    }
+    system_baseline.settle(document, args.record_system_baseline)
+    print(f"QEMU system baseline ({platform_id}): passed")
 
 
 def main() -> int:
@@ -3932,6 +4073,8 @@ def main() -> int:
                     )
         if "storage-baseline" in scenario_groups:
             storage_baseline.build_probe(skip_build=args.skip_build)
+        if "system-baseline" in scenario_groups:
+            system_baseline.build_probe(skip_build=args.skip_build)
         install_runtime = not args.smoke and "filesystem" in scenario_groups
         if install_runtime:
             if args.skip_build:
@@ -3955,7 +4098,9 @@ def main() -> int:
                 install_runtime=install_runtime,
                 install_cpython=install_cpython,
             )
-        if len(platform_ids) == 1 or "storage-baseline" in scenario_groups:
+        if len(platform_ids) == 1 or scenario_groups.intersection(
+            ("storage-baseline", "system-baseline")
+        ):
             for platform_id in platform_ids:
                 test_platform(platform_id, args)
         else:

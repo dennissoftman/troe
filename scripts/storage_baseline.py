@@ -88,7 +88,12 @@ def command_output(*command: str) -> str:
 
 
 def provenance(
-    platform_id: str, environment: str, command: list[str]
+    platform_id: str,
+    environment: str,
+    command: list[str],
+    *,
+    probe_name: str = "storage-baseline",
+    extra_sources: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Record the actual runner, firmware, disks, probe and source before boot."""
     inputs = {}
@@ -124,9 +129,15 @@ def provenance(
         "base_commit": command_output("git", "rev-parse", "HEAD"),
         "command": [argument.replace(str(REPO_ROOT), "$REPO") for argument in command],
         "input_sha256": inputs,
-        "source_sha256": {name: digest(REPO_ROOT / name) for name in sources},
+        "source_sha256": {
+            name: digest(REPO_ROOT / name) for name in (*sources, *extra_sources)
+        },
         "probe_sha256": digest(
-            PROBE_PACKAGES / profile.architecture / "storage-baseline.kex"
+            REPO_ROOT
+            / "build"
+            / f"{probe_name}-packages"
+            / profile.architecture
+            / f"{probe_name}.kex"
         ),
     }
 

@@ -1025,5 +1025,229 @@ class StorageBaselineTests(unittest.TestCase):
         self.assertTrue(TEST_QEMU.requires_acceptance_images(groups))
 
 
+class SystemBaselineTests(unittest.TestCase):
+    """The comparison oracle rejects partial or inconsistent native evidence."""
+
+    @staticmethod
+    def output() -> str:
+        lines = []
+        ticks = ",".join(str(value) for value in range(256, 0, -1))
+        for path in ("in-process", "isolated-diagnostics"):
+            for size in (0, 64, 256, 4096):
+                lines.append(
+                    f"ipc-samples path={path} payload={size} "
+                    f"counter_hz=1000000 ticks={ticks}"
+                )
+                fragments = 512 if size == 4096 else 256
+                boundaries = 768 if size == 4096 else 256
+                if path == "in-process":
+                    structural = (
+                        f"request_copies=0 reply_copies={256 if size else 0} "
+                        f"reply_allocations={256 if size else 0} "
+                        "address_space_switches=0 tlb_invalidations=0 timer_programs=0"
+                    )
+                else:
+                    copies = fragments * 2 if size else 0
+                    structural = (
+                        f"request_copies={copies} reply_copies={copies} "
+                        f"reply_allocations=0 address_space_switches={boundaries * 2} "
+                        f"tlb_invalidations={boundaries * 2} "
+                        f"timer_programs={boundaries} "
+                        f"wire_fragments={fragments} retained_requests=1 "
+                        "contexts=1 steady_allocations=0"
+                    )
+                lines.append(
+                    f"ipc-baseline path={path} payload={size} warmup=64 samples=256 "
+                    "counter_hz=1000000 p50_ticks=128 p95_ticks=244 p99_ticks=254 "
+                    f"max_ticks=256 calls=256 request_bytes={size * 256} "
+                    f"reply_bytes={size * 256} request_allocations=0 {structural}"
+                )
+        contract = TEST_QEMU.system_baseline.NETWORK_CONTRACT
+        lines.append(
+            "NETWORK-BASELINE "
+            + " ".join(f"{key}={value}" for key, value in contract.items())
+        )
+        lines.extend(
+            f"NETWORK protocol={protocol} frequency_hz=1000000 ticks={ticks}"
+            for protocol in ("udp", "tcp")
+        )
+        lines.append("END network-baseline")
+        return "\n".join(lines)
+
+    @staticmethod
+    def boot() -> str:
+        return (
+            "TROE-BOOT-BASELINE-v1 start_ticks=100 end_ticks=600 "
+            "excluded_ipc_ticks=200 ticks=300 counter_hz=1000000\nsh:/> "
+        )
+
+    def document(self) -> dict[str, object]:
+        baseline = TEST_QEMU.system_baseline
+        record = baseline.boot_record(self.boot())
+        return {
+            "adr": 35,
+            "contract": baseline.CONTRACT,
+            "provenance": {
+                **StorageBaselineTests.origin(),
+                "network_peer": {
+                    "host": "10.0.2.2",
+                    "udp_port": 10001,
+                    "tcp_port": 10002,
+                    "tcp_nodelay": True,
+                },
+            },
+            "ipc": baseline.ipc_rows(self.output()),
+            "network": baseline.network_rows(self.output()),
+            "boot": {
+                "records": [dict(record) for _ in range(5)],
+                "measurement": baseline.statistics([300000] * 5, 1000000000, 5, 0),
+            },
+        }
+
+    def test_committed_system_fixtures_cover_every_platform(self) -> None:
+        baseline = TEST_QEMU.system_baseline
+        for platform_id in PLATFORM_IDS:
+            with self.subTest(platform=platform_id):
+                fixture = baseline.storage.FIXTURES / f"system-{platform_id}.json"
+                baseline.validate_document(
+                    json.loads(fixture.read_text("utf-8")), platform_id
+                )
+
+    def test_raw_order_statistics_and_structural_counts_are_preserved(self) -> None:
+        baseline = TEST_QEMU.system_baseline
+        document = self.document()
+        baseline.validate_document(document, X86_64_Q35_UEFI)
+        row = document["ipc"]["isolated-diagnostics/4096"]
+        self.assertEqual(row["measurement"]["ticks"], list(range(256, 0, -1)))
+        self.assertEqual(row["measurement"]["p95_ticks"], 244)
+        self.assertEqual(row["counters"]["request_copies"], 1024)
+        self.assertEqual(
+            document["network"]["udp"]["bytes_per_second"], 256 * 2944 * 1000000 / 32896
+        )
+        self.assertEqual(document["boot"]["measurement"]["p50_ticks"], 300000)
+
+    def test_counter_quantization_and_per_boot_calibration_remain_exact(self) -> None:
+        baseline = TEST_QEMU.system_baseline
+        document = self.document()
+        row = document["ipc"]["in-process/0"]
+        row["measurement"]["ticks"][-1] = 0
+        row["measurement"] = baseline.statistics(
+            row["measurement"]["ticks"], 1000000, 256, 0, allow_zero=True
+        )
+        boot = document["boot"]["records"][1]
+        boot["counter_hz"] *= 2
+        for field in ("start_ticks", "end_ticks", "excluded_ipc_ticks", "ticks"):
+            boot[field] *= 2
+        baseline.validate_document(document, X86_64_Q35_UEFI)
+        with self.assertRaises(ValueError):
+            baseline.statistics([0] * 256, 1000000, 256, 0, allow_zero=True)
+
+    def test_partial_duplicate_or_changed_ipc_rows_fail(self) -> None:
+        baseline = TEST_QEMU.system_baseline
+        output = self.output()
+        for invalid in (
+            output + "\n" + output.splitlines()[0],
+            output.replace("ipc-samples path=in-process payload=0 ", "missing "),
+            output.replace("tlb_invalidations=1536", "tlb_invalidations=0"),
+            output.replace("p95_ticks=244", "p95_ticks=245"),
+            output.replace("ticks=256,255,", "ticks=-1,255,"),
+            output.replace("counter_hz=1000000", "counter_hz=0"),
+            output.replace("samples=256", "samples=256 samples=256"),
+        ):
+            with self.subTest(record=invalid[:100]), self.assertRaises(ValueError):
+                baseline.ipc_rows(invalid)
+
+    def test_network_completion_matrix_and_order_are_required(self) -> None:
+        baseline = TEST_QEMU.system_baseline
+        output = self.output()
+        udp_line = next(
+            line
+            for line in output.splitlines()
+            if line.startswith("NETWORK protocol=udp")
+        )
+        for invalid in (
+            output.replace("END network-baseline", ""),
+            output + "\nEND network-baseline",
+            output.replace(udp_line, ""),
+            output + "\n" + udp_line,
+            output.replace("protocol=udp", "protocol=tcp"),
+            output.replace("udp_bytes=1472", "udp_bytes=1473"),
+        ):
+            with self.assertRaises(ValueError):
+                baseline.network_rows(invalid)
+
+    def test_boot_markers_reject_host_order_and_counter_corruption(self) -> None:
+        baseline = TEST_QEMU.system_baseline
+        output = self.boot()
+        for invalid in (
+            output + output,
+            output.replace("ticks=300", "ticks=301"),
+            output.replace("start_ticks=100", "start_ticks=700"),
+            "sh:/> " + output,
+            output.replace("counter_hz=1000000", "counter_hz=0"),
+        ):
+            with self.assertRaises(ValueError):
+                baseline.boot_record(invalid)
+
+    def test_fixture_rejects_different_platform_corruption_and_partial_boots(
+        self,
+    ) -> None:
+        baseline = TEST_QEMU.system_baseline
+        with self.assertRaises(ValueError):
+            baseline.validate_document(self.document(), AARCH64_SBSA_REF)
+        for section, key, value in (
+            ("boot", "records", []),
+            ("network", "udp", {}),
+            ("provenance", "probe_sha256", "invalid"),
+        ):
+            document = self.document()
+            document[section][key] = value
+            with self.assertRaises(ValueError):
+                baseline.validate_document(document, X86_64_Q35_UEFI)
+
+    def test_capture_never_overwrites_and_verification_has_no_absolute_threshold(
+        self,
+    ) -> None:
+        baseline = TEST_QEMU.system_baseline
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            frozen = root / "fixtures"
+            baseline.settle(self.document(), frozen)
+            fixture = frozen / f"system-{X86_64_Q35_UEFI}.json"
+            before = fixture.read_bytes()
+            with self.assertRaises(FileExistsError):
+                baseline.settle(self.document(), frozen)
+            fresh = self.document()
+            fresh["network"]["udp"] = baseline.statistics(
+                [1000000] * 256, 1000000, 256, 2944
+            )
+            with (
+                mock.patch.object(baseline.storage, "FIXTURES", frozen),
+                mock.patch.object(baseline, "REPO_ROOT", root),
+            ):
+                baseline.settle(fresh, None)
+            self.assertEqual(fixture.read_bytes(), before)
+            self.assertTrue(
+                (root / "build/system-baseline-results" / fixture.name).is_file()
+            )
+
+    def test_capture_requires_fresh_build_and_matching_scenario(self) -> None:
+        arguments = [
+            "--platform",
+            X86_64_Q35_UEFI,
+            "--environment",
+            "qemu",
+            "--record-system-baseline",
+            "/tmp/unused",
+        ]
+        for selector in (["--smoke"], ["--skip-build"], ["--scenario", "network"]):
+            with self.assertRaises(ValueError):
+                TEST_QEMU.selected_scenarios(TEST_QEMU.parse_args(arguments + selector))
+        groups = TEST_QEMU.selected_scenarios(
+            TEST_QEMU.parse_args([*arguments, "--scenario", "system-baseline"])
+        )
+        self.assertTrue(TEST_QEMU.requires_acceptance_images(groups))
+
+
 if __name__ == "__main__":
     unittest.main()

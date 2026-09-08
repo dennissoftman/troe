@@ -679,11 +679,13 @@ fact that belongs to one platform rather than to both.
   timestamp's fraction. The anchor keeps seconds and a remainder rather than
   one nanosecond count because the accepted range reaches year 9999, which
   `u64` nanoseconds since the epoch does not.
-- Acceptance storage probes sample the high-resolution architecture counter
+- Acceptance storage and network probes sample the high-resolution architecture counter
   through an acceptance-only timer payload. The counter includes kernel and
   I/O time; it does not change production timer or execution-lease resolution.
   The [storage measurement contract](testing.md#storage-baseline-capture)
-  defines the intervals and fixture validation.
+  defines the intervals and fixture validation. The
+  [IPC, network, and boot contract](testing.md#ipc-network-and-boot-baseline-capture)
+  also specifies raw compatibility samples and internal boot timing.
 - A sleep is a deadline, not a duration. The wait re-arms the one-shot timer in
   slices no longer than the application timeslice and recomputes the remainder
   from the counter on every pass, so a long wait cannot accumulate per-slice

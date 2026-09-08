@@ -294,6 +294,8 @@ pub(crate) fn run_shell_task(task: &mut ShellTask<'_>) -> TaskStep {
         )
         .unwrap_or_else(|()| fatal(b"fatal: initial service process pump failed\n"));
 
+    #[cfg(feature = "acceptance-probes")]
+    crate::boot_baseline::finish();
     loop {
         let prompt = shell_prompt(&shell);
         if write_all(&mut console, prompt.as_bytes()).is_err() {

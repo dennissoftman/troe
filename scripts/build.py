@@ -33,6 +33,8 @@ DEFAULT_VOLUME_TABLE = REPO_ROOT / "config" / "volumes.toml"
 IMAGE_SIZE_LIMIT = 16 * 1024 * 1024
 PRODUCTION_FORBIDDEN_MARKERS = (
     b"TROE-BASELINE-CLOCK-v1",
+    b"TROE-BOOT-BASELINE-v1",
+    b"ipc-samples path=",
     b"mmu-probe",
     b"task-probe",
     b"service-probe",
