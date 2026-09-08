@@ -756,13 +756,8 @@ impl ExternalCommand for KexCommandRunner<'_> {
         self.pending_script_lines = None;
         let reference = external_command_reference(command)?;
         let explicit_path = matches!(reference, ExternalCommandReference::Path(_));
-        let catalog_path = match reference {
-            ExternalCommandReference::CatalogName(name) => Some(alloc::format!("/bin/{name}.kex")),
-            ExternalCommandReference::Path(_) => None,
-        };
-        let path = catalog_path.as_deref().unwrap_or(command);
-        let metadata = match namespace.borrow_mut().metadata(cwd, path) {
-            Ok(metadata) => metadata,
+        let (path, metadata) = match reference.resolve(&mut *namespace.borrow_mut(), cwd) {
+            Ok(resolved) => resolved,
             Err(troe_fs_api::FsError::NotFound) if !explicit_path => return None,
             Err(troe_fs_api::FsError::NotFound) => {
                 return Some(command_application_status_error(
@@ -793,7 +788,7 @@ impl ExternalCommand for KexCommandRunner<'_> {
             |offset, destination| {
                 namespace
                     .borrow_mut()
-                    .read_file_at(cwd, path, offset, destination)
+                    .read_file_at(cwd, &path, offset, destination)
                     .map_err(|_| ())
             },
             native_application_target(),
@@ -1027,7 +1022,7 @@ impl ExternalCommand for KexCommandRunner<'_> {
                 words,
                 cwd,
                 namespace,
-                path,
+                &path,
                 &package,
                 BackgroundRequirements {
                     datagram: datagram_required,
@@ -1504,7 +1499,7 @@ impl ExternalCommand for KexCommandRunner<'_> {
             |offset, destination| {
                 namespace
                     .borrow_mut()
-                    .read_file_at(cwd, path, offset, destination)
+                    .read_file_at(cwd, &path, offset, destination)
                     .map_err(|_| ())
             },
             0,

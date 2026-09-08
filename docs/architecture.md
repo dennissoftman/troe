@@ -53,7 +53,7 @@ bundle. Unsupported firmware fails before device publication or volatile I/O.
    word, byte, or directory-scan bound (ADR 0057). Unquoted `&&` and `||` form
    left-associative short-circuit lists; `<`, `>`, and `>>` select
    bounded-memory file streams.
-3. The pipeline executor protects shell intrinsics, then resolves the exact KEX
+3. The pipeline executor protects shell intrinsics, then resolves the KEX
    command path. Absence reports an unavailable application and never selects
    privileged utility behavior. KEX receives bounded stdin/stdout/stderr streams
    plus only declared optional datagram, read-only VFS, streamed file mutation,
@@ -459,8 +459,10 @@ and service, `PWD` resolves from the invocation directory rather than being
 stored, and a name carries exactly one value because both the encoder and the
 decoder reject a duplicate. `spawn --env NAME=VALUE` narrows a child by
 replacing an inherited entry. A bare `argv[0]` resolves `/bin/<name>.kex`; one containing
-`/` resolves exactly against the supplied cwd. The kernel streams and validates
-the selected regular KEX file through the same coherent bounded loader used by
+`/` resolves against the supplied cwd, trying the exact path before one `.kex`
+suffix fallback on not-found when the filename does not already end in `.kex`.
+The kernel streams and validates the selected regular KEX file through the same
+coherent bounded loader used by
 direct launches, grants only a child-manifest attenuation of the
 launcher's own capabilities, and
 returns an opaque control token separate from the observable process ID.
@@ -498,7 +500,11 @@ one foreground application runs, then resumes only after owner-wide handle
 revocation, record reaping, page zeroization, and exact frame return. Bare
 artifacts are read from target-selected `/bin/<name>.kex`; explicit path
 artifacts are resolved through the same VFS namespace against the immutable
-invocation cwd. No suffix or search path is inferred, and absence is a terminal
+invocation cwd. Direct and nested launches share the same resolver: an explicit
+path is tried exactly, then with `.kex` appended only on not-found if the final
+component is nonempty, neither `.` nor `..`, and does not already end in `.kex`.
+Existing nodes, other lookup errors, and package rejection never trigger a retry.
+No search path is inferred, and absence of both candidates is a terminal
 not-found result. Individual service payloads and retained tables have hard ceilings;
 ordinary applications have no cumulative service-call ceiling. Heap and
 private-memory commitment are bounded by physical availability, exact owned

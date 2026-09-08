@@ -26,10 +26,13 @@ DESCRIPTION
     directly executable and have no shebang handling; use sh FILE.
 
     A bare ordinary command resolves only /bin/COMMAND.kex. A command token
-    containing / instead names an exact KEX package path relative to the
-    current directory or absolute from /. No suffix is inferred and neither
-    PATH nor the current directory is searched implicitly. The target must be a
-    regular file containing a valid KEX package. Package capabilities are still
+    containing / instead names a KEX package path relative to the current
+    directory or absolute from /. The exact path is tried first. If missing,
+    .kex is appended once unless the final component is empty, . or .., or
+    already ends in .kex. Thus ./python3 can launch ./python3.kex. Existing
+    nodes, other lookup errors, and invalid packages never trigger a retry.
+    Neither PATH nor the current directory is searched implicitly. The target
+    must be a regular file containing a valid KEX package. Capabilities are still
     limited by the launcher; copying a package does not add authority.
     Direct interactive execution outside /bin asks for confirmation and treats
     Enter or any answer other than y as cancellation. The prompt is an advisory
@@ -90,7 +93,7 @@ EXAMPLES
     ls "*.txt"
     sh /share/sh/bench.sh
     printf 'echo from-stdin\n' | sh -
-    cp /bin/echo.kex /vol/shared/echo-copy
+    cp /bin/echo.kex /vol/shared/echo-copy.kex
     cd /vol/shared
     ./echo-copy from-shared
     Run untrusted application './echo-copy' outside /bin? [y/N] y
