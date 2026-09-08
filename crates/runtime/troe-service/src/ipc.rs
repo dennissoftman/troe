@@ -938,6 +938,9 @@ impl Runtime {
     ///
     /// # Errors
     /// Rejects stale/terminal actors.
+    // Keep the scalar completion in registers at the native handoff boundary.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn take_resume(&mut self, actor: Actor) -> Result<Option<Resume>, Error> {
         self.context(actor)?;
         Ok(self.contexts[actor.slot()].resume.take())
@@ -962,6 +965,9 @@ impl Runtime {
 
     /// Queue slots whose entire storage must be zeroed before recycling.
     #[must_use]
+    // Direct calls have no dirty slot; avoid an out-of-line empty-table probe.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn dirty_queue(&self) -> Option<QueueSlotId> {
         if self.dirty_count == 0 {
             return None;
@@ -1203,9 +1209,9 @@ impl Runtime {
         c.resume = Some(Resume::Reply { status, bytes });
         if self.contexts[p.server.slot()].inbound == Some(id)
             && let Some(task) = self.contexts[p.server.slot()].task
-            && self.chains.is_engaged(task)
+            && let Some(active) = self.chains.active(task)
         {
-            if self.chains.active(task) == Some(task) {
+            if active == task {
                 self.chains.unwind(task).map_err(|_| Error::Invalid)?;
             } else {
                 self.chains.detach(task).map_err(|_| Error::Invalid)?;

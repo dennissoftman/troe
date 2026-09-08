@@ -669,6 +669,13 @@ impl ProtectedRuntime {
             .take_resume(actor)
             .map_err(|_| MmuError::InvalidUserContext)?;
         let context = &mut self.peer_mut(actor)?.context;
+        Self::resume_context(context, resume);
+        Ok(())
+    }
+    // Write the consumed scalar result using the already checked context owner.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
+    fn resume_context(context: &mut ArchitectureApplicationContext, resume: Option<Resume>) {
         match resume {
             Some(Resume::Reply { status, bytes }) => {
                 application_context_set_results(context, status, u64::from(bytes));
@@ -676,7 +683,6 @@ impl ProtectedRuntime {
             Some(Resume::Event(event)) => ipc::set_event(context, event),
             None => {}
         }
-        Ok(())
     }
     // Keep checked metadata access inside the measured trap path.
     #[allow(clippy::inline_always)]
@@ -697,10 +703,14 @@ impl ProtectedRuntime {
             self.stop = Some(ProtectedStop::Kernel(destination));
             return Ok(OUTCOME_APPLICATION_YIELD);
         }
-        self.apply_resume(destination)?;
-        *frame = self.peer(destination)?.context.clone();
-        self.peer(destination)?
-            .address_space
+        let resume = self
+            .model
+            .take_resume(destination)
+            .map_err(|_| MmuError::InvalidUserContext)?;
+        let peer = self.peer_mut(destination)?;
+        Self::resume_context(&mut peer.context, resume);
+        *frame = peer.context.clone();
+        peer.address_space
             .tag
             .as_ref()
             .ok_or(MmuError::InvalidUserContext)?

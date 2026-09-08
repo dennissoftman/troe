@@ -640,6 +640,9 @@ fn idle_event(kind: EventKind) -> Event {
     }
 }
 #[cfg(target_arch = "x86_64")]
+// Keep scalar event encoding inside the checked context handoff.
+#[allow(clippy::inline_always)]
+#[inline(always)]
 pub(super) fn set_event(context: &mut ArchitectureApplicationContext, event: Event) {
     let words = event.words();
     (
@@ -652,6 +655,9 @@ pub(super) fn set_event(context: &mut ArchitectureApplicationContext, event: Eve
     ) = (words[0], words[1], words[2], words[3], words[4], words[5]);
 }
 #[cfg(target_arch = "aarch64")]
+// Keep scalar event encoding inside the checked context handoff.
+#[allow(clippy::inline_always)]
+#[inline(always)]
 pub(super) fn set_event(context: &mut ArchitectureApplicationContext, event: Event) {
     context.general[..6].copy_from_slice(&event.words());
 }
