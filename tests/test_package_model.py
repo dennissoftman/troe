@@ -146,7 +146,9 @@ class ManifestTests(unittest.TestCase):
             ),
             (
                 "invalid-limit",
-                lambda document: document["resources"].update({"handles": 9}),
+                lambda document: document["resources"].update(
+                    {"handles": package_model.MAX_INITIAL_HANDLES + 1}
+                ),
             ),
             (
                 "invalid-array",
@@ -368,6 +370,27 @@ class PackageAndPlanTests(unittest.TestCase):
         outsider = parse_fixture("outsider", (1, 0, 0), b"outsider")
         with self.assertRaisesRegex(package_model.ModelError, "manifest-mismatch"):
             package_model.build_package(outsider, lock, b"outsider")
+
+    def test_plan_accepts_full_startup_budgets_above_256_total_handles(self) -> None:
+        manifests = []
+        for name, dependencies in [
+            ("app", (("library", (1, 0, 0), (2, 0, 0)),)),
+            ("library", ()),
+        ]:
+            document = manifest_document(
+                name, (1, 0, 0), b"kex", dependencies=dependencies
+            )
+            document["resources"]["handles"] = package_model.MAX_INITIAL_HANDLES
+            manifests.append(
+                package_model.parse_manifest(package_model.canonical_json(document))
+            )
+        lock = package_model.resolve("app", TARGET, manifests)
+        result = package_model.plan(
+            lock, {(item.name, item.version): item for item in manifests}
+        )
+        self.assertEqual(
+            result["totals"]["handles"], 2 * package_model.MAX_INITIAL_HANDLES
+        )
 
     def test_plan_reports_exact_authority_services_and_totals(self) -> None:
         manifest = parse_fixture("hello", (1, 0, 0), b"native-kex")

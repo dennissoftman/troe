@@ -2,14 +2,28 @@
 
 /// Product-independent capability-manifest format identifier.
 pub const MAGIC: [u8; 8] = *b"KCAPv1\0\0";
+/// Manifest format minor implemented by the kernel and the SDK builder.
+pub const MINOR: u16 = 1;
 /// Fixed manifest header bytes.
-pub const HEADER_BYTES: usize = 16;
+pub const HEADER_BYTES: usize = 24;
 /// Fixed bytes per required interface.
-pub const RECORD_BYTES: usize = 8;
+pub const RECORD_BYTES: usize = 16;
 /// Maximum optional startup authorities declared by one package.
 pub const MAX_REQUIREMENTS: usize = 128;
 /// Largest canonical manifest accepted by the kernel.
 pub const MAX_MANIFEST_BYTES: usize = HEADER_BYTES + MAX_REQUIREMENTS * RECORD_BYTES;
+/// Record kind of an exact interface requirement, the only kind 1.1 defines.
+///
+/// The kernel rejects every other kind and requires the parameter bytes
+/// following this field to be zero.
+pub const KIND_INTERFACE: u16 = 0;
+
+// Every requirement a package can declare becomes one startup handle beside
+// the mandatory command and stream handles, so the manifest ceiling must fit
+// the startup region's descriptor capacity.
+const _: () = assert!(
+    crate::startup::MANDATORY_HANDLES + MAX_REQUIREMENTS <= crate::startup::MAX_INITIAL_HANDLES
+);
 
 /// One exact interface version required at application startup.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -49,16 +63,23 @@ impl<'a> Manifest<'a> {
             .checked_add(count.checked_mul(RECORD_BYTES).ok_or(EncodingError)?)
             .ok_or(EncodingError)?;
         if count > MAX_REQUIREMENTS
-            || read_u16(bytes, 10)? != 0
+            || read_u16(bytes, 10)? != MINOR
             || usize::try_from(read_u32(bytes, 12)?).map_err(|_| EncodingError)? != expected
+            || read_u64(bytes, 16)? != 0
             || bytes.len() != expected
         {
             return Err(EncodingError);
         }
         let manifest = Self { bytes, count };
         let mut previous = 0_u32;
-        for requirement in manifest.iter() {
-            if requirement.interface <= previous || requirement.major == 0 {
+        for (index, requirement) in manifest.iter().enumerate() {
+            let offset = HEADER_BYTES + index * RECORD_BYTES;
+            if requirement.interface <= previous
+                || requirement.major == 0
+                || read_u16(bytes, offset + 8)? != KIND_INTERFACE
+                || read_u16(bytes, offset + 10)? != 0
+                || read_u32(bytes, offset + 12)? != 0
+            {
                 return Err(EncodingError);
             }
             previous = requirement.interface;
@@ -149,6 +170,7 @@ pub fn encode(
             .map_err(|_| EncodingError)?
             .to_le_bytes(),
     );
+    encoded[10..12].copy_from_slice(&MINOR.to_le_bytes());
     encoded[12..16].copy_from_slice(
         &u32::try_from(encoded_bytes)
             .map_err(|_| EncodingError)?
@@ -159,6 +181,7 @@ pub fn encode(
         encoded[offset..offset + 4].copy_from_slice(&requirement.interface.to_le_bytes());
         encoded[offset + 4..offset + 6].copy_from_slice(&requirement.major.to_le_bytes());
         encoded[offset + 6..offset + 8].copy_from_slice(&requirement.minor.to_le_bytes());
+        encoded[offset + 8..offset + 10].copy_from_slice(&KIND_INTERFACE.to_le_bytes());
     }
     destination[..encoded_bytes].copy_from_slice(&encoded[..encoded_bytes]);
     Ok(encoded_bytes)
@@ -172,6 +195,13 @@ fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, EncodingError> {
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, EncodingError> {
     let raw = bytes.get(offset..offset + 4).ok_or(EncodingError)?;
     Ok(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
+}
+
+fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, EncodingError> {
+    let raw = bytes.get(offset..offset + 8).ok_or(EncodingError)?;
+    Ok(u64::from_le_bytes([
+        raw[0], raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7],
+    ]))
 }
 
 #[cfg(test)]
@@ -197,6 +227,23 @@ mod tests {
         let mut trailing = bytes[..count].to_vec();
         trailing.push(0);
         assert!(requirements::Manifest::parse(&trailing).is_err());
+        // The format minor, the header's reserved bytes, the record kind, and
+        // the record's reserved parameter bytes are all exact.
+        for offset in [
+            10,
+            16,
+            23,
+            requirements::HEADER_BYTES + 8,
+            requirements::HEADER_BYTES + 10,
+            requirements::HEADER_BYTES + 15,
+        ] {
+            let mut corrupt = bytes[..count].to_vec();
+            corrupt[offset] ^= 1;
+            assert!(
+                requirements::Manifest::parse(&corrupt).is_err(),
+                "byte {offset} must be exact"
+            );
+        }
 
         let duplicate = [declared[0], declared[0]];
         let mut unchanged = [0xa5_u8; requirements::MAX_MANIFEST_BYTES];

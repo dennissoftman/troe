@@ -247,16 +247,16 @@ class CpythonIntegrationTests(unittest.TestCase):
     def test_kex_page_measurement_reads_exact_package_records(self) -> None:
         with tempfile.TemporaryDirectory(prefix="troe-cpython-kex-") as temporary:
             path = Path(temporary) / "python.kex"
-            artifact = bytearray(48 + 88 + 2 * 40)
+            artifact = bytearray(80 + 96 + 2 * 40)
             artifact[:8] = b"KEXPKG\0\0"
-            struct.pack_into("<I", artifact, 24, 48)
-            struct.pack_into("<Q", artifact, 32, len(artifact) - 48)
-            executable = memoryview(artifact)[48:]
+            struct.pack_into("<Q", artifact, 24, 80)
+            struct.pack_into("<Q", artifact, 32, len(artifact) - 80)
+            executable = memoryview(artifact)[80:]
             executable[:8] = b"KEX\0FMT\0"
-            struct.pack_into("<HH", executable, 14, 88, 40)
+            struct.pack_into("<HH", executable, 14, 96, 40)
             struct.pack_into("<H", executable, 32, 2)
-            struct.pack_into("<Q", executable, 88 + 24, 3 * 4096)
-            struct.pack_into("<Q", executable, 88 + 40 + 24, 5 * 4096)
+            struct.pack_into("<Q", executable, 96 + 24, 3 * 4096)
+            struct.pack_into("<Q", executable, 96 + 40 + 24, 5 * 4096)
             path.write_bytes(artifact)
             self.assertEqual(build_cpython.kex_image_pages(path), 8)
 

@@ -372,6 +372,8 @@ class Elf2KexTests(unittest.TestCase):
             0,
             22,
             60,
+            88,
+            95,
             elf2kex.KEX_HEADER_BYTES + 32,
             elf2kex.KEX_HEADER_BYTES + 36,
         ):

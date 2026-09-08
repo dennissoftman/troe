@@ -18,7 +18,7 @@ class RuntimeTreeTests(unittest.TestCase):
     def test_artifact_ceiling_matches_the_complete_package_contract(self) -> None:
         self.assertEqual(
             mkruntime.MAX_ARTIFACT_BYTES,
-            48 + (16 + 128 * 8) + 32 * 1024 * 1024 + 16 * 1024,
+            2_147_502_184,
         )
 
     def _artifacts(self, root: Path) -> list[mkruntime.Artifact]:

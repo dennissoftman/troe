@@ -95,11 +95,16 @@ class KexToolTests(unittest.TestCase):
                         capability_offset,
                         capability_bytes,
                         executable_offset,
-                        completion_offset,
                         executable_bytes,
+                        completion_offset,
+                        completion_bytes,
                         encoded_bytes,
-                    ) = struct.unpack_from("<HHHHIIIIQQ", package_bytes, 8)
-                    self.assertEqual((major, minor, header_bytes, flags), (1, 0, 48, 1))
+                    ) = struct.unpack_from("<HHHHIIQQQQQ", package_bytes, 8)
+                    self.assertEqual((major, minor, header_bytes, flags), (1, 1, 80, 1))
+                    self.assertEqual(package_bytes[64:80], bytes(16))
+                    self.assertEqual(
+                        completion_bytes, len(package_bytes) - completion_offset
+                    )
                     self.assertEqual(capability_offset, header_bytes)
                     self.assertEqual(
                         executable_offset, capability_offset + capability_bytes
@@ -123,13 +128,14 @@ class KexToolTests(unittest.TestCase):
                         capability_offset:executable_offset
                     ]
                     self.assertEqual(capability_bytes[:8], b"KCAPv1\0\0")
-                    count, reserved, encoded_bytes = struct.unpack_from(
+                    count, minor, encoded_bytes = struct.unpack_from(
                         "<HHI", capability_bytes, 8
                     )
-                    self.assertEqual(reserved, 0)
+                    self.assertEqual(minor, 1)
+                    self.assertEqual(capability_bytes[16:24], bytes(8))
                     self.assertEqual(encoded_bytes, len(capability_bytes))
                     records = [
-                        struct.unpack_from("<IHH", capability_bytes, 16 + index * 8)
+                        struct.unpack_from("<IHHHHI", capability_bytes, 24 + index * 16)
                         for index in range(count)
                     ]
                     if command == "udp":
@@ -196,7 +202,9 @@ class KexToolTests(unittest.TestCase):
                         expected = [(6, 1, 5), (20, 1, 0), (21, 1, 0)]
                     else:
                         expected = []
-                    self.assertEqual(records, expected)
+                    self.assertEqual(
+                        records, [(*record, 0, 0, 0) for record in expected]
+                    )
                     self.assertEqual(report["requirements"], len(expected))
                     self.assertFalse(artifact.with_suffix(".kcap").exists())
 
@@ -213,8 +221,8 @@ class KexToolTests(unittest.TestCase):
         artifact = REPO_ROOT / "rootfs" / "bin" / "x86_64" / "echo.kex"
         with tempfile.TemporaryDirectory() as directory:
             package_bytes = artifact.read_bytes()
-            executable_offset = struct.unpack_from("<I", package_bytes, 24)[0]
-            completion_offset = struct.unpack_from("<I", package_bytes, 28)[0]
+            executable_offset = struct.unpack_from("<Q", package_bytes, 24)[0]
+            completion_offset = struct.unpack_from("<Q", package_bytes, 40)[0]
             raw = Path(directory) / "raw.kex"
             raw.write_bytes(package_bytes[executable_offset:completion_offset])
             raw_inspection = cargo_kex("inspect", raw, "--json")

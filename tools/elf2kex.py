@@ -58,7 +58,7 @@ ELF_SHF_EXECINSTR = 0x4
 ELF_SHF_TLS = 0x400
 
 KEX_MAGIC = b"KEX\0FMT\0"
-KEX_HEADER_BYTES = 88
+KEX_HEADER_BYTES = 96
 KEX_RECORD_BYTES = 40
 KEX_RELOCATION_BYTES = 16
 KEX_IMAGE_BASE = 0x0000_4000_0000_0000
@@ -561,7 +561,7 @@ def verify_kex(
         raise ValueError("KEX output exceeds the standard encoded-byte ceiling")
     if artifact[:8] != KEX_MAGIC:
         raise ValueError("KEX output magic is invalid")
-    if struct.unpack_from("<HH", artifact, 8) != (1, 1):
+    if struct.unpack_from("<HH", artifact, 8) != (1, 2):
         raise ValueError("KEX output container version is invalid")
     if struct.unpack_from("<H", artifact, 12)[0] != KEX_TARGETS[target]:
         raise ValueError("KEX output target is invalid")
@@ -591,6 +591,7 @@ def verify_kex(
         count == 0
         or count > limits["records"]
         or reserved != 0
+        or struct.unpack_from("<Q", artifact, 88)[0] != 0
         or encoded_span == 0
         or encoded_span > limits["maximum_image_span"]
         or encoded_span % KEX_IMAGE_ALIGNMENT
@@ -705,7 +706,7 @@ def convert_elf(
         output,
         8,
         1,
-        1,
+        2,
         KEX_TARGETS[parsed.target],
         KEX_HEADER_BYTES,
         KEX_RECORD_BYTES,

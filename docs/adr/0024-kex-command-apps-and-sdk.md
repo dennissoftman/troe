@@ -9,6 +9,11 @@ execution prohibition with explicit path execution. Bare-name resolution still
 uses only the immutable `/bin` catalog, and writable directories are never
 searched implicitly.
 
+Supersession note, 2026-09-08: [ADR 0069](0069-kex-format-reserved-space-and-derived-handle-ceiling.md)
+defines the current KCAP 1.1 and KEXPKG 1.1 layouts, including reserved fields,
+full-width package offsets, and the shared startup-handle ceiling. Earlier
+layout descriptions below preserve the original decision.
+
 ## Decision
 
 TROE command applications are immutable KEX package v1 files installed at

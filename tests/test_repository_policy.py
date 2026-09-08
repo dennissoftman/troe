@@ -388,7 +388,8 @@ class RepositoryPolicyTests(unittest.TestCase):
             if crate.startswith("troe-fmt-"):
                 for dependency in dependencies:
                     self.assertTrue(
-                        dependency in {"troe-block", "troe-checksum", "troe-fs-api"}
+                        dependency
+                        in {"troe-abi", "troe-block", "troe-checksum", "troe-fs-api"}
                         or dependency.startswith("troe-fmt-"),
                         f"{crate} is a format codec: {dependency} is not a leaf"
                         " vocabulary. A block-resident format may read through"
@@ -407,6 +408,12 @@ class RepositoryPolicyTests(unittest.TestCase):
                     },
                     f"{crate} is a provider: it may not reach past the filesystem"
                     " contract, and must never link the namespace",
+                )
+            # SCFG shares the startup descriptor capacity through this leaf
+            # wire vocabulary; keep it free of runtime or provider linkage.
+            if crate == "troe-abi":
+                self.assertEqual(
+                    dependencies, set(), "troe-abi must remain leaf vocabulary"
                 )
             if crate == "troe-fs-api":
                 self.assertEqual(

@@ -924,7 +924,8 @@ impl ExternalCommand for KexCommandRunner<'_> {
         if let (Some(initial_handles), Some(authorized)) =
             (self.service_initial_handles, self.service_capability_bits)
         {
-            let requested_handles = 4_usize.saturating_add(capability_manifest.len());
+            let requested_handles =
+                troe_abi::startup::MANDATORY_HANDLES.saturating_add(capability_manifest.len());
             let unsupported_service_authority = filesystem_required
                 || filesystem_mutation_required
                 || diagnostics_required
