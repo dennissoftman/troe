@@ -197,9 +197,23 @@ print("lua-southern", os.date("%Z", 1768478400))
         completed = subprocess.run(
             (self.printf_runner,),
             cwd=REPO_ROOT,
-            check=True,
+            check=False,
             capture_output=True,
             timeout=10,
+        )
+        # On a mismatch the runner writes the value, conversion, precision,
+        # expected text and actual text to stderr and then exits non-zero.
+        # `check=True` discards exactly that, leaving an exit status as the
+        # whole report, which says nothing about which value disagreed.
+        self.assertEqual(
+            completed.returncode,
+            0,
+            "\n".join(
+                (
+                    "the freestanding formatter disagreed with the host libc",
+                    completed.stderr.decode("utf-8", "replace").rstrip(),
+                )
+            ),
         )
         self.assertEqual(completed.stdout, b"troe-printf-double ok\n")
 

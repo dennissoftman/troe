@@ -529,7 +529,18 @@ failure surface minutes later. `MINIMUM_E2FSPROGS_VERSION` still admits
 `1.47.0`, so the version check alone does not reject a tool that cannot satisfy
 the verifier.
 
-Two properties are specific to the hosted run. Each named platform gets its own
+The hosted run covers three of the four platforms: `x86_64-q35-uefi`,
+`x86_64-uefi-virtio-pci`, and `aarch64-uefi-virtio-mmio`. `aarch64-sbsa-ref` is
+not hosted. On the distribution's QEMU 8.2.2 its Trusted Firmware and UEFI both
+start and then no boot device is found; that firmware needs `FEAT_RNG`, which
+`cpu=max` did not implement that far back, and the `sbsa-ref` machine model
+itself changed between 8.x and the pinned 11.1.0. So that platform stays
+verified locally, with `python3 scripts/test-qemu.py --platform
+aarch64-sbsa-ref --environment qemu`, and a green hosted run is not evidence
+about it. Hosting it needs a runner with a newer QEMU than any distribution
+package supplies.
+
+Two properties are specific to the hosted run. Each hosted platform gets its own
 runner, so the fixed acceptance UDP ports cannot collide the way two overlapping
 runs on one machine do. And the work is selected by `scripts/test_changed.py`
 from the changed paths rather than always running everything, so a
@@ -538,7 +549,7 @@ and booting four VMs. The selector owns that mapping; the workflow does not
 restate it. A change under `.github/workflows/` escalates to the exhaustive
 gate, so the workflow cannot weaken its own coverage unobserved.
 
-`aarch64-sbsa-ref` has no distribution firmware, so its job builds the pinned
+`aarch64-sbsa-ref` has no distribution firmware, so a local run builds the pinned
 edk2 and Trusted Firmware-A banks and caches them against
 `tools/sbsa-firmware-sources.lock.json`. A restored cache is still verified
 against the `MANIFEST.sha256` its builder wrote.

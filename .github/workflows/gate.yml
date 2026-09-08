@@ -11,6 +11,14 @@ name: gate
 # `scripts/test_changed.py` rather than always running everything, so a
 # documentation-only change does not rebuild the kernel or boot a VM.
 #
+# It covers three of the four platforms. `aarch64-sbsa-ref` is not here: on
+# 24.04's QEMU 8.2.2 its Trusted Firmware and UEFI both start and then no boot
+# device is found, and the profile already records that this firmware needs
+# FEAT_RNG, which `cpu=max` did not implement that far back. The machine model
+# itself also moved between 8.x and the pinned 11.1.0. That platform therefore
+# stays locally verified until a runner can supply a newer QEMU; adding it back
+# means building QEMU rather than installing the distribution one.
+#
 # The selector owns that taxonomy, not this file. It already maps `.md`,
 # `docs/` and `skills/` paths to a single policy test, escalates build and
 # toolchain files to the exhaustive gate, and falls back to the exhaustive gate
@@ -269,111 +277,13 @@ jobs:
             --platform ${{ matrix.platform }} \
             --environment qemu
 
-  acceptance-sbsa:
-    name: acceptance aarch64-sbsa-ref
-    needs: select
-    if: needs.select.outputs.exhaustive == 'true'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          # assets/*.kefs and the large KEX corpus are Git LFS objects; without
-          # this they arrive as pointer text and a reader reports InvalidMagic.
-          lfs: true
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
-
-      - name: Install QEMU, firmware build tools, and filesystem tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential clang lld llvm pkg-config libssl-dev \
-            acpica-tools uuid-dev nasm python3-dev \
-            qemu-system-arm qemu-system-data seabios ipxe-qemu \
-            e2fsprogs dosfstools mtools
-          qemu-system-aarch64 --version | head -1
-
-      # This platform drives a `bochs-display` framebuffer and carries virtio
-      # on PCI, so QEMU loads a VGA BIOS and the iPXE virtio ROM. Ubuntu splits
-      # those across packages and installs one outside the directory QEMU
-      # searches: `seabios` puts the VGA BIOS in /usr/share/seabios.
-      #
-      # The other jobs never reach this. The x86 ones get efi-virtio.rom
-      # because qemu-system-x86 depends on ipxe-qemu, and
-      # aarch64-uefi-virtio-mmio loads no ROM at all, since ramfb and
-      # virtio-mmio need none. Only this platform combines PCI virtio and a
-      # VGA framebuffer without the x86 package.
-      - name: Ensure the ROM blobs this platform loads are present
-        run: |
-          set -euo pipefail
-          for rom in vgabios-bochs-display.bin efi-virtio.rom; do
-            if [ -f "/usr/share/qemu/$rom" ]; then
-              echo "present: /usr/share/qemu/$rom"
-              continue
-            fi
-            found="$(find /usr/share /usr/lib -name "$rom" -print -quit 2>/dev/null || true)"
-            if [ -z "$found" ]; then
-              echo "could not find $rom. Candidate directories:"
-              for dir in /usr/share/qemu /usr/share/seabios /usr/share/ipxe \
-                         /usr/lib/ipxe /usr/share/vgabios; do
-                echo "--- $dir"
-                ls -1 "$dir" 2>/dev/null | head -20 || echo "    (absent)"
-              done
-              exit 1
-            fi
-            sudo install -Dm644 "$found" "/usr/share/qemu/$rom"
-            echo "installed $found -> /usr/share/qemu/$rom"
-          done
-
-      # This platform has no distribution firmware. Its banks are edk2 plus
-      # Trusted Firmware-A built from the revisions pinned in
-      # tools/sbsa-firmware-sources.lock.json, so the result is reproducible
-      # and worth caching. The key covers the lock file and the builder, the
-      # tree is restored to the directory the firmware search checks first, and
-      # the builder's own MANIFEST.sha256 is what acceptance verifies it
-      # against, so a restored cache is checked rather than trusted.
-      - name: Cache SBSA reference firmware
-        id: sbsa-firmware
-        uses: actions/cache@v4
-        with:
-          path: build/sbsa-firmware
-          key: sbsa-firmware-${{ hashFiles('tools/sbsa-firmware-sources.lock.json', 'tools/build_sbsa_firmware.py') }}
-
-      - name: Build SBSA reference firmware
-        if: steps.sbsa-firmware.outputs.cache-hit != 'true'
-        run: python3 tools/build_sbsa_firmware.py
-
-      # 24.04's e2fsprogs 1.47.0 passes the version check and then fails the
-      # ext4 byte verifier, because it does not honour E2FSPROGS_FAKE_TIME.
-      - name: Use the pinned e2fsprogs
-        uses: ./.github/actions/pinned-e2fsprogs
-
-      - name: Cache cargo and target
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-sbsa-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
-          restore-keys: cargo-sbsa-
-
-      - name: Run QEMU acceptance
-        run: |
-          python3 scripts/test-qemu.py \
-            --platform aarch64-sbsa-ref \
-            --environment qemu
-
   # One job to require in branch protection. It succeeds when every selected
   # job succeeded and fails if any did, so protecting this single check works
   # for a focused plan and an exhaustive one alike; a job skipped by selection
   # is not a failure.
   gate:
     name: gate
-    needs: [select, focused, host, acceptance, acceptance-sbsa]
+    needs: [select, focused, host, acceptance]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -385,13 +295,11 @@ jobs:
           printf 'focused         %s\n' '${{ needs.focused.result }}'
           printf 'host            %s\n' '${{ needs.host.result }}'
           printf 'acceptance      %s\n' '${{ needs.acceptance.result }}'
-          printf 'acceptance-sbsa %s\n' '${{ needs['acceptance-sbsa'].result }}'
           for result in \
             '${{ needs.select.result }}' \
             '${{ needs.focused.result }}' \
             '${{ needs.host.result }}' \
-            '${{ needs.acceptance.result }}' \
-            '${{ needs['acceptance-sbsa'].result }}'; do
+            '${{ needs.acceptance.result }}'; do
             case "$result" in
               success|skipped) ;;
               *) echo "a selected gate did not succeed"; exit 1 ;;
