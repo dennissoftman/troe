@@ -511,7 +511,9 @@ class FirmwareProfileTests(unittest.TestCase):
                 ) as run,
             ):
                 for environment in (QEMU_ENVIRONMENT, "qemu-kvm"):
-                    with self.assertRaisesRegex(RuntimeError, "synthetic build failure"):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "synthetic build failure"
+                    ):
                         qemu_profile.build_cloud_bundle(profile, environment)
                     command = run.call_args.args[0]
                     self.assertEqual(
