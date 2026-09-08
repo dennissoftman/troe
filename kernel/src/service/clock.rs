@@ -60,6 +60,18 @@ pub(crate) struct ApplicationClockControlService {
 impl Service for ApplicationTimerService {
     fn call(&mut self, request: Request<'_>) -> Result<ServiceReply, troe_dispatch::DispatchError> {
         match request.opcode() {
+            #[cfg(feature = "acceptance-probes")]
+            timer::NOW if request.payload() == b"TROE-BASELINE-CLOCK-v1" => {
+                let frequency_hz = troe_machine::benchmark_counter_frequency_hz()
+                    .ok_or(troe_dispatch::DispatchError::AccountingOverflow)?;
+                let ticks = troe_machine::benchmark_counter_ticks();
+                let reply = timer::encode_process_cpu_time(timer::ProcessCpuTime {
+                    ticks,
+                    frequency_hz,
+                })
+                .map_err(|_| troe_dispatch::DispatchError::AccountingOverflow)?;
+                ServiceReply::with_payload(ReplyStatus::Success, &reply)
+            }
             timer::NOW if request.payload().is_empty() => {
                 let milliseconds = self.runtime.borrow().now().as_millis();
                 ServiceReply::with_payload(

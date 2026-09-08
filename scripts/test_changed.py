@@ -555,6 +555,20 @@ def build_plan(
                 plan.qemu_all_platforms = True
                 _add_qemu(plan, path, *RUNTIME_TOOL_SCENARIOS[path_text])
             continue
+        if path_text == "scripts/system_baseline.py" or path_text.startswith(
+            ("tests/network-baseline/", "tests/fixtures/adr-0035/system-")
+        ):
+            _add_python(plan, path, "test_qemu_profile.py")
+            _add_qemu(plan, path, "system-baseline")
+            plan.qemu_all_platforms = True
+            continue
+        if path_text == "scripts/storage_baseline.py" or path_text.startswith(
+            ("tests/storage-baseline/", "tests/fixtures/adr-0035/")
+        ):
+            _add_python(plan, path, "test_qemu_profile.py")
+            _add_qemu(plan, path, "storage-baseline")
+            plan.qemu_all_platforms = True
+            continue
         if path_text in {"scripts/test-qemu.py", "scripts/run-qemu.py"}:
             _add_python(plan, path, "test_qemu_profile.py")
             _add_qemu(plan, path, *ALL_QEMU_SCENARIOS)

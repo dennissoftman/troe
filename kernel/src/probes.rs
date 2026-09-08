@@ -173,6 +173,7 @@ pub(crate) fn run_ipc_baseline_verification(
             core::hint::black_box(reply);
             *sample = finished.checked_sub(started).ok_or(())?;
         }
+        emit_ipc_samples("in-process", payload_bytes, frequency, &samples)?;
         samples.sort_unstable();
         let stats = dispatcher.stats();
         let completed_calls = stats.replies.checked_sub(baseline.replies).ok_or(())?;
@@ -321,6 +322,12 @@ pub(crate) fn run_isolated_ipc_baseline_verification(
         {
             return Err(());
         }
+        emit_ipc_samples(
+            "isolated-diagnostics",
+            payload_bytes,
+            frequency,
+            &exchange.samples,
+        )?;
         exchange.samples.sort_unstable();
         let completed_calls = u64::try_from(IPC_BASELINE_SAMPLES).map_err(|_| ())?;
         let mut line = String::new();
@@ -345,6 +352,29 @@ pub(crate) fn run_isolated_ipc_baseline_verification(
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "acceptance-probes")]
+fn emit_ipc_samples(
+    path: &str,
+    payload: usize,
+    frequency: u64,
+    samples: &[u64; IPC_BASELINE_SAMPLES],
+) -> Result<(), ()> {
+    let mut line =
+        alloc::format!("ipc-samples path={path} payload={payload} counter_hz={frequency} ticks=");
+    for (index, sample) in samples.iter().enumerate() {
+        if index != 0 {
+            line.push(',');
+        }
+        write!(line, "{sample}").map_err(|_| ())?;
+    }
+    line.push('\n');
+    if troe_machine::write(line.as_bytes()) {
+        Ok(())
+    } else {
+        Err(())
+    }
 }
 
 #[cfg(feature = "acceptance-probes")]

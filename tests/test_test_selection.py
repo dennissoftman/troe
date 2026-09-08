@@ -423,6 +423,36 @@ class ChangedTestSelectionTests(unittest.TestCase):
             test_scenarios.OPTIONAL_SCENARIOS, frozenset({"cpython", "lua"})
         )
 
+    def test_storage_probe_and_fixture_changes_select_all_platform_measurements(
+        self,
+    ) -> None:
+        for name in (
+            "scripts/storage_baseline.py",
+            "tests/storage-baseline/src/main.rs",
+            "tests/fixtures/adr-0035/storage-x86_64-q35-uefi.json",
+        ):
+            with self.subTest(path=name):
+                plan = test_changed.build_plan((PurePosixPath(name),), PACKAGES)
+                self.assertFalse(plan.full_reasons)
+                self.assertEqual(plan.qemu_scenarios, {"storage-baseline"})
+                self.assertTrue(plan.qemu_all_platforms)
+                self.assertEqual(plan.python_tests, {"test_qemu_profile.py"})
+
+    def test_system_probe_and_fixture_changes_select_all_platform_measurements(
+        self,
+    ) -> None:
+        for name in (
+            "scripts/system_baseline.py",
+            "tests/network-baseline/src/main.rs",
+            "tests/fixtures/adr-0035/system-x86_64-q35-uefi.json",
+        ):
+            with self.subTest(path=name):
+                plan = test_changed.build_plan((PurePosixPath(name),), PACKAGES)
+                self.assertFalse(plan.full_reasons)
+                self.assertEqual(plan.qemu_scenarios, {"system-baseline"})
+                self.assertTrue(plan.qemu_all_platforms)
+                self.assertEqual(plan.python_tests, {"test_qemu_profile.py"})
+
     def test_selector_and_qemu_scenario_catalogs_are_exactly_aligned(self) -> None:
         self.assertEqual(
             test_changed.ALL_QEMU_SCENARIOS,
@@ -432,6 +462,8 @@ class ChangedTestSelectionTests(unittest.TestCase):
                     "network",
                     "shell-terminal",
                     "filesystem",
+                    "storage-baseline",
+                    "system-baseline",
                     "quota-memory",
                     "persistence",
                     "fault-isolation",

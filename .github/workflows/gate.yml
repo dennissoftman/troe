@@ -1,6 +1,6 @@
 name: gate
 
-# The merge gate is `scripts/test.py`: 105 gates, including exhaustive QEMU
+# The merge gate is `scripts/test.py`: 109 gates, including exhaustive QEMU
 # acceptance on all four named platforms. Run serially on one machine it takes
 # 12-15 minutes, every session queues behind every other, and two overlapping
 # runs collide on the fixed acceptance UDP ports.

@@ -111,6 +111,8 @@ pub(crate) fn load_boot_mount_manifest() -> Result<BootMountManifest, ()> {
 }
 
 pub(crate) fn post_handoff(prepared: &mut PreparedHandoff) -> ! {
+    #[cfg(feature = "acceptance-probes")]
+    crate::boot_baseline::start();
     let final_map = troe_machine::exit_boot_services_after_protocols();
     troe_machine::mark_firmware_exited();
     troe_machine::take_interrupt_ownership();

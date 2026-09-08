@@ -39,6 +39,8 @@ extern crate alloc;
 
 #[cfg(target_os = "uefi")]
 mod artifacts;
+#[cfg(all(target_os = "uefi", feature = "acceptance-probes"))]
+mod boot_baseline;
 #[cfg(target_os = "uefi")]
 mod console;
 #[cfg(target_os = "uefi")]

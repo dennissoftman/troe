@@ -81,8 +81,12 @@ pub(crate) fn run_owned(mut accounting: OwnedAccounting) -> ! {
     run_application_load_verification(&mut scheduler, &mut accounting)
         .unwrap_or_else(|()| fatal(b"fatal: Stage 7 load-boundary verification failed\n"));
     #[cfg(feature = "acceptance-probes")]
-    run_ipc_baseline_verification(&mut scheduler, &mut accounting)
-        .unwrap_or_else(|()| fatal(b"fatal: IPC baseline verification failed\n"));
+    {
+        let start = troe_machine::benchmark_counter_ticks();
+        run_ipc_baseline_verification(&mut scheduler, &mut accounting)
+            .unwrap_or_else(|()| fatal(b"fatal: IPC baseline verification failed\n"));
+        crate::boot_baseline::exclude_ipc(start);
+    }
     if !write_machine_boot_status(BOOT_RUNTIME_LABEL, true) {
         fatal(b"fatal: application loader diagnostic failed\n");
     }

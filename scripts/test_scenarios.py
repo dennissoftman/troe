@@ -5,6 +5,8 @@ SCENARIO_IDS = (
     "network",
     "shell-terminal",
     "filesystem",
+    "storage-baseline",
+    "system-baseline",
     "lua",
     "cpython",
     "quota-memory",
