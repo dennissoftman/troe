@@ -242,7 +242,8 @@ pub(crate) fn run_isolated_ipc_baseline_verification(
     accounting: &mut OwnedAccounting,
     frequency: u64,
 ) -> Result<(), ()> {
-    for payload_bytes in [0_usize, 64, 256, 4 * 1024] {
+    let mut compatibility_p95 = [0; 4];
+    for (index, payload_bytes) in [0_usize, 64, 256, 4 * 1024].into_iter().enumerate() {
         let baseline_frames = accounting.frames.free_frames();
         let exchange = Rc::new(RefCell::new(DiagnosticsBenchmarkExchange {
             payload: [0x5a; troe_abi::MAX_MESSAGE_BYTES],
@@ -329,6 +330,7 @@ pub(crate) fn run_isolated_ipc_baseline_verification(
             &exchange.samples,
         )?;
         exchange.samples.sort_unstable();
+        compatibility_p95[index] = ipc_percentile(&exchange.samples, 95);
         let completed_calls = u64::try_from(IPC_BASELINE_SAMPLES).map_err(|_| ())?;
         let mut line = String::new();
         writeln!(
@@ -351,18 +353,23 @@ pub(crate) fn run_isolated_ipc_baseline_verification(
             return Err(());
         }
     }
-    Ok(())
+    crate::ipc::verify(scheduler, accounting, compatibility_p95)
 }
 
 #[cfg(feature = "acceptance-probes")]
-fn emit_ipc_samples(
+pub(crate) fn emit_ipc_samples(
     path: &str,
     payload: usize,
     frequency: u64,
     samples: &[u64; IPC_BASELINE_SAMPLES],
 ) -> Result<(), ()> {
+    let record = if path.starts_with("persistent-") {
+        "ipc-phase-b-samples"
+    } else {
+        "ipc-samples"
+    };
     let mut line =
-        alloc::format!("ipc-samples path={path} payload={payload} counter_hz={frequency} ticks=");
+        alloc::format!("{record} path={path} payload={payload} counter_hz={frequency} ticks=");
     for (index, sample) in samples.iter().enumerate() {
         if index != 0 {
             line.push(',');
@@ -621,6 +628,7 @@ pub(crate) fn run_one_isolated(
     Ok(allocation_start)
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn run_application_load_verification(
     scheduler: &mut Scheduler,
     accounting: &mut OwnedAccounting,
@@ -641,6 +649,26 @@ pub(crate) fn run_application_load_verification(
         artifact,
         ApplicationProbe::Calls,
     )?;
+    #[cfg(target_arch = "x86_64")]
+    let legacy = [
+        include_bytes!("../../tests/kex-corpus/native-calls-abi0-x86_64.kex").as_slice(),
+        include_bytes!("../../tests/kex-corpus/native-calls-abi1-x86_64.kex").as_slice(),
+    ];
+    #[cfg(target_arch = "aarch64")]
+    let legacy = [
+        include_bytes!("../../tests/kex-corpus/native-calls-abi0-aarch64.kex").as_slice(),
+        include_bytes!("../../tests/kex-corpus/native-calls-abi1-aarch64.kex").as_slice(),
+    ];
+    for artifact in legacy {
+        load_and_reclaim_application(
+            scheduler,
+            accounting,
+            &mut dispatcher,
+            port,
+            artifact,
+            ApplicationProbe::Calls,
+        )?;
+    }
     #[cfg(not(feature = "acceptance-probes"))]
     let _ = first;
 
@@ -680,9 +708,9 @@ pub(crate) fn run_application_load_verification(
     };
 
     #[cfg(not(all(feature = "acceptance-probes", target_arch = "aarch64")))]
-    let expected_yields = baseline_tasks.yields.checked_add(1).ok_or(())?;
+    let expected_yields = baseline_tasks.yields.checked_add(3).ok_or(())?;
     #[cfg(all(feature = "acceptance-probes", target_arch = "aarch64"))]
-    let expected_yields = baseline_tasks.yields.checked_add(2).ok_or(())?;
+    let expected_yields = baseline_tasks.yields.checked_add(4).ok_or(())?;
     if accounting.frames.free_frames() != baseline_frames
         || scheduler.stats().owned_address_spaces != baseline_tasks.owned_address_spaces
         || scheduler.stats().owned_isolation_pages != baseline_tasks.owned_isolation_pages
@@ -820,7 +848,7 @@ pub(crate) fn load_and_reclaim_application(
         clear_provisional_loader_ownership(&mut transaction);
         return Err(());
     }
-    let Ok(address_space) =
+    let Ok(mut address_space) =
         troe_machine::build_user_address_space(&mapping_plan, allocation.tables)
     else {
         reclaim_application(accounting, allocation)?;
@@ -828,40 +856,54 @@ pub(crate) fn load_and_reclaim_application(
         return Err(());
     };
     if transaction.acquire(LoaderResource::Tables).is_err() {
+        drop(address_space);
         reclaim_application(accounting, allocation)?;
         clear_provisional_loader_ownership(&mut transaction);
         return Err(());
     }
     let (planned_user_regions, planned_user_pages) =
         troe_machine::planned_user_regions(&mapping_plan).map_err(|_| ())?;
+    if let (Some(pair), Some((tx, _))) = (&allocation.ipc, plan.layout().ipc_addresses())
+        && address_space.bind_ipc(pair, tx).is_err()
+    {
+        drop(address_space);
+        reclaim_application(accounting, allocation)?;
+        clear_provisional_loader_ownership(&mut transaction);
+        return Err(());
+    }
     let table_pages = address_space.stats().table_pages;
     if table_pages == 0
         || table_pages != allocation.tables.page_count()
         || address_space.user_region_count() != planned_user_regions
         || planned_user_pages != private_pages
     {
+        drop(address_space);
         reclaim_application(accounting, allocation)?;
         clear_provisional_loader_ownership(&mut transaction);
         return Err(());
     }
     let retained_table_pages = allocation.tables.page_count();
     let Ok(isolation) = IsolationResource::new(0, retained_table_pages, private_pages, 1) else {
+        drop(address_space);
         reclaim_application(accounting, allocation)?;
         clear_provisional_loader_ownership(&mut transaction);
         return Err(());
     };
     let Ok(stack_resource) = StackResource::new(0, stack_pages) else {
+        drop(address_space);
         reclaim_application(accounting, allocation)?;
         clear_provisional_loader_ownership(&mut transaction);
         return Err(());
     };
     let Ok(task_id) = scheduler.spawn_isolated(Capabilities::SERVICE, stack_resource, isolation)
     else {
+        drop(address_space);
         reclaim_application(accounting, allocation)?;
         clear_provisional_loader_ownership(&mut transaction);
         return Err(());
     };
     if transaction.acquire(LoaderResource::Task).is_err() {
+        drop(address_space);
         rollback_application_task(scheduler, task_id, dispatcher, None, accounting, allocation)?;
         clear_provisional_loader_ownership(&mut transaction);
         return Err(());
@@ -899,6 +941,7 @@ pub(crate) fn load_and_reclaim_application(
         Ok((owner, handle))
     })();
     let Ok((owner, handle)) = setup else {
+        drop(address_space);
         rollback_application_task(
             scheduler, task_id, dispatcher, live_owner, accounting, allocation,
         )?;
@@ -909,6 +952,7 @@ pub(crate) fn load_and_reclaim_application(
     drop(staging);
     drop(mapping_plan);
     if transaction.commit().is_err() {
+        drop(address_space);
         rollback_application_task(
             scheduler, task_id, dispatcher, live_owner, accounting, allocation,
         )?;

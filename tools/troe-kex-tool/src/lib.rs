@@ -449,6 +449,8 @@ fn capability_requirement(name: &str) -> ToolResult<requirements::Requirement> {
             troe_abi::server::MAJOR,
             troe_abi::server::MINOR,
         ),
+        "persistent-endpoint" => (interface::SERVER_ENDPOINT, troe_abi::ipc::ENDPOINT_MAJOR, 0),
+        "wait-set" => (interface::WAIT_SET, troe_abi::ipc::WAIT_SET_MAJOR, 0),
         "shell-script" => (
             interface::SHELL_SCRIPT,
             troe_abi::shell_script::MAJOR,
@@ -1111,6 +1113,26 @@ mod tests {
     use super::{filtered_rustc_arguments, read_manifest, repo_root};
     use std::ffi::OsString;
     use std::fs;
+
+    #[test]
+    fn persistent_requirements_preserve_legacy_endpoint_version() -> Result<(), super::ToolError> {
+        let legacy = super::capability_requirement("server-endpoint")?;
+        let persistent = super::capability_requirement("persistent-endpoint")?;
+        let wait = super::capability_requirement("wait-set")?;
+        assert_eq!(
+            (legacy.interface, legacy.major),
+            (troe_abi::interface::SERVER_ENDPOINT, 1)
+        );
+        assert_eq!(
+            (persistent.interface, persistent.major),
+            (legacy.interface, 2)
+        );
+        assert_eq!(
+            (wait.interface, wait.major),
+            (troe_abi::interface::WAIT_SET, 1)
+        );
+        Ok(())
+    }
 
     #[test]
     fn listener_capability_is_separate_from_outbound_authority() -> Result<(), super::ToolError> {

@@ -1,6 +1,11 @@
 # ADR 0069: KEX format reserved space and derived handle ceiling
 
-Status: accepted and implemented, 2026-09-08.
+Status: accepted and implemented, 2026-09-08. The ABI 1.3 extension in
+[ADR 0035, Phase B](https://github.com/dennissoftman/troe/issues/8) supersedes the
+single-prefix startup calculation below: ABI 1.3 uses an 80-byte prefix and
+167 handles; ABI 1.0–1.2 retain 64 bytes and 168 handles. The SDK subtracts the
+versioned IPC extent as well as the startup region when deriving image span.
+Container, package, and KCAP versions in this decision are unchanged.
 
 ## Context
 

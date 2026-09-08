@@ -4,27 +4,9 @@
 //! `#[entry]` point, and the panic handler. Every other authority the kernel
 //! holds is named by the module that holds it.
 //!
-//! ADR 0035, tracked by #8, states the end-state layout this tree is walking
-//! towards: `kernel/src/ipc.rs`, `kernel/src/supervisor.rs`,
-//! `kernel/src/client.rs`, and `kernel/src/broker/{block,packet}.rs`, leaving
-//! `main.rs` as composition and boot ordering. That layout describes the kernel
-//! *after* the Phase D and E extractions, which have not happened, so it cannot
-//! be adopted wholesale today. The modules that will fold into it are:
-//!
-//! - `ipc.rs` — `deferred` (pending calls, blocked tasks, wakeups) and the
-//!   dispatcher wiring in `service`.
-//! - `supervisor.rs` — `supervision` (boot services, restarts, readiness).
-//! - `client.rs` — the kernel's own client side of the servers Phase D and E
-//!   create: `runtime`, `namespace`, `mounts`, `service::filesystem`, and
-//!   `network::services`, each of which reaches a subsystem in-process today
-//!   that it will reach through a typed capability instead.
-//! - `broker/block.rs` — the virtio-block device access retained by `storage`
-//!   once its formats, volume selection, and generation policy move out.
-//! - `broker/packet.rs` — the virtio-net device access retained by `network`
-//!   and `network::bringup` once the stack itself moves out.
-//!
-//! The remaining modules are not part of that sentence: they hold authority the
-//! accepted end state leaves in the kernel.
+//! `ipc` contains the synthetic ABI 1.3 acceptance composition; `deferred`
+//! and `service` retain compatibility service routing. Product supervision,
+//! network, storage, and namespace authority are named by their own modules.
 #![cfg_attr(target_os = "uefi", no_std)]
 #![cfg_attr(target_os = "uefi", no_main)]
 #![forbid(unsafe_code)]
@@ -51,6 +33,8 @@ mod handles;
 mod handoff;
 #[cfg(target_os = "uefi")]
 mod invocation;
+#[cfg(all(target_os = "uefi", feature = "acceptance-probes"))]
+mod ipc;
 #[cfg(target_os = "uefi")]
 mod kex;
 #[cfg(target_os = "uefi")]

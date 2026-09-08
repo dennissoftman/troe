@@ -194,10 +194,10 @@ fn network_failure(command: &CommandContext, failure: Error) -> u32 {
         Error::NotConfigured => ("IPv4 is not configured; run dhcp", exit::FAILURE),
         Error::Timeout => ("operation timed out", exit::FAILURE),
         Error::TooLarge => ("packet exceeds network limit", exit::FAILURE),
-        Error::Exhausted | Error::ResourceLimit | Error::Conflict => {
+        Error::Exhausted | Error::ResourceLimit | Error::Conflict | Error::Deadlock => {
             ("bounded network resources exhausted", exit::FAILURE)
         }
-        Error::Cancelled => ("cancelled", exit::CANCELLED),
+        Error::Cancelled | Error::Closed | Error::PeerDied => ("cancelled", exit::CANCELLED),
         Error::Denied => ("permission denied", exit::DENIED),
         Error::Failure | Error::NotFound => ("network device failed", exit::FAILURE),
         Error::InvalidCall

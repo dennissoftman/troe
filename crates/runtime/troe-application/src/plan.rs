@@ -164,6 +164,7 @@ pub struct LoadCharges {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ApplicationLayout {
     pub(crate) startup_address: u64,
+    pub(crate) ipc_addresses: Option<(u64, u64)>,
     pub(crate) heap_address: u64,
     pub(crate) heap_bytes: u64,
     pub(crate) stack_bottom: u64,
@@ -177,6 +178,12 @@ impl ApplicationLayout {
     #[must_use]
     pub const fn startup_address(self) -> u64 {
         self.startup_address
+    }
+
+    /// Private TX/RX virtual addresses, present only for ABI 1.3.
+    #[must_use]
+    pub const fn ipc_addresses(self) -> Option<(u64, u64)> {
+        self.ipc_addresses
     }
 
     /// First byte of the application's initially mapped, growable zeroed heap.

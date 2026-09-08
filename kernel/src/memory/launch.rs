@@ -214,7 +214,15 @@ pub(crate) fn allocate_application<P: NativeApplicationPlan>(
     {
         return Err(());
     }
-    let extents = reserve_zeroed_private_extents(accounting, resource_pages)?;
+    let ipc = if plan.layout().ipc_addresses().is_some() {
+        Some(troe_machine::IpcPagePair::allocate().map_err(|_| ())?)
+    } else {
+        None
+    };
+    let ordinary_pages = resource_pages
+        .checked_sub(if ipc.is_some() { 2 } else { 0 })
+        .ok_or(())?;
+    let extents = reserve_zeroed_private_extents(accounting, ordinary_pages)?;
     let image_pages = plan.charges().image_pages();
     let heap_pages = plan.heap_pages();
     let stack_pages = plan.stack_pages();
@@ -238,7 +246,7 @@ pub(crate) fn allocate_application<P: NativeApplicationPlan>(
         heap_pages,
         stack_pages,
     };
-    let Ok(mapping_plan) = build_application_plan(
+    let Ok(mut mapping_plan) = build_application_plan(
         &accounting.kernel_plan,
         accounting.kernel_runtime,
         &private,
@@ -247,6 +255,18 @@ pub(crate) fn allocate_application<P: NativeApplicationPlan>(
         release_launch_extents(accounting, &private.extents)?;
         return Err(());
     };
+    if let (Some(pair), Some((tx, _rx))) = (&ipc, plan.layout().ipc_addresses())
+        && insert_application_mapping(
+            &mut mapping_plan,
+            tx,
+            pair.range(),
+            MappingPermissions::READ_WRITE,
+        )
+        .is_err()
+    {
+        release_launch_extents(accounting, &private.extents)?;
+        return Err(());
+    }
     let Ok(table_pages) = troe_machine::required_page_table_pages(&mapping_plan) else {
         release_launch_extents(accounting, &private.extents)?;
         return Err(());
@@ -268,6 +288,7 @@ pub(crate) fn allocate_application<P: NativeApplicationPlan>(
     accounting.application_committed_pages = committed_pages;
     Ok((
         ApplicationAllocation {
+            ipc,
             extents: private.extents,
             tables,
             image_pages: private.image_pages,
@@ -554,7 +575,8 @@ pub(crate) fn reclaim_application(
     let committed_pages = allocation
         .extents
         .page_count()
-        .checked_add(application_growth_pages(&allocation)?)
+        .checked_add(if allocation.ipc.is_some() { 2 } else { 0 })
+        .and_then(|pages| pages.checked_add(application_growth_pages(&allocation).ok()?))
         .and_then(|pages| pages.checked_add(allocation.private_memory.committed_pages))
         .ok_or(())?;
     accounting.application_committed_pages = accounting

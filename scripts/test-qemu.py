@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import hashlib
+import json
+import platform
 import queue
 import re
 import shutil
@@ -18,6 +21,7 @@ import time
 import zlib
 from pathlib import Path
 
+import ipc_phase_b
 import storage_baseline
 import system_baseline
 from platform_profile import (
@@ -26,6 +30,7 @@ from platform_profile import (
     REPO_ROOT,
     X86_64_Q35_UEFI,
     X86_64_UEFI_VIRTIO_PCI,
+    boot_image_path,
     resolve_platform,
     root_storage_image_path,
     shared_test_image_path,
@@ -658,8 +663,42 @@ def assert_owned_boot(session: SerialSession) -> None:
         raise AcceptanceError(f"{session.platform_id} boot missed {discovery_marker!r}")
 
 
+def assert_ipc_phase_b(session: SerialSession) -> None:
+    """Require the new paths and retain independently recomputed boot evidence."""
+    try:
+        evidence = ipc_phase_b.validate(
+            session.transcript(), require_tagged=session.require_tagged
+        )
+    except (KeyError, ValueError) as error:
+        raise AcceptanceError(f"{session.platform_id} Phase B IPC: {error}") from error
+    evidence.update(
+        {
+            "platform": session.platform_id,
+            "command": session.command_line,
+            "host": platform.platform(),
+            "image_sha256": hashlib.sha256(
+                boot_image_path(
+                    resolve_platform(session.platform_id), acceptance_probes=True
+                ).read_bytes()
+            ).hexdigest(),
+        }
+    )
+    mode = "tagged" if evidence["tagged"] else "fallback"
+    destination = REPO_ROOT / "build" / f"ipc-phase-b-{session.platform_id}-{mode}.json"
+    destination.write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
+    ratios = ", ".join(
+        f"{size}={evidence['rows'][f'persistent-direct/{size}']['p95_ratio']:.3f}"
+        for size in (0, 64, 256, 4096)
+    )
+    print(
+        f"IPC Phase B ({session.platform_id}, {mode}): "
+        f"direct p95 ratios {ratios}; {destination}"
+    )
+
+
 def assert_ipc_baseline(session: SerialSession) -> None:
-    """Require both IPC paths and their deterministic structural counters."""
+    """Require compatibility and private-page IPC structural matrices."""
+    assert_ipc_phase_b(session)
     rows: dict[tuple[str, int], dict[str, int]] = {}
     for line in session.transcript().splitlines():
         if not line.startswith("ipc-baseline "):
@@ -727,6 +766,10 @@ class SerialSession:
     """A QEMU child with deadline-bound serial reads and deterministic cleanup."""
 
     def __init__(self, command: list[str], platform_id: str) -> None:
+        self.command_line = command
+        self.require_tagged = (
+            resolve_platform(platform_id).architecture == "aarch64" or "kvm" in command
+        )
         self.platform_id = platform_id
         self.architecture = resolve_platform(platform_id).architecture
         self.process = subprocess.Popen(

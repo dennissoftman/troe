@@ -16,6 +16,18 @@ use troe_memory::{BASE_PAGE_SIZE, MappingPermissions, PhysicalRange, VirtualRang
 #[cfg(any(test, target_os = "uefi"))]
 use troe_memory::{MappingMemoryType, MappingPrivilege};
 
+#[cfg(target_os = "uefi")]
+mod ipc;
+#[cfg(target_os = "uefi")]
+mod tags;
+#[cfg(target_os = "uefi")]
+pub use ipc::{IpcPair, IpcStats, IpcStop};
+#[cfg(target_os = "uefi")]
+#[cfg(feature = "acceptance-probes")]
+pub use tags::TagIdentity;
+#[cfg(target_os = "uefi")]
+pub use tags::{TagStats, tag_stats};
+
 const MAX_IMAGE_REGIONS: usize = 64;
 const BASE_PAGE_BYTES: usize = 4096;
 const PE_SIGNATURE: u32 = 0x0000_4550;
@@ -27,9 +39,8 @@ const OPTIONAL_SIZE_OF_IMAGE_OFFSET: usize = 56;
 const SECTION_HEADER_BYTES: usize = 40;
 const SECTION_EXECUTE: u32 = 0x2000_0000;
 const SECTION_WRITE: u32 = 0x8000_0000;
-// Shared Stage 7 storage: Full KEX permits sixteen image segments plus startup,
-// heap, and stack. The Stage 6 composition remains independently capped at
-// eight regions and currently constructs exactly code, data, and stack.
+// Full KEX retains a coalesced vector of image, startup, private IPC, heap,
+// and stack mappings. The small isolation probe constructs code, data, and stack.
 #[cfg(target_os = "uefi")]
 const ISOLATED_EXIT_CALL: u64 = 1;
 #[cfg(target_os = "uefi")]
@@ -122,6 +133,10 @@ pub enum ApplicationOutcome {
 /// Opaque architecture-owned root and validated unprivileged mapping summary.
 #[derive(Debug, Eq, PartialEq)]
 pub struct UserAddressSpace {
+    #[cfg(target_os = "uefi")]
+    tag: Option<tags::TagLease>,
+    #[cfg(target_os = "uefi")]
+    ipc: Option<IpcMapping>,
     root: u64,
     table_arena: PhysicalRange,
     regions: Vec<UserRegion>,
@@ -129,6 +144,38 @@ pub struct UserAddressSpace {
 }
 
 impl UserAddressSpace {
+    /// Bind this root to its uniquely owned ABI 1.3 IPC pair.
+    ///
+    /// # Errors
+    /// Rejects a stale pair, duplicate binding, kernel-client pair, foreign
+    /// physical mapping, or a missing writable/nonexecutable user mapping.
+    #[cfg(target_os = "uefi")]
+    pub fn bind_ipc(&mut self, pair: &crate::IpcPagePair, tx: u64) -> Result<(), MmuError> {
+        let end = tx.checked_add(8192).ok_or(MmuError::AddressUnsupported)?;
+        if !pair.is_live()
+            || pair.slot() >= crate::IPC_TASK_PAIRS
+            || self.ipc.is_some()
+            || !user_range_contains(&self.regions, tx, 8192, true, false)
+            || self.regions.iter().any(|region| {
+                region.permissions.execute && region.range.start() < end && tx < region.range.end()
+            })
+            || architecture_translate_page(self.root, tx)? != pair.range().start()
+            || architecture_translate_page(self.root, tx + 4096)? != pair.range().start() + 4096
+        {
+            return Err(MmuError::InvalidUserContext);
+        }
+        self.tag = Some(tags::TagLease::bind(
+            pair.slot(),
+            pair.generation(),
+            self.root,
+        )?);
+        self.ipc = Some(IpcMapping {
+            alias: pair.range().start(),
+            tx,
+            wait_set: 0,
+        });
+        Ok(())
+    }
     /// Page-table and mapped-page accounting for teardown validation.
     #[must_use]
     pub const fn stats(&self) -> MmuStats {
@@ -140,6 +187,14 @@ impl UserAddressSpace {
     pub const fn user_region_count(&self) -> usize {
         self.regions.len()
     }
+}
+
+#[cfg(target_os = "uefi")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct IpcMapping {
+    alias: u64,
+    tx: u64,
+    wait_set: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -292,6 +347,16 @@ pub enum ApplicationResume<'reply> {
 
 #[cfg(target_os = "uefi")]
 impl ApplicationSession {
+    /// Retain a non-owning tag identity for native teardown/reuse verification.
+    #[cfg(feature = "acceptance-probes")]
+    #[must_use]
+    pub fn tag_identity(&self) -> Option<tags::TagIdentity> {
+        self.address_space
+            .tag
+            .as_ref()
+            .map(tags::TagLease::identity)
+    }
+
     /// Current mapped-page and page-table accounting retained by this session.
     #[must_use]
     pub const fn stats(&self) -> MmuStats {
@@ -332,6 +397,7 @@ impl ApplicationSession {
     ///
     /// Rejects a non-growth session, invalid/non-writable heap geometry,
     /// duplicate mappings, unsupported addresses, or table-arena exhaustion.
+    #[allow(clippy::too_many_lines)]
     pub fn commit_heap_growth(
         &mut self,
         heap_start: u64,
@@ -353,7 +419,8 @@ impl ApplicationSession {
             .regions
             .iter()
             .position(|region| {
-                region.range.start() == heap_start
+                region.range.start() <= heap_start
+                    && heap_start < region.range.end()
                     && region.permissions.write
                     && !region.permissions.execute
             })
@@ -367,8 +434,9 @@ impl ApplicationSession {
             .end()
             .checked_add(added_bytes)
             .ok_or(MmuError::AddressUnsupported)?;
-        let grown = VirtualRange::from_pages(heap_start, region.range.page_count() + page_count)
-            .map_err(|_| MmuError::InvalidUserContext)?;
+        let grown =
+            VirtualRange::from_pages(region.range.start(), region.range.page_count() + page_count)
+                .map_err(|_| MmuError::InvalidUserContext)?;
         if grown.end() != new_end
             || self
                 .address_space
@@ -425,6 +493,9 @@ impl ApplicationSession {
                     .checked_add(BASE_PAGE_SIZE)
                     .ok_or(MmuError::AddressUnsupported)?;
             }
+        }
+        if let Some(tag) = &self.address_space.tag {
+            tag.invalidate_range(region.range.end(), page_count)?;
         }
         self.address_space.regions[region_index] = UserRegion {
             range: grown,
@@ -560,6 +631,9 @@ impl ApplicationSession {
                     .ok_or(MmuError::AddressUnsupported)?;
             }
         }
+        if let Some(tag) = &self.address_space.tag {
+            tag.invalidate_range(target.start(), page_count)?;
+        }
         self.address_space.regions = updated_regions;
         self.address_space.stats.mapped_pages = match (was_mapped, permissions.is_some()) {
             (false, true) => self
@@ -667,6 +741,7 @@ enum ApplicationPending {
     Yield,
     HandleCall(ApplicationCall),
     HeapGrow(ApplicationHeapGrowth),
+    IpcWait(troe_abi::ipc::ReplyWait),
 }
 
 #[cfg(target_os = "uefi")]
@@ -677,6 +752,7 @@ struct IsolatedRunState {
     destination_len: usize,
     application_context: Option<ArchitectureApplicationContext>,
     pending_application: Option<ApplicationPending>,
+    ipc: Option<IpcMapping>,
 }
 
 #[cfg(target_os = "uefi")]
@@ -684,6 +760,7 @@ struct IsolatedRunState {
 enum RunKind {
     Stage6Probe,
     Application,
+    Ipc,
 }
 
 #[cfg(target_os = "uefi")]
@@ -1203,6 +1280,8 @@ pub fn build_user_address_space(
     }
     let (root, stats) = build_tables(plan, table_arena)?;
     Ok(UserAddressSpace {
+        tag: None,
+        ipc: None,
         root,
         table_arena,
         regions,
@@ -1362,6 +1441,8 @@ pub fn run_isolated(
     let UserAddressSpace {
         root,
         table_arena: _,
+        tag: _tag,
+        ipc: _,
         regions,
         stats: _,
     } = address_space;
@@ -1392,6 +1473,7 @@ pub fn run_isolated(
             destination_len: message_destination.len(),
             application_context: None,
             pending_application: None,
+            ipc: None,
         });
     }
     let raw = architecture_run_isolated(root, entry, stack_top);
@@ -1429,6 +1511,8 @@ pub fn run_application(
         table_arena,
         regions,
         stats,
+        tag,
+        ipc,
     } = address_space;
     let user_stack = stack_top
         .checked_sub(8)
@@ -1459,6 +1543,7 @@ pub fn run_application(
             destination_len: 0,
             application_context: None,
             pending_application: None,
+            ipc,
         });
     }
     if crate::mechanism::prepare_application_execution(timeslice_milliseconds).is_err() {
@@ -1481,6 +1566,8 @@ pub fn run_application(
     decode_application_outcome(
         raw,
         UserAddressSpace {
+            tag,
+            ipc,
             root,
             table_arena,
             regions,
@@ -1553,6 +1640,8 @@ pub fn resume_application(
         table_arena,
         regions,
         stats,
+        tag,
+        ipc,
     } = address_space;
     // SAFETY: The active transition grants unique state ownership until the
     // architecture completion path restores the kernel root.
@@ -1564,6 +1653,7 @@ pub fn resume_application(
             destination_len: 0,
             application_context: None,
             pending_application: None,
+            ipc,
         });
     }
     if crate::mechanism::prepare_application_execution(timeslice_milliseconds).is_err() {
@@ -1586,6 +1676,8 @@ pub fn resume_application(
     decode_application_outcome(
         raw,
         UserAddressSpace {
+            tag,
+            ipc,
             root,
             table_arena,
             regions,
@@ -1643,9 +1735,10 @@ fn decode_application_outcome(
             (OUTCOME_APPLICATION_PREEMPTED, ApplicationPending::Timeslice) => {
                 Ok(ApplicationOutcome::Preempted(application))
             }
-            (OUTCOME_APPLICATION_YIELD, ApplicationPending::Yield) => {
-                Ok(ApplicationOutcome::Yielded(application))
-            }
+            (
+                OUTCOME_APPLICATION_YIELD,
+                ApplicationPending::Yield | ApplicationPending::IpcWait(_),
+            ) => Ok(ApplicationOutcome::Yielded(application)),
             (OUTCOME_APPLICATION_HANDLE_CALL, ApplicationPending::HandleCall(call)) => {
                 Ok(ApplicationOutcome::HandleCall { application, call })
             }
@@ -1841,7 +1934,7 @@ fn isolated_syscall(opcode: u64, address: u64, length: u64, status: u64) -> u64 
 #[cfg(target_os = "uefi")]
 fn application_syscall(
     call_number: u64,
-    arguments: [u64; 5],
+    arguments: [u64; 6],
     context: ArchitectureApplicationContext,
 ) -> u64 {
     crate::mechanism::disarm_execution_timer();
@@ -1894,9 +1987,28 @@ fn application_syscall(
                 OUTCOME_APPLICATION_HANDLE_CALL,
             )
         }
+        troe_abi::ipc::REPLY_WAIT => {
+            let Some(wait) = troe_abi::ipc::ReplyWait::decode(arguments) else {
+                return encoded_fault(IsolatedFault::InvalidCall);
+            };
+            // Initial publication is retained as an owned suspended context.
+            let valid = unsafe { (&*ISOLATED_RUN.0.get()).as_ref() }.is_some_and(|state| {
+                state
+                    .ipc
+                    .is_some_and(|ipc| ipc.wait_set != 0 && ipc.wait_set == wait.wait_set)
+            });
+            if !valid || wait.token != 0 {
+                return encoded_fault(IsolatedFault::InvalidCall);
+            }
+            suspend_application(
+                context,
+                ApplicationPending::IpcWait(wait),
+                OUTCOME_APPLICATION_YIELD,
+            )
+        }
         APPLICATION_HEAP_GROW_CALL => {
             let minimum_pages = arguments[0];
-            if minimum_pages == 0 || arguments[1..].iter().any(|argument| *argument != 0) {
+            if minimum_pages == 0 || arguments[1..5].iter().any(|argument| *argument != 0) {
                 return encoded_fault(IsolatedFault::InvalidCall);
             }
             suspend_application(
@@ -2999,25 +3111,56 @@ extern "C" fn x86_isolated_syscall_entry() -> ! {
         "mov rcx, rsp",
         "sub rsp, 32",
         "call {handler}",
-        "jmp {complete}",
+        "add rsp, 32",
+        "mov r11, {continue_value}",
+        "cmp rax, r11",
+        "jne {complete}",
+        "fxrstor64 [rsp]",
+        "add rsp, 512",
+        "pop rax",
+        "pop rbx",
+        "pop rcx",
+        "pop rdx",
+        "pop rbp",
+        "pop rsi",
+        "pop rdi",
+        "pop r8",
+        "pop r9",
+        "pop r10",
+        "pop r11",
+        "pop r12",
+        "pop r13",
+        "pop r14",
+        "pop r15",
+        "iretq",
+        continue_value = const ipc::continue_value(),
         handler = sym x86_isolated_syscall_handler,
         complete = sym x86_isolated_complete,
     );
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
-extern "C" fn x86_isolated_syscall_handler(frame: *const ArchitectureApplicationContext) -> u64 {
+extern "C" fn x86_isolated_syscall_handler(frame: *mut ArchitectureApplicationContext) -> u64 {
     if !ISOLATED_ACTIVE.load(Ordering::Acquire) {
         x86_exception_fatal();
     }
     // SAFETY: The naked gate constructed one complete aligned frame on the
     // owned kernel stack and retains it for this synchronous handler call.
-    let frame = unsafe { &*frame };
+    let frame = unsafe { &mut *frame };
     match active_run_kind() {
         Some(RunKind::Stage6Probe) => isolated_syscall(frame.rax, frame.rdi, frame.rsi, frame.rdx),
+        Some(RunKind::Ipc) => ipc::syscall(
+            frame.rax,
+            [
+                frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
+            ],
+            frame,
+        ),
         Some(RunKind::Application) => application_syscall(
             frame.rax,
-            [frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8],
+            [
+                frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
+            ],
             frame.clone(),
         ),
         None => x86_exception_fatal(),
@@ -3120,9 +3263,13 @@ extern "C" fn x86_execution_timer_handler(frame: *const ArchitectureApplicationC
     let frame = unsafe { &*frame };
     if frame.code_selector & 3 == 3
         && ISOLATED_ACTIVE.load(Ordering::Acquire)
-        && active_run_kind() == Some(RunKind::Application)
+        && matches!(active_run_kind(), Some(RunKind::Application | RunKind::Ipc))
     {
-        preempt_application(frame.clone())
+        if active_run_kind() == Some(RunKind::Ipc) {
+            encoded_fault(IsolatedFault::ExecutionLeaseExpired)
+        } else {
+            preempt_application(frame.clone())
+        }
     } else {
         x86_exception_fatal()
     }
@@ -3374,7 +3521,7 @@ fn aarch64_leaf_attributes(
     validate_leaf_profile(permissions, memory_type)?;
     let mut flags = AARCH64_TABLE_OR_PAGE | AARCH64_ACCESS_FLAG;
     if privilege == MappingPrivilege::User {
-        flags |= AARCH64_PXN;
+        flags |= AARCH64_PXN | (1 << 11);
         flags |= if permissions.write {
             AARCH64_USER_READ_WRITE
         } else {
@@ -4011,6 +4158,7 @@ core::arch::global_asm!(
     "mov x0, sp",
     "mov x1, x9",
     "bl troe_aarch64_isolated_syscall",
+    "tbnz x0, #58, troe_aarch64_restore_context",
     "b troe_aarch64_isolated_complete_entry",
     "troe_aarch64_isolated_complete_entry:",
     "b {isolated_complete}",
@@ -4066,6 +4214,7 @@ core::arch::global_asm!(
     "mov x0, sp",
     "bl troe_aarch64_input_interrupt",
     "cbnz x0, troe_aarch64_isolated_complete_entry",
+    "troe_aarch64_restore_context:",
     "ldr x9, [sp, #768]",
     "ldr x10, [sp, #776]",
     "msr fpcr, x9",
@@ -4165,13 +4314,17 @@ extern "C" fn troe_aarch64_input_interrupt(frame: *const ArchitectureApplication
     let frame = unsafe { &*frame };
     if crate::mechanism::handle_application_interrupt() {
         let active_application = ISOLATED_ACTIVE.load(Ordering::Acquire)
-            && active_run_kind() == Some(RunKind::Application);
+            && matches!(active_run_kind(), Some(RunKind::Application | RunKind::Ipc));
         if !active_application {
             // A disarmed level timer can still have one acknowledged edge in
             // flight. With no published run there is no context to complete.
             0
         } else if frame.status & AARCH64_SPSR_MODE_MASK == 0 {
-            preempt_application(frame.clone())
+            if active_run_kind() == Some(RunKind::Ipc) {
+                encoded_fault(IsolatedFault::ExecutionLeaseExpired)
+            } else {
+                preempt_application(frame.clone())
+            }
         } else {
             troe_aarch64_exception_fatal(0, 0)
         }
@@ -4183,7 +4336,7 @@ extern "C" fn troe_aarch64_input_interrupt(frame: *const ArchitectureApplication
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 #[unsafe(no_mangle)]
 extern "C" fn troe_aarch64_isolated_syscall(
-    frame: *const ArchitectureApplicationContext,
+    frame: *mut ArchitectureApplicationContext,
     syndrome: u64,
 ) -> u64 {
     if !ISOLATED_ACTIVE.load(Ordering::Acquire) {
@@ -4194,13 +4347,25 @@ extern "C" fn troe_aarch64_isolated_syscall(
     } else {
         // SAFETY: The lower-EL gate constructed one complete aligned frame on
         // the owned kernel stack and retains it for this synchronous call.
-        let frame = unsafe { &*frame };
+        let frame = unsafe { &mut *frame };
         match active_run_kind() {
             Some(RunKind::Stage6Probe) => isolated_syscall(
                 frame.general[0],
                 frame.general[1],
                 frame.general[2],
                 frame.general[3],
+            ),
+            Some(RunKind::Ipc) => ipc::syscall(
+                frame.general[8],
+                [
+                    frame.general[0],
+                    frame.general[1],
+                    frame.general[2],
+                    frame.general[3],
+                    frame.general[4],
+                    frame.general[5],
+                ],
+                frame,
             ),
             Some(RunKind::Application) => application_syscall(
                 frame.general[8],
@@ -4210,6 +4375,7 @@ extern "C" fn troe_aarch64_isolated_syscall(
                     frame.general[2],
                     frame.general[3],
                     frame.general[4],
+                    frame.general[5],
                 ],
                 frame.clone(),
             ),
@@ -4393,8 +4559,8 @@ mod tests {
         let aarch64_base = super::AARCH64_TABLE_OR_PAGE | super::AARCH64_ACCESS_FLAG;
         let aarch64_kernel_ro = super::AARCH64_READ_ONLY | super::AARCH64_UXN;
         let aarch64_kernel_rw = super::AARCH64_UXN;
-        let aarch64_user_ro = super::AARCH64_USER_READ_ONLY | super::AARCH64_PXN;
-        let aarch64_user_rw = super::AARCH64_USER_READ_WRITE | super::AARCH64_PXN;
+        let aarch64_user_ro = super::AARCH64_USER_READ_ONLY | super::AARCH64_PXN | (1 << 11);
+        let aarch64_user_rw = super::AARCH64_USER_READ_WRITE | super::AARCH64_PXN | (1 << 11);
         let cases = [
             Case {
                 permissions: MappingPermissions::READ_ONLY,

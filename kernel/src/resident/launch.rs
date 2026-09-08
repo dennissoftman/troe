@@ -117,7 +117,7 @@ pub(crate) fn prepare_resident_application_with_plan<'service, P: NativeApplicat
         clear_provisional_loader_ownership(&mut transaction);
         return Err(());
     }
-    let Ok(address_space) =
+    let Ok(mut address_space) =
         troe_machine::build_user_address_space(&mapping_plan, allocation.tables)
     else {
         reclaim_command_application(accounting, allocation);
@@ -125,6 +125,7 @@ pub(crate) fn prepare_resident_application_with_plan<'service, P: NativeApplicat
         return Err(());
     };
     if transaction.acquire(LoaderResource::Tables).is_err() {
+        drop(address_space);
         reclaim_command_application(accounting, allocation);
         clear_provisional_loader_ownership(&mut transaction);
         return Err(());
@@ -132,16 +133,26 @@ pub(crate) fn prepare_resident_application_with_plan<'service, P: NativeApplicat
     let Ok((planned_user_regions, planned_user_pages)) =
         troe_machine::planned_user_regions(&mapping_plan)
     else {
+        drop(address_space);
         reclaim_command_application(accounting, allocation);
         clear_provisional_loader_ownership(&mut transaction);
         return Err(());
     };
+    if let (Some(pair), Some((tx, _))) = (&allocation.ipc, plan.layout().ipc_addresses())
+        && address_space.bind_ipc(pair, tx).is_err()
+    {
+        drop(address_space);
+        reclaim_command_application(accounting, allocation);
+        clear_provisional_loader_ownership(&mut transaction);
+        return Err(());
+    }
     let table_pages = address_space.stats().table_pages;
     if table_pages == 0
         || table_pages != allocation.tables.page_count()
         || address_space.user_region_count() != planned_user_regions
         || planned_user_pages != private_pages
     {
+        drop(address_space);
         reclaim_command_application(accounting, allocation);
         clear_provisional_loader_ownership(&mut transaction);
         return Err(());
@@ -154,22 +165,26 @@ pub(crate) fn prepare_resident_application_with_plan<'service, P: NativeApplicat
         private_pages,
         handle_count,
     ) else {
+        drop(address_space);
         reclaim_command_application(accounting, allocation);
         clear_provisional_loader_ownership(&mut transaction);
         return Err(());
     };
     let Ok(stack_resource) = StackResource::new(resource_slot, stack_pages) else {
+        drop(address_space);
         reclaim_command_application(accounting, allocation);
         clear_provisional_loader_ownership(&mut transaction);
         return Err(());
     };
     let Ok(task_id) = scheduler.spawn_isolated(Capabilities::SERVICE, stack_resource, isolation)
     else {
+        drop(address_space);
         reclaim_command_application(accounting, allocation);
         clear_provisional_loader_ownership(&mut transaction);
         return Err(());
     };
     if transaction.acquire(LoaderResource::Task).is_err() {
+        drop(address_space);
         rollback_command_application_task(
             scheduler,
             task_id,
@@ -228,6 +243,7 @@ pub(crate) fn prepare_resident_application_with_plan<'service, P: NativeApplicat
         Ok((owner, command_handles))
     })();
     let Ok((owner, handles)) = setup else {
+        drop(address_space);
         rollback_command_application_task(
             scheduler,
             task_id,
@@ -254,6 +270,7 @@ pub(crate) fn prepare_resident_application_with_plan<'service, P: NativeApplicat
         .map_err(|_| ())
         .and_then(|mut table| table.register(registration).map_err(|_| ()))
     else {
+        drop(address_space);
         rollback_command_application_task(
             scheduler,
             task_id,
@@ -269,6 +286,7 @@ pub(crate) fn prepare_resident_application_with_plan<'service, P: NativeApplicat
         let _removed = processes
             .try_borrow_mut()
             .map(|mut table| table.remove(process_id));
+        drop(address_space);
         rollback_command_application_task(
             scheduler,
             task_id,

@@ -127,6 +127,7 @@ pub(crate) const USER_UNMAPPED_BASE: u64 = USER_CODE_BASE + 0x1000_0000;
 pub(crate) const ISOLATED_MESSAGE: &[u8] = b"stage6 copied request";
 
 pub(crate) const BOOT_ARENA_PAGES: usize = ((OWNED_HEAP_BYTES
+    + troe_machine::IPC_POOL_PAGES * BASE_PAGE_SIZE
     + PAGE_TABLE_BYTES
     + OWNED_STACK_BYTES
     + EXCEPTION_STACK_BYTES

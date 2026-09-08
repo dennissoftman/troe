@@ -3,6 +3,11 @@
 
 use core::{fmt, slice};
 
+mod ipc;
+#[doc(hidden)]
+pub use ipc::run as __run_persistent;
+pub use ipc::{Event, EventKind, IpcHandle, IpcPages, PersistentContext};
+
 mod listener;
 pub use listener::TcpListen;
 
@@ -17,14 +22,13 @@ use troe_abi::{MAX_MESSAGE_BYTES, MAX_SERVICE_PAYLOAD_BYTES, heap_growth, stream
 const STARTUP_PAGE_BYTES: usize = troe_abi::startup::PAGE_BYTES;
 const STARTUP_HEADER_BYTES: usize = troe_abi::startup::HEADER_BYTES;
 const STARTUP_HANDLE_BYTES: usize = troe_abi::startup::HANDLE_BYTES;
-const CALL_RIGHT: u32 = 1;
 #[cfg(test)]
 const KEX_IMAGE_BASE: u64 = 0x0000_4000_0000_0000;
 const KEX_MIN_IMAGE_BASE: u64 = 0x0000_0001_0000_0000;
 const KEX_IMAGE_ALIGNMENT: u64 = 2 * 1024 * 1024;
 const KEX_MAX_IMAGE_SPAN_BYTES: u64 = 1024 * 1024 * 1024;
 const KEX_USER_END: u64 = 0x0000_8000_0000_0000;
-const KEX_MAXIMUM_STACK_BYTES: u64 = 256 * STARTUP_PAGE_BYTES as u64;
+const KEX_MAXIMUM_STACK_BYTES: u64 = (1_u64 << 32) * STARTUP_PAGE_BYTES as u64;
 const KEX_MINIMUM_STACK_BYTES: u64 = 4 * STARTUP_PAGE_BYTES as u64;
 /// Image span used by hosted tests, which build a minimal single-page image.
 #[cfg(test)]
@@ -162,6 +166,12 @@ pub enum Error {
     CrossDevice,
     /// An explicit configured resource policy rejected the request.
     ResourceLimit,
+    /// The IPC endpoint closed cleanly.
+    Closed,
+    /// The IPC peer faulted or was revoked.
+    PeerDied,
+    /// The call would create a wait cycle.
+    Deadlock,
 }
 
 impl fmt::Display for Error {
@@ -193,6 +203,9 @@ impl fmt::Display for Error {
             Self::Denied => "operation denied",
             Self::NotEmpty => "directory not empty",
             Self::CrossDevice => "cross-device operation",
+            Self::Closed => "IPC endpoint closed",
+            Self::PeerDied => "IPC peer died",
+            Self::Deadlock => "IPC call cycle",
             Self::ResourceLimit => "configured resource limit exceeded",
         })
     }
@@ -224,6 +237,7 @@ pub struct CommandContext {
     private_memory: Option<Handle>,
     random: Option<Handle>,
     heap: Option<HeapRegion>,
+    ipc: Option<IpcPages>,
 }
 
 impl CommandContext {
@@ -334,17 +348,30 @@ impl CommandContext {
             )?,
             random: startup.optional_handle(interface::RANDOM, random::MAJOR, random::MINOR)?,
             heap: startup.heap_region()?,
+            ipc: startup.ipc_pages()?,
         })
     }
 
+    /// Take the unique ABI 1.3 payload-page owner. Later calls return `None`.
+    pub fn take_ipc(&mut self) -> Option<IpcPages> {
+        self.ipc.take()
+    }
+
     /// Consume the application's validated heap token, if the package
-    /// requested a nonzero heap.
-    ///
-    /// A second call returns `None`. This makes allocator ownership explicit
-    /// and prevents two safe runtimes from independently managing the same
-    /// bytes.
+    /// requested a nonzero heap. Later calls return `None`, preventing two safe
+    /// runtimes from independently managing the same bytes.
     pub fn take_heap(&mut self) -> Option<HeapRegion> {
         self.heap.take()
+    }
+
+    /// Obtain the call authority used by private-page diagnostics IPC.
+    ///
+    /// # Errors
+    /// Returns missing authority if diagnostics was not granted at startup.
+    pub fn ipc_diagnostics(&self) -> Result<IpcHandle, Error> {
+        self.diagnostics
+            .map(|handle| IpcHandle(handle.value))
+            .ok_or(Error::MissingAuthority)
     }
 
     /// Fetch and validate the one immutable invocation record.
@@ -660,6 +687,7 @@ impl CommandContext {
 pub struct ServerContext {
     endpoint: Handle,
     heap: Option<HeapRegion>,
+    ipc: Option<IpcPages>,
 }
 
 impl ServerContext {
@@ -671,10 +699,16 @@ impl ServerContext {
                 server::MINOR,
             )?,
             heap: startup.heap_region()?,
+            ipc: startup.ipc_pages()?,
         })
     }
 
-    /// Consume the server's validated heap token, if one was configured.
+    /// Take the unique ABI 1.3 payload-page owner. Later calls return `None`.
+    pub fn take_ipc(&mut self) -> Option<IpcPages> {
+        self.ipc.take()
+    }
+
+    /// Take the unique optional heap owner.
     pub fn take_heap(&mut self) -> Option<HeapRegion> {
         self.heap.take()
     }
@@ -2443,6 +2477,7 @@ struct Descriptor {
 struct Startup<'a> {
     bytes: &'a [u8],
     handle_count: usize,
+    header_bytes: usize,
 }
 
 fn valid_startup_region_bytes(bytes: usize) -> bool {
@@ -2452,9 +2487,11 @@ fn valid_startup_region_bytes(bytes: usize) -> bool {
 
 impl<'a> Startup<'a> {
     fn parse(bytes: &'a [u8]) -> Result<Self, StartupError> {
+        let minor = read_u16(bytes, 6)?;
+        let header_bytes = troe_abi::startup::header_bytes(minor);
         if !valid_startup_region_bytes(bytes.len())
             || read_u32(bytes, 0)? as usize
-                != STARTUP_HEADER_BYTES
+                != header_bytes
                     .checked_add(
                         usize::from(read_u16(bytes, 14)?)
                             .checked_mul(STARTUP_HANDLE_BYTES)
@@ -2462,14 +2499,14 @@ impl<'a> Startup<'a> {
                     )
                     .ok_or(StartupError::InvalidPage)?
             || read_u16(bytes, 4)? != ABI_MAJOR
-            || read_u16(bytes, 6)? != ABI_MINOR
+            || minor > ABI_MINOR
             || read_u32(bytes, 8)? != 4096
             || read_u16(bytes, 12)? != 0
         {
             return Err(StartupError::InvalidPage);
         }
         let handle_count = usize::from(read_u16(bytes, 14)?);
-        let encoded_bytes = STARTUP_HEADER_BYTES + handle_count * STARTUP_HANDLE_BYTES;
+        let encoded_bytes = header_bytes + handle_count * STARTUP_HANDLE_BYTES;
         let image_base = read_u64(bytes, 16)?;
         let heap_address = read_u64(bytes, 24)?;
         let heap_bytes = read_u64(bytes, 32)?;
@@ -2480,7 +2517,9 @@ impl<'a> Startup<'a> {
         // guest cannot know that span independently, so it checks the canonical
         // relationship and the policy bound rather than one fixed offset.
         let declared_span = heap_address
-            .checked_sub(bytes.len() as u64)
+            .checked_sub(
+                (bytes.len() + troe_abi::startup::ipc_pages(minor) * STARTUP_PAGE_BYTES) as u64,
+            )
             .and_then(|startup| startup.checked_sub(image_base))
             .ok_or(StartupError::InvalidPage)?;
         let lower_guard = stack_top
@@ -2490,11 +2529,12 @@ impl<'a> Startup<'a> {
         let heap_end = heap_address
             .checked_add(heap_bytes)
             .ok_or(StartupError::InvalidPage)?;
-        if handle_count > troe_abi::startup::MAX_INITIAL_HANDLES
+        if handle_count > troe_abi::startup::max_initial_handles(minor)
             || encoded_bytes > bytes.len()
             || bytes[encoded_bytes..].iter().any(|byte| *byte != 0)
             || image_base < KEX_MIN_IMAGE_BASE
             || !image_base.is_multiple_of(KEX_IMAGE_ALIGNMENT)
+            || (minor < 2 && declared_span != 128 * 1024 * 1024)
             || declared_span == 0
             || declared_span > KEX_MAX_IMAGE_SPAN_BYTES
             || !declared_span.is_multiple_of(KEX_IMAGE_ALIGNMENT)
@@ -2510,15 +2550,24 @@ impl<'a> Startup<'a> {
         {
             return Err(StartupError::InvalidPage);
         }
+        if minor >= troe_abi::startup::IPC_ABI_MINOR
+            && (read_u64(bytes, 64)? != heap_address - 8192
+                || read_u64(bytes, 72)? != heap_address - 4096)
+        {
+            return Err(StartupError::InvalidPage);
+        }
         let startup = Self {
             bytes,
             handle_count,
+            header_bytes,
         };
         for index in 0..handle_count {
             let descriptor = startup.descriptor(index)?;
             if descriptor.value == 0
-                || descriptor.rights & !CALL_RIGHT != 0
-                || descriptor.rights & CALL_RIGHT == 0
+                || (minor < 3 && descriptor.rights != 1)
+                || descriptor.rights == 0
+                || descriptor.rights & !u32::from(interface::allowed_rights(descriptor.interface))
+                    != 0
                 || startup
                     .descriptors_before(index)
                     .any(|prior| prior.is_ok_and(|prior| prior.value == descriptor.value))
@@ -2527,6 +2576,16 @@ impl<'a> Startup<'a> {
             }
         }
         Ok(startup)
+    }
+
+    fn ipc_pages(&self) -> Result<Option<IpcPages>, StartupError> {
+        if read_u16(self.bytes, 6)? < troe_abi::startup::IPC_ABI_MINOR {
+            return Ok(None);
+        }
+        Ok(Some(IpcPages::new(
+            usize::try_from(read_u64(self.bytes, 64)?).map_err(|_| StartupError::InvalidPage)?,
+            usize::try_from(read_u64(self.bytes, 72)?).map_err(|_| StartupError::InvalidPage)?,
+        )))
     }
 
     fn heap_region(&self) -> Result<Option<HeapRegion>, StartupError> {
@@ -2570,7 +2629,7 @@ impl<'a> Startup<'a> {
         if index >= self.handle_count {
             return Err(StartupError::InvalidHandle);
         }
-        let offset = STARTUP_HEADER_BYTES + index * STARTUP_HANDLE_BYTES;
+        let offset = self.header_bytes + index * STARTUP_HANDLE_BYTES;
         if self.bytes[offset + 20..offset + 24]
             .iter()
             .any(|byte| *byte != 0)
@@ -2611,8 +2670,14 @@ fn call(
     if count > reply_bytes.len() {
         return Err(Error::InvalidCall);
     }
+    decode_status(u64::from(status))?;
+    Ok(count)
+}
+
+fn decode_status(status: u64) -> Result<(), Error> {
+    let status = u32::try_from(status).map_err(|_| Error::InvalidCall)?;
     match status {
-        reply::SUCCESS => Ok(count),
+        reply::SUCCESS => Ok(()),
         reply::INVALID_REQUEST => Err(Error::InvalidRequest),
         reply::NOT_FOUND => Err(Error::NotFound),
         reply::FAILURE => Err(Error::Failure),
@@ -2636,6 +2701,9 @@ fn call(
         reply::NOT_EMPTY => Err(Error::NotEmpty),
         reply::CROSS_DEVICE => Err(Error::CrossDevice),
         reply::RESOURCE_LIMIT => Err(Error::ResourceLimit),
+        reply::CLOSED => Err(Error::Closed),
+        reply::PEER_DIED => Err(Error::PeerDied),
+        reply::DEADLOCK => Err(Error::Deadlock),
         _ => Err(Error::InvalidCall),
     }
 }
@@ -2703,9 +2771,13 @@ pub unsafe fn __run_server(
 #[macro_export]
 macro_rules! entry {
     ($main:path) => {
-        #[allow(clippy::not_unsafe_ptr_arg_deref)]
         #[unsafe(no_mangle)]
-        pub extern "C" fn _start(startup_address: *const u8, startup_bytes: usize) -> ! {
+        /// Enter this task exactly once with its immutable kernel startup state.
+        ///
+        /// # Safety
+        /// The pointer and length must be the current task's mapped startup
+        /// region. No existing context or private-page owner may be reused.
+        pub unsafe extern "C" fn _start(startup_address: *const u8, startup_bytes: usize) -> ! {
             // SAFETY: Only the kernel KEX loader enters this exported symbol.
             unsafe { $crate::__run(startup_address, startup_bytes, $main) }
         }
@@ -2721,9 +2793,13 @@ macro_rules! entry {
 #[macro_export]
 macro_rules! server_entry {
     ($main:path) => {
-        #[allow(clippy::not_unsafe_ptr_arg_deref)]
         #[unsafe(no_mangle)]
-        pub extern "C" fn _start(startup_address: *const u8, startup_bytes: usize) -> ! {
+        /// Enter this task exactly once with its immutable kernel startup state.
+        ///
+        /// # Safety
+        /// The pointer and length must be the current task's mapped startup
+        /// region. No existing context or private-page owner may be reused.
+        pub unsafe extern "C" fn _start(startup_address: *const u8, startup_bytes: usize) -> ! {
             // SAFETY: Only the kernel KEX loader enters this exported symbol.
             unsafe { $crate::__run_server(startup_address, startup_bytes, $main) }
         }
@@ -2950,7 +3026,7 @@ mod tests {
     extern crate std;
 
     use super::{
-        ABI_MAJOR, ABI_MINOR, CommandContext, HeapRegion, KEX_HEAP_ADDRESS, KEX_STACK_TOP,
+        ABI_MAJOR, CommandContext, HeapRegion, KEX_HEAP_ADDRESS, KEX_STACK_TOP,
         STARTUP_HANDLE_BYTES, STARTUP_HEADER_BYTES, STARTUP_PAGE_BYTES, ServerContext, Startup,
         StartupError, command, interface, pipe, private_memory, process_launch, random, stream,
         timer,
@@ -2961,7 +3037,7 @@ mod tests {
         let encoded = STARTUP_HEADER_BYTES + interfaces.len() * STARTUP_HANDLE_BYTES;
         page[0..4].copy_from_slice(&u32::try_from(encoded).unwrap_or(u32::MAX).to_le_bytes());
         page[4..6].copy_from_slice(&ABI_MAJOR.to_le_bytes());
-        page[6..8].copy_from_slice(&ABI_MINOR.to_le_bytes());
+        page[6..8].copy_from_slice(&2_u16.to_le_bytes());
         page[8..12].copy_from_slice(&4096_u32.to_le_bytes());
         page[14..16].copy_from_slice(
             &u16::try_from(interfaces.len())
@@ -3000,6 +3076,47 @@ mod tests {
             page[offset + 18..offset + 20].copy_from_slice(&minor.to_le_bytes());
         }
         page
+    }
+
+    #[test]
+    fn startup_versions_and_private_page_geometry() {
+        for minor in 0_u16..=3 {
+            let mut page = startup_page(&[interface::DIAGNOSTICS]);
+            page[6..8].copy_from_slice(&minor.to_le_bytes());
+            let base = 0x0000_4000_0000_0000_u64;
+            let span = if minor < 2 {
+                128 * 1024 * 1024
+            } else {
+                2 * 1024 * 1024
+            };
+            let startup = base + span;
+            let heap = startup + if minor == 3 { 12288 } else { 4096 };
+            page[24..32].copy_from_slice(&heap.to_le_bytes());
+            if minor == 3 {
+                page.copy_within(64..88, 80);
+                page[0..4].copy_from_slice(&104_u32.to_le_bytes());
+                page[64..72].copy_from_slice(&(startup + 4096).to_le_bytes());
+                page[72..80].copy_from_slice(&(startup + 8192).to_le_bytes());
+            }
+            let parsed = Startup::parse(&page).unwrap_or_else(|_| std::process::abort());
+            assert_eq!(
+                parsed.ipc_pages().is_ok_and(|pages| pages.is_some()),
+                minor == 3
+            );
+            if minor == 3 {
+                for offset in [64, 72] {
+                    for invalid in [0_u64, startup, startup + 1, heap, u64::MAX] {
+                        let mut bad = page;
+                        bad[offset..offset + 8].copy_from_slice(&invalid.to_le_bytes());
+                        assert!(Startup::parse(&bad).is_err());
+                    }
+                }
+                // Growing the prefix cannot reinterpret a legacy handle record.
+                let mut bad = page;
+                bad[6..8].copy_from_slice(&2_u16.to_le_bytes());
+                assert!(Startup::parse(&bad).is_err());
+            }
+        }
     }
 
     #[test]

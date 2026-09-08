@@ -378,12 +378,22 @@ def generate_corpus() -> dict[str, bytes]:
     for target in elf2kex.KEX_TARGETS:
         calls = _canonical(target, NATIVE_CODE[target]["calls"])
         calls_name = f"native-calls-{target}.kex"
-        files[calls_name] = calls
+        # Native probes deliberately retain the ABI 1.2 startup layout.
+        files[calls_name] = _put_u16(bytearray(calls), 20, 2)
         manifest.append(f"{calls_name}\t{target}\tok")
         valid_rows.append(
             f'    ("{calls_name}", include_bytes!("{calls_name}") as &[u8], '
             f"Target::{'X86_64' if target == 'x86_64' else 'Aarch64'}),"
         )
+        for minor in (0, 1):
+            legacy = _put_u16(bytearray(_put_u32(bytearray(calls), 36, 0)), 20, minor)
+            name = f"native-calls-abi{minor}-{target}.kex"
+            files[name] = legacy
+            manifest.append(f"{name}\t{target}\tok")
+            valid_rows.append(
+                f'    ("{name}", include_bytes!("{name}") as &[u8], '
+                f"Target::{'X86_64' if target == 'x86_64' else 'Aarch64'}),"
+            )
         for probe in (
             "spin",
             "heap-growth-limit",
@@ -394,7 +404,7 @@ def generate_corpus() -> dict[str, bytes]:
                 target, NATIVE_CODE[target][probe] + ACCEPTANCE_MARKER
             )
             name = f"native-{probe}-{target}.kex"
-            files[name] = artifact
+            files[name] = _put_u16(bytearray(artifact), 20, 2)
             manifest.append(f"{name}\t{target}\tok")
             valid_rows.append(
                 f'    ("{name}", include_bytes!("{name}") as &[u8], '
@@ -407,7 +417,7 @@ def generate_corpus() -> dict[str, bytes]:
                 target, NATIVE_CODE[target][probe] + ACCEPTANCE_MARKER
             )
             name = f"native-{probe}-{target}.kex"
-            files[name] = artifact
+            files[name] = _put_u16(bytearray(artifact), 20, 2)
             manifest.append(f"{name}\t{target}\tok")
             valid_rows.append(
                 f'    ("{name}", include_bytes!("{name}") as &[u8], Target::Aarch64),'

@@ -73,7 +73,7 @@ fn artifact_with_relocations(
         usize_u16(KEX_V1_LOAD_RECORD_BYTES),
     );
     put_u16(&mut bytes, HEADER_ABI_MAJOR, ABI_MAJOR);
-    put_u16(&mut bytes, HEADER_ABI_MINOR, ABI_MINOR);
+    put_u16(&mut bytes, HEADER_ABI_MINOR, 2);
     let image_end = segments
         .iter()
         .map(|segment| segment.image_offset + segment.memory_bytes)
@@ -647,7 +647,7 @@ fn valid_plan_is_ordered_bounded_and_exactly_charged() {
         let segments = plan.segments().collect::<Vec<_>>();
 
         assert_eq!(plan.target(), target);
-        assert_eq!(plan.abi_minor(), ABI_MINOR);
+        assert_eq!(plan.abi_minor(), 2);
         assert_eq!(plan.entry_address(), KEX_V1_IMAGE_BASE);
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0].file_bytes(), [0x90, 0xc3]);
@@ -769,7 +769,7 @@ fn startup_page_is_canonical_and_rejections_are_atomic() {
 
     assert_eq!(read_u32(&page, 0), Ok(112));
     assert_eq!(read_u16(&page, 4), Ok(ABI_MAJOR));
-    assert_eq!(read_u16(&page, 6), Ok(ABI_MINOR));
+    assert_eq!(read_u16(&page, 6), Ok(2));
     assert_eq!(read_u32(&page, 8), Ok(4096));
     assert_eq!(read_u16(&page, 12), Ok(0));
     assert_eq!(read_u16(&page, 14), Ok(2));
@@ -868,6 +868,93 @@ fn legacy_startup_page_retains_abi_and_layout() {
 }
 
 #[test]
+fn ipc_startup_versions_preserve_legacy_geometry_and_charge_private_pages() {
+    for target in [Target::X86_64, Target::Aarch64] {
+        for minor in 0..=3 {
+            let mut bytes = valid_artifact(target);
+            put_u16(&mut bytes, HEADER_ABI_MINOR, minor);
+            if minor < 2 {
+                put_u32(&mut bytes, HEADER_IMAGE_SPAN_PAGES, 0);
+            }
+            let plan = parse_standard(&bytes, target).unwrap_or_else(|_| unreachable!());
+            let layout = plan.layout();
+            let span = if minor < 2 {
+                KEX_V1_LEGACY_IMAGE_SPAN_BYTES
+            } else {
+                KEX_V1_IMAGE_ALIGNMENT
+            };
+            assert_eq!(layout.startup_address(), KEX_V1_IMAGE_BASE + span);
+            let ipc_pages = if minor == 3 { 2 } else { 0 };
+            assert_eq!(
+                layout.heap_address(),
+                layout.startup_address() + (1 + ipc_pages) * PAGE_SIZE
+            );
+            assert_eq!(plan.charges().private_pages(), 7 + ipc_pages);
+            assert_eq!(
+                layout.ipc_addresses(),
+                (minor == 3).then_some((
+                    layout.startup_address() + PAGE_SIZE,
+                    layout.startup_address() + 2 * PAGE_SIZE
+                ))
+            );
+            let capacity = troe_abi::startup::max_initial_handles(minor);
+            let handles: Vec<_> = (0..capacity)
+                .map(|index| InitialHandle {
+                    value: index as u64 + 1,
+                    rights: 1,
+                    interface: 9,
+                    major: 1,
+                    minor: 0,
+                })
+                .collect();
+            let mut page = [0xa5; STARTUP_REGION_BYTES];
+            plan.encode_startup_page(
+                StartupInfo {
+                    task_id: 1,
+                    handles: &handles,
+                },
+                &mut page,
+            )
+            .unwrap_or_else(|_| unreachable!());
+            let prefix = troe_abi::startup::header_bytes(minor);
+            assert_eq!(read_u64(&page, prefix), Ok(1));
+            assert_eq!(
+                read_u32(&page, 0),
+                u32::try_from(prefix + capacity * 24).map_err(|_| ParseError::ArithmeticOverflow)
+            );
+            assert!(page[prefix + capacity * 24..].iter().all(|byte| *byte == 0));
+            if minor == 3 {
+                assert_eq!(capacity, 167);
+                assert_eq!(read_u64(&page, 64), Ok(layout.heap_address() - 8192));
+                assert_eq!(read_u64(&page, 72), Ok(layout.heap_address() - 4096));
+            } else {
+                assert_eq!(capacity, 168);
+            }
+            let mut excess = handles;
+            excess.push(InitialHandle {
+                value: 999,
+                rights: 1,
+                interface: 9,
+                major: 1,
+                minor: 0,
+            });
+            let before = page;
+            assert_eq!(
+                plan.encode_startup_page(
+                    StartupInfo {
+                        task_id: 1,
+                        handles: &excess
+                    },
+                    &mut page
+                ),
+                Err(StartupPageError::TooManyHandles)
+            );
+            assert_eq!(page, before);
+        }
+    }
+}
+
+#[test]
 fn format_identifier_is_product_name_independent() {
     assert_eq!(KEX_V1_MAGIC, *b"KEX\0FMT\0");
 }
@@ -935,7 +1022,11 @@ fn rejects_truncated_magic_version_target_and_abi() {
         (HEADER_ABI_MINOR, ParseError::UnsupportedAbi),
     ] {
         let mut bytes = valid.clone();
-        bytes[offset] = bytes[offset].wrapping_add(1);
+        bytes[offset] = if offset == HEADER_ABI_MINOR {
+            u8::try_from(ABI_MINOR + 1).unwrap_or_else(|_| unreachable!())
+        } else {
+            bytes[offset].wrapping_add(1)
+        };
         assert_eq!(parse_standard(&bytes, Target::X86_64), Err(error));
     }
     assert_eq!(
@@ -1253,7 +1344,11 @@ fn generated_shared_corpus_covers_both_targets_and_exact_boundaries() {
         assert_eq!(plan.charges().image_pages(), image_pages, "{name}");
         assert_eq!(
             plan.charges().private_pages(),
-            image_pages + 1 + plan.stack_pages() + plan.heap_pages(),
+            image_pages
+                + 1
+                + troe_abi::startup::ipc_pages(plan.abi_minor()) as u64
+                + plan.stack_pages()
+                + plan.heap_pages(),
             "{name}"
         );
         assert_eq!(

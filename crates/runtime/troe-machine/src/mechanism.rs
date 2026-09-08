@@ -1084,6 +1084,27 @@ pub fn zero_physical_range(range: PhysicalRange) -> Result<(), PhysicalMemoryErr
     Ok(())
 }
 
+/// Inspect an owned IPC pool range while the kernel root is installed.
+#[cfg(all(target_os = "uefi", feature = "acceptance-probes"))]
+pub(crate) fn physical_range_is_zero(range: PhysicalRange) -> bool {
+    let Ok(start) = usize::try_from(range.start()) else {
+        return false;
+    };
+    let Ok(bytes) = usize::try_from(range.byte_count()) else {
+        return false;
+    };
+    if bytes > isize::MAX as usize || start.checked_add(bytes).is_none() {
+        return false;
+    }
+    // SAFETY: Only the IPC pool's acceptance verifier calls this with its
+    // retained boot reservation, after the prior user root has been revoked.
+    unsafe {
+        core::slice::from_raw_parts(start as *const u8, bytes)
+            .iter()
+            .all(|byte| *byte == 0)
+    }
+}
+
 /// Copy initialized bytes into one kernel-owned, identity-mapped range.
 ///
 /// # Errors

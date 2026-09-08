@@ -254,7 +254,9 @@ pub(crate) fn parse_with_limits(
         .image_pages
         .checked_add(header.stack_pages)
         .and_then(|pages| pages.checked_add(header.heap_pages))
-        .and_then(|pages| pages.checked_add(STARTUP_PAGES))
+        .and_then(|pages| {
+            pages.checked_add(STARTUP_PAGES + troe_abi::startup::ipc_pages(header.abi_minor) as u64)
+        })
         .ok_or(ParseError::ArithmeticOverflow)?;
     let reserved_resident_pages = maximum_table_pages(private_pages)
         .and_then(|tables| private_pages.checked_add(tables))
@@ -313,8 +315,9 @@ pub(crate) fn application_layout(
         .image_base
         .checked_add(image_span_bytes)
         .ok_or(ParseError::ArithmeticOverflow)?;
+    let ipc_bytes = troe_abi::startup::ipc_pages(abi_minor) as u64 * PAGE_SIZE;
     let heap_address = startup_address
-        .checked_add(PAGE_SIZE)
+        .checked_add(PAGE_SIZE + ipc_bytes)
         .ok_or(ParseError::ArithmeticOverflow)?;
     let heap_bytes = heap_pages
         .checked_mul(PAGE_SIZE)
@@ -361,6 +364,8 @@ pub(crate) fn application_layout(
     }
     Ok(ApplicationLayout {
         startup_address,
+        ipc_addresses: (ipc_bytes != 0)
+            .then_some((heap_address - 2 * PAGE_SIZE, heap_address - PAGE_SIZE)),
         heap_address,
         heap_bytes,
         stack_bottom,

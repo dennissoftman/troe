@@ -234,6 +234,20 @@ mod mechanism;
 #[cfg(any(test, target_os = "uefi"))]
 #[allow(unsafe_code)]
 mod mmu;
+
+#[cfg(target_os = "uefi")]
+mod ipc_pages;
+#[cfg(all(target_os = "uefi", feature = "acceptance-probes"))]
+pub use ipc_pages::{ipc_range_is_zero, verify_ipc_pool};
+#[cfg(all(target_os = "uefi", feature = "acceptance-probes"))]
+pub use mmu::TagIdentity;
+#[cfg(target_os = "uefi")]
+pub use mmu::{IpcPair, IpcStats, IpcStop, TagStats, tag_stats};
+
+#[cfg(target_os = "uefi")]
+pub use ipc_pages::{
+    IPC_KERNEL_PAIRS, IPC_POOL_PAGES, IPC_TASK_PAIRS, IpcPagePair, initialize_ipc_pool,
+};
 #[cfg(all(
     target_os = "uefi",
     any(

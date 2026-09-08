@@ -10,7 +10,7 @@ use core::str;
 /// Application ABI major implemented by the current kernel and SDK.
 pub const ABI_MAJOR: u16 = 1;
 /// Highest compatible application ABI minor implemented by the current kernel and SDK.
-pub const ABI_MINOR: u16 = 2;
+pub const ABI_MINOR: u16 = 3;
 /// Maximum complete request or reply crossing the application call gate.
 pub const MAX_MESSAGE_BYTES: usize = 4 * 1024;
 /// Maximum service payload after the required two-byte opcode.
@@ -26,6 +26,7 @@ pub mod filesystem_mutation;
 pub mod heap_growth;
 pub mod icmp_echo;
 pub mod interface;
+pub mod ipc;
 pub mod network_configuration;
 pub mod network_observation;
 pub mod pipe;

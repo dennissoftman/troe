@@ -11,7 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 if __package__:
@@ -194,6 +194,18 @@ RUNNER_PROFILES = {
         extra_arguments=("-global", "virtio-mmio.force-legacy=false"),
     ),
 }
+# TCG does not implement PCID/INVPCID. These explicit hardware-backed runners
+# require KVM and host CPU features; they never silently fall back to emulation.
+KVM_ENVIRONMENT = "qemu-kvm"
+for _platform in (X86_64_Q35_UEFI, X86_64_UEFI_VIRTIO_PCI):
+    _base = RUNNER_PROFILES[(_platform, QEMU_ENVIRONMENT)]
+    RUNNER_PROFILES[(_platform, KVM_ENVIRONMENT)] = replace(
+        _base,
+        environment=KVM_ENVIRONMENT,
+        cpu="host",
+        acceptance_udp_port=_base.acceptance_udp_port + 1000,
+        extra_arguments=(*_base.extra_arguments, "-accel", "kvm"),
+    )
 ENVIRONMENT_IDS = tuple(dict.fromkeys(key[1] for key in RUNNER_PROFILES))
 FIRMWARE_ARCHITECTURES = tuple(
     dict.fromkeys(runner.firmware_architecture for runner in RUNNER_PROFILES.values())

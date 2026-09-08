@@ -1,6 +1,6 @@
 name: gate
 
-# The merge gate is `scripts/test.py`: 109 gates, including exhaustive QEMU
+# The merge gate is `scripts/test.py`, including exhaustive QEMU
 # acceptance on all four named platforms. Run serially on one machine it takes
 # 12-15 minutes, every session queues behind every other, and two overlapping
 # runs collide on the fixed acceptance UDP ports.
@@ -246,7 +246,7 @@ jobs:
             --progress-interval 60
 
   acceptance:
-    name: acceptance ${{ matrix.platform }}
+    name: acceptance ${{ matrix.platform }} (${{ matrix.environment }})
     needs: select
     if: needs.select.outputs.exhaustive == 'true'
     runs-on: ubuntu-24.04
@@ -255,10 +255,12 @@ jobs:
       # One platform's failure must not hide another's result.
       fail-fast: false
       matrix:
-        platform:
-          - x86_64-q35-uefi
-          - x86_64-uefi-virtio-pci
-          - aarch64-uefi-virtio-mmio
+        include:
+          - {platform: x86_64-q35-uefi, environment: qemu}
+          - {platform: x86_64-uefi-virtio-pci, environment: qemu}
+          - {platform: aarch64-uefi-virtio-mmio, environment: qemu}
+          - {platform: x86_64-q35-uefi, environment: qemu-kvm}
+          - {platform: x86_64-uefi-virtio-pci, environment: qemu-kvm}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -300,11 +302,30 @@ jobs:
           key: cargo-${{ matrix.platform }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ matrix.platform }}-
 
+      - name: Enable the required KVM device
+        if: matrix.environment == 'qemu-kvm'
+        run: |
+          test -c /dev/kvm
+          sudo chmod a+rw /dev/kvm
+
       - name: Run QEMU acceptance
         run: |
+          if [ '${{ matrix.environment }}' = qemu-kvm ]; then
+            scenarios='--scenario fault-isolation'
+          else
+            scenarios=''
+          fi
           python3 scripts/test-qemu.py \
             --platform ${{ matrix.platform }} \
-            --environment qemu
+            --environment ${{ matrix.environment }} $scenarios
+
+      - name: Retain same-boot IPC evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipc-${{ matrix.platform }}-${{ matrix.environment }}
+          path: build/ipc-phase-b-*.json
+          if-no-files-found: error
 
   # One job to require in branch protection. It succeeds when every selected
   # job succeeded and fails if any did, so protecting this single check works

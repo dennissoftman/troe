@@ -104,22 +104,22 @@ and standard-policy arithmetic before allocating or mapping application memory.
 | Heap pages | 0–4,294,967,296 (16 TiB) |
 | Conservative format table charge | derived from the mapped layout |
 | Initial resident admission | maximum private pages plus their table bound |
-| Initial handles | startup descriptor capacity, currently 168 |
+| Initial handles | 167 for ABI 1.3; 168 for ABI 1.0–1.2 |
 
-An ABI-minor-2 artifact declares its own image span as a page count. The span
+An ABI-minor-2-or-newer artifact declares its own image span as a page count. The span
 is nonzero, 2 MiB-aligned, within the standard maximum, and exactly the image
 end rounded up to that alignment, so it bounds the mapped image without a
 separate page ceiling and reserves no address space the artifact never maps.
 ABI minor 0 and 1 artifacts leave the field zero and take the fixed 128 MiB
 implied span.
 
-The preliminary portable plan charges exact image, startup, initial heap, and
+The preliminary portable plan charges exact image, startup, private IPC (ABI 1.3), initial heap, and
 stack pages plus a table amount derived from that layout. Native launch
 computes and retains the exact tables implied by the complete mapping plan.
 Physical availability, the active 64-bit memory policy, and the protected
 free-frame reserve decide whether a valid large request is admitted; no maximum
 table is preallocated. Launch zeroing is bounded by the configured operation
-quantum. ABI 1.2 heap growth and private mappings use the same system/process
+quantum. Heap growth and private mappings use the same system/process
 commitment accounting.
 
 ## Hosted ELF input contract
@@ -159,14 +159,14 @@ the build entrypoint.
 The shared generated corpus lives under `tests/kex-corpus`; its exact file set
 and bytes are checked with `python3 tools/gen_kex_corpus.py --check`.
 
-## ABI 1.2 randomized virtual layout and startup region
+## ABI 1.0–1.3 virtual layout and startup region
 
 The kernel draws an independently randomized 2 MiB-aligned image base from the
 4 GiB–64 TiB window and a 2 MiB-aligned stack placement from the 96–128 TiB
 window. Placement uses the kernel CSPRNG and fails closed if firmware entropy
 was unavailable at boot. The startup region begins at `selected image base +
 declared image span`. For an application requiring ABI
-minor 1 or above, the heap follows it and may grow through the otherwise unused user
+minor 1 or above, the heap follows the startup and any private IPC pages and may grow through the otherwise unused user
 virtual-address gap. A lower guard and the fixed maximum stack slot are placed
 at the top of the user half; the requested stack pages are mapped at the top of
 that slot so they end immediately before an unmapped upper guard. All
@@ -179,11 +179,13 @@ The immutable startup region is `troe_abi::startup::REGION_PAGES` pages
 (currently one 4 KiB page), little-endian, and zero-padded. Entry receives both
 its address and mapped byte count. The SDK accepts page-multiple lengths from
 64 bytes through `REGION_BYTES` and derives the image span from
-`heap_base - mapped_startup_bytes - image_base`. Its fixed header is 64 bytes:
+`heap_base - mapped_startup_bytes - ipc_bytes - image_base`. Here `ipc_bytes`
+is 8,192 for ABI 1.3 and zero for ABI 1.0–1.2. The fixed prefix is 80 bytes
+for ABI 1.3 and 64 bytes for ABI 1.0–1.2:
 
 | Offset | Bytes | Field |
 | ---: | ---: | --- |
-| 0 | 4 | encoded bytes: `64 + handle_count * 24` |
+| 0 | 4 | encoded bytes: `header_bytes(minor) + handle_count * 24` |
 | 4 | 2 | ABI major, 1 |
 | 6 | 2 | negotiated ABI minor selected for this application |
 | 8 | 4 | page bytes, 4,096 |
@@ -195,16 +197,28 @@ its address and mapped byte count. The SDK accepts page-multiple lengths from
 | 40 | 8 | mapped stack bottom |
 | 48 | 8 | mapped stack top / initial stack pointer |
 | 56 | 8 | monotonic nonzero task identity |
+| 64 | 8 | ABI 1.3 only: private TX virtual address |
+| 72 | 8 | ABI 1.3 only: private RX virtual address |
 
 Each 24-byte initial handle descriptor then contains an opaque handle value
 (`u64`), rights bits (`u32`), interface identifier (`u32`), interface major and
 minor (`u16` each), and four reserved zero bytes. Values must be nonzero and
 unique within the region. The shared initial-handle ceiling is
-`(REGION_BYTES - HEADER_BYTES) / HANDLE_BYTES`, currently `(4096 - 64) / 24 = 168`.
-The loader, SDK, and SCFG service budget use this same capacity. The kernel
+`max_initial_handles(minor)`: `(4096 - 80) / 24 = 167` for ABI 1.3 and
+`(4096 - 64) / 24 = 168` for ABI 1.0–1.2. Handle records start at that version's
+prefix length. The SCFG format accepts up to the legacy maximum, while launch
+also enforces the selected application's versioned capacity. The kernel
 asserts that its physical backing and machine mapping agree with the region.
 The kernel validates the complete descriptor set before clearing and encoding the
 destination, so rejection cannot leave a partial startup record.
+
+For ABI 1.3, `ipc_tx = startup + 4096`, `ipc_rx = startup + 8192`, and
+`heap = startup + 12288`. Both IPC pages are private user RW/NX normal memory.
+The boot arena retains 16 task pairs and four separate kernel-only pairs (40
+pages, 160 KiB). All roots share supervisor-only aliases; only the owner has
+user mappings. Task admission charges both pages. Allocation and rollback zero
+the complete pair; terminal teardown revokes authority and roots before zeroing
+and releasing the slot. Slot generations never wrap.
 
 ABI call 3 may grow the mapped heap prefix without moving its base. Each
 successful request commits actual zeroed frames and any supplemental page-table
@@ -213,10 +227,59 @@ mapping unchanged. There is no format-level lifetime heap-byte ceiling other
 than the remaining v1 user virtual range; on the current no-swap system,
 available physical memory is the practical bound.
 
+## ABI 1.3 private-page IPC calls
+
+The acceptance harness binds one isolated client and one persistent echo task.
+Calls 0–3 retain their existing contracts for all supported minors. Call 4 is
+`ipc_call(handle, opcode, request_bytes, reply_capacity, deadline_millis,
+object_parameter)`. It sends the exact TX prefix and returns `(status,
+reply_bytes)` for the exact RX prefix. Both lengths range from zero through
+4,096; opcode is a `u16`; user endpoints require object parameter zero. The
+absolute boot-relative deadline must be bounded by 4,000 ms from admission;
+a past deadline returns `timeout` without delivery. Invalid scalar or authority
+arguments fault the caller before copying.
+
+Call 5 is `ipc_reply_wait(wait_set, token, status, reply_bytes, deadline_millis)`;
+the sixth argument register must be zero. It requires endpoint interface 15
+version 2.0 with receive/reply rights and wait-set interface 24 version 1.0
+with wait rights. The nonzero token names exactly one delivered call and is
+consumed once. With no delivered inbound call, token, status, and reply length
+are all zero. Reply validation/copy and the next wait are atomic. The new wait's
+deadline is independent of the reply; a past deadline returns a deadline event,
+and `u64::MAX` means an idle server wait.
+
+The six receive words use x86-64 `RAX, RDX, RDI, RSI, R8, R9` or AArch64
+`X0`–`X5`; every other ABI-visible register is preserved. Call 4 preserves the
+normal two-result convention. Receive words are:
+
+| Word | Encoding |
+| ---: | --- |
+| 0 | kind: 1 call, 2 resource ready, 3 deadline, 4 closed, 5 revoked, 6 client closed |
+| 1 | nonzero call token; zero for non-call events |
+| 2 | source index in bits 0–15; bits 16–31 zero; opaque client badge in bits 32–63 |
+| 3 | interface in bits 0–31; opcode in bits 32–47; bits 48–63 zero |
+| 4 | exact received request bytes |
+| 5 | maximum permitted reply bytes |
+
+Non-call events zero words 1 and 3–5. Only calls and client-closed events carry
+a badge. The synthetic harness exercises calls and deadlines; the codec also
+validates the remaining closed event vocabulary. Badges use an eight-bit slot
+and 24-bit nonwrapping generation. Service statuses remain 0–23; transport
+results add 24 `closed`, 25 `peer-died`, and 26 `deadlock`. Services cannot forge
+these terminal transport results. Existing `exhausted` and `timeout` statuses
+retain values 4 and 7.
+
+`CommandContext::take_ipc` transfers the SDK's unique, non-cloneable `IpcPages`
+owner once. Its `tx`, `rx`, and `buffers` borrows cannot survive another mutable
+call. `PersistentContext` and `persistent_entry!` expose the typed server event
+and atomic reply/wait operation. ABI 1.0–1.2 contexts have no IPC page owner. The generated raw `_start` symbols
+are unsafe Rust entry points: only one native startup invocation may construct
+these owners. Their native calling convention is unchanged.
+
 ## Deliberate omissions
 
 KEX v1 carries no sections, symbols, interpreter, imports, exports, general
 dynamic linking, TLS, compression, capabilities, signatures, device mappings,
 or shared-memory contract. Its relative relocation table is deliberately only
-the load-time mechanism needed for ASLR. Future package identity and trust
-metadata wrap KEX rather than changing this executable parser implicitly.
+the load-time mechanism needed for ASLR. Package identity and trust
+metadata belong to the surrounding trust formats.

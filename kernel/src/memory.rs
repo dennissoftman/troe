@@ -22,6 +22,7 @@ pub(crate) struct IsolatedAllocation {
 }
 
 pub(crate) struct ApplicationAllocation {
+    pub(crate) ipc: Option<troe_machine::IpcPagePair>,
     pub(crate) extents: PhysicalExtents,
     pub(crate) tables: PhysicalRange,
     image_pages: u64,

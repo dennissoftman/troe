@@ -5,10 +5,8 @@
 //! with the wait it registered, and resumed when the wait fires. This is the
 //! plumbing that lets one cooperative task block without stalling the loop.
 //!
-//! This is the native IPC integration ADR 0035 names `kernel/src/ipc.rs`:
-//! the continuation machine stays in the kernel when the servers move out,
-//! and folds into that module together with the dispatcher wiring in
-//! `service`.
+//! This module routes compatibility calls. The private-page synthetic endpoint
+//! is composed separately in `ipc` and owns both suspended task contexts.
 
 use crate::handles::{
     SharedApplicationDatagram, SharedChildTable, SharedDiagnosticsSnapshot, SharedPipeTable,

@@ -88,6 +88,7 @@ const MAX_INITIAL_HANDLES_U16: u16 = {
         abi_startup::MAX_INITIAL_HANDLES as u16
     }
 };
+#[cfg(test)]
 const STARTUP_FIXED_BYTES: usize = abi_startup::HEADER_BYTES;
 const STARTUP_HANDLE_BYTES: usize = abi_startup::HANDLE_BYTES;
 const _: () = assert!(PAGE_BYTES == abi_startup::PAGE_BYTES);
@@ -181,10 +182,13 @@ const TABLE_ENTRIES: u64 = 512;
 /// Page-table levels below the shared root on both supported architectures.
 const TABLE_LEVELS_BELOW_ROOT: u32 = 3;
 /// Contiguous virtual regions in one launch layout: image, startup, heap, stack.
-const LAUNCH_REGIONS: u64 = 4;
+const LAUNCH_REGIONS: u64 = 5;
 /// Largest private page count one launch may charge before its page tables.
-const MAX_PRIVATE_PAGES: u64 =
-    MAX_IMAGE_SPAN_PAGES + STARTUP_PAGES + MAX_INITIAL_STACK_PAGES + MAX_INITIAL_HEAP_PAGES;
+const MAX_PRIVATE_PAGES: u64 = MAX_IMAGE_SPAN_PAGES
+    + STARTUP_PAGES
+    + abi_startup::IPC_PAGES as u64
+    + MAX_INITIAL_STACK_PAGES
+    + MAX_INITIAL_HEAP_PAGES;
 /// Fixed prefix retained while parsing a streamed KEX package.
 ///
 /// This covers the largest package header, capability manifest, executable

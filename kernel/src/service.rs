@@ -6,10 +6,8 @@
 //! submission. The filesystem, process, clock, and diagnostics families live
 //! in the children.
 //!
-//! The dispatcher wiring here — registering an endpoint and routing a call to
-//! it — is the other half of the `kernel/src/ipc.rs` ADR 0035 names. The
-//! endpoints themselves belong to whichever subsystem answers them, so the
-//! filesystem and network families leave with their servers while these stay.
+//! These are the current compatibility dispatch endpoints. Private-page IPC
+//! acceptance uses the separate owned two-task composition in `ipc`.
 
 pub(crate) mod clock;
 pub(crate) mod diagnostics;

@@ -364,6 +364,7 @@ name = "troe-machine"
 version = "0.1.0"
 dependencies = [
  "rlsf",
+ "troe-abi",
  "troe-block",
  "troe-console",
  "troe-driver",

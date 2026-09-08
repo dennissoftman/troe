@@ -497,18 +497,68 @@ Both QEMU architecture gates require these totals for each 256-request row:
 | 256 | 256 | 512 | 512 | 0 | 512 | 512 | 256 |
 | 4096 | 512 | 1024 | 1024 | 0 | 1536 | 1536 | 768 |
 
-The zero-byte row counts payload copies, not fixed envelope writes. x86-64
-currently reloads CR3 in each direction; AArch64 changes TTBR0 and executes a
-full `TLBI VMALLE1`. No ASID/PCID retention is implemented or simulated; the
-protected-IPC design that would add it is tracked in
-[GitHub issue #8](https://github.com/dennissoftman/troe/issues/8). One lease is
-deliberately programmed for every user-execution segment; removing that safety
-boundary is not an acceptable latency optimization.
+The zero-byte row counts payload copies separately from fixed envelope writes.
+This compatibility path reloads CR3 in each direction on x86-64; AArch64 changes
+TTBR0 and executes `TLBI VMALLE1`. Each compatibility execution segment retains
+its existing lease program. The private-page path below uses retained tags and
+donates one absolute lease across handoffs.
 
 The isolated path performs no transient kernel allocation in its measured
 receive-to-reply interval and copies directly into caller-owned bounded storage.
 Reply ownership, token generation checks, server-fault fate, and teardown remain
 part of the current contract.
+
+## Private-page IPC and tagged-root gate
+
+`kernel/src/ipc.rs` runs ABI 1.3 client and persistent echo artifacts in the same
+acceptance image and boot as the compatibility matrix. Each payload (0, 64,
+256, 4,096 bytes) has direct and queued rows, each with 64 warmup calls followed
+by 256 measured calls. One lease covers the complete measured batch. Timing
+begins at kernel call admission and ends after validated reply completion and
+the root handoff; construction, teardown, and diagnostic output are excluded.
+The unsorted `ipc-phase-b-samples` records use the same counter/frequency as
+`ipc-samples`; frozen fixtures in `tests/fixtures/adr-0035` are never rewritten.
+
+For each nonempty direct round trip the gate requires one request copy, one
+reply copy, two user-root handoffs, zero heap allocations, zero queue slots,
+zero scheduler scans, zero targeted/full invalidations, and zero additional
+lease programs. Queued requests copy into and out of one preallocated slot,
+which is fully zeroed on delivery; replies still copy once. Zero-length
+payloads cause zero payload copies. The measured batch includes 512 direct
+traps or 768 queued traps, plus its final client yield. Scheduler snapshots,
+actual allocation/timer counters, native tag/root counters, and payload counters
+must agree before a row is emitted.
+
+`scripts/ipc_phase_b.py` independently recomputes nearest-rank p95 values from
+both arrays. Direct p95 divided by same-boot compatibility p95 must be at most
+0.60 for 0/64/256 bytes and 0.70 for 4 KiB. A queued ratio is reported without a
+latency threshold. All rows must use one clock and feature mode. Evidence is
+written to `build/ipc-phase-b-<platform>-<tagged|fallback>.json`, including raw
+samples, structural counts, host, QEMU command, and acceptance-image SHA-256.
+Hosted acceptance uploads those files as artifacts.
+
+AArch64 profiles require real ASID use in the emulated architecture. x86 TCG
+reports the full-flush fallback and cannot satisfy a tagged-profile claim. The
+two x86 hosted profiles also run `qemu-kvm` with `-cpu host -accel kvm`, require
+PCID plus INVPCID, and fail if hardware tagging is unavailable. There is no
+silent accelerator fallback. Local SBSA acceptance uses the pinned firmware:
+
+```console
+python3 scripts/test-qemu.py --platform aarch64-sbsa-ref --environment qemu
+python3 scripts/test-qemu.py --platform x86_64-q35-uefi --environment qemu-kvm --scenario fault-isolation
+```
+
+The native safety matrix checks all 20 pool slots and atomic exhaustion,
+zeroization on provisional release and terminal reuse, stale tag rejection
+across root reincarnation, and native ABI 1.0/1.1/1.2 compatibility calls. The
+adversarial persistent task exercises clean exit, server lease expiry, repeated
+handoffs until the original lease expires, stale token, oversized reply,
+zero-token reply while owning a call, supervisor-alias access, NX execution, and
+server exit with an undelivered queued request.
+Client probes exercise illegal object parameters and past/oversized deadlines.
+Each terminal case has one caller fate, no replay, and exact frame/handle/page
+cleanup. The general lifecycle models remain covered by host tests; the native
+IPC composition is the synthetic two-task endpoint.
 
 ## Storage baseline capture
 

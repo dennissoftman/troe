@@ -27,6 +27,8 @@ use alloc::vec::Vec;
 pub const MAX_CLIENT_BADGES: usize = 256;
 /// Hard ceiling for client badges at one endpoint.
 pub const MAX_BADGES_PER_ENDPOINT: usize = 32;
+/// Twenty-four generation bits fit with the eight-bit slot in ABI receive metadata.
+pub const MAX_BADGE_GENERATION: u32 = 0x00ff_ffff;
 
 /// Opaque endpoint-scoped client identity.
 ///
@@ -65,12 +67,11 @@ impl ClientBadge {
 
     /// Stable nonzero opaque value carried in a call event.
     ///
-    /// The low 32 bits encode a one-based slot and the high bits its
-    /// generation, so no live badge is ever zero and a non-client event's zero
-    /// badge cannot be confused with one.
+    /// The low eight bits encode the slot and the next 24 bits its nonzero
+    /// generation. The complete identity fits the 32-bit receive badge field.
     #[must_use]
     pub const fn event_value(self) -> u64 {
-        ((self.generation as u64) << 32) | (self.slot as u64 + 1)
+        ((self.generation as u64) << 8) | self.slot as u64
     }
 }
 
@@ -353,7 +354,7 @@ impl BadgeTable {
         record.state = BadgeState::Free;
         record.owner = HandleOwner::Kernel;
         record.endpoint_slot = 0;
-        if generation == u32::MAX {
+        if generation == MAX_BADGE_GENERATION {
             record.retired = true;
             self.retired = self
                 .retired
@@ -476,7 +477,8 @@ impl BadgeTable {
 #[cfg(test)]
 mod tests {
     use super::{
-        BadgeClosure, BadgeTable, ClientBadge, MAX_BADGES_PER_ENDPOINT, MAX_CLIENT_BADGES,
+        BadgeClosure, BadgeTable, ClientBadge, MAX_BADGE_GENERATION, MAX_BADGES_PER_ENDPOINT,
+        MAX_CLIENT_BADGES,
     };
     use crate::{DispatchError, HandleOwner};
 
@@ -674,10 +676,10 @@ mod tests {
     fn a_slot_retires_at_the_maximum_generation_rather_than_wrapping() {
         let mut table = BadgeTable::new(1).unwrap_or_else(|_| unreachable!());
         let badge = table.open(3, owner(7)).unwrap_or_else(|_| unreachable!());
-        table.slots[0].generation = u32::MAX;
+        table.slots[0].generation = MAX_BADGE_GENERATION;
         let aged = ClientBadge {
             slot: badge.slot(),
-            generation: u32::MAX,
+            generation: MAX_BADGE_GENERATION,
         };
         table.close_handle(aged).unwrap_or_else(|_| unreachable!());
         assert_eq!(table.take_closed(3), Ok(Some(aged)));

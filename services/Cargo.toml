@@ -4,6 +4,8 @@ members = [
     "diagnostics",
     "diagnostics-benchmark",
     "diagnostics-fault",
+    "ipc-echo",
+    "ipc-client",
 ]
 
 [workspace.package]
