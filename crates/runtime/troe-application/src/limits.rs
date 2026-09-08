@@ -155,7 +155,7 @@ mod tests {
         assert_eq!(standard.maximum_image_span_bytes(), 1024 * 1024 * 1024);
         assert_eq!(standard.stack_pages(), (4, 1 << 32));
         assert_eq!(standard.heap_pages(), 1 << 32);
-        let maximum_private = 2 * (1 << 32) + MAX_IMAGE_SPAN_PAGES + 1;
+        let maximum_private = 2 * (1 << 32) + MAX_IMAGE_SPAN_PAGES + 3;
         assert_eq!(
             standard.resident_pages(),
             maximum_private

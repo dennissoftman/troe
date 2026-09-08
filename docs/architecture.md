@@ -157,7 +157,7 @@ cannot intercept intrinsic names. A token containing `/` bypasses discovery
 and selects one exact relative or absolute VFS file; it adds neither a `PATH`
 search nor implicit current-directory execution. The interactive shell asks a
 default-negative confirmation before direct execution outside `/bin`; nested
-typed process launch remains noninteractive. ABI 1.2 exposes no platform-transition operation.
+typed process launch remains noninteractive. The application ABI exposes no platform-transition operation.
 
 Native KEX interfaces follow ADR 0034: opaque handles share generation,
 ownership, accounting, cancellation, waiting, and teardown machinery, while
@@ -244,7 +244,8 @@ This makes every scheduling boundary explicit and keeps architecture register
 state out of portable code.
 
 The boot arena contains one reusable 64 KiB cooperative task payload plus
-128 KiB isolated-server and shell payloads. Each has an unmapped 4 KiB page on
+128 KiB isolated-server and 192 KiB shell payloads. The shell reserve covers
+eight nested launch levels including private IPC/root metadata. Each has an unmapped 4 KiB page on
 both sides, while the payload is RW/NX. Boot verification
 interleaves two services, checks deterministic yield/exit counts, reaps their
 records, and reuses a returned slot before launching the shell on the third.
@@ -362,7 +363,7 @@ retains supervisor mappings for the kernel image, devices, and only the explicit
 boot-arena runtime ranges needed across an isolated transition; it does not copy
 the general free-RAM identity map. The kernel counts the exact four-level tables
 implied by the complete plan and allocates only those retained frames; both
-backends still enforce the standard 512-page ceiling. A provisional task receives only the
+backends account for the complete mapped layout. A provisional task receives only the
 loader-selected handle; boot acceptance then revokes it,
 reaps the record, zeroes every provisional frame, and verifies exact reuse.
 Malformed native corpus cases fail before frame allocation. Application entry
@@ -382,7 +383,7 @@ complete non-overlapping ranges, copies a two-byte opcode-prefixed request,
 checks task handle ownership, and copies a successful bounded reply before a
 fresh leased resume. Unknown calls and an attempted `_start` return are
 contained and reclaimed as invalid-call and translation faults.
-ABI 1.2 also suspends on `grow_heap`; the kernel atomically commits owned,
+The application ABI also suspends on `grow_heap`; the kernel atomically commits owned,
 zeroed physical extents at the end of the virtual heap prefix, falling back to
 discontiguous frames when necessary, adds page-table frames as mappings
 require, updates scheduler ownership accounting, and resumes with the new
@@ -394,6 +395,32 @@ Initial mappings, heap growth, and dynamic private mappings share
 full-width per-process and system commitment accounting under the active SCFG
 memory policy; the kernel protects a configured minimum-free reserve without
 preallocating any policy ceiling.
+
+ABI 1.3 additionally reserves private TX/RX pages from the boot arena for up to
+16 live task incarnations, plus four kernel-only pairs. `troe-machine` owns
+these slots, retained PCID/ASID identities, and the protected two-context IPC
+mechanism; `kernel/src/ipc.rs` binds the synthetic acceptance client and echo
+server to exact startup capabilities. The same virtual addresses map distinct
+physical pages in each root. The fast gate touches only shared supervisor
+mappings, including the IPC aliases, and never the general free-RAM identity map.
+
+The direct path copies one request and one reply, switches user roots twice,
+and retains the initiating segment's already armed absolute 50 ms lease.
+Waiting-server delivery uses no queue, allocation, scheduler selection, or TLB
+invalidation. A runnable server uses the retained copied queue slot, which is
+zeroed after delivery. Invalid tokens/scalars fault their owner; a server fault
+resumes the caller with `peer-died` and no replay. Lease expiry terminates the
+active member of this IPC segment. Product services retain the compatibility
+transport and their existing scheduling contracts.
+
+PCID/ASID 0 belongs to the kernel; task slots use 1–16. x86 enables PCID only
+with both PCID and INVPCID support, otherwise reporting full-flush fallback.
+AArch64 checks ASID feature width, uses non-global user leaves, and retains the
+ASID in TTBR0. Mapping changes invalidate only their address/tag range; terminal
+root release and slot reuse invalidate the complete old tag with completion
+barriers. A stale incarnation or unsupported ownership state fails closed.
+See the [wire contract](formats/kex-v1.md#abi-13-private-page-ipc-calls) and
+[native acceptance requirements](testing.md#private-page-ipc-and-tagged-root-gate).
 
 ADR 0048 adds a separate typed private-memory capability for zeroed anonymous
 data. It provides reservation, mapping, partial protection, partial unmapping,

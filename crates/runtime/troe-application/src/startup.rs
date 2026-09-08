@@ -1,10 +1,7 @@
 //! The canonical startup page handed to a launching application.
 
 use crate::bytes::{write_u16, write_u32, write_u64};
-use crate::{
-    ABI_MAJOR, ApplicationLayout, ApplicationLimits, PAGE_BYTES, STARTUP_FIXED_BYTES,
-    STARTUP_HANDLE_BYTES, STARTUP_REGION_BYTES,
-};
+use crate::{ABI_MAJOR, ApplicationLayout, PAGE_BYTES, STARTUP_HANDLE_BYTES, STARTUP_REGION_BYTES};
 
 /// The page-size field the record carries, kept a plain `u32` constant so the
 /// encoder needs no fallible conversion; it must name the loader's page size.
@@ -57,8 +54,8 @@ pub(crate) fn encode_startup_page(
     if info.task_id == 0 {
         return Err(StartupPageError::InvalidTaskId);
     }
-    let limits = ApplicationLimits::standard();
-    if info.handles.len() > usize::from(limits.initial_handles) {
+    let header_bytes = troe_abi::startup::header_bytes(abi_minor);
+    if info.handles.len() > troe_abi::startup::max_initial_handles(abi_minor) {
         return Err(StartupPageError::TooManyHandles);
     }
     for (index, handle) in info.handles.iter().enumerate() {
@@ -74,7 +71,7 @@ pub(crate) fn encode_startup_page(
     }
 
     destination.fill(0);
-    let encoded_bytes = STARTUP_FIXED_BYTES + info.handles.len() * STARTUP_HANDLE_BYTES;
+    let encoded_bytes = header_bytes + info.handles.len() * STARTUP_HANDLE_BYTES;
     let encoded_bytes =
         u32::try_from(encoded_bytes).map_err(|_| StartupPageError::TooManyHandles)?;
     let handle_count =
@@ -91,8 +88,12 @@ pub(crate) fn encode_startup_page(
     write_u64(destination, 40, layout.stack_bottom);
     write_u64(destination, 48, layout.stack_top);
     write_u64(destination, 56, info.task_id);
+    if let Some((tx, rx)) = layout.ipc_addresses() {
+        write_u64(destination, 64, tx);
+        write_u64(destination, 72, rx);
+    }
     for (index, handle) in info.handles.iter().enumerate() {
-        let offset = STARTUP_FIXED_BYTES + index * STARTUP_HANDLE_BYTES;
+        let offset = header_bytes + index * STARTUP_HANDLE_BYTES;
         write_u64(destination, offset, handle.value);
         write_u32(destination, offset + 8, handle.rights);
         write_u32(destination, offset + 12, handle.interface);

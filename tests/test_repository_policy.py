@@ -820,7 +820,7 @@ fn shipped() -> u8 {
             with self.subTest(tree=tree):
                 table = lints(REPO_ROOT / tree / "Cargo.toml")
                 # `deny` rather than `forbid`: `forbid` cannot be lifted, and
-                # four members genuinely need `unsafe`. They opt in per crate.
+                # six members genuinely need `unsafe`. They opt in per crate.
                 self.assertEqual(
                     table["rust"], {"unsafe_code": "deny", "missing_docs": "allow"}
                 )
@@ -863,9 +863,9 @@ fn shipped() -> u8 {
                     self.assertEqual(set(table), {"opt-level"})
 
     def test_every_unsafe_opt_in_is_named_at_its_crate_root(self) -> None:
-        """`unsafe_code` is `deny`, so each of the four members that needs it
+        """`unsafe_code` is `deny`, so each of the six members that needs it
         carries one crate-level `#![allow(unsafe_code)]` with the reason directly
-        above it. Pin that set, so a fifth opt-in has to be argued for in review
+        above it. Pin that set, so another opt-in has to be argued for in review
         rather than added quietly.
 
         Pin the `SAFETY:` coverage too, per block rather than per file.
@@ -894,6 +894,8 @@ fn shipped() -> u8 {
                 "apps/mem/src/main.rs",
                 "apps/python/src/main.rs",
                 "services/diagnostics-fault/src/main.rs",
+                "services/ipc-client/src/main.rs",
+                "services/ipc-echo/src/main.rs",
             ],
         )
         for relative, text in opted_in.items():

@@ -33,3 +33,17 @@ version = "0.1.0"
 dependencies = [
  "troe-kex-sdk",
 ]
+
+[[package]]
+name = "troe-service-ipc-client"
+version = "0.1.0"
+dependencies = [
+ "troe-kex-sdk",
+]
+
+[[package]]
+name = "troe-service-ipc-echo"
+version = "0.1.0"
+dependencies = [
+ "troe-kex-sdk",
+]

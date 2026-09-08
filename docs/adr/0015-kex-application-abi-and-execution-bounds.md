@@ -2,6 +2,12 @@
 
 Status: accepted and implemented, 2026-08-25.
 
+Supersession note: [ADR 0035, Phase B](https://github.com/dennissoftman/troe/issues/8)
+adds ABI 1.3 private IPC pages and calls 4/5. Its 80-byte startup prefix holds
+167 handles; ABI 1.0–1.2 keep the 64-byte prefix and 168-handle capacity.
+[The current KEX contract](../formats/kex-v1.md) defines these versioned layouts.
+The absolute 50 ms lease still applies across direct IPC handoffs.
+
 Supersession note, 2026-08-27: ADR 0037 replaces the foreground runner's
 1,024-resumption and ten-second total lifetime ceilings with supervisor-owned
 resident execution. The 50 ms maximum uninterrupted application lease and all

@@ -52,6 +52,8 @@ APPLICATIONS_MANIFEST = REPO_ROOT / "apps" / "Cargo.toml"
 UNLINTABLE_APPLICATION_EXCLUSIONS = unlintable_application_exclusions()
 SERVICES_MANIFEST = REPO_ROOT / "services" / "Cargo.toml"
 KEX_SERVICES = (
+    (REPO_ROOT / "services" / "ipc-echo", "ipc-echo-server", 8),
+    (REPO_ROOT / "services" / "ipc-client", "ipc-client", 8),
     (REPO_ROOT / "services" / "diagnostics", "diagnostics-server", 8),
     (
         REPO_ROOT / "services" / "diagnostics-benchmark",

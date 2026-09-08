@@ -43,7 +43,8 @@ The SCFG v1 service capability word is a closed launcher-authority mask:
 
 Every other bit is rejected. A KEX manifest must request a subset of this mask,
 and its four mandatory command/stream handles plus optional capability handles
-must fit the record's initial-handle ceiling. The budget accepts 0–168 handles,
+must fit the record's initial-handle ceiling. The budget accepts 0–168 handles; ABI 1.3 launch additionally enforces its
+167-descriptor startup capacity. The format ceiling is
 derived from `troe_abi::startup::MAX_INITIAL_HANDLES`. The current supervisor
 rejects service manifests requesting optional interfaces not expressible by this v1
 mask.

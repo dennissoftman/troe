@@ -338,7 +338,7 @@ class FirmwareProfileTests(unittest.TestCase):
         )
 
     def test_qemu_runner_records_are_complete_and_exact(self) -> None:
-        self.assertEqual(ENVIRONMENT_IDS, (QEMU_ENVIRONMENT,))
+        self.assertEqual(ENVIRONMENT_IDS, (QEMU_ENVIRONMENT, "qemu-kvm"))
         x86 = resolve_runner(X86_64_Q35_UEFI, QEMU_ENVIRONMENT)
         arm = resolve_runner(AARCH64_SBSA_REF, QEMU_ENVIRONMENT)
         self.assertEqual(
@@ -395,6 +395,18 @@ class FirmwareProfileTests(unittest.TestCase):
                 (),
             ),
         )
+
+    def test_tagged_x86_requires_kvm_without_a_fallback_accelerator(self) -> None:
+        for platform in (X86_64_Q35_UEFI, X86_64_UEFI_VIRTIO_PCI):
+            runner = resolve_runner(platform, "qemu-kvm")
+            self.assertEqual(runner.cpu, "host")
+            self.assertEqual(runner.extra_arguments, ("-accel", "kvm"))
+            self.assertEqual(
+                runner.acceptance_udp_port,
+                resolve_runner(platform, "qemu").acceptance_udp_port,
+            )
+        with self.assertRaisesRegex(RuntimeError, "no runner"):
+            resolve_runner(AARCH64_SBSA_REF, "qemu-kvm")
 
     def test_unknown_platform_and_runner_pair_fail_closed(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "unknown platform"):
@@ -496,10 +508,17 @@ class FirmwareProfileTests(unittest.TestCase):
                     qemu_profile.subprocess,
                     "run",
                     side_effect=RuntimeError("synthetic build failure"),
-                ),
-                self.assertRaisesRegex(RuntimeError, "synthetic build failure"),
+                ) as run,
             ):
-                qemu_profile.build_cloud_bundle(profile, QEMU_ENVIRONMENT)
+                for environment in (QEMU_ENVIRONMENT, "qemu-kvm"):
+                    with self.assertRaisesRegex(
+                        RuntimeError, "synthetic build failure"
+                    ):
+                        qemu_profile.build_cloud_bundle(profile, environment)
+                    command = run.call_args.args[0]
+                    self.assertEqual(
+                        command[command.index("--environment") + 1], QEMU_ENVIRONMENT
+                    )
             self.assertEqual(
                 (bundle / "sentinel").read_text(encoding="utf-8"),
                 "last-good",

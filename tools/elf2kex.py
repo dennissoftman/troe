@@ -64,7 +64,7 @@ KEX_RELOCATION_BYTES = 16
 KEX_IMAGE_BASE = 0x0000_4000_0000_0000
 KEX_PAGE_BYTES = 4096
 KEX_ABI_MAJOR = 1
-KEX_ABI_MINOR = 2
+KEX_ABI_MINOR = 3
 KEX_IMAGE_ALIGNMENT = 2 * 1024 * 1024
 KEX_TARGETS = {"x86_64": 1, "aarch64": 2}
 ELF_MACHINES = {ELF_EM_X86_64: "x86_64", ELF_EM_AARCH64: "aarch64"}
@@ -75,8 +75,8 @@ KEX_PERMISSIONS = {
 }
 MAX_IMAGE_SPAN_BYTES = 1024 * 1024 * 1024
 MAX_IMAGE_SPAN_PAGES = MAX_IMAGE_SPAN_BYTES // KEX_PAGE_BYTES
-# Contiguous virtual regions in one launch layout: image, startup, heap, stack.
-LAUNCH_REGIONS = 4
+# Contiguous virtual regions in one launch layout: image, startup, IPC, heap, stack.
+LAUNCH_REGIONS = 5
 TABLE_ENTRIES = 512
 TABLE_LEVELS_BELOW_ROOT = 3
 STANDARD_LIMITS = {
@@ -88,7 +88,7 @@ STANDARD_LIMITS = {
     "heap_pages": 1 << 32,
     "resident_pages": 0,
 }
-MAX_PRIVATE_PAGES = MAX_IMAGE_SPAN_PAGES + 1 + (1 << 32) + (1 << 32)
+MAX_PRIVATE_PAGES = MAX_IMAGE_SPAN_PAGES + 3 + (1 << 32) + (1 << 32)
 
 
 def maximum_table_pages(mapped_pages: int) -> int:
@@ -658,7 +658,7 @@ def verify_kex(
         raise ValueError("KEX output segment ends beyond the declared image span")
     if encoded_span != image_span_bytes(previous_end):
         raise ValueError("KEX output declared image span is not the canonical span")
-    private_pages = image_pages + 1 + encoded_stack + encoded_heap
+    private_pages = image_pages + 3 + encoded_stack + encoded_heap
     resident_pages = private_pages + maximum_table_pages(private_pages)
     if resident_pages > limits["resident_pages"]:
         raise ValueError("KEX output resident charge exceeds the standard policy")
@@ -690,7 +690,7 @@ def convert_elf(
         raise ValueError("requested KEX stack pages exceed the standard KEX policy")
     if not 0 <= heap_pages <= limits["heap_pages"]:
         raise ValueError("requested KEX heap pages exceed the standard KEX policy")
-    private = image_pages + 1 + stack_pages + heap_pages
+    private = image_pages + 3 + stack_pages + heap_pages
     resident = private + maximum_table_pages(private)
     if resident > limits["resident_pages"]:
         raise ValueError(

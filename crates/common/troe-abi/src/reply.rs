@@ -48,6 +48,18 @@ pub const NOT_EMPTY: u32 = 21;
 pub const CROSS_DEVICE: u32 = 22;
 /// An explicit configured resource policy rejected the request.
 pub const RESOURCE_LIMIT: u32 = 23;
+/// Endpoint closed cleanly; synthesized only by the IPC transport.
+pub const CLOSED: u32 = 24;
+/// Endpoint owner faulted or was revoked; synthesized only by the transport.
+pub const PEER_DIED: u32 = 25;
+/// Call would form a cycle; synthesized only by the IPC transport.
+pub const DEADLOCK: u32 = 26;
+
+/// Whether a result is a service result or a terminal IPC transport result.
+#[must_use]
+pub const fn is_ipc_result(value: u32) -> bool {
+    value <= DEADLOCK
+}
 
 /// Whether a scalar is one defined service reply value.
 #[must_use]

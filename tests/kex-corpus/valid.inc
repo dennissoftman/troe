@@ -1,5 +1,7 @@
 [
     ("native-calls-x86_64.kex", include_bytes!("native-calls-x86_64.kex") as &[u8], Target::X86_64),
+    ("native-calls-abi0-x86_64.kex", include_bytes!("native-calls-abi0-x86_64.kex") as &[u8], Target::X86_64),
+    ("native-calls-abi1-x86_64.kex", include_bytes!("native-calls-abi1-x86_64.kex") as &[u8], Target::X86_64),
     ("native-spin-x86_64.kex", include_bytes!("native-spin-x86_64.kex") as &[u8], Target::X86_64),
     ("native-heap-growth-limit-x86_64.kex", include_bytes!("native-heap-growth-limit-x86_64.kex") as &[u8], Target::X86_64),
     ("native-invalid-call-x86_64.kex", include_bytes!("native-invalid-call-x86_64.kex") as &[u8], Target::X86_64),
@@ -10,6 +12,8 @@
     ("valid-standard-max-stack-heap-x86_64.kex", include_bytes!("valid-standard-max-stack-heap-x86_64.kex") as &[u8], Target::X86_64),
     ("valid-standard-large-image-x86_64.kex", include_bytes!("valid-standard-large-image-x86_64.kex") as &[u8], Target::X86_64),
     ("native-calls-aarch64.kex", include_bytes!("native-calls-aarch64.kex") as &[u8], Target::Aarch64),
+    ("native-calls-abi0-aarch64.kex", include_bytes!("native-calls-abi0-aarch64.kex") as &[u8], Target::Aarch64),
+    ("native-calls-abi1-aarch64.kex", include_bytes!("native-calls-abi1-aarch64.kex") as &[u8], Target::Aarch64),
     ("native-spin-aarch64.kex", include_bytes!("native-spin-aarch64.kex") as &[u8], Target::Aarch64),
     ("native-heap-growth-limit-aarch64.kex", include_bytes!("native-heap-growth-limit-aarch64.kex") as &[u8], Target::Aarch64),
     ("native-invalid-call-aarch64.kex", include_bytes!("native-invalid-call-aarch64.kex") as &[u8], Target::Aarch64),

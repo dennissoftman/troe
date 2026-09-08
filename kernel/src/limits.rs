@@ -41,7 +41,7 @@ pub(crate) const TASK_STACK_BYTES: u64 = 64 * 1024;
 
 pub(crate) const SERVER_TASK_STACK_BYTES: u64 = 128 * 1024;
 
-pub(crate) const SHELL_TASK_STACK_BYTES: u64 = 128 * 1024;
+pub(crate) const SHELL_TASK_STACK_BYTES: u64 = 192 * 1024;
 
 pub(crate) const TASK_GUARD_BYTES: u64 = BASE_PAGE_SIZE;
 
@@ -49,7 +49,7 @@ pub(crate) const TASK_STACK_PAGES: u64 = 16;
 
 pub(crate) const SERVER_TASK_STACK_PAGES: u64 = 32;
 
-pub(crate) const SHELL_TASK_STACK_PAGES: u64 = 32;
+pub(crate) const SHELL_TASK_STACK_PAGES: u64 = 48;
 
 pub(crate) const TASK_STACK_COUNT: usize = 3;
 
@@ -67,9 +67,9 @@ pub(crate) const RESIDENT_PROCESS_LOG_BYTES: usize = 64 * 1024;
 // re-enters `ResidentApplication::step`, so nesting costs one frame per
 // level. `step` keeps only the pump on that recursive path and leaves its
 // message buffers and service handlers in `run_execution_slice`, which is
-// never recursive, so a level costs about 1 KiB and the one running slice
-// about 53 KiB. Eight levels stay near two thirds of
-// SHELL_TASK_STACK_BYTES on both architectures.
+// never recursive. The 192 KiB shell stack covers the shell/launcher frames,
+// eight small pump frames, and the active slice's IPC-aware launch work.
+// Native acceptance exercises the depth boundary on both architectures.
 pub(crate) const MAX_LAUNCH_DEPTH: u32 = 8;
 
 pub(crate) const RESIDENT_APPLICATION_TIMESLICE_MILLISECONDS: u32 = 10;
@@ -127,6 +127,7 @@ pub(crate) const USER_UNMAPPED_BASE: u64 = USER_CODE_BASE + 0x1000_0000;
 pub(crate) const ISOLATED_MESSAGE: &[u8] = b"stage6 copied request";
 
 pub(crate) const BOOT_ARENA_PAGES: usize = ((OWNED_HEAP_BYTES
+    + troe_machine::IPC_POOL_PAGES * BASE_PAGE_SIZE
     + PAGE_TABLE_BYTES
     + OWNED_STACK_BYTES
     + EXCEPTION_STACK_BYTES

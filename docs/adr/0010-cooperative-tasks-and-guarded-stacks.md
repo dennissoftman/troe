@@ -2,6 +2,11 @@
 
 Status: accepted, 2026-08-23; stack-size amendments, 2026-08-24 and 2026-08-26.
 
+Stack amendment: ADR 0035 Phase B reserves a 192 KiB guarded shell payload
+for the accepted eight-level nested launch path with IPC/root ownership. The
+cooperative and isolated-server payloads remain 64 KiB and 128 KiB. Earlier
+128 KiB shell and aggregate stack figures below preserve the original decision.
+
 ## Decision
 
 Stage 4 introduces an architecture-independent `troe-task` policy crate. One

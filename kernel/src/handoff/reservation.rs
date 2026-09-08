@@ -33,6 +33,7 @@ pub(crate) struct TaskStackLayout {
 pub(crate) struct BootMemory {
     pub(crate) arena: PhysicalRange,
     pub(crate) heap: PhysicalRange,
+    pub(crate) ipc_pool: PhysicalRange,
     pub(crate) page_tables: PhysicalRange,
     pub(crate) stack: PhysicalRange,
     pub(crate) exception_stack: PhysicalRange,
@@ -67,6 +68,14 @@ pub(crate) fn reserve_and_install_heap() -> Result<BootMemory, ()> {
         allocate_task_stack(&mut allocator, SERVER_TASK_STACK_BYTES)?,
         allocate_task_stack(&mut allocator, SHELL_TASK_STACK_BYTES)?,
     ];
+    let ipc_pool = allocator
+        .allocate(
+            troe_machine::IPC_POOL_PAGES * BASE_PAGE_SIZE,
+            BASE_PAGE_SIZE,
+        )
+        .map_err(|_| ())?;
+    let ipc_pool = allocation_range(ipc_pool)?;
+    troe_machine::initialize_ipc_pool(ipc_pool).map_err(|_| ())?;
     allocator.seal();
     let heap_start = usize::try_from(heap.start()).map_err(|_| ())?;
     let heap_bytes = usize::try_from(heap.byte_count()).map_err(|_| ())?;
@@ -77,6 +86,7 @@ pub(crate) fn reserve_and_install_heap() -> Result<BootMemory, ()> {
     let table_pages = page_tables.byte_count() / BASE_PAGE_SIZE;
     Ok(BootMemory {
         arena,
+        ipc_pool,
         heap: PhysicalRange::from_pages(heap.start(), heap_pages).map_err(|_| ())?,
         page_tables: PhysicalRange::from_pages(page_tables.start(), table_pages).map_err(|_| ())?,
         stack: PhysicalRange::from_pages(stack.start(), stack.byte_count() / BASE_PAGE_SIZE)
@@ -135,6 +145,7 @@ pub(crate) fn build_mapping_plan(
     }
     for range in [
         boot_memory.heap,
+        boot_memory.ipc_pool,
         boot_memory.page_tables,
         boot_memory.stack,
         boot_memory.exception_stack,

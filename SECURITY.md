@@ -68,6 +68,13 @@ never executes the ordinary application.
   coherent full-source and relocation fingerprints, inactive-frame streaming,
   canonical startup pages, explicit initial handles, and transactional zeroized
   reclamation without a package-sized kernel-heap copy;
+- ABI 1.3 IPC: 16 private task TX/RX pairs and four kernel-only pairs in the
+  owned boot arena, owner-only user mappings, supervisor aliases in every root,
+  complete zeroization before publication/reuse and after terminal revocation;
+  retained PCID/ASID generations reject stale roots, and mapping changes use
+  targeted invalidation with a full-flush correctness fallback on unsupported
+  x86 CPUs. Direct handoffs preserve the absolute 50 ms lease; expiry faults
+  the active IPC participant and does not replay the call;
 - KEX resolution: bare names select only `/bin/<name>.kex`; a command containing
   `/` selects one exact VFS path relative to its explicit cwd, with no suffix
   inference, `PATH`, or implicit writable-directory search; every selected file

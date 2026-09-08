@@ -30,7 +30,7 @@ Each 16-byte record has this layout:
 Unsupported minors, unknown kinds, and nonzero reserved bytes are rejected.
 Records are strictly ascending by nonzero interface identifier; duplicates and major version zero are invalid. There are
 no rights bits: KCAP declares which typed startup interface is required, while
-the kernel grants only that interface's fixed call right and exact version.
+the kernel grants only that interface's fixed rights and exact version.
 
 The repo-local builder reads the closed capability names from:
 
@@ -43,7 +43,8 @@ The implemented closed names are `datagram`, `filesystem-read`,
 `filesystem-mutate`, `timer`, `diagnostics`, `network-observe`,
 `network-configure`, `icmp-echo`, `tcp-connect`, `tcp-listen`, `volume-control`,
 `shell-script`, `wall-clock`, `clock-control`, `process-observe`,
-`process-launch`, and `pipe`. Each selects one exact
+`process-launch`, `pipe`, `private-memory`, `random`, `server-endpoint`,
+`persistent-endpoint`, and `wait-set`. Each selects one exact
 interface; no name implies another. `clock-control` is privileged launcher
 authority and is denied to ordinary session-launched commands. The
 `shell-script` authority stages validated physical command lines only for the
@@ -58,11 +59,19 @@ not grant process control or memory inspection.
 the child's manifest must attenuate the launcher's grants. `pipe` grants only
 owner-scoped bounded byte pipes. Neither capability implies the other.
 
+`server-endpoint` retains interface 15 version 1.0 with call authority for the
+compatibility diagnostics server. `persistent-endpoint` selects the same ID at
+version 2.0 with receive/reply authority; `wait-set` selects interface 24 version
+1.0 with wait authority. The ABI 1.3 synthetic acceptance launcher checks this
+exact manifest before supplying its two boot-selected grants. Ordinary command
+launch does not grant these persistent-server capabilities.
+
 The builder embeds the encoded manifest before the executable in
 `<command>.kex`; no `.kcap` sidecar is installed. A malformed, unknown,
 unsupported, or unavailable requirement rejects launch and never selects
 privileged fallback behavior. The four command/standard-stream handles are
 mandatory ABI context and therefore are not repeated in KCAP. The 128 optional
-requirements plus these four mandatory handles fit the 168 descriptors derived
-from `troe_abi::startup::REGION_BYTES`, `HEADER_BYTES`, and `HANDLE_BYTES`;
+requirements plus these four mandatory handles fit both versioned capacities
+(167 for ABI 1.3 and 168 for ABI 1.0–1.2) derived from
+`troe_abi::startup::max_initial_handles`;
 this relationship is checked at compile time.

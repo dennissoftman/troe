@@ -390,6 +390,10 @@ for a completed one. See
   `aarch64-sbsa-ref` drives a `bochs-display` framebuffer, which loads
   `vgabios-bochs-display.bin`. Homebrew ships those blobs inside the QEMU
   formula, while Debian and Ubuntu split them into `qemu-system-data`.
+- The tagged IPC gate on x86-64 additionally requires Linux KVM with PCID and
+  INVPCID exposed by `-cpu host`. The explicit `qemu-kvm` runner fails if these
+  are absent. TCG remains a separately reported correctness fallback; see
+  [the IPC gate](docs/testing.md#private-page-ipc-and-tagged-root-gate).
 - For `aarch64-sbsa-ref` only, firmware for the SBSA reference machine, which
   no distribution packages. Build both flash banks once from pinned sources:
 

@@ -544,7 +544,9 @@ fn parse_stream_prefix(
         .image_pages
         .checked_add(header.stack_pages)
         .and_then(|pages| pages.checked_add(header.heap_pages))
-        .and_then(|pages| pages.checked_add(STARTUP_PAGES))
+        .and_then(|pages| {
+            pages.checked_add(STARTUP_PAGES + troe_abi::startup::ipc_pages(header.abi_minor) as u64)
+        })
         .ok_or(StreamError::Executable(ParseError::ArithmeticOverflow))?;
     let reserved_resident_pages = maximum_table_pages(private_pages)
         .and_then(|tables| private_pages.checked_add(tables))

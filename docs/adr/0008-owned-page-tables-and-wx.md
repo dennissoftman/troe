@@ -6,6 +6,11 @@ Scope note: the decision text preserves the Stage 3 contract at the time it was
 accepted. Dated implementation notes distinguish later current behavior and
 verification from that historical baseline.
 
+Stack amendment: ADR 0035 Phase B reserves a 192 KiB guarded shell payload
+for the accepted eight-level nested launch path with IPC/root ownership. The
+cooperative and isolated-server payloads remain 64 KiB and 128 KiB. Earlier
+128 KiB shell and aggregate stack figures below preserve the original decision.
+
 ## Decision
 
 Stage 3 keeps the existing low identity layout but replaces firmware page
