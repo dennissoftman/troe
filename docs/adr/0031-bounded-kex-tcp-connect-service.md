@@ -7,7 +7,8 @@ Status: accepted and implemented for the first Stage 9 TCP slice, 2026-08-25;
 the four-connection system-wide ceiling below is superseded by
 [ADR 0070](0070-bounded-tcp-passive-open-and-tuple-retention.md), which raises
 it to sixteen and adds the portable passive-open and tuple-retention states.
-Inbound listen authority remains absent as this ADR states.
+Inbound listen authority is independently defined by the TCP listener v1
+contract linked above; the absence described below is historical.
 
 ## Decision
 
