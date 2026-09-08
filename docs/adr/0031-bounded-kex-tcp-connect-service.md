@@ -1,5 +1,8 @@
 # ADR 0031: Bounded KEX TCP connect service
 
+Extension: the independent [TCP listener v1](../formats/tcp-listen-v1.md)
+interface grants inbound authority. It does not widen `tcp-connect`.
+
 Status: accepted and implemented for the first Stage 9 TCP slice, 2026-08-25;
 the four-connection system-wide ceiling below is superseded by
 [ADR 0069](0069-bounded-tcp-passive-open-and-tuple-retention.md), which raises

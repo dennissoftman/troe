@@ -30,7 +30,7 @@ capabilities = ["datagram"]
 
 The implemented closed names are `datagram`, `filesystem-read`,
 `filesystem-mutate`, `timer`, `diagnostics`, `network-observe`,
-`network-configure`, `icmp-echo`, `tcp-connect`, `volume-control`,
+`network-configure`, `icmp-echo`, `tcp-connect`, `tcp-listen`, `volume-control`,
 `shell-script`, `wall-clock`, `clock-control`, `process-observe`,
 `process-launch`, and `pipe`. Each selects one exact
 interface; no name implies another. `clock-control` is privileged launcher
@@ -38,7 +38,9 @@ authority and is denied to ordinary session-launched commands. The
 `shell-script` authority stages validated physical command lines only for the
 owning shell session and never launches a nested application. In particular,
 `tcp-connect` accepts only a literal IPv4 endpoint and does not grant DNS, TLS,
-listening, or raw packets.
+listening, or raw packets. The independent `tcp-listen` capability selects
+interface 29 version 1.0 and grants one bounded inbound endpoint and its
+accepted streams; see [TCP listener v1](tcp-listen-v1.md).
 `process-observe` returns bounded current metadata and accounting only; it does
 not grant process control or memory inspection.
 `process-launch` grants only owner-scoped child admission and lifecycle calls;

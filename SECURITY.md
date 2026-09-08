@@ -13,8 +13,7 @@ fate, and zeroized teardown; no privileged utility fallback exists. The shell
 retains only `cd`, `fg`, `jobs`, `kill`, `log`, `poweroff`, `reboot`, `svc`, and
 `wait`. Hosted tooling verifies the current signed package/trust formats, but
 the native image has no secure-boot integration, accepted production
-publication path, or multi-user boundary. DNS, TLS, inbound TCP listening, and
-general sockets are not implemented.
+publication path, or multi-user boundary. DNS, TLS, and general sockets are not implemented.
 
 The portable crates and kernel forbid unsafe Rust. Project-authored unsafe
 operations are confined to `troe-machine` and are verified through native
@@ -110,7 +109,13 @@ never executes the ordinary application.
   after close, one 1,460-byte unacknowledged segment and 4 KiB receive FIFO per
   connection, exact-tuple/sequence admission, four retransmissions, four-second
   cancellable operations, a four-second tuple retention on the active closer,
-  and owner-teardown removal; no DNS, TLS, listen, or raw packets;
+  and owner-teardown removal of live streams; no DNS, TLS, or raw packets;
+- inbound TCP: independent `tcp-listen` authority, one local port per handle,
+  two listeners system-wide, backlog 1 through 4, and eight accepted streams
+  per handle within the shared sixteen-connection ceiling. Connection IDs are
+  handle-local and never reused. Owner teardown removes the listener and live
+  accepted streams; gracefully closed tuples remain until expiry. See the
+  [listener contract](docs/formats/tcp-listen-v1.md).
 - dependencies: complete `Cargo.lock` checked by pinned `cargo-audit` against the
   exact RustSec database revision in `tools/rustsec-advisory-db.rev`.
 

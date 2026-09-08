@@ -340,6 +340,18 @@ impl TcpConnection {
         self.state
     }
 
+    /// Local endpoint of this connection.
+    #[must_use]
+    pub const fn local(&self) -> TcpEndpoint {
+        self.local
+    }
+
+    /// Exact remote endpoint this connection admits segments from.
+    #[must_use]
+    pub const fn remote(&self) -> TcpEndpoint {
+        self.remote
+    }
+
     /// Exact endpoint tuple match used before state admission.
     #[must_use]
     pub fn accepts(&self, segment: TcpSegment<'_>) -> bool {
@@ -424,11 +436,11 @@ impl TcpConnection {
     ///
     /// # Errors
     ///
-    /// Rejects empty/oversized data, non-established state, a pending send, or
+    /// Rejects empty/oversized data, a closed sending half, a pending send, or
     /// data exceeding the peer's current unscaled window.
     pub fn begin_send(&mut self, payload: &[u8]) -> Result<(), TcpError> {
         self.check_terminal()?;
-        if self.state != TcpState::Established
+        if !matches!(self.state, TcpState::Established | TcpState::CloseWait)
             || payload.is_empty()
             || payload.len() > MAX_TCP_PAYLOAD_BYTES
         {
@@ -897,6 +909,14 @@ impl TcpListener {
             }
             Err(_) => TcpAdmission::Ignored,
         }
+    }
+
+    /// Whether this segment belongs to a connection already in the backlog.
+    #[must_use]
+    pub fn has_connection(&self, segment: TcpSegment<'_>) -> bool {
+        self.backlog
+            .iter()
+            .any(|connection| connection.accepts(segment))
     }
 
     /// Remove and return the oldest connection whose handshake completed.

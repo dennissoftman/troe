@@ -1,10 +1,9 @@
 # ADR 0069: bounded TCP passive open and tuple retention
 
-Status: accepted; the portable state machine is implemented, 2026-09-02. It is
-not yet reachable by an application: no KEX interface grants listen authority,
-so the only application-facing TCP service remains
-[ADR 0031](0031-bounded-kex-tcp-connect-service.md)'s outbound `tcp-connect`.
-This ADR supersedes that ADR's four-connection system-wide ceiling.
+Status: accepted and implemented. Application access is defined by the
+[TCP listener v1 contract](../formats/tcp-listen-v1.md). Interface 29 grants
+independent `tcp-listen` authority; statements below about an absent KEX
+listener describe the original state-machine-only decision.
 
 ## Context
 

@@ -99,10 +99,13 @@ impl KernelRuntime {
     }
 
     pub(crate) fn service_ambient(&mut self) {
-        if troe_machine::take_network_interrupt()
-            && let Some(network) = &self.network
-        {
-            let _bounded_poll = network.borrow_mut().poll();
+        let interrupted = troe_machine::take_network_interrupt();
+        if let Some(network) = &self.network {
+            let mut network = network.borrow_mut();
+            if interrupted {
+                let _bounded_poll = network.poll();
+            }
+            network.flush_pending(self.now().as_millis());
         }
     }
 

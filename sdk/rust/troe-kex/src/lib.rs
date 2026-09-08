@@ -3,11 +3,14 @@
 
 use core::{fmt, slice};
 
+mod listener;
+pub use listener::TcpListen;
+
 pub use troe_abi::{
     ABI_MAJOR, ABI_MINOR, clock_control, command, datagram, diagnostics, exit, filesystem,
     filesystem_mutation, icmp_echo, interface, network_configuration, network_observation, pipe,
     private_memory, process_launch, process_observation, random, reply, server, shell_script,
-    tcp_connect, timer, timezone, volume_control, wall_clock,
+    tcp_connect, tcp_listen, timer, timezone, volume_control, wall_clock,
 };
 use troe_abi::{MAX_MESSAGE_BYTES, MAX_SERVICE_PAYLOAD_BYTES, heap_growth, stream};
 
@@ -213,6 +216,7 @@ pub struct CommandContext {
     network_configuration: Option<Handle>,
     icmp_echo: Option<Handle>,
     tcp_connect: Option<Handle>,
+    tcp_listen: Option<Handle>,
     volume_control: Option<Handle>,
     shell_script: Option<Handle>,
     wall_clock: Option<Handle>,
@@ -297,6 +301,11 @@ impl CommandContext {
                 interface::TCP_CONNECT,
                 tcp_connect::MAJOR,
                 tcp_connect::MINOR,
+            )?,
+            tcp_listen: startup.optional_handle(
+                interface::TCP_LISTEN,
+                tcp_listen::MAJOR,
+                tcp_listen::MINOR,
             )?,
             volume_control: startup.optional_handle(
                 interface::VOLUME_CONTROL,
@@ -596,6 +605,18 @@ impl CommandContext {
     pub const fn tcp_connect(&self) -> Result<TcpConnect, Error> {
         match self.tcp_connect {
             Some(handle) => Ok(TcpConnect { handle }),
+            None => Err(Error::MissingAuthority),
+        }
+    }
+
+    /// Borrow the optional inbound TCP listen authority.
+    ///
+    /// # Errors
+    ///
+    /// Reports that the package did not request or receive TCP authority.
+    pub const fn tcp_listen(&self) -> Result<TcpListen, Error> {
+        match self.tcp_listen {
+            Some(handle) => Ok(TcpListen { handle }),
             None => Err(Error::MissingAuthority),
         }
     }
@@ -2933,6 +2954,7 @@ mod tests {
             interface::NETWORK_CONFIGURE,
             interface::ICMP_ECHO,
             interface::TCP_CONNECT,
+            interface::TCP_LISTEN,
             interface::VOLUME_CONTROL,
             interface::SHELL_SCRIPT,
             interface::WALL_CLOCK,
@@ -2955,6 +2977,7 @@ mod tests {
                 assert!(command.network_configuration().is_ok());
                 assert!(command.icmp_echo().is_ok());
                 assert!(command.tcp_connect().is_ok());
+                assert!(command.tcp_listen().is_ok());
                 assert!(command.volume_control().is_ok());
                 assert!(command.wall_clock().is_ok());
                 assert!(command.clock_control().is_ok());

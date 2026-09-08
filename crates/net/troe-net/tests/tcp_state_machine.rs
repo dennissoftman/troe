@@ -539,6 +539,11 @@ fn passive_open_retains_bytes_and_fin_carried_by_the_final_acknowledgement() -> 
     );
     assert_eq!(&received[..request.len()], request);
     assert_eq!(connection.read(&mut received)?, Some(0), "orderly peer EOF");
+    // A peer may finish its request before the server writes the response.
+    connection.begin_send(b"response")?;
+    let _ack = connection.poll_emission(0)?;
+    let response = connection.poll_emission(0)?.ok_or(TcpError::Invalid)?;
+    assert_eq!(response.payload, b"response");
     Ok(())
 }
 
@@ -586,6 +591,25 @@ fn listener_admits_only_a_bare_syn_for_its_own_endpoint() -> Result<(), TcpError
 fn retransmitted_inbound_syn_never_opens_a_second_connection() -> Result<(), TcpError> {
     let mut listener = TcpListener::bind(SERVER, MAX_TCP_BACKLOG)?;
     admit_syn(&mut listener, CLIENT, CLIENT_SEQUENCE, SERVER_SEQUENCE)?;
+
+    assert!(listener.has_connection(segment(
+        CLIENT,
+        SERVER,
+        CLIENT_SEQUENCE,
+        0,
+        TcpFlags::SYN,
+        4096,
+        &[],
+    )));
+    assert!(!listener.has_connection(segment(
+        SERVER,
+        CLIENT,
+        CLIENT_SEQUENCE,
+        0,
+        TcpFlags::SYN,
+        4096,
+        &[],
+    )));
 
     // The pending SYN+ACK schedule answers a retransmitted SYN; a second
     // queue entry for the same tuple would duplicate the connection.
