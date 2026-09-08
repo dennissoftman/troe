@@ -132,6 +132,9 @@ impl CallChainTable {
     /// caller or target that already owns a synchronous call as
     /// [`CallChainError::Busy`]. Every check runs before any mutation, so a
     /// rejected call leaves the table unchanged.
+    // Let native composition eliminate copies while retaining every model check.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn enter(&mut self, caller: TaskId, target: TaskId) -> Result<usize, CallChainError> {
         if caller == target {
             self.stats.deadlocks = self.stats.deadlocks.saturating_add(1);
@@ -187,6 +190,9 @@ impl CallChainTable {
         Ok(depth)
     }
 
+    // Let native composition eliminate copies while retaining every model check.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn begin(&mut self, caller: TaskId, target: TaskId) -> Result<usize, CallChainError> {
         let index = self
             .chains
@@ -222,6 +228,9 @@ impl CallChainTable {
     /// # Errors
     ///
     /// Rejects a task that is not the active member of any chain.
+    // Let native composition eliminate copies while retaining every model check.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn unwind(&mut self, member: TaskId) -> Result<Option<TaskId>, CallChainError> {
         let index = self.chain_of(member).ok_or(CallChainError::NotActive)?;
         let chain = self

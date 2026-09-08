@@ -145,7 +145,10 @@ struct Pending {
     endpoint: EndpointId,
     badge: ClientBadge,
     interface: u32,
-    call: Call,
+    deadline_millis: u64,
+    opcode: u16,
+    request_bytes: u16,
+    reply_capacity: u16,
 }
 
 /// Live state used to prove exact cancellation and teardown.
@@ -404,6 +407,9 @@ impl Runtime {
     /// Invalid authority/scalars fault the caller; capacity/cycle/timeout become
     /// typed client results with no service-visible admission.
     #[allow(clippy::too_many_lines)]
+    // Elide aggregate transition copies at the native trap boundary.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn call(&mut self, caller: Actor, call: Call, now: u64) -> Result<Transition, Error> {
         let c = self.context(caller)?;
         if c.outbound.is_some()
@@ -469,7 +475,7 @@ impl Runtime {
                         p.endpoint == endpoint
                             && self.pending.payload_slot(p.id).ok().flatten().is_some()
                     })
-                    .map(|p| u32::from(p.call.request_bytes))
+                    .map(|p| u32::from(p.request_bytes))
                     .sum::<u32>()
                     .saturating_add(u32::from(call.request_bytes))
                     > limits.retained_bytes())
@@ -516,7 +522,10 @@ impl Runtime {
             endpoint,
             badge,
             interface,
-            call,
+            deadline_millis: call.deadline_millis,
+            opcode: call.opcode,
+            request_bytes: call.request_bytes,
+            reply_capacity: call.reply_capacity,
         };
         self.calls[id.slot() as usize] = Some(pending);
         self.contexts[caller.slot()].outbound = Some(id);
@@ -547,6 +556,9 @@ impl Runtime {
     /// # Errors
     /// Stale, cancelled, oversized, foreign or transport-status replies fault
     /// the server before any client RX bytes are written.
+    // Elide aggregate transition copies at the native trap boundary.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn reply_wait(
         &mut self,
         server: Actor,
@@ -611,10 +623,7 @@ impl Runtime {
             return Err(Error::Invalid);
         }
         let p = self.pending_record(id)?;
-        if p.server != server
-            || wait.reply_bytes > p.call.reply_capacity
-            || p.call.deadline_millis <= now
-        {
+        if p.server != server || wait.reply_bytes > p.reply_capacity || p.deadline_millis <= now {
             return Err(Error::Invalid);
         }
         Ok(())
@@ -736,7 +745,7 @@ impl Runtime {
                         .map_err(|_| Error::Invalid)?
                         .ok_or(Error::Invalid)?;
                     let p = self.pending_record(delivery.call)?;
-                    if p.call.deadline_millis <= now {
+                    if p.deadline_millis <= now {
                         return Err(Error::Invalid);
                     }
                     self.delivered(p)?;
@@ -747,7 +756,7 @@ impl Runtime {
                             reply: false,
                             source: Buffer::Queue(queue),
                             destination: Buffer::Rx(server),
-                            bytes: p.call.request_bytes,
+                            bytes: p.request_bytes,
                         }),
                         handoff: Some(server),
                     });
@@ -1164,9 +1173,9 @@ impl Runtime {
             source: u16::try_from(index).map_err(|_| Error::Invalid)?,
             badge: u32::try_from(p.badge.event_value()).map_err(|_| Error::Invalid)?,
             interface: p.interface,
-            opcode: p.call.opcode,
-            request_bytes: p.call.request_bytes,
-            reply_capacity: p.call.reply_capacity,
+            opcode: p.opcode,
+            request_bytes: p.request_bytes,
+            reply_capacity: p.reply_capacity,
         }));
         Ok(())
     }

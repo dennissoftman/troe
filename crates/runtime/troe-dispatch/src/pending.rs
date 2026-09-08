@@ -264,6 +264,9 @@ impl PendingCallTable {
     /// exceed the retained-byte ceiling. Queue-full and table-full are distinct
     /// results, and neither has any service-visible effect.
     #[allow(clippy::too_many_arguments)]
+    // Let native composition eliminate copies while retaining every model check.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn admit(
         &mut self,
         endpoint_slot: u32,
@@ -446,6 +449,9 @@ impl PendingCallTable {
     /// never took, and an accounting failure. A call may only be replied to
     /// from [`CallState::Delivered`], because a reply to a call no server
     /// observed would be a forged completion.
+    // Let native composition eliminate copies while retaining every model check.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn complete(
         &mut self,
         call: CallId,
