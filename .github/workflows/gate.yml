@@ -148,9 +148,23 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/.cargo/bin
             target
           key: cargo-focused-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-focused-
+
+      # `dependency audit` runs `cargo audit`, which is not a runner default.
+      # docs/testing.md pins 0.22.1, so install exactly that; a restored cache
+      # already holds the binary and the version check skips the build.
+      - name: Install the pinned cargo-audit
+        run: |
+          set -euo pipefail
+          if cargo audit --version 2>/dev/null | grep -q '0\.22\.1'; then
+            echo "cached: $(cargo audit --version)"
+          else
+            cargo install cargo-audit --version 0.22.1 --locked
+          fi
+          cargo audit --version
 
       - name: Run focused verification
         run: |
@@ -200,9 +214,23 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/.cargo/bin
             target
           key: cargo-host-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-host-
+
+      # `dependency audit` runs `cargo audit`, which is not a runner default.
+      # docs/testing.md pins 0.22.1, so install exactly that; a restored cache
+      # already holds the binary and the version check skips the build.
+      - name: Install the pinned cargo-audit
+        run: |
+          set -euo pipefail
+          if cargo audit --version 2>/dev/null | grep -q '0\.22\.1'; then
+            echo "cached: $(cargo audit --version)"
+          else
+            cargo install cargo-audit --version 0.22.1 --locked
+          fi
+          cargo audit --version
 
       # rustup reads rust-toolchain.toml, so the channel, profile, components
       # and all four bare-metal targets install without being named here.
@@ -267,6 +295,7 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
+            ~/.cargo/bin
             target
           key: cargo-${{ matrix.platform }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ matrix.platform }}-
