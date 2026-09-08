@@ -35,6 +35,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "troe-service-diagnostics-persistent"
+version = "0.1.0"
+dependencies = [
+ "troe-kex-sdk",
+]
+
+[[package]]
 name = "troe-service-ipc-client"
 version = "0.1.0"
 dependencies = [
@@ -43,6 +50,20 @@ dependencies = [
 
 [[package]]
 name = "troe-service-ipc-echo"
+version = "0.1.0"
+dependencies = [
+ "troe-kex-sdk",
+]
+
+[[package]]
+name = "troe-service-ipc-persistent"
+version = "0.1.0"
+dependencies = [
+ "troe-kex-sdk",
+]
+
+[[package]]
+name = "troe-service-ipc-relay"
 version = "0.1.0"
 dependencies = [
  "troe-kex-sdk",

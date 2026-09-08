@@ -79,3 +79,9 @@ lto = "fat"
 opt-level = "z"
 panic = "abort"
 strip = "symbols"
+
+# The bounded transport model runs on every protected call and reply. Preserve
+# speed optimization for its checked table operations inside the size-optimized
+# kernel; payloads and ownership tables remain fixed-capacity.
+[profile.release.package.troe-service]
+opt-level = 3

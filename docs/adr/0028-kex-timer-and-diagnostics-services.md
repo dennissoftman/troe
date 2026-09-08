@@ -3,6 +3,11 @@
 Status: accepted and implemented for the Stage 9 timer and diagnostics command
 migration, 2026-08-25; isolated diagnostics-server amendment, 2026-08-26.
 
+Supersession: [ADR 0035 Phase C](https://github.com/dennissoftman/troe/issues/8)
+replaces per-request diagnostics launch with a persistent initialized incarnation,
+scalar kernel continuations and bounded restart. The one-shot composition below
+is retained only as the acceptance compatibility comparison.
+
 ## Decision
 
 Timer and diagnostics remain separate least-authority KEX interfaces. A package

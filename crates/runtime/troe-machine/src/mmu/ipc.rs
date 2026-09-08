@@ -541,8 +541,7 @@ impl UserAddressSpace {
     ///
     /// # Errors
     /// Rejects absent or incompatible endpoint and wait-set authority. Only the
-    /// synthetic acceptance composition publishes persistent endpoints.
-    #[cfg(feature = "acceptance-probes")]
+    /// kernel composition publishes persistent endpoints.
     pub fn authorize_persistent_ipc(&mut self, startup: u64) -> Result<(), MmuError> {
         authority(self, startup, troe_abi::interface::SERVER_ENDPOINT, 2, 6)?;
         let (wait_set, _) = authority(self, startup, troe_abi::interface::WAIT_SET, 1, 8)?;
@@ -554,7 +553,7 @@ impl UserAddressSpace {
     }
 }
 
-fn authority(
+pub(super) fn authority(
     space: &UserAddressSpace,
     startup: u64,
     interface: u32,
@@ -641,7 +640,7 @@ fn idle_event(kind: EventKind) -> Event {
     }
 }
 #[cfg(target_arch = "x86_64")]
-fn set_event(context: &mut ArchitectureApplicationContext, event: Event) {
+pub(super) fn set_event(context: &mut ArchitectureApplicationContext, event: Event) {
     let words = event.words();
     (
         context.rax,
@@ -653,7 +652,7 @@ fn set_event(context: &mut ArchitectureApplicationContext, event: Event) {
     ) = (words[0], words[1], words[2], words[3], words[4], words[5]);
 }
 #[cfg(target_arch = "aarch64")]
-fn set_event(context: &mut ArchitectureApplicationContext, event: Event) {
+pub(super) fn set_event(context: &mut ArchitectureApplicationContext, event: Event) {
     context.general[..6].copy_from_slice(&event.words());
 }
 

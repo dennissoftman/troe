@@ -452,6 +452,11 @@ pub(crate) fn run_shell_task(task: &mut ShellTask<'_>) -> TaskStep {
             }
         }
         if let Some(action) = shell.machine_action() {
+            task.scheduler
+                .yield_current(task.task_id)
+                .unwrap_or_else(|_| fatal(b"fatal: cannot park shell before shutdown\n"));
+            crate::supervisor::shutdown_all(task.scheduler, task.accounting)
+                .unwrap_or_else(|()| fatal(b"fatal: persistent service shutdown failed\n"));
             perform_machine_action(action, &mut console);
         }
     }

@@ -5,17 +5,21 @@
 //! with the wait it registered, and resumed when the wait fires. This is the
 //! plumbing that lets one cooperative task block without stalling the loop.
 //!
-//! This module routes compatibility calls. The private-page synthetic endpoint
-//! is composed separately in `ipc` and owns both suspended task contexts.
+//! This module routes compatibility calls. Product diagnostics defers into the
+//! scalar records in `client`; the supervisor owns its persistent server.
+//! Blocking compatibility runners are compiled only for acceptance comparisons.
 
-use crate::handles::{
-    SharedApplicationDatagram, SharedChildTable, SharedDiagnosticsSnapshot, SharedPipeTable,
-    SharedRuntime,
-};
+#[cfg(feature = "acceptance-probes")]
+use crate::handles::SharedDiagnosticsSnapshot;
+use crate::handles::{SharedApplicationDatagram, SharedChildTable, SharedPipeTable, SharedRuntime};
 use crate::invocation::CommandApplicationHandle;
-use crate::limits::{APPLICATION_DATAGRAM_WAIT_MILLISECONDS, APPLICATION_TIMESLICE_MILLISECONDS};
+use crate::limits::APPLICATION_DATAGRAM_WAIT_MILLISECONDS;
+#[cfg(feature = "acceptance-probes")]
+use crate::limits::APPLICATION_TIMESLICE_MILLISECONDS;
+#[cfg(feature = "acceptance-probes")]
 use crate::machine::OwnedAccounting;
 use crate::network::ReceivedUdp;
+#[cfg(feature = "acceptance-probes")]
 use crate::service::diagnostics::run_diagnostics_server;
 use crate::service::process::child_process_status;
 use crate::session::{SESSION_TERMINAL_WAIT_IDENTITY, SharedSessionTerminal};
@@ -25,10 +29,12 @@ use troe_abi::{datagram, diagnostics, pipe, process_launch, stream, timer};
 use troe_dispatch::ReplyStatus;
 use troe_process::{OwnerId, PipeEndpoint, ProcessError as ChildProcessError};
 use troe_task::{
-    Capabilities, MonotonicMillis, PendingCallState, PendingCallTable, PendingOperationId,
-    Scheduler, TaskId, WaitObservation, WaitRegistration, WaitResource, WaitSpec, WaitTable,
-    WakeInterest, WakeReason,
+    MonotonicMillis, PendingCallTable, PendingOperationId, TaskId, WaitResource, WaitSpec,
+    WaitTable, WakeInterest, WakeReason,
 };
+
+#[cfg(feature = "acceptance-probes")]
+use troe_task::{Capabilities, PendingCallState, Scheduler, WaitObservation, WaitRegistration};
 
 pub(crate) struct CommandDeferredServices {
     pub(crate) runtime: SharedRuntime,
@@ -60,6 +66,7 @@ pub(crate) enum DeferredCallKind {
     },
     Diagnostics {
         resource: WaitResource,
+        deadline: MonotonicMillis,
     },
     Child {
         children: SharedChildTable,
@@ -641,19 +648,25 @@ pub(crate) fn prepare_deferred_call(
             )
             .map_err(|_| ())?;
         *next_request_id = (*next_request_id).checked_add(1).ok_or(())?;
+        let deadline = MonotonicMillis::from_millis(
+            troe_machine::monotonic_millis()
+                .ok_or(())?
+                .checked_add(4000)
+                .ok_or(())?,
+        );
         let resource = WaitResource::new(operation.abi_value(), task_id.get()).map_err(|_| ())?;
         let spec = WaitSpec::new(
             task_id,
             operation,
             Some(resource),
             WakeInterest::RESOURCE_READY,
-            None,
+            Some(deadline),
         )
         .map_err(|_| ())?;
         return Ok(DeferredCallPreparation::Blocked {
             operation,
             spec,
-            kind: DeferredCallKind::Diagnostics { resource },
+            kind: DeferredCallKind::Diagnostics { resource, deadline },
         });
     }
     if interface != troe_abi::interface::DATAGRAM || opcode != datagram::RECEIVE {
@@ -877,6 +890,7 @@ pub(crate) fn deferred_reply(
 }
 
 #[allow(clippy::too_many_lines)]
+#[cfg(feature = "acceptance-probes")]
 pub(crate) fn wait_for_deferred_call(
     scheduler: &mut Scheduler,
     task_id: TaskId,
@@ -1005,6 +1019,7 @@ pub(crate) fn wait_for_deferred_call(
 
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "acceptance-probes")]
 pub(crate) fn complete_diagnostics_deferred_call(
     scheduler: &mut Scheduler,
     accounting: &mut OwnedAccounting,
@@ -1076,6 +1091,7 @@ pub(crate) fn complete_diagnostics_deferred_call(
 
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
+#[cfg(feature = "acceptance-probes")]
 pub(crate) fn resume_deferred_application_call(
     scheduler: &mut Scheduler,
     accounting: &mut OwnedAccounting,
@@ -1116,7 +1132,7 @@ pub(crate) fn resume_deferred_application_call(
         }
         WaitRegistration::Blocked(wait) => {
             let diagnostics = match &kind {
-                DeferredCallKind::Diagnostics { resource } => {
+                DeferredCallKind::Diagnostics { resource, .. } => {
                     Some((Rc::clone(diagnostics_snapshot.ok_or(())?), *resource))
                 }
                 DeferredCallKind::Timer { .. }

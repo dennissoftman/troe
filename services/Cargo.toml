@@ -2,9 +2,12 @@
 resolver = "3"
 members = [
     "diagnostics",
+    "diagnostics-persistent",
     "diagnostics-benchmark",
     "diagnostics-fault",
     "ipc-echo",
+    "ipc-persistent",
+    "ipc-relay",
     "ipc-client",
 ]
 

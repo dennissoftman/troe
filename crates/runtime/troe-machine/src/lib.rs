@@ -242,7 +242,7 @@ pub use ipc_pages::{ipc_range_is_zero, verify_ipc_pool};
 #[cfg(all(target_os = "uefi", feature = "acceptance-probes"))]
 pub use mmu::TagIdentity;
 #[cfg(target_os = "uefi")]
-pub use mmu::{IpcPair, IpcStats, IpcStop, TagStats, tag_stats};
+pub use mmu::{IpcPair, IpcStats, IpcStop, ProtectedRuntime, ProtectedStop, TagStats, tag_stats};
 
 #[cfg(target_os = "uefi")]
 pub use ipc_pages::{
@@ -935,3 +935,6 @@ fn acknowledge_network_interrupt_from_isr() -> bool {
         VirtioTransportKind::PciGic { .. } => false,
     }
 }
+
+#[cfg(feature = "acceptance-probes")]
+pub use mmu::FaultPoint;

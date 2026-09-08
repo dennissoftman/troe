@@ -279,14 +279,31 @@ exception: its immutable snapshot crosses a canonical copied
 receive/reply transport to an isolated KEX server, while the remaining
 registered services stay in-process.
 
-Server-endpoint calls use fixed kernel request/reply buffers and let the
-endpoint encode directly into caller-owned reply storage. The protected
-receive-to-reply interval therefore performs no dynamic allocation while still
-copying across the protection boundary. The diagnostics composition retains at most
-one request and one suspended server context. It launches one server process
-per client request and implements no persistent residency or restart policy.
-Persistent services are tracked in
-[GitHub issue #8](https://github.com/dennissoftman/troe/issues/8).
+Diagnostics runs as one persistent ABI 1.3 KEX instance. Its boot record fixes a
+256-page resident ceiling, a 4,000 ms initialization deadline, and at most three
+starts in 60 seconds. Ordinary handles become available only after the empty
+successful lifecycle initialization reply. Task, endpoint, handle, wait and tag
+identities belong to an incarnation; a replacement never inherits client handles
+or replays requests. Clean unsolicited exit remains offline. Poweroff and reboot
+request the lifecycle shutdown handshake before reclaiming the service.
+Boot artifacts are immutable image bytes, limited to 4 MiB each and 8 MiB in
+aggregate; configured resident ceilings must fit the 8,192-page aggregate bound.
+
+`troe-service::ipc::Runtime` composes the bounded endpoint, badge, pending-call,
+call-chain and immutable wait-set models. `ProtectedRuntime` owns up to 16 live
+KEX contexts and four kernel IPC pairs; the persistent profile admits eight
+servers, 16 endpoints, 256 handles (32 per owner), 32 pending calls, eight queued
+calls per endpoint, 128 KiB of copied queue storage, four chain members and four
+sources per wait set. Endpoint calls are FIFO, closure events cannot be dropped,
+and ready sources are selected round-robin. Cancellation and absolute deadlines
+consume one client fate; cancelled reply tokens cannot write client RX.
+
+Native diagnostics clients submit a copied snapshot and a scalar continuation
+containing task, operation, service incarnation and the original absolute
+deadline. The client step returns before the scheduler pump runs a server.
+Completion is consumed in a subsequent step. No client Rust frame, borrow or
+payload pointer is retained as a server continuation. Other product services
+remain in-process; the compatibility diagnostics runner is acceptance-only.
 
 `troe-terminal` keeps transport-independent input
 decoding, line editing, and history outside the machine mechanism, and
@@ -398,9 +415,9 @@ preallocating any policy ceiling.
 
 ABI 1.3 additionally reserves private TX/RX pages from the boot arena for up to
 16 live task incarnations, plus four kernel-only pairs. `troe-machine` owns
-these slots, retained PCID/ASID identities, and the protected two-context IPC
-mechanism; `kernel/src/ipc.rs` binds the synthetic acceptance client and echo
-server to exact startup capabilities. The same virtual addresses map distinct
+these slots, retained PCID/ASID identities, and the protected context runtime.
+The kernel supervisor binds each instance to exact startup capabilities;
+`kernel/src/ipc.rs` also retains the two-context acceptance comparison. The same virtual addresses map distinct
 physical pages in each root. The fast gate touches only shared supervisor
 mappings, including the IPC aliases, and never the general free-RAM identity map.
 
@@ -410,8 +427,12 @@ Waiting-server delivery uses no queue, allocation, scheduler selection, or TLB
 invalidation. A runnable server uses the retained copied queue slot, which is
 zeroed after delivery. Invalid tokens/scalars fault their owner; a server fault
 resumes the caller with `peer-died` and no replay. Lease expiry terminates the
-active member of this IPC segment. Product services retain the compatibility
-transport and their existing scheduling contracts.
+active member of this IPC segment. A queued or blocked continuation resumes
+with a fresh bounded execution segment while retaining the call's original
+absolute deadline. All native peer identities are validated before a masked
+segment; owned sessions and tag leases cannot change during that segment, and
+each root activation additionally checks its retained tag. Fixed boot-service
+reservations cannot be widened by heap-growth calls; exhaustion is typed.
 
 PCID/ASID 0 belongs to the kernel; task slots use 1–16. x86 enables PCID only
 with both PCID and INVPCID support, otherwise reporting full-flush fallback.

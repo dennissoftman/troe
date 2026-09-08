@@ -187,6 +187,7 @@ pub(crate) fn complete_handoff(
         RandomGenerator::new(entropy_seed).map_err(|_| ())?,
     ));
     Ok(OwnedAccounting {
+        persistent_services: None,
         map,
         frames,
         #[cfg(feature = "acceptance-probes")]

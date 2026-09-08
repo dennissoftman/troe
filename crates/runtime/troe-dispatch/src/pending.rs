@@ -184,6 +184,7 @@ pub struct PendingCallStats {
 /// Bounded table of pending synchronous calls and their endpoint queues.
 #[derive(Debug)]
 pub struct PendingCallTable {
+    queued_live: u32,
     slots: Vec<CallSlot>,
     free_queue_slots: Vec<QueueSlotId>,
     loaned_queue_slots: u32,
@@ -244,6 +245,7 @@ impl PendingCallTable {
             loaned_queue_slots: 0,
             retained_ceiling,
             next_sequence: 0,
+            queued_live: 0,
             stats: PendingCallStats::default(),
         })
     }
@@ -347,6 +349,7 @@ impl PendingCallTable {
         record.state = state;
         record.payload = payload;
         if let Some((slot, retained)) = reservation {
+            self.queued_live += 1;
             self.free_queue_slots.retain(|free| *free != slot);
             self.loaned_queue_slots = self.loaned_queue_slots.saturating_add(1);
             self.stats.retained_bytes = retained;
@@ -376,6 +379,24 @@ impl PendingCallTable {
             },
             admission,
         ))
+    }
+
+    /// Queue storage reserved for an admitted call, before delivery.
+    ///
+    /// # Errors
+    /// Rejects a stale or completed call.
+    pub fn payload_slot(&self, call: CallId) -> Result<Option<QueueSlotId>, DispatchError> {
+        Ok(self.slots[self.live_index(call)?].payload)
+    }
+
+    /// Observe the FIFO head without consuming its delivery or payload slot.
+    #[must_use]
+    pub fn next_queued(&self, endpoint_slot: u32) -> Option<CallId> {
+        let index = self.oldest_queued(endpoint_slot)?;
+        Some(CallId {
+            slot: u32::try_from(index).ok()?,
+            generation: self.slots[index].generation,
+        })
     }
 
     /// Deliver the oldest queued call at one endpoint.
@@ -409,6 +430,7 @@ impl PendingCallTable {
             .get_mut(index)
             .ok_or(DispatchError::InvalidCall)?;
         record.state = CallState::Delivered;
+        self.queued_live -= 1;
         // The bytes stop being retained the moment they reach the server, but
         // the slot itself stays loaned until composition zeroes and recycles it.
         record.payload = None;
@@ -455,6 +477,9 @@ impl PendingCallTable {
             .slots
             .get_mut(index)
             .ok_or(DispatchError::InvalidCall)?;
+        if record.state == CallState::Queued {
+            self.queued_live -= 1;
+        }
         record.state = CallState::Ended(outcome);
         record.payload = None;
         record.occupied = false;
@@ -546,6 +571,9 @@ impl PendingCallTable {
     /// Calls currently queued at one endpoint.
     #[must_use]
     pub fn queued_at(&self, endpoint_slot: u32) -> usize {
+        if self.queued_live == 0 {
+            return 0;
+        }
         self.slots
             .iter()
             .filter(|slot| {
@@ -569,6 +597,9 @@ impl PendingCallTable {
     }
 
     fn oldest_queued(&self, endpoint_slot: u32) -> Option<usize> {
+        if self.queued_live == 0 {
+            return None;
+        }
         self.slots
             .iter()
             .enumerate()

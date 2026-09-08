@@ -19,6 +19,12 @@ use troe_memory::{MappingMemoryType, MappingPrivilege};
 #[cfg(target_os = "uefi")]
 mod ipc;
 #[cfg(target_os = "uefi")]
+mod protected;
+#[cfg(feature = "acceptance-probes")]
+pub use protected::FaultPoint;
+#[cfg(target_os = "uefi")]
+pub use protected::{ProtectedRuntime, ProtectedStop};
+#[cfg(target_os = "uefi")]
 mod tags;
 #[cfg(target_os = "uefi")]
 pub use ipc::{IpcPair, IpcStats, IpcStop};
@@ -761,6 +767,7 @@ enum RunKind {
     Stage6Probe,
     Application,
     Ipc,
+    Protected,
 }
 
 #[cfg(target_os = "uefi")]
@@ -3149,6 +3156,13 @@ extern "C" fn x86_isolated_syscall_handler(frame: *mut ArchitectureApplicationCo
     let frame = unsafe { &mut *frame };
     match active_run_kind() {
         Some(RunKind::Stage6Probe) => isolated_syscall(frame.rax, frame.rdi, frame.rsi, frame.rdx),
+        Some(RunKind::Protected) => protected::syscall(
+            frame.rax,
+            [
+                frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
+            ],
+            frame,
+        ),
         Some(RunKind::Ipc) => ipc::syscall(
             frame.rax,
             [
@@ -3263,9 +3277,12 @@ extern "C" fn x86_execution_timer_handler(frame: *const ArchitectureApplicationC
     let frame = unsafe { &*frame };
     if frame.code_selector & 3 == 3
         && ISOLATED_ACTIVE.load(Ordering::Acquire)
-        && matches!(active_run_kind(), Some(RunKind::Application | RunKind::Ipc))
+        && matches!(
+            active_run_kind(),
+            Some(RunKind::Application | RunKind::Ipc | RunKind::Protected)
+        )
     {
-        if active_run_kind() == Some(RunKind::Ipc) {
+        if matches!(active_run_kind(), Some(RunKind::Ipc | RunKind::Protected)) {
             encoded_fault(IsolatedFault::ExecutionLeaseExpired)
         } else {
             preempt_application(frame.clone())
@@ -4314,13 +4331,16 @@ extern "C" fn troe_aarch64_input_interrupt(frame: *const ArchitectureApplication
     let frame = unsafe { &*frame };
     if crate::mechanism::handle_application_interrupt() {
         let active_application = ISOLATED_ACTIVE.load(Ordering::Acquire)
-            && matches!(active_run_kind(), Some(RunKind::Application | RunKind::Ipc));
+            && matches!(
+                active_run_kind(),
+                Some(RunKind::Application | RunKind::Ipc | RunKind::Protected)
+            );
         if !active_application {
             // A disarmed level timer can still have one acknowledged edge in
             // flight. With no published run there is no context to complete.
             0
         } else if frame.status & AARCH64_SPSR_MODE_MASK == 0 {
-            if active_run_kind() == Some(RunKind::Ipc) {
+            if matches!(active_run_kind(), Some(RunKind::Ipc | RunKind::Protected)) {
                 encoded_fault(IsolatedFault::ExecutionLeaseExpired)
             } else {
                 preempt_application(frame.clone())
@@ -4354,6 +4374,18 @@ extern "C" fn troe_aarch64_isolated_syscall(
                 frame.general[1],
                 frame.general[2],
                 frame.general[3],
+            ),
+            Some(RunKind::Protected) => protected::syscall(
+                frame.general[8],
+                [
+                    frame.general[0],
+                    frame.general[1],
+                    frame.general[2],
+                    frame.general[3],
+                    frame.general[4],
+                    frame.general[5],
+                ],
+                frame,
             ),
             Some(RunKind::Ipc) => ipc::syscall(
                 frame.general[8],

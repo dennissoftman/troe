@@ -104,12 +104,15 @@ pub struct PersistentContext {
     pages: IpcPages,
     wait_set: u64,
     heap: Option<HeapRegion>,
+    calls: [Option<(u32, u16, u16, IpcHandle)>; 32],
 }
 
 impl PersistentContext {
     fn from_startup(startup: &Startup<'_>) -> Result<Self, StartupError> {
         let endpoint = startup.required_handle(interface::SERVER_ENDPOINT, 2, 0)?;
         let wait_set = startup.required_handle(interface::WAIT_SET, 1, 0)?;
+        let mut calls = [None; 32];
+        let mut count = 0;
         for descriptor in startup.descriptors_before(startup.handle_count) {
             let descriptor = descriptor?;
             let required = if descriptor.value == endpoint.value {
@@ -117,6 +120,16 @@ impl PersistentContext {
             } else if descriptor.value == wait_set.value {
                 interface::rights::WAIT
             } else {
+                if descriptor.rights == u32::from(interface::rights::CALL) {
+                    let slot = calls.get_mut(count).ok_or(StartupError::MissingAuthority)?;
+                    *slot = Some((
+                        descriptor.interface,
+                        descriptor.major,
+                        descriptor.minor,
+                        IpcHandle(descriptor.value),
+                    ));
+                    count += 1;
+                }
                 continue;
             };
             if descriptor.rights != u32::from(required) {
@@ -127,7 +140,59 @@ impl PersistentContext {
             pages: startup.ipc_pages()?.ok_or(StartupError::InvalidPage)?,
             wait_set: wait_set.value,
             heap: startup.heap_region()?,
+            calls,
         })
+    }
+
+    /// Select a typed startup call grant without retaining the startup page.
+    ///
+    /// # Errors
+    /// Rejects absent or ambiguous interface/version authority.
+    pub fn call_handle(&self, interface: u32, major: u16, minor: u16) -> Result<IpcHandle, Error> {
+        let mut matches = self
+            .calls
+            .iter()
+            .flatten()
+            .filter(|&&(id, ma, mi, _)| id == interface && ma == major && mi == minor);
+        let handle = matches
+            .next()
+            .map(|entry| entry.3)
+            .ok_or(Error::InvalidCall)?;
+        if matches.next().is_some() {
+            return Err(Error::InvalidCall);
+        }
+        Ok(handle)
+    }
+
+    /// Make a nested call with exclusive page ownership and an absolute deadline.
+    ///
+    /// ```compile_fail
+    /// use troe_kex_sdk::{PersistentContext, IpcHandle};
+    /// fn cannot_retain_rx(context: &mut PersistentContext, handle: IpcHandle) {
+    ///     let request = context.rx();
+    ///     context.call(handle, 1, 0, 4096, 100).ok();
+    ///     core::hint::black_box(request);
+    /// }
+    /// ```
+    ///
+    /// # Errors
+    /// Returns canonical service or transport failure; RX is empty on failure.
+    pub fn call(
+        &mut self,
+        handle: IpcHandle,
+        opcode: u16,
+        request_bytes: usize,
+        reply_capacity: usize,
+        deadline_millis: u64,
+    ) -> Result<(), Error> {
+        self.pages.call(
+            handle,
+            opcode,
+            request_bytes,
+            reply_capacity,
+            deadline_millis,
+            0,
+        )
     }
 
     /// Take the optional unique heap owner.

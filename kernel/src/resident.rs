@@ -48,6 +48,7 @@ pub(crate) struct ResidentLaunch {
 }
 
 pub(crate) struct ResidentApplication<'service> {
+    diagnostics_generation: Option<u32>,
     pub(crate) task_id: TaskId,
     process_id: ProcessId,
     processes: SharedProcessTable,
@@ -166,6 +167,9 @@ impl ResidentProcessTable {
         scheduler: &mut Scheduler,
         accounting: &mut OwnedAccounting,
     ) -> Result<(), ()> {
+        // Every client step has returned before a server resumes. Only owned
+        // scalar continuation records survive this scheduler boundary.
+        crate::supervisor::step(scheduler, accounting)?;
         for index in 0..self.jobs.len() {
             if self.jobs[index].outcome.is_some() {
                 continue;

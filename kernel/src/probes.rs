@@ -353,7 +353,8 @@ pub(crate) fn run_isolated_ipc_baseline_verification(
             return Err(());
         }
     }
-    crate::ipc::verify(scheduler, accounting, compatibility_p95)
+    crate::ipc::verify(scheduler, accounting, compatibility_p95)?;
+    crate::supervisor::benchmark::verify(scheduler, accounting, compatibility_p95)
 }
 
 #[cfg(feature = "acceptance-probes")]
@@ -363,7 +364,9 @@ pub(crate) fn emit_ipc_samples(
     frequency: u64,
     samples: &[u64; IPC_BASELINE_SAMPLES],
 ) -> Result<(), ()> {
-    let record = if path.starts_with("persistent-") {
+    let record = if path.starts_with("general-") {
+        "ipc-phase-c-samples"
+    } else if path.starts_with("persistent-") {
         "ipc-phase-b-samples"
     } else {
         "ipc-samples"

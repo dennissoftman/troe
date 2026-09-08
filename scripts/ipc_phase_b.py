@@ -31,7 +31,14 @@ def p95(ticks: list[int]) -> int:
     return value
 
 
-def validate(output: str, *, require_tagged: bool) -> dict[str, Any]:
+def validate(
+    output: str,
+    *,
+    require_tagged: bool,
+    paths: tuple[str, ...] = PATHS,
+    record_prefix: str = "ipc-phase-b",
+    sample_prefix: str = "ipc-phase-b-samples",
+) -> dict[str, Any]:
     """Recompute every ratio and require actual direct/queued structural counts."""
     checks = [
         fields(line)
@@ -53,14 +60,14 @@ def validate(output: str, *, require_tagged: bool) -> dict[str, Any]:
     compatibility = {}
     for line in output.splitlines():
         if not line.startswith(
-            ("ipc-phase-b ", "ipc-phase-b-samples ", "ipc-samples ")
+            (f"{record_prefix} ", f"{sample_prefix} ", "ipc-samples ")
         ):
             continue
         row = fields(line)
         key = (row.pop("path"), int(row.pop("payload")))
-        if line.startswith("ipc-phase-b "):
+        if line.startswith(f"{record_prefix} "):
             destination = rows
-        elif line.startswith("ipc-phase-b-samples "):
+        elif line.startswith(f"{sample_prefix} "):
             destination = raw
         elif key[0] == "isolated-diagnostics":
             destination = compatibility
@@ -69,7 +76,7 @@ def validate(output: str, *, require_tagged: bool) -> dict[str, Any]:
         if key in destination:
             raise ValueError("duplicate IPC row")
         destination[key] = row
-    expected = {(path, size) for path in PATHS for size in PAYLOADS}
+    expected = {(path, size) for path in paths for size in PAYLOADS}
     if (
         set(rows) != expected
         or set(raw) != expected

@@ -22,6 +22,7 @@ pub(crate) const fn native_application_target() -> Target {
     }
 }
 
+#[cfg(feature = "acceptance-probes")]
 pub(crate) fn native_diagnostics_server_artifact() -> (&'static [u8], bool) {
     #[cfg(feature = "acceptance-probes")]
     if DIAGNOSTICS_FAULT_PROBE_REQUESTED.swap(false, Ordering::AcqRel) {

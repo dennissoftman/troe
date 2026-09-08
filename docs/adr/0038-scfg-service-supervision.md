@@ -3,6 +3,11 @@
 Status: accepted; bounded supervisor and boot-service increment implemented,
 2026-08-27.
 
+Current composition: [ADR 0035 Phase C](https://github.com/dennissoftman/troe/issues/8)
+supersedes the one-shot diagnostics context below with a persistent initialized
+KEX incarnation. Its fixed kernel boot record and restart ownership are separate
+from the SCFG resident-job service graph specified here.
+
 ## Context
 
 SCFG v1 already describes service identities, boot-required, boot-optional,

@@ -16,12 +16,13 @@ use troe_dispatch::{BadgeTable, Dispatcher, HandleOwner, PortId, Rights};
 use troe_machine::{ApplicationOutcome, ApplicationSession, IpcPair, IpcStop};
 use troe_task::{Capabilities, IsolationResource, Scheduler, StackResource, TaskId};
 
-struct ProbeTask {
-    allocation: ApplicationAllocation,
-    task: TaskId,
-    owner: HandleOwner,
-    startup: u64,
-    session: ApplicationSession,
+pub(crate) struct ProbeTask {
+    pub(crate) actor: Option<troe_service::ipc::Actor>,
+    pub(crate) allocation: ApplicationAllocation,
+    pub(crate) task: TaskId,
+    pub(crate) owner: HandleOwner,
+    pub(crate) startup: u64,
+    pub(crate) session: ApplicationSession,
 }
 
 fn artifact(server: bool) -> &'static [u8] {
@@ -44,13 +45,12 @@ fn artifact(server: bool) -> &'static [u8] {
 }
 
 #[derive(Clone, Copy)]
-struct ProbeRequest {
-    bytes: usize,
-    opcode: u16,
-    argument: u64,
+pub(crate) struct ProbeRequest {
+    pub(crate) bytes: usize,
+    pub(crate) opcode: u16,
+    pub(crate) argument: u64,
 }
 
-#[allow(clippy::too_many_lines)]
 fn launch(
     accounting: &mut OwnedAccounting,
     scheduler: &mut Scheduler,
@@ -58,6 +58,44 @@ fn launch(
     port: PortId,
     server: bool,
     request: ProbeRequest,
+) -> Result<ProbeTask, ()> {
+    launch_owned(
+        accounting, scheduler, dispatcher, port, server, request, None,
+    )
+}
+
+pub(crate) fn launch_protected(
+    accounting: &mut OwnedAccounting,
+    scheduler: &mut Scheduler,
+    dispatcher: &mut Dispatcher<'_>,
+    port: PortId,
+    request: ProbeRequest,
+    runtime: &mut troe_machine::ProtectedRuntime,
+    endpoint: troe_dispatch::EndpointId,
+) -> Result<ProbeTask, ()> {
+    launch_owned(
+        accounting,
+        scheduler,
+        dispatcher,
+        port,
+        false,
+        request,
+        Some((runtime, endpoint)),
+    )
+}
+
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn launch_owned(
+    accounting: &mut OwnedAccounting,
+    scheduler: &mut Scheduler,
+    dispatcher: &mut Dispatcher<'_>,
+    port: PortId,
+    server: bool,
+    request: ProbeRequest,
+    mut protected: Option<(
+        &mut troe_machine::ProtectedRuntime,
+        troe_dispatch::EndpointId,
+    )>,
 ) -> Result<ProbeTask, ()> {
     let ProbeRequest {
         bytes,
@@ -89,6 +127,7 @@ fn launch(
     })?;
     let mut task_id = None;
     let mut live_owner = None;
+    let mut actor = None;
     let setup = (|| {
         prepare_application_memory(&allocation, &plan)?;
         let mut root =
@@ -165,6 +204,19 @@ fn launch(
                 minor,
             });
         }
+        if let Some((runtime, endpoint)) = protected.as_mut() {
+            let owner = runtime.model().attach(Some(task)).map_err(|_| ())?;
+            actor = Some(owner);
+            let value = runtime
+                .model()
+                .open(owner, *endpoint, troe_abi::interface::DIAGNOSTICS, 1, 0)
+                .map_err(|_| ())?;
+            handles
+                .iter_mut()
+                .find(|h| h.interface == troe_abi::interface::DIAGNOSTICS)
+                .ok_or(())?
+                .value = value;
+        }
         let mut startup = [0; 4096];
         plan.encode_startup_page(
             StartupInfo {
@@ -221,6 +273,7 @@ fn launch(
     })();
     if let Ok((task, owner, session)) = setup {
         Ok(ProbeTask {
+            actor,
             allocation,
             task,
             owner,
@@ -228,6 +281,11 @@ fn launch(
             session,
         })
     } else {
+        if let Some(actor) = actor
+            && let Some((runtime, _)) = protected.as_mut()
+        {
+            runtime.model().terminate(actor, false).map_err(|_| ())?;
+        }
         if let Some(task) = task_id {
             terminate_revoke_and_reap_task(scheduler, task, dispatcher, live_owner)?;
         }

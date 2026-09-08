@@ -300,6 +300,10 @@ pub(crate) fn prepare_resident_application_with_plan<'service, P: NativeApplicat
     }
 
     Ok(ResidentApplication {
+        diagnostics_generation: accounting
+            .persistent_services
+            .as_ref()
+            .and_then(|services| services.generation()),
         task_id,
         process_id,
         processes,

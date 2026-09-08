@@ -34,6 +34,8 @@ extern crate std;
 use alloc::vec::Vec;
 use core::fmt;
 
+pub mod ipc;
+
 /// Maximum persistent servers the Standard profile admits.
 pub const MAX_BOOT_SERVICES: usize = 8;
 /// Aggregate resident pages every persistent server may hold together.
@@ -48,10 +50,15 @@ pub const MAX_INITIALIZATION_DEADLINE_MILLIS: u64 = 4_000;
 /// before that server exists.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ServiceRole {
+    /// Isolated test-only roles; never configured in a product boot.
+    #[cfg(feature = "acceptance-probes")]
+    Acceptance(u8),
     /// The combined VFS, volume, and filesystem-provider server.
     Storage,
     /// The network protocol server.
     Network,
+    /// Persistent diagnostics snapshot validation service.
+    Diagnostics,
 }
 
 impl ServiceRole {
@@ -59,8 +66,11 @@ impl ServiceRole {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
+            #[cfg(feature = "acceptance-probes")]
+            Self::Acceptance(_) => "transport-probe",
             Self::Storage => "storage-server",
             Self::Network => "network-server",
+            Self::Diagnostics => "diagnostics-server",
         }
     }
 }
@@ -236,6 +246,8 @@ pub enum ServiceEvent {
     Started,
     /// The server answered initialization successfully.
     ReportedReady,
+    /// Teardown finished and the supervisor requested a bounded replacement.
+    RestartRequested,
     /// The server published a wait.
     Blocked,
     /// The server was woken from its wait.
@@ -244,6 +256,12 @@ pub enum ServiceEvent {
     Exited,
     /// The server faulted, was revoked, or its lease expired.
     Faulted,
+    /// The absolute execution lease expired in this incarnation.
+    LeaseExpired,
+    /// The initial handshake failed before ordinary handles were published.
+    InitializationRejected,
+    /// The supervisor revoked this incarnation.
+    Revoked,
     /// The supervisor asked the server to shut down, and it complied.
     ShutdownCompleted,
 }
@@ -265,6 +283,12 @@ pub enum ServiceError {
     IllegalTransition,
     /// Bounded metadata allocation failed.
     MetadataExhausted,
+    /// An event refers to a replaced or absent incarnation.
+    StaleIncarnation,
+    /// The incarnation generation cannot advance without wrapping.
+    GenerationExhausted,
+    /// Initialization was late, nonempty, or unsuccessful.
+    InitializationRejected,
 }
 
 impl fmt::Display for ServiceError {
@@ -279,6 +303,9 @@ impl fmt::Display for ServiceError {
             Self::UnknownRole => formatter.write_str("boot-service role is not configured"),
             Self::IllegalTransition => formatter.write_str("service transition is not legal"),
             Self::MetadataExhausted => formatter.write_str("service metadata allocation failed"),
+            Self::StaleIncarnation => formatter.write_str("stale service incarnation"),
+            Self::GenerationExhausted => formatter.write_str("service incarnation retired"),
+            Self::InitializationRejected => formatter.write_str("service initialization rejected"),
         }
     }
 }
@@ -291,6 +318,17 @@ impl fmt::Display for ServiceError {
 /// accidentally acquire one.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KernelContinuation {
+    /// Native diagnostics client suspended on an exact operation and server.
+    Diagnostics {
+        /// Scheduler identity of the requesting application.
+        task: u32,
+        /// Generation-checked compatibility operation.
+        operation: u64,
+        /// Service incarnation captured when the client handle was opened.
+        incarnation: u32,
+        /// Original absolute call deadline, retained across every resumption.
+        deadline_millis: u64,
+    },
     /// Waiting for one boot service to answer its initialization call.
     AwaitingInitialization {
         /// Role being started.
@@ -321,6 +359,7 @@ impl KernelContinuation {
     #[must_use]
     pub const fn role(self) -> ServiceRole {
         match self {
+            Self::Diagnostics { .. } => ServiceRole::Diagnostics,
             Self::AwaitingInitialization { role, .. }
             | Self::StagingArtifact { role, .. }
             | Self::AwaitingShutdown { role, .. } => role,
@@ -336,8 +375,31 @@ impl KernelContinuation {
                 total_bytes,
                 ..
             } => offset >= total_bytes,
-            Self::AwaitingInitialization { .. } | Self::AwaitingShutdown { .. } => false,
+            Self::Diagnostics { .. }
+            | Self::AwaitingInitialization { .. }
+            | Self::AwaitingShutdown { .. } => false,
         }
+    }
+}
+
+/// Exact ownership of one server start, never retargeted to a replacement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Incarnation {
+    role: ServiceRole,
+    generation: u32,
+    task: u32,
+}
+
+impl Incarnation {
+    /// Monotonic task identity owned by this service start.
+    #[must_use]
+    pub const fn task(self) -> u32 {
+        self.task
+    }
+    /// Role-local generation, advanced before initialization begins.
+    #[must_use]
+    pub const fn generation(self) -> u32 {
+        self.generation
     }
 }
 
@@ -349,6 +411,9 @@ struct ServiceEntry {
     starts: Vec<u64>,
     faults: u32,
     ready_transitions: u32,
+    generation: u32,
+    incarnation: Option<Incarnation>,
+    initialization_deadline: u64,
 }
 
 /// Live supervision accounting.
@@ -364,6 +429,14 @@ pub struct ServiceStats {
     pub faults: u64,
     /// Clean exits recorded across every role.
     pub exits: u64,
+    /// Faults specifically caused by an exhausted execution lease.
+    pub lease_deaths: u64,
+    /// Rejected initialization handshakes, distinct from ready-server faults.
+    pub initialization_rejections: u64,
+    /// Explicit supervisor revocations.
+    pub revocations: u64,
+    /// Acknowledged shutdowns, distinct from unsolicited clean exits.
+    pub shutdowns: u64,
 }
 
 /// Bounded supervisor over the configured boot services.
@@ -416,12 +489,105 @@ impl ServiceSupervisor {
                 starts,
                 faults: 0,
                 ready_transitions: 0,
+                generation: 0,
+                incarnation: None,
+                initialization_deadline: 0,
             });
         }
         Ok(Self {
             entries,
             stats: ServiceStats::default(),
         })
+    }
+
+    /// Start one exact task incarnation after any preceding teardown completed.
+    ///
+    /// # Errors
+    /// Rejects stale/live ownership, exhausted restart policy, zero task identity,
+    /// deadline overflow and maximum-generation reuse.
+    pub fn start(
+        &mut self,
+        role: ServiceRole,
+        task: u32,
+        now: u64,
+    ) -> Result<Incarnation, ServiceError> {
+        let entry = self.entry(role)?;
+        if task == 0 || entry.state.accepts_clients() || entry.state == ServiceState::Starting {
+            return Err(ServiceError::StaleIncarnation);
+        }
+        let generation = entry
+            .generation
+            .checked_add(1)
+            .ok_or(ServiceError::GenerationExhausted)?;
+        let deadline = now
+            .checked_add(entry.record.initialization_deadline_millis)
+            .ok_or(ServiceError::InitializationRejected)?;
+        if entry.state == ServiceState::Faulted
+            && self.apply(role, ServiceEvent::RestartRequested, now)? == ServiceState::Offline
+        {
+            return Err(ServiceError::IllegalTransition);
+        }
+        self.apply(role, ServiceEvent::Started, now)?;
+        let ticket = Incarnation {
+            role,
+            generation,
+            task,
+        };
+        let index = self.index(role)?;
+        self.entries[index].generation = generation;
+        self.entries[index].incarnation = Some(ticket);
+        self.entries[index].initialization_deadline = deadline;
+        Ok(ticket)
+    }
+
+    /// Original absolute initialization deadline for the exact current owner.
+    ///
+    /// # Errors
+    /// Rejects an unknown role or a stale incarnation.
+    pub fn initialization_deadline(&self, ticket: Incarnation) -> Result<u64, ServiceError> {
+        let entry = self.entry(ticket.role)?;
+        if entry.incarnation != Some(ticket) {
+            return Err(ServiceError::StaleIncarnation);
+        }
+        Ok(entry.initialization_deadline)
+    }
+
+    /// Validate the canonical initialization reply for the current incarnation.
+    ///
+    /// # Errors
+    /// Rejects old owners, non-success/nonempty replies and elapsed deadlines.
+    pub fn initialized(
+        &mut self,
+        ticket: Incarnation,
+        status: u32,
+        bytes: usize,
+        now: u64,
+    ) -> Result<(), ServiceError> {
+        let entry = self.entry(ticket.role)?;
+        if entry.incarnation != Some(ticket) {
+            return Err(ServiceError::StaleIncarnation);
+        }
+        if status != 0 || bytes != 0 || now >= entry.initialization_deadline {
+            return Err(ServiceError::InitializationRejected);
+        }
+        self.observe(ticket, ServiceEvent::ReportedReady, now)?;
+        Ok(())
+    }
+
+    /// Record a lifecycle event only for the exact current task incarnation.
+    ///
+    /// # Errors
+    /// Rejects delayed events from previous starts and illegal transitions.
+    pub fn observe(
+        &mut self,
+        ticket: Incarnation,
+        event: ServiceEvent,
+        now: u64,
+    ) -> Result<ServiceState, ServiceError> {
+        if self.entry(ticket.role)?.incarnation != Some(ticket) {
+            return Err(ServiceError::StaleIncarnation);
+        }
+        self.apply(ticket.role, event, now)
     }
 
     /// Aggregate resident pages the configured set reserves.
@@ -474,13 +640,9 @@ impl ServiceSupervisor {
         now_millis: u64,
     ) -> Result<ServiceState, ServiceError> {
         let index = self.index(role)?;
-        let entry = self
-            .entries
-            .get(index)
-            .ok_or(ServiceError::UnknownRole)?
-            .clone();
-        let next = Self::next_state(&entry, event, now_millis)?;
-        let admitted_start = matches!(event, ServiceEvent::Started);
+        let entry = self.entries.get(index).ok_or(ServiceError::UnknownRole)?;
+        let next = Self::next_state(entry, event, now_millis)?;
+        let admitted_start = event == ServiceEvent::Started && next == ServiceState::Starting;
         let entry = self
             .entries
             .get_mut(index)
@@ -490,7 +652,10 @@ impl ServiceSupervisor {
             entry.starts.push(now_millis);
         }
         match event {
-            ServiceEvent::Faulted => entry.faults = entry.faults.saturating_add(1),
+            ServiceEvent::Faulted
+            | ServiceEvent::LeaseExpired
+            | ServiceEvent::InitializationRejected
+            | ServiceEvent::Revoked => entry.faults = entry.faults.saturating_add(1),
             ServiceEvent::ReportedReady => {
                 entry.ready_transitions = entry.ready_transitions.saturating_add(1);
             }
@@ -498,9 +663,24 @@ impl ServiceSupervisor {
         }
         entry.state = next;
         match event {
-            ServiceEvent::Started => self.stats.starts = self.stats.starts.saturating_add(1),
+            ServiceEvent::Started if admitted_start => {
+                self.stats.starts = self.stats.starts.saturating_add(1);
+            }
             ServiceEvent::Faulted => self.stats.faults = self.stats.faults.saturating_add(1),
-            ServiceEvent::Exited | ServiceEvent::ShutdownCompleted => {
+            ServiceEvent::LeaseExpired => {
+                self.stats.lease_deaths = self.stats.lease_deaths.saturating_add(1);
+            }
+            ServiceEvent::InitializationRejected => {
+                self.stats.initialization_rejections =
+                    self.stats.initialization_rejections.saturating_add(1);
+            }
+            ServiceEvent::Revoked => {
+                self.stats.revocations = self.stats.revocations.saturating_add(1);
+            }
+            ServiceEvent::ShutdownCompleted => {
+                self.stats.shutdowns = self.stats.shutdowns.saturating_add(1);
+            }
+            ServiceEvent::Exited => {
                 self.stats.exits = self.stats.exits.saturating_add(1);
             }
             _ => {}
@@ -533,7 +713,18 @@ impl ServiceSupervisor {
         let legal = match (entry.state, event) {
             // A start is admitted from `Absent` and from a fault the policy
             // still has an allowance for.
-            (ServiceState::Absent, ServiceEvent::Started) => Some(ServiceState::Starting),
+            (ServiceState::Absent | ServiceState::Restarting, ServiceEvent::Started) => {
+                Some(ServiceState::Starting)
+            }
+            (ServiceState::Faulted, ServiceEvent::RestartRequested) => Some(
+                if Self::starts_in_window(entry, now_millis)
+                    < u32::from(entry.record.restart.max_starts)
+                {
+                    ServiceState::Restarting
+                } else {
+                    ServiceState::Offline
+                },
+            ),
             (ServiceState::Faulted, ServiceEvent::Started) => {
                 if Self::starts_in_window(entry, now_millis)
                     < u32::from(entry.record.restart.max_starts)
@@ -554,7 +745,10 @@ impl ServiceSupervisor {
             // reached readiness.
             (
                 ServiceState::Starting | ServiceState::Ready | ServiceState::Blocked,
-                ServiceEvent::Faulted,
+                ServiceEvent::Faulted
+                | ServiceEvent::LeaseExpired
+                | ServiceEvent::InitializationRejected
+                | ServiceEvent::Revoked,
             ) => Some(ServiceState::Faulted),
             // An unsolicited clean exit is recorded distinctly and is never
             // treated as an acknowledged shutdown: a core service that leaves
@@ -923,8 +1117,8 @@ mod tests {
 
     #[test]
     fn a_continuation_carries_scalars_and_nothing_else() {
-        // The type is `Copy`, which a borrow, trait object, or owned frame
-        // could not be. That is the property ADR 0035 asks for.
+        // Copying this scalar record preserves operation identity. Its fields
+        // are explicitly scalars; Copy alone would not exclude references.
         fn assert_copy<T: Copy>(_: &T) {}
         let staging = KernelContinuation::StagingArtifact {
             role: ServiceRole::Storage,
@@ -962,5 +1156,48 @@ mod tests {
     fn a_role_names_itself_for_fatal_output() {
         assert_eq!(ServiceRole::Storage.name(), "storage-server");
         assert_eq!(ServiceRole::Network.name(), "network-server");
+    }
+    #[test]
+    fn incarnation_readiness_and_exhausted_restart_are_exact() {
+        let mut s = supervisor();
+        let first = s
+            .start(ServiceRole::Network, 11, 0)
+            .unwrap_or_else(|_| unreachable!());
+        assert!(!s.accepts_clients(ServiceRole::Network));
+        assert_eq!(
+            s.initialized(first, 0, 1, 1),
+            Err(ServiceError::InitializationRejected)
+        );
+        assert_eq!(
+            s.initialized(first, 0, 0, 4000),
+            Err(ServiceError::InitializationRejected)
+        );
+        s.observe(first, ServiceEvent::InitializationRejected, 4000)
+            .unwrap_or_else(|_| unreachable!());
+        let second = s
+            .start(ServiceRole::Network, 12, 4001)
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            s.initialized(first, 0, 0, 4002),
+            Err(ServiceError::StaleIncarnation)
+        );
+        s.initialized(second, 0, 0, 4002)
+            .unwrap_or_else(|_| unreachable!());
+        assert!(s.accepts_clients(ServiceRole::Network));
+        s.observe(second, ServiceEvent::LeaseExpired, 4003)
+            .unwrap_or_else(|_| unreachable!());
+        let third = s
+            .start(ServiceRole::Network, 13, 4004)
+            .unwrap_or_else(|_| unreachable!());
+        s.observe(third, ServiceEvent::Faulted, 4005)
+            .unwrap_or_else(|_| unreachable!());
+        let capacity = s.entries[0].starts.capacity();
+        assert!(s.start(ServiceRole::Network, 14, 4006).is_err());
+        assert_eq!(s.stats().starts, 3);
+        assert_eq!(s.stats().initialization_rejections, 1);
+        assert_eq!(s.stats().lease_deaths, 1);
+        assert_eq!(s.state(ServiceRole::Network), Ok(ServiceState::Offline));
+        assert_eq!(s.entries[0].starts.capacity(), capacity);
+        assert!(!s.admits_restart(ServiceRole::Network, 120_000));
     }
 }

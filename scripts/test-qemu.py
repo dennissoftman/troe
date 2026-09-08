@@ -22,6 +22,7 @@ import zlib
 from pathlib import Path
 
 import ipc_phase_b
+import ipc_phase_c
 import storage_baseline
 import system_baseline
 from platform_profile import (
@@ -696,9 +697,43 @@ def assert_ipc_phase_b(session: SerialSession) -> None:
     )
 
 
+def assert_ipc_phase_c(session: SerialSession) -> None:
+    """Retain the general-runtime matrix with its exact machine and image."""
+    try:
+        evidence = ipc_phase_c.validate(
+            session.transcript(), require_tagged=session.require_tagged
+        )
+    except (KeyError, ValueError) as error:
+        raise AcceptanceError(f"{session.platform_id} Phase C IPC: {error}") from error
+    evidence.update(
+        {
+            "platform": session.platform_id,
+            "command": session.command_line,
+            "host": platform.platform(),
+            "image_sha256": hashlib.sha256(
+                boot_image_path(
+                    resolve_platform(session.platform_id), acceptance_probes=True
+                ).read_bytes()
+            ).hexdigest(),
+        }
+    )
+    mode = "tagged" if evidence["tagged"] else "fallback"
+    destination = REPO_ROOT / "build" / f"ipc-phase-c-{session.platform_id}-{mode}.json"
+    destination.write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
+    ratios = ", ".join(
+        f"{size}={evidence['rows'][f'general-direct/{size}']['p95_ratio']:.3f}"
+        for size in (0, 64, 256, 4096)
+    )
+    print(
+        f"IPC Phase C ({session.platform_id}, {mode}): "
+        f"direct p95 ratios {ratios}; {destination}"
+    )
+
+
 def assert_ipc_baseline(session: SerialSession) -> None:
     """Require compatibility and private-page IPC structural matrices."""
     assert_ipc_phase_b(session)
+    assert_ipc_phase_c(session)
     rows: dict[tuple[str, int], dict[str, int]] = {}
     for line in session.transcript().splitlines():
         if not line.startswith("ipc-baseline "):

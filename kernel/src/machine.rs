@@ -35,6 +35,7 @@ use troe_memory::{FrameAllocator, MappingPlan, MemoryMapStats, PhysicalRange};
 use troe_task::{Capabilities, Scheduler, StackResource, TaskId, TaskStep};
 
 pub(crate) struct OwnedAccounting {
+    pub(crate) persistent_services: Option<Box<crate::supervisor::Supervisor>>,
     pub(crate) map: MemoryMapStats,
     pub(crate) frames: FrameAllocator,
     #[cfg(feature = "acceptance-probes")]
@@ -85,12 +86,32 @@ pub(crate) fn run_owned(mut accounting: OwnedAccounting) -> ! {
         let start = troe_machine::benchmark_counter_ticks();
         run_ipc_baseline_verification(&mut scheduler, &mut accounting)
             .unwrap_or_else(|()| fatal(b"fatal: IPC baseline verification failed\n"));
+        crate::supervisor::probes::verify(&mut scheduler, &mut accounting)
+            .unwrap_or_else(|()| fatal(b"fatal: persistent service verification failed\n"));
         crate::boot_baseline::exclude_ipc(start);
     }
     if !write_machine_boot_status(BOOT_RUNTIME_LABEL, true) {
         fatal(b"fatal: application loader diagnostic failed\n");
     }
 
+    crate::supervisor::initialize(&mut scheduler, &mut accounting)
+        .unwrap_or_else(|()| fatal(b"fatal: persistent service construction failed\n"));
+    while !accounting
+        .persistent_services
+        .as_ref()
+        .is_some_and(|services| services.ready())
+    {
+        if accounting
+            .persistent_services
+            .as_ref()
+            .is_some_and(|services| services.offline())
+        {
+            fatal(b"fatal: persistent service offline during initialization\n");
+        }
+        crate::supervisor::step(&mut scheduler, &mut accounting)
+            .unwrap_or_else(|()| fatal(b"fatal: persistent service initialization failed\n"));
+    }
+    let service_stack_pages = scheduler.stats().owned_stack_pages;
     let capabilities = Capabilities::CONSOLE
         .union(Capabilities::FILESYSTEM)
         .union(Capabilities::MACHINE_CONTROL);
@@ -102,7 +123,8 @@ pub(crate) fn run_owned(mut accounting: OwnedAccounting) -> ! {
     let dispatched = scheduler
         .dispatch_next(capabilities)
         .unwrap_or_else(|_| fatal(b"fatal: shell task dispatch failed\n"));
-    if dispatched != Some(shell_id) || scheduler.stats().owned_stack_pages != SHELL_TASK_STACK_PAGES
+    if dispatched != Some(shell_id)
+        || scheduler.stats().owned_stack_pages != SHELL_TASK_STACK_PAGES + service_stack_pages
     {
         fatal(b"fatal: shell task accounting failed\n");
     }

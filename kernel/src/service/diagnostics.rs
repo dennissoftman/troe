@@ -8,8 +8,12 @@
 
 #[cfg(feature = "acceptance-probes")]
 use crate::artifacts::native_diagnostics_benchmark_artifact;
+#[cfg(feature = "acceptance-probes")]
 use crate::artifacts::native_diagnostics_server_artifact;
-use crate::handles::{DiagnosticsServerFate, SharedDiagnosticsSnapshot};
+#[cfg(feature = "acceptance-probes")]
+use crate::handles::DiagnosticsServerFate;
+use crate::handles::SharedDiagnosticsSnapshot;
+#[cfg(feature = "acceptance-probes")]
 use crate::invocation::{
     CommandApplicationOutcome, CommandStartupService, run_command_application,
 };
@@ -18,18 +22,27 @@ use crate::limits::{
     IPC_BASELINE_SAMPLES, IPC_BASELINE_WARMUP_CALLS, IPC_ISOLATED_SERVICE_CALL_LIMIT,
 };
 use crate::machine::OwnedAccounting;
+#[cfg(feature = "acceptance-probes")]
 use crate::supervision::register_command_service;
 use crate::support::usize_as_u64;
 use alloc::rc::Rc;
+#[cfg(feature = "acceptance-probes")]
 use alloc::vec::Vec;
+#[cfg(feature = "acceptance-probes")]
 use core::cell::RefCell;
 #[cfg(feature = "acceptance-probes")]
 use core::sync::atomic::{AtomicBool, Ordering};
-use troe_abi::{diagnostics, server};
+use troe_abi::diagnostics;
+#[cfg(feature = "acceptance-probes")]
+use troe_abi::server;
+#[cfg(feature = "acceptance-probes")]
 use troe_application::parse_kex_package;
 use troe_core::{MachineMemoryOwner, MachineMemorySnapshot, MemoryStats};
-use troe_dispatch::{Dispatcher, ReplyStatus, Request, Service, ServiceReply, ServiceReplyInfo};
+#[cfg(feature = "acceptance-probes")]
+use troe_dispatch::{Dispatcher, ServiceReplyInfo};
+use troe_dispatch::{ReplyStatus, Request, Service, ServiceReply};
 use troe_driver::InputQueueStats;
+#[cfg(feature = "acceptance-probes")]
 use troe_task::{PendingOperationId, Scheduler, TaskStep, WakeReason};
 
 pub(crate) struct ApplicationDiagnosticsProxyService;
@@ -38,6 +51,7 @@ pub(crate) struct ApplicationDiagnosticsSnapshotService {
     pub(crate) snapshot: SharedDiagnosticsSnapshot,
 }
 
+#[cfg(feature = "acceptance-probes")]
 pub(crate) struct DiagnosticsServerExchange {
     operation: PendingOperationId,
     snapshot: SharedDiagnosticsSnapshot,
@@ -51,10 +65,12 @@ pub(crate) struct DiagnosticsServerExchange {
     steady_allocation_free: bool,
 }
 
+#[cfg(feature = "acceptance-probes")]
 pub(crate) struct DiagnosticsServerEndpoint {
     exchange: Rc<RefCell<DiagnosticsServerExchange>>,
 }
 
+#[cfg(feature = "acceptance-probes")]
 pub(crate) struct DiagnosticsServerRunner<'a> {
     accounting: &'a mut OwnedAccounting,
     scheduler: &'a mut Scheduler,
@@ -152,6 +168,7 @@ pub(crate) fn run_diagnostics_benchmark_task(
 }
 
 #[inline(never)]
+#[cfg(feature = "acceptance-probes")]
 pub(crate) fn run_diagnostics_server_task(runner: &mut DiagnosticsServerRunner<'_>) -> TaskStep {
     let outcome = (|| -> Result<CommandApplicationOutcome, ()> {
         let package = parse_kex_package(runner.artifact).map_err(|_| ())?;
@@ -198,6 +215,7 @@ pub(crate) fn run_diagnostics_server_task(runner: &mut DiagnosticsServerRunner<'
 }
 
 #[inline(never)]
+#[cfg(feature = "acceptance-probes")]
 pub(crate) fn run_diagnostics_server(
     scheduler: &mut Scheduler,
     accounting: &mut OwnedAccounting,
@@ -292,6 +310,7 @@ impl Service for ApplicationDiagnosticsSnapshotService {
     }
 }
 
+#[cfg(feature = "acceptance-probes")]
 impl Service for DiagnosticsServerEndpoint {
     fn call(&mut self, request: Request<'_>) -> Result<ServiceReply, troe_dispatch::DispatchError> {
         match request.opcode() {

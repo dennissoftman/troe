@@ -40,7 +40,6 @@ use crate::resident::{ResidentApplication, ResidentExecution, ResidentProcessCon
 use crate::service::clock::{ApplicationTimerService, ApplicationWallClockService};
 use crate::service::diagnostics::{
     ApplicationDiagnosticsSnapshotService, application_diagnostics_snapshot, machine_snapshot,
-    run_diagnostics_server,
 };
 use crate::service::filesystem::{
     ApplicationFilesystemMutationService, ApplicationFilesystemService,
@@ -1321,8 +1320,33 @@ impl<'service> ResidentApplication<'service> {
             .call(operation)
             .map_err(|_| ())?
             .reply_capacity();
-        let (reason, server_reply) =
-            run_diagnostics_server(scheduler, accounting, operation, snapshot, reply_capacity)?;
+        let DeferredCallKind::Diagnostics { deadline, .. } = state.suspended.get(operation)?.kind
+        else {
+            return Err(());
+        };
+        let key = crate::supervisor::ClientKey {
+            task: self.task_id,
+            operation,
+        };
+        let Some(incarnation) = self.diagnostics_generation else {
+            return Err(());
+        };
+        let immediate = crate::client::submit(
+            accounting,
+            key,
+            incarnation,
+            snapshot.as_ref(),
+            reply_capacity,
+            deadline.as_millis(),
+        )?;
+        drop(snapshot);
+        let fate = match immediate {
+            Some(fate) => Some(fate),
+            None => crate::client::consume(accounting, key)?,
+        };
+        let Some((reason, server_reply)) = fate else {
+            return Ok(None);
+        };
         let completion = match reason {
             WakeReason::ResourceReady | WakeReason::Closed => state
                 .waits
@@ -1331,12 +1355,11 @@ impl<'service> ResidentApplication<'service> {
                 .iter()
                 .next()
                 .ok_or(())?,
-            WakeReason::Revoked => state
+            WakeReason::Revoked | WakeReason::Deadline | WakeReason::Cancelled => state
                 .waits
                 .cancel_operation(operation, reason)
                 .map_err(|_| ())?
                 .ok_or(())?,
-            WakeReason::Deadline | WakeReason::Cancelled => return Err(()),
         };
         if completion.key() != wait {
             return Err(());
@@ -1354,8 +1377,8 @@ impl<'service> ResidentApplication<'service> {
         let (status, payload) = match reason {
             WakeReason::ResourceReady => server_reply.ok_or(())?,
             WakeReason::Closed => (ReplyStatus::Conflict, Vec::new()),
-            WakeReason::Revoked => (ReplyStatus::Cancelled, Vec::new()),
-            WakeReason::Deadline | WakeReason::Cancelled => return Err(()),
+            WakeReason::Revoked | WakeReason::Cancelled => (ReplyStatus::Cancelled, Vec::new()),
+            WakeReason::Deadline => (ReplyStatus::Timeout, Vec::new()),
         };
         if payload.len() > suspended.call.reply_capacity() {
             return Err(());
@@ -1429,7 +1452,9 @@ impl<'service> ResidentApplication<'service> {
             PendingCallState::Waiting(wait) => wait,
             PendingCallState::New => return Err(()),
         };
-        if let DeferredCallKind::Diagnostics { resource } = &state.suspended.get(operation)?.kind {
+        if let DeferredCallKind::Diagnostics { resource, .. } =
+            &state.suspended.get(operation)?.kind
+        {
             return self
                 .complete_diagnostics_call(scheduler, accounting, operation, wait, *resource);
         }
@@ -1616,6 +1641,7 @@ impl<'service> ResidentApplication<'service> {
         outcome: CommandApplicationOutcome,
         cancelled: bool,
     ) -> Result<CommandApplicationOutcome, ()> {
+        crate::client::cancel(accounting, self.task_id)?;
         self.terminate_children(scheduler, accounting)?;
         if cancelled {
             self.processes
