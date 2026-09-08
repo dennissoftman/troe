@@ -11,9 +11,11 @@ DESCRIPTION
     manifest; a child cannot gain authority its launcher does not hold.
 
     COMMAND resolves exactly as it does for the shell. A bare name selects
-    /bin/COMMAND.kex, and a name containing / selects that exact package path
-    relative to the current directory. No suffix, PATH search, or implicit
-    current-directory lookup is applied.
+    /bin/COMMAND.kex, and a name containing / tries that exact package path
+    relative to the current directory. If missing, .kex is appended once unless
+    the final component is empty, . or .., or already ends in .kex. Existing
+    nodes, other lookup errors, and invalid packages never trigger a retry.
+    No PATH search or implicit current-directory lookup is applied.
 
     The child inherits spawn's immutable environment with PWD set to its launch
     directory. It does not inherit the session terminal: standard input is an

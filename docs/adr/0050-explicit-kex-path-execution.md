@@ -4,7 +4,8 @@ Status: accepted and implemented, 2026-08-28.
 
 The whole-artifact staging detail in this decision was superseded by the
 coherent bounded streaming loader in [ADR 0052](0052-streamed-kex-and-static-c-runtime.md).
-Path selection and authority semantics are unchanged.
+The exact-only path rule was amended on 2026-09-08 to permit the single `.kex`
+fallback described below. Bare-name selection and authority semantics are unchanged.
 
 ## Context
 
@@ -23,10 +24,14 @@ application or that a new file-mode ABI exists.
 Command resolution classifies `argv[0]` by syntax. A nonempty bare lowercase
 ASCII name containing only digits, `_`, or `-` resolves exactly to
 `/bin/<name>.kex`. A token containing `/` is an explicit path and resolves
-exactly through the caller's VFS namespace against its canonical invocation
+through the caller's VFS namespace against its canonical invocation
 cwd. Relative forms such as `./tool` and `../tools/tool`, and absolute forms
-such as `/vol/shared/tool`, are supported. The resolver does not infer a
-`.kex` suffix, search `PATH`, or search the current directory for a bare name.
+such as `/vol/shared/tool`, are supported. The resolver tries the exact spelling
+first. Only a not-found result permits one retry with `.kex` appended, and only
+if the final component is nonempty, neither `.` nor `..`, and does not already
+end in `.kex`. Existing nodes, other lookup failures, and package rejection never
+trigger a retry. The resolver does not search `PATH` or the current directory
+for a bare name.
 
 The resolved final node must be a regular file; a final symbolic link may be
 followed by the owning provider to such a file. The kernel streams the selected

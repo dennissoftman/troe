@@ -28,7 +28,9 @@ use troe_core::{
     StreamError, write_all,
 };
 use troe_driver::InputQueueStats;
-use troe_fs_api::{FILE_IO_BUFFER_BYTES, FsError, MAX_FILE_IO_BUFFER_BYTES, NodeKind};
+use troe_fs_api::{
+    FILE_IO_BUFFER_BYTES, FileMetadata, FsError, MAX_FILE_IO_BUFFER_BYTES, NodeKind,
+};
 use troe_fs_client::NamespaceClient;
 
 /// Shared namespace ownership used by stream endpoints and KEX services.
@@ -742,14 +744,54 @@ fn valid_command_name(name: &str) -> bool {
 /// Resolver classification for one non-intrinsic command token.
 ///
 /// Bare command names retain the trusted `/bin/<name>.kex` catalog contract.
-/// A token containing `/` is an explicit filesystem path and is never looked
-/// up in the catalog or rewritten with an extension.
+/// A token containing `/` is an explicit filesystem path. Lookup tries its exact
+/// spelling first, then appends `.kex` only when that path is missing.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExternalCommandReference<'a> {
     /// Valid bare name eligible for `/bin` catalog lookup.
     CatalogName(&'a str),
-    /// Exact path selected by the caller, relative to its logical cwd or absolute.
+    /// Path selected by the caller, relative to its logical cwd or absolute.
     Path(&'a str),
+}
+
+impl ExternalCommandReference<'_> {
+    /// Resolve a command to its selected path and metadata through the caller's VFS.
+    ///
+    /// Explicit paths get one `.kex` fallback on `NotFound`, unless the final
+    /// component is empty, `.` or `..`, or already ends in `.kex`. Existing nodes
+    /// and all other lookup failures are authoritative; package validation is
+    /// the launcher's responsibility and never triggers another lookup.
+    ///
+    /// # Errors
+    /// Returns the VFS lookup error, or `FsError::NoSpace` if the suffix cannot
+    /// be allocated. Normal VFS path bounds apply to both lookup candidates.
+    #[expect(
+        clippy::case_sensitive_file_extension_comparisons,
+        reason = "KEX lookup uses the literal lowercase .kex catalog suffix"
+    )]
+    pub fn resolve(
+        self,
+        namespace: &mut dyn NamespaceClient,
+        cwd: &str,
+    ) -> Result<(String, FileMetadata), FsError> {
+        let mut path = match self {
+            Self::CatalogName(name) => format!("/bin/{name}.kex"),
+            Self::Path(path) => path.to_string(),
+        };
+        let metadata = match namespace.metadata(cwd, &path) {
+            Err(FsError::NotFound)
+                if matches!(self, Self::Path(_))
+                    && !path.ends_with(".kex")
+                    && !matches!(path.rsplit('/').next(), Some("" | "." | "..")) =>
+            {
+                path.try_reserve(4).map_err(|_| FsError::NoSpace)?;
+                path.push_str(".kex");
+                namespace.metadata(cwd, &path)?
+            }
+            result => result?,
+        };
+        Ok((path, metadata))
+    }
 }
 
 /// Classify one non-intrinsic command token for an application resolver.
@@ -1765,7 +1807,7 @@ impl Shell {
 
     /// Expand every argument word of one stage into concrete operands.
     ///
-    /// The command word is left literal so that exact KEX path resolution and
+    /// The command word is left literal so that explicit KEX path resolution and
     /// the untrusted-path confirmation see what was written. A pattern that
     /// matches nothing is passed through unchanged, so a failed match surfaces
     /// as the command's own diagnostic rather than as a silently empty
@@ -4234,6 +4276,99 @@ mod tests {
         for invalid in ["", "Echo", "not.valid"] {
             assert_eq!(external_command_reference(invalid), None);
         }
+    }
+
+    #[test]
+    fn explicit_command_paths_try_kex_suffix_relative_to_the_invocation_cwd() -> Result<(), FsError>
+    {
+        let mut namespace = Namespace::new();
+        namespace.add_read_only_dir("/vol")?;
+        namespace.add_read_only_dir("/vol/shared")?;
+        assert_eq!(
+            namespace.add_read_only_file("/vol/shared/python3.14.kex", b"package"),
+            Ok(())
+        );
+        for (cwd, command) in [
+            ("/vol/shared", "./python3.14"),
+            ("/vol", "./shared/python3.14"),
+            ("/bin", "../vol/shared/python3.14"),
+            ("/", "/vol/shared/python3.14"),
+        ] {
+            let (path, metadata) =
+                ExternalCommandReference::Path(command).resolve(&mut namespace, cwd)?;
+            assert_eq!(path, format!("{command}.kex"));
+            assert_eq!(metadata.kind, NodeKind::File);
+            assert_eq!(metadata.byte_count, 7);
+        }
+        let command = "/vol/shared/python3.14.kex";
+        let (path, _) = ExternalCommandReference::Path(command).resolve(&mut namespace, "/")?;
+        assert_eq!(path, command);
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_command_paths_preserve_existing_files_and_directories() -> Result<(), FsError> {
+        let mut namespace = Namespace::new();
+        namespace.add_read_only_dir("/vol")?;
+        namespace.add_read_only_dir("/vol/shared")?;
+        namespace.add_read_only_dir("/vol/shared/directory")?;
+        for (path, bytes) in [
+            ("/vol/shared/tool", b"invalid".as_slice()),
+            ("/vol/shared/tool.kex", b"package".as_slice()),
+            ("/vol/shared/directory/child", b"child".as_slice()),
+            ("/vol/shared/directory.kex", b"package".as_slice()),
+        ] {
+            assert_eq!(namespace.add_read_only_file(path, bytes), Ok(()));
+        }
+        for (command, kind) in [
+            ("./tool", NodeKind::File),
+            ("./directory", NodeKind::Directory),
+        ] {
+            let (path, metadata) =
+                ExternalCommandReference::Path(command).resolve(&mut namespace, "/vol/shared")?;
+            assert_eq!(path, command);
+            assert_eq!(metadata.kind, kind);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn resolver_never_searches_cwd_for_bare_names_or_repeats_suffixes() -> Result<(), FsError> {
+        let mut namespace = Namespace::new();
+        namespace.add_read_only_dir("/vol")?;
+        namespace.add_read_only_dir("/vol/shared")?;
+        namespace.add_read_only_dir("/vol/shared/trailing")?;
+        namespace.add_read_only_dir("/bin")?;
+        for path in [
+            "/vol/shared/python3.kex",
+            "/vol/shared/tool.kex.kex",
+            "/vol/shared/trailing/.kex",
+        ] {
+            assert_eq!(namespace.add_read_only_file(path, b"package"), Ok(()));
+        }
+        assert_eq!(
+            ExternalCommandReference::CatalogName("python3").resolve(&mut namespace, "/vol/shared"),
+            Err(FsError::NotFound)
+        );
+        for command in ["./missing", "./tool.kex"] {
+            assert_eq!(
+                ExternalCommandReference::Path(command).resolve(&mut namespace, "/vol/shared"),
+                Err(FsError::NotFound)
+            );
+        }
+        let (path, metadata) =
+            ExternalCommandReference::Path("./trailing/").resolve(&mut namespace, "/vol/shared")?;
+        assert_eq!(path, "./trailing/");
+        assert_eq!(metadata.kind, NodeKind::Directory);
+        assert_eq!(
+            namespace.add_read_only_file("/bin/python3.kex", b"bin"),
+            Ok(())
+        );
+        let (path, metadata) = ExternalCommandReference::CatalogName("python3")
+            .resolve(&mut namespace, "/vol/shared")?;
+        assert_eq!(path, "/bin/python3.kex");
+        assert_eq!(metadata.byte_count, 3);
+        Ok(())
     }
 
     #[test]

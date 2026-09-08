@@ -377,9 +377,13 @@ terminate the shell.
 
 A bare ordinary command MUST resolve only through the bounded immutable
 `/bin/<name>.kex` catalog. A command token containing `/` MUST instead resolve
-the exact relative or absolute VFS path against the invocation cwd, without
-extension inference or a directory search. The target MUST be a regular file
-whose complete package, capability manifest, target, and embedded executable
+the relative or absolute VFS path against the invocation cwd. It MUST try the
+exact spelling first. Only a not-found result permits one retry with `.kex`
+appended, and only if the final component is nonempty, is neither `.` nor `..`,
+and does not already end in `.kex`. Existing nodes, other lookup errors, and
+package validation failures MUST NOT trigger a retry. Neither candidate permits
+a directory search. The target MUST be a regular file whose complete package,
+capability manifest, target, and embedded executable
 validate before admission. Explicit path selection MUST NOT manufacture
 capabilities: nested launch requirements remain an attenuation of the
 launcher's authority. Writable mounts are therefore usable only through an

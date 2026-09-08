@@ -52,9 +52,12 @@ Running status is zero. A contained fault maps to 125 and cancellation maps to
 130. Normal exits preserve the full `u32` application status.
 
 When `argv[0]` contains no `/`, launch resolves exactly
-`/bin/<argv[0]>.kex`. When it contains `/`, launch resolves that exact path
-against the invocation cwd; it performs no suffix inference, `PATH` search, or
-implicit current-directory lookup. The selected node must resolve to a regular
+`/bin/<argv[0]>.kex`. When it contains `/`, launch first resolves that exact path
+against the invocation cwd. Only a not-found result permits one retry with
+`.kex` appended, provided the final component is nonempty, is neither `.` nor
+`..`, and does not already end in `.kex`. Existing nodes, other lookup errors,
+and package rejection never trigger a retry. Launch performs no `PATH` search
+or implicit current-directory lookup. The selected node must resolve to a regular
 file and pass complete KEX package validation. The child's package manifest
 must be an attenuation of the launcher's manifest. The owner-scoped child
 token, not the observable process ID, authorizes lifecycle calls.
