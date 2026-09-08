@@ -14,9 +14,9 @@ pub use troe_abi::{
 };
 use troe_abi::{MAX_MESSAGE_BYTES, MAX_SERVICE_PAYLOAD_BYTES, heap_growth, stream};
 
-const STARTUP_PAGE_BYTES: usize = 4096;
-const STARTUP_HEADER_BYTES: usize = 64;
-const STARTUP_HANDLE_BYTES: usize = 24;
+const STARTUP_PAGE_BYTES: usize = troe_abi::startup::PAGE_BYTES;
+const STARTUP_HEADER_BYTES: usize = troe_abi::startup::HEADER_BYTES;
+const STARTUP_HANDLE_BYTES: usize = troe_abi::startup::HANDLE_BYTES;
 const CALL_RIGHT: u32 = 1;
 #[cfg(test)]
 const KEX_IMAGE_BASE: u64 = 0x0000_4000_0000_0000;
@@ -32,7 +32,7 @@ const KEX_TEST_IMAGE_SPAN_BYTES: u64 = KEX_IMAGE_ALIGNMENT;
 #[cfg(test)]
 const KEX_STARTUP_ADDRESS: u64 = KEX_IMAGE_BASE + KEX_TEST_IMAGE_SPAN_BYTES;
 #[cfg(test)]
-const KEX_HEAP_ADDRESS: u64 = KEX_STARTUP_ADDRESS + STARTUP_PAGE_BYTES as u64;
+const KEX_HEAP_ADDRESS: u64 = KEX_STARTUP_ADDRESS + troe_abi::startup::REGION_BYTES as u64;
 #[cfg(test)]
 const KEX_STACK_TOP: u64 = KEX_USER_END - STARTUP_PAGE_BYTES as u64;
 
@@ -2445,9 +2445,14 @@ struct Startup<'a> {
     handle_count: usize,
 }
 
+fn valid_startup_region_bytes(bytes: usize) -> bool {
+    (STARTUP_HEADER_BYTES..=troe_abi::startup::REGION_BYTES).contains(&bytes)
+        && bytes.is_multiple_of(STARTUP_PAGE_BYTES)
+}
+
 impl<'a> Startup<'a> {
     fn parse(bytes: &'a [u8]) -> Result<Self, StartupError> {
-        if bytes.len() != STARTUP_PAGE_BYTES
+        if !valid_startup_region_bytes(bytes.len())
             || read_u32(bytes, 0)? as usize
                 != STARTUP_HEADER_BYTES
                     .checked_add(
@@ -2470,12 +2475,12 @@ impl<'a> Startup<'a> {
         let heap_bytes = read_u64(bytes, 32)?;
         let stack_bottom = read_u64(bytes, 40)?;
         let stack_top = read_u64(bytes, 48)?;
-        // The kernel places the startup page directly above the image, so the
+        // The kernel places the startup region directly above the image, so the
         // span the artifact declared is recoverable from the heap address. The
         // guest cannot know that span independently, so it checks the canonical
         // relationship and the policy bound rather than one fixed offset.
         let declared_span = heap_address
-            .checked_sub(STARTUP_PAGE_BYTES as u64)
+            .checked_sub(bytes.len() as u64)
             .and_then(|startup| startup.checked_sub(image_base))
             .ok_or(StartupError::InvalidPage)?;
         let lower_guard = stack_top
@@ -2485,7 +2490,7 @@ impl<'a> Startup<'a> {
         let heap_end = heap_address
             .checked_add(heap_bytes)
             .ok_or(StartupError::InvalidPage)?;
-        if handle_count > 32
+        if handle_count > troe_abi::startup::MAX_INITIAL_HANDLES
             || encoded_bytes > bytes.len()
             || bytes[encoded_bytes..].iter().any(|byte| *byte != 0)
             || image_base < KEX_MIN_IMAGE_BASE
@@ -2644,7 +2649,7 @@ pub fn terminate(status: u32) -> ! {
 ///
 /// # Safety
 ///
-/// `startup_address` must identify the immutable mapped startup page supplied
+/// `startup_address` must identify the immutable mapped startup region supplied
 /// by the KEX loader for the complete duration of this non-returning call.
 #[doc(hidden)]
 pub unsafe fn __run(
@@ -2652,11 +2657,11 @@ pub unsafe fn __run(
     startup_bytes: usize,
     main: fn(&mut CommandContext) -> u32,
 ) -> ! {
-    if startup_address.is_null() || startup_bytes != STARTUP_PAGE_BYTES {
+    if startup_address.is_null() || !valid_startup_region_bytes(startup_bytes) {
         terminate(exit::FAILURE);
     }
     // SAFETY: The raw KEX entry contract supplies one immutable mapped startup
-    // page. Startup parsing validates every byte before exposing authority.
+    // region. Startup parsing validates every byte before exposing authority.
     let bytes = unsafe { slice::from_raw_parts(startup_address, startup_bytes) };
     let Ok(startup) = Startup::parse(bytes) else {
         terminate(exit::FAILURE);
@@ -2671,7 +2676,7 @@ pub unsafe fn __run(
 ///
 /// # Safety
 ///
-/// `startup_address` must identify the immutable mapped startup page supplied
+/// `startup_address` must identify the immutable mapped startup region supplied
 /// by the KEX loader for the complete duration of this non-returning call.
 #[doc(hidden)]
 pub unsafe fn __run_server(
@@ -2679,11 +2684,11 @@ pub unsafe fn __run_server(
     startup_bytes: usize,
     main: fn(&mut ServerContext) -> u32,
 ) -> ! {
-    if startup_address.is_null() || startup_bytes != STARTUP_PAGE_BYTES {
+    if startup_address.is_null() || !valid_startup_region_bytes(startup_bytes) {
         terminate(exit::FAILURE);
     }
     // SAFETY: The raw KEX entry contract supplies one immutable mapped startup
-    // page. Startup parsing validates every byte before exposing authority.
+    // region. Startup parsing validates every byte before exposing authority.
     let bytes = unsafe { slice::from_raw_parts(startup_address, startup_bytes) };
     let Ok(startup) = Startup::parse(bytes) else {
         terminate(exit::FAILURE);
@@ -2951,8 +2956,8 @@ mod tests {
         timer,
     };
 
-    fn startup_page(interfaces: &[u32]) -> [u8; STARTUP_PAGE_BYTES] {
-        let mut page = [0_u8; STARTUP_PAGE_BYTES];
+    fn startup_page(interfaces: &[u32]) -> [u8; troe_abi::startup::REGION_BYTES] {
+        let mut page = [0_u8; troe_abi::startup::REGION_BYTES];
         let encoded = STARTUP_HEADER_BYTES + interfaces.len() * STARTUP_HANDLE_BYTES;
         page[0..4].copy_from_slice(&u32::try_from(encoded).unwrap_or(u32::MAX).to_le_bytes());
         page[4..6].copy_from_slice(&ABI_MAJOR.to_le_bytes());
@@ -3075,6 +3080,32 @@ mod tests {
             ServerContext::from_startup(&startup),
             Err(StartupError::MissingAuthority)
         ));
+    }
+
+    #[test]
+    fn startup_accepts_region_capacity_and_rejects_oversized_regions() {
+        let mut page = startup_page(&[interface::TIMER; troe_abi::startup::MAX_INITIAL_HANDLES]);
+        assert!(Startup::parse(&page).is_ok());
+        let too_many = troe_abi::startup::MAX_INITIAL_HANDLES + 1;
+        page[14..16].copy_from_slice(&u16::try_from(too_many).unwrap_or(u16::MAX).to_le_bytes());
+        let encoded = STARTUP_HEADER_BYTES + too_many * STARTUP_HANDLE_BYTES;
+        page[0..4].copy_from_slice(&u32::try_from(encoded).unwrap_or(u32::MAX).to_le_bytes());
+        assert!(matches!(
+            Startup::parse(&page),
+            Err(StartupError::InvalidPage)
+        ));
+        let oversized = [0; troe_abi::startup::REGION_BYTES + STARTUP_PAGE_BYTES];
+        for bytes in [
+            &[][..],
+            &page[..STARTUP_HEADER_BYTES - 1],
+            &page[..STARTUP_HEADER_BYTES],
+            &oversized,
+        ] {
+            assert!(matches!(
+                Startup::parse(bytes),
+                Err(StartupError::InvalidPage)
+            ));
+        }
     }
 
     #[test]

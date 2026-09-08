@@ -5,7 +5,7 @@ interface grants inbound authority. It does not widen `tcp-connect`.
 
 Status: accepted and implemented for the first Stage 9 TCP slice, 2026-08-25;
 the four-connection system-wide ceiling below is superseded by
-[ADR 0069](0069-bounded-tcp-passive-open-and-tuple-retention.md), which raises
+[ADR 0070](0070-bounded-tcp-passive-open-and-tuple-retention.md), which raises
 it to sixteen and adds the portable passive-open and tuple-retention states.
 Inbound listen authority remains absent as this ADR states.
 
@@ -37,7 +37,7 @@ and treats an in-window reset as terminal.
 Resource bounds are part of interface 1.0:
 
 - at most four live TCP connections system-wide and one per `tcp-connect`
-  handle; the system-wide half is superseded by ADR 0069's sixteen, the
+  handle; the system-wide half is superseded by ADR 0070's sixteen, the
   per-handle half is current;
 - one at-most-1,460-byte unacknowledged transmit segment per connection;
 - one 4 KiB receive FIFO per connection, with no out-of-order queue;

@@ -25,7 +25,9 @@ use crate::resident::launch::parse_native_application;
 use crate::support::{fatal, task_fault, write_all};
 use alloc::vec::Vec;
 use troe_abi::heap_growth;
-use troe_application::{InitialHandle, LoaderResource, LoaderTransaction, PAGE_BYTES, StartupInfo};
+use troe_application::{
+    InitialHandle, LoaderResource, LoaderTransaction, STARTUP_REGION_BYTES, StartupInfo,
+};
 use troe_core::{CommandStatus, Output};
 use troe_dispatch::{Dispatcher, HandleOwner, Rights};
 use troe_memory::BASE_PAGE_SIZE;
@@ -194,7 +196,7 @@ pub(crate) fn run_command_application(
         transaction
             .acquire(LoaderResource::Handles)
             .map_err(|_| ())?;
-        let mut startup = [0_u8; PAGE_BYTES];
+        let mut startup = [0_u8; STARTUP_REGION_BYTES];
         plan.encode_startup_page(
             StartupInfo {
                 task_id: u64::from(task_id.get()),
@@ -242,7 +244,7 @@ pub(crate) fn run_command_application(
             entry,
             layout.stack_top(),
             layout.startup_address(),
-            PAGE_BYTES,
+            STARTUP_REGION_BYTES,
             APPLICATION_TIMESLICE_MILLISECONDS,
         )
         .map_err(|_| ())?;

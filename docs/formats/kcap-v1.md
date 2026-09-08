@@ -6,18 +6,29 @@ with no embedded capabilities; the manifest is carried by the surrounding
 single-file KEX package and validated before any optional service is registered
 or any application page is mapped.
 
-All integers are unsigned little-endian. The 16-byte header is:
+All integers are unsigned little-endian. The KCAP 1.1 header is exactly 24 bytes:
 
 | Offset | Bytes | Field | Rule |
 | ---: | ---: | --- | --- |
 | 0 | 8 | magic | `KCAPv1`, two zero bytes |
 | 8 | 2 | record count | 0–128 |
-| 10 | 2 | reserved | zero |
-| 12 | 4 | encoded bytes | exactly `16 + count * 8` |
+| 10 | 2 | minor | 1 |
+| 12 | 4 | encoded bytes | exactly `24 + count * 16`, at most 2,072 |
+| 16 | 8 | reserved | zero |
 
-Each eight-byte record contains interface identifier (`u32`), required major
-(`u16`), and required minor (`u16`). Records are strictly ascending by nonzero
-interface identifier; duplicates and major version zero are invalid. There are
+Each 16-byte record has this layout:
+
+| Offset | Bytes | Field | Rule |
+| ---: | ---: | --- | --- |
+| 0 | 4 | interface | nonzero |
+| 4 | 2 | required major | nonzero |
+| 6 | 2 | required minor | exact requested interface minor |
+| 8 | 2 | kind | 0 = `KIND_INTERFACE` |
+| 10 | 2 | reserved | zero |
+| 12 | 4 | reserved | zero |
+
+Unsupported minors, unknown kinds, and nonzero reserved bytes are rejected.
+Records are strictly ascending by nonzero interface identifier; duplicates and major version zero are invalid. There are
 no rights bits: KCAP declares which typed startup interface is required, while
 the kernel grants only that interface's fixed call right and exact version.
 
@@ -51,4 +62,7 @@ The builder embeds the encoded manifest before the executable in
 `<command>.kex`; no `.kcap` sidecar is installed. A malformed, unknown,
 unsupported, or unavailable requirement rejects launch and never selects
 privileged fallback behavior. The four command/standard-stream handles are
-mandatory ABI context and therefore are not repeated in KCAP.
+mandatory ABI context and therefore are not repeated in KCAP. The 128 optional
+requirements plus these four mandatory handles fit the 168 descriptors derived
+from `troe_abi::startup::REGION_BYTES`, `HEADER_BYTES`, and `HANDLE_BYTES`;
+this relationship is checked at compile time.

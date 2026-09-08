@@ -2,8 +2,9 @@
 
 use crate::startup::encode_startup_page;
 use crate::{
-    KEX_V1_RELOCATION_RECORD_BYTES, MAX_LOAD_RECORDS, PAGE_BYTES, RELOCATION_TARGET_OFFSET,
-    RELOCATION_VALUE_OFFSET, SegmentPermissions, StartupInfo, StartupPageError, Target,
+    KEX_V1_RELOCATION_RECORD_BYTES, MAX_LOAD_RECORDS, RELOCATION_TARGET_OFFSET,
+    RELOCATION_VALUE_OFFSET, STARTUP_REGION_BYTES, SegmentPermissions, StartupInfo,
+    StartupPageError, Target,
 };
 
 /// One validated KEX load segment borrowing its staged payload bytes.
@@ -172,7 +173,7 @@ pub struct ApplicationLayout {
 }
 
 impl ApplicationLayout {
-    /// Address of the immutable one-page ABI startup record.
+    /// Address of the immutable ABI startup region.
     #[must_use]
     pub const fn startup_address(self) -> u64 {
         self.startup_address
@@ -345,7 +346,7 @@ impl<'artifact> LoadPlan<'artifact> {
         self.layout
     }
 
-    /// Encode the immutable ABI 1.x startup page into a zeroed base page.
+    /// Encode the immutable ABI 1.x startup record into a zeroed region.
     ///
     /// # Errors
     ///
@@ -354,7 +355,7 @@ impl<'artifact> LoadPlan<'artifact> {
     pub fn encode_startup_page(
         &self,
         info: StartupInfo<'_>,
-        destination: &mut [u8; PAGE_BYTES],
+        destination: &mut [u8; STARTUP_REGION_BYTES],
     ) -> Result<(), StartupPageError> {
         encode_startup_page(
             self.abi_minor,

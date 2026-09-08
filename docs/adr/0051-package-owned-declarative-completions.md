@@ -4,6 +4,11 @@ Status: accepted and implemented, 2026-08-29. Portable descriptors, embedded
 CMPL artifacts, recovery activation registry, and current app migration are
 complete. Hosted PMAN/PLOCK publication binding remains a follow-up.
 
+Supersession note, 2026-09-08: [ADR 0069](0069-kex-format-reserved-space-and-derived-handle-ceiling.md)
+revises the package envelope to KEXPKG 1.1 with an explicit 64-bit completion
+length and offset. Both must match the exact trailing CMPL range; the completion
+semantics in this ADR remain in force.
+
 ## Context
 
 The shell already owns cursor-aware completion, its revision-aware command

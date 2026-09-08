@@ -180,6 +180,12 @@ not part of this facade. `localtime`, `mktime`, and `strftime` resolve a POSIX
 `TZ` string from the launch environment through the one rule evaluator in the
 KEX runtime; see [ADR 0067](adr/0067-posix-timezone-strings-and-local-time.md).
 
+SCFG obtains its initial-handle ceiling from the dependency-free
+`troe-abi::startup` vocabulary shared with the loader and SDK. Format codecs may
+link this vocabulary, other format codecs, the checksum and filesystem
+contracts, and block transport; repository-policy tests reject links to
+providers, namespaces, or runtime policy and require `troe-abi` to remain a leaf.
+
 ## Allocation
 
 Portable components use `alloc` but every untrusted growth path has a local
@@ -403,7 +409,7 @@ ADR 0049 adds boot-seeded kernel randomness and KEX ASLR. UEFI must supply an
 approved seed before application admission; the kernel retains a ChaCha20
 CSPRNG and exposes fresh bytes only through the caller's typed `random`
 capability. There is a bounded request size but no artificial lifetime entropy
-quota. Container-1.1 KEX images carry only validated relative relocations and
+quota. Container-1.2 KEX images carry only validated relative relocations and
 receive independent randomized image and stack placements; private mappings
 also use unbiased randomized free-slot selection.
 

@@ -13,6 +13,7 @@ reject-truncated-header-x86_64.kex	x86_64	TruncatedHeader
 reject-invalid-magic-x86_64.kex	x86_64	InvalidMagic
 reject-container-major-x86_64.kex	x86_64	UnsupportedContainerVersion
 reject-container-minor-x86_64.kex	x86_64	UnsupportedContainerVersion
+reject-header-reserved64-x86_64.kex	x86_64	NonzeroReserved
 reject-wrong-target-x86_64.kex	x86_64	WrongTarget
 reject-header-bytes-x86_64.kex	x86_64	InvalidLayout
 reject-record-bytes-x86_64.kex	x86_64	InvalidLayout
@@ -62,6 +63,7 @@ reject-truncated-header-aarch64.kex	aarch64	TruncatedHeader
 reject-invalid-magic-aarch64.kex	aarch64	InvalidMagic
 reject-container-major-aarch64.kex	aarch64	UnsupportedContainerVersion
 reject-container-minor-aarch64.kex	aarch64	UnsupportedContainerVersion
+reject-header-reserved64-aarch64.kex	aarch64	NonzeroReserved
 reject-wrong-target-aarch64.kex	aarch64	WrongTarget
 reject-header-bytes-aarch64.kex	aarch64	InvalidLayout
 reject-record-bytes-aarch64.kex	aarch64	InvalidLayout

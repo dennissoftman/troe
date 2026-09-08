@@ -2,8 +2,8 @@
 
 use crate::{
     KEX_V1_IMAGE_ALIGNMENT, LAUNCH_REGIONS, MAX_IMAGE_SPAN_BYTES, MAX_IMAGE_SPAN_USIZE,
-    MAX_INITIAL_HEAP_PAGES, MAX_INITIAL_STACK_PAGES, MAX_PRIVATE_PAGES, TABLE_ENTRIES,
-    TABLE_LEVELS_BELOW_ROOT,
+    MAX_INITIAL_HANDLES_U16, MAX_INITIAL_HEAP_PAGES, MAX_INITIAL_STACK_PAGES, MAX_PRIVATE_PAGES,
+    TABLE_ENTRIES, TABLE_LEVELS_BELOW_ROOT,
 };
 
 /// Canonical declared span for one image that ends at `image_end`.
@@ -89,7 +89,7 @@ impl ApplicationLimits {
             Some(tables) => MAX_PRIVATE_PAGES + tables,
             None => panic!("maximum private pages must have a table bound"),
         },
-        initial_handles: 32,
+        initial_handles: MAX_INITIAL_HANDLES_U16,
     };
 
     /// Limits fixed by the standard application policy.
@@ -161,6 +161,13 @@ mod tests {
             maximum_private
                 + maximum_table_pages(maximum_private).unwrap_or_else(|| unreachable!())
         );
-        assert_eq!(standard.initial_handles(), 32);
+        assert_eq!(
+            usize::from(standard.initial_handles()),
+            troe_abi::startup::MAX_INITIAL_HANDLES
+        );
+        assert!(
+            usize::from(standard.initial_handles())
+                >= troe_abi::startup::MANDATORY_HANDLES + troe_abi::requirements::MAX_REQUIREMENTS
+        );
     }
 }

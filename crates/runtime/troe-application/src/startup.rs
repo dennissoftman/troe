@@ -3,8 +3,13 @@
 use crate::bytes::{write_u16, write_u32, write_u64};
 use crate::{
     ABI_MAJOR, ApplicationLayout, ApplicationLimits, PAGE_BYTES, STARTUP_FIXED_BYTES,
-    STARTUP_HANDLE_BYTES,
+    STARTUP_HANDLE_BYTES, STARTUP_REGION_BYTES,
 };
+
+/// The page-size field the record carries, kept a plain `u32` constant so the
+/// encoder needs no fallible conversion; it must name the loader's page size.
+const PAGE_BYTES_FIELD: u32 = 4096;
+const _: () = assert!(PAGE_BYTES_FIELD as usize == PAGE_BYTES);
 
 /// One explicit initial authority descriptor encoded into the startup page.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,7 +52,7 @@ pub(crate) fn encode_startup_page(
     image_base: u64,
     layout: ApplicationLayout,
     info: StartupInfo<'_>,
-    destination: &mut [u8; PAGE_BYTES],
+    destination: &mut [u8; STARTUP_REGION_BYTES],
 ) -> Result<(), StartupPageError> {
     if info.task_id == 0 {
         return Err(StartupPageError::InvalidTaskId);
@@ -77,7 +82,7 @@ pub(crate) fn encode_startup_page(
     write_u32(destination, 0, encoded_bytes);
     write_u16(destination, 4, ABI_MAJOR);
     write_u16(destination, 6, abi_minor);
-    write_u32(destination, 8, 4096);
+    write_u32(destination, 8, PAGE_BYTES_FIELD);
     write_u16(destination, 12, 0);
     write_u16(destination, 14, handle_count);
     write_u64(destination, 16, image_base);

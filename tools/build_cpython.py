@@ -712,15 +712,15 @@ def copy_artifact(source: Path, destination: Path, executable: bool = False) -> 
 def kex_image_pages(path: Path) -> int:
     """Return the exact sum of mapped KEX image-record pages."""
     artifact = path.read_bytes()
-    if len(artifact) < 48 or artifact[:8] != b"KEXPKG\0\0":
+    if len(artifact) < 80 or artifact[:8] != b"KEXPKG\0\0":
         raise RuntimeError(f"CPython artifact is not a KEX package: {path}")
-    executable_offset = struct.unpack_from("<I", artifact, 24)[0]
+    executable_offset = struct.unpack_from("<Q", artifact, 24)[0]
     executable_bytes = struct.unpack_from("<Q", artifact, 32)[0]
     executable_end = executable_offset + executable_bytes
     if (
-        executable_offset < 48
+        executable_offset < 80
         or executable_end > len(artifact)
-        or executable_bytes < 88
+        or executable_bytes < 96
     ):
         raise RuntimeError(f"CPython KEX package geometry is invalid: {path}")
     executable = artifact[executable_offset:executable_end]
@@ -729,7 +729,7 @@ def kex_image_pages(path: Path) -> int:
     header_bytes, record_bytes = struct.unpack_from("<HH", executable, 14)
     record_count = struct.unpack_from("<H", executable, 32)[0]
     if (
-        header_bytes != 88
+        header_bytes != 96
         or record_bytes != 40
         or record_count == 0
         or header_bytes + record_count * record_bytes > len(executable)

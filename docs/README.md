@@ -52,7 +52,8 @@ remain available in Git history rather than in current documentation.
 | POSIX timezone strings and local time | [ADR 0067](adr/0067-posix-timezone-strings-and-local-time.md) |
 | Operator-configured session timezone | [ADR 0068](adr/0068-operator-configured-session-timezone.md) |
 | Application TCP listener wire contract and SDK | [TCP listener v1](formats/tcp-listen-v1.md) |
-| Bounded TCP passive open and tuple retention | [ADR 0069](adr/0069-bounded-tcp-passive-open-and-tuple-retention.md) |
+| KEX format reservations and derived handle ceiling | [ADR 0069](adr/0069-kex-format-reserved-space-and-derived-handle-ceiling.md) |
+| Bounded TCP passive open and tuple retention | [ADR 0070](adr/0070-bounded-tcp-passive-open-and-tuple-retention.md) |
 
 The current serialized contracts are versioned independently under
 [`formats/`](formats):

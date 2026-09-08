@@ -1,4 +1,4 @@
-# ADR 0069: bounded TCP passive open and tuple retention
+# ADR 0070: bounded TCP passive open and tuple retention
 
 Status: accepted and implemented. Application access is defined by the
 [TCP listener v1 contract](../formats/tcp-listen-v1.md). Interface 29 grants
