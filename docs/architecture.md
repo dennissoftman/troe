@@ -244,7 +244,8 @@ This makes every scheduling boundary explicit and keeps architecture register
 state out of portable code.
 
 The boot arena contains one reusable 64 KiB cooperative task payload plus
-128 KiB isolated-server and shell payloads. Each has an unmapped 4 KiB page on
+128 KiB isolated-server and 192 KiB shell payloads. The shell reserve covers
+eight nested launch levels including private IPC/root metadata. Each has an unmapped 4 KiB page on
 both sides, while the payload is RW/NX. Boot verification
 interleaves two services, checks deterministic yield/exit counts, reaps their
 records, and reuses a returned slot before launching the shell on the third.

@@ -401,7 +401,7 @@ class FirmwareProfileTests(unittest.TestCase):
             runner = resolve_runner(platform, "qemu-kvm")
             self.assertEqual(runner.cpu, "host")
             self.assertEqual(runner.extra_arguments, ("-accel", "kvm"))
-            self.assertNotEqual(
+            self.assertEqual(
                 runner.acceptance_udp_port,
                 resolve_runner(platform, "qemu").acceptance_udp_port,
             )

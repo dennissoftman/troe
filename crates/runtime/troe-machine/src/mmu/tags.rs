@@ -219,7 +219,7 @@ fn initialize() -> Result<bool, MmuError> {
 #[cfg(target_arch = "x86_64")]
 fn invalidate(tag: u64, address: Option<u64>) {
     let descriptor = [tag, address.unwrap_or(0)];
-    let kind: u64 = if address.is_some() { 0 } else { 1 };
+    let kind = u64::from(address.is_none());
     // SAFETY: PCID and INVPCID were both detected. This 128-bit descriptor
     // has no reserved bits; type 0 targets one address, type 1 one context.
     unsafe {

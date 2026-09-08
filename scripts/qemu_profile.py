@@ -196,6 +196,8 @@ RUNNER_PROFILES = {
 }
 # TCG does not implement PCID/INVPCID. These explicit hardware-backed runners
 # require KVM and host CPU features; they never silently fall back to emulation.
+# A platform keeps its compiled guest probe port across environments. Run its
+# environments on separate machines, as the hosted matrix does.
 KVM_ENVIRONMENT = "qemu-kvm"
 for _platform in (X86_64_Q35_UEFI, X86_64_UEFI_VIRTIO_PCI):
     _base = RUNNER_PROFILES[(_platform, QEMU_ENVIRONMENT)]
@@ -203,7 +205,6 @@ for _platform in (X86_64_Q35_UEFI, X86_64_UEFI_VIRTIO_PCI):
         _base,
         environment=KVM_ENVIRONMENT,
         cpu="host",
-        acceptance_udp_port=_base.acceptance_udp_port + 1000,
         extra_arguments=(*_base.extra_arguments, "-accel", "kvm"),
     )
 ENVIRONMENT_IDS = tuple(dict.fromkeys(key[1] for key in RUNNER_PROFILES))
@@ -250,7 +251,7 @@ def validate_runner_catalog(
     runners: dict[tuple[str, str], RunnerProfile],
 ) -> None:
     """Reject incomplete, ambiguous, or mismatched execution runner records."""
-    ports: set[int] = set()
+    ports: set[tuple[str, int]] = set()
     for key, runner in runners.items():
         platform = resolve_platform(runner.platform_id)
         if key != (runner.platform_id, runner.environment):
@@ -278,9 +279,10 @@ def validate_runner_catalog(
             or runner.firmware_build_command == ""
         ):
             raise RuntimeError(f"invalid runner record for {key!r}")
-        if runner.acceptance_udp_port in ports:
+        port_key = (runner.environment, runner.acceptance_udp_port)
+        if port_key in ports:
             raise RuntimeError("runner acceptance UDP ports must be unique")
-        ports.add(runner.acceptance_udp_port)
+        ports.add(port_key)
 
 
 validate_runner_catalog(RUNNER_PROFILES)
