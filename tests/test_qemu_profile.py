@@ -916,6 +916,51 @@ class StorageBaselineTests(unittest.TestCase):
             "probe_sha256": "d" * 64,
         }
 
+    def test_mutating_cloud_baselines_each_start_from_the_pristine_bundle(self) -> None:
+        baseline = TEST_QEMU.storage_baseline
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "build").mkdir()
+            bundle = root / "bundle"
+            bundle.mkdir()
+            source = bundle / "system.raw"
+            source.write_bytes(b"pristine filesystem timestamps")
+            command = [
+                "qemu",
+                "-drive",
+                f"file={source},format=raw,id=system",
+                "-name",
+                "baseline",
+            ]
+            with (
+                mock.patch.object(baseline, "REPO_ROOT", root),
+                mock.patch.object(baseline, "cloud_bundle_path", return_value=bundle),
+            ):
+                for platform_id in (X86_64_UEFI_VIRTIO_PCI, AARCH64_UEFI_VIRTIO_MMIO):
+                    isolated = baseline.isolate_cloud_system_disk(
+                        platform_id, "qemu", command
+                    )
+                    copy = baseline.cloud_system_copy_path(platform_id)
+                    self.assertEqual(isolated[2], f"file={copy},format=raw,id=system")
+                    self.assertEqual(isolated[3:], command[3:])
+                    copy.write_bytes(b"timestamps changed by storage writes")
+                    self.assertEqual(
+                        source.read_bytes(), b"pristine filesystem timestamps"
+                    )
+                    baseline.isolate_cloud_system_disk(platform_id, "qemu", command)
+                    self.assertEqual(copy.read_bytes(), source.read_bytes())
+                    for invalid in (command[:2], command + command[1:3]):
+                        with self.assertRaises(ValueError):
+                            baseline.isolate_cloud_system_disk(
+                                platform_id, "qemu", invalid
+                            )
+                self.assertEqual(
+                    baseline.isolate_cloud_system_disk(
+                        X86_64_Q35_UEFI, "qemu", command
+                    ),
+                    command,
+                )
+
     def test_committed_storage_matrix_is_complete_and_internally_consistent(
         self,
     ) -> None:

@@ -514,7 +514,10 @@ part of the current contract.
 
 The default QEMU gate includes `storage-baseline`. This scenario measures the
 current application filesystem path on fresh disposable ext4 and FAT32 media.
-Platforms run sequentially to avoid competing measurement guests. Run just
+Cloud profiles copy the verified bundle system disk before each baseline
+scenario; guest writes never modify the pristine bundle. Split profiles reset
+their separate root disk. Platforms run sequentially to avoid competing
+measurement guests. Run just
 this scenario with:
 
 ```console

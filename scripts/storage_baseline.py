@@ -7,6 +7,7 @@ import json
 import math
 import platform
 import re
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -17,7 +18,7 @@ from platform_profile import (
     resolve_platform,
     shared_test_image_path,
 )
-from qemu_profile import qemu_version
+from qemu_profile import cloud_bundle_path, qemu_version, resolve_runner
 
 PROBE_PACKAGES = REPO_ROOT / "build" / "storage-baseline-packages"
 FIXTURES = REPO_ROOT / "tests" / "fixtures" / "adr-0035"
@@ -72,6 +73,38 @@ def install_probe(profile: PlatformProfile) -> None:
         cwd=REPO_ROOT,
         check=True,
     )
+
+
+def cloud_system_copy_path(platform_id: str) -> Path:
+    """Return the disposable system disk shared by sequential baseline boots."""
+    resolve_platform(platform_id)
+    return REPO_ROOT / "build" / f"baseline-system-{platform_id}.raw"
+
+
+def isolate_cloud_system_disk(
+    platform_id: str, environment: str, command: list[str]
+) -> list[str]:
+    """Keep a verified cloud bundle pristine across mutating baseline scenarios."""
+    if resolve_runner(platform_id, environment).disk_layout != "cloud-bundle-v1":
+        return command
+    source = (
+        cloud_bundle_path(
+            resolve_platform(platform_id), environment, acceptance_probes=True
+        )
+        / "system.raw"
+    )
+    destination = cloud_system_copy_path(platform_id)
+    source_field = f"file={source}"
+    if sum(argument.split(",").count(source_field) for argument in command) != 1:
+        raise ValueError("baseline cloud system disk missing or duplicated")
+    shutil.copyfile(source, destination)
+    return [
+        ",".join(
+            f"file={destination}" if field == source_field else field
+            for field in argument.split(",")
+        )
+        for argument in command
+    ]
 
 
 def digest(path: Path) -> str:
