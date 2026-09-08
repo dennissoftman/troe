@@ -195,9 +195,10 @@ to every application gate and every QEMU scenario.
 
 ## QEMU scenario groups
 
-`scripts/test-qemu.py` accepts a repeatable `--scenario` option. Omitting it is
-the exhaustive default and selects every group. Multiple selected groups run in
-their canonical order during the same primary guest boot where possible.
+`scripts/test-qemu.py` accepts a repeatable `--scenario` option. Omitting it
+selects the default groups; Lua and CPython require explicit selection. Multiple
+selected groups run in their canonical order during the same primary guest boot
+where possible.
 
 | Group | Runtime contract exercised |
 | --- | --- |
@@ -205,6 +206,7 @@ their canonical order during the same primary guest boot where possible.
 | `network` | Link and IPv4 state, DHCP, ICMP, ARP, cancellation, UDP including a terminal-supplied datagram payload, bounded TCP streams |
 | `shell-terminal` | Editing, completion, history, manuals, parsing, CRLF, clear-screen behavior, and the foreground session terminal-input loan: typed lines, end of input, cancellation, background and nested end-of-input, resident-job and service coexistence, and unchanged redirection and pipelines |
 | `filesystem` | KEFS/ext4/FAT32 reads and writes, shared-media restart persistence, paths, logical lists, pipelines, bounded `sh.kex` scripts, RAMFS mutation, read-only and error behavior, plus repeated direct and nested launches of the large shared-media C runtime probe |
+| `storage-baseline` | Fresh-media ext4/FAT32 4 KiB read and write-plus-sync timing, exact payload checks, and frozen fixture validation |
 | `lua` | Explicit-path execution of the optional shared-media runtime, Lua inline/stdin/file loading, the portable compute/allocation benchmark, consolidated language/numeric/system examples, script argument/`-l` compatibility, exact binary64 formatting, complete pipe reads, buffering modes, protected errors, shared-runtime math/calendar/environment/process/random behavior, typed filesystem errno failures, OS-shim clock and exit behavior, timer preemption, fragmentation, a 48 MiB private allocation beyond the former narrow TLSF geometry, and bounded OOM recovery. Not selected by default: it consumes the shared runtime tree, which the `filesystem` group also installs |
 | `cpython` | Version-addressable and default interpreters, explicit-path execution consent, `-c`, arguments after `--`, scripts, `-m`, redirected stdin, an interactive REPL that retains state and ends on end of input, upstream Unicode/GC/weakref/traceback semantics, the shipped library profile plus a full shipped-module import sweep, TROE-backed filesystem/temporary-file/clock/entropy behavior, excluded modules and explicit thread-creation failure, withheld random and mutation authority, and kernel-frame reclamation across repeated successful and failing launches. Not selected by default: it consumes the separately built interpreter package (see below) |
 | `quota-memory` | 128-entry quota, recovery, repeated transient workloads, exact initial/heap/private commitment accounting, zeroed private mappings, partial protect/unmap and recoalescing, typed CSPRNG reads, and independently randomized KEX image bases |
@@ -506,6 +508,59 @@ The isolated path performs no transient kernel allocation in its measured
 receive-to-reply interval and copies directly into caller-owned bounded storage.
 Reply ownership, token generation checks, server-fault fate, and teardown remain
 part of the current contract.
+
+## Storage baseline capture
+
+The default QEMU gate includes `storage-baseline`. This scenario measures the
+current application filesystem path on fresh disposable ext4 and FAT32 media.
+Platforms run sequentially to avoid competing measurement guests. Run just
+this scenario with:
+
+```console
+python3 scripts/test-qemu.py --platform all --environment qemu --scenario storage-baseline
+```
+
+The harness builds `tests/storage-baseline` as a standalone KEX package on the
+shared disk. It uses an acceptance-only timer diagnostic to sample the same
+architecture counter as the IPC matrix. The SDK `acceptance-probes` feature
+exposes this hook; production kernels reject its payload, and the production
+image verifier rejects its marker. No baseline executable is installed into the
+production rootfs.
+
+Each volume runs 64 unreported warmups followed by 256 timed 4 KiB writes, then
+64 warmups and 256 timed 4 KiB reads from that file. A write interval includes
+`begin_append`, the complete 4 KiB `write_all`, and `commit` (including the
+provider sync). The current ABI splits both a 4 KiB write and read across two
+bounded data calls. Read intervals cover the loop that receives all 4 KiB at
+consecutive offsets; open/close and
+byte-for-byte payload validation are outside the interval. The payload is
+4096 bytes of `0x5a` with its first eight bytes replaced by the little-endian
+chunk index; a repeated or reordered chunk therefore fails verification. Every
+operation yields outside its measured interval, and
+all serial formatting occurs after the samples for a row have completed.
+
+Elapsed ticks include kernel execution and device waits. Each interval also
+includes the return half of the first timer call and entry half of the second;
+no timer-overhead subtraction is applied. The fixture retains every sample,
+nearest-rank p50/p95, and throughput calculated as total measured bytes divided
+by total elapsed time. These are QEMU engineering measurements, with no absolute
+hardware latency claim.
+
+Frozen fixtures live under `tests/fixtures/adr-0035/storage-*.json`. Capture
+requires a fresh build and an explicit output directory; it refuses
+`--skip-build` and existing output files:
+
+```console
+python3 scripts/test-qemu.py --platform all --environment qemu --scenario storage-baseline --record-storage-baseline /tmp/troe-storage-capture
+```
+
+Capture records the QEMU command and version, verbose Rust version, host,
+source/base revision, probe hash, and hashes of firmware and disk inputs before
+boot. The ordinary gate validates the frozen contract and recomputes its
+statistics from the raw samples, then writes fresh observations separately to
+`build/storage-baseline-results`. It does not treat another run's timing as an
+absolute pass threshold. The subsystem migration and same-image ratio gates
+are specified by [issue #8](https://github.com/dennissoftman/troe/issues/8).
 
 ## Maintainer merge and release gates
 

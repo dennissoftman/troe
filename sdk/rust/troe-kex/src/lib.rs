@@ -3070,3 +3070,26 @@ mod tests {
         ));
     }
 }
+
+/// Private measurement hook for acceptance packages and acceptance kernels.
+#[cfg(feature = "acceptance-probes")]
+impl Timer {
+    /// Sample the elapsed architecture counter, including kernel and I/O time.
+    ///
+    /// This diagnostic payload is rejected by production kernels. The returned
+    /// ticks are an absolute counter sample, not process CPU accounting.
+    ///
+    /// # Errors
+    ///
+    /// Reports an unavailable counter, production kernel, or malformed reply.
+    pub fn acceptance_counter(&mut self) -> Result<timer::ProcessCpuTime, Error> {
+        let mut reply = [0_u8; timer::PROCESS_CPU_TIME_BYTES];
+        let count = call(
+            self.handle,
+            timer::NOW,
+            b"TROE-BASELINE-CLOCK-v1",
+            &mut reply,
+        )?;
+        timer::decode_process_cpu_time(&reply[..count]).map_err(|_| Error::InvalidCall)
+    }
+}

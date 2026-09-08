@@ -447,6 +447,32 @@ def verification_steps(args: argparse.Namespace) -> list[Step]:
             for application in SHARED_VOLUME_KEX_APPLICATIONS
         ),
         Step(
+            "fmt storage baseline probe",
+            (
+                "cargo",
+                "fmt",
+                "--manifest-path",
+                REPO_ROOT / "tests" / "storage-baseline" / "Cargo.toml",
+                "--check",
+            ),
+        ),
+        Step(
+            "clippy storage baseline probe",
+            (
+                "cargo",
+                "clippy",
+                "--manifest-path",
+                REPO_ROOT / "tests" / "storage-baseline" / "Cargo.toml",
+                "--target",
+                "x86_64-unknown-none",
+                "--target",
+                "aarch64-unknown-none",
+                "--",
+                "-D",
+                "warnings",
+            ),
+        ),
+        Step(
             "kex runtime probe",
             (
                 "cargo",

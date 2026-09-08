@@ -884,5 +884,146 @@ class FirmwareProfileTests(unittest.TestCase):
         poweroff.assert_called_once_with(session, 10.0)
 
 
+class StorageBaselineTests(unittest.TestCase):
+    """Frozen evidence rejects partial captures and internally inconsistent data."""
+
+    @staticmethod
+    def output() -> str:
+        baseline = TEST_QEMU.storage_baseline
+        header = "STORAGE-BASELINE " + " ".join(
+            f"{key}={value}" for key, value in baseline.CONTRACT.items()
+        )
+        samples = ",".join(str(value) for value in range(1, 257))
+        rows = [
+            f"STORAGE volume={volume} phase={phase} "
+            f"frequency_hz=1000000 ticks={samples}"
+            for volume, phase in sorted(baseline.ROWS)
+        ]
+        return "\n".join((header, *rows, "END storage-baseline"))
+
+    @staticmethod
+    def origin() -> dict[str, object]:
+        return {
+            "platform": X86_64_Q35_UEFI,
+            "environment": "qemu",
+            "qemu": "QEMU test",
+            "rust": "rustc test",
+            "host": "test",
+            "base_commit": "a" * 40,
+            "command": ["qemu"],
+            "source_sha256": {"source": "b" * 64},
+            "input_sha256": {"image": "c" * 64},
+            "probe_sha256": "d" * 64,
+        }
+
+    def test_committed_storage_matrix_is_complete_and_internally_consistent(
+        self,
+    ) -> None:
+        baseline = TEST_QEMU.storage_baseline
+        for platform_id in PLATFORM_IDS:
+            with self.subTest(platform=platform_id):
+                fixture = baseline.FIXTURES / f"storage-{platform_id}.json"
+                baseline.validate_document(
+                    json.loads(fixture.read_text("utf-8")), platform_id
+                )
+
+    def test_sample_statistics_use_nearest_rank_and_total_elapsed(self) -> None:
+        baseline = TEST_QEMU.storage_baseline
+        document = baseline.make_document(self.output(), self.origin())
+        baseline.validate_document(document, X86_64_Q35_UEFI)
+        row = document["storage"]["ext4/read"]
+        self.assertEqual(row["p95_ticks"], 244)
+        self.assertEqual(row["p50_ticks"], 128)
+        self.assertEqual(row["total_ticks"], sum(range(1, 257)))
+        self.assertEqual(
+            row["bytes_per_second"], 256 * 4096 * 1000000 / sum(range(1, 257))
+        )
+
+    def test_partial_duplicate_nonfinite_zero_and_changed_records_fail(self) -> None:
+        baseline = TEST_QEMU.storage_baseline
+        output = self.output()
+        variants = (
+            output.replace("END storage-baseline", ""),
+            output + "\nEND storage-baseline",
+            output.replace("chunk_bytes=4096", "chunk_bytes=512"),
+            output.replace("ticks=1,", "ticks=0,"),
+            output.replace("ticks=1,", "ticks=nan,"),
+            output.replace("ticks=1,", "ticks=inf,"),
+            output.replace("ticks=1,", f"ticks={1 << 64},"),
+            output.replace("ticks=1,", "ticks="),
+            output.replace("phase=read", "phase=write_sync"),
+            output.replace("frequency_hz=1000000", "frequency_hz=0"),
+            output.replace("volume=ext4", "volume=ext4 volume=ext4"),
+            output.replace("volume=fat32", "volume=unknown"),
+            "\n".join(output.splitlines()[1:]),
+        )
+        for invalid in variants:
+            with self.subTest(invalid=invalid[:100]), self.assertRaises(ValueError):
+                baseline.make_document(invalid, self.origin())
+
+    def test_fixture_corruption_and_wrong_platform_fail(self) -> None:
+        baseline = TEST_QEMU.storage_baseline
+        document = baseline.make_document(self.output(), self.origin())
+        with self.assertRaises(ValueError):
+            baseline.validate_document(document, AARCH64_UEFI_VIRTIO_MMIO)
+        document["storage"]["ext4/read"]["p95_ticks"] = 1
+        with self.assertRaises(ValueError):
+            baseline.validate_document(document, X86_64_Q35_UEFI)
+        document = baseline.make_document(self.output(), self.origin())
+        document["provenance"]["probe_sha256"] = "unknown"
+        with self.assertRaises(ValueError):
+            baseline.validate_document(document, X86_64_Q35_UEFI)
+
+    def test_recording_refuses_to_overwrite_frozen_evidence(self) -> None:
+        baseline = TEST_QEMU.storage_baseline
+        document = baseline.make_document(self.output(), self.origin())
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory)
+            baseline.settle(document, destination)
+            captured = next(destination.glob("*.json"))
+            original = captured.read_bytes()
+            with self.assertRaises(FileExistsError):
+                baseline.settle(document, destination)
+            self.assertEqual(captured.read_bytes(), original)
+
+    def test_fresh_timing_never_overwrites_or_thresholds_frozen_evidence(self) -> None:
+        baseline = TEST_QEMU.storage_baseline
+        document = baseline.make_document(self.output(), self.origin())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            frozen = root / "fixtures"
+            baseline.settle(document, frozen)
+            fixture = next(frozen.glob("*.json"))
+            original = fixture.read_bytes()
+            for name, row in document["storage"].items():
+                document["storage"][name] = baseline.summarize(
+                    [value * 100 for value in row["ticks"]], row["frequency_hz"]
+                )
+            with (
+                mock.patch.object(baseline, "FIXTURES", frozen),
+                mock.patch.object(baseline, "REPO_ROOT", root),
+            ):
+                baseline.settle(document, None)
+            self.assertEqual(fixture.read_bytes(), original)
+            observed = root / "build" / "storage-baseline-results" / fixture.name
+            self.assertEqual(json.loads(observed.read_text("utf-8")), document)
+
+    def test_capture_flag_requires_the_storage_scenario(self) -> None:
+        arguments = [
+            "--platform",
+            X86_64_Q35_UEFI,
+            "--environment",
+            "qemu",
+            "--record-storage-baseline",
+            "/tmp/unused",
+        ]
+        for selector in (["--smoke"], ["--scenario", "network"], ["--skip-build"]):
+            with self.assertRaises(ValueError):
+                TEST_QEMU.selected_scenarios(TEST_QEMU.parse_args(arguments + selector))
+        args = TEST_QEMU.parse_args([*arguments, "--scenario", "storage-baseline"])
+        groups = TEST_QEMU.selected_scenarios(args)
+        self.assertTrue(TEST_QEMU.requires_acceptance_images(groups))
+
+
 if __name__ == "__main__":
     unittest.main()

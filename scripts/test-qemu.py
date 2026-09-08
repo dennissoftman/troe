@@ -18,6 +18,7 @@ import time
 import zlib
 from pathlib import Path
 
+import storage_baseline
 from platform_profile import (
     AARCH64_UEFI_VIRTIO_MMIO,
     PLATFORM_IDS,
@@ -486,11 +487,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=COMMAND_TIMEOUT_SECONDS,
         help=f"seconds to wait for each command (default: {COMMAND_TIMEOUT_SECONDS:g})",
     )
+    parser.add_argument(
+        "--record-storage-baseline",
+        type=Path,
+        metavar="DIRECTORY",
+        help="record frozen storage fixtures without overwriting existing files",
+    )
     return parser.parse_args(argv)
 
 
 def selected_scenarios(args: argparse.Namespace) -> frozenset[str]:
     """Resolve explicit acceptance groups while keeping the default exhaustive."""
+    if args.record_storage_baseline is not None and (
+        args.smoke
+        or args.skip_build
+        or (args.scenario and "storage-baseline" not in args.scenario)
+    ):
+        raise ValueError(
+            "--record-storage-baseline requires storage-baseline and a fresh build"
+        )
     if args.smoke:
         if args.scenario:
             raise ValueError("--smoke and --scenario are mutually exclusive")
@@ -508,8 +523,8 @@ def apply_scenario_requirements(
 
 
 def requires_acceptance_images(scenario_groups: frozenset[str]) -> bool:
-    """Return whether selected groups execute destructive acceptance probes."""
-    return "fault-isolation" in scenario_groups
+    """Return whether selected groups need acceptance-only instrumentation."""
+    return bool(scenario_groups.intersection(("fault-isolation", "storage-baseline")))
 
 
 def normalize(data: bytes) -> str:
@@ -3648,6 +3663,9 @@ def test_platform(
     args: argparse.Namespace,
 ) -> None:
     scenario_groups = selected_scenarios(args)
+    if scenario_groups == frozenset(("storage-baseline",)):
+        run_storage_acceptance(platform_id, args)
+        return
     command = prepare_qemu_command(
         platform_id,
         args.environment,
@@ -3800,9 +3818,59 @@ def test_platform(
         and platform_id == X86_64_Q35_UEFI
     ):
         run_native_keyboard_scenario(args)
+    if "storage-baseline" in scenario_groups:
+        run_storage_acceptance(platform_id, args)
     suite = "smoke" if args.smoke else "acceptance"
     groups = "smoke" if args.smoke else ",".join(sorted(scenario_groups))
     print(f"QEMU {suite} ({platform_id}; groups={groups}): passed")
+
+
+def run_storage_acceptance(platform_id: str, args: argparse.Namespace) -> None:
+    """Measure fresh disposable ext4/FAT32 media in an acceptance image."""
+    reset_txslot(platform_id, args.environment)
+    reset_shared_media(platform_id, install_runtime=False)
+    profile = resolve_platform(platform_id)
+    storage_baseline.install_probe(profile)
+    command = prepare_qemu_command(
+        platform_id,
+        args.environment,
+        args.firmware_code,
+        args.firmware_vars,
+        skip_version_check=args.skip_version_check,
+        strict_tool_versions=args.strict_tool_versions,
+        build=False,
+        acceptance_probes=True,
+        data_disks=(shared_test_image_path(profile),),
+    )
+    provenance = storage_baseline.provenance(platform_id, args.environment, command)
+    peer = UdpAcceptancePeer(platform_id, args.environment)
+    peer.start()
+    session = None
+    try:
+        session = SerialSession(command, platform_id)
+        session.wait_for(b"sh:/> ", args.boot_timeout)
+        assert_owned_boot(session)
+        assert_ipc_baseline(session)
+        output = session.confirmed_command(
+            "/vol/shared/storage-baseline.kex",
+            "/",
+            max(args.command_timeout, 180.0),
+            contains=("STORAGE-BASELINE version=1", "END storage-baseline"),
+        )
+        document = storage_baseline.make_document(output, provenance)
+        request_poweroff(session, args.command_timeout)
+    except Exception:
+        if session is not None:
+            print(session.transcript(), file=sys.stderr)
+        raise
+    finally:
+        if session is not None:
+            session.close()
+        peer.close()
+    if peer.error is not None or peer.received != 1:
+        raise AcceptanceError(f"{platform_id} storage baseline boot peer failed")
+    storage_baseline.settle(document, args.record_storage_baseline)
+    print(f"QEMU storage baseline ({platform_id}): passed")
 
 
 def main() -> int:
@@ -3862,6 +3930,8 @@ def main() -> int:
                         args.environment,
                         acceptance_probes=True,
                     )
+        if "storage-baseline" in scenario_groups:
+            storage_baseline.build_probe(skip_build=args.skip_build)
         install_runtime = not args.smoke and "filesystem" in scenario_groups
         if install_runtime:
             if args.skip_build:
@@ -3885,8 +3955,9 @@ def main() -> int:
                 install_runtime=install_runtime,
                 install_cpython=install_cpython,
             )
-        if len(platform_ids) == 1:
-            test_platform(platform_ids[0], args)
+        if len(platform_ids) == 1 or "storage-baseline" in scenario_groups:
+            for platform_id in platform_ids:
+                test_platform(platform_id, args)
         else:
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=len(platform_ids), thread_name_prefix="qemu-acceptance"
@@ -3897,7 +3968,13 @@ def main() -> int:
                 }
                 for future in concurrent.futures.as_completed(futures):
                     future.result()
-    except (AcceptanceError, FileNotFoundError, OSError, RuntimeError) as error:
+    except (
+        AcceptanceError,
+        FileNotFoundError,
+        OSError,
+        RuntimeError,
+        ValueError,
+    ) as error:
         print(f"QEMU acceptance failed: {error}", file=sys.stderr)
         return 1
     except subprocess.CalledProcessError as error:

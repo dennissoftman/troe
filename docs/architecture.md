@@ -663,10 +663,15 @@ fact that belongs to one platform rather than to both.
   bits wide; both AArch64 platforms read `CNTPCT_EL0` scaled by `CNTFRQ_EL0`.
   Calibration is cached after the first nonzero result, so repeated reads cannot
   re-time a running machine.
-- One millisecond is the resolution floor at every boundary: the timer interface
-  encodes milliseconds, the execution timer is armed in whole milliseconds, and
-  the C runtime therefore reports a 1,000 Hz frequency. A sub-millisecond
+- One millisecond is the resolution floor for production scheduling: the timer
+  interface encodes milliseconds, the execution timer is armed in whole
+  milliseconds, and the C runtime therefore reports a 1,000 Hz frequency. A sub-millisecond
   deadline is not expressible and returns immediately.
+- Acceptance storage probes sample the high-resolution architecture counter
+  through an acceptance-only timer payload. The counter includes kernel and
+  I/O time; it does not change production timer or execution-lease resolution.
+  The [storage measurement contract](testing.md#storage-baseline-capture)
+  defines the intervals and fixture validation.
 - A sleep is a deadline, not a duration. The wait re-arms the one-shot timer in
   slices no longer than the application timeslice and recomputes the remainder
   from the counter on every pass, so a long wait cannot accumulate per-slice
