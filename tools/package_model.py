@@ -14,6 +14,8 @@ from pathlib import Path
 MAX_DOCUMENT_BYTES = 256 * 1024
 MAX_PACKAGE_BYTES = 8 * 1024 * 1024
 MAX_PACKAGES = 128
+# Mirrors troe_abi::startup::MAX_INITIAL_HANDLES (startup descriptor capacity).
+MAX_INITIAL_HANDLES = 168
 MAX_DEPENDENCIES = 32
 MAX_TARGETS = 2
 MAX_CAPABILITIES = 32
@@ -530,7 +532,9 @@ def parse_manifest(data: bytes, label: str = "manifest") -> Manifest:
         _bounded_int(
             resource["execution_ms"], f"{label}.resources.execution_ms", 1, 50
         ),
-        _bounded_int(resource["handles"], f"{label}.resources.handles", 1, 8),
+        _bounded_int(
+            resource["handles"], f"{label}.resources.handles", 1, MAX_INITIAL_HANDLES
+        ),
         _bounded_int(
             resource["heap_bytes"], f"{label}.resources.heap_bytes", 4096, U64_MAX
         ),
@@ -928,7 +932,7 @@ def plan(
         raise ModelError(
             "plan-capacity", "plan.artifact_bytes", str(totals["artifact_bytes"])
         )
-    if totals["handles"] > 256:
+    if totals["handles"] > MAX_PACKAGES * MAX_INITIAL_HANDLES:
         raise ModelError("plan-capacity", "plan.handles", str(totals["handles"]))
     if totals["heap_bytes"] > U64_MAX:
         raise ModelError("plan-capacity", "plan.heap_bytes", str(totals["heap_bytes"]))

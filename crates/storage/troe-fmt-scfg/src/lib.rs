@@ -39,7 +39,13 @@ const MAX_SERVICE_NAME_BYTES: usize = 32;
 const MAX_BOOT_ATTEMPTS: u8 = 8;
 const MAX_HEALTH_WINDOW_MS: u32 = 10 * 60 * 1000;
 const MAX_EXECUTION_LEASE_MS: u16 = 50;
-const MAX_INITIAL_HANDLES: u8 = 8;
+const MAX_INITIAL_HANDLES: u8 = {
+    assert!(troe_abi::startup::MAX_INITIAL_HANDLES <= u8::MAX as usize);
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        troe_abi::startup::MAX_INITIAL_HANDLES as u8
+    }
+};
 const FLAG_FALLBACK_PREVIOUS: u8 = 1 << 0;
 const FLAG_RECOVERY_SHELL: u8 = 1 << 1;
 const KNOWN_FLAGS: u8 = FLAG_FALLBACK_PREVIOUS | FLAG_RECOVERY_SHELL;
@@ -1409,6 +1415,23 @@ mod tests {
             FailureAction::RecoveryShell
         );
         Ok(())
+    }
+
+    #[test]
+    fn service_handle_budget_uses_startup_descriptor_capacity() {
+        for count in [0, 9, 33, super::MAX_INITIAL_HANDLES] {
+            let mut bytes = valid_config();
+            bytes[HEADER_BYTES + 7] = count;
+            refresh_crc(&mut bytes);
+            let config = parse_config(&bytes).unwrap_or_else(|_| unreachable!());
+            assert_eq!(config.services()[0].initial_handles(), count);
+        }
+        for count in [super::MAX_INITIAL_HANDLES + 1, u8::MAX] {
+            let mut bytes = valid_config();
+            bytes[HEADER_BYTES + 7] = count;
+            refresh_crc(&mut bytes);
+            assert!(parse_config(&bytes).is_err());
+        }
     }
 
     #[test]

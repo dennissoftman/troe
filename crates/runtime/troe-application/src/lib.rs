@@ -16,8 +16,8 @@ mod stream;
 mod tests;
 mod transaction;
 
-use troe_abi::requirements;
 pub use troe_abi::{ABI_MAJOR, ABI_MINOR};
+use troe_abi::{requirements, startup as abi_startup};
 
 pub use executable::{
     LoadPlacement, ParseError, SegmentPermissions, Target, parse_kex, parse_kex_at,
@@ -57,7 +57,11 @@ pub const KEX_V1_LEGACY_IMAGE_SPAN_BYTES: u64 = 128 * 1024 * 1024;
 /// Lowest application ABI minor whose artifacts declare their own image span.
 pub const KEX_V1_DECLARED_SPAN_ABI_MINOR: u16 = 2;
 /// KEX v1 header length in bytes.
-pub const KEX_V1_HEADER_BYTES: usize = 88;
+pub const KEX_V1_HEADER_BYTES: usize = 96;
+/// KEX container major implemented by the loader.
+pub const KEX_V1_CONTAINER_MAJOR: u16 = 1;
+/// KEX container minor implemented by the loader.
+pub const KEX_V1_CONTAINER_MINOR: u16 = 2;
 /// KEX v1 load-record length in bytes.
 pub const KEX_V1_LOAD_RECORD_BYTES: usize = 40;
 /// KEX v1 relative-relocation record length in bytes.
@@ -65,18 +69,28 @@ pub const KEX_V1_RELOCATION_RECORD_BYTES: usize = 16;
 /// Product-name-independent KEX v1 format identifier.
 pub const KEX_V1_MAGIC: [u8; 8] = *b"KEX\0FMT\0";
 /// KEX package v1 header length in bytes.
-pub const KEX_PACKAGE_V1_HEADER_BYTES: usize = 48;
+pub const KEX_PACKAGE_V1_HEADER_BYTES: usize = 80;
+/// Mapped bytes of the immutable startup region a launch encodes.
+pub const STARTUP_REGION_BYTES: usize = abi_startup::REGION_BYTES;
 /// Canonical single-file KEX package identifier.
 pub const KEX_PACKAGE_V1_MAGIC: [u8; 8] = *b"KEXPKG\0\0";
 /// Maximum load records accepted by the standard application policy.
 pub const MAX_LOAD_RECORDS: usize = 16;
-const CONTAINER_MAJOR: u16 = 1;
-const CONTAINER_MINOR: u16 = 1;
-const STARTUP_PAGES: u64 = 1;
+const CONTAINER_MAJOR: u16 = KEX_V1_CONTAINER_MAJOR;
+const CONTAINER_MINOR: u16 = KEX_V1_CONTAINER_MINOR;
+const STARTUP_PAGES: u64 = abi_startup::REGION_PAGES as u64;
 const MAX_INITIAL_STACK_PAGES: u64 = 1 << 32;
 const MAX_INITIAL_HEAP_PAGES: u64 = 1 << 32;
-const STARTUP_FIXED_BYTES: usize = 64;
-const STARTUP_HANDLE_BYTES: usize = 24;
+const MAX_INITIAL_HANDLES_U16: u16 = {
+    assert!(abi_startup::MAX_INITIAL_HANDLES <= u16::MAX as usize);
+    #[allow(clippy::cast_possible_truncation)]
+    {
+        abi_startup::MAX_INITIAL_HANDLES as u16
+    }
+};
+const STARTUP_FIXED_BYTES: usize = abi_startup::HEADER_BYTES;
+const STARTUP_HANDLE_BYTES: usize = abi_startup::HANDLE_BYTES;
+const _: () = assert!(PAGE_BYTES == abi_startup::PAGE_BYTES);
 
 const HEADER_CONTAINER_MAJOR: usize = 8;
 const HEADER_CONTAINER_MINOR: usize = 10;
@@ -100,6 +114,7 @@ const HEADER_RELOCATION_BYTES: usize = 72;
 const HEADER_RESERVED_RELOCATION16: usize = 74;
 const HEADER_RESERVED_RELOCATION32: usize = 76;
 const HEADER_ARTIFACT_BYTES: usize = 80;
+const HEADER_RESERVED64: usize = 88;
 
 const RECORD_IMAGE_OFFSET: usize = 0;
 const RECORD_FILE_OFFSET: usize = 8;
@@ -112,7 +127,7 @@ const RELOCATION_TARGET_OFFSET: usize = 0;
 const RELOCATION_VALUE_OFFSET: usize = 8;
 
 const PACKAGE_MAJOR: u16 = 1;
-const PACKAGE_MINOR: u16 = 0;
+const PACKAGE_MINOR: u16 = 1;
 const PACKAGE_HEADER_MAJOR: usize = 8;
 const PACKAGE_HEADER_MINOR: usize = 10;
 const PACKAGE_HEADER_BYTES: usize = 12;
@@ -120,9 +135,12 @@ const PACKAGE_HEADER_FLAGS: usize = 14;
 const PACKAGE_HEADER_MANIFEST_OFFSET: usize = 16;
 const PACKAGE_HEADER_MANIFEST_BYTES: usize = 20;
 const PACKAGE_HEADER_EXECUTABLE_OFFSET: usize = 24;
-const PACKAGE_HEADER_COMPLETION_OFFSET: usize = 28;
 const PACKAGE_HEADER_EXECUTABLE_BYTES: usize = 32;
-const PACKAGE_HEADER_PACKAGE_BYTES: usize = 40;
+const PACKAGE_HEADER_COMPLETION_OFFSET: usize = 40;
+const PACKAGE_HEADER_COMPLETION_BYTES: usize = 48;
+const PACKAGE_HEADER_PACKAGE_BYTES: usize = 56;
+const PACKAGE_HEADER_RESERVED: usize = 64;
+const PACKAGE_HEADER_RESERVED_BYTES: usize = 16;
 const PACKAGE_FLAG_COMPLETION: u16 = 1;
 
 /// Maximum complete package bytes admitted by the standard application policy.
@@ -173,5 +191,13 @@ const MAX_PRIVATE_PAGES: u64 =
 /// header, and sixteen load records. Relocations and payload bytes are never
 /// retained as a whole.
 pub const STREAM_PREFIX_BYTES: usize = PAGE_BYTES;
+const _: () = assert!(
+    KEX_PACKAGE_V1_HEADER_BYTES
+        + requirements::MAX_MANIFEST_BYTES
+        + KEX_V1_HEADER_BYTES
+        + MAX_LOAD_RECORDS * KEX_V1_LOAD_RECORD_BYTES
+        <= STREAM_PREFIX_BYTES,
+    "the streamed prefix must hold every table the loader validates before the payload"
+);
 /// Peak byte buffers used by the format-side streaming verifier.
 pub const STREAM_WORKING_SET_BYTES: usize = 2 * PAGE_BYTES + troe_completion::MAX_ARTIFACT_BYTES;

@@ -2,6 +2,11 @@
 
 Status: accepted and implemented, 2026-08-28.
 
+Supersession note, 2026-09-08: [ADR 0069](0069-kex-format-reserved-space-and-derived-handle-ceiling.md)
+revises the executable envelope to container 1.2 with a 96-byte header and
+reserved zero tail. This ADR's position-independent layout and relocation
+semantics remain in force.
+
 ## Context
 
 Private virtual memory makes address placement a security-relevant kernel

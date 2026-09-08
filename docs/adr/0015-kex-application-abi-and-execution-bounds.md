@@ -64,6 +64,11 @@ cover staging, frames, inactive tables, task records, and handles, including
 reverse rollback and the rule that no root becomes active before complete
 commit.
 
+Supersession note, 2026-09-08: [ADR 0069](0069-kex-format-reserved-space-and-derived-handle-ceiling.md)
+defines the current 96-byte KEX container 1.2 header and derives the initial-handle
+ceiling from the startup region, currently 168. Earlier container sizes and
+handle ceilings below preserve the original decision.
+
 ## Decision
 
 Stage 7 introduces a project-owned, target-specific static executable container
@@ -287,7 +292,7 @@ separately bounded and is released before entry.
 | Runtime heap/private commit | active 64-bit policy, minimum-free reserve, and available frames |
 | Format page-table charge | derived from the mapped layout; native launch retains the exact fallibly allocated amount |
 | Initial resident-page admission | maximum private pages plus their derived table bound |
-| Initial handles | 32 |
+| Initial handles | startup descriptor capacity, currently 168 (ADR 0069) |
 
 There is one initial application resource policy. These values are launch
 safety maxima, not a machine-size selector. Every launch charges its

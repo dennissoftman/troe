@@ -8,7 +8,7 @@ use std::vec::Vec;
 use super::*;
 use crate::bytes::{read_u16, read_u32, read_u64, write_u64};
 use crate::executable::parse_with_limits;
-use crate::package::read_package_u32;
+use crate::package::read_package_u64;
 
 #[derive(Clone, Copy)]
 struct TestSegment<'bytes> {
@@ -489,7 +489,7 @@ fn package_parser_rejects_every_noncanonical_boundary() {
     );
 
     let executable_offset = usize::try_from(
-        read_package_u32(&canonical, PACKAGE_HEADER_EXECUTABLE_OFFSET)
+        read_package_u64(&canonical, PACKAGE_HEADER_EXECUTABLE_OFFSET)
             .unwrap_or_else(|_| unreachable!()),
     )
     .unwrap_or_else(|_| unreachable!());
@@ -497,6 +497,121 @@ fn package_parser_rejects_every_noncanonical_boundary() {
     invalid[executable_offset] ^= 1;
     let package = parse_kex_package(&invalid).unwrap_or_else(|_| unreachable!());
     assert!(parse_standard(package.executable(), Target::Aarch64).is_err());
+}
+
+#[test]
+fn package_parsers_agree_on_reserved_and_full_width_geometry() {
+    let executable = valid_artifact(Target::X86_64);
+    let completion = b"CMPL\t1\techo\n";
+    for completion in [None, Some(completion.as_slice())] {
+        let canonical = encode_kex_package_with_completion(&executable, &[], completion)
+            .unwrap_or_else(|_| std::process::abort());
+        let mut mutations = Vec::new();
+        for offset in PACKAGE_HEADER_RESERVED..KEX_PACKAGE_V1_HEADER_BYTES {
+            let mut bytes = canonical.clone();
+            bytes[offset] = 1;
+            mutations.push((bytes, PackageError::NonzeroReserved));
+        }
+        for offset in [
+            PACKAGE_HEADER_EXECUTABLE_OFFSET,
+            PACKAGE_HEADER_EXECUTABLE_BYTES,
+            PACKAGE_HEADER_COMPLETION_OFFSET,
+            PACKAGE_HEADER_COMPLETION_BYTES,
+        ] {
+            for value in [1_u64 << 32, u64::MAX] {
+                let mut bytes = canonical.clone();
+                put_u64(&mut bytes, offset, value);
+                mutations.push((bytes, PackageError::InvalidLayout));
+            }
+        }
+        let mut bytes = canonical.clone();
+        put_u64(
+            &mut bytes,
+            PACKAGE_HEADER_COMPLETION_BYTES,
+            completion.map_or(1, |bytes| usize_u64(bytes.len() - 1)),
+        );
+        mutations.push((bytes, PackageError::InvalidLayout));
+        let mut bytes = canonical;
+        put_u16(&mut bytes, PACKAGE_HEADER_MINOR, 0);
+        mutations.push((bytes, PackageError::UnsupportedVersion));
+        for (bytes, error) in mutations {
+            assert_eq!(parse_kex_package(&bytes), Err(error));
+            assert_eq!(
+                kex_package_completion_range(
+                    &bytes[..KEX_PACKAGE_V1_HEADER_BYTES],
+                    usize_u64(bytes.len())
+                ),
+                Err(error)
+            );
+            assert_eq!(
+                parse_streamed_kex_package(
+                    usize_u64(bytes.len()),
+                    |offset, destination| {
+                        let start = usize::try_from(offset).map_err(|_| ())?;
+                        let count = destination.len().min(bytes.len() - start);
+                        destination[..count].copy_from_slice(&bytes[start..start + count]);
+                        Ok(count)
+                    },
+                    Target::X86_64,
+                    ABI_MINOR,
+                    LoadPlacement::STANDARD
+                ),
+                Err(StreamError::Package(error))
+            );
+        }
+    }
+}
+
+#[test]
+fn maximum_manifest_and_startup_capacity_fit_the_bounded_loader() {
+    let required: Vec<_> = (1..=requirements::MAX_REQUIREMENTS)
+        .map(|index| requirements::Requirement {
+            interface: usize_u32(index),
+            major: 1,
+            minor: 0,
+        })
+        .collect();
+    let executable = valid_artifact(Target::X86_64);
+    let bytes =
+        encode_kex_package(&executable, &required).unwrap_or_else(|_| std::process::abort());
+    let streamed = parse_streamed_kex_package(
+        usize_u64(bytes.len()),
+        |offset, destination| {
+            let start = usize::try_from(offset).map_err(|_| ())?;
+            let count = destination.len().min(bytes.len() - start);
+            destination[..count].copy_from_slice(&bytes[start..start + count]);
+            Ok(count)
+        },
+        Target::X86_64,
+        ABI_MINOR,
+        LoadPlacement::STANDARD,
+    )
+    .unwrap_or_else(|_| std::process::abort());
+    let handles: Vec<_> = (1..=troe_abi::startup::MAX_INITIAL_HANDLES)
+        .map(|index| InitialHandle {
+            value: usize_u64(index),
+            rights: 1,
+            interface: usize_u32(index),
+            major: 1,
+            minor: 0,
+        })
+        .collect();
+    let mut region = [0xa5; STARTUP_REGION_BYTES];
+    streamed
+        .executable()
+        .encode_startup_page(
+            StartupInfo {
+                task_id: 1,
+                handles: &handles,
+            },
+            &mut region,
+        )
+        .unwrap_or_else(|_| std::process::abort());
+    let encoded = STARTUP_FIXED_BYTES + handles.len() * STARTUP_HANDLE_BYTES;
+    assert_eq!(read_u32(&region, 0), Ok(usize_u32(encoded)));
+    assert_eq!(read_u16(&region, 14), Ok(usize_u16(handles.len())));
+    assert!(region[encoded..].iter().all(|byte| *byte == 0));
+    assert_eq!(MAX_KEX_PACKAGE_BYTES, 2_147_502_184);
 }
 
 #[test]
@@ -642,7 +757,7 @@ fn startup_page_is_canonical_and_rejections_are_atomic() {
             minor: 4,
         },
     ];
-    let mut page = [0xa5_u8; PAGE_BYTES];
+    let mut page = [0xa5_u8; STARTUP_REGION_BYTES];
     plan.encode_startup_page(
         StartupInfo {
             task_id: 42,
@@ -668,7 +783,7 @@ fn startup_page_is_canonical_and_rejections_are_atomic() {
     assert_eq!(read_u64(&page, 88), Ok(handles[1].value));
     assert!(page[112..].iter().all(|byte| *byte == 0));
 
-    let original = [0x5a_u8; PAGE_BYTES];
+    let original = [0x5a_u8; STARTUP_REGION_BYTES];
     let mut rejected = original;
     assert_eq!(
         plan.encode_startup_page(
@@ -711,7 +826,7 @@ fn startup_page_is_canonical_and_rejections_are_atomic() {
     );
     assert_eq!(rejected, original);
 
-    let too_many = [handles[0]; 33];
+    let too_many = [handles[0]; troe_abi::startup::MAX_INITIAL_HANDLES + 1];
     assert_eq!(
         plan.encode_startup_page(
             StartupInfo {
@@ -733,7 +848,7 @@ fn legacy_startup_page_retains_abi_and_layout() {
     put_u16(&mut legacy_bytes, HEADER_ABI_MINOR, 0);
     put_u32(&mut legacy_bytes, HEADER_IMAGE_SPAN_PAGES, 0);
     let legacy = parse_standard(&legacy_bytes, Target::X86_64).unwrap_or_else(|_| unreachable!());
-    let mut legacy_page = [0_u8; PAGE_BYTES];
+    let mut legacy_page = [0_u8; STARTUP_REGION_BYTES];
     legacy
         .encode_startup_page(
             StartupInfo {
@@ -845,7 +960,13 @@ fn rejects_noncanonical_header_and_reserved_fields() {
             Err(ParseError::InvalidLayout)
         );
     }
-    for offset in [HEADER_FLAGS, HEADER_RESERVED16] {
+    for offset in [
+        HEADER_FLAGS,
+        HEADER_FLAGS + 1,
+        HEADER_RESERVED16,
+        HEADER_RESERVED64,
+        HEADER_RESERVED64 + 7,
+    ] {
         let mut bytes = valid.clone();
         bytes[offset] = 1;
         assert_eq!(
