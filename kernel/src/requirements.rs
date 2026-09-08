@@ -7,7 +7,8 @@
 use troe_abi::{
     clock_control, datagram, diagnostics, filesystem, filesystem_mutation, icmp_echo,
     network_configuration, network_observation, pipe, private_memory, process_launch,
-    process_observation, random, shell_script, tcp_connect, timer, volume_control, wall_clock,
+    process_observation, random, shell_script, tcp_connect, tcp_listen, timer, volume_control,
+    wall_clock,
 };
 
 #[allow(clippy::struct_excessive_bools)]
@@ -25,6 +26,7 @@ pub(crate) struct BackgroundRequirements {
     pub(crate) network_configuration: bool,
     pub(crate) icmp_echo: bool,
     pub(crate) tcp_connect: bool,
+    pub(crate) tcp_listen: bool,
     pub(crate) volume_control: bool,
     pub(crate) wall_clock: bool,
     pub(crate) clock_control: bool,
@@ -48,6 +50,7 @@ impl BackgroundRequirements {
             && (!required.network_configuration || self.network_configuration)
             && (!required.icmp_echo || self.icmp_echo)
             && (!required.tcp_connect || self.tcp_connect)
+            && (!required.tcp_listen || self.tcp_listen)
             && (!required.volume_control || self.volume_control)
             && (!required.wall_clock || self.wall_clock)
             && (!required.private_memory || self.private_memory)
@@ -72,6 +75,7 @@ pub(crate) fn decode_application_requirements(
         network_configuration: false,
         icmp_echo: false,
         tcp_connect: false,
+        tcp_listen: false,
         volume_control: false,
         wall_clock: false,
         clock_control: false,
@@ -133,6 +137,10 @@ pub(crate) fn decode_application_requirements(
             troe_abi::interface::TCP_CONNECT => {
                 required.tcp_connect = true;
                 requirement.major == tcp_connect::MAJOR && requirement.minor == tcp_connect::MINOR
+            }
+            troe_abi::interface::TCP_LISTEN => {
+                required.tcp_listen = true;
+                requirement.major == tcp_listen::MAJOR && requirement.minor == tcp_listen::MINOR
             }
             troe_abi::interface::VOLUME_CONTROL => {
                 required.volume_control = true;

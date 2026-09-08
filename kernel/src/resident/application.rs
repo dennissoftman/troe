@@ -30,7 +30,7 @@ use crate::nested::{
 use crate::network::services::{
     ApplicationDatagramService, ApplicationDatagramState, ApplicationIcmpEchoService,
     ApplicationNetworkConfigurationService, ApplicationNetworkObservationService,
-    ApplicationTcpConnectService,
+    ApplicationTcpConnectService, ApplicationTcpListenService,
 };
 use crate::requirements::decode_application_requirements;
 use crate::resident::launch::{
@@ -61,7 +61,7 @@ use core::cell::{Cell, RefCell};
 use troe_abi::{
     command, datagram, diagnostics, filesystem, filesystem_mutation, heap_growth, icmp_echo,
     network_configuration, network_observation, pipe, private_memory, process_launch,
-    process_observation, random, tcp_connect, timer, volume_control, wall_clock,
+    process_observation, random, tcp_connect, tcp_listen, timer, volume_control, wall_clock,
 };
 use troe_application::{ABI_MINOR, PAGE_BYTES, parse_streamed_kex_package};
 use troe_dispatch::{CommandInvocationService, Dispatcher, ReplyStatus};
@@ -200,15 +200,16 @@ impl<'service> ResidentApplication<'service> {
         };
 
         let application_network = control.launch.runtime.borrow().network.clone();
-        let application_transport_network = if required.datagram || required.tcp_connect {
-            Some(
-                application_network
-                    .clone()
-                    .ok_or(ReplyStatus::NotConfigured)?,
-            )
-        } else {
-            None
-        };
+        let application_transport_network =
+            if required.datagram || required.tcp_connect || required.tcp_listen {
+                Some(
+                    application_network
+                        .clone()
+                        .ok_or(ReplyStatus::NotConfigured)?,
+                )
+            } else {
+                None
+            };
         let datagram_state = if required.datagram {
             Some(Rc::new(RefCell::new(ApplicationDatagramState::new(
                 application_transport_network
@@ -245,6 +246,7 @@ impl<'service> ResidentApplication<'service> {
             + usize::from(required.network_configuration)
             + usize::from(required.icmp_echo)
             + usize::from(required.tcp_connect)
+            + usize::from(required.tcp_listen)
             + usize::from(required.volume_control)
             + usize::from(required.wall_clock)
             + usize::from(required.private_memory)
@@ -491,6 +493,24 @@ impl<'service> ResidentApplication<'service> {
                 interface: troe_abi::interface::TCP_CONNECT,
                 major: tcp_connect::MAJOR,
                 minor: tcp_connect::MINOR,
+            });
+        }
+        if required.tcp_listen {
+            services.push(CommandStartupService {
+                port: register_command_service(
+                    &mut dispatcher,
+                    ApplicationTcpListenService::new(
+                        application_transport_network
+                            .as_ref()
+                            .ok_or(ReplyStatus::NotConfigured)?
+                            .clone(),
+                        control.launch.runtime.clone(),
+                    ),
+                )
+                .map_err(|_| ReplyStatus::Exhausted)?,
+                interface: troe_abi::interface::TCP_LISTEN,
+                major: tcp_listen::MAJOR,
+                minor: tcp_listen::MINOR,
             });
         }
         if required.volume_control {
