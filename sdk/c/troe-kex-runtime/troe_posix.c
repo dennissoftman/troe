@@ -1519,11 +1519,23 @@ int clock_gettime(clockid_t clock_id, struct timespec *destination) {
   if (destination == NULL)
     return troe_fail(EFAULT);
   if (clock_id == CLOCK_REALTIME) {
-    time_t seconds = time(NULL);
-    if (seconds == (time_t)-1)
-      return -1;
-    destination->tv_sec = seconds;
-    destination->tv_nsec = 0;
+    /* `time` reports whole seconds, which left `tv_nsec` at zero and made
+       every sub-second difference read as no difference at all. The precise
+       host call carries the remainder, and its two fields are already shaped
+       like the `timespec` this fills. */
+    uint64_t seconds = 0;
+    uint64_t nanoseconds = 0;
+    int result;
+    if (troe_host == NULL || troe_host->wall_time_precise == NULL)
+      return troe_fail(EACCES);
+    result =
+        troe_host->wall_time_precise(troe_host->context, &seconds, &nanoseconds);
+    if (result != 0)
+      return troe_fail(troe_host_error(result));
+    if (seconds > (uint64_t)LONG_MAX || nanoseconds >= 1000000000u)
+      return troe_fail(EOVERFLOW);
+    destination->tv_sec = (time_t)seconds;
+    destination->tv_nsec = (long)nanoseconds;
     return 0;
   }
   uint64_t ticks = 0;

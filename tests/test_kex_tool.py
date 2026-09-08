@@ -159,8 +159,8 @@ class KexToolTests(unittest.TestCase):
                         expected = [
                             (6, 1, 5),
                             (7, 1, 5),
-                            (8, 1, 0),
-                            (17, 1, 0),
+                            (8, 1, 1),
+                            (17, 1, 1),
                             (20, 1, 0),
                             (21, 1, 0),
                             (22, 1, 0),
@@ -169,17 +169,17 @@ class KexToolTests(unittest.TestCase):
                     elif command in {"ln", "rmdir"}:
                         expected = [(7, 1, 5)]
                     elif command == "sleep":
-                        expected = [(8, 1, 0)]
+                        expected = [(8, 1, 1)]
                     elif command == "date":
-                        expected = [(17, 1, 0)]
+                        expected = [(17, 1, 1)]
                     elif command == "timesync":
-                        expected = [(5, 1, 0), (8, 1, 0), (18, 1, 0)]
+                        expected = [(5, 1, 0), (8, 1, 1), (18, 1, 1)]
                     elif command == "mem":
                         expected = [(9, 1, 0), (22, 1, 0), (23, 1, 0)]
                     elif command == "ps":
                         expected = [(19, 1, 1)]
                     elif command == "top":
-                        expected = [(8, 1, 0), (19, 1, 1)]
+                        expected = [(8, 1, 1), (19, 1, 1)]
                     elif command in {"arp", "net"}:
                         expected = [(10, 1, 0)]
                     elif command == "dhcp":
