@@ -29,14 +29,14 @@ const CALLS: usize = 32;
 /// Runtime slot and incarnation; possession alone grants no authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Actor {
-    slot: usize,
+    slot: u32,
     generation: u32,
 }
 impl Actor {
     /// Index for the matching machine-owned context or kernel IPC pair.
     #[must_use]
     pub const fn slot(self) -> usize {
-        self.slot
+        self.slot as usize
     }
 }
 
@@ -250,7 +250,7 @@ impl Runtime {
         c.resume = None;
         c.deadline = u64::MAX;
         Ok(Actor {
-            slot,
+            slot: u32::try_from(slot).map_err(|_| Error::Invalid)?,
             generation: c.generation,
         })
     }
@@ -277,7 +277,7 @@ impl Runtime {
                             .bindings
                             .iter()
                             .flatten()
-                            .any(|e| e.server.slot == *slot)
+                            .any(|e| e.server.slot() == *slot)
                 })
                 .count()
                 >= crate::MAX_BOOT_SERVICES
@@ -327,7 +327,7 @@ impl Runtime {
         }
         let receive = self.grant(server, Grant::Receive)?;
         let wait_handle = self.grant(server, Grant::Wait)?;
-        self.contexts[server.slot].wait = Some(wait);
+        self.contexts[server.slot()].wait = Some(wait);
         Ok((receive, wait_handle))
     }
 
@@ -363,7 +363,7 @@ impl Runtime {
     ) -> Result<u64, Error> {
         self.context(owner)?;
         let binding = self.endpoint(endpoint)?;
-        if (interface == troe_abi::interface::SERVICE_LIFECYCLE && owner.slot < TASKS)
+        if (interface == troe_abi::interface::SERVICE_LIFECYCLE && owner.slot() < TASKS)
             || major != 1
             || minor != 0
             || (interface != troe_abi::interface::SERVICE_LIFECYCLE && !binding.ready)
@@ -519,7 +519,7 @@ impl Runtime {
             call,
         };
         self.calls[id.slot() as usize] = Some(pending);
-        self.contexts[caller.slot].outbound = Some(id);
+        self.contexts[caller.slot()].outbound = Some(id);
         let destination = if admission == Admission::Direct {
             self.delivered(pending)?;
             Buffer::Rx(server)
@@ -560,7 +560,7 @@ impl Runtime {
             return Err(error);
         }
         if wait.token == 0 {
-            self.contexts[server.slot].deadline = wait.deadline_millis;
+            self.contexts[server.slot()].deadline = wait.deadline_millis;
             self.expire(now)?;
             return self.observe_wait(server, now);
         }
@@ -569,9 +569,9 @@ impl Runtime {
         // All reply checks precede the first payload action. The newly requested
         // wait deadline has no effect on the call just completed.
         self.end_call(id, CallOutcome::Replied, wait.status, wait.reply_bytes)?;
-        self.contexts[server.slot].inbound = None;
-        self.contexts[server.slot].deadline = wait.deadline_millis;
-        self.contexts[server.slot].waiting = true;
+        self.contexts[server.slot()].inbound = None;
+        self.contexts[server.slot()].deadline = wait.deadline_millis;
+        self.contexts[server.slot()].waiting = true;
         // The replied caller wins even when other endpoint work is pending.
         Ok(Transition {
             transfer: Some(Transfer {
@@ -589,6 +589,9 @@ impl Runtime {
     ///
     /// # Errors
     /// Rejects stale authority, cancelled tokens, deadlines and invalid replies.
+    // Inline checked metadata operations so the trap can reuse validated fields.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn validate_reply(&self, server: Actor, wait: ReplyWait, now: u64) -> Result<(), Error> {
         if !matches!(self.handle(server, wait.wait_set)?, Grant::Wait)
             || !reply::is_known(wait.status)
@@ -682,7 +685,7 @@ impl Runtime {
             .select(&readiness[..set.len()], c.deadline <= now)
             .map_err(|_| Error::Invalid)?;
         let Some(selection) = selection else {
-            self.contexts[server.slot].waiting = true;
+            self.contexts[server.slot()].waiting = true;
             return Ok(Transition::default());
         };
         let mut event = Event {
@@ -749,7 +752,7 @@ impl Runtime {
                         handoff: Some(server),
                     });
                 }
-                self.contexts[server.slot]
+                self.contexts[server.slot()]
                     .wait
                     .as_mut()
                     .ok_or(Error::Invalid)?
@@ -757,8 +760,8 @@ impl Runtime {
                     .map_err(|_| Error::Invalid)?;
             }
         }
-        self.contexts[server.slot].resume = Some(Resume::Event(event));
-        self.contexts[server.slot].waiting = false;
+        self.contexts[server.slot()].resume = Some(Resume::Event(event));
+        self.contexts[server.slot()].waiting = false;
         Ok(Transition {
             transfer: None,
             handoff: Some(server),
@@ -801,7 +804,7 @@ impl Runtime {
             let c = &self.contexts[slot];
             if c.occupied && c.waiting && c.inbound.is_none() && c.outbound.is_none() {
                 let actor = Actor {
-                    slot,
+                    slot: u32::try_from(slot).map_err(|_| Error::Invalid)?,
                     generation: c.generation,
                 };
                 let transition = self.observe_wait(actor, now)?;
@@ -843,7 +846,7 @@ impl Runtime {
     /// Rejects stale actors or inconsistent ownership accounting.
     pub fn terminate(&mut self, actor: Actor, clean: bool) -> Result<(), Error> {
         self.context(actor)?;
-        self.contexts[actor.slot].terminal = true;
+        self.contexts[actor.slot()].terminal = true;
         for index in 0..self.bindings.len() {
             if let Some(endpoint) = self.bindings[index]
                 && endpoint.server == actor
@@ -893,7 +896,7 @@ impl Runtime {
                 self.close_index(index)?;
             }
         }
-        let c = &mut self.contexts[actor.slot];
+        let c = &mut self.contexts[actor.slot()];
         c.wait = None;
         c.waiting = false;
         c.inbound = None;
@@ -928,7 +931,7 @@ impl Runtime {
     /// Rejects stale/terminal actors.
     pub fn take_resume(&mut self, actor: Actor) -> Result<Option<Resume>, Error> {
         self.context(actor)?;
-        Ok(self.contexts[actor.slot].resume.take())
+        Ok(self.contexts[actor.slot()].resume.take())
     }
 
     /// Round-robin slow scheduling; direct transitions never call this method.
@@ -940,7 +943,7 @@ impl Runtime {
             if c.occupied && !c.terminal && !c.waiting && c.outbound.is_none() {
                 self.cursor = (slot + 1) % ACTORS;
                 return Some(Actor {
-                    slot,
+                    slot: u32::try_from(slot).ok()?,
                     generation: c.generation,
                 });
             }
@@ -1016,6 +1019,9 @@ impl Runtime {
         }
         Ok(readiness)
     }
+    // Inline checked metadata operations so the trap can reuse validated fields.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn direct_source(&self, server: Actor, endpoint: EndpointId, now: u64) -> Result<bool, Error> {
         let c = self.context(server)?;
         let set = c.wait.as_ref().ok_or(Error::Invalid)?;
@@ -1025,6 +1031,12 @@ impl Runtime {
         }) else {
             return Err(Error::Invalid);
         };
+        // Admission already validated this endpoint and excluded queued calls
+        // and mandatory closures. With one immutable source there is no other
+        // terminal/ready source to arbitrate; retain the absolute deadline check.
+        if set.len() == 1 {
+            return Ok(c.deadline > now);
+        }
         let mut readiness = self.readiness(set)?;
         readiness[index] = SourceReadiness::Ready;
         Ok(set
@@ -1040,7 +1052,7 @@ impl Runtime {
     #[inline(always)]
     fn context(&self, actor: Actor) -> Result<&Context, Error> {
         self.contexts
-            .get(actor.slot)
+            .get(actor.slot())
             .filter(|c| c.occupied && !c.terminal && c.generation == actor.generation)
             .ok_or(Error::Invalid)
     }
@@ -1111,7 +1123,7 @@ impl Runtime {
     }
     fn immediate(&mut self, caller: Actor, status: u32) -> Result<Transition, Error> {
         self.context(caller)?;
-        self.contexts[caller.slot].resume = Some(Resume::Reply { status, bytes: 0 });
+        self.contexts[caller.slot()].resume = Some(Resume::Reply { status, bytes: 0 });
         Ok(Transition {
             transfer: None,
             handoff: Some(caller),
@@ -1128,8 +1140,11 @@ impl Runtime {
             .filter(|p| p.id == id)
             .ok_or(Error::Invalid)
     }
+    // Inline checked metadata operations so the trap can reuse validated fields.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn delivered(&mut self, p: Pending) -> Result<(), Error> {
-        let c = &mut self.contexts[p.server.slot];
+        let c = &mut self.contexts[p.server.slot()];
         let set = c.wait.as_mut().ok_or(Error::Invalid)?;
         let index = set
             .sources()
@@ -1155,6 +1170,9 @@ impl Runtime {
         }));
         Ok(())
     }
+    // Inline checked metadata operations so the trap can reuse validated fields.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn end_call(
         &mut self,
         id: CallId,
@@ -1171,11 +1189,11 @@ impl Runtime {
             self.mark_dirty(slot);
         }
         self.calls[id.slot() as usize] = None;
-        let c = &mut self.contexts[p.caller.slot];
+        let c = &mut self.contexts[p.caller.slot()];
         c.outbound = None;
         c.resume = Some(Resume::Reply { status, bytes });
-        if self.contexts[p.server.slot].inbound == Some(id)
-            && let Some(task) = self.contexts[p.server.slot].task
+        if self.contexts[p.server.slot()].inbound == Some(id)
+            && let Some(task) = self.contexts[p.server.slot()].task
             && self.chains.is_engaged(task)
         {
             if self.chains.active(task) == Some(task) {
@@ -1192,7 +1210,7 @@ impl Runtime {
             if target == caller {
                 return true;
             }
-            let Some(id) = self.contexts[target.slot].outbound else {
+            let Some(id) = self.contexts[target.slot()].outbound else {
                 return false;
             };
             let Ok(pending) = self.pending_record(id) else {
@@ -1314,6 +1332,48 @@ mod tests {
         assert_eq!(r.chains.stats().live, 0);
         assert_eq!(r.pending.stats().direct_admissions, 2);
         assert_eq!(r.pending.stats().queue_slots_consumed, 0);
+    }
+
+    #[test]
+    fn immutable_wait_arbitration_prevents_direct_calls_bypassing_another_source() {
+        let mut r = Runtime::new().unwrap_or_else(|_| unreachable!());
+        let a = actors(&mut r, 3);
+        let endpoints = [0, 1].map(|_| {
+            r.bind(
+                a[1],
+                InterfaceSet::new(&[troe_abi::interface::DIAGNOSTICS])
+                    .unwrap_or_else(|_| unreachable!()),
+                EndpointLimits::STANDARD,
+            )
+            .unwrap_or_else(|_| unreachable!())
+        });
+        let (_, wait) = r
+            .configure_wait(a[1], &endpoints)
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(r.configure_wait(a[1], &endpoints), Err(Error::Invalid));
+        r.reply_wait(a[1], idle(wait), 0)
+            .unwrap_or_else(|_| unreachable!());
+        for endpoint in endpoints {
+            r.ready(endpoint).unwrap_or_else(|_| unreachable!());
+        }
+        let first = open(&mut r, a[0], endpoints[0]);
+        let second = open(&mut r, a[2], endpoints[1]);
+        r.call(a[0], call(first), 0)
+            .unwrap_or_else(|_| unreachable!());
+        let received = event(&mut r, a[1]);
+        assert_eq!(received.source, 0);
+        r.call(a[2], call(second), 0)
+            .unwrap_or_else(|_| unreachable!());
+        reply_to(&mut r, a[1], wait, received);
+        r.take_resume(a[0]).unwrap_or_else(|_| unreachable!());
+        assert_eq!(r.call(a[0], call(first), 1).map(|t| t.handoff), Ok(None));
+        r.poll_waits(1).unwrap_or_else(|_| unreachable!());
+        let received = event(&mut r, a[1]);
+        assert_eq!(received.source, 1);
+        reply_to(&mut r, a[1], wait, received);
+        clean_queues(&mut r);
+        r.poll_waits(1).unwrap_or_else(|_| unreachable!());
+        assert_eq!(event(&mut r, a[1]).source, 0);
     }
 
     #[test]
@@ -1445,9 +1505,9 @@ mod tests {
         }
         assert_eq!(r.call(a[0], call(h1), 0), Err(Error::Invalid));
         let fresh = r
-            .attach(r.contexts[a[1].slot].task)
+            .attach(r.contexts[a[1].slot()].task)
             .unwrap_or_else(|_| unreachable!());
-        assert_eq!(fresh.slot, a[1].slot);
+        assert_eq!(fresh.slot(), a[1].slot());
         assert_ne!(fresh, a[1]);
         assert_eq!(r.take_resume(a[1]), Err(Error::Invalid));
         let (new_endpoint, wait) = server(&mut r, fresh);
