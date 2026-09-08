@@ -3,15 +3,24 @@
 /// Interface major version.
 pub const MAJOR: u16 = 1;
 /// Interface minor version.
-pub const MINOR: u16 = 0;
+///
+/// Raised for `NOW_NANOS`.
+pub const MINOR: u16 = 1;
 /// Read the current boot-relative monotonic millisecond count.
 pub const NOW: u16 = 1;
 /// Cooperatively wait until one boot-relative monotonic deadline.
 pub const SLEEP_UNTIL: u16 = 2;
 /// Read CPU ticks charged to the calling process and their frequency.
 pub const PROCESS_CPU_TIME: u16 = 3;
+/// Read the current boot-relative monotonic nanosecond count.
+///
+/// `NOW` remains milliseconds because deadlines are expressed in them.
+/// This is the same counter read without that truncation.
+pub const NOW_NANOS: u16 = 4;
 /// Exact timestamp or deadline bytes.
 pub const MILLISECONDS_BYTES: usize = 8;
+/// Exact nanosecond timestamp bytes.
+pub const NANOSECONDS_BYTES: usize = 8;
 /// Exact process CPU-time reply bytes.
 pub const PROCESS_CPU_TIME_BYTES: usize = 16;
 
@@ -46,6 +55,22 @@ pub fn decode_milliseconds(bytes: &[u8]) -> Result<u64, EncodingError> {
     Ok(u64::from_le_bytes([
         bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
     ]))
+}
+
+/// Encode one boot-relative monotonic nanosecond count.
+#[must_use]
+pub const fn encode_nanoseconds(nanoseconds: u64) -> [u8; NANOSECONDS_BYTES] {
+    nanoseconds.to_le_bytes()
+}
+
+/// Decode one exact boot-relative monotonic nanosecond count.
+///
+/// # Errors
+///
+/// Rejects every length other than eight bytes.
+pub fn decode_nanoseconds(bytes: &[u8]) -> Result<u64, EncodingError> {
+    let bytes: [u8; NANOSECONDS_BYTES] = bytes.try_into().map_err(|_| EncodingError)?;
+    Ok(u64::from_le_bytes(bytes))
 }
 
 /// Encode one exact process CPU-time sample.
