@@ -36,9 +36,14 @@ static int significant_digits(const char *text) {
   const char *cursor = text;
   int count = 0;
   int started = 0;
+  /* A width can pad either side, so the mantissa need not start or end the
+     text. */
+  while (*cursor == ' ')
+    cursor++;
   if (*cursor == '-' || *cursor == '+')
     cursor++;
-  for (; *cursor != '\0' && *cursor != 'e' && *cursor != 'E'; cursor++) {
+  for (; *cursor != '\0' && *cursor != 'e' && *cursor != 'E' && *cursor != ' ';
+       cursor++) {
     if (*cursor == '.')
       continue;
     if (*cursor < '0' || *cursor > '9')
@@ -49,6 +54,33 @@ static int significant_digits(const char *text) {
     count++;
   }
   return count;
+}
+
+/* Whether `format`'s single conversion asks for the alternate form of `g`, and
+   what precision it names. Both scan from the last `%` so literal text in a
+   template cannot be mistaken for part of the specifier. An unrecognised shape
+   reports no precision, which leaves the disagreement to be reported plainly
+   rather than reinterpreted. */
+static int format_requests_alternate_g(const char *format) {
+  const char *percent = strrchr(format, '%');
+  size_t length = strlen(format);
+  if (percent == NULL || strchr(percent, '#') == NULL || length == 0)
+    return 0;
+  return format[length - 1] == 'g' || format[length - 1] == 'G';
+}
+
+static int format_precision(const char *format) {
+  const char *percent = strrchr(format, '%');
+  const char *point;
+  int precision = 0;
+  if (percent == NULL)
+    return -1;
+  point = strchr(percent, '.');
+  if (point == NULL)
+    return -1;
+  for (point++; *point >= '0' && *point <= '9'; point++)
+    precision = precision * 10 + (*point - '0');
+  return precision;
 }
 
 static int compare(double value, char conversion, int precision,
@@ -117,6 +149,25 @@ static int compare_complete(double value, const char *format) {
       troe_test_snprintf(actual, sizeof(actual), format, value);
   if (expected_length != actual_length || actual_length < 0 ||
       memcmp(expected, actual, (size_t)expected_length + 1) != 0) {
+    /* Same alternate-form divergence as in `compare`, reached through a whole
+       format rather than one conversion: `%-#18.4g` of 9999.5 is `1.000e+04`
+       and glibc renders `1.e+04`. Only a disagreement asks the question, and
+       only a host that dropped the zeros `#` requires forfeits it. */
+    int precision = format_precision(format);
+    if (format_requests_alternate_g(format) && precision >= 0 &&
+        host_dropped_alternate_zeros(expected)) {
+      int wanted = precision == 0 ? 1 : precision;
+      int digits = actual_length < 0 ? -1 : significant_digits(actual);
+      if (digits == wanted && strchr(actual, '.') != NULL)
+        return 0;
+      fprintf(stderr,
+              "complete alternate-form mismatch value=%a format=%s expected %d "
+              "significant digits and a decimal point, got %s with %d (host is "
+              "non-conforming here and rendered %s)\n",
+              value, format, wanted,
+              actual_length < 0 ? "(failure)" : actual, digits, expected);
+      return 1;
+    }
     fprintf(stderr,
             "complete format mismatch value=%a format=%s expected=%s actual=%s\n",
             value, format, expected, actual_length < 0 ? "(failure)" : actual);
