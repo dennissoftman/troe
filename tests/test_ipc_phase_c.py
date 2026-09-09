@@ -23,7 +23,7 @@ def transcript(
             row["ticks"] = ",".join([str(measured)] * 256)
         else:
             prefix = "ipc-phase-c-latency"
-            limit = 700 if size == 4096 else 675
+            limit = 700 if size == 4096 else 685
             row.update(
                 p95_ticks=str(measured),
                 ratio_limit=str(limit),
@@ -45,10 +45,10 @@ def transcript(
 
 class PhaseCTests(unittest.TestCase):
     def test_complete_matrix_and_real_tagging(self) -> None:
-        result = ipc_phase_c.validate(transcript(ticks=675), require_tagged=True)
+        result = ipc_phase_c.validate(transcript(ticks=685), require_tagged=True)
         self.assertEqual(len(result["faults"]), 7)
         self.assertEqual(len(result["rows"]), 4)
-        self.assertEqual(result["rows"]["general-direct/64"]["p95_ratio"], 0.675)
+        self.assertEqual(result["rows"]["general-direct/64"]["p95_ratio"], 0.685)
         with self.assertRaisesRegex(ValueError, "unavailable"):
             ipc_phase_c.validate(transcript(tagged=False), require_tagged=True)
 
@@ -56,7 +56,7 @@ class PhaseCTests(unittest.TestCase):
         ipc_phase_c.validate(
             transcript(ticks=653, large_ticks=700), require_tagged=True
         )
-        for output in (transcript(ticks=676), transcript(large_ticks=701)):
+        for output in (transcript(ticks=686), transcript(large_ticks=701)):
             with self.assertRaisesRegex(ValueError, "ratio failed"):
                 ipc_phase_c.validate(output, require_tagged=True)
         with self.assertRaisesRegex(ValueError, "ratio failed"):
@@ -65,7 +65,7 @@ class PhaseCTests(unittest.TestCase):
     def test_limits_cannot_be_relaxed_or_fates_duplicated(self) -> None:
         output = transcript()
         for bad in (
-            output.replace("ratio_limit=675", "ratio_limit=700", 1),
+            output.replace("ratio_limit=685", "ratio_limit=700", 1),
             output.replace("ratio_scale=1000", "ratio_scale=100", 1),
             output.replace("fates=1", "fates=2", 1),
             output.replace("frames=0", "frames=1", 1),
