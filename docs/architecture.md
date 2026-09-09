@@ -243,6 +243,27 @@ identity, authority, lifecycle, and stack resource.
 This makes every scheduling boundary explicit and keeps architecture register
 state out of portable code.
 
+`troe-task::thread` separately models process-owned thread lifetimes. Its
+metadata slots are reserved at construction; preparation, publication, waits,
+join claims, stop, completion and reaping allocate nothing. Prepared and
+unreaped completion records consume process quotas, while native page charges
+remain until composition explicitly acknowledges reclamation. The model uses
+generation-checked identities and does not execute native threads, establish
+physical quiescence, or enable pthread support. The application runtime still
+has one execution thread per process.
+
+The paired `troe-task::thread::sync` model owns typed mutex, condition and permit
+records and intrusive FIFO wait queues. Mutex ownership transfers before a
+waiter resumes. Condition timeout and notification preserve the original mutex
+reference through reacquisition and result consumption; permanent poison is a
+distinct failure without ownership. An immutable essential-mutex policy instead
+revokes the process on owner exit. Permits remain ownerless and are not refunded
+on thread exit. Object/wait quotas include pending completions, and the lifecycle
+model refuses thread resource release while synchronization references remain.
+These serialized transitions allocate nothing after table construction. Native
+clock delivery, instruction-level memory ordering and work-quantum enforcement
+are outside these portable models.
+
 The boot arena contains one reusable 64 KiB cooperative task payload plus
 128 KiB isolated-server and 192 KiB shell payloads. The shell reserve covers
 eight nested launch levels including private IPC/root metadata. Each has an unmapped 4 KiB page on

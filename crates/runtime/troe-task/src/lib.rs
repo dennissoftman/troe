@@ -8,6 +8,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 mod chain;
+pub mod thread;
 mod wait;
 mod waitset;
 

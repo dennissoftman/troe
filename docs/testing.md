@@ -66,6 +66,27 @@ runner. `--require-filesystem-tools` makes absence of the exact external FAT32
 and ext4 interoperability tools an error. `--require-python-tools` does the
 same for the Python format and lint gates.
 
+## Portable thread and synchronization models
+
+`cargo test -p troe-task --lib thread::` exercises the process-owned lifecycle
+policy: transactional admission, per-process/global charges, stale generations,
+join/detach and timeout claims, creator exit, sticky stop, and reclamation only
+after native acknowledgement. The corpus includes 10,000 short transition
+schedules, each followed by complete model teardown and accounting checks.
+
+The paired synchronization model covers FIFO grants, self-lock/non-owner errors,
+expired and stopped waiters, stale events, condition binding/reacquisition,
+notification cohorts, both owner-death policies, ownerless permits, quotas and
+resource-release interlocks. It also enumerates 3,125 five-event schedules over
+notification, timeout, stop, unlock and exit. Each step checks queue membership,
+exact ownership, pending-completion references and unchanged vector capacities;
+each schedule ends with teardown and resource-baseline checks.
+
+These tests verify the portable policy; they do not execute application threads
+or establish machine-level TLS, isolation, pthread, or physical-reclamation
+support. Changes to the crate also select its consumers and native regression
+scenarios through the normal impact selector.
+
 ## Python tooling gates
 
 The repository's own Python is formatted and linted by one tool. `ruff` is both
