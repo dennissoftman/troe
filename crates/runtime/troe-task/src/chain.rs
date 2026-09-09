@@ -296,6 +296,9 @@ impl CallChainTable {
 
     /// The member currently running in the chain one task takes part in.
     #[must_use]
+    // Reuse the checked chain lookup inside a native reply/unwind transition.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn active(&self, member: TaskId) -> Option<TaskId> {
         self.chain_of(member)
             .and_then(|index| self.chains.get(index))
@@ -305,6 +308,8 @@ impl CallChainTable {
 
     /// Members of the chain one task takes part in, initiator first.
     #[must_use]
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn members(&self, member: TaskId) -> Option<&[TaskId]> {
         self.chain_of(member)
             .and_then(|index| self.chains.get(index))
@@ -314,6 +319,8 @@ impl CallChainTable {
 
     /// Depth of the chain one task takes part in.
     #[must_use]
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn depth(&self, member: TaskId) -> usize {
         self.members(member).map_or(0, <[TaskId]>::len)
     }
@@ -336,6 +343,9 @@ impl CallChainTable {
         self.chains.len()
     }
 
+    // Preserve bounded membership checks without an aggregate call boundary.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn chain_of(&self, task: TaskId) -> Option<usize> {
         if self.stats.live == 0 {
             return None;
