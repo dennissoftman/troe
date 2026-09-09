@@ -7,13 +7,15 @@ import unittest
 from scripts import ipc_phase_b
 
 
-def transcript(*, tagged: bool = True, direct_ticks: int = 50) -> str:
+def transcript(
+    *, tagged: bool = True, direct_ticks: int = 50, compatibility_ticks: int = 100
+) -> str:
     lines = [
         "ipc-phase-b-checks pool=20 fates=12 terminal_zeroization=1 stale_tags=1 "
         "lease_millis=50"
     ]
     for size in ipc_phase_b.PAYLOADS:
-        old = ",".join(["100"] * 256)
+        old = ",".join([str(compatibility_ticks)] * 256)
         lines.append(
             f"ipc-samples path=isolated-diagnostics payload={size} "
             f"counter_hz=1000000 ticks={old}"
@@ -34,8 +36,9 @@ def transcript(*, tagged: bool = True, direct_ticks: int = 50) -> str:
             lines.append(
                 f"ipc-phase-b path={path} payload={size} warmup=64 samples=256 "
                 f"p95_ticks={ticks} "
-                f"compatibility_p95=100 ratio_limit={limit} "
-                f"ratio_pass={int(ticks <= limit)} tagged={int(tagged)} "
+                f"compatibility_p95={compatibility_ticks} ratio_limit={limit} "
+                f"ratio_pass={int(ticks * 100 <= compatibility_ticks * limit)} "
+                f"tagged={int(tagged)} "
                 f"calls=256 request_copies={copies} reply_copies={reply} "
                 f"root_writes=512 "
                 f"targeted_invalidations=0 full_invalidations={full} "

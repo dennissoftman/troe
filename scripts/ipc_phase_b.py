@@ -38,6 +38,9 @@ def validate(
     paths: tuple[str, ...] = PATHS,
     record_prefix: str = "ipc-phase-b",
     sample_prefix: str = "ipc-phase-b-samples",
+    small_limit: int = 60,
+    large_limit: int = 70,
+    ratio_scale: int = 100,
 ) -> dict[str, Any]:
     """Recompute every ratio and require actual direct/queued structural counts."""
     checks = [
@@ -108,8 +111,8 @@ def validate(
         old_ticks = [int(value) for value in old_row["ticks"].split(",")]
         measured = p95(ticks)
         old_p95 = p95(old_ticks)
-        limit = 70 if size == 4096 else 60
-        passed = measured * 100 <= old_p95 * limit
+        limit = large_limit if size == 4096 else small_limit
+        passed = measured * ratio_scale <= old_p95 * limit
         expected_counts = {
             "warmup": 64,
             "samples": SAMPLES,
@@ -131,6 +134,8 @@ def validate(
             "scheduler_scans": 0,
             "additional_lease_programs": 0,
         }
+        if ratio_scale != 100:
+            expected_counts["ratio_scale"] = ratio_scale
         if counts != expected_counts:
             raise ValueError(f"invalid IPC structural or latency record: {path}/{size}")
         if tagged and not queued and not passed:
