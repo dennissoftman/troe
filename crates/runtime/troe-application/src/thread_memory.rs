@@ -19,13 +19,13 @@ pub enum ThreadMemoryError {
     ArithmeticOverflow,
     /// The reservation is misaligned, includes page zero or leaves user space.
     InvalidPlacement,
-    /// Mapped stack, TLS and IPC pages exceed the logical process allowance.
+    /// Mapped stack, TLS, IPC and startup pages exceed the process allowance.
     MappedPageBudget,
     /// Logical resident pages, including supplemental tables, exceed allowance.
     ResidentPageBudget,
     /// The entire window, including guards and padding, exceeds its allowance.
     ReservedPageBudget,
-    /// Stack, TLS and supplemental tables exceed the ordinary-frame allowance.
+    /// Stack, TLS, startup and supplemental tables exceed the frame allowance.
     FrameBudget,
     /// The caller has not made enough task IPC pairs available.
     IpcBudget,
@@ -54,7 +54,7 @@ impl fmt::Display for ThreadMemoryError {
 /// Checking a snapshot does not reserve it against another caller.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ThreadMemoryBudget {
-    /// Remaining logically charged stack, TLS and IPC mapping pages.
+    /// Remaining logically charged stack, TLS, IPC and startup mapping pages.
     pub mapped_pages: u64,
     /// Remaining logical resident allowance, including IPC and supplemental tables.
     pub resident_pages: u64,
@@ -105,7 +105,7 @@ pub struct ThreadMemoryCharges {
 }
 
 impl ThreadMemoryCharges {
-    /// Stack, complete TLS allocation and both IPC pages, excluding tables.
+    /// Stack, TLS, both IPC pages and the read-only startup page, excluding tables.
     #[must_use]
     pub const fn mapped_pages(self) -> u64 {
         self.mapped_pages
@@ -129,7 +129,7 @@ impl ThreadMemoryCharges {
         self.ipc_pairs
     }
 
-    /// New ordinary frames: stack, TLS and supplemental tables, excluding IPC.
+    /// New ordinary frames: stack, TLS, startup and tables, excluding boot IPC.
     #[must_use]
     pub const fn ordinary_frames(self) -> u64 {
         self.mapped_pages - self.ipc_pairs * 2 + self.table_pages
@@ -161,16 +161,42 @@ impl ThreadMemoryCharges {
     }
 }
 
-/// One nonempty page-aligned region that composition must map user RW/NX.
+/// Required purpose and write permission of a thread-owned mapping.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ThreadMemoryKind {
+    /// Committed user RW/NX stack.
+    Stack,
+    /// Complete user RW/NX TLS allocation.
+    Tls,
+    /// User RW/NX transmit and receive pages.
+    Ipc,
+    /// Immutable user read-only/NX startup descriptor page.
+    Startup,
+}
+
+/// One nonempty page-aligned user region. Every region is nonexecutable.
 ///
 /// A region carries no physical owner or authority to change a process mapping.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ThreadMemoryRegion {
     start: u64,
     pages: u64,
+    kind: ThreadMemoryKind,
 }
 
 impl ThreadMemoryRegion {
+    /// Purpose and required mapping permission.
+    #[must_use]
+    pub const fn kind(self) -> ThreadMemoryKind {
+        self.kind
+    }
+
+    /// Whether composition must permit user writes; startup is read-only.
+    #[must_use]
+    pub const fn writable(self) -> bool {
+        !matches!(self.kind, ThreadMemoryKind::Startup)
+    }
+
     /// First virtual byte.
     #[must_use]
     pub const fn start(self) -> u64 {
@@ -193,7 +219,8 @@ impl ThreadMemoryRegion {
 /// Canonical window for a fixed, fully committed stack and static TLS template.
 ///
 /// Ascending layout: lower guard, stack, upper stack guard, unmapped TLS alignment
-/// gap, TLS, IPC TX/RX pair, final guard. Each guard is one base page. The entire
+/// gap, TLS, IPC TX/RX pair, read-only startup, final guard. Each guard and startup
+/// mapping is one base page. The entire
 /// window must remain exclusively reserved, including every unmapped byte.
 /// Guards do not prevent a large stack-pointer jump; compiler stack probing is
 /// a separate requirement. All regions share process authority and visibility.
@@ -201,7 +228,7 @@ impl ThreadMemoryRegion {
 pub struct ThreadMemoryPlan {
     reservation_base: u64,
     reservation_end: u64,
-    regions: [ThreadMemoryRegion; 3],
+    regions: [ThreadMemoryRegion; 4],
     thread_pointer: u64,
     charges: ThreadMemoryCharges,
 }
@@ -236,7 +263,8 @@ impl ThreadMemoryPlan {
         let tls_start = add(after_guard, alignment - 1)? & !(alignment - 1);
         let ipc_start = add(tls_start, tls.mapped_bytes())?;
         let ipc_end = add(ipc_start, 2 * PAGE_SIZE)?;
-        let reservation_end = add(ipc_end, PAGE_SIZE)?;
+        let startup_end = add(ipc_end, PAGE_SIZE)?;
+        let reservation_end = add(startup_end, PAGE_SIZE)?;
         if reservation_end > KEX_V1_USER_END {
             return Err(ThreadMemoryError::InvalidPlacement);
         }
@@ -244,18 +272,26 @@ impl ThreadMemoryPlan {
             ThreadMemoryRegion {
                 start: stack_start,
                 pages: stack_pages,
+                kind: ThreadMemoryKind::Stack,
             },
             ThreadMemoryRegion {
                 start: tls_start,
                 pages: tls.pages(),
+                kind: ThreadMemoryKind::Tls,
             },
             ThreadMemoryRegion {
                 start: ipc_start,
                 pages: 2,
+                kind: ThreadMemoryKind::Ipc,
+            },
+            ThreadMemoryRegion {
+                start: ipc_end,
+                pages: 1,
+                kind: ThreadMemoryKind::Startup,
             },
         ];
         let charges = ThreadMemoryCharges {
-            mapped_pages: add(add(stack_pages, tls.pages())?, 2)?,
+            mapped_pages: add(add(stack_pages, tls.pages())?, 3)?,
             reserved_pages: (reservation_end - reservation_base) / PAGE_SIZE,
             table_pages: additional_tables(regions),
             ipc_pairs: 1,
@@ -283,10 +319,10 @@ impl ThreadMemoryPlan {
         self.reservation_end
     }
 
-    /// Ordered nonoverlapping RW/NX mappings: stack, TLS, then the IPC pair.
+    /// Ordered mappings: RW/NX stack, TLS, IPC pair, then read-only/NX startup.
     /// Every byte in the reservation outside these regions stays unmapped.
     #[must_use]
-    pub const fn regions(self) -> [ThreadMemoryRegion; 3] {
+    pub const fn regions(self) -> [ThreadMemoryRegion; 4] {
         self.regions
     }
 
@@ -314,11 +350,11 @@ fn page_bytes(pages: u64) -> Result<u64, ThreadMemoryError> {
         .ok_or(ThreadMemoryError::ArithmeticOverflow)
 }
 
-// Count the union of table prefixes touched by the three ordered mappings at
+// Count the union of table prefixes touched by the four ordered mappings at
 // each level below the root. Gaps consume no leaf mappings, and shared prefixes
-// count once. The fixed nine iterations do not depend on requested stack size.
+// count once. The fixed twelve iterations do not depend on requested stack size.
 // All inputs are private, nonempty, disjoint and bounded by the lower user half.
-fn additional_tables(regions: [ThreadMemoryRegion; 3]) -> u64 {
+fn additional_tables(regions: [ThreadMemoryRegion; 4]) -> u64 {
     let mut total = 0;
     for shift in [21, 30, 39] {
         let mut previous = None;

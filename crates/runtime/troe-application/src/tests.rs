@@ -591,7 +591,7 @@ fn maximum_manifest_and_startup_capacity_fit_the_bounded_loader() {
         .map(|index| InitialHandle {
             value: usize_u64(index),
             rights: 1,
-            interface: usize_u32(index),
+            interface: troe_abi::interface::DIAGNOSTICS,
             major: 1,
             minor: 0,
         })
@@ -838,6 +838,46 @@ fn startup_page_is_canonical_and_rejections_are_atomic() {
         Err(StartupPageError::TooManyHandles)
     );
     assert_eq!(rejected, original);
+}
+
+#[test]
+fn current_startup_rejects_thread_contracts_before_writing() {
+    let bytes = valid_artifact(Target::X86_64);
+    let plan = parse_standard(&bytes, Target::X86_64).unwrap_or_else(|_| unreachable!());
+    for minor in 0..=troe_abi::startup::THREAD_ABI_MINOR {
+        for interface in [
+            troe_abi::interface::THREAD_CONTROL,
+            troe_abi::interface::THREAD_SYNC,
+        ] {
+            let handles = [InitialHandle {
+                value: 1,
+                rights: 1,
+                interface,
+                major: 1,
+                minor: 0,
+            }];
+            let mut page = [0xa5; STARTUP_REGION_BYTES];
+            let error = crate::startup::encode_startup_page(
+                minor,
+                KEX_V1_IMAGE_BASE,
+                plan.layout(),
+                StartupInfo {
+                    task_id: 1,
+                    handles: &handles,
+                },
+                &mut page,
+            );
+            assert_eq!(
+                error,
+                Err(if minor > ABI_MINOR {
+                    StartupPageError::UnsupportedAbi
+                } else {
+                    StartupPageError::InvalidHandle
+                })
+            );
+            assert_eq!(page, [0xa5; STARTUP_REGION_BYTES]);
+        }
+    }
 }
 
 #[test]

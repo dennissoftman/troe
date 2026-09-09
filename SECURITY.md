@@ -75,6 +75,10 @@ never executes the ordinary application.
   targeted invalidation with a full-flush correctness fallback on unsupported
   x86 CPUs. Direct handoffs preserve the absolute 50 ms lease; expiry faults
   the active IPC participant and does not replay the call;
+- thread preflight: allocation-free typed wire/startup codecs and checked memory
+  plans, including a separately charged read-only descriptor page. The active
+  loader and SDK reject the assigned threaded startup revision and reject thread
+  interfaces in older startup records; these components enable no native workers;
 - KEX resolution: bare names select only `/bin/<name>.kex`; a command containing
   `/` tries its exact VFS path relative to its explicit cwd, then appends `.kex`
   only if the path is missing and the filename does not already end in `.kex`;

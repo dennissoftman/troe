@@ -2564,6 +2564,8 @@ impl<'a> Startup<'a> {
         for index in 0..handle_count {
             let descriptor = startup.descriptor(index)?;
             if descriptor.value == 0
+                || (interface::is_threading(descriptor.interface)
+                    && minor < troe_abi::startup::THREAD_ABI_MINOR)
                 || (minor < 3 && descriptor.rights != 1)
                 || descriptor.rights == 0
                 || descriptor.rights & !u32::from(interface::allowed_rights(descriptor.interface))
@@ -3103,6 +3105,19 @@ mod tests {
                 parsed.ipc_pages().is_ok_and(|pages| pages.is_some()),
                 minor == 3
             );
+            // Assigning a contract cannot activate it for an old startup profile.
+            let descriptor = troe_abi::startup::header_bytes(minor);
+            for interface in [interface::THREAD_CONTROL, interface::THREAD_SYNC] {
+                let mut bad = page;
+                bad[descriptor + 12..descriptor + 16].copy_from_slice(&interface.to_le_bytes());
+                assert_eq!(
+                    Startup::parse(&bad).err(),
+                    Some(StartupError::InvalidHandle)
+                );
+            }
+            let mut unsupported = page;
+            unsupported[6..8].copy_from_slice(&troe_abi::startup::THREAD_ABI_MINOR.to_le_bytes());
+            assert!(Startup::parse(&unsupported).is_err());
             if minor == 3 {
                 for offset in [64, 72] {
                     for invalid in [0_u64, startup, startup + 1, heap, u64::MAX] {

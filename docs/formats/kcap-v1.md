@@ -55,6 +55,8 @@ interface 29 version 1.0 and grants one bounded inbound endpoint and its
 accepted streams; see [TCP listener v1](tcp-listen-v1.md).
 `process-observe` returns bounded current metadata and accounting only; it does
 not grant process control or memory inspection.
+Interfaces 30/31 have [thread codec assignments](thread-v1.md), but no builder
+capability name or native grant. Current startup profiles reject them.
 `process-launch` grants only owner-scoped child admission and lifecycle calls;
 the child's manifest must attenuate the launcher's grants. `pipe` grants only
 owner-scoped bounded byte pipes. Neither capability implies the other.

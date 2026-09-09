@@ -71,10 +71,15 @@ pub const SERVICE_LIFECYCLE: u32 = 28;
 /// One bounded inbound IPv4/TCP listening endpoint and its accepted streams.
 pub const TCP_LISTEN: u32 = 29;
 
-/// Highest assigned interface identifier.
-pub const HIGHEST: u32 = TCP_LISTEN;
+/// Process-owned thread lifecycle contract; native admission is disabled.
+pub const THREAD_CONTROL: u32 = 30;
+/// Process-private owned synchronization contract; native admission is disabled.
+pub const THREAD_SYNC: u32 = 31;
 
-/// Rights bit positions shared by every interface, fixed by ADR 0035.
+/// Highest assigned interface identifier.
+pub const HIGHEST: u32 = THREAD_SYNC;
+
+/// Shared rights positions: ADR 0035's base and ADR 0071's thread controls.
 pub mod rights {
     /// Synchronous request/reply calls.
     pub const CALL: u16 = 1 << 0;
@@ -94,12 +99,34 @@ pub mod rights {
     pub const DERIVE: u16 = 1 << 7;
     /// Supervisor device reset.
     pub const RESET: u16 = 1 << 8;
+    /// Prepare a new process-owned thread.
+    pub const THREAD_CREATE: u16 = 1 << 9;
+    /// Start or abort a prepared thread.
+    pub const THREAD_START: u16 = 1 << 10;
+    /// Consume a thread's joinable completion.
+    pub const THREAD_JOIN: u16 = 1 << 11;
+    /// Relinquish a thread's joinable completion.
+    pub const THREAD_DETACH: u16 = 1 << 12;
+    /// Request sticky cooperative thread stop.
+    pub const THREAD_STOP: u16 = 1 << 13;
+    /// Observe thread identity or lifecycle state.
+    pub const THREAD_OBSERVE: u16 = 1 << 14;
+    /// Closed operation-right set for the thread-control interface.
+    pub const THREAD_CONTROL: u16 =
+        THREAD_CREATE | THREAD_START | THREAD_JOIN | THREAD_DETACH | THREAD_STOP | THREAD_OBSERVE;
     /// Every bit this ABI assigns a meaning.
     ///
-    /// The assignment occupies bits 0 through 8, so rights are stored in 16
+    /// The assignment occupies bits 0 through 14, so rights are stored in 16
     /// bits and widened to the 32-bit field a startup handle descriptor
     /// carries.
-    pub const ASSIGNED: u16 = CALL | RECEIVE | REPLY | WAIT | READ | WRITE | FLUSH | DERIVE | RESET;
+    pub const ASSIGNED: u16 =
+        CALL | RECEIVE | REPLY | WAIT | READ | WRITE | FLUSH | DERIVE | RESET | THREAD_CONTROL;
+}
+
+/// Whether a contract requires the separately versioned threaded startup profile.
+#[must_use]
+pub const fn is_threading(interface: u32) -> bool {
+    matches!(interface, THREAD_CONTROL | THREAD_SYNC)
 }
 
 /// Whether one identifier belongs to the closed boot-only internal registry.
@@ -122,6 +149,8 @@ pub const fn is_boot_only(interface: u32) -> bool {
 #[must_use]
 pub const fn allowed_rights(interface: u32) -> u16 {
     match interface {
+        THREAD_CONTROL => rights::CALL | rights::THREAD_CONTROL,
+        THREAD_SYNC => rights::CALL,
         // A persistent server owns the receive and reply side of its endpoint;
         // its clients hold the call side of the same interface.
         SERVER_ENDPOINT => rights::CALL | rights::RECEIVE | rights::REPLY,
@@ -177,6 +206,8 @@ mod tests {
             interface::BOOT_BLOB,
             interface::SERVICE_LIFECYCLE,
             interface::TCP_LISTEN,
+            interface::THREAD_CONTROL,
+            interface::THREAD_SYNC,
         ];
         assert!(interfaces.iter().all(|value| *value != 0));
         assert!(
@@ -256,10 +287,16 @@ mod tests {
     }
 
     #[test]
-    fn assigned_rights_are_the_nine_fixed_bits() {
-        assert_eq!(interface::rights::ASSIGNED.count_ones(), 9);
-        assert_eq!(interface::rights::ASSIGNED, 0b1_1111_1111);
+    fn assigned_rights_preserve_the_base_and_extend_only_thread_control() {
+        assert_eq!(interface::rights::ASSIGNED.count_ones(), 15);
+        assert_eq!(interface::rights::ASSIGNED, 0x7fff);
         assert_eq!(interface::rights::CALL, 1);
         assert_eq!(interface::rights::RESET, 1 << 8);
+        for id in 1..=interface::HIGHEST {
+            assert_eq!(
+                interface::allowed_rights(id) & interface::rights::THREAD_CONTROL != 0,
+                id == interface::THREAD_CONTROL
+            );
+        }
     }
 }

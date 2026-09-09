@@ -42,6 +42,7 @@ pub mod startup;
 pub mod stream;
 pub mod tcp_connect;
 pub mod tcp_listen;
+pub mod threading;
 pub mod timer;
 pub mod timezone;
 pub mod volume_control;

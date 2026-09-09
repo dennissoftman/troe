@@ -107,7 +107,7 @@ impl CopiedMessage {
 
 /// Rights attached to one capability handle.
 ///
-/// The bit assignment is fixed by ADR 0035 and shared by every interface. An
+/// The base assignment is fixed by ADR 0035, with thread rights in ADR 0071. An
 /// interface still rejects the bits its operations have no meaning for, so
 /// possession of a bit is necessary rather than sufficient; see
 /// [`troe_abi::interface::allowed_rights`].
@@ -135,6 +135,18 @@ impl Rights {
     pub const DERIVE: Self = Self(abi_rights::DERIVE);
     /// Supervisor device reset is authorized.
     pub const RESET: Self = Self(abi_rights::RESET);
+    /// Prepare process-owned workers in the threaded profile.
+    pub const THREAD_CREATE: Self = Self(abi_rights::THREAD_CREATE);
+    /// Start or abort workers prepared by the caller.
+    pub const THREAD_START: Self = Self(abi_rights::THREAD_START);
+    /// Join an eligible process-owned worker.
+    pub const THREAD_JOIN: Self = Self(abi_rights::THREAD_JOIN);
+    /// Relinquish an eligible worker's join result.
+    pub const THREAD_DETACH: Self = Self(abi_rights::THREAD_DETACH);
+    /// Request cooperative stop of a process-owned thread.
+    pub const THREAD_STOP: Self = Self(abi_rights::THREAD_STOP);
+    /// Observe process-owned thread state and caller identity.
+    pub const THREAD_OBSERVE: Self = Self(abi_rights::THREAD_OBSERVE);
 
     /// Combine two rights sets.
     #[must_use]
@@ -535,7 +547,7 @@ mod tests {
             Ok(Rights(interface::rights::ASSIGNED))
         );
         assert_eq!(Rights::from_bits(0), Ok(Rights::NONE));
-        for shift in 9..32 {
+        for shift in 15..32 {
             assert_eq!(
                 Rights::from_bits(1 << shift).err(),
                 Some(DispatchError::InvalidRights),

@@ -26,7 +26,7 @@ The container-1.2 header is exactly 96 bytes.
 | 14 | 2 | header bytes | 96 |
 | 16 | 2 | load-record bytes | 40 |
 | 18 | 2 | ABI major | 1 |
-| 20 | 2 | minimum ABI minor | at most the kernel-supported minor; currently 2 |
+| 20 | 2 | minimum ABI minor | at most the kernel-supported minor; currently 3 |
 | 22 | 2 | flags | zero |
 | 24 | 8 | entry offset | image-relative byte inside an RX segment |
 | 32 | 2 | load-record count | bounded, nonzero |
@@ -177,6 +177,10 @@ prefix no larger than its memory extent. The planner enforces its caller's
 page budget and a common 16 MiB local-exec displacement window. This command
 does not parse ELF, produce KEX bytes, reserve memory, or grant thread admission.
 Container 1.2, application ABI 1.3, and their TLS rejection rules are unchanged.
+
+The standalone [thread codec](thread-v1.md) assigns an ABI 1.4 startup extension
+and read-only per-thread descriptor. The current kernel/SDK reject that minor;
+it does not enable TLS in container 1.2 or change the layouts below.
 
 ## ABI 1.0–1.3 virtual layout and startup region
 
