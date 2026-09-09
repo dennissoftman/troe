@@ -129,7 +129,10 @@ windows, TLS initializer agreement, sparse alignment gaps, page-zero and user
 range exclusion, overflow, and independent mapped-page, resident-page,
 reserved-page, ordinary-frame and IPC-pair budgets. Checked sums include all
 retained plans and reject overflow in derived byte counts. IPC pages count toward logical
-resident charges without also consuming ordinary-frame allowances.
+resident charges without also consuming ordinary-frame allowances. The immutable
+startup descriptor consumes a mapped page and an ordinary frame. Tests check
+its read-only region kind and compose complete descriptor bytes from both
+compiler TLS layouts without overlapping stack guards or private IPC.
 
 An independent oracle enumerates mapped pages and collects their parent-table
 identities. The constant-work table calculation must match it across 512
@@ -137,6 +140,14 @@ generated layouts and explicit 2 MiB, 1 GiB and 512 GiB boundary cases. A 1 TiB
 stack case exercises planning without allocating or walking its pages. These
 tests verify geometry and accounting only; they do not reserve memory, validate
 collision against live mappings, or establish native guard-fault/teardown behavior.
+
+`cargo test -p troe-abi --lib threading::` checks every operation, exact wire
+lengths and reserved bytes, typed token/generation boundaries, deadline tags,
+response correlation and ownership-sensitive outcomes. Adversarial bit mutations
+must be rejected or reproduce identical canonical bytes. Startup tests reject
+overlap, arithmetic overflow and nonzero page slack. Application encoder and SDK
+tests also prove ABI 1.0–1.3 cannot gain threading from newly assigned interface
+IDs, and that ABI 1.4 stays rejected. These checks do not execute native threads.
 
 ## Python tooling gates
 

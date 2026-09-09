@@ -13,9 +13,10 @@ or complete native admission proof.
 The portable table constructors also enforce compiled metadata-byte budgets;
 the paired admission annex below constrains record/wait capacity and protected
 IPC headroom without enabling native execution.
-Numeric wire assignments and measured admission limits must pass the gates
-below before native implementation is enabled. This decision does not supersede an
-implemented contract yet.
+Allocation-free wire/startup codecs implement the numeric assignments described
+in the wire annex below. Application ABI 1.4 and native entry 6 remain disabled;
+these assignments do not supersede the active ABI 1.3 contract. Complete native
+admission and the remaining gates below are still required.
 
 ## Context and priorities
 
@@ -100,12 +101,54 @@ where meaningful. These are API discipline within one process, not an intra-
 process security boundary. External supervisors retain process-level control;
 the initial profile exposes no authority to kill or suspend one sibling.
 
-The new interface, startup revision, TLS container revision, and capability
-requirements must be allocated against the registries at implementation time.
+The interface and startup assignments are recorded in the wire annex below.
+The TLS container revision and capability requirements must also be allocated
+against the live registries before native admission.
 Do not reuse ABI 1.3 startup fields or activate the reserved TLS flag in an old
 version. Old readers reject new requirements before execution. Old artifacts
 keep their exact layouts and remain single-threaded even if a caller supplies
 extra authority. Library linkage alone is not a declaration of thread safety.
+
+### Wire and startup annex
+
+The implemented [thread codec v1](../formats/thread-v1.md) assigns interfaces
+30/31, interface version 1.0, operation rights in bits 9–14, entry 6 with a
+64-byte request and 32-byte response, and the standalone ABI 1.4 startup
+extension. Typed tokens carry a nonzero generation and kind, with no caller
+process field. Current kernel/SDK admission remains capped at ABI 1.3; startup
+encoding/decoding rejects the new interfaces in older profiles. KCAP grants
+and KEX TLS encoding are separate prerequisites, not inferred from codec availability.
+Collapse internal wrong-process and stale-generation lookup failures to the
+same public stale result. A caller must not probe another process's record
+existence through a more specific ownership error. Mutex-not-owner remains a
+distinct error for an already authenticated object inside the same process.
+
+Native entry 6 must authenticate an actual built-in scheduler capability,
+including owner, interface version and operation rights. An application endpoint
+advertising the same interface number cannot become a scheduler service. Copy
+the complete request into owned kernel storage before validating or suspending;
+no borrowed TX bytes survive admission. Sibling writes to shared memory can
+corrupt application requests but cannot bypass trusted owner/state checks.
+Resume uses the retained operation identity and caller's live IPC generation,
+never a payload-supplied destination or another thread's pending result. Before
+return, clear unused RX bytes; rejected frames expose zero response bytes.
+
+Thread/synchronization waits are scheduler operations, separate from service IPC
+deadlines and lease status. A timeout, cooperative stop, poison or self-deadlock
+is an operation result, not a transport fault. Suspending on a wait cannot
+renew an active delegated IPC execution lease, transfer that lease to a sibling,
+or grant another process CPU entitlement. The complete native attribution proof
+remains a #206 gate. Frame/profile/capability rejection does not perform an
+operation; native faults still use the process-wide failure boundary.
+
+ABI 1.4 keeps the initial entry's process-startup pointer and mapped-byte-count
+convention. Its header points to a separate immutable initial-thread descriptor.
+A worker enters a kernel-selected, admitted image trampoline with its own
+descriptor address and 128-byte prefix count in the normal first two argument
+registers. The descriptor contains shared process startup, private stack/TLS/IPC,
+resolved worker entry and the scalar argument. The trampoline is selected from
+validated executable metadata, never supplied as a syscall callback. Its native
+implementation and compiler profile are not established by decoding addresses.
 
 ## Decision 3: transactional creation and precise lifecycle
 
@@ -242,29 +285,31 @@ converter acceptance is changed by this portable component.
 ### Portable managed-memory layout annex
 
 `troe-application::thread_memory` composes the checked TLS layout with one fixed,
-fully committed stack and one task IPC pair. Its kernel-selected reservation
+fully committed stack, one task IPC pair and one read-only startup descriptor
+page. Its kernel-selected reservation
 base is page aligned, excludes page zero, and the complete window must fit
 below or end at the exclusive 48-bit user limit. An empty stack is rejected;
 the final stack minimum/default remains a profile acceptance input in #206.
 
 In ascending addresses the canonical window contains one lower guard page,
 the stack, one upper stack guard page, an unmapped alignment gap, TLS aligned
-to its required mapping alignment, two adjacent IPC pages in TX/RX order, and
-one final guard page. The gap may be empty. The three mapped regions are
-nonempty, disjoint and RW/NX; every other byte remains unmapped but reserved.
+to its required mapping alignment, two adjacent IPC pages in TX/RX order, a
+read-only startup page, and one final guard page. The gap may be empty. The four
+mapped regions are nonempty and disjoint. Stack, TLS and IPC are RW/NX; startup
+is read-only/NX. Every other byte remains unmapped but reserved.
 The stack top is 16-byte aligned. Architecture entry frames, stack probes and
-startup descriptors remain separate native obligations. Keeping guards around
+publication of startup mappings remain native obligations. Keeping guards around
 the stack reduces accidental adjacent-object corruption; neither the guards
-nor the final IPC guard isolates one sibling from another.
+nor the final guard isolates one sibling from another.
 
 The planner distinguishes five simultaneous memory constraints:
 
 | Charge | Included resources |
 | --- | --- |
-| Mapped pages | stack + full TLS allocation + 2 IPC pages |
+| Mapped pages | stack + full TLS allocation + 2 IPC pages + startup page |
 | Logical resident pages | mapped pages + supplemental page tables |
 | Reserved virtual pages | complete window, including three guards and alignment gaps |
-| Ordinary frames | stack + TLS + maximum additional page-table pages |
+| Ordinary frames | stack + TLS + startup + maximum additional page-table pages |
 | Task IPC pairs | one, from task capacity after essential-service reservations |
 
 The logical resident charge adds supplemental tables to mapped pages. The IPC
@@ -275,7 +320,7 @@ charges and slot occupancy attribute that existing storage to its current user.
 Kernel-continuation pairs are not available for application admission.
 
 For each of the three levels below the shared process root, count the union of
-page-table prefixes intersecting the ordered mapped regions. This takes nine
+page-table prefixes intersecting the ordered mapped regions. This takes twelve
 range calculations, independent of stack size. It excludes prefixes touched
 only by gaps, deduplicates prefixes shared within one plan and includes all
 boundary crossings. It is exact for otherwise absent lower tables and an

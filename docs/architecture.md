@@ -298,19 +298,28 @@ rejects TLS-bearing artifacts; compiler probes verify this portable layout
 independently of native execution.
 
 `troe-application::thread_memory` places one fixed, fully committed stack, the
-checked TLS allocation and a two-page IPC pair inside a page-aligned user
+checked TLS allocation, a two-page IPC pair and a read-only startup descriptor
+page inside a page-aligned user
 window. The stack has a guard on each side; TLS alignment gaps and a final
-guard after IPC also stay unmapped. The complete window counts against virtual
-reservation limits. Mapped-page charges include IPC, while ordinary-frame
-demand includes stack, TLS and supplemental page tables: IPC backing already
+guard after startup also stay unmapped. The complete window counts against virtual
+reservation limits. Mapped-page charges include IPC and startup, while ordinary-frame
+demand includes stack, TLS, startup and supplemental page tables: IPC backing already
 belongs to the boot arena. The table bound counts distinct prefixes at each
-of the three levels below the shared root in nine range calculations, without
+of the three levels below the shared root in twelve range calculations, without
 walking individual pages or charging unmapped gaps as leaf mappings.
 Checked cumulative charges and simultaneous budget checks are pure preflight
 calculations. They do not acquire ownership, detect collisions with existing
 reservations, or select service reserves. Context/wait/runtime metadata and
 the shared process root remain separate charges. The native loader does not
 consume these plans or admit additional execution threads.
+
+`troe-abi::threading` provides closed request/response and immutable startup
+descriptor codecs for assigned interfaces 30/31 and entry 6. The
+[wire contract](formats/thread-v1.md) separates scheduler outcomes from IPC
+transport failures and validates token kinds, wait flags and response payloads.
+It authenticates no capability or pending operation. Application ABI 1.4 is
+assigned but rejected by the active loader and SDK; older startup profiles
+also reject the two thread interfaces.
 
 The boot arena contains one reusable 64 KiB cooperative task payload plus
 128 KiB isolated-server and 192 KiB shell payloads. The shell reserve covers

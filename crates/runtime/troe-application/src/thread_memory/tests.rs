@@ -48,7 +48,7 @@ fn canonical_window_keeps_all_three_guards_unmapped() {
     for target in [Target::X86_64, Target::Aarch64] {
         let description = tls(target, 37, 64);
         let planned = plan(0x1_0000_0000, 4, description);
-        let [stack, template, ipc] = planned.regions();
+        let [stack, template, ipc, startup] = planned.regions();
         assert_eq!(stack.start(), planned.reservation_base() + PAGE_SIZE);
         assert_eq!(stack.pages(), 4);
         assert_eq!(stack.end() % 16, 0);
@@ -56,14 +56,55 @@ fn canonical_window_keeps_all_three_guards_unmapped() {
         assert_eq!(template.pages(), description.pages());
         assert_eq!(ipc.start(), template.end());
         assert_eq!(ipc.pages(), 2);
-        assert_eq!(planned.reservation_end(), ipc.end() + PAGE_SIZE);
-        assert_eq!(planned.charges().mapped_pages(), 7);
-        assert_eq!(planned.charges().reserved_pages(), 10);
+        assert_eq!(startup.start(), ipc.end());
+        assert_eq!(startup.pages(), 1);
+        assert_eq!(startup.kind(), ThreadMemoryKind::Startup);
+        assert!(!startup.writable());
+        assert!(
+            [stack, template, ipc]
+                .iter()
+                .all(|region| region.writable())
+        );
+        assert_eq!(planned.reservation_end(), startup.end() + PAGE_SIZE);
+        assert_eq!(planned.charges().mapped_pages(), 8);
+        assert_eq!(planned.charges().reserved_pages(), 11);
         assert_eq!(planned.charges().table_pages(), 3);
-        assert_eq!(planned.charges().ordinary_frames(), 8);
-        assert_eq!(planned.charges().resident_pages(), 10);
+        assert_eq!(planned.charges().ordinary_frames(), 9);
+        assert_eq!(planned.charges().resident_pages(), 11);
         assert_eq!(planned.charges().ipc_pairs(), 1);
         assert_eq!(table_oracle(planned), 3);
+    }
+}
+
+#[test]
+fn both_compiler_layouts_encode_a_disjoint_immutable_startup_descriptor() {
+    use troe_abi::threading::{Kind, StartupDescriptor, Token};
+    for target in [Target::X86_64, Target::Aarch64] {
+        for alignment in [1, 64, 4096, 8192, 65536] {
+            let planned = plan(0x1_0000_0000, 4, tls(target, 5001, alignment));
+            let [stack, template, ipc, startup] = planned.regions();
+            let descriptor = StartupDescriptor {
+                thread: Token::new(Kind::Thread, 1, 1).unwrap_or_else(|_| unreachable!()),
+                process_startup: PAGE_SIZE,
+                stack_bottom: stack.start(),
+                stack_top: stack.end(),
+                tls_base: template.start(),
+                tls_bytes: template.pages() * PAGE_SIZE,
+                thread_pointer: planned.thread_pointer(),
+                ipc_tx: ipc.start(),
+                entry: 1 << 21,
+                argument: u64::MAX,
+                initial: false,
+                address: startup.start(),
+            };
+            let bytes = descriptor.encode().unwrap_or_else(|_| unreachable!());
+            assert_eq!(StartupDescriptor::decode(&bytes), Ok(descriptor));
+            assert_eq!(
+                startup.pages() * PAGE_SIZE,
+                troe_abi::threading::STARTUP_MAPPING_BYTES
+            );
+            assert!(!startup.writable());
+        }
     }
 }
 
@@ -192,12 +233,12 @@ fn sparse_alignment_gap_costs_virtual_pages_but_no_leaf_tables_or_frames() {
     let description = tls(Target::X86_64, 0, LOCAL_EXEC_BYTES);
     let planned = plan(PAGE_SIZE, 1, description);
     assert_eq!(planned.regions()[1].start(), LOCAL_EXEC_BYTES);
-    assert_eq!(planned.charges().mapped_pages(), 4);
+    assert_eq!(planned.charges().mapped_pages(), 5);
     assert_eq!(planned.charges().table_pages(), 4);
-    assert_eq!(planned.charges().ordinary_frames(), 6);
+    assert_eq!(planned.charges().ordinary_frames(), 7);
     assert_eq!(
         planned.charges().reserved_pages(),
-        LOCAL_EXEC_BYTES / PAGE_SIZE + 3
+        LOCAL_EXEC_BYTES / PAGE_SIZE + 4
     );
     assert_eq!(table_oracle(planned), 4);
     let small_virtual = ThreadMemoryBudget {
@@ -236,7 +277,7 @@ fn varied_layouts_match_independent_page_enumeration() {
             assert_eq!(planned.charges().table_pages(), table_oracle(planned));
             assert_eq!(
                 planned.charges().mapped_pages(),
-                stack + planned.regions()[1].pages() + 2
+                stack + planned.regions()[1].pages() + 3
             );
         }
     }
@@ -265,8 +306,8 @@ fn invalid_and_overflowing_ranges_fail_before_a_plan_exists() {
             Err(ThreadMemoryError::ArithmeticOverflow)
         );
     }
-    // One stack page, one TLS page, two IPC pages and three guards exactly fit.
-    let base = KEX_V1_USER_END - 7 * PAGE_SIZE;
+    // Stack, TLS, two IPC pages, read-only startup and three guards exactly fit.
+    let base = KEX_V1_USER_END - 8 * PAGE_SIZE;
     let planned = plan(base, 1, description);
     assert_eq!(planned.reservation_end(), KEX_V1_USER_END);
     assert_eq!(
@@ -286,7 +327,7 @@ fn huge_stack_planning_is_bounded_without_allocating_or_walking_pages() {
         planned.charges().table_pages(),
         (1 << 19) + 1 + (1 << 10) + 1 + 3
     );
-    assert_eq!(planned.charges().mapped_pages(), pages + 3);
+    assert_eq!(planned.charges().mapped_pages(), pages + 4);
 }
 
 #[test]
@@ -300,12 +341,12 @@ fn aggregate_prepared_and_retained_plans_exhaust_all_allowances() {
         .charges()
         .checked_add(second.charges())
         .unwrap_or_else(|_| unreachable!());
-    assert_eq!(both.mapped_pages(), 21);
-    assert_eq!(both.reserved_pages(), 27);
+    assert_eq!(both.mapped_pages(), 23);
+    assert_eq!(both.reserved_pages(), 29);
     assert_eq!(both.ipc_pairs(), 2);
     assert_eq!(both.table_pages(), 6);
-    assert_eq!(both.ordinary_frames(), 23);
-    assert_eq!(both.resident_pages(), 27);
+    assert_eq!(both.ordinary_frames(), 25);
+    assert_eq!(both.resident_pages(), 29);
     assert_eq!(exact_budget(both).check(both), Ok(()));
     assert_eq!(
         ThreadMemoryBudget {
