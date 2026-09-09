@@ -6,9 +6,10 @@ Status: architectural direction accepted, 2026-09-09. Implementation tracked by
 [#208](https://github.com/dennissoftman/troe/issues/208).
 No native thread, TLS, format, or pthread support is claimed by this document.
 Current single-execution-thread application contracts remain in force.
-Portable lifecycle/synchronization models and an independently compiler-checked
-static TLS layout/initializer implement portions of this direction. The layout
-annex below is not a KEX TLS encoding or complete native admission proof.
+Portable lifecycle/synchronization models, an independently compiler-checked
+static TLS layout/initializer, and a guarded thread-memory planner implement
+portions of this direction. The layout annexes below are not a KEX TLS encoding
+or complete native admission proof.
 Numeric wire assignments and measured admission limits must pass the gates
 below before native implementation is enabled. This decision does not supersede an
 implemented contract yet.
@@ -234,6 +235,63 @@ wire/startup versions and KEX TLS encoding remain in
 [#206](https://github.com/dennissoftman/troe/issues/206), together with the
 selected and pinned production compiler profile. No native admission or current
 converter acceptance is changed by this portable component.
+
+### Portable managed-memory layout annex
+
+`troe-application::thread_memory` composes the checked TLS layout with one fixed,
+fully committed stack and one task IPC pair. Its kernel-selected reservation
+base is page aligned, excludes page zero, and the complete window must fit
+below or end at the exclusive 48-bit user limit. An empty stack is rejected;
+the final stack minimum/default remains a profile acceptance input in #206.
+
+In ascending addresses the canonical window contains one lower guard page,
+the stack, one upper stack guard page, an unmapped alignment gap, TLS aligned
+to its required mapping alignment, two adjacent IPC pages in TX/RX order, and
+one final guard page. The gap may be empty. The three mapped regions are
+nonempty, disjoint and RW/NX; every other byte remains unmapped but reserved.
+The stack top is 16-byte aligned. Architecture entry frames, stack probes and
+startup descriptors remain separate native obligations. Keeping guards around
+the stack reduces accidental adjacent-object corruption; neither the guards
+nor the final IPC guard isolates one sibling from another.
+
+The planner distinguishes five simultaneous memory constraints:
+
+| Charge | Included resources |
+| --- | --- |
+| Mapped pages | stack + full TLS allocation + 2 IPC pages |
+| Logical resident pages | mapped pages + supplemental page tables |
+| Reserved virtual pages | complete window, including three guards and alignment gaps |
+| Ordinary frames | stack + TLS + maximum additional page-table pages |
+| Task IPC pairs | one, from task capacity after essential-service reservations |
+
+The logical resident charge adds supplemental tables to mapped pages. The IPC
+pool already owns its physical backing in the boot arena, so admitting a thread
+must not allocate or charge those same pages as ordinary free frames again.
+Global physical accounting counts the whole pool once; per-thread logical
+charges and slot occupancy attribute that existing storage to its current user.
+Kernel-continuation pairs are not available for application admission.
+
+For each of the three levels below the shared process root, count the union of
+page-table prefixes intersecting the ordered mapped regions. This takes nine
+range calculations, independent of stack size. It excludes prefixes touched
+only by gaps, deduplicates prefixes shared within one plan and includes all
+boundary crossings. It is exact for otherwise absent lower tables and an
+upper bound when the process already owns some tables. The shared root is
+charged once to the process. Summing separately admitted plans conservatively
+reserves possible additional tables again; unused frames remain charged until
+their physical owner returns them. No optimistic sharing credit is needed to
+pass preflight.
+
+Checked aggregate charges cover prepared, live and unreleased plans and reject
+overflow in every stored or derived count. A budget is a trusted snapshot after
+existing charges, system minimum-free, service and teardown reserves have been
+removed. Checking it neither reserves resources nor prevents a competing
+admission from consuming them. Native composition must serialize reservation,
+validate the whole window against all existing mapped and reserved ranges,
+own/zero backing and enforce mapping permissions before publication. The
+planner does not establish these facts. Compiled context/wait/mapping/runtime
+metadata, object/key capacities, final defaults and the supervisor/service
+allocation remain acceptance work in #206. Native loading remains unchanged.
 
 ### Native mapping and TSS ownership
 
@@ -597,10 +655,11 @@ commit, service reservations, and existing system memory reserves. Count the
 whole expression, including preparation rollback and completion tombstones:
 
 ```text
-process charge = shared image/root/runtime
+process logical charge = shared image/root/runtime
                + sum(thread stack + TLS + IPC + mapping overhead + metadata)
                + synchronization objects + retained completions
-global charge  = all process charges + supervisor/service reservations
+global physical charge = shared process physical owners + ordinary thread frames
+                       + IPC boot pool once + other supervisor/service storage
 ```
 
 Preflight rejects an impossible declared configuration before boot services

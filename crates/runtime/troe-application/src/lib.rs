@@ -15,6 +15,7 @@ pub mod static_tls;
 mod stream;
 #[cfg(test)]
 mod tests;
+pub mod thread_memory;
 mod transaction;
 
 pub use troe_abi::{ABI_MAJOR, ABI_MINOR};

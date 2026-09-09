@@ -112,6 +112,22 @@ Changes to `troe-application` select these probes as well as Rust and native
 regression checks. These are host compiler/layout checks, not evidence of
 thread-pointer switching or TLS execution inside a guest.
 
+## Thread memory planning
+
+`cargo test -p troe-application --lib thread_memory::` verifies complete guarded
+windows, TLS initializer agreement, sparse alignment gaps, page-zero and user
+range exclusion, overflow, and independent mapped-page, resident-page,
+reserved-page, ordinary-frame and IPC-pair budgets. Checked sums include all
+retained plans and reject overflow in derived byte counts. IPC pages count toward logical
+resident charges without also consuming ordinary-frame allowances.
+
+An independent oracle enumerates mapped pages and collects their parent-table
+identities. The constant-work table calculation must match it across 512
+generated layouts and explicit 2 MiB, 1 GiB and 512 GiB boundary cases. A 1 TiB
+stack case exercises planning without allocating or walking its pages. These
+tests verify geometry and accounting only; they do not reserve memory, validate
+collision against live mappings, or establish native guard-fault/teardown behavior.
+
 ## Python tooling gates
 
 The repository's own Python is formatted and linted by one tool. `ruff` is both
