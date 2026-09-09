@@ -277,6 +277,21 @@ libc-private metadata, or account for complete thread admission. KEX still
 rejects TLS-bearing artifacts; compiler probes verify this portable layout
 independently of native execution.
 
+`troe-application::thread_memory` places one fixed, fully committed stack, the
+checked TLS allocation and a two-page IPC pair inside a page-aligned user
+window. The stack has a guard on each side; TLS alignment gaps and a final
+guard after IPC also stay unmapped. The complete window counts against virtual
+reservation limits. Mapped-page charges include IPC, while ordinary-frame
+demand includes stack, TLS and supplemental page tables: IPC backing already
+belongs to the boot arena. The table bound counts distinct prefixes at each
+of the three levels below the shared root in nine range calculations, without
+walking individual pages or charging unmapped gaps as leaf mappings.
+Checked cumulative charges and simultaneous budget checks are pure preflight
+calculations. They do not acquire ownership, detect collisions with existing
+reservations, or select service reserves. Context/wait/runtime metadata and
+the shared process root remain separate charges. The native loader does not
+consume these plans or admit additional execution threads.
+
 The boot arena contains one reusable 64 KiB cooperative task payload plus
 128 KiB isolated-server and 192 KiB shell payloads. The shell reserve covers
 eight nested launch levels including private IPC/root metadata. Each has an unmapped 4 KiB page on
