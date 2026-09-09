@@ -519,6 +519,15 @@ the root handoff; construction, teardown, and diagnostic output are excluded.
 The unsorted `ipc-phase-b-samples` records use the same counter/frequency as
 `ipc-samples`; frozen fixtures in `tests/fixtures/adr-0035` are never rewritten.
 
+Measurements are grouped by payload: compatibility, Phase B direct and queued,
+then Phase C general-direct. Each group uses one compatibility sample array.
+Its serial transcript is emitted after all paths finish, including observations
+collected before a failure. Native fault probes run after the latency groups.
+This keeps comparisons close in time without changing clocks, sample counts,
+warmups, timing boundaries, or thresholds; host scheduling can still affect
+the results. The release build optimizes the machine, service, task and dispatch
+crates for speed while retaining the workspace's size profile elsewhere.
+
 For each nonempty direct round trip the gate requires one request copy, one
 reply copy, two user-root handoffs, zero heap allocations, zero queue slots,
 zero scheduler scans, zero targeted/full invalidations, and zero additional

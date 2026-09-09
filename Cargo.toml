@@ -90,3 +90,11 @@ opt-level = 3
 # checks into a size-optimized caller otherwise loses their hot-path lowering.
 [profile.release.package.troe-machine]
 opt-level = 3
+
+# Chain/wait arbitration and pending-call accounting are part of the same gate.
+# Their iterator bodies must also be lowered for speed across crate boundaries.
+[profile.release.package.troe-task]
+opt-level = 3
+
+[profile.release.package.troe-dispatch]
+opt-level = 3

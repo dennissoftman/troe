@@ -2,28 +2,19 @@
 use super::{ServerSpec, Supervisor};
 use crate::{machine::OwnedAccounting, memory::launch::reclaim_application};
 use alloc::boxed::Box;
+use core::fmt::Write;
 use troe_dispatch::{Dispatcher, Rights};
 use troe_machine::ProtectedStop;
 use troe_service::{RestartPolicy, ServiceEvent, ServiceRecord, ServiceRole};
 use troe_task::{Capabilities, Scheduler};
 
-pub(crate) fn verify(
-    scheduler: &mut Scheduler,
-    accounting: &mut OwnedAccounting,
-    compatibility: [u64; 4],
-) -> Result<(), ()> {
-    for (index, bytes) in [0, 64, 256, 4096].into_iter().enumerate() {
-        measure(scheduler, accounting, bytes, compatibility[index])?;
-    }
-    Ok(())
-}
-
 #[allow(clippy::too_many_lines)]
-fn measure(
+pub(crate) fn measure(
     scheduler: &mut Scheduler,
     accounting: &mut OwnedAccounting,
     bytes: usize,
     compatibility: u64,
+    transcript: &mut alloc::string::String,
 ) -> Result<(), ()> {
     let free = accounting.frames.free_frames();
     let mut s = Supervisor::new(&[ServerSpec {
@@ -138,7 +129,8 @@ fn measure(
     {
         return Err(());
     }
-    crate::probes::emit_ipc_samples(
+    crate::probes::append_ipc_samples(
+        transcript,
         "general-direct",
         bytes,
         troe_machine::benchmark_counter_frequency_hz().ok_or(())?,
@@ -146,7 +138,7 @@ fn measure(
     )?;
     let ratio_limit = if bytes == 4096 { 70 } else { 60 };
     let pass = p95.saturating_mul(100) <= compatibility.saturating_mul(ratio_limit);
-    if !troe_machine::write(alloc::format!("ipc-phase-c-latency path=general-direct payload={bytes} warmup=64 samples=256 p95_ticks={p95} compatibility_p95={compatibility} ratio_limit={ratio_limit} ratio_pass={} tagged={} calls=256 request_copies={request_copies} reply_copies={reply_copies} root_writes={roots} targeted_invalidations={targeted} full_invalidations={full} queue_slots=0 traps={traps} tag_hits={hits} steady_allocations=0 scheduler_scans=0 additional_lease_programs={leases}\n", u8::from(pass), u8::from(tags.supported)).as_bytes()) { return Err(()); }
+    writeln!(transcript, "ipc-phase-c-latency path=general-direct payload={bytes} warmup=64 samples=256 p95_ticks={p95} compatibility_p95={compatibility} ratio_limit={ratio_limit} ratio_pass={} tagged={} calls=256 request_copies={request_copies} reply_copies={reply_copies} root_writes={roots} targeted_invalidations={targeted} full_invalidations={full} queue_slots=0 traps={traps} tag_hits={hits} steady_allocations=0 scheduler_scans=0 additional_lease_programs={leases}", u8::from(pass), u8::from(tags.supported)).map_err(|_| ())?;
     runtime.terminate(actor, true).map_err(|_| ())?;
     drop(runtime.remove(actor).map_err(|_| ())?);
     crate::memory::launch::terminate_revoke_and_reap_task(
