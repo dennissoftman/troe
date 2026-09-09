@@ -87,6 +87,31 @@ or establish machine-level TLS, isolation, pthread, or physical-reclamation
 support. Changes to the crate also select its consumers and native regression
 scenarios through the normal impact selector.
 
+## Static TLS layout and compiler probes
+
+`cargo test -p troe-application --lib static_tls::` checks both architecture
+layouts, empty and zero-filled templates, alignment padding, complete page
+charges, displacement ceilings, overflow, virtual-range boundaries, independent
+thread storage, and unchanged destination bytes after rejected initialization.
+Successful initialization must overwrite every byte, including reused padding.
+
+`python3 -m unittest discover -s tests -p test_kex_tool.py -k StaticTls -v`
+compiles and links eighteen C11 local-exec fixtures for x86-64 and AArch64. It
+reads the ELF TLS geometry and symbols, decodes the actual address-return
+instructions, and compares their thread-pointer offsets with the Rust planner
+through `cargo kex tls-layout`. The fixtures cover sub-word and over-page
+alignment, BSS-only templates, odd lengths, and both halves of AArch64's
+24-bit relocation. Unexpected instruction sequences require explicit review;
+they are not silently interpreted as equivalent. The canonical converter must
+still reject these artifacts (TLS, or unsupported over-page load geometry).
+
+The probes require `clang` and `ld.lld` and fail if either is unavailable.
+`TROE_TLS_CC` and `TROE_TLS_LD` select explicit executables; compiler/linker
+versions are printed with the results. Missing tools do not skip this check.
+Changes to `troe-application` select these probes as well as Rust and native
+regression checks. These are host compiler/layout checks, not evidence of
+thread-pointer switching or TLS execution inside a guest.
+
 ## Python tooling gates
 
 The repository's own Python is formatted and linted by one tool. `ruff` is both

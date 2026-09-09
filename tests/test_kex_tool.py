@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import struct
 import subprocess
 import sys
@@ -250,6 +251,295 @@ class KexToolTests(unittest.TestCase):
                 )
                 self.assertNotEqual(rejected.returncode, 0)
                 self.assertIn(b"command name", rejected.stderr)
+
+
+class StaticTlsTests(unittest.TestCase):
+    """Compare portable TLS policy with actual cross-target compiler output."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        subprocess.run(
+            ("cargo", "build", "--quiet", "--package", "troe-kex-tool"),
+            cwd=REPO_ROOT,
+            check=True,
+        )
+
+    def layout(
+        self, target: str, file: int, memory: int, alignment: int, pages: int = 4097
+    ) -> dict[str, int | str]:
+        """Read the actual Rust planner rather than duplicating it in Python."""
+        result = cargo_kex(
+            "tls-layout",
+            "--target",
+            target,
+            "--file-bytes",
+            file,
+            "--memory-bytes",
+            memory,
+            "--alignment",
+            alignment,
+            "--max-pages",
+            pages,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        return json.loads(result.stdout)
+
+    def test_empty_tls_still_charges_a_control_block(self) -> None:
+        for target, offset in (("x86_64", 0), ("aarch64", 16)):
+            with self.subTest(target=target):
+                layout = self.layout(target, 0, 0, 1, 1)
+                self.assertEqual(layout["template_offset"], offset)
+                self.assertEqual(layout["thread_pointer_offset"], 0)
+                self.assertEqual(layout["mapped_bytes"], 4096)
+                self.assertEqual(layout["pages"], 1)
+
+    def test_layout_rejects_malformed_or_underfunded_requests(self) -> None:
+        valid = [
+            "tls-layout",
+            "--target",
+            "x86_64",
+            "--file-bytes",
+            "3",
+            "--memory-bytes",
+            "37",
+            "--alignment",
+            "64",
+            "--max-pages",
+            "1",
+        ]
+        for flag, value in (
+            ("--target", "arm"),
+            ("--file-bytes", "38"),
+            ("--file-bytes", "-1"),
+            ("--memory-bytes", str(1 << 64)),
+            ("--memory-bytes", str((1 << 24) + 1)),
+            ("--alignment", "0"),
+            ("--alignment", "3"),
+            ("--max-pages", "0"),
+        ):
+            with self.subTest(flag=flag, value=value):
+                arguments = valid.copy()
+                arguments[arguments.index(flag) + 1] = value
+                result = cargo_kex(*arguments)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, b"")
+        for extra in (("--alignment", "64"), ("--target", "aarch64"), ("--json",)):
+            self.assertNotEqual(cargo_kex(*valid, *extra).returncode, 0)
+        self.assertNotEqual(cargo_kex(*valid[:-2]).returncode, 0)
+
+    def read_probe(
+        self, image: bytes, target: str
+    ) -> tuple[tuple[int, int, int], dict[str, int], dict[str, bytes]]:
+        """Read only fixture ELF headers and named symbols, not production input."""
+        self.assertEqual(image[:7], b"\x7fELF\x02\x01\x01")
+        self.assertEqual(struct.unpack_from("<H", image, 16)[0], 3)
+        self.assertEqual(
+            struct.unpack_from("<H", image, 18)[0],
+            {"x86_64": 62, "aarch64": 183}[target],
+        )
+        phoff, shoff = struct.unpack_from("<QQ", image, 32)
+        phsize, phcount, shsize, shcount = struct.unpack_from("<HHHH", image, 54)
+        self.assertEqual((phsize, shsize), (56, 64))
+        programs = [
+            struct.unpack_from("<IIQQQQQQ", image, phoff + index * phsize)
+            for index in range(phcount)
+        ]
+        tls = [header for header in programs if header[0] == 7]
+        self.assertEqual(len(tls), 1)
+        _, _, offset, address, _, file, memory, alignment = tls[0]
+        self.assertEqual(address % alignment, 0)
+        self.assertEqual(offset % alignment, 0)
+        self.assertLessEqual(file, memory)
+        sections = [
+            struct.unpack_from("<IIQQQQIIQQ", image, shoff + index * shsize)
+            for index in range(shcount)
+        ]
+        symbols: dict[str, int] = {}
+        functions: dict[str, bytes] = {}
+        for section in sections:
+            if section[1] != 2:  # SHT_SYMTAB
+                continue
+            strings_section = sections[section[6]]
+            strings = image[
+                strings_section[4] : strings_section[4] + strings_section[5]
+            ]
+            self.assertEqual(section[9], 24)
+            for position in range(section[4], section[4] + section[5], 24):
+                name, info, _, index, value, size = struct.unpack_from(
+                    "<IBBHQQ", image, position
+                )
+                name = strings[name : strings.index(b"\0", name)].decode()
+                if name in {"initialized", "zeroed", "tail"}:
+                    self.assertEqual(info & 15, 6)  # STT_TLS
+                    symbols[name] = value
+                elif name.startswith("address_"):
+                    self.assertEqual(info & 15, 2)  # STT_FUNC
+                    owner = sections[index]
+                    start = owner[4] + value - owner[3]
+                    functions[name.removeprefix("address_")] = image[
+                        start : start + size
+                    ]
+        self.assertEqual(symbols.keys(), functions.keys())
+        self.assertTrue(symbols)
+        if "initialized" in symbols:
+            start = offset + symbols["initialized"]
+            self.assertEqual(image[start], 19)
+        return (file, memory, alignment), symbols, functions
+
+    def thread_pointer_displacement(self, target: str, code: bytes) -> int:
+        """Decode the small address-return sequence emitted by the probe flags.
+
+        Reject any other sequence so a compiler change needs deliberate review.
+        These assertions verify use of FS:0 / TPIDR_EL0 as well as the offset.
+        """
+        if target == "x86_64":
+            self.assertEqual(len(code), 17, code.hex())
+            self.assertEqual(code[:12], bytes.fromhex("64488b042500000000488d80"))
+            self.assertEqual(code[-1], 0xC3)
+            return struct.unpack_from("<i", code, 12)[0]
+        self.assertEqual(len(code), 16, code.hex())
+        read_tp, high, low, ret = struct.unpack("<IIII", code)
+        self.assertEqual(read_tp, 0xD53BD048)  # mrs x8, TPIDR_EL0
+        immediate = 0xFFF << 10
+        self.assertEqual(high & ~immediate, 0x91400108)  # add x8, x8, #hi, lsl #12
+        self.assertEqual(low & ~immediate, 0x91000100)  # add x0, x8, #lo
+        self.assertEqual(ret, 0xD65F03C0)
+        return (((high >> 10) & 0xFFF) << 12) + ((low >> 10) & 0xFFF)
+
+    def test_compiled_local_exec_addresses_match_layout_and_tls_stays_rejected(
+        self,
+    ) -> None:
+        cc = os.environ.get("TROE_TLS_CC", "clang")
+        linker = os.environ.get("TROE_TLS_LD", "ld.lld")
+        self.assertIsNotNone(shutil.which(cc), f"TLS probes require {cc}")
+        self.assertIsNotNone(shutil.which(linker), f"TLS probes require {linker}")
+        versions = tuple(
+            subprocess.run(
+                (tool, "--version"), check=True, capture_output=True, text=True
+            ).stdout.splitlines()[0]
+            for tool in (cc, linker)
+        )
+        print(f"TLS compiler probes: {'; '.join(versions)}")
+        for target in ("x86_64", "aarch64"):
+            # initialized bytes/alignment, zero-filled bytes/alignment. Include
+            # BSS-only, odd lengths, sub-word and over-page alignment, and offsets
+            # which require both halves of the AArch64 24-bit relocation.
+            for initialized, init_align, zeroed, zero_align in (
+                (1, 1, 0, 1),
+                (3, 2, 0, 1),
+                (0, 1, 5, 1),
+                (0, 1, 5, 64),
+                (3, 64, 0, 1),
+                (3, 8, 5, 32),
+                (3, 64, 5, 32),
+                (3, 64, 65537, 64),
+                (3, 8192, 8193, 8192),
+            ):
+                with (
+                    self.subTest(
+                        target=target,
+                        initialized=initialized,
+                        init_align=init_align,
+                        zeroed=zeroed,
+                        zero_align=zero_align,
+                        compilers=versions,
+                    ),
+                    tempfile.TemporaryDirectory(prefix="troe-static-tls-") as directory,
+                ):
+                    root = Path(directory)
+                    source = root / "probe.c"
+                    declarations = []
+                    for name, size, alignment, initializer in (
+                        ("initialized", initialized, init_align, " = {19}"),
+                        ("zeroed", zeroed, zero_align, ""),
+                    ):
+                        if size:
+                            declarations.extend(
+                                (
+                                    f"_Thread_local unsigned char {name}[{size}] "
+                                    f"__attribute__((aligned({alignment}))){initializer};",
+                                    f"void *address_{name}(void) {{ return {name}; }}",
+                                )
+                            )
+                    if zeroed:
+                        # A separate symbol after BSS forces the linker to
+                        # resolve a far offset, including nonzero high/low bits.
+                        declarations.extend(
+                            (
+                                "_Thread_local unsigned char tail[1];",
+                                "void *address_tail(void) { return tail; }",
+                            )
+                        )
+                    source.write_text(
+                        "\n".join((*declarations, "void _start(void) {}"))
+                    )
+                    obj = root / "probe.o"
+                    elf = root / "probe.elf"
+                    subprocess.run(
+                        (
+                            cc,
+                            f"--target={target}-unknown-none-elf",
+                            "-std=c11",
+                            "-O2",
+                            "-fPIC",
+                            "-ffreestanding",
+                            "-fomit-frame-pointer",
+                            "-fno-stack-protector",
+                            "-ftls-model=local-exec",
+                            "-c",
+                            source,
+                            "-o",
+                            obj,
+                        ),
+                        check=True,
+                        capture_output=True,
+                    )
+                    subprocess.run(
+                        (
+                            linker,
+                            "-pie",
+                            "-e",
+                            "_start",
+                            "--no-relax",
+                            "--no-dynamic-linker",
+                            "-z",
+                            "separate-code",
+                            "-z",
+                            "norelro",
+                            "-z",
+                            "max-page-size=4096",
+                            obj,
+                            "-o",
+                            elf,
+                        ),
+                        check=True,
+                        capture_output=True,
+                    )
+                    geometry, symbols, functions = self.read_probe(
+                        elf.read_bytes(), target
+                    )
+                    layout = self.layout(target, *geometry)
+                    for name, symbol_offset in symbols.items():
+                        actual = self.thread_pointer_displacement(
+                            target, functions[name]
+                        )
+                        expected = (
+                            layout["template_offset"]
+                            + symbol_offset
+                            - layout["thread_pointer_offset"]
+                        )
+                        self.assertEqual(actual, expected)
+                    # The canonical converter still refuses TLS. Over-page TLS
+                    # alignment also produces PT_LOAD geometry outside today's
+                    # input contract; the portable planner does not widen it.
+                    output = root / "probe.kex"
+                    result = cargo_kex("convert", elf, output)
+                    self.assertNotEqual(result.returncode, 0)
+                    if geometry[2] <= 4096:
+                        self.assertIn(b"TLS", result.stderr)
+                    else:
+                        self.assertIn(b"PT_LOAD geometry", result.stderr)
+                    self.assertFalse(output.exists())
 
 
 if __name__ == "__main__":

@@ -6,6 +6,9 @@ Status: architectural direction accepted, 2026-09-09. Implementation tracked by
 [#208](https://github.com/dennissoftman/troe/issues/208).
 No native thread, TLS, format, or pthread support is claimed by this document.
 Current single-execution-thread application contracts remain in force.
+Portable lifecycle/synchronization models and an independently compiler-checked
+static TLS layout/initializer implement portions of this direction. The layout
+annex below is not a KEX TLS encoding or complete native admission proof.
 Numeric wire assignments and measured admission limits must pass the gates
 below before native implementation is enabled. This decision does not supersede an
 implemented contract yet.
@@ -177,6 +180,62 @@ all supported architectural state, including TLS bases, FP/SIMD state, flags,
 and privileged-return constraints. Unsupported vector/debug extensions remain
 disabled; a context switch cannot leak stale state from another process.
 The kernel never trusts a user-writable TLS base or TCB for its own identity.
+
+### Portable local-exec layout annex
+
+The allocation-free `troe-application::static_tls` component defines geometry
+for one fully linked template. Let `F` be initialized bytes, `M` total template
+bytes, `A` a nonzero power-of-two alignment, and `round(x, a)` checked upward
+alignment. Require `F <= M` and zero template alignment residue. An eventual
+ELF adapter must normalize `p_align = 0` to one and reject nonzero
+`p_vaddr mod A`; the scalar planner does not parse or authenticate ELF.
+
+| Target | Template offset from allocation base | Thread pointer offset | Required bytes before page rounding |
+| --- | --- | --- | --- |
+| x86-64 | `round(S, 8) - S`, where `S = round(M, A)` | `round(S, 8)` | thread pointer offset + 8 |
+| AArch64 | `round(16, A)` | 0 | template offset + `M` |
+
+The x86-64 self-pointer word occupies FS:0. Prefix padding aligns that word
+without changing the linker's negative template displacement. This is the
+compiler requirement documented by the
+[x86-64 psABI TLS specification](https://gitlab.com/x86-psABIs/x86-64-ABI/-/tree/usr/hjl/tls)
+and its [FS:0 clarification](https://gitlab.com/x86-psABIs/x86-64-ABI/-/merge_requests/14/commits).
+On AArch64, TPIDR_EL0 addresses a 16-byte control prefix. The template follows
+that prefix and alignment padding, consistent with the zero-residue case of
+the [Arm System V ABI TLS layout](https://github.com/ARM-software/abi-aa/blob/main/sysvabi64/sysvabi64.rst).
+The Arm System V document labels its 2025Q4 revision Alpha; emitted compiler
+and linker instructions are therefore part of the verification, not an
+assumption about every historical platform runtime.
+
+This component uses a conservative common 16 MiB local-exec window: x86-64's
+rounded negative span and AArch64's template end must fit that window, and
+`A` may not exceed it. AArch64's default local-exec relocation has a 24-bit
+offset; see [AAELF64 relocation definitions](https://github.com/ARM-software/abi-aa/blob/main/aaelf64/aaelf64.rst).
+This bound is not a grant to allocate 16 MiB per thread. The caller must supply
+an adequate page budget for the entire rounded mapping. The allocation base
+must be aligned to `max(A, 4096)`, exclude page zero, and fit wholly inside the
+48-bit lower user range. An empty template still needs its control bytes.
+
+Initialization first checks exact input/output sizes and the complete virtual
+range. Rejected initialization writes nothing. Success clears the entire
+mapping, copies the initialized prefix, and writes the x86 self pointer.
+Zero-filled TLS, internal padding, control bytes and final-page slack cannot
+retain another allocation's contents. This deliberately costs work proportional
+to all mapped bytes. The caller owns unpublished, quiescent storage and must
+resolve any permitted image-relative initializers before copying it.
+
+These control bytes do not freeze a musl, glibc, Darwin or BSD private TCB/DTV
+layout. They carry no trusted kernel identity. Libc-private state and TSS key
+destructors need their own explicit ownership and lifetime; neither can be
+inferred from an FS:0 self pointer. Complete thread budgets must additionally
+charge page tables, virtual guard/alignment reservations, stacks, IPC pairs,
+context records, wait records and runtime metadata. Their exact resource proof,
+wire/startup versions and KEX TLS encoding remain in
+[#206](https://github.com/dennissoftman/troe/issues/206), together with the
+selected and pinned production compiler profile. No native admission or current
+converter acceptance is changed by this portable component.
+
+### Native mapping and TSS ownership
 
 Stack, TLS and IPC mappings are RW/NX and process-owned; guards remain unmapped.
 The mapping service refuses arbitrary unmap/protection changes to live managed

@@ -159,6 +159,25 @@ the build entrypoint.
 The shared generated corpus lives under `tests/kex-corpus`; its exact file set
 and bytes are checked with `python3 tools/gen_kex_corpus.py --check`.
 
+### Offline TLS geometry inspection
+
+`cargo kex tls-layout` reports the portable single-template local-exec layout as
+JSON. Every input and the complete page budget is explicit:
+
+```console
+cargo kex tls-layout --target x86_64 --file-bytes 3 --memory-bytes 37 \
+  --alignment 64 --max-pages 1
+```
+
+`template_offset` and `thread_pointer_offset` are measured from the mapping
+base; `mapping_alignment`, `mapped_bytes`, and `pages` describe the complete
+data allocation, including the control block and padding. The template must
+have zero alignment residue, a power-of-two alignment, and an initialized
+prefix no larger than its memory extent. The planner enforces its caller's
+page budget and a common 16 MiB local-exec displacement window. This command
+does not parse ELF, produce KEX bytes, reserve memory, or grant thread admission.
+Container 1.2, application ABI 1.3, and their TLS rejection rules are unchanged.
+
 ## ABI 1.0–1.3 virtual layout and startup region
 
 The kernel draws an independently randomized 2 MiB-aligned image base from the
