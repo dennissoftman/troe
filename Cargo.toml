@@ -85,3 +85,8 @@ strip = "symbols"
 # kernel; payloads and ownership tables remain fixed-capacity.
 [profile.release.package.troe-service]
 opt-level = 3
+
+# Compile the native protected-call gate for speed as well: inlining portable
+# checks into a size-optimized caller otherwise loses their hot-path lowering.
+[profile.release.package.troe-machine]
+opt-level = 3
