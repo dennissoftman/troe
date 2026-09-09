@@ -8,8 +8,12 @@
 
 use super::{MAX_TASKS, ProcessId};
 use alloc::vec::Vec;
+use core::alloc::Layout;
 
+pub mod admission;
+mod metadata;
 pub mod sync;
+pub use metadata::TableMetadata;
 
 /// A slot generation within this table and a non-reused process lifetime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -101,6 +105,8 @@ pub enum ThreadError {
     InvalidLimit,
     /// Construction could not reserve metadata.
     MetadataExhausted,
+    /// Requested or actually retained metadata exceeds the explicit byte budget.
+    MetadataBudget,
     /// A process, record, page or identity bound is exhausted.
     Exhausted,
     /// The process was never registered or has been removed.
@@ -160,16 +166,57 @@ pub struct ThreadTable {
     slots: Vec<Slot>,
     page_limit: u64,
     next_join: u64,
+    metadata_bytes: usize,
+    max_process_threads: usize,
 }
 
 impl ThreadTable {
-    /// Reserve every process/thread metadata slot before publication.
+    /// Compiled storage requests for process slots and retained thread slots.
+    ///
+    /// The result includes the inline owner and full array capacities. Prepared,
+    /// completed and empty slots all require the same permanently reserved bytes.
     ///
     /// # Errors
-    /// Rejects zero/excessive bounds or failed metadata allocation.
-    pub fn new(processes: usize, threads: usize, pages: u64) -> Result<Self, ThreadError> {
-        if processes == 0 || processes > threads || threads > MAX_TASKS || pages == 0 {
+    /// Rejects invalid counts or unrepresentable allocation/total sizes.
+    pub fn metadata_layout(
+        processes: usize,
+        threads: usize,
+    ) -> Result<TableMetadata<2>, ThreadError> {
+        if processes == 0 || processes > threads || threads > MAX_TASKS {
             return Err(ThreadError::InvalidLimit);
+        }
+        Self::storage_layout(processes, threads)
+    }
+
+    fn storage_layout(processes: usize, threads: usize) -> Result<TableMetadata<2>, ThreadError> {
+        TableMetadata::new::<Self>([
+            Layout::array::<Option<Process>>(processes).map_err(|_| ThreadError::InvalidLimit)?,
+            Layout::array::<Slot>(threads).map_err(|_| ThreadError::InvalidLimit)?,
+        ])
+        .ok_or(ThreadError::InvalidLimit)
+    }
+
+    /// Reserve every process/thread metadata slot before publication.
+    ///
+    /// Checks compiled storage against `max_metadata_bytes` before allocation,
+    /// then checks actual vector capacities before returning the owner. Failure
+    /// drops all provisional buffers. Allocator overhead is outside this logical
+    /// metadata budget; the underlying allocator remains independently fallible.
+    ///
+    /// # Errors
+    /// Rejects invalid bounds, insufficient metadata budget or allocation failure.
+    pub fn new(
+        processes: usize,
+        threads: usize,
+        pages: u64,
+        max_metadata_bytes: usize,
+    ) -> Result<Self, ThreadError> {
+        let requested = Self::metadata_layout(processes, threads)?;
+        if pages == 0 {
+            return Err(ThreadError::InvalidLimit);
+        }
+        if requested.bytes() > max_metadata_bytes {
+            return Err(ThreadError::MetadataBudget);
         }
         let mut process_slots = Vec::new();
         process_slots
@@ -187,12 +234,24 @@ impl ThreadTable {
                 record: None,
             },
         );
+        let retained = Self::storage_layout(process_slots.capacity(), slots.capacity())?;
+        if retained.bytes() > max_metadata_bytes {
+            return Err(ThreadError::MetadataBudget);
+        }
         Ok(Self {
             processes: process_slots,
             slots,
             page_limit: pages,
             next_join: 1,
+            metadata_bytes: retained.bytes(),
+            max_process_threads: threads,
         })
+    }
+
+    /// Retained inline/backing storage, including empty capacity, until table drop.
+    #[must_use]
+    pub const fn metadata_bytes(&self) -> usize {
+        self.metadata_bytes
     }
 
     /// Register an authenticated process with immutable effective quotas.
@@ -205,7 +264,7 @@ impl ThreadTable {
         quota: ThreadQuota,
     ) -> Result<(), ThreadError> {
         if quota.records == 0
-            || quota.records > self.slots.len()
+            || quota.records > self.max_process_threads
             || quota.pages == 0
             || quota.pages > self.page_limit
         {

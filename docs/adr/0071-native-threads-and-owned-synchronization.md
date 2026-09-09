@@ -10,6 +10,9 @@ Portable lifecycle/synchronization models, an independently compiler-checked
 static TLS layout/initializer, and a guarded thread-memory planner implement
 portions of this direction. The layout annexes below are not a KEX TLS encoding
 or complete native admission proof.
+The portable table constructors also enforce compiled metadata-byte budgets;
+the paired admission annex below constrains record/wait capacity and protected
+IPC headroom without enabling native execution.
 Numeric wire assignments and measured admission limits must pass the gates
 below before native implementation is enabled. This decision does not supersede an
 implemented contract yet.
@@ -647,6 +650,64 @@ supervisor capacity before admitting application workers. Per-process worker
 ceilings must be lower than the unreserved global allowance so one process
 cannot exhaust every context needed for essential progress. Single-thread
 legacy execution outside that pool keeps its existing admission rules.
+
+### Portable metadata and paired-capacity annex
+
+`ThreadTable` and `SyncTable` require a metadata-byte budget at construction.
+Their `metadata_layout` methods compute `core::alloc::Layout` values from the
+actual compiled types: each inline owner, two lifecycle buffers (process slots
+and retained thread slots), and three synchronization buffers (process slots,
+object slots and wait slots). Full `Option`/enum and record padding is included;
+no wire layout or guessed per-thread byte constant stands in for these records.
+Requested totals are checked without allocation. After fallible reservation,
+actual vector capacities are charged and checked before the owner is returned.
+Any failure drops the unpublished buffers. Empty slots, completion tombstones,
+unused wait slots and process removal never refund this retained backing;
+`metadata_bytes()` stays constant until the entire table is dropped.
+
+This is logical allocated storage, not a complete heap/physical-memory bound.
+Allocator bookkeeping, size-class rounding, fragmentation, and transient
+allocator behavior remain outside these requests and need the allocator's own
+bounded backing. `try_reserve_exact` is fallible and does not promise physical
+success merely because preflight fits. Native contexts, mapping records, IPC
+state and libc/TSS metadata are additional compiled owners in #206/#207.
+
+`ThreadAdmissionPlan` composes both table requests. It requires valid process,
+thread and object counts, a positive per-process thread ceiling strictly below
+the global thread count, and nonzero protected task IPC headroom. Subtract that
+headroom with checked arithmetic before comparing retained thread capacity;
+kernel-continuation pairs never enter the task allowance. Reserving headroom
+outside the application table prevents its workers and unreaped records from
+consuming capacity assigned to essential services and teardown progress. The
+exact reservation is supplied by composition, not guessed or expanded by the
+planner. One global wait slot is reserved for every thread record, including
+the initial thread. Per-process quotas remain simultaneous ceilings, not a
+guarantee that all processes can attain their maximum together.
+The global table may not exceed the aggregate process quotas: such slots could
+never be used and would waste reserved metadata. Together with the strict
+per-process ceiling, this paired application pool needs capacity for at least
+two processes; this is not a requirement that two processes be running.
+
+`maximum_capacity` derives the largest fitting global thread count for fixed
+process/object counts and a per-process ceiling. Start with the minimum valid
+configuration, subtract its fixed metadata charge, and divide remaining bytes
+by the compiled cost of one lifecycle slot plus one wait slot. Cap the result
+by aggregate process quotas, unreserved task context capacity and the existing
+record backstop, then validate the resulting plan. The calculation allocates nothing and selects no
+product default; it exposes the actual binding constraints for profile review.
+
+Pair construction leaves the synchronization request available while creating
+the lifecycle table, checks its actual charge, then uses the remaining budget
+to construct synchronization storage. Only both complete empty tables are
+returned, with the configured per-process ceiling installed in lifecycle quota
+validation. No process or native thread is published during this operation.
+The page allowance supplied to this operation is independent of metadata and
+does not allocate those pages. The plan is a copyable configuration, not a
+unique reservation token: native composition must still serialize global
+admission, subtract existing owners/retired IPC slots, reserve actual resources,
+and establish the mapping and quiescence obligations.
+
+### Complete native admission and teardown
 
 Exact worker/object limits and default stack sizes are acceptance inputs,
 not invented performance claims. Derive them from compiled record sizes,

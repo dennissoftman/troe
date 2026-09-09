@@ -82,6 +82,16 @@ notification, timeout, stop, unlock and exit. Each step checks queue membership,
 exact ownership, pending-completion references and unchanged vector capacities;
 each schedule ends with teardown and resource-baseline checks.
 
+Metadata checks compare the compiled inline/array layouts with retained vector
+capacities, test exact-byte and one-byte-short budgets, reject invalid counts
+before allocation, and ensure retirement does not refund reserved backing.
+`cargo test -p troe-task --lib thread::admission::` checks the combined table
+budget, protected IPC headroom and the enforced per-process ceiling. Its
+two-process case blocks every admitted thread simultaneously, then times out
+and consumes every wait without changing the retained metadata charge.
+The maximum-capacity calculation is compared with exhaustive candidate
+validation over varied object counts, context limits and metadata budgets.
+
 These tests verify the portable policy; they do not execute application threads
 or establish machine-level TLS, isolation, pthread, or physical-reclamation
 support. Changes to the crate also select its consumers and native regression

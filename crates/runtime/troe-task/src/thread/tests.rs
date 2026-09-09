@@ -3,12 +3,88 @@ use super::*;
 const OWNER: ProcessId = ProcessId(1);
 const OTHER: ProcessId = ProcessId(2);
 
+#[test]
+fn compiled_metadata_covers_inline_owner_and_actual_backing() -> Result<(), ThreadError> {
+    for (processes, threads) in [(1, 1), (2, 4), (7, 19), (32, 256)] {
+        let requested = ThreadTable::metadata_layout(processes, threads)?;
+        assert_eq!(requested.inline(), Layout::new::<ThreadTable>());
+        assert_eq!(
+            requested.buffers(),
+            [
+                Layout::array::<Option<Process>>(processes).unwrap_or_else(|_| unreachable!()),
+                Layout::array::<Slot>(threads).unwrap_or_else(|_| unreachable!()),
+            ]
+        );
+        assert_eq!(
+            ThreadTable::new(processes, threads, 1, requested.bytes() - 1).err(),
+            Some(ThreadError::MetadataBudget)
+        );
+        let table = ThreadTable::new(processes, threads, 1, requested.bytes())?;
+        assert_eq!(
+            table.metadata_bytes(),
+            core::mem::size_of_val(&table)
+                + table.processes.capacity() * core::mem::size_of::<Option<Process>>()
+                + table.slots.capacity() * core::mem::size_of::<Slot>()
+        );
+        assert_eq!(table.metadata_bytes(), requested.bytes());
+    }
+    Ok(())
+}
+
+#[test]
+fn metadata_validation_needs_no_large_allocation() {
+    for (processes, threads) in [
+        (0, 1),
+        (2, 1),
+        (1, 0),
+        (1, MAX_TASKS + 1),
+        (usize::MAX, usize::MAX),
+    ] {
+        assert_eq!(
+            ThreadTable::metadata_layout(processes, threads),
+            Err(ThreadError::InvalidLimit)
+        );
+    }
+    assert!(ThreadTable::metadata_layout(MAX_TASKS, MAX_TASKS).is_ok());
+    assert_eq!(
+        ThreadTable::new(1, 1, 1, 0).err(),
+        Some(ThreadError::MetadataBudget)
+    );
+    assert_eq!(
+        ThreadTable::new(1, 1, 0, usize::MAX).err(),
+        Some(ThreadError::InvalidLimit)
+    );
+}
+
+#[test]
+fn retired_records_do_not_refund_backing_metadata() -> Result<(), ThreadError> {
+    let layout = ThreadTable::metadata_layout(1, 2)?;
+    let mut table = ThreadTable::new(1, 2, 4, layout.bytes())?;
+    for reservation in 1..=100 {
+        table.register_process(
+            OWNER,
+            ThreadQuota {
+                records: 2,
+                pages: 4,
+            },
+        )?;
+        let id = table.prepare_initial(OWNER, resources(reservation, 1))?;
+        assert_eq!(table.metadata_bytes(), layout.bytes());
+        table.abort_prepared(OWNER, id)?;
+        table.release_resources(OWNER, id)?;
+        table.reap(OWNER, id)?;
+        table.remove_process(OWNER)?;
+        assert_eq!(table.metadata_bytes(), layout.bytes());
+    }
+    Ok(())
+}
+
 fn resources(reservation: u64, pages: u64) -> ThreadResources {
     ThreadResources { reservation, pages }
 }
 
 fn setup() -> Result<(ThreadTable, ThreadId, ThreadId), ThreadError> {
-    let mut table = ThreadTable::new(2, 4, 16)?;
+    let mut table = ThreadTable::new(2, 4, 16, ThreadTable::metadata_layout(2, 4)?.bytes())?;
     table.register_process(
         OWNER,
         ThreadQuota {
@@ -57,7 +133,7 @@ fn preparation_failure_preserves_charges_and_publication() -> Result<(), ThreadE
 
 #[test]
 fn initial_thread_is_unique_and_aborted_reservations_remain_charged() -> Result<(), ThreadError> {
-    let mut table = ThreadTable::new(1, 2, 4)?;
+    let mut table = ThreadTable::new(1, 2, 4, ThreadTable::metadata_layout(1, 2)?.bytes())?;
     table.register_process(
         OWNER,
         ThreadQuota {
@@ -86,7 +162,7 @@ fn initial_thread_is_unique_and_aborted_reservations_remain_charged() -> Result<
 
 #[test]
 fn per_process_and_global_limits_are_independent() -> Result<(), ThreadError> {
-    let mut table = ThreadTable::new(2, 4, 6)?;
+    let mut table = ThreadTable::new(2, 4, 6, ThreadTable::metadata_layout(2, 4)?.bytes())?;
     table.register_process(
         OWNER,
         ThreadQuota {

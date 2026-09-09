@@ -264,6 +264,26 @@ These serialized transitions allocate nothing after table construction. Native
 clock delivery, instruction-level memory ordering and work-quantum enforcement
 are outside these portable models.
 
+Both table constructors require an explicit metadata-byte budget. Their
+`metadata_layout` methods derive inline-owner and backing-array sizes/alignment
+from the compiled Rust types. Constructors check those requests before allocating
+and check actual vector capacities before returning an owner. Unused slots stay
+charged through process removal and slot reuse, until the table is dropped.
+Allocator bookkeeping, rounding and fragmentation are separate physical costs.
+
+`troe-task::thread::admission` checks a paired table configuration against a
+combined metadata allowance and task IPC capacity after nonzero protected
+headroom. It reserves one synchronization wait slot per retained thread and
+enforces a per-process thread ceiling below the global record count. Its
+`maximum_capacity` calculation derives the largest fitting thread count from
+the compiled lifecycle/wait strides, aggregate process quotas and remaining context/metadata limits,
+holding the process/object counts and per-process ceiling fixed. Pair
+construction leaves the complete synchronization request available while
+allocating lifecycle storage, then assigns the remaining budget using actual
+capacity. It returns two empty owners only after both constructions succeed.
+The caller supplies capacity and reserve counts; this portable check does not
+reserve native IPC slots or establish a complete native admission budget.
+
 `troe-application::static_tls` computes and initializes a separate local-exec
 TLS allocation without allocating memory itself. The x86-64 layout preserves
 negative offsets from FS base and writes the self pointer at FS:0; AArch64
