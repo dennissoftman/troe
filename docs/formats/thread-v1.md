@@ -5,7 +5,9 @@ interfaces 30 (`THREAD_CONTROL`) and 31 (`THREAD_SYNC`), both version 1.0.
 These are assigned contracts, not executable native services. The active
 application ABI remains 1.3; the kernel and SDK reject ABI 1.4, and current
 startup encoding/decoding rejects both thread interfaces. No KCAP builder name
-grants them. KEX TLS flags remain rejected. Native composition is governed by
+grants them. Native loaders reject the separately encoded
+[KEX static TLS container](kex-static-tls-v1.md); its reader supports offline
+inspection and conversion only. Native composition is governed by
 [ADR 0071](../adr/0071-native-threads-and-owned-synchronization.md).
 
 ## Identity, authority and call framing

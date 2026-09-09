@@ -4,12 +4,14 @@ Status: architectural direction accepted, 2026-09-09. Implementation tracked by
 [#65](https://github.com/dennissoftman/troe/issues/65) and delivery issues
 [#204](https://github.com/dennissoftman/troe/issues/204) through
 [#208](https://github.com/dennissoftman/troe/issues/208).
-No native thread, TLS, format, or pthread support is claimed by this document.
+No native thread execution, native TLS, or pthread support is claimed by this document.
 Current single-execution-thread application contracts remain in force.
 Portable lifecycle/synchronization models, an independently compiler-checked
 static TLS layout/initializer, and a guarded thread-memory planner implement
-portions of this direction. The layout annexes below are not a KEX TLS encoding
-or complete native admission proof.
+portions of this direction. The implemented offline
+[KEX static TLS container 1.3](../formats/kex-static-tls-v1.md) encodes the
+initializer, extent, alignment and worker trampoline under application ABI 1.4.
+Its reader and explicit converter produce no complete native admission proof.
 The portable table constructors also enforce compiled metadata-byte budgets;
 the paired admission annex below constrains record/wait capacity and protected
 IPC headroom without enabling native execution.
@@ -32,7 +34,8 @@ preemption, process ownership, guarded mappings, and bounded wait models.
 `ApplicationSession` currently owns both a root and one register context;
 `ResidentApplication` similarly combines process and execution ownership.
 AArch64 already saves a thread-pointer field; the x86 saved context does not
-yet carry a corresponding TLS base. KEX reserves, but rejects, TLS metadata.
+yet carry a corresponding TLS base. Native KEX loaders reject TLS metadata;
+the separate offline container reader does not change that boundary.
 These are starting points, not evidence of thread support.
 
 The ordering of design goals is:
@@ -102,8 +105,8 @@ process security boundary. External supervisors retain process-level control;
 the initial profile exposes no authority to kill or suspend one sibling.
 
 The interface and startup assignments are recorded in the wire annex below.
-The TLS container revision and capability requirements must also be allocated
-against the live registries before native admission.
+The TLS container assignment is recorded in the format annex below. Capability
+requirements still need allocation against the live registries before native admission.
 Do not reuse ABI 1.3 startup fields or activate the reserved TLS flag in an old
 version. Old readers reject new requirements before execution. Old artifacts
 keep their exact layouts and remain single-threaded even if a caller supplies
@@ -117,7 +120,7 @@ The implemented [thread codec v1](../formats/thread-v1.md) assigns interfaces
 extension. Typed tokens carry a nonzero generation and kind, with no caller
 process field. Current kernel/SDK admission remains capped at ABI 1.3; startup
 encoding/decoding rejects the new interfaces in older profiles. KCAP grants
-and KEX TLS encoding are separate prerequisites, not inferred from codec availability.
+and native KEX admission are separate prerequisites, not inferred from codec availability.
 Collapse internal wrong-process and stale-generation lookup failures to the
 same public stale result. A caller must not probe another process's record
 existence through a more specific ownership error. Mutex-not-owner remains a
@@ -268,19 +271,54 @@ range. Rejected initialization writes nothing. Success clears the entire
 mapping, copies the initialized prefix, and writes the x86 self pointer.
 Zero-filled TLS, internal padding, control bytes and final-page slack cannot
 retain another allocation's contents. This deliberately costs work proportional
-to all mapped bytes. The caller owns unpublished, quiescent storage and must
-resolve any permitted image-relative initializers before copying it.
+to all mapped bytes. The caller owns unpublished, quiescent storage. Container
+profile 1 rejects
+initializers requiring pointer fixups; any broader initializer profile requires
+a separately specified relocation and ownership contract.
 
 These control bytes do not freeze a musl, glibc, Darwin or BSD private TCB/DTV
 layout. They carry no trusted kernel identity. Libc-private state and TSS key
 destructors need their own explicit ownership and lifetime; neither can be
 inferred from an FS:0 self pointer. Complete thread budgets must additionally
 charge page tables, virtual guard/alignment reservations, stacks, IPC pairs,
-context records, wait records and runtime metadata. Their exact resource proof,
-wire/startup versions and KEX TLS encoding remain in
+context records, wait records and runtime metadata. The complete native
+resource proof remains in
 [#206](https://github.com/dennissoftman/troe/issues/206), together with the
-selected and pinned production compiler profile. No native admission or current
-converter acceptance is changed by this portable component.
+selected and pinned production compiler profile. No native admission or
+converter acceptance is implied by the layout component itself.
+
+### Static TLS format and immutable-source annex
+
+The implemented [container 1.3](../formats/kex-static-tls-v1.md) uses a 160-byte
+header and requires ABI 1.4. An exact initializer suffix follows all image
+payloads; it must agree with its file-backed nonexecutable image source.
+Keeping this duplicate in the artifact makes immutable per-process ownership
+explicit. A thread created after a sibling changes the image's writable `.tdata`
+cannot inherit those modified bytes. This costs encoded space and validation
+work proportional to the initializer; correctness takes precedence here.
+
+The allocation-free artifact reader reuses image/relocation grammar but returns
+no native load plan or startup placement. Native and streaming readers retain
+container 1.2 and fail closed on the new revision, even under a higher caller
+ABI ceiling. Opt-in conversion requires the complete ELF symbol table, exact
+TLS extents and one strong `__troe_thread_start_v1` function. Empty TLS is an
+explicit profile with a control block, not an absent thread-pointer contract.
+
+Profile 1 rejects every image relocation overlapping initialized TLS bytes.
+Copying unrelocated addresses would produce plausible but incorrect pointers;
+applying relocations to user-writable source later would introduce races and
+lifetime ambiguity. General TLS modules and runtime initializer fixups are
+outside this profile. ELF validation checks metadata, not arbitrary code's
+semantic conformance to the compiler model or libc ownership rules.
+
+Native integration under #206/#207 must retain a coherent immutable initializer
+for the process lifetime, including while any worker can be prepared. Charge its
+owned bytes/pages and verification staging separately from the ordinary image
+and each thread's initialized mapping. Reserve before copying, rollback on any
+failure, and release only after creation is revoked and every context/backing
+reader is quiescent. Reconstructing the template from a running process's image
+or retaining a borrowed transient converter/source buffer is not valid.
+The compiler/libc profile and initial-thread layout remain explicit prerequisites.
 
 ### Portable managed-memory layout annex
 
@@ -950,7 +988,7 @@ decision, not a claim that every partition is complete or a calendar commitment:
    platform gates, and update current-behavior documentation in the same change.
 
 Before native integration, remaining decisions are explicit blockers:
-exact TLS/wire layouts and version assignments; compiled resource accounting
+native composition of the assigned TLS/wire formats; complete resource accounting
 and essential-service reservations, including the finite graceful-shutdown
 policy; lock ordering and ownership proof for each
 blocking C bridge callback. The architectural choices
@@ -960,6 +998,7 @@ The documentation review at implementation must include README, CORE-SPEC,
 SECURITY, architecture/testing guidance, KEX/KCAP/startup contracts, C and Rust
 SDK docs, CPython module/build manifests and negative probes, and status notes
 in ADRs 0015, 0037, 0052 and 0069. Until native thread enablement, their current
-single-thread and rejected-TLS statements remain correct. Follow-on delivery
+single-thread and native rejected-TLS statements remain correct. Offline
+conversion and inspection use the explicit container-1.3 contract. Follow-on delivery
 tracking belongs in live issues; this ADR records rationale and acceptance
 boundaries, not a parallel repository roadmap.

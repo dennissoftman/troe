@@ -293,9 +293,14 @@ checks exact buffer lengths and the complete aligned user-address range before
 writing, then clears every mapped byte and copies the initialized template.
 The helper has a common 16 MiB displacement window and accepts only a template
 with zero alignment residue. It does not map memory, publish a thread, define
-libc-private metadata, or account for complete thread admission. KEX still
-rejects TLS-bearing artifacts; compiler probes verify this portable layout
-independently of native execution.
+libc-private metadata, or account for complete thread admission.
+`troe-application::tls_artifact` validates the separate
+[container 1.3](formats/kex-static-tls-v1.md) for offline conversion/inspection.
+Its exact immutable initializer suffix is checked against its nonexecutable
+image source; initializers requiring pointer fixups are rejected. Explicit
+`cargo kex convert --threaded` checks ELF TLS extents and the worker trampoline.
+Native and streaming loaders still reject this format. Compiler probes verify
+the portable geometry and emitted bytes independently of native execution.
 
 `troe-application::thread_memory` places one fixed, fully committed stack, the
 checked TLS allocation, a two-page IPC pair and a read-only startup descriptor

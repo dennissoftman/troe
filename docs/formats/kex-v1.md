@@ -13,6 +13,10 @@ bytes and have no Rust or C in-memory-layout contract. The v1 base page size is
 image-relative addresses; `0x0000_4000_0000_0000` is only the deterministic
 hosted inspection placement.
 
+The separate [static TLS container 1.3](kex-static-tls-v1.md) is supported by
+offline conversion and inspection only. Native loaders reject that revision;
+the executable and startup contracts below describe the active native profile.
+
 ## Header
 
 The container-1.2 header is exactly 96 bytes.
@@ -45,7 +49,8 @@ The container-1.2 header is exactly 96 bytes.
 | 88 | 8 | reserved | zero |
 
 Flag bit 0 is reserved for a block-mappable image and bit 1 for a TLS template.
-Both are unimplemented reservations: the loader requires all flags to be zero.
+Both remain rejected in container 1.2: its loader requires all flags to be zero.
+Container 1.3 assigns bit 1 only in its separately versioned TLS extension.
 
 Header sizes and offsets are exact canonical assertions. Reserved fields must
 be zero; they do not permit implicit extension. Unknown container versions,
@@ -122,7 +127,7 @@ table is preallocated. Launch zeroing is bounded by the configured operation
 quantum. Heap growth and private mappings use the same system/process
 commitment accounting.
 
-## Hosted ELF input contract
+## Hosted single-thread ELF input contract
 
 `tools/troe-kex-tool` is the canonical dependency-free Rust converter. Its
 input is a final, statically linked, position-independent little-endian System V
@@ -153,7 +158,10 @@ cargo kex convert app.elf app.kex --target x86_64
 cargo kex convert app.elf app.kex --target x86_64 --check
 ```
 
-`tools/elf2kex.py` remains an independent parity and rejection oracle; it is not
+`convert --threaded` selects the separate [static TLS contract](kex-static-tls-v1.md).
+It does not change ordinary conversion or enable native loading.
+
+`tools/elf2kex.py` remains an independent container-1.2 parity and rejection oracle; it is not
 the build entrypoint.
 
 The shared generated corpus lives under `tests/kex-corpus`; its exact file set
@@ -301,7 +309,7 @@ these owners. Their native calling convention is unchanged.
 
 ## Deliberate omissions
 
-KEX v1 carries no sections, symbols, interpreter, imports, exports, general
+The native container-1.2 profile carries no sections, symbols, interpreter, imports, exports, general
 dynamic linking, TLS, compression, capabilities, signatures, device mappings,
 or shared-memory contract. Its relative relocation table is deliberately only
 the load-time mechanism needed for ASLR. Package identity and trust
