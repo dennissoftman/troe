@@ -5,6 +5,7 @@
 //! address spaces and saved registers are owned separately by the machine.
 
 use alloc::vec::Vec;
+use core::num::NonZeroU32;
 use troe_abi::{
     ipc::{Call, Event, EventKind, ReplyWait},
     reply,
@@ -30,8 +31,11 @@ const CALLS: usize = 32;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Actor {
     slot: u32,
-    generation: u32,
+    generation: NonZeroU32,
 }
+// Zero is never an incarnation. Encode that invariant so optional handoffs do
+// not need a separate discriminator or fragment the scalar transition copy.
+const _: () = assert!(core::mem::size_of::<Option<Actor>>() == 8);
 impl Actor {
     /// Index for the matching machine-owned context or kernel IPC pair.
     #[must_use]
@@ -254,7 +258,7 @@ impl Runtime {
         c.deadline = u64::MAX;
         Ok(Actor {
             slot: u32::try_from(slot).map_err(|_| Error::Invalid)?,
-            generation: c.generation,
+            generation: NonZeroU32::new(c.generation).ok_or(Error::Invalid)?,
         })
     }
 
@@ -434,12 +438,16 @@ impl Runtime {
         if major != 1 || minor != 0 {
             return Err(Error::Invalid);
         }
-        let binding = self.endpoint(endpoint)?;
+        // Resolve the endpoint generation once, then bind its immutable limits
+        // and owning incarnation to this admission before any mutation.
         let limits = self
             .endpoints
             .resolve(endpoint)
             .map_err(|_| Error::Invalid)?
             .limits();
+        let binding = self.bindings[endpoint.slot() as usize]
+            .filter(|binding| binding.id == endpoint)
+            .ok_or(Error::Invalid)?;
         if call.deadline_millis <= now {
             return self.immediate(caller, reply::TIMEOUT);
         }
@@ -454,10 +462,13 @@ impl Runtime {
         {
             return self.immediate(caller, reply::EXHAUSTED);
         }
-        if self.cycle(caller, server) {
+        let target = self.context(server)?;
+        // A server with no outbound call cannot lead back to the caller.
+        // Self-calls still fail, and queued/blocked targets retain the complete
+        // transitive graph walk rather than only checking donated chains.
+        if caller == server || (target.outbound.is_some() && self.cycle(caller, server)) {
             return self.immediate(caller, reply::DEADLOCK);
         }
-        let target = self.context(server)?;
         let direct = target.waiting
             && target.inbound.is_none()
             && target.outbound.is_none()
@@ -814,7 +825,7 @@ impl Runtime {
             if c.occupied && c.waiting && c.inbound.is_none() && c.outbound.is_none() {
                 let actor = Actor {
                     slot: u32::try_from(slot).map_err(|_| Error::Invalid)?,
-                    generation: c.generation,
+                    generation: NonZeroU32::new(c.generation).ok_or(Error::Invalid)?,
                 };
                 let transition = self.observe_wait(actor, now)?;
                 if transition.handoff.is_some() {
@@ -956,7 +967,7 @@ impl Runtime {
                 self.cursor = (slot + 1) % ACTORS;
                 return Some(Actor {
                     slot: u32::try_from(slot).ok()?,
-                    generation: c.generation,
+                    generation: NonZeroU32::new(c.generation)?,
                 });
             }
         }
@@ -1068,7 +1079,7 @@ impl Runtime {
     fn context(&self, actor: Actor) -> Result<&Context, Error> {
         self.contexts
             .get(actor.slot())
-            .filter(|c| c.occupied && !c.terminal && c.generation == actor.generation)
+            .filter(|c| c.occupied && !c.terminal && c.generation == actor.generation.get())
             .ok_or(Error::Invalid)
     }
     // Keep checked metadata access inside the measured trap path.
@@ -1603,6 +1614,70 @@ mod tests {
         );
         assert_eq!(r.take_resume(a[0]), Ok(None));
         assert_eq!(r.stats().replied, 0);
+    }
+
+    #[test]
+    fn idle_self_calls_and_cycles_through_queued_calls_are_rejected() {
+        let mut r = Runtime::new().unwrap_or_else(|_| unreachable!());
+        let a = actors(&mut r, 2);
+        let (first, _) = server(&mut r, a[0]);
+        let (second, wait) = server(&mut r, a[1]);
+        let own = open(&mut r, a[0], first);
+        r.call(a[0], call(own), 0)
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            r.take_resume(a[0]),
+            Ok(Some(Resume::Reply {
+                status: reply::DEADLOCK,
+                bytes: 0
+            }))
+        );
+        assert_eq!(r.live().calls, 0);
+
+        // Wake the second server without an inbound call, so the first call
+        // queues instead of forming a donated chain.
+        let expired = ReplyWait {
+            deadline_millis: 1,
+            ..idle(wait)
+        };
+        r.reply_wait(a[1], expired, 1)
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(event(&mut r, a[1]).kind, EventKind::Deadline);
+        let forward = open(&mut r, a[0], second);
+        assert_eq!(r.call(a[0], call(forward), 2).map(|t| t.handoff), Ok(None));
+        let back = open(&mut r, a[1], first);
+        r.call(a[1], call(back), 2)
+            .unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            r.take_resume(a[1]),
+            Ok(Some(Resume::Reply {
+                status: reply::DEADLOCK,
+                bytes: 0
+            }))
+        );
+        assert_eq!(r.live().calls, 1);
+        r.reply_wait(a[1], idle(wait), 2)
+            .unwrap_or_else(|_| unreachable!());
+        let received = event(&mut r, a[1]);
+        r.reply_wait(
+            a[1],
+            ReplyWait {
+                token: received.token,
+                reply_bytes: 8,
+                ..idle(wait)
+            },
+            3,
+        )
+        .unwrap_or_else(|_| unreachable!());
+        assert_eq!(
+            r.take_resume(a[0]),
+            Ok(Some(Resume::Reply {
+                status: 0,
+                bytes: 8
+            }))
+        );
+        clean_queues(&mut r);
+        assert_eq!(r.live().calls, 0);
     }
 
     #[test]
