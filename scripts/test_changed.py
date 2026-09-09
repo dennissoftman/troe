@@ -514,6 +514,10 @@ def build_plan(
                 _add_python(plan, path, "test_elf2kex.py", "test_kex_tool.py")
                 plan.all_applications = True
                 plan.note("kex:all", path)
+            elif package == "troe-application":
+                # TLS geometry must agree with emitted compiler instructions,
+                # not just with Rust tests of the same policy implementation.
+                _add_python(plan, path, "test_kex_tool.py")
             elif package == "troe-kex":
                 _add_python(plan, path, "test_kex_tool.py")
                 plan.all_applications = True

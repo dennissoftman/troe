@@ -264,6 +264,19 @@ These serialized transitions allocate nothing after table construction. Native
 clock delivery, instruction-level memory ordering and work-quantum enforcement
 are outside these portable models.
 
+`troe-application::static_tls` computes and initializes a separate local-exec
+TLS allocation without allocating memory itself. The x86-64 layout preserves
+negative offsets from FS base and writes the self pointer at FS:0; AArch64
+places the template after an aligned 16-byte control prefix at TPIDR_EL0.
+The caller's page budget includes control bytes and all padding. Initialization
+checks exact buffer lengths and the complete aligned user-address range before
+writing, then clears every mapped byte and copies the initialized template.
+The helper has a common 16 MiB displacement window and accepts only a template
+with zero alignment residue. It does not map memory, publish a thread, define
+libc-private metadata, or account for complete thread admission. KEX still
+rejects TLS-bearing artifacts; compiler probes verify this portable layout
+independently of native execution.
+
 The boot arena contains one reusable 64 KiB cooperative task payload plus
 128 KiB isolated-server and 192 KiB shell payloads. The shell reserve covers
 eight nested launch levels including private IPC/root metadata. Each has an unmapped 4 KiB page on

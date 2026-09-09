@@ -11,6 +11,7 @@ mod package;
 mod plan;
 mod sha256;
 mod startup;
+pub mod static_tls;
 mod stream;
 #[cfg(test)]
 mod tests;

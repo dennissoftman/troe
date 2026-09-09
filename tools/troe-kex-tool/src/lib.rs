@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 mod elf;
+mod tls;
 
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -65,6 +66,8 @@ Usage:
   cargo kex convert <input.elf> <output.kex> [--target x86_64|aarch64]
                        [--stack-pages N] [--heap-pages N] [--check]
   cargo kex inspect <artifact.kex> [--json]
+  cargo kex tls-layout --target x86_64|aarch64 --file-bytes N --memory-bytes N
+                       --alignment N --max-pages N
   cargo kex --help
 ";
 
@@ -1097,6 +1100,7 @@ pub fn run(arguments: impl Iterator<Item = OsString>) -> Result<(), ToolError> {
         Some("build") => execute_build(&parse_build(&mut arguments)?),
         Some("convert") => execute_convert(&parse_convert(&mut arguments)?),
         Some("inspect") => execute_inspect(&mut arguments),
+        Some("tls-layout") => tls::execute(&mut arguments),
         Some("--help" | "-h" | "help") => {
             print!("{HELP}");
             Ok(())
