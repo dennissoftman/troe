@@ -8,9 +8,12 @@
 //! Completed waits retain references until consumed or retired, including when
 //! ownership has been granted but the thread has not resumed.
 
-use super::{ProcessId, ThreadError, ThreadId, ThreadState, ThreadTable, ThreadWait};
+use super::{
+    ProcessId, TableMetadata, ThreadError, ThreadId, ThreadState, ThreadTable, ThreadWait,
+};
 use crate::{MAX_TASKS, MonotonicMillis};
 use alloc::vec::Vec;
+use core::alloc::Layout;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ObjectId {
@@ -126,6 +129,8 @@ pub enum SyncError {
     InvalidLimit,
     /// Initial metadata allocation failed.
     MetadataExhausted,
+    /// Requested or actually retained metadata exceeds the explicit byte budget.
+    MetadataBudget,
     /// The owner has no registration in this synchronization table.
     UnknownProcess,
     /// The owner is already paired with a synchronization table.
@@ -227,14 +232,19 @@ pub struct SyncTable {
     objects: Vec<Slot>,
     waits: Vec<Option<Waiter>>,
     last_now: MonotonicMillis,
+    metadata_bytes: usize,
 }
 
 impl SyncTable {
-    /// Reserve all storage. No operation after construction allocates.
+    /// Compiled requests for process, object and wait arrays, plus the owner.
     ///
     /// # Errors
-    /// Rejects zero/excessive bounds and failed allocation.
-    pub fn new(processes: usize, objects: usize, waits: usize) -> Result<Self, SyncError> {
+    /// Rejects invalid counts or unrepresentable allocation/total sizes.
+    pub fn metadata_layout(
+        processes: usize,
+        objects: usize,
+        waits: usize,
+    ) -> Result<TableMetadata<3>, SyncError> {
         if processes == 0
             || processes > objects
             || objects > MAX_TASKS
@@ -243,18 +253,67 @@ impl SyncTable {
         {
             return Err(SyncError::InvalidLimit);
         }
+        Self::storage_layout(processes, objects, waits)
+    }
+
+    fn storage_layout(
+        processes: usize,
+        objects: usize,
+        waits: usize,
+    ) -> Result<TableMetadata<3>, SyncError> {
+        TableMetadata::new::<Self>([
+            Layout::array::<Option<Process>>(processes).map_err(|_| SyncError::InvalidLimit)?,
+            Layout::array::<Slot>(objects).map_err(|_| SyncError::InvalidLimit)?,
+            Layout::array::<Option<Waiter>>(waits).map_err(|_| SyncError::InvalidLimit)?,
+        ])
+        .ok_or(SyncError::InvalidLimit)
+    }
+
+    /// Reserve all storage under an explicit logical metadata byte budget.
+    ///
+    /// Compiled requests are checked before allocation; actual vector capacities
+    /// are checked before publication. Failure drops every provisional buffer.
+    /// Allocator overhead is separate. No operation after construction allocates.
+    ///
+    /// # Errors
+    /// Rejects invalid bounds, insufficient metadata budget or allocation failure.
+    pub fn new(
+        processes: usize,
+        objects: usize,
+        waits: usize,
+        max_metadata_bytes: usize,
+    ) -> Result<Self, SyncError> {
+        let requested = Self::metadata_layout(processes, objects, waits)?;
+        if requested.bytes() > max_metadata_bytes {
+            return Err(SyncError::MetadataBudget);
+        }
+        let processes = reserved(processes, None)?;
+        let objects = reserved(
+            objects,
+            Slot {
+                generation: 0,
+                object: None,
+            },
+        )?;
+        let waits = reserved(waits, None)?;
+        let retained =
+            Self::storage_layout(processes.capacity(), objects.capacity(), waits.capacity())?;
+        if retained.bytes() > max_metadata_bytes {
+            return Err(SyncError::MetadataBudget);
+        }
         Ok(Self {
-            processes: reserved(processes, None)?,
-            objects: reserved(
-                objects,
-                Slot {
-                    generation: 0,
-                    object: None,
-                },
-            )?,
-            waits: reserved(waits, None)?,
+            processes,
+            objects,
+            waits,
             last_now: MonotonicMillis::default(),
+            metadata_bytes: retained.bytes(),
         })
+    }
+
+    /// Retained inline/backing storage, including unused slots, until table drop.
+    #[must_use]
+    pub const fn metadata_bytes(&self) -> usize {
+        self.metadata_bytes
     }
 
     /// Pair an admitted process with exactly one synchronization table.

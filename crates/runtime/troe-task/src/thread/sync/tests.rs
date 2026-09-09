@@ -3,6 +3,73 @@ use crate::thread::{ThreadQuota, ThreadResources};
 
 const OWNER: ProcessId = ProcessId(1);
 const OTHER: ProcessId = ProcessId(2);
+
+#[test]
+fn compiled_metadata_includes_object_and_wait_capacity() -> Result<(), SyncError> {
+    for (processes, objects, waits) in [(1, 1, 1), (2, 8, 4), (7, 19, 32)] {
+        let requested = SyncTable::metadata_layout(processes, objects, waits)?;
+        assert_eq!(requested.inline(), Layout::new::<SyncTable>());
+        assert_eq!(
+            requested.buffers(),
+            [
+                Layout::array::<Option<Process>>(processes).unwrap_or_else(|_| unreachable!()),
+                Layout::array::<Slot>(objects).unwrap_or_else(|_| unreachable!()),
+                Layout::array::<Option<Waiter>>(waits).unwrap_or_else(|_| unreachable!()),
+            ]
+        );
+        assert_eq!(
+            SyncTable::new(processes, objects, waits, requested.bytes() - 1).err(),
+            Some(SyncError::MetadataBudget)
+        );
+        let table = SyncTable::new(processes, objects, waits, requested.bytes())?;
+        assert_eq!(
+            table.metadata_bytes(),
+            core::mem::size_of_val(&table)
+                + table.processes.capacity() * core::mem::size_of::<Option<Process>>()
+                + table.objects.capacity() * core::mem::size_of::<Slot>()
+                + table.waits.capacity() * core::mem::size_of::<Option<Waiter>>()
+        );
+        assert_eq!(table.metadata_bytes(), requested.bytes());
+    }
+    Ok(())
+}
+
+#[test]
+fn metadata_counts_reject_invalid_bounds_before_allocation() {
+    for (processes, objects, waits) in [
+        (0, 1, 1),
+        (2, 1, 1),
+        (1, 0, 1),
+        (1, 1, 0),
+        (1, MAX_TASKS + 1, 1),
+        (1, 1, usize::MAX),
+    ] {
+        assert_eq!(
+            SyncTable::metadata_layout(processes, objects, waits),
+            Err(SyncError::InvalidLimit)
+        );
+    }
+    assert!(SyncTable::metadata_layout(MAX_TASKS, MAX_TASKS, MAX_TASKS).is_ok());
+    assert_eq!(
+        SyncTable::new(1, 1, 1, 0).err(),
+        Some(SyncError::MetadataBudget)
+    );
+}
+
+#[test]
+fn synchronization_retirement_keeps_metadata_charged() -> Result<(), SyncError> {
+    let mut h = Harness::new()?;
+    let bytes = h.sync.metadata_bytes();
+    let mutex = h.mutex(OwnerDeath::Poison)?;
+    let a = h.ids[0];
+    let b = h.ids[1];
+    h.lock(a, mutex, WAIT, 1)?;
+    h.lock(b, mutex, WAIT, 2)?;
+    assert_eq!(h.sync.metadata_bytes(), bytes);
+    h.teardown()?;
+    assert_eq!(h.sync.metadata_bytes(), bytes);
+    Ok(())
+}
 const WAIT: WaitMode = WaitMode::Wait(WaitOptions {
     deadline: None,
     observe_stop: false,
@@ -26,7 +93,7 @@ struct Harness {
 
 impl Harness {
     fn new() -> Result<Self, SyncError> {
-        let mut threads = ThreadTable::new(2, 6, 12)?;
+        let mut threads = ThreadTable::new(2, 6, 12, ThreadTable::metadata_layout(2, 6)?.bytes())?;
         threads.register_process(
             OWNER,
             ThreadQuota {
@@ -61,7 +128,7 @@ impl Harness {
         )?;
         threads.start(OWNER, b)?;
         threads.start(OWNER, c)?;
-        let mut sync = SyncTable::new(2, 8, 4)?;
+        let mut sync = SyncTable::new(2, 8, 4, SyncTable::metadata_layout(2, 8, 4)?.bytes())?;
         sync.register_process(
             &mut threads,
             OWNER,
@@ -926,7 +993,7 @@ fn object_tokens_quota_and_process_pairing_cannot_be_bypassed() -> Result<(), Sy
     )?;
     h.threads.start(OTHER, other)?;
     assert_eq!(h.lock(other, new, WAIT, 0), Err(SyncError::WrongOwner));
-    let mut wrong = SyncTable::new(1, 2, 1)?;
+    let mut wrong = SyncTable::new(1, 2, 1, SyncTable::metadata_layout(1, 2, 1)?.bytes())?;
     assert_eq!(
         wrong.register_process(
             &mut h.threads,
