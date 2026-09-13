@@ -79,6 +79,13 @@ terminal records before reaping, reallocation under a different synchronization
 kind, teardown and unchanged accounting after failed lookups. Resolving a retained
 identity does not bypass a stopping process or operation-specific state checks.
 
+The owned control-wait tests cover early deadline/stop with no admission, try-join
+without claim-identity consumption, physical-quiescence acknowledgement, result
+retention through target-slot reuse, timeout/stop/join/detach ordering, full-width
+absolute sleep deadlines, regressing clocks, exhausted wait/claim identities,
+duplicate consumption and process-stop reclamation. Ordinary wake and orderly
+sync exit cannot bypass a pending control result or poison its held mutex.
+
 The paired synchronization model covers FIFO grants, self-lock/non-owner errors,
 expired and stopped waiters, stale events, condition binding/reacquisition,
 notification cohorts, both owner-death policies, ownerless permits, quotas and
@@ -91,8 +98,9 @@ expired/stopped FIFO waiters, and rejection without partial grants, timeout
 publication or count changes.
 
 `cargo test -p troe-service threading::` exercises authenticated operation binding,
-captured Current identities, live Observe/RequestStop targets and canonical
-Unsupported lifecycle replies. It covers foreign/stale/wrong-kind identities,
+captured Current identities, live Observe/RequestStop targets, owned Join/Sleep
+waits, Detach and canonical Unsupported prepare/start/abort/exit replies.
+It covers foreign/stale/wrong-kind identities,
 authority revocation after admission, caller-state checks, pending completion
 interlocks, condition notification/timeout/stop with mutex reacquisition, poison
 and essential-owner termination, permit-batch atomicity, quotas, and regressing

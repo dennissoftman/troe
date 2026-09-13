@@ -9,10 +9,13 @@ acceptance mechanisms. The native owner also captures scheduler calls and
 validates correlated completions. The dispatcher has closed built-in capability
 targets and owned request authorization. The portable operation dispatcher binds
 that authority to a captured caller and trusted process snapshot and executes
-Current, Observe, RequestStop and synchronization operations, retaining owned
-waits and checking atomic permit batches. Other lifecycle operations return
-Unsupported. Native execution of the full operation set, threaded package
-admission, compiler-TLS allocation and pthread support remain disabled.
+Current, Observe, RequestStop, Join, Detach, Sleep and synchronization operations,
+retaining owned waits and checking atomic permit batches. Join/sleep waits retain
+their caller interlock and committed result through dispatch; join requires
+quiescent native resources and timeout/stop does not consume an uncommitted
+result. Prepare, Start, Abort and Exit return Unsupported. Native execution of the
+full operation set, threaded package admission, compiler-TLS allocation and pthread
+support remain disabled.
 Native acceptance composes a restricted control capability with Current calls
 and process-scoped live thread-token resolution. The native owner also claims
 each captured call once into a non-cloneable execution value and returns that

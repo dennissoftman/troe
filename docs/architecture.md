@@ -252,6 +252,18 @@ generation-checked identities and does not execute native threads, establish
 physical quiescence, or enable pthread support. The application runtime still
 has one execution thread per process.
 
+`troe-task::thread::control` owns join and sleep waits without allocating at
+admission. An early deadline/stop and an unsuccessful try-join create no wait or
+claim. Join consumes a result only after native resource acknowledgement; a
+deadline or stop observed before commitment cancels the claim without consuming
+the result. A committed result belongs to the owned wait even if its target is
+reaped before the caller resumes. Sleep uses the same absolute deadline/stop
+rules and reports timeout when its deadline expires. Waking retains a caller
+interlock until result consumption, so ordinary wake, new calls and orderly exit
+cannot bypass a pending completion. Process stop revokes these waits and claims
+without callbacks. Composition owns timer/event delivery and charges retained
+wait storage separately from the compiled table metadata.
+
 The paired `troe-task::thread::sync` model owns typed mutex, condition and permit
 records and intrusive FIFO wait queues. Mutex ownership transfers before a
 waiter resumes. Condition timeout and notification preserve the original mutex
@@ -422,10 +434,10 @@ execute an operation, bind it to a native continuation or publish a startup gran
 
 `troe-service::threading` binds an owned authorization to the captured caller and
 the trusted process record's task principal. Consuming the operation validates a
-running caller with no unconsumed synchronization wait, then executes Current,
-Observe, RequestStop or any synchronization operation against the paired tables.
-Other lifecycle requests return Unsupported. Expected failures produce canonical
-request-correlated outcomes; clock/configuration/invariant failures require
+running caller with no unconsumed policy wait, then executes Current, Observe,
+RequestStop, Join, Detach, Sleep or any synchronization operation against the
+paired tables. Prepare, Start, Abort and Exit return Unsupported. Expected
+failures produce canonical request-correlated outcomes; clock/configuration/invariant failures require
 process termination and must not replay the request. A suspended operation owns
 its original request, caller and exact wait generation without retaining a table
 borrow. Deadline/stop observation addresses that wait alone, and completion is

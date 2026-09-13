@@ -1,4 +1,4 @@
-//! Owned execution of authenticated thread identity and synchronization calls.
+//! Owned execution of authenticated thread lifecycle and synchronization calls.
 //!
 //! One serialized composition supplies the live process snapshot, captured
 //! caller and paired tables. Native composition must claim the matching native
@@ -9,7 +9,7 @@
 
 use troe_abi::threading::{self as wire, Kind, Outcome, Request, Response, Token};
 use troe_dispatch::{AuthorizedSchedulerCall, HandleOwner};
-use troe_task::thread::{ThreadError, ThreadId, ThreadState, ThreadTable, sync};
+use troe_task::thread::{ThreadError, ThreadId, ThreadState, ThreadTable, control, sync};
 use troe_task::{MonotonicMillis, ProcessSnapshot};
 
 #[cfg(test)]
@@ -27,6 +27,8 @@ pub enum Error {
     Thread(ThreadError),
     /// An impossible synchronization state or regressing clock was supplied.
     Sync(sync::SyncError),
+    /// An invalid retained lifecycle wait or regressing clock was supplied.
+    Control(control::Error),
     /// Trusted identity/result metadata cannot satisfy the wire contract.
     Encoding,
 }
@@ -55,7 +57,7 @@ pub struct Completion {
 #[derive(Debug, Eq, PartialEq)]
 #[must_use]
 pub enum Progress {
-    /// No synchronization wait remains to consume.
+    /// No policy wait remains to consume.
     Complete(Completion),
     /// Retain this value and the native claim until completion or process stop.
     Waiting(Waiting),
@@ -69,7 +71,13 @@ pub enum Progress {
 #[must_use]
 pub struct Waiting {
     operation: Operation,
-    wait: sync::SyncWait,
+    wait: WaitKind,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum WaitKind {
+    Sync(sync::SyncWait),
+    Control(control::Waiting),
 }
 
 impl Operation {
@@ -98,8 +106,8 @@ impl Operation {
 
     /// Consume this operation under exclusive ownership of the paired tables.
     ///
-    /// Supports `Current`, `Observe`, `RequestStop` and all synchronization operations.
-    /// Other lifecycle operations return `Unsupported` without changing records.
+    /// Supports identity/stop, join/detach/sleep and all synchronization operations.
+    /// Prepare/start/abort/exit return `Unsupported` without changing records.
     /// Absolute wire deadlines are boot-relative milliseconds; they are never
     /// restarted on resumption. Work and storage are bounded by table capacity.
     ///
@@ -186,6 +194,24 @@ impl Operation {
                 let id = threads.resolve(owner, token.slot() as usize, token.generation())?;
                 threads.request_stop(owner, id)?;
                 reply(Outcome::Success, 0)
+            }
+            Request::Join { thread, wait } => {
+                let target = threads.resolve(owner, thread.slot() as usize, thread.generation())?;
+                return threads
+                    .join(owner, caller, target, mode(wait), now)
+                    .map(control_start)
+                    .map_err(Into::into);
+            }
+            Request::Detach(token) => {
+                let id = threads.resolve(owner, token.slot() as usize, token.generation())?;
+                threads.detach(owner, id)?;
+                reply(Outcome::Success, 0)
+            }
+            Request::Sleep(wait) => {
+                return threads
+                    .sleep(owner, caller, options(wait), now)
+                    .map(control_start)
+                    .map_err(Into::into);
             }
             Request::CreateMutex(policy) => {
                 let policy = match policy {
@@ -282,13 +308,9 @@ impl Operation {
                 table.destroy_permit(threads, owner, caller, id)?;
                 reply(Outcome::Success, 0)
             }
-            Request::Prepare { .. }
-            | Request::Start(_)
-            | Request::Abort(_)
-            | Request::Join { .. }
-            | Request::Detach(_)
-            | Request::Exit(_)
-            | Request::Sleep(_) => reply(Outcome::Unsupported, 0),
+            Request::Prepare { .. } | Request::Start(_) | Request::Abort(_) | Request::Exit(_) => {
+                reply(Outcome::Unsupported, 0)
+            }
         };
         Ok(Effect::Reply(response))
     }
@@ -331,8 +353,13 @@ impl Waiting {
         sync: &mut sync::SyncTable,
         now: MonotonicMillis,
     ) -> Result<bool, Error> {
-        sync.observe(threads, self.caller().process(), self.wait, now)
-            .map_err(Error::Sync)
+        let owner = self.caller().process();
+        match &mut self.wait {
+            WaitKind::Sync(wait) => sync
+                .observe(threads, owner, *wait, now)
+                .map_err(Error::Sync),
+            WaitKind::Control(wait) => wait.observe(threads, now).map_err(Error::Control),
+        }
     }
 
     /// Consume the result after dispatching the captured waiting thread.
@@ -343,24 +370,34 @@ impl Waiting {
     /// Encoding failure may follow a consumed policy result and must not retry.
     #[allow(clippy::result_large_err)] // Return bounded ownership without allocation.
     pub fn finish(
-        self,
+        mut self,
         threads: &mut ThreadTable,
         sync: &mut sync::SyncTable,
     ) -> Result<Completion, (Error, Self)> {
         let caller = self.caller();
-        match sync.finish_wait(threads, caller.process(), caller, self.wait) {
-            Ok(outcome) => match self.operation.complete(reply(outcome_code(outcome), 0)) {
+        let response = match &mut self.wait {
+            WaitKind::Sync(wait) => sync
+                .finish_wait(threads, caller.process(), caller, *wait)
+                .map(|outcome| reply(outcome_code(outcome), 0))
+                .map_err(Error::Sync),
+            WaitKind::Control(wait) => wait
+                .finish(threads)
+                .map(control_response)
+                .map_err(Error::Control),
+        };
+        match response {
+            Ok(response) => match self.operation.complete(response) {
                 Ok(completion) => Ok(completion),
                 Err(error) => Err((error, self)),
             },
-            Err(error) => Err((Error::Sync(error), self)),
+            Err(error) => Err((error, self)),
         }
     }
 }
 
 enum Effect {
     Reply(Response),
-    Wait(sync::SyncWait),
+    Wait(WaitKind),
     Identity(Kind, usize, u32),
 }
 
@@ -389,7 +426,23 @@ fn mode(wait: wire::WaitMode) -> sync::WaitMode {
 fn start(start: sync::SyncStart) -> Effect {
     match start {
         sync::SyncStart::Complete(outcome) => Effect::Reply(reply(outcome_code(outcome), 0)),
-        sync::SyncStart::Waiting(wait) => Effect::Wait(wait),
+        sync::SyncStart::Waiting(wait) => Effect::Wait(WaitKind::Sync(wait)),
+    }
+}
+
+fn control_start(start: control::Start) -> Effect {
+    match start {
+        control::Start::Complete(outcome) => Effect::Reply(control_response(outcome)),
+        control::Start::Waiting(wait) => Effect::Wait(WaitKind::Control(wait)),
+    }
+}
+
+fn control_response(outcome: control::Outcome) -> Response {
+    match outcome {
+        control::Outcome::Joined(value) => reply(Outcome::Success, value),
+        control::Outcome::WouldBlock => reply(Outcome::WouldBlock, 0),
+        control::Outcome::TimedOut => reply(Outcome::TimedOut, 0),
+        control::Outcome::Stopped => reply(Outcome::Stopped, 0),
     }
 }
 
@@ -413,7 +466,7 @@ fn error_outcome(error: sync::SyncError) -> Result<Outcome, Error> {
         S::Thread(T::Stopping) => Outcome::Stopping,
         S::Thread(T::InvalidState) => Outcome::InvalidState,
         S::NotOwner => Outcome::NotOwner,
-        S::Deadlock => Outcome::Deadlock,
+        S::Deadlock | S::Thread(T::SelfJoin) => Outcome::Deadlock,
         S::DifferentMutex => Outcome::DifferentMutex,
         S::Overflow => Outcome::Overflow,
         S::Thread(error) => return Err(Error::Thread(error)),

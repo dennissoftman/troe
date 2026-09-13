@@ -944,6 +944,9 @@ impl SyncTable {
         now: MonotonicMillis,
     ) -> Result<ExitEffect, SyncError> {
         self.active(threads, owner)?;
+        if threads.record(owner, caller)?.control_wait {
+            return Err(ThreadError::Busy.into());
+        }
         if threads.record(owner, caller)?.snapshot.state != ThreadState::Running {
             return Err(ThreadError::InvalidState.into());
         }

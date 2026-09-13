@@ -311,13 +311,7 @@ fn unimplemented_lifecycle_operations_do_not_publish_or_change_state() -> Result
         },
         Request::Start(token),
         Request::Abort(token),
-        Request::Join {
-            thread: token,
-            wait: TRY,
-        },
-        Request::Detach(token),
         Request::Exit(42),
-        Request::Sleep(WAIT),
     ] {
         h.response(0, request, Outcome::Unsupported)?;
         assert_eq!(
@@ -818,5 +812,218 @@ fn mismatched_table_configuration_fails_without_publishing_an_object() -> Result
     );
     assert_eq!(unrelated.usage(h.ids[0].process()), (0, 0));
     assert_eq!(h.sync.usage(h.ids[0].process()), (0, 0));
+    Ok(())
+}
+
+#[test]
+fn owned_join_dispatch_waits_for_quiescence_and_returns_the_scalar_once() -> Result<(), ()> {
+    let mut h = Harness::new()?;
+    let caller = h.create(0, Request::Current)?;
+    h.response(
+        0,
+        Request::Join {
+            thread: caller,
+            wait: TRY,
+        },
+        Outcome::Deadlock,
+    )?;
+    h.select(1)?;
+    let target = h.create(1, Request::Current)?;
+    h.select(0)?;
+    h.response(
+        0,
+        Request::Join {
+            thread: target,
+            wait: TRY,
+        },
+        Outcome::WouldBlock,
+    )?;
+    let mut wait = h.wait(
+        0,
+        Request::Join {
+            thread: target,
+            wait: BLOCK,
+        },
+    )?;
+    h.select(2)?;
+    h.response(2, Request::Detach(target), Outcome::Busy)?;
+    h.response(
+        2,
+        Request::Join {
+            thread: target,
+            wait: TRY,
+        },
+        Outcome::Busy,
+    )?;
+    h.select(1)?;
+    let owner = h.ids[1].process();
+    h.sync
+        .begin_exit(
+            &mut h.threads,
+            owner,
+            h.ids[1],
+            MonotonicMillis::from_millis(0),
+        )
+        .map_err(|_| ())?;
+    h.threads
+        .complete(owner, h.ids[1], u64::MAX)
+        .map_err(|_| ())?;
+    assert!(
+        !wait
+            .observe(&mut h.threads, &mut h.sync, MonotonicMillis::from_millis(1))
+            .map_err(|_| ())?
+    );
+    h.threads
+        .release_resources(owner, h.ids[1])
+        .map_err(|_| ())?;
+    assert!(
+        wait.observe(&mut h.threads, &mut h.sync, MonotonicMillis::from_millis(2))
+            .map_err(|_| ())?
+    );
+    h.select(0)?;
+    h.response(0, Request::Current, Outcome::Busy)?;
+    let result = wait.finish(&mut h.threads, &mut h.sync).map_err(|_| ())?;
+    assert_eq!(
+        result.request(),
+        Request::Join {
+            thread: target,
+            wait: BLOCK
+        }
+    );
+    assert_eq!(result.response(), reply(Outcome::Success, u64::MAX));
+    assert!(result.response().encode(result.request()).is_ok());
+    h.response(
+        0,
+        Request::Join {
+            thread: target,
+            wait: TRY,
+        },
+        Outcome::Busy,
+    )?;
+    Ok(())
+}
+
+#[test]
+fn timed_join_releases_claim_and_a_later_try_can_consume_the_result() -> Result<(), ()> {
+    let mut h = Harness::new()?;
+    h.select(1)?;
+    let target = h.create(1, Request::Current)?;
+    h.select(0)?;
+    let options = wire::Wait {
+        deadline: Some(5),
+        observe_stop: true,
+    };
+    let mut wait = h.wait(
+        0,
+        Request::Join {
+            thread: target,
+            wait: wire::WaitMode::Wait(options),
+        },
+    )?;
+    h.select(1)?;
+    let owner = h.ids[1].process();
+    h.sync
+        .begin_exit(
+            &mut h.threads,
+            owner,
+            h.ids[1],
+            MonotonicMillis::from_millis(0),
+        )
+        .map_err(|_| ())?;
+    h.threads.complete(owner, h.ids[1], 42).map_err(|_| ())?;
+    assert!(
+        wait.observe(&mut h.threads, &mut h.sync, MonotonicMillis::from_millis(5))
+            .map_err(|_| ())?
+    );
+    h.finish(0, wait, Outcome::TimedOut)?;
+    h.response(
+        0,
+        Request::Join {
+            thread: target,
+            wait: TRY,
+        },
+        Outcome::WouldBlock,
+    )?;
+    h.threads
+        .release_resources(owner, h.ids[1])
+        .map_err(|_| ())?;
+    assert_eq!(
+        h.response(
+            0,
+            Request::Join {
+                thread: target,
+                wait: TRY
+            },
+            Outcome::Success
+        )?
+        .value,
+        42
+    );
+    Ok(())
+}
+
+#[test]
+fn sleep_dispatch_keeps_its_owned_wait_through_early_finish_and_stop() -> Result<(), ()> {
+    let mut h = Harness::new()?;
+    let caller = h.create(0, Request::Current)?;
+    let request = Request::Sleep(wire::Wait {
+        deadline: Some(10),
+        observe_stop: true,
+    });
+    let wait = h.wait(0, request)?;
+    let (error, mut wait) = wait.finish(&mut h.threads, &mut h.sync).err().ok_or(())?;
+    assert_eq!(
+        error,
+        Error::Control(control::Error::Thread(ThreadError::InvalidState))
+    );
+    h.select(1)?;
+    assert!(
+        !wait
+            .observe(&mut h.threads, &mut h.sync, MonotonicMillis::from_millis(5))
+            .map_err(|_| ())?
+    );
+    h.response(1, Request::RequestStop(caller), Outcome::Success)?;
+    assert!(
+        wait.observe(&mut h.threads, &mut h.sync, MonotonicMillis::from_millis(6))
+            .map_err(|_| ())?
+    );
+    assert!(
+        !wait
+            .observe(
+                &mut h.threads,
+                &mut h.sync,
+                MonotonicMillis::from_millis(10)
+            )
+            .map_err(|_| ())?
+    );
+    h.finish(0, wait, Outcome::Stopped)?;
+    Ok(())
+}
+
+#[test]
+fn detached_and_foreign_join_targets_do_not_acquire_authority() -> Result<(), ()> {
+    let mut h = Harness::new()?;
+    h.select(1)?;
+    let target = h.create(1, Request::Current)?;
+    h.select(0)?;
+    h.response(0, Request::Detach(target), Outcome::Success)?;
+    h.response(
+        0,
+        Request::Join {
+            thread: target,
+            wait: TRY,
+        },
+        Outcome::Busy,
+    )?;
+    h.select(3)?;
+    h.response(3, Request::Detach(target), Outcome::Stale)?;
+    h.response(
+        3,
+        Request::Join {
+            thread: target,
+            wait: TRY,
+        },
+        Outcome::Stale,
+    )?;
     Ok(())
 }

@@ -11,6 +11,7 @@ use alloc::vec::Vec;
 use core::alloc::Layout;
 
 pub mod admission;
+pub mod control;
 mod metadata;
 pub mod sync;
 pub use metadata::TableMetadata;
@@ -162,6 +163,7 @@ struct Record {
     incoming_join: Option<JoinClaim>,
     outgoing_join: Option<JoinClaim>,
     sync_wait: bool,
+    control_wait: bool,
     owned_mutexes: usize,
 }
 
@@ -404,6 +406,7 @@ impl ThreadTable {
             incoming_join: None,
             outgoing_join: None,
             sync_wait: false,
+            control_wait: false,
             owned_mutexes: 0,
         });
         Ok(id)
@@ -464,7 +467,7 @@ impl ThreadTable {
     ///
     /// # Errors
     /// Rejects stale/non-running threads, retained synchronization completions,
-    /// or exhausted operation generations.
+    /// retained control waits, or exhausted operation generations.
     pub fn block(&mut self, owner: ProcessId, id: ThreadId) -> Result<ThreadWait, ThreadError> {
         self.require_running(owner, id)?;
         let record = self.record_mut(owner, id)?;
@@ -484,10 +487,11 @@ impl ThreadTable {
     ///
     /// # Errors
     /// Rejects stale, duplicate or cross-owner completions. Synchronization
-    /// waits must be completed through the paired synchronization table.
+    /// waits must be completed through the paired synchronization table; owned
+    /// control waits must be observed through their exact operation record.
     pub fn wake(&mut self, owner: ProcessId, wait: ThreadWait) -> Result<(), ThreadError> {
         let record = self.record_mut(owner, wait.thread)?;
-        if record.sync_wait {
+        if record.sync_wait || record.control_wait {
             return Err(ThreadError::Busy);
         }
         if record.snapshot.state != ThreadState::Blocked || record.wait_sequence != wait.sequence {
@@ -566,6 +570,28 @@ impl ThreadTable {
         caller: ThreadId,
         target: ThreadId,
     ) -> Result<JoinClaim, ThreadError> {
+        self.validate_join(owner, caller, target)?;
+        let next = self
+            .next_join
+            .checked_add(1)
+            .ok_or(ThreadError::Exhausted)?;
+        let claim = JoinClaim {
+            caller,
+            target,
+            sequence: self.next_join,
+        };
+        self.next_join = next;
+        self.record_mut(owner, caller)?.outgoing_join = Some(claim);
+        self.record_mut(owner, target)?.incoming_join = Some(claim);
+        Ok(claim)
+    }
+
+    fn validate_join(
+        &self,
+        owner: ProcessId,
+        caller: ThreadId,
+        target: ThreadId,
+    ) -> Result<(), ThreadError> {
         self.require_running(owner, caller)?;
         if caller == target {
             return Err(ThreadError::SelfJoin);
@@ -583,19 +609,7 @@ impl ThreadTable {
         ) {
             return Err(ThreadError::InvalidState);
         }
-        let next = self
-            .next_join
-            .checked_add(1)
-            .ok_or(ThreadError::Exhausted)?;
-        let claim = JoinClaim {
-            caller,
-            target,
-            sequence: self.next_join,
-        };
-        self.next_join = next;
-        self.record_mut(owner, caller)?.outgoing_join = Some(claim);
-        self.record_mut(owner, target)?.incoming_join = Some(claim);
-        Ok(claim)
+        Ok(())
     }
 
     /// Poll/consume a claimed completion after native resources have quiesced.
@@ -664,6 +678,7 @@ impl ThreadTable {
                 record.snapshot.stop_requested = true;
                 record.incoming_join = None;
                 record.outgoing_join = None;
+                record.control_wait = false;
             }
         }
         Ok(())
@@ -676,7 +691,7 @@ impl ThreadTable {
     /// establish physical quiescence on behalf of the machine boundary.
     ///
     /// # Errors
-    /// Rejects nonterminal lifetimes, retained synchronization references, or
+    /// Rejects nonterminal lifetimes, retained synchronization/control references, or
     /// duplicate acknowledgements.
     pub fn release_resources(
         &mut self,
@@ -693,7 +708,7 @@ impl ThreadTable {
         if record.snapshot.resources_released {
             return Err(ThreadError::Stale);
         }
-        if record.sync_wait || record.owned_mutexes != 0 {
+        if record.sync_wait || record.control_wait || record.owned_mutexes != 0 {
             return Err(ThreadError::Busy);
         }
         record.snapshot.resources_released = true;
@@ -840,12 +855,12 @@ impl ThreadTable {
     }
     /// Validate a caller before accepting a new operation.
     ///
-    /// A dispatched thread with an unconsumed synchronization completion cannot
-    /// start another operation. This check grants no continuing execution lease.
+    /// A dispatched thread with an unconsumed synchronization/control completion
+    /// cannot start another operation. This grants no continuing execution lease.
     ///
     /// # Errors
     /// Rejects stopping processes, stale/foreign callers, non-running threads
-    /// and retained synchronization waits, without changing either table.
+    /// and retained synchronization/control waits, without changing either table.
     pub fn validate_running(&self, owner: ProcessId, id: ThreadId) -> Result<(), ThreadError> {
         if self.process(owner)?.stopping {
             return Err(ThreadError::Stopping);
@@ -855,7 +870,7 @@ impl ThreadTable {
 
     fn require_running(&self, owner: ProcessId, id: ThreadId) -> Result<(), ThreadError> {
         let record = self.record(owner, id)?;
-        if record.sync_wait {
+        if record.sync_wait || record.control_wait {
             return Err(ThreadError::Busy);
         }
         if record.snapshot.state == ThreadState::Running {
