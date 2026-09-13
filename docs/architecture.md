@@ -547,9 +547,21 @@ the whole page before copying the prefix. These are kernel storage primitives;
 capability and operation authentication remain composition obligations. Threads
 share all user mappings, so the buffers do not isolate siblings.
 The mechanism supports copied-call continuations and rejects roots bound to
-the single-thread IPC profile. It accepts a caller-supplied remaining slice of
-at most 50 ms; process-share scheduling, native scheduler calls and threaded
-package admission are not enabled by this mechanism.
+the single-thread IPC profile. A selected native context with an IPC binding
+can suspend at scheduler entry 6. The masked trap copies the fixed 64-byte TX
+prefix before any sibling executes; malformed register framing retains no
+request. An opaque operation records the original caller, a nonwrapping
+sequence and the IPC pair generation. Completion validates that retained
+operation and request-correlated response before writing RX, then makes the
+context resumable with exact `[0, 32]` or rejected `[1, 0]` results. It neither
+executes the caller nor grants another timeslice. Duplicate, late and mismatched
+completions leave RX unchanged. The copied scheduler request has separate
+storage so legacy IPC continuation records retain their compact representation.
+Built-in scheduler capability authentication and operation execution are
+composition obligations. The mechanism accepts a caller-supplied remaining
+slice of at most 50 ms; process-share scheduling and threaded package admission
+are not enabled. Ordinary application entries carry no scheduler IPC binding
+and continue to reject entry 6.
 Unsaved AVX-family, SVE, and SME state remains disabled rather than leaking or
 corrupting across tasks. ABI call 0 exits through the owned gate. The x86
 local-APIC and AArch64 generic physical timers capture a complete resumable

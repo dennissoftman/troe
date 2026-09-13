@@ -237,6 +237,8 @@ impl IpcPair {
                 destination_len: 0,
                 application_context: None,
                 pending_application: None,
+                scheduler_tx: None,
+                scheduler_request: None,
                 ipc: None,
             });
         }

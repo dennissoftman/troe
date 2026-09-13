@@ -475,8 +475,8 @@ pub use mmu::planned_user_regions;
 #[cfg(target_os = "uefi")]
 pub use mmu::{
     ApplicationCall, ApplicationResume, ApplicationSession, NativeProcessBacking,
-    NativeProcessContext, NativeThreadStart, NativeThreadStop, build_user_address_space,
-    install_exception_vectors, install_mmu, loaded_image_layout,
+    NativeProcessContext, NativeSchedulerCall, NativeThreadStart, NativeThreadStop,
+    build_user_address_space, install_exception_vectors, install_mmu, loaded_image_layout,
     maximum_additional_page_table_pages, required_page_table_pages, resume_application,
     run_application, run_isolated,
 };

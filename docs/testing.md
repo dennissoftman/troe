@@ -594,9 +594,18 @@ native fault revokes both contexts; subsequent sibling execution and IPC writes
 are rejected. Stopped contexts retain their IPC slots while the root exists;
 root retirement precedes pair zeroing/reuse and ordinary frame reclamation.
 Reused pair slots have a new generation, and thread resource release is
-acknowledged only after physical reclamation. These are native mechanism
-checks; they do not establish threaded package admission, process-share
-scheduling, native scheduler calls, compiler TLS initialization or C/CPython
+acknowledged only after physical reclamation.
+The same probe issues malformed scheduler frames/requests followed by repeated
+canonical requests. Both callers suspend before either completes; the sibling
+actually overwrites the first caller's writable TX header. The retained kernel
+request remains unchanged. It rejects a mismatched interface/request, invalid
+response payload and previous/already-completed operation before RX writes;
+rejected calls clear RX, while correlated responses clear every byte after the
+32-byte prefix. User instructions check exact register completion pairs and a
+denied operation result. Late completions after process fault are rejected.
+The probe grants no built-in scheduler authority and executes no synchronization
+operation. These native mechanism checks do not establish threaded package
+admission, process-share scheduling, compiler TLS initialization or C/CPython
 thread safety.
 The acceptance image exceeds 1 MiB and therefore also exercises the
 page-relative data-symbol relocations used by AArch64 entry and completion.
