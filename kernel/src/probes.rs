@@ -105,6 +105,8 @@ pub(crate) enum IsolationProbe {
     WritePermission,
     ExecutePermission,
     IllegalInstruction,
+    #[cfg(target_arch = "x86_64")]
+    InvalidLdtSelector,
     UnexpectedEntry,
     InvalidOpcode,
     #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
@@ -121,6 +123,8 @@ impl IsolationProbe {
             Self::Translation => Some(TaskFault::Translation),
             Self::WritePermission | Self::ExecutePermission => Some(TaskFault::Permission),
             Self::IllegalInstruction | Self::UnexpectedEntry => Some(TaskFault::IllegalInstruction),
+            #[cfg(target_arch = "x86_64")]
+            Self::InvalidLdtSelector => Some(TaskFault::IllegalInstruction),
             Self::InvalidOpcode
             | Self::InvalidCallEncoding
             | Self::InvalidPointer
@@ -461,6 +465,7 @@ pub(crate) fn run_isolation_verification(
         IsolationProbe::WritePermission,
         IsolationProbe::ExecutePermission,
         IsolationProbe::IllegalInstruction,
+        IsolationProbe::InvalidLdtSelector,
         IsolationProbe::UnexpectedEntry,
         IsolationProbe::InvalidOpcode,
         IsolationProbe::InvalidPointer,
@@ -1027,7 +1032,7 @@ pub(crate) fn load_and_reclaim_application(
         let mut tls_preemptions = 0_u32;
         loop {
             #[cfg(all(feature = "acceptance-probes", target_arch = "x86_64"))]
-            if !troe_machine::ApplicationSession::probe_kernel_thread_pointer_is_clear() {
+            if !troe_machine::ApplicationSession::probe_kernel_segments_are_normalized() {
                 return Err(());
             }
             match (probe, outcome) {

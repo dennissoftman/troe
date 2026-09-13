@@ -517,10 +517,13 @@ resets visible register/control state, passes only the startup address and
 length, and enables IRQs after arming a 50 ms one-shot. x86 normalizes x87 and
 SSE operation and saves the complete FXSAVE image; AArch64 enables baseline
 FP/Advanced SIMD and saves all 32 128-bit vector registers plus FPCR/FPSR.
-The x86 context independently retains the FS selector and FS base across
-syscalls, preemption and IPC handoffs. Kernel entry clears both before Rust
-handlers run; resume restores the selector before the base. FSGSBASE remains
-disabled and neither the FS base nor user TLS supplies kernel identity.
+The 688-byte x86 context retains FS/GS/DS/ES selectors and the independent FS
+base across syscalls, preemption and IPC handoffs. Fresh application entry
+clears all four selectors. Kernel entry clears FS/GS selectors and FS base,
+and restores fixed kernel DS/ES selectors before Rust handlers run; resume
+restores the saved selectors before FS base. The owned GDT contains only flat
+code/data descriptors, the LDT is disabled, and FSGSBASE remains disabled, so
+GS base stays zero. Neither a segment base nor user TLS supplies kernel identity.
 AArch64 retains TPIDR_EL0 in each saved context. These register mechanisms do
 not enable threaded KEX admission or the pthread facade.
 Unsaved AVX-family, SVE, and SME state remains disabled rather than leaking or

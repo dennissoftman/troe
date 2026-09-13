@@ -263,7 +263,8 @@ impl ApplicationHeapGrowth {
 struct ArchitectureApplicationContext {
     floating_point: [u8; 512],
     thread_pointer: u64,
-    fs_selector: u64,
+    // FS, GS, DS and ES selectors; all bases except FS remain zero.
+    segment_selectors: [u16; 4],
     rax: u64,
     rbx: u64,
     rcx: u64,
@@ -290,7 +291,7 @@ struct ArchitectureApplicationContext {
 const _: () = {
     assert!(core::mem::size_of::<ArchitectureApplicationContext>() == 688);
     assert!(core::mem::offset_of!(ArchitectureApplicationContext, thread_pointer) == 512);
-    assert!(core::mem::offset_of!(ArchitectureApplicationContext, fs_selector) == 520);
+    assert!(core::mem::offset_of!(ArchitectureApplicationContext, segment_selectors) == 520);
     assert!(core::mem::offset_of!(ArchitectureApplicationContext, rax) == 528);
     assert!(core::mem::offset_of!(ArchitectureApplicationContext, r10) == 600);
     assert!(core::mem::offset_of!(ArchitectureApplicationContext, instruction) == 648);
@@ -383,16 +384,16 @@ impl ApplicationSession {
     /// Check preservation without modifying the saved context.
     #[cfg(all(feature = "acceptance-probes", target_arch = "x86_64"))]
     #[must_use]
-    pub const fn probe_thread_pointer_matches(&self, address: u64) -> bool {
+    pub fn probe_thread_pointer_matches(&self, address: u64) -> bool {
         self.context.thread_pointer == address
-            && self.context.fs_selector == X86_USER_DATA_SELECTOR as u64
+            && self.context.segment_selectors == [X86_USER_DATA_SELECTOR; 4]
     }
 
-    /// Observe the actual kernel FS selector and base after a native return.
+    /// Observe the fixed kernel segment profile after a native return.
     #[cfg(all(feature = "acceptance-probes", target_arch = "x86_64"))]
     #[must_use]
-    pub fn probe_kernel_thread_pointer_is_clear() -> bool {
-        x86_kernel_thread_pointer_is_clear()
+    pub fn probe_kernel_segments_are_normalized() -> bool {
+        x86_kernel_segments_are_normalized()
     }
 
     /// Retain a non-owning tag identity for native teardown/reuse verification.
@@ -2868,8 +2869,10 @@ fn architecture_install_exception_vectors(exception_stack: PhysicalRange) -> Res
         base: X86_IDT.0.get() as u64,
     };
     // SAFETY: Interrupts are disabled. The assembly installs the initialized
-    // descriptor tables, reloads fixed kernel selectors, loads the TSS, and does
-    // not execute a faulting memory access between GDT and IDT replacement.
+    // descriptor tables, reloads fixed kernel selectors, loads the TSS, and
+    // invalidates any firmware LDT. Only this owned flat GDT may supply user
+    // segment bases. No faulting memory access occurs between GDT and IDT
+    // replacement.
     unsafe {
         core::arch::asm!(
             "lgdt [{gdt}]",
@@ -2884,6 +2887,8 @@ fn architecture_install_exception_vectors(exception_stack: PhysicalRange) -> Res
             "mov ss, ax",
             "mov ax, {tss_selector:x}",
             "ltr ax",
+            "xor eax, eax",
+            "lldt ax",
             "lidt [{idt}]",
             gdt = in(reg) &raw const gdt_descriptor,
             idt = in(reg) &raw const descriptor,
@@ -2968,6 +2973,11 @@ unsafe extern "C" fn x86_enter_isolated(_root: u64, _entry: u64, _stack_top: u64
         "push rdx",
         "cli",
         "mov cr3, rcx",
+        "xor eax, eax",
+        "mov ds, ax",
+        "mov es, ax",
+        "mov fs, ax",
+        "mov gs, ax",
         "iretq",
         context = sym X86_KERNEL_CONTEXT,
         user_data = const X86_USER_DATA_SELECTOR,
@@ -3019,6 +3029,11 @@ unsafe extern "C" fn x86_enter_application(
         "push rdx",
         "cli",
         "mov cr3, rcx",
+        "xor eax, eax",
+        "mov ds, ax",
+        "mov es, ax",
+        "mov fs, ax",
+        "mov gs, ax",
         "fninit",
         "ldmxcsr [rip + {default_mxcsr}]",
         "pxor xmm0, xmm0",
@@ -3093,6 +3108,12 @@ unsafe extern "C" fn x86_resume_application(
         "push qword ptr [r10 + 648]",
         "cli",
         "mov cr3, rcx",
+        "mov ax, [r10 + 524]",
+        "mov ds, ax",
+        "mov ax, [r10 + 526]",
+        "mov es, ax",
+        "mov ax, [r10 + 522]",
+        "mov gs, ax",
         "mov ax, [r10 + 520]",
         "mov fs, ax",
         "mov rax, [r10 + 512]",
@@ -3130,6 +3151,10 @@ extern "C" fn x86_isolated_complete() -> ! {
         "mov r11, rax",
         "xor eax, eax",
         "mov fs, ax",
+        "mov gs, ax",
+        "mov edx, {kernel_data}",
+        "mov ds, dx",
+        "mov es, dx",
         "xor edx, edx",
         "mov ecx, 0xc0000100",
         "wrmsr",
@@ -3155,6 +3180,7 @@ extern "C" fn x86_isolated_complete() -> ! {
         "ret",
         kernel_root = sym KERNEL_ROOT,
         context = sym X86_KERNEL_CONTEXT,
+        kernel_data = const X86_DATA_SELECTOR,
     );
 }
 
@@ -3179,9 +3205,14 @@ extern "C" fn x86_isolated_syscall_entry() -> ! {
         "push rax",
         "sub rsp, 528",
         "fxsave64 [rsp]",
-        "xor eax, eax",
         "mov ax, fs",
-        "mov [rsp + 520], rax",
+        "mov [rsp + 520], ax",
+        "mov ax, gs",
+        "mov [rsp + 522], ax",
+        "mov ax, ds",
+        "mov [rsp + 524], ax",
+        "mov ax, es",
+        "mov [rsp + 526], ax",
         "mov ecx, 0xc0000100",
         "rdmsr",
         "shl rdx, 32",
@@ -3189,6 +3220,10 @@ extern "C" fn x86_isolated_syscall_entry() -> ! {
         "mov [rsp + 512], rax",
         "xor eax, eax",
         "mov fs, ax",
+        "mov gs, ax",
+        "mov edx, {kernel_data}",
+        "mov ds, dx",
+        "mov es, dx",
         "xor edx, edx",
         "mov ecx, 0xc0000100",
         "wrmsr",
@@ -3203,6 +3238,12 @@ extern "C" fn x86_isolated_syscall_entry() -> ! {
         "mov r11, {continue_value}",
         "cmp rax, r11",
         "jne {complete}",
+        "mov ax, [rsp + 524]",
+        "mov ds, ax",
+        "mov ax, [rsp + 526]",
+        "mov es, ax",
+        "mov ax, [rsp + 522]",
+        "mov gs, ax",
         "mov ax, [rsp + 520]",
         "mov fs, ax",
         "mov rax, [rsp + 512]",
@@ -3231,6 +3272,7 @@ extern "C" fn x86_isolated_syscall_entry() -> ! {
         continue_value = const ipc::continue_value(),
         handler = sym x86_isolated_syscall_handler,
         complete = sym x86_isolated_complete,
+        kernel_data = const X86_DATA_SELECTOR,
     );
 }
 
@@ -3239,25 +3281,47 @@ extern "C" fn x86_isolated_syscall_entry() -> ! {
     target_arch = "x86_64",
     feature = "acceptance-probes"
 ))]
-fn x86_kernel_thread_pointer_is_clear() -> bool {
+fn x86_kernel_segments_are_normalized() -> bool {
     let selector: u16;
+    let gs: u16;
+    let ds: u16;
+    let es: u16;
+    let ldt: u16;
     let low: u32;
     let high: u32;
+    let gs_low: u32;
+    let gs_high: u32;
     // SAFETY: This read-only acceptance observation runs at CPL0 after the
-    // naked entry has normalized FS; no untrusted pointer is dereferenced.
+    // naked entry has normalized the segment profile; no untrusted pointer is
+    // dereferenced.
     unsafe {
-        core::arch::asm!("mov {selector:x}, fs", selector = out(reg) selector,
+        core::arch::asm!(
+            "mov {selector:x}, fs", "mov {gs:x}, gs", "mov {ds:x}, ds", "mov {es:x}, es",
+            selector = out(reg) selector, gs = out(reg) gs,
+            ds = out(reg) ds, es = out(reg) es,
+            options(nomem, nostack, preserves_flags));
+        core::arch::asm!("sldt {ldt:x}", ldt = out(reg) ldt,
             options(nomem, nostack, preserves_flags));
         core::arch::asm!("rdmsr", in("ecx") 0xc000_0100_u32,
             out("eax") low, out("edx") high, options(nomem, nostack, preserves_flags));
+        core::arch::asm!("rdmsr", in("ecx") 0xc000_0101_u32,
+            out("eax") gs_low, out("edx") gs_high, options(nomem, nostack, preserves_flags));
     }
-    selector == 0 && low == 0 && high == 0
+    selector == 0
+        && gs == 0
+        && ds == X86_DATA_SELECTOR
+        && es == X86_DATA_SELECTOR
+        && ldt == 0
+        && low == 0
+        && high == 0
+        && gs_low == 0
+        && gs_high == 0
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 extern "C" fn x86_isolated_syscall_handler(frame: *mut ArchitectureApplicationContext) -> u64 {
     #[cfg(feature = "acceptance-probes")]
-    if !x86_kernel_thread_pointer_is_clear() {
+    if !x86_kernel_segments_are_normalized() {
         x86_exception_fatal();
     }
     if !ISOLATED_ACTIVE.load(Ordering::Acquire) {
@@ -3316,9 +3380,14 @@ extern "C" fn x86_execution_timer_entry() -> ! {
         "push rax",
         "sub rsp, 528",
         "fxsave64 [rsp]",
-        "xor eax, eax",
         "mov ax, fs",
-        "mov [rsp + 520], rax",
+        "mov [rsp + 520], ax",
+        "mov ax, gs",
+        "mov [rsp + 522], ax",
+        "mov ax, ds",
+        "mov [rsp + 524], ax",
+        "mov ax, es",
+        "mov [rsp + 526], ax",
         "mov ecx, 0xc0000100",
         "rdmsr",
         "shl rdx, 32",
@@ -3326,6 +3395,10 @@ extern "C" fn x86_execution_timer_entry() -> ! {
         "mov [rsp + 512], rax",
         "xor eax, eax",
         "mov fs, ax",
+        "mov gs, ax",
+        "mov edx, {kernel_data}",
+        "mov ds, dx",
+        "mov es, dx",
         "xor edx, edx",
         "mov ecx, 0xc0000100",
         "wrmsr",
@@ -3385,13 +3458,14 @@ extern "C" fn x86_execution_timer_entry() -> ! {
         handler = sym x86_execution_timer_handler,
         runtime_handler = sym x86_runtime_timer_handler,
         complete = sym x86_isolated_complete,
+        kernel_data = const X86_DATA_SELECTOR,
     );
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 extern "C" fn x86_runtime_timer_handler() {
     #[cfg(feature = "acceptance-probes")]
-    if !x86_kernel_thread_pointer_is_clear() {
+    if !x86_kernel_segments_are_normalized() {
         x86_exception_fatal();
     }
     crate::mechanism::handle_runtime_timer_interrupt();
@@ -3400,7 +3474,7 @@ extern "C" fn x86_runtime_timer_handler() {
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 extern "C" fn x86_execution_timer_handler(frame: *const ArchitectureApplicationContext) -> u64 {
     #[cfg(feature = "acceptance-probes")]
-    if !x86_kernel_thread_pointer_is_clear() {
+    if !x86_kernel_segments_are_normalized() {
         x86_exception_fatal();
     }
     crate::mechanism::disarm_execution_timer();
@@ -3448,9 +3522,14 @@ extern "C" fn x86_input_interrupt_entry() {
         "sub rsp, 560",
         "and rsp, -16",
         "fxsave64 [rsp]",
-        "xor eax, eax",
         "mov ax, fs",
-        "mov [rsp + 520], rax",
+        "mov [rsp + 520], ax",
+        "mov ax, gs",
+        "mov [rsp + 522], ax",
+        "mov ax, ds",
+        "mov [rsp + 524], ax",
+        "mov ax, es",
+        "mov [rsp + 526], ax",
         "mov ecx, 0xc0000100",
         "rdmsr",
         "shl rdx, 32",
@@ -3458,6 +3537,10 @@ extern "C" fn x86_input_interrupt_entry() {
         "mov [rsp + 512], rax",
         "xor eax, eax",
         "mov fs, ax",
+        "mov gs, ax",
+        "mov edx, {kernel_data}",
+        "mov ds, dx",
+        "mov es, dx",
         "xor edx, edx",
         "mov ecx, 0xc0000100",
         "wrmsr",
@@ -3468,6 +3551,12 @@ extern "C" fn x86_input_interrupt_entry() {
         "sub rsp, 32",
         "call {handler}",
         "add rsp, 32",
+        "mov ax, [rsp + 524]",
+        "mov ds, ax",
+        "mov ax, [rsp + 526]",
+        "mov es, ax",
+        "mov ax, [rsp + 522]",
+        "mov gs, ax",
         "mov ax, [rsp + 520]",
         "mov fs, ax",
         "mov rax, [rsp + 512]",
@@ -3494,13 +3583,14 @@ extern "C" fn x86_input_interrupt_entry() {
         "pop rax",
         "iretq",
         handler = sym x86_input_interrupt_handler,
+        kernel_data = const X86_DATA_SELECTOR,
     );
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 extern "C" fn x86_input_interrupt_handler() {
     #[cfg(feature = "acceptance-probes")]
-    if !x86_kernel_thread_pointer_is_clear() {
+    if !x86_kernel_segments_are_normalized() {
         x86_exception_fatal();
     }
     crate::mechanism::handle_input_interrupt();
@@ -3518,6 +3608,10 @@ extern "C" fn x86_exception_no_error_entry() -> ! {
     core::arch::naked_asm!(
         "xor eax, eax",
         "mov fs, ax",
+        "mov gs, ax",
+        "mov edx, {kernel_data}",
+        "mov ds, dx",
+        "mov es, dx",
         "xor edx, edx",
         "mov ecx, 0xc0000100",
         "wrmsr",
@@ -3532,6 +3626,7 @@ extern "C" fn x86_exception_no_error_entry() -> ! {
         "jmp {complete}",
         dispatch = sym x86_exception_dispatch,
         complete = sym x86_isolated_complete,
+        kernel_data = const X86_DATA_SELECTOR,
     );
 }
 
@@ -3541,6 +3636,10 @@ extern "C" fn x86_exception_error_entry() -> ! {
     core::arch::naked_asm!(
         "xor eax, eax",
         "mov fs, ax",
+        "mov gs, ax",
+        "mov edx, {kernel_data}",
+        "mov ds, dx",
+        "mov es, dx",
         "xor edx, edx",
         "mov ecx, 0xc0000100",
         "wrmsr",
@@ -3555,13 +3654,14 @@ extern "C" fn x86_exception_error_entry() -> ! {
         "jmp {complete}",
         dispatch = sym x86_exception_dispatch,
         complete = sym x86_isolated_complete,
+        kernel_data = const X86_DATA_SELECTOR,
     );
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 extern "C" fn x86_exception_dispatch(code_selector: u64) -> u64 {
     #[cfg(feature = "acceptance-probes")]
-    if !x86_kernel_thread_pointer_is_clear() {
+    if !x86_kernel_segments_are_normalized() {
         x86_exception_fatal();
     }
     if code_selector & 3 == 3 && ISOLATED_ACTIVE.load(Ordering::Acquire) {
@@ -3583,6 +3683,10 @@ extern "C" fn x86_page_fault_entry() -> ! {
     core::arch::naked_asm!(
         "xor eax, eax",
         "mov fs, ax",
+        "mov gs, ax",
+        "mov edx, {kernel_data}",
+        "mov ds, dx",
+        "mov es, dx",
         "xor edx, edx",
         "mov ecx, 0xc0000100",
         "wrmsr",
@@ -3599,13 +3703,14 @@ extern "C" fn x86_page_fault_entry() -> ! {
         "jmp {complete}",
         dispatch = sym x86_page_fault_dispatch,
         complete = sym x86_isolated_complete,
+        kernel_data = const X86_DATA_SELECTOR,
     );
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 extern "C" fn x86_page_fault_dispatch(address: u64, error: u64, code_selector: u64) -> u64 {
     #[cfg(feature = "acceptance-probes")]
-    if !x86_kernel_thread_pointer_is_clear() {
+    if !x86_kernel_segments_are_normalized() {
         x86_exception_fatal();
     }
     if code_selector & 3 == 3 && ISOLATED_ACTIVE.load(Ordering::Acquire) {

@@ -216,6 +216,13 @@ pub(crate) fn isolated_program(probe: IsolationProbe) -> Result<Vec<u8>, ()> {
                 code.extend_from_slice(&[0xff, 0xe0]);
             }
             IsolationProbe::IllegalInstruction => code.extend_from_slice(&[0x0f, 0x0b]),
+            IsolationProbe::InvalidLdtSelector => {
+                // mov eax, 7; mov gs, ax must #GP: TI selects the disabled LDT.
+                // If it succeeds, an invalid syscall produces a distinct fate.
+                code.extend_from_slice(&[
+                    0xb8, 7, 0, 0, 0, 0x8e, 0xe8, 0xb8, 99, 0, 0, 0, 0xcd, 0x80,
+                ]);
+            }
             IsolationProbe::UnexpectedEntry => code.extend_from_slice(&[0x0f, 0x05]),
             IsolationProbe::Success
             | IsolationProbe::InvalidOpcode
@@ -317,6 +324,8 @@ pub(crate) fn exit_call_parameters(probe: IsolationProbe) -> Result<(u32, u64, u
             0,
         ),
         IsolationProbe::InvalidStatus => (1, USER_DATA_BASE, message_len, 256),
+        #[cfg(target_arch = "x86_64")]
+        IsolationProbe::InvalidLdtSelector => return Err(()),
         IsolationProbe::Translation
         | IsolationProbe::WritePermission
         | IsolationProbe::ExecutePermission

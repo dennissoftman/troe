@@ -540,13 +540,16 @@ x86-64 and AArch64 backends; it is not a generic ABI for other machines.
 All Rust-calling x86 gates execute `cld` and clear `RFLAGS.AC` before the call.
 The original user RFLAGS remains in the hardware/application frame and is
 restored only when that user continuation is deliberately resumed.
-Syscall and user-timer frames independently save the FS selector and full FS
-base. They clear both before calling Rust; input IRQs also save, clear and
-restore both. Terminal exception gates clear FS before dispatch. Kernel timer
-IRQs enter with the kernel's zero FS state. Each resumed user context restores
-the selector before the base. The acceptance handlers check the actual hardware
-selector/base before doing their work; the loader probes also check that both
-are zero after each native return, including faults and final exit.
+Syscall and user-timer frames save FS/GS/DS/ES selectors and the independent
+full FS base. Before Rust, gates clear FS/GS selectors and FS base and restore
+the fixed kernel DS/ES selectors; input IRQs also save, normalize and restore
+this state. Terminal exception gates normalize it before dispatch. Kernel
+timer IRQs enter with the fixed kernel profile. Each resumed user context
+restores selectors before FS base. The owned flat GDT, disabled LDT and
+disabled FSGSBASE keep GS base zero. Acceptance handlers observe all four
+selectors, both FS/GS bases and LDTR before doing their work; loader probes
+also check this kernel profile after every native return, including faults
+and final exit.
 
 ### AArch64 gates
 
@@ -566,12 +569,15 @@ The acceptance image exercises successful and invalid syscalls, translation,
 write-permission, execute-permission, illegal-instruction, unexpected-entry,
 page-return, execution-timer, external input/network IRQ, heap-growth-limit,
 and both architecture thread-pointer preservation paths. The x86 probe binds
-only a validated writable nonexecutable user word while retaining a nonzero
-user data selector, rejects null, executable and overflowing addresses without
-modifying the saved context, then verifies FS:0 and the selector after yield
-and actual timer preemption. A 1 ms initial probe slice forces the preemption;
+only a validated writable nonexecutable user word, checks that all four data
+selectors start at zero, then installs a nonzero user data selector in each.
+It rejects null, executable and overflowing TLS addresses without modifying
+the saved context, then verifies FS:0 and all four selectors after yield and
+actual timer preemption. A separate native isolation probe attempts to load
+GS from the disabled LDT and requires a contained fault and full reclamation.
+A 1 ms initial TLS probe slice forces the preemption;
 subsequent slices use the ordinary 50 ms limit. Read-only checks
-verify the retained base and selector before each resume, without repairing
+verify the retained base and selectors before each resume, without repairing
 them. The loop and accepted preemption count are bounded. Terminal fault
 sessions exercise kernel-origin write, execute, synchronous-exception, and
 task-stack-guard paths.
