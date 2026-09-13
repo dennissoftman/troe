@@ -185,6 +185,18 @@ stack case exercises planning without allocating or walking its pages. These
 tests verify geometry and accounting only; they do not reserve memory, validate
 collision against live mappings, or establish native guard-fault/teardown behavior.
 
+`cargo test -p troe-application --lib process_memory::` checks whole-process
+placement and peak memory charges. It verifies disjoint shared/initial-thread
+reservations on either side of the image, image holes, reserved heap growth,
+guard-only collisions, zero heap and empty/BSS/initialized TLS, image permission
+preservation, and complete initial-descriptor round trips. Every independent
+budget is tested at its exact boundary and one unit below it. A page-enumerating
+oracle checks the combined table count across 512 layouts with sparse images,
+all sixteen load records, large TLS alignments and table-boundary crossings.
+Maximum 16 TiB heap and stack requests exercise bounded work without allocating
+their backing. Tests account for architecture-specific empty-TLS padding and
+prove native loaders continue to reject the artifact after successful preflight.
+
 `cargo test -p troe-abi --lib threading::` checks every operation, exact wire
 lengths and reserved bytes, typed token/generation boundaries, deadline tags,
 response correlation and ownership-sensitive outcomes. Adversarial bit mutations

@@ -5,6 +5,9 @@ and converter verification. It produces no native load plan, startup layout,
 mapping, capability grant, or resource admission. Native and streaming loaders
 accept only [container 1.2](kex-v1.md), and the active SDK accepts application
 ABI 1.3. Both loaders reject container 1.3 even with a higher caller ABI ceiling.
+The separate `process_memory` preflight can compose this reader's validated
+geometry into shared and initial-thread reservations with peak memory charges.
+It grants no resource ownership or native admission.
 
 ## Encoding
 

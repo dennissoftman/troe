@@ -323,6 +323,27 @@ reservations, or select service reserves. Context/wait/runtime metadata and
 the shared process root remain separate charges. The native loader does not
 consume these plans or admit additional execution threads.
 
+`troe-application::process_memory` composes a validated static-TLS artifact
+with shared image/startup/heap geometry and the initial thread window. The shared
+reservation covers image holes and an explicit heap growth capacity; the thread
+may lie on either side, but neither its mappings nor its guards and alignment
+gaps may intersect that reservation. Only the initially committed heap prefix
+is mapped. Image permissions are preserved; both startup pages are read-only/NX.
+The planner resolves main/trampoline addresses and composes the initial thread's
+descriptor using its checked TLS pointer and private IPC addresses.
+
+Whole-process charges include the shared mappings once, the initial thread,
+one user page-table root and the union of lower-table prefixes across at most
+22 regions. They do not add the thread's independent table bound again. Dedicated
+immutable initializer pages and full-executable staging pages are rounded and
+charged separately. Resident and ordinary-frame budgets use the peak while both
+coexist; steady charges exclude staging only after it is actually released.
+The two boot-owned IPC pages count logically and occupy a task pair, but do not
+consume ordinary free frames again. This is an allocation-free preflight model,
+not a native load plan or owner: package/I/O staging, allocator overhead,
+architecture kernel mapping tables and context/runtime metadata are separate.
+Native loading does not consume this plan or admit ABI 1.4.
+
 `troe-abi::threading` provides closed request/response and immutable startup
 descriptor codecs for assigned interfaces 30/31 and entry 6. The
 [wire contract](formats/thread-v1.md) separates scheduler outcomes from IPC

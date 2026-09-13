@@ -180,4 +180,8 @@ that an address is mapped, immutable, owned or actually contains these bytes.
 `troe-application::thread_memory` includes and charges the descriptor page.
 Its typed regions specify RW/NX stack, TLS and IPC, followed by read-only/NX
 startup. Geometry tests compose its outputs with both compiler TLS layouts and
-this descriptor codec. No mapping or thread is published by either component.
+this descriptor codec. `troe-application::process_memory` composes shared image,
+startup and heap reservations with this window and builds an initial descriptor
+with zero worker entry/argument fields. It rejects overlap between its two
+reservations and checks peak memory charges; it does not authenticate a live thread token. No mapping or
+thread is published by these components.

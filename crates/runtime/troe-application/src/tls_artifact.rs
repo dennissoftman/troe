@@ -274,6 +274,12 @@ impl<'a> Artifact<'a> {
     pub const fn template(&self) -> &'a [u8] {
         self.template
     }
+    /// Complete executable bytes retained by a full-artifact staging path.
+    #[must_use]
+    pub const fn encoded_bytes(&self) -> u64 {
+        // Parsing proves that the exact initializer suffix ends the artifact.
+        self.metadata.file_offset + self.metadata.file_bytes
+    }
     /// Main entry as an image-relative byte offset.
     #[must_use]
     pub const fn entry_offset(&self) -> u64 {
