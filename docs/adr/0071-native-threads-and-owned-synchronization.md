@@ -28,9 +28,15 @@ scalar completion; an essential mutex instead stops the complete process.
 Abort retains an owned reclamation action after logical revocation. Native
 discard rechecks the live Revoked record and never-executed context before
 removing access; the caller's normal reply follows physical reclamation,
-resource acknowledgement and target reaping. Prepare and Start return Unsupported. Native execution of the
-full operation set, threaded package admission, production compiler-TLS allocation and pthread
-support remain disabled.
+resource acknowledgement and target reaping. Prepare and Start retain owned
+actions through native initialization/readiness. Native completion matches the
+claimed caller and admitted descriptor/IPC before returning a token or publishing
+Ready; Start and Abort enforce creator ownership. Failed preparation rolls back
+through reclamation and reaping before its failure reply. Native C acceptance
+executes creation, early worker entry, sibling rejection, IPC-exhaustion rollback,
+child revocation and Join. Production event/process-share integration, threaded
+package admission, production compiler-TLS allocation and pthread support remain
+disabled.
 Native acceptance composes a restricted control capability with Current calls
 and process-scoped live thread-token resolution. The native owner also claims
 each captured call once into a non-cloneable execution value and returns that

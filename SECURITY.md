@@ -95,6 +95,17 @@ never executes the ordinary application.
   A rejected preflight returns the IPC owner. Failure after mutation begins stops
   the whole process and retains root and IPC until teardown. No allocation,
   callback, logical Start or resource refund occurs in mapping admission;
+- native creation publication: Prepare retains its copied request and exact
+  reserved target through initialization. Native completion matches the caller's
+  claimed operation, complete admitted context, live IPC and immutable descriptor,
+  including image-relative entry, scalar argument and stack size. Start additionally
+  requires the current creator's Prepared child before publishing Ready with release
+  ordering. Scheduled first entry checks Running policy state and acquires that
+  initialization; unresolved native or policy work cannot be resumed by this path.
+  Start and Abort reject another creator's preparation. Failed preparation retains
+  its target through revocation, native/physical reclamation, acknowledgement and
+  reaping before a failure reply. Partial mapping requires process teardown;
+  these mechanisms do not establish production allocation or scheduling policy;
 - native thread retirement: a claimed Exit can remove one inactive context's
   stack, TLS, optional private read-only startup and IPC mappings. Read-only
   preflight checks kernel-owned physical extents, permissions, sibling references,

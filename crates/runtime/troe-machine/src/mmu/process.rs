@@ -20,6 +20,7 @@ mod retirement;
 pub use retirement::{NativeThreadBacking, NativeThreadRetirement};
 mod admission;
 pub use admission::{NativeThreadAdmission, NativeThreadAdmissionError};
+mod creation;
 
 /// Trusted initial register and mapping geometry for an already owned thread.
 #[derive(Clone, Copy, Debug)]

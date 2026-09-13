@@ -14,6 +14,8 @@ use troe_task::{MonotonicMillis, ProcessSnapshot};
 
 mod abort;
 pub use abort::Aborting;
+mod creation;
+pub use creation::{PreparationRollback, PrepareFailure, Preparing, Starting};
 
 #[cfg(test)]
 mod tests;
@@ -68,6 +70,10 @@ pub enum Progress {
     Retiring(Retiring),
     /// Retain the caller's claim until the aborted preparation is reclaimed.
     Aborting(Aborting),
+    /// Retain the caller and all resource owners through native initialization.
+    Preparing(Preparing),
+    /// Validate native readiness before publishing this creator's prepared child.
+    Starting(Starting),
 }
 
 /// An admitted Exit after lifecycle and synchronization owner-death policy.
@@ -131,9 +137,9 @@ impl Operation {
 
     /// Consume this operation under exclusive ownership of the paired tables.
     ///
-    /// Supports identity/stop, join/detach/sleep/exit, prepared Abort and synchronization.
-    /// Prepare/start return `Unsupported` without changing records. Abort
-    /// retains an owned action until physical reclamation is acknowledged. An
+    /// Supports identity/stop, lifecycle and synchronization operations. Prepare
+    /// and Start return owned actions for native initialization/readiness checks.
+    /// Abort retains an owned action until physical reclamation is acknowledged. An
     /// admitted Exit returns an owned terminal action, never a success reply.
     /// Absolute wire deadlines are boot-relative milliseconds; they are never
     /// restarted on resumption. Work and storage are bounded by table capacity.
@@ -167,6 +173,8 @@ impl Operation {
                 disposition,
             })),
             Ok(Effect::Abort(target)) => Ok(Progress::Aborting(Aborting::new(self, target))),
+            Ok(Effect::Prepare) => Ok(Progress::Preparing(Preparing::new(self))),
+            Ok(Effect::Start(target)) => Ok(Progress::Starting(Starting::new(self, target))),
             Err(error) => self
                 .complete(reply(error_outcome(error)?, 0))
                 .map(Progress::Complete),
@@ -252,8 +260,14 @@ impl Operation {
             }
             Request::Abort(token) => {
                 let target = threads.resolve(owner, token.slot() as usize, token.generation())?;
-                threads.abort_prepared(owner, target)?;
+                threads.abort_worker(owner, caller, target)?;
                 return Ok(Effect::Abort(target));
+            }
+            Request::Prepare { .. } => return Ok(Effect::Prepare),
+            Request::Start(token) => {
+                let target = threads.resolve(owner, token.slot() as usize, token.generation())?;
+                threads.validate_prepared_child(owner, caller, target)?;
+                return Ok(Effect::Start(target));
             }
             Request::CreateMutex(policy) => {
                 let policy = match policy {
@@ -350,7 +364,6 @@ impl Operation {
                 table.destroy_permit(threads, owner, caller, id)?;
                 reply(Outcome::Success, 0)
             }
-            Request::Prepare { .. } | Request::Start(_) => reply(Outcome::Unsupported, 0),
         };
         Ok(Effect::Reply(response))
     }
@@ -485,6 +498,8 @@ enum Effect {
     Identity(Kind, usize, u32),
     Exit(sync::ExitEffect),
     Abort(ThreadId),
+    Prepare,
+    Start(ThreadId),
 }
 
 fn reply(outcome: Outcome, value: u64) -> Response {

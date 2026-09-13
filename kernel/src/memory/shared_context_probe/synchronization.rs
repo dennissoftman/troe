@@ -430,7 +430,10 @@ impl Probe {
                             .execute(&mut self.threads, &mut self.sync, now()?)
                             .map_err(|_| ())?
                         {
-                            Progress::Retiring(_) | Progress::Aborting(_) => return Err(()),
+                            Progress::Retiring(_)
+                            | Progress::Aborting(_)
+                            | Progress::Preparing(_)
+                            | Progress::Starting(_) => return Err(()),
                             Progress::Complete(completion) => {
                                 self.publish(native, execution, completion, index, expected)?;
                                 self.threads.yield_running(owner, id).map_err(|_| ())?;

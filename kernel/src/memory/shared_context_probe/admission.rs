@@ -216,14 +216,14 @@ impl Policy {
     }
 }
 
-struct Memory {
+pub(super) struct Memory {
     plan: ThreadMemoryPlan,
-    descriptor: StartupDescriptor,
+    pub(super) descriptor: StartupDescriptor,
     extents: [PhysicalRange; 3],
-    entry: u64,
+    pub(super) entry: u64,
 }
 impl Memory {
-    fn new(
+    pub(super) fn new(
         index: usize,
         id: ThreadId,
         threads: &ThreadTable,
@@ -274,14 +274,14 @@ impl Memory {
             entry: USER_CODE_BASE + if index == 0 { 0 } else { program::WORKER_ENTRY },
         })
     }
-    fn backing(&self) -> NativeThreadBacking<'_> {
+    pub(super) fn backing(&self) -> NativeThreadBacking<'_> {
         NativeThreadBacking {
             stack: &self.extents[..1],
             tls: &self.extents[1..2],
             startup: &self.extents[2..],
         }
     }
-    fn admission(&self, thread: ThreadId) -> NativeThreadAdmission<'_> {
+    pub(super) fn admission(&self, thread: ThreadId) -> NativeThreadAdmission<'_> {
         NativeThreadAdmission {
             thread,
             descriptor: self.descriptor,
@@ -289,7 +289,7 @@ impl Memory {
             backing: self.backing(),
         }
     }
-    fn verify(
+    pub(super) fn verify(
         &self,
         native: &NativeProcessContext,
         tls: StaticTlsLayout,
@@ -362,12 +362,13 @@ impl Memory {
     }
 }
 
-fn mappings(
+pub(super) fn mappings(
     accounting: &OwnedAccounting,
     allocation: &IsolatedAllocation,
+    code: &[u8],
 ) -> Result<MappingPlan, ()> {
     troe_machine::zero_physical_range(allocation.complete).map_err(|_| ())?;
-    troe_machine::copy_to_physical(allocation.code, 0, program::CODE).map_err(|_| ())?;
+    troe_machine::copy_to_physical(allocation.code, 0, code).map_err(|_| ())?;
     let base = build_isolated_plan(&accounting.kernel_plan, allocation)?;
     let mut plan = MappingPlan::new();
     for mapping in base.mappings() {
@@ -412,7 +413,7 @@ fn run(
     stage: &mut &'static str,
 ) -> Result<Reclamation, ()> {
     *stage = "shared root and initial resources";
-    let mut plan = mappings(accounting, allocation)?;
+    let mut plan = mappings(accounting, allocation, program::CODE)?;
     if scenario == Scenario::HeaderAlias {
         plan.insert(
             Mapping::user(

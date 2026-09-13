@@ -116,8 +116,12 @@ publication or count changes.
 
 `cargo test -p troe-service threading::` exercises authenticated operation binding,
 captured Current identities, live Observe/RequestStop targets, owned Join/Sleep
-waits, Detach, terminal Exit actions, owned Abort reclamation and canonical
-Unsupported prepare/start replies.
+waits, Detach, terminal Exit actions, owned Abort reclamation and retained
+Prepare/Start actions. Creation checks cover one reservation per request, no
+implicit Ready publication, resource exhaustion, rollback/reclamation/reaping
+before a failure reply, creator ownership, Start/Abort/creator-exit ordering,
+stopped callers and stale target reuse. Start cannot authorize a sibling's
+preparation, and a pending Start loses to revocation without publishing Ready.
 It covers foreign/stale/wrong-kind identities,
 authority revocation after admission, caller-state checks, pending completion
 interlocks, condition notification/timeout/stop with mutex reacquisition, poison
@@ -750,6 +754,29 @@ relocations before extracting `.text` with `llvm-objcopy`. The TLS template is
 8 initialized bytes plus 8 zero bytes aligned to 8; x86 accesses FS:0 then
 offsets -16/-8, and Arm accesses TPIDR_EL0+16/+24. This fixture has no libc or
 stack protector and does not qualify a production C compiler profile.
+A separate C creation fixture uses the same reserved mappings and canonical
+Prepare/Start/Abort/Current/Join/Exit calls. It checks unmapped entry and stack
+allowance rejection, forced IPC exhaustion after logical reservation, rollback
+before a failure reply and successful slot reuse with a new generation. Native
+completion rejects unpublished mappings and a mismatched trusted image base.
+The scheduler deliberately runs a worker before publishing the creator's Start
+reply, then holds that worker while the creator attempts forbidden Start/Abort
+operations on its prepared child. The worker aborts and replaces that child,
+then returns through a userspace trampoline into Exit. Creator exit revokes the
+replacement; Join waits for physical acknowledgement and retains the scalar
+result through reaping. All user replies include canonical framing and a zeroed
+RX suffix. Initial/worker TLS remains independent, and the shared writes survive
+Join. Final checks restore physical/logical baselines while retaining process
+table pages until root teardown. This is a controlled acceptance schedule, not
+fairness or deadline-delivery evidence.
+The source and layout are `shared_context_probe/creation/program.c` and
+`program.ld` below `kernel/src/memory`; `program.rs` embeds their inspected linked
+text. Compile with the same Clang/LLD extraction procedure as the admission
+fixture, using `-fpie` instead of `-fno-pic` for image-relative function addresses.
+PT_TLS has 8 initialized and 16 zero bytes aligned to 8: marker, counter and the
+thread's descriptor pointer. x86 accesses FS:0 with offsets -24/-16/-8; Arm uses
+TPIDR_EL0+16/+24/+32. Both linked fixtures have no retained relocations, libc or
+stack protector. Neither qualifies a production C runtime profile.
 These native mechanism checks do not establish threaded package
 admission, process-share scheduling, production compiler-TLS ownership or C/CPython
 thread safety.
