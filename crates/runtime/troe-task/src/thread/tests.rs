@@ -4,6 +4,60 @@ const OWNER: ProcessId = ProcessId(1);
 const OTHER: ProcessId = ProcessId(2);
 
 #[test]
+fn native_preparation_rechecks_role_charge_state_stop_and_incarnation() -> Result<(), ThreadError> {
+    let (mut table, initial, worker) = setup()?;
+    let before = (table.usage(OWNER), table.metadata_bytes());
+    assert_eq!(table.validate_prepared(OWNER, worker, false, 2), Ok(()));
+    for (id, role, pages) in [
+        (initial, true, 2),
+        (worker, true, 2),
+        (worker, false, 1),
+        (worker, false, 3),
+    ] {
+        assert_eq!(
+            table.validate_prepared(OWNER, id, role, pages),
+            Err(ThreadError::InvalidState)
+        );
+    }
+    table.register_process(
+        OTHER,
+        ThreadQuota {
+            records: 1,
+            pages: 2,
+        },
+    )?;
+    let foreign = table.prepare_initial(OTHER, resources(3, 2))?;
+    assert_eq!(table.validate_prepared(OTHER, foreign, true, 2), Ok(()));
+    assert!(table.validate_prepared(OWNER, foreign, true, 2).is_err());
+    assert_eq!((table.usage(OWNER), table.metadata_bytes()), before);
+    table.abort_prepared(OWNER, worker)?;
+    assert_eq!(
+        table.validate_prepared(OWNER, worker, false, 2),
+        Err(ThreadError::InvalidState)
+    );
+    table.release_resources(OWNER, worker)?;
+    table.reap(OWNER, worker)?;
+    let replacement = table.prepare_worker(OWNER, initial, resources(2, 2))?;
+    assert_eq!(replacement.slot(), worker.slot());
+    assert_ne!(replacement.generation(), worker.generation());
+    assert_eq!(
+        table.validate_prepared(OWNER, worker, false, 2),
+        Err(ThreadError::Stale)
+    );
+    table.start(OWNER, replacement)?;
+    assert_eq!(
+        table.validate_prepared(OWNER, replacement, false, 2),
+        Err(ThreadError::InvalidState)
+    );
+    table.stop_process(OTHER)?;
+    assert_eq!(
+        table.validate_prepared(OTHER, foreign, true, 2),
+        Err(ThreadError::Stopping)
+    );
+    Ok(())
+}
+
+#[test]
 fn resolve_collapses_foreign_vacant_and_stale_identity_failures() -> Result<(), ThreadError> {
     let (mut table, initial, worker) = setup()?;
     table.register_process(

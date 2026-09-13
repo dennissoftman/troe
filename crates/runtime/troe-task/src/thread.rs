@@ -762,6 +762,35 @@ impl ThreadTable {
         Ok(self.record(owner, id)?.snapshot)
     }
 
+    /// Recheck a retained preparation before native mapping publication.
+    ///
+    /// `initial` and `pages` must match the record's creator role and complete
+    /// mapped-page charge. This grants no physical ownership or Start authority.
+    /// Keep this table borrowed through the synchronous native operation.
+    ///
+    /// # Errors
+    /// Rejects stopped, stale, released, started, wrong-role or mischarged records.
+    pub fn validate_prepared(
+        &self,
+        owner: ProcessId,
+        id: ThreadId,
+        initial: bool,
+        pages: u64,
+    ) -> Result<(), ThreadError> {
+        if self.process(owner)?.stopping {
+            return Err(ThreadError::Stopping);
+        }
+        let record = self.record(owner, id)?;
+        if record.snapshot.state != ThreadState::Prepared
+            || record.snapshot.resources_released
+            || record.creator.is_none() != initial
+            || record.resources.pages != pages
+        {
+            return Err(ThreadError::InvalidState);
+        }
+        Ok(())
+    }
+
     /// Resolve untrusted identity components in the selected process's table.
     ///
     /// The owner comes from trusted composition, never request bytes. A match

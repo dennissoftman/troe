@@ -5,7 +5,12 @@ Status: architectural direction accepted, 2026-09-09. Implementation tracked by
 [#204](https://github.com/dennissoftman/troe/issues/204) through
 [#208](https://github.com/dennissoftman/troe/issues/208).
 Native shared-root context switching and retained per-thread IPC storage have
-acceptance mechanisms. Individual retirement preflights physical backing and
+acceptance mechanisms. Native prepared mapping admission rechecks the current
+lifecycle identity, role and charge, preflights complete windows/backing and
+bounded root-table capacity, then encodes private descriptors and binds retained
+IPC. Compiler-generated local-exec TLS acceptance exercises initial/worker entry
+and initial-thread retirement with a live sibling. This does not activate the
+threaded loader or production C runtime. Individual retirement preflights physical backing and
 user aliases, removes private mappings and returns an ordinary-frame reclamation
 receipt; partial mutation failure stops the complete process. Native acceptance
 executes Join across physical acknowledgement and target reaping, then verifies
@@ -24,7 +29,7 @@ Abort retains an owned reclamation action after logical revocation. Native
 discard rechecks the live Revoked record and never-executed context before
 removing access; the caller's normal reply follows physical reclamation,
 resource acknowledgement and target reaping. Prepare and Start return Unsupported. Native execution of the
-full operation set, threaded package admission, compiler-TLS allocation and pthread
+full operation set, threaded package admission, production compiler-TLS allocation and pthread
 support remain disabled.
 Native acceptance composes a restricted control capability with Current calls
 and process-scoped live thread-token resolution. The native owner also claims
@@ -216,6 +221,11 @@ registers. The descriptor contains shared process startup, private stack/TLS/IPC
 resolved worker entry and the scalar argument. The trampoline is selected from
 validated executable metadata, never supplied as a syscall callback. Its native
 implementation and compiler profile are not established by decoding addresses.
+The native mapping mechanism treats the initial header's descriptor reference as
+bootstrap data, valid until that initial thread's resources are reclaimed. The
+private descriptor retires with its thread; the shared process header, arguments
+and capabilities retain process lifetime. Siblings use their own descriptor and
+must not treat the initial reference as a permanent descriptor lookup.
 
 ## Decision 3: transactional creation and precise lifecycle
 
@@ -626,7 +636,7 @@ and machine contexts/page-table users are quiescent, and perform physical releas
 and zeroization in the established order. The Rust owner cannot establish those
 machine facts. Native package verification, process startup publication, global
 context/runtime budgets and the separately versioned C binding remain distinct
-acceptance requirements. Current native admission remains closed.
+acceptance requirements. Current threaded package admission remains closed.
 
 ### Native mapping and TSS ownership
 

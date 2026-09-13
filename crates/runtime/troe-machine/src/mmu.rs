@@ -16,6 +16,8 @@ use troe_memory::{BASE_PAGE_SIZE, MappingPermissions, PhysicalRange, VirtualRang
 #[cfg(any(test, target_os = "uefi"))]
 use troe_memory::{MappingMemoryType, MappingPrivilege};
 
+#[cfg(any(test, target_os = "uefi"))]
+mod admission;
 #[cfg(target_os = "uefi")]
 mod ipc;
 #[cfg(target_os = "uefi")]
@@ -27,7 +29,8 @@ mod retirement;
 #[cfg(target_os = "uefi")]
 pub use process::{
     NativeProcessBacking, NativeProcessContext, NativeSchedulerCall, NativeSchedulerExecution,
-    NativeThreadBacking, NativeThreadRetirement, NativeThreadStart, NativeThreadStop,
+    NativeThreadAdmission, NativeThreadAdmissionError, NativeThreadBacking, NativeThreadRetirement,
+    NativeThreadStart, NativeThreadStop,
 };
 #[cfg(feature = "acceptance-probes")]
 pub use protected::FaultPoint;

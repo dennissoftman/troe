@@ -115,6 +115,8 @@ class ChangedTestSelectionTests(unittest.TestCase):
             "crates/runtime/troe-machine/src/mmu/process.rs",
             "crates/runtime/troe-machine/src/mmu/process/retirement.rs",
             "crates/runtime/troe-machine/src/mmu/retirement.rs",
+            "crates/runtime/troe-machine/src/mmu/admission.rs",
+            "crates/runtime/troe-machine/src/mmu/admission/tests.rs",
             "crates/runtime/troe-machine/src/mmu/retirement/tests.rs",
             "kernel/src/memory/shared_context_probe.rs",
             "kernel/src/memory/shared_context_probe/retirement.rs",

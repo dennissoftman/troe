@@ -614,6 +614,31 @@ TX copying and RX publication use the retained binding; RX publication clears
 the whole page before copying the prefix. These are kernel storage primitives;
 capability and operation authentication remain composition obligations. Threads
 share all user mappings, so the buffers do not isolate siblings.
+`admit_prepared` adds a fully reserved thread to an inactive root. It borrows the
+current lifecycle table through publication and checks Prepared state, exact
+identity, creator role and mapped-page charge. Its descriptor defines a complete
+managed window with guarded stack, compiler TLS, IPC and private read-only/NX
+startup; guards and alignment gaps stay reserved. Preflight checks all backing,
+existing user aliases and the whole window, excludes the retained table arena,
+and requires a conservative unused table bound before writes. The process owner
+preallocates and charges its complete pair-vector capacity. It clears stack,
+descriptor and IPC, encodes the descriptor from trusted fields, maps and binds
+the context without allocation or logical Start. Compiler initialization of TLS
+and physical/resource ownership remain composition duties.
+Preflight rejection returns the unpublished IPC owner. Once mapping begins, any
+failure stops the complete native process and retains the root and IPC for
+teardown. Table storage comes only from the original retained arena; its unused
+pages remain owned and charged externally. Admission retains the full virtual
+window until retirement, preventing another thread from occupying its gaps.
+The initial native entry receives the shared process header and 4,096-byte
+count; a worker trampoline receives its private descriptor and 128-byte count.
+Both retain a separate private descriptor. The initial header's descriptor
+reference is valid for initial bootstrap until that thread's resources are
+reclaimed; it is not a permanent descriptor lookup for siblings. Shared
+arguments and capability descriptors keep their process lifetime.
+The first mapped initial thread binds one uniquely mapped shared-header page to
+the native root. Admission rejects physical aliases of that page and requires
+every worker to use the same header even after the initial thread is retired.
 The mechanism supports copied-call continuations and rejects tagged roots and
 roots bound to the single-thread IPC profile. A selected native context with an IPC binding
 can suspend at scheduler entry 6. The masked trap copies the fixed 64-byte TX

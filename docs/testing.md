@@ -89,6 +89,12 @@ overlap, remaining user aliases, missing leaves, read-only startup permissions,
 coalesced-region splitting, metadata exhaustion before leaf reads and first-error
 termination of unmapping. Successful metadata removal preserves capacity and
 the permissions of the surviving regions.
+Native mapping-admission tests additionally check fragmented physical extents,
+complete guard/gap emptiness, existing user aliases, table-arena exclusion,
+metadata exhaustion before leaf reads, first-error mapping termination and
+allocation-free metadata addition followed by retirement. Lifecycle validation
+tests reject wrong creator role, page charge, state, stop and stale incarnation
+without changing charges.
 
 The owned control-wait tests cover early deadline/stop with no admission, try-join
 without claim-identity consumption, physical-quiescence acknowledgement, result
@@ -713,8 +719,32 @@ stack/TLS/startup/TX/RX reads after the user has checked both replies. The
 Start-wins case verifies the target remains mapped before any target execution;
 alias and startup-reference cases reject removal without mutation and prevent
 late success after process stop. Every case restores physical/logical accounting.
+Dynamic admission probes start from shared code/startup mappings and add initial
+and worker windows with compiler-generated local-exec TLS. The user code checks
+both entry argument conventions, initialized and zero TLS, independent mutation
+across yields, complete descriptor bytes and shared-header survival after the
+initial thread exits. Native checks cover unpublished-page clearing, immutable
+descriptors, unmapped guards, initial descriptor retirement, IPC generation reuse,
+preflight rejection and terminal partial mapping with retained IPC ownership.
+An abort/re-admission case reuses the same virtual window with fresh logical and
+IPC generations, initialized TLS, and rejection of the old incarnation.
+Record-capacity, Ready-before-admission and root-table-budget failures cannot
+publish mappings. A writable header alias, wrong initial descriptor reference,
+or worker substitution of another header is rejected. All cases recover physical
+and logical resource baselines.
+The inspected source and linker layout are
+`kernel/src/memory/shared_context_probe/admission/program.c` and `program.ld`;
+`program.rs` contains only their linked `.text` bytes and worker-entry offsets.
+Clang 23.1.0 compiles with `-O2 -ffreestanding -fno-stack-protector
+-ftls-model=local-exec -fno-pic -fno-unwind-tables`, plus `-mno-red-zone` on x86,
+for `x86_64-unknown-none-elf` and `aarch64-unknown-none-elf`. Link with GNU-flavor
+LLD and that script; inspect disassembly, symbols, PT_TLS and absence of retained
+relocations before extracting `.text` with `llvm-objcopy`. The TLS template is
+8 initialized bytes plus 8 zero bytes aligned to 8; x86 accesses FS:0 then
+offsets -16/-8, and Arm accesses TPIDR_EL0+16/+24. This fixture has no libc or
+stack protector and does not qualify a production C compiler profile.
 These native mechanism checks do not establish threaded package
-admission, process-share scheduling, compiler TLS initialization or C/CPython
+admission, process-share scheduling, production compiler-TLS ownership or C/CPython
 thread safety.
 The acceptance image exceeds 1 MiB and therefore also exercises the
 page-relative data-symbol relocations used by AArch64 entry and completion.
