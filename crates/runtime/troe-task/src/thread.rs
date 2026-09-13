@@ -59,7 +59,11 @@ pub struct JoinClaim {
     sequence: u64,
 }
 
-/// Owned preparation supplied after native memory admission succeeds.
+/// Reservation identity and page charge supplied after native resources are reserved.
+///
+/// This record does not own frames or establish mappings. Composition retains
+/// the resources while the logical Prepared identity is mapped and initialized,
+/// and until physical reclamation permits resource acknowledgement.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ThreadResources {
     /// Nonzero resource-owner identity, unique among retained reservations.
@@ -308,7 +312,7 @@ impl ThreadTable {
         Ok(())
     }
 
-    /// Admit the process's initial thread after native preparation.
+    /// Retain the process's initial identity after reserving its native resources.
     ///
     /// The initial thread is non-joinable; its completion belongs to process
     /// supervision. Abort before start permits another initial preparation.
@@ -328,7 +332,7 @@ impl ThreadTable {
         Ok(id)
     }
 
-    /// Admit a worker owned by the current running creator.
+    /// Retain a reserved worker owned by the current running creator.
     ///
     /// # Errors
     /// Rejects stale/wrong-owner/non-running creators, stopping or exhausted admission.
