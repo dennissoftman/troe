@@ -8,7 +8,9 @@ No native thread execution, native TLS, or pthread support is claimed by this do
 Current single-execution-thread application contracts remain in force.
 Portable lifecycle/synchronization models, an independently compiler-checked
 static TLS layout/initializer, guarded thread-memory planning, and composed
-initial-process geometry/peak memory charges implement portions of this direction. The implemented offline
+initial-process geometry/peak memory charges implement portions of this direction.
+The owned-initializer annex implements coherent staged-buffer ownership, immutable
+TLS copying and retained logical charges; native frame/context integration remains open. The implemented offline
 [KEX static TLS container 1.3](../formats/kex-static-tls-v1.md) encodes the
 initializer, extent, alignment and worker trampoline under application ABI 1.4.
 Its reader and explicit converter produce no complete native admission proof.
@@ -516,6 +518,53 @@ The native integration must retain an immutable process-lifetime initializer,
 rollback partial preparation, revoke creation and wait for quiescence before
 releasing it. Those ownership and complete native-admission obligations remain
 in #206/#207; a copyable plan is not evidence that they have been satisfied.
+
+### Owned initializer and logical backing annex
+
+`StagedTlsImage::prepare` consumes an owned executable `Vec<u8>`, charges its full
+capacity to a shared `TlsBackingAccount`, validates its immutable bytes, and builds
+`ProcessMemoryPlan` from that same artifact. It reserves initializer pages before
+fallible allocation. Both actual capacities, independently rounded to pages, must
+fit the shared backing account and the process's peak memory budget before any
+initializer zeroing/copying. Extra staging capacity is checked before attempting
+initializer allocation. The plan updates capacity charges atomically; it rejects
+undercharges, overflow and budget exhaustion without changing its previous value.
+The exact staged executable length remains the format/staging-byte constraint.
+
+The initializer copy reads only the exact validated suffix, never a running image.
+All of its available capacity is cleared before copying the initialized prefix.
+Preparation has no fallible step after the checked copy. Failure drops accepted
+buffers and refunds their private, non-cloneable reservations exactly once.
+Declaration and field drop order release allocations before their logical charge.
+There are no persistent raw template pointers, clones, user callbacks or resumable
+readers. Revalidating an immutable artifact view avoids a self-referential owner
+and unsafe lifetime extension; it is bounded by the existing artifact limits.
+
+Image consumers can borrow the staged artifact. Consuming `release_staging` requires
+all such borrows to have ended; it drops executable storage and transfers the
+unchanged initializer owner/reservation into `ProcessTls`. Future TLS copies use
+its stored compiler layout and immutable prefix, fully initializing exclusively
+borrowed destinations. Mutating another thread's TLS or the ordinary writable
+image cannot change this source. `stop_creation` takes exclusive access, permanently
+rejects new copies and retains storage and charges. Drop releases the buffer then
+its reservation. Safe Rust borrowing establishes synchronous reader quiescence.
+
+The shared account uses `Cell` and deliberately is not `Sync`; introducing SMP
+requires a reviewed synchronization/ownership boundary. The caller keeps the
+account alive for every owner and supplies an allowance after protected reserves.
+This is logical heap-buffer accounting, not a new physical frame pool: allocator
+bookkeeping, size classes and transient allocation behavior need the allocator's
+own bound, and inline owner/account metadata needs separate compiled charges.
+The incoming staging allocation remains the caller's responsibility until transfer;
+a failed preparation consumes and drops it. No physical admission credit follows
+from successful logical reservation, and heap drop is not certified erasure.
+
+Native #206/#207 integration must keep the process owner until creation is revoked
+and machine contexts/page-table users are quiescent, and perform physical release
+and zeroization in the established order. The Rust owner cannot establish those
+machine facts. Native package verification, process startup publication, global
+context/runtime budgets and the separately versioned C binding remain distinct
+acceptance requirements. Current native admission remains closed.
 
 ### Native mapping and TSS ownership
 

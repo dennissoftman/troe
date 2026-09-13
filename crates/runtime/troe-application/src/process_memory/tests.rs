@@ -1,12 +1,9 @@
 use super::*;
 use crate::{
-    ABI_MINOR, KEX_V1_LOAD_RECORD_BYTES, KEX_V1_MAGIC, PAGE_BYTES, Target,
-    bytes::{write_u16, write_u32, write_u64},
-    canonical_image_span_bytes, parse_kex,
-    static_tls::LOCAL_EXEC_BYTES,
-    tls_artifact::{HEADER_BYTES, Metadata},
+    ABI_MINOR, PAGE_BYTES, Target, parse_kex, static_tls::LOCAL_EXEC_BYTES,
+    test_support::TlsFixture,
 };
-use alloc::{collections::BTreeSet, vec, vec::Vec};
+use alloc::{collections::BTreeSet, vec};
 use troe_abi::threading::{Kind, StartupReference};
 
 const UNLIMITED: ProcessMemoryBudget = ProcessMemoryBudget {
@@ -24,122 +21,6 @@ const PLACEMENT: ProcessMemoryPlacement = ProcessMemoryPlacement {
     heap_capacity_pages: 16,
     initial_thread_base: KEX_V1_MIN_IMAGE_BASE + (1 << 24),
 };
-
-struct Fixture {
-    heap: u64,
-    stack: u64,
-    file: usize,
-    memory: u64,
-    alignment: u64,
-    segments: usize,
-    gap: u64,
-}
-impl Default for Fixture {
-    fn default() -> Self {
-        Self {
-            heap: 3,
-            stack: 4,
-            file: 3,
-            memory: 37,
-            alignment: 64,
-            segments: 2,
-            gap: 0,
-        }
-    }
-}
-impl Fixture {
-    fn encode(&self, target: Target) -> Vec<u8> {
-        let payload = HEADER_BYTES + self.segments * KEX_V1_LOAD_RECORD_BYTES;
-        let file_offset = payload + 16 + self.file;
-        let mut bytes = vec![0; file_offset + self.file];
-        bytes[..8].copy_from_slice(&KEX_V1_MAGIC);
-        for (offset, value) in [
-            (8, 1),
-            (10, 3),
-            (12, target as u16),
-            (14, 160),
-            (16, 40),
-            (18, 1),
-            (20, 4),
-            (22, 2),
-            (
-                32,
-                u16::try_from(self.segments).unwrap_or_else(|_| unreachable!()),
-            ),
-            (72, 16),
-        ] {
-            write_u16(&mut bytes, offset, value);
-        }
-        for (offset, value) in [(56, HEADER_BYTES), (60, payload), (64, payload)] {
-            write_u32(
-                &mut bytes,
-                offset,
-                u32::try_from(value).unwrap_or_else(|_| unreachable!()),
-            );
-        }
-        write_u64(&mut bytes, 40, self.stack);
-        write_u64(&mut bytes, 48, self.heap);
-        write_u64(&mut bytes, 80, (file_offset + self.file) as u64);
-        let mut image_end = 0;
-        let mut source = 0;
-        let mut file_at = payload;
-        for index in 0..self.segments {
-            let at = HEADER_BYTES + index * KEX_V1_LOAD_RECORD_BYTES;
-            let offset = if index == 0 { 0 } else { image_end + self.gap };
-            let file = match index {
-                0 => 16,
-                1 => self.file,
-                _ => 0,
-            };
-            let memory = pages_for(file as u64)
-                .unwrap_or_else(|_| unreachable!())
-                .max(1)
-                * PAGE_SIZE;
-            for (field, value) in [
-                (0, offset),
-                (8, file_at as u64),
-                (16, file as u64),
-                (24, memory),
-            ] {
-                write_u64(&mut bytes, at + field, value);
-            }
-            write_u32(
-                &mut bytes,
-                at + 32,
-                match index {
-                    0 => 2,
-                    1 => 3,
-                    _ => 1,
-                },
-            );
-            if index == 1 {
-                source = offset;
-            }
-            bytes[file_at..file_at + file].fill(if index == 0 { 0x90 } else { 0x5a });
-            image_end = offset + memory;
-            file_at += file;
-        }
-        let span = canonical_image_span_bytes(image_end).unwrap_or_else(|| unreachable!());
-        write_u32(
-            &mut bytes,
-            36,
-            u32::try_from(span / PAGE_SIZE).unwrap_or_else(|_| unreachable!()),
-        );
-        bytes[file_offset..].fill(0x5a);
-        let extension = Metadata {
-            source_offset: if self.file == 0 { 0 } else { source },
-            file_offset: file_offset as u64,
-            file_bytes: self.file as u64,
-            memory_bytes: self.memory,
-            alignment: self.alignment,
-            trampoline_offset: 4,
-        }
-        .encode(target)
-        .unwrap_or_else(|_| unreachable!());
-        bytes[96..HEADER_BYTES].copy_from_slice(&extension);
-        bytes
-    }
-}
 
 fn plan(bytes: &[u8], target: Target, placement: ProcessMemoryPlacement) -> ProcessMemoryPlan {
     let artifact = Artifact::parse(bytes, target).unwrap_or_else(|error| unreachable!("{error:?}"));
@@ -176,7 +57,7 @@ fn oracle(plan: &ProcessMemoryPlan) -> u64 {
 #[test]
 fn initial_thread_composes_with_shared_memory_and_roundtrips_its_descriptor() {
     for target in [Target::X86_64, Target::Aarch64] {
-        let bytes = Fixture::default().encode(target);
+        let bytes = TlsFixture::default().encode(target);
         let planned = plan(&bytes, target, PLACEMENT);
         assert_eq!(planned.startup_address(), PLACEMENT.image_base + (1 << 21));
         assert_eq!(
@@ -240,7 +121,7 @@ fn initial_thread_composes_with_shared_memory_and_roundtrips_its_descriptor() {
 
 #[test]
 fn peaks_include_independent_initializer_and_staging_without_recharging_boot_ipc() {
-    let bytes = Fixture::default().encode(Target::X86_64);
+    let bytes = TlsFixture::default().encode(Target::X86_64);
     let planned = plan(&bytes, Target::X86_64, PLACEMENT);
     let c = planned.charges();
     assert_eq!(c.shared_pages(), 6); // two image pages, startup, three heap pages
@@ -260,7 +141,7 @@ fn peaks_include_independent_initializer_and_staging_without_recharging_boot_ipc
 
 #[test]
 fn each_independent_allowance_is_required_at_the_exact_boundary() {
-    let bytes = Fixture::default().encode(Target::X86_64);
+    let bytes = TlsFixture::default().encode(Target::X86_64);
     let artifact = Artifact::parse(&bytes, Target::X86_64).unwrap_or_else(|_| unreachable!());
     let planned = plan(&bytes, Target::X86_64, PLACEMENT);
     let exact = exact(planned.charges());
@@ -333,7 +214,7 @@ fn each_independent_allowance_is_required_at_the_exact_boundary() {
 
 #[test]
 fn reservation_collisions_include_image_holes_heap_growth_and_thread_guards() {
-    let bytes = Fixture::default().encode(Target::Aarch64);
+    let bytes = TlsFixture::default().encode(Target::Aarch64);
     let artifact = Artifact::parse(&bytes, Target::Aarch64).unwrap_or_else(|_| unreachable!());
     let baseline = plan(&bytes, Target::Aarch64, PLACEMENT);
     let (shared_start, shared_end) = baseline.shared_reservation();
@@ -380,7 +261,7 @@ fn reservation_collisions_include_image_holes_heap_growth_and_thread_guards() {
 
 #[test]
 fn invalid_capacity_placement_and_arithmetic_fail_before_publication() {
-    let bytes = Fixture::default().encode(Target::X86_64);
+    let bytes = TlsFixture::default().encode(Target::X86_64);
     let artifact = Artifact::parse(&bytes, Target::X86_64).unwrap_or_else(|_| unreachable!());
     for capacity in [0, 2, (1 << 32) + 1, u64::MAX] {
         assert_eq!(
@@ -447,12 +328,12 @@ fn empty_bss_and_initialized_tls_charge_and_initialize_the_actual_target_layout(
         for (file, memory, alignment) in
             [(0, 0, 1), (0, 5001, 8192), (3, 37, 64), (4097, 9001, 65536)]
         {
-            let bytes = Fixture {
+            let bytes = TlsFixture {
                 file,
                 memory,
                 alignment,
                 heap: 0,
-                ..Fixture::default()
+                ..TlsFixture::default()
             }
             .encode(target);
             let planned = plan(
@@ -506,13 +387,13 @@ fn empty_bss_and_initialized_tls_charge_and_initialize_the_actual_target_layout(
 fn prefix_union_matches_page_oracle_across_sparse_images_and_both_thread_sides() {
     for target in [Target::X86_64, Target::Aarch64] {
         for index in 0..128_u64 {
-            let fixture = Fixture {
+            let fixture = TlsFixture {
                 alignment: 1 << (index % 17),
                 segments: if index % 3 == 0 { MAX_LOAD_RECORDS } else { 2 },
                 gap: (index % 4) * (1 << 21),
                 heap: index % 17,
                 stack: 4 + index % 19,
-                ..Fixture::default()
+                ..TlsFixture::default()
             };
             let bytes = fixture.encode(target);
             let image_base = (1 << 39) - KEX_V1_IMAGE_ALIGNMENT + (index % 3) * (1 << 30);
@@ -546,13 +427,13 @@ fn prefix_union_matches_page_oracle_across_sparse_images_and_both_thread_sides()
 #[test]
 fn huge_commit_and_alignment_require_bounded_region_work_without_backing() {
     for target in [Target::X86_64, Target::Aarch64] {
-        let bytes = Fixture {
+        let bytes = TlsFixture {
             heap: 1 << 32,
             stack: 1 << 32,
             file: 0,
             memory: 0,
             alignment: LOCAL_EXEC_BYTES,
-            ..Fixture::default()
+            ..TlsFixture::default()
         }
         .encode(target);
         let planned = plan(
@@ -578,7 +459,7 @@ fn huge_commit_and_alignment_require_bounded_region_work_without_backing() {
 #[test]
 fn process_preflight_cannot_enable_native_admission_or_mutate_the_artifact() {
     for target in [Target::X86_64, Target::Aarch64] {
-        let bytes = Fixture::default().encode(target);
+        let bytes = TlsFixture::default().encode(target);
         let original = bytes.clone();
         let planned = plan(&bytes, target, PLACEMENT);
         assert_eq!(planned.charges().staging_bytes(), bytes.len() as u64);
@@ -592,9 +473,9 @@ fn process_preflight_cannot_enable_native_admission_or_mutate_the_artifact() {
 #[test]
 fn reservations_may_end_at_user_end_and_read_only_image_permissions_survive() {
     for target in [Target::X86_64, Target::Aarch64] {
-        let bytes = Fixture {
+        let bytes = TlsFixture {
             segments: 3,
-            ..Fixture::default()
+            ..TlsFixture::default()
         }
         .encode(target);
         let shared_at_end = plan(

@@ -8,6 +8,10 @@ ABI 1.3. Both loaders reject container 1.3 even with a higher caller ABI ceiling
 The separate `process_memory` preflight can compose this reader's validated
 geometry into shared and initial-thread reservations with peak memory charges.
 It grants no resource ownership or native admission.
+`tls_owner::StagedTlsImage` additionally owns the staged executable and a copied
+initializer, with checked logical capacity charges. Its `ProcessTls` owner can
+initialize TLS after staging release without reading a running writable image.
+This buffer owner does not change either loader's accepted container versions.
 
 ## Encoding
 

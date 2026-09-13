@@ -85,6 +85,12 @@ never executes the ordinary application.
   container revision, validates the immutable initializer against its image source,
   and rejects initializer pointer fixups. Native and streaming loaders reject this
   container; these components enable no native workers;
+- TLS initializer ownership: exclusively owned staging supplies an independent
+  immutable process initializer. Fallible preparation reserves logical backing,
+  checks actual capacity and process peak budgets, and drops buffers before
+  refunding charges. Stopping creation retains storage; synchronous Rust borrows
+  prevent release during a copy. Native context quiescence, physical accounting
+  and zeroization are not established by this heap-buffer owner;
 - compiler qualification: explicit C11 target/TLS options and isolated headers,
   exact release checks and observed-input fingerprints; missing, skipped or
   failed qualification cannot publish a success report. These reports grant
