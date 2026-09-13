@@ -2,7 +2,8 @@
 
 `troe_abi::threading` implements allocation-free, little-endian codecs for
 interfaces 30 (`THREAD_CONTROL`) and 31 (`THREAD_SYNC`), both version 1.0.
-These are assigned contracts, not executable native services. The active
+These contracts have native acceptance mechanisms but no ordinary application
+service admission. The active
 application ABI remains 1.3; the kernel and SDK reject ABI 1.4, and current
 startup encoding/decoding rejects both thread interfaces. No KCAP builder name
 grants them. Native loaders reject the separately encoded
@@ -42,7 +43,9 @@ does not execute or correlate a native operation.
 The portable `troe-service::threading` operation dispatcher binds this owned
 authorization to the captured caller and trusted process snapshot. It executes
 Current, Observe, RequestStop, Join, Detach, Sleep, Exit, Abort and all interface 31
-operations against the paired tables; Prepare and Start return Unsupported.
+operations against the paired tables; Prepare and Start retain owned actions
+through native initialization and readiness checks rather than completing in
+the generic dispatcher.
 A new operation requires a running caller with no unconsumed policy wait. Waiting owns
 the original request and exact wait generation, with no table borrow or user
 pointer. Clock/configuration failures require process termination rather than
@@ -83,7 +86,9 @@ reaping. The portable Exit action owns its authenticated caller, captured scalar
 and owner-death disposition. Consuming it publishes logical completion only
 after native retirement; it acknowledges no resources. Essential-mutex
 abandonment instead requires process stop, with no thread completion or reply.
-Abort wins logical revocation only for a Prepared target and retains an owned
+Start and Abort require the current caller's own unreleased Prepared worker;
+another creator's preparation or an initial record cannot satisfy that check.
+Abort wins logical revocation only for such a target and retains an owned
 reclamation action. The native discard path rechecks that live Revoked state,
 unreleased resources and a never-executed context before applying the same
 backing/alias preflight. The caller keeps its separate captured execution claim.
@@ -93,7 +98,7 @@ Start winning first rejects Abort even if the target has not yet executed.
 Early finish, caller stop or a stale/reused target cannot publish late success.
 The separate native `admit_prepared` mechanism maps and binds a retained logical
 preparation after live identity/role/page-charge and full backing/window checks.
-It does not execute the Prepare or Start wire operations. Descriptor bytes are
+Mapping admission alone does not complete Prepare or Start. Descriptor bytes are
 kernel-encoded into a cleared private read-only/NX page. Initial entry receives
 the shared process header and mapped-byte count; a worker receives its private
 descriptor and 128-byte prefix count. Mapping failure after mutation stops the
@@ -104,6 +109,16 @@ final guard. The standalone descriptor codec permits other disjoint placements;
 decoding alone does not establish this native admission contract.
 The first mapped initial thread binds a uniquely mapped shared process header;
 subsequent admissions must name that same header after initial-thread retirement.
+`complete_preparation` additionally correlates the owned Prepare and native claim,
+admitted context/IPC and descriptor with the request's image-relative entry,
+argument and stack size. Its token reply leaves the worker Prepared. A retained
+rollback after reservation requires revocation, reclamation, acknowledgement and
+reaping before a failure reply; partial mutation requires process teardown.
+`complete_start` checks native readiness and current creator ownership before
+publishing Ready with release ordering. The worker may run before the creator
+observes success. Scheduled first entry checks Running policy state and acquires
+initialization. These mechanisms neither allocate production resources nor
+activate ABI 1.4 application admission.
 
 ## Requests
 

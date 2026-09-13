@@ -139,4 +139,5 @@ the output before writing or checking its destination.
 The compiler probes in [testing guidance](../testing.md#static-tls-layout-and-compiler-probes)
 check actual local-exec address sequences on both architectures. ELF metadata
 validation alone is not a proof of arbitrary machine code's TLS model or a
-production libc's thread safety. Native execution remains disabled.
+production libc's thread safety. Native execution of container 1.3 packages
+remains disabled; native acceptance fixtures use separately constructed mappings.

@@ -4,6 +4,61 @@ const OWNER: ProcessId = ProcessId(1);
 const OTHER: ProcessId = ProcessId(2);
 
 #[test]
+fn creator_scoped_start_and_abort_keep_sibling_and_stale_records_unchanged()
+-> Result<(), ThreadError> {
+    let (mut table, initial, worker) = setup()?;
+    let sibling = table.prepare_worker(OWNER, initial, resources(3, 2))?;
+    table.start_worker(OWNER, initial, sibling)?;
+    table.yield_running(OWNER, initial)?;
+    table.dispatch(OWNER, sibling)?;
+    let before = (table.snapshot(OWNER, worker)?, table.usage(OWNER));
+    assert_eq!(
+        table.start_worker(OWNER, sibling, worker),
+        Err(ThreadError::InvalidState)
+    );
+    assert_eq!(
+        table.abort_worker(OWNER, sibling, worker),
+        Err(ThreadError::InvalidState)
+    );
+    assert_eq!((table.snapshot(OWNER, worker)?, table.usage(OWNER)), before);
+    table.yield_running(OWNER, sibling)?;
+    table.dispatch(OWNER, initial)?;
+    assert_eq!(
+        table.validate_prepared_child(OWNER, initial, initial),
+        Err(ThreadError::InvalidState)
+    );
+    table.abort_worker(OWNER, initial, worker)?;
+    assert_eq!(
+        table.start_worker(OWNER, initial, worker),
+        Err(ThreadError::InvalidState)
+    );
+    table.release_resources(OWNER, worker)?;
+    table.reap(OWNER, worker)?;
+    let fresh = table.prepare_worker(OWNER, initial, resources(2, 2))?;
+    assert_eq!(worker.slot(), fresh.slot());
+    assert_ne!(worker.generation(), fresh.generation());
+    assert_eq!(
+        table.start_worker(OWNER, initial, worker),
+        Err(ThreadError::Stale)
+    );
+    assert_eq!(
+        table.abort_worker(OWNER, initial, worker),
+        Err(ThreadError::Stale)
+    );
+    table.start_worker(OWNER, initial, fresh)?;
+    assert_eq!(
+        table.abort_worker(OWNER, initial, fresh),
+        Err(ThreadError::InvalidState)
+    );
+    table.stop_process(OWNER)?;
+    assert_eq!(
+        table.validate_prepared_child(OWNER, initial, fresh),
+        Err(ThreadError::Stopping)
+    );
+    Ok(())
+}
+
+#[test]
 fn native_preparation_rechecks_role_charge_state_stop_and_incarnation() -> Result<(), ThreadError> {
     let (mut table, initial, worker) = setup()?;
     let before = (table.usage(OWNER), table.metadata_bytes());

@@ -424,7 +424,42 @@ impl ThreadTable {
         if self.process(owner)?.stopping {
             return Err(ThreadError::Stopping);
         }
+        // Publish initialization before any native first-entry acquire. The
+        // table remains exclusively borrowed; this does not add SMP support.
+        core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
         self.transition(owner, id, ThreadState::Prepared, ThreadState::Ready)
+    }
+
+    /// Publish only the current creator's exact prepared worker.
+    ///
+    /// Native composition validates complete readiness before this transition.
+    ///
+    /// # Errors
+    /// Rejects stale, stopped, wrong-creator or no-longer-prepared records.
+    pub fn start_worker(
+        &mut self,
+        owner: ProcessId,
+        creator: ThreadId,
+        target: ThreadId,
+    ) -> Result<(), ThreadError> {
+        self.validate_prepared_child(owner, creator, target)?;
+        self.start(owner, target)
+    }
+
+    /// Revoke only the current creator's exact prepared worker.
+    ///
+    /// This grants no physical reclamation or logical resource refund.
+    ///
+    /// # Errors
+    /// Rejects stale, stopped, wrong-creator or no-longer-prepared records.
+    pub fn abort_worker(
+        &mut self,
+        owner: ProcessId,
+        creator: ThreadId,
+        target: ThreadId,
+    ) -> Result<(), ThreadError> {
+        self.validate_prepared_child(owner, creator, target)?;
+        self.abort_prepared(owner, target)
     }
 
     /// Revoke an unstarted preparation without prematurely releasing its pages.
@@ -789,6 +824,31 @@ impl ThreadTable {
             || record.snapshot.resources_released
             || record.creator.is_none() != initial
             || record.resources.pages != pages
+        {
+            return Err(ThreadError::InvalidState);
+        }
+        Ok(())
+    }
+
+    /// Validate a current creator's private preparation before Start or Abort.
+    ///
+    /// Initial records have no creator and cannot satisfy this wire-operation
+    /// check. Trusted initial admission and teardown use separate methods.
+    ///
+    /// # Errors
+    /// Rejects stale/foreign, stopped, busy or non-running creators and targets
+    /// that are not an unreleased Prepared child of this exact creator lifetime.
+    pub fn validate_prepared_child(
+        &self,
+        owner: ProcessId,
+        creator: ThreadId,
+        target: ThreadId,
+    ) -> Result<(), ThreadError> {
+        self.validate_running(owner, creator)?;
+        let record = self.record(owner, target)?;
+        if record.creator != Some(creator)
+            || record.snapshot.state != ThreadState::Prepared
+            || record.snapshot.resources_released
         {
             return Err(ThreadError::InvalidState);
         }

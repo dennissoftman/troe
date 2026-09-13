@@ -7,6 +7,7 @@ use troe_task::{
 };
 
 mod abort;
+mod creation;
 mod exit;
 
 struct Harness {
@@ -299,29 +300,31 @@ fn current_observe_and_stop_use_captured_caller_and_live_target() -> Result<(), 
 }
 
 #[test]
-fn unimplemented_lifecycle_operations_do_not_publish_or_change_state() -> Result<(), ()> {
+fn creation_dispatch_does_not_publish_without_owned_native_completion() -> Result<(), ()> {
     let mut h = Harness::new()?;
     let token = h.create(0, Request::Current)?;
     let before = h
         .threads
         .snapshot(h.ids[0].process(), h.ids[0])
         .map_err(|_| ())?;
-    for request in [
+    let Progress::Preparing(_) = h.run(
+        0,
         Request::Prepare {
             entry_offset: 0,
             argument: u64::MAX,
             stack_pages: 1,
         },
-        Request::Start(token),
-    ] {
-        h.response(0, request, Outcome::Unsupported)?;
-        assert_eq!(
-            h.threads
-                .snapshot(h.ids[0].process(), h.ids[0])
-                .map_err(|_| ())?,
-            before
-        );
-    }
+    )?
+    else {
+        return Err(());
+    };
+    h.response(0, Request::Start(token), Outcome::InvalidState)?;
+    assert_eq!(
+        h.threads
+            .snapshot(h.ids[0].process(), h.ids[0])
+            .map_err(|_| ())?,
+        before
+    );
     h.response(1, Request::CreateCondition, Outcome::InvalidState)?;
     assert_eq!(h.sync.usage(h.ids[0].process()), (0, 0));
     Ok(())

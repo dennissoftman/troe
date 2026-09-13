@@ -436,7 +436,8 @@ execute an operation, bind it to a native continuation or publish a startup gran
 the trusted process record's task principal. Consuming the operation validates a
 running caller with no unconsumed policy wait, then executes Current, Observe,
 RequestStop, Join, Detach, Sleep, Exit, Abort or any synchronization operation
-against the paired tables. Prepare and Start return Unsupported. Expected
+against the paired tables. Prepare and Start return owned actions for native
+initialization and readiness checks before completion. Expected
 failures produce canonical request-correlated outcomes; clock/configuration/invariant failures require
 process termination and must not replay the request. A suspended operation owns
 its original request, caller and exact wait generation without retaining a table
@@ -452,7 +453,9 @@ reply. Composition removes the native continuation before consuming the action
 to publish its retained scalar; physical resource acknowledgement remains later.
 Essential-mutex abandonment requires whole-process stop. Initial-thread exit
 leaves surviving siblings live; last-thread completion and process fate remain
-composition responsibilities. Abort first wins the Prepared-to-Revoked transition
+composition responsibilities. Start and Abort require an unreleased Prepared
+worker created by the exact current caller. Initial records and another creator's
+preparations fail without mutation. Abort first wins the Prepared-to-Revoked transition
 and returns an owned `Aborting` action. Native composition retains the caller's
 separate execution claim, removes the target, zeroes/reclaims its physical owners
 and acknowledges resources. Finishing the action requires a running caller and
@@ -636,6 +639,26 @@ Both retain a separate private descriptor. The initial header's descriptor
 reference is valid for initial bootstrap until that thread's resources are
 reclaimed; it is not a permanent descriptor lookup for siblings. Shared
 arguments and capability descriptors keep their process lifetime.
+`Preparing` retains the copied request and, after complete native reservation,
+its exact logical target and page charge. It cannot reserve twice. Native
+`complete_preparation` matches its live caller claim, never-executed admitted
+context, IPC binding and descriptor to the copied image offset, argument and
+stack size before producing a token. The image base comes from trusted retained
+image metadata. This does not set Ready. Before logical reservation, rejection
+requires releasing any unpublished physical backing. After reservation, an owned
+rollback revokes the target and requires native/physical reclamation, resource
+acknowledgement and exact reaping before a failure reply. A partial mapping stops
+the whole process instead. Dropping an action performs no refund or reply.
+`Starting` defers Ready publication until `complete_start` has matched the caller
+claim and complete native target. It rechecks creator ownership and Prepared state
+under the same exclusive table borrow, then publishes initialization with release
+ordering. The child may run before the creator observes the reply; a later reply
+failure stops further process execution. `resume_scheduled` requires a Running
+policy record with no retained policy completion and uses its native Yield or
+Timeslice state. First entry acquires initialization; unresolved calls need their
+own completion path. This adds no CPU entitlement or deadline renewal and is not
+an SMP scheduling contract. Production ownership and event/process-share policy
+remain separate from these completion mechanisms.
 The first mapped initial thread binds one uniquely mapped shared-header page to
 the native root. Admission rejects physical aliases of that page and requires
 every worker to use the same header even after the initial thread is retired.
