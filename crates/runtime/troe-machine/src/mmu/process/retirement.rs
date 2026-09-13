@@ -6,7 +6,7 @@ use crate::mmu::{
     retirement::{self, Backing},
 };
 use troe_memory::{PhysicalRange, VirtualRange};
-use troe_task::thread::ThreadId;
+use troe_task::thread::{ThreadId, ThreadState, ThreadTable};
 
 /// Borrowed extents from the exact thread's retained kernel frame reservations.
 ///
@@ -33,14 +33,14 @@ pub struct NativeThreadBacking<'a> {
 #[derive(Debug, Eq, PartialEq)]
 #[must_use = "Reclaim the retained physical owners before acknowledging thread resources"]
 pub struct NativeThreadRetirement {
-    caller: ThreadId,
+    thread: ThreadId,
     ordinary_pages: u64,
 }
 impl NativeThreadRetirement {
     /// Exact retired process-scoped incarnation.
     #[must_use]
-    pub const fn caller(&self) -> ThreadId {
-        self.caller
+    pub const fn thread(&self) -> ThreadId {
+        self.thread
     }
 
     /// Stack, TLS and private startup pages; excludes the two boot-arena IPC pages.
@@ -51,6 +51,47 @@ impl NativeThreadRetirement {
 }
 
 impl NativeProcessContext {
+    /// Remove a fully bound, never-executed context after logical revocation.
+    ///
+    /// Composition must first win prepared Abort or creator-exit revocation in
+    /// the paired lifecycle table. `started == false` alone is insufficient:
+    /// logical Start may already have published a runnable thread. This call
+    /// rechecks the exact live Revoked record and retained resource charge while
+    /// borrowing that table, then applies the same complete backing/alias checks
+    /// and native quiescence contract as [`Self::retire_thread`]. It neither
+    /// refunds logical charges nor completes the separate caller's Abort request.
+    ///
+    /// # Errors
+    /// Rejects non-revoked, released, stale, executed or captured targets before
+    /// writes. A failure after mutation stops the complete native process and
+    /// retains its backing until root teardown.
+    pub fn discard_revoked(
+        &mut self,
+        threads: &ThreadTable,
+        target: ThreadId,
+        backing: NativeThreadBacking<'_>,
+    ) -> Result<NativeThreadRetirement, MmuError> {
+        let snapshot = threads
+            .snapshot(self.process, target)
+            .map_err(|_| MmuError::InvalidUserContext)?;
+        if snapshot.state != ThreadState::Revoked || snapshot.resources_released {
+            return Err(MmuError::InvalidUserContext);
+        }
+        let index = self
+            .contexts
+            .iter()
+            .position(|context| context.id == target)
+            .ok_or(MmuError::InvalidUserContext)?;
+        let context = &self.contexts[index];
+        if context.started
+            || context.scheduler_operation.is_some()
+            || !matches!(context.pending, super::ApplicationPending::Timeslice)
+        {
+            return Err(MmuError::InvalidUserContext);
+        }
+        self.retire_index(index, backing, crate::mmu::architecture_unmap_page)
+    }
+
     /// Consume a claimed Exit after trusted lifecycle and owner-death checks.
     ///
     /// Requires an inactive untagged root. Validates complete physical backing,
@@ -108,7 +149,7 @@ impl NativeProcessContext {
         &mut self,
         execution: &NativeSchedulerExecution,
         backing: NativeThreadBacking<'_>,
-        mut unmap: impl FnMut(u64, u64) -> Result<u64, MmuError>,
+        unmap: impl FnMut(u64, u64) -> Result<u64, MmuError>,
     ) -> Result<NativeThreadRetirement, MmuError> {
         if !matches!(execution.request(), troe_abi::threading::Request::Exit(_))
             || self.backing.address_space.tag.is_some()
@@ -116,9 +157,24 @@ impl NativeProcessContext {
             return Err(MmuError::InvalidUserContext);
         }
         let index = self.scheduler_index(execution.operation, true)?;
+        self.retire_index(index, backing, unmap)
+    }
+
+    // All entry points share read-only preflight and terminal mutation failure handling.
+    #[allow(clippy::too_many_lines)]
+    fn retire_index(
+        &mut self,
+        index: usize,
+        backing: NativeThreadBacking<'_>,
+        mut unmap: impl FnMut(u64, u64) -> Result<u64, MmuError>,
+    ) -> Result<NativeThreadRetirement, MmuError> {
+        if self.stopped || self.backing.address_space.tag.is_some() {
+            return Err(MmuError::InvalidUserContext);
+        }
         let context = &self.contexts[index];
+        let target = context.id;
         let start = context.start;
-        let ipc = context.ipc.ok_or(MmuError::InvalidUserContext)?;
+        let (ipc, _) = self.bound_ipc(target)?;
         let pair = [self.backing.pairs[ipc.index].range()];
         let ipc_range =
             VirtualRange::from_pages(ipc.tx, 2).map_err(|_| MmuError::InvalidUserContext)?;
@@ -212,7 +268,7 @@ impl NativeProcessContext {
         // retain usable translations. Pair Drop zeros before publishing reuse.
         drop(released);
         Ok(NativeThreadRetirement {
-            caller: execution.caller(),
+            thread: target,
             ordinary_pages: pages - 2,
         })
     }

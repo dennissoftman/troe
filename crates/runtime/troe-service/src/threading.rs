@@ -12,6 +12,9 @@ use troe_dispatch::{AuthorizedSchedulerCall, HandleOwner};
 use troe_task::thread::{ThreadError, ThreadId, ThreadState, ThreadTable, control, sync};
 use troe_task::{MonotonicMillis, ProcessSnapshot};
 
+mod abort;
+pub use abort::Aborting;
+
 #[cfg(test)]
 mod tests;
 
@@ -63,6 +66,8 @@ pub enum Progress {
     Waiting(Waiting),
     /// No success reply is possible; finish native retirement or process stop.
     Retiring(Retiring),
+    /// Retain the caller's claim until the aborted preparation is reclaimed.
+    Aborting(Aborting),
 }
 
 /// An admitted Exit after lifecycle and synchronization owner-death policy.
@@ -126,8 +131,9 @@ impl Operation {
 
     /// Consume this operation under exclusive ownership of the paired tables.
     ///
-    /// Supports identity/stop, join/detach/sleep/exit and all synchronization operations.
-    /// Prepare/start/abort return `Unsupported` without changing records. An
+    /// Supports identity/stop, join/detach/sleep/exit, prepared Abort and synchronization.
+    /// Prepare/start return `Unsupported` without changing records. Abort
+    /// retains an owned action until physical reclamation is acknowledged. An
     /// admitted Exit returns an owned terminal action, never a success reply.
     /// Absolute wire deadlines are boot-relative milliseconds; they are never
     /// restarted on resumption. Work and storage are bounded by table capacity.
@@ -160,6 +166,7 @@ impl Operation {
                 operation: self,
                 disposition,
             })),
+            Ok(Effect::Abort(target)) => Ok(Progress::Aborting(Aborting::new(self, target))),
             Err(error) => self
                 .complete(reply(error_outcome(error)?, 0))
                 .map(Progress::Complete),
@@ -242,6 +249,11 @@ impl Operation {
                 return table
                     .begin_exit(threads, owner, caller, now)
                     .map(Effect::Exit);
+            }
+            Request::Abort(token) => {
+                let target = threads.resolve(owner, token.slot() as usize, token.generation())?;
+                threads.abort_prepared(owner, target)?;
+                return Ok(Effect::Abort(target));
             }
             Request::CreateMutex(policy) => {
                 let policy = match policy {
@@ -338,9 +350,7 @@ impl Operation {
                 table.destroy_permit(threads, owner, caller, id)?;
                 reply(Outcome::Success, 0)
             }
-            Request::Prepare { .. } | Request::Start(_) | Request::Abort(_) => {
-                reply(Outcome::Unsupported, 0)
-            }
+            Request::Prepare { .. } | Request::Start(_) => reply(Outcome::Unsupported, 0),
         };
         Ok(Effect::Reply(response))
     }
@@ -474,6 +484,7 @@ enum Effect {
     Wait(WaitKind),
     Identity(Kind, usize, u32),
     Exit(sync::ExitEffect),
+    Abort(ThreadId),
 }
 
 fn reply(outcome: Outcome, value: u64) -> Response {

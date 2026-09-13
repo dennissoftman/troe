@@ -25,6 +25,7 @@ use troe_task::{
     Scheduler, StackResource,
 };
 
+mod abort;
 mod program;
 const STARTUP: u64 = USER_STACK_BASE + 18 * PAGE;
 const ZERO: MonotonicMillis = MonotonicMillis::from_millis(0);
@@ -43,6 +44,10 @@ enum Scenario {
     StartupReference,
     Partial,
     Essential,
+    Abort(u64),
+    AbortAlias,
+    AbortReference,
+    StartWins,
 }
 
 pub(super) fn verify(accounting: &mut OwnedAccounting) -> Result<(), ()> {
@@ -56,6 +61,14 @@ pub(super) fn verify(accounting: &mut OwnedAccounting) -> Result<(), ()> {
         Scenario::StartupReference,
         Scenario::Partial,
         Scenario::Essential,
+        Scenario::Abort(USER_STACK_BASE),
+        Scenario::Abort(USER_STACK_BASE + 6 * PAGE),
+        Scenario::Abort(STARTUP),
+        Scenario::Abort(TX[0]),
+        Scenario::Abort(TX[0] + PAGE),
+        Scenario::AbortAlias,
+        Scenario::AbortReference,
+        Scenario::StartWins,
     ] {
         let free = accounting.frames.free_frames();
         let allocation = allocate_isolated(&mut accounting.frames)?;
@@ -134,7 +147,7 @@ impl Policy {
             ],
         })
     }
-    fn new(table_pages: u64) -> Result<Self, ()> {
+    fn new(table_pages: u64, prepared_worker: bool, abort_authority: bool) -> Result<Self, ()> {
         let mut scheduler = Scheduler::new(1).map_err(|_| ())?;
         let task_id = scheduler
             .spawn(
@@ -154,13 +167,13 @@ impl Policy {
                 handles: 1,
             })
             .map_err(|_| ())?;
-        let authority = ProbeScheduler::with_rights(
-            &processes,
-            owner,
-            troe_dispatch::Rights::CALL
-                .union(troe_dispatch::Rights::THREAD_OBSERVE)
-                .union(troe_dispatch::Rights::THREAD_JOIN),
-        )?;
+        let mut rights = troe_dispatch::Rights::CALL
+            .union(troe_dispatch::Rights::THREAD_OBSERVE)
+            .union(troe_dispatch::Rights::THREAD_JOIN);
+        if abort_authority {
+            rights = rights.union(troe_dispatch::Rights::THREAD_START);
+        }
+        let authority = ProbeScheduler::with_rights(&processes, owner, rights)?;
         let mut threads = ThreadTable::new(1, 2, 9, METADATA_LIMIT).map_err(|_| ())?;
         threads
             .register_process(
@@ -192,7 +205,9 @@ impl Policy {
                 },
             )
             .map_err(|_| ())?;
-        threads.start(owner, worker).map_err(|_| ())?;
+        if !prepared_worker {
+            threads.start(owner, worker).map_err(|_| ())?;
+        }
         threads.yield_running(owner, initial).map_err(|_| ())?;
         let mut sync = sync::SyncTable::new(1, 1, 1, METADATA_LIMIT).map_err(|_| ())?;
         sync.register_process(
@@ -290,7 +305,7 @@ fn mappings(
     .map_err(|_| ())?;
     starts[0].startup = STARTUP;
     starts[0].private_startup = Some(startup);
-    if matches!(scenario, Scenario::Alias) {
+    if matches!(scenario, Scenario::Alias | Scenario::AbortAlias) {
         plan.insert(user(
             VirtualRange::from_pages(STARTUP + 3 * PAGE, 1).map_err(|_| ())?,
             PhysicalRange::from_pages(worker.start() + PAGE, 1).map_err(|_| ())?,
@@ -298,7 +313,10 @@ fn mappings(
         )?)
         .map_err(|_| ())?;
     }
-    if matches!(scenario, Scenario::StartupReference) {
+    if matches!(
+        scenario,
+        Scenario::StartupReference | Scenario::AbortReference
+    ) {
         starts[1].startup = starts[0].tls.start();
     }
     Ok((plan, starts))
@@ -324,6 +342,8 @@ fn scripts(
     worker: PhysicalRange,
     policy: &Policy,
     fault: u64,
+    abort: bool,
+    start_wins: bool,
 ) -> Result<(), ()> {
     troe_machine::zero_physical_range(worker).map_err(|_| ())?;
     let token = Token::new(
@@ -332,12 +352,16 @@ fn scripts(
         policy.ids[0].generation(),
     )
     .map_err(|_| ())?;
-    let join = Request::Join {
-        thread: token,
-        wait: WaitMode::Wait(Wait {
-            deadline: None,
-            observe_stop: true,
-        }),
+    let join = if abort {
+        Request::Abort(token)
+    } else {
+        Request::Join {
+            thread: token,
+            wait: WaitMode::Wait(Wait {
+                deadline: None,
+                observe_stop: true,
+            }),
+        }
     };
     let current = Response {
         outcome: Outcome::Success,
@@ -345,8 +369,12 @@ fn scripts(
         snapshot: None,
     };
     let joined = Response {
-        outcome: Outcome::Success,
-        value: u64::MAX,
+        outcome: if start_wins {
+            Outcome::InvalidState
+        } else {
+            Outcome::Success
+        },
+        value: if abort { 0 } else { u64::MAX },
         snapshot: None,
     };
     let exit = Request::Exit(u64::MAX);
@@ -402,14 +430,19 @@ fn run_case(
         scenario,
     )?;
     let root = troe_machine::build_user_address_space(&plan, allocation.tables).map_err(|_| ())?;
-    let mut policy = Policy::new(root.stats().table_pages)?;
+    let is_abort = matches!(
+        scenario,
+        Scenario::Abort(_) | Scenario::AbortAlias | Scenario::AbortReference | Scenario::StartWins
+    );
+    let start_wins = matches!(scenario, Scenario::StartWins);
+    let mut policy = Policy::new(root.stats().table_pages, is_abort && !start_wins, is_abort)?;
     let owner = policy.ids[0].process();
-    let fault = if let Scenario::Retire(address) = scenario {
+    let fault = if let Scenario::Retire(address) | Scenario::Abort(address) = scenario {
         address
     } else {
         STARTUP
     };
-    scripts(allocation, worker, &policy, fault)?;
+    scripts(allocation, worker, &policy, fault, is_abort, start_wins)?;
     let mut native = NativeProcessContext::with_backing(
         owner,
         NativeProcessBacking::new(root, pairs),
@@ -445,6 +478,19 @@ fn run_case(
         tls: &tls,
         startup: &startup,
     };
+    if is_abort {
+        return abort::run(
+            accounting,
+            retained,
+            abort::Fixture {
+                native,
+                policy,
+                starts,
+                identities,
+                scenario,
+            },
+        );
+    }
     let (peer_call, peer, current) = policy.capture(&mut native, 1)?;
     policy
         .threads
@@ -553,7 +599,7 @@ fn run_case(
         }
     } else {
         let retired = native.retire_thread(exit, backing).map_err(|_| ())?;
-        if retired.caller() != policy.ids[0]
+        if retired.thread() != policy.ids[0]
             || retired.ordinary_pages() != 3
             || native.stats().mapped_pages != charges.mapped_pages - 5
             || native.stats().table_pages != charges.table_pages
@@ -633,7 +679,7 @@ fn run_case(
         }
         if policy
             .threads
-            .release_resources(owner, retired.caller())
+            .release_resources(owner, retired.thread())
             .map_err(|_| ())?
             .pages
             != 5

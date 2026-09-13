@@ -41,8 +41,8 @@ does not execute or correlate a native operation.
 
 The portable `troe-service::threading` operation dispatcher binds this owned
 authorization to the captured caller and trusted process snapshot. It executes
-Current, Observe, RequestStop, Join, Detach, Sleep, Exit and all interface 31 operations
-against the paired tables; Prepare, Start and Abort return Unsupported.
+Current, Observe, RequestStop, Join, Detach, Sleep, Exit, Abort and all interface 31
+operations against the paired tables; Prepare and Start return Unsupported.
 A new operation requires a running caller with no unconsumed policy wait. Waiting owns
 the original request and exact wait generation, with no table borrow or user
 pointer. Clock/configuration failures require process termination rather than
@@ -83,6 +83,14 @@ reaping. The portable Exit action owns its authenticated caller, captured scalar
 and owner-death disposition. Consuming it publishes logical completion only
 after native retirement; it acknowledges no resources. Essential-mutex
 abandonment instead requires process stop, with no thread completion or reply.
+Abort wins logical revocation only for a Prepared target and retains an owned
+reclamation action. The native discard path rechecks that live Revoked state,
+unreleased resources and a never-executed context before applying the same
+backing/alias preflight. The caller keeps its separate captured execution claim.
+After physical reclamation and resource acknowledgement, finishing the action
+reaps the exact retained target and returns a canonical success with value zero.
+Start winning first rejects Abort even if the target has not yet executed.
+Early finish, caller stop or a stale/reused target cannot publish late success.
 
 ## Requests
 

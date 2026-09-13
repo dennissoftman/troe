@@ -6,6 +6,7 @@ use troe_task::{
     StackResource,
 };
 
+mod abort;
 mod exit;
 
 struct Harness {
@@ -312,7 +313,6 @@ fn unimplemented_lifecycle_operations_do_not_publish_or_change_state() -> Result
             stack_pages: 1,
         },
         Request::Start(token),
-        Request::Abort(token),
     ] {
         h.response(0, request, Outcome::Unsupported)?;
         assert_eq!(

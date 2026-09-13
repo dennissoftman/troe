@@ -90,7 +90,11 @@ never executes the ordinary application.
   root teardown. Success erases the register record in place and releases only
   the unmapped IPC pair; ordinary physical owners must still zero/reclaim frames
   before logical resource acknowledgement or a join result becomes available.
-  Untagged single-CPU execution flushes translations at native boundaries;
+  Untagged single-CPU execution flushes translations at native boundaries.
+  Discarding a never-executed preparation additionally rechecks its live Revoked
+  lifecycle record and unreleased resources; a Ready thread cannot be discarded
+  merely because it has not executed. Both retirement paths share preflight and
+  terminal mutation-failure handling;
 - tasks and process records: at most 65,536, with monotonic identities, explicit
   capabilities, deterministic lifecycle accounting, fallible metadata growth,
   and guarded native stack payloads. Portable thread and synchronization lookup
@@ -111,7 +115,11 @@ never executes the ordinary application.
   no success reply and cannot acknowledge memory. Native retirement precedes
   scalar completion, physical reclamation precedes Join readiness, and essential
   owner death requires process stop. Prepared children retain charges until
-  their backing is reclaimed.
+  their backing is reclaimed. Abort wins Prepared-to-Revoked before returning an
+  owned action; its target remains retained until physical reclamation and resource
+  acknowledgement. Only then can a running caller finish the action, reap that
+  exact target and publish its checked reply. Stopping or target reuse rejects
+  late completion without affecting another incarnation.
   Internal clock/configuration failures require process stop without replay.
   Native execution claims and retained operation storage remain separately owned
   and charged by composition; ordinary package grants remain disabled;
