@@ -387,7 +387,8 @@ described below.
 
 `troe-dispatch` connects selected clients and services. A port names
 one registered service; a generation-checked handle names explicit call
-authority to that port. Port and handle tables grow fallibly from small initial
+authority to a service port or a closed built-in scheduler target. Port and handle
+tables grow fallibly from small initial
 reservations to hard ceilings of 65,536 ports and 262,144 handles, and stale
 identities remain invalid when slots are reused. One synchronous request
 borrows at most 4 KiB of immutable input and produces at most 4 KiB of owned
@@ -395,6 +396,18 @@ reply bytes with a matching monotonic request ID and typed service status.
 Because the dispatcher is exclusively borrowed for delivery, it has no
 queued cancellation state: closing before a call invalidates the handle, and a
 delivered call completes before another mutation can occur.
+
+`SchedulerInterface` identifies only the built-in control and synchronization
+interfaces at version 1.0. Trusted composition can mint these handles for a
+nonzero isolated process principal. They share service handle capacity,
+generation retirement and owner revocation, but consume no service port.
+`authorize_scheduler_owned_abi` checks the live owner/target, exact copied request
+and every required operation right, returning an owned `AuthorizedSchedulerCall`.
+Authorization performs no allocation or callback and retains no table/request
+borrow. Closing prevents later admission; it does not cancel an already owned
+admission result. Service dispatch rejects built-in targets, and a service handle
+cannot become a scheduler target through its payload. This mechanism does not
+execute an operation, bind it to a native continuation or publish a startup grant.
 
 Native console output uses `ConsoleService` to convert a
 bounded write request into the existing `Output` operation, while

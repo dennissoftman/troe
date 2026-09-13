@@ -11,7 +11,7 @@ pub struct PortId {
     pub(crate) generation: u32,
 }
 
-/// Opaque generation-checked authority to call one service port.
+/// Opaque generation-checked authority to one service or built-in scheduler target.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Handle {
     pub(crate) slot: u32,
