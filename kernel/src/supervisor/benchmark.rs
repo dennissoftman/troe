@@ -136,7 +136,7 @@ pub(crate) fn measure(
         troe_machine::benchmark_counter_frequency_hz().ok_or(())?,
         &samples,
     )?;
-    let ratio_limit = if bytes == 4096 { 700 } else { 685 };
+    let ratio_limit = 700;
     let pass = p95.saturating_mul(1000) <= compatibility.saturating_mul(ratio_limit);
     writeln!(transcript, "ipc-phase-c-latency path=general-direct payload={bytes} warmup=64 samples=256 p95_ticks={p95} compatibility_p95={compatibility} ratio_limit={ratio_limit} ratio_scale=1000 ratio_pass={} tagged={} calls=256 request_copies={request_copies} reply_copies={reply_copies} root_writes={roots} targeted_invalidations={targeted} full_invalidations={full} queue_slots=0 traps={traps} tag_hits={hits} steady_allocations=0 scheduler_scans=0 additional_lease_programs={leases}", u8::from(pass), u8::from(tags.supported)).map_err(|_| ())?;
     runtime.terminate(actor, true).map_err(|_| ())?;

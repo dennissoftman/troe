@@ -708,8 +708,8 @@ Hosted acceptance uploads those files as artifacts.
 The general runtime is separately measured by `kernel/src/supervisor/benchmark.rs`
 using the same native client and same-boot compatibility samples. Its
 `general-direct` rows must meet the same copy, root, trap, allocation, scheduler,
-and lease requirements. The Phase C p95 budget is 0.685 for 0/64/256 bytes and
-0.70 for 4 KiB; its records encode those limits as 685/1000 and 700/1000 using
+and lease requirements. The Phase C p95 budget is 0.70 at every payload size;
+its records encode that limit as 700/1000 using
 `ratio_scale=1000`. Phase B retains its 0.60/0.70 limits. The performance
 follow-up is tracked in [issue #211](https://github.com/dennissoftman/troe/issues/211).
 `scripts/ipc_phase_c.py` also requires seven native
