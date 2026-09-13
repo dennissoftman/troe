@@ -51,7 +51,7 @@ pub struct ProcessMemoryBudget {
     pub ipc_pairs: u64,
     /// Complete initial-thread TLS mapping, including control bytes and padding.
     pub tls_pages: u64,
-    /// Page-owned immutable initializer backing, independent of image and TLS.
+    /// Page-rounded immutable initializer backing, independent of image and TLS.
     pub template_pages: u64,
     /// Complete executable bytes simultaneously retained for verification.
     pub staging_bytes: u64,
@@ -68,6 +68,8 @@ pub enum ProcessMemoryError {
     Overlap,
     /// Checked address, byte or page arithmetic overflowed.
     ArithmeticOverflow,
+    /// Actual backing would undercharge the canonical initializer or staging.
+    InvalidBacking,
     /// TLS layout cannot fit the requested initial-thread allowance.
     Tls(tls_artifact::Error),
     /// Initial thread geometry is invalid.
@@ -97,6 +99,7 @@ impl fmt::Display for ProcessMemoryError {
             Self::InvalidHeapCapacity => "heap reservation violates the initial commit or limit",
             Self::Overlap => "shared process and initial-thread reservations overlap",
             Self::ArithmeticOverflow => "process memory arithmetic overflow",
+            Self::InvalidBacking => "actual TLS backing is below its canonical charge",
             Self::Tls(error) => return error.fmt(formatter),
             Self::Thread(error) => return error.fmt(formatter),
             Self::MappedPageBudget => "process mappings exceed their page budget",
@@ -163,8 +166,9 @@ impl ProcessMemoryRegion {
 
 /// Checked whole-process memory charges; excludes native/runtime metadata.
 ///
-/// These counts assume dedicated page backing for the initializer and staged
-/// executable. Allocator overhead, package metadata and extra verification or
+/// Canonical counts round initializer and executable backing separately to pages.
+/// Owned loading also includes their actual retained buffer capacities.
+/// Allocator overhead, package metadata and extra verification or
 /// I/O buffers are separate charges. Staging remains charged until its owner is
 /// actually released; execution starting alone does not justify a refund.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -221,7 +225,7 @@ impl ProcessMemoryCharges {
     pub const fn staging_bytes(self) -> u64 {
         self.staging_bytes
     }
-    /// Dedicated staging pages, rounded up independently of the initializer.
+    /// Staging backing pages, including retained capacity in an owned load.
     #[must_use]
     pub const fn staging_pages(self) -> u64 {
         self.staging_pages
@@ -468,6 +472,37 @@ impl ProcessMemoryPlan {
     #[must_use]
     pub const fn charges(&self) -> ProcessMemoryCharges {
         self.charges
+    }
+
+    // Owned loading must charge actual retained capacity, not only artifact
+    // lengths. Update atomically after checking every derived count and budget.
+    pub(crate) fn charge_backing(
+        &mut self,
+        template_pages: u64,
+        staging_pages: u64,
+        budget: ProcessMemoryBudget,
+    ) -> Result<(), ProcessMemoryError> {
+        if template_pages < self.charges.template_pages
+            || staging_pages < self.charges.staging_pages
+        {
+            return Err(ProcessMemoryError::InvalidBacking);
+        }
+        let charges = ProcessMemoryCharges {
+            template_pages,
+            staging_pages,
+            ..self.charges
+        };
+        let peak = add(
+            add(
+                add(charges.mapped_pages(), charges.table_pages)?,
+                template_pages,
+            )?,
+            staging_pages,
+        )?;
+        page_bytes(peak)?;
+        budget.check(charges)?;
+        self.charges = charges;
+        Ok(())
     }
 
     /// Compose the initial descriptor with zero worker entry/argument fields.

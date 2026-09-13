@@ -15,9 +15,12 @@ mod startup;
 pub mod static_tls;
 mod stream;
 #[cfg(test)]
+mod test_support;
+#[cfg(test)]
 mod tests;
 pub mod thread_memory;
 pub mod tls_artifact;
+pub mod tls_owner;
 mod transaction;
 
 pub use troe_abi::{ABI_MAJOR, ABI_MINOR};

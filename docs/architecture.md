@@ -344,6 +344,26 @@ not a native load plan or owner: package/I/O staging, allocator overhead,
 architecture kernel mapping tables and context/runtime metadata are separate.
 Native loading does not consume this plan or admit ABI 1.4.
 
+`troe-application::tls_owner` takes ownership of a staged executable buffer,
+validates its coherent contents, and creates an independent immutable initializer.
+`TlsBackingAccount` reserves page-rounded buffer capacity across all live owners,
+including spare capacity. Initializer pages are reserved before fallible allocation;
+actual capacity is then checked against the shared account and process peak budgets
+before initialization. Failure drops provisional buffers before refunding their
+charges. The composed plan retains the actual staging/initializer capacities.
+
+`StagedTlsImage` retains the executable while image consumers borrow it. Consuming
+`release_staging` requires those borrows to end and transfers the initializer to
+`ProcessTls` without releasing its charge. TLS copies use the stored compiler layout
+and immutable source, initialize the entire destination, and expose no initializer
+pointer or mutable access. Copies are synchronous and run no callbacks. Stopping
+creation requires exclusive access, permanently rejects new copies and retains
+storage/charges until drop. The account is not `Sync`; this is serialized ownership.
+These are logical heap-buffer charges, with allocator overhead/transient backing
+and inline metadata accounted separately. Rust borrows establish copy-reader
+quiescence, not native context quiescence. Native loaders still do not consume
+these owners; heap drop does not certify physical zeroization or native admission.
+
 `troe-abi::threading` provides closed request/response and immutable startup
 descriptor codecs for assigned interfaces 30/31 and entry 6. The
 [wire contract](formats/thread-v1.md) separates scheduler outcomes from IPC

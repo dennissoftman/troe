@@ -197,6 +197,18 @@ Maximum 16 TiB heap and stack requests exercise bounded work without allocating
 their backing. Tests account for architecture-specific empty-TLS padding and
 prove native loaders continue to reject the artifact after successful preflight.
 
+`cargo test -p troe-application tls_owner::` checks owned staging and immutable
+initializer lifetimes, reservation-before-allocation, malformed input and injected
+allocation failure, actual-capacity rejection/charges, failed-update rollback,
+overflow and competing retained owners. Stop is permanent and refunds nothing
+until drop. Both compiler layouts initialize from the original template after
+staging release and after other image/TLS copies change; bad destinations remain
+untouched. The tests distinguish zero initialized bytes from a nonempty compiler
+TLS mapping and verify cleared destination slack. Compile-fail examples reject
+releasing staging with a live artifact borrow and sharing the account as `Sync`.
+These are portable buffer-lifetime checks, not native frame-reuse or context
+quiescence evidence.
+
 `cargo test -p troe-abi --lib threading::` checks every operation, exact wire
 lengths and reserved bytes, typed token/generation boundaries, deadline tags,
 response correlation and ownership-sensitive outcomes. Adversarial bit mutations
