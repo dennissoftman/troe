@@ -51,6 +51,25 @@ else:
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ALL_QEMU_SCENARIOS = DEFAULT_SCENARIOS
+# These boundaries require the hosted gate's explicit KVM profiles as well as
+# all emulated platforms; the focused QEMU command alone does not select KVM.
+NATIVE_THREAD_GATE_PATHS = frozenset(
+    (
+        "crates/runtime/troe-service/src/threading.rs",
+        "crates/runtime/troe-task/src/thread.rs",
+        "crates/runtime/troe-dispatch/src/scheduler.rs",
+        "crates/runtime/troe-machine/src/mmu/process.rs",
+        "crates/runtime/troe-machine/src/mmu/retirement.rs",
+        "kernel/src/memory/shared_context_probe.rs",
+    )
+)
+NATIVE_THREAD_GATE_PREFIXES = (
+    "crates/runtime/troe-service/src/threading/",
+    "crates/runtime/troe-task/src/thread/",
+    "crates/runtime/troe-machine/src/mmu/process/",
+    "crates/runtime/troe-machine/src/mmu/retirement/",
+    "kernel/src/memory/shared_context_probe/",
+)
 NETWORK_APPS = frozenset(("arp", "dhcp", "net", "ping", "tcp", "udp"))
 FILESYSTEM_APPS = frozenset(
     (
@@ -494,6 +513,13 @@ def build_plan(
         path_text = path.as_posix()
         if path_text in FULL_GATE_PATHS or path_text.startswith(".github/workflows/"):
             plan.require_full(path, "global verification or dependency policy changed")
+            continue
+        if path_text in NATIVE_THREAD_GATE_PATHS or path_text.startswith(
+            NATIVE_THREAD_GATE_PREFIXES
+        ):
+            plan.require_full(
+                path, "native threading requires every hosted execution profile"
+            )
             continue
 
         # `changed_paths` reports deletions and, under `--no-renames`, the old

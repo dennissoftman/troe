@@ -38,6 +38,11 @@ selects that package and all transitive workspace consumers. Shared KEX SDK or
 tool changes select every app on both targets. An unknown path, dependency
 policy change, workflow change, or test-runner change fails closed to
 `python3 scripts/test.py`.
+Native thread lifecycle, synchronization, built-in scheduler authorization,
+native context/retirement and shared-context probe changes also select the full
+gate. Hosted verification therefore includes the separate x86 KVM profiles in
+addition to all four emulated platforms; a focused QEMU command does not supply
+that hardware-tagging coverage.
 
 The exhaustive runner gives image generation a single owner. Production and
 acceptance variants use `scripts/build.py --all-variants`, which creates shared
