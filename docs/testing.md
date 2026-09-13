@@ -110,7 +110,8 @@ publication or count changes.
 
 `cargo test -p troe-service threading::` exercises authenticated operation binding,
 captured Current identities, live Observe/RequestStop targets, owned Join/Sleep
-waits, Detach, terminal Exit actions and canonical Unsupported prepare/start/abort replies.
+waits, Detach, terminal Exit actions, owned Abort reclamation and canonical
+Unsupported prepare/start replies.
 It covers foreign/stale/wrong-kind identities,
 authority revocation after admission, caller-state checks, pending completion
 interlocks, condition notification/timeout/stop with mutex reacquisition, poison
@@ -120,7 +121,11 @@ original request codec; wait completion cannot execute the request again. Exit
 checks include initial/worker/last-thread retirement, full-width result retention,
 quiescence-gated Join, prepared-child revocation without early refunds, pending
 completion interlocks, handle revocation, late completion after process stop or
-reaping, and clock rejection before essential owner-death effects.
+reaping, and clock rejection before essential owner-death effects. Abort tests
+cover retained charges and target identity before acknowledgement, early and
+non-running completion, a Start winner before first execution, foreign/busy
+callers, process stop and premature target reaping/reuse. Compile-fail doctests
+require non-cloneable Exit and Abort actions.
 
 Metadata checks compare the compiled inline/array layouts with retained vector
 capacities, test exact-byte and one-byte-short budgets, reject invalid counts
@@ -698,6 +703,16 @@ the owned operation dispatcher; its terminal action must match the native claim.
 An essential-mutex abandonment case stops the whole process without individual
 mapping removal or a reply, retains IPC until root teardown, and rejects late
 sibling completion.
+Prepared Abort probes reject native discard while the target remains Prepared
+or Ready, then retain the caller's claimed operation through the successful
+logical revocation, native removal and physical zero/free. They reject early
+reply completion, verify sibling context/IPC compaction, pair generation/zeroing
+and unchanged process metadata/table charges, then reap the acknowledged target
+before publishing the reply. Five cases require hardware denial of retired
+stack/TLS/startup/TX/RX reads after the user has checked both replies. The
+Start-wins case verifies the target remains mapped before any target execution;
+alias and startup-reference cases reject removal without mutation and prevent
+late success after process stop. Every case restores physical/logical accounting.
 These native mechanism checks do not establish threaded package
 admission, process-share scheduling, compiler TLS initialization or C/CPython
 thread safety.

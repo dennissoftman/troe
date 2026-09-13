@@ -435,8 +435,8 @@ execute an operation, bind it to a native continuation or publish a startup gran
 `troe-service::threading` binds an owned authorization to the captured caller and
 the trusted process record's task principal. Consuming the operation validates a
 running caller with no unconsumed policy wait, then executes Current, Observe,
-RequestStop, Join, Detach, Sleep, Exit or any synchronization operation against the
-paired tables. Prepare, Start and Abort return Unsupported. Expected
+RequestStop, Join, Detach, Sleep, Exit, Abort or any synchronization operation
+against the paired tables. Prepare and Start return Unsupported. Expected
 failures produce canonical request-correlated outcomes; clock/configuration/invariant failures require
 process termination and must not replay the request. A suspended operation owns
 its original request, caller and exact wait generation without retaining a table
@@ -452,7 +452,13 @@ reply. Composition removes the native continuation before consuming the action
 to publish its retained scalar; physical resource acknowledgement remains later.
 Essential-mutex abandonment requires whole-process stop. Initial-thread exit
 leaves surviving siblings live; last-thread completion and process fate remain
-composition responsibilities. RequestStop sets the sticky flag; delivery to
+composition responsibilities. Abort first wins the Prepared-to-Revoked transition
+and returns an owned `Aborting` action. Native composition retains the caller's
+separate execution claim, removes the target, zeroes/reclaims its physical owners
+and acknowledges resources. Finishing the action requires a running caller and
+the same retained, revoked, acknowledged target; it reaps that target before
+producing the checked response. It rejects early finish, caller stop and stale
+targets without replying. RequestStop sets the sticky flag; delivery to
 admitted waits uses their explicit observation or the synchronization model's
 grant transitions.
 
@@ -649,7 +655,12 @@ The untagged native boundaries flush translations before kernel return and user
 reactivation. A non-cloneable receipt identifies the retired thread and ordinary
 mapped-page count; composition still owns zeroing/reclamation and the later
 logical resource acknowledgement. Shared startup data and page-table frames
-stay owned and charged to the process.
+stay owned and charged to the process. `discard_revoked` reuses the same removal
+path for a fully bound context that has never executed and has no scheduler
+capture. It first borrows the paired lifecycle table to recheck the exact live
+Revoked record and unreleased resources. Prepared or Ready alone is insufficient:
+Start can publish a runnable thread before its first native execution. The receipt
+identifies the removed thread, which can differ from the Abort caller.
 Native acceptance composes the dispatcher authority check and owned operation
 dispatcher with captured Current calls. Its restricted control handle belongs
 to the process record's task principal, and replies identify the captured caller.
@@ -673,7 +684,13 @@ and contain an injected failure after the first leaf removal. The fixture
 executes the authenticated Exit through the owned dispatcher and matches its
 terminal action to the native claim. A worker exiting with an essential mutex
 stops the whole process, retains all mappings/IPC until root teardown and rejects
-late sibling completion. Ordinary package admission remains unchanged.
+late sibling completion. Prepared Abort acceptance keeps the caller's claim
+through context/IPC compaction, frame reclamation and target reaping, then checks
+both replies in user instructions and faults on each retired stack/TLS/startup/
+TX/RX page. A Start-wins case rejects Abort before the target's first execution
+and allows the same hardware read. Alias and sibling-startup references reject
+removal and require complete process teardown. Ordinary package admission remains
+unchanged.
 Unsaved AVX-family, SVE, and SME state remains disabled rather than leaking or
 corrupting across tasks. ABI call 0 exits through the owned gate. The x86
 local-APIC and AArch64 generic physical timers capture a complete resumable
