@@ -34,6 +34,48 @@ pub struct ConditionId(ObjectId);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PermitId(ObjectId);
 
+impl MutexId {
+    /// Bounded object slot for encoding identity, without granting authority.
+    #[must_use]
+    pub const fn slot(self) -> usize {
+        self.0.slot
+    }
+
+    /// Retained object lifetime generation.
+    #[must_use]
+    pub const fn generation(self) -> u32 {
+        self.0.generation
+    }
+}
+
+impl ConditionId {
+    /// Bounded object slot for encoding identity, without granting authority.
+    #[must_use]
+    pub const fn slot(self) -> usize {
+        self.0.slot
+    }
+
+    /// Retained object lifetime generation.
+    #[must_use]
+    pub const fn generation(self) -> u32 {
+        self.0.generation
+    }
+}
+
+impl PermitId {
+    /// Bounded object slot for encoding identity, without granting authority.
+    #[must_use]
+    pub const fn slot(self) -> usize {
+        self.0.slot
+    }
+
+    /// Retained object lifetime generation.
+    #[must_use]
+    pub const fn generation(self) -> u32 {
+        self.0.generation
+    }
+}
+
 /// One outstanding operation; duplicate and delayed events cannot reuse it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SyncWait(ThreadWait);
@@ -314,6 +356,76 @@ impl SyncTable {
     #[must_use]
     pub const fn metadata_bytes(&self) -> usize {
         self.metadata_bytes
+    }
+
+    /// Resolve a retained mutex from untrusted slot/generation components.
+    ///
+    /// The process comes from trusted composition. This validates identity and
+    /// kind only, including poisoned or currently owned mutexes. It grants no
+    /// authority and does not bypass operation-specific caller/state checks.
+    /// Like every model identity, the result is scoped to this table.
+    ///
+    /// # Errors
+    /// Returns only `Stale` for wrong owners/kinds, absent slots and generations.
+    pub fn resolve_mutex(
+        &self,
+        owner: ProcessId,
+        slot: usize,
+        generation: u32,
+    ) -> Result<MutexId, SyncError> {
+        let id = ObjectId {
+            process: owner,
+            slot,
+            generation,
+        };
+        if !matches!(self.object(owner, id)?.kind, Kind::Mutex { .. }) {
+            return Err(SyncError::Stale);
+        }
+        Ok(MutexId(id))
+    }
+
+    /// Resolve a retained condition using the same identity-only checks as
+    /// [`Self::resolve_mutex`]; retained wait references do not invalidate it.
+    ///
+    /// # Errors
+    /// Returns only `Stale` for wrong owners/kinds, absent slots and generations.
+    pub fn resolve_condition(
+        &self,
+        owner: ProcessId,
+        slot: usize,
+        generation: u32,
+    ) -> Result<ConditionId, SyncError> {
+        let id = ObjectId {
+            process: owner,
+            slot,
+            generation,
+        };
+        if !matches!(self.object(owner, id)?.kind, Kind::Condition) {
+            return Err(SyncError::Stale);
+        }
+        Ok(ConditionId(id))
+    }
+
+    /// Resolve a retained permit using the same identity-only checks as
+    /// [`Self::resolve_mutex`]; its current count does not affect resolution.
+    ///
+    /// # Errors
+    /// Returns only `Stale` for wrong owners/kinds, absent slots and generations.
+    pub fn resolve_permit(
+        &self,
+        owner: ProcessId,
+        slot: usize,
+        generation: u32,
+    ) -> Result<PermitId, SyncError> {
+        let id = ObjectId {
+            process: owner,
+            slot,
+            generation,
+        };
+        if !matches!(self.object(owner, id)?.kind, Kind::Permit { .. }) {
+            return Err(SyncError::Stale);
+        }
+        Ok(PermitId(id))
     }
 
     /// Pair an admitted process with exactly one synchronization table.

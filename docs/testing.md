@@ -73,6 +73,11 @@ policy: transactional admission, per-process/global charges, stale generations,
 join/detach and timeout claims, creator exit, sticky stop, and reclamation only
 after native acknowledgement. The corpus includes 10,000 short transition
 schedules, each followed by complete model teardown and accounting checks.
+Identity resolution checks the selected process, slot, generation and object
+kind, with one stale result for foreign/vacant/mismatched identities. Tests cover
+terminal records before reaping, reallocation under a different synchronization
+kind, teardown and unchanged accounting after failed lookups. Resolving a retained
+identity does not bypass a stopping process or operation-specific state checks.
 
 The paired synchronization model covers FIFO grants, self-lock/non-owner errors,
 expired and stopped waiters, stale events, condition binding/reacquisition,
@@ -612,11 +617,15 @@ actually overwrites the first caller's writable TX header. The retained kernel
 request remains unchanged. It rejects a mismatched interface/request, invalid
 response payload and previous/already-completed operation before RX writes;
 rejected calls clear RX, while correlated responses clear every byte after the
-32-byte prefix. User instructions check exact register completion pairs and a
-denied operation result. Late completions after process fault are rejected.
+32-byte prefix. The probe derives the capability principal from its process
+record, mints a control handle with only CALL/OBSERVE rights and authenticates the
+captured Current requests. Each reply contains the captured caller's live typed
+thread token; user instructions check that identity and exact register completion
+pairs. Revocation removes the capability, and late completions after process
+fault are rejected.
 Native builds assert that suspension/fault outcomes cannot collide with the
 inline IPC continuation sentinel or application exit statuses.
-The probe grants no built-in scheduler authority and executes no synchronization
+The probe executes only Current identity observations and no synchronization
 operation. These native mechanism checks do not establish threaded package
 admission, process-share scheduling, compiler TLS initialization or C/CPython
 thread safety.

@@ -4,6 +4,77 @@ const OWNER: ProcessId = ProcessId(1);
 const OTHER: ProcessId = ProcessId(2);
 
 #[test]
+fn resolve_collapses_foreign_vacant_and_stale_identity_failures() -> Result<(), ThreadError> {
+    let (mut table, initial, worker) = setup()?;
+    table.register_process(
+        OTHER,
+        ThreadQuota {
+            records: 1,
+            pages: 1,
+        },
+    )?;
+    let foreign = table.prepare_initial(OTHER, resources(3, 1))?;
+    let before = (
+        table.usage(OWNER),
+        table.usage(OTHER),
+        table.metadata_bytes(),
+    );
+    for id in [initial, worker] {
+        assert_eq!(table.resolve(OWNER, id.slot(), id.generation()), Ok(id));
+    }
+    for (owner, slot, generation) in [
+        (OTHER, initial.slot(), initial.generation()),
+        (OWNER, foreign.slot(), foreign.generation()),
+        (OWNER, 3, 1),
+        (OWNER, usize::MAX, 1),
+        (OWNER, initial.slot(), 0),
+        (OWNER, initial.slot(), u32::MAX),
+    ] {
+        assert_eq!(
+            table.resolve(owner, slot, generation),
+            Err(ThreadError::Stale)
+        );
+    }
+    assert_eq!(
+        (
+            table.usage(OWNER),
+            table.usage(OTHER),
+            table.metadata_bytes()
+        ),
+        before
+    );
+    table.abort_prepared(OWNER, worker)?;
+    assert_eq!(
+        table.resolve(OWNER, worker.slot(), worker.generation()),
+        Ok(worker)
+    );
+    table.release_resources(OWNER, worker)?;
+    table.reap(OWNER, worker)?;
+    assert_eq!(
+        table.resolve(OWNER, worker.slot(), worker.generation()),
+        Err(ThreadError::Stale)
+    );
+    let replacement = table.prepare_worker(OWNER, initial, resources(4, 1))?;
+    assert_eq!(replacement.slot(), worker.slot());
+    assert_ne!(replacement.generation(), worker.generation());
+    assert_eq!(
+        table.resolve(OWNER, worker.slot(), worker.generation()),
+        Err(ThreadError::Stale)
+    );
+    assert_eq!(
+        table.resolve(OWNER, replacement.slot(), replacement.generation()),
+        Ok(replacement)
+    );
+    table.stop_process(OWNER)?;
+    assert_eq!(
+        table.resolve(OWNER, replacement.slot(), replacement.generation()),
+        Ok(replacement)
+    );
+    assert_eq!(table.start(OWNER, replacement), Err(ThreadError::Stopping));
+    Ok(())
+}
+
+#[test]
 fn compiled_metadata_covers_inline_owner_and_actual_backing() -> Result<(), ThreadError> {
     for (processes, threads) in [(1, 1), (2, 4), (7, 19), (32, 256)] {
         let requested = ThreadTable::metadata_layout(processes, threads)?;

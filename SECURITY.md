@@ -75,10 +75,15 @@ never executes the ordinary application.
   completion validates the retained caller, nonwrapping operation identity and
   live IPC generation, rejects stale/corrupt responses before writing, and clears
   RX before publishing. Capability and operation authority remain composition
-  obligations; ordinary application admission does not enable scheduler calls;
+  obligations; native acceptance composes a restricted built-in control handle
+  with captured Current calls and live caller identities. Ordinary application
+  admission does not enable scheduler calls;
 - tasks and process records: at most 65,536, with monotonic identities, explicit
   capabilities, deterministic lifecycle accounting, fallible metadata growth,
-  and guarded native stack payloads;
+  and guarded native stack payloads. Portable thread and synchronization lookup
+  resolves slot/generation against the trusted process and exact object kind,
+  collapsing foreign/absent/mismatched lifetimes to stale. A retained identity
+  grants no capability and does not bypass operation-specific state checks;
 - dispatch: at most 65,536 ports and 262,144 handles, generation-checked
   identities, explicit call rights, and 4 KiB request/reply limits. Built-in
   scheduler targets share the handle bound and generation/owner revocation,

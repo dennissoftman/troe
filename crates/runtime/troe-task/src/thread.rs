@@ -29,6 +29,18 @@ impl ThreadId {
     pub const fn process(self) -> ProcessId {
         self.process
     }
+
+    /// Bounded table slot for encoding an identity, without granting authority.
+    #[must_use]
+    pub const fn slot(self) -> usize {
+        self.slot
+    }
+
+    /// Retained lifetime generation; a reused slot has a different generation.
+    #[must_use]
+    pub const fn generation(self) -> u32 {
+        self.generation
+    }
 }
 
 /// One generation of a thread's blocking operation.
@@ -733,6 +745,32 @@ impl ThreadTable {
     /// Rejects stale or cross-owner tokens.
     pub fn snapshot(&self, owner: ProcessId, id: ThreadId) -> Result<ThreadSnapshot, ThreadError> {
         Ok(self.record(owner, id)?.snapshot)
+    }
+
+    /// Resolve untrusted identity components in the selected process's table.
+    ///
+    /// The owner comes from trusted composition, never request bytes. A match
+    /// identifies a retained record, including terminal records before reaping;
+    /// it grants no operation rights and does not validate the caller's state.
+    /// The returned identity is scoped to this table and must be revalidated at
+    /// use if an intervening transition can retire it.
+    ///
+    /// # Errors
+    /// Returns only `Stale` for foreign owners, vacant/out-of-range slots and
+    /// mismatched generations, without exposing another process's record state.
+    pub fn resolve(
+        &self,
+        owner: ProcessId,
+        slot: usize,
+        generation: u32,
+    ) -> Result<ThreadId, ThreadError> {
+        let id = ThreadId {
+            process: owner,
+            slot,
+            generation,
+        };
+        self.record(owner, id)?;
+        Ok(id)
     }
 
     /// Retained records and unreleased native page charges for one process.
