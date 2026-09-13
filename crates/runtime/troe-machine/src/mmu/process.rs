@@ -8,8 +8,9 @@ use super::{
     ApplicationCall, ApplicationHeapGrowth, ApplicationPending, ApplicationResume,
     ArchitectureApplicationContext, IsolatedFault, MmuError, MmuStats,
     OUTCOME_APPLICATION_HANDLE_CALL, OUTCOME_APPLICATION_HEAP_GROW, OUTCOME_APPLICATION_PREEMPTED,
-    OUTCOME_APPLICATION_YIELD, OUTCOME_FAULT_BIT, UserAddressSpace, apply_application_resume,
-    decode_fault, run_saved_application, user_range_contains,
+    OUTCOME_APPLICATION_YIELD, OUTCOME_FAULT_BIT, OUTCOME_SCHEDULER_CALL, TrappedSchedulerCall,
+    UserAddressSpace, application_context_set_results, apply_application_resume, decode_fault,
+    run_saved_application, user_range_contains,
 };
 use alloc::vec::Vec;
 use troe_memory::VirtualRange;
@@ -43,10 +44,56 @@ pub enum NativeThreadStop {
     HandleCall(ApplicationCall),
     /// One heap request awaits a kernel completion.
     HeapGrow(ApplicationHeapGrowth),
+    /// A copied scheduler request awaits capability/operation authentication.
+    SchedulerCall(NativeSchedulerCall),
     /// ABI call 0 exits the whole process and revokes every continuation.
     ProcessExited(u32),
     /// A native fault revokes every continuation in this process.
     ProcessFaulted(IsolatedFault),
+}
+
+/// Opaque copied scheduler operation tied to its original caller and IPC owner.
+///
+/// This proves native capture and completion identity, not scheduler authority.
+/// Composition must authenticate the built-in capability and execute the request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NativeSchedulerCall {
+    caller: ThreadId,
+    sequence: u64,
+    pair_slot: usize,
+    pair_generation: u64,
+    frame: TrappedSchedulerCall,
+}
+impl NativeSchedulerCall {
+    /// Original process-scoped caller for trusted lifecycle/capability lookup.
+    #[must_use]
+    pub const fn caller(self) -> ThreadId {
+        self.caller
+    }
+
+    /// Exact valid register framing, or `None` for a rejected frame.
+    #[must_use]
+    pub const fn call(self) -> Option<troe_abi::threading::Call> {
+        self.frame.call
+    }
+
+    /// Immutable kernel copy of a canonically framed TX request.
+    #[must_use]
+    pub fn request_bytes(&self) -> Option<&[u8; troe_abi::threading::REQUEST_BYTES]> {
+        self.frame.call.map(|_| &self.frame.request)
+    }
+
+    /// Decode against the trusted capability's interface without rereading user memory.
+    ///
+    /// # Errors
+    /// Rejects malformed register framing or noncanonical request bytes.
+    pub fn request(
+        self,
+        expected_interface: u32,
+    ) -> Result<troe_abi::threading::Request, troe_abi::threading::EncodingError> {
+        self.frame.call.ok_or(troe_abi::threading::EncodingError)?;
+        troe_abi::threading::Request::decode(expected_interface, &self.frame.request)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -82,6 +129,7 @@ struct ThreadContext {
     pending: ApplicationPending,
     started: bool,
     ipc: Option<ThreadIpc>,
+    scheduler_operation: Option<NativeSchedulerCall>,
 }
 
 impl Drop for ThreadContext {
@@ -103,8 +151,8 @@ impl Drop for ThreadContext {
 /// or mappings can be reclaimed. This retains its IPC page pairs, but composition
 /// must drop this owner before zeroing and releasing ordinary user/table frames.
 /// The current mechanism rejects roots bound to the single-thread IPC profile.
-/// Owned per-thread IPC buffers do not enable threaded package admission or
-/// the scheduler-call dispatcher.
+/// Scheduler calls suspend with owned request bytes; trusted composition must
+/// authenticate and execute them. Threaded package admission remains disabled.
 pub struct NativeProcessContext {
     // Contexts precede the root so dropping the owner retires them first.
     contexts: Vec<ThreadContext>,
@@ -113,6 +161,7 @@ pub struct NativeProcessContext {
     capacity: usize,
     metadata_bytes: usize,
     stopped: bool,
+    next_operation: u64,
 }
 
 impl NativeProcessContext {
@@ -191,6 +240,7 @@ impl NativeProcessContext {
             capacity,
             metadata_bytes,
             stopped: false,
+            next_operation: 1,
         })
     }
 
@@ -292,6 +342,7 @@ impl NativeProcessContext {
             pending: ApplicationPending::Timeslice,
             started: false,
             ipc: None,
+            scheduler_operation: None,
         });
         Ok(())
     }
@@ -401,6 +452,64 @@ impl NativeProcessContext {
         result
     }
 
+    /// Publish a correlated scheduler response, or reject without exposing RX bytes.
+    ///
+    /// Completion does not run the caller or grant it another process timeslice.
+    /// `None` rejects a malformed frame/request or unauthenticated capability.
+    ///
+    /// # Errors
+    /// Rejects stopped/foreign/stale/already-completed operations and invalid
+    /// response payloads before any write. Storage failure stops the process.
+    pub fn complete_scheduler(
+        &mut self,
+        operation: NativeSchedulerCall,
+        response: Option<(troe_abi::threading::Request, troe_abi::threading::Response)>,
+    ) -> Result<(), MmuError> {
+        let (_, pair) = self.bound_ipc(operation.caller)?;
+        if pair.slot() != operation.pair_slot || pair.generation() != operation.pair_generation {
+            return Err(MmuError::InvalidUserContext);
+        }
+        let index = self
+            .contexts
+            .iter()
+            .position(|context| {
+                context.id == operation.caller
+                    && context.scheduler_operation == Some(operation)
+                    && context.pending == ApplicationPending::SchedulerCall
+            })
+            .ok_or(MmuError::InvalidUserContext)?;
+        let reply = response
+            .map(|(request, response)| {
+                if operation
+                    .request(request.interface())
+                    .map_err(|_| MmuError::InvalidUserContext)?
+                    != request
+                {
+                    return Err(MmuError::InvalidUserContext);
+                }
+                response
+                    .encode(request)
+                    .map_err(|_| MmuError::InvalidUserContext)
+            })
+            .transpose()?;
+        let completion = if reply.is_some() {
+            troe_abi::threading::Completion::Response
+        } else {
+            troe_abi::threading::Completion::Rejected
+        }
+        .encode();
+        let status = u32::try_from(completion[0]).map_err(|_| MmuError::InvalidUserContext)?;
+        self.publish_thread_rx(
+            operation.caller,
+            reply.as_ref().map_or(&[], |bytes| bytes.as_slice()),
+        )?;
+        let context = &mut self.contexts[index];
+        application_context_set_results(&mut context.registers, status, completion[1]);
+        context.pending = ApplicationPending::Timeslice;
+        context.scheduler_operation = None;
+        Ok(())
+    }
+
     fn bound_ipc(&self, id: ThreadId) -> Result<(ThreadIpc, &crate::IpcPagePair), MmuError> {
         if self.stopped || id.process() != self.process {
             return Err(MmuError::InvalidUserContext);
@@ -431,6 +540,8 @@ impl NativeProcessContext {
     /// completions. Completion or native mechanism failure for an accepted token
     /// stops all sibling execution. Foreign tokens and invalid slice bounds do
     /// not mutate the owner.
+    // Keep native execution, outcome adoption and terminal revocation together.
+    #[allow(clippy::too_many_lines)]
     pub fn resume(
         &mut self,
         id: ThreadId,
@@ -463,12 +574,18 @@ impl NativeProcessContext {
             &mut self.backing.address_space,
             &context.registers,
             remaining_milliseconds,
+            context.ipc.map(|ipc| ipc.tx),
         );
         let result = result.and_then(|(raw, mut state)| {
             if raw & OUTCOME_FAULT_BIT != 0 {
                 return Ok(NativeThreadStop::ProcessFaulted(decode_fault(raw)?));
             }
             if state.application_context.is_some() != state.pending_application.is_some() {
+                return Err(MmuError::InvalidUserContext);
+            }
+            let scheduler_call =
+                state.pending_application == Some(ApplicationPending::SchedulerCall);
+            if state.scheduler_request.is_some() != scheduler_call {
                 return Err(MmuError::InvalidUserContext);
             }
             if let (Some(registers), Some(pending)) = (
@@ -487,6 +604,32 @@ impl NativeProcessContext {
                     }
                     (OUTCOME_APPLICATION_HEAP_GROW, ApplicationPending::HeapGrow(request)) => {
                         NativeThreadStop::HeapGrow(request)
+                    }
+                    (OUTCOME_SCHEDULER_CALL, ApplicationPending::SchedulerCall) => {
+                        let frame = state
+                            .scheduler_request
+                            .take()
+                            .ok_or(MmuError::InvalidUserContext)?;
+                        let ipc = context.ipc.ok_or(MmuError::InvalidUserContext)?;
+                        let pair = self
+                            .backing
+                            .pairs
+                            .get(ipc.index)
+                            .filter(|pair| pair.is_live())
+                            .ok_or(MmuError::InvalidUserContext)?;
+                        let sequence = self.next_operation;
+                        self.next_operation = sequence
+                            .checked_add(1)
+                            .ok_or(MmuError::InvalidUserContext)?;
+                        let operation = NativeSchedulerCall {
+                            caller: id,
+                            sequence,
+                            pair_slot: pair.slot(),
+                            pair_generation: pair.generation(),
+                            frame,
+                        };
+                        context.scheduler_operation = Some(operation);
+                        NativeThreadStop::SchedulerCall(operation)
                     }
                     _ => return Err(MmuError::InvalidUserContext),
                 };

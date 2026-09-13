@@ -24,7 +24,8 @@ mod process;
 mod protected;
 #[cfg(target_os = "uefi")]
 pub use process::{
-    NativeProcessBacking, NativeProcessContext, NativeThreadStart, NativeThreadStop,
+    NativeProcessBacking, NativeProcessContext, NativeSchedulerCall, NativeThreadStart,
+    NativeThreadStop,
 };
 #[cfg(feature = "acceptance-probes")]
 pub use protected::FaultPoint;
@@ -75,6 +76,8 @@ const OUTCOME_APPLICATION_HANDLE_CALL: u64 = 1 << 61;
 const OUTCOME_APPLICATION_HEAP_GROW: u64 = 1 << 60;
 #[cfg(target_os = "uefi")]
 const OUTCOME_APPLICATION_PREEMPTED: u64 = 1 << 59;
+#[cfg(target_os = "uefi")]
+const OUTCOME_SCHEDULER_CALL: u64 = 1 << 58;
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 const AARCH64_SPSR_MODE_MASK: u64 = 0b1111;
 
@@ -797,6 +800,15 @@ enum ApplicationPending {
     HandleCall(ApplicationCall),
     HeapGrow(ApplicationHeapGrowth),
     IpcWait(troe_abi::ipc::ReplyWait),
+    SchedulerCall,
+}
+
+/// Request bytes copied under the original user root before any sibling runs.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg(target_os = "uefi")]
+struct TrappedSchedulerCall {
+    call: Option<troe_abi::threading::Call>,
+    request: [u8; troe_abi::threading::REQUEST_BYTES],
 }
 
 #[cfg(target_os = "uefi")]
@@ -807,6 +819,10 @@ struct IsolatedRunState {
     destination_len: usize,
     application_context: Option<ArchitectureApplicationContext>,
     pending_application: Option<ApplicationPending>,
+    // Only the native process owner can supply its selected thread's binding.
+    scheduler_tx: Option<u64>,
+    // Separate from ApplicationPending to keep legacy IPC continuations compact.
+    scheduler_request: Option<TrappedSchedulerCall>,
     ipc: Option<IpcMapping>,
 }
 
@@ -822,9 +838,10 @@ enum RunKind {
 #[cfg(target_os = "uefi")]
 struct IsolatedRunCell(UnsafeCell<Option<IsolatedRunState>>);
 
-// SAFETY: Stage 6 remains single-CPU and cooperative. `run_isolated` is the
-// unique initializer and clears the cell before returning; interrupts remain
-// masked during EL0/ring-3 execution.
+// SAFETY: Native execution remains single-CPU. Each entry acquires the sole
+// ISOLATED_ACTIVE run; traps access this cell with nested delivery masked.
+// The owner clears it after kernel-root restoration and before releasing the
+// active run. User execution may be timer-preempted; no sibling runs concurrently.
 #[cfg(target_os = "uefi")]
 unsafe impl Sync for IsolatedRunCell {}
 
@@ -1529,6 +1546,8 @@ pub fn run_isolated(
             destination_len: message_destination.len(),
             application_context: None,
             pending_application: None,
+            scheduler_tx: None,
+            scheduler_request: None,
             ipc: None,
         });
     }
@@ -1599,6 +1618,8 @@ pub fn run_application(
             destination_len: 0,
             application_context: None,
             pending_application: None,
+            scheduler_tx: None,
+            scheduler_request: None,
             ipc,
         });
     }
@@ -1656,7 +1677,8 @@ pub fn resume_application(
     } = application;
     apply_application_resume(&address_space, &mut context, pending, completion)?;
     let mut address_space = address_space;
-    let (raw, state) = run_saved_application(&mut address_space, &context, timeslice_milliseconds)?;
+    let (raw, state) =
+        run_saved_application(&mut address_space, &context, timeslice_milliseconds, None)?;
     decode_application_outcome(raw, address_space, state)
 }
 
@@ -1709,6 +1731,7 @@ fn run_saved_application(
     address_space: &mut UserAddressSpace,
     context: &ArchitectureApplicationContext,
     timeslice_milliseconds: u32,
+    scheduler_tx: Option<u64>,
 ) -> Result<(u64, IsolatedRunState), MmuError> {
     if timeslice_milliseconds == 0 || KERNEL_ROOT.load(Ordering::Acquire) == 0 {
         return Err(MmuError::InvalidUserContext);
@@ -1730,6 +1753,8 @@ fn run_saved_application(
             destination_len: 0,
             application_context: None,
             pending_application: None,
+            scheduler_tx,
+            scheduler_request: None,
             ipc: address_space.ipc,
         });
     }
@@ -2076,6 +2101,7 @@ fn application_syscall(
                 OUTCOME_APPLICATION_YIELD,
             )
         }
+        troe_abi::threading::CALL => suspend_scheduler_call(arguments, context),
         APPLICATION_HEAP_GROW_CALL => {
             let minimum_pages = arguments[0];
             if minimum_pages == 0 || arguments[1..5].iter().any(|argument| *argument != 0) {
@@ -2089,6 +2115,50 @@ fn application_syscall(
         }
         _ => encoded_fault(IsolatedFault::InvalidCall),
     }
+}
+
+/// Capture fixed framing and the owned TX prefix before returning to composition.
+/// A legacy application has no scheduler binding and retains entry-6 rejection.
+#[cfg(target_os = "uefi")]
+fn suspend_scheduler_call(arguments: [u64; 6], context: ArchitectureApplicationContext) -> u64 {
+    // SAFETY: The active trap exclusively owns this state with exceptions masked.
+    let Some(state) = (unsafe { &*ISOLATED_RUN.0.get() }).as_ref() else {
+        return encoded_fault(IsolatedFault::InvalidCall);
+    };
+    let Some(tx) = state.scheduler_tx else {
+        return encoded_fault(IsolatedFault::InvalidCall);
+    };
+    let call = troe_abi::threading::Call::decode(arguments);
+    let mut request = [0; troe_abi::threading::REQUEST_BYTES];
+    if call.is_some() {
+        if !user_range_valid(&state.regions, tx, request.len(), false) {
+            return encoded_fault(IsolatedFault::InvalidCall);
+        }
+        let Ok(tx) = usize::try_from(tx) else {
+            return encoded_fault(IsolatedFault::InvalidCall);
+        };
+        for (offset, byte) in request.iter_mut().enumerate() {
+            // SAFETY: The complete fixed TX prefix is validated under this active
+            // root. No sibling or mapping mutation can run until capture returns.
+            *byte = unsafe { architecture_read_user_byte(tx + offset) };
+        }
+    }
+    // Malformed register framing is retained without a request. Composition can
+    // issue only a rejected completion, with no scheduler operation or RX prefix.
+    // SAFETY: The same masked trap still owns the state. This native request
+    // buffer is separate from compact legacy IPC continuation metadata.
+    let Some(state) = (unsafe { &mut *ISOLATED_RUN.0.get() }).as_mut() else {
+        return encoded_fault(IsolatedFault::InvalidCall);
+    };
+    if state.scheduler_request.is_some() {
+        return encoded_fault(IsolatedFault::InvalidCall);
+    }
+    state.scheduler_request = Some(TrappedSchedulerCall { call, request });
+    suspend_application(
+        context,
+        ApplicationPending::SchedulerCall,
+        OUTCOME_SCHEDULER_CALL,
+    )
 }
 
 #[cfg(target_os = "uefi")]

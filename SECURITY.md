@@ -70,7 +70,12 @@ never executes the ordinary application.
   them. Bindings validate process/thread identity, live task-pair ownership,
   physical pages and RW/NX geometry before publication; replies clear the entire
   RX page before copying a bounded prefix. Sibling threads share these user
-  mappings; the bindings select kernel destinations, not isolation between siblings;
+  mappings; the bindings select kernel destinations, not isolation between siblings.
+  The native owner captures fixed scheduler requests before switching siblings;
+  completion validates the retained caller, nonwrapping operation identity and
+  live IPC generation, rejects stale/corrupt responses before writing, and clears
+  RX before publishing. Capability and operation authority remain composition
+  obligations; ordinary application admission does not enable scheduler calls;
 - tasks and process records: at most 65,536, with monotonic identities, explicit
   capabilities, deterministic lifecycle accounting, fallible metadata growth,
   and guarded native stack payloads;
