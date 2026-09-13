@@ -62,6 +62,10 @@ never executes the ordinary application.
   and fixed kernel DS/ES selectors. Resume restores the retained selectors
   before FS base. The owned flat GDT, disabled LDT and disabled FSGSBASE keep
   GS base zero; TLS never supplies kernel identity;
+- native context owner: one retained root with bounded process-scoped register
+  records, checked stack guards and disjoint stack/TLS payloads, actual retained
+  metadata accounting, and process-wide continuation revocation on native fault
+  or exit. Register records are erased before their backing is released;
 - tasks and process records: at most 65,536, with monotonic identities, explicit
   capabilities, deterministic lifecycle accounting, fallible metadata growth,
   and guarded native stack payloads;

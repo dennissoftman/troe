@@ -526,6 +526,20 @@ code/data descriptors, the LDT is disabled, and FSGSBASE remains disabled, so
 GS base stays zero. Neither a segment base nor user TLS supplies kernel identity.
 AArch64 retains TPIDR_EL0 in each saved context. These register mechanisms do
 not enable threaded KEX admission or the pthread facade.
+`NativeProcessContext` retains one root and a bounded array of private register
+continuations keyed by process-owned thread tokens. It validates initial stack
+guards, executable entry, TLS geometry and nonoverlapping stack/TLS payloads.
+Its logical metadata charge includes actual context/mapping vector capacities
+and the compiled inline owner. Admission and switching allocate no new metadata.
+Saved execution moves only the mapping summary into the masked trap state;
+the unique root stays with the caller and its summary is restored before IRQs
+are enabled. Process exit, native fault and explicit stop revoke all sibling
+contexts without user cleanup; their register bytes are erased before metadata
+release. Composition retains physical frame ownership until this native owner
+has been retired. The current mechanism supports copied-call continuations and
+rejects roots bound to the single-thread IPC profile. It accepts a caller-supplied
+remaining slice of at most 50 ms; process-share scheduling, per-thread IPC and
+threaded package admission are not enabled by this mechanism.
 Unsaved AVX-family, SVE, and SME state remains disabled rather than leaking or
 corrupting across tasks. ABI call 0 exits through the owned gate. The x86
 local-APIC and AArch64 generic physical timers capture a complete resumable

@@ -4,13 +4,14 @@ Status: architectural direction accepted, 2026-09-09. Implementation tracked by
 [#65](https://github.com/dennissoftman/troe/issues/65) and delivery issues
 [#204](https://github.com/dennissoftman/troe/issues/204) through
 [#208](https://github.com/dennissoftman/troe/issues/208).
-No native thread execution, native TLS, or pthread support is claimed by this document.
+Native shared-root context switching has an acceptance mechanism; threaded
+package admission, native compiler-TLS allocation and pthread support remain disabled.
 Current single-execution-thread application contracts remain in force.
 Portable lifecycle/synchronization models, an independently compiler-checked
 static TLS layout/initializer, guarded thread-memory planning, and composed
 initial-process geometry/peak memory charges implement portions of this direction.
 The owned-initializer annex implements coherent staged-buffer ownership, immutable
-TLS copying and retained logical charges; native frame/context integration remains open. The implemented offline
+TLS copying and retained logical charges; production frame/admission integration remains open. The implemented offline
 [KEX static TLS container 1.3](../formats/kex-static-tls-v1.md) encodes the
 initializer, extent, alignment and worker trampoline under application ABI 1.4.
 Its reader and explicit converter produce no complete native admission proof.
@@ -33,8 +34,14 @@ assumptions survives enabling another execution context unchanged.
 
 The resident runtime already supplies isolated roots, resumable user contexts,
 preemption, process ownership, guarded mappings, and bounded wait models.
-`ApplicationSession` currently owns both a root and one register context;
+The legacy `ApplicationSession` owns both a root and one register context;
 `ResidentApplication` similarly combines process and execution ownership.
+The native `NativeProcessContext` mechanism separately owns one root and a
+bounded set of process-scoped continuations, with guarded-stack/TLS validation,
+retained metadata charges and process-wide stop. Native acceptance switches
+two such contexts across timer preemption and yields and checks shared memory,
+distinct TLS words, fault revocation and reclamation. This does not enable the
+threaded loader, process-share scheduler, per-thread IPC or the C facade.
 AArch64 saves TPIDR_EL0; the x86 saved context retains FS/GS/DS/ES selectors
 and an independent FS base. The x86 gates normalize kernel selectors and FS
 base before Rust handlers and restore user selectors before FS base on resume.
@@ -837,9 +844,12 @@ for kernel reclamation and are not promised after forced termination.
 ## Decision 7: scheduling, IPC and shared services must become thread-aware
 
 The first implementation remains single-CPU. A process owns one address-space
-root; each thread owns one register context. Sharing a root requires a new owned
-process/session split, not cloning a root-owning `ApplicationSession`. Mapping
-mutation, context activation and final root destruction are serialized.
+root; each thread owns one register context. `NativeProcessContext` supplies an
+owned root/context split without cloning a root-owning `ApplicationSession`.
+It retains the root during each native transition and serializes access to
+all continuations. Resident scheduling and per-thread IPC integration remain
+tracked by #207. Mapping mutation, context activation and final root destruction
+must remain serialized during that integration.
 
 Schedule processes fairly first, then select a runnable thread within the
 chosen process. Creating, waking, joining, yielding or handing work to siblings
