@@ -323,6 +323,17 @@ impl IpcPair {
         frame: &mut ArchitectureApplicationContext,
     ) -> Result<(), MmuError> {
         self.peers[self.active].context = frame.clone();
+        self.resume_saved(destination, frame)
+    }
+
+    /// Resume a peer after the outgoing context has already been saved.
+    /// Reply/wait can change the saved server event, so copying the old trap
+    /// frame over it here would lose the newly published wait completion.
+    fn resume_saved(
+        &mut self,
+        destination: usize,
+        frame: &mut ArchitectureApplicationContext,
+    ) -> Result<(), MmuError> {
         *frame = self.peers[destination].context.clone();
         self.peers[destination]
             .address_space
@@ -511,7 +522,6 @@ impl IpcPair {
         // caller. No scheduler scan or execution-timer operation occurs here.
         self.peers[1].context = frame.clone();
         self.publish_wait(wait.deadline_millis)?;
-        *frame = self.peers[1].context.clone();
         application_context_set_results(
             &mut self.peers[0].context,
             if expired {
@@ -524,7 +534,7 @@ impl IpcPair {
         if expired {
             self.stats.timeouts = self.stats.timeouts.saturating_add(1);
         }
-        self.switch(0, frame)?;
+        self.resume_saved(0, frame)?;
         self.stats.completed = self.stats.completed.saturating_add(1);
         self.stats.last_ticks = ticks().saturating_sub(started);
         #[cfg(feature = "acceptance-probes")]
