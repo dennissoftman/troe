@@ -589,14 +589,53 @@ pub(crate) fn revoke_network_interrupt_publication(
 
 /// Failure to arm the architecture-owned application execution timer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[cfg(target_os = "uefi")]
+#[cfg(any(test, target_os = "uefi"))]
 pub enum ExecutionTimerError {
     /// The pinned CPU does not expose the required deadline facility.
+    #[cfg(target_os = "uefi")]
     Unsupported,
     /// Frequency or deadline arithmetic could not be represented safely.
     InvalidFrequency,
     /// A required interrupt-controller resource is unavailable.
+    #[cfg(target_os = "uefi")]
     InterruptUnavailable,
+}
+
+/// A copied timer bound from an already authenticated, charged process dispatch.
+#[derive(Clone, Copy, Debug)]
+#[cfg(any(test, target_os = "uefi"))]
+pub(crate) struct ExecutionDeadline {
+    pub(crate) ticks: u64,
+    pub(crate) frequency: u64,
+    pub(crate) observed: u64,
+}
+
+#[cfg(any(test, target_os = "uefi"))]
+impl ExecutionDeadline {
+    fn remaining(self, now: u64, frequency: u64) -> Result<u32, ExecutionTimerError> {
+        if self.frequency < 1_000 || frequency != self.frequency || now < self.observed {
+            return Err(ExecutionTimerError::InvalidFrequency);
+        }
+        if now >= self.ticks {
+            return Ok(0);
+        }
+        if u128::from(self.ticks - now) * 1_000 > u128::from(frequency) * 50 {
+            return Err(ExecutionTimerError::InvalidFrequency);
+        }
+        let milliseconds = u128::from(self.ticks - now) * 1_000 / u128::from(frequency);
+        let milliseconds =
+            u32::try_from(milliseconds).map_err(|_| ExecutionTimerError::InvalidFrequency)?;
+        if milliseconds > 50 {
+            return Err(ExecutionTimerError::InvalidFrequency);
+        }
+        Ok(milliseconds)
+    }
+
+    fn observe(&mut self, now: u64, frequency: u64) -> Result<u32, ExecutionTimerError> {
+        let remaining = self.remaining(now, frequency)?;
+        self.observed = now;
+        Ok(remaining)
+    }
 }
 
 #[cfg(target_os = "uefi")]
@@ -1432,8 +1471,9 @@ pub fn monotonic_millis() -> Option<u64> {
 /// millisecond reading above is a truncation rather than the resolution the
 /// hardware has. `u64` nanoseconds still spans 584 years of uptime.
 ///
-/// This is a read. Deadlines and the execution timer remain millisecond-based,
-/// so a finer reading does not imply a finer sleep.
+/// This is a read. Public timer/sleep requests remain millisecond-based, so a
+/// finer reading does not imply a finer sleep. Owned native process dispatches
+/// separately retain raw-counter deadlines.
 #[must_use]
 #[cfg(target_os = "uefi")]
 pub fn monotonic_nanos() -> Option<u64> {
@@ -1618,6 +1658,22 @@ pub(crate) fn prepare_application_execution(milliseconds: u32) -> Result<(), Exe
         Err(error) => {
             architecture_disarm_execution_timer();
             Err(error)
+        }
+    }
+}
+
+/// Arm only the remainder of one retained process dispatch with IRQs masked.
+/// `false` leaves no armed timer and permits no user entry, without a process fault.
+#[cfg(target_os = "uefi")]
+pub(crate) fn prepare_application_dispatch(
+    deadline: ExecutionDeadline,
+) -> Result<bool, ExecutionTimerError> {
+    architecture_mask_input_interrupts();
+    match architecture_arm_execution_timer_bound(0, Some(deadline)) {
+        Ok(true) => Ok(true),
+        result => {
+            architecture_disarm_execution_timer();
+            result
         }
     }
 }
@@ -2084,6 +2140,14 @@ fn x86_calibrate_tsc_with_pm_timer(resource: IoPortResource, counter_bits: u8) -
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
 fn architecture_arm_execution_timer(milliseconds: u32) -> Result<(), ExecutionTimerError> {
+    architecture_arm_execution_timer_bound(milliseconds, None).map(|_| ())
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
+fn architecture_arm_execution_timer_bound(
+    milliseconds: u32,
+    mut deadline: Option<ExecutionDeadline>,
+) -> Result<bool, ExecutionTimerError> {
     const LAPIC_LVT_TIMER: usize = 0x320;
     const LAPIC_INITIAL_COUNT: usize = 0x380;
     let platform =
@@ -2112,6 +2176,21 @@ fn architecture_arm_execution_timer(milliseconds: u32) -> Result<(), ExecutionTi
         }
         troe_platform::TimerKind::Aarch64Generic => Err(ExecutionTimerError::InterruptUnavailable),
     })?;
+    let milliseconds = match &mut deadline {
+        Some(deadline) => deadline.observe(
+            x86_read_tsc(),
+            architecture_benchmark_counter_frequency_hz()
+                .ok_or(ExecutionTimerError::Unsupported)?,
+        )?,
+        None => milliseconds,
+    };
+    if milliseconds == 0 {
+        return if deadline.is_some() {
+            Ok(false)
+        } else {
+            Err(ExecutionTimerError::InvalidFrequency)
+        };
+    }
     let lease_ticks = ticks_per_millisecond
         .checked_mul(u64::from(milliseconds))
         .and_then(|ticks| u32::try_from(ticks).ok())
@@ -2123,7 +2202,16 @@ fn architecture_arm_execution_timer(milliseconds: u32) -> Result<(), ExecutionTi
         mmio_write32(lapic + LAPIC_LVT_TIMER, u32::from(timer_vector));
         mmio_write32(lapic + LAPIC_INITIAL_COUNT, lease_ticks);
     }
-    Ok(())
+    if let Some(deadline) = deadline {
+        #[cfg(feature = "acceptance-probes")]
+        APPLICATION_TIMER_PROGRAMS.fetch_add(1, Ordering::Relaxed);
+        // Include calibration/preparation in the retained bound. IRQs are still
+        // masked, and expiry here forbids entry even though the timer was armed.
+        return deadline
+            .remaining(x86_read_tsc(), deadline.frequency)
+            .map(|left| left != 0);
+    }
+    Ok(true)
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "x86_64"))]
@@ -3266,6 +3354,14 @@ fn architecture_initialize_monotonic_clock() -> bool {
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 fn architecture_arm_execution_timer(milliseconds: u32) -> Result<(), ExecutionTimerError> {
+    architecture_arm_execution_timer_bound(milliseconds, None).map(|_| ())
+}
+
+#[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
+fn architecture_arm_execution_timer_bound(
+    milliseconds: u32,
+    mut retained: Option<ExecutionDeadline>,
+) -> Result<bool, ExecutionTimerError> {
     let redistributor =
         aarch64_gicv3_redistributor().map_err(|_| ExecutionTimerError::InterruptUnavailable)?;
     let timer_route = crate::selected_platform()
@@ -3316,14 +3412,21 @@ fn architecture_arm_execution_timer(milliseconds: u32) -> Result<(), ExecutionTi
     if frequency == 0 {
         return Err(ExecutionTimerError::Unsupported);
     }
-    let ticks = frequency
-        .checked_mul(u64::from(milliseconds))
-        .and_then(|value| value.checked_div(1_000))
-        .filter(|ticks| *ticks != 0)
-        .ok_or(ExecutionTimerError::InvalidFrequency)?;
-    let deadline = counter
-        .checked_add(ticks)
-        .ok_or(ExecutionTimerError::InvalidFrequency)?;
+    let deadline = if let Some(retained) = &mut retained {
+        if retained.observe(counter, frequency)? == 0 {
+            return Ok(false);
+        }
+        retained.ticks
+    } else {
+        let ticks = frequency
+            .checked_mul(u64::from(milliseconds))
+            .and_then(|value| value.checked_div(1_000))
+            .filter(|ticks| *ticks != 0)
+            .ok_or(ExecutionTimerError::InvalidFrequency)?;
+        counter
+            .checked_add(ticks)
+            .ok_or(ExecutionTimerError::InvalidFrequency)?
+    };
     // SAFETY: The checked deadline is programmed before enabling the EL1-owned
     // physical timer; ISB makes the one-shot state visible before user entry.
     unsafe {
@@ -3331,7 +3434,14 @@ fn architecture_arm_execution_timer(milliseconds: u32) -> Result<(), ExecutionTi
         core::arch::asm!("msr cntp_ctl_el0, {}", in(reg) 1_u64, options(nostack));
         core::arch::asm!("isb", options(nostack));
     }
-    Ok(())
+    if let Some(retained) = retained {
+        #[cfg(feature = "acceptance-probes")]
+        APPLICATION_TIMER_PROGRAMS.fetch_add(1, Ordering::Relaxed);
+        return retained
+            .remaining(architecture_benchmark_counter_ticks(), frequency)
+            .map(|left| left != 0);
+    }
+    Ok(true)
 }
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
@@ -3862,11 +3972,12 @@ unsafe fn mmio_write64(address: usize, value: u64) {
 mod tests {
     use super::{
         ActiveNetworkInterrupt, COMPLETION_BUDGET_MILLIS, CompletionWait, CompletionWaitState,
-        DeactivatedNetworkInterrupt, DmaInitializationPhase, DmaInitializationState, HeapState,
-        InputInterruptError, NetworkInterruptRoute, NetworkInterruptSource,
-        PreparedNetworkInterrupt, TaskStackError, UsedIndexTransition, aarch64_tcr_el1_from_el2,
-        cached_nonzero, claim_network_interrupt_publication, classify_used_index, counter_millis,
-        counter_nanos, el2, revoke_network_interrupt_publication, validate_task_stack,
+        DeactivatedNetworkInterrupt, DmaInitializationPhase, DmaInitializationState,
+        ExecutionDeadline, ExecutionTimerError, HeapState, InputInterruptError,
+        NetworkInterruptRoute, NetworkInterruptSource, PreparedNetworkInterrupt, TaskStackError,
+        UsedIndexTransition, aarch64_tcr_el1_from_el2, cached_nonzero,
+        claim_network_interrupt_publication, classify_used_index, counter_millis, counter_nanos,
+        el2, revoke_network_interrupt_publication, validate_task_stack,
     };
     use core::alloc::Layout;
     use core::cell::Cell;
@@ -3875,6 +3986,83 @@ mod tests {
 
     #[repr(align(4096))]
     struct TestArena([u8; 4096]);
+
+    #[test]
+    fn dispatch_timer_observations_cannot_refresh_the_deadline() {
+        let mut deadline = ExecutionDeadline {
+            ticks: 50_000,
+            frequency: 1_000_000,
+            observed: 0,
+        };
+        for (now, remaining) in [
+            (0, 50),
+            (1, 49),
+            (48_001, 1),
+            (49_001, 0),
+            (50_000, 0),
+            (u64::MAX, 0),
+        ] {
+            assert_eq!(deadline.observe(now, 1_000_000), Ok(remaining));
+            assert_eq!(deadline.ticks, 50_000);
+            assert_eq!(deadline.observed, now);
+        }
+    }
+
+    #[test]
+    fn dispatch_timer_rejects_clock_changes_and_oversized_raw_intervals() {
+        let mut deadline = ExecutionDeadline {
+            ticks: 50_000,
+            frequency: 1_000_000,
+            observed: 100,
+        };
+        assert_eq!(
+            deadline.observe(99, 1_000_000),
+            Err(ExecutionTimerError::InvalidFrequency)
+        );
+        assert_eq!(
+            deadline.observe(100, 0),
+            Err(ExecutionTimerError::InvalidFrequency)
+        );
+        assert_eq!(
+            deadline.observe(100, 2_000_000),
+            Err(ExecutionTimerError::InvalidFrequency)
+        );
+        assert_eq!(deadline.observe(1_000, 1_000_000), Ok(49));
+        assert_eq!(
+            deadline.remaining(999, 1_000_000),
+            Err(ExecutionTimerError::InvalidFrequency)
+        );
+        deadline.ticks = 51_001;
+        assert_eq!(
+            deadline.remaining(1_000, 1_000_000),
+            Err(ExecutionTimerError::InvalidFrequency)
+        );
+        deadline.frequency = 999;
+        assert_eq!(
+            deadline.remaining(100_000, 999),
+            Err(ExecutionTimerError::InvalidFrequency)
+        );
+    }
+
+    #[test]
+    fn dispatch_timer_scaling_does_not_wrap_at_full_width() {
+        let deadline = ExecutionDeadline {
+            ticks: u64::MAX,
+            frequency: u64::MAX,
+            observed: u64::MAX - u64::MAX / 20,
+        };
+        assert_eq!(deadline.remaining(deadline.observed, u64::MAX), Ok(49));
+        assert_eq!(deadline.remaining(u64::MAX, u64::MAX), Ok(0));
+        assert_eq!(
+            ExecutionDeadline {
+                ticks: u64::MAX,
+                frequency: 1_000,
+                observed: 0
+            }
+            .remaining(0, 1_000),
+            Err(ExecutionTimerError::InvalidFrequency)
+        );
+    }
 
     #[test]
     fn timer_calibration_is_cached_after_one_nonzero_result() {

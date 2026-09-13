@@ -84,6 +84,19 @@ terminal records before reaping, reallocation under a different synchronization
 kind, teardown and unchanged accounting after failed lookups. Resolving a retained
 identity does not bypass a stopping process or operation-specific state checks.
 
+`cargo test -p troe-task thread::schedule::` checks owned process dispatches:
+process turns alternate independently of runnable thread count, while a separate
+cursor selects siblings. Tests cover all-blocked transitions, wake storms,
+preparation churn, thread/process slot reuse, stale dispatch completion, equal
+clock readings, fractional-millisecond truncation, clock regression/frequency
+changes, busy completion and deadline/identity overflow. Failed work consumes the
+finite step allowance. Compiled table accounting includes the dispatch state and
+retained process-slot indices. These are portable selection/accounting checks;
+they do not prove native timer enforcement or production process fairness.
+The machine counter tests separately cover a fixed dispatch deadline through
+repeated observations, fractional remainders, controller-preparation delay,
+clock regression/frequency changes and full-width arithmetic without wrapping.
+
 `troe-machine` retirement tests cover fragmented backing, physical and virtual
 overlap, remaining user aliases, missing leaves, read-only startup permissions,
 coalesced-region splitting, metadata exhaustion before leaf reads and first-error
@@ -767,8 +780,11 @@ replacement; Join waits for physical acknowledgement and retains the scalar
 result through reaping. All user replies include canonical framing and a zeroed
 RX suffix. Initial/worker TLS remains independent, and the shared writes survive
 Join. Final checks restore physical/logical baselines while retaining process
-table pages until root teardown. This is a controlled acceptance schedule, not
-fairness or deadline-delivery evidence.
+table pages until root teardown. Creation runs through retained process turns
+of at most 20 ms and eight charged entries, and checks that exhaustion occurs
+without losing its owned native calls, initialization or Join result. Thread
+selection in this fixture is controlled for lifecycle ordering; it is not
+fairness or timer-delivery evidence.
 The source and layout are `shared_context_probe/creation/program.c` and
 `program.ld` below `kernel/src/memory`; `program.rs` embeds their inspected linked
 text. Compile with the same Clang/LLD extraction procedure as the admission
@@ -777,9 +793,20 @@ PT_TLS has 8 initialized and 16 zero bytes aligned to 8: marker, counter and the
 thread's descriptor pointer. x86 accesses FS:0 with offsets -24/-16/-8; Arm uses
 TPIDR_EL0+16/+24/+32. Both linked fixtures have no retained relocations, libc or
 stack protector. Neither qualifies a production C runtime profile.
-These native mechanism checks do not establish threaded package
-admission, process-share scheduling, production compiler-TLS ownership or C/CPython
-thread safety.
+A separate native dispatch fixture competes two roots at identical virtual
+addresses, with two runnable siblings versus one. It checks process rotation,
+bounded repeated yields, independent TLS/shared counters and rejection of an
+extra entry after the work allowance is spent. Deliberately expired turns and
+timer-preparation expiry preserve the saved continuation, mappings and accounting
+without entering userspace. A shared flag changes the loop into a busy worker
+that must be timer-preempted without a process fault. Final stop and root teardown
+restore physical and logical baselines. The adjacent `dispatch/x86_64.S` and
+`dispatch/aarch64.S` assemble with Clang's corresponding `unknown-none-elf`
+target; `llvm-readelf -r` must report no relocations before extracting `.text`
+with `llvm-objcopy --only-section=.text -O binary`. `program.rs` embeds those
+inspected loop bytes. These tests do not establish a hard real-time guarantee.
+These native mechanisms do not establish threaded package admission, production
+resident scheduling, production compiler-TLS ownership or C/CPython thread safety.
 The acceptance image exceeds 1 MiB and therefore also exercises the
 page-relative data-symbol relocations used by AArch64 entry and completion.
 The source contract test pins assembly ordering that cannot be probabilistically

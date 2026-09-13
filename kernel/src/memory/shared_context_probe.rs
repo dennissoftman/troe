@@ -76,6 +76,7 @@ const CODE: &[u8] = &[
 
 mod admission;
 mod creation;
+mod dispatch;
 mod retirement;
 mod synchronization;
 
@@ -477,7 +478,8 @@ pub(crate) fn verify(accounting: &mut OwnedAccounting) -> Result<(), ()> {
     synchronization::verify(accounting)?;
     retirement::verify(accounting)?;
     admission::verify(accounting)?;
-    creation::verify(accounting)
+    creation::verify(accounting)?;
+    dispatch::verify(accounting)
 }
 
 fn prepare(

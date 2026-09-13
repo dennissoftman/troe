@@ -395,6 +395,32 @@ out-of-range and mismatched lifetimes return the same stale result. Resolution
 is allocation-free and retains no borrow; terminal records remain identifiable
 until reaping. It grants no capability or permission to skip lifecycle checks.
 
+The separate `thread::schedule` policy selects a runnable process before a
+sibling. It retains independent process and thread cursors and one owned
+dispatch identity; dropping that owner does not free the turn. The fixed table
+stores process-slot indices alongside thread records, allowing process selection
+in one thread-slot scan without allocation. Process slots cannot be reused while
+their records or active dispatch remain live. Stop revokes a retained dispatch,
+and its stale completion cannot close a later turn.
+A turn retains its raw-counter frequency and checked deadline, with a selected
+bound of 1–50 ms and 1–256 charged native entries or bounded kernel-work batches.
+Whole-millisecond observations round down. Equal clock readings still consume
+steps; regression invalidates the turn and requires stop. Sibling creation,
+wake and yield do not renew either allowance. Selection permits a Ready caller
+whose committed policy completion must be consumed before native execution.
+The native `resume_dispatch` boundary checks this exact active turn and Running
+caller, charges an entry using the boot's counter, and carries the immutable
+deadline into timer preparation. It accepts only completed Yield/Timeslice state.
+Expiry before entry returns `DispatchExpired` with the root, registers and pending
+state retained; composition returns the Running record to Ready and ends the turn.
+Native clock/configuration/invariant failure stops the root. On Arm, timer setup
+programs the retained absolute counter value. On x86, setup samples after LAPIC
+calibration, floors the remainder for its one-shot and checks expiry after arming.
+Timer calibration, programming and interrupt-delivery latency are not a hard
+real-time guarantee. Resident scheduling and event ownership remain separate from
+these mechanisms; the ordinary single-context execution and protected IPC lease
+contracts are unchanged.
+
 The boot arena contains one reusable 64 KiB cooperative task payload plus
 128 KiB isolated-server and 192 KiB shell payloads. The shell reserve covers
 eight nested launch levels including private IPC/root metadata. Each has an unmapped 4 KiB page on
@@ -674,9 +700,10 @@ executes the caller nor grants another timeslice. Duplicate, late and mismatched
 completions leave RX unchanged. The copied scheduler request has separate
 storage so legacy IPC continuation records retain their compact representation.
 Built-in scheduler capability authentication and operation execution are
-composition obligations. The mechanism accepts a caller-supplied remaining
-slice of at most 50 ms; process-share scheduling and threaded package admission
-are not enabled. Ordinary application entries carry no scheduler IPC binding
+composition obligations. The lower-level mechanism accepts an explicitly
+accounted remaining slice of at most 50 ms; `resume_dispatch` instead consumes
+the selected process turn at the timer boundary. Production resident scheduling
+and threaded package admission are not enabled. Ordinary application entries carry no scheduler IPC binding
 and continue to reject entry 6.
 Compile-time assertions keep every native outcome distinct from the gate's
 immediate IPC continuation sentinel and ordinary application exit statuses.

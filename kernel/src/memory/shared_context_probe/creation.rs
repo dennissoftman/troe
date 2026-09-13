@@ -241,11 +241,21 @@ fn run(
         .start(f.policy.owner(), initial)
         .map_err(|_| ())?;
     let mut cursor = 0;
+    let frequency = troe_machine::process_accounting_frequency_hz().ok_or(())?;
+    let mut turn: Option<troe_task::thread::schedule::Dispatch> = None;
+    let mut expired_turns = 0;
     for _ in 0..256 {
         trace.stage = "wait completion";
         f.finish_wait()?;
         if f.policy.ids.iter().all(Option::is_none) {
             break;
+        }
+        if turn.is_none() {
+            turn = f
+                .policy
+                .threads
+                .begin_dispatch(troe_machine::process_accounting_ticks(), frequency, 20, 8)
+                .map_err(|_| ())?;
         }
         let index = (0..3)
             .map(|n| (cursor + n) % 3)
@@ -269,9 +279,23 @@ fn run(
         trace.stage = "C execution";
         match f
             .native
-            .resume_scheduled(&f.policy.threads, id, 50)
+            .resume_dispatch(&mut f.policy.threads, turn.as_mut().ok_or(())?, id)
             .map_err(|_| ())?
         {
+            NativeThreadStop::DispatchExpired => {
+                f.policy
+                    .threads
+                    .yield_running(f.policy.owner(), id)
+                    .map_err(|_| ())?;
+                f.policy
+                    .threads
+                    .finish_dispatch(
+                        turn.take().ok_or(())?,
+                        troe_machine::process_accounting_ticks(),
+                    )
+                    .map_err(|_| ())?;
+                expired_turns += 1;
+            }
             NativeThreadStop::Preempted => f
                 .policy
                 .threads
@@ -326,6 +350,12 @@ fn run(
         }
     }
     trace.stage = "final resource accounting";
+    if let Some(turn) = turn {
+        f.policy
+            .threads
+            .finish_dispatch(turn, troe_machine::process_accounting_ticks())
+            .map_err(|_| ())?;
+    }
     if !f.policy.ids.iter().all(Option::is_none)
         || frames.iter().any(Option::is_some)
         || f.delayed_start.is_some()
@@ -334,6 +364,7 @@ fn run(
         || !f.joined
         || f.prepared != 3
         || f.revoked_children != 1
+        || expired_turns == 0
         || f.native.stats().mapped_pages != baseline.mapped_pages
         || f.native.stats().table_pages != baseline.table_pages + 4
         || f.native.metadata_bytes() != metadata

@@ -62,6 +62,20 @@ never executes the ordinary application.
   and fixed kernel DS/ES selectors. Resume restores the retained selectors
   before FS base. The owned flat GDT, disabled LDT and disabled FSGSBASE keep
   GS base zero; TLS never supplies kernel identity;
+- portable process dispatch: one non-cloneable turn selects a process before
+  its siblings. Process and sibling cursors survive wake and thread churn;
+  fixed process-slot indices permit one scan of the thread table. An immutable
+  checked raw-counter deadline, floored whole-millisecond observations and at
+  most 256 charged work batches bound a turn. Regressing clocks invalidate that
+  turn; stale completion cannot release a later dispatch. These policy mechanisms
+  do not program native timers or enable production thread scheduling;
+- native process dispatch: a Running sibling and its exact retained process turn
+  are checked and charged before entry. The timer boundary validates the boot
+  frequency and monotonic observations after controller preparation. Arm retains
+  the absolute counter deadline; x86 floors its remainder for the calibrated
+  LAPIC one-shot and checks expiry again before entry. Expiry preserves the saved
+  continuation and permits no user entry; clock/invariant failure stops the root.
+  This is not a hard real-time guarantee or production resident scheduling;
 - native context owner: one retained root with bounded process-scoped register
   records, checked stack guards and disjoint stack/TLS payloads, actual retained
   metadata accounting, and process-wide continuation revocation on native fault

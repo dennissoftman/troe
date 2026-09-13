@@ -2,15 +2,16 @@
 //!
 //! This mechanism does not admit threaded packages, allocate user frames, or
 //! schedule process shares. Composition authenticates lifecycle tokens, owns
-//! guarded frame reservations and supplies the process's remaining timeslice.
+//! guarded frame reservations and supplies a retained process dispatch or an
+//! explicitly accounted remaining timeslice at the lower-level boundary.
 
 use super::{
-    ApplicationCall, ApplicationHeapGrowth, ApplicationPending, ApplicationResume,
-    ArchitectureApplicationContext, IsolatedFault, MmuError, MmuStats,
+    ApplicationCall, ApplicationExecutionBound, ApplicationHeapGrowth, ApplicationPending,
+    ApplicationResume, ArchitectureApplicationContext, IsolatedFault, MmuError, MmuStats,
     OUTCOME_APPLICATION_HANDLE_CALL, OUTCOME_APPLICATION_HEAP_GROW, OUTCOME_APPLICATION_PREEMPTED,
     OUTCOME_APPLICATION_YIELD, OUTCOME_FAULT_BIT, OUTCOME_SCHEDULER_CALL, TrappedSchedulerCall,
     UserAddressSpace, application_context_set_results, apply_application_resume, decode_fault,
-    run_saved_application, user_range_contains,
+    run_saved_application_bound, user_range_contains,
 };
 use alloc::vec::Vec;
 use troe_memory::VirtualRange;
@@ -21,6 +22,7 @@ pub use retirement::{NativeThreadBacking, NativeThreadRetirement};
 mod admission;
 pub use admission::{NativeThreadAdmission, NativeThreadAdmissionError};
 mod creation;
+mod dispatch;
 
 /// Trusted initial register and mapping geometry for an already owned thread.
 #[derive(Clone, Copy, Debug)]
@@ -47,6 +49,9 @@ pub struct NativeThreadStart {
 /// Copied stop information; no root or runnable context escapes its process.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum NativeThreadStop {
+    /// The retained process dispatch expired before entry; no user code ran.
+    /// Composition returns the still-Running policy record to Ready and ends its turn.
+    DispatchExpired,
     /// The selected thread yielded; its continuation remains owned.
     Yielded,
     /// The selected thread used the caller-supplied remaining timeslice.
@@ -722,18 +727,31 @@ impl NativeProcessContext {
     /// completions. Completion or native mechanism failure for an accepted token
     /// stops all sibling execution. Foreign tokens and invalid slice bounds do
     /// not mutate the owner.
-    // Keep native execution, outcome adoption and terminal revocation together.
-    #[allow(clippy::too_many_lines)]
     pub fn resume(
         &mut self,
         id: ThreadId,
         completion: ApplicationResume<'_>,
         remaining_milliseconds: u32,
     ) -> Result<NativeThreadStop, MmuError> {
-        if self.stopped
-            || id.process() != self.process
-            || !(1..=50).contains(&remaining_milliseconds)
-        {
+        if !(1..=50).contains(&remaining_milliseconds) {
+            return Err(MmuError::InvalidUserContext);
+        }
+        self.resume_bound(
+            id,
+            completion,
+            ApplicationExecutionBound::Relative(remaining_milliseconds),
+        )
+    }
+
+    // Keep native execution, outcome adoption and terminal revocation together.
+    #[allow(clippy::too_many_lines)]
+    fn resume_bound(
+        &mut self,
+        id: ThreadId,
+        completion: ApplicationResume<'_>,
+        bound: ApplicationExecutionBound,
+    ) -> Result<NativeThreadStop, MmuError> {
+        if self.stopped || id.process() != self.process {
             return Err(MmuError::InvalidUserContext);
         }
         let index = self
@@ -751,14 +769,17 @@ impl NativeProcessContext {
             self.stop();
             return Err(error);
         }
-        context.started = true;
-        let result = run_saved_application(
+        let result = run_saved_application_bound(
             &mut self.backing.address_space,
             &context.registers,
-            remaining_milliseconds,
+            bound,
             context.ipc.map(|ipc| ipc.tx),
         );
-        let result = result.and_then(|(raw, mut state)| {
+        let result = result.and_then(|run| {
+            let Some((raw, mut state)) = run else {
+                return Ok(NativeThreadStop::DispatchExpired);
+            };
+            context.started = true;
             if raw & OUTCOME_FAULT_BIT != 0 {
                 return Ok(NativeThreadStop::ProcessFaulted(decode_fault(raw)?));
             }

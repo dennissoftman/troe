@@ -1761,7 +1761,34 @@ fn run_saved_application(
     timeslice_milliseconds: u32,
     scheduler_tx: Option<u64>,
 ) -> Result<(u64, IsolatedRunState), MmuError> {
-    if timeslice_milliseconds == 0 || KERNEL_ROOT.load(Ordering::Acquire) == 0 {
+    run_saved_application_bound(
+        address_space,
+        context,
+        ApplicationExecutionBound::Relative(timeslice_milliseconds),
+        scheduler_tx,
+    )?
+    .ok_or(MmuError::InvalidUserContext)
+}
+
+#[cfg(target_os = "uefi")]
+#[derive(Clone, Copy)] // Copied timer parameters; the process dispatch owns the entitlement.
+enum ApplicationExecutionBound {
+    Relative(u32),
+    Dispatch(crate::mechanism::ExecutionDeadline),
+}
+
+/// None means the retained process budget expired before entry; root ownership
+/// and the saved continuation are still intact. Errors remain terminal.
+#[cfg(target_os = "uefi")]
+fn run_saved_application_bound(
+    address_space: &mut UserAddressSpace,
+    context: &ArchitectureApplicationContext,
+    bound: ApplicationExecutionBound,
+    scheduler_tx: Option<u64>,
+) -> Result<Option<(u64, IsolatedRunState)>, MmuError> {
+    if matches!(bound, ApplicationExecutionBound::Relative(0))
+        || KERNEL_ROOT.load(Ordering::Acquire) == 0
+    {
         return Err(MmuError::InvalidUserContext);
     }
     if ISOLATED_ACTIVE
@@ -1786,8 +1813,15 @@ fn run_saved_application(
             ipc: address_space.ipc,
         });
     }
-    let prepared = crate::mechanism::prepare_application_execution(timeslice_milliseconds);
-    let raw = if prepared.is_ok() {
+    let prepared = match bound {
+        ApplicationExecutionBound::Relative(milliseconds) => {
+            crate::mechanism::prepare_application_execution(milliseconds).map(|()| true)
+        }
+        ApplicationExecutionBound::Dispatch(deadline) => {
+            crate::mechanism::prepare_application_dispatch(deadline)
+        }
+    };
+    let raw = if matches!(prepared, Ok(true)) {
         let raw = architecture_resume_application(address_space.root, context);
         #[cfg(feature = "acceptance-probes")]
         crate::mechanism::record_application_execution_boundary();
@@ -1804,10 +1838,12 @@ fn run_saved_application(
     }
     ISOLATED_ACTIVE.store(false, Ordering::Release);
     crate::mechanism::finish_application_execution();
-    if prepared.is_err() {
-        return Err(MmuError::ExecutionTimerUnavailable);
+    let state = state.ok_or(MmuError::InvalidUserContext)?;
+    match prepared {
+        Err(_) => Err(MmuError::ExecutionTimerUnavailable),
+        Ok(false) => Ok(None),
+        Ok(true) => Ok(Some((raw, state))),
     }
-    Ok((raw, state.ok_or(MmuError::InvalidUserContext)?))
 }
 
 #[cfg(target_os = "uefi")]

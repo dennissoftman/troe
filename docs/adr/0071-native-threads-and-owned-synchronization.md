@@ -4,6 +4,15 @@ Status: architectural direction accepted, 2026-09-09. Implementation tracked by
 [#65](https://github.com/dennissoftman/troe/issues/65) and delivery issues
 [#204](https://github.com/dennissoftman/troe/issues/204) through
 [#208](https://github.com/dennissoftman/troe/issues/208).
+Portable process-first dispatch selection retains independent process/thread
+cursors and an owned turn with checked raw-counter time and finite kernel-work
+allowances. It rejects clock regression and stale completion and preserves
+process rotation across thread churn. Native dispatch consumes that turn at the
+timer boundary, preserves the continuation on expiry before entry and checks
+clock frequency/regression. Arm programs the retained absolute counter deadline;
+x86 floors the remaining interval for its calibrated one-shot. Native acceptance
+competes two roots with unequal sibling counts and runs the C creation lifecycle
+across exhausted turns. Production resident/event integration remains in #207.
 Native shared-root context switching and retained per-thread IPC storage have
 acceptance mechanisms. Native prepared mapping admission rechecks the current
 lifecycle identity, role and charge, preflights complete windows/backing and
