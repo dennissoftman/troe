@@ -16,7 +16,7 @@ pub use startup::{StartupDescriptor, StartupReference};
 pub const MAJOR: u16 = 1;
 /// Thread/synchronization interface minor.
 pub const MINOR: u16 = 0;
-/// Assigned scheduler-call entry; the current native dispatcher rejects it.
+/// Scheduler-call entry; ordinary application admission/dispatch still rejects it.
 pub const CALL: u64 = 6;
 /// Exact private TX request prefix.
 pub const REQUEST_BYTES: usize = 64;

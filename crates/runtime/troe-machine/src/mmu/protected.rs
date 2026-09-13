@@ -515,6 +515,8 @@ impl ProtectedRuntime {
                 destination_len: 0,
                 application_context: None,
                 pending_application: None,
+                scheduler_tx: None,
+                scheduler_request: None,
                 ipc: None,
             });
         }
@@ -716,7 +718,7 @@ impl ProtectedRuntime {
             .ok_or(MmuError::InvalidUserContext)?
             .activate()?;
         self.active = Some(destination);
-        Ok(1 << 58)
+        Ok(super::ipc::continue_value())
     }
 }
 
@@ -791,7 +793,7 @@ pub(super) fn syscall(
                 // This runtime's fixed boot records reserve all private pages
                 // up front. A dynamic request cannot widen that reservation.
                 application_context_set_results(frame, troe_abi::heap_growth::EXHAUSTED, 0);
-                return Ok(1 << 58);
+                return Ok(super::ipc::continue_value());
             }
             super::APPLICATION_EXIT_CALL => {
                 return u32::try_from(args[0])

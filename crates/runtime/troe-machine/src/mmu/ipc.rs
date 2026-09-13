@@ -237,6 +237,8 @@ impl IpcPair {
                 destination_len: 0,
                 application_context: None,
                 pending_application: None,
+                scheduler_tx: None,
+                scheduler_request: None,
                 ipc: None,
             });
         }
@@ -723,7 +725,6 @@ pub(super) fn syscall(
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 pub(super) const fn continue_value() -> u64 {
     CONTINUE
 }

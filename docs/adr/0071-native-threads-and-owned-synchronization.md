@@ -5,8 +5,10 @@ Status: architectural direction accepted, 2026-09-09. Implementation tracked by
 [#204](https://github.com/dennissoftman/troe/issues/204) through
 [#208](https://github.com/dennissoftman/troe/issues/208).
 Native shared-root context switching and retained per-thread IPC storage have
-acceptance mechanisms; threaded package admission, native scheduler calls,
-compiler-TLS allocation and pthread support remain disabled.
+acceptance mechanisms. The native owner also captures scheduler calls and
+validates correlated completions; built-in scheduler capability/operation
+integration, threaded package admission, compiler-TLS allocation and pthread
+support remain disabled.
 Current single-execution-thread application contracts remain in force.
 Portable lifecycle/synchronization models, an independently compiler-checked
 static TLS layout/initializer, guarded thread-memory planning, and composed
@@ -20,7 +22,9 @@ The portable table constructors also enforce compiled metadata-byte budgets;
 the paired admission annex below constrains record/wait capacity and protected
 IPC headroom without enabling native execution.
 Allocation-free wire/startup codecs implement the numeric assignments described
-in the wire annex below. Application ABI 1.4 and native entry 6 remain disabled;
+in the wire annex below. Application ABI 1.4 remains disabled and ordinary
+application dispatch rejects entry 6. Native owner acceptance exercises the
+separate capture/completion boundary without activating scheduler services;
 these assignments do not supersede the active ABI 1.3 contract. Complete native
 admission and the remaining gates below are still required.
 
@@ -46,7 +50,14 @@ distinct TLS words, per-thread TX/RX storage, fault revocation and reclamation.
 rejection and final drop; stop keeps the pairs occupied until root retirement.
 Bindings validate live task pairs and mapped physical pages, and RX publication
 clears the whole page before copying a bounded prefix. This does not enable the
-threaded loader, process-share scheduler, native scheduler calls or the C facade.
+threaded loader, process-share scheduler, built-in scheduler services or the C facade.
+Native scheduler capture copies the fixed TX prefix before another sibling can
+run. Opaque operation identity includes the caller, sequence and live IPC pair
+generation; completion validates the retained request/response before RX writes.
+Malformed framing can only complete rejected; stale and mismatched completions
+leave storage unchanged. Completion does not execute the caller or renew CPU
+entitlement. The built-in capability and operation dispatch remain composition
+requirements.
 AArch64 saves TPIDR_EL0; the x86 saved context retains FS/GS/DS/ES selectors
 and an independent FS base. The x86 gates normalize kernel selectors and FS
 base before Rust handlers and restore user selectors before FS base on resume.
@@ -854,9 +865,10 @@ owned root/context split without cloning a root-owning `ApplicationSession`.
 It retains the root during each native transition and serializes access to
 all continuations. The backing bundle retains per-thread IPC pair owners and
 validates immutable bindings; kernel copying/publication uses those bindings.
-Resident scheduling and native scheduler-call integration remain tracked by
-#207. Mapping mutation, context activation and final root destruction
-must remain serialized during that integration.
+Native scheduler calls retain copied request bytes and operation identity until
+a validated completion; resident scheduling, built-in capability authentication
+and operation execution remain tracked by #207. Mapping mutation, context
+activation and final root destruction must remain serialized during that integration.
 
 Schedule processes fairly first, then select a runnable thread within the
 chosen process. Creating, waking, joining, yielding or handing work to siblings

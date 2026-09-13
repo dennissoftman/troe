@@ -31,8 +31,13 @@ The `Call` codec assigns entry 6 with six words:
 values. There are no user pointers. The request and response occupy prefixes
 of the calling thread's already-owned TX/RX pages. `Completion` encodes exactly
 `[0, 32]` for an operation response or `[1, 0]` for a rejected call with no
-exposed RX prefix. All other completion pairs are invalid. These codecs do not
-alter the current dispatcher's rejection of entry 6.
+exposed RX prefix. All other completion pairs are invalid. Ordinary application
+dispatch still rejects entry 6. The separate `NativeProcessContext` mechanism
+captures the fixed request from its selected context's retained IPC pair and
+supports a correlated completion. It requires trusted composition to authenticate
+the built-in capability and execute the operation; it does not enable threaded
+package admission. Native capture copies the request before another sibling
+runs and retains caller, operation sequence and IPC generation through completion.
 
 ## Requests
 
