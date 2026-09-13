@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 use troe_dispatch::{Dispatcher, Handle, HandleOwner, Rights, SchedulerInterface};
 use troe_machine::{
     ApplicationResume, IpcPagePair, NativeProcessBacking, NativeProcessContext,
-    NativeSchedulerCall, NativeThreadStart, NativeThreadStop,
+    NativeSchedulerCall, NativeSchedulerExecution, NativeThreadStart, NativeThreadStop,
 };
 use troe_memory::{
     Mapping, MappingLifetime, MappingOwner, MappingPermissions, MappingPlan, PhysicalRange,
@@ -384,7 +384,8 @@ pub(crate) fn verify(accounting: &mut OwnedAccounting) -> Result<(), ()> {
         {
             return Err(());
         }
-        let operations = verify_scheduler_calls(&mut native, &mut threads, owner, ids, &authority)?;
+        let (operations, late) =
+            verify_scheduler_calls(&mut native, &mut threads, owner, ids, &authority)?;
         threads.dispatch(owner, first).map_err(|_| ())?;
         if native
             .resume(first, ApplicationResume::Timeslice, 50)
@@ -404,6 +405,24 @@ pub(crate) fn verify(accounting: &mut OwnedAccounting) -> Result<(), ()> {
             || native.probe_word(TX[1] + PAGE + 16).map_err(|_| ())?
                 != thread_token(&threads, owner, second)?
             || native.probe_word(USER_DATA_BASE + 16).map_err(|_| ())? != 32
+        {
+            return Err(());
+        }
+        let before = native.probe_word(TX[1] + PAGE).map_err(|_| ())?;
+        let (error, late) = native
+            .complete_scheduler_execution(
+                late,
+                troe_abi::threading::Response {
+                    outcome: troe_abi::threading::Outcome::Success,
+                    value: thread_token(&threads, owner, second)?,
+                    snapshot: None,
+                },
+            )
+            .err()
+            .ok_or(())?;
+        if error != troe_machine::MmuError::InvalidUserContext
+            || late.caller() != second
+            || native.probe_word(TX[1] + PAGE).map_err(|_| ())? != before
         {
             return Err(());
         }
@@ -592,7 +611,7 @@ fn verify_scheduler_calls(
     owner: ProcessId,
     ids: [ThreadId; 2],
     authority: &ProbeScheduler,
-) -> Result<[NativeSchedulerCall; 2], ()> {
+) -> Result<([NativeSchedulerCall; 2], NativeSchedulerExecution), ()> {
     use troe_abi::interface::{THREAD_CONTROL, THREAD_SYNC};
     use troe_abi::threading::{Call, Outcome, Request, Response};
     let denied = Response {
@@ -606,6 +625,7 @@ fn verify_scheduler_calls(
         snapshot: None,
     };
     let mut previous = [None; 2];
+    let mut late = None;
     for phase in 0..4 {
         let mut captured = [None; 2];
         for (index, id) in ids.into_iter().enumerate() {
@@ -651,6 +671,9 @@ fn verify_scheduler_calls(
                     }
                 || operation.request(THREAD_SYNC).is_ok()
                 || native
+                    .claim_scheduler(operation, Request::CreateCondition)
+                    .is_ok()
+                || native
                     .complete_scheduler(operation, Some((Request::CreateCondition, denied)))
                     .is_ok()
                 || native
@@ -669,6 +692,7 @@ fn verify_scheduler_calls(
             if phase < 2 {
                 if operation.request(THREAD_CONTROL).is_ok()
                     || operation.request_bytes().is_some() != (phase == 1)
+                    || native.claim_scheduler(operation, Request::Current).is_ok()
                 {
                     return Err(());
                 }
@@ -693,6 +717,9 @@ fn verify_scheduler_calls(
                 {
                     return Err(());
                 }
+                let execution = native
+                    .claim_scheduler(operation, admitted.request())
+                    .map_err(|_| ())?;
                 // Identity comes from the captured caller and live thread table,
                 // never writable TLS or an application-supplied destination.
                 let response = Response {
@@ -700,9 +727,38 @@ fn verify_scheduler_calls(
                     value: thread_token(threads, owner, operation.caller())?,
                     snapshot: None,
                 };
-                native
-                    .complete_scheduler(operation, Some((admitted.request(), response)))
-                    .map_err(|_| ())?;
+                if execution.caller() != operation.caller()
+                    || execution.request() != admitted.request()
+                    || native
+                        .claim_scheduler(operation, admitted.request())
+                        .is_ok()
+                    || native.complete_scheduler(operation, None).is_ok()
+                    || native
+                        .complete_scheduler(operation, Some((admitted.request(), response)))
+                        .is_ok()
+                    || native.probe_word(TX[index] + PAGE).map_err(|_| ())? != before
+                {
+                    return Err(());
+                }
+                let (error, execution) = native
+                    .complete_scheduler_execution(execution, invalid)
+                    .err()
+                    .ok_or(())?;
+                if error != troe_machine::MmuError::InvalidUserContext
+                    || execution.caller() != operation.caller()
+                    || execution.request() != admitted.request()
+                    || native.probe_word(TX[index] + PAGE).map_err(|_| ())? != before
+                {
+                    return Err(());
+                }
+                if phase == 3 && index == 1 {
+                    // The first sibling faults while this owned execution waits.
+                    late = Some(execution);
+                } else {
+                    native
+                        .complete_scheduler_execution(execution, response)
+                        .map_err(|_| ())?;
+                }
                 verify_rx_tail(native, TX[index], 32)?;
             }
             let after = native.probe_word(TX[index] + PAGE).map_err(|_| ())?;
@@ -714,7 +770,10 @@ fn verify_scheduler_calls(
             previous[index] = Some(operation);
         }
     }
-    Ok([previous[0].ok_or(())?, previous[1].ok_or(())?])
+    Ok((
+        [previous[0].ok_or(())?, previous[1].ok_or(())?],
+        late.ok_or(())?,
+    ))
 }
 
 struct ProbeScheduler {

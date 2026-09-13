@@ -584,6 +584,15 @@ are not enabled. Ordinary application entries carry no scheduler IPC binding
 and continue to reject entry 6.
 Compile-time assertions keep every native outcome distinct from the gate's
 immediate IPC continuation sentinel and ordinary application exit statuses.
+After capability authentication, `claim_scheduler` matches the canonical request
+and retained operation, marks the capture claimed once and returns an owned
+`NativeSchedulerExecution`. The value contains no borrow or user pointer and can
+belong to a suspended operation; composition charges its retained storage separately
+from the native context owner. Repeat claims and direct completion of claimed
+calls are rejected. Consuming completion validates the original request/IPC
+lifetime; an error returns the execution value so composition can recover or
+retire it after process stop. Claiming or completing never runs user code,
+allocates a buffer or renews CPU entitlement.
 Native acceptance composes the dispatcher authority check with captured Current
 calls and live thread identity resolution. Its restricted control handle belongs
 to the process record's task principal, and replies identify the captured caller.

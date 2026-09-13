@@ -11,7 +11,9 @@ targets and owned request authorization; native capability/operation integration
 threaded package admission, compiler-TLS allocation and pthread
 support remain disabled.
 Native acceptance composes a restricted control capability with Current calls
-and process-scoped live thread-token resolution. This does not activate general
+and process-scoped live thread-token resolution. The native owner also claims
+each captured call once into a non-cloneable execution value and returns that
+ownership if completion fails. This does not activate general
 scheduler operation execution or application grants.
 Current single-execution-thread application contracts remain in force.
 Portable lifecycle/synchronization models, an independently compiler-checked
