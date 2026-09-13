@@ -421,9 +421,7 @@ def generate_corpus() -> dict[str, bytes]:
             )
 
         probe = "thread-pointer"
-        artifact = _canonical(
-            target, NATIVE_CODE[target][probe] + ACCEPTANCE_MARKER
-        )
+        artifact = _canonical(target, NATIVE_CODE[target][probe] + ACCEPTANCE_MARKER)
         name = f"native-{probe}-{target}.kex"
         files[name] = _put_u16(bytearray(artifact), 20, 2)
         manifest.append(f"{name}\t{target}\tok")
