@@ -802,7 +802,10 @@ The unsorted `ipc-phase-b-samples` records use the same counter/frequency as
 Measurements are grouped by payload: compatibility, Phase B direct and queued,
 then Phase C general-direct. Each group uses one compatibility sample array.
 Its serial transcript is emitted after all paths finish, including observations
-collected before a failure. Native fault probes run after the latency groups.
+collected before a failure. A latency miss does not halt the guest: both paths
+finish the measurement matrix and native fault probes before the host rejects
+the ratio. Ownership, structural and deadline failures still stop immediately.
+Native fault probes run after the latency groups.
 This keeps comparisons close in time without changing clocks, sample counts,
 warmups, timing boundaries, or thresholds; host scheduling can still affect
 the results. The release build optimizes the machine, service, task and dispatch
@@ -832,7 +835,12 @@ both arrays. Direct p95 divided by same-boot compatibility p95 must be at most
 latency threshold. All rows must use one clock and feature mode. Evidence is
 written to `build/ipc-phase-b-<platform>-<tagged|fallback>.json`, including raw
 samples, structural counts, host, QEMU command, and acceptance-image SHA-256.
-Hosted acceptance uploads those files as artifacts.
+Before validating either phase, the host also retains each boot's complete
+`ipc-` transcript in a uniquely named `build/ipc-observation-<platform>-*.json`
+file with its image digest, command, host and required tagging mode. These raw
+observations are explicitly unvalidated, retain failed ratios, and do not
+replace either validator. Later boots do not overwrite them. Hosted acceptance
+uploads both raw observations and validated evidence as artifacts.
 
 The general runtime is separately measured by `kernel/src/supervisor/benchmark.rs`
 using the same native client and same-boot compatibility samples. Its

@@ -327,6 +327,7 @@ jobs:
           path: |
             build/ipc-phase-b-*.json
             build/ipc-phase-c-*.json
+            build/ipc-observation-*.json
           if-no-files-found: error
 
   # One job to require in branch protection. It succeeds when every selected
