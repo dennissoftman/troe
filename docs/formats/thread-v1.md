@@ -41,9 +41,9 @@ does not execute or correlate a native operation.
 
 The portable `troe-service::threading` operation dispatcher binds this owned
 authorization to the captured caller and trusted process snapshot. It executes
-Current, Observe, RequestStop and all interface 31 operations against the paired
-tables; the other interface 30 requests return Unsupported. A new operation
-requires a running caller with no unconsumed synchronization wait. Waiting owns
+Current, Observe, RequestStop, Join, Detach, Sleep and all interface 31 operations
+against the paired tables; Prepare, Start, Abort and Exit return Unsupported.
+A new operation requires a running caller with no unconsumed policy wait. Waiting owns
 the original request and exact wait generation, with no table borrow or user
 pointer. Clock/configuration failures require process termination rather than
 an application reply or request replay. Native composition separately claims the
@@ -136,6 +136,17 @@ counter capacity. Overflow rejects the whole batch without publishing grants,
 timeouts or stop results. Expired/stopped waiters do not supply release capacity.
 RequestStop sets a sticky flag; observing an admitted wait or processing its
 queue selects the result without restarting an absolute deadline.
+
+Join requires a started, joinable noninitial target and one exclusive claim.
+Try returns would-block without retaining a claim when no quiescent result is
+available. An expired deadline or observed stop precedes result acquisition;
+while queued it relinquishes the claim without consuming completion. Once
+committed, the scalar result remains owned through target reaping and later
+events. Sleep selects timed-out when its absolute deadline expires or stopped
+when an opted-in stop wins first. An indefinite sleep without stop observation
+requires process termination. Selected control results become consumable only
+after caller dispatch; generic wake and another call cannot bypass them.
+At one observation, expiry takes precedence over a simultaneous sticky stop.
 
 ## Responses
 

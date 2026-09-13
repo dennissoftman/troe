@@ -90,10 +90,14 @@ never executes the ordinary application.
   grants no capability and does not bypass operation-specific state checks;
 - owned thread operations: the portable dispatcher binds authenticated capability
   ownership to a captured caller and trusted process snapshot, validates running
-  state and rejects new work with an unconsumed synchronization wait. Owned wait
-  records carry no user pointer, callback or table borrow. Absolute deadlines do
+  state and rejects new work with an unconsumed synchronization or control wait.
+  Owned wait records carry no user pointer, callback or table borrow. Absolute deadlines do
   not restart on resumption; condition timeout/stop retains mutex reacquisition.
   Permit batches check complete capacity before any grant or timeout publication.
+  Join waits consume only quiescent results; timeout/stop cancels an uncommitted
+  claim without consuming its target. A committed scalar result remains owned
+  through target reaping and cannot be replaced by a later timeout or stop.
+  Ordinary wake and orderly exit cannot bypass the completion interlock.
   Internal clock/configuration failures require process stop without replay.
   Native execution claims and retained operation storage remain separately owned
   and charged by composition; ordinary package grants remain disabled;
