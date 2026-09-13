@@ -60,6 +60,7 @@ NATIVE_THREAD_GATE_PATHS = frozenset(
         "crates/runtime/troe-dispatch/src/scheduler.rs",
         "crates/runtime/troe-machine/src/mmu/process.rs",
         "crates/runtime/troe-machine/src/mmu/retirement.rs",
+        "crates/runtime/troe-machine/src/mmu/admission.rs",
         "kernel/src/memory/shared_context_probe.rs",
     )
 )
@@ -68,6 +69,7 @@ NATIVE_THREAD_GATE_PREFIXES = (
     "crates/runtime/troe-task/src/thread/",
     "crates/runtime/troe-machine/src/mmu/process/",
     "crates/runtime/troe-machine/src/mmu/retirement/",
+    "crates/runtime/troe-machine/src/mmu/admission/",
     "kernel/src/memory/shared_context_probe/",
 )
 NETWORK_APPS = frozenset(("arp", "dhcp", "net", "ping", "tcp", "udp"))

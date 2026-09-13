@@ -456,7 +456,9 @@ fn run_case(
         return Err(());
     }
     invalid = starts[0];
-    invalid.startup = USER_DATA_BASE;
+    // Startup arguments can be shared independently of private descriptor ownership.
+    // An unreadable argument is still rejected before publishing a context.
+    invalid.startup = 0;
     if native.prepare(policy.ids[0], invalid).is_ok() {
         return Err(());
     }

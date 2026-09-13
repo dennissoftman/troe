@@ -18,6 +18,8 @@ use troe_task::{ProcessId, thread::ThreadId};
 
 mod retirement;
 pub use retirement::{NativeThreadBacking, NativeThreadRetirement};
+mod admission;
+pub use admission::{NativeThreadAdmission, NativeThreadAdmissionError};
 
 /// Trusted initial register and mapping geometry for an already owned thread.
 #[derive(Clone, Copy, Debug)]
@@ -35,6 +37,8 @@ pub struct NativeThreadStart {
     /// Nonzero startup record length passed as the second argument.
     pub startup_bytes: usize,
     /// Optional complete, private read-only/NX startup mapping to retire with this thread.
+    /// Independent of the first argument: initial entry receives the shared
+    /// process header while retaining its separate private descriptor here.
     /// `None` retains a shared startup record under process ownership.
     pub private_startup: Option<VirtualRange>,
 }
@@ -167,6 +171,8 @@ struct ThreadContext {
     started: bool,
     ipc: Option<ThreadIpc>,
     scheduler_operation: Option<PendingSchedulerCall>,
+    // Complete mapped-admission reservation, including its inaccessible gaps.
+    window: Option<VirtualRange>,
 }
 
 impl Drop for ThreadContext {
@@ -200,6 +206,8 @@ pub struct NativeProcessContext {
     metadata_bytes: usize,
     stopped: bool,
     next_operation: u64,
+    // Immutable shared bootstrap identity survives initial-thread retirement.
+    process_startup: Option<u64>,
 }
 
 impl NativeProcessContext {
@@ -249,6 +257,7 @@ impl NativeProcessContext {
         let pair_bytes = backing
             .pairs
             .capacity()
+            .max(capacity)
             .checked_mul(core::mem::size_of::<crate::IpcPagePair>())
             .ok_or(MmuError::InvalidUserContext)?;
         // Retiring four disjoint regions can split at most four existing ones.
@@ -276,6 +285,15 @@ impl NativeProcessContext {
         if requested > metadata_limit {
             return Err(MmuError::InvalidUserContext);
         }
+        backing
+            .pairs
+            .try_reserve_exact(capacity - backing.pairs.len())
+            .map_err(|_| MmuError::InvalidUserContext)?;
+        let pair_bytes = backing
+            .pairs
+            .capacity()
+            .checked_mul(core::mem::size_of::<crate::IpcPagePair>())
+            .ok_or(MmuError::InvalidUserContext)?;
         backing
             .address_space
             .regions
@@ -310,6 +328,7 @@ impl NativeProcessContext {
             metadata_bytes,
             stopped: false,
             next_operation: 1,
+            process_startup: None,
         })
     }
 
@@ -345,6 +364,17 @@ impl NativeProcessContext {
             &mut bytes,
         )?;
         Ok(u64::from_le_bytes(bytes))
+    }
+
+    /// Inspect a native leaf independently of published user-region metadata.
+    /// Acceptance uses this to distinguish a partially written PTE from a
+    /// readable published mapping while the failed process remains stopped.
+    ///
+    /// # Errors
+    /// Rejects absent or structurally invalid page-table entries.
+    #[cfg(feature = "acceptance-probes")]
+    pub fn probe_leaf(&self, address: u64) -> Result<u64, MmuError> {
+        super::architecture_translate_page(self.backing.address_space.root, address)
     }
 
     /// Copy one suspended thread's validated request into kernel-owned storage.
@@ -390,9 +420,16 @@ impl NativeProcessContext {
             || self.contexts.len() == self.capacity
             || self.contexts.iter().any(|context| context.id == id)
             || !valid_start(&self.backing.address_space, start)
+            || self.process_startup.is_some_and(|address| {
+                private_ranges(start)
+                    .any(|range| range.start() < address + 4096 && address < range.end())
+            })
             || self.contexts.iter().any(|context| {
-                private_ranges(context.start)
-                    .any(|old| private_ranges(start).any(|new| overlaps(old, new)))
+                context
+                    .window
+                    .is_some_and(|window| admission::conflicts(start, window))
+                    || private_ranges(context.start)
+                        .any(|old| private_ranges(start).any(|new| overlaps(old, new)))
                     || context.ipc.is_some_and(|ipc| {
                         private_ranges(start)
                             .any(|new| ipc.tx < new.end() && new.start() < ipc.tx + 8192)
@@ -409,6 +446,7 @@ impl NativeProcessContext {
             started: false,
             ipc: None,
             scheduler_operation: None,
+            window: None,
         });
         Ok(())
     }
@@ -444,7 +482,8 @@ impl NativeProcessContext {
             || super::architecture_translate_page(self.backing.address_space.root, tx + 4096)?
                 != pair.range().start() + 4096
             || self.contexts.iter().any(|context| {
-                private_ranges(context.start).any(|private| overlaps(range, private))
+                (context.id != id && context.window.is_some_and(|window| overlaps(range, window)))
+                    || private_ranges(context.start).any(|private| overlaps(range, private))
                     || context.ipc.is_some_and(|ipc| {
                         ipc.index == pair_index
                             || (ipc.tx < range.end() && range.start() < ipc.tx + 8192)
@@ -839,11 +878,6 @@ fn valid_start(space: &UserAddressSpace, start: NativeThreadStart) -> bool {
         };
         !overlaps(range, start.stack)
             && !overlaps(range, start.tls)
-            && range.start() <= start.startup
-            && start
-                .startup
-                .checked_add(start.startup_bytes as u64)
-                .is_some_and(|end| end <= range.end())
             && user_range_contains(&space.regions, range.start(), bytes, false, false)
             && !space.regions.iter().any(|region| {
                 overlaps(region.range, range)

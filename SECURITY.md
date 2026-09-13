@@ -82,6 +82,19 @@ never executes the ordinary application.
   for captured Current/Join calls and synchronization requests under separate closed
   handles. Pending synchronization claims cannot complete after a sibling's
   native fault. Ordinary application admission does not enable scheduler calls;
+- native prepared mapping admission: the current lifecycle table must match the
+  exact Prepared identity, initial/worker role and mapped-page charge. The native
+  owner reserves and charges IPC-owner capacity before publication. It checks the
+  complete virtual window, guards and alignment gaps, physical extents, existing
+  user aliases, root-table exclusion and conservative unused table capacity
+  before changing mappings. Stack, private descriptor and IPC are cleared; the
+  descriptor is encoded from trusted fields and published read-only/NX. The first
+  mapped initial thread binds one uniquely mapped shared-header page to the root;
+  worker descriptors cannot substitute another header after initial exit. Compiler
+  TLS initialization and ordinary physical ownership remain composition duties.
+  A rejected preflight returns the IPC owner. Failure after mutation begins stops
+  the whole process and retains root and IPC until teardown. No allocation,
+  callback, logical Start or resource refund occurs in mapping admission;
 - native thread retirement: a claimed Exit can remove one inactive context's
   stack, TLS, optional private read-only startup and IPC mappings. Read-only
   preflight checks kernel-owned physical extents, permissions, sibling references,
@@ -94,7 +107,10 @@ never executes the ordinary application.
   Discarding a never-executed preparation additionally rechecks its live Revoked
   lifecycle record and unreleased resources; a Ready thread cannot be discarded
   merely because it has not executed. Both retirement paths share preflight and
-  terminal mutation-failure handling;
+  terminal mutation-failure handling. An initial thread's private descriptor is
+  retired with that thread; the shared process header's reference is bootstrap
+  data, not a process-lifetime guarantee for the descriptor. Shared startup and
+  page-table backing retain process lifetime;
 - tasks and process records: at most 65,536, with monotonic identities, explicit
   capabilities, deterministic lifecycle accounting, fallible metadata growth,
   and guarded native stack payloads. Portable thread and synchronization lookup

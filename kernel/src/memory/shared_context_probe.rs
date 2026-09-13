@@ -74,6 +74,7 @@ const CODE: &[u8] = &[
     0x08, 0x00, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4, 0x00, 0x00, 0x20, 0xd4,
 ];
 
+mod admission;
 mod retirement;
 mod synchronization;
 
@@ -86,7 +87,10 @@ pub(crate) fn verify(accounting: &mut OwnedAccounting) -> Result<(), ()> {
     let free = accounting.frames.free_frames();
     let allocation = allocate_isolated(&mut accounting.frames)?;
     let result = (|| {
-        let pairs = allocate_pairs()?;
+        let mut pairs = allocate_pairs()?;
+        // Native admission reserves pair slots even for a bare owner. Retain
+        // extra actual capacity here to verify that it is independently charged.
+        pairs.try_reserve_exact(1).map_err(|_| ())?;
         let (plan, _) = prepare(&allocation, &accounting.kernel_plan, &pairs, CODE)?;
         let root =
             troe_machine::build_user_address_space(&plan, allocation.tables).map_err(|_| ())?;
@@ -176,8 +180,8 @@ pub(crate) fn verify(accounting: &mut OwnedAccounting) -> Result<(), ()> {
         let prior = pair_identities(&pairs);
         let root =
             troe_machine::build_user_address_space(&plan, allocation.tables).map_err(|_| ())?;
-        // The allowance fits the context/root arrays but not the retained pair
-        // vector capacity. Rejection must retire the root before releasing pairs.
+        // The allowance fits the bare owner, including its reserved pair slots,
+        // but not this larger retained pair capacity. Root must retire first.
         if NativeProcessContext::with_backing(
             owner,
             NativeProcessBacking::new(root, pairs),
@@ -193,7 +197,6 @@ pub(crate) fn verify(accounting: &mut OwnedAccounting) -> Result<(), ()> {
         }
         let pairs = allocate_pairs()?;
         verify_reused(&pairs, prior)?;
-        let pair_capacity = pairs.capacity();
         let identities = pair_identities(&pairs);
         let (plan, starts) = prepare(&allocation, &accounting.kernel_plan, &pairs, CODE)?;
         let authority = ProbeScheduler::new(&processes, owner)?;
@@ -219,9 +222,7 @@ pub(crate) fn verify(accounting: &mut OwnedAccounting) -> Result<(), ()> {
             METADATA_LIMIT,
         )
         .map_err(|_| ())?;
-        if native.metadata_bytes()
-            < bare_metadata + pair_capacity * core::mem::size_of::<IpcPagePair>()
-        {
+        if native.metadata_bytes() < bare_metadata {
             return Err(());
         }
         let root_charges = native.stats();
@@ -473,7 +474,8 @@ pub(crate) fn verify(accounting: &mut OwnedAccounting) -> Result<(), ()> {
         return Err(());
     }
     synchronization::verify(accounting)?;
-    retirement::verify(accounting)
+    retirement::verify(accounting)?;
+    admission::verify(accounting)
 }
 
 fn prepare(

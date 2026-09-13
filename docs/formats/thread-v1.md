@@ -91,6 +91,19 @@ After physical reclamation and resource acknowledgement, finishing the action
 reaps the exact retained target and returns a canonical success with value zero.
 Start winning first rejects Abort even if the target has not yet executed.
 Early finish, caller stop or a stale/reused target cannot publish late success.
+The separate native `admit_prepared` mechanism maps and binds a retained logical
+preparation after live identity/role/page-charge and full backing/window checks.
+It does not execute the Prepare or Start wire operations. Descriptor bytes are
+kernel-encoded into a cleared private read-only/NX page. Initial entry receives
+the shared process header and mapped-byte count; a worker receives its private
+descriptor and 128-byte prefix count. Mapping failure after mutation stops the
+process and retains root/IPC ownership until teardown.
+This native path requires the managed window order: guarded stack, optional TLS
+alignment gap, TLS, immediately adjacent TX/RX and private descriptor, then a
+final guard. The standalone descriptor codec permits other disjoint placements;
+decoding alone does not establish this native admission contract.
+The first mapped initial thread binds a uniquely mapped shared process header;
+subsequent admissions must name that same header after initial-thread retirement.
 
 ## Requests
 
@@ -224,6 +237,11 @@ retains 80 bytes/167 slots. The current startup encoder does not publish ABI 1.4
 
 `StartupDescriptor` encodes an exact 128-byte prefix of a dedicated 4 KiB
 read-only/NX page. `decode_page` also requires every trailing byte to be zero.
+The native mapping mechanism retires this private page with its thread. The
+initial header's reference is bootstrap data valid until the initial thread's
+resources are reclaimed; retaining the process header does not extend the
+private descriptor's lifetime. Shared process arguments and capabilities remain
+process-owned. Workers use their own descriptors, not the initial reference.
 
 | Offset | Bytes | Field |
 | ---: | ---: | --- |
