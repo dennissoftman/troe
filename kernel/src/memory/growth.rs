@@ -2,7 +2,8 @@
 //!
 //! A growth request is committed as whole pages appended to the private
 //! reservation, charged against the application's totals, and rolled back as a
-//! suffix if any part of it fails.
+//! suffix before mapping starts. Once mapping begins, failure retains backing
+//! and charges until the inactive application root has been retired.
 
 use crate::machine::OwnedAccounting;
 use crate::memory::ApplicationAllocation;
@@ -178,13 +179,13 @@ pub(crate) fn commit_application_heap_growth(
         }
     }
     let new_ranges = &allocation.growth_ranges[start..];
-    let Ok(stats) =
-        application.commit_heap_growth(heap_start, new_ranges, &allocation.growth_table_frames)
-    else {
-        release_application_growth_suffix(&mut accounting.frames, allocation, start, table_start)?;
-        return Err(());
-    };
+    // From the first PTE mutation onward, a failure may leave reachable pages.
+    // Keep the backing and its commitment until the caller retires the root and
+    // complete application teardown reclaims this allocation.
     accounting.application_committed_pages = application_commit;
+    let stats = application
+        .commit_heap_growth(heap_start, new_ranges, &allocation.growth_table_frames)
+        .map_err(|_| ())?;
     let mapped_pages = current_pages.checked_add(minimum_pages).ok_or(())?;
     let mapped_bytes = mapped_pages.checked_mul(BASE_PAGE_SIZE).ok_or(())?;
     Ok(ApplicationGrowth::Committed {

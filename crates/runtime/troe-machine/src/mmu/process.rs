@@ -6,7 +6,7 @@
 //! explicitly accounted remaining timeslice at the lower-level boundary.
 
 use super::{
-    ApplicationExecutionBound, ApplicationHeapGrowth, ApplicationPending, ApplicationResume,
+    ApplicationExecutionBound, ApplicationPending, ApplicationResume,
     ArchitectureApplicationContext, IsolatedFault, MmuError, MmuStats,
     OUTCOME_APPLICATION_HANDLE_CALL, OUTCOME_APPLICATION_HEAP_GROW, OUTCOME_APPLICATION_PREEMPTED,
     OUTCOME_APPLICATION_YIELD, OUTCOME_FAULT_BIT, OUTCOME_SCHEDULER_CALL, TrappedSchedulerCall,
@@ -25,6 +25,8 @@ mod creation;
 mod dispatch;
 mod handle;
 pub use handle::{NativeHandleCall, NativeHandleExecution};
+mod heap;
+pub use heap::{NativeHeapCall, NativeHeapExecution};
 
 /// Trusted initial register and mapping geometry for an already owned thread.
 #[derive(Clone, Copy, Debug)]
@@ -61,7 +63,7 @@ pub enum NativeThreadStop {
     /// One validated copied-message call awaits a kernel completion.
     HandleCall(NativeHandleCall),
     /// One heap request awaits a kernel completion.
-    HeapGrow(ApplicationHeapGrowth),
+    HeapGrow(NativeHeapCall),
     /// A copied scheduler request awaits capability/operation authentication.
     SchedulerCall(NativeSchedulerCall),
     /// ABI call 0 exits the whole process and revokes every continuation.
@@ -180,6 +182,7 @@ struct ThreadContext {
     ipc: Option<ThreadIpc>,
     scheduler_operation: Option<PendingSchedulerCall>,
     handle_operation: Option<handle::PendingHandleCall>,
+    heap_operation: Option<heap::PendingHeapCall>,
     // Preallocated/charged with the native record, including while no call is pending.
     handle_request: [u8; troe_abi::MAX_MESSAGE_BYTES],
     // Complete mapped-admission reservation, including its inaccessible gaps.
@@ -232,6 +235,7 @@ pub struct NativeProcessContext {
     next_operation: u64,
     // Immutable shared bootstrap identity survives initial-thread retirement.
     process_startup: Option<u64>,
+    heap: Option<VirtualRange>,
 }
 
 impl NativeProcessContext {
@@ -353,6 +357,7 @@ impl NativeProcessContext {
             stopped: false,
             next_operation: 1,
             process_startup: None,
+            heap: None,
         })
     }
 
@@ -445,6 +450,9 @@ impl NativeProcessContext {
             || self.contexts.len() == self.capacity
             || self.contexts.iter().any(|context| context.id == id)
             || !valid_start(&self.backing.address_space, start)
+            || self
+                .heap
+                .is_some_and(|heap| admission::conflicts(start, heap))
             || self.process_startup.is_some_and(|address| {
                 private_ranges(start)
                     .any(|range| range.start() < address + 4096 && address < range.end())
@@ -472,6 +480,7 @@ impl NativeProcessContext {
             ipc: None,
             scheduler_operation: None,
             handle_operation: None,
+            heap_operation: None,
             handle_request: [0; troe_abi::MAX_MESSAGE_BYTES],
             window: None,
         });
@@ -785,7 +794,7 @@ impl NativeProcessContext {
         let context = &mut self.contexts[index];
         // Ordinary handle completion is a separate, correlated operation. In
         // particular, lower-level resume must not bypass an owned service wait.
-        if context.handle_operation.is_some() {
+        if context.handle_operation.is_some() || context.heap_operation.is_some() {
             return Err(MmuError::InvalidUserContext);
         }
         if let Err(error) = apply_application_resume(
@@ -843,7 +852,16 @@ impl NativeProcessContext {
                         )?)
                     }
                     (OUTCOME_APPLICATION_HEAP_GROW, ApplicationPending::HeapGrow(request)) => {
-                        NativeThreadStop::HeapGrow(request)
+                        let sequence = self.next_operation;
+                        self.next_operation = sequence
+                            .checked_add(1)
+                            .ok_or(MmuError::InvalidUserContext)?;
+                        NativeThreadStop::HeapGrow(heap::capture(
+                            &self.backing,
+                            context,
+                            sequence,
+                            request,
+                        )?)
                     }
                     (OUTCOME_SCHEDULER_CALL, ApplicationPending::SchedulerCall) => {
                         let frame = state

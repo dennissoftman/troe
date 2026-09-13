@@ -129,6 +129,13 @@ never executes the ordinary application.
   its target through revocation, native/physical reclamation, acknowledgement and
   reaping before a failure reply. Partial mapping requires process teardown;
   these mechanisms do not establish production allocation or scheduling policy;
+- native heap mutation: the process binds an immutable heap reservation before
+  first execution; future thread admission cannot consume it. Heap calls retain
+  original caller/operation/IPC identity and have one owned mapping claim.
+  Completion cannot invent success bytes or report exhaustion after committing.
+  Mapping failure stops every continuation and requires backing retention until
+  root retirement. Allocator ownership and process/system quotas remain trusted
+  composition obligations; the production loader does not enable this path;
 - native thread retirement: a claimed Exit can remove one inactive context's
   stack, TLS, optional private read-only startup and IPC mappings. Read-only
   preflight checks kernel-owned physical extents, permissions, sibling references,

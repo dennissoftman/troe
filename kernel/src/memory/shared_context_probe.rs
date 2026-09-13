@@ -78,6 +78,7 @@ mod admission;
 mod creation;
 mod dispatch;
 mod handle;
+mod heap;
 mod retirement;
 mod synchronization;
 
@@ -482,7 +483,8 @@ pub(crate) fn verify(accounting: &mut OwnedAccounting) -> Result<(), ()> {
     admission::verify(accounting)?;
     creation::verify(accounting)?;
     dispatch::verify(accounting)?;
-    handle::verify(accounting)
+    handle::verify(accounting)?;
+    heap::verify(accounting)
 }
 
 fn prepare(

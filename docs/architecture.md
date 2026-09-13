@@ -801,7 +801,8 @@ zeroed physical extents at the end of the virtual heap prefix, falling back to
 discontiguous frames when necessary, adds page-table frames as mappings
 require, updates scheduler ownership accounting, and resumes with the new
 mapped length. Expected physical-memory exhaustion leaves the mapping
-unchanged. The initial launch reservation is itself a sequence of coalesced physical
+unchanged. Once page-table mutation begins, failure retains the new heap
+backing and its commitment until terminal teardown retires the inactive root. The initial launch reservation is itself a sequence of coalesced physical
 extents rather than one contiguous run, so a large application starts on a
 fragmented machine; an unfragmented one still reserves exactly one extent.
 Initial mappings, heap growth, and dynamic private mappings share

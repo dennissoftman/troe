@@ -21,6 +21,8 @@ mod admission;
 #[cfg(target_os = "uefi")]
 mod ipc;
 #[cfg(target_os = "uefi")]
+mod mutation;
+#[cfg(target_os = "uefi")]
 mod process;
 #[cfg(target_os = "uefi")]
 mod protected;
@@ -28,10 +30,10 @@ mod protected;
 mod retirement;
 #[cfg(target_os = "uefi")]
 pub use process::{
-    NativeHandleCall, NativeHandleExecution, NativeProcessBacking, NativeProcessContext,
-    NativeSchedulerCall, NativeSchedulerExecution, NativeThreadAdmission,
-    NativeThreadAdmissionError, NativeThreadBacking, NativeThreadRetirement, NativeThreadStart,
-    NativeThreadStop,
+    NativeHandleCall, NativeHandleExecution, NativeHeapCall, NativeHeapExecution,
+    NativeProcessBacking, NativeProcessContext, NativeSchedulerCall, NativeSchedulerExecution,
+    NativeThreadAdmission, NativeThreadAdmissionError, NativeThreadBacking, NativeThreadRetirement,
+    NativeThreadStart, NativeThreadStop,
 };
 #[cfg(feature = "acceptance-probes")]
 pub use protected::FaultPoint;
@@ -484,7 +486,6 @@ impl ApplicationSession {
     ///
     /// Rejects a non-growth session, invalid/non-writable heap geometry,
     /// duplicate mappings, unsupported addresses, or table-arena exhaustion.
-    #[allow(clippy::too_many_lines)]
     pub fn commit_heap_growth(
         &mut self,
         heap_start: u64,
@@ -494,108 +495,12 @@ impl ApplicationSession {
         let ApplicationPending::HeapGrow(request) = self.pending else {
             return Err(MmuError::InvalidUserContext);
         };
-        let page_count = physical_ranges
-            .iter()
-            .try_fold(0_u64, |pages, range| pages.checked_add(range.page_count()))
-            .ok_or(MmuError::InvalidUserContext)?;
-        if page_count < request.minimum_pages || physical_ranges.is_empty() {
-            return Err(MmuError::InvalidUserContext);
-        }
-        let region_index = self
-            .address_space
-            .regions
-            .iter()
-            .position(|region| {
-                region.range.start() <= heap_start
-                    && heap_start < region.range.end()
-                    && region.permissions.write
-                    && !region.permissions.execute
-            })
-            .ok_or(MmuError::InvalidUserContext)?;
-        let region = self.address_space.regions[region_index];
-        let added_bytes = page_count
-            .checked_mul(BASE_PAGE_SIZE)
-            .ok_or(MmuError::AddressUnsupported)?;
-        let new_end = region
-            .range
-            .end()
-            .checked_add(added_bytes)
-            .ok_or(MmuError::AddressUnsupported)?;
-        let grown =
-            VirtualRange::from_pages(region.range.start(), region.range.page_count() + page_count)
-                .map_err(|_| MmuError::InvalidUserContext)?;
-        if grown.end() != new_end
-            || self
-                .address_space
-                .regions
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| *index != region_index)
-                .map(|(_, region)| *region)
-                .any(|other| heap_start < other.range.end() && other.range.start() < new_end)
-        {
-            return Err(MmuError::InvalidUserContext);
-        }
-        let mut virtual_address = region.range.end();
-        for range in physical_ranges {
-            if range.start() == 0 {
-                return Err(MmuError::InvalidUserContext);
-            }
-            for _ in 0..range.page_count() {
-                if architecture_translate_page(self.address_space.root, virtual_address).is_ok() {
-                    return Err(MmuError::InvalidUserContext);
-                }
-                virtual_address = virtual_address
-                    .checked_add(BASE_PAGE_SIZE)
-                    .ok_or(MmuError::AddressUnsupported)?;
-            }
-        }
-        if virtual_address != new_end {
-            return Err(MmuError::InvalidUserContext);
-        }
-        let capabilities = architecture_mmu_capabilities()?;
-        let mut arena = TableArena::resume(
-            self.address_space.table_arena,
-            self.address_space.stats.table_pages,
+        self.address_space.grow_heap(
+            heap_start,
+            request.minimum_pages,
+            physical_ranges,
             supplemental_table_pages,
-        )?;
-        let mut virtual_address = region.range.end();
-        for range in physical_ranges {
-            let mut physical = range.start();
-            for _ in 0..range.page_count() {
-                architecture_map_page(
-                    &mut arena,
-                    self.address_space.root,
-                    virtual_address,
-                    physical,
-                    MappingPermissions::READ_WRITE,
-                    MappingMemoryType::Normal,
-                    MappingPrivilege::User,
-                    capabilities,
-                )?;
-                virtual_address = virtual_address
-                    .checked_add(BASE_PAGE_SIZE)
-                    .ok_or(MmuError::AddressUnsupported)?;
-                physical = physical
-                    .checked_add(BASE_PAGE_SIZE)
-                    .ok_or(MmuError::AddressUnsupported)?;
-            }
-        }
-        if let Some(tag) = &self.address_space.tag {
-            tag.invalidate_range(region.range.end(), page_count)?;
-        }
-        self.address_space.regions[region_index] = UserRegion {
-            range: grown,
-            permissions: region.permissions,
-        };
-        self.address_space.stats.mapped_pages = self
-            .address_space
-            .stats
-            .mapped_pages
-            .checked_add(page_count)
-            .ok_or(MmuError::InvalidUserContext)?;
-        self.address_space.stats.table_pages = arena.used_pages;
-        Ok(self.address_space.stats)
+        )
     }
 
     /// Replace accessibility for one caller-private physical backing range.
@@ -614,7 +519,6 @@ impl ApplicationSession {
     /// Rejects a non-handle-call session, empty/overflowing geometry,
     /// executable or unreadable permissions, mismatched physical leaves,
     /// metadata allocation failure, and page-table failure.
-    #[allow(clippy::too_many_lines)]
     pub fn replace_private_access(
         &mut self,
         virtual_start: u64,
@@ -623,122 +527,16 @@ impl ApplicationSession {
         permissions: Option<MappingPermissions>,
         supplemental_table_pages: &[u64],
     ) -> Result<MmuStats, MmuError> {
-        if !matches!(self.pending, ApplicationPending::HandleCall(_))
-            || virtual_start == 0
-            || !virtual_start.is_multiple_of(BASE_PAGE_SIZE)
-            || physical_ranges.is_empty()
-            || permissions.is_some_and(|value| !value.read || value.execute)
-        {
+        if !matches!(self.pending, ApplicationPending::HandleCall(_)) {
             return Err(MmuError::InvalidUserContext);
         }
-        let page_count = physical_ranges
-            .iter()
-            .try_fold(0_u64, |total, range| {
-                if range.start() == 0 {
-                    return None;
-                }
-                total.checked_add(range.page_count())
-            })
-            .ok_or(MmuError::InvalidUserContext)?;
-        if page_count == 0 {
-            return Err(MmuError::InvalidUserContext);
-        }
-        let target = VirtualRange::from_pages(virtual_start, page_count)
-            .map_err(|_| MmuError::InvalidUserContext)?;
-        let updated_regions =
-            updated_user_regions(&self.address_space.regions, target, permissions)?;
-        let mut virtual_address = virtual_start;
-        for range in physical_ranges {
-            let mut physical = range.start();
-            for _ in 0..range.page_count() {
-                match (
-                    was_mapped,
-                    architecture_translate_page(self.address_space.root, virtual_address),
-                ) {
-                    (true, Ok(mapped)) if mapped == physical => {}
-                    (false, Err(MmuError::InvalidUserContext)) => {}
-                    _ => return Err(MmuError::InvalidUserContext),
-                }
-                virtual_address = virtual_address
-                    .checked_add(BASE_PAGE_SIZE)
-                    .ok_or(MmuError::AddressUnsupported)?;
-                physical = physical
-                    .checked_add(BASE_PAGE_SIZE)
-                    .ok_or(MmuError::AddressUnsupported)?;
-            }
-        }
-        if virtual_address != target.end() {
-            return Err(MmuError::InvalidUserContext);
-        }
-        let capabilities = architecture_mmu_capabilities()?;
-        let mut arena = TableArena::resume(
-            self.address_space.table_arena,
-            self.address_space.stats.table_pages,
+        self.address_space.replace_private(
+            virtual_start,
+            physical_ranges,
+            was_mapped,
+            permissions,
             supplemental_table_pages,
-        )?;
-        let mut virtual_address = virtual_start;
-        for range in physical_ranges {
-            let mut physical = range.start();
-            for _ in 0..range.page_count() {
-                match (was_mapped, permissions) {
-                    (false, Some(permissions)) => architecture_map_page(
-                        &mut arena,
-                        self.address_space.root,
-                        virtual_address,
-                        physical,
-                        permissions,
-                        MappingMemoryType::Normal,
-                        MappingPrivilege::User,
-                        capabilities,
-                    )?,
-                    (true, Some(permissions)) => {
-                        let retained = architecture_protect_page(
-                            self.address_space.root,
-                            virtual_address,
-                            permissions,
-                        )?;
-                        if retained != physical {
-                            return Err(MmuError::InvalidUserContext);
-                        }
-                    }
-                    (true, None) => {
-                        let removed =
-                            architecture_unmap_page(self.address_space.root, virtual_address)?;
-                        if removed != physical {
-                            return Err(MmuError::InvalidUserContext);
-                        }
-                    }
-                    (false, None) => return Err(MmuError::InvalidUserContext),
-                }
-                virtual_address = virtual_address
-                    .checked_add(BASE_PAGE_SIZE)
-                    .ok_or(MmuError::AddressUnsupported)?;
-                physical = physical
-                    .checked_add(BASE_PAGE_SIZE)
-                    .ok_or(MmuError::AddressUnsupported)?;
-            }
-        }
-        if let Some(tag) = &self.address_space.tag {
-            tag.invalidate_range(target.start(), page_count)?;
-        }
-        self.address_space.regions = updated_regions;
-        self.address_space.stats.mapped_pages = match (was_mapped, permissions.is_some()) {
-            (false, true) => self
-                .address_space
-                .stats
-                .mapped_pages
-                .checked_add(page_count)
-                .ok_or(MmuError::InvalidUserContext)?,
-            (true, false) => self
-                .address_space
-                .stats
-                .mapped_pages
-                .checked_sub(page_count)
-                .ok_or(MmuError::InvalidUserContext)?,
-            _ => self.address_space.stats.mapped_pages,
-        };
-        self.address_space.stats.table_pages = arena.used_pages;
-        Ok(self.address_space.stats)
+        )
     }
 }
 

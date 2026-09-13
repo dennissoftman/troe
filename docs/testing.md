@@ -818,6 +818,14 @@ capability-rejection completion. Every user entry
 uses a retained process dispatch; completion checks unchanged native-entry/timer
 counters. Stop and root teardown restore physical/logical baselines. The fixture
 does not authenticate a real service grant or establish production service safety.
+The native heap fixture issues simultaneous sibling growth calls, commits each
+once, completes them in reverse order and has user code check zeroed new pages.
+It rejects duplicate claims, replayed mapping, native-resume bypass, stale calls,
+success without mapping and exhaustion after mapping. Completion does not enter
+userspace or reprogram the timer. A separate exhaustion case leaves mapping
+counts unchanged. An exact initial table arena permits the first new leaf but
+exhausts at the next table boundary; the root must stop, retain that partial leaf
+and reject completion before all physical backing is reclaimed after root drop.
 Native probe metadata has a 32 KiB allowance and charges the compiled records,
 including one 4 KiB request buffer per context. The buffers are allocated before
 native execution and erased on completion or destruction.

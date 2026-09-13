@@ -142,6 +142,16 @@ renewal. A claimed call cannot complete through the unclaimed or resume paths.
 Request capture and claim identity do not authenticate the service capability.
 This mechanism leaves the production single-context calling contract unchanged.
 
+Native heap entry 3 retains its caller, operation sequence and IPC incarnation.
+Its claim can map pages once; completion derives success bytes from that recorded
+commit and accepts exhaustion only before a commit. Both are separate from user
+entry and policy wakeup. The process binds its complete heap reservation before
+any thread starts. Initial and later thread admission respect that reservation,
+including unmapped heap capacity; growth cannot consume thread guards or windows.
+Composition supplies owned, zeroed backing and enforces allocation quotas. A
+mapping failure stops all native continuations and retains the root and backing
+until teardown. The production loader does not yet use this mechanism.
+
 ## Requests
 
 Each request is exactly 64 bytes. Truncated and trailing bytes are rejected.

@@ -52,16 +52,37 @@ pub(super) fn verify(accounting: &mut OwnedAccounting) -> Result<(), ()> {
     Ok(())
 }
 
-fn root(
+pub(super) fn root(
     index: u32,
     accounting: &OwnedAccounting,
     allocation: &IsolatedAllocation,
     scheduler: &mut Scheduler,
     processes: &mut ProcessTable,
+    heap: Option<(troe_memory::VirtualRange, PhysicalRange, bool)>,
 ) -> Result<(NativeProcessContext, ProcessId, [NativeThreadStart; 2]), ()> {
     let pairs = allocate_pairs()?;
-    let (plan, starts) = prepare(allocation, &accounting.kernel_plan, &pairs, program::CODE)?;
-    let root = troe_machine::build_user_address_space(&plan, allocation.tables).map_err(|_| ())?;
+    let (mut plan, starts) = prepare(allocation, &accounting.kernel_plan, &pairs, program::CODE)?;
+    if let Some((range, backing, _)) = heap {
+        plan.insert(
+            troe_memory::Mapping::user(
+                troe_memory::VirtualRange::from_pages(range.start(), 1).map_err(|_| ())?,
+                PhysicalRange::from_pages(backing.start(), 1).map_err(|_| ())?,
+                troe_memory::MappingPermissions::READ_WRITE,
+                troe_memory::MappingOwner::IsolatedTask,
+                troe_memory::MappingLifetime::Task,
+            )
+            .map_err(|_| ())?,
+        )
+        .map_err(|_| ())?;
+    }
+    let mut root =
+        troe_machine::build_user_address_space(&plan, allocation.tables).map_err(|_| ())?;
+    if heap.is_some_and(|(_, _, exact_tables)| exact_tables) {
+        let tables = PhysicalRange::from_pages(allocation.tables.start(), root.stats().table_pages)
+            .map_err(|_| ())?;
+        drop(root);
+        root = troe_machine::build_user_address_space(&plan, tables).map_err(|_| ())?;
+    }
     let task_id = scheduler
         .spawn(
             Capabilities::SERVICE,
@@ -92,7 +113,7 @@ fn root(
     ))
 }
 
-fn policy(owner: ProcessId) -> Result<(ThreadTable, [ThreadId; 2]), ()> {
+pub(super) fn policy(owner: ProcessId) -> Result<(ThreadTable, [ThreadId; 2]), ()> {
     let mut threads = ThreadTable::new(1, 2, 8, METADATA_LIMIT).map_err(|_| ())?;
     threads
         .register_process(
@@ -129,14 +150,18 @@ fn policy(owner: ProcessId) -> Result<(ThreadTable, [ThreadId; 2]), ()> {
     Ok((threads, [first, second]))
 }
 
-fn mode_word(allocation: &IsolatedAllocation, sibling: u64, mode: u64) -> Result<(), ()> {
+pub(super) fn mode_word(
+    allocation: &IsolatedAllocation,
+    sibling: u64,
+    mode: u64,
+) -> Result<(), ()> {
     let tls = PhysicalRange::from_pages(allocation.stack.start() + (sibling + 2) * PAGE, 1)
         .map_err(|_| ())?;
     troe_machine::copy_to_physical(tls, 48, &mode.to_le_bytes()).map_err(|_| ())
 }
 
 /// Keep normal preemption resumable while imposing a finite acceptance work bound.
-fn enter(
+pub(super) fn enter(
     native: &mut NativeProcessContext,
     threads: &mut ThreadTable,
     id: ThreadId,
@@ -163,7 +188,10 @@ fn enter(
             threads.stop_process(owner).map_err(|_| ())?;
             return Ok((stop, None));
         }
-        let wait = if matches!(stop, NativeThreadStop::HandleCall(_)) {
+        let wait = if matches!(
+            stop,
+            NativeThreadStop::HandleCall(_) | NativeThreadStop::HeapGrow(_)
+        ) {
             Some(threads.block(owner, id).map_err(|_| ())?)
         } else {
             threads.yield_running(owner, id).map_err(|_| ())?;
@@ -265,6 +293,7 @@ fn run(
         &allocations[0],
         &mut scheduler,
         &mut processes,
+        None,
     )?;
     let (mut foreign, _, _) = root(
         1,
@@ -272,6 +301,7 @@ fn run(
         &allocations[1],
         &mut scheduler,
         &mut processes,
+        None,
     )?;
     let (mut threads, ids) = policy(owner)?;
     for (index, id) in ids.into_iter().enumerate() {

@@ -475,12 +475,12 @@ pub use mmu::planned_user_regions;
 #[cfg(target_os = "uefi")]
 pub use mmu::{
     ApplicationCall, ApplicationResume, ApplicationSession, NativeHandleCall,
-    NativeHandleExecution, NativeProcessBacking, NativeProcessContext, NativeSchedulerCall,
-    NativeSchedulerExecution, NativeThreadAdmission, NativeThreadAdmissionError,
-    NativeThreadBacking, NativeThreadRetirement, NativeThreadStart, NativeThreadStop,
-    build_user_address_space, install_exception_vectors, install_mmu, loaded_image_layout,
-    maximum_additional_page_table_pages, required_page_table_pages, resume_application,
-    run_application, run_isolated,
+    NativeHandleExecution, NativeHeapCall, NativeHeapExecution, NativeProcessBacking,
+    NativeProcessContext, NativeSchedulerCall, NativeSchedulerExecution, NativeThreadAdmission,
+    NativeThreadAdmissionError, NativeThreadBacking, NativeThreadRetirement, NativeThreadStart,
+    NativeThreadStop, build_user_address_space, install_exception_vectors, install_mmu,
+    loaded_image_layout, maximum_additional_page_table_pages, required_page_table_pages,
+    resume_application, run_application, run_isolated,
 };
 #[cfg(any(test, target_os = "uefi"))]
 pub use mmu::{ApplicationOutcome, IsolatedFault, IsolatedOutcome, UserAddressSpace};

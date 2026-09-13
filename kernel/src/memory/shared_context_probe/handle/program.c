@@ -51,6 +51,20 @@ __attribute__((noreturn,section(".text.entry"))) void entry(volatile u64 *startu
     volatile u64 *tx = (volatile u64 *)tls_read(24);
     volatile u64 *rx = tx + 512;
     volatile u64 *peer = (volatile u64 *)tls_read(32);
+    if (tls_read(48) == 7 || tls_read(48) == 8) {
+        u64 status, count;
+        trap(3, 1, 0, 0, 0, 0, &status, &count);
+        if (tls_read(48) == 8) {
+            if (status != 1 || count != 0) fail();
+        } else {
+            if (status != 0 || count != tls_read(64)) fail();
+            volatile u64 *page = (volatile u64 *)tls_read(56);
+            for (u64 i = 0; i < 512; ++i) if (page[i]) fail();
+            page[0] = marker;
+        }
+        tls_write(16, 1);
+        for (;;) trap(1, 0, 0, 0, 0, 0, &status, &count);
+    }
     for (u64 round = 0; round < 2; ++round) {
         const u64 mode = tls_read(48);
         if (mode == 1) __builtin_trap();

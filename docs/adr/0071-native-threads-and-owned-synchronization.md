@@ -4,6 +4,10 @@ Status: architectural direction accepted, 2026-09-09. Implementation tracked by
 [#65](https://github.com/dennissoftman/troe/issues/65) and delivery issues
 [#204](https://github.com/dennissoftman/troe/issues/204) through
 [#208](https://github.com/dennissoftman/troe/issues/208).
+Native heap requests now retain owned operation identity, bind immutable heap
+bounds, and separate one mapping commit from completion. Mapping errors revoke
+all continuations while backing remains retained until root retirement. These
+mechanisms do not establish production heap/private-memory ownership or admission.
 Native ordinary-call capture uses the caller's retained IPC prefixes and a
 preallocated immutable request buffer. Owned claims permit correlated completion
 without executing the caller or renewing a process turn; the native acceptance
