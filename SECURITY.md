@@ -66,6 +66,11 @@ never executes the ordinary application.
   records, checked stack guards and disjoint stack/TLS payloads, actual retained
   metadata accounting, and process-wide continuation revocation on native fault
   or exit. Register records are erased before their backing is released;
+  retained per-thread IPC owners outlive every root mapping that references
+  them. Bindings validate process/thread identity, live task-pair ownership,
+  physical pages and RW/NX geometry before publication; replies clear the entire
+  RX page before copying a bounded prefix. Sibling threads share these user
+  mappings; the bindings select kernel destinations, not isolation between siblings;
 - tasks and process records: at most 65,536, with monotonic identities, explicit
   capabilities, deterministic lifecycle accounting, fallible metadata growth,
   and guarded native stack payloads;

@@ -4,8 +4,9 @@ Status: architectural direction accepted, 2026-09-09. Implementation tracked by
 [#65](https://github.com/dennissoftman/troe/issues/65) and delivery issues
 [#204](https://github.com/dennissoftman/troe/issues/204) through
 [#208](https://github.com/dennissoftman/troe/issues/208).
-Native shared-root context switching has an acceptance mechanism; threaded
-package admission, native compiler-TLS allocation and pthread support remain disabled.
+Native shared-root context switching and retained per-thread IPC storage have
+acceptance mechanisms; threaded package admission, native scheduler calls,
+compiler-TLS allocation and pthread support remain disabled.
 Current single-execution-thread application contracts remain in force.
 Portable lifecycle/synchronization models, an independently compiler-checked
 static TLS layout/initializer, guarded thread-memory planning, and composed
@@ -40,8 +41,12 @@ The native `NativeProcessContext` mechanism separately owns one root and a
 bounded set of process-scoped continuations, with guarded-stack/TLS validation,
 retained metadata charges and process-wide stop. Native acceptance switches
 two such contexts across timer preemption and yields and checks shared memory,
-distinct TLS words, fault revocation and reclamation. This does not enable the
-threaded loader, process-share scheduler, per-thread IPC or the C facade.
+distinct TLS words, per-thread TX/RX storage, fault revocation and reclamation.
+`NativeProcessBacking` retires the root before its retained IPC pairs on both
+rejection and final drop; stop keeps the pairs occupied until root retirement.
+Bindings validate live task pairs and mapped physical pages, and RX publication
+clears the whole page before copying a bounded prefix. This does not enable the
+threaded loader, process-share scheduler, native scheduler calls or the C facade.
 AArch64 saves TPIDR_EL0; the x86 saved context retains FS/GS/DS/ES selectors
 and an independent FS base. The x86 gates normalize kernel selectors and FS
 base before Rust handlers and restore user selectors before FS base on resume.
@@ -847,8 +852,10 @@ The first implementation remains single-CPU. A process owns one address-space
 root; each thread owns one register context. `NativeProcessContext` supplies an
 owned root/context split without cloning a root-owning `ApplicationSession`.
 It retains the root during each native transition and serializes access to
-all continuations. Resident scheduling and per-thread IPC integration remain
-tracked by #207. Mapping mutation, context activation and final root destruction
+all continuations. The backing bundle retains per-thread IPC pair owners and
+validates immutable bindings; kernel copying/publication uses those bindings.
+Resident scheduling and native scheduler-call integration remain tracked by
+#207. Mapping mutation, context activation and final root destruction
 must remain serialized during that integration.
 
 Schedule processes fairly first, then select a runnable thread within the

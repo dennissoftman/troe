@@ -23,7 +23,9 @@ mod process;
 #[cfg(target_os = "uefi")]
 mod protected;
 #[cfg(target_os = "uefi")]
-pub use process::{NativeProcessContext, NativeThreadStart, NativeThreadStop};
+pub use process::{
+    NativeProcessBacking, NativeProcessContext, NativeThreadStart, NativeThreadStop,
+};
 #[cfg(feature = "acceptance-probes")]
 pub use protected::FaultPoint;
 #[cfg(target_os = "uefi")]
