@@ -838,6 +838,21 @@ impl ThreadTable {
             .filter(|record| record.snapshot.id == id)
             .ok_or(ThreadError::Stale)
     }
+    /// Validate a caller before accepting a new operation.
+    ///
+    /// A dispatched thread with an unconsumed synchronization completion cannot
+    /// start another operation. This check grants no continuing execution lease.
+    ///
+    /// # Errors
+    /// Rejects stopping processes, stale/foreign callers, non-running threads
+    /// and retained synchronization waits, without changing either table.
+    pub fn validate_running(&self, owner: ProcessId, id: ThreadId) -> Result<(), ThreadError> {
+        if self.process(owner)?.stopping {
+            return Err(ThreadError::Stopping);
+        }
+        self.require_running(owner, id)
+    }
+
     fn require_running(&self, owner: ProcessId, id: ThreadId) -> Result<(), ThreadError> {
         let record = self.record(owner, id)?;
         if record.sync_wait {

@@ -260,6 +260,10 @@ distinct failure without ownership. An immutable essential-mutex policy instead
 revokes the process on owner exit. Permits remain ownerless and are not refunded
 on thread exit. Object/wait quotas include pending completions, and the lifecycle
 model refuses thread resource release while synchronization references remain.
+Permit batches preflight the complete count against eligible FIFO waiters and
+remaining counter capacity before publishing any grant, timeout or stop result.
+Overflow changes neither count nor wait state; two bounded queue walks require
+no temporary allocation and use the same clock observation.
 These serialized transitions allocate nothing after table construction. Native
 clock delivery, instruction-level memory ordering and work-quantum enforcement
 are outside these portable models.
@@ -415,6 +419,22 @@ borrow. Closing prevents later admission; it does not cancel an already owned
 admission result. Service dispatch rejects built-in targets, and a service handle
 cannot become a scheduler target through its payload. This mechanism does not
 execute an operation, bind it to a native continuation or publish a startup grant.
+
+`troe-service::threading` binds an owned authorization to the captured caller and
+the trusted process record's task principal. Consuming the operation validates a
+running caller with no unconsumed synchronization wait, then executes Current,
+Observe, RequestStop or any synchronization operation against the paired tables.
+Other lifecycle requests return Unsupported. Expected failures produce canonical
+request-correlated outcomes; clock/configuration/invariant failures require
+process termination and must not replay the request. A suspended operation owns
+its original request, caller and exact wait generation without retaining a table
+borrow. Deadline/stop observation addresses that wait alone, and completion is
+consumed only after dispatch; condition results preserve mutex reacquisition.
+Native composition must retain the matching single-use execution claim beside
+these values and charge their compiled storage. This portable dispatcher does
+not itself publish native replies, allocate thread memory or enable application
+grants. RequestStop sets the sticky flag; delivery to admitted waits uses their
+explicit observation or the synchronization model's grant transitions.
 
 Native console output uses `ConsoleService` to convert a
 bounded write request into the existing `Output` operation, while
@@ -593,8 +613,8 @@ calls are rejected. Consuming completion validates the original request/IPC
 lifetime; an error returns the execution value so composition can recover or
 retire it after process stop. Claiming or completing never runs user code,
 allocates a buffer or renews CPU entitlement.
-Native acceptance composes the dispatcher authority check with captured Current
-calls and live thread identity resolution. Its restricted control handle belongs
+Native acceptance composes the dispatcher authority check and owned operation
+dispatcher with captured Current calls. Its restricted control handle belongs
 to the process record's task principal, and replies identify the captured caller.
 This probe does not enable scheduler services for admitted application packages.
 Unsaved AVX-family, SVE, and SME state remains disabled rather than leaking or

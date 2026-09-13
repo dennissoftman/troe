@@ -734,25 +734,90 @@ impl SyncTable {
         permit: PermitId,
         now: MonotonicMillis,
     ) -> Result<(), SyncError> {
+        self.release_permits(threads, owner, caller, permit, 1, now)
+    }
+
+    /// Release a nonzero batch atomically, granting eligible FIFO waiters first.
+    ///
+    /// Check the complete batch against available count capacity and waiters
+    /// before publishing any grant, timeout or stop result. Deadline/stop choices
+    /// use one immutable clock observation. Two bounded queue walks need no
+    /// allocation or temporary array; a failed preflight changes no resource.
+    ///
+    /// # Errors
+    /// Rejects zero counts, invalid callers/handles, overflow, clock regression
+    /// or inconsistent wait ownership before changing count or waiter state.
+    pub fn release_permits(
+        &mut self,
+        threads: &mut ThreadTable,
+        owner: ProcessId,
+        caller: ThreadId,
+        permit: PermitId,
+        release: u32,
+        now: MonotonicMillis,
+    ) -> Result<(), SyncError> {
         self.caller(threads, owner, caller)?;
+        if release == 0 {
+            return Err(SyncError::InvalidLimit);
+        }
         let Kind::Permit { count, maximum } = self.object(owner, permit.0)?.kind else {
             return Err(SyncError::Stale);
         };
-        if count == maximum {
+        let mut stored = release;
+        let mut next = self.object(owner, permit.0)?.queue.head;
+        let mut visited = 0;
+        while stored != 0 {
+            let Some(index) = next else {
+                break;
+            };
+            if visited == self.waits.len() {
+                return Err(SyncError::Stale);
+            }
+            visited += 1;
+            let waiter = self
+                .waits
+                .get(index)
+                .and_then(|slot| *slot)
+                .ok_or(SyncError::Stale)?;
+            let record = threads.record(owner, waiter.token.0.thread)?;
+            if waiter.source != permit.0
+                || waiter.queued_on != Some(permit.0)
+                || waiter.mutex.is_some()
+                || waiter.phase != Phase::Queued
+                || !record.sync_wait
+                || record.snapshot.state != ThreadState::Blocked
+                || record.wait_sequence != waiter.token.0.sequence
+            {
+                return Err(SyncError::Stale);
+            }
+            if Self::due(threads, waiter.token.0.thread, waiter.options, now)?.is_none() {
+                stored -= 1;
+            }
+            next = waiter.next;
+        }
+        if stored > maximum.checked_sub(count).ok_or(SyncError::Stale)? {
             return Err(SyncError::Overflow);
         }
+        let next_count = count.checked_add(stored).ok_or(SyncError::Overflow)?;
         self.clock(now)?;
-        while let Some(index) = self.pop(permit.0)? {
+        let mut remaining = release;
+        while remaining != 0 {
+            let Some(index) = self.pop(permit.0)? else {
+                break;
+            };
             let waiter = self.waits[index].ok_or(SyncError::Stale)?;
             if let Some(outcome) = Self::due(threads, waiter.token.0.thread, waiter.options, now)? {
                 self.complete_wait(threads, index, outcome)?;
             } else {
                 self.complete_wait(threads, index, SyncOutcome::Acquired)?;
-                return Ok(());
+                remaining -= 1;
             }
         }
+        if remaining != stored {
+            return Err(SyncError::Stale);
+        }
         self.object_mut(permit.0)?.kind = Kind::Permit {
-            count: count + 1,
+            count: next_count,
             maximum,
         };
         Ok(())

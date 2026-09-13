@@ -39,6 +39,16 @@ the payload. The result owns the decoded request without a table borrow; closing
 the handle prevents new admissions. This mechanism supplies no startup grant and
 does not execute or correlate a native operation.
 
+The portable `troe-service::threading` operation dispatcher binds this owned
+authorization to the captured caller and trusted process snapshot. It executes
+Current, Observe, RequestStop and all interface 31 operations against the paired
+tables; the other interface 30 requests return Unsupported. A new operation
+requires a running caller with no unconsumed synchronization wait. Waiting owns
+the original request and exact wait generation, with no table borrow or user
+pointer. Clock/configuration failures require process termination rather than
+an application reply or request replay. Native composition separately claims the
+captured operation once and retains that execution through reply publication.
+
 The `Call` codec assigns entry 6 with six words:
 `[handle, 64, 32, 0, 0, 0]`. The handle is nonzero; lengths are exact full-width
 values. There are no user pointers. The request and response occupy prefixes
@@ -57,8 +67,9 @@ reject repeat claims and the direct completion path. Consuming completion return
 ownership on failure so a retained wait can be recovered or retired after stop;
 it never selects a new caller or renews CPU time.
 Native acceptance authenticates a restricted built-in control handle and returns
-the captured caller's live token for Current. Its probe dispatcher executes no
-other operation and does not change ordinary application admission.
+the captured caller's live token for Current through the owned operation
+dispatcher. The native probe executes no other operation and does not change
+ordinary application admission.
 
 ## Requests
 
@@ -115,6 +126,12 @@ flags and deadline zero. Indefinite wait requires deadline zero. Tagged
 deadlines use boot-relative milliseconds; zero and `u64::MAX` are real values,
 not sentinels. Condition wait and sleep reject try mode. Stop observation is
 cooperative and cannot asynchronously unwind a thread.
+
+A permit batch first accounts for eligible queued waiters and the remaining
+counter capacity. Overflow rejects the whole batch without publishing grants,
+timeouts or stop results. Expired/stopped waiters do not supply release capacity.
+RequestStop sets a sticky flag; observing an admitted wait or processing its
+queue selects the result without restarting an absolute deadline.
 
 ## Responses
 

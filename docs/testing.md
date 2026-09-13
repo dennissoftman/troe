@@ -86,6 +86,18 @@ resource-release interlocks. It also enumerates 3,125 five-event schedules over
 notification, timeout, stop, unlock and exit. Each step checks queue membership,
 exact ownership, pending-completion references and unchanged vector capacities;
 each schedule ends with teardown and resource-baseline checks.
+Permit batch tests cover zero/full-width counts, immutable-maximum overflow,
+expired/stopped FIFO waiters, and rejection without partial grants, timeout
+publication or count changes.
+
+`cargo test -p troe-service threading::` exercises authenticated operation binding,
+captured Current identities, live Observe/RequestStop targets and canonical
+Unsupported lifecycle replies. It covers foreign/stale/wrong-kind identities,
+authority revocation after admission, caller-state checks, pending completion
+interlocks, condition notification/timeout/stop with mutex reacquisition, poison
+and essential-owner termination, permit-batch atomicity, quotas, and regressing
+clocks as composition errors. Every successful response is checked against its
+original request codec; wait completion cannot execute the request again.
 
 Metadata checks compare the compiled inline/array layouts with retained vector
 capacities, test exact-byte and one-byte-short budgets, reject invalid counts
@@ -619,7 +631,8 @@ response payload and previous/already-completed operation before RX writes;
 rejected calls clear RX, while correlated responses clear every byte after the
 32-byte prefix. The probe derives the capability principal from its process
 record, mints a control handle with only CALL/OBSERVE rights and authenticates the
-captured Current requests. Each reply contains the captured caller's live typed
+captured Current requests. The owned operation dispatcher validates the logically
+dispatched caller and produces each reply with that caller's live typed
 thread token; user instructions check that identity and exact register completion
 pairs. Revocation removes the capability, and late completions after process
 fault are rejected.

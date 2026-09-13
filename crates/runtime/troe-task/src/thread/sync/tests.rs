@@ -1004,6 +1004,166 @@ fn permits_skip_expired_waiters_and_enforce_overflow_and_pending_references()
 }
 
 #[test]
+fn bulk_permit_overflow_does_not_publish_timeouts_or_partial_grants() -> Result<(), SyncError> {
+    let mut h = Harness::new()?;
+    let [a, b, c] = h.ids;
+    let permit = h.sync.create_permit(&mut h.threads, OWNER, a, 0, 1)?;
+    h.select(b)?;
+    let first = pending(h.sync.acquire_permit(
+        &mut h.threads,
+        OWNER,
+        b,
+        permit,
+        WaitMode::Wait(options(Some(1), false)),
+        time(0),
+    )?)?;
+    h.select(c)?;
+    let second =
+        pending(
+            h.sync
+                .acquire_permit(&mut h.threads, OWNER, c, permit, WAIT, time(0))?,
+        )?;
+    h.select(a)?;
+    let before = (
+        h.sync.usage(OWNER),
+        h.sync.metadata_bytes(),
+        h.threads.usage(OWNER),
+    );
+    assert_eq!(
+        h.sync
+            .release_permits(&mut h.threads, OWNER, a, permit, 3, time(1)),
+        Err(SyncError::Overflow)
+    );
+    assert_eq!(
+        h.sync
+            .release_permits(&mut h.threads, OWNER, a, permit, 0, time(1)),
+        Err(SyncError::InvalidLimit)
+    );
+    assert_eq!(h.threads.snapshot(OWNER, b)?.state, ThreadState::Blocked);
+    assert_eq!(h.threads.snapshot(OWNER, c)?.state, ThreadState::Blocked);
+    assert_eq!(
+        (
+            h.sync.usage(OWNER),
+            h.sync.metadata_bytes(),
+            h.threads.usage(OWNER)
+        ),
+        before
+    );
+    h.invariants()?;
+    h.sync
+        .release_permits(&mut h.threads, OWNER, a, permit, 2, time(1))?;
+    assert_eq!(h.finish(first)?, SyncOutcome::TimedOut);
+    assert_eq!(h.finish(second)?, SyncOutcome::Acquired);
+    assert_eq!(
+        h.sync
+            .acquire_permit(&mut h.threads, OWNER, c, permit, WaitMode::Try, time(1))?,
+        SyncStart::Complete(SyncOutcome::Acquired)
+    );
+    assert_eq!(
+        h.sync
+            .acquire_permit(&mut h.threads, OWNER, c, permit, WaitMode::Try, time(1))?,
+        SyncStart::Complete(SyncOutcome::WouldBlock)
+    );
+    h.invariants()?;
+    h.teardown()
+}
+
+#[test]
+fn bulk_permits_grant_fifo_without_counting_stopped_waiters_as_capacity() -> Result<(), SyncError> {
+    for stopped in [false, true] {
+        let mut h = Harness::new()?;
+        let [a, b, c] = h.ids;
+        let permit = h.sync.create_permit(&mut h.threads, OWNER, a, 0, 1)?;
+        h.select(b)?;
+        let first = pending(h.sync.acquire_permit(
+            &mut h.threads,
+            OWNER,
+            b,
+            permit,
+            WaitMode::Wait(options(None, true)),
+            time(0),
+        )?)?;
+        h.select(c)?;
+        let second =
+            pending(
+                h.sync
+                    .acquire_permit(&mut h.threads, OWNER, c, permit, WAIT, time(0))?,
+            )?;
+        h.select(a)?;
+        if stopped {
+            h.threads.request_stop(OWNER, b)?;
+        }
+        assert_eq!(
+            h.sync
+                .release_permits(&mut h.threads, OWNER, a, permit, 4, time(0)),
+            Err(SyncError::Overflow)
+        );
+        h.sync
+            .release_permits(&mut h.threads, OWNER, a, permit, 2, time(0))?;
+        assert_eq!(
+            h.finish(first)?,
+            if stopped {
+                SyncOutcome::Stopped
+            } else {
+                SyncOutcome::Acquired
+            }
+        );
+        assert_eq!(h.finish(second)?, SyncOutcome::Acquired);
+        assert_eq!(
+            h.sync
+                .acquire_permit(&mut h.threads, OWNER, c, permit, WaitMode::Try, time(0))?,
+            SyncStart::Complete(if stopped {
+                SyncOutcome::Acquired
+            } else {
+                SyncOutcome::WouldBlock
+            })
+        );
+        h.invariants()?;
+        h.teardown()?;
+    }
+    Ok(())
+}
+
+#[test]
+fn full_width_permit_batches_cannot_wrap_the_immutable_maximum() -> Result<(), SyncError> {
+    let mut h = Harness::new()?;
+    let a = h.ids[0];
+    let permit = h
+        .sync
+        .create_permit(&mut h.threads, OWNER, a, 0, u32::MAX)?;
+    h.sync
+        .release_permits(&mut h.threads, OWNER, a, permit, u32::MAX, time(1))?;
+    assert_eq!(
+        h.sync
+            .release_permits(&mut h.threads, OWNER, a, permit, 1, time(1)),
+        Err(SyncError::Overflow)
+    );
+    assert_eq!(
+        h.sync
+            .acquire_permit(&mut h.threads, OWNER, a, permit, WaitMode::Try, time(1))?,
+        SyncStart::Complete(SyncOutcome::Acquired)
+    );
+    assert_eq!(
+        h.sync
+            .release_permits(&mut h.threads, OWNER, a, permit, 2, time(1)),
+        Err(SyncError::Overflow)
+    );
+    assert_eq!(
+        h.sync
+            .release_permits(&mut h.threads, OWNER, a, permit, 1, time(0)),
+        Err(SyncError::ClockRegressed)
+    );
+    h.sync
+        .release_permits(&mut h.threads, OWNER, a, permit, 1, time(1))?;
+    let Kind::Permit { count, maximum } = h.sync.object(OWNER, permit.0)?.kind else {
+        return Err(SyncError::Stale);
+    };
+    assert_eq!((count, maximum), (u32::MAX, u32::MAX));
+    h.invariants()?;
+    h.teardown()
+}
+
+#[test]
 fn admission_and_generation_failures_preserve_mutex_ownership() -> Result<(), SyncError> {
     let mut h = Harness::new()?;
     let a = h.ids[0];
