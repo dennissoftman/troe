@@ -100,9 +100,11 @@ impl Reclamation {
             self.threads.release_resources(owner, id).map_err(|_| ())?;
             self.threads.reap(owner, id).map_err(|_| ())?;
         }
-        self.sync
-            .remove_process(&mut self.threads, owner)
-            .map_err(|_| ())?;
+        // stop_process already deregistered the paired synchronization owner.
+        // Verify it drained its objects/waits without attempting a second removal.
+        if self.sync.usage(owner) != (0, 0) {
+            return Err(());
+        }
         self.threads.remove_process(owner).map_err(|_| ())?;
         if self.threads.committed_pages() != 0 {
             return Err(());
