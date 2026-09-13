@@ -751,6 +751,7 @@ pub(crate) fn run_application_load_verification(
             ApplicationProbe::UnexpectedReturn,
         )?;
         verify_application_thread_pointer(scheduler, accounting, &mut dispatcher, port, first)?;
+        crate::memory::shared_context_probe::verify(accounting)?;
         verify_application_heap_growth_limit(scheduler, accounting, &mut dispatcher, port)?;
         (reused, invalid_reused, return_reused)
     };

@@ -8,6 +8,8 @@ pub(crate) mod growth;
 pub(crate) mod isolated;
 pub(crate) mod launch;
 pub(crate) mod private;
+#[cfg(feature = "acceptance-probes")]
+pub(crate) mod shared_context_probe;
 
 use crate::memory::private::ApplicationPrivateMemory;
 use alloc::vec::Vec;

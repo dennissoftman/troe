@@ -19,7 +19,11 @@ use troe_memory::{MappingMemoryType, MappingPrivilege};
 #[cfg(target_os = "uefi")]
 mod ipc;
 #[cfg(target_os = "uefi")]
+mod process;
+#[cfg(target_os = "uefi")]
 mod protected;
+#[cfg(target_os = "uefi")]
+pub use process::{NativeProcessContext, NativeThreadStart, NativeThreadStop};
 #[cfg(feature = "acceptance-probes")]
 pub use protected::FaultPoint;
 #[cfg(target_os = "uefi")]
@@ -1648,10 +1652,23 @@ pub fn resume_application(
         mut context,
         pending,
     } = application;
+    apply_application_resume(&address_space, &mut context, pending, completion)?;
+    let mut address_space = address_space;
+    let (raw, state) = run_saved_application(&mut address_space, &context, timeslice_milliseconds)?;
+    decode_application_outcome(raw, address_space, state)
+}
+
+#[cfg(target_os = "uefi")]
+fn apply_application_resume(
+    address_space: &UserAddressSpace,
+    context: &mut ArchitectureApplicationContext,
+    pending: ApplicationPending,
+    completion: ApplicationResume<'_>,
+) -> Result<(), MmuError> {
     match (pending, completion) {
         (ApplicationPending::Timeslice, ApplicationResume::Timeslice) => {}
         (ApplicationPending::Yield, ApplicationResume::Yield) => {
-            application_context_set_results(&mut context, 0, 0);
+            application_context_set_results(context, 0, 0);
         }
         (
             ApplicationPending::HandleCall(call),
@@ -1668,7 +1685,7 @@ pub fn resume_application(
             )?;
             let reply_bytes =
                 u64::try_from(reply.len()).map_err(|_| MmuError::InvalidUserContext)?;
-            application_context_set_results(&mut context, status, reply_bytes);
+            application_context_set_results(context, status, reply_bytes);
         }
         (
             ApplicationPending::HeapGrow(_),
@@ -1676,8 +1693,23 @@ pub fn resume_application(
                 status,
                 mapped_bytes,
             },
-        ) => application_context_set_results(&mut context, status, mapped_bytes),
+        ) => application_context_set_results(context, status, mapped_bytes),
         _ => return Err(MmuError::InvalidUserContext),
+    }
+    Ok(())
+}
+
+/// Execute while the caller retains the unique root owner. All peer contexts
+/// must remain inside that caller; only the selected registers cross the gate.
+/// An error is terminal for this execution owner.
+#[cfg(target_os = "uefi")]
+fn run_saved_application(
+    address_space: &mut UserAddressSpace,
+    context: &ArchitectureApplicationContext,
+    timeslice_milliseconds: u32,
+) -> Result<(u64, IsolatedRunState), MmuError> {
+    if timeslice_milliseconds == 0 || KERNEL_ROOT.load(Ordering::Acquire) == 0 {
+        return Err(MmuError::InvalidUserContext);
     }
     if ISOLATED_ACTIVE
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -1685,56 +1717,42 @@ pub fn resume_application(
     {
         return Err(MmuError::IsolationBusy);
     }
-    let UserAddressSpace {
-        root,
-        table_arena,
-        regions,
-        stats,
-        tag,
-        ipc,
-    } = address_space;
     // SAFETY: The active transition grants unique state ownership until the
-    // architecture completion path restores the kernel root.
+    // architecture completion restores the kernel root. Moving this vector
+    // does not duplicate a mapping owner or lend references across callbacks.
     unsafe {
         *ISOLATED_RUN.0.get() = Some(IsolatedRunState {
             kind: RunKind::Application,
-            regions,
+            regions: core::mem::take(&mut address_space.regions),
             destination: ptr::null_mut(),
             destination_len: 0,
             application_context: None,
             pending_application: None,
-            ipc,
+            ipc: address_space.ipc,
         });
     }
-    if crate::mechanism::prepare_application_execution(timeslice_milliseconds).is_err() {
-        // SAFETY: No user re-entry occurred and this call still owns the state.
-        unsafe { *ISOLATED_RUN.0.get() = None };
-        ISOLATED_ACTIVE.store(false, Ordering::Release);
-        crate::mechanism::finish_application_execution();
-        return Err(MmuError::ExecutionTimerUnavailable);
-    }
-    let raw = architecture_resume_application(root, &context);
-    #[cfg(feature = "acceptance-probes")]
-    crate::mechanism::record_application_execution_boundary();
+    let prepared = crate::mechanism::prepare_application_execution(timeslice_milliseconds);
+    let raw = if prepared.is_ok() {
+        let raw = architecture_resume_application(address_space.root, context);
+        #[cfg(feature = "acceptance-probes")]
+        crate::mechanism::record_application_execution_boundary();
+        raw
+    } else {
+        0
+    };
     crate::mechanism::quiesce_application_execution();
-    // SAFETY: Native completion restored the kernel root and unique call frame.
-    let state = unsafe { (*ISOLATED_RUN.0.get()).take() };
+    // SAFETY: Either entry never occurred or native completion restored the
+    // kernel root. This call still uniquely owns the masked transition.
+    let mut state = unsafe { (*ISOLATED_RUN.0.get()).take() };
+    if let Some(state) = state.as_mut() {
+        address_space.regions = core::mem::take(&mut state.regions);
+    }
     ISOLATED_ACTIVE.store(false, Ordering::Release);
     crate::mechanism::finish_application_execution();
-    let mut state = state.ok_or(MmuError::InvalidUserContext)?;
-    let regions = core::mem::take(&mut state.regions);
-    decode_application_outcome(
-        raw,
-        UserAddressSpace {
-            tag,
-            ipc,
-            root,
-            table_arena,
-            regions,
-            stats,
-        },
-        state,
-    )
+    if prepared.is_err() {
+        return Err(MmuError::ExecutionTimerUnavailable);
+    }
+    Ok((raw, state.ok_or(MmuError::InvalidUserContext)?))
 }
 
 #[cfg(target_os = "uefi")]

@@ -581,6 +581,17 @@ verify the retained base and selectors before each resume, without repairing
 them. The loop and accepted preemption count are bounded. Terminal fault
 sessions exercise kernel-origin write, execute, synchronous-exception, and
 task-stack-guard paths.
+The shared-context acceptance probe creates two native continuations under one
+root with separate guarded stacks and TLS pages. It switches to the sibling
+while the first is timer-preempted, then alternates sixteen yields per context,
+checking distinct TLS counters and one shared counter. It rejects foreign and
+duplicate thread tokens, missing stack guards, overlapping payloads and invalid
+slice lengths. An intentional native fault revokes both contexts; a subsequent
+sibling resume is rejected and the shared counter stays unchanged. The probe
+retires the root before zeroing/freeing its sole allocation and acknowledges
+thread resource release only afterward. These are native mechanism checks;
+they do not establish threaded package admission, process-share scheduling,
+compiler TLS initialization, per-thread IPC or C/CPython thread safety.
 The acceptance image exceeds 1 MiB and therefore also exercises the
 page-relative data-symbol relocations used by AArch64 entry and completion.
 The source contract test pins assembly ordering that cannot be probabilistically
