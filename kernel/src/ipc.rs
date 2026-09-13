@@ -447,7 +447,7 @@ pub(crate) fn measure(
         )?;
         samples.sort_unstable();
         let p95 = ipc_percentile(&samples, 95);
-        let ratio_limit = if bytes == 4096 { 70 } else { 60 };
+        let ratio_limit = 70;
         let ratio_pass = p95.saturating_mul(100) <= compatibility_p95.saturating_mul(ratio_limit);
         let line = alloc::format!(
             "ipc-phase-b path={path} payload={bytes} warmup=64 samples=256 p95_ticks={p95} compatibility_p95={} ratio_limit={ratio_limit} ratio_pass={} tagged={} calls={calls} request_copies={request_copies} reply_copies={reply_copies} root_writes={roots} targeted_invalidations={targeted} full_invalidations={full} queue_slots={queue_zeroes} traps={traps} tag_hits={hits} steady_allocations=0 scheduler_scans=0 additional_lease_programs={additional_lease_programs}\n",

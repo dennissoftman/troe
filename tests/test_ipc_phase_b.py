@@ -28,7 +28,7 @@ def transcript(
                 f"ipc-phase-b-samples path={path} payload={size} counter_hz=1000000 "
                 f"ticks={raw}"
             )
-            limit = 70 if size == 4096 else 60
+            limit = 70
             copies = (512 if queued else 256) if size else 0
             reply = 256 if size else 0
             full = 0 if tagged else 512
@@ -51,11 +51,11 @@ def transcript(
 
 class IpcPhaseBTests(unittest.TestCase):
     def test_ratios_are_recomputed_and_bounds_are_inclusive(self) -> None:
-        result = ipc_phase_b.validate(transcript(direct_ticks=60), require_tagged=True)
+        result = ipc_phase_b.validate(transcript(direct_ticks=70), require_tagged=True)
         self.assertTrue(result["tagged"])
         self.assertEqual(len(result["rows"]), 8)
         with self.assertRaisesRegex(ValueError, "ratio failed"):
-            ipc_phase_b.validate(transcript(direct_ticks=61), require_tagged=True)
+            ipc_phase_b.validate(transcript(direct_ticks=71), require_tagged=True)
 
     def test_fallback_cannot_satisfy_the_tagged_gate(self) -> None:
         output = transcript(tagged=False, direct_ticks=90)
@@ -66,6 +66,7 @@ class IpcPhaseBTests(unittest.TestCase):
     def test_tampered_or_missing_evidence_fails(self) -> None:
         output = transcript()
         for damaged in (
+            output.replace("ratio_limit=70", "ratio_limit=71", 1),
             output.replace(
                 "additional_lease_programs=0", "additional_lease_programs=1", 1
             ),

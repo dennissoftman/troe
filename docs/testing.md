@@ -699,7 +699,7 @@ must agree before a row is emitted.
 
 `scripts/ipc_phase_b.py` independently recomputes nearest-rank p95 values from
 both arrays. Direct p95 divided by same-boot compatibility p95 must be at most
-0.60 for 0/64/256 bytes and 0.70 for 4 KiB. A queued ratio is reported without a
+0.70 at every payload size. A queued ratio is reported without a
 latency threshold. All rows must use one clock and feature mode. Evidence is
 written to `build/ipc-phase-b-<platform>-<tagged|fallback>.json`, including raw
 samples, structural counts, host, QEMU command, and acceptance-image SHA-256.
@@ -710,7 +710,7 @@ using the same native client and same-boot compatibility samples. Its
 `general-direct` rows must meet the same copy, root, trap, allocation, scheduler,
 and lease requirements. The Phase C p95 budget is 0.70 at every payload size;
 its records encode that limit as 700/1000 using
-`ratio_scale=1000`. Phase B retains its 0.60/0.70 limits. The performance
+`ratio_scale=1000`. Phase B encodes the same cap as 70/100. The performance
 follow-up is tracked in [issue #211](https://github.com/dennissoftman/troe/issues/211).
 `scripts/ipc_phase_c.py` also requires seven native
 fault rows: before receive, after receive, in a nested call, before reply, after

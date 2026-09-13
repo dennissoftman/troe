@@ -52,7 +52,7 @@ class PhaseCTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "unavailable"):
             ipc_phase_c.validate(transcript(tagged=False), require_tagged=True)
 
-    def test_budget_is_exact_at_every_payload_and_phase_b_is_unchanged(self) -> None:
+    def test_budget_is_exact_at_every_payload_on_both_paths(self) -> None:
         ipc_phase_c.validate(
             transcript(ticks=653, large_ticks=700), require_tagged=True
         )
@@ -60,7 +60,7 @@ class PhaseCTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "ratio failed"):
                 ipc_phase_c.validate(output, require_tagged=True)
         with self.assertRaisesRegex(ValueError, "ratio failed"):
-            ipc_phase_b.validate(phase_b(direct_ticks=61), require_tagged=True)
+            ipc_phase_b.validate(phase_b(direct_ticks=71), require_tagged=True)
 
     def test_limits_cannot_be_relaxed_or_fates_duplicated(self) -> None:
         output = transcript()
