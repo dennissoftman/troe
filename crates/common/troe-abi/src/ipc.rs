@@ -33,6 +33,7 @@ pub struct Call {
 impl Call {
     /// Decode all six argument registers without truncation.
     #[must_use]
+    #[inline]
     pub fn decode(words: [u64; 6]) -> Option<Self> {
         if words[0] == 0 || words[2] > 4096 || words[3] > 4096 || words[4] == IDLE {
             return None;
@@ -76,6 +77,7 @@ pub struct ReplyWait {
 impl ReplyWait {
     /// Decode the five arguments and require the unused sixth word to be zero.
     #[must_use]
+    #[inline]
     pub fn decode(words: [u64; 6]) -> Option<Self> {
         let status = u32::try_from(words[2]).ok()?;
         if words[0] == 0

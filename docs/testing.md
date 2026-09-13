@@ -678,6 +678,11 @@ This keeps comparisons close in time without changing clocks, sample counts,
 warmups, timing boundaries, or thresholds; host scheduling can still affect
 the results. The release build optimizes the machine, service, task and dispatch
 crates for speed while retaining the workspace's size profile elsewhere.
+Scalar call/reply decoding can inline into the native checked path. Phase B
+reply/wait saves the server context before publishing its next event, then
+restores the caller directly; it does not copy the updated server context
+through the trap frame before restoring that caller. The native deadline and
+queued-delivery case verifies that the published server event survives.
 
 For each nonempty direct round trip the gate requires one request copy, one
 reply copy, two user-root handoffs, zero heap allocations, zero queue slots,
