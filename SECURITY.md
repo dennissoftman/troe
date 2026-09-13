@@ -107,6 +107,11 @@ never executes the ordinary application.
   claim without consuming its target. A committed scalar result remains owned
   through target reaping and cannot be replaced by a later timeout or stop.
   Ordinary wake and orderly exit cannot bypass the completion interlock.
+  Exit returns an owned terminal action after mutex owner-death policy; it has
+  no success reply and cannot acknowledge memory. Native retirement precedes
+  scalar completion, physical reclamation precedes Join readiness, and essential
+  owner death requires process stop. Prepared children retain charges until
+  their backing is reclaimed.
   Internal clock/configuration failures require process stop without replay.
   Native execution claims and retained operation storage remain separately owned
   and charged by composition; ordinary package grants remain disabled;

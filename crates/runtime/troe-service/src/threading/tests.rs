@@ -6,6 +6,8 @@ use troe_task::{
     StackResource,
 };
 
+mod exit;
+
 struct Harness {
     processes: [ProcessSnapshot; 2],
     threads: ThreadTable,
@@ -311,7 +313,6 @@ fn unimplemented_lifecycle_operations_do_not_publish_or_change_state() -> Result
         },
         Request::Start(token),
         Request::Abort(token),
-        Request::Exit(42),
     ] {
         h.response(0, request, Outcome::Unsupported)?;
         assert_eq!(
@@ -611,17 +612,13 @@ fn poison_returns_no_ownership_and_essential_owner_death_retires_waits() -> Resu
         let mut wait = h.wait(1, Request::Lock { mutex, wait: BLOCK })?;
         h.select(0)?;
         let owner = h.ids[0].process();
-        let effect = h
-            .sync
-            .begin_exit(
-                &mut h.threads,
-                owner,
-                h.ids[0],
-                MonotonicMillis::from_millis(0),
-            )
-            .map_err(|_| ())?;
+        let Progress::Retiring(retiring) = h.run(0, Request::Exit(42))? else {
+            return Err(());
+        };
+        let effect = retiring.disposition();
         if essential {
             assert_eq!(effect, sync::ExitEffect::ProcessStopped);
+            assert!(retiring.complete_thread(&mut h.threads).is_err());
             assert!(
                 wait.observe(&mut h.threads, &mut h.sync, MonotonicMillis::from_millis(0))
                     .is_err()
@@ -631,6 +628,7 @@ fn poison_returns_no_ownership_and_essential_owner_death_retires_waits() -> Resu
             assert_eq!(h.sync.usage(owner), (0, 0));
         } else {
             assert_eq!(effect, sync::ExitEffect::ThreadExiting);
+            retiring.complete_thread(&mut h.threads).map_err(|_| ())?;
             h.finish(1, wait, Outcome::Poisoned)?;
             h.response(1, Request::Unlock(mutex), Outcome::NotOwner)?;
             h.response(1, Request::Lock { mutex, wait: TRY }, Outcome::Poisoned)?;
@@ -996,6 +994,8 @@ fn sleep_dispatch_keeps_its_owned_wait_through_early_finish_and_stop() -> Result
             )
             .map_err(|_| ())?
     );
+    h.select(0)?;
+    h.response(0, Request::Exit(42), Outcome::Busy)?;
     h.finish(0, wait, Outcome::Stopped)?;
     Ok(())
 }

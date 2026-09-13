@@ -41,8 +41,8 @@ does not execute or correlate a native operation.
 
 The portable `troe-service::threading` operation dispatcher binds this owned
 authorization to the captured caller and trusted process snapshot. It executes
-Current, Observe, RequestStop, Join, Detach, Sleep and all interface 31 operations
-against the paired tables; Prepare, Start, Abort and Exit return Unsupported.
+Current, Observe, RequestStop, Join, Detach, Sleep, Exit and all interface 31 operations
+against the paired tables; Prepare, Start and Abort return Unsupported.
 A new operation requires a running caller with no unconsumed policy wait. Waiting owns
 the original request and exact wait generation, with no table borrow or user
 pointer. Clock/configuration failures require process termination rather than
@@ -79,7 +79,10 @@ reply after composition applies lifecycle policy. It preflights private backing
 and aliases, removes the context and mappings, and returns a receipt; physical
 owners must complete reclamation before acknowledging resources. Native Join
 acceptance checks this ordering and retains the scalar result through target
-reaping. This fixture does not enable Exit in the portable operation dispatcher.
+reaping. The portable Exit action owns its authenticated caller, captured scalar
+and owner-death disposition. Consuming it publishes logical completion only
+after native retirement; it acknowledges no resources. Essential-mutex
+abandonment instead requires process stop, with no thread completion or reply.
 
 ## Requests
 
@@ -156,7 +159,10 @@ At one observation, expiry takes precedence over a simultaneous sticky stop.
 
 ## Responses
 
-Each response is exactly 32 bytes and is decoded against a validated request.
+Successful Exit never returns to its caller and has no response; the codec
+rejects a success response for Exit. Rejection before Exit admission can return
+a canonical failure outcome. Each response is exactly 32 bytes and is decoded
+against a validated request.
 Matching interface and opcode are necessary but do not establish a live pending
 operation or protect a caller from its own shared-memory siblings.
 

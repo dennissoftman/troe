@@ -105,13 +105,17 @@ publication or count changes.
 
 `cargo test -p troe-service threading::` exercises authenticated operation binding,
 captured Current identities, live Observe/RequestStop targets, owned Join/Sleep
-waits, Detach and canonical Unsupported prepare/start/abort/exit replies.
+waits, Detach, terminal Exit actions and canonical Unsupported prepare/start/abort replies.
 It covers foreign/stale/wrong-kind identities,
 authority revocation after admission, caller-state checks, pending completion
 interlocks, condition notification/timeout/stop with mutex reacquisition, poison
 and essential-owner termination, permit-batch atomicity, quotas, and regressing
 clocks as composition errors. Every successful response is checked against its
-original request codec; wait completion cannot execute the request again.
+original request codec; wait completion cannot execute the request again. Exit
+checks include initial/worker/last-thread retirement, full-width result retention,
+quiescence-gated Join, prepared-child revocation without early refunds, pending
+completion interlocks, handle revocation, late completion after process stop or
+reaping, and clock rejection before essential owner-death effects.
 
 Metadata checks compare the compiled inline/array layouts with retained vector
 capacities, test exact-byte and one-byte-short budgets, reject invalid counts
@@ -684,8 +688,11 @@ translation fault on the retired stack, TLS, startup, TX or RX page after checki
 both complete replies. Remaining-user-alias and sibling-startup-reference cases
 reject retirement without mutation; an injected failure after the first unmap
 stops all contexts and keeps IPC slots occupied until root teardown. Every case
-restores ordinary frame and logical resource accounting. Exit policy is applied
-directly by the fixture; ordinary portable Exit dispatch remains Unsupported.
+restores ordinary frame and logical resource accounting. Exit policy comes from
+the owned operation dispatcher; its terminal action must match the native claim.
+An essential-mutex abandonment case stops the whole process without individual
+mapping removal or a reply, retains IPC until root teardown, and rejects late
+sibling completion.
 These native mechanism checks do not establish threaded package
 admission, process-share scheduling, compiler TLS initialization or C/CPython
 thread safety.
