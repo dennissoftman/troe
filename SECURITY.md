@@ -74,7 +74,11 @@ never executes the ordinary application.
   The native owner captures fixed scheduler requests before switching siblings;
   completion validates the retained caller, nonwrapping operation identity and
   live IPC generation, rejects stale/corrupt responses before writing, and clears
-  RX before publishing. Capability and operation authority remain composition
+  RX before publishing. A captured canonical call can be claimed once into an
+  owned, non-cloneable execution; claimed calls reject direct completion and
+  repeat claims. Completion failure returns the owned execution for safe recovery
+  or retirement after process stop. Capability and operation authority remain
+  composition
   obligations; native acceptance composes a restricted built-in control handle
   with captured Current calls and live caller identities. Ordinary application
   admission does not enable scheduler calls;

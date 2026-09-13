@@ -51,6 +51,11 @@ supports a correlated completion. It requires trusted composition to authenticat
 the built-in capability and execute the operation; it does not enable threaded
 package admission. Native capture copies the request before another sibling
 runs and retains caller, operation sequence and IPC generation through completion.
+After trusted authentication, native claiming matches the canonical request to
+that retained capture once and produces an owned execution value. Claimed calls
+reject repeat claims and the direct completion path. Consuming completion returns
+ownership on failure so a retained wait can be recovered or retired after stop;
+it never selects a new caller or renews CPU time.
 Native acceptance authenticates a restricted built-in control handle and returns
 the captured caller's live token for Current. Its probe dispatcher executes no
 other operation and does not change ordinary application admission.

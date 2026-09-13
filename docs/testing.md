@@ -623,6 +623,12 @@ captured Current requests. Each reply contains the captured caller's live typed
 thread token; user instructions check that identity and exact register completion
 pairs. Revocation removes the capability, and late completions after process
 fault are rejected.
+The probe claims authenticated captures into non-cloneable execution values,
+rejects malformed/mismatched/repeated claims and direct completion of a claimed
+call without RX writes. An invalid response returns the original execution,
+which then accepts a valid completion. One sibling's final execution remains
+owned across the other's native fault; its late completion returns stale without
+changing RX or reviving a context.
 Native builds assert that suspension/fault outcomes cannot collide with the
 inline IPC continuation sentinel or application exit statuses.
 The probe executes only Current identity observations and no synchronization

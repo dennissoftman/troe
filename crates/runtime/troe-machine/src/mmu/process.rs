@@ -96,6 +96,37 @@ impl NativeSchedulerCall {
     }
 }
 
+/// One claimed native scheduler execution, containing no borrow or user pointer.
+///
+/// Claim only after trusted capability authentication. This non-cloneable value
+/// belongs to the executing operation or its retained wait until completion or
+/// process stop; it is not an independently authenticated capability.
+/// Composition accounts for its storage separately from the native context owner.
+#[derive(Debug, Eq, PartialEq)]
+#[must_use = "A claimed execution must be completed or its process stopped"]
+pub struct NativeSchedulerExecution {
+    operation: NativeSchedulerCall,
+    request: troe_abi::threading::Request,
+}
+impl NativeSchedulerExecution {
+    /// Captured caller, independent of the thread currently selected to run.
+    #[must_use]
+    pub const fn caller(&self) -> ThreadId {
+        self.operation.caller
+    }
+
+    /// Canonical request matched against the immutable native capture.
+    #[must_use]
+    pub const fn request(&self) -> troe_abi::threading::Request {
+        self.request
+    }
+}
+
+struct PendingSchedulerCall {
+    operation: NativeSchedulerCall,
+    claimed: bool,
+}
+
 #[derive(Clone, Copy)]
 struct ThreadIpc {
     index: usize,
@@ -129,7 +160,7 @@ struct ThreadContext {
     pending: ApplicationPending,
     started: bool,
     ipc: Option<ThreadIpc>,
-    scheduler_operation: Option<NativeSchedulerCall>,
+    scheduler_operation: Option<PendingSchedulerCall>,
 }
 
 impl Drop for ThreadContext {
@@ -456,6 +487,7 @@ impl NativeProcessContext {
     ///
     /// Completion does not run the caller or grant it another process timeslice.
     /// `None` rejects a malformed frame/request or unauthenticated capability.
+    /// Claimed executions must instead use [`Self::complete_scheduler_execution`].
     ///
     /// # Errors
     /// Rejects stopped/foreign/stale/already-completed operations and invalid
@@ -465,19 +497,94 @@ impl NativeProcessContext {
         operation: NativeSchedulerCall,
         response: Option<(troe_abi::threading::Request, troe_abi::threading::Response)>,
     ) -> Result<(), MmuError> {
+        self.complete_scheduler_inner(operation, response, false)
+    }
+
+    /// Claim one captured call for execution after capability authentication.
+    ///
+    /// The canonical request must equal the native copy. One capture can be
+    /// claimed only once; direct completion cannot bypass the owned execution.
+    /// No callback, allocation, user execution or RX write occurs here. Trusted
+    /// composition must retain the result through execution or suspension.
+    ///
+    /// # Errors
+    /// Rejects stopped/stale/already-claimed calls and mismatched/malformed requests
+    /// without changing the retained operation or its reply storage.
+    pub fn claim_scheduler(
+        &mut self,
+        operation: NativeSchedulerCall,
+        request: troe_abi::threading::Request,
+    ) -> Result<NativeSchedulerExecution, MmuError> {
+        let index = self.scheduler_index(operation, false)?;
+        if operation
+            .request(request.interface())
+            .map_err(|_| MmuError::InvalidUserContext)?
+            != request
+        {
+            return Err(MmuError::InvalidUserContext);
+        }
+        self.contexts[index]
+            .scheduler_operation
+            .as_mut()
+            .ok_or(MmuError::InvalidUserContext)?
+            .claimed = true;
+        Ok(NativeSchedulerExecution { operation, request })
+    }
+
+    /// Consume a claimed execution and publish its exact canonical response.
+    ///
+    /// Completion neither runs user code nor renews CPU entitlement. On error the
+    /// caller receives ownership back and must retry a valid completion or stop
+    /// the process. After stop, the returned value conveys no live native authority.
+    ///
+    /// # Errors
+    /// Returns the error and original owned execution for stale/stopped lifetimes
+    /// or invalid responses, without writes. A native storage failure stops the
+    /// process and also returns the value, which must then be retired.
+    #[allow(clippy::result_large_err)] // Return bounded ownership without allocating an error box.
+    pub fn complete_scheduler_execution(
+        &mut self,
+        execution: NativeSchedulerExecution,
+        response: troe_abi::threading::Response,
+    ) -> Result<(), (MmuError, NativeSchedulerExecution)> {
+        match self.complete_scheduler_inner(
+            execution.operation,
+            Some((execution.request, response)),
+            true,
+        ) {
+            Ok(()) => Ok(()),
+            Err(error) => Err((error, execution)),
+        }
+    }
+
+    fn scheduler_index(
+        &self,
+        operation: NativeSchedulerCall,
+        claimed: bool,
+    ) -> Result<usize, MmuError> {
         let (_, pair) = self.bound_ipc(operation.caller)?;
         if pair.slot() != operation.pair_slot || pair.generation() != operation.pair_generation {
             return Err(MmuError::InvalidUserContext);
         }
-        let index = self
-            .contexts
+        self.contexts
             .iter()
             .position(|context| {
                 context.id == operation.caller
-                    && context.scheduler_operation == Some(operation)
+                    && context.scheduler_operation.as_ref().is_some_and(|pending| {
+                        pending.operation == operation && pending.claimed == claimed
+                    })
                     && context.pending == ApplicationPending::SchedulerCall
             })
-            .ok_or(MmuError::InvalidUserContext)?;
+            .ok_or(MmuError::InvalidUserContext)
+    }
+
+    fn complete_scheduler_inner(
+        &mut self,
+        operation: NativeSchedulerCall,
+        response: Option<(troe_abi::threading::Request, troe_abi::threading::Response)>,
+        claimed: bool,
+    ) -> Result<(), MmuError> {
+        let index = self.scheduler_index(operation, claimed)?;
         let reply = response
             .map(|(request, response)| {
                 if operation
@@ -628,7 +735,10 @@ impl NativeProcessContext {
                             pair_generation: pair.generation(),
                             frame,
                         };
-                        context.scheduler_operation = Some(operation);
+                        context.scheduler_operation = Some(PendingSchedulerCall {
+                            operation,
+                            claimed: false,
+                        });
                         NativeThreadStop::SchedulerCall(operation)
                     }
                     _ => return Err(MmuError::InvalidUserContext),
