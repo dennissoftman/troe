@@ -372,6 +372,13 @@ It authenticates no capability or pending operation. Application ABI 1.4 is
 assigned but rejected by the active loader and SDK; older startup profiles
 also reject the two thread interfaces.
 
+Portable thread/synchronization identities expose their slot and generation for
+encoding. Their tables resolve those components only against a trusted selected
+process and, for synchronization, the exact object kind. Foreign, empty,
+out-of-range and mismatched lifetimes return the same stale result. Resolution
+is allocation-free and retains no borrow; terminal records remain identifiable
+until reaping. It grants no capability or permission to skip lifecycle checks.
+
 The boot arena contains one reusable 64 KiB cooperative task payload plus
 128 KiB isolated-server and 192 KiB shell payloads. The shell reserve covers
 eight nested launch levels including private IPC/root metadata. Each has an unmapped 4 KiB page on
@@ -577,6 +584,10 @@ are not enabled. Ordinary application entries carry no scheduler IPC binding
 and continue to reject entry 6.
 Compile-time assertions keep every native outcome distinct from the gate's
 immediate IPC continuation sentinel and ordinary application exit statuses.
+Native acceptance composes the dispatcher authority check with captured Current
+calls and live thread identity resolution. Its restricted control handle belongs
+to the process record's task principal, and replies identify the captured caller.
+This probe does not enable scheduler services for admitted application packages.
 Unsaved AVX-family, SVE, and SME state remains disabled rather than leaking or
 corrupting across tasks. ABI call 0 exits through the owned gate. The x86
 local-APIC and AArch64 generic physical timers capture a complete resumable

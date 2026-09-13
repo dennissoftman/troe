@@ -10,6 +10,9 @@ validates correlated completions. The dispatcher has closed built-in capability
 targets and owned request authorization; native capability/operation integration,
 threaded package admission, compiler-TLS allocation and pthread
 support remain disabled.
+Native acceptance composes a restricted control capability with Current calls
+and process-scoped live thread-token resolution. This does not activate general
+scheduler operation execution or application grants.
 Current single-execution-thread application contracts remain in force.
 Portable lifecycle/synchronization models, an independently compiler-checked
 static TLS layout/initializer, guarded thread-memory planning, and composed
@@ -25,7 +28,7 @@ IPC headroom without enabling native execution.
 Allocation-free wire/startup codecs implement the numeric assignments described
 in the wire annex below. Application ABI 1.4 remains disabled and ordinary
 application dispatch rejects entry 6. Native owner acceptance exercises the
-separate capture/completion boundary without activating scheduler services;
+separate capture/completion boundary and authenticated Current identity replies;
 these assignments do not supersede the active ABI 1.3 contract. Complete native
 admission and the remaining gates below are still required.
 

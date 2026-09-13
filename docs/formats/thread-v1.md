@@ -18,6 +18,11 @@ nonzero generation. Slots range from 0 through 16,777,214. Zero slot fields,
 zero generations and unknown kinds are rejected. This representational bound
 does not grant storage. Tokens contain no process identifier or authority;
 decoding proves only shape. Generation exhaustion must retire a native slot.
+Portable table resolution validates those slot/generation components against
+the kernel-selected process and requested kind without allocating or changing
+state. Foreign, absent and mismatched lifetimes all resolve stale. Terminal
+thread records remain identifiable until reaping; identity lookup does not
+authorize an operation or bypass its state checks.
 
 Every operation requires `CALL` (bit 0). Interface 30 additionally uses create
 (bit 9), start/abort (10), join (11), detach (12), stop (13), and observe/current
@@ -46,6 +51,9 @@ supports a correlated completion. It requires trusted composition to authenticat
 the built-in capability and execute the operation; it does not enable threaded
 package admission. Native capture copies the request before another sibling
 runs and retains caller, operation sequence and IPC generation through completion.
+Native acceptance authenticates a restricted built-in control handle and returns
+the captured caller's live token for Current. Its probe dispatcher executes no
+other operation and does not change ordinary application admission.
 
 ## Requests
 

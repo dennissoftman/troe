@@ -5,6 +5,120 @@ const OWNER: ProcessId = ProcessId(1);
 const OTHER: ProcessId = ProcessId(2);
 
 #[test]
+fn resolve_checks_live_owner_kind_and_generation_without_state_changes() -> Result<(), SyncError> {
+    let mut h = Harness::new()?;
+    let caller = h.ids[0];
+    let mutex = h.mutex(OwnerDeath::Poison)?;
+    let condition = h.sync.create_condition(&mut h.threads, OWNER, caller)?;
+    let permit = h.sync.create_permit(&mut h.threads, OWNER, caller, 0, 1)?;
+    let before = (
+        h.sync.usage(OWNER),
+        h.threads.usage(OWNER),
+        h.sync.metadata_bytes(),
+    );
+    assert_eq!(
+        h.sync
+            .resolve_mutex(OWNER, mutex.slot(), mutex.generation()),
+        Ok(mutex)
+    );
+    assert_eq!(
+        h.sync
+            .resolve_condition(OWNER, condition.slot(), condition.generation()),
+        Ok(condition)
+    );
+    assert_eq!(
+        h.sync
+            .resolve_permit(OWNER, permit.slot(), permit.generation()),
+        Ok(permit)
+    );
+    assert_eq!(
+        h.sync
+            .resolve_mutex(OWNER, condition.slot(), condition.generation()),
+        Err(SyncError::Stale)
+    );
+    assert_eq!(
+        h.sync
+            .resolve_condition(OWNER, permit.slot(), permit.generation()),
+        Err(SyncError::Stale)
+    );
+    assert_eq!(
+        h.sync
+            .resolve_permit(OWNER, mutex.slot(), mutex.generation()),
+        Err(SyncError::Stale)
+    );
+    for (owner, slot, generation) in [
+        (OTHER, mutex.slot(), mutex.generation()),
+        (OTHER, condition.slot(), condition.generation()),
+        (OTHER, permit.slot(), permit.generation()),
+        (OWNER, usize::MAX, 1),
+        (OWNER, 15, 1),
+        (OWNER, mutex.slot(), 0),
+        (OWNER, condition.slot(), u32::MAX),
+    ] {
+        assert_eq!(
+            h.sync.resolve_mutex(owner, slot, generation),
+            Err(SyncError::Stale)
+        );
+        assert_eq!(
+            h.sync.resolve_condition(owner, slot, generation),
+            Err(SyncError::Stale)
+        );
+        assert_eq!(
+            h.sync.resolve_permit(owner, slot, generation),
+            Err(SyncError::Stale)
+        );
+    }
+    assert_eq!(
+        (
+            h.sync.usage(OWNER),
+            h.threads.usage(OWNER),
+            h.sync.metadata_bytes()
+        ),
+        before
+    );
+    Ok(())
+}
+
+#[test]
+fn resolve_rejects_previous_generations_after_kind_reuse_and_teardown() -> Result<(), SyncError> {
+    let mut h = Harness::new()?;
+    let caller = h.ids[0];
+    let mutex = h.mutex(OwnerDeath::Poison)?;
+    let permit = h.sync.create_permit(&mut h.threads, OWNER, caller, 0, 1)?;
+    h.sync.destroy_mutex(&mut h.threads, OWNER, caller, mutex)?;
+    let replacement = h.sync.create_condition(&mut h.threads, OWNER, caller)?;
+    assert_eq!(replacement.slot(), mutex.slot());
+    assert_ne!(replacement.generation(), mutex.generation());
+    assert_eq!(
+        h.sync
+            .resolve_mutex(OWNER, mutex.slot(), mutex.generation()),
+        Err(SyncError::Stale)
+    );
+    assert_eq!(
+        h.sync
+            .resolve_condition(OWNER, mutex.slot(), mutex.generation()),
+        Err(SyncError::Stale)
+    );
+    assert_eq!(
+        h.sync
+            .resolve_condition(OWNER, replacement.slot(), replacement.generation()),
+        Ok(replacement)
+    );
+    h.teardown()?;
+    assert_eq!(
+        h.sync
+            .resolve_condition(OWNER, replacement.slot(), replacement.generation()),
+        Err(SyncError::Stale)
+    );
+    assert_eq!(
+        h.sync
+            .resolve_permit(OWNER, permit.slot(), permit.generation()),
+        Err(SyncError::Stale)
+    );
+    Ok(())
+}
+
+#[test]
 fn compiled_metadata_includes_object_and_wait_capacity() -> Result<(), SyncError> {
     for (processes, objects, waits) in [(1, 1, 1), (2, 8, 4), (7, 19, 32)] {
         let requested = SyncTable::metadata_layout(processes, objects, waits)?;
