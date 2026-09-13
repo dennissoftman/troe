@@ -82,6 +82,10 @@ never executes the ordinary application.
   container revision, validates the immutable initializer against its image source,
   and rejects initializer pointer fixups. Native and streaming loaders reject this
   container; these components enable no native workers;
+- compiler qualification: explicit C11 target/TLS options and isolated headers,
+  exact release checks and observed-input fingerprints; missing, skipped or
+  failed qualification cannot publish a success report. These reports grant
+  no native authority and do not certify production runtime hardening;
 - KEX resolution: bare names select only `/bin/<name>.kex`; a command containing
   `/` tries its exact VFS path relative to its explicit cwd, then appends `.kex`
   only if the path is missing and the filename does not already end in `.kex`;

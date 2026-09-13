@@ -134,6 +134,38 @@ Changes to `troe-application` select these probes as well as Rust and native
 regression checks. These are host compiler/layout checks, not evidence of
 thread-pointer switching or TLS execution inside a guest.
 
+The shared recipe in `tools/thread_profile.py` selects explicit target CPU/TLS
+options, Clang builtin headers and the TROE sysroot, and excludes ambient
+compiler configuration and include-path variables. The C ABI probe checks
+freestanding LP64/LE, type widths, lock-free word atomics and separate TLS
+storage. It also verifies that ABI-1 `errno` is still a non-TLS declaration.
+
+Pin qualification uses the exact Clang/LLD releases in
+`sdk/c/thread-profile-v1.json`. Select explicit executable paths where required:
+
+```console
+python3 tools/thread_profile.py --cc /path/to/clang --ld /path/to/ld.lld \
+  --output /tmp/troe-thread-profile.json
+python3 tools/thread_profile.py --compatible-tools
+python3 -m unittest discover -s tests -p test_thread_profile.py
+```
+
+Both tool families are checked. Strict mode rejects other releases before
+qualification; compatible mode records whether each pin matches. The report
+binds tool binaries, builtin/sysroot headers, compiler recipe, linker script,
+probe and format-decoder sources, Cargo lock and Rust toolchain specification
+by SHA-256. Inputs are fingerprinted before and after the run. Required probes
+must be present and pass without skips or expected failures; zero selected tests
+cannot produce success. A failed qualification leaves an existing report
+untouched. Report publication is an atomic replacement in its destination
+directory; the directory must already exist.
+
+This is regression/provenance evidence, not a signed toolchain attestation or
+native admission credential. Reports always state `qualification_only: true`
+and `native_admission: false`. The recipe's disabled stack protector and RELRO
+apply to layout qualification only. The selected runtime ownership and native
+hardening prerequisites are recorded in [ADR 0071](adr/0071-native-threads-and-owned-synchronization.md).
+
 ## Thread memory planning
 
 `cargo test -p troe-application --lib thread_memory::` verifies complete guarded

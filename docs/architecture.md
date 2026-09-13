@@ -301,6 +301,11 @@ image source; initializers requiring pointer fixups are rejected. Explicit
 `cargo kex convert --threaded` checks ELF TLS extents and the worker trampoline.
 Native and streaming loaders still reject this format. Compiler probes verify
 the portable geometry and emitted bytes independently of native execution.
+The shared C11 qualification recipe pins Clang/LLD releases, excludes host
+headers/configuration, and records binary/header/source fingerprints only after
+the required checks pass. Its reports grant no admission. The C ABI-1 runtime
+retains its single-thread ownership; [ADR 0071](adr/0071-native-threads-and-owned-synchronization.md)
+specifies the separate process/thread/callback ownership needed by its adapter.
 
 `troe-application::thread_memory` places one fixed, fully committed stack, the
 checked TLS allocation, a two-page IPC pair and a read-only startup descriptor
