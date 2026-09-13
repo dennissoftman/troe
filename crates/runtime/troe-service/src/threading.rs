@@ -53,7 +53,7 @@ pub struct Completion {
     response: Response,
 }
 
-/// Immediate completion or an owned suspension on one exact wait generation.
+/// A checked reply, exact wait or terminal action with retained ownership.
 #[derive(Debug, Eq, PartialEq)]
 #[must_use]
 pub enum Progress {
@@ -61,6 +61,26 @@ pub enum Progress {
     Complete(Completion),
     /// Retain this value and the native claim until completion or process stop.
     Waiting(Waiting),
+    /// No success reply is possible; finish native retirement or process stop.
+    Retiring(Retiring),
+}
+
+/// An admitted Exit after lifecycle and synchronization owner-death policy.
+///
+/// Retain this beside the matching native execution claim. Dropping it neither
+/// completes the thread nor reclaims any resource. Composition must retire the
+/// thread or stop and reclaim the process without returning to the caller.
+///
+/// ```compile_fail
+/// fn duplicate(exit: troe_service::threading::Retiring) {
+///     let duplicate = exit.clone();
+/// }
+/// ```
+#[derive(Debug, Eq, PartialEq)]
+#[must_use]
+pub struct Retiring {
+    operation: Operation,
+    disposition: sync::ExitEffect,
 }
 
 /// An admitted wait, including its immutable request and authenticated caller.
@@ -106,8 +126,9 @@ impl Operation {
 
     /// Consume this operation under exclusive ownership of the paired tables.
     ///
-    /// Supports identity/stop, join/detach/sleep and all synchronization operations.
-    /// Prepare/start/abort/exit return `Unsupported` without changing records.
+    /// Supports identity/stop, join/detach/sleep/exit and all synchronization operations.
+    /// Prepare/start/abort return `Unsupported` without changing records. An
+    /// admitted Exit returns an owned terminal action, never a success reply.
     /// Absolute wire deadlines are boot-relative milliseconds; they are never
     /// restarted on resumption. Work and storage are bounded by table capacity.
     ///
@@ -134,6 +155,10 @@ impl Operation {
             Ok(Effect::Wait(wait)) => Ok(Progress::Waiting(Waiting {
                 operation: self,
                 wait,
+            })),
+            Ok(Effect::Exit(disposition)) => Ok(Progress::Retiring(Retiring {
+                operation: self,
+                disposition,
             })),
             Err(error) => self
                 .complete(reply(error_outcome(error)?, 0))
@@ -212,6 +237,11 @@ impl Operation {
                     .sleep(owner, caller, options(wait), now)
                     .map(control_start)
                     .map_err(Into::into);
+            }
+            Request::Exit(_) => {
+                return table
+                    .begin_exit(threads, owner, caller, now)
+                    .map(Effect::Exit);
             }
             Request::CreateMutex(policy) => {
                 let policy = match policy {
@@ -308,11 +338,55 @@ impl Operation {
                 table.destroy_permit(threads, owner, caller, id)?;
                 reply(Outcome::Success, 0)
             }
-            Request::Prepare { .. } | Request::Start(_) | Request::Abort(_) | Request::Exit(_) => {
+            Request::Prepare { .. } | Request::Start(_) | Request::Abort(_) => {
                 reply(Outcome::Unsupported, 0)
             }
         };
         Ok(Effect::Reply(response))
+    }
+}
+
+impl Retiring {
+    /// Exact caller that must never resume after this accepted Exit.
+    #[must_use]
+    pub const fn caller(&self) -> ThreadId {
+        self.operation.caller
+    }
+
+    /// Captured Exit and scalar result for matching the retained native claim.
+    #[must_use]
+    pub const fn request(&self) -> Request {
+        self.operation.authority.request()
+    }
+
+    /// Whether native composition retires one thread or stops the entire process.
+    #[must_use]
+    pub const fn disposition(&self) -> sync::ExitEffect {
+        self.disposition
+    }
+
+    /// Publish the retained scalar only after removing this native continuation.
+    ///
+    /// This acknowledges no resources and produces no wire response. Physical
+    /// owners must still zero/reclaim frames before logical resource release or
+    /// Join readiness. Initial-thread and last-thread process fate, including
+    /// reclamation of revoked prepared children, remain composition obligations.
+    ///
+    /// # Errors
+    /// Returns this action unchanged if process-wide stop was required or the
+    /// lifecycle no longer permits completion. Never replay the original Exit.
+    #[allow(clippy::result_large_err)] // Preserve bounded ownership without allocation.
+    pub fn complete_thread(self, threads: &mut ThreadTable) -> Result<(), (Error, Self)> {
+        let Request::Exit(result) = self.request() else {
+            return Err((Error::Encoding, self));
+        };
+        if self.disposition != sync::ExitEffect::ThreadExiting {
+            return Err((Error::Thread(ThreadError::InvalidState), self));
+        }
+        let caller = self.caller();
+        threads
+            .complete(caller.process(), caller, result)
+            .map_err(|error| (Error::Thread(error), self))
     }
 }
 
@@ -399,6 +473,7 @@ enum Effect {
     Reply(Response),
     Wait(WaitKind),
     Identity(Kind, usize, u32),
+    Exit(sync::ExitEffect),
 }
 
 fn reply(outcome: Outcome, value: u64) -> Response {

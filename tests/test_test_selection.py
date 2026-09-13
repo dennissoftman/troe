@@ -104,6 +104,32 @@ class ChangedTestSelectionTests(unittest.TestCase):
         self.assertIn("fault-isolation", plan.qemu_scenarios)
         self.assertIn("troe-kernel", plan.rust_packages)
 
+    def test_native_thread_boundaries_require_the_complete_hosted_gate(self) -> None:
+        paths = (
+            "crates/runtime/troe-service/src/threading.rs",
+            "crates/runtime/troe-service/src/threading/tests/exit.rs",
+            "crates/runtime/troe-task/src/thread.rs",
+            "crates/runtime/troe-task/src/thread/sync.rs",
+            "crates/runtime/troe-task/src/thread/control/tests.rs",
+            "crates/runtime/troe-dispatch/src/scheduler.rs",
+            "crates/runtime/troe-machine/src/mmu/process.rs",
+            "crates/runtime/troe-machine/src/mmu/process/retirement.rs",
+            "crates/runtime/troe-machine/src/mmu/retirement.rs",
+            "crates/runtime/troe-machine/src/mmu/retirement/tests.rs",
+            "kernel/src/memory/shared_context_probe.rs",
+            "kernel/src/memory/shared_context_probe/retirement.rs",
+        )
+        for path in paths:
+            with self.subTest(path=path):
+                plan = test_changed.build_plan((PurePosixPath(path),), PACKAGES)
+                self.assertEqual(len(plan.full_reasons), 1)
+                self.assertIn("every hosted execution profile", plan.full_reasons[0])
+        docs = test_changed.build_plan(
+            (PurePosixPath("docs/formats/thread-v1.md"),), PACKAGES
+        )
+        self.assertFalse(docs.full_reasons)
+        self.assertEqual(docs.python_tests, {"test_repository_policy.py"})
+
     def test_one_app_selects_only_its_dual_target_build_and_behavior(self) -> None:
         plan = test_changed.build_plan(
             (PurePosixPath("apps/tcp/src/main.rs"),), PACKAGES

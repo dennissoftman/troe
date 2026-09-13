@@ -18,7 +18,7 @@ use troe_memory::{
     Mapping, MappingLifetime, MappingOwner, MappingPermissions, MappingPlan, PhysicalRange,
     VirtualRange,
 };
-use troe_service::threading::{Operation, Progress, Waiting};
+use troe_service::threading::{Operation, Progress, Retiring, Waiting};
 use troe_task::thread::{ThreadId, ThreadQuota, ThreadResources, ThreadTable, sync};
 use troe_task::{
     Capabilities, MonotonicMillis, ProcessName, ProcessOrigin, ProcessRegistration, ProcessTable,
@@ -30,7 +30,8 @@ const STARTUP: u64 = USER_STACK_BASE + 18 * PAGE;
 const ZERO: MonotonicMillis = MonotonicMillis::from_millis(0);
 const _: () = assert!(
     2 * core::mem::size_of::<NativeSchedulerExecution>()
-        + 2 * core::mem::size_of::<Operation>()
+        + core::mem::size_of::<Operation>()
+        + core::mem::size_of::<Retiring>()
         + core::mem::size_of::<Waiting>()
         <= 4096
 );
@@ -41,6 +42,7 @@ enum Scenario {
     Alias,
     StartupReference,
     Partial,
+    Essential,
 }
 
 pub(super) fn verify(accounting: &mut OwnedAccounting) -> Result<(), ()> {
@@ -53,6 +55,7 @@ pub(super) fn verify(accounting: &mut OwnedAccounting) -> Result<(), ()> {
         Scenario::Alias,
         Scenario::StartupReference,
         Scenario::Partial,
+        Scenario::Essential,
     ] {
         let free = accounting.frames.free_frames();
         let allocation = allocate_isolated(&mut accounting.frames)?;
@@ -452,9 +455,6 @@ fn run_case(
     if exit.request() != (Request::Exit(u64::MAX)) {
         return Err(());
     }
-    // Exit's native fixture applies lifecycle policy directly; ordinary dispatch
-    // still reports Unsupported until full admission/cleanup composition exists.
-    drop(exit_operation);
     let bad = NativeThreadBacking {
         stack: &tls,
         tls: &stack,
@@ -464,7 +464,59 @@ fn run_case(
     if native.is_stopped() || native.stats() != charges {
         return Err(());
     }
-    if matches!(scenario, Scenario::Alias | Scenario::StartupReference) {
+    if matches!(scenario, Scenario::Essential) {
+        let mutex = policy
+            .sync
+            .create_mutex(
+                &mut policy.threads,
+                owner,
+                policy.ids[0],
+                sync::OwnerDeath::FailProcess,
+            )
+            .map_err(|_| ())?;
+        if policy
+            .sync
+            .lock(
+                &mut policy.threads,
+                owner,
+                policy.ids[0],
+                mutex,
+                sync::WaitMode::Try,
+                ZERO,
+            )
+            .map_err(|_| ())?
+            != sync::SyncStart::Complete(sync::SyncOutcome::Acquired)
+        {
+            return Err(());
+        }
+    }
+    let Progress::Retiring(retiring) = exit_operation
+        .execute(&mut policy.threads, &mut policy.sync, ZERO)
+        .map_err(|_| ())?
+    else {
+        return Err(());
+    };
+    if retiring.caller() != exit.caller()
+        || retiring.request() != exit.request()
+        || retiring.disposition()
+            != if matches!(scenario, Scenario::Essential) {
+                sync::ExitEffect::ProcessStopped
+            } else {
+                sync::ExitEffect::ThreadExiting
+            }
+    {
+        return Err(());
+    }
+    if matches!(scenario, Scenario::Essential) {
+        native.stop();
+        if native.retire_thread(exit, backing).is_ok()
+            || native.stats() != charges
+            || native.probe_word(starts[0].stack.start()).is_err()
+            || retiring.complete_thread(&mut policy.threads).is_ok()
+        {
+            return Err(());
+        }
+    } else if matches!(scenario, Scenario::Alias | Scenario::StartupReference) {
         let (_, exit) = native.retire_thread(exit, backing).err().ok_or(())?;
         if native.is_stopped()
             || native.stats() != charges
@@ -500,14 +552,6 @@ fn run_case(
             return Err(());
         }
     } else {
-        if policy
-            .sync
-            .begin_exit(&mut policy.threads, owner, policy.ids[0], ZERO)
-            .map_err(|_| ())?
-            != sync::ExitEffect::ThreadExiting
-        {
-            return Err(());
-        }
         let retired = native.retire_thread(exit, backing).map_err(|_| ())?;
         if retired.caller() != policy.ids[0]
             || retired.ordinary_pages() != 3
@@ -546,9 +590,8 @@ fn run_case(
         {
             return Err(());
         }
-        policy
-            .threads
-            .complete(owner, policy.ids[0], u64::MAX)
+        retiring
+            .complete_thread(&mut policy.threads)
             .map_err(|_| ())?;
         policy
             .threads

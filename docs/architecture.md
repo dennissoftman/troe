@@ -435,8 +435,8 @@ execute an operation, bind it to a native continuation or publish a startup gran
 `troe-service::threading` binds an owned authorization to the captured caller and
 the trusted process record's task principal. Consuming the operation validates a
 running caller with no unconsumed policy wait, then executes Current, Observe,
-RequestStop, Join, Detach, Sleep or any synchronization operation against the
-paired tables. Prepare, Start, Abort and Exit return Unsupported. Expected
+RequestStop, Join, Detach, Sleep, Exit or any synchronization operation against the
+paired tables. Prepare, Start and Abort return Unsupported. Expected
 failures produce canonical request-correlated outcomes; clock/configuration/invariant failures require
 process termination and must not replay the request. A suspended operation owns
 its original request, caller and exact wait generation without retaining a table
@@ -445,8 +445,16 @@ consumed only after dispatch; condition results preserve mutex reacquisition.
 Native composition must retain the matching single-use execution claim beside
 these values and charge their compiled storage. This portable dispatcher does
 not itself publish native replies, allocate thread memory or enable application
-grants. RequestStop sets the sticky flag; delivery to admitted waits uses their
-explicit observation or the synchronization model's grant transitions.
+grants. Exit applies synchronization owner-death policy and revokes the caller's
+unstarted children, then returns a non-cloneable `Retiring` action with the
+captured caller, request and thread/process disposition. It publishes no success
+reply. Composition removes the native continuation before consuming the action
+to publish its retained scalar; physical resource acknowledgement remains later.
+Essential-mutex abandonment requires whole-process stop. Initial-thread exit
+leaves surviving siblings live; last-thread completion and process fate remain
+composition responsibilities. RequestStop sets the sticky flag; delivery to
+admitted waits uses their explicit observation or the synchronization model's
+grant transitions.
 
 Native console output uses `ConsoleService` to convert a
 bounded write request into the existing `Output` operation, while
@@ -661,9 +669,11 @@ the worker's physical reservation is zeroed/freed and logically acknowledged;
 its committed result survives target reaping. The sibling checks the complete
 reply, then faults on a read from a retired stack, TLS, startup, TX or RX page.
 Separate cases reject a remaining physical alias and a sibling startup reference,
-and contain an injected failure after the first leaf removal. Exit lifecycle
-policy in this fixture is composed directly; the portable dispatcher still
-returns Unsupported for Exit and ordinary package admission remains unchanged.
+and contain an injected failure after the first leaf removal. The fixture
+executes the authenticated Exit through the owned dispatcher and matches its
+terminal action to the native claim. A worker exiting with an essential mutex
+stops the whole process, retains all mappings/IPC until root teardown and rejects
+late sibling completion. Ordinary package admission remains unchanged.
 Unsaved AVX-family, SVE, and SME state remains disabled rather than leaking or
 corrupting across tasks. ABI call 0 exits through the owned gate. The x86
 local-APIC and AArch64 generic physical timers capture a complete resumable

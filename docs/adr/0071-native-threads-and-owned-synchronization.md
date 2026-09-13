@@ -13,11 +13,14 @@ hardware denial of retired-page reads. The native owner also captures scheduler 
 validates correlated completions. The dispatcher has closed built-in capability
 targets and owned request authorization. The portable operation dispatcher binds
 that authority to a captured caller and trusted process snapshot and executes
-Current, Observe, RequestStop, Join, Detach, Sleep and synchronization operations,
+Current, Observe, RequestStop, Join, Detach, Sleep, Exit and synchronization operations,
 retaining owned waits and checking atomic permit batches. Join/sleep waits retain
 their caller interlock and committed result through dispatch; join requires
 quiescent native resources and timeout/stop does not consume an uncommitted
-result. Prepare, Start, Abort and Exit return Unsupported. Native execution of the
+result. Exit returns an owned terminal action after owner-death policy, with no
+success response or resource acknowledgement. Native retirement precedes its
+scalar completion; an essential mutex instead stops the complete process.
+Prepare, Start and Abort return Unsupported. Native execution of the
 full operation set, threaded package admission, compiler-TLS allocation and pthread
 support remain disabled.
 Native acceptance composes a restricted control capability with Current calls
