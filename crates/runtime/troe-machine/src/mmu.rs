@@ -77,7 +77,30 @@ const OUTCOME_APPLICATION_HEAP_GROW: u64 = 1 << 60;
 #[cfg(target_os = "uefi")]
 const OUTCOME_APPLICATION_PREEMPTED: u64 = 1 << 59;
 #[cfg(target_os = "uefi")]
-const OUTCOME_SCHEDULER_CALL: u64 = 1 << 58;
+const OUTCOME_SCHEDULER_CALL: u64 = 1 << 57;
+#[cfg(target_os = "uefi")]
+const _: () = {
+    // Naked gates interpret the IPC sentinel before returning to composition.
+    // No suspended outcome may alias it or an application exit status.
+    let outcomes = [
+        OUTCOME_FAULT_BIT,
+        OUTCOME_APPLICATION_YIELD,
+        OUTCOME_APPLICATION_HANDLE_CALL,
+        OUTCOME_APPLICATION_HEAP_GROW,
+        OUTCOME_APPLICATION_PREEMPTED,
+        OUTCOME_SCHEDULER_CALL,
+        ipc::continue_value(),
+    ];
+    let mut used = 0;
+    let mut index = 0;
+    while index < outcomes.len() {
+        let value = outcomes[index];
+        assert!(value > u32::MAX as u64 && value.is_power_of_two());
+        assert!(used & value == 0);
+        used |= value;
+        index += 1;
+    }
+};
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]
 const AARCH64_SPSR_MODE_MASK: u64 = 0b1111;
 
@@ -4550,7 +4573,7 @@ core::arch::global_asm!(
     "mov x0, sp",
     "mov x1, x9",
     "bl troe_aarch64_isolated_syscall",
-    "tbnz x0, #58, troe_aarch64_restore_context",
+    "tbnz x0, #{continue_bit}, troe_aarch64_restore_context",
     "b troe_aarch64_isolated_complete_entry",
     "troe_aarch64_isolated_complete_entry:",
     "b {isolated_complete}",
@@ -4654,6 +4677,7 @@ core::arch::global_asm!(
     "add sp, sp, #816",
     "eret",
     isolated_complete = sym aarch64_isolated_complete,
+    continue_bit = const ipc::continue_value().trailing_zeros(),
 );
 
 #[cfg(all(target_os = "uefi", target_arch = "aarch64"))]

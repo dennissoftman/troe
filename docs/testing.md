@@ -603,6 +603,8 @@ response payload and previous/already-completed operation before RX writes;
 rejected calls clear RX, while correlated responses clear every byte after the
 32-byte prefix. User instructions check exact register completion pairs and a
 denied operation result. Late completions after process fault are rejected.
+Native builds assert that suspension/fault outcomes cannot collide with the
+inline IPC continuation sentinel or application exit statuses.
 The probe grants no built-in scheduler authority and executes no synchronization
 operation. These native mechanism checks do not establish threaded package
 admission, process-share scheduling, compiler TLS initialization or C/CPython

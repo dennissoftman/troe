@@ -562,6 +562,8 @@ composition obligations. The mechanism accepts a caller-supplied remaining
 slice of at most 50 ms; process-share scheduling and threaded package admission
 are not enabled. Ordinary application entries carry no scheduler IPC binding
 and continue to reject entry 6.
+Compile-time assertions keep every native outcome distinct from the gate's
+immediate IPC continuation sentinel and ordinary application exit statuses.
 Unsaved AVX-family, SVE, and SME state remains disabled rather than leaking or
 corrupting across tasks. ABI call 0 exits through the owned gate. The x86
 local-APIC and AArch64 generic physical timers capture a complete resumable

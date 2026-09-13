@@ -725,7 +725,6 @@ pub(super) fn syscall(
     }
 }
 
-#[cfg(target_arch = "x86_64")]
 pub(super) const fn continue_value() -> u64 {
     CONTINUE
 }
