@@ -16,6 +16,7 @@ mod stream;
 #[cfg(test)]
 mod tests;
 pub mod thread_memory;
+pub mod tls_artifact;
 mod transaction;
 
 pub use troe_abi::{ABI_MAJOR, ABI_MINOR};

@@ -75,6 +75,10 @@ defines the current 96-byte KEX container 1.2 header and derives the initial-han
 ceiling from the startup region, currently 168. Earlier container sizes and
 handle ceilings below preserve the original decision.
 
+Current scope note: the separate [static TLS container 1.3](../formats/kex-static-tls-v1.md)
+is available for offline conversion and inspection. Native loading retains
+container 1.2 and ABI 1.3; its reserved TLS encodings remain rejected.
+
 ## Decision
 
 Stage 7 introduces a project-owned, target-specific static executable container

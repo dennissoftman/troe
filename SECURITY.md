@@ -78,7 +78,10 @@ never executes the ordinary application.
 - thread preflight: allocation-free typed wire/startup codecs and checked memory
   plans, including a separately charged read-only descriptor page. The active
   loader and SDK reject the assigned threaded startup revision and reject thread
-  interfaces in older startup records; these components enable no native workers;
+  interfaces in older startup records. Offline TLS conversion requires an explicit
+  container revision, validates the immutable initializer against its image source,
+  and rejects initializer pointer fixups. Native and streaming loaders reject this
+  container; these components enable no native workers;
 - KEX resolution: bare names select only `/bin/<name>.kex`; a command containing
   `/` tries its exact VFS path relative to its explicit cwd, then appends `.kex`
   only if the path is missing and the filename does not already end in `.kex`;

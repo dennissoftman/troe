@@ -112,8 +112,20 @@ instructions, and compares their thread-pointer offsets with the Rust planner
 through `cargo kex tls-layout`. The fixtures cover sub-word and over-page
 alignment, BSS-only templates, odd lengths, and both halves of AArch64's
 24-bit relocation. Unexpected instruction sequences require explicit review;
-they are not silently interpreted as equivalent. The canonical converter must
-still reject these artifacts (TLS, or unsupported over-page load geometry).
+they are not silently interpreted as equivalent. Ordinary conversion rejects
+these inputs; explicit `convert --threaded` must emit canonical container 1.3
+with matching geometry and initializer bytes and pass reproducibility checks.
+The test linker uses separate loadable pages and an explicit full-page `.text`
+extent so target trap padding is described, preserving strict unexplained-byte
+rejection. Additional compiled fixtures check empty TLS, pointer-fixup rejection,
+malformed headers/sections/symbols, trampoline identity, and unchanged output
+after failed conversion.
+
+`cargo test -p troe-application --lib tls_artifact::` checks exact extension
+versions, reserved bytes, all truncations, source/suffix agreement, relocation
+overlap, file-backed entries, and empty/BSS-only templates on both targets.
+Native and streaming package loaders must reject this format even when their
+caller supplies a higher ABI ceiling. Inspection produces no native load plan.
 
 The probes require `clang` and `ld.lld` and fail if either is unavailable.
 `TROE_TLS_CC` and `TROE_TLS_LD` select explicit executables; compiler/linker
