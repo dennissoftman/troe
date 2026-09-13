@@ -120,6 +120,16 @@ observes success. Scheduled first entry checks Running policy state and acquires
 initialization. These mechanisms neither allocate production resources nor
 activate ABI 1.4 application admission.
 
+Native dispatch can retain a kernel-owned process turn across scheduler requests
+and sibling switches. Selection first rotates processes, then Ready siblings;
+request count and thread churn cannot replace that turn's time/work allowances.
+`resume_dispatch` checks the exact turn and Running caller, debits a bounded step
+and carries the retained deadline into timer setup. Expiry before entry preserves
+the continuation and returns to scheduling, with no application fault or wire
+reply. Clock or native invariant failure remains terminal. Owned operations may
+outlive a turn but do not grant another one. This mechanism does not activate
+production resident scheduling or change the request/reply encoding below.
+
 ## Requests
 
 Each request is exactly 64 bytes. Truncated and trailing bytes are rejected.

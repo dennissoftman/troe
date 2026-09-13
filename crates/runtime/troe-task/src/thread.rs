@@ -13,6 +13,7 @@ use core::alloc::Layout;
 pub mod admission;
 pub mod control;
 mod metadata;
+pub mod schedule;
 pub mod sync;
 pub use metadata::TableMetadata;
 
@@ -154,11 +155,14 @@ struct Process {
     initial_admitted: bool,
     sync_objects: usize,
     sync_registered: bool,
+    thread_cursor: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
 struct Record {
     snapshot: ThreadSnapshot,
+    // Process slots do not move and cannot be reused until every record is reaped.
+    process_slot: usize,
     creator: Option<ThreadId>,
     resources: ThreadResources,
     wait_sequence: u64,
@@ -186,6 +190,10 @@ pub struct ThreadTable {
     next_join: u64,
     metadata_bytes: usize,
     max_process_threads: usize,
+    process_cursor: usize,
+    dispatch_sequence: u64,
+    active_dispatch: Option<(ProcessId, u64)>,
+    dispatch_clock: Option<(u64, u64)>,
 }
 
 impl ThreadTable {
@@ -263,6 +271,10 @@ impl ThreadTable {
             next_join: 1,
             metadata_bytes: retained.bytes(),
             max_process_threads: threads,
+            process_cursor: 0,
+            dispatch_sequence: 0,
+            active_dispatch: None,
+            dispatch_clock: None,
         })
     }
 
@@ -308,6 +320,7 @@ impl ThreadTable {
             initial_admitted: false,
             sync_objects: 0,
             sync_registered: false,
+            thread_cursor: 0,
         });
         Ok(())
     }
@@ -352,7 +365,16 @@ impl ThreadTable {
         creator: Option<ThreadId>,
         resources: ThreadResources,
     ) -> Result<ThreadId, ThreadError> {
-        let process = *self.process(owner)?;
+        let (process_slot, process) = self
+            .processes
+            .iter()
+            .enumerate()
+            .find_map(|(index, process)| {
+                process
+                    .filter(|process| process.id == owner)
+                    .map(|process| (index, process))
+            })
+            .ok_or(ThreadError::UnknownProcess)?;
         if process.stopping {
             return Err(ThreadError::Stopping);
         }
@@ -402,6 +424,7 @@ impl ThreadTable {
                 detached: creator.is_none(),
                 resources_released: false,
             },
+            process_slot,
             creator,
             resources,
             wait_sequence: 0,
@@ -482,6 +505,12 @@ impl ThreadTable {
     pub fn dispatch(&mut self, owner: ProcessId, id: ThreadId) -> Result<(), ThreadError> {
         if self.process(owner)?.stopping {
             return Err(ThreadError::Stopping);
+        }
+        if self
+            .active_dispatch
+            .is_some_and(|(selected, _)| selected != owner)
+        {
+            return Err(ThreadError::Busy);
         }
         if self
             .slots
@@ -707,6 +736,12 @@ impl ThreadTable {
     /// Rejects unknown processes. Repeated stop is idempotent.
     pub fn stop_process(&mut self, owner: ProcessId) -> Result<(), ThreadError> {
         self.process_mut(owner)?.stopping = true;
+        if self
+            .active_dispatch
+            .is_some_and(|(selected, _)| selected == owner)
+        {
+            self.active_dispatch = None;
+        }
         for record in self
             .slots
             .iter_mut()
@@ -779,9 +814,14 @@ impl ThreadTable {
     /// Remove an owner only after every retained thread record has been reaped.
     ///
     /// # Errors
-    /// Rejects unknown owners, outstanding records and synchronization registrations.
+    /// Rejects unknown owners, outstanding records, dispatches and synchronization registrations.
     pub fn remove_process(&mut self, owner: ProcessId) -> Result<(), ThreadError> {
-        if self.usage(owner).0 != 0 || self.process(owner)?.sync_registered {
+        if self.usage(owner).0 != 0
+            || self.process(owner)?.sync_registered
+            || self
+                .active_dispatch
+                .is_some_and(|(selected, _)| selected == owner)
+        {
             return Err(ThreadError::Busy);
         }
         let slot = self
