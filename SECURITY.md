@@ -57,6 +57,11 @@ never executes the ordinary application.
   CPU-reported physical-address limits checked before activation;
 - exception state: interrupts masked during ownership transition, all x86
   exception gates present, and double fault uses a dedicated IST stack;
+- x86 segment context: saved FS/GS/DS/ES selectors and independent FS base;
+  Rust trap handlers and application completion use zero FS/GS selectors/bases
+  and fixed kernel DS/ES selectors. Resume restores the retained selectors
+  before FS base. The owned flat GDT, disabled LDT and disabled FSGSBASE keep
+  GS base zero; TLS never supplies kernel identity;
 - tasks and process records: at most 65,536, with monotonic identities, explicit
   capabilities, deterministic lifecycle accounting, fallible metadata growth,
   and guarded native stack payloads;

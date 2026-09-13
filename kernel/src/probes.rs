@@ -70,7 +70,7 @@ pub(crate) enum ApplicationProbe {
     Spin,
     #[cfg(feature = "acceptance-probes")]
     HeapGrowthLimit,
-    #[cfg(all(feature = "acceptance-probes", target_arch = "aarch64"))]
+    #[cfg(feature = "acceptance-probes")]
     ThreadPointer,
     #[cfg(feature = "acceptance-probes")]
     InvalidCall,
@@ -86,7 +86,7 @@ impl ApplicationProbe {
             Self::Spin => Some(TaskFault::ExecutionLeaseExpired),
             #[cfg(feature = "acceptance-probes")]
             Self::HeapGrowthLimit => None,
-            #[cfg(all(feature = "acceptance-probes", target_arch = "aarch64"))]
+            #[cfg(feature = "acceptance-probes")]
             Self::ThreadPointer => None,
             #[cfg(feature = "acceptance-probes")]
             Self::InvalidCall => Some(TaskFault::InvalidCall),
@@ -105,6 +105,8 @@ pub(crate) enum IsolationProbe {
     WritePermission,
     ExecutePermission,
     IllegalInstruction,
+    #[cfg(target_arch = "x86_64")]
+    InvalidLdtSelector,
     UnexpectedEntry,
     InvalidOpcode,
     #[cfg_attr(target_arch = "x86_64", allow(dead_code))]
@@ -121,6 +123,8 @@ impl IsolationProbe {
             Self::Translation => Some(TaskFault::Translation),
             Self::WritePermission | Self::ExecutePermission => Some(TaskFault::Permission),
             Self::IllegalInstruction | Self::UnexpectedEntry => Some(TaskFault::IllegalInstruction),
+            #[cfg(target_arch = "x86_64")]
+            Self::InvalidLdtSelector => Some(TaskFault::IllegalInstruction),
             Self::InvalidOpcode
             | Self::InvalidCallEncoding
             | Self::InvalidPointer
@@ -461,6 +465,7 @@ pub(crate) fn run_isolation_verification(
         IsolationProbe::WritePermission,
         IsolationProbe::ExecutePermission,
         IsolationProbe::IllegalInstruction,
+        IsolationProbe::InvalidLdtSelector,
         IsolationProbe::UnexpectedEntry,
         IsolationProbe::InvalidOpcode,
         IsolationProbe::InvalidPointer,
@@ -745,16 +750,17 @@ pub(crate) fn run_application_load_verification(
             unexpected_return,
             ApplicationProbe::UnexpectedReturn,
         )?;
-        #[cfg(target_arch = "aarch64")]
         verify_application_thread_pointer(scheduler, accounting, &mut dispatcher, port, first)?;
         verify_application_heap_growth_limit(scheduler, accounting, &mut dispatcher, port)?;
         (reused, invalid_reused, return_reused)
     };
 
-    #[cfg(not(all(feature = "acceptance-probes", target_arch = "aarch64")))]
+    #[cfg(not(feature = "acceptance-probes"))]
     let expected_yields = baseline_tasks.yields.checked_add(3).ok_or(())?;
     #[cfg(all(feature = "acceptance-probes", target_arch = "aarch64"))]
     let expected_yields = baseline_tasks.yields.checked_add(4).ok_or(())?;
+    #[cfg(all(feature = "acceptance-probes", target_arch = "x86_64"))]
+    let expected_yields = baseline_tasks.yields.checked_add(5).ok_or(())?;
     if accounting.frames.free_frames() != baseline_frames
         || scheduler.stats().owned_address_spaces != baseline_tasks.owned_address_spaces
         || scheduler.stats().owned_isolation_pages != baseline_tasks.owned_isolation_pages
@@ -794,7 +800,7 @@ pub(crate) fn run_application_load_verification(
     Ok(())
 }
 
-#[cfg(all(feature = "acceptance-probes", target_arch = "aarch64"))]
+#[cfg(feature = "acceptance-probes")]
 pub(crate) fn verify_application_thread_pointer(
     scheduler: &mut Scheduler,
     accounting: &mut OwnedAccounting,
@@ -1022,7 +1028,13 @@ pub(crate) fn load_and_reclaim_application(
         .map_err(|_| ())?;
         let mut observed_yield = false;
         let mut observed_call = false;
+        #[cfg(all(feature = "acceptance-probes", target_arch = "x86_64"))]
+        let mut tls_preemptions = 0_u32;
         loop {
+            #[cfg(all(feature = "acceptance-probes", target_arch = "x86_64"))]
+            if !troe_machine::ApplicationSession::probe_kernel_segments_are_normalized() {
+                return Err(());
+            }
             match (probe, outcome) {
                 (
                     ApplicationProbe::Calls,
@@ -1082,7 +1094,7 @@ pub(crate) fn load_and_reclaim_application(
                     scheduler.exit_current(task_id, 0).map_err(|_| ())?;
                     break;
                 }
-                #[cfg(all(feature = "acceptance-probes", target_arch = "aarch64"))]
+                #[cfg(feature = "acceptance-probes")]
                 (
                     ApplicationProbe::ThreadPointer,
                     troe_machine::ApplicationOutcome::Yielded(application),
@@ -1096,6 +1108,65 @@ pub(crate) fn load_and_reclaim_application(
                         return Err(());
                     }
                     observed_yield = true;
+                    #[cfg(target_arch = "x86_64")]
+                    let application = {
+                        let mut application = application;
+                        // The probe stores its marker at entry rsp - 64.
+                        // Reject invalid storage before publishing a TLS base.
+                        if application.probe_thread_pointer(0).is_ok()
+                            || application.probe_thread_pointer(entry).is_ok()
+                            || application.probe_thread_pointer(u64::MAX - 7).is_ok()
+                            || !application.probe_thread_pointer_matches(0)
+                        {
+                            return Err(());
+                        }
+                        application
+                            .probe_thread_pointer(layout.stack_top() - 72)
+                            .map_err(|_| ())?;
+                        application
+                    };
+                    outcome = troe_machine::resume_application(
+                        application,
+                        troe_machine::ApplicationResume::Yield,
+                        if cfg!(target_arch = "x86_64") {
+                            1
+                        } else {
+                            APPLICATION_TIMESLICE_MILLISECONDS
+                        },
+                    )
+                    .map_err(|_| ())?;
+                }
+                #[cfg(all(feature = "acceptance-probes", target_arch = "x86_64"))]
+                (
+                    ApplicationProbe::ThreadPointer,
+                    troe_machine::ApplicationOutcome::Preempted(application),
+                ) if observed_yield && !observed_call => {
+                    tls_preemptions = tls_preemptions.checked_add(1).ok_or(())?;
+                    if tls_preemptions > 128
+                        || !application.probe_thread_pointer_matches(layout.stack_top() - 72)
+                    {
+                        return Err(());
+                    }
+                    outcome = troe_machine::resume_application(
+                        application,
+                        troe_machine::ApplicationResume::Timeslice,
+                        APPLICATION_TIMESLICE_MILLISECONDS,
+                    )
+                    .map_err(|_| ())?;
+                }
+                #[cfg(all(feature = "acceptance-probes", target_arch = "x86_64"))]
+                (
+                    ApplicationProbe::ThreadPointer,
+                    troe_machine::ApplicationOutcome::Yielded(application),
+                ) if observed_yield && !observed_call && tls_preemptions != 0 => {
+                    if !application.probe_thread_pointer_matches(layout.stack_top() - 72) {
+                        return Err(());
+                    }
+                    scheduler.yield_current(task_id).map_err(|_| ())?;
+                    scheduler
+                        .dispatch(task_id, Capabilities::SERVICE)
+                        .map_err(|_| ())?;
+                    observed_call = true;
                     outcome = troe_machine::resume_application(
                         application,
                         troe_machine::ApplicationResume::Yield,
@@ -1103,11 +1174,11 @@ pub(crate) fn load_and_reclaim_application(
                     )
                     .map_err(|_| ())?;
                 }
-                #[cfg(all(feature = "acceptance-probes", target_arch = "aarch64"))]
+                #[cfg(feature = "acceptance-probes")]
                 (
                     ApplicationProbe::ThreadPointer,
                     troe_machine::ApplicationOutcome::Exited { status: 0 },
-                ) if observed_yield => {
+                ) if observed_yield && (cfg!(target_arch = "aarch64") || observed_call) => {
                     scheduler.exit_current(task_id, 0).map_err(|_| ())?;
                     break;
                 }

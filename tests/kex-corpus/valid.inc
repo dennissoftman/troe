@@ -6,6 +6,7 @@
     ("native-heap-growth-limit-x86_64.kex", include_bytes!("native-heap-growth-limit-x86_64.kex") as &[u8], Target::X86_64),
     ("native-invalid-call-x86_64.kex", include_bytes!("native-invalid-call-x86_64.kex") as &[u8], Target::X86_64),
     ("native-unexpected-return-x86_64.kex", include_bytes!("native-unexpected-return-x86_64.kex") as &[u8], Target::X86_64),
+    ("native-thread-pointer-x86_64.kex", include_bytes!("native-thread-pointer-x86_64.kex") as &[u8], Target::X86_64),
     ("valid-standard-max-records-x86_64.kex", include_bytes!("valid-standard-max-records-x86_64.kex") as &[u8], Target::X86_64),
     ("valid-standard-max-span-x86_64.kex", include_bytes!("valid-standard-max-span-x86_64.kex") as &[u8], Target::X86_64),
     ("valid-standard-minimum-span-x86_64.kex", include_bytes!("valid-standard-minimum-span-x86_64.kex") as &[u8], Target::X86_64),

@@ -33,6 +33,19 @@ NATIVE_CODE = {
             "83fa047514817c241070696e67750a4883c42031ff31c0cd80bf0100000031c0cd"
             "800f0b"
         ),
+        # Fresh application data selectors are zero. Install the actual user
+        # data selector in FS/GS/DS/ES before the first yield; the kernel binds
+        # the independent FS base to the stack marker. Verify every selector
+        # and FS:0 across yields and a preemptible loop.
+        "thread-pointer": bytes.fromhex(
+            "8ce08cea6609d08cda6609d08cc26609d00f85d50000008cd0668ee0668ee8668ed8668ec04c"
+            "8d6424c049c7042478563412b801000000cd808ce08cd26639d00f85a60000008ce86639d00f"
+            "859b0000008cd86639d00f85900000008cc06639d00f858500000064488b042500000000483d"
+            "785634127574bb00e1f505ffcb75fc8ce08cd26639d075628ce86639d0755b8cd86639d07554"
+            "8cc06639d0754d64488b042500000000483d78563412753cb801000000cd808ce08cd26639d0"
+            "752c8ce86639d075258cd86639d0751e8cc06639d0751764488b042500000000483d78563412"
+            "750631ff31c0cd80bf0100000031c0cd800f0b"
+        ),
         "spin": bytes.fromhex("ebfe"),
         "heap-growth-limit": bytes.fromhex(
             "b80300000048c7c7ffffffff31f631d24531d24531c0cd8031ff31c0cd800f0b"
@@ -411,17 +424,15 @@ def generate_corpus() -> dict[str, bytes]:
                 f"Target::{'X86_64' if target == 'x86_64' else 'Aarch64'}),"
             )
 
-        if target == "aarch64":
-            probe = "thread-pointer"
-            artifact = _canonical(
-                target, NATIVE_CODE[target][probe] + ACCEPTANCE_MARKER
-            )
-            name = f"native-{probe}-{target}.kex"
-            files[name] = _put_u16(bytearray(artifact), 20, 2)
-            manifest.append(f"{name}\t{target}\tok")
-            valid_rows.append(
-                f'    ("{name}", include_bytes!("{name}") as &[u8], Target::Aarch64),'
-            )
+        probe = "thread-pointer"
+        artifact = _canonical(target, NATIVE_CODE[target][probe] + ACCEPTANCE_MARKER)
+        name = f"native-{probe}-{target}.kex"
+        files[name] = _put_u16(bytearray(artifact), 20, 2)
+        manifest.append(f"{name}\t{target}\tok")
+        valid_rows.append(
+            f'    ("{name}", include_bytes!("{name}") as &[u8], '
+            f"Target::{'X86_64' if target == 'x86_64' else 'Aarch64'}),"
+        )
 
         boundary_artifacts = {
             "standard-max-records": _canonical(
