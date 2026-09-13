@@ -683,6 +683,9 @@ reply/wait saves the server context before publishing its next event, then
 restores the caller directly; it does not copy the updated server context
 through the trap frame before restoring that caller. The native deadline and
 queued-delivery case verifies that the published server event survives.
+Phase B recognizes the explicit infinite-wait sentinel before reading the
+monotonic clock. Finite waits, call deadlines and the execution lease retain
+their checks, including the native expired-wait and call-timeout cases.
 
 For each nonempty direct round trip the gate requires one request copy, one
 reply copy, two user-root handoffs, zero heap allocations, zero queue slots,

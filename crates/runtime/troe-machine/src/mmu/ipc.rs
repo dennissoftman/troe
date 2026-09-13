@@ -300,10 +300,12 @@ impl IpcPair {
     }
 
     fn publish_wait(&mut self, deadline: u64) -> Result<(), MmuError> {
-        let now = crate::monotonic_millis().ok_or(MmuError::ExecutionTimerUnavailable)?;
         // The synthetic endpoint has no device sources. A finite future wait
-        // remains retained until a client or its deadline is observed.
-        self.waiting = deadline == u64::MAX || deadline > now;
+        // remains retained until a client or its deadline is observed. The
+        // explicit infinite-wait sentinel needs no counter read; call deadlines
+        // and the absolute execution lease remain independently enforced.
+        self.waiting = deadline == u64::MAX
+            || deadline > crate::monotonic_millis().ok_or(MmuError::ExecutionTimerUnavailable)?;
         if !self.waiting {
             set_event(&mut self.peers[1].context, idle_event(EventKind::Deadline));
         }
