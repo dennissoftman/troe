@@ -80,7 +80,14 @@ never executes the ordinary application.
   capabilities, deterministic lifecycle accounting, fallible metadata growth,
   and guarded native stack payloads;
 - dispatch: at most 65,536 ports and 262,144 handles, generation-checked
-  identities, explicit call rights, and 4 KiB request/reply limits;
+  identities, explicit call rights, and 4 KiB request/reply limits. Built-in
+  scheduler targets share the handle bound and generation/owner revocation,
+  but have a closed interface/version type distinct from service ports.
+  Admission checks the trusted process principal, live handle, canonical copied
+  request and complete operation rights without callbacks or retained borrows.
+  Service handles cannot acquire scheduler authority from payload interface IDs;
+  scheduler handles cannot invoke service callbacks. This authorization mechanism
+  does not publish startup grants or execute native scheduler operations;
 - KEX: exact target/version/layout validation before allocation, closed R/RX/RW
   permissions, fixed standard ceilings, a 24 KiB format-verifier buffer ceiling
   with fallible heap-backed completion scratch,

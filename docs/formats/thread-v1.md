@@ -26,6 +26,14 @@ Bits 0–8 keep their existing meanings; bit 15 is unassigned. Rights are checke
 against trusted capability state, not the startup copy or payload. Shared
 process memory means handles cannot isolate mutually hostile siblings.
 
+`troe-dispatch` can mint kernel-selected `SchedulerInterface` handles at version
+1.0 for nonzero isolated owners. Its authorization API validates the live handle's
+owner and closed target, then the copied request and complete operation rights.
+Ordinary service handles cannot acquire this target from interface numbers in
+the payload. The result owns the decoded request without a table borrow; closing
+the handle prevents new admissions. This mechanism supplies no startup grant and
+does not execute or correlate a native operation.
+
 The `Call` codec assigns entry 6 with six words:
 `[handle, 64, 32, 0, 0, 0]`. The handle is nonzero; lengths are exact full-width
 values. There are no user pointers. The request and response occupy prefixes

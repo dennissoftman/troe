@@ -6,8 +6,9 @@ Status: architectural direction accepted, 2026-09-09. Implementation tracked by
 [#208](https://github.com/dennissoftman/troe/issues/208).
 Native shared-root context switching and retained per-thread IPC storage have
 acceptance mechanisms. The native owner also captures scheduler calls and
-validates correlated completions; built-in scheduler capability/operation
-integration, threaded package admission, compiler-TLS allocation and pthread
+validates correlated completions. The dispatcher has closed built-in capability
+targets and owned request authorization; native capability/operation integration,
+threaded package admission, compiler-TLS allocation and pthread
 support remain disabled.
 Current single-execution-thread application contracts remain in force.
 Portable lifecycle/synchronization models, an independently compiler-checked
@@ -56,8 +57,10 @@ run. Opaque operation identity includes the caller, sequence and live IPC pair
 generation; completion validates the retained request/response before RX writes.
 Malformed framing can only complete rejected; stale and mismatched completions
 leave storage unchanged. Completion does not execute the caller or renew CPU
-entitlement. The built-in capability and operation dispatch remain composition
-requirements.
+entitlement. The dispatcher supplies distinct built-in handle targets with live
+owner, version and operation-rights checks and an owned admission result. Native
+composition must bind that authorization to the captured operation, execute it
+once and retain its completion identity; these remain composition requirements.
 AArch64 saves TPIDR_EL0; the x86 saved context retains FS/GS/DS/ES selectors
 and an independent FS base. The x86 gates normalize kernel selectors and FS
 base before Rust handlers and restore user selectors before FS base on resume.

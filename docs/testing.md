@@ -217,6 +217,17 @@ overlap, arithmetic overflow and nonzero page slack. Application encoder and SDK
 tests also prove ABI 1.0–1.3 cannot gain threading from newly assigned interface
 IDs, and that ABI 1.4 stays rejected. These checks do not execute native threads.
 
+`cargo test -p troe-dispatch scheduler::` checks built-in capability admission for
+all 22 operations against independently assigned rights, including omission of
+each required bit. Tests reject cross-target service calls, foreign/invalid
+owners, stale or malformed handles, mismatched interfaces, malformed headers,
+reserved bytes and incorrect lengths without callbacks, reply writes or service
+accounting changes. Mixed targets share capacity, slot generations and owner
+revocation; closing a service port leaves built-in handles valid. An admitted
+request owns its decoded value after source mutation and table revocation/drop.
+These checks establish authorization at admission, not native operation execution
+or cancellation of an already admitted operation.
+
 ## Python tooling gates
 
 The repository's own Python is formatted and linted by one tool. `ruff` is both

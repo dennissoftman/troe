@@ -1,8 +1,9 @@
-//! Synchronous in-process request and reply dispatch over bounded tables.
+//! Bounded service dispatch and closed built-in scheduler capability checks.
 
 use crate::{
-    DispatchError, Handle, HandleOwner, MAX_HANDLES, MAX_MESSAGE_BYTES, MAX_PORTS, PortId, Reply,
-    ReplyInfo, Request, Rights, ServiceReply, ServiceReplyInfo,
+    AuthorizedSchedulerCall, DispatchError, Handle, HandleOwner, MAX_HANDLES, MAX_MESSAGE_BYTES,
+    MAX_PORTS, PortId, Reply, ReplyInfo, Request, Rights, SchedulerInterface, ServiceReply,
+    ServiceReplyInfo,
 };
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -57,8 +58,14 @@ struct PortSlot<'service> {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HandleTarget {
+    Service(PortId),
+    Scheduler(SchedulerInterface),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct HandleBinding {
-    port: PortId,
+    target: HandleTarget,
     rights: Rights,
     owner: HandleOwner,
 }
@@ -100,13 +107,15 @@ pub struct DispatchStats {
     pub reply_payload_allocations: u64,
 }
 
-/// Bounded synchronous in-process service router.
+/// Bounded service router and built-in scheduler capability table.
 ///
 /// Requests borrow their payload only for the duration of [`Self::call`]. A
 /// call either returns one owned reply or a typed mechanism failure. There is no
 /// queued or cancellable state: closing before delivery invalidates a handle,
 /// while closing during a synchronous call is impossible through the exclusive
-/// dispatcher borrow. Stage 6 additionally revokes handles by task owner.
+/// dispatcher borrow. Built-in scheduler authorization instead returns an
+/// owned admission result with no callback or retained table borrow. Teardown
+/// revokes both kinds of handle by task owner.
 pub struct Dispatcher<'service> {
     ports: Vec<PortSlot<'service>>,
     handles: Vec<HandleSlot>,
@@ -205,17 +214,82 @@ impl<'service> Dispatcher<'service> {
             return Err(DispatchError::InvalidOwner);
         }
         self.validate_port(port)?;
+        self.allocate_handle(HandleBinding {
+            target: HandleTarget::Service(port),
+            rights,
+            owner,
+        })
+    }
+
+    /// Mint a built-in scheduler capability for an admitted process principal.
+    ///
+    /// Only trusted composition calls this constructor. It uses the same handle
+    /// namespace, capacity and generations as service handles, with a distinct
+    /// closed target type at version 1.0. It publishes no application startup grant.
+    ///
+    /// # Errors
+    /// Rejects a non-isolated owner, invalid interface rights or exhausted storage.
+    pub fn open_scheduler_owned(
+        &mut self,
+        interface: SchedulerInterface,
+        rights: Rights,
+        owner: HandleOwner,
+    ) -> Result<Handle, DispatchError> {
+        if !matches!(owner, HandleOwner::IsolatedTask(id) if id != 0) {
+            return Err(DispatchError::InvalidOwner);
+        }
+        self.allocate_handle(HandleBinding {
+            target: HandleTarget::Scheduler(interface),
+            rights: rights.for_interface(interface.id())?,
+            owner,
+        })
+    }
+
+    /// Authenticate a copied scheduler request without invoking a service callback.
+    ///
+    /// The selected process supplies the trusted owner and its dispatcher. Payload
+    /// interface numbers cannot turn an ordinary service handle into a scheduler
+    /// capability. No allocation, table borrow or callback escapes this check.
+    ///
+    /// # Errors
+    /// Rejects wrong owners, malformed/stale/foreign/service handles, invalid
+    /// version/interface/request bytes and missing per-operation rights.
+    pub fn authorize_scheduler_owned_abi(
+        &self,
+        owner: HandleOwner,
+        value: u64,
+        bytes: &[u8],
+    ) -> Result<AuthorizedSchedulerCall, DispatchError> {
+        if !matches!(owner, HandleOwner::IsolatedTask(id) if id != 0) {
+            return Err(DispatchError::InvalidOwner);
+        }
+        let binding = self.handle_binding(Handle::from_abi_value(value)?)?;
+        if binding.owner != owner {
+            return Err(DispatchError::InvalidHandle);
+        }
+        let HandleTarget::Scheduler(interface) = binding.target else {
+            return Err(DispatchError::InvalidHandle);
+        };
+        let request = troe_abi::threading::Request::decode(interface.id(), bytes)
+            .map_err(|_| DispatchError::InvalidCall)?;
+        let required = Rights::from_bits(u32::from(request.required_rights()))?;
+        if !binding.rights.contains(required) {
+            return Err(DispatchError::PermissionDenied);
+        }
+        Ok(AuthorizedSchedulerCall { owner, request })
+    }
+
+    fn allocate_handle(&mut self, binding: HandleBinding) -> Result<Handle, DispatchError> {
+        if matches!(binding.owner, HandleOwner::IsolatedTask(0)) {
+            return Err(DispatchError::InvalidOwner);
+        }
         if let Some((index, slot)) = self
             .handles
             .iter_mut()
             .enumerate()
             .find(|(_, slot)| slot.binding.is_none() && !slot.retired)
         {
-            slot.binding = Some(HandleBinding {
-                port,
-                rights,
-                owner,
-            });
+            slot.binding = Some(binding);
             return Ok(Handle {
                 slot: u32::try_from(index).map_err(|_| DispatchError::AccountingOverflow)?,
                 generation: slot.generation,
@@ -231,11 +305,7 @@ impl<'service> Dispatcher<'service> {
         self.handles.push(HandleSlot {
             generation: 1,
             retired: false,
-            binding: Some(HandleBinding {
-                port,
-                rights,
-                owner,
-            }),
+            binding: Some(binding),
         });
         Ok(Handle {
             slot: u32::try_from(index).map_err(|_| DispatchError::AccountingOverflow)?,
@@ -297,7 +367,10 @@ impl<'service> Dispatcher<'service> {
     pub fn close_port(&mut self, port: PortId) -> Result<(), DispatchError> {
         self.validate_port(port)?;
         for slot in &mut self.handles {
-            if slot.binding.is_some_and(|binding| binding.port == port) {
+            if slot
+                .binding
+                .is_some_and(|binding| binding.target == HandleTarget::Service(port))
+            {
                 slot.binding = None;
                 match slot.generation.checked_add(1) {
                     Some(generation) => slot.generation = generation,
@@ -337,7 +410,10 @@ impl<'service> Dispatcher<'service> {
         if !binding.rights.contains(Rights::CALL) {
             return Err(DispatchError::PermissionDenied);
         }
-        self.validate_port(binding.port)?;
+        let HandleTarget::Service(port) = binding.target else {
+            return Err(DispatchError::InvalidHandle);
+        };
+        self.validate_port(port)?;
         let request_id = self.next_request_id;
         let next_request_id = request_id
             .checked_add(1)
@@ -360,8 +436,7 @@ impl<'service> Dispatcher<'service> {
         self.next_request_id = next_request_id;
         self.calls = calls;
         self.request_bytes = request_bytes;
-        let port_index =
-            usize::try_from(binding.port.slot).map_err(|_| DispatchError::InvalidPort)?;
+        let port_index = usize::try_from(port.slot).map_err(|_| DispatchError::InvalidPort)?;
         let service = self
             .ports
             .get_mut(port_index)
@@ -492,7 +567,10 @@ impl<'service> Dispatcher<'service> {
         if !binding.rights.contains(Rights::CALL) {
             return Err(DispatchError::PermissionDenied);
         }
-        self.validate_port(binding.port)?;
+        let HandleTarget::Service(port) = binding.target else {
+            return Err(DispatchError::InvalidHandle);
+        };
+        self.validate_port(port)?;
         let request_id = self.next_request_id;
         let next_request_id = request_id
             .checked_add(1)
@@ -515,8 +593,7 @@ impl<'service> Dispatcher<'service> {
         self.next_request_id = next_request_id;
         self.calls = calls;
         self.request_bytes = request_bytes;
-        let port_index =
-            usize::try_from(binding.port.slot).map_err(|_| DispatchError::InvalidPort)?;
+        let port_index = usize::try_from(port.slot).map_err(|_| DispatchError::InvalidPort)?;
         let service = self
             .ports
             .get_mut(port_index)

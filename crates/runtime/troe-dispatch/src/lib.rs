@@ -1,4 +1,4 @@
-//! Bounded handles, ports, and synchronous in-process request/reply dispatch.
+//! Bounded service dispatch and owned built-in scheduler capability admission.
 #![no_std]
 #![forbid(unsafe_code)]
 
@@ -11,6 +11,7 @@ mod dispatcher;
 mod endpoint;
 mod message;
 mod pending;
+mod scheduler;
 mod services;
 
 use core::fmt;
@@ -32,6 +33,7 @@ pub use pending::{
     Admission, CallId, CallOutcome, CallState, Delivery, MAX_PENDING_CALLS,
     MAX_QUEUED_PER_ENDPOINT, PendingCallStats, PendingCallTable, QueueSlotId,
 };
+pub use scheduler::{AuthorizedSchedulerCall, SchedulerInterface};
 pub use services::{
     ByteInputService, ByteOutputService, CONSOLE_WRITE, CommandInvocationService, ConsoleService,
     DispatchedOutput, SharedOutput,
@@ -78,7 +80,7 @@ pub enum DispatchError {
     BadgeCapacityExhausted,
     /// A stale, retired, closed, or unoccupied client badge was supplied.
     InvalidBadge,
-    /// A stale, retired, or already ended pending call was supplied.
+    /// A stale/ended pending call or noncanonical scheduler request was supplied.
     InvalidCall,
     /// A call deadline is zero, which no ordinary client may request.
     InvalidDeadline,
@@ -100,13 +102,13 @@ impl fmt::Display for DispatchError {
             Self::MetadataExhausted => formatter.write_str("dispatch metadata allocation failed"),
             Self::PortCapacityExhausted => formatter.write_str("service port capacity exhausted"),
             Self::HandleCapacityExhausted => {
-                formatter.write_str("service handle capacity exhausted")
+                formatter.write_str("capability handle capacity exhausted")
             }
             Self::MessageTooLarge => formatter.write_str("message payload exceeds its bound"),
-            Self::InvalidHandle => formatter.write_str("service handle is invalid"),
+            Self::InvalidHandle => formatter.write_str("capability handle is invalid"),
             Self::InvalidPort => formatter.write_str("service port is invalid"),
-            Self::PermissionDenied => formatter.write_str("service handle right denied"),
-            Self::InvalidRights => formatter.write_str("service handle rights are invalid"),
+            Self::PermissionDenied => formatter.write_str("capability handle right denied"),
+            Self::InvalidRights => formatter.write_str("capability handle rights are invalid"),
             Self::EndpointCapacityExhausted => {
                 formatter.write_str("service endpoint capacity exhausted")
             }
@@ -114,7 +116,7 @@ impl fmt::Display for DispatchError {
             Self::InvalidInterface => formatter.write_str("service interface is invalid"),
             Self::BadgeCapacityExhausted => formatter.write_str("client badge capacity exhausted"),
             Self::InvalidBadge => formatter.write_str("client badge is invalid"),
-            Self::InvalidCall => formatter.write_str("pending call is invalid"),
+            Self::InvalidCall => formatter.write_str("call is invalid"),
             Self::InvalidDeadline => formatter.write_str("call deadline is invalid"),
             Self::CallCapacityExhausted => formatter.write_str("pending call capacity exhausted"),
             Self::QueueFull => formatter.write_str("service endpoint queue is full"),
