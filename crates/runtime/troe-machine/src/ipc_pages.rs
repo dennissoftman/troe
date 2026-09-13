@@ -34,8 +34,9 @@ pub fn initialize_ipc_pool(range: PhysicalRange) -> Result<(), MmuError> {
 
 /// Unique retained pair. Drop zeros both pages before releasing the slot.
 ///
-/// Composition must revoke all task roots before dropping this owner, just as
-/// it must revoke roots before returning ordinary task frames.
+/// Composition must remove every user alias and invalidate retained translations,
+/// or retire every referencing task root, before dropping this owner. Ordinary
+/// task frames require the same quiescence before reclamation.
 #[derive(Debug, Eq, PartialEq)]
 pub struct IpcPagePair {
     slot: usize,

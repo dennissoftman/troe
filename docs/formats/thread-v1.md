@@ -74,6 +74,12 @@ notification/reacquisition, permit acquisition/batch release and destruction.
 It retains owned policy waits beside their native execution claims across
 sibling execution and rejects late completion after a native process fault.
 These probes do not change ordinary application admission.
+Native retirement separately consumes an authenticated, claimed Exit without a
+reply after composition applies lifecycle policy. It preflights private backing
+and aliases, removes the context and mappings, and returns a receipt; physical
+owners must complete reclamation before acknowledging resources. Native Join
+acceptance checks this ordering and retains the scalar result through target
+reaping. This fixture does not enable Exit in the portable operation dispatcher.
 
 ## Requests
 

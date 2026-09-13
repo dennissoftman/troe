@@ -79,6 +79,12 @@ terminal records before reaping, reallocation under a different synchronization
 kind, teardown and unchanged accounting after failed lookups. Resolving a retained
 identity does not bypass a stopping process or operation-specific state checks.
 
+`troe-machine` retirement tests cover fragmented backing, physical and virtual
+overlap, remaining user aliases, missing leaves, read-only startup permissions,
+coalesced-region splitting, metadata exhaustion before leaf reads and first-error
+termination of unmapping. Successful metadata removal preserves capacity and
+the permissions of the surviving regions.
+
 The owned control-wait tests cover early deadline/stop with no admission, try-join
 without claim-identity consumption, physical-quiescence acknowledgement, result
 retention through target-slot reuse, timeout/stop/join/detach ordering, full-width
@@ -667,6 +673,19 @@ unchanged retained metadata, bounded pending/script storage, zeroed IPC slot
 reuse and full frame-accounting recovery. Fixture scheduling serializes each
 operation through any timer preemption; it does not measure process-share
 fairness or expiry of a queued real-time deadline.
+The retirement probe retains the initial thread's owned Current execution while
+its worker captures Exit. It validates private stack/TLS/read-only startup/IPC
+removal, unchanged shared table/metadata charges, IPC zeroization and generation
+reuse, and rejection of the retired execution. The sibling's pending response
+survives context/pair compaction. Its next native Join remains blocked before
+physical acknowledgement, then receives the full-width result after the worker's
+reservation is zeroed/freed and its record reaped. Five cases require a hardware
+translation fault on the retired stack, TLS, startup, TX or RX page after checking
+both complete replies. Remaining-user-alias and sibling-startup-reference cases
+reject retirement without mutation; an injected failure after the first unmap
+stops all contexts and keeps IPC slots occupied until root teardown. Every case
+restores ordinary frame and logical resource accounting. Exit policy is applied
+directly by the fixture; ordinary portable Exit dispatch remains Unsupported.
 These native mechanism checks do not establish threaded package
 admission, process-share scheduling, compiler TLS initialization or C/CPython
 thread safety.
