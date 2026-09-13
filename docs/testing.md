@@ -805,6 +805,29 @@ restore physical and logical baselines. The adjacent `dispatch/x86_64.S` and
 target; `llvm-readelf -r` must report no relocations before extracting `.text`
 with `llvm-objcopy --only-section=.text -O binary`. `program.rs` embeds those
 inspected loop bytes. These tests do not establish a hard real-time guarantee.
+A native ordinary-call fixture retains two callers' claimed operations while the
+second caller overwrites the first caller's TX. It checks the unchanged kernel
+capture, completes replies in reverse order, and has both user programs validate
+their complete RX pages. Duplicate claims, completion bypass through native
+resume, wrong-root completion, stale operations, undefined service status and
+oversized replies leave ownership and RX intact. A sibling fault revokes a retained
+call and rejects late native/policy completion. Separate cases reject otherwise
+valid user addresses offset from the caller's exact IPC prefixes. Additional cases
+cover full-page request/capacity, zero reply capacity and an unclaimed
+capability-rejection completion. Every user entry
+uses a retained process dispatch; completion checks unchanged native-entry/timer
+counters. Stop and root teardown restore physical/logical baselines. The fixture
+does not authenticate a real service grant or establish production service safety.
+Native probe metadata has a 32 KiB allowance and charges the compiled records,
+including one 4 KiB request buffer per context. The buffers are allocated before
+native execution and erased on completion or destruction.
+The adjacent `handle/program.c` and `program.ld` define the fixture without libc,
+stack protector or compiler TLS. Compile both `unknown-none-elf` targets with
+Clang `-O2 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie
+-mcmodel=large` and x86 `-mno-red-zone`, link with that script, and verify `entry`
+is exactly `0x400000000000` and no relocations remain before extracting `.text`.
+The script includes Clang's x86 large-model `.ltext` sections. `program.rs` embeds
+the inspected linked text; manual FS/TPIDR access is native mechanism evidence.
 These native mechanisms do not establish threaded package admission, production
 resident scheduling, production compiler-TLS ownership or C/CPython thread safety.
 The acceptance image exceeds 1 MiB and therefore also exercises the

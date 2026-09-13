@@ -6,8 +6,8 @@
 //! explicitly accounted remaining timeslice at the lower-level boundary.
 
 use super::{
-    ApplicationCall, ApplicationExecutionBound, ApplicationHeapGrowth, ApplicationPending,
-    ApplicationResume, ArchitectureApplicationContext, IsolatedFault, MmuError, MmuStats,
+    ApplicationExecutionBound, ApplicationHeapGrowth, ApplicationPending, ApplicationResume,
+    ArchitectureApplicationContext, IsolatedFault, MmuError, MmuStats,
     OUTCOME_APPLICATION_HANDLE_CALL, OUTCOME_APPLICATION_HEAP_GROW, OUTCOME_APPLICATION_PREEMPTED,
     OUTCOME_APPLICATION_YIELD, OUTCOME_FAULT_BIT, OUTCOME_SCHEDULER_CALL, TrappedSchedulerCall,
     UserAddressSpace, application_context_set_results, apply_application_resume, decode_fault,
@@ -23,6 +23,8 @@ mod admission;
 pub use admission::{NativeThreadAdmission, NativeThreadAdmissionError};
 mod creation;
 mod dispatch;
+mod handle;
+pub use handle::{NativeHandleCall, NativeHandleExecution};
 
 /// Trusted initial register and mapping geometry for an already owned thread.
 #[derive(Clone, Copy, Debug)]
@@ -57,7 +59,7 @@ pub enum NativeThreadStop {
     /// The selected thread used the caller-supplied remaining timeslice.
     Preempted,
     /// One validated copied-message call awaits a kernel completion.
-    HandleCall(ApplicationCall),
+    HandleCall(NativeHandleCall),
     /// One heap request awaits a kernel completion.
     HeapGrow(ApplicationHeapGrowth),
     /// A copied scheduler request awaits capability/operation authentication.
@@ -177,18 +179,32 @@ struct ThreadContext {
     started: bool,
     ipc: Option<ThreadIpc>,
     scheduler_operation: Option<PendingSchedulerCall>,
+    handle_operation: Option<handle::PendingHandleCall>,
+    // Preallocated/charged with the native record, including while no call is pending.
+    handle_request: [u8; troe_abi::MAX_MESSAGE_BYTES],
     // Complete mapped-admission reservation, including its inaccessible gaps.
     window: Option<VirtualRange>,
 }
 
 impl Drop for ThreadContext {
     fn drop(&mut self) {
+        self.clear_handle_request();
         // SAFETY: Exclusive final access to a live integer/byte-only register
         // record. Volatile erasure prevents retained user registers from being
         // optimized away when the metadata allocation is released.
         let bytes = core::ptr::from_mut(&mut self.registers).cast::<u8>();
         for offset in 0..core::mem::size_of::<ArchitectureApplicationContext>() {
             unsafe { core::ptr::write_volatile(bytes.add(offset), 0) };
+        }
+    }
+}
+
+impl ThreadContext {
+    fn clear_handle_request(&mut self) {
+        for byte in &mut self.handle_request {
+            // SAFETY: Exclusive access to this retained byte array; volatile
+            // erasure also covers stop/retirement and unused request suffixes.
+            unsafe { core::ptr::write_volatile(byte, 0) };
         }
     }
 }
@@ -202,7 +218,9 @@ impl Drop for ThreadContext {
 /// drop this owner before zeroing and releasing ordinary user/table frames.
 /// The mechanism rejects tagged roots and the single-thread IPC profile.
 /// Scheduler calls suspend with owned request bytes; trusted composition must
-/// authenticate and execute them. Threaded package admission remains disabled.
+/// authenticate and execute them. Ordinary calls retain a bounded immutable
+/// request from the caller's fixed IPC pair and require separate correlated
+/// completion before execution. Threaded package admission remains disabled.
 pub struct NativeProcessContext {
     // Contexts precede the root so dropping the owner retires them first.
     contexts: Vec<ThreadContext>,
@@ -383,7 +401,7 @@ impl NativeProcessContext {
         super::architecture_translate_page(self.backing.address_space.root, address)
     }
 
-    /// Copy one suspended thread's validated request into kernel-owned storage.
+    /// Copy one suspended thread's immutable native request capture.
     ///
     /// # Errors
     /// Rejects a stopped process, foreign/stale token, non-call continuation,
@@ -403,12 +421,13 @@ impl NativeProcessContext {
         if destination.len() != call.request_bytes {
             return Err(MmuError::InvalidUserContext);
         }
-        super::copy_user_from_physical(
-            self.backing.address_space.root,
-            &self.backing.address_space.regions,
-            call.request_address,
-            destination,
-        )
+        let operation = context
+            .handle_operation
+            .as_ref()
+            .ok_or(MmuError::InvalidUserContext)?
+            .operation;
+        destination.copy_from_slice(self.handle_request(operation)?);
+        Ok(())
     }
 
     /// Install one fresh context after composition reserves its guarded memory.
@@ -452,6 +471,8 @@ impl NativeProcessContext {
             started: false,
             ipc: None,
             scheduler_operation: None,
+            handle_operation: None,
+            handle_request: [0; troe_abi::MAX_MESSAGE_BYTES],
             window: None,
         });
         Ok(())
@@ -721,6 +742,8 @@ impl NativeProcessContext {
     /// The caller must debit process time across yields and sibling switches;
     /// this low-level bound is not a new entitlement. No callback into process
     /// ownership occurs while the trap owns the moved mapping summary.
+    /// A retained ordinary call must be completed separately; attempting to
+    /// bypass that call is rejected without changing its pending ownership.
     ///
     /// # Errors
     /// Rejects stale/wrong-owner tokens, zero or over-50-ms slices and mismatched
@@ -760,6 +783,11 @@ impl NativeProcessContext {
             .position(|context| context.id == id)
             .ok_or(MmuError::InvalidUserContext)?;
         let context = &mut self.contexts[index];
+        // Ordinary handle completion is a separate, correlated operation. In
+        // particular, lower-level resume must not bypass an owned service wait.
+        if context.handle_operation.is_some() {
+            return Err(MmuError::InvalidUserContext);
+        }
         if let Err(error) = apply_application_resume(
             &self.backing.address_space,
             &mut context.registers,
@@ -803,7 +831,16 @@ impl NativeProcessContext {
                         NativeThreadStop::Preempted
                     }
                     (OUTCOME_APPLICATION_HANDLE_CALL, ApplicationPending::HandleCall(call)) => {
-                        NativeThreadStop::HandleCall(call)
+                        let sequence = self.next_operation;
+                        self.next_operation = sequence
+                            .checked_add(1)
+                            .ok_or(MmuError::InvalidUserContext)?;
+                        NativeThreadStop::HandleCall(handle::capture(
+                            &self.backing,
+                            context,
+                            sequence,
+                            call,
+                        )?)
                     }
                     (OUTCOME_APPLICATION_HEAP_GROW, ApplicationPending::HeapGrow(request)) => {
                         NativeThreadStop::HeapGrow(request)

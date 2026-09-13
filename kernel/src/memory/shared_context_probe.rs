@@ -77,11 +77,13 @@ const CODE: &[u8] = &[
 mod admission;
 mod creation;
 mod dispatch;
+mod handle;
 mod retirement;
 mod synchronization;
 
 const PAGE: u64 = 4096;
-const METADATA_LIMIT: usize = 16 * 1024;
+// Covers the compiled native records including one immutable request page per sibling.
+const METADATA_LIMIT: usize = 32 * 1024;
 const TX: [u64; 2] = [USER_STACK_BASE + 12 * PAGE, USER_STACK_BASE + 15 * PAGE];
 
 #[allow(clippy::too_many_lines)]
@@ -479,7 +481,8 @@ pub(crate) fn verify(accounting: &mut OwnedAccounting) -> Result<(), ()> {
     retirement::verify(accounting)?;
     admission::verify(accounting)?;
     creation::verify(accounting)?;
-    dispatch::verify(accounting)
+    dispatch::verify(accounting)?;
+    handle::verify(accounting)
 }
 
 fn prepare(

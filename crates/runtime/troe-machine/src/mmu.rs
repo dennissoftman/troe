@@ -28,9 +28,10 @@ mod protected;
 mod retirement;
 #[cfg(target_os = "uefi")]
 pub use process::{
-    NativeProcessBacking, NativeProcessContext, NativeSchedulerCall, NativeSchedulerExecution,
-    NativeThreadAdmission, NativeThreadAdmissionError, NativeThreadBacking, NativeThreadRetirement,
-    NativeThreadStart, NativeThreadStop,
+    NativeHandleCall, NativeHandleExecution, NativeProcessBacking, NativeProcessContext,
+    NativeSchedulerCall, NativeSchedulerExecution, NativeThreadAdmission,
+    NativeThreadAdmissionError, NativeThreadBacking, NativeThreadRetirement, NativeThreadStart,
+    NativeThreadStop,
 };
 #[cfg(feature = "acceptance-probes")]
 pub use protected::FaultPoint;

@@ -705,6 +705,24 @@ accounted remaining slice of at most 50 ms; `resume_dispatch` instead consumes
 the selected process turn at the timer boundary. Production resident scheduling
 and threaded package admission are not enabled. Ordinary application entries carry no scheduler IPC binding
 and continue to reject entry 6.
+Ordinary calls inside `NativeProcessContext` use the calling context's exact
+retained TX/RX prefixes for entry 2. The existing single-context application ABI
+still accepts its validated request/reply buffers. The shared-root mechanism
+copies up to 4 KiB into preallocated, charged context storage before returning
+control to composition, so a sibling's later TX writes cannot change that request.
+`NativeHandleCall` retains the caller incarnation, checked operation sequence,
+original capacity and IPC slot/generation; it conveys no service authority.
+Composition authenticates its handle against the process's live grants before
+claiming execution. One non-cloneable `NativeHandleExecution` can remain in a
+service wait while siblings run. Direct completion and low-level resume cannot
+bypass a claimed call. Completion checks the live binding, defined service status
+and original capacity before clearing RX and publishing its prefix and ABI results.
+It consumes native pending state without executing the caller, arming a timer,
+changing policy wait state or renewing the process turn. Preflight errors return
+the owned execution without publication; native storage failure stops the root.
+The immutable request is erased on completion, retirement or process stop.
+These mechanisms do not activate production service concurrency or threaded
+package admission.
 Compile-time assertions keep every native outcome distinct from the gate's
 immediate IPC continuation sentinel and ordinary application exit statuses.
 After capability authentication, `claim_scheduler` matches the canonical request

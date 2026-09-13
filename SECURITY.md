@@ -76,6 +76,15 @@ never executes the ordinary application.
   LAPIC one-shot and checks expiry again before entry. Expiry preserves the saved
   continuation and permits no user entry; clock/invariant failure stops the root.
   This is not a hard real-time guarantee or production resident scheduling;
+- native ordinary call ownership: shared-root calls require the caller's retained
+  TX/RX prefixes. Each context reserves and charges a 4 KiB immutable request
+  buffer before execution; capture completes before another sibling can run.
+  Checked operation, caller and IPC generations identify once-only claims.
+  Completion validates the original binding, service status and capacity before
+  clearing/publishing RX, and grants no execution time. Stale, foreign, duplicate
+  and malformed completions do not write. Request buffers are erased on completion
+  and context destruction. Production service and C runtime concurrency remain
+  separate from this mechanism;
 - native context owner: one retained root with bounded process-scoped register
   records, checked stack guards and disjoint stack/TLS payloads, actual retained
   metadata accounting, and process-wide continuation revocation on native fault

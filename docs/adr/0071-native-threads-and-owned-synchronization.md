@@ -4,6 +4,13 @@ Status: architectural direction accepted, 2026-09-09. Implementation tracked by
 [#65](https://github.com/dennissoftman/troe/issues/65) and delivery issues
 [#204](https://github.com/dennissoftman/troe/issues/204) through
 [#208](https://github.com/dennissoftman/troe/issues/208).
+Native ordinary-call capture uses the caller's retained IPC prefixes and a
+preallocated immutable request buffer. Owned claims permit correlated completion
+without executing the caller or renewing a process turn; the native acceptance
+fixture retains competing calls across TX mutation, reverse completion and fault.
+This shared-root mechanism deliberately avoids retaining arbitrary reply mappings
+across sibling execution. The production single-context ABI is unchanged; native
+service event integration and the C adapter remain tracked in #207/#208.
 Portable process-first dispatch selection retains independent process/thread
 cursors and an owned turn with checked raw-counter time and finite kernel-work
 allowances. It rejects clock regression and stale completion and preserves
