@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 mod elf;
+mod tls;
 
 use std::env;
 use std::ffi::{OsStr, OsString};
@@ -11,7 +12,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub use elf::convert_elf;
+pub use elf::{convert_elf, convert_threaded_elf};
 use troe_abi::{
     clock_control, datagram, diagnostics, filesystem, filesystem_mutation, icmp_echo, interface,
     network_configuration, network_observation, pipe, private_memory, process_launch,
@@ -63,8 +64,10 @@ Usage:
   cargo kex build <app> [--name NAME] [--target all|x86_64|aarch64]
                        [--output DIR] [--stack-pages N] [--heap-pages N] [--check]
   cargo kex convert <input.elf> <output.kex> [--target x86_64|aarch64]
-                       [--stack-pages N] [--heap-pages N] [--check]
+                       [--stack-pages N] [--heap-pages N] [--threaded] [--check]
   cargo kex inspect <artifact.kex> [--json]
+  cargo kex tls-layout --target x86_64|aarch64 --file-bytes N --memory-bytes N
+                       --alignment N --max-pages N
   cargo kex --help
 ";
 
@@ -128,6 +131,7 @@ struct ConvertOptions {
     stack_pages: u64,
     heap_pages: u64,
     check: bool,
+    threaded: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -143,6 +147,7 @@ struct InspectReport {
     stack_pages: u64,
     heap_pages: u64,
     image_span_bytes: u64,
+    tls: Option<troe_application::tls_artifact::Metadata>,
 }
 
 struct Arguments {
@@ -267,6 +272,7 @@ fn parse_convert(arguments: &mut Arguments) -> ToolResult<ConvertOptions> {
         stack_pages: DEFAULT_STACK_PAGES,
         heap_pages: DEFAULT_HEAP_PAGES,
         check: false,
+        threaded: false,
     };
     while let Some(option) = arguments.next() {
         match option.to_str() {
@@ -275,6 +281,7 @@ fn parse_convert(arguments: &mut Arguments) -> ToolResult<ConvertOptions> {
             }
             Some("--stack-pages") => options.stack_pages = arguments.number("--stack-pages")?,
             Some("--heap-pages") => options.heap_pages = arguments.number("--heap-pages")?,
+            Some("--threaded") if !options.threaded => options.threaded = true,
             Some("--check") => options.check = true,
             Some("--help" | "-h") => return Err(ToolError::new(HELP)),
             _ => {
@@ -958,7 +965,12 @@ fn execute_convert(options: &ConvertOptions) -> ToolResult<()> {
     let input = absolute(&options.input)?;
     let output = absolute(&options.output)?;
     let image = read_bounded(&input, ELF_MAX_BYTES, "ELF artifact")?;
-    let artifact = convert_elf(
+    let convert = if options.threaded {
+        convert_threaded_elf
+    } else {
+        convert_elf
+    };
+    let artifact = convert(
         &image,
         options.target,
         options.stack_pages,
@@ -993,6 +1005,26 @@ fn inspect(path: &Path) -> ToolResult<InspectReport> {
         2 => Target::Aarch64,
         _ => return Err(ToolError::new("embedded KEX target is unknown")),
     };
+    if u16::from_le_bytes([executable[10], executable[11]])
+        == troe_application::tls_artifact::CONTAINER_MINOR
+    {
+        let parsed = troe_application::tls_artifact::Artifact::parse(executable, target)
+            .map_err(|error| ToolError::new(format!("invalid TLS KEX executable: {error}")))?;
+        return Ok(InspectReport {
+            package,
+            target,
+            abi_minor: troe_abi::startup::THREAD_ABI_MINOR,
+            bytes: artifact.len(),
+            executable_bytes: executable.len(),
+            requirements,
+            records: parsed.segments().count(),
+            entry_offset: parsed.entry_offset(),
+            stack_pages: parsed.stack_pages(),
+            heap_pages: parsed.heap_pages(),
+            image_span_bytes: parsed.image_span_bytes(),
+            tls: Some(parsed.metadata()),
+        });
+    }
     let plan = parse_kex(executable, target, ABI_MINOR)
         .map_err(|error| ToolError::new(format!("invalid embedded KEX executable: {error}")))?;
     let entry_offset = plan
@@ -1015,6 +1047,7 @@ fn inspect(path: &Path) -> ToolResult<InspectReport> {
             .startup_address()
             .checked_sub(plan.image_base())
             .ok_or_else(|| ToolError::new("KEX startup page is below the image base"))?,
+        tls: None,
     })
 }
 
@@ -1040,8 +1073,11 @@ fn execute_inspect(arguments: &mut Arguments) -> ToolResult<()> {
         "KEX v1"
     };
     if json {
+        let tls = report.tls.map_or_else(String::new, |tls| format!(
+            ",\"container_minor\":3,\"native_admission\":false,\"tls\":{{\"source_offset\":{},\"file_offset\":{},\"file_bytes\":{},\"memory_bytes\":{},\"alignment\":{},\"trampoline_offset\":{},\"profile\":1}}",
+            tls.source_offset, tls.file_offset, tls.file_bytes, tls.memory_bytes, tls.alignment, tls.trampoline_offset));
         println!(
-            "{{\"abi\":\"{ABI_MAJOR}.{}\",\"bytes\":{},\"entry_offset\":{},\"executable_bytes\":{},\"executable_format\":\"KEX v1\",\"format\":\"{format}\",\"heap_pages\":{},\"image_span_bytes\":{},\"records\":{},\"requirements\":{},\"stack_pages\":{},\"target\":\"{}\"}}",
+            "{{\"abi\":\"{ABI_MAJOR}.{}\",\"bytes\":{},\"entry_offset\":{},\"executable_bytes\":{},\"executable_format\":\"KEX v1\",\"format\":\"{format}\",\"heap_pages\":{},\"image_span_bytes\":{},\"records\":{},\"requirements\":{},\"stack_pages\":{},\"target\":\"{}\"{tls}}}",
             report.abi_minor,
             report.bytes,
             report.entry_offset,
@@ -1067,6 +1103,12 @@ fn execute_inspect(arguments: &mut Arguments) -> ToolResult<()> {
             report.stack_pages,
             report.heap_pages,
         );
+        if let Some(tls) = report.tls {
+            println!(
+                "container=1.3; native admission=disabled; TLS={} initialized/{} total bytes; alignment={}; trampoline={:#x}",
+                tls.file_bytes, tls.memory_bytes, tls.alignment, tls.trampoline_offset
+            );
+        }
     }
     Ok(())
 }
@@ -1097,6 +1139,7 @@ pub fn run(arguments: impl Iterator<Item = OsString>) -> Result<(), ToolError> {
         Some("build") => execute_build(&parse_build(&mut arguments)?),
         Some("convert") => execute_convert(&parse_convert(&mut arguments)?),
         Some("inspect") => execute_inspect(&mut arguments),
+        Some("tls-layout") => tls::execute(&mut arguments),
         Some("--help" | "-h" | "help") => {
             print!("{HELP}");
             Ok(())

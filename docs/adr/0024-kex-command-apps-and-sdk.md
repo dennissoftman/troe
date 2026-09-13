@@ -14,6 +14,10 @@ defines the current KCAP 1.1 and KEXPKG 1.1 layouts, including reserved fields,
 full-width package offsets, and the shared startup-handle ceiling. Earlier
 layout descriptions below preserve the original decision.
 
+Current scope note: explicit offline TLS conversion uses the separate
+[container 1.3](../formats/kex-static-tls-v1.md). The command SDK and native
+loaders retain their single-thread profile.
+
 ## Decision
 
 TROE command applications are immutable KEX package v1 files installed at

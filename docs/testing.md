@@ -66,6 +66,157 @@ runner. `--require-filesystem-tools` makes absence of the exact external FAT32
 and ext4 interoperability tools an error. `--require-python-tools` does the
 same for the Python format and lint gates.
 
+## Portable thread and synchronization models
+
+`cargo test -p troe-task --lib thread::` exercises the process-owned lifecycle
+policy: transactional admission, per-process/global charges, stale generations,
+join/detach and timeout claims, creator exit, sticky stop, and reclamation only
+after native acknowledgement. The corpus includes 10,000 short transition
+schedules, each followed by complete model teardown and accounting checks.
+
+The paired synchronization model covers FIFO grants, self-lock/non-owner errors,
+expired and stopped waiters, stale events, condition binding/reacquisition,
+notification cohorts, both owner-death policies, ownerless permits, quotas and
+resource-release interlocks. It also enumerates 3,125 five-event schedules over
+notification, timeout, stop, unlock and exit. Each step checks queue membership,
+exact ownership, pending-completion references and unchanged vector capacities;
+each schedule ends with teardown and resource-baseline checks.
+
+Metadata checks compare the compiled inline/array layouts with retained vector
+capacities, test exact-byte and one-byte-short budgets, reject invalid counts
+before allocation, and ensure retirement does not refund reserved backing.
+`cargo test -p troe-task --lib thread::admission::` checks the combined table
+budget, protected IPC headroom and the enforced per-process ceiling. Its
+two-process case blocks every admitted thread simultaneously, then times out
+and consumes every wait without changing the retained metadata charge.
+The maximum-capacity calculation is compared with exhaustive candidate
+validation over varied object counts, context limits and metadata budgets.
+
+These tests verify the portable policy; they do not execute application threads
+or establish machine-level TLS, isolation, pthread, or physical-reclamation
+support. Changes to the crate also select its consumers and native regression
+scenarios through the normal impact selector.
+
+## Static TLS layout and compiler probes
+
+`cargo test -p troe-application --lib static_tls::` checks both architecture
+layouts, empty and zero-filled templates, alignment padding, complete page
+charges, displacement ceilings, overflow, virtual-range boundaries, independent
+thread storage, and unchanged destination bytes after rejected initialization.
+Successful initialization must overwrite every byte, including reused padding.
+
+`python3 -m unittest discover -s tests -p test_kex_tool.py -k StaticTls -v`
+compiles and links eighteen C11 local-exec fixtures for x86-64 and AArch64. It
+reads the ELF TLS geometry and symbols, decodes the actual address-return
+instructions, and compares their thread-pointer offsets with the Rust planner
+through `cargo kex tls-layout`. The fixtures cover sub-word and over-page
+alignment, BSS-only templates, odd lengths, and both halves of AArch64's
+24-bit relocation. Unexpected instruction sequences require explicit review;
+they are not silently interpreted as equivalent. Ordinary conversion rejects
+these inputs; explicit `convert --threaded` must emit canonical container 1.3
+with matching geometry and initializer bytes and pass reproducibility checks.
+The test linker uses separate loadable pages and an explicit full-page `.text`
+extent so target trap padding is described, preserving strict unexplained-byte
+rejection. Additional compiled fixtures check empty TLS, pointer-fixup rejection,
+malformed headers/sections/symbols, trampoline identity, and unchanged output
+after failed conversion.
+
+`cargo test -p troe-application --lib tls_artifact::` checks exact extension
+versions, reserved bytes, all truncations, source/suffix agreement, relocation
+overlap, file-backed entries, and empty/BSS-only templates on both targets.
+Native and streaming package loaders must reject this format even when their
+caller supplies a higher ABI ceiling. Inspection produces no native load plan.
+
+The probes require `clang` and `ld.lld` and fail if either is unavailable.
+`TROE_TLS_CC` and `TROE_TLS_LD` select explicit executables; compiler/linker
+versions are printed with the results. Missing tools do not skip this check.
+Changes to `troe-application` select these probes as well as Rust and native
+regression checks. These are host compiler/layout checks, not evidence of
+thread-pointer switching or TLS execution inside a guest.
+
+The shared recipe in `tools/thread_profile.py` selects explicit target CPU/TLS
+options, Clang builtin headers and the TROE sysroot, and excludes ambient
+compiler configuration and include-path variables. The C ABI probe checks
+freestanding LP64/LE, type widths, lock-free word atomics and separate TLS
+storage. It also verifies that ABI-1 `errno` is still a non-TLS declaration.
+
+Pin qualification uses the exact Clang/LLD releases in
+`sdk/c/thread-profile-v1.json`. Select explicit executable paths where required:
+
+```console
+python3 tools/thread_profile.py --cc /path/to/clang --ld /path/to/ld.lld \
+  --output /tmp/troe-thread-profile.json
+python3 tools/thread_profile.py --compatible-tools
+python3 -m unittest discover -s tests -p test_thread_profile.py
+```
+
+Both tool families are checked. Strict mode rejects other releases before
+qualification; compatible mode records whether each pin matches. The report
+binds tool binaries, builtin/sysroot headers, compiler recipe, linker script,
+probe and format-decoder sources, Cargo lock and Rust toolchain specification
+by SHA-256. Inputs are fingerprinted before and after the run. Required probes
+must be present and pass without skips or expected failures; zero selected tests
+cannot produce success. A failed qualification leaves an existing report
+untouched. Report publication is an atomic replacement in its destination
+directory; the directory must already exist.
+
+This is regression/provenance evidence, not a signed toolchain attestation or
+native admission credential. Reports always state `qualification_only: true`
+and `native_admission: false`. The recipe's disabled stack protector and RELRO
+apply to layout qualification only. The selected runtime ownership and native
+hardening prerequisites are recorded in [ADR 0071](adr/0071-native-threads-and-owned-synchronization.md).
+
+## Thread memory planning
+
+`cargo test -p troe-application --lib thread_memory::` verifies complete guarded
+windows, TLS initializer agreement, sparse alignment gaps, page-zero and user
+range exclusion, overflow, and independent mapped-page, resident-page,
+reserved-page, ordinary-frame and IPC-pair budgets. Checked sums include all
+retained plans and reject overflow in derived byte counts. IPC pages count toward logical
+resident charges without also consuming ordinary-frame allowances. The immutable
+startup descriptor consumes a mapped page and an ordinary frame. Tests check
+its read-only region kind and compose complete descriptor bytes from both
+compiler TLS layouts without overlapping stack guards or private IPC.
+
+An independent oracle enumerates mapped pages and collects their parent-table
+identities. The constant-work table calculation must match it across 512
+generated layouts and explicit 2 MiB, 1 GiB and 512 GiB boundary cases. A 1 TiB
+stack case exercises planning without allocating or walking its pages. These
+tests verify geometry and accounting only; they do not reserve memory, validate
+collision against live mappings, or establish native guard-fault/teardown behavior.
+
+`cargo test -p troe-application --lib process_memory::` checks whole-process
+placement and peak memory charges. It verifies disjoint shared/initial-thread
+reservations on either side of the image, image holes, reserved heap growth,
+guard-only collisions, zero heap and empty/BSS/initialized TLS, image permission
+preservation, and complete initial-descriptor round trips. Every independent
+budget is tested at its exact boundary and one unit below it. A page-enumerating
+oracle checks the combined table count across 512 layouts with sparse images,
+all sixteen load records, large TLS alignments and table-boundary crossings.
+Maximum 16 TiB heap and stack requests exercise bounded work without allocating
+their backing. Tests account for architecture-specific empty-TLS padding and
+prove native loaders continue to reject the artifact after successful preflight.
+
+`cargo test -p troe-application tls_owner::` checks owned staging and immutable
+initializer lifetimes, reservation-before-allocation, malformed input and injected
+allocation failure, actual-capacity rejection/charges, failed-update rollback,
+overflow and competing retained owners. Stop is permanent and refunds nothing
+until drop. Both compiler layouts initialize from the original template after
+staging release and after other image/TLS copies change; bad destinations remain
+untouched. The tests distinguish zero initialized bytes from a nonempty compiler
+TLS mapping and verify cleared destination slack. Compile-fail examples reject
+releasing staging with a live artifact borrow and sharing the account as `Sync`.
+These are portable buffer-lifetime checks, not native frame-reuse or context
+quiescence evidence.
+
+`cargo test -p troe-abi --lib threading::` checks every operation, exact wire
+lengths and reserved bytes, typed token/generation boundaries, deadline tags,
+response correlation and ownership-sensitive outcomes. Adversarial bit mutations
+must be rejected or reproduce identical canonical bytes. Startup tests reject
+overlap, arithmetic overflow and nonzero page slack. Application encoder and SDK
+tests also prove ABI 1.0–1.3 cannot gain threading from newly assigned interface
+IDs, and that ABI 1.4 stays rejected. These checks do not execute native threads.
+
 ## Python tooling gates
 
 The repository's own Python is formatted and linted by one tool. `ruff` is both
@@ -248,7 +399,7 @@ Sigstore-verifies each pinned upstream release, so it needs the `sigstore` CLI
 and an exact build Python for every pinned series.
 
 ```console
-python3 tools/build_cpython.py build build/cpython-package \
+python3 tools/build_cpython.py build build/cpython-package --version all \
   --source-cache "$TROE_CPYTHON_CACHE" --work-directory "$TROE_CPYTHON_WORK"
 
 python3 tools/build_cpython.py variants build/cpython-diagnostics \

@@ -139,6 +139,27 @@ class CpythonIntegrationTests(unittest.TestCase):
         self.assertEqual(args.source_cache, Path.cwd() / "build" / "cpython-cache")
         self.assertEqual(args.work_directory, Path.cwd() / "build" / "cpython-work")
 
+    def test_minimal_build_and_install_share_safe_defaults(self) -> None:
+        with mock.patch.object(sys, "argv", ["build_cpython.py", "build"]):
+            args = build_cpython.parse_args()
+        self.assertEqual(args.output, REPO_ROOT / "build" / "cpython-package")
+        self.assertEqual(args.source_cache, REPO_ROOT / "build" / "cpython-cache")
+        self.assertEqual(args.version, build_cpython.DEFAULT_VERSION)
+        self.assertEqual(args.architecture, "all")
+        self.assertIsNone(args.work_directory)
+        output = args.output
+        for action in ("install-image", "verify-image"):
+            with mock.patch.object(
+                sys, "argv", ["build_cpython.py", action, "--image", "shared.img"]
+            ):
+                args = build_cpython.parse_args()
+            self.assertEqual(args.tree, output)
+            self.assertEqual(args.image, Path.cwd() / "shared.img")
+        with mock.patch.object(
+            sys, "argv", ["build_cpython.py", "build", "--version", "all"]
+        ):
+            self.assertEqual(build_cpython.parse_args().version, "all")
+
     def test_seeding_never_falls_back_from_capability_backed_entropy(self) -> None:
         self.assertEqual(build_cpython.PATCH, APP_ROOT / "patches" / "troe.patch")
         patch = build_cpython.PATCH.read_text(encoding="utf-8")

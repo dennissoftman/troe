@@ -7,6 +7,10 @@ single-prefix startup calculation below: ABI 1.3 uses an 80-byte prefix and
 versioned IPC extent as well as the startup region when deriving image span.
 Container, package, and KCAP versions in this decision are unchanged.
 
+Current scope note: the separate [static TLS container 1.3](../formats/kex-static-tls-v1.md)
+is available for offline conversion and inspection. Native loading retains
+container 1.2 and ABI 1.3; its reserved TLS encodings remain rejected.
+
 ## Context
 
 TROE keeps its canonical KEX executable and host-side ELF converter. Native ELF

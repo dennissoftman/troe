@@ -35,11 +35,13 @@ pub struct StartupInfo<'handles> {
 /// Failure to encode a canonical ABI startup page.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StartupPageError {
+    /// The current encoder cannot publish an unimplemented startup revision.
+    UnsupportedAbi,
     /// The task identity is the reserved zero value.
     InvalidTaskId,
     /// More initial handles were supplied than the standard policy permits.
     TooManyHandles,
-    /// A descriptor used the reserved zero opaque-handle value.
+    /// A descriptor has a zero handle or requires a different startup profile.
     InvalidHandle,
     /// Two descriptors expose the same opaque handle value.
     DuplicateHandle,
@@ -51,6 +53,9 @@ pub(crate) fn encode_startup_page(
     info: StartupInfo<'_>,
     destination: &mut [u8; STARTUP_REGION_BYTES],
 ) -> Result<(), StartupPageError> {
+    if abi_minor > crate::ABI_MINOR {
+        return Err(StartupPageError::UnsupportedAbi);
+    }
     if info.task_id == 0 {
         return Err(StartupPageError::InvalidTaskId);
     }
@@ -59,7 +64,10 @@ pub(crate) fn encode_startup_page(
         return Err(StartupPageError::TooManyHandles);
     }
     for (index, handle) in info.handles.iter().enumerate() {
-        if handle.value == 0 {
+        if handle.value == 0
+            || (troe_abi::interface::is_threading(handle.interface)
+                && abi_minor < troe_abi::startup::THREAD_ABI_MINOR)
+        {
             return Err(StartupPageError::InvalidHandle);
         }
         if info.handles[..index]

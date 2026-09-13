@@ -443,14 +443,58 @@ pub(crate) fn parse_header_with_len(
     supported_abi_minor: u16,
     limits: ApplicationLimits,
 ) -> Result<ParsedHeader, ParseError> {
+    parse_header_for_format(
+        artifact_prefix,
+        artifact_len,
+        expected_target,
+        supported_abi_minor,
+        limits,
+        HeaderFormat::Native,
+    )
+}
+
+/// Format validation is separate from native admission. The TLS reader produces
+/// no load plan or startup layout; the native and streaming paths stay closed.
+#[derive(Clone, Copy)]
+pub(crate) enum HeaderFormat {
+    Native,
+    StaticTls,
+}
+
+impl HeaderFormat {
+    fn accepts_abi(self, minor: u16, supported: u16) -> bool {
+        minor <= supported
+            && (!matches!(self, Self::StaticTls) || minor == troe_abi::startup::THREAD_ABI_MINOR)
+    }
+    fn properties(self) -> (u16, usize, u16) {
+        match self {
+            Self::Native => (CONTAINER_MINOR, KEX_V1_HEADER_BYTES, 0),
+            Self::StaticTls => (
+                crate::tls_artifact::CONTAINER_MINOR,
+                crate::tls_artifact::HEADER_BYTES,
+                crate::tls_artifact::FLAG,
+            ),
+        }
+    }
+}
+
+pub(crate) fn parse_header_for_format(
+    artifact_prefix: &[u8],
+    artifact_len: usize,
+    expected_target: Target,
+    supported_abi_minor: u16,
+    limits: ApplicationLimits,
+    format: HeaderFormat,
+) -> Result<ParsedHeader, ParseError> {
+    let (container_minor, header_bytes, flags) = format.properties();
     let header = artifact_prefix
-        .get(..KEX_V1_HEADER_BYTES)
+        .get(..header_bytes)
         .ok_or(ParseError::TruncatedHeader)?;
     if header.get(..KEX_V1_MAGIC.len()) != Some(KEX_V1_MAGIC.as_slice()) {
         return Err(ParseError::InvalidMagic);
     }
     if read_u16(header, HEADER_CONTAINER_MAJOR)? != CONTAINER_MAJOR
-        || read_u16(header, HEADER_CONTAINER_MINOR)? != CONTAINER_MINOR
+        || read_u16(header, HEADER_CONTAINER_MINOR)? != container_minor
     {
         return Err(ParseError::UnsupportedContainerVersion);
     }
@@ -459,17 +503,17 @@ pub(crate) fn parse_header_with_len(
     if target != expected_target {
         return Err(ParseError::WrongTarget);
     }
-    if usize::from(read_u16(header, HEADER_BYTES)?) != KEX_V1_HEADER_BYTES
+    if usize::from(read_u16(header, HEADER_BYTES)?) != header_bytes
         || usize::from(read_u16(header, HEADER_RECORD_BYTES)?) != KEX_V1_LOAD_RECORD_BYTES
     {
         return Err(ParseError::InvalidLayout);
     }
     let abi_major = read_u16(header, HEADER_ABI_MAJOR)?;
     let abi_minor = read_u16(header, HEADER_ABI_MINOR)?;
-    if abi_major != ABI_MAJOR || abi_minor > supported_abi_minor {
+    if abi_major != ABI_MAJOR || !format.accepts_abi(abi_minor, supported_abi_minor) {
         return Err(ParseError::UnsupportedAbi);
     }
-    if read_u16(header, HEADER_FLAGS)? != 0
+    if read_u16(header, HEADER_FLAGS)? != flags
         || read_u16(header, HEADER_RESERVED16)? != 0
         || read_u16(header, HEADER_RESERVED_RELOCATION16)? != 0
         || read_u32(header, HEADER_RESERVED_RELOCATION32)? != 0
@@ -511,7 +555,7 @@ pub(crate) fn parse_header_with_len(
     let relocations_end = relocations_offset
         .checked_add(relocation_table_bytes)
         .ok_or(ParseError::ArithmeticOverflow)?;
-    if records_offset != KEX_V1_HEADER_BYTES
+    if records_offset != header_bytes
         || relocations_offset != records_end
         || payload_offset != relocations_end
         || payload_offset > artifact_len
@@ -544,12 +588,12 @@ pub(crate) fn parse_header_with_len(
     })
 }
 
-struct ParsedSegments<'artifact> {
-    segments: [Option<LoadSegment<'artifact>>; MAX_LOAD_RECORDS],
-    image_pages: u64,
+pub(crate) struct ParsedSegments<'artifact> {
+    pub(crate) segments: [Option<LoadSegment<'artifact>>; MAX_LOAD_RECORDS],
+    pub(crate) image_pages: u64,
 }
 
-fn parse_relocations<'artifact>(
+pub(crate) fn parse_relocations<'artifact>(
     artifact: &'artifact [u8],
     header: ParsedHeader,
     parsed: &ParsedSegments<'artifact>,
@@ -598,7 +642,7 @@ fn parse_relocations<'artifact>(
     Ok(records)
 }
 
-fn parse_segments(
+pub(crate) fn parse_segments(
     artifact: &[u8],
     header: ParsedHeader,
     image_base: u64,

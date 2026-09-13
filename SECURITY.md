@@ -75,6 +75,26 @@ never executes the ordinary application.
   targeted invalidation with a full-flush correctness fallback on unsupported
   x86 CPUs. Direct handoffs preserve the absolute 50 ms lease; expiry faults
   the active IPC participant and does not replay the call;
+- thread preflight: allocation-free typed wire/startup codecs and checked memory
+  plans, including a separately charged read-only descriptor page. Whole-process
+  preflight rejects overlap with image holes, heap growth reservations and thread
+  guards; peak budgets include separate immutable-initializer and executable
+  staging backing. Preflight does not acquire or authenticate that backing. The active
+  loader and SDK reject the assigned threaded startup revision and reject thread
+  interfaces in older startup records. Offline TLS conversion requires an explicit
+  container revision, validates the immutable initializer against its image source,
+  and rejects initializer pointer fixups. Native and streaming loaders reject this
+  container; these components enable no native workers;
+- TLS initializer ownership: exclusively owned staging supplies an independent
+  immutable process initializer. Fallible preparation reserves logical backing,
+  checks actual capacity and process peak budgets, and drops buffers before
+  refunding charges. Stopping creation retains storage; synchronous Rust borrows
+  prevent release during a copy. Native context quiescence, physical accounting
+  and zeroization are not established by this heap-buffer owner;
+- compiler qualification: explicit C11 target/TLS options and isolated headers,
+  exact release checks and observed-input fingerprints; missing, skipped or
+  failed qualification cannot publish a success report. These reports grant
+  no native authority and do not certify production runtime hardening;
 - KEX resolution: bare names select only `/bin/<name>.kex`; a command containing
   `/` tries its exact VFS path relative to its explicit cwd, then appends `.kex`
   only if the path is missing and the filename does not already end in `.kex`;

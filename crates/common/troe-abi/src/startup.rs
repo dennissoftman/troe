@@ -28,10 +28,17 @@ pub const IPC_PAGES: usize = 2;
 /// Private payload bytes, separate from the immutable startup mapping.
 pub const IPC_BYTES: usize = IPC_PAGES * PAGE_BYTES;
 
+/// Assigned threaded profile; the current kernel/SDK still reject this minor.
+pub const THREAD_ABI_MINOR: u16 = 4;
+/// Threaded prefix adds the initial thread descriptor address and byte count.
+pub const THREAD_HEADER_BYTES: usize = 96;
+
 /// Fixed prefix for an already validated ABI minor.
 #[must_use]
 pub const fn header_bytes(minor: u16) -> usize {
-    if minor >= IPC_ABI_MINOR {
+    if minor >= THREAD_ABI_MINOR {
+        THREAD_HEADER_BYTES
+    } else if minor >= IPC_ABI_MINOR {
         IPC_HEADER_BYTES
     } else {
         HEADER_BYTES

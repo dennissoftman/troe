@@ -216,6 +216,9 @@ PYTHON_IMPACTS = {
     "tools/qemu-firmware-profile.json": ("test_qemu_profile.py",),
     "tools/size_report.py": ("test_build_policy.py",),
     "tools/build_c_sysroot.py": ("test_c_sysroot.py",),
+    "tools/thread_profile.py": ("test_kex_tool.py", "test_thread_profile.py"),
+    "sdk/c/thread-profile-v1.json": ("test_kex_tool.py", "test_thread_profile.py"),
+    "sdk/c/thread-profile-v1.ld": ("test_kex_tool.py", "test_thread_profile.py"),
     "tools/build_cpython.py": ("test_cpython_integration.py",),
     # Host-side measurement tool. It is loaded by QEMU and is not part of any
     # guest artifact, so it selects no runtime scenario.
@@ -514,6 +517,10 @@ def build_plan(
                 _add_python(plan, path, "test_elf2kex.py", "test_kex_tool.py")
                 plan.all_applications = True
                 plan.note("kex:all", path)
+            elif package == "troe-application":
+                # TLS geometry must agree with emitted compiler instructions,
+                # not just with Rust tests of the same policy implementation.
+                _add_python(plan, path, "test_kex_tool.py")
             elif package == "troe-kex":
                 _add_python(plan, path, "test_kex_tool.py")
                 plan.all_applications = True

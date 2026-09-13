@@ -2,6 +2,8 @@
 
 use std::ops::Range;
 
+mod tls;
+
 use troe_application::{
     ABI_MAJOR, ABI_MINOR, ApplicationLimits, KEX_V1_CONTAINER_MAJOR, KEX_V1_CONTAINER_MINOR,
     KEX_V1_HEADER_BYTES, KEX_V1_IMAGE_ALIGNMENT, KEX_V1_LOAD_RECORD_BYTES, KEX_V1_MAGIC,
@@ -77,6 +79,7 @@ struct ParsedElf {
     entry: u64,
     segments: Vec<ElfLoadSegment>,
     relocations: Vec<ElfRelativeRelocation>,
+    tls: Option<tls::Info>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -363,6 +366,7 @@ fn validate_sections(
     sections: &[SectionHeader],
     string_index: usize,
     loads: &[ElfLoadSegment],
+    tls_header: Option<ProgramHeader>,
 ) -> ToolResult<Vec<Range<usize>>> {
     if sections.is_empty() {
         if string_index != 0 {
@@ -424,13 +428,15 @@ fn validate_sections(
         }
         validate_section_kind(section.kind)?;
         if section.flags & ELF_SHF_TLS != 0 {
-            return Err(invalid("ELF contains thread-local storage"));
+            tls::validate_section(image, section, tls_header)?;
         }
         if section.flags & ELF_SHF_WRITE != 0 && section.flags & ELF_SHF_EXECINSTR != 0 {
             return Err(invalid("ELF section requests writable executable memory"));
         }
         if let Some(name) = section_name(string_table, section.name_offset)?
-            && matches!(name, b".interp" | b".tdata" | b".tbss")
+            && (name == b".interp"
+                || (matches!(name, b".tdata" | b".tbss")
+                    && (tls_header.is_none() || section.flags & ELF_SHF_TLS == 0)))
         {
             return Err(invalid(format!(
                 "ELF contains unsupported section {}",
@@ -452,7 +458,10 @@ fn validate_sections(
                 described.push(range);
             }
         }
-        if section.flags & ELF_SHF_ALLOC != 0 {
+        if section.flags & ELF_SHF_TLS != 0 {
+            // PT_TLS owns the template extent. In particular, .tbss need not
+            // occupy the ordinary process image's PT_LOAD memory extent.
+        } else if section.flags & ELF_SHF_ALLOC != 0 {
             validate_alloc_section(section, section.kind, loads)?;
         } else if section.address != 0 {
             return Err(invalid("ELF non-allocating section has a virtual address"));
@@ -602,6 +611,7 @@ fn validate_loads(
     image: &[u8],
     headers: &[ProgramHeader],
     program_offset: u64,
+    threaded: bool,
 ) -> ToolResult<ValidatedLoads> {
     let mut loads = Vec::new();
     let mut file_ranges: Vec<Range<usize>> = Vec::new();
@@ -609,6 +619,9 @@ fn validate_loads(
     let mut stack_seen = false;
     let mut dynamic = None;
     for (index, header) in headers.iter().copied().enumerate() {
+        if threaded && header.kind == ELF_PT_TLS {
+            continue;
+        }
         if header.kind == ELF_PT_NULL {
             if header.flags != 0
                 || header.offset != 0
@@ -697,9 +710,15 @@ fn validate_loads(
         if permissions(header.flags).is_none() {
             return Err(invalid("ELF PT_LOAD permissions are not R, RX, or RW"));
         }
-        if header.alignment != PAGE_SIZE
+        if !(header.alignment == PAGE_SIZE
+            || (threaded
+                && header.alignment.is_power_of_two()
+                && (PAGE_SIZE..=troe_application::static_tls::LOCAL_EXEC_BYTES)
+                    .contains(&header.alignment)))
             || header.offset % PAGE_SIZE != 0
             || header.virtual_address % PAGE_SIZE != 0
+            || header.virtual_address % header.alignment.max(1)
+                != header.offset % header.alignment.max(1)
             || !matches!(header.physical_address, 0)
                 && header.physical_address != header.virtual_address
             || header.memory_bytes == 0
@@ -847,7 +866,11 @@ fn validate_described_bytes(image: &[u8], mut described: Vec<Range<usize>>) -> T
 }
 
 #[allow(clippy::too_many_lines)]
-fn parse_elf(image: &[u8], expected_target: Option<Target>) -> ToolResult<ParsedElf> {
+fn parse_elf(
+    image: &[u8],
+    expected_target: Option<Target>,
+    threaded: bool,
+) -> ToolResult<ParsedElf> {
     if image.len() < ELF_HEADER_BYTES {
         return Err(invalid("ELF header is truncated"));
     }
@@ -901,7 +924,7 @@ fn parse_elf(image: &[u8], expected_target: Option<Target>) -> ToolResult<Parsed
     }
 
     let headers = program_headers(image, program_offset, program_count)?;
-    let validated = validate_loads(image, &headers, program_offset)?;
+    let validated = validate_loads(image, &headers, program_offset, threaded)?;
     let loads = validated.loads;
     validate_load_order_and_entry(&loads, entry)?;
     let program_bytes = u64::try_from(program_count)
@@ -920,7 +943,13 @@ fn parse_elf(image: &[u8], expected_target: Option<Target>) -> ToolResult<Parsed
     } else {
         section_headers(image, section_offset, section_count)?
     };
-    let section_ranges = validate_sections(image, &sections, section_string_index, &loads)?;
+    let tls_header = if threaded {
+        tls::header(image, &headers, &loads, target)?
+    } else {
+        None
+    };
+    let section_ranges =
+        validate_sections(image, &sections, section_string_index, &loads, tls_header)?;
     let relocations =
         parse_relative_relocations(image, &sections, section_string_index, &loads, target)?;
     let mut described = vec![
@@ -947,11 +976,24 @@ fn parse_elf(image: &[u8], expected_target: Option<Target>) -> ToolResult<Parsed
         )?);
     }
     validate_described_bytes(image, described)?;
+    let tls = if threaded {
+        Some(tls::validate(
+            image,
+            &sections,
+            &loads,
+            &relocations,
+            tls_header,
+            target,
+        )?)
+    } else {
+        None
+    };
     Ok(ParsedElf {
         target,
         entry,
         segments: loads,
         relocations,
+        tls,
     })
 }
 
@@ -1115,20 +1157,65 @@ fn verify_generated(
 ///
 /// Rejects unsupported targets, dynamic or relocatable facilities, malformed
 /// geometry, noncanonical padding, forbidden permissions, or policy overruns.
-#[allow(clippy::too_many_lines)]
 pub fn convert_elf(
     image: &[u8],
     expected_target: Option<Target>,
     stack_pages: u64,
     heap_pages: u64,
 ) -> ToolResult<Vec<u8>> {
-    let parsed = parse_elf(image, expected_target)?;
+    convert_profile(image, expected_target, stack_pages, heap_pages, false)
+}
+
+/// Convert an explicitly selected static TLS profile to container 1.3 / ABI 1.4.
+/// Native and streamed load admission remain disabled for that format.
+///
+/// # Errors
+/// Rejects malformed TLS, missing/ambiguous worker entry, unsupported TLS
+/// relocations, legacy facilities and every ordinary ELF/KEX validation failure.
+pub fn convert_threaded_elf(
+    image: &[u8],
+    expected_target: Option<Target>,
+    stack_pages: u64,
+    heap_pages: u64,
+) -> ToolResult<Vec<u8>> {
+    convert_profile(image, expected_target, stack_pages, heap_pages, true)
+}
+
+#[allow(clippy::too_many_lines)]
+fn convert_profile(
+    image: &[u8],
+    expected_target: Option<Target>,
+    stack_pages: u64,
+    heap_pages: u64,
+    threaded: bool,
+) -> ToolResult<Vec<u8>> {
+    use troe_application::tls_artifact;
+    let parsed = parse_elf(image, expected_target, threaded)?;
     let records = records(&parsed, image)?;
-    let (artifact_bytes, span_bytes) =
+    let (mut artifact_bytes, span_bytes) =
         validate_policy(&records, &parsed.relocations, stack_pages, heap_pages)?;
+    let (header_bytes, container_minor, abi_minor, flags) = if let Some(tls) = parsed.tls {
+        artifact_bytes = artifact_bytes
+            .checked_add(tls_artifact::EXTENSION_BYTES)
+            .and_then(|bytes| {
+                usize::try_from(tls.file_bytes)
+                    .ok()
+                    .and_then(|file| bytes.checked_add(file))
+            })
+            .filter(|bytes| *bytes <= ApplicationLimits::standard().encoded_bytes())
+            .ok_or_else(|| invalid("KEX TLS artifact exceeds the encoded-size budget"))?;
+        (
+            tls_artifact::HEADER_BYTES,
+            tls_artifact::CONTAINER_MINOR,
+            troe_abi::startup::THREAD_ABI_MINOR,
+            tls_artifact::FLAG,
+        )
+    } else {
+        (KEX_V1_HEADER_BYTES, KEX_V1_CONTAINER_MINOR, ABI_MINOR, 0)
+    };
     let record_count = u16::try_from(records.len())
         .map_err(|_| invalid("KEX load-record count is not representable"))?;
-    let relocations_offset = KEX_V1_HEADER_BYTES
+    let relocations_offset = header_bytes
         .checked_add(records.len() * KEX_V1_LOAD_RECORD_BYTES)
         .ok_or_else(|| invalid("KEX relocation offset overflows"))?;
     let payload_offset = relocations_offset
@@ -1139,13 +1226,12 @@ pub fn convert_elf(
     let mut output = vec![0_u8; artifact_bytes];
     output[..8].copy_from_slice(&KEX_V1_MAGIC);
     write_u16(&mut output, 8, KEX_V1_CONTAINER_MAJOR);
-    write_u16(&mut output, 10, KEX_V1_CONTAINER_MINOR);
+    write_u16(&mut output, 10, container_minor);
     write_u16(&mut output, 12, parsed.target as u16);
     write_u16(
         &mut output,
         14,
-        u16::try_from(KEX_V1_HEADER_BYTES)
-            .map_err(|_| invalid("KEX header size is not representable"))?,
+        u16::try_from(header_bytes).map_err(|_| invalid("KEX header size is not representable"))?,
     );
     write_u16(
         &mut output,
@@ -1154,8 +1240,8 @@ pub fn convert_elf(
             .map_err(|_| invalid("KEX record size is not representable"))?,
     );
     write_u16(&mut output, 18, ABI_MAJOR);
-    write_u16(&mut output, 20, ABI_MINOR);
-    write_u16(&mut output, 22, 0);
+    write_u16(&mut output, 20, abi_minor);
+    write_u16(&mut output, 22, flags);
     write_u64(&mut output, 24, entry_offset);
     write_u16(&mut output, 32, record_count);
     write_u16(&mut output, 34, 0);
@@ -1170,7 +1256,7 @@ pub fn convert_elf(
     write_u32(
         &mut output,
         56,
-        u32::try_from(KEX_V1_HEADER_BYTES)
+        u32::try_from(header_bytes)
             .map_err(|_| invalid("KEX records offset is not representable"))?,
     );
     write_u32(
@@ -1212,7 +1298,7 @@ pub fn convert_elf(
 
     let mut next_payload = payload_offset;
     for (index, record) in records.iter().enumerate() {
-        let at = KEX_V1_HEADER_BYTES + index * KEX_V1_LOAD_RECORD_BYTES;
+        let at = header_bytes + index * KEX_V1_LOAD_RECORD_BYTES;
         write_u64(&mut output, at, record.image_offset);
         write_u64(
             &mut output,
@@ -1235,14 +1321,24 @@ pub fn convert_elf(
         output[next_payload..end].copy_from_slice(record.file_bytes);
         next_payload = end;
     }
-    verify_generated(
-        &output,
-        &parsed,
-        &records,
-        &parsed.relocations,
-        stack_pages,
-        heap_pages,
-    )?;
+    if let Some(info) = parsed.tls {
+        let metadata = info
+            .metadata(next_payload as u64)
+            .encode(parsed.target)
+            .map_err(|error| invalid(format!("KEX TLS metadata: {error}")))?;
+        output[KEX_V1_HEADER_BYTES..header_bytes].copy_from_slice(&metadata);
+        output[next_payload..].copy_from_slice(info.template(image)?);
+        tls::verify_generated(&output, image, &parsed, &records, stack_pages, heap_pages)?;
+    } else {
+        verify_generated(
+            &output,
+            &parsed,
+            &records,
+            &parsed.relocations,
+            stack_pages,
+            heap_pages,
+        )?;
+    }
     Ok(output)
 }
 

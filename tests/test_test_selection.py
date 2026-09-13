@@ -22,6 +22,9 @@ def package(
 
 
 PACKAGES = {
+    "troe-application": package(
+        "troe-application", "crates/runtime/troe-application", "troe-kex-tool"
+    ),
     "troe-completion": package(
         "troe-completion", "crates/common/troe-completion", "troe-shell"
     ),
@@ -45,6 +48,14 @@ PACKAGES = {
 
 class ChangedTestSelectionTests(unittest.TestCase):
     """Selection widens through dependencies and fails closed for uncertainty."""
+
+    def test_tls_policy_change_requires_real_compiler_probes(self) -> None:
+        path = PurePosixPath("crates/runtime/troe-application/src/static_tls.rs")
+        plan = test_changed.build_plan((path,), PACKAGES)
+        self.assertFalse(plan.full_reasons)
+        self.assertIn("troe-application", plan.rust_packages)
+        self.assertIn("troe-kex-tool", plan.rust_packages)
+        self.assertIn("test_kex_tool.py", plan.python_tests)
 
     def test_rust_change_selects_reverse_dependency_closure_and_scenarios(self) -> None:
         path = PurePosixPath("crates/net/troe-net/src/lib.rs")

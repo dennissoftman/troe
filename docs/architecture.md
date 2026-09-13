@@ -243,6 +243,135 @@ identity, authority, lifecycle, and stack resource.
 This makes every scheduling boundary explicit and keeps architecture register
 state out of portable code.
 
+`troe-task::thread` separately models process-owned thread lifetimes. Its
+metadata slots are reserved at construction; preparation, publication, waits,
+join claims, stop, completion and reaping allocate nothing. Prepared and
+unreaped completion records consume process quotas, while native page charges
+remain until composition explicitly acknowledges reclamation. The model uses
+generation-checked identities and does not execute native threads, establish
+physical quiescence, or enable pthread support. The application runtime still
+has one execution thread per process.
+
+The paired `troe-task::thread::sync` model owns typed mutex, condition and permit
+records and intrusive FIFO wait queues. Mutex ownership transfers before a
+waiter resumes. Condition timeout and notification preserve the original mutex
+reference through reacquisition and result consumption; permanent poison is a
+distinct failure without ownership. An immutable essential-mutex policy instead
+revokes the process on owner exit. Permits remain ownerless and are not refunded
+on thread exit. Object/wait quotas include pending completions, and the lifecycle
+model refuses thread resource release while synchronization references remain.
+These serialized transitions allocate nothing after table construction. Native
+clock delivery, instruction-level memory ordering and work-quantum enforcement
+are outside these portable models.
+
+Both table constructors require an explicit metadata-byte budget. Their
+`metadata_layout` methods derive inline-owner and backing-array sizes/alignment
+from the compiled Rust types. Constructors check those requests before allocating
+and check actual vector capacities before returning an owner. Unused slots stay
+charged through process removal and slot reuse, until the table is dropped.
+Allocator bookkeeping, rounding and fragmentation are separate physical costs.
+
+`troe-task::thread::admission` checks a paired table configuration against a
+combined metadata allowance and task IPC capacity after nonzero protected
+headroom. It reserves one synchronization wait slot per retained thread and
+enforces a per-process thread ceiling below the global record count. Its
+`maximum_capacity` calculation derives the largest fitting thread count from
+the compiled lifecycle/wait strides, aggregate process quotas and remaining context/metadata limits,
+holding the process/object counts and per-process ceiling fixed. Pair
+construction leaves the complete synchronization request available while
+allocating lifecycle storage, then assigns the remaining budget using actual
+capacity. It returns two empty owners only after both constructions succeed.
+The caller supplies capacity and reserve counts; this portable check does not
+reserve native IPC slots or establish a complete native admission budget.
+
+`troe-application::static_tls` computes and initializes a separate local-exec
+TLS allocation without allocating memory itself. The x86-64 layout preserves
+negative offsets from FS base and writes the self pointer at FS:0; AArch64
+places the template after an aligned 16-byte control prefix at TPIDR_EL0.
+The caller's page budget includes control bytes and all padding. Initialization
+checks exact buffer lengths and the complete aligned user-address range before
+writing, then clears every mapped byte and copies the initialized template.
+The helper has a common 16 MiB displacement window and accepts only a template
+with zero alignment residue. It does not map memory, publish a thread, define
+libc-private metadata, or account for complete thread admission.
+`troe-application::tls_artifact` validates the separate
+[container 1.3](formats/kex-static-tls-v1.md) for offline conversion/inspection.
+Its exact immutable initializer suffix is checked against its nonexecutable
+image source; initializers requiring pointer fixups are rejected. Explicit
+`cargo kex convert --threaded` checks ELF TLS extents and the worker trampoline.
+Native and streaming loaders still reject this format. Compiler probes verify
+the portable geometry and emitted bytes independently of native execution.
+The shared C11 qualification recipe pins Clang/LLD releases, excludes host
+headers/configuration, and records binary/header/source fingerprints only after
+the required checks pass. Its reports grant no admission. The C ABI-1 runtime
+retains its single-thread ownership; [ADR 0071](adr/0071-native-threads-and-owned-synchronization.md)
+specifies the separate process/thread/callback ownership needed by its adapter.
+
+`troe-application::thread_memory` places one fixed, fully committed stack, the
+checked TLS allocation, a two-page IPC pair and a read-only startup descriptor
+page inside a page-aligned user
+window. The stack has a guard on each side; TLS alignment gaps and a final
+guard after startup also stay unmapped. The complete window counts against virtual
+reservation limits. Mapped-page charges include IPC and startup, while ordinary-frame
+demand includes stack, TLS, startup and supplemental page tables: IPC backing already
+belongs to the boot arena. The table bound counts distinct prefixes at each
+of the three levels below the shared root in twelve range calculations, without
+walking individual pages or charging unmapped gaps as leaf mappings.
+Checked cumulative charges and simultaneous budget checks are pure preflight
+calculations. They do not acquire ownership, detect collisions with existing
+reservations, or select service reserves. Context/wait/runtime metadata and
+the shared process root remain separate charges. The native loader does not
+consume these plans or admit additional execution threads.
+
+`troe-application::process_memory` composes a validated static-TLS artifact
+with shared image/startup/heap geometry and the initial thread window. The shared
+reservation covers image holes and an explicit heap growth capacity; the thread
+may lie on either side, but neither its mappings nor its guards and alignment
+gaps may intersect that reservation. Only the initially committed heap prefix
+is mapped. Image permissions are preserved; both startup pages are read-only/NX.
+The planner resolves main/trampoline addresses and composes the initial thread's
+descriptor using its checked TLS pointer and private IPC addresses.
+
+Whole-process charges include the shared mappings once, the initial thread,
+one user page-table root and the union of lower-table prefixes across at most
+22 regions. They do not add the thread's independent table bound again. Dedicated
+immutable initializer pages and full-executable staging pages are rounded and
+charged separately. Resident and ordinary-frame budgets use the peak while both
+coexist; steady charges exclude staging only after it is actually released.
+The two boot-owned IPC pages count logically and occupy a task pair, but do not
+consume ordinary free frames again. This is an allocation-free preflight model,
+not a native load plan or owner: package/I/O staging, allocator overhead,
+architecture kernel mapping tables and context/runtime metadata are separate.
+Native loading does not consume this plan or admit ABI 1.4.
+
+`troe-application::tls_owner` takes ownership of a staged executable buffer,
+validates its coherent contents, and creates an independent immutable initializer.
+`TlsBackingAccount` reserves page-rounded buffer capacity across all live owners,
+including spare capacity. Initializer pages are reserved before fallible allocation;
+actual capacity is then checked against the shared account and process peak budgets
+before initialization. Failure drops provisional buffers before refunding their
+charges. The composed plan retains the actual staging/initializer capacities.
+
+`StagedTlsImage` retains the executable while image consumers borrow it. Consuming
+`release_staging` requires those borrows to end and transfers the initializer to
+`ProcessTls` without releasing its charge. TLS copies use the stored compiler layout
+and immutable source, initialize the entire destination, and expose no initializer
+pointer or mutable access. Copies are synchronous and run no callbacks. Stopping
+creation requires exclusive access, permanently rejects new copies and retains
+storage/charges until drop. The account is not `Sync`; this is serialized ownership.
+These are logical heap-buffer charges, with allocator overhead/transient backing
+and inline metadata accounted separately. Rust borrows establish copy-reader
+quiescence, not native context quiescence. Native loaders still do not consume
+these owners; heap drop does not certify physical zeroization or native admission.
+
+`troe-abi::threading` provides closed request/response and immutable startup
+descriptor codecs for assigned interfaces 30/31 and entry 6. The
+[wire contract](formats/thread-v1.md) separates scheduler outcomes from IPC
+transport failures and validates token kinds, wait flags and response payloads.
+It authenticates no capability or pending operation. Application ABI 1.4 is
+assigned but rejected by the active loader and SDK; older startup profiles
+also reject the two thread interfaces.
+
 The boot arena contains one reusable 64 KiB cooperative task payload plus
 128 KiB isolated-server and 192 KiB shell payloads. The shell reserve covers
 eight nested launch levels including private IPC/root metadata. Each has an unmapped 4 KiB page on
