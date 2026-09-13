@@ -26,3 +26,12 @@ canonical `TARGET.json` ownership record. The archive is a build-time static
 library; it is not installed in the guest filesystem. A KEX build links the
 archive and supplies the versioned `troe_runtime_host` callbacks through the
 Rust `troe-kex-c-runtime` bridge.
+
+The separate compiler qualification profile in `../thread-profile-v1.json`
+uses these headers with explicit freestanding C11/local-exec options. Run
+`python3 tools/thread_profile.py` from the repository to qualify the pinned
+Clang/LLD pair; `--compatible-tools` records checks with other releases. This
+produces host verification evidence only. Runtime ABI 1, global errno, and
+single-thread pthread/TSS behavior remain unchanged; it supplies no threaded
+libc archive or native launch capability. See the
+[compiler qualification checks](../../../docs/testing.md#static-tls-layout-and-compiler-probes).

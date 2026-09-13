@@ -14,8 +14,11 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
+sys.path.insert(0, str(REPO_ROOT))
 
 from repository_policy import rootfs_application_directories  # noqa: E402
+
+from tools import thread_profile  # noqa: E402
 
 KEX_APPLICATION_NAMES = tuple(
     path.name for path in rootfs_application_directories(REPO_ROOT)
@@ -285,59 +288,14 @@ class StaticTlsTests(unittest.TestCase):
         return json.loads(result.stdout)
 
     def compile_probe(self, root: Path, target: str, source: str) -> Path:
-        """Link a bounded local-exec probe with fully described executable padding."""
-        (root / "probe.c").write_text(source)
-        # LLD's default x86 separate-code tail padding lives outside p_filesz.
-        # Describe it inside .text instead of relaxing the converter's rejection
-        # of unexplained bytes. LLD supplies target-specific trap padding here.
-        (root / "probe.ld").write_text(
-            "SECTIONS { .text : { *(.text .text.*) . = ALIGN(4096); } }\n"
-            "INSERT AFTER .dynstr;\n"
+        """Use the reviewed compiler recipe for every geometry/rejection fixture."""
+        return thread_profile.compile_probe(
+            root,
+            target,
+            source,
+            os.environ.get("TROE_TLS_CC", "clang"),
+            os.environ.get("TROE_TLS_LD", "ld.lld"),
         )
-        subprocess.run(
-            (
-                os.environ.get("TROE_TLS_CC", "clang"),
-                f"--target={target}-unknown-none-elf",
-                "-std=c11",
-                "-O2",
-                "-fPIC",
-                "-ffreestanding",
-                "-fomit-frame-pointer",
-                "-fno-stack-protector",
-                "-ftls-model=local-exec",
-                "-c",
-                root / "probe.c",
-                "-o",
-                root / "probe.o",
-            ),
-            check=True,
-            capture_output=True,
-        )
-        elf = root / "probe.elf"
-        subprocess.run(
-            (
-                os.environ.get("TROE_TLS_LD", "ld.lld"),
-                "-pie",
-                "-e",
-                "_start",
-                "--no-relax",
-                "--no-dynamic-linker",
-                "-z",
-                "separate-loadable-segments",
-                "-z",
-                "norelro",
-                "-z",
-                "max-page-size=4096",
-                "-T",
-                root / "probe.ld",
-                root / "probe.o",
-                "-o",
-                elf,
-            ),
-            check=True,
-            capture_output=True,
-        )
-        return elf
 
     def test_empty_tls_still_charges_a_control_block(self) -> None:
         for target, offset in (("x86_64", 0), ("aarch64", 16)):
@@ -347,6 +305,46 @@ class StaticTlsTests(unittest.TestCase):
                 self.assertEqual(layout["thread_pointer_offset"], 0)
                 self.assertEqual(layout["mapped_bytes"], 4096)
                 self.assertEqual(layout["pages"], 1)
+
+    def test_c_profile_uses_troe_headers_lp64_and_local_exec_storage(self) -> None:
+        source = """
+#include <troe/runtime.h>
+#include <stdatomic.h>
+#if !defined(__ELF__) || defined(__linux__) || __STDC_HOSTED__ != 0
+#error Wrong target personality
+#endif
+_Static_assert(__STDC_VERSION__ == 201112L, "C11 profile required");
+_Static_assert(__BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__, "little endian required");
+_Static_assert(sizeof(int) == 4 && sizeof(float) == 4 && sizeof(double) == 8,
+               "scalar ABI changed");
+_Static_assert(_Alignof(void *) == 8, "pointer alignment changed");
+_Static_assert(__atomic_always_lock_free(8, 0), "native word atomics required");
+_Static_assert(TROE_C_RUNTIME_ABI == 1, "review runtime ownership on ABI change");
+_Thread_local unsigned long observed[2];
+void _start(const void *descriptor, unsigned long bytes) {
+  observed[0] = (unsigned long)descriptor; observed[1] = bytes;
+}
+void __troe_thread_start_v1(const void *descriptor, unsigned long bytes) {
+  observed[0] = (unsigned long)descriptor; observed[1] = bytes;
+}
+"""
+        for target in ("x86_64", "aarch64"):
+            with tempfile.TemporaryDirectory(prefix="troe-c-profile-") as directory:
+                root = Path(directory)
+                elf = self.compile_probe(root, target, source)
+                output = root / "profile.kex"
+                result = cargo_kex("convert", elf, output, "--threaded")
+                self.assertEqual(result.returncode, 0, result.stderr.decode())
+                report = json.loads(cargo_kex("inspect", output, "--json").stdout)
+                self.assertEqual(report["tls"]["file_bytes"], 0)
+                self.assertEqual(report["tls"]["memory_bytes"], 16)
+                # Runtime ABI 1 still exports global errno. A compiler profile
+                # must not silently turn that declaration into a TLS ABI.
+                with self.assertRaises(subprocess.CalledProcessError) as rejected:
+                    self.compile_probe(
+                        root, target, "#include <errno.h>\n_Thread_local int errno;\n"
+                    )
+                self.assertIn(b"thread-local", rejected.exception.stderr)
 
     def test_layout_rejects_malformed_or_underfunded_requests(self) -> None:
         valid = [

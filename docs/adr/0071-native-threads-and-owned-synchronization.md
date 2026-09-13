@@ -320,6 +320,91 @@ reader is quiescent. Reconstructing the template from a running process's image
 or retaining a borrowed transient converter/source buffer is not valid.
 The compiler/libc profile and initial-thread layout remain explicit prerequisites.
 
+### C compiler and runtime ownership annex
+
+The selected source compatibility baseline for initial integration is C11 and
+this ADR's explicit pthread/C11 subset, interpreted against POSIX.1-2024 where
+that subset claims POSIX behavior. Use the repository's source-linked TROE C
+sysroot/runtime and Rust capability bridge. Do not import musl or glibc's opaque
+TCB, DTV, pthread object representation, Linux syscall assembly, or dynamic TLS
+loader. This settles the bounded source/profile dependency of #206; #63 still
+owns the broader musl-derived maintenance architecture, upstream components,
+standards tiers, licensing and general libc ABI.
+
+The implemented compiler qualification recipe is
+`tools/thread_profile.py`, with the Clang/LLD release pair pinned in
+`sdk/c/thread-profile-v1.json`. It checks C11 freestanding LP64/LE, 32-bit
+`wchar_t`, aligned 64-bit lock-free atomics, static local-exec TLS, and the
+TROE headers on both `*-unknown-none-elf` backend triples. These are LLVM code
+selection triples, not a promise of a third-party OS ABI or host libc.
+X86 code is limited to the baseline/SSE2 state with no red zone or AVX; Arm code
+uses Armv8-A SIMD without outlined atomics. The compiled instruction probes and
+strict KEX converter establish the tested layout contract. They do not prove
+arbitrary C code thread-safe, restore architectural state, or publish workers.
+
+Exact-release qualification records binary/header/source fingerprints and
+rejects a changed observed input, missing required probe, skipped test, or
+failed test. Compatible-tool checks remain useful CI evidence but do not claim
+the pinned release pair. Reports are provenance and regression evidence, not a
+signature, toolchain supply-chain attestation, or runtime admission credential.
+
+The C runtime's ABI 1 is exclusively single-threaded. Its global `errno`,
+process-global TSS values and callback `&mut Runtime` borrows must not become
+reachable from concurrent workers. A threaded bridge requires a separately
+versioned, source-linked binding; changing `pthread_create` alone or mixing an
+ABI-1 archive with threaded headers is invalid. No general binary ABI is frozen.
+The required ownership split before publication is:
+
+| Owner | State and callback rule |
+| --- | --- |
+| Process | allocator, descriptor/open-file objects, stream metadata, cwd/environment snapshots, atexit registration and TSS key definitions; explicit synchronization and bounded metadata |
+| Thread | compiler TLS, errno, TSS values/generations, temporary conversion state, IPC pages, active operation and cleanup phase |
+| Suspended operation | copied scalar inputs and stable leases on referenced objects; no whole-runtime mutable borrow or table lock survives a blocking capability call |
+| Bootstrap | process initialization completes once before a worker is published; bind zeroed thread-local state and validated startup before application callbacks |
+
+Keep critical sections short enough to avoid a process-wide stall: reserve an
+operation and retain its object, release metadata locks, block with the caller's
+private IPC, then reacquire and validate identity/generation before commit.
+Close/delete races invalidate new use while retained in-flight references stay
+charged. The allocator's locking/bootstrap path cannot depend on allocating a
+new lock, and a callback must never return two overlapping mutable Rust borrows.
+This proof belongs to the synchronized bridge in #208, with IPC ownership from
+#188/#207; the compiler qualification does not satisfy it.
+
+TSS keys and compiler TLS are separate lifetimes. Retain 32 bounded process key
+slots, with nonwrapping generations and per-thread value/generation pairs.
+This is an explicit initial-subset capacity, not a claim to all POSIX resource
+minimums.
+A new generation sees null even if a sibling still holds an older value. Key
+deletion invalidates the definition without invoking destructors; it does not
+scan or free other threads' TLS. Reuse cannot revive stale values or callbacks.
+A destructor pass clears the selected value before calling out, commits its
+key-generation snapshot under metadata protection, and releases protection
+before invoking application code. A committed callback may finish during a
+concurrent delete; deletion prevents later commitments for that generation.
+At most four passes run, including values re-registered by callbacks. Normal
+thread exit clears that thread's values, never the process's key definitions.
+Forced process teardown runs no application destructors. Static linkage keeps
+callback code alive; no module-unload lifetime is implied. The applicable
+[POSIX key creation](https://pubs.opengroup.org/onlinepubs/9799919799/functions/pthread_key_create.html)
+and [deletion](https://pubs.opengroup.org/onlinepubs/9799919799/functions/pthread_key_delete.html)
+contracts inform these decisions; generation checks and bounded cleanup are
+explicit TROE requirements, not a claim that all legacy behavior is implemented.
+[OpenBSD also bounds repeated destructor passes](https://man.openbsd.org/pthread_key_create.3),
+supporting a finite cleanup policy without importing its private thread layout.
+
+The compiler layout probes deliberately disable stack protection and RELRO
+because they isolate TLS geometry and pass through the closed converter.
+Those switches are not a production security decision. Before native C thread
+admission, specify and test strong stack protection, unpredictable guard
+initialization before protected C code, guard ownership across thread creation,
+a nonreturning process-fault path, and complete context preservation. Audit any
+unprotected bootstrap instructions separately. A guard cannot be sourced from
+uninitialized/reused TLS or silently replaced with a constant. Likewise,
+production writable relocation metadata must not imply permanently writable
+control state. Until these requirements and complete resource admission pass,
+the profile remains qualification-only and native execution stays disabled.
+
 ### Portable managed-memory layout annex
 
 `troe-application::thread_memory` composes the checked TLS layout with one fixed,
