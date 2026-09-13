@@ -293,7 +293,7 @@ impl ThreadMemoryPlan {
         let charges = ThreadMemoryCharges {
             mapped_pages: add(add(stack_pages, tls.pages())?, 3)?,
             reserved_pages: (reservation_end - reservation_base) / PAGE_SIZE,
-            table_pages: additional_tables(regions),
+            table_pages: additional_tables(regions.map(|region| (region.start(), region.end()))),
             ipc_pairs: 1,
         };
         // The user-range bound also bounds every derived charge and address.
@@ -350,22 +350,25 @@ fn page_bytes(pages: u64) -> Result<u64, ThreadMemoryError> {
         .ok_or(ThreadMemoryError::ArithmeticOverflow)
 }
 
-// Count the union of table prefixes touched by the four ordered mappings at
-// each level below the root. Gaps consume no leaf mappings, and shared prefixes
-// count once. The fixed twelve iterations do not depend on requested stack size.
-// All inputs are private, nonempty, disjoint and bounded by the lower user half.
-fn additional_tables(regions: [ThreadMemoryRegion; 4]) -> u64 {
+// Count prefixes of bounded, validated user mappings, excluding the root.
+// Empty slots consume no tables. Sorting a fixed-size array handles placement
+// before or after the image without allocation or walking individual pages.
+pub(crate) fn additional_tables<const N: usize>(mut regions: [(u64, u64); N]) -> u64 {
+    regions.sort_unstable();
     let mut total = 0;
     for shift in [21, 30, 39] {
         let mut previous = None;
-        for region in regions {
-            let first = region.start() >> shift;
-            let last = (region.end() - 1) >> shift;
+        for (start, end) in regions {
+            if start == end {
+                continue;
+            }
+            let first = start >> shift;
+            let last = (end - 1) >> shift;
             let uncounted = previous.map_or(first, |end: u64| first.max(end + 1));
             if uncounted <= last {
                 total += last - uncounted + 1;
             }
-            previous = Some(last);
+            previous = Some(previous.map_or(last, |end| last.max(end)));
         }
     }
     total

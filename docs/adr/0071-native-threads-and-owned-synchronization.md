@@ -7,8 +7,8 @@ Status: architectural direction accepted, 2026-09-09. Implementation tracked by
 No native thread execution, native TLS, or pthread support is claimed by this document.
 Current single-execution-thread application contracts remain in force.
 Portable lifecycle/synchronization models, an independently compiler-checked
-static TLS layout/initializer, and a guarded thread-memory planner implement
-portions of this direction. The implemented offline
+static TLS layout/initializer, guarded thread-memory planning, and composed
+initial-process geometry/peak memory charges implement portions of this direction. The implemented offline
 [KEX static TLS container 1.3](../formats/kex-static-tls-v1.md) encodes the
 initializer, extent, alignment and worker trampoline under application ABI 1.4.
 Its reader and explicit converter produce no complete native admission proof.
@@ -318,7 +318,9 @@ and each thread's initialized mapping. Reserve before copying, rollback on any
 failure, and release only after creation is revoked and every context/backing
 reader is quiescent. Reconstructing the template from a running process's image
 or retaining a borrowed transient converter/source buffer is not valid.
-The compiler/libc profile and initial-thread layout remain explicit prerequisites.
+The C source/profile boundary is selected in the next annex. The implemented
+initial-process planner below supplies geometry and peak memory preflight; native
+backing ownership, startup publication and the production runtime remain prerequisites.
 
 ### C compiler and runtime ownership annex
 
@@ -463,6 +465,57 @@ own/zero backing and enforce mapping permissions before publication. The
 planner does not establish these facts. Compiled context/wait/mapping/runtime
 metadata, object/key capacities, final defaults and the supervisor/service
 allocation remain acceptance work in #206. Native loading remains unchanged.
+
+### Initial process layout and peak-memory annex
+
+`ProcessMemoryPlan` composes a validated container-1.3 artifact with a trusted
+image base, heap capacity and initial-thread reservation base. It preserves the
+native image minimum and 2 MiB alignment. The shared reservation is the complete
+image span, one read-only/NX process startup page, then an explicit heap capacity
+at least as large as the initial commit and no larger than the application heap
+limit. Its initially committed heap prefix is RW/NX; the remainder stays unmapped
+but reserved. Image holes are reserved too. Heap growth requires new backing and
+table charges before extending this prefix, without invading thread reservations.
+This layout is specific to the new preflight; ABI 1.0–1.3 meanings do not change.
+
+The initial thread uses `ThreadMemoryPlan` without treating it as a worker or
+omitting any of its guards, TLS, IPC or descriptor charges. Its entire reservation
+may be below or above the shared reservation, never overlapping even unmapped
+bytes. Placement still supplies no ASLR entropy or collision check against other
+live owners. Entry and trampoline offsets are resolved only from the validated
+artifact. The standalone initial descriptor has the composed addresses and TLS
+pointer, with worker entry/argument zero; its token is informational. A complete
+native process startup, publication and executable authority are not supplied.
+
+At most sixteen image mappings, process startup, optional committed heap and
+four thread regions fit a fixed array of twenty-two regions. Count the union of
+lower-table prefixes across this array and add one process root; do not add the
+thread's separately conservative table bound again. This counts tables needed by
+user mappings. Architecture-specific kernel/shared root entries and their owned
+tables must be separately accounted by native composition.
+
+The loading model uses dedicated pages for the full executable staging buffer
+and an independent retained initializer copied from its validated immutable
+suffix. Round each allocation separately; zero initialized bytes require zero
+initializer backing pages, while empty compiler TLS still has its own control
+allocation. The original image-source bytes, retained initializer and each
+thread TLS mapping all count independently. Logical steady pages are shared
+mappings plus thread mappings plus combined tables plus initializer backing.
+Peak pages additionally include the complete staged executable. Ordinary frames
+subtract the two already-owned boot IPC pages, while logical residency and one
+task IPC slot still attribute them to the initial thread. The reserved virtual
+charge sums both full, disjoint windows; intervening unreserved addresses do not
+count. Mapped, peak resident, reserved, peak ordinary-frame, task IPC, complete
+TLS, initializer and staging-byte limits must all hold together.
+
+This calculation acquires nothing and promises no successful allocation. Reserve
+before copying, and keep the peak charged until the staging owner is actually
+released. Package headers/manifests, signature or I/O staging, allocator overhead,
+context/mapping/wait/runtime metadata and service reserves are additional inputs.
+The native integration must retain an immutable process-lifetime initializer,
+rollback partial preparation, revoke creation and wait for quiescence before
+releasing it. Those ownership and complete native-admission obligations remain
+in #206/#207; a copyable plan is not evidence that they have been satisfied.
 
 ### Native mapping and TSS ownership
 

@@ -9,6 +9,7 @@ mod executable;
 mod limits;
 mod package;
 mod plan;
+pub mod process_memory;
 mod sha256;
 mod startup;
 pub mod static_tls;

@@ -76,7 +76,10 @@ never executes the ordinary application.
   x86 CPUs. Direct handoffs preserve the absolute 50 ms lease; expiry faults
   the active IPC participant and does not replay the call;
 - thread preflight: allocation-free typed wire/startup codecs and checked memory
-  plans, including a separately charged read-only descriptor page. The active
+  plans, including a separately charged read-only descriptor page. Whole-process
+  preflight rejects overlap with image holes, heap growth reservations and thread
+  guards; peak budgets include separate immutable-initializer and executable
+  staging backing. Preflight does not acquire or authenticate that backing. The active
   loader and SDK reject the assigned threaded startup revision and reject thread
   interfaces in older startup records. Offline TLS conversion requires an explicit
   container revision, validates the immutable initializer against its image source,

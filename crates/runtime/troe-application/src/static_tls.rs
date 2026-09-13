@@ -1,7 +1,8 @@
 //! Allocation-free layout and initialization of one local-exec static TLS block.
 //!
-//! This is a portable policy component, not an admitted KEX encoding. KEX loaders
-//! and converters still reject TLS. The input describes a single linked template
+//! This is a portable policy component, not native admission. The explicit KEX
+//! TLS converter uses this geometry; native loaders still reject TLS artifacts.
+//! The input describes a single linked template
 //! with zero alignment residue; ELF alignment zero must first be normalized to
 //! one. There is no dynamic TLS, DTV, libc-private TCB, or destructor registry.
 
