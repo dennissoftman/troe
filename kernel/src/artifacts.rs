@@ -103,9 +103,16 @@ pub(crate) fn native_kex_artifact(probe: ApplicationProbe) -> &'static [u8] {
                 include_bytes!("../../tests/kex-corpus/native-heap-growth-limit-aarch64.kex")
             }
         }
-        #[cfg(all(feature = "acceptance-probes", target_arch = "aarch64"))]
+        #[cfg(feature = "acceptance-probes")]
         ApplicationProbe::ThreadPointer => {
-            include_bytes!("../../tests/kex-corpus/native-thread-pointer-aarch64.kex")
+            #[cfg(target_arch = "x86_64")]
+            {
+                include_bytes!("../../tests/kex-corpus/native-thread-pointer-x86_64.kex")
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                include_bytes!("../../tests/kex-corpus/native-thread-pointer-aarch64.kex")
+            }
         }
         #[cfg(feature = "acceptance-probes")]
         ApplicationProbe::InvalidCall => {

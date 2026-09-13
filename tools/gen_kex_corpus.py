@@ -33,6 +33,15 @@ NATIVE_CODE = {
             "83fa047514817c241070696e67750a4883c42031ff31c0cd80bf0100000031c0cd"
             "800f0b"
         ),
+        # User FS selects the actual user data descriptor before the first
+        # yield; the kernel binds its independent base to the stack marker.
+        # Check selector and FS:0 across yields and a preemptible loop.
+        "thread-pointer": bytes.fromhex(
+            "8cd0668ee04c8d6424c049c7042478563412b801000000cd808ce08cd26639d0755b64488b04"
+            "2500000000483d78563412754abb00e1f505ffcb75fc8ce08cd26639d0753864488b04250000"
+            "0000483d785634127527b801000000cd808ce08cd26639d0751764488b042500000000483d78"
+            "563412750631ff31c0cd80bf0100000031c0cd800f0b"
+        ),
         "spin": bytes.fromhex("ebfe"),
         "heap-growth-limit": bytes.fromhex(
             "b80300000048c7c7ffffffff31f631d24531d24531c0cd8031ff31c0cd800f0b"
@@ -411,17 +420,17 @@ def generate_corpus() -> dict[str, bytes]:
                 f"Target::{'X86_64' if target == 'x86_64' else 'Aarch64'}),"
             )
 
-        if target == "aarch64":
-            probe = "thread-pointer"
-            artifact = _canonical(
-                target, NATIVE_CODE[target][probe] + ACCEPTANCE_MARKER
-            )
-            name = f"native-{probe}-{target}.kex"
-            files[name] = _put_u16(bytearray(artifact), 20, 2)
-            manifest.append(f"{name}\t{target}\tok")
-            valid_rows.append(
-                f'    ("{name}", include_bytes!("{name}") as &[u8], Target::Aarch64),'
-            )
+        probe = "thread-pointer"
+        artifact = _canonical(
+            target, NATIVE_CODE[target][probe] + ACCEPTANCE_MARKER
+        )
+        name = f"native-{probe}-{target}.kex"
+        files[name] = _put_u16(bytearray(artifact), 20, 2)
+        manifest.append(f"{name}\t{target}\tok")
+        valid_rows.append(
+            f'    ("{name}", include_bytes!("{name}") as &[u8], '
+            f"Target::{'X86_64' if target == 'x86_64' else 'Aarch64'}),"
+        )
 
         boundary_artifacts = {
             "standard-max-records": _canonical(

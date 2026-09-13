@@ -6,6 +6,7 @@ native-spin-x86_64.kex	x86_64	ok
 native-heap-growth-limit-x86_64.kex	x86_64	ok
 native-invalid-call-x86_64.kex	x86_64	ok
 native-unexpected-return-x86_64.kex	x86_64	ok
+native-thread-pointer-x86_64.kex	x86_64	ok
 valid-standard-max-records-x86_64.kex	x86_64	ok
 valid-standard-max-span-x86_64.kex	x86_64	ok
 valid-standard-minimum-span-x86_64.kex	x86_64	ok

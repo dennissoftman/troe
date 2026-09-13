@@ -540,6 +540,13 @@ x86-64 and AArch64 backends; it is not a generic ABI for other machines.
 All Rust-calling x86 gates execute `cld` and clear `RFLAGS.AC` before the call.
 The original user RFLAGS remains in the hardware/application frame and is
 restored only when that user continuation is deliberately resumed.
+Syscall and user-timer frames independently save the FS selector and full FS
+base. They clear both before calling Rust; input IRQs also save, clear and
+restore both. Terminal exception gates clear FS before dispatch. Kernel timer
+IRQs enter with the kernel's zero FS state. Each resumed user context restores
+the selector before the base. The acceptance handlers check the actual hardware
+selector/base before doing their work; the loader probes also check that both
+are zero after each native return, including faults and final exit.
 
 ### AArch64 gates
 
@@ -558,8 +565,16 @@ preemption preserves it in the complete resumable application context.
 The acceptance image exercises successful and invalid syscalls, translation,
 write-permission, execute-permission, illegal-instruction, unexpected-entry,
 page-return, execution-timer, external input/network IRQ, heap-growth-limit,
-and AArch64 thread-pointer preservation paths. Terminal fault sessions exercise
-kernel-origin write, execute, synchronous-exception, and task-stack-guard paths.
+and both architecture thread-pointer preservation paths. The x86 probe binds
+only a validated writable nonexecutable user word while retaining a nonzero
+user data selector, rejects null, executable and overflowing addresses without
+modifying the saved context, then verifies FS:0 and the selector after yield
+and actual timer preemption. A 1 ms initial probe slice forces the preemption;
+subsequent slices use the ordinary 50 ms limit. Read-only checks
+verify the retained base and selector before each resume, without repairing
+them. The loop and accepted preemption count are bounded. Terminal fault
+sessions exercise kernel-origin write, execute, synchronous-exception, and
+task-stack-guard paths.
 The acceptance image exceeds 1 MiB and therefore also exercises the
 page-relative data-symbol relocations used by AArch64 entry and completion.
 The source contract test pins assembly ordering that cannot be probabilistically

@@ -57,6 +57,9 @@ never executes the ordinary application.
   CPU-reported physical-address limits checked before activation;
 - exception state: interrupts masked during ownership transition, all x86
   exception gates present, and double fault uses a dedicated IST stack;
+- x86 TLS context: independently saved FS selector/base, cleared before Rust
+  trap handlers and after application completion, and restored only from the
+  retained context. FSGSBASE is disabled; TLS never supplies kernel identity;
 - tasks and process records: at most 65,536, with monotonic identities, explicit
   capabilities, deterministic lifecycle accounting, fallible metadata growth,
   and guarded native stack payloads;

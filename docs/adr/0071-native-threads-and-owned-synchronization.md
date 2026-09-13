@@ -35,8 +35,11 @@ The resident runtime already supplies isolated roots, resumable user contexts,
 preemption, process ownership, guarded mappings, and bounded wait models.
 `ApplicationSession` currently owns both a root and one register context;
 `ResidentApplication` similarly combines process and execution ownership.
-AArch64 already saves a thread-pointer field; the x86 saved context does not
-yet carry a corresponding TLS base. Native KEX loaders reject TLS metadata;
+AArch64 saves TPIDR_EL0; the x86 saved context independently retains its FS
+selector and base. The x86 gates clear FS before Rust handlers and restore its
+selector before its base on resume. An acceptance-only checked setter exercises
+TLS-word access across yield and actual timer preemption; it does not implement
+native TLS allocation or admission. Native KEX loaders reject TLS metadata;
 the separate offline container reader does not change that boundary.
 These are starting points, not evidence of thread support.
 
