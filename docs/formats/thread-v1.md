@@ -68,8 +68,12 @@ ownership on failure so a retained wait can be recovered or retired after stop;
 it never selects a new caller or renews CPU time.
 Native acceptance authenticates a restricted built-in control handle and returns
 the captured caller's live token for Current through the owned operation
-dispatcher. The native probe executes no other operation and does not change
-ordinary application admission.
+dispatcher. Separate synchronization acceptance uses a closed interface 31
+handle and kernel-created fixture objects to exercise lock/wait/unlock, condition
+notification/reacquisition, permit acquisition/batch release and destruction.
+It retains owned policy waits beside their native execution claims across
+sibling execution and rejects late completion after a native process fault.
+These probes do not change ordinary application admission.
 
 ## Requests
 

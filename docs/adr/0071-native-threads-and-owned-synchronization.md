@@ -17,7 +17,11 @@ Native acceptance composes a restricted control capability with Current calls
 and process-scoped live thread-token resolution. The native owner also claims
 each captured call once into a non-cloneable execution value and returns that
 ownership if completion fails. The Current probe uses the owned operation
-dispatcher; it does not activate application grants or general native operations.
+dispatcher. Separate native synchronization acceptance retains owned policy waits
+beside native execution claims across mutex/condition/permit handoffs, validates
+complete replies in user instructions, and rejects completion after a sibling's
+native fault. These acceptance paths do not activate application grants or the
+complete native lifecycle.
 Current single-execution-thread application contracts remain in force.
 Portable lifecycle/synchronization models, an independently compiler-checked
 static TLS layout/initializer, guarded thread-memory planning, and composed
