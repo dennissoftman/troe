@@ -616,7 +616,16 @@ allocates a buffer or renews CPU entitlement.
 Native acceptance composes the dispatcher authority check and owned operation
 dispatcher with captured Current calls. Its restricted control handle belongs
 to the process record's task principal, and replies identify the captured caller.
-This probe does not enable scheduler services for admitted application packages.
+A separate synchronization probe pairs owned native execution claims with owned
+policy waits while another user context runs. Kernel-created fixture objects
+exercise native mutex contention, condition notification/reacquisition, permit
+transfer, overflow, already-expired deadlines and object destruction. Both user
+programs validate the complete reply records. A native fault while the sibling
+is blocked revokes both contexts and retires the logical wait; late completion
+cannot publish a reply. Fixed pending/script storage has an explicit bound, and
+each scenario verifies retained metadata, IPC zeroization/reuse and complete
+frame reclamation. These probes do not enable scheduler services for admitted
+application packages or establish process-share scheduling.
 Unsaved AVX-family, SVE, and SME state remains disabled rather than leaking or
 corrupting across tasks. ABI call 0 exits through the owned gate. The x86
 local-APIC and AArch64 generic physical timers capture a complete resumable

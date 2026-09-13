@@ -79,8 +79,9 @@ never executes the ordinary application.
   repeat claims. Completion failure returns the owned execution for safe recovery
   or retirement after process stop. Capability and operation authority remain
   composition obligations; native acceptance uses the owned operation dispatcher
-  with a restricted built-in control handle and captured Current calls. Ordinary application
-  admission does not enable scheduler calls;
+  for captured Current calls and synchronization requests under separate closed
+  handles. Pending synchronization claims cannot complete after a sibling's
+  native fault. Ordinary application admission does not enable scheduler calls;
 - tasks and process records: at most 65,536, with monotonic identities, explicit
   capabilities, deterministic lifecycle accounting, fallible metadata growth,
   and guarded native stack payloads. Portable thread and synchronization lookup

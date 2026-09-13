@@ -644,8 +644,22 @@ owned across the other's native fault; its late completion returns stale without
 changing RX or reviving a context.
 Native builds assert that suspension/fault outcomes cannot collide with the
 inline IPC continuation sentinel or application exit statuses.
-The probe executes only Current identity observations and no synchronization
-operation. These native mechanism checks do not establish threaded package
+The Current probe executes only identity observations. The separate native
+synchronization probe uses kernel-created mutex, condition and permit fixtures
+and two user programs that copy canonical TX requests and compare all 32 RX
+bytes. Its normal path checks mutex contention, condition notification followed
+by reacquisition, permit transfer, atomic batch overflow, already-expired permit
+and condition deadlines, and destruction. Twenty requests include three retained
+waits; owned policy/native claims survive sibling execution and reject duplicate
+execution. Each program records the number of replies it actually checked.
+A second path faults the mutex owner while the sibling has an owned blocked
+acquisition. It requires process-wide native stop, logical wait retirement,
+rejection of late observation/completion and unchanged RX. Both paths check
+unchanged retained metadata, bounded pending/script storage, zeroed IPC slot
+reuse and full frame-accounting recovery. Fixture scheduling serializes each
+operation through any timer preemption; it does not measure process-share
+fairness or expiry of a queued real-time deadline.
+These native mechanism checks do not establish threaded package
 admission, process-share scheduling, compiler TLS initialization or C/CPython
 thread safety.
 The acceptance image exceeds 1 MiB and therefore also exercises the

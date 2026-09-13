@@ -74,6 +74,8 @@ const CODE: &[u8] = &[
     0x08, 0x00, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4, 0x00, 0x00, 0x20, 0xd4,
 ];
 
+mod synchronization;
+
 const PAGE: u64 = 4096;
 const METADATA_LIMIT: usize = 16 * 1024;
 const TX: [u64; 2] = [USER_STACK_BASE + 12 * PAGE, USER_STACK_BASE + 15 * PAGE];
@@ -84,7 +86,7 @@ pub(crate) fn verify(accounting: &mut OwnedAccounting) -> Result<(), ()> {
     let allocation = allocate_isolated(&mut accounting.frames)?;
     let result = (|| {
         let pairs = allocate_pairs()?;
-        let (plan, _) = prepare(&allocation, &accounting.kernel_plan, &pairs)?;
+        let (plan, _) = prepare(&allocation, &accounting.kernel_plan, &pairs, CODE)?;
         let root =
             troe_machine::build_user_address_space(&plan, allocation.tables).map_err(|_| ())?;
         let mut scheduler = Scheduler::new(2).map_err(|_| ())?;
@@ -192,7 +194,7 @@ pub(crate) fn verify(accounting: &mut OwnedAccounting) -> Result<(), ()> {
         verify_reused(&pairs, prior)?;
         let pair_capacity = pairs.capacity();
         let identities = pair_identities(&pairs);
-        let (plan, starts) = prepare(&allocation, &accounting.kernel_plan, &pairs)?;
+        let (plan, starts) = prepare(&allocation, &accounting.kernel_plan, &pairs, CODE)?;
         let authority = ProbeScheduler::new(&processes, owner)?;
         for (index, id) in [first, second].into_iter().enumerate() {
             let tls =
@@ -469,16 +471,17 @@ pub(crate) fn verify(accounting: &mut OwnedAccounting) -> Result<(), ()> {
     if accounting.frames.free_frames() != free || threads.committed_pages() != 0 {
         return Err(());
     }
-    Ok(())
+    synchronization::verify(accounting)
 }
 
 fn prepare(
     allocation: &IsolatedAllocation,
     kernel: &MappingPlan,
     pairs: &[IpcPagePair],
+    code: &[u8],
 ) -> Result<(MappingPlan, [NativeThreadStart; 2]), ()> {
     troe_machine::zero_physical_range(allocation.complete).map_err(|_| ())?;
-    troe_machine::copy_to_physical(allocation.code, 0, CODE).map_err(|_| ())?;
+    troe_machine::copy_to_physical(allocation.code, 0, code).map_err(|_| ())?;
     let base = build_isolated_plan(kernel, allocation)?;
     let mut plan = MappingPlan::new();
     for mapping in base.mappings() {
