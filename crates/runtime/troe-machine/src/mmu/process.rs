@@ -366,6 +366,17 @@ impl NativeProcessContext {
         Ok(u64::from_le_bytes(bytes))
     }
 
+    /// Inspect a native leaf independently of published user-region metadata.
+    /// Acceptance uses this to distinguish a partially written PTE from a
+    /// readable published mapping while the failed process remains stopped.
+    ///
+    /// # Errors
+    /// Rejects absent or structurally invalid page-table entries.
+    #[cfg(feature = "acceptance-probes")]
+    pub fn probe_leaf(&self, address: u64) -> Result<u64, MmuError> {
+        super::architecture_translate_page(self.backing.address_space.root, address)
+    }
+
     /// Copy one suspended thread's validated request into kernel-owned storage.
     ///
     /// # Errors

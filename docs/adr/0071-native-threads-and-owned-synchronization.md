@@ -10,8 +10,8 @@ lifecycle identity, role and charge, preflights complete windows/backing and
 bounded root-table capacity, then encodes private descriptors and binds retained
 IPC. Compiler-generated local-exec TLS acceptance exercises initial/worker entry
 and initial-thread retirement with a live sibling. This does not activate the
-threaded loader or production C runtime. Individual retirement preflights physical backing and
-user aliases, removes private mappings and returns an ordinary-frame reclamation
+threaded loader or production C runtime. Individual retirement preflights physical
+backing and user aliases, removes private mappings and returns an ordinary-frame reclamation
 receipt; partial mutation failure stops the complete process. Native acceptance
 executes Join across physical acknowledgement and target reaping, then verifies
 hardware denial of retired-page reads. The native owner also captures scheduler calls and

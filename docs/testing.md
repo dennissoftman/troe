@@ -719,19 +719,26 @@ stack/TLS/startup/TX/RX reads after the user has checked both replies. The
 Start-wins case verifies the target remains mapped before any target execution;
 alias and startup-reference cases reject removal without mutation and prevent
 late success after process stop. Every case restores physical/logical accounting.
-Dynamic admission probes start from shared code/startup mappings and add initial
+Dynamic admission probes start from shared code/startup/heap mappings and add initial
 and worker windows with compiler-generated local-exec TLS. The user code checks
 both entry argument conventions, initialized and zero TLS, independent mutation
 across yields, complete descriptor bytes and shared-header survival after the
 initial thread exits. Native checks cover unpublished-page clearing, immutable
 descriptors, unmapped guards, initial descriptor retirement, IPC generation reuse,
 preflight rejection and terminal partial mapping with retained IPC ownership.
+The partial case checks the written stack PTE independently of user-region
+metadata, which remains unpublished and denies public reads; the next TLS leaf
+is absent and every continuation is stopped.
 An abort/re-admission case reuses the same virtual window with fresh logical and
 IPC generations, initialized TLS, and rejection of the old incarnation.
 Record-capacity, Ready-before-admission and root-table-budget failures cannot
 publish mappings. A writable header alias, wrong initial descriptor reference,
 or worker substitution of another header is rejected. All cases recover physical
 and logical resource baselines.
+The worker window is one GiB from the initial window, requiring a new lower
+directory and leaf table. Both tables remain process-owned through partial
+admission, retirement and same-window reuse. Failed admission verification emits
+the scenario and fixture stage before the outer load-boundary failure.
 The inspected source and linker layout are
 `kernel/src/memory/shared_context_probe/admission/program.c` and `program.ld`;
 `program.rs` contains only their linked `.text` bytes and worker-entry offsets.

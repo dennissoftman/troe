@@ -41,7 +41,7 @@ const BUDGET: ThreadMemoryBudget = ThreadMemoryBudget {
     ipc_pairs: 1,
 };
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Scenario {
     Complete,
     Reuse,
@@ -81,6 +81,7 @@ pub(super) fn verify(accounting: &mut OwnedAccounting) -> Result<(), ()> {
         let free = accounting.frames.free_frames();
         let allocation = allocate_isolated(&mut accounting.frames)?;
         let mut frames = [None; 2];
+        let mut stage = "frame allocation";
         let result = (|| {
             for owner in &mut frames {
                 *owner = Some(
@@ -90,8 +91,14 @@ pub(super) fn verify(accounting: &mut OwnedAccounting) -> Result<(), ()> {
                         .map_err(|_| ())?,
                 );
             }
-            run(accounting, &allocation, &mut frames, scenario)
+            run(accounting, &allocation, &mut frames, scenario, &mut stage)
         })();
+        if result.is_err() {
+            let _ = troe_machine::write(
+                alloc::format!("native admission verification failed: {scenario:?}: {stage}\n")
+                    .as_bytes(),
+            );
+        }
         // Every run-local root dropped before either ordinary owner is recycled.
         for range in frames.into_iter().flatten() {
             troe_machine::zero_physical_range(range).map_err(|_| ())?;
@@ -153,7 +160,7 @@ impl Policy {
                 origin: ProcessOrigin::Foreground,
                 started_millis: 0,
                 table_pages,
-                private_pages: 12,
+                private_pages: 13,
                 handles: 1,
             })
             .map_err(|_| ())?;
@@ -223,8 +230,9 @@ impl Memory {
         range: PhysicalRange,
         tls: StaticTlsLayout,
     ) -> Result<Self, ()> {
-        let plan = ThreadMemoryPlan::new(USER_STACK_BASE + index as u64 * 0x2_0000, 1, tls, BUDGET)
-            .map_err(|_| ())?;
+        let plan =
+            ThreadMemoryPlan::new(USER_STACK_BASE + index as u64 * 0x4000_0000, 1, tls, BUDGET)
+                .map_err(|_| ())?;
         let [stack, tls_region, ipc, startup] = plan.regions();
         let descriptor = StartupDescriptor {
             thread: Token::decode(thread_token(threads, id.process(), id)?).map_err(|_| ())?,
@@ -378,6 +386,20 @@ fn mappings(
         .map_err(|_| ())?,
     )
     .map_err(|_| ())?;
+    // The shared root includes a committed heap page, as the ordinary builder
+    // requires executable and writable user mappings before it returns a root.
+    // Private thread mappings are still absent until admit_prepared succeeds.
+    plan.insert(
+        Mapping::user(
+            VirtualRange::from_pages(USER_DATA_BASE + 2 * PAGE, 1).map_err(|_| ())?,
+            PhysicalRange::from_pages(allocation.stack.start(), 1).map_err(|_| ())?,
+            MappingPermissions::READ_WRITE,
+            MappingOwner::IsolatedTask,
+            MappingLifetime::Task,
+        )
+        .map_err(|_| ())?,
+    )
+    .map_err(|_| ())?;
     Ok(plan)
 }
 
@@ -387,7 +409,9 @@ fn run(
     allocation: &IsolatedAllocation,
     frames: &mut [Option<PhysicalRange>; 2],
     scenario: Scenario,
+    stage: &mut &'static str,
 ) -> Result<Reclamation, ()> {
+    *stage = "shared root and initial resources";
     let mut plan = mappings(accounting, allocation)?;
     if scenario == Scenario::HeaderAlias {
         plan.insert(
@@ -411,7 +435,9 @@ fn run(
     } else {
         allocation.tables
     };
+    *stage = "initial root build";
     let root = troe_machine::build_user_address_space(&plan, tables).map_err(|_| ())?;
+    *stage = "initial policy";
     let mut policy = Policy::new(root.stats().table_pages)?;
     let owner = policy.authority.process.id();
     let initial = policy.ids[0].ok_or(())?;
@@ -421,6 +447,7 @@ fn run(
         Target::Aarch64
     };
     let tls = StaticTlsLayout::new(target, 8, 16, 8, 1).map_err(|_| ())?;
+    *stage = "initial compiler TLS";
     let first = Memory::new(0, initial, &policy.threads, frames[0].ok_or(())?, tls)?;
     for (offset, value) in [
         (0, HEADER),
@@ -442,6 +469,7 @@ fn run(
         &Request::Exit(u64::MAX).encode().map_err(|_| ())?,
     )
     .map_err(|_| ())?;
+    *stage = "initial native owner";
     let mut native = NativeProcessContext::new(
         owner,
         root,
@@ -451,6 +479,7 @@ fn run(
     .map_err(|_| ())?;
     let baseline = native.stats();
     let metadata = native.metadata_bytes();
+    *stage = "initial IPC owner";
     let pair = IpcPagePair::allocate().map_err(|_| ())?;
     let mut identities = [(pair.slot(), pair.generation(), pair.range()); 2];
     if matches!(scenario, Scenario::Tables | Scenario::HeaderAlias) {
@@ -475,6 +504,7 @@ fn run(
         drop(native);
         return policy.stop();
     }
+    *stage = "initial admission and entry";
     let pair = rejections(
         &mut native,
         &policy.threads,
@@ -493,10 +523,11 @@ fn run(
     }
     policy.threads.start(owner, initial).map_err(|_| ())?;
     policy.threads.dispatch(owner, initial).map_err(|_| ())?;
-    if resume(&mut native, initial)? != NativeThreadStop::Yielded {
+    if resume(&mut native, initial, ApplicationResume::Timeslice)? != NativeThreadStop::Yielded {
         return Err(());
     }
     first.verify(&native, tls, 1)?;
+    *stage = "worker preparation";
     let mut worker = policy
         .threads
         .prepare_worker(
@@ -528,6 +559,7 @@ fn run(
     if scenario == Scenario::Ready {
         policy.threads.start(owner, worker).map_err(|_| ())?;
     }
+    *stage = "worker mapping";
     let result = if scenario == Scenario::Partial {
         native.probe_admission_failure(&policy.threads, second.admission(worker), pair)
     } else {
@@ -539,9 +571,16 @@ fn run(
     ) {
         match result {
             Err(NativeThreadAdmissionError::Stopped(_)) if scenario == Scenario::Partial => {
+                *stage = "partial mapping containment";
                 if !native.is_stopped()
+                    || native.stats().table_pages != before.table_pages + 2
                     || native.stats().mapped_pages != before.mapped_pages + 1
-                    || native.probe_word(second.descriptor.stack_bottom).is_err()
+                    || native
+                        .probe_leaf(second.descriptor.stack_bottom)
+                        .map_err(|_| ())?
+                        != second.extents[0].start()
+                    || native.probe_leaf(second.descriptor.tls_base).is_ok()
+                    || native.probe_word(second.descriptor.stack_bottom).is_ok()
                     || native.probe_word(second.descriptor.tls_base).is_ok()
                     || native
                         .resume(initial, ApplicationResume::Timeslice, 1)
@@ -578,7 +617,14 @@ fn run(
         }
         return policy.stop();
     }
+    *stage = "worker mapping result";
     result.map_err(|_| ())?;
+    // The worker is one GiB away: the existing root branch needs a new lower
+    // directory and leaf table. Retirement and same-window reuse retain both.
+    if native.stats().table_pages != before.table_pages + 2 {
+        return Err(());
+    }
+    *stage = "same-window re-admission";
     if scenario == Scenario::Reuse {
         let old = worker;
         policy.threads.abort_prepared(owner, old).map_err(|_| ())?;
@@ -642,7 +688,9 @@ fn run(
             return Err(());
         }
     }
+    *stage = "compiler TLS and descriptor checks";
     second.verify(&native, tls, 0)?;
+    *stage = "retained initial words before worker start";
     first.verify(&native, tls, 1)?;
     policy
         .threads
@@ -654,13 +702,33 @@ fn run(
         (initial, &first, 2),
         (worker, &second, 2),
     ] {
+        *stage = if id == initial {
+            "initial C resume"
+        } else {
+            "worker C resume"
+        };
         policy.threads.dispatch(owner, id).map_err(|_| ())?;
-        if resume(&mut native, id)? != NativeThreadStop::Yielded {
+        let completion = if cycles == 1 {
+            ApplicationResume::Timeslice
+        } else {
+            ApplicationResume::Yield
+        };
+        let stopped = resume(&mut native, id, completion)?;
+        if stopped != NativeThreadStop::Yielded {
+            let _ = troe_machine::write(
+                alloc::format!("native admission unexpected stop: {stopped:?}\n").as_bytes(),
+            );
             return Err(());
         }
+        *stage = if id == initial {
+            "initial C word verification"
+        } else {
+            "worker C word verification"
+        };
         memory.verify(&native, tls, cycles)?;
         policy.threads.yield_running(owner, id).map_err(|_| ())?;
     }
+    *stage = "initial retirement";
     policy.threads.dispatch(owner, initial).map_err(|_| ())?;
     retire(
         &mut native,
@@ -688,6 +756,7 @@ fn run(
     {
         return Err(());
     }
+    *stage = "surviving worker";
     second.verify(&native, tls, 2)?;
     policy.threads.dispatch(owner, worker).map_err(|_| ())?;
     if matches!(scenario, Scenario::Complete | Scenario::Reuse) {
@@ -708,13 +777,16 @@ fn run(
         } else {
             IsolatedFault::Translation
         };
-        if resume(&mut native, worker)? != NativeThreadStop::ProcessFaulted(expected)
+        if resume(&mut native, worker, ApplicationResume::Yield)?
+            != NativeThreadStop::ProcessFaulted(expected)
             || !native.is_stopped()
         {
             return Err(());
         }
     }
-    if !troe_machine::ipc_range_is_zero(replacement.range()) || native.metadata_bytes() != metadata
+    if !troe_machine::ipc_range_is_zero(replacement.range())
+        || native.metadata_bytes() != metadata
+        || native.stats().table_pages != baseline.table_pages + 2
     {
         return Err(());
     }
@@ -727,17 +799,21 @@ fn run(
     {
         return Err(());
     }
+    *stage = "final teardown";
     policy.stop()
 }
 
-fn resume(native: &mut NativeProcessContext, id: ThreadId) -> Result<NativeThreadStop, ()> {
+fn resume(
+    native: &mut NativeProcessContext,
+    id: ThreadId,
+    mut completion: ApplicationResume<'_>,
+) -> Result<NativeThreadStop, ()> {
     for _ in 0..20 {
-        let stop = native
-            .resume(id, ApplicationResume::Timeslice, 50)
-            .map_err(|_| ())?;
+        let stop = native.resume(id, completion, 50).map_err(|_| ())?;
         if stop != NativeThreadStop::Preempted {
             return Ok(stop);
         }
+        completion = ApplicationResume::Timeslice;
     }
     Err(())
 }
@@ -808,7 +884,8 @@ fn retire(
     frames: &mut Option<PhysicalRange>,
     accounting: &mut OwnedAccounting,
 ) -> Result<(), ()> {
-    let NativeThreadStop::SchedulerCall(call) = resume(native, id)? else {
+    let NativeThreadStop::SchedulerCall(call) = resume(native, id, ApplicationResume::Yield)?
+    else {
         return Err(());
     };
     let admitted = policy
