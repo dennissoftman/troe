@@ -260,7 +260,10 @@ available physical memory is the practical bound.
 
 ## ABI 1.3 private-page IPC calls
 
-The acceptance harness binds one isolated client and one persistent echo task.
+The persistent runtime binds multiple independently owned client and server
+contexts. The acceptance harness additionally retains its two-context comparison.
+Persistent boot services use immutable wait sets and lifecycle initialization;
+ordinary client handles cannot name an instance before readiness commits.
 Calls 0–3 retain their existing contracts for all supported minors. Call 4 is
 `ipc_call(handle, opcode, request_bytes, reply_capacity, deadline_millis,
 object_parameter)`. It sends the exact TX prefix and returns `(status,
@@ -293,8 +296,10 @@ normal two-result convention. Receive words are:
 | 5 | maximum permitted reply bytes |
 
 Non-call events zero words 1 and 3–5. Only calls and client-closed events carry
-a badge. The synthetic harness exercises calls and deadlines; the codec also
-validates the remaining closed event vocabulary. Badges use an eight-bit slot
+a badge. Immutable endpoint wait sets choose ready sources round-robin, with
+terminal and expired events preceding ordinary calls. Last-handle closure
+delivers one client-closed event after that badge's admitted calls finish.
+Badges use an eight-bit slot
 and 24-bit nonwrapping generation. Service statuses remain 0–23; transport
 results add 24 `closed`, 25 `peer-died`, and 26 `deadlock`. Services cannot forge
 these terminal transport results. Existing `exhausted` and `timeout` statuses
@@ -302,8 +307,9 @@ retain values 4 and 7.
 
 `CommandContext::take_ipc` transfers the SDK's unique, non-cloneable `IpcPages`
 owner once. Its `tx`, `rx`, and `buffers` borrows cannot survive another mutable
-call. `PersistentContext` and `persistent_entry!` expose the typed server event
-and atomic reply/wait operation. ABI 1.0–1.2 contexts have no IPC page owner. The generated raw `_start` symbols
+call. `PersistentContext` and `persistent_entry!` expose the typed server event,
+atomic reply/wait operation, and nested calls through typed startup grants.
+ABI 1.0–1.2 contexts have no IPC page owner. The generated raw `_start` symbols
 are unsafe Rust entry points: only one native startup invocation may construct
 these owners. Their native calling convention is unchanged.
 

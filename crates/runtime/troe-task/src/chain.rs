@@ -64,7 +64,14 @@ impl fmt::Display for CallChainError {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Chain {
-    members: Vec<TaskId>,
+    members: [TaskId; MAX_CALL_CHAIN_MEMBERS],
+    len: usize,
+}
+
+impl Chain {
+    fn members(&self) -> &[TaskId] {
+        &self.members[..self.len]
+    }
 }
 
 /// Live and high-water chain accounting.
@@ -125,6 +132,9 @@ impl CallChainTable {
     /// caller or target that already owns a synchronous call as
     /// [`CallChainError::Busy`]. Every check runs before any mutation, so a
     /// rejected call leaves the table unchanged.
+    // Let native composition eliminate copies while retaining every model check.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn enter(&mut self, caller: TaskId, target: TaskId) -> Result<usize, CallChainError> {
         if caller == target {
             self.stats.deadlocks = self.stats.deadlocks.saturating_add(1);
@@ -161,10 +171,10 @@ impl CallChainTable {
             .ok_or(CallChainError::NotActive)?;
         // Only the member currently running may donate onward. A task further
         // up the chain is blocked and cannot be calling.
-        if chain.members.last() != Some(&caller) {
+        if chain.members().last() != Some(&caller) {
             return Err(CallChainError::Busy);
         }
-        if chain.members.len() >= MAX_CALL_CHAIN_MEMBERS {
+        if chain.len >= MAX_CALL_CHAIN_MEMBERS {
             self.stats.exhaustions = self.stats.exhaustions.saturating_add(1);
             return Err(CallChainError::Exhausted);
         }
@@ -173,12 +183,16 @@ impl CallChainTable {
             .get_mut(index)
             .and_then(Option::as_mut)
             .ok_or(CallChainError::NotActive)?;
-        chain.members.push(target);
-        let depth = chain.members.len();
+        chain.members[chain.len] = target;
+        chain.len += 1;
+        let depth = chain.len;
         self.record_entry(depth);
         Ok(depth)
     }
 
+    // Let native composition eliminate copies while retaining every model check.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn begin(&mut self, caller: TaskId, target: TaskId) -> Result<usize, CallChainError> {
         let index = self
             .chains
@@ -188,18 +202,17 @@ impl CallChainTable {
             .inspect_err(|_| {
                 self.stats.exhaustions = self.stats.exhaustions.saturating_add(1);
             })?;
-        let mut members = Vec::new();
-        members
-            .try_reserve_exact(MAX_CALL_CHAIN_MEMBERS)
-            .map_err(|_| CallChainError::Exhausted)?;
-        members.push(caller);
-        members.push(target);
-        let depth = members.len();
+        let mut members = [caller; MAX_CALL_CHAIN_MEMBERS];
+        members[1] = target;
+        let depth = 2;
         let slot = self
             .chains
             .get_mut(index)
             .ok_or(CallChainError::Exhausted)?;
-        *slot = Some(Chain { members });
+        *slot = Some(Chain {
+            members,
+            len: depth,
+        });
         self.stats.live = self.stats.live.saturating_add(1);
         self.record_entry(depth);
         Ok(depth)
@@ -215,6 +228,9 @@ impl CallChainTable {
     /// # Errors
     ///
     /// Rejects a task that is not the active member of any chain.
+    // Let native composition eliminate copies while retaining every model check.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn unwind(&mut self, member: TaskId) -> Result<Option<TaskId>, CallChainError> {
         let index = self.chain_of(member).ok_or(CallChainError::NotActive)?;
         let chain = self
@@ -222,15 +238,15 @@ impl CallChainTable {
             .get_mut(index)
             .and_then(Option::as_mut)
             .ok_or(CallChainError::NotActive)?;
-        if chain.members.last() != Some(&member) {
+        if chain.members().last() != Some(&member) {
             return Err(CallChainError::NotActive);
         }
-        chain.members.pop();
-        let resumed = chain.members.last().copied();
+        chain.len -= 1;
+        let resumed = chain.members().last().copied();
         // One remaining member is an initiator with no outstanding call, which
         // is not a chain: the record is released so its slot and that task are
         // both free again.
-        if chain.members.len() <= 1 {
+        if chain.len <= 1 {
             *self
                 .chains
                 .get_mut(index)
@@ -251,35 +267,60 @@ impl CallChainTable {
     /// Rejects a task that takes part in no chain, and a failed reservation.
     pub fn abandon(&mut self, member: TaskId) -> Result<Vec<TaskId>, CallChainError> {
         let index = self.chain_of(member).ok_or(CallChainError::NotActive)?;
-        let slot = self
-            .chains
-            .get_mut(index)
-            .ok_or(CallChainError::NotActive)?;
-        let chain = slot.take().ok_or(CallChainError::NotActive)?;
+        let members = self.chains[index]
+            .as_ref()
+            .ok_or(CallChainError::NotActive)?
+            .members();
+        let mut abandoned = Vec::new();
+        abandoned
+            .try_reserve_exact(members.len())
+            .map_err(|_| CallChainError::Exhausted)?;
+        abandoned.extend_from_slice(members);
+        self.detach(member)?;
+        Ok(abandoned)
+    }
+
+    /// Release a chain without allocating or retaining a task reference.
+    ///
+    /// Composition reads [`Self::members`] before detaching to complete each
+    /// pending call with its own terminal fate.
+    ///
+    /// # Errors
+    /// Rejects a task that does not belong to a live chain.
+    pub fn detach(&mut self, member: TaskId) -> Result<(), CallChainError> {
+        let index = self.chain_of(member).ok_or(CallChainError::NotActive)?;
+        self.chains[index] = None;
         self.stats.live = self.stats.live.saturating_sub(1);
-        Ok(chain.members)
+        Ok(())
     }
 
     /// The member currently running in the chain one task takes part in.
     #[must_use]
+    // Reuse the checked chain lookup inside a native reply/unwind transition.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn active(&self, member: TaskId) -> Option<TaskId> {
         self.chain_of(member)
             .and_then(|index| self.chains.get(index))
             .and_then(Option::as_ref)
-            .and_then(|chain| chain.members.last().copied())
+            .and_then(|chain| chain.members().last().copied())
     }
 
     /// Members of the chain one task takes part in, initiator first.
     #[must_use]
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn members(&self, member: TaskId) -> Option<&[TaskId]> {
         self.chain_of(member)
             .and_then(|index| self.chains.get(index))
             .and_then(Option::as_ref)
-            .map(|chain| chain.members.as_slice())
+            .map(Chain::members)
     }
 
     /// Depth of the chain one task takes part in.
     #[must_use]
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     pub fn depth(&self, member: TaskId) -> usize {
         self.members(member).map_or(0, <[TaskId]>::len)
     }
@@ -302,10 +343,16 @@ impl CallChainTable {
         self.chains.len()
     }
 
+    // Preserve bounded membership checks without an aggregate call boundary.
+    #[allow(clippy::inline_always)]
+    #[inline(always)]
     fn chain_of(&self, task: TaskId) -> Option<usize> {
+        if self.stats.live == 0 {
+            return None;
+        }
         self.chains.iter().position(|slot| {
             slot.as_ref()
-                .is_some_and(|chain| chain.members.contains(&task))
+                .is_some_and(|chain| chain.members().contains(&task))
         })
     }
 

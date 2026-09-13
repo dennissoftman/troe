@@ -475,6 +475,13 @@ or machine lifecycle state and therefore execute in the invoking shell. The two
 terminal actions remain behind the shell's explicit machine-control capability;
 ordinary KEX applications cannot acquire that authority or invoke an intrinsic
 through application ABI 1.3. No ordinary command has a privileged fallback.
+Native diagnostics MUST use the persistent ABI 1.3 service instance. The kernel
+MUST publish readiness only after successful empty lifecycle initialization,
+retain exact incarnation ownership through teardown, and enforce the configured
+restart bound. Kernel service waits MUST retain pointer-free scalar continuation
+records and original absolute deadlines. Direct IPC handoffs MUST NOT reprogram
+or extend the current 50 ms execution lease. Network and storage services retain
+their current in-process composition.
 
 ### 11.5 Resident jobs and services
 

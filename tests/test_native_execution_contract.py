@@ -20,6 +20,7 @@ def kernel_module(relative: str) -> str:
 ARTIFACTS_SOURCE = kernel_module("artifacts.rs")
 DEFERRED_SOURCE = kernel_module("deferred.rs")
 INVOCATION_SOURCE = kernel_module("invocation.rs")
+COMPATIBILITY_SOURCE = kernel_module("invocation/compatibility.rs")
 LAUNCH_MEMORY_SOURCE = kernel_module("memory/launch.rs")
 GROWTH_MEMORY_SOURCE = kernel_module("memory/growth.rs")
 CONTRACT_SOURCE = (REPO_ROOT / "docs/testing.md").read_text(encoding="utf-8")
@@ -268,11 +269,7 @@ class NativeExecutionContractTests(unittest.TestCase):
     def test_timeslices_and_local_service_budgets_do_not_cap_process_lifetime(
         self,
     ) -> None:
-        runner = source_between(
-            INVOCATION_SOURCE,
-            "fn run_command_application(",
-            "fn command_application_error(",
-        )
+        runner = source_after(COMPATIBILITY_SOURCE, "fn run_command_application(")
         budget = source_between(runner, "let terminal = loop", "match outcome")
         self.assertIn("ApplicationOutcome::HandleCall", budget)
         self.assertIn("if service_call && let Some(service_call_limit)", budget)
@@ -340,20 +337,34 @@ class NativeExecutionContractTests(unittest.TestCase):
         self.assertIn("cancel_owner(owner, WakeReason::Revoked)", deferred_state)
         self.assertIn("teardown_owner(owner, WakeReason::Revoked)", deferred_state)
 
-        runner = source_between(
-            INVOCATION_SOURCE,
-            "fn run_command_application(",
-            "fn command_application_error(",
-        )
+        runner = source_after(COMPATIBILITY_SOURCE, "fn run_command_application(")
         self.assertIn("resume_deferred_application_call(", runner)
         self.assertIn("state.revoke_owner(task_id)", runner)
 
-    def test_command_cleanup_failures_are_terminal(self) -> None:
-        runner = source_between(
+    def test_product_service_waits_use_separate_scalar_continuations(self) -> None:
+        self.assertIn(
+            '#[cfg(feature = "acceptance-probes")]\nmod compatibility;',
             INVOCATION_SOURCE,
-            "fn run_command_application(",
-            "fn command_application_error(",
         )
+        client = kernel_module("client.rs")
+        for execution in (
+            "run_application(",
+            "resume_application(",
+            ".run(",
+            "supervisor::step(",
+        ):
+            self.assertNotIn(execution, client)
+        resident = kernel_module("resident/application.rs")
+        completion = source_between(
+            resident, "fn complete_diagnostics_call(", "fn request_deferred_cancel("
+        )
+        self.assertIn("crate::client::submit(", completion)
+        self.assertIn("crate::client::consume(", completion)
+        self.assertNotIn("run_diagnostics_server(", completion)
+        self.assertNotIn("supervisor::step(", completion)
+
+    def test_command_cleanup_failures_are_terminal(self) -> None:
+        runner = source_after(COMPATIBILITY_SOURCE, "fn run_command_application(")
         self.assertIn("rollback_command_application_task(", runner)
         self.assertIn("reclaim_command_application(", runner)
 

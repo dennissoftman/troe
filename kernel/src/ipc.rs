@@ -8,7 +8,7 @@ use crate::memory::launch::{
     allocate_application, prepare_application_memory, reclaim_application,
     terminate_revoke_and_reap_task, write_launch_bytes,
 };
-use crate::probes::{EchoService, emit_ipc_samples, ipc_percentile};
+use crate::probes::{EchoService, append_ipc_samples, ipc_percentile};
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use troe_application::{InitialHandle, StartupInfo, parse_kex, parse_kex_package};
@@ -16,12 +16,13 @@ use troe_dispatch::{BadgeTable, Dispatcher, HandleOwner, PortId, Rights};
 use troe_machine::{ApplicationOutcome, ApplicationSession, IpcPair, IpcStop};
 use troe_task::{Capabilities, IsolationResource, Scheduler, StackResource, TaskId};
 
-struct ProbeTask {
-    allocation: ApplicationAllocation,
-    task: TaskId,
-    owner: HandleOwner,
-    startup: u64,
-    session: ApplicationSession,
+pub(crate) struct ProbeTask {
+    pub(crate) actor: Option<troe_service::ipc::Actor>,
+    pub(crate) allocation: ApplicationAllocation,
+    pub(crate) task: TaskId,
+    pub(crate) owner: HandleOwner,
+    pub(crate) startup: u64,
+    pub(crate) session: ApplicationSession,
 }
 
 fn artifact(server: bool) -> &'static [u8] {
@@ -44,13 +45,12 @@ fn artifact(server: bool) -> &'static [u8] {
 }
 
 #[derive(Clone, Copy)]
-struct ProbeRequest {
-    bytes: usize,
-    opcode: u16,
-    argument: u64,
+pub(crate) struct ProbeRequest {
+    pub(crate) bytes: usize,
+    pub(crate) opcode: u16,
+    pub(crate) argument: u64,
 }
 
-#[allow(clippy::too_many_lines)]
 fn launch(
     accounting: &mut OwnedAccounting,
     scheduler: &mut Scheduler,
@@ -58,6 +58,44 @@ fn launch(
     port: PortId,
     server: bool,
     request: ProbeRequest,
+) -> Result<ProbeTask, ()> {
+    launch_owned(
+        accounting, scheduler, dispatcher, port, server, request, None,
+    )
+}
+
+pub(crate) fn launch_protected(
+    accounting: &mut OwnedAccounting,
+    scheduler: &mut Scheduler,
+    dispatcher: &mut Dispatcher<'_>,
+    port: PortId,
+    request: ProbeRequest,
+    runtime: &mut troe_machine::ProtectedRuntime,
+    endpoint: troe_dispatch::EndpointId,
+) -> Result<ProbeTask, ()> {
+    launch_owned(
+        accounting,
+        scheduler,
+        dispatcher,
+        port,
+        false,
+        request,
+        Some((runtime, endpoint)),
+    )
+}
+
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn launch_owned(
+    accounting: &mut OwnedAccounting,
+    scheduler: &mut Scheduler,
+    dispatcher: &mut Dispatcher<'_>,
+    port: PortId,
+    server: bool,
+    request: ProbeRequest,
+    mut protected: Option<(
+        &mut troe_machine::ProtectedRuntime,
+        troe_dispatch::EndpointId,
+    )>,
 ) -> Result<ProbeTask, ()> {
     let ProbeRequest {
         bytes,
@@ -89,6 +127,7 @@ fn launch(
     })?;
     let mut task_id = None;
     let mut live_owner = None;
+    let mut actor = None;
     let setup = (|| {
         prepare_application_memory(&allocation, &plan)?;
         let mut root =
@@ -165,6 +204,19 @@ fn launch(
                 minor,
             });
         }
+        if let Some((runtime, endpoint)) = protected.as_mut() {
+            let owner = runtime.model().attach(Some(task)).map_err(|_| ())?;
+            actor = Some(owner);
+            let value = runtime
+                .model()
+                .open(owner, *endpoint, troe_abi::interface::DIAGNOSTICS, 1, 0)
+                .map_err(|_| ())?;
+            handles
+                .iter_mut()
+                .find(|h| h.interface == troe_abi::interface::DIAGNOSTICS)
+                .ok_or(())?
+                .value = value;
+        }
         let mut startup = [0; 4096];
         plan.encode_startup_page(
             StartupInfo {
@@ -221,6 +273,7 @@ fn launch(
     })();
     if let Ok((task, owner, session)) = setup {
         Ok(ProbeTask {
+            actor,
             allocation,
             task,
             owner,
@@ -228,6 +281,11 @@ fn launch(
             session,
         })
     } else {
+        if let Some(actor) = actor
+            && let Some((runtime, _)) = protected.as_mut()
+        {
+            runtime.model().terminate(actor, false).map_err(|_| ())?;
+        }
         if let Some(task) = task_id {
             terminate_revoke_and_reap_task(scheduler, task, dispatcher, live_owner)?;
         }
@@ -237,214 +295,210 @@ fn launch(
 }
 
 #[allow(clippy::too_many_lines)]
-pub(crate) fn verify(
+pub(crate) fn measure(
     scheduler: &mut Scheduler,
     accounting: &mut OwnedAccounting,
-    compatibility_p95: [u64; 4],
+    bytes: usize,
+    compatibility_p95: u64,
+    stale_tags: &mut Option<[troe_machine::TagIdentity; 2]>,
+    transcript: &mut alloc::string::String,
 ) -> Result<(), ()> {
-    troe_machine::verify_ipc_pool().map_err(|_| ())?;
-    let mut stale_tags: Option<[troe_machine::TagIdentity; 2]> = None;
-    for (index, bytes) in [0, 64, 256, 4096].into_iter().enumerate() {
-        for queued in [false, true] {
-            let free = accounting.frames.free_frames();
-            let mut dispatcher = Dispatcher::new(1, 16).map_err(|_| ())?;
-            let (port, root_handle) = dispatcher
-                .register(Box::new(EchoService), Rights::CALL)
-                .map_err(|_| ())?;
-            let server = launch(
-                accounting,
-                scheduler,
-                &mut dispatcher,
-                port,
-                true,
-                ProbeRequest {
-                    bytes,
-                    opcode: if queued { 2 } else { 1 },
-                    argument: 0,
-                },
-            )
-            .inspect_err(|()| {
-                let _ = troe_machine::write(b"ipc-probe failure=server-launch\n");
-            })?;
-            let Ok(client) = launch(
-                accounting,
-                scheduler,
-                &mut dispatcher,
-                port,
-                false,
-                ProbeRequest {
-                    bytes,
-                    opcode: if queued { 2 } else { 1 },
-                    argument: 0,
-                },
-            ) else {
-                terminate_revoke_and_reap_task(
-                    scheduler,
-                    server.task,
-                    &mut dispatcher,
-                    Some(server.owner),
-                )?;
-                drop(server.session);
-                reclaim_application(accounting, server.allocation)?;
-                return Err(());
-            };
-            if stale_tags
-                .is_some_and(|tags| tags.into_iter().any(troe_machine::TagIdentity::is_live))
-            {
-                return Err(());
-            }
-            let identities = [
-                client.session.tag_identity().ok_or(())?,
-                server.session.tag_identity().ok_or(())?,
-            ];
-            if identities.iter().any(|tag| !tag.is_live()) {
-                return Err(());
-            }
-            let mut badges = BadgeTable::new(1).map_err(|_| ())?;
-            let badge = badges.open(0, client.owner).map_err(|_| ())?;
-            let mut pair = IpcPair::new(
-                client.session,
-                server.session,
-                client.startup,
-                server.startup,
-                u32::try_from(badge.event_value()).map_err(|_| ())?,
-            )
-            .map_err(|error| {
-                let _ = troe_machine::write(
-                    alloc::format!("ipc-probe failure=pair error={error:?}\n").as_bytes(),
-                );
-            })?;
-            let (next, stop) = pair.run().map_err(|_| ())?;
-            pair = next;
-            if stop != IpcStop::Yielded
-                || !pair.quiescent()
-                || pair.samples().len() != IPC_BASELINE_WARMUP_CALLS
-            {
-                return Err(());
-            }
-            let before = pair.stats();
-            let tags = troe_machine::tag_stats();
-            let allocation_calls = troe_machine::heap_stats().allocation_calls;
-            let execution = troe_machine::application_execution_stats();
-            let tasks = scheduler.stats();
-            let (next, stop) = pair.run().map_err(|_| ())?;
-            pair = next;
-            if stop != IpcStop::Yielded || !pair.quiescent() {
-                let _ = troe_machine::write(
-                    alloc::format!(
-                        "ipc-probe failure=run stop={stop:?} stats={:?}\n",
-                        pair.stats()
-                    )
-                    .as_bytes(),
-                );
-                return Err(());
-            }
-            let mut samples: [u64; IPC_BASELINE_SAMPLES] =
-                pair.samples().try_into().map_err(|_| ())?;
-            let after = pair.stats();
-            let final_tags = troe_machine::tag_stats();
-            let calls = IPC_BASELINE_SAMPLES as u64;
-            let request_copies = after.request_copies - before.request_copies;
-            let reply_copies = after.reply_copies - before.reply_copies;
-            let roots = final_tags.root_writes - tags.root_writes;
-            let full = final_tags.full_invalidations - tags.full_invalidations;
-            let targeted = final_tags.targeted_invalidations - tags.targeted_invalidations;
-            let additional_lease_programs =
-                after.additional_lease_programs - before.additional_lease_programs;
-            let traps = after.traps - before.traps;
-            let hits = final_tags.hits - tags.hits;
-            let queue_zeroes = after.queue_zeroes - before.queue_zeroes;
-            if after.completed - before.completed != calls
-                || after.direct - before.direct != if queued { 0 } else { calls }
-                || after.queued - before.queued != if queued { calls } else { 0 }
-                || request_copies
-                    != if bytes == 0 {
-                        0
-                    } else {
-                        calls * if queued { 2 } else { 1 }
-                    }
-                || reply_copies != if bytes == 0 { 0 } else { calls }
-                || roots != calls * 2
-                || targeted != 0
-                || additional_lease_programs != 0
-                || traps != calls * if queued { 3 } else { 2 } + 1
-                || hits != if tags.supported { roots } else { 0 }
-                || troe_machine::application_execution_stats().timer_programs
-                    - execution.timer_programs
-                    != 1
-                || scheduler.stats() != tasks
-                || full != if tags.supported { 0 } else { roots }
-                || queue_zeroes != if queued { calls } else { 0 }
-                || troe_machine::heap_stats().allocation_calls != allocation_calls
-            {
-                return Err(());
-            }
-            let path = if queued {
-                "persistent-queued"
-            } else {
-                "persistent-direct"
-            };
-            emit_ipc_samples(
-                path,
+    for queued in [false, true] {
+        let free = accounting.frames.free_frames();
+        let mut dispatcher = Dispatcher::new(1, 16).map_err(|_| ())?;
+        let (port, root_handle) = dispatcher
+            .register(Box::new(EchoService), Rights::CALL)
+            .map_err(|_| ())?;
+        let server = launch(
+            accounting,
+            scheduler,
+            &mut dispatcher,
+            port,
+            true,
+            ProbeRequest {
                 bytes,
-                troe_machine::benchmark_counter_frequency_hz().ok_or(())?,
-                &samples,
-            )?;
-            samples.sort_unstable();
-            let p95 = ipc_percentile(&samples, 95);
-            let ratio_limit = if bytes == 4096 { 70 } else { 60 };
-            let ratio_pass =
-                p95.saturating_mul(100) <= compatibility_p95[index].saturating_mul(ratio_limit);
-            let line = alloc::format!(
-                "ipc-phase-b path={path} payload={bytes} warmup=64 samples=256 p95_ticks={p95} compatibility_p95={} ratio_limit={ratio_limit} ratio_pass={} tagged={} calls={calls} request_copies={request_copies} reply_copies={reply_copies} root_writes={roots} targeted_invalidations={targeted} full_invalidations={full} queue_slots={queue_zeroes} traps={traps} tag_hits={hits} steady_allocations=0 scheduler_scans=0 additional_lease_programs={additional_lease_programs}\n",
-                compatibility_p95[index],
-                u8::from(ratio_pass),
-                u8::from(tags.supported)
-            );
-            if !troe_machine::write(line.as_bytes()) {
-                return Err(());
-            }
-            let client_range = client.allocation.ipc.as_ref().ok_or(())?.range();
-            let server_range = server.allocation.ipc.as_ref().ok_or(())?.range();
-            terminate_revoke_and_reap_task(
-                scheduler,
-                client.task,
-                &mut dispatcher,
-                Some(client.owner),
-            )?;
+                opcode: if queued { 2 } else { 1 },
+                argument: 0,
+            },
+        )
+        .inspect_err(|()| {
+            let _ = troe_machine::write(b"ipc-probe failure=server-launch\n");
+        })?;
+        let Ok(client) = launch(
+            accounting,
+            scheduler,
+            &mut dispatcher,
+            port,
+            false,
+            ProbeRequest {
+                bytes,
+                opcode: if queued { 2 } else { 1 },
+                argument: 0,
+            },
+        ) else {
             terminate_revoke_and_reap_task(
                 scheduler,
                 server.task,
                 &mut dispatcher,
                 Some(server.owner),
             )?;
-            drop(pair);
-            if identities.iter().any(|tag| tag.is_live()) {
-                return Err(());
-            }
-            stale_tags = Some(identities);
-            reclaim_application(accounting, client.allocation)?;
+            drop(server.session);
             reclaim_application(accounting, server.allocation)?;
-            if !troe_machine::ipc_range_is_zero(client_range)
-                || !troe_machine::ipc_range_is_zero(server_range)
-            {
-                return Err(());
-            }
-            dispatcher.close(root_handle).map_err(|_| ())?;
-            if accounting.frames.free_frames() != free {
-                return Err(());
-            }
-            if tags.supported && !queued && !ratio_pass {
-                return Err(());
-            }
+            return Err(());
+        };
+        if stale_tags.is_some_and(|tags| tags.into_iter().any(troe_machine::TagIdentity::is_live)) {
+            return Err(());
+        }
+        let identities = [
+            client.session.tag_identity().ok_or(())?,
+            server.session.tag_identity().ok_or(())?,
+        ];
+        if identities.iter().any(|tag| !tag.is_live()) {
+            return Err(());
+        }
+        let mut badges = BadgeTable::new(1).map_err(|_| ())?;
+        let badge = badges.open(0, client.owner).map_err(|_| ())?;
+        let mut pair = IpcPair::new(
+            client.session,
+            server.session,
+            client.startup,
+            server.startup,
+            u32::try_from(badge.event_value()).map_err(|_| ())?,
+        )
+        .map_err(|error| {
+            let _ = troe_machine::write(
+                alloc::format!("ipc-probe failure=pair error={error:?}\n").as_bytes(),
+            );
+        })?;
+        let (next, stop) = pair.run().map_err(|_| ())?;
+        pair = next;
+        if stop != IpcStop::Yielded
+            || !pair.quiescent()
+            || pair.samples().len() != IPC_BASELINE_WARMUP_CALLS
+        {
+            return Err(());
+        }
+        let before = pair.stats();
+        let tags = troe_machine::tag_stats();
+        let allocation_calls = troe_machine::heap_stats().allocation_calls;
+        let execution = troe_machine::application_execution_stats();
+        let tasks = scheduler.stats();
+        let (next, stop) = pair.run().map_err(|_| ())?;
+        pair = next;
+        if stop != IpcStop::Yielded || !pair.quiescent() {
+            let _ = troe_machine::write(
+                alloc::format!(
+                    "ipc-probe failure=run stop={stop:?} stats={:?}\n",
+                    pair.stats()
+                )
+                .as_bytes(),
+            );
+            return Err(());
+        }
+        let mut samples: [u64; IPC_BASELINE_SAMPLES] = pair.samples().try_into().map_err(|_| ())?;
+        let after = pair.stats();
+        let final_tags = troe_machine::tag_stats();
+        let calls = IPC_BASELINE_SAMPLES as u64;
+        let request_copies = after.request_copies - before.request_copies;
+        let reply_copies = after.reply_copies - before.reply_copies;
+        let roots = final_tags.root_writes - tags.root_writes;
+        let full = final_tags.full_invalidations - tags.full_invalidations;
+        let targeted = final_tags.targeted_invalidations - tags.targeted_invalidations;
+        let additional_lease_programs =
+            after.additional_lease_programs - before.additional_lease_programs;
+        let traps = after.traps - before.traps;
+        let hits = final_tags.hits - tags.hits;
+        let queue_zeroes = after.queue_zeroes - before.queue_zeroes;
+        if after.completed - before.completed != calls
+            || after.direct - before.direct != if queued { 0 } else { calls }
+            || after.queued - before.queued != if queued { calls } else { 0 }
+            || request_copies
+                != if bytes == 0 {
+                    0
+                } else {
+                    calls * if queued { 2 } else { 1 }
+                }
+            || reply_copies != if bytes == 0 { 0 } else { calls }
+            || roots != calls * 2
+            || targeted != 0
+            || additional_lease_programs != 0
+            || traps != calls * if queued { 3 } else { 2 } + 1
+            || hits != if tags.supported { roots } else { 0 }
+            || troe_machine::application_execution_stats().timer_programs - execution.timer_programs
+                != 1
+            || scheduler.stats() != tasks
+            || full != if tags.supported { 0 } else { roots }
+            || queue_zeroes != if queued { calls } else { 0 }
+            || troe_machine::heap_stats().allocation_calls != allocation_calls
+        {
+            return Err(());
+        }
+        let path = if queued {
+            "persistent-queued"
+        } else {
+            "persistent-direct"
+        };
+        append_ipc_samples(
+            transcript,
+            path,
+            bytes,
+            troe_machine::benchmark_counter_frequency_hz().ok_or(())?,
+            &samples,
+        )?;
+        samples.sort_unstable();
+        let p95 = ipc_percentile(&samples, 95);
+        let ratio_limit = 70;
+        let ratio_pass = p95.saturating_mul(100) <= compatibility_p95.saturating_mul(ratio_limit);
+        let line = alloc::format!(
+            "ipc-phase-b path={path} payload={bytes} warmup=64 samples=256 p95_ticks={p95} compatibility_p95={} ratio_limit={ratio_limit} ratio_pass={} tagged={} calls={calls} request_copies={request_copies} reply_copies={reply_copies} root_writes={roots} targeted_invalidations={targeted} full_invalidations={full} queue_slots={queue_zeroes} traps={traps} tag_hits={hits} steady_allocations=0 scheduler_scans=0 additional_lease_programs={additional_lease_programs}\n",
+            compatibility_p95,
+            u8::from(ratio_pass),
+            u8::from(tags.supported)
+        );
+        transcript.push_str(&line);
+        let client_range = client.allocation.ipc.as_ref().ok_or(())?.range();
+        let server_range = server.allocation.ipc.as_ref().ok_or(())?.range();
+        terminate_revoke_and_reap_task(
+            scheduler,
+            client.task,
+            &mut dispatcher,
+            Some(client.owner),
+        )?;
+        terminate_revoke_and_reap_task(
+            scheduler,
+            server.task,
+            &mut dispatcher,
+            Some(server.owner),
+        )?;
+        drop(pair);
+        if identities.iter().any(|tag| tag.is_live()) {
+            return Err(());
+        }
+        *stale_tags = Some(identities);
+        reclaim_application(accounting, client.allocation)?;
+        reclaim_application(accounting, server.allocation)?;
+        if !troe_machine::ipc_range_is_zero(client_range)
+            || !troe_machine::ipc_range_is_zero(server_range)
+        {
+            return Err(());
+        }
+        dispatcher.close(root_handle).map_err(|_| ())?;
+        if accounting.frames.free_frames() != free {
+            return Err(());
+        }
+        if tags.supported && !queued && !ratio_pass {
+            return Err(());
         }
     }
-    verify_faults(scheduler, accounting)
+    Ok(())
 }
 
 /// Native fates are checked before all roots, handles, and pages are reclaimed.
 #[allow(clippy::too_many_lines)]
-fn verify_faults(scheduler: &mut Scheduler, accounting: &mut OwnedAccounting) -> Result<(), ()> {
+pub(crate) fn verify_faults(
+    scheduler: &mut Scheduler,
+    accounting: &mut OwnedAccounting,
+) -> Result<(), ()> {
     use troe_machine::IsolatedFault;
     for opcode in [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 16, 17] {
         let free = accounting.frames.free_frames();

@@ -64,8 +64,9 @@ owner-scoped bounded byte pipes. Neither capability implies the other.
 `server-endpoint` retains interface 15 version 1.0 with call authority for the
 compatibility diagnostics server. `persistent-endpoint` selects the same ID at
 version 2.0 with receive/reply authority; `wait-set` selects interface 24 version
-1.0 with wait authority. The ABI 1.3 synthetic acceptance launcher checks this
-exact manifest before supplying its two boot-selected grants. Ordinary command
+1.0 with wait authority. The ABI 1.3 persistent-service launcher checks this
+exact manifest before supplying its endpoint and wait-set grants, plus any
+boot-selected nested-call grant. Ordinary command
 launch does not grant these persistent-server capabilities.
 
 The builder embeds the encoded manifest before the executable in

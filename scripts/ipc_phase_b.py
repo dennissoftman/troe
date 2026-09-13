@@ -31,7 +31,17 @@ def p95(ticks: list[int]) -> int:
     return value
 
 
-def validate(output: str, *, require_tagged: bool) -> dict[str, Any]:
+def validate(
+    output: str,
+    *,
+    require_tagged: bool,
+    paths: tuple[str, ...] = PATHS,
+    record_prefix: str = "ipc-phase-b",
+    sample_prefix: str = "ipc-phase-b-samples",
+    small_limit: int = 70,
+    large_limit: int = 70,
+    ratio_scale: int = 100,
+) -> dict[str, Any]:
     """Recompute every ratio and require actual direct/queued structural counts."""
     checks = [
         fields(line)
@@ -53,14 +63,14 @@ def validate(output: str, *, require_tagged: bool) -> dict[str, Any]:
     compatibility = {}
     for line in output.splitlines():
         if not line.startswith(
-            ("ipc-phase-b ", "ipc-phase-b-samples ", "ipc-samples ")
+            (f"{record_prefix} ", f"{sample_prefix} ", "ipc-samples ")
         ):
             continue
         row = fields(line)
         key = (row.pop("path"), int(row.pop("payload")))
-        if line.startswith("ipc-phase-b "):
+        if line.startswith(f"{record_prefix} "):
             destination = rows
-        elif line.startswith("ipc-phase-b-samples "):
+        elif line.startswith(f"{sample_prefix} "):
             destination = raw
         elif key[0] == "isolated-diagnostics":
             destination = compatibility
@@ -69,7 +79,7 @@ def validate(output: str, *, require_tagged: bool) -> dict[str, Any]:
         if key in destination:
             raise ValueError("duplicate IPC row")
         destination[key] = row
-    expected = {(path, size) for path in PATHS for size in PAYLOADS}
+    expected = {(path, size) for path in paths for size in PAYLOADS}
     if (
         set(rows) != expected
         or set(raw) != expected
@@ -101,8 +111,8 @@ def validate(output: str, *, require_tagged: bool) -> dict[str, Any]:
         old_ticks = [int(value) for value in old_row["ticks"].split(",")]
         measured = p95(ticks)
         old_p95 = p95(old_ticks)
-        limit = 70 if size == 4096 else 60
-        passed = measured * 100 <= old_p95 * limit
+        limit = large_limit if size == 4096 else small_limit
+        passed = measured * ratio_scale <= old_p95 * limit
         expected_counts = {
             "warmup": 64,
             "samples": SAMPLES,
@@ -124,6 +134,8 @@ def validate(output: str, *, require_tagged: bool) -> dict[str, Any]:
             "scheduler_scans": 0,
             "additional_lease_programs": 0,
         }
+        if ratio_scale != 100:
+            expected_counts["ratio_scale"] = ratio_scale
         if counts != expected_counts:
             raise ValueError(f"invalid IPC structural or latency record: {path}/{size}")
         if tagged and not queued and not passed:

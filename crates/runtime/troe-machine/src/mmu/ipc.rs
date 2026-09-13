@@ -300,10 +300,12 @@ impl IpcPair {
     }
 
     fn publish_wait(&mut self, deadline: u64) -> Result<(), MmuError> {
-        let now = crate::monotonic_millis().ok_or(MmuError::ExecutionTimerUnavailable)?;
         // The synthetic endpoint has no device sources. A finite future wait
-        // remains retained until a client or its deadline is observed.
-        self.waiting = deadline == u64::MAX || deadline > now;
+        // remains retained until a client or its deadline is observed. The
+        // explicit infinite-wait sentinel needs no counter read; call deadlines
+        // and the absolute execution lease remain independently enforced.
+        self.waiting = deadline == u64::MAX
+            || deadline > crate::monotonic_millis().ok_or(MmuError::ExecutionTimerUnavailable)?;
         if !self.waiting {
             set_event(&mut self.peers[1].context, idle_event(EventKind::Deadline));
         }
@@ -323,6 +325,17 @@ impl IpcPair {
         frame: &mut ArchitectureApplicationContext,
     ) -> Result<(), MmuError> {
         self.peers[self.active].context = frame.clone();
+        self.resume_saved(destination, frame)
+    }
+
+    /// Resume a peer after the outgoing context has already been saved.
+    /// Reply/wait can change the saved server event, so copying the old trap
+    /// frame over it here would lose the newly published wait completion.
+    fn resume_saved(
+        &mut self,
+        destination: usize,
+        frame: &mut ArchitectureApplicationContext,
+    ) -> Result<(), MmuError> {
         *frame = self.peers[destination].context.clone();
         self.peers[destination]
             .address_space
@@ -511,7 +524,6 @@ impl IpcPair {
         // caller. No scheduler scan or execution-timer operation occurs here.
         self.peers[1].context = frame.clone();
         self.publish_wait(wait.deadline_millis)?;
-        *frame = self.peers[1].context.clone();
         application_context_set_results(
             &mut self.peers[0].context,
             if expired {
@@ -524,7 +536,7 @@ impl IpcPair {
         if expired {
             self.stats.timeouts = self.stats.timeouts.saturating_add(1);
         }
-        self.switch(0, frame)?;
+        self.resume_saved(0, frame)?;
         self.stats.completed = self.stats.completed.saturating_add(1);
         self.stats.last_ticks = ticks().saturating_sub(started);
         #[cfg(feature = "acceptance-probes")]
@@ -541,8 +553,7 @@ impl UserAddressSpace {
     ///
     /// # Errors
     /// Rejects absent or incompatible endpoint and wait-set authority. Only the
-    /// synthetic acceptance composition publishes persistent endpoints.
-    #[cfg(feature = "acceptance-probes")]
+    /// kernel composition publishes persistent endpoints.
     pub fn authorize_persistent_ipc(&mut self, startup: u64) -> Result<(), MmuError> {
         authority(self, startup, troe_abi::interface::SERVER_ENDPOINT, 2, 6)?;
         let (wait_set, _) = authority(self, startup, troe_abi::interface::WAIT_SET, 1, 8)?;
@@ -554,7 +565,7 @@ impl UserAddressSpace {
     }
 }
 
-fn authority(
+pub(super) fn authority(
     space: &UserAddressSpace,
     startup: u64,
     interface: u32,
@@ -641,7 +652,10 @@ fn idle_event(kind: EventKind) -> Event {
     }
 }
 #[cfg(target_arch = "x86_64")]
-fn set_event(context: &mut ArchitectureApplicationContext, event: Event) {
+// Keep scalar event encoding inside the checked context handoff.
+#[allow(clippy::inline_always)]
+#[inline(always)]
+pub(super) fn set_event(context: &mut ArchitectureApplicationContext, event: Event) {
     let words = event.words();
     (
         context.rax,
@@ -653,7 +667,10 @@ fn set_event(context: &mut ArchitectureApplicationContext, event: Event) {
     ) = (words[0], words[1], words[2], words[3], words[4], words[5]);
 }
 #[cfg(target_arch = "aarch64")]
-fn set_event(context: &mut ArchitectureApplicationContext, event: Event) {
+// Keep scalar event encoding inside the checked context handoff.
+#[allow(clippy::inline_always)]
+#[inline(always)]
+pub(super) fn set_event(context: &mut ArchitectureApplicationContext, event: Event) {
     context.general[..6].copy_from_slice(&event.words());
 }
 

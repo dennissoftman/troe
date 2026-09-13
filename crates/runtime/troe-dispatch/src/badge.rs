@@ -318,6 +318,17 @@ impl BadgeTable {
         Ok(closing)
     }
 
+    /// Observe closure readiness without consuming an event or moving a cursor.
+    #[must_use]
+    pub fn has_closed(&self, endpoint_slot: u32) -> bool {
+        if self.pending_closed == 0 {
+            return false;
+        }
+        self.slots
+            .iter()
+            .any(|slot| slot.endpoint_slot == endpoint_slot && slot.state == BadgeState::Closed)
+    }
+
     /// Consume one pending `client-closed` event at an endpoint.
     ///
     /// Delivery is in slot order so a server observes closures deterministically

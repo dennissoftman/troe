@@ -11,6 +11,8 @@
 TROE is an experimental Rust operating system for small, predictable virtual
 machines. It boots as a native UEFI image and provides an interactive shell,
 isolated command-line applications, persistent state, and virtio networking.
+Diagnostics runs in a persistent isolated service with bounded restart and
+incarnation-bound client authority.
 
 Most of TROE is portable `no_std` Rust. Project-authored unsafe code is confined
 to one audited machine boundary; portable crates forbid it.

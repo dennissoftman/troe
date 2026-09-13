@@ -24,6 +24,8 @@ mod artifacts;
 #[cfg(all(target_os = "uefi", feature = "acceptance-probes"))]
 mod boot_baseline;
 #[cfg(target_os = "uefi")]
+mod client;
+#[cfg(target_os = "uefi")]
 mod console;
 #[cfg(target_os = "uefi")]
 mod deferred;
@@ -69,6 +71,8 @@ mod shell;
 mod storage;
 #[cfg(target_os = "uefi")]
 mod supervision;
+#[cfg(target_os = "uefi")]
+mod supervisor;
 #[cfg(target_os = "uefi")]
 mod support;
 

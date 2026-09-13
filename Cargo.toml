@@ -79,3 +79,22 @@ lto = "fat"
 opt-level = "z"
 panic = "abort"
 strip = "symbols"
+
+# The bounded transport model runs on every protected call and reply. Preserve
+# speed optimization for its checked table operations inside the size-optimized
+# kernel; payloads and ownership tables remain fixed-capacity.
+[profile.release.package.troe-service]
+opt-level = 3
+
+# Compile the native protected-call gate for speed as well: inlining portable
+# checks into a size-optimized caller otherwise loses their hot-path lowering.
+[profile.release.package.troe-machine]
+opt-level = 3
+
+# Chain/wait arbitration and pending-call accounting are part of the same gate.
+# Their iterator bodies must also be lowered for speed across crate boundaries.
+[profile.release.package.troe-task]
+opt-level = 3
+
+[profile.release.package.troe-dispatch]
+opt-level = 3

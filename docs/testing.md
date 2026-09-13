@@ -632,8 +632,8 @@ receive-to-reply interval must have exactly zero owned-heap allocation calls.
 Construction and final client-reply ownership remain bounded setup/teardown
 outside that steady interval.
 
-The current diagnostics-server composition has hard ceilings of one retained request and one
-suspended server context. The acceptance-probe build permits 1536 isolated
+The acceptance-only compatibility diagnostics composition retains one request
+and one suspended server context. The acceptance-probe build permits 1536 isolated
 service calls so 320 two-fragment warmup and measured exchanges fit in one
 server lifetime.
 
@@ -670,6 +670,23 @@ the root handoff; construction, teardown, and diagnostic output are excluded.
 The unsorted `ipc-phase-b-samples` records use the same counter/frequency as
 `ipc-samples`; frozen fixtures in `tests/fixtures/adr-0035` are never rewritten.
 
+Measurements are grouped by payload: compatibility, Phase B direct and queued,
+then Phase C general-direct. Each group uses one compatibility sample array.
+Its serial transcript is emitted after all paths finish, including observations
+collected before a failure. Native fault probes run after the latency groups.
+This keeps comparisons close in time without changing clocks, sample counts,
+warmups, timing boundaries, or thresholds; host scheduling can still affect
+the results. The release build optimizes the machine, service, task and dispatch
+crates for speed while retaining the workspace's size profile elsewhere.
+Scalar call/reply decoding can inline into the native checked path. Phase B
+reply/wait saves the server context before publishing its next event, then
+restores the caller directly; it does not copy the updated server context
+through the trap frame before restoring that caller. The native deadline and
+queued-delivery case verifies that the published server event survives.
+Phase B recognizes the explicit infinite-wait sentinel before reading the
+monotonic clock. Finite waits, call deadlines and the execution lease retain
+their checks, including the native expired-wait and call-timeout cases.
+
 For each nonempty direct round trip the gate requires one request copy, one
 reply copy, two user-root handoffs, zero heap allocations, zero queue slots,
 zero scheduler scans, zero targeted/full invalidations, and zero additional
@@ -682,11 +699,28 @@ must agree before a row is emitted.
 
 `scripts/ipc_phase_b.py` independently recomputes nearest-rank p95 values from
 both arrays. Direct p95 divided by same-boot compatibility p95 must be at most
-0.60 for 0/64/256 bytes and 0.70 for 4 KiB. A queued ratio is reported without a
+0.70 at every payload size. A queued ratio is reported without a
 latency threshold. All rows must use one clock and feature mode. Evidence is
 written to `build/ipc-phase-b-<platform>-<tagged|fallback>.json`, including raw
 samples, structural counts, host, QEMU command, and acceptance-image SHA-256.
 Hosted acceptance uploads those files as artifacts.
+
+The general runtime is separately measured by `kernel/src/supervisor/benchmark.rs`
+using the same native client and same-boot compatibility samples. Its
+`general-direct` rows must meet the same copy, root, trap, allocation, scheduler,
+and lease requirements. The Phase C p95 budget is 0.70 at every payload size;
+its records encode that limit as 700/1000 using
+`ratio_scale=1000`. Phase B encodes the same cap as 70/100. The performance
+follow-up is tracked in [issue #211](https://github.com/dennissoftman/troe/issues/211).
+`scripts/ipc_phase_c.py` also requires seven native
+fault rows: before receive, after receive, in a nested call, before reply, after
+reply validation, while queued, and while blocked. Each row proves one fate per
+client, exact transport/wait/frame cleanup before replacement, a new incarnation,
+and a successful subsequent normal call. The queued and blocked cases also
+exercise an independent live caller. Evidence is retained in
+`build/ipc-phase-c-<platform>-<tagged|fallback>.json` with raw timings and the same
+machine/image identity as the Phase B evidence. Latency failures require
+investigation; retries must be disclosed and thresholds must not be reduced.
 
 AArch64 profiles require real ASID use in the emulated architecture. x86 TCG
 reports the full-flush fallback and cannot satisfy a tagged-profile claim. The
@@ -846,16 +880,11 @@ failure surface minutes later. `MINIMUM_E2FSPROGS_VERSION` still admits
 `1.47.0`, so the version check alone does not reject a tool that cannot satisfy
 the verifier.
 
-The hosted run covers three of the four platforms: `x86_64-q35-uefi`,
-`x86_64-uefi-virtio-pci`, and `aarch64-uefi-virtio-mmio`. `aarch64-sbsa-ref` is
-not hosted. On the distribution's QEMU 8.2.2 its Trusted Firmware and UEFI both
-start and then no boot device is found; that firmware needs `FEAT_RNG`, which
-`cpu=max` did not implement that far back, and the `sbsa-ref` machine model
-itself changed between 8.x and the pinned 11.1.0. So that platform stays
-verified locally, with `python3 scripts/test-qemu.py --platform
-aarch64-sbsa-ref --environment qemu`, and a green hosted run is not evidence
-about it. Hosting it needs a runner with a newer QEMU than any distribution
-package supplies.
+The hosted run covers all four named platforms. SBSA uses
+`.github/actions/pinned-sbsa` to build SHA-256-pinned QEMU 11.1.0 and the firmware
+commits in `tools/sbsa-firmware-sources.lock.json`. The other hosted runners use
+the compatible distribution tools; both x86 profiles also require real KVM
+PCID/INVPCID coverage. Local SBSA release evidence still uses strict tool pins.
 
 Two properties are specific to the hosted run. Each hosted platform gets its own
 runner, so the fixed acceptance UDP ports cannot collide the way two overlapping

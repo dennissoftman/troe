@@ -7,7 +7,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-acceptance-probes = ["troe-machine/acceptance-probes"]
+acceptance-probes = ["troe-machine/acceptance-probes", "troe-service/acceptance-probes"]
 platform-aarch64-sbsa-ref = ["troe-machine/platform-aarch64-sbsa-ref"]
 platform-aarch64-uefi-virtio-mmio = ["troe-machine/platform-aarch64-uefi-virtio-mmio"]
 platform-x86_64-q35-uefi = ["troe-machine/platform-x86_64-q35-uefi"]
@@ -37,6 +37,7 @@ troe-shell = { path = "../crates/shell/troe-shell" }
 troe-volume = { path = "../crates/storage/troe-volume" }
 troe-supervisor = { path = "../crates/runtime/troe-supervisor" }
 troe-fs-statefs = { path = "../crates/storage/troe-fs-statefs" }
+troe-service = { path = "../crates/runtime/troe-service" }
 troe-task = { path = "../crates/runtime/troe-task" }
 troe-terminal = { path = "../crates/device/troe-terminal" }
 troe-namespace = { path = "../crates/storage/troe-namespace" }

@@ -309,6 +309,7 @@ dependencies = [
  "troe-net",
  "troe-process",
  "troe-random",
+ "troe-service",
  "troe-shell",
  "troe-supervisor",
  "troe-task",
@@ -371,6 +372,7 @@ dependencies = [
  "troe-memory",
  "troe-net",
  "troe-platform",
+ "troe-service",
  "troe-task",
  "troe-virtio",
  "uefi",
@@ -413,6 +415,11 @@ version = "0.1.0"
 [[package]]
 name = "troe-service"
 version = "0.1.0"
+dependencies = [
+ "troe-abi",
+ "troe-dispatch",
+ "troe-task",
+]
 
 [[package]]
 name = "troe-shell"

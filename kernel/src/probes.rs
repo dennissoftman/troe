@@ -242,8 +242,10 @@ pub(crate) fn run_isolated_ipc_baseline_verification(
     accounting: &mut OwnedAccounting,
     frequency: u64,
 ) -> Result<(), ()> {
-    let mut compatibility_p95 = [0; 4];
-    for (index, payload_bytes) in [0_usize, 64, 256, 4 * 1024].into_iter().enumerate() {
+    troe_machine::verify_ipc_pool().map_err(|_| ())?;
+    let mut stale_tags = None;
+    for payload_bytes in [0_usize, 64, 256, 4 * 1024] {
+        let mut transcript = String::new();
         let baseline_frames = accounting.frames.free_frames();
         let exchange = Rc::new(RefCell::new(DiagnosticsBenchmarkExchange {
             payload: [0x5a; troe_abi::MAX_MESSAGE_BYTES],
@@ -323,14 +325,15 @@ pub(crate) fn run_isolated_ipc_baseline_verification(
         {
             return Err(());
         }
-        emit_ipc_samples(
+        append_ipc_samples(
+            &mut transcript,
             "isolated-diagnostics",
             payload_bytes,
             frequency,
             &exchange.samples,
         )?;
         exchange.samples.sort_unstable();
-        compatibility_p95[index] = ipc_percentile(&exchange.samples, 95);
+        let compatibility_p95 = ipc_percentile(&exchange.samples, 95);
         let completed_calls = u64::try_from(IPC_BASELINE_SAMPLES).map_err(|_| ())?;
         let mut line = String::new();
         writeln!(
@@ -349,11 +352,34 @@ pub(crate) fn run_isolated_ipc_baseline_verification(
             DIAGNOSTICS_SERVER_MAX_CONTEXTS,
         )
         .map_err(|_| ())?;
-        if !troe_machine::write(line.as_bytes()) {
+        transcript.push_str(&line);
+        drop(exchange);
+        // Compare one payload's paths together, before serial output or fault
+        // probes can separate their host scheduling and frequency conditions.
+        // Flush even a failed group's complete observations before returning.
+        let measured = crate::ipc::measure(
+            scheduler,
+            accounting,
+            payload_bytes,
+            compatibility_p95,
+            &mut stale_tags,
+            &mut transcript,
+        )
+        .and_then(|()| {
+            crate::supervisor::benchmark::measure(
+                scheduler,
+                accounting,
+                payload_bytes,
+                compatibility_p95,
+                &mut transcript,
+            )
+        });
+        if !troe_machine::write(transcript.as_bytes()) {
             return Err(());
         }
+        measured?;
     }
-    crate::ipc::verify(scheduler, accounting, compatibility_p95)
+    crate::ipc::verify_faults(scheduler, accounting)
 }
 
 #[cfg(feature = "acceptance-probes")]
@@ -363,25 +389,43 @@ pub(crate) fn emit_ipc_samples(
     frequency: u64,
     samples: &[u64; IPC_BASELINE_SAMPLES],
 ) -> Result<(), ()> {
-    let record = if path.starts_with("persistent-") {
-        "ipc-phase-b-samples"
-    } else {
-        "ipc-samples"
-    };
-    let mut line =
-        alloc::format!("{record} path={path} payload={payload} counter_hz={frequency} ticks=");
-    for (index, sample) in samples.iter().enumerate() {
-        if index != 0 {
-            line.push(',');
-        }
-        write!(line, "{sample}").map_err(|_| ())?;
-    }
-    line.push('\n');
-    if troe_machine::write(line.as_bytes()) {
+    let mut transcript = String::new();
+    append_ipc_samples(&mut transcript, path, payload, frequency, samples)?;
+    if troe_machine::write(transcript.as_bytes()) {
         Ok(())
     } else {
         Err(())
     }
+}
+
+#[cfg(feature = "acceptance-probes")]
+pub(crate) fn append_ipc_samples(
+    transcript: &mut String,
+    path: &str,
+    payload: usize,
+    frequency: u64,
+    samples: &[u64; IPC_BASELINE_SAMPLES],
+) -> Result<(), ()> {
+    let record = if path.starts_with("general-") {
+        "ipc-phase-c-samples"
+    } else if path.starts_with("persistent-") {
+        "ipc-phase-b-samples"
+    } else {
+        "ipc-samples"
+    };
+    write!(
+        transcript,
+        "{record} path={path} payload={payload} counter_hz={frequency} ticks="
+    )
+    .map_err(|_| ())?;
+    for (index, sample) in samples.iter().enumerate() {
+        if index != 0 {
+            transcript.push(',');
+        }
+        write!(transcript, "{sample}").map_err(|_| ())?;
+    }
+    transcript.push('\n');
+    Ok(())
 }
 
 #[cfg(feature = "acceptance-probes")]

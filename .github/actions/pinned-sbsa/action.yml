@@ -1,0 +1,60 @@
+name: pinned SBSA tools
+description: Build QEMU 11.1.0 and the repository-pinned SBSA firmware.
+runs:
+  using: composite
+  steps:
+    - name: Install build dependencies
+      shell: bash
+      run: |
+        sudo apt-get install -y --no-install-recommends \
+          ninja-build python3-venv libglib2.0-dev libpixman-1-dev libslirp-dev \
+          acpica-tools uuid-dev nasm make
+
+    - name: Restore QEMU
+      id: qemu
+      uses: actions/cache@v4
+      with:
+        path: ~/.local/troe-qemu
+        key: sbsa-qemu-11.1.0-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.github/actions/pinned-sbsa/action.yml') }}
+
+    - name: Build pinned QEMU
+      if: steps.qemu.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+        work="$(mktemp -d)"
+        cd "$work"
+        curl -fsSL --http1.1 --retry 5 --retry-all-errors \
+          -o qemu.tar.xz https://download.qemu.org/qemu-11.1.0.tar.xz
+        echo '6ee1d1a61f68212476b27108c26da5f449dc09b626d42f8279ba0dc2e08fa858  qemu.tar.xz' | sha256sum --check
+        tar xf qemu.tar.xz
+        cd qemu-11.1.0
+        ./configure --prefix="$HOME/.local/troe-qemu" \
+          --target-list=aarch64-softmmu --disable-docs --disable-gtk \
+          --disable-sdl --disable-opengl --disable-guest-agent --enable-slirp
+        make -j"$(nproc)"
+        make install
+
+    - name: Select pinned QEMU
+      shell: bash
+      run: |
+        echo "$HOME/.local/troe-qemu/bin" >> "$GITHUB_PATH"
+        "$HOME/.local/troe-qemu/bin/qemu-system-aarch64" --version
+
+    - name: Restore firmware
+      id: firmware
+      uses: actions/cache@v4
+      with:
+        path: build/sbsa-firmware
+        key: sbsa-firmware-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('tools/sbsa-firmware-sources.lock.json', 'tools/build_sbsa_firmware.py', '.github/actions/pinned-sbsa/action.yml') }}
+
+    - name: Build pinned firmware
+      if: steps.firmware.outputs.cache-hit != 'true'
+      shell: bash
+      run: python3 tools/build_sbsa_firmware.py --jobs "$(nproc)"
+
+    - name: Verify firmware
+      shell: bash
+      run: |
+        cd build/sbsa-firmware
+        sha256sum --check MANIFEST.sha256

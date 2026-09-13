@@ -153,6 +153,17 @@ in the same change, identify the affected crate and advisory, explain why it is
 not currently exploitable, name an owner, and include an expiry date. Expired
 exceptions fail the release review and must be removed or renewed explicitly.
 
+Persistent diagnostics uses an initialized, incarnation-bound KEX service. Its
+256-page boot reservation and three-start/60-second policy bound residency and
+restart. Revocation cancels inbound/outbound calls and waits before native roots,
+tags and frames are reclaimed; IPC and copied queue storage are zeroed before
+reuse. Old client handles never address a replacement. Server reply statuses
+remain 0–23; only the kernel synthesizes closed, peer-died and deadlock outcomes.
+Kernel clients retain copied data and scalar continuation identities, with no
+borrowed client frame or pointer serving as a suspended continuation. Direct
+handoffs preserve the original absolute 50 ms lease; slow waits preserve the
+original absolute service deadline.
+
 ## Reporting
 
 Until a private reporting address exists, do not publish a suspected

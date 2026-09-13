@@ -11,13 +11,8 @@ name: gate
 # `scripts/test_changed.py` rather than always running everything, so a
 # documentation-only change does not rebuild the kernel or boot a VM.
 #
-# It covers three of the four platforms. `aarch64-sbsa-ref` is not here: on
-# 24.04's QEMU 8.2.2 its Trusted Firmware and UEFI both start and then no boot
-# device is found, and the profile already records that this firmware needs
-# FEAT_RNG, which `cpu=max` did not implement that far back. The machine model
-# itself also moved between 8.x and the pinned 11.1.0. That platform therefore
-# stays locally verified until a runner can supply a newer QEMU; adding it back
-# means building QEMU rather than installing the distribution one.
+# All four platforms are hosted. SBSA uses source-pinned QEMU and firmware
+# because its machine and FEAT_RNG contract require the pinned implementation.
 #
 # The selector owns that taxonomy, not this file. It already maps `.md`,
 # `docs/` and `skills/` paths to a single policy test, escalates build and
@@ -259,6 +254,7 @@ jobs:
           - {platform: x86_64-q35-uefi, environment: qemu}
           - {platform: x86_64-uefi-virtio-pci, environment: qemu}
           - {platform: aarch64-uefi-virtio-mmio, environment: qemu}
+          - {platform: aarch64-sbsa-ref, environment: qemu}
           - {platform: x86_64-q35-uefi, environment: qemu-kvm}
           - {platform: x86_64-uefi-virtio-pci, environment: qemu-kvm}
     steps:
@@ -302,6 +298,10 @@ jobs:
           key: cargo-${{ matrix.platform }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
           restore-keys: cargo-${{ matrix.platform }}-
 
+      - name: Use pinned SBSA QEMU and firmware
+        if: matrix.platform == 'aarch64-sbsa-ref'
+        uses: ./.github/actions/pinned-sbsa
+
       - name: Enable the required KVM device
         if: matrix.environment == 'qemu-kvm'
         run: |
@@ -324,7 +324,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ipc-${{ matrix.platform }}-${{ matrix.environment }}
-          path: build/ipc-phase-b-*.json
+          path: |
+            build/ipc-phase-b-*.json
+            build/ipc-phase-c-*.json
           if-no-files-found: error
 
   # One job to require in branch protection. It succeeds when every selected
