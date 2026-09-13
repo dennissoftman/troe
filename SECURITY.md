@@ -78,9 +78,8 @@ never executes the ordinary application.
   owned, non-cloneable execution; claimed calls reject direct completion and
   repeat claims. Completion failure returns the owned execution for safe recovery
   or retirement after process stop. Capability and operation authority remain
-  composition
-  obligations; native acceptance composes a restricted built-in control handle
-  with captured Current calls and live caller identities. Ordinary application
+  composition obligations; native acceptance uses the owned operation dispatcher
+  with a restricted built-in control handle and captured Current calls. Ordinary application
   admission does not enable scheduler calls;
 - tasks and process records: at most 65,536, with monotonic identities, explicit
   capabilities, deterministic lifecycle accounting, fallible metadata growth,
@@ -88,6 +87,15 @@ never executes the ordinary application.
   resolves slot/generation against the trusted process and exact object kind,
   collapsing foreign/absent/mismatched lifetimes to stale. A retained identity
   grants no capability and does not bypass operation-specific state checks;
+- owned thread operations: the portable dispatcher binds authenticated capability
+  ownership to a captured caller and trusted process snapshot, validates running
+  state and rejects new work with an unconsumed synchronization wait. Owned wait
+  records carry no user pointer, callback or table borrow. Absolute deadlines do
+  not restart on resumption; condition timeout/stop retains mutex reacquisition.
+  Permit batches check complete capacity before any grant or timeout publication.
+  Internal clock/configuration failures require process stop without replay.
+  Native execution claims and retained operation storage remain separately owned
+  and charged by composition; ordinary package grants remain disabled;
 - dispatch: at most 65,536 ports and 262,144 handles, generation-checked
   identities, explicit call rights, and 4 KiB request/reply limits. Built-in
   scheduler targets share the handle bound and generation/owner revocation,

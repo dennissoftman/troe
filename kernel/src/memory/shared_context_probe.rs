@@ -14,7 +14,8 @@ use troe_memory::{
     Mapping, MappingLifetime, MappingOwner, MappingPermissions, MappingPlan, PhysicalRange,
     VirtualRange,
 };
-use troe_task::thread::{ThreadId, ThreadQuota, ThreadResources, ThreadTable};
+use troe_service::threading::{Operation, Progress};
+use troe_task::thread::{ThreadId, ThreadQuota, ThreadResources, ThreadTable, sync};
 use troe_task::{
     Capabilities, ProcessId, ProcessName, ProcessOrigin, ProcessRegistration, ProcessTable,
     Scheduler, StackResource,
@@ -614,6 +615,16 @@ fn verify_scheduler_calls(
 ) -> Result<([NativeSchedulerCall; 2], NativeSchedulerExecution), ()> {
     use troe_abi::interface::{THREAD_CONTROL, THREAD_SYNC};
     use troe_abi::threading::{Call, Outcome, Request, Response};
+    let mut sync = sync::SyncTable::new(1, 1, 1, METADATA_LIMIT).map_err(|_| ())?;
+    sync.register_process(
+        threads,
+        owner,
+        sync::SyncQuota {
+            objects: 1,
+            waits: 1,
+        },
+    )
+    .map_err(|_| ())?;
     let denied = Response {
         outcome: Outcome::Denied,
         value: 0,
@@ -720,21 +731,37 @@ fn verify_scheduler_calls(
                 let execution = native
                     .claim_scheduler(operation, admitted.request())
                     .map_err(|_| ())?;
-                // Identity comes from the captured caller and live thread table,
-                // never writable TLS or an application-supplied destination.
-                let response = Response {
-                    outcome: Outcome::Success,
-                    value: thread_token(threads, owner, operation.caller())?,
-                    snapshot: None,
+                let request = admitted.request();
+                let bound = Operation::bind(authority.process, operation.caller(), admitted)
+                    .map_err(|_| ())?;
+                // Logical dispatch validates policy state without running user code.
+                // Native execution remains suspended under its single-use claim.
+                threads
+                    .dispatch(owner, operation.caller())
+                    .map_err(|_| ())?;
+                let progress = bound
+                    .execute(
+                        threads,
+                        &mut sync,
+                        troe_task::MonotonicMillis::from_millis(0),
+                    )
+                    .map_err(|_| ())?;
+                threads
+                    .yield_running(owner, operation.caller())
+                    .map_err(|_| ())?;
+                let Progress::Complete(completion) = progress else {
+                    return Err(());
                 };
+                if completion.caller() != operation.caller() || completion.request() != request {
+                    return Err(());
+                }
+                let response = completion.response();
                 if execution.caller() != operation.caller()
-                    || execution.request() != admitted.request()
-                    || native
-                        .claim_scheduler(operation, admitted.request())
-                        .is_ok()
+                    || execution.request() != request
+                    || native.claim_scheduler(operation, request).is_ok()
                     || native.complete_scheduler(operation, None).is_ok()
                     || native
-                        .complete_scheduler(operation, Some((admitted.request(), response)))
+                        .complete_scheduler(operation, Some((request, response)))
                         .is_ok()
                     || native.probe_word(TX[index] + PAGE).map_err(|_| ())? != before
                 {
@@ -746,7 +773,7 @@ fn verify_scheduler_calls(
                     .ok_or(())?;
                 if error != troe_machine::MmuError::InvalidUserContext
                     || execution.caller() != operation.caller()
-                    || execution.request() != admitted.request()
+                    || execution.request() != request
                     || native.probe_word(TX[index] + PAGE).map_err(|_| ())? != before
                 {
                     return Err(());
@@ -770,6 +797,7 @@ fn verify_scheduler_calls(
             previous[index] = Some(operation);
         }
     }
+    sync.remove_process(threads, owner).map_err(|_| ())?;
     Ok((
         [previous[0].ok_or(())?, previous[1].ok_or(())?],
         late.ok_or(())?,
@@ -778,18 +806,18 @@ fn verify_scheduler_calls(
 
 struct ProbeScheduler {
     dispatcher: Dispatcher<'static>,
+    process: troe_task::ProcessSnapshot,
     principal: HandleOwner,
     handle: Handle,
 }
 
 impl ProbeScheduler {
     fn new(processes: &ProcessTable, owner: ProcessId) -> Result<Self, ()> {
-        let task = processes
+        let process = processes
             .snapshots()
             .find(|process| process.id() == owner)
-            .ok_or(())?
-            .task_id();
-        let principal = HandleOwner::isolated(task.get()).map_err(|_| ())?;
+            .ok_or(())?;
+        let principal = HandleOwner::isolated(process.task_id().get()).map_err(|_| ())?;
         let mut dispatcher = Dispatcher::new(1, 1).map_err(|_| ())?;
         let handle = dispatcher
             .open_scheduler_owned(
@@ -800,6 +828,7 @@ impl ProbeScheduler {
             .map_err(|_| ())?;
         Ok(Self {
             dispatcher,
+            process,
             principal,
             handle,
         })

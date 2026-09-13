@@ -7,14 +7,17 @@ Status: architectural direction accepted, 2026-09-09. Implementation tracked by
 Native shared-root context switching and retained per-thread IPC storage have
 acceptance mechanisms. The native owner also captures scheduler calls and
 validates correlated completions. The dispatcher has closed built-in capability
-targets and owned request authorization; native capability/operation integration,
-threaded package admission, compiler-TLS allocation and pthread
-support remain disabled.
+targets and owned request authorization. The portable operation dispatcher binds
+that authority to a captured caller and trusted process snapshot and executes
+Current, Observe, RequestStop and synchronization operations, retaining owned
+waits and checking atomic permit batches. Other lifecycle operations return
+Unsupported. Native execution of the full operation set, threaded package
+admission, compiler-TLS allocation and pthread support remain disabled.
 Native acceptance composes a restricted control capability with Current calls
 and process-scoped live thread-token resolution. The native owner also claims
 each captured call once into a non-cloneable execution value and returns that
-ownership if completion fails. This does not activate general
-scheduler operation execution or application grants.
+ownership if completion fails. The Current probe uses the owned operation
+dispatcher; it does not activate application grants or general native operations.
 Current single-execution-thread application contracts remain in force.
 Portable lifecycle/synchronization models, an independently compiler-checked
 static TLS layout/initializer, guarded thread-memory planning, and composed

@@ -35,6 +35,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 pub mod ipc;
+pub mod threading;
 
 /// Maximum persistent servers the Standard profile admits.
 pub const MAX_BOOT_SERVICES: usize = 8;
