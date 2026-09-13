@@ -580,7 +580,8 @@ AArch64 retains TPIDR_EL0 in each saved context. These register mechanisms do
 not enable threaded KEX admission or the pthread facade.
 `NativeProcessContext` retains one root and a bounded array of private register
 continuations keyed by process-owned thread tokens. It validates initial stack
-guards, executable entry, TLS geometry and nonoverlapping stack/TLS payloads.
+guards, executable entry, TLS geometry and nonoverlapping stack/TLS/private
+startup payloads. Private startup mappings are read-only and nonexecutable.
 Its logical metadata charge includes actual context/mapping/IPC-owner vector
 capacities and the compiled inline owner. Context preparation and switching
 allocate no new metadata after the owner's fallible constructor.
@@ -591,15 +592,16 @@ contexts without user cleanup; their register bytes are erased before metadata
 release. `NativeProcessBacking` transfers the unique root and retained task IPC
 pairs together: contexts retire first, then the root, then the zeroing pair
 owners. Explicit stop retains the root and pairs until the owner drops.
-Composition retains ordinary user/table frames until this native owner retires.
+Composition retains ordinary user/table frames until this native owner retires,
+except private frames covered by successful individual thread retirement.
 Each never-started context can bind one pair after process/thread, live pair,
 physical-page, RW/NX and nonoverlap checks. Bindings cannot be replaced. Bounded
 TX copying and RX publication use the retained binding; RX publication clears
 the whole page before copying the prefix. These are kernel storage primitives;
 capability and operation authentication remain composition obligations. Threads
 share all user mappings, so the buffers do not isolate siblings.
-The mechanism supports copied-call continuations and rejects roots bound to
-the single-thread IPC profile. A selected native context with an IPC binding
+The mechanism supports copied-call continuations and rejects tagged roots and
+roots bound to the single-thread IPC profile. A selected native context with an IPC binding
 can suspend at scheduler entry 6. The masked trap copies the fixed 64-byte TX
 prefix before any sibling executes; malformed register framing retains no
 request. An opaque operation records the original caller, a nonwrapping
@@ -625,6 +627,21 @@ calls are rejected. Consuming completion validates the original request/IPC
 lifetime; an error returns the execution value so composition can recover or
 retire it after process stop. Claiming or completing never runs user code,
 allocates a buffer or renews CPU entitlement.
+`retire_thread` consumes a claimed Exit after composition applies lifecycle and
+synchronization owner-death policy. Its inactive-root preflight matches stack,
+TLS, optional private startup and retained IPC mappings to kernel-owned physical
+extents, checks permissions and sibling entry/startup references, and scans all
+user leaves for physical aliases. This scan prioritizes safe reclamation over
+retirement latency. Split-region capacity is reserved and charged at native
+admission; retirement allocates nothing and rejects insufficient capacity before
+writes. A partial unmap or metadata failure stops every continuation and retains
+all IPC backing until root teardown. Success erases the retired register record
+in place, repairs a moved sibling's IPC index and drops only the unmapped pair.
+The untagged native boundaries flush translations before kernel return and user
+reactivation. A non-cloneable receipt identifies the retired thread and ordinary
+mapped-page count; composition still owns zeroing/reclamation and the later
+logical resource acknowledgement. Shared startup data and page-table frames
+stay owned and charged to the process.
 Native acceptance composes the dispatcher authority check and owned operation
 dispatcher with captured Current calls. Its restricted control handle belongs
 to the process record's task principal, and replies identify the captured caller.
@@ -638,6 +655,15 @@ cannot publish a reply. Fixed pending/script storage has an explicit bound, and
 each scenario verifies retained metadata, IPC zeroization/reuse and complete
 frame reclamation. These probes do not enable scheduler services for admitted
 application packages or establish process-share scheduling.
+A retirement probe keeps a sibling's claimed Current pending while another
+thread exits, then executes an owned native Join. The join stays blocked until
+the worker's physical reservation is zeroed/freed and logically acknowledged;
+its committed result survives target reaping. The sibling checks the complete
+reply, then faults on a read from a retired stack, TLS, startup, TX or RX page.
+Separate cases reject a remaining physical alias and a sibling startup reference,
+and contain an injected failure after the first leaf removal. Exit lifecycle
+policy in this fixture is composed directly; the portable dispatcher still
+returns Unsupported for Exit and ordinary package admission remains unchanged.
 Unsaved AVX-family, SVE, and SME state remains disabled rather than leaking or
 corrupting across tasks. ABI call 0 exits through the owned gate. The x86
 local-APIC and AArch64 generic physical timers capture a complete resumable

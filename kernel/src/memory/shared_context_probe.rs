@@ -74,6 +74,7 @@ const CODE: &[u8] = &[
     0x08, 0x00, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4, 0x00, 0x00, 0x20, 0xd4,
 ];
 
+mod retirement;
 mod synchronization;
 
 const PAGE: u64 = 4096;
@@ -471,7 +472,8 @@ pub(crate) fn verify(accounting: &mut OwnedAccounting) -> Result<(), ()> {
     if accounting.frames.free_frames() != free || threads.committed_pages() != 0 {
         return Err(());
     }
-    synchronization::verify(accounting)
+    synchronization::verify(accounting)?;
+    retirement::verify(accounting)
 }
 
 fn prepare(
@@ -531,6 +533,7 @@ fn prepare(
             thread_pointer: tls.start(),
             startup: USER_DATA_BASE + index * 8,
             startup_bytes: 8,
+            private_startup: None,
         })
     };
     let starts = [start(0)?, start(1)?];
@@ -816,6 +819,10 @@ struct ProbeScheduler {
 
 impl ProbeScheduler {
     fn new(processes: &ProcessTable, owner: ProcessId) -> Result<Self, ()> {
+        Self::with_rights(processes, owner, Rights::CALL.union(Rights::THREAD_OBSERVE))
+    }
+
+    fn with_rights(processes: &ProcessTable, owner: ProcessId, rights: Rights) -> Result<Self, ()> {
         let process = processes
             .snapshots()
             .find(|process| process.id() == owner)
@@ -823,11 +830,7 @@ impl ProbeScheduler {
         let principal = HandleOwner::isolated(process.task_id().get()).map_err(|_| ())?;
         let mut dispatcher = Dispatcher::new(1, 1).map_err(|_| ())?;
         let handle = dispatcher
-            .open_scheduler_owned(
-                SchedulerInterface::ControlV1,
-                Rights::CALL.union(Rights::THREAD_OBSERVE),
-                principal,
-            )
+            .open_scheduler_owned(SchedulerInterface::ControlV1, rights, principal)
             .map_err(|_| ())?;
         Ok(Self {
             dispatcher,

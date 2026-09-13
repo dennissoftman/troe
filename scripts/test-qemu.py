@@ -730,8 +730,45 @@ def assert_ipc_phase_c(session: SerialSession) -> None:
     )
 
 
+def retain_ipc_observation(session: SerialSession) -> Path:
+    """Keep one immutable raw boot observation before any validator can fail."""
+    observation = {
+        "schema_version": 1,
+        "kind": "unvalidated-native-ipc-observation",
+        "platform": session.platform_id,
+        "command": session.command_line,
+        "host": platform.platform(),
+        "require_tagged": session.require_tagged,
+        "image_sha256": hashlib.sha256(
+            boot_image_path(
+                resolve_platform(session.platform_id), acceptance_probes=True
+            ).read_bytes()
+        ).hexdigest(),
+        "transcript": "\n".join(
+            line
+            for line in session.transcript().splitlines()
+            if line.startswith("ipc-")
+        )
+        + "\n",
+    }
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        delete=False,
+        dir=REPO_ROOT / "build",
+        prefix=f"ipc-observation-{session.platform_id}-",
+        suffix=".json",
+    ) as output:
+        json.dump(observation, output, indent=2)
+        output.write("\n")
+        destination = Path(output.name)
+    print(f"Raw IPC observation ({session.platform_id}): {destination}")
+    return destination
+
+
 def assert_ipc_baseline(session: SerialSession) -> None:
     """Require compatibility and private-page IPC structural matrices."""
+    retain_ipc_observation(session)
     assert_ipc_phase_b(session)
     assert_ipc_phase_c(session)
     rows: dict[tuple[str, int], dict[str, int]] = {}

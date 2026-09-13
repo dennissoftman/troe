@@ -5,7 +5,11 @@ Status: architectural direction accepted, 2026-09-09. Implementation tracked by
 [#204](https://github.com/dennissoftman/troe/issues/204) through
 [#208](https://github.com/dennissoftman/troe/issues/208).
 Native shared-root context switching and retained per-thread IPC storage have
-acceptance mechanisms. The native owner also captures scheduler calls and
+acceptance mechanisms. Individual retirement preflights physical backing and
+user aliases, removes private mappings and returns an ordinary-frame reclamation
+receipt; partial mutation failure stops the complete process. Native acceptance
+executes Join across physical acknowledgement and target reaping, then verifies
+hardware denial of retired-page reads. The native owner also captures scheduler calls and
 validates correlated completions. The dispatcher has closed built-in capability
 targets and owned request authorization. The portable operation dispatcher binds
 that authority to a captured caller and trusted process snapshot and executes
@@ -64,6 +68,12 @@ two such contexts across timer preemption and yields and checks shared memory,
 distinct TLS words, per-thread TX/RX storage, fault revocation and reclamation.
 `NativeProcessBacking` retires the root before its retained IPC pairs on both
 rejection and final drop; stop keeps the pairs occupied until root retirement.
+Individual retirement is the exception: a claimed Exit can remove all private
+stack/TLS/startup/IPC mappings before releasing its pair. It reserves split
+metadata at admission, validates kernel-owned extents and all user aliases before
+writes, erases the retired register record in place and preserves sibling claims.
+A receipt proves native quiescence; ordinary frame owners still zero/reclaim
+before logical resource acknowledgement. Shared root tables remain charged.
 Bindings validate live task pairs and mapped physical pages, and RX publication
 clears the whole page before copying a bounded prefix. This does not enable the
 threaded loader, process-share scheduler, built-in scheduler services or the C facade.

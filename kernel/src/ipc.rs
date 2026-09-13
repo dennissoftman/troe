@@ -486,9 +486,10 @@ pub(crate) fn measure(
         if accounting.frames.free_frames() != free {
             return Err(());
         }
-        if tags.supported && !queued && !ratio_pass {
-            return Err(());
-        }
+        // A latency miss is retained in the row and rejected by the host's
+        // independent validator. Finish the matrix and native fault probes so
+        // that a timing failure cannot hide their evidence. Ownership and
+        // structural failures above still stop immediately.
     }
     Ok(())
 }

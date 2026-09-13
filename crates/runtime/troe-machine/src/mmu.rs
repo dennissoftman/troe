@@ -22,10 +22,12 @@ mod ipc;
 mod process;
 #[cfg(target_os = "uefi")]
 mod protected;
+#[cfg(any(test, target_os = "uefi"))]
+mod retirement;
 #[cfg(target_os = "uefi")]
 pub use process::{
     NativeProcessBacking, NativeProcessContext, NativeSchedulerCall, NativeSchedulerExecution,
-    NativeThreadStart, NativeThreadStop,
+    NativeThreadBacking, NativeThreadRetirement, NativeThreadStart, NativeThreadStop,
 };
 #[cfg(feature = "acceptance-probes")]
 pub use protected::FaultPoint;

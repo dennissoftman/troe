@@ -16,6 +16,9 @@ use alloc::vec::Vec;
 use troe_memory::VirtualRange;
 use troe_task::{ProcessId, thread::ThreadId};
 
+mod retirement;
+pub use retirement::{NativeThreadBacking, NativeThreadRetirement};
+
 /// Trusted initial register and mapping geometry for an already owned thread.
 #[derive(Clone, Copy, Debug)]
 pub struct NativeThreadStart {
@@ -31,6 +34,9 @@ pub struct NativeThreadStart {
     pub startup: u64,
     /// Nonzero startup record length passed as the second argument.
     pub startup_bytes: usize,
+    /// Optional complete, private read-only/NX startup mapping to retire with this thread.
+    /// `None` retains a shared startup record under process ownership.
+    pub private_startup: Option<VirtualRange>,
 }
 
 /// Copied stop information; no root or runnable context escapes its process.
@@ -179,9 +185,10 @@ impl Drop for ThreadContext {
 ///
 /// Records never expose their registers or root. Execution requires unique
 /// access, and a native run returns to the kernel before another record can run
-/// or mappings can be reclaimed. This retains its IPC page pairs, but composition
-/// must drop this owner before zeroing and releasing ordinary user/table frames.
-/// The current mechanism rejects roots bound to the single-thread IPC profile.
+/// or mappings can be reclaimed. Validated thread retirement removes its private
+/// mappings before returning a reclamation receipt. Otherwise composition must
+/// drop this owner before zeroing and releasing ordinary user/table frames.
+/// The mechanism rejects tagged roots and the single-thread IPC profile.
 /// Scheduler calls suspend with owned request bytes; trusted composition must
 /// authenticate and execute them. Threaded package admission remains disabled.
 pub struct NativeProcessContext {
@@ -199,7 +206,7 @@ impl NativeProcessContext {
     /// Reserve bounded native metadata before publishing any thread.
     ///
     /// # Errors
-    /// Rejects zero/excess capacity, an IPC-bound root, allocation failure, or
+    /// Rejects zero/excess capacity, a tagged/IPC-bound root, allocation failure, or
     /// requested/actual retained metadata beyond the supplied byte allowance.
     pub fn new(
         process: ProcessId,
@@ -218,18 +225,19 @@ impl NativeProcessContext {
     /// Admit an owned root/IPC bundle with bounded native metadata.
     ///
     /// # Errors
-    /// Rejects a legacy IPC-bound root, non-task/stale pairs, excess capacity,
+    /// Rejects a tagged or legacy IPC-bound root, non-task/stale pairs, excess capacity,
     /// or requested/actual metadata over budget. The bundle retires its root
     /// before releasing any pair on every rejected path.
     pub fn with_backing(
         process: ProcessId,
-        backing: NativeProcessBacking,
+        mut backing: NativeProcessBacking,
         capacity: usize,
         metadata_limit: usize,
     ) -> Result<Self, MmuError> {
         if capacity == 0
             || capacity > crate::IPC_TASK_PAIRS
             || backing.address_space.ipc.is_some()
+            || backing.address_space.tag.is_some()
             || backing.pairs.len() > capacity
             || backing
                 .pairs
@@ -243,6 +251,36 @@ impl NativeProcessContext {
             .capacity()
             .checked_mul(core::mem::size_of::<crate::IpcPagePair>())
             .ok_or(MmuError::InvalidUserContext)?;
+        // Retiring four disjoint regions can split at most four existing ones.
+        // Reserve and charge that space before publishing native contexts.
+        let additional = capacity
+            .checked_mul(super::retirement::MAX_REGIONS)
+            .ok_or(MmuError::InvalidUserContext)?;
+        let region_capacity = backing
+            .address_space
+            .regions
+            .len()
+            .checked_add(additional)
+            .map(|needed| needed.max(backing.address_space.regions.capacity()))
+            .ok_or(MmuError::InvalidUserContext)?;
+        let requested = region_capacity
+            .checked_mul(core::mem::size_of::<super::UserRegion>())
+            .and_then(|bytes| bytes.checked_add(core::mem::size_of::<Self>()))
+            .and_then(|bytes| bytes.checked_add(pair_bytes))
+            .and_then(|bytes| {
+                capacity
+                    .checked_mul(core::mem::size_of::<ThreadContext>())
+                    .and_then(|contexts| bytes.checked_add(contexts))
+            })
+            .ok_or(MmuError::InvalidUserContext)?;
+        if requested > metadata_limit {
+            return Err(MmuError::InvalidUserContext);
+        }
+        backing
+            .address_space
+            .regions
+            .try_reserve_exact(additional)
+            .map_err(|_| MmuError::InvalidUserContext)?;
         let retained_root = backing
             .address_space
             .regions
@@ -353,15 +391,12 @@ impl NativeProcessContext {
             || self.contexts.iter().any(|context| context.id == id)
             || !valid_start(&self.backing.address_space, start)
             || self.contexts.iter().any(|context| {
-                [context.start.stack, context.start.tls].iter().any(|old| {
-                    [start.stack, start.tls]
-                        .iter()
-                        .any(|new| overlaps(*old, *new))
-                }) || context.ipc.is_some_and(|ipc| {
-                    [start.stack, start.tls]
-                        .iter()
-                        .any(|new| ipc.tx < new.end() && new.start() < ipc.tx + 8192)
-                })
+                private_ranges(context.start)
+                    .any(|old| private_ranges(start).any(|new| overlaps(old, new)))
+                    || context.ipc.is_some_and(|ipc| {
+                        private_ranges(start)
+                            .any(|new| ipc.tx < new.end() && new.start() < ipc.tx + 8192)
+                    })
             })
         {
             return Err(MmuError::InvalidUserContext);
@@ -380,8 +415,9 @@ impl NativeProcessContext {
 
     /// Bind one retained pair to a never-started thread after mapping validation.
     ///
-    /// The pair remains owned until the complete root is retired, including
-    /// after `stop`. This method does not allocate, map pages or publish entry 6.
+    /// The pair remains owned until validated worker retirement removes all its
+    /// user aliases, or until the complete root drops (including after `stop`).
+    /// This method does not allocate, map pages or publish entry 6.
     ///
     /// # Errors
     /// Rejects foreign/stale threads, duplicate/rebound pairs, started contexts,
@@ -408,8 +444,7 @@ impl NativeProcessContext {
             || super::architecture_translate_page(self.backing.address_space.root, tx + 4096)?
                 != pair.range().start() + 4096
             || self.contexts.iter().any(|context| {
-                overlaps(range, context.start.stack)
-                    || overlaps(range, context.start.tls)
+                private_ranges(context.start).any(|private| overlaps(range, private))
                     || context.ipc.is_some_and(|ipc| {
                         ipc.index == pair_index
                             || (ipc.tx < range.end() && range.start() < ipc.tx + 8192)
@@ -773,6 +808,11 @@ impl NativeProcessContext {
 fn overlaps(a: VirtualRange, b: VirtualRange) -> bool {
     a.start() < b.end() && b.start() < a.end()
 }
+fn private_ranges(start: NativeThreadStart) -> impl Iterator<Item = VirtualRange> {
+    [Some(start.stack), Some(start.tls), start.private_startup]
+        .into_iter()
+        .flatten()
+}
 fn writable_nx(space: &UserAddressSpace, range: VirtualRange) -> bool {
     let Ok(bytes) = usize::try_from(range.byte_count()) else {
         return false;
@@ -793,7 +833,25 @@ fn valid_start(space: &UserAddressSpace, start: NativeThreadStart) -> bool {
     let Some(tp_end) = start.thread_pointer.checked_add(8) else {
         return false;
     };
-    !overlaps(start.stack, start.tls)
+    let private_startup_valid = start.private_startup.is_none_or(|range| {
+        let Ok(bytes) = usize::try_from(range.byte_count()) else {
+            return false;
+        };
+        !overlaps(range, start.stack)
+            && !overlaps(range, start.tls)
+            && range.start() <= start.startup
+            && start
+                .startup
+                .checked_add(start.startup_bytes as u64)
+                .is_some_and(|end| end <= range.end())
+            && user_range_contains(&space.regions, range.start(), bytes, false, false)
+            && !space.regions.iter().any(|region| {
+                overlaps(region.range, range)
+                    && (region.permissions.write || region.permissions.execute)
+            })
+    });
+    private_startup_valid
+        && !overlaps(start.stack, start.tls)
         && writable_nx(space, start.stack)
         && writable_nx(space, start.tls)
         && start

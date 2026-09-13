@@ -79,9 +79,18 @@ never executes the ordinary application.
   repeat claims. Completion failure returns the owned execution for safe recovery
   or retirement after process stop. Capability and operation authority remain
   composition obligations; native acceptance uses the owned operation dispatcher
-  for captured Current calls and synchronization requests under separate closed
+  for captured Current/Join calls and synchronization requests under separate closed
   handles. Pending synchronization claims cannot complete after a sibling's
   native fault. Ordinary application admission does not enable scheduler calls;
+- native thread retirement: a claimed Exit can remove one inactive context's
+  stack, TLS, optional private read-only startup and IPC mappings. Read-only
+  preflight checks kernel-owned physical extents, permissions, sibling references,
+  all user aliases and bounded metadata capacity before any page-table write.
+  Partial mutation failure stops the whole process and retains backing until
+  root teardown. Success erases the register record in place and releases only
+  the unmapped IPC pair; ordinary physical owners must still zero/reclaim frames
+  before logical resource acknowledgement or a join result becomes available.
+  Untagged single-CPU execution flushes translations at native boundaries;
 - tasks and process records: at most 65,536, with monotonic identities, explicit
   capabilities, deterministic lifecycle accounting, fallible metadata growth,
   and guarded native stack payloads. Portable thread and synchronization lookup
