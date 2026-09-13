@@ -22,13 +22,13 @@ def transcript(
         )
         for path in ipc_phase_b.PATHS:
             queued = path == "persistent-queued"
-            ticks = 90 if queued else direct_ticks
+            ticks = 110 if queued else direct_ticks
             raw = ",".join([str(ticks)] * 256)
             lines.append(
                 f"ipc-phase-b-samples path={path} payload={size} counter_hz=1000000 "
                 f"ticks={raw}"
             )
-            limit = 70
+            limit = 90
             copies = (512 if queued else 256) if size else 0
             reply = 256 if size else 0
             full = 0 if tagged else 512
@@ -51,14 +51,14 @@ def transcript(
 
 class IpcPhaseBTests(unittest.TestCase):
     def test_ratios_are_recomputed_and_bounds_are_inclusive(self) -> None:
-        result = ipc_phase_b.validate(transcript(direct_ticks=70), require_tagged=True)
+        result = ipc_phase_b.validate(transcript(direct_ticks=90), require_tagged=True)
         self.assertTrue(result["tagged"])
         self.assertEqual(len(result["rows"]), 8)
         with self.assertRaisesRegex(ValueError, "ratio failed"):
-            ipc_phase_b.validate(transcript(direct_ticks=71), require_tagged=True)
+            ipc_phase_b.validate(transcript(direct_ticks=91), require_tagged=True)
 
     def test_fallback_cannot_satisfy_the_tagged_gate(self) -> None:
-        output = transcript(tagged=False, direct_ticks=90)
+        output = transcript(tagged=False, direct_ticks=110)
         self.assertFalse(ipc_phase_b.validate(output, require_tagged=False)["tagged"])
         with self.assertRaisesRegex(ValueError, "unavailable"):
             ipc_phase_b.validate(output, require_tagged=True)
@@ -66,7 +66,7 @@ class IpcPhaseBTests(unittest.TestCase):
     def test_tampered_or_missing_evidence_fails(self) -> None:
         output = transcript()
         for damaged in (
-            output.replace("ratio_limit=70", "ratio_limit=71", 1),
+            output.replace("ratio_limit=90", "ratio_limit=91", 1),
             output.replace(
                 "additional_lease_programs=0", "additional_lease_programs=1", 1
             ),

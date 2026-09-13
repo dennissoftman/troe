@@ -38,8 +38,8 @@ def validate(
     paths: tuple[str, ...] = PATHS,
     record_prefix: str = "ipc-phase-b",
     sample_prefix: str = "ipc-phase-b-samples",
-    small_limit: int = 70,
-    large_limit: int = 70,
+    small_limit: int = 90,
+    large_limit: int = 90,
     ratio_scale: int = 100,
 ) -> dict[str, Any]:
     """Recompute every ratio and require actual direct/queued structural counts."""

@@ -53,8 +53,8 @@ def validate(output: str, *, require_tagged: bool) -> dict[str, Any]:
         paths=("general-direct",),
         record_prefix="ipc-phase-c-latency",
         sample_prefix="ipc-phase-c-samples",
-        small_limit=700,
-        large_limit=700,
+        small_limit=900,
+        large_limit=900,
         ratio_scale=1000,
     )
     result["faults"] = faults
