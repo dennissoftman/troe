@@ -529,17 +529,27 @@ not enable threaded KEX admission or the pthread facade.
 `NativeProcessContext` retains one root and a bounded array of private register
 continuations keyed by process-owned thread tokens. It validates initial stack
 guards, executable entry, TLS geometry and nonoverlapping stack/TLS payloads.
-Its logical metadata charge includes actual context/mapping vector capacities
-and the compiled inline owner. Admission and switching allocate no new metadata.
+Its logical metadata charge includes actual context/mapping/IPC-owner vector
+capacities and the compiled inline owner. Context preparation and switching
+allocate no new metadata after the owner's fallible constructor.
 Saved execution moves only the mapping summary into the masked trap state;
 the unique root stays with the caller and its summary is restored before IRQs
 are enabled. Process exit, native fault and explicit stop revoke all sibling
 contexts without user cleanup; their register bytes are erased before metadata
-release. Composition retains physical frame ownership until this native owner
-has been retired. The current mechanism supports copied-call continuations and
-rejects roots bound to the single-thread IPC profile. It accepts a caller-supplied
-remaining slice of at most 50 ms; process-share scheduling, per-thread IPC and
-threaded package admission are not enabled by this mechanism.
+release. `NativeProcessBacking` transfers the unique root and retained task IPC
+pairs together: contexts retire first, then the root, then the zeroing pair
+owners. Explicit stop retains the root and pairs until the owner drops.
+Composition retains ordinary user/table frames until this native owner retires.
+Each never-started context can bind one pair after process/thread, live pair,
+physical-page, RW/NX and nonoverlap checks. Bindings cannot be replaced. Bounded
+TX copying and RX publication use the retained binding; RX publication clears
+the whole page before copying the prefix. These are kernel storage primitives;
+capability and operation authentication remain composition obligations. Threads
+share all user mappings, so the buffers do not isolate siblings.
+The mechanism supports copied-call continuations and rejects roots bound to
+the single-thread IPC profile. It accepts a caller-supplied remaining slice of
+at most 50 ms; process-share scheduling, native scheduler calls and threaded
+package admission are not enabled by this mechanism.
 Unsaved AVX-family, SVE, and SME state remains disabled rather than leaking or
 corrupting across tasks. ABI call 0 exits through the owned gate. The x86
 local-APIC and AArch64 generic physical timers capture a complete resumable

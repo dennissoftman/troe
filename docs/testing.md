@@ -582,16 +582,22 @@ them. The loop and accepted preemption count are bounded. Terminal fault
 sessions exercise kernel-origin write, execute, synchronous-exception, and
 task-stack-guard paths.
 The shared-context acceptance probe creates two native continuations under one
-root with separate guarded stacks and TLS pages. It switches to the sibling
-while the first is timer-preempted, then alternates sixteen yields per context,
-checking distinct TLS counters and one shared counter. It rejects foreign and
-duplicate thread tokens, missing stack guards, overlapping payloads and invalid
-slice lengths. An intentional native fault revokes both contexts; a subsequent
-sibling resume is rejected and the shared counter stays unchanged. The probe
-retires the root before zeroing/freeing its sole allocation and acknowledges
-thread resource release only afterward. These are native mechanism checks;
-they do not establish threaded package admission, process-share scheduling,
-compiler TLS initialization, per-thread IPC or C/CPython thread safety.
+root with separate guarded stacks, TLS pages and retained TX/RX pairs. It
+switches to the sibling while the first is timer-preempted, then alternates
+sixteen yields per context, checking distinct TLS counters, one shared counter,
+TX markers and RX replies. It rejects foreign/duplicate tokens, missing stack
+guards, overlapping stack/TLS/IPC ranges, invalid slice lengths, wrong physical
+IPC bindings and rebinding. It checks actual retained pair-vector capacity
+against the metadata budget, full RX-tail zeroing after shorter/empty replies,
+and unchanged buffers after oversized or foreign operations. An intentional
+native fault revokes both contexts; subsequent sibling execution and IPC writes
+are rejected. Stopped contexts retain their IPC slots while the root exists;
+root retirement precedes pair zeroing/reuse and ordinary frame reclamation.
+Reused pair slots have a new generation, and thread resource release is
+acknowledged only after physical reclamation. These are native mechanism
+checks; they do not establish threaded package admission, process-share
+scheduling, native scheduler calls, compiler TLS initialization or C/CPython
+thread safety.
 The acceptance image exceeds 1 MiB and therefore also exercises the
 page-relative data-symbol relocations used by AArch64 entry and completion.
 The source contract test pins assembly ordering that cannot be probabilistically

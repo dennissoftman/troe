@@ -49,11 +49,39 @@ pub enum NativeThreadStop {
     ProcessFaulted(IsolatedFault),
 }
 
+#[derive(Clone, Copy)]
+struct ThreadIpc {
+    index: usize,
+    tx: u64,
+}
+
+/// Root and IPC owners whose declaration order enforces root-before-pair drop.
+///
+/// Construct only after all mappings are prepared while the pairs are retained.
+/// Moving this bundle into native admission also keeps rejected preparation from
+/// dropping an IPC pair before the root which maps it.
+pub struct NativeProcessBacking {
+    address_space: UserAddressSpace,
+    pairs: Vec<crate::IpcPagePair>,
+}
+impl NativeProcessBacking {
+    /// Transfer the unique root and every retained task IPC pair together.
+    #[must_use]
+    pub const fn new(address_space: UserAddressSpace, pairs: Vec<crate::IpcPagePair>) -> Self {
+        Self {
+            address_space,
+            pairs,
+        }
+    }
+}
+
 struct ThreadContext {
     id: ThreadId,
     start: NativeThreadStart,
     registers: ArchitectureApplicationContext,
     pending: ApplicationPending,
+    started: bool,
+    ipc: Option<ThreadIpc>,
 }
 
 impl Drop for ThreadContext {
@@ -70,16 +98,17 @@ impl Drop for ThreadContext {
 
 /// Exclusive native address-space owner with preallocated thread records.
 ///
-/// Records never expose their registers or root. Every operation requires unique
+/// Records never expose their registers or root. Execution requires unique
 /// access, and a native run returns to the kernel before another record can run
-/// or mappings can be reclaimed. This does not own physical frames; composition
-/// must consume/drop this owner before zeroing and releasing its frame owner.
+/// or mappings can be reclaimed. This retains its IPC page pairs, but composition
+/// must drop this owner before zeroing and releasing ordinary user/table frames.
 /// The current mechanism rejects roots bound to the single-thread IPC profile.
-/// Native threaded package admission and per-thread IPC remain disabled.
+/// Owned per-thread IPC buffers do not enable threaded package admission or
+/// the scheduler-call dispatcher.
 pub struct NativeProcessContext {
     // Contexts precede the root so dropping the owner retires them first.
     contexts: Vec<ThreadContext>,
-    address_space: UserAddressSpace,
+    backing: NativeProcessBacking,
     process: ProcessId,
     capacity: usize,
     metadata_bytes: usize,
@@ -98,14 +127,49 @@ impl NativeProcessContext {
         capacity: usize,
         metadata_limit: usize,
     ) -> Result<Self, MmuError> {
-        if capacity == 0 || capacity > crate::IPC_TASK_PAIRS || address_space.ipc.is_some() {
+        Self::with_backing(
+            process,
+            NativeProcessBacking::new(address_space, Vec::new()),
+            capacity,
+            metadata_limit,
+        )
+    }
+
+    /// Admit an owned root/IPC bundle with bounded native metadata.
+    ///
+    /// # Errors
+    /// Rejects a legacy IPC-bound root, non-task/stale pairs, excess capacity,
+    /// or requested/actual metadata over budget. The bundle retires its root
+    /// before releasing any pair on every rejected path.
+    pub fn with_backing(
+        process: ProcessId,
+        backing: NativeProcessBacking,
+        capacity: usize,
+        metadata_limit: usize,
+    ) -> Result<Self, MmuError> {
+        if capacity == 0
+            || capacity > crate::IPC_TASK_PAIRS
+            || backing.address_space.ipc.is_some()
+            || backing.pairs.len() > capacity
+            || backing
+                .pairs
+                .iter()
+                .any(|pair| pair.slot() >= crate::IPC_TASK_PAIRS || !pair.is_live())
+        {
             return Err(MmuError::InvalidUserContext);
         }
-        let retained_root = address_space
+        let pair_bytes = backing
+            .pairs
+            .capacity()
+            .checked_mul(core::mem::size_of::<crate::IpcPagePair>())
+            .ok_or(MmuError::InvalidUserContext)?;
+        let retained_root = backing
+            .address_space
             .regions
             .capacity()
             .checked_mul(core::mem::size_of::<super::UserRegion>())
             .and_then(|bytes| bytes.checked_add(core::mem::size_of::<Self>()))
+            .and_then(|bytes| bytes.checked_add(pair_bytes))
             .ok_or(MmuError::InvalidUserContext)?;
         let charge = |slots: usize| {
             slots
@@ -122,7 +186,7 @@ impl NativeProcessContext {
         let metadata_bytes = charge(contexts.capacity())?;
         Ok(Self {
             contexts,
-            address_space,
+            backing,
             process,
             capacity,
             metadata_bytes,
@@ -130,7 +194,7 @@ impl NativeProcessContext {
         })
     }
 
-    /// Actual context/mapping array capacities plus the compiled inline owner.
+    /// Actual context/mapping/IPC-owner capacities plus the compiled inline owner.
     #[must_use]
     pub const fn metadata_bytes(&self) -> usize {
         self.metadata_bytes
@@ -139,7 +203,7 @@ impl NativeProcessContext {
     /// Shared mapped-page and root-table charges, counted once for the process.
     #[must_use]
     pub const fn stats(&self) -> MmuStats {
-        self.address_space.stats
+        self.backing.address_space.stats
     }
 
     /// Whether native process exit, fault or explicit stop forbids execution.
@@ -156,8 +220,8 @@ impl NativeProcessContext {
     pub fn probe_word(&self, address: u64) -> Result<u64, MmuError> {
         let mut bytes = [0; 8];
         super::copy_user_from_physical(
-            self.address_space.root,
-            &self.address_space.regions,
+            self.backing.address_space.root,
+            &self.backing.address_space.regions,
             address,
             &mut bytes,
         )?;
@@ -185,8 +249,8 @@ impl NativeProcessContext {
             return Err(MmuError::InvalidUserContext);
         }
         super::copy_user_from_physical(
-            self.address_space.root,
-            &self.address_space.regions,
+            self.backing.address_space.root,
+            &self.backing.address_space.regions,
             call.request_address,
             destination,
         )
@@ -206,12 +270,16 @@ impl NativeProcessContext {
             || id.process() != self.process
             || self.contexts.len() == self.capacity
             || self.contexts.iter().any(|context| context.id == id)
-            || !valid_start(&self.address_space, start)
+            || !valid_start(&self.backing.address_space, start)
             || self.contexts.iter().any(|context| {
                 [context.start.stack, context.start.tls].iter().any(|old| {
                     [start.stack, start.tls]
                         .iter()
                         .any(|new| overlaps(*old, *new))
+                }) || context.ipc.is_some_and(|ipc| {
+                    [start.stack, start.tls]
+                        .iter()
+                        .any(|new| ipc.tx < new.end() && new.start() < ipc.tx + 8192)
                 })
             })
         {
@@ -222,8 +290,134 @@ impl NativeProcessContext {
             start,
             registers: initial_registers(start),
             pending: ApplicationPending::Timeslice,
+            started: false,
+            ipc: None,
         });
         Ok(())
+    }
+
+    /// Bind one retained pair to a never-started thread after mapping validation.
+    ///
+    /// The pair remains owned until the complete root is retired, including
+    /// after `stop`. This method does not allocate, map pages or publish entry 6.
+    ///
+    /// # Errors
+    /// Rejects foreign/stale threads, duplicate/rebound pairs, started contexts,
+    /// overlaps, non-page-aligned TX, or physical/permission mismatches.
+    pub fn bind_thread_ipc(
+        &mut self,
+        id: ThreadId,
+        pair_index: usize,
+        tx: u64,
+    ) -> Result<(), MmuError> {
+        if self.stopped || id.process() != self.process || !tx.is_multiple_of(4096) {
+            return Err(MmuError::InvalidUserContext);
+        }
+        let range = VirtualRange::from_pages(tx, 2).map_err(|_| MmuError::InvalidUserContext)?;
+        let pair = self
+            .backing
+            .pairs
+            .get(pair_index)
+            .ok_or(MmuError::InvalidUserContext)?;
+        if !pair.is_live()
+            || !writable_nx(&self.backing.address_space, range)
+            || super::architecture_translate_page(self.backing.address_space.root, tx)?
+                != pair.range().start()
+            || super::architecture_translate_page(self.backing.address_space.root, tx + 4096)?
+                != pair.range().start() + 4096
+            || self.contexts.iter().any(|context| {
+                overlaps(range, context.start.stack)
+                    || overlaps(range, context.start.tls)
+                    || context.ipc.is_some_and(|ipc| {
+                        ipc.index == pair_index
+                            || (ipc.tx < range.end() && range.start() < ipc.tx + 8192)
+                    })
+            })
+        {
+            return Err(MmuError::InvalidUserContext);
+        }
+        let context = self
+            .contexts
+            .iter_mut()
+            .find(|context| context.id == id)
+            .ok_or(MmuError::InvalidUserContext)?;
+        if context.started || context.ipc.is_some() {
+            return Err(MmuError::InvalidUserContext);
+        }
+        context.ipc = Some(ThreadIpc {
+            index: pair_index,
+            tx,
+        });
+        Ok(())
+    }
+
+    /// Retained virtual TX/RX addresses for a live thread's immutable binding.
+    ///
+    /// # Errors
+    /// Rejects stopped, foreign, stale or unbound threads/pairs.
+    pub fn ipc_addresses(&self, id: ThreadId) -> Result<(u64, u64), MmuError> {
+        let (ipc, _) = self.bound_ipc(id)?;
+        Ok((ipc.tx, ipc.tx + 4096))
+    }
+
+    /// Copy a bounded TX prefix from the caller's retained pair into kernel storage.
+    ///
+    /// # Errors
+    /// Rejects invalid bindings and prefixes larger than one page before copying.
+    pub fn copy_thread_tx(&self, id: ThreadId, destination: &mut [u8]) -> Result<(), MmuError> {
+        if destination.len() > 4096 {
+            return Err(MmuError::InvalidUserContext);
+        }
+        let (ipc, _) = self.bound_ipc(id)?;
+        super::copy_user_from_physical(
+            self.backing.address_space.root,
+            &self.backing.address_space.regions,
+            ipc.tx,
+            destination,
+        )
+    }
+
+    /// Clear the whole caller RX page, then publish one bounded kernel-owned prefix.
+    ///
+    /// This is a storage primitive; scheduler capability, operation identity and
+    /// response validation are composition obligations before calling it.
+    ///
+    /// # Errors
+    /// Rejects invalid bindings/oversized prefixes before writing. Native storage
+    /// failure stops the complete process rather than permitting further execution.
+    pub fn publish_thread_rx(&mut self, id: ThreadId, bytes: &[u8]) -> Result<(), MmuError> {
+        if bytes.len() > 4096 {
+            return Err(MmuError::InvalidUserContext);
+        }
+        let (_, pair) = self.bound_ipc(id)?;
+        let rx = troe_memory::PhysicalRange::from_pages(pair.range().start() + 4096, 1)
+            .map_err(|_| MmuError::InvalidUserContext)?;
+        let result = crate::zero_physical_range(rx)
+            .and_then(|()| crate::copy_to_physical(rx, 0, bytes))
+            .map_err(|_| MmuError::InvalidUserContext);
+        if result.is_err() {
+            self.stop();
+        }
+        result
+    }
+
+    fn bound_ipc(&self, id: ThreadId) -> Result<(ThreadIpc, &crate::IpcPagePair), MmuError> {
+        if self.stopped || id.process() != self.process {
+            return Err(MmuError::InvalidUserContext);
+        }
+        let ipc = self
+            .contexts
+            .iter()
+            .find(|context| context.id == id)
+            .and_then(|context| context.ipc)
+            .ok_or(MmuError::InvalidUserContext)?;
+        let pair = self
+            .backing
+            .pairs
+            .get(ipc.index)
+            .filter(|pair| pair.is_live())
+            .ok_or(MmuError::InvalidUserContext)?;
+        Ok((ipc, pair))
     }
 
     /// Run one authenticated thread within the caller's remaining process slice.
@@ -256,7 +450,7 @@ impl NativeProcessContext {
             .ok_or(MmuError::InvalidUserContext)?;
         let context = &mut self.contexts[index];
         if let Err(error) = apply_application_resume(
-            &self.address_space,
+            &self.backing.address_space,
             &mut context.registers,
             context.pending,
             completion,
@@ -264,8 +458,9 @@ impl NativeProcessContext {
             self.stop();
             return Err(error);
         }
+        context.started = true;
         let result = run_saved_application(
-            &mut self.address_space,
+            &mut self.backing.address_space,
             &context.registers,
             remaining_milliseconds,
         );
@@ -315,6 +510,7 @@ impl NativeProcessContext {
 
     /// Revoke every continuation synchronously, without running user cleanup.
     /// Unique access proves no native gate from this owner is still running.
+    /// IPC pairs remain owned until the root is retired when this owner drops.
     pub fn stop(&mut self) {
         self.stopped = true;
         self.contexts.clear();
