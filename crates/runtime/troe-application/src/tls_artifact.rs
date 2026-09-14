@@ -1,7 +1,8 @@
 //! Static TLS container inspection, separate from native load admission.
 //!
 //! Container 1.3 explicitly requires application ABI 1.4. The native and
-//! streaming loaders still accept only container 1.2. This reader reuses their
+//! default streaming loaders still accept only container 1.2. Explicit threaded
+//! streaming verification is separate in `stream`. This reader reuses the
 //! image grammar but produces no startup layout, native mappings or load plan.
 //! The immutable TLS initializer is an exact suffix of the artifact; it must
 //! never be reconstructed from writable application memory after execution starts.

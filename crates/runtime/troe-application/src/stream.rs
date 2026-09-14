@@ -1,12 +1,13 @@
 //! Streamed package verification and bounded segment replay.
 
 use crate::bytes::{read_u32, read_u64};
-use crate::executable::{ParsedHeader, application_layout, parse_header_with_len};
+use crate::executable::{HeaderFormat, ParsedHeader, application_layout, parse_header_for_format};
 use crate::package::{
     package_reserved_is_nonzero, read_package_u16, read_package_u32, read_package_u64,
 };
 use crate::sha256::Sha256;
 use crate::startup::encode_startup_page;
+use crate::tls_artifact::{self, Metadata as TlsMetadata};
 use crate::{
     ApplicationLayout, ApplicationLimits, KEX_PACKAGE_V1_HEADER_BYTES, KEX_PACKAGE_V1_MAGIC,
     KEX_V1_DECLARED_SPAN_ABI_MINOR, KEX_V1_LOAD_RECORD_BYTES, KEX_V1_RELOCATION_RECORD_BYTES,
@@ -25,6 +26,10 @@ use crate::{
 use alloc::vec::Vec;
 use troe_abi::requirements;
 
+mod tls;
+use tls::TlsHashes;
+pub use tls::stream_verified_tls;
+
 /// Failure while validating or replaying a bounded streamed package.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StreamError {
@@ -40,6 +45,8 @@ pub enum StreamError {
     Package(PackageError),
     /// The embedded executable was rejected.
     Executable(ParseError),
+    /// Static TLS grammar, source consistency or entry validation failed.
+    Tls(tls_artifact::Error),
     /// A replay pass did not match the bytes used to construct the plan.
     SourceChanged,
     /// The inactive-frame or relocation consumer rejected a verified chunk.
@@ -61,9 +68,23 @@ pub struct StreamedLoadPlan {
     relocation_count: usize,
     charges: LoadCharges,
     layout: ApplicationLayout,
+    tls: Option<TlsMetadata>,
+    encoded_bytes: u64,
 }
 
 impl StreamedLoadPlan {
+    /// Checked compiler TLS metadata, present only for explicit threaded parsing.
+    #[must_use]
+    pub const fn tls_metadata(&self) -> Option<TlsMetadata> {
+        self.tls
+    }
+
+    /// Complete executable length, including an immutable TLS suffix if present.
+    #[must_use]
+    pub const fn encoded_bytes(&self) -> u64 {
+        self.encoded_bytes
+    }
+
     /// Artifact target.
     #[must_use]
     pub const fn target(&self) -> Target {
@@ -186,10 +207,53 @@ impl StreamedKexPackage {
 /// and any source mutation observed between validation passes.
 pub fn parse_streamed_kex_package(
     byte_len: u64,
+    read_at: impl FnMut(u64, &mut [u8]) -> Result<usize, ()>,
+    expected_target: Target,
+    supported_abi_minor: u16,
+    placement: LoadPlacement,
+) -> Result<StreamedKexPackage, StreamError> {
+    parse_streamed_package(
+        byte_len,
+        read_at,
+        expected_target,
+        supported_abi_minor,
+        placement,
+        HeaderFormat::Native,
+    )
+}
+
+/// Verify an explicitly selected static-TLS package with bounded working storage.
+///
+/// This does not enable the legacy loader or authenticate capabilities. It
+/// validates ABI 1.4/container 1.3, both file-backed entries, an exact immutable
+/// initializer matching its image source, and the absence of TLS relocations.
+/// Replays must still finish successfully before provisional frames are published.
+///
+/// # Errors
+/// Rejects invalid packages, inconsistent TLS and changes between verification passes.
+pub fn parse_streamed_threaded_kex_package(
+    byte_len: u64,
+    read_at: impl FnMut(u64, &mut [u8]) -> Result<usize, ()>,
+    expected_target: Target,
+    placement: LoadPlacement,
+) -> Result<StreamedKexPackage, StreamError> {
+    parse_streamed_package(
+        byte_len,
+        read_at,
+        expected_target,
+        troe_abi::startup::THREAD_ABI_MINOR,
+        placement,
+        HeaderFormat::StaticTls,
+    )
+}
+
+fn parse_streamed_package(
+    byte_len: u64,
     mut read_at: impl FnMut(u64, &mut [u8]) -> Result<usize, ()>,
     expected_target: Target,
     supported_abi_minor: u16,
     placement: LoadPlacement,
+    format: HeaderFormat,
 ) -> Result<StreamedKexPackage, StreamError> {
     let package_bytes = usize::try_from(byte_len).map_err(|_| StreamError::InvalidLength)?;
     if package_bytes == 0 || package_bytes > MAX_KEX_PACKAGE_BYTES {
@@ -205,6 +269,7 @@ pub fn parse_streamed_kex_package(
         expected_target,
         supported_abi_minor,
         placement,
+        format,
     )?;
     let relocation_start = usize::try_from(parsed.executable_offset)
         .ok()
@@ -226,6 +291,8 @@ pub fn parse_streamed_kex_package(
     let mut package_hash = Sha256::new();
     package_hash.update(&prefix[..prefix_bytes]);
     let mut relocation_hash = Sha256::new();
+    let mut tls_hashes = TlsHashes::new(&parsed)?;
+    tls_hashes.update(0, &prefix[..prefix_bytes]);
     hash_overlap(
         &mut relocation_hash,
         0,
@@ -243,6 +310,7 @@ pub fn parse_streamed_kex_package(
             &mut buffer[..count],
         )?;
         package_hash.update(&buffer[..count]);
+        tls_hashes.update(offset, &buffer[..count]);
         hash_overlap(
             &mut relocation_hash,
             offset,
@@ -256,6 +324,7 @@ pub fn parse_streamed_kex_package(
     }
     let digest = package_hash.finish();
     let relocation_digest = relocation_hash.finish();
+    tls_hashes.finish()?;
     if let Some((completion_offset, completion_bytes)) = parsed.completion {
         validate_streamed_completion(completion_offset, completion_bytes, &mut read_at)?;
     }
@@ -421,6 +490,7 @@ fn parse_stream_prefix(
     expected_target: Target,
     supported_abi_minor: u16,
     placement: LoadPlacement,
+    format: HeaderFormat,
 ) -> Result<ParsedStreamPrefix, StreamError> {
     if prefix.len() < KEX_PACKAGE_V1_HEADER_BYTES {
         return Err(StreamError::Package(PackageError::TruncatedHeader));
@@ -516,21 +586,56 @@ fn parse_stream_prefix(
     let executable_prefix = prefix
         .get(executable_offset..)
         .ok_or(StreamError::Executable(ParseError::TruncatedHeader))?;
-    let header = parse_header_with_len(
+    let header = parse_header_for_format(
         executable_prefix,
         executable_bytes,
         expected_target,
         supported_abi_minor,
         ApplicationLimits::standard(),
+        format,
     )
     .map_err(StreamError::Executable)?;
-    let parsed = parse_stream_segments(
-        executable_prefix,
-        executable_bytes,
-        header,
-        placement.image_base,
-    )
-    .map_err(StreamError::Executable)?;
+    let tls = if matches!(format, HeaderFormat::StaticTls) {
+        Some(
+            TlsMetadata::decode(
+                executable_prefix
+                    .get(96..tls_artifact::HEADER_BYTES)
+                    .ok_or(StreamError::Tls(tls_artifact::Error::InvalidTemplate))?,
+                expected_target,
+            )
+            .map_err(StreamError::Tls)?,
+        )
+    } else {
+        None
+    };
+    let image_bytes = match tls {
+        Some(metadata) => {
+            if metadata.file_offset.checked_add(metadata.file_bytes)
+                != Some(executable_bytes as u64)
+                || metadata.file_offset < header.payload_offset as u64
+            {
+                return Err(StreamError::Tls(tls_artifact::Error::InvalidTemplate));
+            }
+            usize::try_from(metadata.file_offset).map_err(|_| StreamError::InvalidLength)?
+        }
+        None => executable_bytes,
+    };
+    let parsed =
+        parse_stream_segments(executable_prefix, image_bytes, header, placement.image_base)
+            .map_err(StreamError::Executable)?;
+    if let Some(metadata) = tls {
+        for entry in [header.entry_offset, metadata.trampoline_offset] {
+            if (expected_target == Target::Aarch64 && !entry.is_multiple_of(4))
+                || !parsed.segments.iter().flatten().any(|segment| {
+                    segment.permissions().executable()
+                        && segment.image_offset() <= entry
+                        && entry - segment.image_offset() < segment.file_byte_count()
+                })
+            {
+                return Err(StreamError::Tls(tls_artifact::Error::InvalidEntry));
+            }
+        }
+    }
     let layout = application_layout(
         header.stack_pages,
         header.heap_pages,
@@ -583,6 +688,8 @@ fn parse_stream_prefix(
                 reserved_resident_pages,
             },
             layout,
+            tls,
+            encoded_bytes: executable_bytes as u64,
         },
     })
 }
@@ -755,6 +862,13 @@ fn validate_streamed_relocations(
                 })
             {
                 return Err(StreamError::Executable(ParseError::InvalidRelocation));
+            }
+            if plan.tls.is_some_and(|tls| {
+                tls.file_bytes != 0
+                    && target_offset < tls.source_offset + tls.file_bytes
+                    && tls.source_offset < target_end
+            }) {
+                return Err(StreamError::Tls(tls_artifact::Error::RelocatedTemplate));
             }
             previous_target = Some(target_offset);
         }

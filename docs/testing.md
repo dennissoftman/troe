@@ -192,8 +192,11 @@ after failed conversion.
 `cargo test -p troe-application --lib tls_artifact::` checks exact extension
 versions, reserved bytes, all truncations, source/suffix agreement, relocation
 overlap, file-backed entries, and empty/BSS-only templates on both targets.
-Native and streaming package loaders must reject this format even when their
+Default native and streaming package loaders must reject this format even when their
 caller supplies a higher ABI ceiling. Inspection produces no native load plan.
+`cargo test -p troe-application stream::tls::` checks the explicit streamed TLS
+verifier, short reads, source/suffix agreement, unchanged default-parser rejection,
+bounded image/initializer replay, and rejection after source mutation.
 
 The probes require `clang` and `ld.lld` and fail if either is unavailable.
 `TROE_TLS_CC` and `TROE_TLS_LD` select explicit executables; compiler/linker
@@ -265,7 +268,9 @@ Maximum 16 TiB heap and stack requests exercise bounded work without allocating
 their backing. Tests account for architecture-specific empty-TLS padding and
 prove native loaders continue to reject the artifact after successful preflight.
 
-`cargo test -p troe-application tls_owner::` checks owned staging and immutable
+`cargo test -p troe-application tls_owner::` checks shared-account lifetime,
+independent refunds, bounded TLS copies across padding and split control words,
+owned staging and immutable
 initializer lifetimes, reservation-before-allocation, malformed input and injected
 allocation failure, actual-capacity rejection/charges, failed-update rollback,
 overflow and competing retained owners. Stop is permanent and refunds nothing
@@ -674,7 +679,21 @@ are rejected. Stopped contexts retain their IPC slots while the root exists;
 root retirement precedes pair zeroing/reuse and ordinary frame reclamation.
 Reused pair slots have a new generation, and thread resource release is
 acknowledged only after physical reclamation.
-The same probe issues malformed scheduler frames/requests followed by repeated
+The resident TLS probe loads two converted KEX 1.3 programs through the explicit
+streamed resident loader and steps them through the resident process branch.
+Compiler local-exec TLS checks distinguish initialized and zero data in the
+initial thread and its worker. The programs exercise invalid/exhausted Prepare,
+Abort and generation reuse, Start, Join, mutex creation/lock/unlock/destruction,
+and two additions to an initially empty heap. The probe requires successful
+process exits, empty logical tables, and recovery of frame, commit, initializer
+and per-process metadata charges. It uses an acceptance-only freestanding C
+consumer, not the production libc or CPython.
+`python3 tools/build_resident_thread_probe.py --cc clang --linker ld.lld --check`
+rebuilds both embedded artifacts with the pinned compiler profile and compares
+their bytes. Omitting `--check` regenerates them after changing the C source.
+This recipe uses the shared target/TLS flags and linker script from
+`tools/thread_profile.py`; it rejects compiler/linker versions outside that pin.
+The shared-context probe issues malformed scheduler frames/requests followed by repeated
 canonical requests. Both callers suspend before either completes; the sibling
 actually overwrites the first caller's writable TX header. The retained kernel
 request remains unchanged. It rejects a mismatched interface/request, invalid

@@ -1349,6 +1349,35 @@ impl Scheduler {
         Ok(())
     }
 
+    /// Finish resource accounting for an inactive Ready isolated task.
+    ///
+    /// Trusted loading uses this after obtaining its final root and backing.
+    /// Address-space identity and handle ownership stay unchanged.
+    ///
+    /// # Errors
+    /// Rejects active/non-Ready tasks, non-isolated tasks and changed ownership.
+    pub fn resize_ready_isolation(
+        &mut self,
+        id: TaskId,
+        replacement: IsolationResource,
+    ) -> Result<(), TaskError> {
+        if self.current == Some(id) {
+            return Err(TaskError::InvalidState);
+        }
+        let record = self.record_mut(id)?;
+        if record.snapshot.state != TaskState::Ready {
+            return Err(TaskError::InvalidState);
+        }
+        let Some(current) = record.snapshot.isolation else {
+            return Err(TaskError::InvalidState);
+        };
+        if current.slot != replacement.slot || current.handles != replacement.handles {
+            return Err(TaskError::InvalidState);
+        }
+        record.snapshot.isolation = Some(replacement);
+        Ok(())
+    }
+
     /// Finish the running task and retain its resources for explicit reaping.
     ///
     /// # Errors
@@ -2032,6 +2061,37 @@ mod tests {
         );
         scheduler.exit_current(id, 0)?;
         assert_eq!(scheduler.reap(id)?.isolation, Some(grown));
+        Ok(())
+    }
+
+    #[test]
+    fn ready_isolation_finishes_loading_without_dispatch_or_authority_change()
+    -> Result<(), TaskError> {
+        let mut scheduler = Scheduler::new(2)?;
+        let initial = IsolationResource::new(2, 1, 12, 3)?;
+        let actual = IsolationResource::new(2, 8, 12, 3)?;
+        let parent = scheduler.spawn(Capabilities::SERVICE, stack(1)?)?;
+        scheduler.dispatch(parent, Capabilities::SERVICE)?;
+        let child = scheduler.spawn_isolated(Capabilities::SERVICE, stack(0)?, initial)?;
+        scheduler.resize_ready_isolation(child, actual)?;
+        assert_eq!(scheduler.task(child)?.isolation(), Some(actual));
+        assert_eq!(scheduler.task(parent)?.state(), TaskState::Running);
+        assert_eq!(
+            scheduler.resize_ready_isolation(child, IsolationResource::new(3, 8, 12, 3)?),
+            Err(TaskError::InvalidState)
+        );
+        assert_eq!(
+            scheduler.resize_ready_isolation(child, IsolationResource::new(2, 8, 12, 4)?),
+            Err(TaskError::InvalidState)
+        );
+        scheduler.yield_current(parent)?;
+        scheduler.dispatch(child, Capabilities::SERVICE)?;
+        assert_eq!(
+            scheduler.resize_ready_isolation(child, actual),
+            Err(TaskError::InvalidState)
+        );
+        scheduler.exit_current(child, 0)?;
+        assert_eq!(scheduler.reap(child)?.isolation, Some(actual));
         Ok(())
     }
 

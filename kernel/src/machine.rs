@@ -51,6 +51,8 @@ pub(crate) struct OwnedAccounting {
     pub(crate) memory_policy: MemoryPolicy,
     pub(crate) application_committed_pages: u64,
     pub(crate) private_metadata_bytes: u64,
+    pub(crate) thread_tls_backing: alloc::rc::Rc<troe_application::tls_owner::TlsBackingAccount>,
+    pub(crate) native_threads: Option<crate::resident::threading::SharedNativeThreads>,
     pub(crate) random: SharedRandom,
     pub(crate) firmware_wall_seconds: Option<u64>,
     pub(crate) boot_mount_manifest: BootMountManifest,

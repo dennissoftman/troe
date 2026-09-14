@@ -7,6 +7,8 @@
 pub(crate) mod growth;
 pub(crate) mod isolated;
 pub(crate) mod launch;
+#[cfg_attr(not(feature = "acceptance-probes"), allow(dead_code))]
+pub(crate) mod native;
 pub(crate) mod private;
 #[cfg(feature = "acceptance-probes")]
 pub(crate) mod shared_context_probe;

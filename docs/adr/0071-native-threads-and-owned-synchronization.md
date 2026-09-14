@@ -4,6 +4,16 @@ Status: architectural direction accepted, 2026-09-09. Implementation tracked by
 [#65](https://github.com/dennissoftman/troe/issues/65) and delivery issues
 [#204](https://github.com/dennissoftman/troe/issues/204) through
 [#208](https://github.com/dennissoftman/troe/issues/208).
+The explicit resident acceptance profile now loads converted TLS KEX programs
+through the streamed verifier, native frame owner and resident process loop. One
+shared policy owner selects process turns without starting another resident's
+deadline. Initial and worker backing, scheduler waits, synchronous service calls,
+bounded heap additions and teardown use retained native owners. Two loaded C
+consumers cover compiler TLS, Prepare/Start/Abort/Join, synchronization and growth
+from an empty heap. Ordinary threaded package admission, deferred service I/O,
+private-memory integration and the production C/CPython adapter remain disabled
+and tracked by #207/#208. The limits of this explicit profile are documented in
+the current [architecture](../architecture.md) and [thread contract](../formats/thread-v1.md).
 Native heap requests now retain owned operation identity, bind immutable heap
 bounds, and separate one mapping commit from completion. Mapping errors revoke
 all continuations while backing remains retained until root retirement. These

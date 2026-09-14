@@ -921,6 +921,18 @@ impl ThreadTable {
         Ok(id)
     }
 
+    /// Inspect retained records belonging to one trusted process identity.
+    ///
+    /// The bounded iterator neither allocates nor grants lifecycle authority.
+    /// Composition revalidates each copied identity after intervening mutations.
+    pub fn snapshots(&self, owner: ProcessId) -> impl Iterator<Item = ThreadSnapshot> + '_ {
+        self.slots
+            .iter()
+            .filter_map(|slot| slot.record)
+            .map(|record| record.snapshot)
+            .filter(move |snapshot| snapshot.id.process == owner)
+    }
+
     /// Retained records and unreleased native page charges for one process.
     #[must_use]
     pub fn usage(&self, owner: ProcessId) -> (usize, u64) {

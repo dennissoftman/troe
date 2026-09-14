@@ -17,6 +17,132 @@ const PLACEMENT: ProcessMemoryPlacement = ProcessMemoryPlacement {
     heap_capacity_pages: 16,
     initial_thread_base: KEX_V1_MIN_IMAGE_BASE + (1 << 24),
 };
+
+#[test]
+fn resident_account_survives_its_outer_owner_and_refunds_independent_backing() {
+    let account = Rc::new(TlsBackingAccount::new(8));
+    let weak = Rc::downgrade(&account);
+    let staged = StagedTlsImage::prepare_shared(
+        TlsFixture::default().encode(Target::X86_64),
+        Target::X86_64,
+        PLACEMENT,
+        UNLIMITED,
+        Rc::clone(&account),
+    )
+    .unwrap_or_else(|_| unreachable!());
+    assert!(account.usage().staging_pages() > 0);
+    drop(account);
+    let process = staged.release_staging();
+    let retained = weak.upgrade().unwrap_or_else(|| unreachable!());
+    assert_eq!(retained.usage().staging_pages(), 0);
+    assert_eq!(
+        retained.usage().initializer_pages(),
+        process.backing_pages()
+    );
+    drop(retained);
+    let mut page = [0xa5; PAGE_BYTES];
+    process
+        .initialize(
+            process.plan().initial_thread().regions()[1].start(),
+            &mut page,
+        )
+        .unwrap_or_else(|_| unreachable!());
+    drop(process);
+    assert!(weak.upgrade().is_none());
+}
+
+#[test]
+fn failed_shared_preparation_preserves_other_reservations() {
+    let account = Rc::new(TlsBackingAccount::new(32));
+    let retained = prepared(&account, Target::Aarch64).release_staging();
+    let baseline = account.usage();
+    for bytes in [vec![], TlsFixture::default().encode(Target::X86_64)] {
+        assert!(
+            StagedTlsImage::prepare_shared(
+                bytes,
+                Target::Aarch64,
+                PLACEMENT,
+                UNLIMITED,
+                Rc::clone(&account),
+            )
+            .is_err()
+        );
+        assert_eq!(account.usage(), baseline);
+        assert_eq!(Rc::strong_count(&account), 1);
+    }
+    let failed = StagedTlsImage::prepare_using(
+        TlsFixture::default().encode(Target::Aarch64),
+        Target::Aarch64,
+        PLACEMENT,
+        UNLIMITED,
+        &Account::Shared(Rc::clone(&account)),
+        |_| Err(TlsOwnerError::AllocationFailed),
+    );
+    assert_eq!(failed.err(), Some(TlsOwnerError::AllocationFailed));
+    assert_eq!(account.usage(), baseline);
+    assert_eq!(Rc::strong_count(&account), 1);
+    drop(retained);
+    assert_eq!(account.usage().pages(), 0);
+}
+
+#[test]
+fn bounded_tls_copies_cover_padding_template_and_split_control_words() {
+    for target in [Target::X86_64, Target::Aarch64] {
+        let account = TlsBackingAccount::new(32);
+        let fixture = TlsFixture {
+            file: 4097,
+            memory: 9001,
+            alignment: 64,
+            ..TlsFixture::default()
+        };
+        let mut process = StagedTlsImage::prepare(
+            fixture.encode(target),
+            target,
+            PLACEMENT,
+            UNLIMITED,
+            &account,
+        )
+        .unwrap_or_else(|_| unreachable!())
+        .release_staging();
+        let base = process.plan().initial_thread().regions()[1].start();
+        let layout = process.plan().tls_layout();
+        let mut expected =
+            vec![0xa5; usize::try_from(layout.mapped_bytes()).unwrap_or_else(|_| unreachable!())];
+        let pointer = process
+            .initialize(base, &mut expected)
+            .unwrap_or_else(|_| unreachable!());
+        for quantum in [3, 4096, 5003] {
+            let mut actual = vec![0xb6; expected.len()];
+            for (index, chunk) in actual.chunks_mut(quantum).enumerate() {
+                assert_eq!(
+                    process.initialize_chunk(base, (index * quantum) as u64, chunk),
+                    Ok(pointer)
+                );
+            }
+            assert_eq!(actual, expected);
+        }
+        for (invalid_base, offset) in [
+            (base + 1, 0),
+            (base, u64::MAX),
+            (base, layout.mapped_bytes() - 2),
+        ] {
+            let mut chunk = [0xc7; 3];
+            assert!(
+                process
+                    .initialize_chunk(invalid_base, offset, &mut chunk)
+                    .is_err()
+            );
+            assert_eq!(chunk, [0xc7; 3]);
+        }
+        process.stop_creation();
+        let mut chunk = [0xd8; 3];
+        assert_eq!(
+            process.initialize_chunk(base, 0, &mut chunk),
+            Err(TlsOwnerError::Stopped)
+        );
+        assert_eq!(chunk, [0xd8; 3]);
+    }
+}
 fn prepared(account: &TlsBackingAccount, target: Target) -> StagedTlsImage<'_> {
     StagedTlsImage::prepare(
         TlsFixture::default().encode(target),

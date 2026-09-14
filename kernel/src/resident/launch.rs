@@ -4,6 +4,12 @@
 //! image base, reserves the private memory, and describes the segments the
 //! memory layer will map.
 
+// Ordinary package selection rejects ABI 1.4; acceptance loads it explicitly.
+#[cfg_attr(not(feature = "acceptance-probes"), allow(dead_code))]
+mod threaded;
+#[cfg(feature = "acceptance-probes")]
+pub(crate) use threaded::prepare_threaded_resident_application;
+
 use crate::artifacts::native_application_target;
 use crate::handles::{SharedProcessTable, SharedRandom};
 use crate::invocation::{CommandApplicationHandle, CommandStartupService};
@@ -307,7 +313,7 @@ pub(crate) fn prepare_resident_application_with_plan<'service, P: NativeApplicat
         task_id,
         process_id,
         processes,
-        allocation,
+        allocation: Some(allocation),
         isolation,
         owner,
         handles,

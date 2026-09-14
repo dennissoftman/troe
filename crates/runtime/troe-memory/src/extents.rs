@@ -66,6 +66,13 @@ impl PhysicalExtents {
         &self.extents
     }
 
+    /// Heap bytes retained for extent records, including unused vector capacity.
+    /// The inline owner is excluded so enclosing owners can charge it once.
+    #[must_use]
+    pub fn buffer_bytes(&self) -> usize {
+        self.extents.capacity() * core::mem::size_of::<PhysicalRange>()
+    }
+
     /// Physical start of the first extent.
     ///
     /// This identifies one reservation for diagnostics. It is not the base of a

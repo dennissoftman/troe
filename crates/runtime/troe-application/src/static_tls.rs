@@ -205,6 +205,28 @@ impl StaticTlsLayout {
         template: &[u8],
         destination: &mut [u8],
     ) -> Result<u64, StaticTlsError> {
+        if u64::try_from(destination.len()) != Ok(self.mapped_bytes) {
+            return Err(StaticTlsError::InvalidBufferSize);
+        }
+        self.initialize_chunk(virtual_base, 0, template, destination)
+    }
+
+    /// Initialize a range of an unpublished TLS mapping without a full scratch copy.
+    ///
+    /// The offset is relative to the complete mapping. Every chunk receives the
+    /// same zero padding, template bytes and architecture control word as full
+    /// initialization. Composition must cover the entire mapping before exposing
+    /// it; a successful chunk alone is not an initialization or admission proof.
+    ///
+    /// # Errors
+    /// Validates the full mapping, exact template and chunk bounds before writes.
+    pub fn initialize_chunk(
+        self,
+        virtual_base: u64,
+        offset: u64,
+        template: &[u8],
+        destination: &mut [u8],
+    ) -> Result<u64, StaticTlsError> {
         if virtual_base < PAGE_SIZE
             || !virtual_base.is_multiple_of(self.mapping_alignment())
             || virtual_base
@@ -214,7 +236,10 @@ impl StaticTlsLayout {
             return Err(StaticTlsError::InvalidMapping);
         }
         if u64::try_from(template.len()) != Ok(self.file_bytes)
-            || u64::try_from(destination.len()) != Ok(self.mapped_bytes)
+            || u64::try_from(destination.len())
+                .ok()
+                .and_then(|length| offset.checked_add(length))
+                .is_none_or(|end| end > self.mapped_bytes)
         {
             return Err(StaticTlsError::InvalidBufferSize);
         }
@@ -222,15 +247,25 @@ impl StaticTlsLayout {
             .map_err(|_| StaticTlsError::ArithmeticOverflow)?;
         let pointer_start = usize::try_from(self.thread_pointer_offset)
             .map_err(|_| StaticTlsError::ArithmeticOverflow)?;
+        let offset = usize::try_from(offset).map_err(|_| StaticTlsError::ArithmeticOverflow)?;
         // Private fields and successful construction bound all ranges below by
         // mapped_bytes. The checked mapping bounds this addition by USER_END.
         let pointer = virtual_base + self.thread_pointer_offset;
         destination.fill(0);
-        destination[template_start..template_start + template.len()].copy_from_slice(template);
+        copy_overlap(destination, offset, template, template_start);
         if self.target == Target::X86_64 {
-            destination[pointer_start..pointer_start + 8].copy_from_slice(&pointer.to_le_bytes());
+            copy_overlap(destination, offset, &pointer.to_le_bytes(), pointer_start);
         }
         Ok(pointer)
+    }
+}
+
+fn copy_overlap(destination: &mut [u8], offset: usize, source: &[u8], start: usize) {
+    let first = offset.max(start);
+    let last = (offset + destination.len()).min(start + source.len());
+    if first < last {
+        destination[first - offset..last - offset]
+            .copy_from_slice(&source[first - start..last - start]);
     }
 }
 

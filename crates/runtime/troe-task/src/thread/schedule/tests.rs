@@ -42,6 +42,54 @@ fn fixture() -> Result<(ThreadTable, [ThreadId; 4]), ThreadError> {
 }
 
 #[test]
+fn resident_visits_do_not_start_or_consume_another_process_turn() -> Result<(), Error> {
+    let (mut table, _) = fixture()?;
+    let mut now = 0;
+    for owner in [A, B, A, B] {
+        let clock = table.dispatch_clock;
+        let sequence = table.dispatch_sequence;
+        // Mixed legacy/native visits can take arbitrarily long before the
+        // selected root is reached, without consuming its execution budget.
+        for _ in 0..5 {
+            assert_eq!(table.next_dispatch_process()?, Some(owner));
+            now += 50_000;
+            assert_eq!(table.dispatch_clock, clock);
+            assert_eq!(table.dispatch_sequence, sequence);
+        }
+        let mut dispatch = table.begin_dispatch(now, HZ, 10, 4)?.ok_or(Error::Stale)?;
+        assert_eq!(dispatch.process(), owner);
+        assert_eq!(dispatch.deadline_ticks(), now + 10_000);
+        assert_eq!(table.next_dispatch_process(), Err(ThreadError::Busy.into()));
+        let caller = table
+            .dispatch_sibling(&mut dispatch, now)?
+            .ok_or(Error::Stale)?;
+        assert_eq!(table.charge_dispatch_step(&mut dispatch, caller, now)?, 10);
+        table.yield_running(owner, caller)?;
+        table
+            .finish_dispatch(dispatch, now)
+            .map_err(|(error, _)| error)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn resident_inspection_is_revoked_by_stop_and_confers_no_authority() -> Result<(), Error> {
+    let (mut table, ids) = fixture()?;
+    assert_eq!(table.next_dispatch_process()?, Some(A));
+    table.stop_process(A)?;
+    assert_eq!(table.next_dispatch_process()?, Some(B));
+    table.dispatch(B, ids[3])?;
+    assert_eq!(table.next_dispatch_process(), Err(ThreadError::Busy.into()));
+    let wait = table.block(B, ids[3])?;
+    assert_eq!(table.next_dispatch_process()?, None);
+    table.wake(B, wait)?;
+    assert_eq!(table.next_dispatch_process()?, Some(B));
+    let dispatch = table.begin_dispatch(0, HZ, 10, 4)?.ok_or(Error::Stale)?;
+    assert_eq!(dispatch.process(), B);
+    Ok(())
+}
+
+#[test]
 fn process_turns_do_not_multiply_with_runnable_siblings() -> Result<(), Error> {
     let (mut table, ids) = fixture()?;
     let metadata = table.metadata_bytes();
