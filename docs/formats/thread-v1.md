@@ -2,13 +2,13 @@
 
 `troe_abi::threading` implements allocation-free, little-endian codecs for
 interfaces 30 (`THREAD_CONTROL`) and 31 (`THREAD_SYNC`), both version 1.0.
-These contracts have native acceptance mechanisms but no ordinary application
-service admission. The active
-application ABI remains 1.3; the kernel and SDK reject ABI 1.4, and current
-startup encoding/decoding rejects both thread interfaces. No KCAP builder name
-grants them. Native loaders reject the separately encoded
-[KEX static TLS container](kex-static-tls-v1.md); its reader supports offline
-inspection and conversion only. Native composition is governed by
+Ordinary applications use ABI 1.3: default startup encoding/decoding rejects
+ABI 1.4 and both thread interfaces, and no KCAP builder name grants them.
+The explicit resident loader admits the separately encoded
+[KEX static TLS container](kex-static-tls-v1.md) and publishes ABI 1.4 startup.
+The Rust SDK's optional [native thread profile](../../sdk/rust/troe-kex/README.md)
+provides initial/worker entry and copied per-thread transport for this loader.
+It does not enable ordinary threaded package admission. Native composition is governed by
 [ADR 0071](../adr/0071-native-threads-and-owned-synchronization.md).
 
 ## Identity, authority and call framing
@@ -308,7 +308,8 @@ composition.
 header offset 80, the initial descriptor's page-aligned address; at offset 88,
 the exact descriptor prefix size, 128. The assigned header is 96 bytes, giving
 166 initial-handle slots. ABI 1.0–1.2 retain 64 bytes/168 slots and ABI 1.3
-retains 80 bytes/167 slots. The current startup encoder does not publish ABI 1.4.
+retains 80 bytes/167 slots. The ordinary startup encoder does not publish ABI 1.4;
+the explicit native process memory plan encodes this extension.
 
 `StartupDescriptor` encodes an exact 128-byte prefix of a dedicated 4 KiB
 read-only/NX page. `decode_page` also requires every trailing byte to be zero.

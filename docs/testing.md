@@ -266,7 +266,7 @@ oracle checks the combined table count across 512 layouts with sparse images,
 all sixteen load records, large TLS alignments and table-boundary crossings.
 Maximum 16 TiB heap and stack requests exercise bounded work without allocating
 their backing. Tests account for architecture-specific empty-TLS padding and
-prove native loaders continue to reject the artifact after successful preflight.
+prove default package loaders reject the artifact after successful preflight.
 
 `cargo test -p troe-task wait::thread_tests::` checks simultaneous sibling calls,
 exclusive legacy task scope, foreign process/thread completion rejection, exact
@@ -709,6 +709,22 @@ each process with two pending I/O waits and checks complete reclamation. Both ca
 require empty logical tables and recovery of frame, commit, initializer and
 per-process metadata charges; the normal case also requires successful exits. It
 uses an acceptance-only freestanding C consumer, not the production libc or CPython.
+The same resident probe also loads a Rust SDK consumer with a C TLS canary. It
+uses the optional native entry/worker adapter, SDK yield and copied service calls;
+workers preserve TLS and Current identity across independent timer/pipe waits.
+It checks Prepare/Abort generation reuse, Join, owned mutex operations, empty
+reply capacities, unchanged caller output tails and zero-handle rejection. Both
+consumers run normal and pending-I/O cancellation cases with the same reclamation
+checks. Fault-isolation acceptance requires both consumer success markers.
+`cargo test -p troe-kex-sdk --features native-threads` validates explicit startup,
+malformed records and worker bootstrap after initial backing retirement/reuse;
+compile-fail examples retain the SDK ownership checks. The full host gate runs
+these feature tests and Clippy in addition to the default SDK checks.
+`python3 tools/build_native_sdk_probe.py --cc clang --linker ld.lld --ar llvm-ar --check`
+rebuilds and compares the Rust/C consumer for both architectures with the pinned
+Rust toolchain and C compiler/linker profile. Omitting `--check` regenerates it.
+The small SDK TLS getter is an unprotected bootstrap helper, and these acceptance
+images do not qualify a production pthread/libc hardening profile.
 `python3 tools/build_resident_thread_probe.py --cc clang --linker ld.lld --check`
 rebuilds both embedded artifacts with the pinned compiler profile and compares
 their bytes. Omitting `--check` regenerates them after changing the C source.

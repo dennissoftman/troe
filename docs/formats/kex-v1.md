@@ -14,8 +14,9 @@ image-relative addresses; `0x0000_4000_0000_0000` is only the deterministic
 hosted inspection placement.
 
 The separate [static TLS container 1.3](kex-static-tls-v1.md) is supported by
-offline conversion and inspection only. Native loaders reject that revision;
-the executable and startup contracts below describe the active native profile.
+explicit native threaded loading, conversion and inspection. Default package
+loaders reject that revision; the executable and startup contracts below describe
+the ordinary application profile.
 
 ## Header
 
@@ -187,8 +188,9 @@ does not parse ELF, produce KEX bytes, reserve memory, or grant thread admission
 Container 1.2, application ABI 1.3, and their TLS rejection rules are unchanged.
 
 The standalone [thread codec](thread-v1.md) assigns an ABI 1.4 startup extension
-and read-only per-thread descriptor. The current kernel/SDK reject that minor;
-it does not enable TLS in container 1.2 or change the layouts below.
+and read-only per-thread descriptor. The explicit resident loader and optional
+native SDK entry support it. Default package loading and SDK entry reject that
+minor; it does not enable TLS in container 1.2 or change the layouts below.
 
 ## ABI 1.0–1.3 virtual layout and startup region
 

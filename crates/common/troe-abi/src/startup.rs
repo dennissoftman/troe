@@ -28,7 +28,7 @@ pub const IPC_PAGES: usize = 2;
 /// Private payload bytes, separate from the immutable startup mapping.
 pub const IPC_BYTES: usize = IPC_PAGES * PAGE_BYTES;
 
-/// Assigned threaded profile; the current kernel/SDK still reject this minor.
+/// Explicit native threaded profile; default package loading/SDK entry reject it.
 pub const THREAD_ABI_MINOR: u16 = 4;
 /// Threaded prefix adds the initial thread descriptor address and byte count.
 pub const THREAD_HEADER_BYTES: usize = 96;

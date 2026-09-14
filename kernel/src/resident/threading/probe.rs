@@ -24,22 +24,34 @@ use troe_task::{ProcessOrigin, ProcessTable, Scheduler};
 const PROGRAM: &[u8] = include_bytes!("probe/program-x86_64.kex");
 #[cfg(target_arch = "aarch64")]
 const PROGRAM: &[u8] = include_bytes!("probe/program-aarch64.kex");
+#[cfg(target_arch = "x86_64")]
+const SDK_PROGRAM: &[u8] = include_bytes!("probe/sdk-x86_64.kex");
+#[cfg(target_arch = "aarch64")]
+const SDK_PROGRAM: &[u8] = include_bytes!("probe/sdk-aarch64.kex");
 
 pub(crate) fn verify(accounting: &mut OwnedAccounting) -> Result<(), ()> {
-    verify_case(accounting, false)?;
-    verify_case(accounting, true)?;
+    for (name, program) in [("C", PROGRAM), ("Rust SDK", SDK_PROGRAM)] {
+        verify_case(accounting, false, name, program)?;
+        verify_case(accounting, true, name, program)?;
+    }
     if !troe_machine::write(b"resident TLS KEX: two processes, private compiler TLS, create/start/abort/join, sync, empty heap, sibling timers, competing pipe reads and pending-I/O cancellation passed\n") { return Err(()); }
+    if !troe_machine::write(b"resident Rust SDK: compiler TLS, native entry/worker transport, sibling timers, competing readers and pending-I/O cancellation passed\n") { return Err(()); }
     Ok(())
 }
 
 #[allow(clippy::too_many_lines)] // Keep failure cleanup beside both loaded residents.
-fn verify_case(accounting: &mut OwnedAccounting, cancel: bool) -> Result<(), ()> {
+fn verify_case(
+    accounting: &mut OwnedAccounting,
+    cancel: bool,
+    name: &str,
+    program: &[u8],
+) -> Result<(), ()> {
     let policy = NativeThreads::shared(accounting)?;
     let metadata = accounting.private_metadata_bytes;
     let committed = accounting.application_committed_pages;
     let free = accounting.frames.free_frames();
     let tls = accounting.thread_tls_backing.usage();
-    let package = encode_kex_package(PROGRAM, &[]).map_err(|_| ())?;
+    let package = encode_kex_package(program, &[]).map_err(|_| ())?;
     let processes = Rc::new(RefCell::new(ProcessTable::new(2).map_err(|_| ())?));
     let mut scheduler = Scheduler::new(2).map_err(|_| ())?;
     let mut residents: [Option<ResidentApplication<'static>>; 2] = [None, None];
@@ -204,7 +216,8 @@ fn verify_case(accounting: &mut OwnedAccounting, cancel: bool) -> Result<(), ()>
                     )?;
                     if result != CommandApplicationOutcome::Exited(0) {
                         let _ = troe_machine::write(
-                            alloc::format!("resident TLS consumer failed: {result:?}\n").as_bytes(),
+                            alloc::format!("resident {name} TLS consumer failed: {result:?}\n")
+                                .as_bytes(),
                         );
                         return Err(());
                     }

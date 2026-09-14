@@ -8,6 +8,11 @@ adds ABI 1.3 private IPC pages and calls 4/5. Its 80-byte startup prefix holds
 [The current KEX contract](../formats/kex-v1.md) defines these versioned layouts.
 The absolute 50 ms lease still applies across direct IPC handoffs.
 
+Scope note: [ADR 0071](0071-native-threads-and-owned-synchronization.md) governs
+the explicit resident threaded loader and optional SDK entry for ABI 1.4.
+Ordinary package loading retains ABI 1.3. The separate
+[thread contract](../formats/thread-v1.md) defines the threaded startup and calls.
+
 Supersession note, 2026-08-27: ADR 0037 replaces the foreground runner's
 1,024-resumption and ten-second total lifetime ceilings with supervisor-owned
 resident execution. The 50 ms maximum uninterrupted application lease and all

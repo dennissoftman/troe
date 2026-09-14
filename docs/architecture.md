@@ -347,8 +347,9 @@ walking individual pages or charging unmapped gaps as leaf mappings.
 Checked cumulative charges and simultaneous budget checks are pure preflight
 calculations. They do not acquire ownership, detect collisions with existing
 reservations, or select service reserves. Context/wait/runtime metadata and
-the shared process root remain separate charges. The native loader does not
-consume these plans or admit additional execution threads.
+the shared process root remain separate charges. The explicit resident threaded
+loader materializes these checked windows through its native frame owner;
+ordinary package admission remains single-threaded.
 
 `troe-application::process_memory` composes a validated static-TLS artifact
 with shared image/startup/heap geometry and the initial thread window. The shared
@@ -367,10 +368,11 @@ working-set pages are rounded and
 charged separately. Resident and ordinary-frame budgets use the peak while both
 coexist; steady charges exclude staging only after it is actually released.
 The two boot-owned IPC pages count logically and occupy a task pair, but do not
-consume ordinary free frames again. This is an allocation-free preflight model,
-not a native load plan or owner: package/I/O staging, allocator overhead,
-architecture kernel mapping tables and context/runtime metadata are separate.
-Native loading does not consume this plan or admit ABI 1.4.
+consume ordinary free frames again. This allocation-free preflight owns no
+backing: package/I/O staging, allocator overhead, architecture kernel mapping
+tables and context/runtime metadata are separate. The explicit native frame
+owner consumes this geometry with separately retained backing and accounting.
+Ordinary package loading does not admit ABI 1.4.
 
 `troe-application::tls_owner` takes ownership of a staged executable buffer,
 validates its coherent contents, and creates an independent immutable initializer.
@@ -427,8 +429,24 @@ descriptor codecs for assigned interfaces 30/31 and entry 6. The
 [wire contract](formats/thread-v1.md) separates scheduler outcomes from IPC
 transport failures and validates token kinds, wait flags and response payloads.
 It authenticates no capability or pending operation. Application ABI 1.4 is
-assigned but rejected by the active loader and SDK; older startup profiles
-also reject the two thread interfaces.
+supported by the explicit resident loader and optional native SDK profile;
+the default loader/SDK entry and older startup profiles reject it and the two
+thread interfaces.
+
+The Rust SDK's `native-threads` feature and `threaded_entry!` macro bind each
+thread through a compiler-managed local-exec TLS object, without assigning
+runtime meaning to TCB padding. Initial entry validates the shared header and
+its referenced descriptor; worker entry validates its own descriptor and the
+shared header without dereferencing initial-thread backing. The initial owner
+can construct one command/heap context. It exposes no additional mutable IPC
+page owner. Each call holds a thread-local reentry guard, copies the request to
+that thread's TX page, and validates full-width completion fields before copying
+RX into the caller's output. Empty replies still name the current RX page.
+Scheduler requests use canonical six-word frames and request-correlated response
+codecs. Low-level preparation and exit remain unsafe language-runtime contracts:
+capability and executable-address checks cannot prove argument lifetimes or
+required stack cleanup. The TLS getter is a minimal freestanding bootstrap helper;
+this profile does not qualify production C hardening or libc thread safety.
 
 Portable thread/synchronization identities expose their slot and generation for
 encoding. Their tables resolve those components only against a trusted selected

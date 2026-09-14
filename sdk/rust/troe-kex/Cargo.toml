@@ -9,6 +9,7 @@ publish = false
 
 [features]
 acceptance-probes = []
+native-threads = []
 
 [dependencies]
 troe-abi = { path = "../../../crates/common/troe-abi" }
