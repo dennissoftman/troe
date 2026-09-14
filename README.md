@@ -360,7 +360,9 @@ their own staged bytes, and links, argv/environment,
 UTC/C-locale time, secure
 randomness, exit handling, and coherent single-execution-thread locks and TSS.
 The Rust [`troe-kex-c-runtime`](sdk/rust/troe-kex-c-runtime) bridge supplies only
-the typed capabilities present in the package manifest. Missing capabilities
+the typed capabilities present in the package manifest. Its generation-qualified
+file operations retain ownership across I/O without holding a runtime-wide lock.
+Missing capabilities
 fail with `EACCES`; unsupported flags and facilities fail explicitly. There is
 no guest `/lib` dependency because every KEX remains statically linked.
 

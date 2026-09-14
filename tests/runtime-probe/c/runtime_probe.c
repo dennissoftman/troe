@@ -30,6 +30,63 @@ static int compare_ints(const void *left, const void *right) {
   return (a > b) - (a < b);
 }
 
+static int host_token_probe(const struct troe_runtime_host *host,
+                            const char *path) {
+  uint32_t tokens[32];
+  uint64_t length;
+  for (size_t i = 0; i < 32; ++i) {
+    if (host->file_open(host->context, (const uint8_t *)path, strlen(path),
+                        &tokens[i], &length) != 0 || length != 20)
+      return fail("host file capacity");
+  }
+  uint32_t overflow = 0;
+  if (host->file_open(host->context, (const uint8_t *)path, strlen(path),
+                      &overflow, &length) != ENOMEM)
+    return fail("host file exhaustion");
+  uint32_t old = tokens[0];
+  if (host->file_close(host->context, old) != 0 ||
+      host->file_open(host->context, (const uint8_t *)path, strlen(path),
+                      &tokens[0], &length) != 0 || tokens[0] == old)
+    return fail("host file generation");
+  uint8_t bytes[20];
+  memset(bytes, 0xa5, sizeof(bytes));
+  if (host->file_read(host->context, old, 0, bytes, sizeof(bytes)) != -EINVAL ||
+      host->file_close(host->context, old) != EINVAL)
+    return fail("host stale file rejection");
+  for (size_t i = 0; i < sizeof(bytes); ++i) {
+    if (bytes[i] != 0xa5)
+      return fail("host stale file output");
+  }
+  if (host->file_read(host->context, tokens[0], 0, bytes, sizeof(bytes)) != 20 ||
+      memcmp(bytes, "runtime-42-ok+append", 20) != 0)
+    return fail("host live file after stale close");
+  for (size_t i = 0; i < 32; ++i) {
+    if (host->file_close(host->context, tokens[i]) != 0)
+      return fail("host file cleanup");
+  }
+
+  const char *staged = "/vol/root/c-runtime-host-staged.txt";
+  uint32_t token;
+  uint64_t offset;
+  if (host->replace_begin(host->context, (const uint8_t *)staged,
+                          strlen(staged), 0, &old, &offset) != 0 || offset != 0 ||
+      host->replace_append(host->context, old, 0, (const uint8_t *)"a", 1) != 0 ||
+      host->replace_finish(host->context, old, 1) != 0 ||
+      host->replace_begin(host->context, (const uint8_t *)staged,
+                          strlen(staged), 0, &token, &offset) != 0 ||
+      offset != 0 || token == old)
+    return fail("host replacement generation");
+  bytes[0] = 0xa5;
+  if (host->replace_append(host->context, old, 0, (const uint8_t *)"x", 1) != EINVAL ||
+      host->replace_read(host->context, old, 0, bytes, 1) != -EINVAL ||
+      bytes[0] != 0xa5 || host->replace_finish(host->context, old, 0) != EINVAL ||
+      host->replace_append(host->context, token, 0, (const uint8_t *)"b", 1) != 0 ||
+      host->replace_read(host->context, token, 0, bytes, 1) != 1 || bytes[0] != 'b' ||
+      host->replace_finish(host->context, token, 1) != 0 || remove(staged) != 0)
+    return fail("host stale replacement rejection");
+  return 0;
+}
+
 int troe_c_missing_capability_probe(void) {
   static const struct troe_runtime_host host = {
       .abi = TROE_C_RUNTIME_ABI,
@@ -60,7 +117,8 @@ int troe_c_missing_capability_probe(void) {
   return failed;
 }
 
-int troe_c_runtime_probe(int argc, char **argv) {
+int troe_c_runtime_probe(int argc, char **argv,
+                         const struct troe_runtime_host *host) {
   if (argc < 1 || argv == NULL || argv[0] == NULL || getenv("PATH") == NULL)
     return fail("argv/environment");
   if (troe_large_kex_payload[0] != 0x54 ||
@@ -171,6 +229,8 @@ int troe_c_runtime_probe(int argc, char **argv) {
   struct stat metadata;
   if (stat("data.txt", &metadata) != 0 || metadata.st_size != 20)
     return fail("metadata");
+  if (host_token_probe(host, file_path) != 0)
+    return 1;
   int directory_descriptor = open(".", O_RDONLY | O_DIRECTORY);
   if (directory_descriptor < 0 ||
       fstat(directory_descriptor, &metadata) != 0 ||
