@@ -37,6 +37,8 @@ pub struct StartupInfo<'handles> {
 pub enum StartupPageError {
     /// The current encoder cannot publish an unimplemented startup revision.
     UnsupportedAbi,
+    /// The managed initial descriptor token or geometry was rejected.
+    InvalidThread,
     /// The task identity is the reserved zero value.
     InvalidTaskId,
     /// More initial handles were supplied than the standard policy permits.
@@ -56,6 +58,37 @@ pub(crate) fn encode_startup_page(
     if abi_minor > crate::ABI_MINOR {
         return Err(StartupPageError::UnsupportedAbi);
     }
+    encode_startup_fields(abi_minor, image_base, layout, info, destination)
+}
+
+pub(crate) fn encode_threaded_startup_page(
+    image_base: u64,
+    layout: ApplicationLayout,
+    reference: troe_abi::threading::StartupReference,
+    info: StartupInfo<'_>,
+    destination: &mut [u8; STARTUP_REGION_BYTES],
+) -> Result<(), StartupPageError> {
+    let reference = reference
+        .encode()
+        .map_err(|_| StartupPageError::InvalidThread)?;
+    encode_startup_fields(
+        troe_abi::startup::THREAD_ABI_MINOR,
+        image_base,
+        layout,
+        info,
+        destination,
+    )?;
+    destination[80..96].copy_from_slice(&reference);
+    Ok(())
+}
+
+fn encode_startup_fields(
+    abi_minor: u16,
+    image_base: u64,
+    layout: ApplicationLayout,
+    info: StartupInfo<'_>,
+    destination: &mut [u8; STARTUP_REGION_BYTES],
+) -> Result<(), StartupPageError> {
     if info.task_id == 0 {
         return Err(StartupPageError::InvalidTaskId);
     }

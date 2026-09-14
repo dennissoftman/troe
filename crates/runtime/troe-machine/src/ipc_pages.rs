@@ -6,6 +6,10 @@ use troe_memory::PhysicalRange;
 
 /// Isolated-task pairs retained permanently in the owned boot arena.
 pub const IPC_TASK_PAIRS: usize = 16;
+/// Task slots excluded from application-thread allocation for other task consumers.
+pub const IPC_PROTECTED_TASK_PAIRS: usize = 4;
+/// Maximum simultaneous application-thread pairs, including initial threads.
+pub const IPC_APPLICATION_THREAD_PAIRS: usize = IPC_TASK_PAIRS - IPC_PROTECTED_TASK_PAIRS;
 /// Kernel continuation pairs, never mapped at user privilege.
 pub const IPC_KERNEL_PAIRS: usize = 4;
 /// Complete boot reservation, including the kernel clients.
@@ -51,6 +55,18 @@ impl IpcPagePair {
     /// Fails atomically when the pool is unpublished or its 16 task pairs are busy.
     pub fn allocate() -> Result<Self, MmuError> {
         Self::allocate_between(0, IPC_TASK_PAIRS)
+    }
+
+    /// Reserve an application-thread pair without consuming protected task slots.
+    ///
+    /// This range is shared across every threaded application. Existing task
+    /// consumers may occupy some of it; that reduces available thread admission
+    /// instead of drawing from the four excluded slots or kernel-only storage.
+    ///
+    /// # Errors
+    /// Fails atomically if the pool is unpublished or this subrange is exhausted.
+    pub fn allocate_application_thread() -> Result<Self, MmuError> {
+        Self::allocate_between(IPC_PROTECTED_TASK_PAIRS, IPC_TASK_PAIRS)
     }
 
     /// Reserve one of the four pairs for a kernel continuation.
@@ -172,6 +188,33 @@ pub fn verify_ipc_pool() -> Result<(), MmuError> {
         }
         *pair = Some(next);
     }
+    drop(tasks);
+    drop(kernel);
+    let mut applications: [Option<IpcPagePair>; IPC_APPLICATION_THREAD_PAIRS] =
+        core::array::from_fn(|_| None);
+    for pair in &mut applications {
+        let next = IpcPagePair::allocate_application_thread()?;
+        if next.slot() < IPC_PROTECTED_TASK_PAIRS || next.slot() >= IPC_TASK_PAIRS {
+            return Err(MmuError::InvalidPlan);
+        }
+        *pair = Some(next);
+    }
+    if IpcPagePair::allocate_application_thread().is_ok() {
+        return Err(MmuError::InvalidPlan);
+    }
+    let mut protected: [Option<IpcPagePair>; IPC_PROTECTED_TASK_PAIRS] =
+        core::array::from_fn(|_| None);
+    for pair in &mut protected {
+        let next = IpcPagePair::allocate()?;
+        if next.slot() >= IPC_PROTECTED_TASK_PAIRS {
+            return Err(MmuError::InvalidPlan);
+        }
+        *pair = Some(next);
+    }
+    if IpcPagePair::allocate().is_ok() {
+        return Err(MmuError::InvalidPlan);
+    }
+    let _kernel_still_available = IpcPagePair::allocate_kernel()?;
     Ok(())
 }
 

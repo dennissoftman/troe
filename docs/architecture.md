@@ -315,7 +315,11 @@ libc-private metadata, or account for complete thread admission.
 Its exact immutable initializer suffix is checked against its nonexecutable
 image source; initializers requiring pointer fixups are rejected. Explicit
 `cargo kex convert --threaded` checks ELF TLS extents and the worker trampoline.
-Native and streaming loaders still reject this format. Compiler probes verify
+Default native and streaming loaders still reject this format. The separate
+`parse_streamed_threaded_kex_package` verifies it with bounded scratch storage,
+including source/suffix hashes and file-backed initial/trampoline entries. Image
+and initializer replay verify the complete package fingerprint before publication.
+Compiler probes verify
 the portable geometry and emitted bytes independently of native execution.
 The shared C11 qualification recipe pins Clang/LLD releases, excludes host
 headers/configuration, and records binary/header/source fingerprints only after
@@ -351,7 +355,8 @@ descriptor using its checked TLS pointer and private IPC addresses.
 Whole-process charges include the shared mappings once, the initial thread,
 one user page-table root and the union of lower-table prefixes across at most
 22 regions. They do not add the thread's independent table bound again. Dedicated
-immutable initializer pages and full-executable staging pages are rounded and
+immutable initializer pages and full-executable staging or bounded streaming
+working-set pages are rounded and
 charged separately. Resident and ordinary-frame budgets use the peak while both
 coexist; steady charges exclude staging only after it is actually released.
 The two boot-owned IPC pages count logically and occupy a task pair, but do not
@@ -375,10 +380,40 @@ and immutable source, initialize the entire destination, and expose no initializ
 pointer or mutable access. Copies are synchronous and run no callbacks. Stopping
 creation requires exclusive access, permanently rejects new copies and retains
 storage/charges until drop. The account is not `Sync`; this is serialized ownership.
+Resident preparation can retain an `Rc` to the same account without borrowing the
+outer accounting object. `ProcessTls::prepare_streamed` retains the verified
+initializer alone. Bounded chunk initialization produces the same template,
+padding and control bytes as full initialization, including chunks which split
+the x86 self-pointer word; all chunks must finish before mapping publication.
 These are logical heap-buffer charges, with allocator overhead/transient backing
 and inline metadata accounted separately. Rust borrows establish copy-reader
-quiescence, not native context quiescence. Native loaders still do not consume
-these owners; heap drop does not certify physical zeroization or native admission.
+quiescence, not native context quiescence. The production launch selection still
+does not activate this path; heap drop does not certify physical zeroization or
+native admission. The kernel native image owner materializes streamed image and
+TLS bytes into owned frames, retains the root and all backing through admission,
+and drops the root before zeroing/freeing ordinary frames in explicit teardown.
+An abandoned owner cannot make those ordinary frames reusable. Its initializer
+account has a boot-selected limit of one quarter of the 6 MiB owned kernel heap.
+
+The explicit resident threaded loader uses this owner for image, initial-thread
+and worker backing. Source callbacks finish before the short policy borrow that
+admits the initial context. It registers a Prepared logical identity, mints only
+the caller-supplied scheduler grants, initializes all backing, replaces provisional
+task resource counts with actual retained counts, and publishes Ready last.
+Its resident branch shares one paired lifecycle/synchronization owner across
+processes. Capacity is 12 global thread records, eight per process, 256 global
+synchronization objects, 128 per process, and one wait slot per thread; both
+tables and their shared owner fit a 64 KiB metadata allowance. Actual IPC acquisition
+also respects other users of the task pool. The explicit profile limits one
+worker window to 256 mapped pages and one synchronous heap commit to 256 pages,
+with at most 128 retained heap-growth records. These bounds are checked alongside
+process/system memory, virtual reservations, TLS and actual metadata capacity.
+Prepared-worker rollback removes its logical lifetime only after reclamation;
+a partial mapping failure retains backing for complete process teardown. A physical
+reclamation failure quarantines accounting and prevents logical acknowledgement,
+including failed-load rollback and unpublished worker cleanup.
+This profile is exercised by acceptance images; ordinary package selection
+continues rejecting ABI 1.4 and the production C runtime remains single-threaded.
 
 `troe-abi::threading` provides closed request/response and immutable startup
 descriptor codecs for assigned interfaces 30/31 and entry 6. The
@@ -705,6 +740,18 @@ accounted remaining slice of at most 50 ms; `resume_dispatch` instead consumes
 the selected process turn at the timer boundary. Production resident scheduling
 and threaded package admission are not enabled. Ordinary application entries carry no scheduler IPC binding
 and continue to reject entry 6.
+The explicit resident branch inspects the next process without creating a turn
+or changing its cursor/clock. It starts the deadline only when that resident is
+visited, then charges native entry and copied kernel work against one 10 ms,
+eight-batch turn. Captured requests that exhaust a turn remain owned until a
+later process selection. Scheduler waits retain both their owned operation and
+native claim; service calls pair their claim with an exact thread-wait generation.
+No shared policy borrow crosses a service callback. Worker exit retires private
+native mappings and physical backing before resource acknowledgement, and also
+reclaims preparations revoked by creator exit. Last-thread exit ends the process;
+essential-mutex owner death produces a process fault. The resident profile's
+service replies are synchronous; deferred I/O and production runtime admission
+are not enabled by this branch.
 Ordinary calls inside `NativeProcessContext` use the calling context's exact
 retained TX/RX prefixes for entry 2. The existing single-context application ABI
 still accepts its validated request/reply buffers. The shared-root mechanism

@@ -246,7 +246,8 @@ pub use mmu::{IpcPair, IpcStats, IpcStop, ProtectedRuntime, ProtectedStop, TagSt
 
 #[cfg(target_os = "uefi")]
 pub use ipc_pages::{
-    IPC_KERNEL_PAIRS, IPC_POOL_PAGES, IPC_TASK_PAIRS, IpcPagePair, initialize_ipc_pool,
+    IPC_APPLICATION_THREAD_PAIRS, IPC_KERNEL_PAIRS, IPC_POOL_PAGES, IPC_PROTECTED_TASK_PAIRS,
+    IPC_TASK_PAIRS, IpcPagePair, initialize_ipc_pool,
 };
 #[cfg(all(
     target_os = "uefi",

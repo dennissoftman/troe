@@ -3942,6 +3942,13 @@ def test_platform(
                         args.command_timeout,
                         fault,
                     )
+                    if (
+                        "resident TLS KEX: two processes,"
+                        not in fault_session.transcript()
+                    ):
+                        raise AcceptanceError(
+                            f"{platform_id}: loaded resident TLS consumers did not run"
+                        )
                     if expected_generation == 2 and (
                         "native generation: candidate published"
                         not in fault_session.transcript()

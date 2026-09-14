@@ -130,6 +130,18 @@ reply. Clock or native invariant failure remains terminal. Owned operations may
 outlive a turn but do not grant another one. This mechanism does not activate
 production resident scheduling or change the request/reply encoding below.
 
+The explicit resident acceptance profile composes these operations with loaded
+KEX backing. It retains 12 global thread records and permits eight per process;
+synchronization capacity is 256 global objects, 128 per process, and one wait per
+thread. A worker's stack/TLS/IPC/startup mappings must fit 256 pages. A synchronous
+heap addition is at most 256 pages, with at most 128 retained addition records;
+exceeding a bound reports exhaustion without publishing the requested resource.
+Memory, address reservations, native context metadata and actual IPC availability
+are independent simultaneous limits. One resident turn is 10 ms and eight charged
+native/kernel batches. Process inspection consumes no deadline; owned requests
+can wait for a later turn without renewing the current one. Ordinary package
+selection and the production C runtime still do not admit this profile.
+
 The separate shared-root native mechanism also restricts ordinary entry 2 to
 the calling thread's exact TX/RX page prefixes. Its request length is 2–4096 bytes
 including the ordinary two-byte service opcode; reply capacity is 0–4096 bytes.
@@ -148,9 +160,17 @@ commit and accepts exhaustion only before a commit. Both are separate from user
 entry and policy wakeup. The process binds its complete heap reservation before
 any thread starts. Initial and later thread admission respect that reservation,
 including unmapped heap capacity; growth cannot consume thread guards or windows.
+An initially empty heap uses one precharged mapping-summary slot on its first
+commit, without allocating metadata while mutating page tables.
 Composition supplies owned, zeroed backing and enforces allocation quotas. A
 mapping failure stops all native continuations and retains the root and backing
 until teardown. The production loader does not yet use this mechanism.
+
+Application-thread IPC allocation uses twelve of the sixteen task pairs across
+all processes. Four task slots remain outside that allocation range, and the four
+kernel-only pairs remain separate. Other task consumers can reduce the available
+thread range; exhaustion never borrows excluded slots. A single native process
+cannot reserve the complete twelve-context application range.
 
 ## Requests
 

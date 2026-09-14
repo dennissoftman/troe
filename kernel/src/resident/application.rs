@@ -4,6 +4,8 @@
 //! nested children, drains the dispatcher, services the calls the application
 //! made, and reports whether the application exited, faulted, or yielded.
 
+mod native;
+
 use crate::artifacts::native_application_target;
 use crate::deferred::{
     CommandDeferredServices, CommandDeferredState, DeferredCallKind, DeferredCallPreparation,
@@ -833,6 +835,16 @@ impl<'service> ResidentApplication<'service> {
     ) -> Result<Option<CommandApplicationOutcome>, ()> {
         let execution = self.execution.take().ok_or(())?;
         let mut outcome = match execution {
+            ResidentExecution::Native(mut native) => {
+                let result = self
+                    .run_native_slice(scheduler, accounting, &mut native)
+                    .or_else(|()| {
+                        native.stop()?;
+                        Err(())
+                    });
+                self.execution = Some(ResidentExecution::Native(native));
+                return result;
+            }
             ResidentExecution::Unstarted(launch) => {
                 scheduler
                     .dispatch(self.task_id, Capabilities::SERVICE)
@@ -970,7 +982,7 @@ impl<'service> ResidentApplication<'service> {
                     if interface == Some(troe_abi::interface::PRIVATE_MEMORY) {
                         let reply = match handle_private_memory_call(
                             accounting,
-                            &mut self.allocation,
+                            self.allocation.as_mut().ok_or(())?,
                             &mut application,
                             self.heap_start,
                             opcode,
@@ -995,8 +1007,10 @@ impl<'service> ResidentApplication<'service> {
                             return Err(());
                         }
                         if reply.resources_changed {
-                            let (table_pages, private_pages) =
-                                application_resource_totals(&self.allocation, self.private_pages)?;
+                            let (table_pages, private_pages) = application_resource_totals(
+                                self.allocation.as_ref().ok_or(())?,
+                                self.private_pages,
+                            )?;
                             if application.stats().table_pages > table_pages {
                                 return Err(());
                             }
@@ -1207,7 +1221,7 @@ impl<'service> ResidentApplication<'service> {
                 } => {
                     match commit_application_heap_growth(
                         accounting,
-                        &mut self.allocation,
+                        self.allocation.as_mut().ok_or(())?,
                         &mut application,
                         self.heap_start,
                         self.maximum_heap_pages,
@@ -1219,15 +1233,25 @@ impl<'service> ResidentApplication<'service> {
                         } => {
                             let grown_private_pages = self
                                 .private_pages
-                                .checked_add(application_growth_pages(&self.allocation)?)
+                                .checked_add(application_growth_pages(
+                                    self.allocation.as_ref().ok_or(())?,
+                                )?)
                                 .ok_or(())?;
                             let grown_table_pages = self
                                 .allocation
+                                .as_ref()
+                                .ok_or(())?
                                 .tables
                                 .page_count()
                                 .checked_add(
-                                    u64::try_from(self.allocation.growth_table_frames.len())
-                                        .map_err(|_| ())?,
+                                    u64::try_from(
+                                        self.allocation
+                                            .as_ref()
+                                            .ok_or(())?
+                                            .growth_table_frames
+                                            .len(),
+                                    )
+                                    .map_err(|_| ())?,
                                 )
                                 .ok_or(())?;
                             if stats.table_pages > grown_table_pages {
@@ -1671,7 +1695,9 @@ impl<'service> ResidentApplication<'service> {
         {
             return Err(());
         }
-        self.execution.take();
+        if let Some(ResidentExecution::Native(native)) = self.execution.take() {
+            native.reclaim(accounting)?;
+        }
         let reaped = scheduler.reap(self.task_id).map_err(|_| ())?;
         let expected_fault = match outcome {
             CommandApplicationOutcome::Exited(_) => None,
@@ -1685,7 +1711,9 @@ impl<'service> ResidentApplication<'service> {
             .map_err(|_| ())?
             .remove(self.process_id)
             .map_err(|_| ())?;
-        reclaim_command_application(accounting, self.allocation);
+        if let Some(allocation) = self.allocation {
+            reclaim_command_application(accounting, allocation);
+        }
         if !valid {
             return Err(());
         }

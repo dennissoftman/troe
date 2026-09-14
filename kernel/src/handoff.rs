@@ -204,6 +204,10 @@ pub(crate) fn complete_handoff(
         memory_policy,
         application_committed_pages: 0,
         private_metadata_bytes: 0,
+        native_threads: None,
+        thread_tls_backing: Rc::new(troe_application::tls_owner::TlsBackingAccount::new(
+            crate::limits::OWNED_HEAP_BYTES / troe_memory::BASE_PAGE_SIZE / 4,
+        )),
         random,
         firmware_wall_seconds: prepared.firmware_wall_seconds,
         boot_mount_manifest,

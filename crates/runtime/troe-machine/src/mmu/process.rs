@@ -292,6 +292,7 @@ impl NativeProcessContext {
         // Reserve and charge that space before publishing native contexts.
         let additional = capacity
             .checked_mul(super::retirement::MAX_REGIONS)
+            .and_then(|regions| regions.checked_add(1)) // Initially uncommitted heap.
             .ok_or(MmuError::InvalidUserContext)?;
         let region_capacity = backing
             .address_space

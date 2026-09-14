@@ -19,6 +19,7 @@ impl UserAddressSpace {
         minimum_pages: u64,
         physical_ranges: &[PhysicalRange],
         supplemental_table_pages: &[u64],
+        allow_empty: bool,
     ) -> Result<MmuStats, MmuError> {
         let page_count = physical_ranges
             .iter()
@@ -27,40 +28,52 @@ impl UserAddressSpace {
         if page_count < minimum_pages || physical_ranges.is_empty() {
             return Err(MmuError::InvalidUserContext);
         }
-        let region_index = self
-            .regions
-            .iter()
-            .position(|region| {
-                region.range.start() <= heap_start
-                    && heap_start < region.range.end()
-                    && region.permissions.write
-                    && !region.permissions.execute
-            })
-            .ok_or(MmuError::InvalidUserContext)?;
-        let region = self.regions[region_index];
+        let region_index = self.regions.iter().position(|region| {
+            region.range.start() <= heap_start
+                && heap_start < region.range.end()
+                && region.permissions.write
+                && !region.permissions.execute
+        });
+        let (region_start, old_end, old_pages, permissions) = match region_index {
+            Some(index) => {
+                let region = self.regions[index];
+                (
+                    region.range.start(),
+                    region.range.end(),
+                    region.range.page_count(),
+                    region.permissions,
+                )
+            }
+            None if allow_empty && self.regions.len() < self.regions.capacity() => {
+                (heap_start, heap_start, 0, MappingPermissions::READ_WRITE)
+            }
+            None => return Err(MmuError::InvalidUserContext),
+        };
         let added_bytes = page_count
             .checked_mul(BASE_PAGE_SIZE)
             .ok_or(MmuError::AddressUnsupported)?;
-        let new_end = region
-            .range
-            .end()
+        let new_end = old_end
             .checked_add(added_bytes)
             .ok_or(MmuError::AddressUnsupported)?;
-        let grown =
-            VirtualRange::from_pages(region.range.start(), region.range.page_count() + page_count)
-                .map_err(|_| MmuError::InvalidUserContext)?;
+        let grown = VirtualRange::from_pages(
+            region_start,
+            old_pages
+                .checked_add(page_count)
+                .ok_or(MmuError::AddressUnsupported)?,
+        )
+        .map_err(|_| MmuError::InvalidUserContext)?;
         if grown.end() != new_end
             || self
                 .regions
                 .iter()
                 .enumerate()
-                .filter(|(index, _)| *index != region_index)
+                .filter(|(index, _)| Some(*index) != region_index)
                 .map(|(_, region)| *region)
                 .any(|other| heap_start < other.range.end() && other.range.start() < new_end)
         {
             return Err(MmuError::InvalidUserContext);
         }
-        let mut virtual_address = region.range.end();
+        let mut virtual_address = old_end;
         for range in physical_ranges {
             if range.start() == 0 {
                 return Err(MmuError::InvalidUserContext);
@@ -83,7 +96,7 @@ impl UserAddressSpace {
             self.stats.table_pages,
             supplemental_table_pages,
         )?;
-        let mut virtual_address = region.range.end();
+        let mut virtual_address = old_end;
         for range in physical_ranges {
             let mut physical = range.start();
             for _ in 0..range.page_count() {
@@ -106,12 +119,20 @@ impl UserAddressSpace {
             }
         }
         if let Some(tag) = &self.tag {
-            tag.invalidate_range(region.range.end(), page_count)?;
+            tag.invalidate_range(old_end, page_count)?;
         }
-        self.regions[region_index] = UserRegion {
+        let updated = UserRegion {
             range: grown,
-            permissions: region.permissions,
+            permissions,
         };
+        if let Some(index) = region_index {
+            self.regions[index] = updated;
+        } else {
+            // Empty native heaps reserve this metadata slot before admission.
+            self.regions.push(updated);
+            self.regions
+                .sort_unstable_by_key(|region| region.range.start());
+        }
         self.stats.mapped_pages = self
             .stats
             .mapped_pages

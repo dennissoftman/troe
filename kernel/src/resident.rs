@@ -6,6 +6,8 @@
 
 pub(crate) mod application;
 pub(crate) mod launch;
+#[cfg_attr(not(feature = "acceptance-probes"), allow(dead_code))]
+pub(crate) mod threading;
 
 use crate::deferred::{CommandDeferredServices, CommandDeferredState};
 use crate::handles::{SharedChildTable, SharedPipeTable, SharedProcessTable, SharedResidentLog};
@@ -35,6 +37,8 @@ pub(crate) struct ResidentProcessControl<'service> {
 }
 
 pub(crate) enum ResidentExecution {
+    #[cfg_attr(not(feature = "acceptance-probes"), allow(dead_code))]
+    Native(Box<threading::NativeResident>),
     Unstarted(Box<ResidentLaunch>),
     Pending(Box<troe_machine::ApplicationOutcome>),
     Blocked,
@@ -52,7 +56,7 @@ pub(crate) struct ResidentApplication<'service> {
     pub(crate) task_id: TaskId,
     process_id: ProcessId,
     processes: SharedProcessTable,
-    allocation: ApplicationAllocation,
+    allocation: Option<ApplicationAllocation>,
     isolation: IsolationResource,
     owner: HandleOwner,
     handles: Vec<CommandApplicationHandle>,

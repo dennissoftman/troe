@@ -40,7 +40,8 @@ pub use plan::{
 pub use startup::{InitialHandle, StartupInfo, StartupPageError};
 pub use stream::{
     StreamError, StreamedKexPackage, StreamedLoadPlan, parse_streamed_kex_package,
-    stream_verified_segments, visit_verified_relocations,
+    parse_streamed_threaded_kex_package, stream_verified_segments, stream_verified_tls,
+    visit_verified_relocations,
 };
 pub use transaction::{LoaderResource, LoaderTransaction, LoaderTransactionError};
 

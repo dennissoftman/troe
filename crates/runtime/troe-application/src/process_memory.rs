@@ -2,8 +2,8 @@
 //!
 //! This composes a validated artifact with shared image/startup/heap reservations
 //! and one managed thread window. It is not a native load plan or resource owner.
-//! Charges model page-owned full-executable staging and an independent retained
-//! initializer. Acquiring that backing, authenticating a package, serializing
+//! Charges include full-executable staging or bounded streamed scratch, plus an
+//! independent retained initializer. Acquiring backing, authenticating a package, serializing
 //! admission and releasing only quiescent owners remain composition obligations.
 
 use core::fmt;
@@ -11,7 +11,7 @@ use troe_abi::threading::{EncodingError, StartupDescriptor, Token};
 
 use crate::{
     ApplicationLimits, KEX_V1_IMAGE_ALIGNMENT, KEX_V1_MIN_IMAGE_BASE, KEX_V1_USER_END,
-    MAX_LOAD_RECORDS, PAGE_SIZE, SegmentPermissions,
+    LoadSegmentLayout, MAX_LOAD_RECORDS, PAGE_SIZE, SegmentPermissions, StreamedLoadPlan, Target,
     static_tls::StaticTlsLayout,
     thread_memory::{
         ThreadMemoryBudget, ThreadMemoryError, ThreadMemoryKind, ThreadMemoryPlan,
@@ -53,7 +53,7 @@ pub struct ProcessMemoryBudget {
     pub tls_pages: u64,
     /// Page-rounded immutable initializer backing, independent of image and TLS.
     pub template_pages: u64,
-    /// Complete executable bytes simultaneously retained for verification.
+    /// Executable staging or bounded streamed working-set bytes used for verification.
     pub staging_bytes: u64,
 }
 
@@ -220,7 +220,7 @@ impl ProcessMemoryCharges {
     pub const fn template_pages(self) -> u64 {
         self.template_pages
     }
-    /// Complete executable byte length, including its exact initializer suffix.
+    /// Full executable staging or the selected streamed verifier's bounded working set.
     #[must_use]
     pub const fn staging_bytes(self) -> u64 {
         self.staging_bytes
@@ -240,7 +240,7 @@ impl ProcessMemoryCharges {
     pub const fn resident_pages(self) -> u64 {
         self.mapped_pages() + self.table_pages + self.template_pages
     }
-    /// Maximum logical pages during full-executable loading.
+    /// Maximum logical pages during the selected loading path.
     #[must_use]
     pub const fn peak_resident_pages(self) -> u64 {
         self.resident_pages() + self.staging_pages
@@ -335,12 +335,46 @@ impl ProcessMemoryPlan {
     /// This performs bounded work over at most 22 mapped regions, independent of
     /// their page counts. Callers must reserve addresses and all resource classes
     /// atomically against other admissions before allocating or copying anything.
-    /// The returned plan cannot encode an admitted process startup or run a thread.
+    /// The returned plan owns no backing and cannot authorize grants or run a thread.
     ///
     /// # Errors
     /// Rejects invalid placement, overlap, overflow or any exhausted memory budget.
     pub fn new(
         artifact: &Artifact<'_>,
+        placement: ProcessMemoryPlacement,
+        budget: ProcessMemoryBudget,
+    ) -> Result<Self, ProcessMemoryError> {
+        Self::new_image(artifact, artifact.encoded_bytes(), placement, budget)
+    }
+
+    /// Compose a coherently verified streamed TLS image with bounded scratch charges.
+    ///
+    /// The stream's legacy layout is not used for thread placement. This applies
+    /// the same shared/managed-thread geometry and simultaneous budgets as `new`,
+    /// charging the stream's working set instead of a full executable allocation.
+    /// All image and initializer replays remain provisional until verified.
+    ///
+    /// # Errors
+    /// Rejects non-TLS plans, invalid placement or an exhausted resource budget.
+    pub fn new_streamed(
+        image: &StreamedLoadPlan,
+        placement: ProcessMemoryPlacement,
+        budget: ProcessMemoryBudget,
+    ) -> Result<Self, ProcessMemoryError> {
+        if placement.image_base != image.image_base() {
+            return Err(ProcessMemoryError::InvalidPlacement);
+        }
+        Self::new_image(
+            image,
+            image.charges().staging_bytes() as u64,
+            placement,
+            budget,
+        )
+    }
+
+    fn new_image(
+        artifact: &impl ProcessImage,
+        staging_bytes: u64,
         placement: ProcessMemoryPlacement,
         budget: ProcessMemoryBudget,
     ) -> Result<Self, ProcessMemoryError> {
@@ -360,8 +394,8 @@ impl ProcessMemoryPlan {
         if shared_end > KEX_V1_USER_END {
             return Err(ProcessMemoryError::InvalidPlacement);
         }
-        let tls = artifact
-            .metadata()
+        let metadata = artifact.tls_metadata().map_err(ProcessMemoryError::Tls)?;
+        let tls = metadata
             .layout(artifact.target(), u64::MAX)
             .map_err(ProcessMemoryError::Tls)?;
         // Only geometry here. Whole-process budgets below include shared memory,
@@ -402,9 +436,9 @@ impl ProcessMemoryPlan {
                 initial_thread.charges().reserved_pages(),
             )?,
             table_pages,
-            template_pages: pages_for(artifact.metadata().file_bytes)?,
-            staging_bytes: artifact.encoded_bytes(),
-            staging_pages: pages_for(artifact.encoded_bytes())?,
+            template_pages: pages_for(metadata.file_bytes)?,
+            staging_bytes,
+            staging_pages: pages_for(staging_bytes)?,
         };
         // Private fields, bounded user mappings and the capped executable length
         // bound all derived sums. Also reject an unrepresentable byte charge.
@@ -416,7 +450,7 @@ impl ProcessMemoryPlan {
             shared_end,
             startup_address,
             entry_address: add(placement.image_base, artifact.entry_offset())?,
-            trampoline_address: add(placement.image_base, artifact.metadata().trampoline_offset)?,
+            trampoline_address: add(placement.image_base, metadata.trampoline_offset)?,
             tls,
             initial_thread,
             regions,
@@ -531,12 +565,53 @@ impl ProcessMemoryPlan {
         descriptor.encode()?;
         Ok(descriptor)
     }
+
+    /// Encode this admitted layout's ABI 1.4 process header and initial-thread reference.
+    ///
+    /// Composition supplies authenticated handles and a live initial-thread token.
+    /// This validates their wire representation, not their authority or lifecycle.
+    /// The legacy startup encoder continues rejecting this profile.
+    ///
+    /// # Errors
+    /// Rejects invalid initial metadata before changing the destination.
+    pub fn encode_startup_page(
+        &self,
+        thread: Token,
+        info: crate::StartupInfo<'_>,
+        destination: &mut [u8; crate::STARTUP_REGION_BYTES],
+    ) -> Result<(), crate::StartupPageError> {
+        let initial = self
+            .initial_descriptor(thread)
+            .map_err(|_| crate::StartupPageError::InvalidThread)?;
+        let heap_bytes = self
+            .regions()
+            .find(|region| region.kind() == ProcessMemoryKind::Heap)
+            .map_or(0, |region| region.pages() * PAGE_SIZE);
+        crate::startup::encode_threaded_startup_page(
+            self.placement.image_base,
+            crate::ApplicationLayout {
+                startup_address: self.startup_address,
+                ipc_addresses: Some((initial.ipc_tx, initial.ipc_tx + PAGE_SIZE)),
+                heap_address: self.heap_address(),
+                heap_bytes,
+                stack_bottom: initial.stack_bottom,
+                stack_top: initial.stack_top,
+                lower_guard_address: initial.stack_bottom - PAGE_SIZE,
+                upper_guard_address: initial.stack_top,
+            },
+            troe_abi::threading::StartupReference {
+                address: initial.address,
+            },
+            info,
+            destination,
+        )
+    }
 }
 
 // The validated artifact has at most sixteen segments; startup, optional heap
 // and the four thread mappings fit the fixed array exactly.
 fn process_regions(
-    artifact: &Artifact<'_>,
+    artifact: &impl ProcessImage,
     image_base: u64,
     startup_address: u64,
     initial_thread: ThreadMemoryPlan,
@@ -586,6 +661,66 @@ fn process_regions(
         count += 1;
     }
     Ok((regions, shared_pages))
+}
+
+// Only validated image owners implement this private geometry boundary.
+trait ProcessImage {
+    fn target(&self) -> Target;
+    fn image_span_bytes(&self) -> u64;
+    fn heap_pages(&self) -> u64;
+    fn stack_pages(&self) -> u64;
+    fn entry_offset(&self) -> u64;
+    fn tls_metadata(&self) -> Result<tls_artifact::Metadata, tls_artifact::Error>;
+    fn segments(&self) -> impl Iterator<Item = LoadSegmentLayout>;
+}
+
+impl ProcessImage for Artifact<'_> {
+    fn target(&self) -> Target {
+        self.target()
+    }
+    fn image_span_bytes(&self) -> u64 {
+        self.image_span_bytes()
+    }
+    fn heap_pages(&self) -> u64 {
+        self.heap_pages()
+    }
+    fn stack_pages(&self) -> u64 {
+        self.stack_pages()
+    }
+    fn entry_offset(&self) -> u64 {
+        self.entry_offset()
+    }
+    fn tls_metadata(&self) -> Result<tls_artifact::Metadata, tls_artifact::Error> {
+        Ok(self.metadata())
+    }
+    fn segments(&self) -> impl Iterator<Item = LoadSegmentLayout> {
+        self.segments().map(crate::LoadSegment::layout)
+    }
+}
+
+impl ProcessImage for StreamedLoadPlan {
+    fn target(&self) -> Target {
+        self.target()
+    }
+    fn image_span_bytes(&self) -> u64 {
+        self.layout().startup_address() - self.image_base()
+    }
+    fn heap_pages(&self) -> u64 {
+        self.heap_pages()
+    }
+    fn stack_pages(&self) -> u64 {
+        self.stack_pages()
+    }
+    fn entry_offset(&self) -> u64 {
+        self.entry_address() - self.image_base()
+    }
+    fn tls_metadata(&self) -> Result<tls_artifact::Metadata, tls_artifact::Error> {
+        self.tls_metadata()
+            .ok_or(tls_artifact::Error::InvalidTemplate)
+    }
+    fn segments(&self) -> impl Iterator<Item = LoadSegmentLayout> {
+        self.segments()
+    }
 }
 
 fn add(left: u64, right: u64) -> Result<u64, ProcessMemoryError> {

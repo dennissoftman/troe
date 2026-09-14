@@ -2,7 +2,7 @@
 
 `troe-application::tls_artifact` validates this format for offline inspection
 and converter verification. It produces no native load plan, startup layout,
-mapping, capability grant, or resource admission. Native and streaming loaders
+mapping, capability grant, or resource admission. Production native and streaming loaders
 accept only [container 1.2](kex-v1.md), and the active SDK accepts application
 ABI 1.3. Both loaders reject container 1.3 even with a higher caller ABI ceiling.
 The separate `process_memory` preflight can compose this reader's validated
@@ -11,7 +11,15 @@ It grants no resource ownership or native admission.
 `tls_owner::StagedTlsImage` additionally owns the staged executable and a copied
 initializer, with checked logical capacity charges. Its `ProcessTls` owner can
 initialize TLS after staging release without reading a running writable image.
-This buffer owner does not change either loader's accepted container versions.
+`parse_streamed_threaded_kex_package` separately verifies container 1.3 with
+bounded scratch space. It hashes the complete package, compares the initializer
+with its nonexecutable image source, checks both file-backed entries and rejects
+overlapping relocations. Image and initializer replay must match the retained
+fingerprint before their provisional destinations can be published. The default
+parser still rejects this format. `ProcessTls::prepare_streamed` retains only the
+verified initializer; it does not retain the complete executable or a source callback.
+Shared account handles keep its charges alive independently of the event loop.
+These mechanisms do not activate the production threaded runtime.
 
 ## Encoding
 

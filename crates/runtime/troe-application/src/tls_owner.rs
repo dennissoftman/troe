@@ -14,7 +14,7 @@ use crate::{
     static_tls::StaticTlsError,
     tls_artifact::{self, Artifact},
 };
-use alloc::vec::Vec;
+use alloc::{rc::Rc, vec::Vec};
 use core::{cell::Cell, fmt};
 
 /// Rejected ownership transfer, allocation, geometry or initialization.
@@ -28,6 +28,8 @@ pub enum TlsOwnerError {
     AllocationFailed,
     /// The owned staging bytes are not a valid static-TLS artifact.
     Artifact(tls_artifact::Error),
+    /// Coherent streamed package replay failed before initializer publication.
+    Stream(crate::StreamError),
     /// Canonical or actual-capacity process memory charges are rejected.
     Memory(ProcessMemoryError),
     /// Thread creation was permanently revoked for this initializer.
@@ -42,6 +44,7 @@ impl fmt::Display for TlsOwnerError {
             Self::ArithmeticOverflow => formatter.write_str("TLS backing arithmetic overflow"),
             Self::AllocationFailed => formatter.write_str("TLS initializer allocation failed"),
             Self::Artifact(error) => error.fmt(formatter),
+            Self::Stream(_) => formatter.write_str("streamed TLS verification failed"),
             Self::Memory(error) => error.fmt(formatter),
             Self::Stopped => formatter.write_str("TLS creation has stopped"),
             Self::Initialize(error) => error.fmt(formatter),
@@ -52,13 +55,13 @@ impl fmt::Display for TlsOwnerError {
 /// Live page-rounded allocation charges, including unused vector capacity.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TlsBackingUsage {
-    /// Full-executable staging pages still owned by prepared images.
+    /// Retained executable staging or reserved streamed-verification scratch pages.
     staging_pages: u64,
     /// Independent initializer pages, including stopped but unreleased owners.
     initializer_pages: u64,
 }
 impl TlsBackingUsage {
-    /// Full-executable staging pages still owned by prepared images.
+    /// Retained executable staging or reserved streamed-verification scratch pages.
     #[must_use]
     pub const fn staging_pages(self) -> u64 {
         self.staging_pages
@@ -79,8 +82,8 @@ impl TlsBackingUsage {
 ///
 /// Reservation uses interior mutability without lending a whole allocator or
 /// runtime across a copy. This type is deliberately not `Sync`: SMP requires a
-/// separately reviewed synchronization boundary. Owners borrow the account, so
-/// it cannot be dropped or replaced while they remain live.
+/// separately reviewed synchronization boundary. Owners retain a borrow or an
+/// `Rc` to the same account, so its charges survive the outer caller's handle.
 ///
 /// This does not own physical frames. Supply an allowance after system reserves.
 /// Allocator bookkeeping, size classes and transient allocations remain bounded
@@ -113,13 +116,9 @@ impl TlsBackingAccount {
         self.used.get()
     }
 
+    #[cfg(test)]
     fn reserve(&self, kind: BackingKind, pages: u64) -> Result<Reservation<'_>, TlsOwnerError> {
-        self.increase(kind, pages)?;
-        Ok(Reservation {
-            account: self,
-            kind,
-            pages,
-        })
+        Account::Borrowed(self).reserve(kind, pages)
     }
     fn increase(&self, kind: BackingKind, pages: u64) -> Result<(), TlsOwnerError> {
         let mut used = self.used.get();
@@ -145,8 +144,35 @@ enum BackingKind {
     Initializer,
 }
 
+#[derive(Clone)]
+enum Account<'account> {
+    Borrowed(&'account TlsBackingAccount),
+    Shared(Rc<TlsBackingAccount>),
+}
+impl<'account> Account<'account> {
+    fn get(&self) -> &TlsBackingAccount {
+        match self {
+            Self::Borrowed(account) => account,
+            Self::Shared(account) => account,
+        }
+    }
+
+    fn reserve(
+        &self,
+        kind: BackingKind,
+        pages: u64,
+    ) -> Result<Reservation<'account>, TlsOwnerError> {
+        self.get().increase(kind, pages)?;
+        Ok(Reservation {
+            account: self.clone(),
+            kind,
+            pages,
+        })
+    }
+}
+
 struct Reservation<'account> {
-    account: &'account TlsBackingAccount,
+    account: Account<'account>,
     kind: BackingKind,
     pages: u64,
 }
@@ -155,21 +181,21 @@ impl Reservation<'_> {
         let additional = pages
             .checked_sub(self.pages)
             .ok_or(TlsOwnerError::ArithmeticOverflow)?;
-        self.account.increase(self.kind, additional)?;
+        self.account.get().increase(self.kind, additional)?;
         self.pages = pages;
         Ok(())
     }
 }
 impl Drop for Reservation<'_> {
     fn drop(&mut self) {
-        let mut used = self.account.used.get();
+        let mut used = self.account.get().used.get();
         // Reservations are private and non-cloneable; each removes its charge
         // exactly once. All increases check the combined total first.
         match self.kind {
             BackingKind::Staging => used.staging_pages -= self.pages,
             BackingKind::Initializer => used.initializer_pages -= self.pages,
         }
-        self.account.used.set(used);
+        self.account.get().used.set(used);
     }
 }
 
@@ -179,10 +205,7 @@ struct Backing<'account> {
     reservation: Reservation<'account>,
 }
 impl<'account> Backing<'account> {
-    fn staging(
-        bytes: Vec<u8>,
-        account: &'account TlsBackingAccount,
-    ) -> Result<Self, TlsOwnerError> {
+    fn staging(bytes: Vec<u8>, account: &Account<'account>) -> Result<Self, TlsOwnerError> {
         let pages = capacity_pages(bytes.capacity())?;
         let reservation = account.reserve(BackingKind::Staging, pages)?;
         Ok(Self { bytes, reservation })
@@ -239,6 +262,24 @@ impl<'account> StagedTlsImage<'account> {
         placement: ProcessMemoryPlacement,
         budget: ProcessMemoryBudget,
         account: &'account TlsBackingAccount,
+        allocate: impl FnOnce(usize) -> Result<Vec<u8>, TlsOwnerError>,
+    ) -> Result<Self, TlsOwnerError> {
+        Self::prepare_using(
+            staging,
+            target,
+            placement,
+            budget,
+            &Account::Borrowed(account),
+            allocate,
+        )
+    }
+
+    fn prepare_using(
+        staging: Vec<u8>,
+        target: Target,
+        placement: ProcessMemoryPlacement,
+        budget: ProcessMemoryBudget,
+        account: &Account<'account>,
         allocate: impl FnOnce(usize) -> Result<Vec<u8>, TlsOwnerError>,
     ) -> Result<Self, TlsOwnerError> {
         let staging = Backing::staging(staging, account)?;
@@ -314,6 +355,35 @@ impl<'account> StagedTlsImage<'account> {
     }
 }
 
+impl StagedTlsImage<'static> {
+    /// Prepare a resident image which owns a reference to its shared account.
+    ///
+    /// Trusted composition creates the account once. This operation keeps its
+    /// existing budget and makes no allocation for the reference itself. The
+    /// resulting owner has no borrow of the enclosing allocator or event loop;
+    /// staging and initializer reservations still refund independently on drop.
+    /// `Rc` keeps this serialized composition non-`Send` and non-`Sync`.
+    ///
+    /// # Errors
+    /// Uses the same artifact, geometry, allocation and budget checks as `prepare`.
+    pub fn prepare_shared(
+        staging: Vec<u8>,
+        target: Target,
+        placement: ProcessMemoryPlacement,
+        budget: ProcessMemoryBudget,
+        account: Rc<TlsBackingAccount>,
+    ) -> Result<Self, TlsOwnerError> {
+        Self::prepare_using(
+            staging,
+            target,
+            placement,
+            budget,
+            &Account::Shared(account),
+            allocate,
+        )
+    }
+}
+
 /// Immutable initializer retained by one process, independent of running image data.
 ///
 /// Keep this owner in the process until native creation is revoked and contexts
@@ -328,6 +398,55 @@ pub struct ProcessTls<'account> {
     plan: ProcessMemoryPlan,
     stopped: bool,
 }
+
+impl ProcessTls<'static> {
+    /// Retain a streamed package's independent initializer under a shared account.
+    ///
+    /// Only the initializer is allocated. The verifier's bounded working set is
+    /// also charged while replay runs. Its complete package fingerprint must match
+    /// before this returns an owner; no source callback or runtime borrow survives.
+    /// Image frames need their own verified replay before native admission.
+    ///
+    /// # Errors
+    /// Rejects non-TLS packages, exhausted budgets, allocation or replay failure.
+    /// Accepted provisional reservations are refunded on every rejected path.
+    pub fn prepare_streamed(
+        package: &crate::StreamedKexPackage,
+        placement: ProcessMemoryPlacement,
+        budget: ProcessMemoryBudget,
+        account: Rc<TlsBackingAccount>,
+        read_at: impl FnMut(u64, &mut [u8]) -> Result<usize, ()>,
+    ) -> Result<Self, TlsOwnerError> {
+        let mut plan = ProcessMemoryPlan::new_streamed(package.executable(), placement, budget)
+            .map_err(TlsOwnerError::Memory)?;
+        let account = Account::Shared(account);
+        let _scratch = account.reserve(BackingKind::Staging, plan.charges().staging_pages())?;
+        let mut reservation =
+            account.reserve(BackingKind::Initializer, plan.charges().template_pages())?;
+        let requested = usize::try_from(
+            reservation
+                .pages
+                .checked_mul(PAGE_SIZE)
+                .ok_or(TlsOwnerError::ArithmeticOverflow)?,
+        )
+        .map_err(|_| TlsOwnerError::ArithmeticOverflow)?;
+        let mut bytes = allocate(requested)?;
+        reservation.grow(capacity_pages(bytes.capacity())?)?;
+        plan.charge_backing(reservation.pages, plan.charges().staging_pages(), budget)
+            .map_err(TlsOwnerError::Memory)?;
+        bytes.resize(bytes.capacity(), 0);
+        let file_bytes = usize::try_from(plan.tls_layout().file_bytes())
+            .map_err(|_| TlsOwnerError::ArithmeticOverflow)?;
+        crate::stream_verified_tls(package, read_at, &mut bytes[..file_bytes])
+            .map_err(TlsOwnerError::Stream)?;
+        Ok(Self {
+            initializer: Backing { bytes, reservation },
+            plan,
+            stopped: false,
+        })
+    }
+}
+
 impl ProcessTls<'_> {
     /// Plan retaining both steady and load-time peak charges for this image.
     /// Staging is no longer live; use the shared account for current backing usage.
@@ -379,6 +498,38 @@ impl ProcessTls<'_> {
         self.plan
             .tls_layout()
             .initialize(virtual_base, &self.initializer.bytes[..length], destination)
+            .map_err(TlsOwnerError::Initialize)
+    }
+
+    /// Initialize a bounded part of an exclusively owned, unpublished TLS block.
+    ///
+    /// `offset` is relative to the full mapping at `virtual_base`. This permits
+    /// page-sized scratch copies into fragmented physical backing without a
+    /// second full TLS allocation. The caller must initialize every mapped byte
+    /// before admission. No template borrow or pointer escapes this synchronous
+    /// copy, and stopping creation revokes subsequent chunks.
+    ///
+    /// # Errors
+    /// Stopped creation or invalid geometry/range leaves the destination unchanged.
+    pub fn initialize_chunk(
+        &self,
+        virtual_base: u64,
+        offset: u64,
+        destination: &mut [u8],
+    ) -> Result<u64, TlsOwnerError> {
+        if self.stopped {
+            return Err(TlsOwnerError::Stopped);
+        }
+        let length =
+            usize::try_from(self.file_bytes()).map_err(|_| TlsOwnerError::ArithmeticOverflow)?;
+        self.plan
+            .tls_layout()
+            .initialize_chunk(
+                virtual_base,
+                offset,
+                &self.initializer.bytes[..length],
+                destination,
+            )
             .map_err(TlsOwnerError::Initialize)
     }
 }

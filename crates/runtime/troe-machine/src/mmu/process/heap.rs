@@ -95,7 +95,7 @@ impl NativeProcessContext {
     /// Bind the complete heap reservation before any native thread starts.
     ///
     /// Composition supplies its validated process layout. The initial committed
-    /// heap must be RW/NX and start at this reservation's first page. Uncommitted
+    /// heap, when nonempty, must be RW/NX and start at its first page. Uncommitted
     /// heap pages cannot overlap another mapping or any thread window/guard.
     /// Future thread admission also respects the entire immutable reservation.
     /// This does not reserve physical frames or grant additional process quota.
@@ -121,7 +121,6 @@ impl NativeProcessContext {
         {
             return Err(MmuError::InvalidUserContext);
         }
-        let mut found = false;
         for region in &space.regions {
             if region.range.start() == reservation.start()
                 && region.range.end() <= reservation.end()
@@ -129,13 +128,11 @@ impl NativeProcessContext {
                 && region.permissions.write
                 && !region.permissions.execute
             {
-                found = true;
-            } else if super::overlaps(region.range, reservation) {
+                continue;
+            }
+            if super::overlaps(region.range, reservation) {
                 return Err(MmuError::InvalidUserContext);
             }
-        }
-        if !found {
-            return Err(MmuError::InvalidUserContext);
         }
         self.heap = Some(reservation);
         Ok(())
@@ -185,13 +182,13 @@ impl NativeProcessContext {
             return Err(MmuError::InvalidUserContext);
         }
         let heap = self.heap.ok_or(MmuError::InvalidUserContext)?;
-        let region = self
+        let old_end = self
             .backing
             .address_space
             .regions
             .iter()
             .find(|region| region.range.start() == heap.start())
-            .ok_or(MmuError::InvalidUserContext)?;
+            .map_or(heap.start(), |region| region.range.end());
         let pages = physical_ranges
             .iter()
             .try_fold(0_u64, |pages, range| pages.checked_add(range.page_count()))
@@ -199,9 +196,7 @@ impl NativeProcessContext {
         let added = pages
             .checked_mul(BASE_PAGE_SIZE)
             .ok_or(MmuError::InvalidUserContext)?;
-        let end = region
-            .range
-            .end()
+        let end = old_end
             .checked_add(added)
             .filter(|end| *end <= heap.end())
             .ok_or(MmuError::InvalidUserContext)?;
@@ -210,6 +205,7 @@ impl NativeProcessContext {
             execution.operation.minimum_pages(),
             physical_ranges,
             supplemental_table_pages,
+            true,
         ) {
             Ok(stats) => stats,
             Err(error) => {

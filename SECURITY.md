@@ -76,6 +76,17 @@ never executes the ordinary application.
   LAPIC one-shot and checks expiry again before entry. Expiry preserves the saved
   continuation and permits no user entry; clock/invariant failure stops the root.
   This is not a hard real-time guarantee or production resident scheduling;
+- resident native composition: the explicit acceptance loader owns its image,
+  immutable TLS source and each thread's private backing through root retirement.
+  Policy inspection starts no deadline while another resident is being visited.
+  Native entries and copied kernel work share one bounded process turn; exhausted
+  requests remain captured for a later turn. Worker preparation checks file-backed
+  executable entries, complete reserved windows, retained table headroom and all
+  memory/metadata limits before native publication. Failed partial mapping changes
+  stop the process and retain backing. Native claims and exact policy-wait
+  generations survive service callbacks without a shared-table borrow. Essential
+  mutex owner death faults the process. Production threaded package admission
+  and deferred threaded service I/O remain disabled;
 - native ordinary call ownership: shared-root calls require the caller's retained
   TX/RX prefixes. Each context reserves and charges a 4 KiB immutable request
   buffer before execution; capture completes before another sibling can run.
@@ -133,6 +144,7 @@ never executes the ordinary application.
   first execution; future thread admission cannot consume it. Heap calls retain
   original caller/operation/IPC identity and have one owned mapping claim.
   Completion cannot invent success bytes or report exhaustion after committing.
+  Initially empty heaps use precharged metadata on first commit.
   Mapping failure stops every continuation and requires backing retention until
   root retirement. Allocator ownership and process/system quotas remain trusted
   composition obligations; the production loader does not enable this path;
@@ -202,6 +214,8 @@ never executes the ordinary application.
   targeted invalidation with a full-flush correctness fallback on unsupported
   x86 CPUs. Direct handoffs preserve the absolute 50 ms lease; expiry faults
   the active IPC participant and does not replay the call;
+  application-thread allocation is restricted to twelve task slots and cannot
+  consume the other four task slots or any kernel-only pair;
 - thread preflight: allocation-free typed wire/startup codecs and checked memory
   plans, including a separately charged read-only descriptor page. Whole-process
   preflight rejects overlap with image holes, heap growth reservations and thread
@@ -210,12 +224,16 @@ never executes the ordinary application.
   loader and SDK reject the assigned threaded startup revision and reject thread
   interfaces in older startup records. Offline TLS conversion requires an explicit
   container revision, validates the immutable initializer against its image source,
-  and rejects initializer pointer fixups. Native and streaming loaders reject this
-  container; these components enable no native workers;
+  and rejects initializer pointer fixups. Default native and streaming loaders
+  reject this container. The explicit streamed TLS verifier compares source and
+  suffix hashes and requires complete-package fingerprints on replay; provisional
+  frames and initializer bytes must remain unpublished after any failure;
 - TLS initializer ownership: exclusively owned staging supplies an independent
   immutable process initializer. Fallible preparation reserves logical backing,
   checks actual capacity and process peak budgets, and drops buffers before
-  refunding charges. Stopping creation retains storage; synchronous Rust borrows
+  refunding charges. A shared account reference can outlive the outer event-loop
+  handle. Bounded copies initialize fragmented TLS backing without allocating a
+  second full TLS block. Stopping creation retains storage; synchronous Rust borrows
   prevent release during a copy. Native context quiescence, physical accounting
   and zeroization are not established by this heap-buffer owner;
 - compiler qualification: explicit C11 target/TLS options and isolated headers,

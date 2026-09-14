@@ -500,6 +500,7 @@ impl ApplicationSession {
             request.minimum_pages,
             physical_ranges,
             supplemental_table_pages,
+            false,
         )
     }
 

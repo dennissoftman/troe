@@ -85,6 +85,22 @@ impl Dispatch {
 }
 
 impl ThreadTable {
+    /// Inspect the next process without starting its deadline or advancing a cursor.
+    ///
+    /// Resident composition can visit unrelated roots before reaching this one.
+    /// Call `begin_dispatch` only when the selected root is ready to run, under
+    /// the same exclusive table access. This observation grants no execution
+    /// authority and may change after a lifecycle transition.
+    ///
+    /// # Errors
+    /// Rejects inspection while another turn or Running thread is retained.
+    pub fn next_dispatch_process(&self) -> Result<Option<ProcessId>, Error> {
+        if self.active_dispatch.is_some() || self.any_running() {
+            return Err(ThreadError::Busy.into());
+        }
+        Ok(self.select_dispatch_process().map(|(_, owner)| owner))
+    }
+
     /// Select a process fairly before selecting any of its runnable threads.
     ///
     /// Clock frequency is fixed by the first successful observation. A turn is
@@ -122,22 +138,7 @@ impl ThreadTable {
         let duration = u64::try_from(u128::from(frequency) * u128::from(milliseconds) / 1_000)
             .map_err(|_| Error::Exhausted)?;
         let deadline = now.checked_add(duration).ok_or(Error::Exhausted)?;
-        // One scan of thread slots, rather than a thread scan for every process.
-        // Private retained indices refer to fixed process slots, never user data.
-        let selected = self
-            .slots
-            .iter()
-            .filter_map(|slot| slot.record)
-            .filter(|record| record.snapshot.state == ThreadState::Ready)
-            .filter_map(|record| {
-                self.processes[record.process_slot]
-                    .filter(|process| !process.stopping)
-                    .map(|process| (record.process_slot, process.id))
-            })
-            .min_by_key(|(index, _)| {
-                (index + self.processes.len() - self.process_cursor) % self.processes.len()
-            });
-        let Some((index, owner)) = selected else {
+        let Some((index, owner)) = self.select_dispatch_process() else {
             self.dispatch_clock = Some((now, frequency));
             return Ok(None);
         };
@@ -276,6 +277,23 @@ impl ThreadTable {
                 record.snapshot.id.process() == owner && record.snapshot.state == ThreadState::Ready
             })
             .map(|record| record.snapshot.id)
+    }
+
+    fn select_dispatch_process(&self) -> Option<(usize, ProcessId)> {
+        // One bounded scan shared by inspection and authoritative selection.
+        // Private retained indices refer to fixed process slots, never user data.
+        self.slots
+            .iter()
+            .filter_map(|slot| slot.record)
+            .filter(|record| record.snapshot.state == ThreadState::Ready)
+            .filter_map(|record| {
+                self.processes[record.process_slot]
+                    .filter(|process| !process.stopping)
+                    .map(|process| (record.process_slot, process.id))
+            })
+            .min_by_key(|(index, _)| {
+                (index + self.processes.len() - self.process_cursor) % self.processes.len()
+            })
     }
 
     fn any_running(&self) -> bool {
