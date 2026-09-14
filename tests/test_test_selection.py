@@ -106,6 +106,15 @@ class ChangedTestSelectionTests(unittest.TestCase):
 
     def test_native_thread_boundaries_require_the_complete_hosted_gate(self) -> None:
         paths = (
+            "crates/runtime/troe-task/src/wait.rs",
+            "crates/runtime/troe-task/src/wait/thread_tests.rs",
+            "kernel/src/deferred.rs",
+            "kernel/src/memory/native.rs",
+            "kernel/src/memory/native/creation.rs",
+            "kernel/src/resident/threading.rs",
+            "kernel/src/resident/threading/io.rs",
+            "kernel/src/resident/application/native.rs",
+            "kernel/src/resident/launch/threaded.rs",
             "crates/runtime/troe-service/src/threading.rs",
             "crates/runtime/troe-service/src/threading/tests/exit.rs",
             "crates/runtime/troe-task/src/thread.rs",

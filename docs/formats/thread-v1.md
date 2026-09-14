@@ -142,6 +142,14 @@ native/kernel batches. Process inspection consumes no deadline; owned requests
 can wait for a later turn without renewing the current one. Ordinary package
 selection and the production C runtime still do not admit this profile.
 
+The resident profile additionally precharges eight pending service-call slots and
+eight service-wait slots per process. A pending caller contains the recorded task
+identity and full native thread identity; a legacy task-scoped call remains
+exclusive. One rotating I/O observation per process visit is separately CPU-accounted
+and does not renew a native turn. Service completion consumes its exact operation
+and wait generation before publishing RX or waking the caller. Process teardown
+retires these waits without allocating wake batches and zeroes copied requests.
+
 The separate shared-root native mechanism also restricts ordinary entry 2 to
 the calling thread's exact TX/RX page prefixes. Its request length is 2–4096 bytes
 including the ordinary two-byte service opcode; reply capacity is 0–4096 bytes.

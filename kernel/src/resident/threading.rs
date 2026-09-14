@@ -1,6 +1,7 @@
 //! One shared policy owner, with short borrows between native entries and callbacks.
 
 mod execution;
+pub(crate) mod io;
 pub(crate) use execution::NativeResident;
 #[cfg(feature = "acceptance-probes")]
 pub(crate) mod probe;

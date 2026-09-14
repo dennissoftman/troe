@@ -1,6 +1,6 @@
 //! Bounded portable wait registrations and copied pending-call ownership.
 
-use super::{MonotonicMillis, TaskId};
+use super::{MonotonicMillis, ProcessSnapshot, TaskId, thread::ThreadId};
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -177,10 +177,65 @@ pub enum WaitObservation {
     OwnerRevoked,
 }
 
+/// Copied caller identity for a task call or one of its native threads.
+///
+/// This identifies ownership; it grants no capability or permission to execute.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PendingCaller {
+    task: TaskId,
+    thread: Option<ThreadId>,
+}
+
+impl PendingCaller {
+    /// Preserve the legacy exclusive task-call scope.
+    #[must_use]
+    pub const fn task(task: TaskId) -> Self {
+        Self { task, thread: None }
+    }
+
+    /// Bind a native thread to its recorded process/task identity.
+    ///
+    /// # Errors
+    /// Rejects a thread belonging to another process. Native composition must
+    /// still check current lifecycle state and authenticate the captured call.
+    pub fn threaded(process: ProcessSnapshot, thread: ThreadId) -> Result<Self, PendingCallError> {
+        if process.id() != thread.process() {
+            return Err(PendingCallError::InvalidCaller);
+        }
+        Ok(Self {
+            task: process.task_id(),
+            thread: Some(thread),
+        })
+    }
+
+    /// Task owning the process capability and teardown scope.
+    #[must_use]
+    pub const fn task_id(self) -> TaskId {
+        self.task
+    }
+
+    /// Full native process/slot/generation identity, when present.
+    #[must_use]
+    pub const fn thread_id(self) -> Option<ThreadId> {
+        self.thread
+    }
+
+    fn conflicts(self, other: Self) -> bool {
+        self.task == other.task
+            && (self.thread.is_none() || other.thread.is_none() || self.thread == other.thread)
+    }
+}
+
+impl From<TaskId> for PendingCaller {
+    fn from(task: TaskId) -> Self {
+        Self::task(task)
+    }
+}
+
 /// Complete portable metadata required to publish one wait.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WaitSpec {
-    owner: TaskId,
+    owner: PendingCaller,
     operation: PendingOperationId,
     resource: Option<WaitResource>,
     interests: WakeInterest,
@@ -188,6 +243,12 @@ pub struct WaitSpec {
 }
 
 impl WaitSpec {
+    /// Complete task/thread identity retained by this operation.
+    #[must_use]
+    pub const fn caller(self) -> PendingCaller {
+        self.owner
+    }
+
     /// Validate a wait specification before observation or publication.
     ///
     /// # Errors
@@ -196,6 +257,26 @@ impl WaitSpec {
     /// requires a deadline; and at least one must be selected.
     pub const fn new(
         owner: TaskId,
+        operation: PendingOperationId,
+        resource: Option<WaitResource>,
+        interests: WakeInterest,
+        deadline: Option<MonotonicMillis>,
+    ) -> Result<Self, WaitError> {
+        Self::new_for(
+            PendingCaller::task(owner),
+            operation,
+            resource,
+            interests,
+            deadline,
+        )
+    }
+
+    /// Validate a specification scoped to an explicit task or native caller.
+    ///
+    /// # Errors
+    /// Uses the same resource and deadline checks as [`Self::new`].
+    pub const fn new_for(
+        owner: PendingCaller,
         operation: PendingOperationId,
         resource: Option<WaitResource>,
         interests: WakeInterest,
@@ -219,7 +300,7 @@ impl WaitSpec {
     /// Task that owns the suspended operation.
     #[must_use]
     pub const fn owner(self) -> TaskId {
-        self.owner
+        self.owner.task
     }
 
     /// Pending operation completed by the wake.
@@ -273,12 +354,18 @@ pub enum WaitRegistration {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WaitCompletion {
     key: WaitKey,
-    owner: TaskId,
+    owner: PendingCaller,
     operation: PendingOperationId,
     reason: WakeReason,
 }
 
 impl WaitCompletion {
+    /// Complete task/thread identity retained by this operation.
+    #[must_use]
+    pub const fn caller(self) -> PendingCaller {
+        self.owner
+    }
+
     /// Consumed wait identity.
     #[must_use]
     pub const fn key(self) -> WaitKey {
@@ -288,7 +375,7 @@ impl WaitCompletion {
     /// Task that owns the suspended operation.
     #[must_use]
     pub const fn owner(self) -> TaskId {
-        self.owner
+        self.owner.task
     }
 
     /// Pending operation completed by this wake.
@@ -435,6 +522,12 @@ pub struct WaitTable {
 }
 
 impl WaitTable {
+    /// Current inline and full buffer capacity, including unused slots.
+    #[must_use]
+    pub fn metadata_bytes(&self) -> usize {
+        core::mem::size_of::<Self>() + self.slots.capacity() * core::mem::size_of::<WaitSlot>()
+    }
+
     /// Construct a table with an immutable registration bound.
     ///
     /// # Errors
@@ -474,7 +567,7 @@ impl WaitTable {
     ) -> Result<WaitRegistration, WaitError> {
         if self.slots.iter().any(|slot| {
             slot.record
-                .is_some_and(|record| record.spec.owner == spec.owner)
+                .is_some_and(|record| record.spec.owner.conflicts(spec.owner))
         }) {
             return Err(WaitError::OwnerAlreadyWaiting);
         }
@@ -593,6 +686,52 @@ impl WaitTable {
         Ok(batch)
     }
 
+    /// Observe and complete only one exact operation without allocating a batch.
+    ///
+    /// The resource identity/generation must match the published specification.
+    /// Composition observes resource state under exclusive access and consumes
+    /// any ready data before checking another waiter for the same resource.
+    ///
+    /// # Errors
+    /// Rejects stale operations, foreign resource generations or invalid wake kinds.
+    pub fn observe_operation(
+        &mut self,
+        operation: PendingOperationId,
+        resource: Option<WaitResource>,
+        observation: WaitObservation,
+        now: MonotonicMillis,
+    ) -> Result<Option<WaitCompletion>, WaitError> {
+        let index = self
+            .slots
+            .iter()
+            .position(|slot| {
+                slot.record
+                    .is_some_and(|record| record.spec.operation == operation)
+            })
+            .ok_or(WaitError::StaleWait)?;
+        let spec = self.slots[index].record.ok_or(WaitError::StaleWait)?.spec;
+        if resource != spec.resource {
+            return Err(WaitError::InvalidResource);
+        }
+        let reason = match observation {
+            WaitObservation::Pending => spec
+                .deadline
+                .filter(|deadline| *deadline <= now)
+                .map(|_| WakeReason::Deadline),
+            WaitObservation::ResourceReady => Some(WakeReason::ResourceReady),
+            WaitObservation::ResourceClosed => Some(WakeReason::Closed),
+            WaitObservation::Cancelled => Some(WakeReason::Cancelled),
+            WaitObservation::OwnerRevoked => Some(WakeReason::Revoked),
+        };
+        let Some(reason) = reason else {
+            return Ok(None);
+        };
+        if !spec.accepts(reason) {
+            return Err(WaitError::UnexpectedWake);
+        }
+        self.resolve_index(index, reason).map(Some)
+    }
+
     /// Complete every published deadline at or before `now`.
     ///
     /// # Errors
@@ -634,6 +773,30 @@ impl WaitTable {
         self.resolve_index(index, reason).map(Some)
     }
 
+    /// Retire a stopped owner's waits without allocating completion records.
+    ///
+    /// Composition has already stopped execution and will dispose pending calls;
+    /// no normal reply or wake is published by this teardown operation.
+    ///
+    /// # Errors
+    /// Rejects non-teardown reasons and checked accounting failure.
+    pub fn discard_owner(&mut self, owner: TaskId, reason: WakeReason) -> Result<usize, WaitError> {
+        if !matches!(reason, WakeReason::Cancelled | WakeReason::Revoked) {
+            return Err(WaitError::UnexpectedWake);
+        }
+        let mut removed = 0;
+        for index in 0..self.slots.len() {
+            if self.slots[index]
+                .record
+                .is_some_and(|record| record.spec.owner.task == owner)
+            {
+                self.resolve_index(index, reason)?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     /// Complete every wait owned by one task during cancellation or teardown.
     ///
     /// # Errors
@@ -648,11 +811,10 @@ impl WaitTable {
             return Err(WaitError::UnexpectedWake);
         }
         let mut batch = WakeBatch::new();
-        if let Some(index) = self
-            .slots
-            .iter()
-            .position(|slot| slot.record.is_some_and(|record| record.spec.owner == owner))
-        {
+        if let Some(index) = self.slots.iter().position(|slot| {
+            slot.record
+                .is_some_and(|record| record.spec.owner.task == owner)
+        }) {
             batch.push(self.resolve_index(index, reason)?)?;
         }
         Ok(batch)
@@ -760,7 +922,7 @@ pub enum PendingCallState {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PendingCallSnapshot {
     id: PendingOperationId,
-    owner: TaskId,
+    owner: PendingCaller,
     request_id: u64,
     handle: u64,
     opcode: u16,
@@ -770,6 +932,12 @@ pub struct PendingCallSnapshot {
 }
 
 impl PendingCallSnapshot {
+    /// Complete task/thread identity retained by this operation.
+    #[must_use]
+    pub const fn caller(self) -> PendingCaller {
+        self.owner
+    }
+
     /// Generation-checked pending operation identity.
     #[must_use]
     pub const fn id(self) -> PendingOperationId {
@@ -779,7 +947,7 @@ impl PendingCallSnapshot {
     /// Task that owns the suspended call.
     #[must_use]
     pub const fn owner(self) -> TaskId {
-        self.owner
+        self.owner.task
     }
 
     /// Monotonic dispatcher request identity.
@@ -822,6 +990,8 @@ impl PendingCallSnapshot {
 /// Pending-call capacity, identity, and transition failures.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PendingCallError {
+    /// Native caller does not belong to the recorded process.
+    InvalidCaller,
     /// Configured call or byte capacity is invalid.
     InvalidCapacity,
     /// Complete slot allocation failed during construction.
@@ -849,6 +1019,9 @@ pub enum PendingCallError {
 impl fmt::Display for PendingCallError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidCaller => {
+                formatter.write_str("pending-call caller belongs to another process")
+            }
             Self::InvalidCapacity => formatter.write_str("pending-call capacity is invalid"),
             Self::MetadataExhausted => {
                 formatter.write_str("pending-call metadata allocation failed")
@@ -922,6 +1095,12 @@ pub struct PendingCallTable {
 }
 
 impl PendingCallTable {
+    /// Current inline and full buffer capacity, including unused slots.
+    #[must_use]
+    pub fn metadata_bytes(&self) -> usize {
+        core::mem::size_of::<Self>() + self.slots.capacity() * core::mem::size_of::<PendingSlot>()
+    }
+
     /// Construct a fixed call table and system-wide retained-byte ceiling.
     ///
     /// # Errors
@@ -969,17 +1148,41 @@ impl PendingCallTable {
         request: &[u8],
         reply_capacity: usize,
     ) -> Result<PendingOperationId, PendingCallError> {
+        self.begin_for(
+            PendingCaller::task(owner),
+            request_id,
+            handle,
+            opcode,
+            request,
+            reply_capacity,
+        )
+    }
+
+    /// Retain one call per exact native thread, or one exclusive legacy task call.
+    ///
+    /// # Errors
+    /// Applies the ordinary message, capacity, identity and accounting checks;
+    /// a legacy task call conflicts with every sibling call in that task.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin_for(
+        &mut self,
+        owner: PendingCaller,
+        request_id: u64,
+        handle: u64,
+        opcode: u16,
+        request: &[u8],
+        reply_capacity: usize,
+    ) -> Result<PendingOperationId, PendingCallError> {
         if request.len() > MAX_PENDING_REQUEST_BYTES || reply_capacity > MAX_PENDING_REQUEST_BYTES {
             return Err(PendingCallError::MessageTooLarge);
         }
         if request_id == 0 || request_id <= self.last_request_id {
             return Err(PendingCallError::RequestIdentityNotMonotonic);
         }
-        if self
-            .slots
-            .iter()
-            .any(|slot| slot.record.is_some_and(|record| record.owner == owner))
-        {
+        if self.slots.iter().any(|slot| {
+            slot.record
+                .is_some_and(|record| record.owner.conflicts(owner))
+        }) {
             return Err(PendingCallError::OwnerAlreadyPending);
         }
         let request_bytes =
@@ -1156,7 +1359,7 @@ impl PendingCallTable {
         let mut matching = 0_u32;
         let mut matching_bytes = 0_u32;
         for slot in &self.slots {
-            if let Some(record) = slot.record.filter(|record| record.owner == owner) {
+            if let Some(record) = slot.record.filter(|record| record.owner.task == owner) {
                 matching = matching
                     .checked_add(1)
                     .ok_or(PendingCallError::AccountingOverflow)?;
@@ -1189,7 +1392,7 @@ impl PendingCallTable {
             let Some(mut record) = self.slots[index].record else {
                 continue;
             };
-            if record.owner != owner {
+            if record.owner.task != owner {
                 continue;
             }
             record.state = PendingCallState::Ready(reason);
@@ -1818,3 +2021,6 @@ mod tests {
         assert!(waits.wake(key, WakeReason::Deadline).is_ok());
     }
 }
+
+#[cfg(test)]
+mod thread_tests;

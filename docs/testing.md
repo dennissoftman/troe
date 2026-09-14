@@ -268,6 +268,13 @@ Maximum 16 TiB heap and stack requests exercise bounded work without allocating
 their backing. Tests account for architecture-specific empty-TLS padding and
 prove native loaders continue to reject the artifact after successful preflight.
 
+`cargo test -p troe-task wait::thread_tests::` checks simultaneous sibling calls,
+exclusive legacy task scope, foreign process/thread completion rejection, exact
+resource generations, single-wait observation, slot reuse, late completions and
+request zeroization during allocation-free wait teardown. Actual retained table
+capacities remain unchanged across these operations. Resident threading and shared
+wait-table changes select the complete hosted gate, including both x86 KVM profiles.
+
 `cargo test -p troe-application tls_owner::` checks shared-account lifetime,
 independent refunds, bounded TLS copies across padding and split control words,
 owned staging and immutable
@@ -682,12 +689,16 @@ acknowledged only after physical reclamation.
 The resident TLS probe loads two converted KEX 1.3 programs through the explicit
 streamed resident loader and steps them through the resident process branch.
 Compiler local-exec TLS checks distinguish initialized and zero data in the
-initial thread and its worker. The programs exercise invalid/exhausted Prepare,
+initial thread and its workers. The programs exercise invalid/exhausted Prepare,
 Abort and generation reuse, Start, Join, mutex creation/lock/unlock/destruction,
-and two additions to an initially empty heap. The probe requires successful
-process exits, empty logical tables, and recovery of frame, commit, initializer
-and per-process metadata charges. It uses an acceptance-only freestanding C
-consumer, not the production libc or CPython.
+and two additions to an initially empty heap. Two workers perform independent
+monotonic timer waits and compete to read the same pipe. Each byte must reach
+exactly one reader; after the first byte, the other reader must remain blocked.
+The probe requires at least two simultaneous service waits. A separate case stops
+each process with two pending I/O waits and checks complete reclamation. Both cases
+require empty logical tables and recovery of frame, commit, initializer and
+per-process metadata charges; the normal case also requires successful exits. It
+uses an acceptance-only freestanding C consumer, not the production libc or CPython.
 `python3 tools/build_resident_thread_probe.py --cc clang --linker ld.lld --check`
 rebuilds both embedded artifacts with the pinned compiler profile and compares
 their bytes. Omitting `--check` regenerates them after changing the C source.

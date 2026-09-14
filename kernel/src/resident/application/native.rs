@@ -16,6 +16,20 @@ impl ResidentApplication<'_> {
         accounting: &mut OwnedAccounting,
         native: &mut NativeResident,
     ) -> Result<Option<CommandApplicationOutcome>, ()> {
+        let mut io = native.take_io()?;
+        let result = self.run_native_with_io(scheduler, accounting, native, &mut io);
+        native.restore_io(io);
+        result
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn run_native_with_io(
+        &mut self,
+        scheduler: &mut Scheduler,
+        accounting: &mut OwnedAccounting,
+        native: &mut NativeResident,
+        io: &mut crate::resident::threading::io::NativeIo,
+    ) -> Result<Option<CommandApplicationOutcome>, ()> {
         scheduler
             .dispatch(self.task_id, Capabilities::SERVICE)
             .map_err(|_| ())?;
@@ -24,6 +38,14 @@ impl ResidentApplication<'_> {
             .map_err(|_| ())?
             .dispatch(self.process_id)
             .map_err(|_| ())?;
+        self.execute_accounted(|| {
+            io.poll(
+                native,
+                self.deferred_services.as_ref(),
+                accounting,
+                self.diagnostics_generation,
+            )
+        })?;
         let mut request = [0; troe_abi::MAX_MESSAGE_BYTES];
         while let Some((caller, stop)) = self.execute_accounted(|| native.next())? {
             if matches!(
@@ -66,6 +88,28 @@ impl ResidentApplication<'_> {
                     }
                     let bytes = &mut request[..call.request_bytes()];
                     let pending = native.suspend_handle(call, bytes)?;
+                    let pending = if let Some(services) = &self.deferred_services {
+                        let process = self
+                            .processes
+                            .try_borrow()
+                            .map_err(|_| ())?
+                            .snapshot_for_task(self.task_id)
+                            .map_err(|_| ())?;
+                        io.prepare(
+                            native,
+                            process,
+                            command_handle_interface(&self.handles, call.handle()).ok_or(())?,
+                            call,
+                            pending,
+                            bytes,
+                            services,
+                        )?
+                    } else {
+                        Some(pending)
+                    };
+                    let Some(pending) = pending else {
+                        continue;
+                    };
                     let opcode = u16::from_le_bytes([bytes[0], bytes[1]]);
                     // Native suspension owns its call and exact wait. No policy
                     // or native root borrow reaches this service callback.

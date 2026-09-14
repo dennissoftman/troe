@@ -29,8 +29,8 @@ use troe_abi::{datagram, diagnostics, pipe, process_launch, stream, timer};
 use troe_dispatch::ReplyStatus;
 use troe_process::{OwnerId, PipeEndpoint, ProcessError as ChildProcessError};
 use troe_task::{
-    MonotonicMillis, PendingCallTable, PendingOperationId, TaskId, WaitResource, WaitSpec,
-    WaitTable, WakeInterest, WakeReason,
+    MonotonicMillis, PendingCallTable, PendingCaller, PendingOperationId, TaskId, WaitResource,
+    WaitSpec, WaitTable, WakeInterest, WakeReason,
 };
 
 #[cfg(feature = "acceptance-probes")]
@@ -231,7 +231,7 @@ pub(crate) fn command_handle_interface(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_resource_wait(
-    task_id: TaskId,
+    caller: impl Into<PendingCaller>,
     handle: u64,
     opcode: u16,
     payload: &[u8],
@@ -241,9 +241,10 @@ pub(crate) fn prepare_resource_wait(
     pending: &mut PendingCallTable,
     next_request_id: &mut u64,
 ) -> Result<DeferredCallPreparation, ()> {
+    let caller = caller.into();
     let operation = pending
-        .begin(
-            task_id,
+        .begin_for(
+            caller,
             *next_request_id,
             handle,
             opcode,
@@ -252,8 +253,8 @@ pub(crate) fn prepare_resource_wait(
         )
         .map_err(|_| ())?;
     *next_request_id = (*next_request_id).checked_add(1).ok_or(())?;
-    let spec = WaitSpec::new(
-        task_id,
+    let spec = WaitSpec::new_for(
+        caller,
         operation,
         Some(resource),
         WakeInterest::RESOURCE_READY,
@@ -277,7 +278,7 @@ pub(crate) fn owned_reply_payload(bytes: &[u8]) -> Result<Vec<u8>, ()> {
 #[inline(never)]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn prepare_deferred_call(
-    task_id: TaskId,
+    caller: impl Into<PendingCaller>,
     interface: u32,
     handle: u64,
     opcode: u16,
@@ -287,6 +288,8 @@ pub(crate) fn prepare_deferred_call(
     pending: &mut PendingCallTable,
     next_request_id: &mut u64,
 ) -> Result<DeferredCallPreparation, ()> {
+    let caller = caller.into();
+    let task_id = caller.task_id();
     if interface == troe_abi::interface::PROCESS_LAUNCH && opcode == process_launch::WAIT {
         let Some(owner) = services.process_owner else {
             return Ok(DeferredCallPreparation::Immediate {
@@ -333,7 +336,7 @@ pub(crate) fn prepare_deferred_call(
         }
         let resource = WaitResource::new(token.value(), owner.get()).map_err(|_| ())?;
         return prepare_resource_wait(
-            task_id,
+            caller,
             handle,
             opcode,
             payload,
@@ -384,7 +387,7 @@ pub(crate) fn prepare_deferred_call(
                 Err(ChildProcessError::WouldBlock) => {
                     let resource = WaitResource::new(token.value(), owner.get()).map_err(|_| ())?;
                     prepare_resource_wait(
-                        task_id,
+                        caller,
                         handle,
                         opcode,
                         payload,
@@ -425,7 +428,7 @@ pub(crate) fn prepare_deferred_call(
             Err(ChildProcessError::WouldBlock) => {
                 let resource = WaitResource::new(token.value(), owner.get()).map_err(|_| ())?;
                 prepare_resource_wait(
-                    task_id,
+                    caller,
                     handle,
                     opcode,
                     payload,
@@ -475,7 +478,7 @@ pub(crate) fn prepare_deferred_call(
         let resource =
             WaitResource::new(SESSION_TERMINAL_WAIT_IDENTITY, task_id.get()).map_err(|_| ())?;
         return prepare_resource_wait(
-            task_id,
+            caller,
             handle,
             opcode,
             payload,
@@ -522,7 +525,7 @@ pub(crate) fn prepare_deferred_call(
                     payload: owned_reply_payload(&bytes[..count])?,
                 }),
                 Err(ChildProcessError::WouldBlock) => prepare_resource_wait(
-                    task_id,
+                    caller,
                     handle,
                     opcode,
                     payload,
@@ -561,7 +564,7 @@ pub(crate) fn prepare_deferred_call(
                 }),
                 Ok(_) => Err(()),
                 Err(ChildProcessError::WouldBlock) => prepare_resource_wait(
-                    task_id,
+                    caller,
                     handle,
                     opcode,
                     payload,
@@ -600,8 +603,8 @@ pub(crate) fn prepare_deferred_call(
             });
         }
         let operation = pending
-            .begin(
-                task_id,
+            .begin_for(
+                caller,
                 *next_request_id,
                 handle,
                 opcode,
@@ -610,8 +613,8 @@ pub(crate) fn prepare_deferred_call(
             )
             .map_err(|_| ())?;
         *next_request_id = (*next_request_id).checked_add(1).ok_or(())?;
-        let spec = WaitSpec::new(
-            task_id,
+        let spec = WaitSpec::new_for(
+            caller,
             operation,
             None,
             WakeInterest::DEADLINE,
@@ -638,8 +641,8 @@ pub(crate) fn prepare_deferred_call(
             });
         }
         let operation = pending
-            .begin(
-                task_id,
+            .begin_for(
+                caller,
                 *next_request_id,
                 handle,
                 opcode,
@@ -655,8 +658,8 @@ pub(crate) fn prepare_deferred_call(
                 .ok_or(())?,
         );
         let resource = WaitResource::new(operation.abi_value(), task_id.get()).map_err(|_| ())?;
-        let spec = WaitSpec::new(
-            task_id,
+        let spec = WaitSpec::new_for(
+            caller,
             operation,
             Some(resource),
             WakeInterest::RESOURCE_READY,
@@ -712,8 +715,8 @@ pub(crate) fn prepare_deferred_call(
     let now = services.runtime.borrow().now();
     let deadline = now.saturating_add(APPLICATION_DATAGRAM_WAIT_MILLISECONDS);
     let operation = pending
-        .begin(
-            task_id,
+        .begin_for(
+            caller,
             *next_request_id,
             handle,
             opcode,
@@ -723,8 +726,8 @@ pub(crate) fn prepare_deferred_call(
         .map_err(|_| ())?;
     *next_request_id = (*next_request_id).checked_add(1).ok_or(())?;
     let resource = WaitResource::new(u64::from(local_port), task_id.get()).map_err(|_| ())?;
-    let spec = WaitSpec::new(
-        task_id,
+    let spec = WaitSpec::new_for(
+        caller,
         operation,
         Some(resource),
         WakeInterest::RESOURCE_READY.union(WakeInterest::DEADLINE),

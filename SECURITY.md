@@ -85,8 +85,12 @@ never executes the ordinary application.
   memory/metadata limits before native publication. Failed partial mapping changes
   stop the process and retain backing. Native claims and exact policy-wait
   generations survive service callbacks without a shared-table borrow. Essential
-  mutex owner death faults the process. Production threaded package admission
-  and deferred threaded service I/O remain disabled;
+  mutex owner death faults the process. Deferred service waits retain full
+  task/thread, operation and wait-generation identity. One bounded I/O observation
+  per process visit cannot broadcast a consumed pipe byte to sibling readers.
+  Stop discards waits without allocating wake batches and zeroes copied requests
+  before root/backing reclamation. Production threaded package admission remains
+  disabled;
 - native ordinary call ownership: shared-root calls require the caller's retained
   TX/RX prefixes. Each context reserves and charges a 4 KiB immutable request
   buffer before execution; capture completes before another sibling can run.

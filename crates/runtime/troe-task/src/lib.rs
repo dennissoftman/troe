@@ -23,9 +23,9 @@ pub use waitset::{
 
 pub use wait::{
     MAX_PENDING_CALLS, MAX_PENDING_REQUEST_BYTES, MAX_WAIT_REGISTRATIONS, PendingCallError,
-    PendingCallSnapshot, PendingCallState, PendingCallStats, PendingCallTable, PendingOperationId,
-    WaitCompletion, WaitError, WaitKey, WaitObservation, WaitRegistration, WaitResource, WaitSpec,
-    WaitStats, WaitTable, WakeBatch, WakeInterest, WakeReason,
+    PendingCallSnapshot, PendingCallState, PendingCallStats, PendingCallTable, PendingCaller,
+    PendingOperationId, WaitCompletion, WaitError, WaitKey, WaitObservation, WaitRegistration,
+    WaitResource, WaitSpec, WaitStats, WaitTable, WakeBatch, WakeInterest, WakeReason,
 };
 
 /// Milliseconds elapsed on the machine's monotonic clock.
