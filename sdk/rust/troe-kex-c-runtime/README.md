@@ -7,6 +7,15 @@ and snapshots only the typed filesystem, mutation, timer, wall-clock, and
 random services granted to the executable. `Runtime::host` returns the exact C
 callback table declared in `troe/runtime.h`.
 
+`ProcessStorage`, declared as a static, owns a bridge, host table, configuration,
+argument/environment pointer arrays and their copied string backing for the
+process lifetime. Python and the C runtime probe use this bootstrap. Temporary
+invocation records and the initial stack do not own any C-retained configuration
+pointer. Initialization claims storage once, including failures; it cannot reset
+or replace a published context. The returned `ProcessRuntime` handle is neither
+Send nor Sync, and dropping it does not reclaim the static storage. Runtime
+finalization still releases C allocations and resources before process teardown.
+
 The bridge retains at most 32 read-only file tokens and one sequential
 replacement transaction. It translates typed KEX errors to the shared errno
 contract, returns `EACCES` for absent capabilities, and provides no ambient

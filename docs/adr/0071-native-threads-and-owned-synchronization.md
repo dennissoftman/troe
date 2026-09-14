@@ -27,6 +27,10 @@ compiler-managed TLS and copied per-thread service/scheduler transport. A loaded
 Rust/C consumer exercises this profile and pending-I/O cancellation alongside
 the C mechanism consumer. The default SDK entry still rejects ABI 1.4; production
 pthread/CPython admission remains tracked by #208.
+Python and the shared C runtime probe use fixed process-owned bridge, host-table
+and copied configuration storage with no reset. This supersedes the historical
+initial-stack lifetime of those retained C pointers; it does not enable pthreads
+or qualify concurrent libc/allocator execution.
 Native heap requests now retain owned operation identity, bind immutable heap
 bounds, and separate one mapping commit from completion. Mapping errors revoke
 all continuations while backing remains retained until root retirement. These

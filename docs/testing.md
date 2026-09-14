@@ -559,12 +559,18 @@ contain the probe.
 Direct host-table calls additionally exhaust all 32 read-only slots, reuse a
 closed slot and a finished replacement, reject their stale tokens without
 changing output bytes, and verify the new resources remain usable.
+The probe uses the same process-owned bootstrap as Python, rejects duplicate
+initialization, and overwrites source invocation/environment records before C
+runs so retained configuration must refer to the copied process storage.
 
 `cargo test -p troe-kex-c-runtime` checks the bridge's owned operations while
 modelled callbacks are suspended: independent resources remain available,
 same-token calls and early reuse are rejected, partial progress survives errors,
 and malformed tokens or exhausted generations cannot alias live state. Concurrent
 host threads exercise metadata exclusion and simultaneous retained operations.
+Bootstrap tests cover copied-string lifetime and C mutability, exact argument/cwd
+capacity with pointer terminators, and rejection of malformed or oversized C
+strings without partial writes or offset changes.
 These checks do not qualify production pthread or C thread-local state.
 
 Host-only C and runtime-tree contracts are independently reproducible with:
