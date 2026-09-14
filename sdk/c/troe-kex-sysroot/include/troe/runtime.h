@@ -34,6 +34,9 @@ struct troe_runtime_host {
   intptr_t (*stream_read)(void *context, uint8_t *destination, size_t capacity);
   int (*stream_write)(void *context, int stream, const uint8_t *source,
                       size_t length);
+  /* File and replacement tokens are opaque uint32_t values, not descriptors
+     or array indexes. Preserve every bit and use only their matching callbacks.
+     A successful close/finish consumes its token. */
   int (*file_open)(void *context, const uint8_t *path, size_t path_length,
                    uint32_t *token, uint64_t *byte_count);
   intptr_t (*file_read)(void *context, uint32_t token, uint64_t offset,

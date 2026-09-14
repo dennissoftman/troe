@@ -17,6 +17,11 @@ cancellation. Ordinary threaded package admission, private-memory integration
 and the production C/CPython adapter remain disabled
 and tracked by #207/#208. The limits of this explicit profile are documented in
 the current [architecture](../architecture.md) and [thread contract](../formats/thread-v1.md).
+The C bridge uses shared context access, local service-handle copies and owned,
+generation-qualified file/replacement operations without retaining metadata locks
+over I/O. Allocator exclusion is separate. This supersedes the whole-runtime
+mutable-loan observation in the historical context below; the ABI-1 C profile
+still has single-thread libc/TSS behavior and no production threaded admission.
 Native heap requests now retain owned operation identity, bind immutable heap
 bounds, and separate one mapping commit from completion. Mapping errors revoke
 all continuations while backing remains retained until root retirement. These

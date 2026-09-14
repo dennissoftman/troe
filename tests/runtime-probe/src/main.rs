@@ -2,7 +2,7 @@
 #![no_main]
 
 use core::{ffi::c_char, ptr};
-use troe_kex_c_runtime::{Configuration, Runtime};
+use troe_kex_c_runtime::{Configuration, Host, Runtime};
 use troe_kex_runtime::environment;
 use troe_kex_sdk::{
     CommandContext, ENVIRONMENT_BUFFER_BYTES, INVOCATION_BUFFER_BYTES, command, entry, exit,
@@ -12,7 +12,7 @@ unsafe extern "C" {
     fn troe_runtime_initialize(configuration: *const Configuration) -> i32;
     fn troe_runtime_finalize();
     fn troe_c_missing_capability_probe() -> i32;
-    fn troe_c_runtime_probe(argc: i32, argv: *mut *mut c_char) -> i32;
+    fn troe_c_runtime_probe(argc: i32, argv: *mut *mut c_char, host: *const Host) -> i32;
 }
 
 fn copy_c_string(value: &str, storage: &mut [u8], offset: &mut usize) -> Option<*mut c_char> {
@@ -92,7 +92,7 @@ fn main(command_context: &mut CommandContext) -> u32 {
         if troe_runtime_initialize(&configuration) != 0 {
             return exit::FAILURE;
         }
-        let result = troe_c_runtime_probe(configuration.argc, configuration.argv);
+        let result = troe_c_runtime_probe(configuration.argc, configuration.argv, &host);
         troe_runtime_finalize();
         result
     };

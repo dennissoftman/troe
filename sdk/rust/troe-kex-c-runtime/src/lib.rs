@@ -8,6 +8,9 @@ use core::{
     slice, str,
 };
 
+mod ownership;
+
+use ownership::{Locked, Slots};
 use troe_kex_alloc::{CAllocator, Heap};
 use troe_kex_runtime::errno;
 use troe_kex_sdk::{
@@ -88,14 +91,9 @@ pub struct Configuration {
     pub cwd: *const c_char,
 }
 
-struct PendingReplacement {
-    replacement: FileReplacement,
-    offset: u64,
-}
-
 /// Owned bridge state for one single-threaded C runtime invocation.
 pub struct Runtime {
-    allocator: CAllocator,
+    allocator: Locked<CAllocator>,
     stdin: StandardInput,
     stdout: StandardOutput,
     stderr: StandardOutput,
@@ -104,8 +102,8 @@ pub struct Runtime {
     timer: Option<Timer>,
     wall_clock: Option<WallClock>,
     random: Option<Random>,
-    files: [Option<filesystem::OpenFile>; OPEN_FILES],
-    replacement: Option<PendingReplacement>,
+    files: Slots<filesystem::OpenFile, OPEN_FILES>,
+    replacement: Slots<FileReplacement, 1>,
 }
 
 /// Runtime bridge bootstrap failure.
@@ -134,7 +132,7 @@ impl Runtime {
         }
         .map_err(|_| InitializationError::InvalidHeap)?;
         Ok(Self {
-            allocator: CAllocator::from_heap(heap),
+            allocator: Locked::new(CAllocator::from_heap(heap)),
             stdin: command.stdin(),
             stdout: command.stdout(),
             stderr: command.stderr(),
@@ -143,8 +141,8 @@ impl Runtime {
             timer: command.timer().ok(),
             wall_clock: command.wall_clock().ok(),
             random: command.random().ok(),
-            files: [None; OPEN_FILES],
-            replacement: None,
+            files: Slots::new(),
+            replacement: Slots::new(),
         })
     }
 
@@ -183,14 +181,15 @@ impl Runtime {
 
     /// Return current allocation and private-mapping accounting.
     #[must_use]
-    pub const fn allocator_statistics(&self) -> troe_kex_alloc::Statistics {
-        self.allocator.statistics()
+    pub fn allocator_statistics(&self) -> troe_kex_alloc::Statistics {
+        self.allocator.with(|allocator| allocator.statistics())
     }
 }
 
-unsafe fn runtime<'a>(context: *mut c_void) -> Option<&'a mut Runtime> {
-    // SAFETY: Each callback receives the exclusive context installed by `host`.
-    unsafe { context.cast::<Runtime>().as_mut() }
+unsafe fn runtime<'a>(context: *mut c_void) -> Option<&'a Runtime> {
+    // SAFETY: The host context remains live and unmoved through every callback.
+    // Mutable state is separately protected; blocking calls use local owners.
+    unsafe { context.cast::<Runtime>().as_ref() }
 }
 
 unsafe fn bytes<'a>(pointer: *const u8, length: usize) -> Option<&'a [u8]> {
@@ -251,24 +250,27 @@ unsafe extern "C" fn host_allocate(
     alignment: usize,
     zeroed: i32,
 ) -> *mut c_void {
-    // SAFETY: The host table owns an exclusive runtime context.
+    // SAFETY: The host table retains a live, unmoved runtime context.
     let Some(runtime) = (unsafe { runtime(context) }) else {
         return ptr::null_mut();
     };
-    if pointer.is_null() {
-        return runtime
-            .allocator
-            .allocate(size, alignment, zeroed != 0)
-            .map_or(ptr::null_mut(), |value| value.as_ptr().cast());
-    }
-    if size == 0 {
+    // This allocator-only exclusion can cross bounded backing calls, which
+    // neither invoke C callbacks nor depend on another application thread.
+    runtime.allocator.with(|allocator| {
+        if pointer.is_null() {
+            return allocator
+                .allocate(size, alignment, zeroed != 0)
+                .map_or(ptr::null_mut(), |value| value.as_ptr().cast());
+        }
+        if size == 0 {
+            // SAFETY: The C allocator ABI accepts only its own live pointers.
+            let _released = unsafe { allocator.deallocate(pointer.cast()) };
+            return ptr::null_mut();
+        }
         // SAFETY: The C allocator ABI accepts only its own live pointers.
-        let _released = unsafe { runtime.allocator.deallocate(pointer.cast()) };
-        return ptr::null_mut();
-    }
-    // SAFETY: The C allocator ABI accepts only its own live pointers.
-    unsafe { runtime.allocator.reallocate(pointer.cast(), size) }
-        .map_or(ptr::null_mut(), |value| value.as_ptr().cast())
+        unsafe { allocator.reallocate(pointer.cast(), size) }
+            .map_or(ptr::null_mut(), |value| value.as_ptr().cast())
+    })
 }
 
 unsafe extern "C" fn host_stream_read(
@@ -282,8 +284,8 @@ unsafe extern "C" fn host_stream_read(
     }) else {
         return negative(errno::EINVAL);
     };
-    runtime
-        .stdin
+    let mut input = runtime.stdin;
+    input
         .read(destination)
         .map_or_else(|error| negative(errno::from_kex(error)), positive)
 }
@@ -300,10 +302,10 @@ unsafe extern "C" fn host_stream_write(
     }) else {
         return errno::EINVAL;
     };
-    let output = if stream == 1 {
-        &mut runtime.stdout
+    let mut output = if stream == 1 {
+        runtime.stdout
     } else if stream == 2 {
-        &mut runtime.stderr
+        runtime.stderr
     } else {
         return errno::EINVAL;
     };
@@ -331,30 +333,24 @@ unsafe extern "C" fn host_file_open(
         Ok(path) => path,
         Err(error) => return error,
     };
-    let Some(filesystem) = runtime.filesystem.as_mut() else {
+    let Some(mut filesystem) = runtime.filesystem else {
         return errno::EACCES;
     };
-    let Some(index) = runtime.files.iter().position(Option::is_none) else {
-        return errno::ENOMEM;
+    let mut operation = match runtime.files.reserve() {
+        Ok(operation) => operation,
+        Err(error) => return error,
     };
     let file = match filesystem.open(path) {
         Ok(file) => file,
         Err(error) => return errno::from_kex(error),
     };
-    runtime.files[index] = Some(file);
+    operation.value = Some(file);
     // SAFETY: Nonnull scalar output pointers were checked above.
     unsafe {
-        token.write(u32::try_from(index + 1).unwrap_or(u32::MAX));
+        token.write(operation.token());
         byte_count.write(file.byte_count);
     }
     0
-}
-
-fn file_index(token: u32) -> Option<usize> {
-    usize::try_from(token)
-        .ok()?
-        .checked_sub(1)
-        .filter(|index| *index < OPEN_FILES)
 }
 
 unsafe extern "C" fn host_file_read(
@@ -370,13 +366,14 @@ unsafe extern "C" fn host_file_read(
     }) else {
         return negative(errno::EINVAL);
     };
-    let Some(index) = file_index(token) else {
+    let operation = match runtime.files.acquire(token) {
+        Ok(operation) => operation,
+        Err(error) => return negative(error),
+    };
+    let Some(file) = operation.value else {
         return negative(errno::EINVAL);
     };
-    let Some(file) = runtime.files[index] else {
-        return negative(errno::EINVAL);
-    };
-    let Some(filesystem) = runtime.filesystem.as_mut() else {
+    let Some(mut filesystem) = runtime.filesystem else {
         return negative(errno::EACCES);
     };
     filesystem
@@ -385,17 +382,18 @@ unsafe extern "C" fn host_file_read(
 }
 
 unsafe extern "C" fn host_file_close(context: *mut c_void, token: u32) -> i32 {
-    // SAFETY: The host table owns an exclusive runtime context.
+    // SAFETY: The host table retains a live, unmoved runtime context.
     let Some(runtime) = (unsafe { runtime(context) }) else {
         return errno::EINVAL;
     };
-    let Some(index) = file_index(token) else {
+    let mut operation = match runtime.files.acquire(token) {
+        Ok(operation) => operation,
+        Err(error) => return error,
+    };
+    let Some(file) = operation.value.take() else {
         return errno::EINVAL;
     };
-    let Some(file) = runtime.files[index].take() else {
-        return errno::EINVAL;
-    };
-    let Some(filesystem) = runtime.filesystem.as_mut() else {
+    let Some(mut filesystem) = runtime.filesystem else {
         return errno::EACCES;
     };
     filesystem.close(file).map_or_else(errno::from_kex, |()| 0)
@@ -413,20 +411,19 @@ unsafe extern "C" fn host_replace_begin(
     let Some(runtime) = (unsafe { runtime(context) }) else {
         return errno::EINVAL;
     };
-    if token.is_null() || initial_offset.is_null() || runtime.replacement.is_some() {
-        return if token.is_null() || initial_offset.is_null() {
-            errno::EINVAL
-        } else {
-            errno::EBUSY
-        };
+    if token.is_null() || initial_offset.is_null() {
+        return errno::EINVAL;
     }
     // SAFETY: Forwarded from this callback's path contract.
     let path = match unsafe { path(path_pointer, path_length) } {
         Ok(path) => path,
         Err(error) => return error,
     };
-    let Some(mutation) = runtime.mutation.as_mut() else {
+    let Some(mut mutation) = runtime.mutation else {
         return errno::EACCES;
+    };
+    let Ok(mut operation) = runtime.replacement.reserve() else {
+        return errno::EBUSY;
     };
     let replacement = match if preserve != 0 {
         mutation.begin_append(path)
@@ -437,13 +434,10 @@ unsafe extern "C" fn host_replace_begin(
         Err(error) => return errno::from_kex(error),
     };
     let offset = replacement.offset();
-    runtime.replacement = Some(PendingReplacement {
-        replacement,
-        offset,
-    });
+    operation.value = Some(replacement);
     // SAFETY: The nonnull scalar output pointers were checked above.
     unsafe {
-        token.write(1);
+        token.write(operation.token());
         initial_offset.write(offset);
     }
     0
@@ -462,23 +456,27 @@ unsafe extern "C" fn host_replace_append(
     }) else {
         return errno::EINVAL;
     };
-    let Some(pending) = runtime.replacement.as_mut() else {
+    let mut operation = match runtime.replacement.acquire(token) {
+        Ok(operation) => operation,
+        Err(error) => return error,
+    };
+    let Some(replacement) = operation.value.as_mut() else {
         return errno::EINVAL;
     };
-    if token != 1 || pending.offset != offset {
+    if replacement.offset() != offset {
         return errno::EINVAL;
-    }
-    if let Err(error) = pending.replacement.write_all(source) {
-        return errno::from_kex(error);
     }
     let Ok(length) = u64::try_from(length) else {
         return errno::EOVERFLOW;
     };
-    let Some(next) = pending.offset.checked_add(length) else {
+    if offset.checked_add(length).is_none() {
         return errno::EOVERFLOW;
-    };
-    pending.offset = next;
-    0
+    }
+    // The SDK advances its offset after each completed chunk. Retain that
+    // exact offset even if a later chunk fails; never replay a written prefix.
+    replacement
+        .write_all(source)
+        .map_or_else(errno::from_kex, |()| 0)
 }
 
 unsafe extern "C" fn host_replace_read(
@@ -494,33 +492,34 @@ unsafe extern "C" fn host_replace_read(
     }) else {
         return -(errno::EINVAL as isize);
     };
-    let Some(pending) = runtime.replacement.as_mut() else {
-        return -(errno::EINVAL as isize);
+    let mut operation = match runtime.replacement.acquire(token) {
+        Ok(operation) => operation,
+        Err(error) => return negative(error),
     };
-    if token != 1 {
-        return -(errno::EINVAL as isize);
-    }
-    match pending.replacement.read_at(offset, destination) {
-        Ok(count) => isize::try_from(count).unwrap_or(-(errno::EOVERFLOW as isize)),
-        Err(error) => -(errno::from_kex(error) as isize),
-    }
+    let Some(replacement) = operation.value.as_mut() else {
+        return negative(errno::EINVAL);
+    };
+    replacement
+        .read_at(offset, destination)
+        .map_or_else(|error| negative(errno::from_kex(error)), positive)
 }
 
 unsafe extern "C" fn host_replace_finish(context: *mut c_void, token: u32, commit: i32) -> i32 {
-    // SAFETY: The host table owns an exclusive runtime context.
+    // SAFETY: The host table retains a live, unmoved runtime context.
     let Some(runtime) = (unsafe { runtime(context) }) else {
         return errno::EINVAL;
     };
-    if token != 1 {
-        return errno::EINVAL;
-    }
-    let Some(pending) = runtime.replacement.take() else {
+    let mut operation = match runtime.replacement.acquire(token) {
+        Ok(operation) => operation,
+        Err(error) => return error,
+    };
+    let Some(replacement) = operation.value.take() else {
         return errno::EINVAL;
     };
     let result = if commit != 0 {
-        pending.replacement.commit()
+        replacement.commit()
     } else {
-        pending.replacement.abort()
+        replacement.abort()
     };
     result.map_or_else(errno::from_kex, |()| 0)
 }
@@ -560,7 +559,7 @@ unsafe extern "C" fn host_metadata(
         Ok(path) => path,
         Err(error) => return error,
     };
-    let Some(filesystem) = runtime.filesystem.as_mut() else {
+    let Some(mut filesystem) = runtime.filesystem else {
         return errno::EACCES;
     };
     let metadata = match if follow != 0 {
@@ -609,7 +608,7 @@ unsafe extern "C" fn host_directory_next(
     let Some(name_output) = (unsafe { bytes_mut(name, name_capacity) }) else {
         return negative(errno::EINVAL);
     };
-    let Some(filesystem) = runtime.filesystem.as_mut() else {
+    let Some(mut filesystem) = runtime.filesystem else {
         return negative(errno::EACCES);
     };
     let mut buffer = [0_u8; FILESYSTEM_LIST_BUFFER_BYTES];
@@ -656,7 +655,7 @@ unsafe extern "C" fn host_path_operation(
         Ok(path) => path,
         Err(error) => return error,
     };
-    let Some(mutation) = runtime.mutation.as_mut() else {
+    let Some(mut mutation) = runtime.mutation else {
         return errno::EACCES;
     };
     let result = match operation {
@@ -701,7 +700,7 @@ unsafe extern "C" fn host_read_link(
     let Some(destination) = (unsafe { bytes_mut(destination, capacity) }) else {
         return negative(errno::EINVAL);
     };
-    let Some(filesystem) = runtime.filesystem.as_mut() else {
+    let Some(mut filesystem) = runtime.filesystem else {
         return negative(errno::EACCES);
     };
     let mut buffer = [0_u8; filesystem::MAX_LINK_BYTES];
@@ -728,7 +727,7 @@ unsafe extern "C" fn host_monotonic_time(
     if ticks.is_null() || frequency.is_null() {
         return errno::EINVAL;
     }
-    let Some(timer) = runtime.timer.as_mut() else {
+    let Some(mut timer) = runtime.timer else {
         return errno::EACCES;
     };
     // Nanoseconds rather than milliseconds: `clock_gettime` reports a
@@ -758,7 +757,7 @@ unsafe extern "C" fn host_process_cpu_time(
     if ticks.is_null() || frequency.is_null() {
         return errno::EINVAL;
     }
-    let Some(timer) = runtime.timer.as_mut() else {
+    let Some(mut timer) = runtime.timer else {
         return errno::EACCES;
     };
     let value = match timer.process_cpu_time() {
@@ -781,7 +780,7 @@ unsafe extern "C" fn host_wall_time(context: *mut c_void, seconds: *mut u64) -> 
     if seconds.is_null() {
         return errno::EINVAL;
     }
-    let Some(clock) = runtime.wall_clock.as_mut() else {
+    let Some(mut clock) = runtime.wall_clock else {
         return errno::EACCES;
     };
     let value = match clock.now() {
@@ -805,7 +804,7 @@ unsafe extern "C" fn host_wall_time_precise(
     if seconds.is_null() || nanoseconds.is_null() {
         return errno::EINVAL;
     }
-    let Some(clock) = runtime.wall_clock.as_mut() else {
+    let Some(mut clock) = runtime.wall_clock else {
         return errno::EACCES;
     };
     let value = match clock.now_precise() {
@@ -821,11 +820,11 @@ unsafe extern "C" fn host_wall_time_precise(
 }
 
 unsafe extern "C" fn host_sleep_until(context: *mut c_void, milliseconds: u64) -> i32 {
-    // SAFETY: The host table owns an exclusive runtime context.
+    // SAFETY: The host table retains a live, unmoved runtime context.
     let Some(runtime) = (unsafe { runtime(context) }) else {
         return errno::EINVAL;
     };
-    let Some(timer) = runtime.timer.as_mut() else {
+    let Some(mut timer) = runtime.timer else {
         return errno::EACCES;
     };
     timer
@@ -844,7 +843,7 @@ unsafe extern "C" fn host_random_bytes(
     }) else {
         return errno::EINVAL;
     };
-    let Some(random) = runtime.random.as_mut() else {
+    let Some(mut random) = runtime.random else {
         return errno::EACCES;
     };
     random

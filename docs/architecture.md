@@ -324,8 +324,15 @@ the portable geometry and emitted bytes independently of native execution.
 The shared C11 qualification recipe pins Clang/LLD releases, excludes host
 headers/configuration, and records binary/header/source fingerprints only after
 the required checks pass. Its reports grant no admission. The C ABI-1 runtime
-retains its single-thread ownership; [ADR 0071](adr/0071-native-threads-and-owned-synchronization.md)
-specifies the separate process/thread/callback ownership needed by its adapter.
+retains its single-thread profile. Its Rust bridge uses shared context access and
+local service-handle copies. Separate file/replacement tables retain owned values
+and generation-qualified busy slots across I/O, without retaining a table lock.
+The same-token conflict is `EBUSY`; closed or superseded tokens are `EINVAL`.
+Slots remain unavailable through close/finish and retire on generation exhaustion.
+The allocator has separate atomic exclusion across its callback-free backing
+operations. The runtime and host table must outlive every callback.
+[ADR 0071](adr/0071-native-threads-and-owned-synchronization.md) governs the
+threaded adapter; these bridge rules supply no pthread or ABI 1.4 admission.
 
 `troe-application::thread_memory` places one fixed, fully committed stack, the
 checked TLS allocation, a two-page IPC pair and a read-only startup descriptor

@@ -100,6 +100,12 @@ never executes the ordinary application.
   and malformed completions do not write. Request buffers are erased on completion
   and context destruction. Production service and C runtime concurrency remain
   separate from this mechanism;
+- C callback ownership: the Rust bridge copies service handles before I/O and
+  retains file/replacement resources in exact generation-qualified operations.
+  No table lock or whole-runtime mutable loan crosses these service calls.
+  Close/finish prevents reuse until its call returns; stale tokens cannot act on
+  a replacement lifetime. Allocator exclusion is separate and invokes no user
+  callbacks. The C ABI-1 profile remains single-threaded;
 - native context owner: one retained root with bounded process-scoped register
   records, checked stack guards and disjoint stack/TLS payloads, actual retained
   metadata accounting, and process-wide continuation revocation on native fault
