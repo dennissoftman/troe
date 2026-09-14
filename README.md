@@ -364,6 +364,8 @@ randomness, exit handling, and coherent single-execution-thread locks and TSS.
 The Rust [`troe-kex-c-runtime`](sdk/rust/troe-kex-c-runtime) bridge supplies only
 the typed capabilities present in the package manifest. Its generation-qualified
 file operations retain ownership across I/O without holding a runtime-wide lock.
+Python's bridge, callback table and copied argument/environment storage have
+process lifetime through the SDK's fixed `ProcessStorage` bootstrap.
 Missing capabilities
 fail with `EACCES`; unsupported flags and facilities fail explicitly. There is
 no guest `/lib` dependency because every KEX remains statically linked.

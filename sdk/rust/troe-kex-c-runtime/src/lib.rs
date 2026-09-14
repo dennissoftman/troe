@@ -9,6 +9,9 @@ use core::{
 };
 
 mod ownership;
+mod process;
+
+pub use process::{ProcessRuntime, ProcessStorage};
 
 use ownership::{Locked, Slots};
 use troe_kex_alloc::{CAllocator, Heap};
@@ -113,6 +116,10 @@ pub enum InitializationError {
     MissingHeap,
     /// The heap allocator rejected the startup geometry.
     InvalidHeap,
+    /// Process storage has already been claimed, even if initialization failed.
+    AlreadyInitialized,
+    /// Copied arguments, environment or cwd exceed their bounded representation.
+    InvalidConfiguration,
 }
 
 impl Runtime {

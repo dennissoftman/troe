@@ -331,6 +331,12 @@ The same-token conflict is `EBUSY`; closed or superseded tokens are `EINVAL`.
 Slots remain unavailable through close/finish and retire on generation exhaustion.
 The allocator has separate atomic exclusion across its callback-free backing
 operations. The runtime and host table must outlive every callback.
+Python and the C runtime probe place them, the C configuration and all copied
+argument/environment/cwd backing in fixed process-owned `ProcessStorage`. Its
+single initialization claim cannot reset, including after failure. Temporary
+input records and initial-stack retirement cannot invalidate those retained
+pointers. Its bootstrap handle is neither Send nor Sync; this storage ownership
+does not establish concurrent libc or allocator qualification.
 [ADR 0071](adr/0071-native-threads-and-owned-synchronization.md) governs the
 threaded adapter; these bridge rules supply no pthread or ABI 1.4 admission.
 

@@ -1,11 +1,10 @@
 #![no_std]
 #![no_main]
 
-use core::{ffi::c_char, ptr};
-use troe_kex_c_runtime::{Configuration, Host, Runtime};
-use troe_kex_runtime::environment;
+use core::ffi::c_char;
+use troe_kex_c_runtime::{Configuration, Host, InitializationError, ProcessStorage};
 use troe_kex_sdk::{
-    CommandContext, ENVIRONMENT_BUFFER_BYTES, INVOCATION_BUFFER_BYTES, command, entry, exit,
+    CommandContext, ENVIRONMENT_BUFFER_BYTES, INVOCATION_BUFFER_BYTES, entry, exit,
 };
 
 unsafe extern "C" {
@@ -15,15 +14,7 @@ unsafe extern "C" {
     fn troe_c_runtime_probe(argc: i32, argv: *mut *mut c_char, host: *const Host) -> i32;
 }
 
-fn copy_c_string(value: &str, storage: &mut [u8], offset: &mut usize) -> Option<*mut c_char> {
-    let end = offset.checked_add(value.len())?.checked_add(1)?;
-    let destination = storage.get_mut(*offset..end)?;
-    destination[..value.len()].copy_from_slice(value.as_bytes());
-    destination[value.len()] = 0;
-    let pointer = destination.as_mut_ptr().cast();
-    *offset = end;
-    Some(pointer)
-}
+static PROCESS: ProcessStorage = ProcessStorage::new();
 
 fn main(command_context: &mut CommandContext) -> u32 {
     // SAFETY: The probe constructs and tears down its own callback-free host
@@ -39,60 +30,31 @@ fn main(command_context: &mut CommandContext) -> u32 {
     let Ok(environment) = command_context.environment(&mut environment_buffer) else {
         return exit::FAILURE;
     };
-    let mut argument_storage = [0_u8; command::MAX_ARGUMENT_BYTES + command::MAX_ARGUMENTS];
-    let mut argument_pointers = [ptr::null_mut(); command::MAX_ARGUMENTS + 1];
-    let mut argument_offset = 0;
-    for (index, argument) in invocation.arguments().enumerate() {
-        let Some(pointer) = copy_c_string(argument, &mut argument_storage, &mut argument_offset)
-        else {
-            return exit::FAILURE;
-        };
-        argument_pointers[index] = pointer;
+    let Ok(process) = PROCESS.initialize(command_context, invocation, environment) else {
+        return exit::FAILURE;
+    };
+    if !matches!(
+        PROCESS.initialize(command_context, invocation, environment),
+        Err(InitializationError::AlreadyInitialized)
+    ) {
+        return exit::FAILURE;
     }
-    let mut pwd_storage = [0_u8; command::MAX_CWD_BYTES + 4];
-    let mut environment_entries = [""; command::MAX_ENVIRONMENT];
-    let Ok(environment_count) = environment::child_entries(
-        environment,
-        invocation.cwd(),
-        &mut pwd_storage,
-        &mut environment_entries,
-    ) else {
-        return exit::FAILURE;
-    };
-    let mut environment_storage = [0_u8;
-        command::MAX_ENVIRONMENT_BYTES + command::MAX_ENVIRONMENT + command::MAX_CWD_BYTES + 128];
-    let mut environment_pointers = [ptr::null_mut(); command::MAX_ENVIRONMENT + 1];
-    let mut environment_offset = 0;
-    for (index, value) in environment_entries[..environment_count].iter().enumerate() {
-        let Some(pointer) = copy_c_string(value, &mut environment_storage, &mut environment_offset)
-        else {
-            return exit::FAILURE;
-        };
-        environment_pointers[index] = pointer;
-    }
-    let mut cwd = [0_u8; command::MAX_CWD_BYTES + 1];
-    let mut cwd_offset = 0;
-    let Some(cwd_pointer) = copy_c_string(invocation.cwd(), &mut cwd, &mut cwd_offset) else {
-        return exit::FAILURE;
-    };
-    let Ok(mut runtime) = Runtime::new(command_context) else {
-        return exit::FAILURE;
-    };
-    let host = runtime.host();
-    let configuration = Configuration {
-        host: &host,
-        argc: i32::try_from(invocation.len()).unwrap_or(i32::MAX),
-        argv: argument_pointers.as_mut_ptr(),
-        environment: environment_pointers.as_mut_ptr(),
-        cwd: cwd_pointer,
-    };
+    // Retained C configuration must no longer depend on these source records.
+    invocation_buffer.fill(0xa5);
+    environment_buffer.fill(0xa5);
+    let runtime = process.runtime();
+    // SAFETY: ProcessStorage publishes this immutable record only after complete
+    // initialization; every C-retained pointer names process-owned storage.
+    let configuration = unsafe { &*process.configuration() };
+
     // SAFETY: Every configuration pointer refers to live fixed storage for the
     // complete C call, and the runtime state does not move while callbacks run.
     let result = unsafe {
-        if troe_runtime_initialize(&configuration) != 0 {
+        if troe_runtime_initialize(configuration) != 0 {
             return exit::FAILURE;
         }
-        let result = troe_c_runtime_probe(configuration.argc, configuration.argv, &host);
+        let result =
+            troe_c_runtime_probe(configuration.argc, configuration.argv, configuration.host);
         troe_runtime_finalize();
         result
     };
