@@ -324,6 +324,7 @@ def verification_steps(args: argparse.Namespace) -> list[Step]:
             for label, manifest in (
                 ("applications", APPLICATIONS_MANIFEST),
                 ("services", SERVICES_MANIFEST),
+                ("native thread consumer", "tests/native-thread-probe/Cargo.toml"),
             )
         ),
         *python_lint_steps(require_python_tools=args.require_python_tools),
@@ -357,6 +358,25 @@ def verification_steps(args: argparse.Namespace) -> list[Step]:
             ),
         ),
         Step("cargo test workspace", ("cargo", "test", "--workspace")),
+        Step(
+            "cargo test native SDK",
+            ("cargo", "test", "-p", "troe-kex-sdk", "--features", "native-threads"),
+        ),
+        Step(
+            "clippy native SDK",
+            (
+                "cargo",
+                "clippy",
+                "-p",
+                "troe-kex-sdk",
+                "--all-targets",
+                "--features",
+                "native-threads",
+                "--",
+                "-D",
+                "warnings",
+            ),
+        ),
         Step(
             "cargo test applications",
             (

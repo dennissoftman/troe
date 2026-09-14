@@ -11,6 +11,9 @@ pub use ipc::{Event, EventKind, IpcHandle, IpcPages, PersistentContext};
 mod listener;
 pub use listener::TcpListen;
 
+#[cfg(feature = "native-threads")]
+pub mod threading;
+
 pub use troe_abi::{
     ABI_MAJOR, ABI_MINOR, clock_control, command, datagram, diagnostics, exit, filesystem,
     filesystem_mutation, icmp_echo, interface, network_configuration, network_observation, pipe,
@@ -763,6 +766,10 @@ impl ServerContext {
 ///
 /// Reports an invalid kernel completion or a non-freestanding host build.
 pub fn yield_now() -> Result<(), Error> {
+    #[cfg(feature = "native-threads")]
+    if threading::enabled() {
+        return threading::yield_now();
+    }
     native_yield()
 }
 
@@ -789,6 +796,13 @@ pub unsafe fn grow_heap(minimum_additional_pages: usize) -> Result<usize, Error>
         return Err(Error::InvalidCall);
     }
     let pages = u64::try_from(minimum_additional_pages).map_err(|_| Error::InvalidCall)?;
+    #[cfg(feature = "native-threads")]
+    let (status, mapped_bytes) = if threading::enabled() {
+        threading::grow_heap(pages)?
+    } else {
+        native_grow_heap(pages)?
+    };
+    #[cfg(not(feature = "native-threads"))]
     let (status, mapped_bytes) = native_grow_heap(pages)?;
     match status {
         heap_growth::SUCCESS
@@ -2581,6 +2595,11 @@ impl<'a> Startup<'a> {
     }
 
     fn ipc_pages(&self) -> Result<Option<IpcPages>, StartupError> {
+        // Threaded transport owns the current context's pages through its TLS
+        // call guard. Exposing an additional IpcPages owner would alias it.
+        if read_u16(self.bytes, 6)? == troe_abi::startup::THREAD_ABI_MINOR {
+            return Ok(None);
+        }
         if read_u16(self.bytes, 6)? < troe_abi::startup::IPC_ABI_MINOR {
             return Ok(None);
         }
@@ -2813,8 +2832,20 @@ macro_rules! server_entry {
     };
 }
 
-#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 fn native_handle_call(
+    handle: u64,
+    request: &[u8],
+    reply: &mut [u8],
+) -> Result<(u32, usize), Error> {
+    #[cfg(feature = "native-threads")]
+    if threading::enabled() {
+        return threading::handle_call(handle, request, reply);
+    }
+    legacy_handle_call(handle, request, reply)
+}
+
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn legacy_handle_call(
     handle: u64,
     request: &[u8],
     reply: &mut [u8],
@@ -2835,11 +2866,14 @@ fn native_handle_call(
             options(nostack),
         );
     }
-    Ok((status as u32, secondary as usize))
+    Ok((
+        u32::try_from(status).map_err(|_| Error::InvalidCall)?,
+        usize::try_from(secondary).map_err(|_| Error::InvalidCall)?,
+    ))
 }
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
-fn native_handle_call(
+fn legacy_handle_call(
     handle: u64,
     request: &[u8],
     reply: &mut [u8],
@@ -2860,11 +2894,14 @@ fn native_handle_call(
             options(nostack),
         );
     }
-    Ok((status as u32, secondary as usize))
+    Ok((
+        u32::try_from(status).map_err(|_| Error::InvalidCall)?,
+        usize::try_from(secondary).map_err(|_| Error::InvalidCall)?,
+    ))
 }
 
 #[cfg(not(target_os = "none"))]
-fn native_handle_call(
+fn legacy_handle_call(
     _handle: u64,
     _request: &[u8],
     _reply: &mut [u8],
@@ -2938,7 +2975,10 @@ fn native_grow_heap(minimum_pages: u64) -> Result<(u32, usize), Error> {
             options(nostack),
         );
     }
-    Ok((status as u32, mapped_bytes as usize))
+    Ok((
+        u32::try_from(status).map_err(|_| Error::InvalidCall)?,
+        usize::try_from(mapped_bytes).map_err(|_| Error::InvalidCall)?,
+    ))
 }
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
@@ -2959,7 +2999,10 @@ fn native_grow_heap(minimum_pages: u64) -> Result<(u32, usize), Error> {
             options(nostack),
         );
     }
-    Ok((status as u32, mapped_bytes as usize))
+    Ok((
+        u32::try_from(status).map_err(|_| Error::InvalidCall)?,
+        usize::try_from(mapped_bytes).map_err(|_| Error::InvalidCall)?,
+    ))
 }
 
 #[cfg(not(target_os = "none"))]

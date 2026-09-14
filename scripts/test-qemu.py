@@ -3942,9 +3942,12 @@ def test_platform(
                         args.command_timeout,
                         fault,
                     )
-                    if (
-                        "resident TLS KEX: two processes,"
-                        not in fault_session.transcript()
+                    if any(
+                        marker not in fault_session.transcript()
+                        for marker in (
+                            "resident TLS KEX: two processes,",
+                            "resident Rust SDK: compiler TLS,",
+                        )
                     ):
                         raise AcceptanceError(
                             f"{platform_id}: loaded resident TLS consumers did not run"

@@ -22,6 +22,11 @@ generation-qualified file/replacement operations without retaining metadata lock
 over I/O. Allocator exclusion is separate. This supersedes the whole-runtime
 mutable-loan observation in the historical context below; the ABI-1 C profile
 still has single-thread libc/TSS behavior and no production threaded admission.
+The optional Rust SDK native profile supplies checked initial/worker startup,
+compiler-managed TLS and copied per-thread service/scheduler transport. A loaded
+Rust/C consumer exercises this profile and pending-I/O cancellation alongside
+the C mechanism consumer. The default SDK entry still rejects ABI 1.4; production
+pthread/CPython admission remains tracked by #208.
 Native heap requests now retain owned operation identity, bind immutable heap
 bounds, and separate one mapping commit from completion. Mapping errors revoke
 all continuations while backing remains retained until root retirement. These

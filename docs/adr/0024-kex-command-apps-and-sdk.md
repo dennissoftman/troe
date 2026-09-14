@@ -15,8 +15,10 @@ full-width package offsets, and the shared startup-handle ceiling. Earlier
 layout descriptions below preserve the original decision.
 
 Current scope note: explicit offline TLS conversion uses the separate
-[container 1.3](../formats/kex-static-tls-v1.md). The command SDK and native
-loaders retain their single-thread profile.
+[container 1.3](../formats/kex-static-tls-v1.md). Default command SDK entry and
+package loading retain their single-thread profile. The explicit resident loader
+and optional native SDK entry implement ABI 1.4 under
+[ADR 0071](0071-native-threads-and-owned-synchronization.md).
 
 ## Decision
 

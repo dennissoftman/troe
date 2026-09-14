@@ -3,8 +3,10 @@
 `troe-application::tls_artifact` validates this format for offline inspection
 and converter verification. It produces no native load plan, startup layout,
 mapping, capability grant, or resource admission. Production native and streaming loaders
-accept only [container 1.2](kex-v1.md), and the active SDK accepts application
-ABI 1.3. Both loaders reject container 1.3 even with a higher caller ABI ceiling.
+accept only [container 1.2](kex-v1.md), and the default SDK entry accepts application
+ABI 1.3. Both default loaders reject container 1.3 even with a higher caller ABI
+ceiling. The explicit resident loader and optional native SDK profile use container
+1.3 and application ABI 1.4 with compiler-managed per-thread TLS.
 The separate `process_memory` preflight can compose this reader's validated
 geometry into shared and initial-thread reservations with peak memory charges.
 It grants no resource ownership or native admission.
@@ -19,7 +21,9 @@ fingerprint before their provisional destinations can be published. The default
 parser still rejects this format. `ProcessTls::prepare_streamed` retains only the
 verified initializer; it does not retain the complete executable or a source callback.
 Shared account handles keep its charges alive independently of the event loop.
-These mechanisms do not activate the production threaded runtime.
+The explicit native frame owner materializes the verified shared image and
+per-thread backing. Ordinary package admission and the production C runtime
+remain single-threaded.
 
 ## Encoding
 

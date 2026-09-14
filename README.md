@@ -230,7 +230,9 @@ $ cargo kex inspect rootfs/bin/x86_64/echo.kex
 ```
 
 Start exploring with [`apps/echo`](apps/echo) and the
-[`troe-kex` Rust SDK](sdk/rust/troe-kex).
+[`troe-kex` Rust SDK](sdk/rust/troe-kex/README.md). Its optional native thread
+profile supplies ABI 1.4 entry and per-thread transport for the explicit resident
+loader; ordinary package admission and the C/CPython runtime remain single-threaded.
 
 Bare names use the bounded `/bin/<name>.kex` catalog. Tokens containing `/`
 are relative or absolute VFS paths: lookup tries the exact path first, then

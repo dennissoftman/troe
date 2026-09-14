@@ -230,14 +230,21 @@ never executes the ordinary application.
   plans, including a separately charged read-only descriptor page. Whole-process
   preflight rejects overlap with image holes, heap growth reservations and thread
   guards; peak budgets include separate immutable-initializer and executable
-  staging backing. Preflight does not acquire or authenticate that backing. The active
-  loader and SDK reject the assigned threaded startup revision and reject thread
-  interfaces in older startup records. Offline TLS conversion requires an explicit
+  staging backing. Preflight does not acquire or authenticate that backing. The default
+  loader and SDK entry reject the threaded startup revision and thread interfaces
+  in older startup records; the explicit resident loader and native SDK profile
+  use separately validated ABI 1.4 startup. Offline TLS conversion requires an explicit
   container revision, validates the immutable initializer against its image source,
   and rejects initializer pointer fixups. Default native and streaming loaders
   reject this container. The explicit streamed TLS verifier compares source and
   suffix hashes and requires complete-package fingerprints on replay; provisional
   frames and initializer bytes must remain unpublished after any failure;
+- native SDK transport: compiler-managed TLS binds each worker to its own immutable
+  descriptor and retained IPC pages. A thread-local guard excludes overlapping SDK
+  page loans; callers receive copied, length/status-checked replies. Workers do not
+  dereference the initial thread's retired descriptor. Startup/TLS metadata supplies
+  userspace bookkeeping, not kernel caller authority. Low-level worker entry/argument
+  lifetimes and cleanup before Exit remain explicit unsafe runtime obligations;
 - TLS initializer ownership: exclusively owned staging supplies an independent
   immutable process initializer. Fallible preparation reserves logical backing,
   checks actual capacity and process peak budgets, and drops buffers before

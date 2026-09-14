@@ -247,6 +247,7 @@ impl PersistentContext {
 }
 
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+#[allow(clippy::unnecessary_wraps)] // The hosted transport returns UnsupportedTarget.
 fn native(number: u64, words: [u64; 6]) -> Result<[u64; 6], Error> {
     let (mut a, mut d, mut di, mut si, mut r8, mut r9) =
         (number, words[2], words[0], words[1], words[4], words[5]);
@@ -261,6 +262,7 @@ fn native(number: u64, words: [u64; 6]) -> Result<[u64; 6], Error> {
 }
 
 #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+#[allow(clippy::unnecessary_wraps)] // The hosted transport returns UnsupportedTarget.
 fn native(number: u64, mut words: [u64; 6]) -> Result<[u64; 6], Error> {
     // SAFETY: Validated private-page arguments and the documented six-result
     // SVC convention; all other application registers are preserved.
