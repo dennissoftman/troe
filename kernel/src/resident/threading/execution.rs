@@ -25,6 +25,7 @@ pub(crate) struct NativeResident {
     turn: Option<Dispatch>,
     waits: Vec<SchedulerWait>,
     stops: Vec<(ThreadId, NativeThreadStop)>,
+    io: Option<super::io::NativeIo>,
 }
 
 /// The service event and its exact policy wait are inseparable after suspension.
@@ -34,6 +35,23 @@ pub(crate) struct ResidentHandleCall {
 }
 
 impl NativeResident {
+    #[cfg(feature = "acceptance-probes")]
+    pub(crate) fn io_live(&self) -> u32 {
+        self.io.as_ref().map_or(0, super::io::NativeIo::live)
+    }
+
+    #[cfg(feature = "acceptance-probes")]
+    pub(crate) fn io_high_water(&self) -> u32 {
+        self.io.as_ref().map_or(0, super::io::NativeIo::high_water)
+    }
+
+    pub(crate) fn take_io(&mut self) -> Result<super::io::NativeIo, ()> {
+        self.io.take().ok_or(())
+    }
+    pub(crate) fn restore_io(&mut self, io: super::io::NativeIo) {
+        self.io = Some(io);
+    }
+
     pub(crate) fn resource_totals(&self) -> Result<(u64, u64), ()> {
         self.memory.resource_totals()
     }
@@ -52,6 +70,7 @@ impl NativeResident {
         mut memory: NativeMemory,
         policy: SharedNativeThreads,
         process: ProcessId,
+        task: troe_task::TaskId,
         accounting: &mut OwnedAccounting,
     ) -> Result<Self, NativeMemory> {
         let mut waits = Vec::new();
@@ -61,7 +80,11 @@ impl NativeResident {
         {
             return Err(memory);
         }
-        let metadata = core::mem::size_of::<Self>() - core::mem::size_of::<NativeMemory>()
+        let Ok(io) = super::io::NativeIo::new(task) else {
+            return Err(memory);
+        };
+        let metadata = io.buffer_bytes() + core::mem::size_of::<Self>()
+            - core::mem::size_of::<NativeMemory>()
             + waits.capacity() * core::mem::size_of::<SchedulerWait>()
             + stops.capacity() * core::mem::size_of::<(ThreadId, NativeThreadStop)>();
         if memory
@@ -77,6 +100,7 @@ impl NativeResident {
             turn: None,
             waits,
             stops,
+            io: Some(io),
         })
     }
 
@@ -375,6 +399,9 @@ impl NativeResident {
         self.turn = None;
         self.waits.clear();
         self.stops.clear();
+        if let Some(io) = &mut self.io {
+            io.revoke()?;
+        }
         Ok(())
     }
 

@@ -807,10 +807,14 @@ impl<'service> ResidentApplication<'service> {
         &mut self,
         services: Option<CommandDeferredServices>,
     ) -> Result<(), ()> {
-        self.deferred_state = services
-            .as_ref()
-            .map(|_| CommandDeferredState::new())
-            .transpose()?;
+        self.deferred_state = if matches!(self.execution, Some(ResidentExecution::Native(_))) {
+            None
+        } else {
+            services
+                .as_ref()
+                .map(|_| CommandDeferredState::new())
+                .transpose()?
+        };
         self.deferred_services = services;
         Ok(())
     }

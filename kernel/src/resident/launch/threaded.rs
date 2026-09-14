@@ -166,7 +166,13 @@ pub(crate) fn prepare_threaded_resident_application<'service>(
             backing_reclaimed = true;
             return Err(());
         }
-        let native = match NativeResident::new(memory, Rc::clone(&policy), process_id, accounting) {
+        let native = match NativeResident::new(
+            memory,
+            Rc::clone(&policy),
+            process_id,
+            task_id,
+            accounting,
+        ) {
             Ok(native) => native,
             Err(memory) => {
                 memory.reclaim(accounting)?;

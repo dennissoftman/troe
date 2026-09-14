@@ -62,6 +62,12 @@ NATIVE_THREAD_GATE_PATHS = frozenset(
         "crates/runtime/troe-machine/src/mmu/retirement.rs",
         "crates/runtime/troe-machine/src/mmu/admission.rs",
         "kernel/src/memory/shared_context_probe.rs",
+        "crates/runtime/troe-task/src/wait.rs",
+        "kernel/src/deferred.rs",
+        "kernel/src/memory/native.rs",
+        "kernel/src/resident/threading.rs",
+        "kernel/src/resident/application/native.rs",
+        "kernel/src/resident/launch/threaded.rs",
     )
 )
 NATIVE_THREAD_GATE_PREFIXES = (
@@ -71,6 +77,9 @@ NATIVE_THREAD_GATE_PREFIXES = (
     "crates/runtime/troe-machine/src/mmu/retirement/",
     "crates/runtime/troe-machine/src/mmu/admission/",
     "kernel/src/memory/shared_context_probe/",
+    "crates/runtime/troe-task/src/wait/",
+    "kernel/src/memory/native/",
+    "kernel/src/resident/threading/",
 )
 NETWORK_APPS = frozenset(("arp", "dhcp", "net", "ping", "tcp", "udp"))
 FILESYSTEM_APPS = frozenset(

@@ -2,13 +2,17 @@
 
 use super::{NativeThreads, PROCESS_THREADS};
 use crate::{
-    invocation::CommandApplicationOutcome,
+    deferred::CommandDeferredServices,
+    invocation::{CommandApplicationOutcome, CommandStartupService},
     machine::OwnedAccounting,
     memory::native::NativeLoadLimits,
     resident::{ResidentApplication, launch::prepare_threaded_resident_application},
+    runtime::KernelRuntime,
+    service::{clock::ApplicationTimerService, process::ApplicationPipeService},
+    supervision::register_command_service,
 };
 use alloc::rc::Rc;
-use core::cell::RefCell;
+use core::cell::{Cell, RefCell};
 use troe_application::{
     LoadPlacement, encode_kex_package, parse_streamed_threaded_kex_package,
     process_memory::{ProcessMemoryBudget, ProcessMemoryPlacement},
@@ -21,8 +25,15 @@ const PROGRAM: &[u8] = include_bytes!("probe/program-x86_64.kex");
 #[cfg(target_arch = "aarch64")]
 const PROGRAM: &[u8] = include_bytes!("probe/program-aarch64.kex");
 
-#[allow(clippy::too_many_lines)] // Keep failure cleanup beside both loaded residents.
 pub(crate) fn verify(accounting: &mut OwnedAccounting) -> Result<(), ()> {
+    verify_case(accounting, false)?;
+    verify_case(accounting, true)?;
+    if !troe_machine::write(b"resident TLS KEX: two processes, private compiler TLS, create/start/abort/join, sync, empty heap, sibling timers, competing pipe reads and pending-I/O cancellation passed\n") { return Err(()); }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)] // Keep failure cleanup beside both loaded residents.
+fn verify_case(accounting: &mut OwnedAccounting, cancel: bool) -> Result<(), ()> {
     let policy = NativeThreads::shared(accounting)?;
     let metadata = accounting.private_metadata_bytes;
     let committed = accounting.application_committed_pages;
@@ -45,11 +56,49 @@ pub(crate) fn verify(accounting: &mut OwnedAccounting) -> Result<(), ()> {
                 placement,
             )
             .map_err(|_| ())?;
+            let runtime = Rc::new(RefCell::new(
+                KernelRuntime::new(None, None).map_err(|_| ())?,
+            ));
+            let pipes = Rc::new(RefCell::new(
+                troe_process::PipeTable::new(1).map_err(|_| ())?,
+            ));
+            let pipe_owner = troe_process::OwnerId::new(u32::try_from(index + 1).map_err(|_| ())?)
+                .map_err(|_| ())?;
+            let identity = Rc::new(Cell::new(None));
+            let mut dispatcher = Dispatcher::new(2, 4).map_err(|_| ())?;
+            let timer_port = register_command_service(
+                &mut dispatcher,
+                ApplicationTimerService {
+                    runtime: Rc::clone(&runtime),
+                    processes: Rc::clone(&processes),
+                    task_id: Rc::clone(&identity),
+                },
+            )?;
+            let pipe_port = register_command_service(
+                &mut dispatcher,
+                ApplicationPipeService {
+                    owner: Rc::new(Cell::new(Some(pipe_owner))),
+                    pipes: Rc::clone(&pipes),
+                },
+            )?;
             *resident = Some(prepare_threaded_resident_application(
                 &mut scheduler,
                 accounting,
-                Dispatcher::new(1, 2).map_err(|_| ())?,
-                &[],
+                dispatcher,
+                &[
+                    CommandStartupService {
+                        port: timer_port,
+                        interface: troe_abi::interface::TIMER,
+                        major: 1,
+                        minor: 1,
+                    },
+                    CommandStartupService {
+                        port: pipe_port,
+                        interface: troe_abi::interface::PIPE,
+                        major: 1,
+                        minor: 0,
+                    },
+                ],
                 &[
                     (
                         SchedulerInterface::ControlV1,
@@ -89,13 +138,64 @@ pub(crate) fn verify(accounting: &mut OwnedAccounting) -> Result<(), ()> {
                 0,
                 Rc::clone(&processes),
             )?);
+            identity.set(Some(resident.as_ref().ok_or(())?.task_id));
+            resident
+                .as_mut()
+                .ok_or(())?
+                .install_deferred_services(Some(CommandDeferredServices {
+                    runtime,
+                    datagram: None,
+                    diagnostics: None,
+                    process_owner: Some(pipe_owner),
+                    children: None,
+                    pipes: Some(pipes),
+                    pipe_streams: alloc::vec::Vec::new(),
+                    terminal: None,
+                }))?;
         }
-        for _ in 0..256 {
+        let deadline = troe_machine::monotonic_millis()
+            .ok_or(())?
+            .checked_add(5_000)
+            .ok_or(())?;
+        for _ in 0..4096 {
             for resident in &mut residents {
                 let Some(application) = resident else {
                     continue;
                 };
-                if let Some(outcome) = application.step(&mut scheduler, accounting)? {
+                let outcome = application.step(&mut scheduler, accounting)?;
+                if cancel && outcome.is_none() {
+                    let Some(crate::resident::ResidentExecution::Native(native)) =
+                        &application.execution
+                    else {
+                        return Err(());
+                    };
+                    if native.io_live() >= 2 {
+                        let cancelled =
+                            CommandApplicationOutcome::Exited(troe_abi::exit::CANCELLED);
+                        if resident.take().ok_or(())?.teardown(
+                            &mut scheduler,
+                            accounting,
+                            cancelled,
+                            true,
+                        )? != cancelled
+                        {
+                            return Err(());
+                        }
+                        continue;
+                    }
+                }
+                if let Some(outcome) = outcome {
+                    if cancel {
+                        return Err(());
+                    }
+                    let Some(crate::resident::ResidentExecution::Native(native)) =
+                        &application.execution
+                    else {
+                        return Err(());
+                    };
+                    if native.io_high_water() < 2 {
+                        return Err(());
+                    }
                     let result = resident.take().ok_or(())?.teardown(
                         &mut scheduler,
                         accounting,
@@ -113,6 +213,10 @@ pub(crate) fn verify(accounting: &mut OwnedAccounting) -> Result<(), ()> {
             if residents.iter().all(Option::is_none) {
                 return Ok(());
             }
+            if troe_machine::monotonic_millis().ok_or(())? >= deadline {
+                return Err(());
+            }
+            troe_machine::wait_for_runtime_event_timeout(1).map_err(|_| ())?;
         }
         Err(())
     })();
@@ -140,7 +244,6 @@ pub(crate) fn verify(accounting: &mut OwnedAccounting) -> Result<(), ()> {
     {
         return Err(());
     }
-    if !troe_machine::write(b"resident TLS KEX: two processes, private compiler TLS, create/start/abort/join, sync and empty heap passed\n") { return Err(()); }
     Ok(())
 }
 

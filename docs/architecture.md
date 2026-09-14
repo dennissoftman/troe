@@ -749,9 +749,23 @@ native claim; service calls pair their claim with an exact thread-wait generatio
 No shared policy borrow crosses a service callback. Worker exit retires private
 native mappings and physical backing before resource acknowledgement, and also
 reclaims preparations revoked by creator exit. Last-thread exit ends the process;
-essential-mutex owner death produces a process fault. The resident profile's
-service replies are synchronous; deferred I/O and production runtime admission
-are not enabled by this branch.
+essential-mutex owner death produces a process fault. The resident profile retains
+up to eight deferred service calls per process in precharged pending-call and wait
+tables. Each record owns its native claim, exact policy wait and service operation;
+legacy task calls remain exclusive, while native callers include the full thread
+identity. Completion checks task, thread, operation and wait generation before RX
+publication. Timer, pipe/terminal, datagram, child-wait and persistent diagnostics
+calls use the existing service semantics. Diagnostics retain the endpoint generation
+and the process-wide operation namespace used by the persistent client table.
+
+Each resident visit observes at most one deferred call in rotating order, separately
+charging its CPU time to the process. This fixed observation budget does not grow
+with its sibling count or renew the native turn. A ready resource is consumed before
+another waiter is observed; pipe readers therefore recheck availability individually.
+Blocking one thread preserves runnable siblings. Process stop discards all service
+waits without allocating completion batches, zeroes pending request buffers and
+retires native claims before backing reclamation. Production runtime admission and
+native private-memory integration remain disabled.
 Ordinary calls inside `NativeProcessContext` use the calling context's exact
 retained TX/RX prefixes for entry 2. The existing single-context application ABI
 still accepts its validated request/reply buffers. The shared-root mechanism

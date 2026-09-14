@@ -7,11 +7,14 @@ Status: architectural direction accepted, 2026-09-09. Implementation tracked by
 The explicit resident acceptance profile now loads converted TLS KEX programs
 through the streamed verifier, native frame owner and resident process loop. One
 shared policy owner selects process turns without starting another resident's
-deadline. Initial and worker backing, scheduler waits, synchronous service calls,
-bounded heap additions and teardown use retained native owners. Two loaded C
-consumers cover compiler TLS, Prepare/Start/Abort/Join, synchronization and growth
-from an empty heap. Ordinary threaded package admission, deferred service I/O,
-private-memory integration and the production C/CPython adapter remain disabled
+deadline. Initial and worker backing, scheduler waits, synchronous and deferred
+service calls, bounded heap additions and teardown use retained native owners.
+Deferred calls carry full task/thread and operation/wait identity; the resident
+loop polls one call per process visit and preserves runnable siblings. Loaded C
+consumers cover compiler TLS, Prepare/Start/Abort/Join, synchronization, growth from
+an empty heap, independent timers, competing pipe reads and pending-I/O process
+cancellation. Ordinary threaded package admission, private-memory integration
+and the production C/CPython adapter remain disabled
 and tracked by #207/#208. The limits of this explicit profile are documented in
 the current [architecture](../architecture.md) and [thread contract](../formats/thread-v1.md).
 Native heap requests now retain owned operation identity, bind immutable heap
