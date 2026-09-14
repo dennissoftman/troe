@@ -292,6 +292,9 @@ impl NativeProcessContext {
         if self.stopped
             || space.tag.is_some()
             || space.ipc.is_some()
+            || self
+                .heap
+                .is_some_and(|heap| super::overlaps(heap, geometry.window))
             || self.contexts.len() == self.capacity
             || self.backing.pairs.len() == self.capacity
             || self.backing.pairs.len() == self.backing.pairs.capacity()

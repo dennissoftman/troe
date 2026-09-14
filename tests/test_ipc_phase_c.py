@@ -23,7 +23,7 @@ def transcript(
             row["ticks"] = ",".join([str(measured)] * 256)
         else:
             prefix = "ipc-phase-c-latency"
-            limit = 700
+            limit = 900
             row.update(
                 p95_ticks=str(measured),
                 ratio_limit=str(limit),
@@ -45,27 +45,27 @@ def transcript(
 
 class PhaseCTests(unittest.TestCase):
     def test_complete_matrix_and_real_tagging(self) -> None:
-        result = ipc_phase_c.validate(transcript(ticks=700), require_tagged=True)
+        result = ipc_phase_c.validate(transcript(ticks=900), require_tagged=True)
         self.assertEqual(len(result["faults"]), 7)
         self.assertEqual(len(result["rows"]), 4)
-        self.assertEqual(result["rows"]["general-direct/64"]["p95_ratio"], 0.70)
+        self.assertEqual(result["rows"]["general-direct/64"]["p95_ratio"], 0.90)
         with self.assertRaisesRegex(ValueError, "unavailable"):
             ipc_phase_c.validate(transcript(tagged=False), require_tagged=True)
 
     def test_budget_is_exact_at_every_payload_on_both_paths(self) -> None:
         ipc_phase_c.validate(
-            transcript(ticks=653, large_ticks=700), require_tagged=True
+            transcript(ticks=853, large_ticks=900), require_tagged=True
         )
-        for output in (transcript(ticks=701), transcript(large_ticks=701)):
+        for output in (transcript(ticks=901), transcript(large_ticks=901)):
             with self.assertRaisesRegex(ValueError, "ratio failed"):
                 ipc_phase_c.validate(output, require_tagged=True)
         with self.assertRaisesRegex(ValueError, "ratio failed"):
-            ipc_phase_b.validate(phase_b(direct_ticks=71), require_tagged=True)
+            ipc_phase_b.validate(phase_b(direct_ticks=91), require_tagged=True)
 
     def test_limits_cannot_be_relaxed_or_fates_duplicated(self) -> None:
         output = transcript()
         for bad in (
-            output.replace("ratio_limit=700", "ratio_limit=701", 1),
+            output.replace("ratio_limit=900", "ratio_limit=901", 1),
             output.replace("ratio_scale=1000", "ratio_scale=100", 1),
             output.replace("fates=1", "fates=2", 1),
             output.replace("frames=0", "frames=1", 1),

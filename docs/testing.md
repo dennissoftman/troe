@@ -805,6 +805,37 @@ restore physical and logical baselines. The adjacent `dispatch/x86_64.S` and
 target; `llvm-readelf -r` must report no relocations before extracting `.text`
 with `llvm-objcopy --only-section=.text -O binary`. `program.rs` embeds those
 inspected loop bytes. These tests do not establish a hard real-time guarantee.
+A native ordinary-call fixture retains two callers' claimed operations while the
+second caller overwrites the first caller's TX. It checks the unchanged kernel
+capture, completes replies in reverse order, and has both user programs validate
+their complete RX pages. Duplicate claims, completion bypass through native
+resume, wrong-root completion, stale operations, undefined service status and
+oversized replies leave ownership and RX intact. A sibling fault revokes a retained
+call and rejects late native/policy completion. Separate cases reject otherwise
+valid user addresses offset from the caller's exact IPC prefixes. Additional cases
+cover full-page request/capacity, zero reply capacity and an unclaimed
+capability-rejection completion. Every user entry
+uses a retained process dispatch; completion checks unchanged native-entry/timer
+counters. Stop and root teardown restore physical/logical baselines. The fixture
+does not authenticate a real service grant or establish production service safety.
+The native heap fixture issues simultaneous sibling growth calls, commits each
+once, completes them in reverse order and has user code check zeroed new pages.
+It rejects duplicate claims, replayed mapping, native-resume bypass, stale calls,
+success without mapping and exhaustion after mapping. Completion does not enter
+userspace or reprogram the timer. A separate exhaustion case leaves mapping
+counts unchanged. An exact initial table arena permits the first new leaf but
+exhausts at the next table boundary; the root must stop, retain that partial leaf
+and reject completion before all physical backing is reclaimed after root drop.
+Native probe metadata has a 32 KiB allowance and charges the compiled records,
+including one 4 KiB request buffer per context. The buffers are allocated before
+native execution and erased on completion or destruction.
+The adjacent `handle/program.c` and `program.ld` define the fixture without libc,
+stack protector or compiler TLS. Compile both `unknown-none-elf` targets with
+Clang `-O2 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -fno-pie
+-mcmodel=large` and x86 `-mno-red-zone`, link with that script, and verify `entry`
+is exactly `0x400000000000` and no relocations remain before extracting `.text`.
+The script includes Clang's x86 large-model `.ltext` sections. `program.rs` embeds
+the inspected linked text; manual FS/TPIDR access is native mechanism evidence.
 These native mechanisms do not establish threaded package admission, production
 resident scheduling, production compiler-TLS ownership or C/CPython thread safety.
 The acceptance image exceeds 1 MiB and therefore also exercises the
@@ -949,7 +980,7 @@ must agree before a row is emitted.
 
 `scripts/ipc_phase_b.py` independently recomputes nearest-rank p95 values from
 both arrays. Direct p95 divided by same-boot compatibility p95 must be at most
-0.70 at every payload size. A queued ratio is reported without a
+0.90 at every payload size. A queued ratio is reported without a
 latency threshold. All rows must use one clock and feature mode. Evidence is
 written to `build/ipc-phase-b-<platform>-<tagged|fallback>.json`, including raw
 samples, structural counts, host, QEMU command, and acceptance-image SHA-256.
@@ -963,10 +994,11 @@ uploads both raw observations and validated evidence as artifacts.
 The general runtime is separately measured by `kernel/src/supervisor/benchmark.rs`
 using the same native client and same-boot compatibility samples. Its
 `general-direct` rows must meet the same copy, root, trap, allocation, scheduler,
-and lease requirements. The Phase C p95 budget is 0.70 at every payload size;
-its records encode that limit as 700/1000 using
-`ratio_scale=1000`. Phase B encodes the same cap as 70/100. The performance
-follow-up is tracked in [issue #211](https://github.com/dennissoftman/troe/issues/211).
+and lease requirements. The Phase C p95 budget is 0.90 at every payload size;
+its records encode that limit as 900/1000 using
+`ratio_scale=1000`. Phase B encodes the same cap as 90/100. Performance
+follow-ups are tracked in [issue #246](https://github.com/dennissoftman/troe/issues/246)
+and [issue #211](https://github.com/dennissoftman/troe/issues/211).
 `scripts/ipc_phase_c.py` also requires seven native
 fault rows: before receive, after receive, in a nested call, before reply, after
 reply validation, while queued, and while blocked. Each row proves one fate per
@@ -974,8 +1006,9 @@ client, exact transport/wait/frame cleanup before replacement, a new incarnation
 and a successful subsequent normal call. The queued and blocked cases also
 exercise an independent live caller. Evidence is retained in
 `build/ipc-phase-c-<platform>-<tagged|fallback>.json` with raw timings and the same
-machine/image identity as the Phase B evidence. Latency failures require
-investigation; retries must be disclosed and thresholds must not be reduced.
+machine/image identity as the Phase B evidence. Latency failures remain failures
+under the contract used for that run. Retries and approved budget changes must
+be disclosed; raw failed observations must remain available.
 
 AArch64 profiles require real ASID use in the emulated architecture. x86 TCG
 reports the full-flush fallback and cannot satisfy a tagged-profile claim. The

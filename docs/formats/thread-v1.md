@@ -130,6 +130,28 @@ reply. Clock or native invariant failure remains terminal. Owned operations may
 outlive a turn but do not grant another one. This mechanism does not activate
 production resident scheduling or change the request/reply encoding below.
 
+The separate shared-root native mechanism also restricts ordinary entry 2 to
+the calling thread's exact TX/RX page prefixes. Its request length is 2–4096 bytes
+including the ordinary two-byte service opcode; reply capacity is 0–4096 bytes.
+Both addresses must name their retained page starts, including an empty reply.
+Capture copies the request into preallocated kernel context storage before any
+sibling runs. A once-only owned claim retains caller/operation/IPC identity;
+completion validates the original capacity and defined ordinary service status,
+clears the complete RX page and publishes the reply without user entry or time
+renewal. A claimed call cannot complete through the unclaimed or resume paths.
+Request capture and claim identity do not authenticate the service capability.
+This mechanism leaves the production single-context calling contract unchanged.
+
+Native heap entry 3 retains its caller, operation sequence and IPC incarnation.
+Its claim can map pages once; completion derives success bytes from that recorded
+commit and accepts exhaustion only before a commit. Both are separate from user
+entry and policy wakeup. The process binds its complete heap reservation before
+any thread starts. Initial and later thread admission respect that reservation,
+including unmapped heap capacity; growth cannot consume thread guards or windows.
+Composition supplies owned, zeroed backing and enforces allocation quotas. A
+mapping failure stops all native continuations and retains the root and backing
+until teardown. The production loader does not yet use this mechanism.
+
 ## Requests
 
 Each request is exactly 64 bytes. Truncated and trailing bytes are rejected.

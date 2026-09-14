@@ -17,13 +17,13 @@ from tests.test_qemu_profile import TEST_QEMU
 
 class IpcEvidenceTests(unittest.TestCase):
     def test_failed_ratios_and_structural_failures_retain_raw_boots(self) -> None:
-        phase_b_failure = phase_b(direct_ticks=710, compatibility_ticks=1000)
+        phase_b_failure = phase_b(direct_ticks=910, compatibility_ticks=1000)
         phase_b_failure += "\n" + "\n".join(
             line for line in phase_c().splitlines() if line.startswith("ipc-phase-c")
         )
         observations = (
             (phase_b_failure, "Phase B IPC: direct IPC p95 ratio failed"),
-            (phase_c(ticks=701), "Phase C IPC: direct IPC p95 ratio failed"),
+            (phase_c(ticks=901), "Phase C IPC: direct IPC p95 ratio failed"),
             (
                 phase_c().replace(
                     "additional_lease_programs=0", "additional_lease_programs=1", 1

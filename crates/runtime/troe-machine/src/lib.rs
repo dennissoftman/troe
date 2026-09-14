@@ -474,7 +474,8 @@ pub use mechanism::{
 pub use mmu::planned_user_regions;
 #[cfg(target_os = "uefi")]
 pub use mmu::{
-    ApplicationCall, ApplicationResume, ApplicationSession, NativeProcessBacking,
+    ApplicationCall, ApplicationResume, ApplicationSession, NativeHandleCall,
+    NativeHandleExecution, NativeHeapCall, NativeHeapExecution, NativeProcessBacking,
     NativeProcessContext, NativeSchedulerCall, NativeSchedulerExecution, NativeThreadAdmission,
     NativeThreadAdmissionError, NativeThreadBacking, NativeThreadRetirement, NativeThreadStart,
     NativeThreadStop, build_user_address_space, install_exception_vectors, install_mmu,
